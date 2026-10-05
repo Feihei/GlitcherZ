@@ -1,5 +1,6 @@
-//! 步进音序器（音频线程侧，块边界采样时钟调度）。
+//! 步进音序器（音频线程侧，块边界采样时钟调度，多轨）。
 
+use crate::realtime::NUM_TRACKS;
 use crate::realtime::commands::NoteEvent;
 use crate::realtime::context::ProcessContext;
 
@@ -21,7 +22,9 @@ pub struct SequencerStep {
     pub velocity: f32,
 }
 
-/// 步进音序器：按采样时钟在块边界把到期步进转成 [`NoteEvent`]。
+/// 多轨步进音序器：一个全局走带时钟（BPM / gate / 步进索引），
+/// 每条轨道独立的 16 步模式与 gate 尾音，按采样时钟在块边界把到期
+/// 步进转成 `(轨道, NoteEvent)`。
 ///
 /// 时钟以"流启动以来的绝对采样位置"计（与
 /// [`ProcessContext::playback_sample_pos`] 同一坐标系）。
@@ -37,15 +40,13 @@ pub struct Sequencer {
     bpm: f32,
     /// gate 占步长的比例（0.05..1）。
     gate: f32,
-    pattern: [SequencerStep; PATTERN_STEPS],
+    patterns: [[SequencerStep; PATTERN_STEPS]; NUM_TRACKS],
     step_index: usize,
     /// 最近一次触发步进的时刻（BPM 变化时用于重推下一拍）。
     last_step_sample: u64,
     next_step_sample: u64,
-    /// 待发送的 NoteOff（gate 结束时刻 + 音符）。单声部：同一时刻最多一个。
-    pending_off: Option<(u64, u8)>,
-    /// 最后触发的音符（`stop` 时交给调用方释放包络）。
-    last_note: Option<u8>,
+    /// 各轨待发送的 NoteOff（gate 结束时刻 + 音符）。
+    pending_offs: [Option<(u64, u8)>; NUM_TRACKS],
 }
 
 impl Sequencer {
@@ -60,12 +61,11 @@ impl Sequencer {
             playing: false,
             bpm: 120.0,
             gate: 0.8,
-            pattern: [SequencerStep::default(); PATTERN_STEPS],
+            patterns: [[SequencerStep::default(); PATTERN_STEPS]; NUM_TRACKS],
             step_index: 0,
             last_step_sample: 0,
             next_step_sample: 0,
-            pending_off: None,
-            last_note: None,
+            pending_offs: [None; NUM_TRACKS],
         }
     }
 
@@ -97,15 +97,14 @@ impl Sequencer {
         self.step_index = 0;
         self.last_step_sample = at_sample;
         self.next_step_sample = at_sample;
-        self.pending_off = None;
+        self.pending_offs = [None; NUM_TRACKS];
     }
 
-    /// 停止调度。返回最后触发中的音符，调用方应据此发 `NoteOff`
-    /// 释放包络（`None` 表示没有音符在响）。RT-safe。
-    pub fn stop(&mut self) -> Option<u8> {
+    /// 停止调度并清空全部 gate 尾音。
+    /// 调用方应向所有轨道发 `NoteOff` 释放包络。RT-safe。
+    pub fn stop(&mut self) {
         self.playing = false;
-        self.pending_off = None;
-        self.last_note.take()
+        self.pending_offs = [None; NUM_TRACKS];
     }
 
     /// 设置 BPM（20..300，非有限值忽略）。播放中会保持音乐位置重推下一拍。
@@ -127,46 +126,55 @@ impl Sequencer {
         }
     }
 
-    /// 整块替换模式。RT-safe。
-    pub fn set_pattern(&mut self, pattern: [SequencerStep; PATTERN_STEPS]) {
-        self.pattern = pattern;
+    /// 整块替换某条轨道的模式（越界轨道忽略）。RT-safe。
+    pub fn set_pattern(&mut self, track: usize, steps: [SequencerStep; PATTERN_STEPS]) {
+        if let Some(slot) = self.patterns.get_mut(track) {
+            *slot = steps;
+        }
     }
 
-    /// 推进一个块：把到期的 gate off 与步进 on 经 `emit` 送出
+    /// 推进一个块：把到期的 gate off 与步进 on 经 `emit(轨道, 事件)` 送出
     /// （同一块内先 off 后 on）。RT-safe。
-    pub fn advance(&mut self, ctx: &ProcessContext, emit: &mut dyn FnMut(NoteEvent)) {
+    pub fn advance(&mut self, ctx: &ProcessContext, emit: &mut dyn FnMut(usize, NoteEvent)) {
         if !self.playing {
             return;
         }
         let block_end = ctx.playback_sample_pos + ctx.frames as u64;
 
-        // 1. 到期的 gate off（先于本块的 note on，保证单声部衔接干净）。
-        if let Some((t, note)) = self.pending_off {
-            if t < block_end {
-                emit(NoteEvent::Off { note });
-                self.pending_off = None;
+        // 1. 到期的 gate off（先于本块的 note on，保证各轨衔接干净）。
+        for (track, pending) in self.pending_offs.iter_mut().enumerate() {
+            if let Some((time, note)) = *pending {
+                if time < block_end {
+                    emit(track, NoteEvent::Off { note });
+                    *pending = None;
+                }
             }
         }
 
         // 2. 到期的步进。常规参数下步长 ≫ 块长，每块至多一步；
         //    循环写法保证极端参数下也不丢步。
         while self.next_step_sample < block_end {
-            let step = self.pattern[self.step_index];
-            if step.enabled {
+            for (track, pattern) in self.patterns.iter().enumerate() {
+                let step = pattern[self.step_index];
+                if !step.enabled {
+                    continue;
+                }
                 let velocity = if step.velocity.is_finite() {
                     step.velocity.clamp(0.0, 1.0)
                 } else {
                     0.9
                 };
-                emit(NoteEvent::On {
-                    note: step.note,
-                    velocity,
-                });
-                self.last_note = Some(step.note);
+                emit(
+                    track,
+                    NoteEvent::On {
+                        note: step.note,
+                        velocity,
+                    },
+                );
                 let len = self.step_len_samples();
                 let upper = len.saturating_sub(1).max(1);
                 let gate_samples = ((len as f32 * self.gate) as u64).clamp(1, upper);
-                self.pending_off = Some((self.next_step_sample + gate_samples, step.note));
+                self.pending_offs[track] = Some((self.next_step_sample + gate_samples, step.note));
             }
             self.last_step_sample = self.next_step_sample;
             self.step_index = (self.step_index + 1) % PATTERN_STEPS;
@@ -178,6 +186,7 @@ impl Sequencer {
 #[cfg(test)]
 mod tests {
     use super::{PATTERN_STEPS, Sequencer, SequencerStep};
+    use crate::realtime::NUM_TRACKS;
     use crate::realtime::commands::NoteEvent;
     use crate::realtime::context::ProcessContext;
 
@@ -192,12 +201,16 @@ mod tests {
         }
     }
 
-    /// 推进 `blocks` 个块，收集全部事件。
-    fn run(seq: &mut Sequencer, start_pos: u64, blocks: usize) -> Vec<NoteEvent> {
+    type Event = (usize, NoteEvent);
+
+    /// 推进 `blocks` 个块，收集全部 (轨道, 事件)。
+    fn run(seq: &mut Sequencer, start_pos: u64, blocks: usize) -> Vec<Event> {
         let mut events = Vec::new();
         for i in 0..blocks {
             let pos = start_pos + (i * BLOCK) as u64;
-            seq.advance(&ctx(pos), &mut |event| events.push(event));
+            seq.advance(&ctx(pos), &mut |track, event| {
+                events.push((track, event));
+            });
         }
         events
     }
@@ -210,55 +223,80 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plays_enabled_steps_with_gate_offs() {
-        let mut seq = Sequencer::new(SR);
-        seq.set_bpm(120.0); // 16 分音符 = 6000 样本
-        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
-        pattern[0] = step(60);
-        pattern[1] = step(64);
-        pattern[2] = step(67);
-        seq.set_pattern(pattern);
-        seq.play(0);
-
-        let events = run(&mut seq, 0, 375); // 48_000 样本 = 1 s
-        let on_notes: Vec<u8> = events
+    fn ons(events: &[Event]) -> Vec<(usize, u8)> {
+        events
             .iter()
-            .filter_map(|e| match e {
-                NoteEvent::On { note, .. } => Some(*note),
+            .filter_map(|(t, e)| match e {
+                NoteEvent::On { note, .. } => Some((*t, *note)),
                 _ => None,
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn plays_per_track_patterns_with_gate_offs() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0); // 16 分音符 = 6000 样本
+        let mut track0 = [SequencerStep::default(); PATTERN_STEPS];
+        track0[0] = step(60);
+        track0[1] = step(64);
+        let mut track1 = [SequencerStep::default(); PATTERN_STEPS];
+        track1[0] = step(72);
+        seq.set_pattern(0, track0);
+        seq.set_pattern(1, track1);
+        seq.play(0);
+
+        let events = run(&mut seq, 0, 375); // 1 s
+        assert_eq!(
+            ons(&events),
+            vec![(0, 60), (1, 72), (0, 64)],
+            "两轨应同时钟触发"
+        );
         let offs = events
             .iter()
-            .filter(|e| matches!(e, NoteEvent::Off { .. }))
+            .filter(|(_, e)| matches!(e, NoteEvent::Off { .. }))
             .count();
-        assert_eq!(on_notes, vec![60, 64, 67], "三步应依次触发");
         assert_eq!(offs, 3, "每个音符都应有 gate off");
-        // On / Off 交替：On 必须先于配对的 Off。
-        assert!(matches!(events[0], NoteEvent::On { .. }));
-        assert!(matches!(events[1], NoteEvent::Off { .. }));
+        assert!(matches!(events[0], (0, NoteEvent::On { .. })));
+        assert!(matches!(events[1], (1, NoteEvent::On { .. })));
     }
 
     #[test]
     fn disabled_steps_emit_nothing() {
         let mut seq = Sequencer::new(SR);
-        seq.set_pattern([SequencerStep::default(); PATTERN_STEPS]);
         seq.play(0);
         let events = run(&mut seq, 0, 375);
         assert!(events.is_empty(), "全禁用模式不应发声");
-        // 步进时钟仍然推进。
         assert_eq!(seq.step_index(), 375 * 128 / 6000 % PATTERN_STEPS);
+    }
+
+    #[test]
+    fn pattern_change_targets_only_one_track() {
+        let mut seq = Sequencer::new(SR);
+        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
+        pattern[0] = step(60);
+        seq.set_pattern(0, pattern);
+        seq.set_pattern(1, pattern);
+        // 越界轨道：静默忽略，不得 panic。
+        seq.set_pattern(NUM_TRACKS, pattern);
+        seq.set_pattern(usize::MAX, pattern);
+        seq.play(0);
+        let events = run(&mut seq, 0, 20);
+        assert_eq!(
+            ons(&events),
+            vec![(0, 60), (1, 60)],
+            "越轨设置不应产生额外事件"
+        );
     }
 
     #[test]
     fn bpm_change_alters_step_rate() {
         let mut seq = Sequencer::new(SR);
         let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
-        for s in &mut pattern {
-            *s = step(60);
+        for step_slot in &mut pattern {
+            *step_slot = step(60);
         }
-        seq.set_pattern(pattern);
+        seq.set_pattern(0, pattern);
 
         seq.set_bpm(120.0);
         seq.play(0);
@@ -271,17 +309,18 @@ mod tests {
     }
 
     #[test]
-    fn stop_quiets_and_returns_last_note() {
+    fn stop_quiets_every_track() {
         let mut seq = Sequencer::new(SR);
         let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
         pattern[0] = step(60);
-        seq.set_pattern(pattern);
+        for track in 0..NUM_TRACKS {
+            seq.set_pattern(track, pattern);
+        }
         seq.play(0);
-        let events = run(&mut seq, 0, 1); // 触发第 0 步
-        assert!(matches!(events[0], NoteEvent::On { note: 60, .. }));
+        let events = run(&mut seq, 0, 1);
+        assert_eq!(ons(&events).len(), NUM_TRACKS, "四轨应同时触发第 0 步");
 
-        let last = seq.stop();
-        assert_eq!(last, Some(60));
+        seq.stop();
         let events = run(&mut seq, 256, 375);
         assert!(events.is_empty(), "停止后不应再有事件");
         assert!(!seq.is_playing());
@@ -293,18 +332,24 @@ mod tests {
         let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
         pattern[0] = step(60);
         pattern[15] = step(72);
-        seq.set_pattern(pattern);
+        seq.set_pattern(0, pattern);
         seq.play(0);
 
         // 20 步 ≈ 120_000 样本 + 余量：step 0 触发两次。
-        let ons: Vec<u8> = run(&mut seq, 0, 950)
+        let fired: Vec<u8> = run(&mut seq, 0, 950)
             .iter()
-            .filter_map(|e| match e {
-                NoteEvent::On { note, .. } => Some(*note),
-                _ => None,
+            .filter_map(|(t, e)| {
+                if *t == 0 {
+                    match e {
+                        NoteEvent::On { note, .. } => Some(*note),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
             })
             .collect();
-        assert_eq!(ons, vec![60, 72, 60], "步进时钟应在 16 步后回绕");
+        assert_eq!(fired, vec![60, 72, 60], "步进时钟应在 16 步后回绕");
     }
 
     #[test]
@@ -314,16 +359,15 @@ mod tests {
         let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
         pattern[0] = step(60);
         pattern[1] = step(64);
-        seq.set_pattern(pattern);
+        seq.set_pattern(0, pattern);
         seq.play(0);
 
         let events = run(&mut seq, 0, 60);
-        // gate=1.0 时 off 恰在下一步前一瞬：60 块 = 7680 样本覆盖
-        // 步 0（on@0, off@5999）与步 1 的 on@6000；其 off 在窗口外。
+        // 60 块 = 7680 样本覆盖步 0（on@0, off@5999）与步 1 的 on@6000；
         // 顺序 on → off → on 即证明 off 先于下一个 note on。
         let kinds: Vec<&str> = events
             .iter()
-            .map(|e| match e {
+            .map(|(_, e)| match e {
                 NoteEvent::On { .. } => "on",
                 NoteEvent::Off { .. } => "off",
             })

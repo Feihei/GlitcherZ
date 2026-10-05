@@ -10,8 +10,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::convert;
 use crate::realtime::{
-    BlockRunner, COMMAND_QUEUE_CAPACITY, EngineCommand, FIXED_BLOCK_SIZE, Feedback, GainProcessor,
-    ProcessorChain, Sequencer, SvfProcessor, SynthProcessor, command_channel,
+    BlockRunner, COMMAND_QUEUE_CAPACITY, EngineCommand, FIXED_BLOCK_SIZE, Feedback, Mixer,
+    Sequencer, command_channel,
 };
 
 /// 引擎的基础信息（UI 显示用）。
@@ -63,12 +63,9 @@ impl AudioEngine {
 
         let (commands, command_rx) = command_channel(COMMAND_QUEUE_CAPACITY);
 
-        // 初始处理图：合成器（振荡器 + ADSR）→ SVF 滤波器 → 主增益。
+        // 初始处理图：4 条轨道（合成器 → 延迟）→ 主增益。
         // （图结构重建后续走双缓冲交换方案，见 AGENTS.md「处理图」。）
-        let mut chain = ProcessorChain::new();
-        chain.push(Box::new(SynthProcessor::new(sample_rate_f32)));
-        chain.push(Box::new(SvfProcessor::new(sample_rate_f32)));
-        chain.push(Box::new(GainProcessor::new(1.0)));
+        let mixer = Mixer::new(sample_rate_f32, FIXED_BLOCK_SIZE);
 
         let feedback = Feedback::new();
         let sequencer = Sequencer::new(sample_rate_f32);
@@ -76,7 +73,7 @@ impl AudioEngine {
             FIXED_BLOCK_SIZE,
             stream_config.channels as usize,
             sample_rate_f32,
-            chain,
+            mixer,
             sequencer,
             command_rx,
             feedback.clone(),
@@ -127,6 +124,14 @@ impl AudioEngine {
     /// 音序器是否播放中。
     pub fn is_playing(&self) -> bool {
         self.feedback.playing.load(Ordering::Relaxed)
+    }
+
+    /// 指定轨道的 post-fader 峰值电平（越界返回 0）。
+    pub fn track_level(&self, track: usize) -> f32 {
+        self.feedback
+            .track_levels
+            .get(track)
+            .map_or(0.0, |level| level.load())
     }
 
     /// 播放位置（秒，f64：时间计算用 f64）。

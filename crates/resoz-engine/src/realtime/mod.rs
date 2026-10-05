@@ -30,8 +30,10 @@ pub mod block;
 pub mod buffer;
 pub mod commands;
 pub mod context;
+pub mod delay;
 pub mod envelope;
 pub mod gain;
+pub mod mixer;
 pub mod processor;
 pub mod sequencer;
 pub mod sine;
@@ -41,6 +43,9 @@ pub mod synth;
 /// 固定处理块大小（样本数）。见 AGENTS.md「处理图」（建议 64 或 128）。
 pub const FIXED_BLOCK_SIZE: usize = 128;
 
+/// 项目轨道数（第 5 步固定 4 轨；与 `resoz_model::NUM_TRACKS` 保持一致）。
+pub const NUM_TRACKS: usize = 4;
+
 pub use atomic::AtomicF32;
 pub use block::{BlockRunner, Feedback};
 pub use buffer::AudioBuffer;
@@ -48,8 +53,10 @@ pub use commands::{
     COMMAND_QUEUE_CAPACITY, EngineCommand, NoteEvent, ParamId, SequencerCommand, command_channel,
 };
 pub use context::ProcessContext;
+pub use delay::DelayProcessor;
 pub use envelope::AdsrProcessor;
 pub use gain::GainProcessor;
+pub use mixer::{Mixer, MixerLevels};
 pub use processor::{Processor, ProcessorChain};
 pub use sequencer::{PATTERN_STEPS, Sequencer, SequencerStep};
 pub use sine::SineProcessor;

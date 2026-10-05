@@ -1,4 +1,4 @@
-//! 固定块处理调度：cpal 回调 ↔ 处理链的桥梁。
+//! 固定块处理调度：cpal 回调 ↔ 混音器的桥梁。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -6,10 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use rtrb::Consumer;
 
 use crate::realtime::atomic::AtomicF32;
-use crate::realtime::buffer::AudioBuffer;
-use crate::realtime::commands::{EngineCommand, NoteEvent, SequencerCommand};
+use crate::realtime::commands::{EngineCommand, SequencerCommand};
 use crate::realtime::context::ProcessContext;
-use crate::realtime::processor::{Processor, ProcessorChain};
+use crate::realtime::mixer::Mixer;
 use crate::realtime::sequencer::Sequencer;
 
 /// 引擎 → UI 的状态回传句柄：与 [`BlockRunner`] 共享的一组原子量。
@@ -18,7 +17,7 @@ use crate::realtime::sequencer::Sequencer;
 /// 克隆副本供 UI 读取。
 #[derive(Clone)]
 pub struct Feedback {
-    /// 最近块的峰值电平。
+    /// 主输出最近块峰值电平。
     pub level: Arc<AtomicF32>,
     /// 播放位置（流启动以来的样本数）。
     pub position: Arc<AtomicU64>,
@@ -26,6 +25,8 @@ pub struct Feedback {
     pub step: Arc<AtomicU32>,
     /// 音序器走带状态。
     pub playing: Arc<AtomicBool>,
+    /// 各轨道 post-fader 峰值电平。
+    pub track_levels: [Arc<AtomicF32>; crate::realtime::NUM_TRACKS],
 }
 
 impl Feedback {
@@ -36,6 +37,7 @@ impl Feedback {
             position: Arc::new(AtomicU64::new(0)),
             step: Arc::new(AtomicU32::new(0)),
             playing: Arc::new(AtomicBool::new(false)),
+            track_levels: std::array::from_fn(|_| Arc::new(AtomicF32::new(0.0))),
         }
     }
 }
@@ -46,23 +48,21 @@ impl Default for Feedback {
     }
 }
 
-/// 把宿主（cpal）交来的任意长度交错缓冲区拆成固定块交给处理链执行，
+/// 把宿主（cpal）交来的任意长度交错缓冲区拆成固定块交给混音器执行，
 /// 再交错写回。实例在音频流启动前构造，随后 move 进音频回调线程，
 /// 其生命周期内独占音频线程。
 ///
 /// 每个固定块的执行顺序（`run_next_block`）：
 /// 1. **块边界**消费全部待处理命令（队列空则立即返回）；
-/// 2. 音序器按采样时钟调度，到期音符事件直接送入处理链；
-/// 3. 准备静音块（预分配 scratch）；
-/// 4. 运行处理链；
-/// 5. 回传峰值电平、播放位置、音序器步进与走带状态（原子量）。
+/// 2. 音序器按采样时钟调度，到期音符事件直接送入对应轨道；
+/// 3. 混音器处理一个块（各轨并行 → 求和 → 主链）；
+/// 4. 回传峰值电平、播放位置、音序器步进与走带状态（原子量）。
 pub struct BlockRunner {
     fixed_block: usize,
     out_channels: usize,
     sample_rate: f32,
-    chain: ProcessorChain,
+    mixer: Mixer,
     sequencer: Sequencer,
-    scratch: AudioBuffer,
     scratch_pos: usize,
     commands: Consumer<EngineCommand>,
     feedback: Feedback,
@@ -70,12 +70,12 @@ pub struct BlockRunner {
 }
 
 impl BlockRunner {
-    /// 构造。**非 RT-safe**（分配 scratch），必须在启动音频流前调用。
+    /// 构造。**非 RT-safe**（分配缓冲），必须在启动音频流前调用。
     pub fn new(
         fixed_block: usize,
         out_channels: usize,
         sample_rate: f32,
-        chain: ProcessorChain,
+        mixer: Mixer,
         sequencer: Sequencer,
         commands: Consumer<EngineCommand>,
         feedback: Feedback,
@@ -88,9 +88,8 @@ impl BlockRunner {
             } else {
                 48_000.0
             },
-            chain,
+            mixer,
             sequencer,
-            scratch: AudioBuffer::new(2, fixed_block.max(1)),
             scratch_pos: 0,
             commands,
             feedback,
@@ -104,7 +103,7 @@ impl BlockRunner {
     /// 单声道输出取 L。
     pub fn render_interleaved(&mut self, out: &mut [f32]) {
         for frame in out.chunks_mut(self.out_channels) {
-            if self.scratch_pos >= self.scratch.len() {
+            if self.scratch_pos >= self.mixer_block_len() {
                 self.run_next_block();
             }
             let left = self.sample_at(0, self.scratch_pos);
@@ -120,6 +119,13 @@ impl BlockRunner {
         }
     }
 
+    /// 当前主缓冲活动长度。
+    fn mixer_block_len(&self) -> usize {
+        self.mixer
+            .master_channel(0)
+            .map_or(0, |channel| channel.len())
+    }
+
     /// 执行一个固定块。只应在 [`BlockRunner::render_interleaved`] 内调用。
     fn run_next_block(&mut self) {
         // 1. 块边界：消费所有待处理命令（无锁队列，空则立即返回）。
@@ -127,38 +133,31 @@ impl BlockRunner {
             self.apply_command(cmd);
         }
 
-        // 2. 本块上下文（供音序器与处理链共用）。
-        let frames = self.fixed_block.min(self.scratch.capacity());
+        // 2. 本块上下文（供音序器与混音器共用）。
+        let frames = self.fixed_block;
         let ctx = ProcessContext {
             sample_rate: self.sample_rate,
             frames,
             playback_sample_pos: self.played_samples,
         };
 
-        // 3. 音序器调度：到期音符事件直接送入处理链（块边界精度）。
-        //    拆字段借用，让 sequencer 与 chain 同时可变。
+        // 3. 音序器调度：到期音符事件直接送入对应轨道（块边界精度）。
+        //    拆字段借用，让 sequencer 与 mixer 同时可变。
         let Self {
-            sequencer, chain, ..
+            sequencer, mixer, ..
         } = self;
-        sequencer.advance(&ctx, &mut |event| {
-            let _ = chain.note_event(event);
+        sequencer.advance(&ctx, &mut |track, event| {
+            mixer.track_note(track, event);
         });
 
-        // 4. 准备静音块并运行处理链。
-        self.scratch.set_len(frames);
-        self.scratch.clear();
-        self.chain.process(&ctx, &mut self.scratch);
+        // 4. 混音器处理一个块（各轨并行 → 求和 → 主链）。
+        let levels = self.mixer.process_block(&ctx);
 
-        // 5. 状态回传：峰值电平、播放位置、音序器步进与走带状态。
-        let mut peak = 0.0f32;
-        for ch in 0..self.scratch.channels() {
-            if let Some(channel) = self.scratch.channel(ch) {
-                for sample in channel {
-                    peak = peak.max(sample.abs());
-                }
-            }
+        // 5. 状态回传。
+        self.feedback.level.store(levels.master);
+        for (slot, value) in self.feedback.track_levels.iter().zip(levels.tracks) {
+            slot.store(value);
         }
-        self.feedback.level.store(peak);
         self.feedback
             .position
             .store(self.played_samples, Ordering::Relaxed);
@@ -176,11 +175,14 @@ impl BlockRunner {
     fn apply_command(&mut self, cmd: EngineCommand) {
         match cmd {
             EngineCommand::SetParam { id, value } => {
-                // 未被任何节点识别的参数静默丢弃（发送方负责只发送有效参数）。
-                let _ = self.chain.set_param(id, value);
+                // 未被识别的参数静默丢弃（发送方负责只发送有效参数）。
+                let _ = self.mixer.master_set_param(id, value);
             }
-            EngineCommand::Note(event) => {
-                let _ = self.chain.note_event(event);
+            EngineCommand::SetTrackParam { track, id, value } => {
+                self.mixer.track_set_param(track, id, value);
+            }
+            EngineCommand::Note { track, event } => {
+                self.mixer.track_note(track, event);
             }
             EngineCommand::Sequencer(cmd) => self.apply_sequencer_command(cmd),
         }
@@ -191,23 +193,24 @@ impl BlockRunner {
             SequencerCommand::Play => {
                 self.sequencer.play(self.played_samples);
                 // 清掉可能仍按住的手动音符，避免与音序声部叠加。
-                let _ = self.chain.note_event(NoteEvent::Off { note: 0 });
+                self.mixer.note_off_all();
             }
             SequencerCommand::Stop => {
-                // 返回值仅诊断用；无论是否记录了音符都发 Off 兜底释放。
-                let _ = self.sequencer.stop();
-                let _ = self.chain.note_event(NoteEvent::Off { note: 0 });
+                self.sequencer.stop();
+                self.mixer.note_off_all();
             }
             SequencerCommand::SetBpm(bpm) => self.sequencer.set_bpm(bpm),
             SequencerCommand::SetGate(gate) => self.sequencer.set_gate(gate),
-            SequencerCommand::SetPattern(steps) => self.sequencer.set_pattern(steps),
+            SequencerCommand::SetPattern { track, steps } => {
+                self.sequencer.set_pattern(track, steps);
+            }
         }
     }
 
-    /// 读取 scratch 中 `(声道, 位置)` 的样本；越界一律静音（不 panic）。
+    /// 读取主缓冲中 `(声道, 位置)` 的样本；越界一律静音（不 panic）。
     fn sample_at(&self, ch: usize, pos: usize) -> f32 {
-        self.scratch
-            .channel(ch)
+        self.mixer
+            .master_channel(ch)
             .and_then(|c| c.get(pos))
             .copied()
             .unwrap_or(0.0)
@@ -224,11 +227,8 @@ mod tests {
     use crate::realtime::commands::{
         EngineCommand, NoteEvent, ParamId, SequencerCommand, command_channel,
     };
-    use crate::realtime::gain::GainProcessor;
-    use crate::realtime::processor::ProcessorChain;
+    use crate::realtime::mixer::Mixer;
     use crate::realtime::sequencer::{PATTERN_STEPS, Sequencer, SequencerStep};
-    use crate::realtime::svf::SvfProcessor;
-    use crate::realtime::synth::SynthProcessor;
     use crate::testing::count_positive_crossings;
 
     const SR: f32 = 44_100.0;
@@ -239,18 +239,14 @@ mod tests {
         out_channels: usize,
     ) -> (BlockRunner, Producer<EngineCommand>, Feedback) {
         let (tx, rx) = command_channel(64);
-        // 与 AudioEngine 相同的链路：合成器 → 滤波器 → 主增益。
-        let mut chain = ProcessorChain::new();
-        chain.push(Box::new(SynthProcessor::new(SR)));
-        chain.push(Box::new(SvfProcessor::new(SR)));
-        chain.push(Box::new(GainProcessor::new(1.0)));
+        let mixer = Mixer::new(SR, fixed_block);
         let feedback = Feedback::new();
         let sequencer = Sequencer::new(SR);
         let runner = BlockRunner::new(
             fixed_block,
             out_channels,
             SR,
-            chain,
+            mixer,
             sequencer,
             rx,
             feedback.clone(),
@@ -258,12 +254,15 @@ mod tests {
         (runner, tx, feedback)
     }
 
-    /// 触发 A4 音符（队列在下一个块边界被消费）。
+    /// 向轨道 0 触发 A4 音符（队列在下一个块边界被消费）。
     fn note_on_69(tx: &mut Producer<EngineCommand>) {
-        tx.push(EngineCommand::Note(NoteEvent::On {
-            note: 69,
-            velocity: 1.0,
-        }))
+        tx.push(EngineCommand::Note {
+            track: 0,
+            event: NoteEvent::On {
+                note: 69,
+                velocity: 1.0,
+            },
+        })
         .expect("队列未满");
     }
 
@@ -322,7 +321,8 @@ mod tests {
         let mut out = vec![0.0f32; 44_100 * 2];
 
         runner.render_interleaved(&mut out[..half_frames * 2]);
-        tx.push(EngineCommand::SetParam {
+        tx.push(EngineCommand::SetTrackParam {
+            track: 0,
             id: ParamId::SineFrequency,
             value: 880.0,
         })
@@ -339,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_level_and_position() {
+    fn reports_level_position_and_transport() {
         let (mut runner, mut tx, feedback) = make_runner(128, 2);
         note_on_69(&mut tx);
         let mut out = vec![0.0f32; 300 * 2];
@@ -348,6 +348,7 @@ mod tests {
         // 300 帧 → 消费 3 个块；position 为当前正在缓冲的块起点（第 3 块 = 256）。
         assert_eq!(feedback.position.load(Ordering::Relaxed), 256);
         assert!(feedback.level.load() > 0.0, "有信号输出时峰值电平应为正");
+        assert!(feedback.track_levels[0].load() > 0.0, "轨道 0 电平应为正");
     }
 
     #[test]
@@ -357,8 +358,11 @@ mod tests {
         let mut out = vec![0.0f32; 22_050 * 2];
         runner.render_interleaved(&mut out); // 0.5 s sustain
 
-        tx.push(EngineCommand::Note(NoteEvent::Off { note: 69 }))
-            .expect("队列未满");
+        tx.push(EngineCommand::Note {
+            track: 0,
+            event: NoteEvent::Off { note: 69 },
+        })
+        .expect("队列未满");
         runner.render_interleaved(&mut out); // release 0.2 s + 余量
 
         assert!(
@@ -381,7 +385,7 @@ mod tests {
     fn sequencer_drives_synth_through_command_queue() {
         let (mut runner, mut tx, feedback) = make_runner(128, 2);
 
-        // 模式：步 0/2/4 触发 A4；BPM 240 → 步长 2756 样本（44100 Hz）。
+        // 模式：轨道 0 步 0/2/4 触发 A4；BPM 240。
         let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
         for i in [0usize, 2, 4] {
             pattern[i] = SequencerStep {
@@ -390,9 +394,10 @@ mod tests {
                 velocity: 0.9,
             };
         }
-        tx.push(EngineCommand::Sequencer(SequencerCommand::SetPattern(
-            pattern,
-        )))
+        tx.push(EngineCommand::Sequencer(SequencerCommand::SetPattern {
+            track: 0,
+            steps: pattern,
+        }))
         .expect("队列未满");
         tx.push(EngineCommand::Sequencer(SequencerCommand::SetBpm(240.0)))
             .expect("队列未满");
@@ -431,12 +436,37 @@ mod tests {
             note: 60,
             velocity: 1.0,
         };
-        tx.push(EngineCommand::Sequencer(SequencerCommand::SetPattern(
-            pattern,
-        )))
+        tx.push(EngineCommand::Sequencer(SequencerCommand::SetPattern {
+            track: 0,
+            steps: pattern,
+        }))
         .expect("队列未满");
         let mut out = vec![0.0f32; 22_050];
         runner.render_interleaved(&mut out);
         assert!(feedback.level.load() < 1e-9, "未按播放时音序器不应发声");
+    }
+
+    #[test]
+    fn tracks_play_in_parallel() {
+        let (mut runner, mut tx, feedback) = make_runner(128, 2);
+        // 两条轨道同时触发不同音符：两轨电平均应为正。
+        for (track, note) in [(0usize, 60u8), (1usize, 67u8)] {
+            tx.push(EngineCommand::Note {
+                track,
+                event: NoteEvent::On {
+                    note,
+                    velocity: 1.0,
+                },
+            })
+            .expect("队列未满");
+        }
+        let mut out = vec![0.0f32; 4096 * 2];
+        runner.render_interleaved(&mut out);
+        assert!(feedback.track_levels[0].load() > 0.0, "轨道 0 应有电平");
+        assert!(feedback.track_levels[1].load() > 0.0, "轨道 1 应有电平");
+        assert!(
+            feedback.track_levels[2].load() < 1e-9 && feedback.track_levels[3].load() < 1e-9,
+            "未使用的轨道应为静音"
+        );
     }
 }

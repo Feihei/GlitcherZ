@@ -34,6 +34,18 @@ pub enum ParamId {
     Sustain,
     /// 包络 Release 时间（秒）。
     Release,
+    /// 轨道增益（线性，0..1.5）。
+    TrackGain,
+    /// 轨道声像（-1..1，线性声像律）。
+    TrackPan,
+    /// 轨道静音（≥ 0.5 视为静音）。
+    TrackMute,
+    /// 延迟时间（秒，0.005..1）。
+    DelayTime,
+    /// 延迟反馈（0..0.9）。
+    DelayFeedback,
+    /// 延迟湿声混合比（0..1）。
+    DelayMix,
 }
 
 /// 音符事件（MIDI 语义）。`note` 为 MIDI 音符编号（69 = A4），`velocity`
@@ -51,14 +63,17 @@ pub enum NoteEvent {
 pub enum SequencerCommand {
     /// 从第 0 步开始播放（以接收时刻的流位置为时钟原点）。
     Play,
-    /// 停止并释放当前音符。
+    /// 停止并释放全部轨道当前音符。
     Stop,
     /// 设置 BPM（20..300）。
     SetBpm(f32),
     /// 设置 gate 占步长的比例（0.05..1）。
     SetGate(f32),
-    /// 整块替换 16 步模式。
-    SetPattern([SequencerStep; PATTERN_STEPS]),
+    /// 整块替换某条轨道的 16 步模式。
+    SetPattern {
+        track: usize,
+        steps: [SequencerStep; PATTERN_STEPS],
+    },
 }
 
 /// UI / 控制线程 → 音频线程的控制命令。
@@ -67,10 +82,16 @@ pub enum SequencerCommand {
 /// （`String` / `Vec` / `Box` 等）。
 #[derive(Debug, Clone, Copy)]
 pub enum EngineCommand {
-    /// 设置一个参数值。具体含义由目标节点解释（含钳制）。
+    /// 设置主链参数（主增益等全局参数）。
     SetParam { id: ParamId, value: f32 },
-    /// 发送一个音符事件（当前为单声部：最后一个 `On` 生效）。
-    Note(NoteEvent),
+    /// 设置指定轨道的参数（音色 / 包络 / 延迟 / 增益 / 声像 / 静音）。
+    SetTrackParam {
+        track: usize,
+        id: ParamId,
+        value: f32,
+    },
+    /// 向指定轨道的音源发送音符事件（键盘演奏等）。
+    Note { track: usize, event: NoteEvent },
     /// 音序器走带 / 配置。
     Sequencer(SequencerCommand),
 }
@@ -95,7 +116,8 @@ mod tests {
     fn match_value(cmd: EngineCommand) -> f32 {
         match cmd {
             EngineCommand::SetParam { value, .. } => value,
-            EngineCommand::Note(_) => f32::NAN,
+            EngineCommand::SetTrackParam { value, .. } => value,
+            EngineCommand::Note { .. } => f32::NAN,
             EngineCommand::Sequencer(_) => f32::NAN,
         }
     }
@@ -104,16 +126,22 @@ mod tests {
     fn fifo_order() {
         let (mut tx, mut rx) = command_channel(4);
         tx.push(set_param(0.25)).expect("入队失败");
-        tx.push(EngineCommand::Note(NoteEvent::On {
-            note: 69,
-            velocity: 1.0,
-        }))
+        tx.push(EngineCommand::Note {
+            track: 0,
+            event: NoteEvent::On {
+                note: 69,
+                velocity: 1.0,
+            },
+        })
         .expect("入队失败");
         tx.push(set_param(0.5)).expect("入队失败");
         assert_eq!(rx.pop().ok().map(match_value), Some(0.25));
         assert!(matches!(
             rx.pop(),
-            Ok(EngineCommand::Note(NoteEvent::On { note: 69, .. }))
+            Ok(EngineCommand::Note {
+                track: 0,
+                event: NoteEvent::On { note: 69, .. }
+            })
         ));
         assert_eq!(rx.pop().ok().map(match_value), Some(0.5));
         assert!(rx.pop().is_err(), "空队列应返回 Err");

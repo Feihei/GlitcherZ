@@ -4,15 +4,15 @@
 //!
 //! ResoZ 的 egui 界面：走带控制、步进音序器、钢琴卷帘、混音器。
 //!
-//! 当前（路线图第 4 步）：主窗口 + 完整合成器面板 + 16 步步进音序器
-//! （走带播放/停止、BPM、步进网格、画笔音符、音长）。所有改动经
-//! [`resoz_engine::realtime::EngineCommand`] 无锁队列实时送往音频线程，
-//! 走带状态与当前步进经原子量回传高亮。
+//! 当前（路线图第 5 步）：多轨主窗口 —— 4 条轨道，每轨独立合成器
+//! （滤波器/ADSR/延迟）、16 步音序模式与混音条（静音/推子/声像/电平
+//! 表）。UI 持有 `resoz_model::Project` 文档并把它当作参数面板状态；
+//! 所有改动经 [`resoz_engine::realtime::EngineCommand`] 轨道定向命令
+//! 实时送往音频线程。
 //!
 //! 分层说明：本 crate 直接依赖 engine 的非实时控制端——`AudioEngine`
-//! 只在 UI 线程被触碰，永不进入音频回调。UI 持有 `resoz_model` 文档
-//! （`Pattern`），发送前转换为引擎侧的 `SequencerStep` 数组——两个
-//! crate 互不依赖。
+//! 只在 UI 线程被触碰，永不进入音频回调。模型与引擎互不依赖，发送前
+//! 在此完成文档 → 引擎表示的转换。
 
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
@@ -23,31 +23,43 @@ use eframe::egui;
 use resoz_engine::AudioEngine;
 use resoz_engine::convert;
 use resoz_engine::realtime::{EngineCommand, NoteEvent, ParamId, SequencerCommand, SequencerStep};
-use resoz_model::{PATTERN_STEPS, Pattern};
+use resoz_model::{PATTERN_STEPS, Pattern, Project};
 
 /// 滤波器截止频率滑块范围（对数刻度）。
-pub const CUTOFF_RANGE: RangeInclusive<f64> = 20.0..=18_000.0;
+pub const CUTOFF_RANGE: RangeInclusive<f32> = 20.0..=18_000.0;
 
-/// 主增益滑块范围（线性）。
-pub const GAIN_RANGE: RangeInclusive<f64> = 0.0..=1.0;
+/// 共振滑块范围（Simper SVF res）。
+pub const RES_RANGE: RangeInclusive<f32> = 0.0..=0.98;
 
-/// BPM 可调范围。
+/// Attack / Decay 滑块范围（秒）。
+pub const AD_RANGE: RangeInclusive<f32> = 0.0..=2.0;
+
+/// Sustain 滑块范围（相对电平）。
+pub const S_RANGE: RangeInclusive<f32> = 0.0..=1.0;
+
+/// Release 滑块范围（秒）。
+pub const R_RANGE: RangeInclusive<f32> = 0.0..=3.0;
+
+/// 延迟时间滑块范围（秒）。
+pub const DELAY_TIME_RANGE: RangeInclusive<f32> = 0.005..=1.0;
+
+/// 延迟反馈滑块范围。
+pub const DELAY_FB_RANGE: RangeInclusive<f32> = 0.0..=0.9;
+
+/// 延迟湿声滑块范围。
+pub const DELAY_MIX_RANGE: RangeInclusive<f32> = 0.0..=1.0;
+
+/// 轨道推子范围（线性）。
+pub const TRACK_GAIN_RANGE: RangeInclusive<f32> = 0.0..=1.5;
+
+/// 轨道声像滑块范围。
+pub const PAN_RANGE: RangeInclusive<f32> = -1.0..=1.0;
+
+/// BPM 可调范围（文档中为 f64：时间计算约定）。
 pub const BPM_RANGE: RangeInclusive<f64> = 20.0..=300.0;
 
 /// 音长（gate 占步长比例）滑块范围。
-pub const GATE_RANGE: RangeInclusive<f64> = 0.05..=1.0;
-
-/// 共振滑块范围（Simper SVF res）。
-pub const RES_RANGE: RangeInclusive<f64> = 0.0..=0.98;
-
-/// Attack / Decay 滑块范围（秒）。
-pub const AD_RANGE: RangeInclusive<f64> = 0.0..=2.0;
-
-/// Sustain 滑块范围（相对电平）。
-pub const S_RANGE: RangeInclusive<f64> = 0.0..=1.0;
-
-/// Release 滑块范围（秒）。
-pub const R_RANGE: RangeInclusive<f64> = 0.0..=3.0;
+pub const GATE_RANGE: RangeInclusive<f32> = 0.05..=1.0;
 
 /// 电脑键盘 → 半音偏移（相对八度基准，FL Studio 风格布局）。
 const KEYMAP: &[(egui::Key, u8)] = &[
@@ -86,7 +98,7 @@ fn note_name(note: u8) -> String {
 /// UI 启动参数。
 #[derive(Debug, Clone)]
 pub struct UiConfig {
-    /// 初始主增益，会被钳制进 [`GAIN_RANGE`]。
+    /// 初始主增益，会被钳制进 0..1.5。
     pub gain: f64,
     /// 启动时自动触发的音符（演示/冒烟测试用；`None` = 静默启动）。
     pub auto_play_note: Option<u8>,
@@ -122,24 +134,12 @@ impl PeakMeter {
 /// 主窗口应用。拥有 [`AudioEngine`]：窗口关闭即引擎丢弃、音频流停止。
 pub struct ResoZApp {
     engine: AudioEngine,
-    /// 音序器模式文档（UI 持有模型状态，见 AGENTS.md「线程模型」）。
-    pattern: Pattern,
+    /// 项目文档（UI 持有模型状态，见 AGENTS.md「线程模型」）。
+    project: Project,
+    /// 正在编辑的轨道（合成器/音序器/键盘的目标）。
+    selected_track: usize,
     /// 画笔音符：点选空白步时写入的音符。
     brush_note: u8,
-    /// 音长（gate 占步长比例）。
-    gate: f64,
-    /// 速度（BPM，UI/时间计算用 f64）。
-    bpm: f64,
-    gain: f64,
-    cutoff_hz: f64,
-    resonance: f64,
-    /// 滤波模式：0 = 低通，1 = 高通，2 = 带通（与 `ParamId::FilterMode`
-    /// 的取值约定一致）。
-    mode: f64,
-    attack_s: f64,
-    decay_s: f64,
-    sustain: f64,
-    release_s: f64,
     /// 八度基准（C 的 MIDI 编号，默认 60 = C4）。
     octave_base: u8,
     /// 当前按住的音符（屏幕键 + 电脑键共用，用于高亮与去重）。
@@ -158,22 +158,18 @@ pub struct ResoZApp {
 }
 
 impl ResoZApp {
-    /// 构造窗口应用，并把初始参数经命令队列下发（下一个音频块边界生效）。
+    /// 构造窗口应用，并把整个项目文档的参数经命令队列下发
+    /// （下一个音频块边界生效）。
     pub fn new(engine: AudioEngine, config: UiConfig) -> Self {
+        let project = Project {
+            master_gain: config.gain.clamp(0.0, 1.5) as f32,
+            ..Project::default()
+        };
         let mut app = Self {
             engine,
-            pattern: Pattern::default(),
+            project,
+            selected_track: 0,
             brush_note: 60,
-            gate: 0.8,
-            bpm: 120.0,
-            gain: config.gain.clamp(*GAIN_RANGE.start(), *GAIN_RANGE.end()),
-            cutoff_hz: 12_000.0,
-            resonance: 0.2,
-            mode: 0.0,
-            attack_s: 0.01,
-            decay_s: 0.10,
-            sustain: 0.8,
-            release_s: 0.20,
             octave_base: 60,
             held_notes: HashSet::new(),
             mouse_down_notes: HashSet::new(),
@@ -184,43 +180,93 @@ impl ResoZApp {
             first_frame_logged: false,
             close_sent: false,
         };
-        app.push_params();
-        app.send_pattern();
+        app.push_all_params();
         if let Some(note) = config.auto_play_note {
             app.send_note_on(note, 1.0);
         }
         app
     }
 
-    /// 把当前 UI 参数完整下发一遍（队列满载时命令被丢弃，可安全忽略）。
-    fn push_params(&mut self) {
-        for (id, value) in [
-            (ParamId::MasterGain, self.gain),
-            (ParamId::FilterCutoff, self.cutoff_hz),
-            (ParamId::FilterResonance, self.resonance),
-            (ParamId::FilterMode, self.mode),
-            (ParamId::Attack, self.attack_s),
-            (ParamId::Decay, self.decay_s),
-            (ParamId::Sustain, self.sustain),
-            (ParamId::Release, self.release_s),
-        ] {
-            self.engine.send(EngineCommand::SetParam {
-                id,
-                value: convert::to_f32(value),
-            });
+    /// 把项目文档的参数完整下发一遍（队列满载时命令被丢弃，可安全忽略）。
+    fn push_all_params(&mut self) {
+        self.engine.send(EngineCommand::SetParam {
+            id: ParamId::MasterGain,
+            value: self.project.master_gain,
+        });
+        self.send_sequencer(SequencerCommand::SetBpm(convert::to_f32(
+            self.project.metadata.tempo_bpm,
+        )));
+        self.send_sequencer(SequencerCommand::SetGate(self.project.gate));
+        for track in 0..self.project.tracks.len() {
+            self.push_track_params(track);
+            let steps = self.rt_pattern(track);
+            self.send_sequencer(SequencerCommand::SetPattern { track, steps });
         }
     }
 
+    /// 下发一条轨道的全部参数（音色 / 延迟 / 混音）。
+    fn push_track_params(&mut self, track: usize) {
+        let t = &self.project.tracks[track];
+        let params = [
+            (ParamId::FilterCutoff, t.synth.cutoff_hz),
+            (ParamId::FilterResonance, t.synth.resonance),
+            (ParamId::FilterMode, t.synth.filter_mode),
+            (ParamId::Attack, t.synth.attack_s),
+            (ParamId::Decay, t.synth.decay_s),
+            (ParamId::Sustain, t.synth.sustain),
+            (ParamId::Release, t.synth.release_s),
+            (ParamId::DelayTime, t.delay.time_s),
+            (ParamId::DelayFeedback, t.delay.feedback),
+            (ParamId::DelayMix, t.delay.mix),
+            (ParamId::TrackGain, t.gain),
+            (ParamId::TrackPan, t.pan),
+            (ParamId::TrackMute, if t.muted { 1.0 } else { 0.0 }),
+        ];
+        for (id, value) in params {
+            self.engine
+                .send(EngineCommand::SetTrackParam { track, id, value });
+        }
+    }
+
+    /// 文档模式 → 引擎表示（`Copy` 数组，零堆分配）。
+    fn rt_pattern(&self, track: usize) -> [SequencerStep; PATTERN_STEPS] {
+        let mut steps = [SequencerStep::default(); PATTERN_STEPS];
+        for (i, step) in self.project.tracks[track].pattern.steps.iter().enumerate() {
+            steps[i] = SequencerStep {
+                enabled: step.enabled,
+                note: step.note,
+                velocity: step.velocity,
+            };
+        }
+        steps
+    }
+
+    fn send_sequencer(&mut self, cmd: SequencerCommand) {
+        self.engine.send(EngineCommand::Sequencer(cmd));
+    }
+
+    /// 下发一条轨道的当前模式。
+    fn send_pattern(&mut self, track: usize) {
+        let steps = self.rt_pattern(track);
+        self.send_sequencer(SequencerCommand::SetPattern { track, steps });
+    }
+
     fn send_note_on(&mut self, note: u8, velocity: f32) {
-        self.engine
-            .send(EngineCommand::Note(NoteEvent::On { note, velocity }));
+        let track = self.selected_track;
+        self.engine.send(EngineCommand::Note {
+            track,
+            event: NoteEvent::On { note, velocity },
+        });
         self.held_notes.insert(note);
         self.current_note = Some(note);
     }
 
     fn send_note_off(&mut self, note: u8) {
-        self.engine
-            .send(EngineCommand::Note(NoteEvent::Off { note }));
+        let track = self.selected_track;
+        self.engine.send(EngineCommand::Note {
+            track,
+            event: NoteEvent::Off { note },
+        });
         self.held_notes.remove(&note);
     }
 
@@ -266,24 +312,6 @@ impl ResoZApp {
         }
     }
 
-    /// 发送音序器命令到音频线程。
-    fn send_sequencer(&mut self, cmd: SequencerCommand) {
-        self.engine.send(EngineCommand::Sequencer(cmd));
-    }
-
-    /// 把模式文档整体转换为引擎侧表示并下发（`Copy` 数组，零堆分配）。
-    fn send_pattern(&mut self) {
-        let mut steps = [SequencerStep::default(); PATTERN_STEPS];
-        for (i, step) in self.pattern.steps.iter().enumerate() {
-            steps[i] = SequencerStep {
-                enabled: step.enabled,
-                note: step.note,
-                velocity: step.velocity,
-            };
-        }
-        self.send_sequencer(SequencerCommand::SetPattern(steps));
-    }
-
     fn transport_panel(&mut self, ui: &mut egui::Ui) {
         let playing = self.engine.is_playing();
         egui::Panel::top("resoz_transport").show(ui, |ui| {
@@ -301,13 +329,15 @@ impl ResoZApp {
                 ui.separator();
                 ui.label("速度");
                 let bpm = ui.add(
-                    egui::DragValue::new(&mut self.bpm)
+                    egui::DragValue::new(&mut self.project.metadata.tempo_bpm)
                         .range(*BPM_RANGE.start()..=*BPM_RANGE.end())
                         .speed(0.5)
                         .suffix(" BPM"),
                 );
                 if bpm.changed() {
-                    self.send_sequencer(SequencerCommand::SetBpm(convert::to_f32(self.bpm)));
+                    self.send_sequencer(SequencerCommand::SetBpm(convert::to_f32(
+                        self.project.metadata.tempo_bpm,
+                    )));
                 }
                 ui.separator();
                 ui.weak("ResoZ — Rust DAW");
@@ -322,6 +352,18 @@ impl ResoZApp {
             .current_note
             .map(note_name)
             .unwrap_or_else(|| "—".to_string());
+        let track_name = self
+            .project
+            .tracks
+            .get(self.selected_track)
+            .map(|t| {
+                if t.name.is_empty() {
+                    format!("轨道 {}", self.selected_track + 1)
+                } else {
+                    t.name.clone()
+                }
+            })
+            .unwrap_or_else(|| "—".to_string());
         egui::Panel::bottom("resoz_status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("设备：{}", info.device_name));
@@ -331,18 +373,12 @@ impl ResoZApp {
                     info.sample_rate, info.out_channels
                 ));
                 ui.separator();
+                ui.label(format!("编辑：{track_name}"));
+                ui.separator();
                 ui.label(format!("音符：{note_text}"));
                 ui.separator();
                 ui.label(format!("位置 {:.1} s", position));
             });
-        });
-    }
-
-    /// 发一个参数到音频线程。
-    fn send_param(&mut self, id: ParamId, value: f64) {
-        self.engine.send(EngineCommand::SetParam {
-            id,
-            value: convert::to_f32(value),
         });
     }
 
@@ -352,76 +388,83 @@ impl ResoZApp {
 
         // eframe 0.36 的根 Ui 无边距；包一层 CentralPanel 保持默认观感。
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("合成器");
-            ui.weak("正弦波 → ADSR 包络 → SVF 滤波器（单声部）—— 所有改动实时送达音频线程");
+            let sel = self.selected_track;
+            let track_title = if self.project.tracks[sel].name.is_empty() {
+                format!("轨道 {}", sel + 1)
+            } else {
+                self.project.tracks[sel].name.clone()
+            };
+            ui.heading(format!("合成器 — {track_title}"));
+            ui.weak("正弦波 → ADSR 包络 → SVF 滤波器 → 延迟（每轨独立）—— 改动实时送达音频线程");
             ui.add_space(8.0);
 
+            // 滤波器 / 包络（绑定到选中轨道的文档字段）。
             egui::Grid::new("synth_params")
                 .num_columns(2)
                 .spacing([16.0, 8.0])
                 .show(ui, |ui| {
                     ui.label("截止频率");
                     let r = ui.add(
-                        egui::Slider::new(&mut self.cutoff_hz, CUTOFF_RANGE)
-                            .logarithmic(true)
-                            .text("Hz"),
+                        egui::Slider::new(
+                            &mut self.project.tracks[sel].synth.cutoff_hz,
+                            CUTOFF_RANGE,
+                        )
+                        .logarithmic(true)
+                        .text("Hz"),
                     );
                     if r.changed() {
-                        self.send_param(ParamId::FilterCutoff, self.cutoff_hz);
+                        self.send_track_param(
+                            sel,
+                            ParamId::FilterCutoff,
+                            self.project.tracks[sel].synth.cutoff_hz,
+                        );
                     }
                     ui.end_row();
 
                     ui.label("共振");
-                    let r = ui.add(egui::Slider::new(&mut self.resonance, RES_RANGE));
+                    let r = ui.add(egui::Slider::new(
+                        &mut self.project.tracks[sel].synth.resonance,
+                        RES_RANGE,
+                    ));
                     if r.changed() {
-                        self.send_param(ParamId::FilterResonance, self.resonance);
+                        self.send_track_param(
+                            sel,
+                            ParamId::FilterResonance,
+                            self.project.tracks[sel].synth.resonance,
+                        );
                     }
                     ui.end_row();
 
                     ui.label("滤波模式");
                     ui.horizontal(|ui| {
                         for (name, value) in [("低通", 0.0), ("高通", 1.0), ("带通", 2.0)] {
-                            if ui.selectable_label(self.mode == value, name).clicked() {
-                                self.mode = value;
-                                self.send_param(ParamId::FilterMode, value);
+                            let selected =
+                                (self.project.tracks[sel].synth.filter_mode - value).abs() < 0.5;
+                            if ui.selectable_label(selected, name).clicked() {
+                                self.project.tracks[sel].synth.filter_mode = value;
+                                self.send_track_param(sel, ParamId::FilterMode, value);
                             }
                         }
                     });
                     ui.end_row();
 
                     ui.label("音量包络");
-                    ui.horizontal(|ui| {
-                        // 先取本地副本再写回，避免借用冲突。
-                        let mut a = self.attack_s;
-                        let mut d = self.decay_s;
-                        let mut s = self.sustain;
-                        let mut r = self.release_s;
-                        let sliders = [
-                            ("A", &mut a, AD_RANGE, ParamId::Attack),
-                            ("D", &mut d, AD_RANGE, ParamId::Decay),
-                            ("S", &mut s, S_RANGE, ParamId::Sustain),
-                            ("R", &mut r, R_RANGE, ParamId::Release),
-                        ];
-                        for (label, value, range, id) in sliders {
-                            let resp = ui.add_sized(
-                                [104.0, 20.0],
-                                egui::Slider::new(value, range).text(label),
-                            );
-                            if resp.changed() {
-                                self.send_param(id, *value);
-                            }
-                        }
-                        self.attack_s = a;
-                        self.decay_s = d;
-                        self.sustain = s;
-                        self.release_s = r;
-                    });
+                    self.adsr_sliders(ui);
+                    ui.end_row();
+
+                    ui.label("延迟");
+                    self.delay_sliders(ui);
                     ui.end_row();
 
                     ui.label("主增益");
-                    let r = ui.add(egui::Slider::new(&mut self.gain, GAIN_RANGE).text("线性"));
+                    let r = ui.add(
+                        egui::Slider::new(&mut self.project.master_gain, 0.0..=1.5).text("线性"),
+                    );
                     if r.changed() {
-                        self.send_param(ParamId::MasterGain, self.gain);
+                        self.engine.send(EngineCommand::SetParam {
+                            id: ParamId::MasterGain,
+                            value: self.project.master_gain,
+                        });
                     }
                     ui.end_row();
                 });
@@ -430,7 +473,7 @@ impl ResoZApp {
             self.keyboard_section(ui);
 
             ui.add_space(10.0);
-            ui.label("峰值电平");
+            ui.label("主输出电平");
             ui.add(
                 egui::ProgressBar::new(peak.clamp(0.0, 1.0))
                     .desired_height(16.0)
@@ -440,13 +483,169 @@ impl ResoZApp {
         });
     }
 
-    /// 16 步音序器网格：左键点选/切换（画笔音符），右键清除；
-    /// 播放时以黄色边框高亮当前步进。
-    fn sequencer_section(&mut self, ui: &mut egui::Ui) {
+    /// ADSR 四滑块（本地副本 + 写回，避免借用冲突）。
+    fn adsr_sliders(&mut self, ui: &mut egui::Ui) {
+        let sel = self.selected_track;
+        let mut a = self.project.tracks[sel].synth.attack_s;
+        let mut d = self.project.tracks[sel].synth.decay_s;
+        let mut s = self.project.tracks[sel].synth.sustain;
+        let mut r = self.project.tracks[sel].synth.release_s;
+        ui.horizontal(|ui| {
+            let sliders = [
+                ("A", &mut a, AD_RANGE, ParamId::Attack),
+                ("D", &mut d, AD_RANGE, ParamId::Decay),
+                ("S", &mut s, S_RANGE, ParamId::Sustain),
+                ("R", &mut r, R_RANGE, ParamId::Release),
+            ];
+            for (label, value, range, id) in sliders {
+                let resp = ui.add_sized([104.0, 20.0], egui::Slider::new(value, range).text(label));
+                if resp.changed() {
+                    self.send_track_param(sel, id, *value);
+                }
+            }
+        });
+        self.project.tracks[sel].synth.attack_s = a;
+        self.project.tracks[sel].synth.decay_s = d;
+        self.project.tracks[sel].synth.sustain = s;
+        self.project.tracks[sel].synth.release_s = r;
+    }
+
+    /// 延迟三滑块（湿声/时间/反馈）。
+    fn delay_sliders(&mut self, ui: &mut egui::Ui) {
+        let sel = self.selected_track;
+        let mut mix = self.project.tracks[sel].delay.mix;
+        let mut time = self.project.tracks[sel].delay.time_s;
+        let mut feedback = self.project.tracks[sel].delay.feedback;
+        ui.horizontal(|ui| {
+            let sliders = [
+                ("湿声", &mut mix, DELAY_MIX_RANGE, ParamId::DelayMix),
+                ("时间", &mut time, DELAY_TIME_RANGE, ParamId::DelayTime),
+                (
+                    "反馈",
+                    &mut feedback,
+                    DELAY_FB_RANGE,
+                    ParamId::DelayFeedback,
+                ),
+            ];
+            for (label, value, range, id) in sliders {
+                let resp = ui.add_sized([104.0, 20.0], egui::Slider::new(value, range).text(label));
+                if resp.changed() {
+                    self.send_track_param(sel, id, *value);
+                }
+            }
+        });
+        self.project.tracks[sel].delay.mix = mix;
+        self.project.tracks[sel].delay.time_s = time;
+        self.project.tracks[sel].delay.feedback = feedback;
+    }
+
+    /// 发送一条轨道参数到音频线程。
+    fn send_track_param(&mut self, track: usize, id: ParamId, value: f32) {
+        self.engine
+            .send(EngineCommand::SetTrackParam { track, id, value });
+    }
+
+    /// 混音器：每轨 选择 / 静音 / 电平表 / 推子 / 声像。
+    fn mixer_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
+        ui.label("混音器");
+
+        // 先收集编辑，循环后统一写回并发送（避免借用冲突）。
+        let num_tracks = self.project.tracks.len();
+        let mut mute_edits = [None; 4];
+        let mut gain_edits = [None; 4];
+        let mut pan_edits = [None; 4];
+        let mut select_edits: Option<usize> = None;
+
         ui.horizontal(|ui| {
-            ui.label("步进音序器");
+            for i in 0..num_tracks.min(4) {
+                ui.vertical(|ui| {
+                    let name = if self.project.tracks[i].name.is_empty() {
+                        format!("轨道 {}", i + 1)
+                    } else {
+                        self.project.tracks[i].name.clone()
+                    };
+                    if ui
+                        .selectable_label(self.selected_track == i, name)
+                        .clicked()
+                    {
+                        select_edits = Some(i);
+                    }
+
+                    let muted = self.project.tracks[i].muted;
+                    let mut btn = egui::Button::new(if muted { "静音" } else { "开" });
+                    if muted {
+                        btn = btn.fill(egui::Color32::from_rgb(140, 60, 50));
+                    }
+                    if ui.add_sized([72.0, 22.0], btn).clicked() {
+                        mute_edits[i] = Some(!muted);
+                    }
+
+                    // post-fader 电平条。
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(96.0, 10.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(rect, 2.0, egui::Color32::from_gray(40));
+                    let level = self.engine.track_level(i).clamp(0.0, 1.0);
+                    let filled = egui::Rect::from_min_size(
+                        rect.min,
+                        egui::vec2(rect.width() * level, rect.height()),
+                    );
+                    ui.painter()
+                        .rect_filled(filled, 2.0, egui::Color32::from_rgb(70, 160, 90));
+
+                    let mut gain = self.project.tracks[i].gain;
+                    let fader = ui.add_sized(
+                        [96.0, 110.0],
+                        egui::Slider::new(&mut gain, TRACK_GAIN_RANGE).vertical(),
+                    );
+                    if fader.changed() {
+                        gain_edits[i] = Some(gain);
+                    }
+
+                    let mut pan = self.project.tracks[i].pan;
+                    let pan_resp = ui.add_sized(
+                        [96.0, 20.0],
+                        egui::Slider::new(&mut pan, PAN_RANGE).text("声像"),
+                    );
+                    if pan_resp.changed() {
+                        pan_edits[i] = Some(pan);
+                    }
+                });
+                if i + 1 < num_tracks.min(4) {
+                    ui.separator();
+                }
+            }
+        });
+
+        if let Some(i) = select_edits {
+            self.selected_track = i;
+        }
+        for i in 0..num_tracks.min(4) {
+            if let Some(muted) = mute_edits[i] {
+                self.project.tracks[i].muted = muted;
+                self.send_track_param(i, ParamId::TrackMute, if muted { 1.0 } else { 0.0 });
+            }
+            if let Some(gain) = gain_edits[i] {
+                self.project.tracks[i].gain = gain;
+                self.send_track_param(i, ParamId::TrackGain, gain);
+            }
+            if let Some(pan) = pan_edits[i] {
+                self.project.tracks[i].pan = pan;
+                self.send_track_param(i, ParamId::TrackPan, pan);
+            }
+        }
+    }
+
+    /// 16 步音序器网格（作用于选中轨道）。
+    fn sequencer_section(&mut self, ui: &mut egui::Ui) {
+        self.mixer_section(ui);
+        ui.separator();
+        ui.add_space(4.0);
+        let sel = self.selected_track;
+        ui.horizontal(|ui| {
+            ui.label(format!("步进音序器 — 轨道 {}", sel + 1));
             ui.label("画笔音符");
             ui.add(
                 egui::DragValue::new(&mut self.brush_note)
@@ -457,23 +656,29 @@ impl ResoZApp {
             ui.separator();
             ui.label("音长");
             let gate = ui.add(
-                egui::Slider::new(&mut self.gate, *GATE_RANGE.start()..=*GATE_RANGE.end())
-                    .text("%"),
+                egui::Slider::new(
+                    &mut self.project.gate,
+                    *GATE_RANGE.start()..=*GATE_RANGE.end(),
+                )
+                .text("%"),
             );
             if gate.changed() {
-                self.send_sequencer(SequencerCommand::SetGate(convert::to_f32(self.gate)));
+                self.send_sequencer(SequencerCommand::SetGate(self.project.gate));
             }
             if ui.button("清空").clicked() {
-                self.pattern = Pattern::default();
-                self.send_pattern();
+                self.project.tracks[sel].pattern = Pattern::default();
+                self.send_pattern(sel);
             }
             if ui.button("全部 C4").clicked() {
-                self.pattern.steps.fill(resoz_model::Step {
-                    enabled: true,
-                    note: 60,
-                    velocity: 0.9,
-                });
-                self.send_pattern();
+                self.project.tracks[sel]
+                    .pattern
+                    .steps
+                    .fill(resoz_model::Step {
+                        enabled: true,
+                        note: 60,
+                        velocity: 0.9,
+                    });
+                self.send_pattern(sel);
             }
         });
 
@@ -484,7 +689,7 @@ impl ResoZApp {
         // （避免迭代器借用与 send_pattern 的可变借用冲突）。
         let mut edits: [(bool, bool, u8); PATTERN_STEPS] = [(false, false, 0); PATTERN_STEPS];
         ui.horizontal(|ui| {
-            for (i, step) in self.pattern.steps.iter().enumerate() {
+            for (i, step) in self.project.tracks[sel].pattern.steps.iter().enumerate() {
                 if i > 0 && i % 4 == 0 {
                     ui.separator();
                 }
@@ -518,14 +723,14 @@ impl ResoZApp {
         if edits.iter().any(|(edit, _, _)| *edit) {
             for (i, (edit, enabled, note)) in edits.iter().enumerate() {
                 if *edit {
-                    self.pattern.steps[i] = resoz_model::Step {
+                    self.project.tracks[sel].pattern.steps[i] = resoz_model::Step {
                         enabled: *enabled,
                         note: *note,
                         velocity: 0.9,
                     };
                 }
             }
-            self.send_pattern();
+            self.send_pattern(sel);
         }
 
         // 播放位置高亮（引擎原子量回传，每块更新一次）。
@@ -546,8 +751,9 @@ impl ResoZApp {
     fn keyboard_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
+        let sel = self.selected_track;
         ui.horizontal(|ui| {
-            ui.label("键盘");
+            ui.label(format!("键盘 — 轨道 {}", sel + 1));
             if ui.button("− 八度").clicked() {
                 self.octave_base = (self.octave_base.saturating_sub(12)).max(24);
             }
@@ -630,8 +836,8 @@ pub fn run(engine: AudioEngine, config: UiConfig) -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ResoZ")
-            .with_inner_size([880.0, 620.0])
-            .with_min_inner_size([720.0, 480.0]),
+            .with_inner_size([920.0, 760.0])
+            .with_min_inner_size([760.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(
