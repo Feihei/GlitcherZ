@@ -1,7 +1,7 @@
 //! 处理图节点 trait 与串联链。
 
 use crate::realtime::buffer::AudioBuffer;
-use crate::realtime::commands::ParamId;
+use crate::realtime::commands::{NoteEvent, ParamId};
 use crate::realtime::context::ProcessContext;
 
 /// 处理图节点。
@@ -21,6 +21,15 @@ pub trait Processor: Send {
     /// RT-safe：实现不得分配、不得 panic。
     fn set_param(&mut self, _id: ParamId, _value: f32) -> bool {
         let _ = (_id, _value);
+        false
+    }
+
+    /// 在块边界处理一个音符事件（来自控制命令队列）。
+    ///
+    /// 返回 `true` 表示本节点识别并消费了该事件。
+    /// RT-safe：实现不得分配、不得 panic。
+    fn note_event(&mut self, _event: NoteEvent) -> bool {
+        let _ = _event;
         false
     }
 }
@@ -67,6 +76,10 @@ impl Processor for ProcessorChain {
     fn set_param(&mut self, id: ParamId, value: f32) -> bool {
         // 交给第一个识别该参数的节点。引入图节点 ID 后改为定向路由。
         self.processors.iter_mut().any(|p| p.set_param(id, value))
+    }
+
+    fn note_event(&mut self, event: NoteEvent) -> bool {
+        self.processors.iter_mut().any(|p| p.note_event(event))
     }
 }
 

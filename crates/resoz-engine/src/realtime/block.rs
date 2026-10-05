@@ -126,6 +126,9 @@ impl BlockRunner {
                 // 未被任何节点识别的参数静默丢弃（发送方负责只发送有效参数）。
                 let _ = self.chain.set_param(id, value);
             }
+            EngineCommand::Note(event) => {
+                let _ = self.chain.note_event(event);
+            }
         }
     }
 
@@ -148,9 +151,11 @@ mod tests {
 
     use super::BlockRunner;
     use crate::realtime::atomic::AtomicF32;
-    use crate::realtime::commands::{EngineCommand, ParamId, command_channel};
+    use crate::realtime::commands::{EngineCommand, NoteEvent, ParamId, command_channel};
+    use crate::realtime::gain::GainProcessor;
     use crate::realtime::processor::ProcessorChain;
-    use crate::realtime::sine::SineProcessor;
+    use crate::realtime::svf::SvfProcessor;
+    use crate::realtime::synth::SynthProcessor;
     use crate::testing::count_positive_crossings;
 
     const SR: f32 = 44_100.0;
@@ -165,8 +170,11 @@ mod tests {
         Arc<AtomicU64>,
     ) {
         let (tx, rx) = command_channel(64);
+        // 与 AudioEngine 相同的链路：合成器 → 滤波器 → 主增益。
         let mut chain = ProcessorChain::new();
-        chain.push(Box::new(SineProcessor::new(SR)));
+        chain.push(Box::new(SynthProcessor::new(SR)));
+        chain.push(Box::new(SvfProcessor::new(SR)));
+        chain.push(Box::new(GainProcessor::new(1.0)));
         let level = Arc::new(AtomicF32::new(0.0));
         let position = Arc::new(AtomicU64::new(0));
         let runner = BlockRunner::new(
@@ -181,9 +189,19 @@ mod tests {
         (runner, tx, level, position)
     }
 
+    /// 触发 A4 音符（队列在下一个块边界被消费）。
+    fn note_on_69(tx: &mut Producer<EngineCommand>) {
+        tx.push(EngineCommand::Note(NoteEvent::On {
+            note: 69,
+            velocity: 1.0,
+        }))
+        .expect("队列未满");
+    }
+
     #[test]
     fn phase_continuity_across_arbitrary_host_blocks() {
-        let (mut runner, _tx, _level, _position) = make_runner(128, 2);
+        let (mut runner, mut tx, _level, _position) = make_runner(128, 2);
+        note_on_69(&mut tx);
         // 用不整除固定块（377）的宿主缓冲渲染约 1 秒，验证拆块不破坏相位。
         let total_frames = 44_100usize;
         let mut interleaved = vec![0.0f32; total_frames * 2];
@@ -203,7 +221,8 @@ mod tests {
 
     #[test]
     fn channels_beyond_two_are_silent() {
-        let (mut runner, _tx, _level, _position) = make_runner(128, 4);
+        let (mut runner, mut tx, _level, _position) = make_runner(128, 4);
+        note_on_69(&mut tx);
         let mut out = vec![7.0f32; 256 * 4]; // 预填非零，验证被覆盖/清零
         runner.render_interleaved(&mut out);
 
@@ -219,7 +238,8 @@ mod tests {
 
     #[test]
     fn mono_output_takes_left_channel() {
-        let (mut runner, _tx, _level, _position) = make_runner(128, 1);
+        let (mut runner, mut tx, _level, _position) = make_runner(128, 1);
+        note_on_69(&mut tx);
         let mut out = vec![0.0f32; 256];
         runner.render_interleaved(&mut out);
         assert!(out.iter().any(|s| s.abs() > 0.01), "应有非静音输出");
@@ -228,6 +248,7 @@ mod tests {
     #[test]
     fn command_takes_effect_at_block_boundary() {
         let (mut runner, mut tx, _level, _position) = make_runner(128, 2);
+        note_on_69(&mut tx);
         let half_frames = 11_025usize; // 0.25 s
         let mut out = vec![0.0f32; 44_100 * 2];
 
@@ -250,12 +271,39 @@ mod tests {
 
     #[test]
     fn reports_level_and_position() {
-        let (mut runner, _tx, level, position) = make_runner(128, 2);
+        let (mut runner, mut tx, level, position) = make_runner(128, 2);
+        note_on_69(&mut tx);
         let mut out = vec![0.0f32; 300 * 2];
         runner.render_interleaved(&mut out);
 
         // 300 帧 → 消费 3 个块；position 为当前正在缓冲的块起点（第 3 块 = 256）。
         assert_eq!(position.load(Ordering::Relaxed), 256);
         assert!(level.load() > 0.0, "有信号输出时峰值电平应为正");
+    }
+
+    #[test]
+    fn note_off_fades_stream_to_silence() {
+        let (mut runner, mut tx, level, _position) = make_runner(128, 2);
+        note_on_69(&mut tx);
+        let mut out = vec![0.0f32; 22_050 * 2];
+        runner.render_interleaved(&mut out); // 0.5 s sustain
+
+        tx.push(EngineCommand::Note(NoteEvent::Off { note: 69 }))
+            .expect("队列未满");
+        runner.render_interleaved(&mut out); // release 0.2 s + 余量
+
+        assert!(
+            level.load() < 0.02,
+            "NoteOff 后输出应衰减至静音，实际 {}",
+            level.load()
+        );
+    }
+
+    #[test]
+    fn silent_until_first_note() {
+        let (mut runner, _tx, level, _position) = make_runner(128, 2);
+        let mut out = vec![0.0f32; 1024 * 2];
+        runner.render_interleaved(&mut out);
+        assert!(level.load() < 1e-9, "未触发音符时应为静音");
     }
 }

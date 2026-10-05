@@ -45,8 +45,8 @@ impl SineProcessor {
     }
 
     /// 设置频率：钳制到 `[0, sample_rate/2]`（奈奎斯特），非有限值忽略。
-    /// RT-safe。
-    fn set_frequency(&mut self, hz: f32) {
+    /// RT-safe。公开给合成器等组合节点改音高。
+    pub fn set_frequency(&mut self, hz: f32) {
         if hz.is_finite() {
             self.frequency_hz = hz.clamp(0.0, self.sample_rate * 0.5);
         }
@@ -104,7 +104,7 @@ impl Processor for SineProcessor {
                 self.set_gain(value);
                 true
             }
-            ParamId::MasterGain => false,
+            _ => false,
         }
     }
 }

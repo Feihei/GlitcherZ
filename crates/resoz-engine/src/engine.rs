@@ -12,7 +12,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::convert;
 use crate::realtime::{
     AtomicF32, BlockRunner, COMMAND_QUEUE_CAPACITY, EngineCommand, FIXED_BLOCK_SIZE, GainProcessor,
-    ProcessorChain, SineProcessor, command_channel,
+    ProcessorChain, SvfProcessor, SynthProcessor, command_channel,
 };
 
 /// 引擎的基础信息（UI 显示用）。
@@ -65,10 +65,11 @@ impl AudioEngine {
 
         let (commands, command_rx) = command_channel(COMMAND_QUEUE_CAPACITY);
 
-        // 初始处理图：正弦音源 → 主增益。
+        // 初始处理图：合成器（振荡器 + ADSR）→ SVF 滤波器 → 主增益。
         // （图结构重建后续走双缓冲交换方案，见 AGENTS.md「处理图」。）
         let mut chain = ProcessorChain::new();
-        chain.push(Box::new(SineProcessor::new(sample_rate_f32)));
+        chain.push(Box::new(SynthProcessor::new(sample_rate_f32)));
+        chain.push(Box::new(SvfProcessor::new(sample_rate_f32)));
         chain.push(Box::new(GainProcessor::new(1.0)));
 
         let level = Arc::new(AtomicF32::new(0.0));

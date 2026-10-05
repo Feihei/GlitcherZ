@@ -19,7 +19,8 @@
 //! - [`context`]：每块上下文 [`ProcessContext`]；
 //! - [`processor`]：[`Processor`] trait 与 [`ProcessorChain`]；
 //! - [`sine`] / [`gain`]：正弦音源与增益效果器（`Processor` 参考实现）；
-//! - [`commands`]：`rtrb` 命令队列与 [`EngineCommand`] / [`ParamId`]；
+//! - [`envelope`] / [`svf`] / [`synth`]：ADSR 包络、SVF 滤波器与完整合成器；
+//! - [`commands`]：`rtrb` 命令队列与 [`EngineCommand`] / [`NoteEvent`] / [`ParamId`]；
 //! - [`atomic`]：[`AtomicF32`]（音频线程 → UI 的标量回传）；
 //! - [`block`]：[`BlockRunner`] —— 把宿主（cpal）任意长度的交错缓冲拆成
 //!   固定块、在块边界消费命令、回传状态。
@@ -29,9 +30,12 @@ pub mod block;
 pub mod buffer;
 pub mod commands;
 pub mod context;
+pub mod envelope;
 pub mod gain;
 pub mod processor;
 pub mod sine;
+pub mod svf;
+pub mod synth;
 
 /// 固定处理块大小（样本数）。见 AGENTS.md「处理图」（建议 64 或 128）。
 pub const FIXED_BLOCK_SIZE: usize = 128;
@@ -39,8 +43,11 @@ pub const FIXED_BLOCK_SIZE: usize = 128;
 pub use atomic::AtomicF32;
 pub use block::BlockRunner;
 pub use buffer::AudioBuffer;
-pub use commands::{COMMAND_QUEUE_CAPACITY, EngineCommand, ParamId, command_channel};
+pub use commands::{COMMAND_QUEUE_CAPACITY, EngineCommand, NoteEvent, ParamId, command_channel};
 pub use context::ProcessContext;
+pub use envelope::AdsrProcessor;
 pub use gain::GainProcessor;
 pub use processor::{Processor, ProcessorChain};
 pub use sine::SineProcessor;
+pub use svf::{FilterMode, SvfProcessor};
+pub use synth::{SynthProcessor, note_to_frequency};
