@@ -1,4 +1,9 @@
-//! 步进音序器（音频线程侧，块边界采样时钟调度，多轨）。
+//! 步进音序器与钢琴卷帘调度（音频线程侧，块边界采样时钟，多轨）。
+//!
+//! 调度模型是**纯窗口扫描**：音序器只维护音乐位置（tick），
+//! 每个块把 `[t0, t1)` 窗口内到期的步进/音符一次性调度出来。
+//! BPM 变化只影响未来速率（位置以 tick 计，音乐位置天然保持），
+//! 循环回绕由窗口映射推导，无需行进式时钟簿记。
 
 use crate::realtime::NUM_TRACKS;
 use crate::realtime::commands::NoteEvent;
@@ -7,11 +12,29 @@ use crate::realtime::context::ProcessContext;
 /// 音序器步数。
 pub const PATTERN_STEPS: usize = 16;
 
+/// 音符时间基准：每四分音符的 tick 数（与 `resoz_model` 的约定一致）。
+pub const TICKS_PER_QUARTER: u32 = 96;
+
+/// 每个步进（16 分音符）的 tick 数。
+pub const TICKS_PER_STEP: u32 = 24;
+
+/// 卷帘音符数上限（音频线程侧 `Copy` 表示的容量约束）。
+pub const MAX_CLIP_NOTES: usize = 128;
+
+/// 轨道音源（引擎侧表示，与 `resoz_model::TrackSource` 镜像）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrackSource {
+    /// 16 步步进模式（默认）。
+    #[default]
+    Steps,
+    /// 钢琴卷帘片段。
+    Clip,
+}
+
 /// 单个步进的音频线程侧表示。
 ///
-/// 保持 `Copy`：整条模式（16 步 ≈ 128 字节）可作为一个命令经无锁队列
-/// 整块传递，实时侧零分配。与 `resoz_model::Step` 互为镜像 —— 两个
-/// crate 互不依赖，由 UI/应用层做转换（见 AGENTS.md「数据模型」）。
+/// 保持 `Copy`：整条模式可作为一个命令经无锁队列整块传递，实时侧
+/// 零分配。与 `resoz_model::Step` 互为镜像（见 AGENTS.md「数据模型」）。
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SequencerStep {
     /// 该步是否触发。
@@ -22,12 +45,56 @@ pub struct SequencerStep {
     pub velocity: f32,
 }
 
-/// 多轨步进音序器：一个全局走带时钟（BPM / gate / 步进索引），
-/// 每条轨道独立的 16 步模式与 gate 尾音，按采样时钟在块边界把到期
-/// 步进转成 `(轨道, NoteEvent)`。
+/// 卷帘音符的音频线程侧表示（镜像 `resoz_model::Note`）。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct RtNote {
+    /// 起始位置（tick，相对片段起点）。
+    pub start_ticks: u32,
+    /// 时长（tick）。
+    pub length_ticks: u32,
+    /// MIDI 音符编号。
+    pub note: u8,
+    /// 力度（0..1）。
+    pub velocity: f32,
+}
+
+/// 卷帘片段的音频线程侧表示（镜像 `resoz_model::Clip`，定容 `Copy`）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RtClip {
+    /// 循环长度（tick）。
+    pub loop_ticks: u32,
+    /// 音符集合（前 `note_count` 个有效）。
+    pub notes: [RtNote; MAX_CLIP_NOTES],
+    /// 有效音符数。
+    pub note_count: usize,
+}
+
+impl Default for RtClip {
+    fn default() -> Self {
+        Self {
+            loop_ticks: TICKS_PER_STEP * PATTERN_STEPS as u32,
+            notes: [RtNote::default(); MAX_CLIP_NOTES],
+            note_count: 0,
+        }
+    }
+}
+
+impl RtClip {
+    /// 追加一个音符；超过 [`MAX_CLIP_NOTES`] 时静默丢弃。
+    pub fn push(&mut self, note: RtNote) {
+        if self.note_count < MAX_CLIP_NOTES {
+            self.notes[self.note_count] = note;
+            self.note_count += 1;
+        }
+    }
+}
+
+/// 多轨音序器：一个全局走带时钟（BPM / gate / 音乐位置），
+/// 每条轨道独立的音源（步进模式或卷帘片段）与 gate 尾音，
+/// 按采样时钟在块边界把到期事件转成 `(轨道, NoteEvent)`。
 ///
-/// 时钟以"流启动以来的绝对采样位置"计（与
-/// [`ProcessContext::playback_sample_pos`] 同一坐标系）。
+/// 时钟以 tick 计（音乐位置），与采样时钟的换算由 BPM 推导；
+/// gate off 以绝对采样位置记录，落在包含它的块边界发出。
 ///
 /// 精度说明：事件在包含其时刻的**块边界**统一发出（≤ 1 块 ≈ 2.7 ms
 /// 抖动 @48 kHz / 128 块），逐样本偏移留待后续版本支持。
@@ -38,14 +105,13 @@ pub struct Sequencer {
     sample_rate: f32,
     playing: bool,
     bpm: f32,
-    /// gate 占步长的比例（0.05..1）。
+    /// gate 占步长的比例（0.05..1，仅步进音源使用；卷帘用音符时长）。
     gate: f32,
+    position_ticks: f64,
+    sources: [TrackSource; NUM_TRACKS],
     patterns: [[SequencerStep; PATTERN_STEPS]; NUM_TRACKS],
-    step_index: usize,
-    /// 最近一次触发步进的时刻（BPM 变化时用于重推下一拍）。
-    last_step_sample: u64,
-    next_step_sample: u64,
-    /// 各轨待发送的 NoteOff（gate 结束时刻 + 音符）。
+    clips: [RtClip; NUM_TRACKS],
+    /// 各轨待发送的 NoteOff（gate/时长结束的绝对采样位置 + 音符）。
     pending_offs: [Option<(u64, u8)>; NUM_TRACKS],
 }
 
@@ -61,10 +127,10 @@ impl Sequencer {
             playing: false,
             bpm: 120.0,
             gate: 0.8,
+            position_ticks: 0.0,
+            sources: [TrackSource::default(); NUM_TRACKS],
             patterns: [[SequencerStep::default(); PATTERN_STEPS]; NUM_TRACKS],
-            step_index: 0,
-            last_step_sample: 0,
-            next_step_sample: 0,
+            clips: [RtClip::default(); NUM_TRACKS],
             pending_offs: [None; NUM_TRACKS],
         }
     }
@@ -74,29 +140,32 @@ impl Sequencer {
         self.playing
     }
 
-    /// 当前步索引（0..16）。RT-safe。
+    /// 当前步索引（`⌊音乐位置 / 步长⌋ mod 16`，用于 UI 高亮"正在响的步"）。
+    /// RT-safe。
     pub fn step_index(&self) -> usize {
-        self.step_index
+        (self.position_ticks / f64::from(TICKS_PER_STEP)).floor() as usize % PATTERN_STEPS
     }
 
-    /// 16 分音符的长度（样本数）。
-    fn step_len_samples(&self) -> u64 {
+    /// 音乐位置（tick，自播放起点累计）。RT-safe。
+    pub fn position_ticks(&self) -> f64 {
+        self.position_ticks
+    }
+
+    /// 每采样点对应的 tick 数（f64 中间计算）。
+    fn ticks_per_sample(&self) -> f64 {
         let bpm = if self.bpm.is_finite() {
             self.bpm.clamp(20.0, 300.0)
         } else {
             120.0
         };
-        // 中间计算用 f64（时间计算约定），最终折算为样本数。
-        let seconds_per_step = 60.0_f64 / f64::from(bpm) / 4.0;
-        (seconds_per_step * f64::from(self.sample_rate)).max(1.0) as u64
+        // tick/秒 = BPM/60 × TPQN；除以采样率得 tick/样本。
+        f64::from(bpm) / 60.0 * f64::from(TICKS_PER_QUARTER) / f64::from(self.sample_rate)
     }
 
-    /// 从 `at_sample` 起从第 0 步开始播放。RT-safe。
-    pub fn play(&mut self, at_sample: u64) {
+    /// 从第 0 步开始播放（音乐位置归零）。RT-safe。
+    pub fn play(&mut self) {
         self.playing = true;
-        self.step_index = 0;
-        self.last_step_sample = at_sample;
-        self.next_step_sample = at_sample;
+        self.position_ticks = 0.0;
         self.pending_offs = [None; NUM_TRACKS];
     }
 
@@ -107,15 +176,11 @@ impl Sequencer {
         self.pending_offs = [None; NUM_TRACKS];
     }
 
-    /// 设置 BPM（20..300，非有限值忽略）。播放中会保持音乐位置重推下一拍。
-    /// RT-safe。
+    /// 设置 BPM（20..300，非有限值忽略）。音乐位置以 tick 计，
+    /// 变速不影响已播放的内容，只改变后续速率。RT-safe。
     pub fn set_bpm(&mut self, bpm: f32) {
-        if !bpm.is_finite() {
-            return;
-        }
-        self.bpm = bpm.clamp(20.0, 300.0);
-        if self.playing {
-            self.next_step_sample = self.last_step_sample + self.step_len_samples();
+        if bpm.is_finite() {
+            self.bpm = bpm.clamp(20.0, 300.0);
         }
     }
 
@@ -126,66 +191,196 @@ impl Sequencer {
         }
     }
 
-    /// 整块替换某条轨道的模式（越界轨道忽略）。RT-safe。
+    /// 整块替换某条轨道的步进模式（越界轨道忽略）。RT-safe。
     pub fn set_pattern(&mut self, track: usize, steps: [SequencerStep; PATTERN_STEPS]) {
         if let Some(slot) = self.patterns.get_mut(track) {
             *slot = steps;
         }
     }
 
-    /// 推进一个块：把到期的 gate off 与步进 on 经 `emit(轨道, 事件)` 送出
-    /// （同一块内先 off 后 on）。RT-safe。
+    /// 整块替换某条轨道的卷帘片段（越界轨道忽略）。RT-safe。
+    pub fn set_clip(&mut self, track: usize, clip: RtClip) {
+        if let Some(slot) = self.clips.get_mut(track) {
+            *slot = clip;
+        }
+    }
+
+    /// 切换某条轨道的音源（越界轨道忽略）。RT-safe。
+    pub fn set_source(&mut self, track: usize, source: TrackSource) {
+        if let Some(slot) = self.sources.get_mut(track) {
+            *slot = source;
+        }
+    }
+
+    /// 推进一个块：把窗口 `[t0, t1)`（tick）内到期的 gate off 与
+    /// 音符 on 经 `emit(轨道, 事件)` 送出（同一块内先 off 后 on）。
+    /// RT-safe。
     pub fn advance(&mut self, ctx: &ProcessContext, emit: &mut dyn FnMut(usize, NoteEvent)) {
         if !self.playing {
             return;
         }
-        let block_end = ctx.playback_sample_pos + ctx.frames as u64;
+        let tps = self.ticks_per_sample();
+        let samples_per_tick = 1.0 / tps;
+        let dt_ticks = ctx.frames as f64 * tps;
+        let t0 = self.position_ticks;
+        let t1 = t0 + dt_ticks;
+        let block_start = ctx.playback_sample_pos;
 
         // 1. 到期的 gate off（先于本块的 note on，保证各轨衔接干净）。
         for (track, pending) in self.pending_offs.iter_mut().enumerate() {
             if let Some((time, note)) = *pending {
-                if time < block_end {
+                if time < block_start + ctx.frames as u64 {
                     emit(track, NoteEvent::Off { note });
                     *pending = None;
                 }
             }
         }
 
-        // 2. 到期的步进。常规参数下步长 ≫ 块长，每块至多一步；
-        //    循环写法保证极端参数下也不丢步。
-        while self.next_step_sample < block_end {
-            for (track, pattern) in self.patterns.iter().enumerate() {
-                let step = pattern[self.step_index];
-                if !step.enabled {
-                    continue;
+        // 2. 各轨按音源调度窗口内的音符 on。
+        for track in 0..NUM_TRACKS {
+            match self.sources[track] {
+                TrackSource::Steps => {
+                    self.schedule_steps(track, t0, t1, block_start, samples_per_tick, emit);
                 }
-                let velocity = if step.velocity.is_finite() {
-                    step.velocity.clamp(0.0, 1.0)
-                } else {
-                    0.9
-                };
-                emit(
-                    track,
-                    NoteEvent::On {
-                        note: step.note,
-                        velocity,
-                    },
-                );
-                let len = self.step_len_samples();
-                let upper = len.saturating_sub(1).max(1);
-                let gate_samples = ((len as f32 * self.gate) as u64).clamp(1, upper);
-                self.pending_offs[track] = Some((self.next_step_sample + gate_samples, step.note));
+                TrackSource::Clip => {
+                    self.schedule_clip(track, t0, t1, block_start, samples_per_tick, emit);
+                }
             }
-            self.last_step_sample = self.next_step_sample;
-            self.step_index = (self.step_index + 1) % PATTERN_STEPS;
-            self.next_step_sample += self.step_len_samples();
         }
+
+        self.position_ticks = t1;
+    }
+
+    /// 步进音源：窗口内起始的步（24 tick 一步）。
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_steps(
+        &mut self,
+        track: usize,
+        t0: f64,
+        t1: f64,
+        block_start: u64,
+        samples_per_tick: f64,
+        emit: &mut dyn FnMut(usize, NoteEvent),
+    ) {
+        let step_ticks = f64::from(TICKS_PER_STEP);
+        // 起点恰好落在窗口边界上的步也要触发：ceil(t0) .. ceil(t1)。
+        let first = (t0 / step_ticks).ceil() as i64;
+        let last = (t1 / step_ticks).ceil() as i64;
+        for k in first..last {
+            let start_tick = k as f64 * step_ticks;
+            if start_tick < t0 {
+                continue; // 浮点边界保护
+            }
+            let pattern_index = (k as usize) % PATTERN_STEPS;
+            let step = self.patterns[track][pattern_index];
+            if !step.enabled {
+                continue;
+            }
+            let velocity = sanitize_velocity(step.velocity);
+            emit(
+                track,
+                NoteEvent::On {
+                    note: step.note,
+                    velocity,
+                },
+            );
+            // gate off 时刻（tick）→ 绝对采样位置。
+            let off_tick = start_tick + step_ticks * f64::from(self.gate);
+            self.set_pending_off(
+                track,
+                off_tick,
+                t0,
+                block_start,
+                samples_per_tick,
+                step.note,
+            );
+        }
+    }
+
+    /// 卷帘音源：窗口内起始的音符出现（含跨循环回绕的每一次出现）。
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_clip(
+        &mut self,
+        track: usize,
+        t0: f64,
+        t1: f64,
+        block_start: u64,
+        samples_per_tick: f64,
+        emit: &mut dyn FnMut(usize, NoteEvent),
+    ) {
+        let clip = self.clips[track];
+        if clip.loop_ticks == 0 || clip.note_count == 0 {
+            return;
+        }
+        let loop_ticks = f64::from(clip.loop_ticks);
+        for note in &clip.notes[..clip.note_count] {
+            let start_offset = f64::from(note.start_ticks);
+            let length = f64::from(note.length_ticks.max(1));
+            // 第 m 次出现位于 m·L + s；求首个 ≥ t0 的 m（可为负，钳到 0）。
+            let mut m = ((t0 - start_offset) / loop_ticks).ceil();
+            if m < 0.0 {
+                m = 0.0;
+            }
+            loop {
+                let start_tick = m * loop_ticks + start_offset;
+                if start_tick >= t1 {
+                    break;
+                }
+                if start_tick >= t0 {
+                    let velocity = sanitize_velocity(note.velocity);
+                    emit(
+                        track,
+                        NoteEvent::On {
+                            note: note.note,
+                            velocity,
+                        },
+                    );
+                    let off_tick = start_tick + length;
+                    self.set_pending_off(
+                        track,
+                        off_tick,
+                        t0,
+                        block_start,
+                        samples_per_tick,
+                        note.note,
+                    );
+                }
+                m += 1.0;
+            }
+        }
+    }
+
+    /// 记录 gate off：换算为绝对采样位置，至少落在下一块（保证 off
+    /// 晚于同一块内已发出的 on）。RT-safe。
+    #[allow(clippy::too_many_arguments)]
+    fn set_pending_off(
+        &mut self,
+        track: usize,
+        off_tick: f64,
+        t0: f64,
+        block_start: u64,
+        samples_per_tick: f64,
+        note: u8,
+    ) {
+        let offset_samples = ((off_tick - t0) * samples_per_tick).max(1.0);
+        self.pending_offs[track] = Some((block_start + offset_samples as u64, note));
+    }
+}
+
+fn sanitize_velocity(velocity: f32) -> f32 {
+    if velocity.is_finite() {
+        velocity.clamp(0.0, 1.0)
+    } else {
+        0.9
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PATTERN_STEPS, Sequencer, SequencerStep};
+    use super::{
+        MAX_CLIP_NOTES, PATTERN_STEPS, RtClip, RtNote, Sequencer, SequencerStep, TICKS_PER_STEP,
+        TrackSource,
+    };
     use crate::realtime::NUM_TRACKS;
     use crate::realtime::commands::NoteEvent;
     use crate::realtime::context::ProcessContext;
@@ -204,13 +399,14 @@ mod tests {
     type Event = (usize, NoteEvent);
 
     /// 推进 `blocks` 个块，收集全部 (轨道, 事件)。
-    fn run(seq: &mut Sequencer, start_pos: u64, blocks: usize) -> Vec<Event> {
+    fn run(seq: &mut Sequencer, blocks: usize) -> Vec<Event> {
         let mut events = Vec::new();
-        for i in 0..blocks {
-            let pos = start_pos + (i * BLOCK) as u64;
+        let mut pos = 0u64;
+        for _ in 0..blocks {
             seq.advance(&ctx(pos), &mut |track, event| {
                 events.push((track, event));
             });
+            pos += BLOCK as u64;
         }
         events
     }
@@ -218,6 +414,15 @@ mod tests {
     fn step(note: u8) -> SequencerStep {
         SequencerStep {
             enabled: true,
+            note,
+            velocity: 0.9,
+        }
+    }
+
+    fn clip_note(start: u32, length: u32, note: u8) -> RtNote {
+        RtNote {
+            start_ticks: start,
+            length_ticks: length,
             note,
             velocity: 0.9,
         }
@@ -236,7 +441,7 @@ mod tests {
     #[test]
     fn plays_per_track_patterns_with_gate_offs() {
         let mut seq = Sequencer::new(SR);
-        seq.set_bpm(120.0); // 16 分音符 = 6000 样本
+        seq.set_bpm(120.0); // 16 分音符 = 24 tick = 6000 样本
         let mut track0 = [SequencerStep::default(); PATTERN_STEPS];
         track0[0] = step(60);
         track0[1] = step(64);
@@ -244,9 +449,9 @@ mod tests {
         track1[0] = step(72);
         seq.set_pattern(0, track0);
         seq.set_pattern(1, track1);
-        seq.play(0);
+        seq.play();
 
-        let events = run(&mut seq, 0, 375); // 1 s
+        let events = run(&mut seq, 375); // 1 s
         assert_eq!(
             ons(&events),
             vec![(0, 60), (1, 72), (0, 64)],
@@ -264,29 +469,93 @@ mod tests {
     #[test]
     fn disabled_steps_emit_nothing() {
         let mut seq = Sequencer::new(SR);
-        seq.play(0);
-        let events = run(&mut seq, 0, 375);
+        seq.play();
+        let events = run(&mut seq, 375);
         assert!(events.is_empty(), "全禁用模式不应发声");
-        assert_eq!(seq.step_index(), 375 * 128 / 6000 % PATTERN_STEPS);
+        // 48000 样本 = 192 tick = 8 步。
+        assert_eq!(seq.step_index(), 8);
     }
 
     #[test]
-    fn pattern_change_targets_only_one_track() {
+    fn clip_notes_fire_at_their_positions_with_lengths() {
         let mut seq = Sequencer::new(SR);
-        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
-        pattern[0] = step(60);
-        seq.set_pattern(0, pattern);
-        seq.set_pattern(1, pattern);
-        // 越界轨道：静默忽略，不得 panic。
-        seq.set_pattern(NUM_TRACKS, pattern);
-        seq.set_pattern(usize::MAX, pattern);
-        seq.play(0);
-        let events = run(&mut seq, 0, 20);
+        seq.set_bpm(120.0);
+        let mut clip = RtClip::default();
+        clip.push(clip_note(0, 24, 60));
+        clip.push(clip_note(24, 48, 64));
+        seq.set_clip(0, clip);
+        seq.set_source(0, TrackSource::Clip);
+        seq.play();
+
+        let events = run(&mut seq, 375);
         assert_eq!(
             ons(&events),
-            vec![(0, 60), (1, 60)],
-            "越轨设置不应产生额外事件"
+            vec![(0, 60), (0, 64)],
+            "音符应按 start 依次触发"
         );
+        // 每个音符有 off（按自身长度，而非 gate）。
+        let offs = events
+            .iter()
+            .filter(|(_, e)| matches!(e, NoteEvent::Off { .. }))
+            .count();
+        assert_eq!(offs, 2);
+    }
+
+    #[test]
+    fn clip_loops_around() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        let mut clip = RtClip::default();
+        clip.push(clip_note(0, 24, 60));
+        seq.set_clip(0, clip);
+        seq.set_source(0, TrackSource::Clip);
+        seq.play();
+
+        // 循环长度 384 tick = 96000 样本 = 750 块；跑 2.5 圈 → 触发 3 次。
+        let ons_count = run(&mut seq, 1_900)
+            .iter()
+            .filter(|(_, e)| matches!(e, NoteEvent::On { .. }))
+            .count();
+        assert_eq!(ons_count, 3, "片段应按 loop_ticks 回绕循环");
+    }
+
+    #[test]
+    fn source_switching_uses_only_active_source() {
+        let mut seq = Sequencer::new(SR);
+        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
+        pattern[0] = step(48);
+        seq.set_pattern(0, pattern);
+        let mut clip = RtClip::default();
+        clip.push(clip_note(0, 24, 72));
+        seq.set_clip(0, clip);
+        seq.play();
+
+        seq.set_source(0, TrackSource::Steps);
+        assert_eq!(ons(&run(&mut seq, 30)), vec![(0, 48)]);
+
+        seq.play();
+        seq.set_source(0, TrackSource::Clip);
+        assert_eq!(ons(&run(&mut seq, 30)), vec![(0, 72)]);
+    }
+
+    #[test]
+    fn clip_over_capacity_is_truncated() {
+        let mut clip = RtClip::default();
+        for i in 0..(MAX_CLIP_NOTES + 10) {
+            clip.push(clip_note(i as u32 * TICKS_PER_STEP, 24, 60));
+        }
+        assert_eq!(clip.note_count, MAX_CLIP_NOTES, "超容量的音符应被丢弃");
+    }
+
+    #[test]
+    fn bpm_change_preserves_musical_position() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        seq.play();
+        run(&mut seq, 100); // 12800 样本 = 51.2 tick @120BPM
+        let before = seq.position_ticks();
+        seq.set_bpm(240.0);
+        assert!((seq.position_ticks() - before).abs() < 1e-9, "变速不跳位置");
     }
 
     #[test]
@@ -298,14 +567,22 @@ mod tests {
         }
         seq.set_pattern(0, pattern);
 
+        // 370 块 = 47360 样本：120 BPM 下 189.44 tick（8 步），
+        // 240 BPM 下 378.88 tick（16 步）——窗口都避开步进边界。
+        let count_ons = |events: &[Event]| {
+            events
+                .iter()
+                .filter(|(_, e)| matches!(e, NoteEvent::On { .. }))
+                .count()
+        };
         seq.set_bpm(120.0);
-        seq.play(0);
-        let slow = run(&mut seq, 0, 375).len(); // 6000 样本/步 → 8 On + 8 Off
+        seq.play();
+        let slow = count_ons(&run(&mut seq, 370));
 
         seq.set_bpm(240.0);
-        seq.play(0);
-        let fast = run(&mut seq, 0, 375).len(); // 3000 样本/步 → 16 On + 16 Off
-        assert_eq!(fast, slow * 2, "240 BPM 的事件率应恰为 120 BPM 的两倍");
+        seq.play();
+        let fast = count_ons(&run(&mut seq, 370));
+        assert_eq!(fast, slow * 2, "240 BPM 的触发率应恰为 120 BPM 的两倍");
     }
 
     #[test]
@@ -316,12 +593,12 @@ mod tests {
         for track in 0..NUM_TRACKS {
             seq.set_pattern(track, pattern);
         }
-        seq.play(0);
-        let events = run(&mut seq, 0, 1);
+        seq.play();
+        let events = run(&mut seq, 1);
         assert_eq!(ons(&events).len(), NUM_TRACKS, "四轨应同时触发第 0 步");
 
         seq.stop();
-        let events = run(&mut seq, 256, 375);
+        let events = run(&mut seq, 375);
         assert!(events.is_empty(), "停止后不应再有事件");
         assert!(!seq.is_playing());
     }
@@ -333,10 +610,10 @@ mod tests {
         pattern[0] = step(60);
         pattern[15] = step(72);
         seq.set_pattern(0, pattern);
-        seq.play(0);
+        seq.play();
 
-        // 20 步 ≈ 120_000 样本 + 余量：step 0 触发两次。
-        let fired: Vec<u8> = run(&mut seq, 0, 950)
+        // 20 步（480 tick ≈ 120_000 样本）+ 余量：step 0 触发两次。
+        let fired: Vec<u8> = run(&mut seq, 950)
             .iter()
             .filter_map(|(t, e)| {
                 if *t == 0 {
@@ -360,11 +637,10 @@ mod tests {
         pattern[0] = step(60);
         pattern[1] = step(64);
         seq.set_pattern(0, pattern);
-        seq.play(0);
+        seq.play();
 
-        let events = run(&mut seq, 0, 60);
-        // 60 块 = 7680 样本覆盖步 0（on@0, off@5999）与步 1 的 on@6000；
-        // 顺序 on → off → on 即证明 off 先于下一个 note on。
+        let events = run(&mut seq, 60);
+        // 60 块 = 7680 样本覆盖步 0（on@0, off@5999）与步 1 的 on@6000。
         let kinds: Vec<&str> = events
             .iter()
             .map(|(_, e)| match e {
@@ -379,12 +655,12 @@ mod tests {
     fn playing_and_step_feedback() {
         let mut seq = Sequencer::new(SR);
         assert!(!seq.is_playing());
-        seq.play(0);
+        seq.play();
         assert!(seq.is_playing());
+        // 5760 样本 = 23.04 tick < 24：仍在第 0 步内。
+        run(&mut seq, 45);
         assert_eq!(seq.step_index(), 0);
-        run(&mut seq, 0, 45); // 5760 样本 < 6000：尚未跨过第 1 步
+        run(&mut seq, 5); // 6400 样本 = 25.6 tick：进入第 1 步
         assert_eq!(seq.step_index(), 1);
-        run(&mut seq, 5760, 5); // 再 640 样本，跨过 6000
-        assert_eq!(seq.step_index(), 2);
     }
 }

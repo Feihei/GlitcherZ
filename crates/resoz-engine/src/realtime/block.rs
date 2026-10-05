@@ -25,6 +25,8 @@ pub struct Feedback {
     pub step: Arc<AtomicU32>,
     /// 音序器走带状态。
     pub playing: Arc<AtomicBool>,
+    /// 音序器音乐位置（tick，自播放起点累计）。
+    pub position_ticks: Arc<AtomicF32>,
     /// 各轨道 post-fader 峰值电平。
     pub track_levels: [Arc<AtomicF32>; crate::realtime::NUM_TRACKS],
 }
@@ -37,6 +39,7 @@ impl Feedback {
             position: Arc::new(AtomicU64::new(0)),
             step: Arc::new(AtomicU32::new(0)),
             playing: Arc::new(AtomicBool::new(false)),
+            position_ticks: Arc::new(AtomicF32::new(0.0)),
             track_levels: std::array::from_fn(|_| Arc::new(AtomicF32::new(0.0))),
         }
     }
@@ -167,6 +170,9 @@ impl BlockRunner {
         self.feedback
             .playing
             .store(self.sequencer.is_playing(), Ordering::Relaxed);
+        self.feedback
+            .position_ticks
+            .store(self.sequencer.position_ticks() as f32);
 
         self.played_samples += frames as u64;
         self.scratch_pos = 0;
@@ -191,7 +197,7 @@ impl BlockRunner {
     fn apply_sequencer_command(&mut self, cmd: SequencerCommand) {
         match cmd {
             SequencerCommand::Play => {
-                self.sequencer.play(self.played_samples);
+                self.sequencer.play();
                 // 清掉可能仍按住的手动音符，避免与音序声部叠加。
                 self.mixer.note_off_all();
             }
@@ -203,6 +209,12 @@ impl BlockRunner {
             SequencerCommand::SetGate(gate) => self.sequencer.set_gate(gate),
             SequencerCommand::SetPattern { track, steps } => {
                 self.sequencer.set_pattern(track, steps);
+            }
+            SequencerCommand::SetClip { track, clip } => {
+                self.sequencer.set_clip(track, clip);
+            }
+            SequencerCommand::SetSource { track, source } => {
+                self.sequencer.set_source(track, source);
             }
         }
     }

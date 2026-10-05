@@ -58,7 +58,10 @@ pub use envelope::AdsrProcessor;
 pub use gain::GainProcessor;
 pub use mixer::{Mixer, MixerLevels};
 pub use processor::{Processor, ProcessorChain};
-pub use sequencer::{PATTERN_STEPS, Sequencer, SequencerStep};
+pub use sequencer::{
+    MAX_CLIP_NOTES, PATTERN_STEPS, RtClip, RtNote, Sequencer, SequencerStep, TICKS_PER_QUARTER,
+    TICKS_PER_STEP, TrackSource,
+};
 pub use sine::SineProcessor;
 pub use svf::{FilterMode, SvfProcessor};
 pub use synth::{SynthProcessor, note_to_frequency};

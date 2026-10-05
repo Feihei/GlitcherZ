@@ -4,11 +4,12 @@
 //!
 //! ResoZ 的 egui 界面：走带控制、步进音序器、钢琴卷帘、混音器。
 //!
-//! 当前（路线图第 5 步）：多轨主窗口 —— 4 条轨道，每轨独立合成器
-//! （滤波器/ADSR/延迟）、16 步音序模式与混音条（静音/推子/声像/电平
-//! 表）。UI 持有 `resoz_model::Project` 文档并把它当作参数面板状态；
-//! 所有改动经 [`resoz_engine::realtime::EngineCommand`] 轨道定向命令
-//! 实时送往音频线程。
+//! 当前（路线图第 6 步）：多轨主窗口 —— 4 条轨道，每轨独立合成器
+//! （滤波器/ADSR/延迟）、16 步音序模式或钢琴卷帘片段（可切换）与
+//! 混音条（静音/推子/声像/电平表）。UI 持有 `resoz_model::Project`
+//! 文档并把它当作参数面板状态；所有改动经
+//! [`resoz_engine::realtime::EngineCommand`] 轨道定向命令实时送往
+//! 音频线程。
 //!
 //! 分层说明：本 crate 直接依赖 engine 的非实时控制端——`AudioEngine`
 //! 只在 UI 线程被触碰，永不进入音频回调。模型与引擎互不依赖，发送前
@@ -22,8 +23,13 @@ use eframe::egui;
 
 use resoz_engine::AudioEngine;
 use resoz_engine::convert;
-use resoz_engine::realtime::{EngineCommand, NoteEvent, ParamId, SequencerCommand, SequencerStep};
-use resoz_model::{PATTERN_STEPS, Pattern, Project};
+use resoz_engine::realtime::{
+    EngineCommand, MAX_CLIP_NOTES, NoteEvent, ParamId, RtClip, RtNote, SequencerCommand,
+    SequencerStep, TrackSource,
+};
+use resoz_model::{PATTERN_STEPS, Pattern, Project, TrackSource as ModelTrackSource};
+
+pub mod piano_roll;
 
 /// 滤波器截止频率滑块范围（对数刻度）。
 pub const CUTOFF_RANGE: RangeInclusive<f32> = 20.0..=18_000.0;
@@ -138,6 +144,8 @@ pub struct ResoZApp {
     project: Project,
     /// 正在编辑的轨道（合成器/音序器/键盘的目标）。
     selected_track: usize,
+    /// 钢琴卷帘的跨帧状态（滚动/拖拽）。
+    roll_state: piano_roll::RollState,
     /// 画笔音符：点选空白步时写入的音符。
     brush_note: u8,
     /// 八度基准（C 的 MIDI 编号，默认 60 = C4）。
@@ -169,6 +177,7 @@ impl ResoZApp {
             engine,
             project,
             selected_track: 0,
+            roll_state: piano_roll::RollState::new(),
             brush_note: 60,
             octave_base: 60,
             held_notes: HashSet::new(),
@@ -201,6 +210,13 @@ impl ResoZApp {
             self.push_track_params(track);
             let steps = self.rt_pattern(track);
             self.send_sequencer(SequencerCommand::SetPattern { track, steps });
+            let clip = self.rt_clip(track);
+            self.send_sequencer(SequencerCommand::SetClip { track, clip });
+            let source = match self.project.tracks[track].source {
+                ModelTrackSource::Steps => TrackSource::Steps,
+                ModelTrackSource::Clip => TrackSource::Clip,
+            };
+            self.send_sequencer(SequencerCommand::SetSource { track, source });
         }
     }
 
@@ -226,6 +242,30 @@ impl ResoZApp {
             self.engine
                 .send(EngineCommand::SetTrackParam { track, id, value });
         }
+    }
+
+    /// 文档片段 → 引擎表示（超容量截断，`Copy` 结构，零堆分配）。
+    fn rt_clip(&self, track: usize) -> RtClip {
+        let clip = &self.project.tracks[track].clip;
+        let mut rt = RtClip {
+            loop_ticks: clip.loop_ticks,
+            ..RtClip::default()
+        };
+        for note in clip.notes.iter().take(MAX_CLIP_NOTES) {
+            rt.push(RtNote {
+                start_ticks: note.start,
+                length_ticks: note.length,
+                note: note.note,
+                velocity: note.velocity,
+            });
+        }
+        rt
+    }
+
+    /// 下发一条轨道的当前卷帘片段。
+    fn send_clip(&mut self, track: usize) {
+        let clip = self.rt_clip(track);
+        self.send_sequencer(SequencerCommand::SetClip { track, clip });
     }
 
     /// 文档模式 → 引擎表示（`Copy` 数组，零堆分配）。
@@ -470,6 +510,7 @@ impl ResoZApp {
                 });
 
             self.sequencer_section(ui);
+            self.clip_section(ui);
             self.keyboard_section(ui);
 
             ui.add_space(10.0);
@@ -744,6 +785,26 @@ impl ResoZApp {
                     egui::StrokeKind::Inside,
                 );
             }
+        }
+    }
+
+    /// 钢琴卷帘（编辑选中轨道的片段；编辑即时下发音频线程）。
+    fn clip_section(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.add_space(4.0);
+        let sel = self.selected_track;
+        ui.label(format!("钢琴卷帘 — 轨道 {}", sel + 1));
+        let playhead = self.engine.musical_ticks();
+        let playing = self.engine.is_playing();
+        let edited = piano_roll::show(
+            ui,
+            &mut self.project.tracks[sel].clip,
+            &mut self.roll_state,
+            playhead,
+            playing,
+        );
+        if edited {
+            self.send_clip(sel);
         }
     }
 

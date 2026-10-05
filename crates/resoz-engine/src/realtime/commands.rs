@@ -2,7 +2,7 @@
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::realtime::sequencer::{PATTERN_STEPS, SequencerStep};
+use crate::realtime::sequencer::{PATTERN_STEPS, RtClip, SequencerStep, TrackSource};
 
 /// 控制命令队列的默认容量。满载时新命令被发送方丢弃（见
 /// [`crate::engine::AudioEngine::send`]），不会阻塞任何线程。
@@ -59,6 +59,13 @@ pub enum NoteEvent {
 }
 
 /// 音序器走带与配置命令。
+///
+/// `SetClip` 携带整条 `Copy` 片段（约 2 KB），使本枚举显著大于其余
+/// 变体 —— 这是"实时侧零堆分配"的有意取舍：命令队列按最大变体
+/// 分配槽位（1024 × ≈2 KB ≈ 2 MB，一次性预分配）。若未来片段体积
+/// 增长，可改为独立的批量数据通道（非实时侧预写共享缓冲 + 小命令
+/// 通知）。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy)]
 pub enum SequencerCommand {
     /// 从第 0 步开始播放（以接收时刻的流位置为时钟原点）。
@@ -74,12 +81,17 @@ pub enum SequencerCommand {
         track: usize,
         steps: [SequencerStep; PATTERN_STEPS],
     },
+    /// 整块替换某条轨道的卷帘片段。
+    SetClip { track: usize, clip: RtClip },
+    /// 切换某条轨道的音源（步进模式 / 卷帘片段）。
+    SetSource { track: usize, source: TrackSource },
 }
 
 /// UI / 控制线程 → 音频线程的控制命令。
 ///
 /// 必须保持 `Copy`：命令经无锁队列按值传递，**禁止携带堆分配**
 /// （`String` / `Vec` / `Box` 等）。
+#[allow(clippy::large_enum_variant)] // 见 SequencerCommand 的说明
 #[derive(Debug, Clone, Copy)]
 pub enum EngineCommand {
     /// 设置主链参数（主增益等全局参数）。

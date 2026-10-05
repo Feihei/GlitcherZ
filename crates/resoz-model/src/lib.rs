@@ -169,15 +169,96 @@ fn default_delay_feedback() -> f32 {
     0.35
 }
 
-/// 一条音轨：名称、步进模式、音色与混音参数。
+/// 音符时间基准：每四分音符的 tick 数（1/96 四分音符 ≈ 10.4 ms @120 BPM）。
+pub const TICKS_PER_QUARTER: u32 = 96;
+
+/// 每个步进（16 分音符）的 tick 数。
+pub const TICKS_PER_STEP: u32 = 24;
+
+/// 一小节（4/4）的 tick 数 = 16 步 × 24。
+pub const TICKS_PER_BAR: u32 = TICKS_PER_STEP * 16;
+
+/// 钢琴卷帘中的一个音符块。
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Note {
+    /// 起始位置（tick，相对片段起点）。
+    #[serde(default)]
+    pub start: u32,
+    /// 时长（tick）。
+    #[serde(default = "default_note_length")]
+    pub length: u32,
+    /// MIDI 音符编号。
+    #[serde(default)]
+    pub note: u8,
+    /// 力度（0..1）。
+    #[serde(default = "default_velocity")]
+    pub velocity: f32,
+}
+
+fn default_note_length() -> u32 {
+    TICKS_PER_STEP
+}
+
+impl Default for Note {
+    fn default() -> Self {
+        Self {
+            start: 0,
+            length: default_note_length(),
+            note: 60,
+            velocity: default_velocity(),
+        }
+    }
+}
+
+/// 钢琴卷帘片段：一组音符 + 循环长度。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Clip {
+    /// 循环长度（tick），默认一小节（4/4）。
+    #[serde(default = "default_clip_loop")]
+    pub loop_ticks: u32,
+    /// 音符集合。
+    #[serde(default)]
+    pub notes: Vec<Note>,
+}
+
+fn default_clip_loop() -> u32 {
+    TICKS_PER_BAR
+}
+
+impl Default for Clip {
+    fn default() -> Self {
+        Self {
+            loop_ticks: default_clip_loop(),
+            notes: Vec::new(),
+        }
+    }
+}
+
+/// 轨道音源：16 步步进模式或钢琴卷帘片段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum TrackSource {
+    /// 步进音序模式（默认，向前兼容旧项目文件）。
+    #[default]
+    Steps,
+    /// 钢琴卷帘片段。
+    Clip,
+}
+
+/// 一条音轨：名称、音源（步进模式 / 卷帘片段）、音色与混音参数。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Track {
     /// 轨道名（空则 UI 显示"轨道 N"）。
     #[serde(default)]
     pub name: String,
-    /// 该轨的步进模式。
+    /// 该轨的步进模式（`source = Steps` 时播放）。
     #[serde(default)]
     pub pattern: Pattern,
+    /// 该轨的卷帘片段（`source = Clip` 时播放）。
+    #[serde(default)]
+    pub clip: Clip,
+    /// 音源选择。
+    #[serde(default)]
+    pub source: TrackSource,
     /// 轨道增益（线性，0..1.5）。
     #[serde(default = "default_track_gain")]
     pub gain: f32,
@@ -208,6 +289,8 @@ impl Default for Track {
         Self {
             name: String::new(),
             pattern: Pattern::default(),
+            clip: Clip::default(),
+            source: TrackSource::default(),
             gain: default_track_gain(),
             pan: 0.0,
             muted: false,
@@ -260,7 +343,8 @@ fn default_tempo() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DelayParams, NUM_TRACKS, PATTERN_STEPS, Pattern, Project, Step, SynthParams, Track,
+        Clip, DelayParams, NUM_TRACKS, Note, PATTERN_STEPS, Pattern, Project, Step, SynthParams,
+        TICKS_PER_BAR, TICKS_PER_STEP, Track, TrackSource,
     };
 
     #[test]
@@ -321,6 +405,42 @@ mod tests {
         let d: DelayParams = ron::from_str("()").unwrap_or(track.delay);
         assert!((d.time_s - 0.3).abs() < 1e-6);
         assert_eq!(track.pattern.steps.len(), PATTERN_STEPS);
+    }
+
+    #[test]
+    fn clip_ron_roundtrip() {
+        let mut clip = Clip::default();
+        clip.notes.push(Note {
+            start: 0,
+            length: 48,
+            note: 60,
+            velocity: 0.9,
+        });
+        clip.notes.push(Note {
+            start: 24,
+            length: 24,
+            note: 64,
+            velocity: 1.0,
+        });
+        let text = ron::to_string(&clip).expect("序列化失败");
+        let back: Clip = ron::from_str(&text).expect("反序列化失败");
+        assert_eq!(clip, back);
+    }
+
+    #[test]
+    fn note_partial_fields_use_defaults() {
+        let back: Note = ron::from_str("(start: 48, note: 72)").expect("解析失败");
+        assert_eq!(back.length, TICKS_PER_STEP, "音符时长默认一个 16 分音符");
+        assert!((back.velocity - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn old_track_file_falls_back_to_steps_source() {
+        // 旧项目文件没有 source/clip 字段：应回退为步进音源 + 空片段。
+        let back: Track = ron::from_str(r#"(name: "旧轨道")"#).expect("解析失败");
+        assert_eq!(back.source, TrackSource::Steps);
+        assert!(back.clip.notes.is_empty());
+        assert_eq!(back.clip.loop_ticks, TICKS_PER_BAR);
     }
 
     #[test]

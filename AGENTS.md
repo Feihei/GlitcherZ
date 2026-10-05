@@ -113,7 +113,7 @@ cargo build --release -p resoz-app
 3. ✅ 音量包络 + 简单滤波器（第一个完整合成器）
 4. ✅ 步进音序器（16 步，触发合成器）
 5. ✅ 多轨 + 混音器 + 简单效果器链
-6. ⬜ 钢琴卷帘 MIDI 编辑
+6. ✅ 钢琴卷帘 MIDI 编辑
 7. ⬜ 项目保存/加载（RON）
 8. ⬜ 自动化曲线
 9. ⬜ CLAP 插件宿主（先于 VST3，API 更简洁）
@@ -121,25 +121,25 @@ cargo build --release -p resoz-app
 
 ## 当前状态与下一步
 
-**当前进度**：路线图第 5 步已完成（2026-10-05）。
+**当前进度**：路线图第 6 步已完成（2026-10-05）。
 
 已落地：
 - workspace 四 crate 骨架（`resoz-model` / `resoz-engine` / `resoz-ui` / `resoz-app`）；
 - `resoz-engine::realtime`：`AudioBuffer`、`Processor`（`set_param` + `note_event`）、`ProcessorChain`、`BlockRunner`（固定 128 块拆分 + 块边界命令消费 + `Feedback` 原子回传：主电平/位置/步进/走带/**每轨电平**）；
 - **`Mixer`**：4 条 `TrackStrip`（`SynthProcessor → DelayProcessor`）并行处理 + 线性声像/增益/静音求和 → 主链（`MasterGain`）；`MixerLevels` 每块回传各轨 post-fader 峰值；
 - 完整合成器链（每轨）：正弦振荡器 + 线性 ADSR → TPT SVF（低通/高通/带通）→ 反馈延迟（`DelayProcessor`：预分配环形缓冲 1 s 上限、feedback ≤ 0.9、反规范数冲洗、每声道独立写指针）；
-- `Sequencer`（音频线程块边界采样时钟调度）：**每轨独立 16 步模式**、BPM（20..300）、gate 占比、play/stop 走带；事件按 `(track, NoteEvent)` 送入对应轨道（≤1 块 ≈ 2.7 ms 抖动，逐样本偏移待后续）；
-- `resoz-model`：`Project`（metadata + gate + master_gain + 4×`Track`）；`Track` = 名称 + `Pattern` + 混音（增益/声像/静音）+ `SynthParams` + `DelayParams`，全部 serde/RON + 字段级 `#[serde(default)]`；
+- `Sequencer`（音频线程块边界采样时钟调度）：**纯窗口扫描**模型——只维护音乐位置（tick，1 四分音符 = 96），每块把 `[t0, t1)` 内到期事件一次性调度出来；BPM 变化只改未来速率（音乐位置不跳），循环回绕由窗口映射推导；**每轨双音源**（16 步步进模式 / 钢琴卷帘片段，`SetSource` 切换），卷帘音符按自身 start/length 触发；事件按 `(track, NoteEvent)` 送入对应轨道（≤1 块 ≈ 2.7 ms 抖动，逐样本偏移待后续）；
+- `resoz-model`：`Project`（metadata + gate + master_gain + 4×`Track`）；`Track` = 名称 + `Pattern` + `Clip`（`Note{start,length,note,velocity}` 列表 + loop_ticks，tick 基准：`TICKS_PER_QUARTER=96`/步=24/小节=384）+ 音源枚举 + 混音（增益/声像/静音）+ `SynthParams` + `DelayParams`，全部 serde/RON + 字段级 `#[serde(default)]`；引擎侧镜像 `RtClip`（定容 128 音符 `Copy`，超容截断）经 `SetClip` 命令整块下发；
 - 命令集（轨道定向）：`SetParam`（主链）/ `SetTrackParam{track}` / `Note{track}` / `Sequencer(Play|Stop|SetBpm|SetGate|SetPattern{track})`；模式整块 `Copy` 数组经队列传递；
-- `resoz-ui`：eframe 0.36（glow）——走带 + BPM、**混音器面板**（轨道选择/静音/post-fader 电平条/竖直推子/声像）、16 步网格（编辑选中轨道，播放位置黄色描边）、画笔音符/音长、滤波器/ADSR/延迟面板（作用于选中轨道）、虚拟键盘（屏幕 + 电脑键盘，演奏选中轨道）、主输出电平表。
+- `resoz-ui`：eframe 0.36（glow）——走带 + BPM、**混音器面板**（轨道选择/静音/post-fader 电平条/竖直推子/声像）、16 步网格（播放位置黄色描边）、**钢琴卷帘编辑器**（`piano_roll` 自绘组件：点空白绘制、拖拽移动、右键删除、滚轮滚动音高、播放头走线；fit-to-width 时间轴、1/64 吸附）、画笔音符/音长、滤波器/ADSR/延迟面板（作用于选中轨道）、虚拟键盘（屏幕 + 电脑键盘）、主输出电平表；音序器音乐位置经 `Feedback.position_ticks`（AtomicF32）回传驱动播放头。
 
 版本注意：cpal 0.18；egui 0.36（`App::ui(&mut Ui)`、`egui::Panel`、`Response` 无 `pressed/released` 用 `is_pointer_button_down_on`、`DragValue::range(RangeInclusive)`、`Painter::rect_stroke(rect, radius, stroke, StrokeKind)`）。
 
-**下一步任务**（路线图第 6 步：钢琴卷帘 MIDI 编辑）：
-- [ ] `resoz-model`：片段/音符事件（`Note { start, length, note, velocity }`）与 Clip 结构，取代/兼容步进模式
-- [ ] `resoz-engine`：钢琴卷帘调度（音符按 start/length 精确触发，块边界内子块偏移或逐样本包络起点）
-- [ ] `resoz-ui`：钢琴卷帘编辑器（网格绘制、音符块拖拽/绘制/删除、缩放与滚动）
-- [ ] 回放联动：轨道可切换 步进模式 / 卷帘片段 两种音源
+**下一步任务**（路线图第 7 步：项目保存/加载 RON）：
+- [ ] `resoz-model`：项目文件读写（`Project` → RON，`ron::ser::to_string_pretty`；加载时逐字段容错）
+- [ ] `resoz-app`/`resoz-ui`：保存/打开对话框（rfd 或手动路径输入）、最近文件
+- [ ] 项目文件版本号字段（`version: u32`），向后兼容策略文档化
+- [ ] 端到端测试：保存 → 重新加载 → Project 相等
 
 ---
 

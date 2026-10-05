@@ -121,6 +121,11 @@ impl AudioEngine {
         self.feedback.step.load(Ordering::Relaxed)
     }
 
+    /// 音序器音乐位置（tick，自播放起点累计；用于卷帘播放头）。
+    pub fn musical_ticks(&self) -> f32 {
+        self.feedback.position_ticks.load()
+    }
+
     /// 音序器是否播放中。
     pub fn is_playing(&self) -> bool {
         self.feedback.playing.load(Ordering::Relaxed)
