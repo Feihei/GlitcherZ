@@ -1,15 +1,50 @@
 //! 固定块处理调度：cpal 回调 ↔ 处理链的桥梁。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use rtrb::Consumer;
 
 use crate::realtime::atomic::AtomicF32;
 use crate::realtime::buffer::AudioBuffer;
-use crate::realtime::commands::EngineCommand;
+use crate::realtime::commands::{EngineCommand, NoteEvent, SequencerCommand};
 use crate::realtime::context::ProcessContext;
 use crate::realtime::processor::{Processor, ProcessorChain};
+use crate::realtime::sequencer::Sequencer;
+
+/// 引擎 → UI 的状态回传句柄：与 [`BlockRunner`] 共享的一组原子量。
+///
+/// `BlockRunner` 在每个块边界写入，[`crate::engine::AudioEngine`] 持有
+/// 克隆副本供 UI 读取。
+#[derive(Clone)]
+pub struct Feedback {
+    /// 最近块的峰值电平。
+    pub level: Arc<AtomicF32>,
+    /// 播放位置（流启动以来的样本数）。
+    pub position: Arc<AtomicU64>,
+    /// 音序器当前步进索引。
+    pub step: Arc<AtomicU32>,
+    /// 音序器走带状态。
+    pub playing: Arc<AtomicBool>,
+}
+
+impl Feedback {
+    /// 全零初始值。**非 RT-safe**，在启动音频流前调用。
+    pub fn new() -> Self {
+        Self {
+            level: Arc::new(AtomicF32::new(0.0)),
+            position: Arc::new(AtomicU64::new(0)),
+            step: Arc::new(AtomicU32::new(0)),
+            playing: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Default for Feedback {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// 把宿主（cpal）交来的任意长度交错缓冲区拆成固定块交给处理链执行，
 /// 再交错写回。实例在音频流启动前构造，随后 move 进音频回调线程，
@@ -17,19 +52,20 @@ use crate::realtime::processor::{Processor, ProcessorChain};
 ///
 /// 每个固定块的执行顺序（`run_next_block`）：
 /// 1. **块边界**消费全部待处理命令（队列空则立即返回）；
-/// 2. 准备静音块（预分配 scratch）；
-/// 3. 运行处理链；
-/// 4. 回传峰值电平（`AtomicF32`）与播放位置（`AtomicU64`）。
+/// 2. 音序器按采样时钟调度，到期音符事件直接送入处理链；
+/// 3. 准备静音块（预分配 scratch）；
+/// 4. 运行处理链；
+/// 5. 回传峰值电平、播放位置、音序器步进与走带状态（原子量）。
 pub struct BlockRunner {
     fixed_block: usize,
     out_channels: usize,
     sample_rate: f32,
     chain: ProcessorChain,
+    sequencer: Sequencer,
     scratch: AudioBuffer,
     scratch_pos: usize,
     commands: Consumer<EngineCommand>,
-    level: Arc<AtomicF32>,
-    position: Arc<AtomicU64>,
+    feedback: Feedback,
     played_samples: u64,
 }
 
@@ -40,9 +76,9 @@ impl BlockRunner {
         out_channels: usize,
         sample_rate: f32,
         chain: ProcessorChain,
+        sequencer: Sequencer,
         commands: Consumer<EngineCommand>,
-        level: Arc<AtomicF32>,
-        position: Arc<AtomicU64>,
+        feedback: Feedback,
     ) -> Self {
         Self {
             fixed_block: fixed_block.max(1),
@@ -53,11 +89,11 @@ impl BlockRunner {
                 48_000.0
             },
             chain,
+            sequencer,
             scratch: AudioBuffer::new(2, fixed_block.max(1)),
             scratch_pos: 0,
             commands,
-            level,
-            position,
+            feedback,
             played_samples: 0,
         }
     }
@@ -91,20 +127,29 @@ impl BlockRunner {
             self.apply_command(cmd);
         }
 
-        // 2. 准备静音块。
+        // 2. 本块上下文（供音序器与处理链共用）。
         let frames = self.fixed_block.min(self.scratch.capacity());
-        self.scratch.set_len(frames);
-        self.scratch.clear();
-
-        // 3. 运行处理链。
         let ctx = ProcessContext {
             sample_rate: self.sample_rate,
             frames,
             playback_sample_pos: self.played_samples,
         };
+
+        // 3. 音序器调度：到期音符事件直接送入处理链（块边界精度）。
+        //    拆字段借用，让 sequencer 与 chain 同时可变。
+        let Self {
+            sequencer, chain, ..
+        } = self;
+        sequencer.advance(&ctx, &mut |event| {
+            let _ = chain.note_event(event);
+        });
+
+        // 4. 准备静音块并运行处理链。
+        self.scratch.set_len(frames);
+        self.scratch.clear();
         self.chain.process(&ctx, &mut self.scratch);
 
-        // 4. 状态回传：峰值电平 + 播放位置（本块起始）。
+        // 5. 状态回传：峰值电平、播放位置、音序器步进与走带状态。
         let mut peak = 0.0f32;
         for ch in 0..self.scratch.channels() {
             if let Some(channel) = self.scratch.channel(ch) {
@@ -113,8 +158,16 @@ impl BlockRunner {
                 }
             }
         }
-        self.level.store(peak);
-        self.position.store(self.played_samples, Ordering::Relaxed);
+        self.feedback.level.store(peak);
+        self.feedback
+            .position
+            .store(self.played_samples, Ordering::Relaxed);
+        self.feedback
+            .step
+            .store(self.sequencer.step_index() as u32, Ordering::Relaxed);
+        self.feedback
+            .playing
+            .store(self.sequencer.is_playing(), Ordering::Relaxed);
 
         self.played_samples += frames as u64;
         self.scratch_pos = 0;
@@ -129,6 +182,25 @@ impl BlockRunner {
             EngineCommand::Note(event) => {
                 let _ = self.chain.note_event(event);
             }
+            EngineCommand::Sequencer(cmd) => self.apply_sequencer_command(cmd),
+        }
+    }
+
+    fn apply_sequencer_command(&mut self, cmd: SequencerCommand) {
+        match cmd {
+            SequencerCommand::Play => {
+                self.sequencer.play(self.played_samples);
+                // 清掉可能仍按住的手动音符，避免与音序声部叠加。
+                let _ = self.chain.note_event(NoteEvent::Off { note: 0 });
+            }
+            SequencerCommand::Stop => {
+                // 返回值仅诊断用；无论是否记录了音符都发 Off 兜底释放。
+                let _ = self.sequencer.stop();
+                let _ = self.chain.note_event(NoteEvent::Off { note: 0 });
+            }
+            SequencerCommand::SetBpm(bpm) => self.sequencer.set_bpm(bpm),
+            SequencerCommand::SetGate(gate) => self.sequencer.set_gate(gate),
+            SequencerCommand::SetPattern(steps) => self.sequencer.set_pattern(steps),
         }
     }
 
@@ -144,49 +216,46 @@ impl BlockRunner {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
 
     use rtrb::Producer;
 
-    use super::BlockRunner;
-    use crate::realtime::atomic::AtomicF32;
-    use crate::realtime::commands::{EngineCommand, NoteEvent, ParamId, command_channel};
+    use super::{BlockRunner, Feedback};
+    use crate::realtime::commands::{
+        EngineCommand, NoteEvent, ParamId, SequencerCommand, command_channel,
+    };
     use crate::realtime::gain::GainProcessor;
     use crate::realtime::processor::ProcessorChain;
+    use crate::realtime::sequencer::{PATTERN_STEPS, Sequencer, SequencerStep};
     use crate::realtime::svf::SvfProcessor;
     use crate::realtime::synth::SynthProcessor;
     use crate::testing::count_positive_crossings;
 
     const SR: f32 = 44_100.0;
 
+    /// 测试台架：返回 (runner, 命令发送端, 状态回传句柄)。
     fn make_runner(
         fixed_block: usize,
         out_channels: usize,
-    ) -> (
-        BlockRunner,
-        Producer<EngineCommand>,
-        Arc<AtomicF32>,
-        Arc<AtomicU64>,
-    ) {
+    ) -> (BlockRunner, Producer<EngineCommand>, Feedback) {
         let (tx, rx) = command_channel(64);
         // 与 AudioEngine 相同的链路：合成器 → 滤波器 → 主增益。
         let mut chain = ProcessorChain::new();
         chain.push(Box::new(SynthProcessor::new(SR)));
         chain.push(Box::new(SvfProcessor::new(SR)));
         chain.push(Box::new(GainProcessor::new(1.0)));
-        let level = Arc::new(AtomicF32::new(0.0));
-        let position = Arc::new(AtomicU64::new(0));
+        let feedback = Feedback::new();
+        let sequencer = Sequencer::new(SR);
         let runner = BlockRunner::new(
             fixed_block,
             out_channels,
             SR,
             chain,
+            sequencer,
             rx,
-            level.clone(),
-            position.clone(),
+            feedback.clone(),
         );
-        (runner, tx, level, position)
+        (runner, tx, feedback)
     }
 
     /// 触发 A4 音符（队列在下一个块边界被消费）。
@@ -200,7 +269,7 @@ mod tests {
 
     #[test]
     fn phase_continuity_across_arbitrary_host_blocks() {
-        let (mut runner, mut tx, _level, _position) = make_runner(128, 2);
+        let (mut runner, mut tx, _feedback) = make_runner(128, 2);
         note_on_69(&mut tx);
         // 用不整除固定块（377）的宿主缓冲渲染约 1 秒，验证拆块不破坏相位。
         let total_frames = 44_100usize;
@@ -221,7 +290,7 @@ mod tests {
 
     #[test]
     fn channels_beyond_two_are_silent() {
-        let (mut runner, mut tx, _level, _position) = make_runner(128, 4);
+        let (mut runner, mut tx, _feedback) = make_runner(128, 4);
         note_on_69(&mut tx);
         let mut out = vec![7.0f32; 256 * 4]; // 预填非零，验证被覆盖/清零
         runner.render_interleaved(&mut out);
@@ -238,7 +307,7 @@ mod tests {
 
     #[test]
     fn mono_output_takes_left_channel() {
-        let (mut runner, mut tx, _level, _position) = make_runner(128, 1);
+        let (mut runner, mut tx, _feedback) = make_runner(128, 1);
         note_on_69(&mut tx);
         let mut out = vec![0.0f32; 256];
         runner.render_interleaved(&mut out);
@@ -247,7 +316,7 @@ mod tests {
 
     #[test]
     fn command_takes_effect_at_block_boundary() {
-        let (mut runner, mut tx, _level, _position) = make_runner(128, 2);
+        let (mut runner, mut tx, _feedback) = make_runner(128, 2);
         note_on_69(&mut tx);
         let half_frames = 11_025usize; // 0.25 s
         let mut out = vec![0.0f32; 44_100 * 2];
@@ -271,19 +340,19 @@ mod tests {
 
     #[test]
     fn reports_level_and_position() {
-        let (mut runner, mut tx, level, position) = make_runner(128, 2);
+        let (mut runner, mut tx, feedback) = make_runner(128, 2);
         note_on_69(&mut tx);
         let mut out = vec![0.0f32; 300 * 2];
         runner.render_interleaved(&mut out);
 
         // 300 帧 → 消费 3 个块；position 为当前正在缓冲的块起点（第 3 块 = 256）。
-        assert_eq!(position.load(Ordering::Relaxed), 256);
-        assert!(level.load() > 0.0, "有信号输出时峰值电平应为正");
+        assert_eq!(feedback.position.load(Ordering::Relaxed), 256);
+        assert!(feedback.level.load() > 0.0, "有信号输出时峰值电平应为正");
     }
 
     #[test]
     fn note_off_fades_stream_to_silence() {
-        let (mut runner, mut tx, level, _position) = make_runner(128, 2);
+        let (mut runner, mut tx, feedback) = make_runner(128, 2);
         note_on_69(&mut tx);
         let mut out = vec![0.0f32; 22_050 * 2];
         runner.render_interleaved(&mut out); // 0.5 s sustain
@@ -293,17 +362,81 @@ mod tests {
         runner.render_interleaved(&mut out); // release 0.2 s + 余量
 
         assert!(
-            level.load() < 0.02,
+            feedback.level.load() < 0.02,
             "NoteOff 后输出应衰减至静音，实际 {}",
-            level.load()
+            feedback.level.load()
         );
     }
 
     #[test]
     fn silent_until_first_note() {
-        let (mut runner, _tx, level, _position) = make_runner(128, 2);
+        let (mut runner, _tx, feedback) = make_runner(128, 2);
         let mut out = vec![0.0f32; 1024 * 2];
         runner.render_interleaved(&mut out);
-        assert!(level.load() < 1e-9, "未触发音符时应为静音");
+        assert!(feedback.level.load() < 1e-9, "未触发音符时应为静音");
+    }
+
+    /// 音序器端到端：命令队列下发模式与走带 → 合成器发声 → 状态回传。
+    #[test]
+    fn sequencer_drives_synth_through_command_queue() {
+        let (mut runner, mut tx, feedback) = make_runner(128, 2);
+
+        // 模式：步 0/2/4 触发 A4；BPM 240 → 步长 2756 样本（44100 Hz）。
+        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
+        for i in [0usize, 2, 4] {
+            pattern[i] = SequencerStep {
+                enabled: true,
+                note: 69,
+                velocity: 0.9,
+            };
+        }
+        tx.push(EngineCommand::Sequencer(SequencerCommand::SetPattern(
+            pattern,
+        )))
+        .expect("队列未满");
+        tx.push(EngineCommand::Sequencer(SequencerCommand::SetBpm(240.0)))
+            .expect("队列未满");
+        tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
+            .expect("队列未满");
+
+        let mut out = vec![0.0f32; 44_100]; // 1 s，单声道即可
+        runner.render_interleaved(&mut out);
+
+        assert!(feedback.playing.load(Ordering::Relaxed), "应处于播放状态");
+        // 直接验证音频内容（level 原子量只反映最后一个块，结尾可能恰逢
+        // 新音符从零相位起音，不适合做"是否发声"的判据）。
+        let audio_peak = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+        assert!(
+            audio_peak > 0.05,
+            "音序器触发后应有可闻输出，峰值 {audio_peak}"
+        );
+
+        // 停止 → 走带状态回传翻转为 false。
+        tx.push(EngineCommand::Sequencer(SequencerCommand::Stop))
+            .expect("队列未满");
+        runner.render_interleaved(&mut out);
+        assert!(
+            !feedback.playing.load(Ordering::Relaxed),
+            "停止后应不再是播放状态"
+        );
+        assert!(feedback.step.load(Ordering::Relaxed) < PATTERN_STEPS as u32);
+    }
+
+    #[test]
+    fn silent_when_sequencer_not_playing() {
+        let (mut runner, mut tx, feedback) = make_runner(128, 2);
+        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
+        pattern[0] = SequencerStep {
+            enabled: true,
+            note: 60,
+            velocity: 1.0,
+        };
+        tx.push(EngineCommand::Sequencer(SequencerCommand::SetPattern(
+            pattern,
+        )))
+        .expect("队列未满");
+        let mut out = vec![0.0f32; 22_050];
+        runner.render_interleaved(&mut out);
+        assert!(feedback.level.load() < 1e-9, "未按播放时音序器不应发声");
     }
 }

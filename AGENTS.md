@@ -111,7 +111,7 @@ cargo build --release -p resoz-app
 1. ✅ `cpal` 输出正弦波（验证音频管线）
 2. ✅ `egui` 集成 + 参数滑块实时控制正弦波频率（验证跨线程通信）
 3. ✅ 音量包络 + 简单滤波器（第一个完整合成器）
-4. ⬜ 步进音序器（16 步，触发合成器）
+4. ✅ 步进音序器（16 步，触发合成器）
 5. ⬜ 多轨 + 混音器 + 简单效果器链
 6. ⬜ 钢琴卷帘 MIDI 编辑
 7. ⬜ 项目保存/加载（RON）
@@ -121,23 +121,24 @@ cargo build --release -p resoz-app
 
 ## 当前状态与下一步
 
-**当前进度**：路线图第 3 步已完成（2026-10-05）。
+**当前进度**：路线图第 4 步已完成（2026-10-05）。
 
 已落地：
 - workspace 四 crate 骨架（`resoz-model` / `resoz-engine` / `resoz-ui` / `resoz-app`）；
-- `resoz-engine::realtime`：`AudioBuffer`（预分配平面缓冲）、`Processor` trait（`set_param` + `note_event`）、`ProcessorChain`、`BlockRunner`（固定 128 样本块拆分 + 块边界命令消费 + `AtomicF32`/`AtomicU64` 状态回传）；
-- 完整合成器链：`SynthProcessor`（正弦振荡器 + `AdsrProcessor` 线性 ADSR 包络，velocity 驱动峰值）→ `SvfProcessor`（TPT/Simper SVF，低通/高通/带通，带通增益归一，防反规范数冲洗）→ `GainProcessor`（主增益）；
-- 命令：`EngineCommand::SetParam` / `EngineCommand::Note(NoteEvent)`（`On{note,velocity}` / `Off{note}`）；
-- `resoz-ui`：eframe 0.36（**glow 后端**）——合成器面板（截止频率对数滑块、共振、模式切换、A/D/S/R 滑块、主增益）、虚拟键盘（13 键屏幕键盘 + 电脑键盘 FL 风格布局 A W S E D…，Z/X 切八度，按住检测走 `is_pointer_button_down_on` 边沿）、峰值电平表、状态栏；
-- `resoz-app`：`--note <0-127>`（默认 69）/ `--freq`（兼容旧参，换算最近音符）/ `--no-autoplay` / `--gain` / `--seconds`（自动关窗冒烟测试）/ `--list-devices`。
+- `resoz-engine::realtime`：`AudioBuffer`、`Processor`（`set_param` + `note_event`）、`ProcessorChain`、`BlockRunner`（固定 128 块拆分 + 块边界命令消费 + `Feedback` 原子回传：电平/位置/步进/走带）；
+- 完整合成器链：`SynthProcessor`（正弦振荡器 + 线性 ADSR）→ `SvfProcessor`（TPT SVF）→ `GainProcessor`；
+- `Sequencer`（音频线程块边界采样时钟调度）：16 步模式、BPM（20..300）、gate 占比、play/stop 走带；步进事件按块边界发出（≤1 块 ≈ 2.7 ms 抖动，逐样本偏移待后续）；
+- `resoz-model`：`Pattern`/`Step`（固定 16 步 `Copy` 数组 + serde/RON，`#[serde(default)]` 前向兼容）；
+- `resoz-ui`：eframe 0.36（glow）——走带播放/停止按钮（播放态绿色高亮）、BPM 数值框、16 步网格（左键点选/改写/取消，右键清除，"清空"/"全部 C4"快捷，播放位置黄色描边高亮）、画笔音符与音长控制、滤波器/ADSR 面板、虚拟键盘（屏幕 + 电脑键盘）、峰值电平表；
+- 命令集：`SetParam` / `Note(NoteEvent)` / `Sequencer(Play|Stop|SetBpm|SetGate|SetPattern)`；模式整块以 `Copy` 数组经队列传递，模型与引擎互不依赖（UI 负责转换）。
 
-版本注意：cpal 0.18（错误统一 `cpal::Error`、`SampleRate` 为 u32 别名、设备名走 `Display`）；egui 0.36（`App::ui(&mut Ui)` 取代 `update(ctx)`、面板统一为 `egui::Panel::top/bottom` 且 `show` 接收 `&mut Ui`、`Response` 无 `pressed/released`——按住检测用 `is_pointer_button_down_on`）。
+版本注意：cpal 0.18；egui 0.36（`App::ui(&mut Ui)`、`egui::Panel`、`Response` 无 `pressed/released` 用 `is_pointer_button_down_on`、`DragValue::range(RangeInclusive)`、`Painter::rect_stroke(rect, radius, stroke, StrokeKind)`）。
 
-**下一步任务**（路线图第 4 步：步进音序器）：
-- [ ] `resoz-model`：`Pattern`（16 步 × 音符/力度/ gates）数据结构 + serde（`#[serde(default)]` 约定）
-- [ ] `resoz-engine`：音序器调度器（块边界采样时钟：BPM → 步进事件 → `NoteEvent`，`ProcessContext` 携带采样位置即可推导）
-- [ ] `resoz-ui`：16 步网格编辑器 + BPM 控制 + 走带播放/停止
-- [ ] 音序器触发合成器（短音：步长 gate → NoteOn/NoteOff）
+**下一步任务**（路线图第 5 步：多轨 + 混音器 + 简单效果器链）：
+- [ ] `resoz-model`：`Track`（名称/音色参数/音序模式引用）与多轨项目结构
+- [ ] `resoz-engine`：多声部并行（每轨道独立 SynthProcessor + 链）与轨道混音（增益/声像/静音）
+- [ ] 第一个效果器 `DelayProcessor`（反馈延迟，RT-safe 预分配环形缓冲）挂到轨道链
+- [ ] `resoz-ui`：混音器面板（推子 + 电平表 + 静音按钮），音序器支持多轨选择
 
 ---
 

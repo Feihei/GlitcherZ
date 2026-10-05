@@ -33,6 +33,7 @@ pub mod context;
 pub mod envelope;
 pub mod gain;
 pub mod processor;
+pub mod sequencer;
 pub mod sine;
 pub mod svf;
 pub mod synth;
@@ -41,13 +42,16 @@ pub mod synth;
 pub const FIXED_BLOCK_SIZE: usize = 128;
 
 pub use atomic::AtomicF32;
-pub use block::BlockRunner;
+pub use block::{BlockRunner, Feedback};
 pub use buffer::AudioBuffer;
-pub use commands::{COMMAND_QUEUE_CAPACITY, EngineCommand, NoteEvent, ParamId, command_channel};
+pub use commands::{
+    COMMAND_QUEUE_CAPACITY, EngineCommand, NoteEvent, ParamId, SequencerCommand, command_channel,
+};
 pub use context::ProcessContext;
 pub use envelope::AdsrProcessor;
 pub use gain::GainProcessor;
 pub use processor::{Processor, ProcessorChain};
+pub use sequencer::{PATTERN_STEPS, Sequencer, SequencerStep};
 pub use sine::SineProcessor;
 pub use svf::{FilterMode, SvfProcessor};
 pub use synth::{SynthProcessor, note_to_frequency};

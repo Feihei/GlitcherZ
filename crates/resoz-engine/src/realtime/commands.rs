@@ -2,6 +2,8 @@
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use crate::realtime::sequencer::{PATTERN_STEPS, SequencerStep};
+
 /// 控制命令队列的默认容量。满载时新命令被发送方丢弃（见
 /// [`crate::engine::AudioEngine::send`]），不会阻塞任何线程。
 pub const COMMAND_QUEUE_CAPACITY: usize = 1024;
@@ -44,6 +46,21 @@ pub enum NoteEvent {
     Off { note: u8 },
 }
 
+/// 音序器走带与配置命令。
+#[derive(Debug, Clone, Copy)]
+pub enum SequencerCommand {
+    /// 从第 0 步开始播放（以接收时刻的流位置为时钟原点）。
+    Play,
+    /// 停止并释放当前音符。
+    Stop,
+    /// 设置 BPM（20..300）。
+    SetBpm(f32),
+    /// 设置 gate 占步长的比例（0.05..1）。
+    SetGate(f32),
+    /// 整块替换 16 步模式。
+    SetPattern([SequencerStep; PATTERN_STEPS]),
+}
+
 /// UI / 控制线程 → 音频线程的控制命令。
 ///
 /// 必须保持 `Copy`：命令经无锁队列按值传递，**禁止携带堆分配**
@@ -54,6 +71,8 @@ pub enum EngineCommand {
     SetParam { id: ParamId, value: f32 },
     /// 发送一个音符事件（当前为单声部：最后一个 `On` 生效）。
     Note(NoteEvent),
+    /// 音序器走带 / 配置。
+    Sequencer(SequencerCommand),
 }
 
 /// 创建一对命令队列端点：producer 交给 UI / 控制线程，consumer 交给
@@ -77,6 +96,7 @@ mod tests {
         match cmd {
             EngineCommand::SetParam { value, .. } => value,
             EngineCommand::Note(_) => f32::NAN,
+            EngineCommand::Sequencer(_) => f32::NAN,
         }
     }
 

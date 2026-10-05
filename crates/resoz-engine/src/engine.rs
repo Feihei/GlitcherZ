@@ -4,15 +4,14 @@
 //! 代码都在 [`crate::realtime::BlockRunner`] 中，随流回调启动时 move 进
 //! 音频线程。UI / 控制代码永远不直接触碰实时数据。
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::convert;
 use crate::realtime::{
-    AtomicF32, BlockRunner, COMMAND_QUEUE_CAPACITY, EngineCommand, FIXED_BLOCK_SIZE, GainProcessor,
-    ProcessorChain, SvfProcessor, SynthProcessor, command_channel,
+    BlockRunner, COMMAND_QUEUE_CAPACITY, EngineCommand, FIXED_BLOCK_SIZE, Feedback, GainProcessor,
+    ProcessorChain, Sequencer, SvfProcessor, SynthProcessor, command_channel,
 };
 
 /// 引擎的基础信息（UI 显示用）。
@@ -40,8 +39,7 @@ pub enum EngineError {
 pub struct AudioEngine {
     _stream: cpal::Stream,
     commands: rtrb::Producer<EngineCommand>,
-    level: Arc<AtomicF32>,
-    position_samples: Arc<AtomicU64>,
+    feedback: Feedback,
     info: AudioEngineInfo,
 }
 
@@ -72,16 +70,16 @@ impl AudioEngine {
         chain.push(Box::new(SvfProcessor::new(sample_rate_f32)));
         chain.push(Box::new(GainProcessor::new(1.0)));
 
-        let level = Arc::new(AtomicF32::new(0.0));
-        let position = Arc::new(AtomicU64::new(0));
+        let feedback = Feedback::new();
+        let sequencer = Sequencer::new(sample_rate_f32);
         let mut runner = BlockRunner::new(
             FIXED_BLOCK_SIZE,
             stream_config.channels as usize,
             sample_rate_f32,
             chain,
+            sequencer,
             command_rx,
-            level.clone(),
-            position.clone(),
+            feedback.clone(),
         );
 
         // 数据回调：实时铁律约束的代码全部集中在 BlockRunner 内。
@@ -101,8 +99,7 @@ impl AudioEngine {
         Ok(Self {
             _stream: stream,
             commands,
-            level,
-            position_samples: position,
+            feedback,
             info: AudioEngineInfo {
                 device_name,
                 sample_rate: stream_config.sample_rate,
@@ -119,13 +116,23 @@ impl AudioEngine {
 
     /// 最近一个音频块的峰值电平（两个声道取最大，约 0..1）。
     pub fn peak_level(&self) -> f32 {
-        self.level.load()
+        self.feedback.level.load()
+    }
+
+    /// 音序器当前步进索引（0..16，未播放时停留在最后一次位置）。
+    pub fn current_step(&self) -> u32 {
+        self.feedback.step.load(Ordering::Relaxed)
+    }
+
+    /// 音序器是否播放中。
+    pub fn is_playing(&self) -> bool {
+        self.feedback.playing.load(Ordering::Relaxed)
     }
 
     /// 播放位置（秒，f64：时间计算用 f64）。
     pub fn position_seconds(&self) -> f64 {
         convert::samples_to_seconds(
-            self.position_samples.load(Ordering::Relaxed),
+            self.feedback.position.load(Ordering::Relaxed),
             convert::sample_rate_to_f32(self.info.sample_rate),
         )
     }

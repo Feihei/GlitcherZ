@@ -4,15 +4,15 @@
 //!
 //! ResoZ 的 egui 界面：走带控制、步进音序器、钢琴卷帘、混音器。
 //!
-//! 当前（路线图第 3 步）：主窗口 + 完整合成器面板 —— 滤波器（截止/
-//! 共振/模式）、ADSR 包络参数、虚拟键盘（屏幕按键 + 电脑键盘）。所有
-//! 参数改动经 [`resoz_engine::realtime::EngineCommand`] 无锁队列实时
-//! 送往音频线程（块边界生效），峰值电平经
-//! [`resoz_engine::AudioEngine::peak_level`]（内部为 `AtomicF32`）回传。
+//! 当前（路线图第 4 步）：主窗口 + 完整合成器面板 + 16 步步进音序器
+//! （走带播放/停止、BPM、步进网格、画笔音符、音长）。所有改动经
+//! [`resoz_engine::realtime::EngineCommand`] 无锁队列实时送往音频线程，
+//! 走带状态与当前步进经原子量回传高亮。
 //!
 //! 分层说明：本 crate 直接依赖 engine 的非实时控制端——`AudioEngine`
-//! 只在 UI 线程被触碰，永不进入音频回调。引入图节点编辑后，这一层
-//! 将改为持有通用的控制句柄抽象。
+//! 只在 UI 线程被触碰，永不进入音频回调。UI 持有 `resoz_model` 文档
+//! （`Pattern`），发送前转换为引擎侧的 `SequencerStep` 数组——两个
+//! crate 互不依赖。
 
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
@@ -22,13 +22,20 @@ use eframe::egui;
 
 use resoz_engine::AudioEngine;
 use resoz_engine::convert;
-use resoz_engine::realtime::{EngineCommand, NoteEvent, ParamId};
+use resoz_engine::realtime::{EngineCommand, NoteEvent, ParamId, SequencerCommand, SequencerStep};
+use resoz_model::{PATTERN_STEPS, Pattern};
 
 /// 滤波器截止频率滑块范围（对数刻度）。
 pub const CUTOFF_RANGE: RangeInclusive<f64> = 20.0..=18_000.0;
 
 /// 主增益滑块范围（线性）。
 pub const GAIN_RANGE: RangeInclusive<f64> = 0.0..=1.0;
+
+/// BPM 可调范围。
+pub const BPM_RANGE: RangeInclusive<f64> = 20.0..=300.0;
+
+/// 音长（gate 占步长比例）滑块范围。
+pub const GATE_RANGE: RangeInclusive<f64> = 0.05..=1.0;
 
 /// 共振滑块范围（Simper SVF res）。
 pub const RES_RANGE: RangeInclusive<f64> = 0.0..=0.98;
@@ -115,6 +122,14 @@ impl PeakMeter {
 /// 主窗口应用。拥有 [`AudioEngine`]：窗口关闭即引擎丢弃、音频流停止。
 pub struct ResoZApp {
     engine: AudioEngine,
+    /// 音序器模式文档（UI 持有模型状态，见 AGENTS.md「线程模型」）。
+    pattern: Pattern,
+    /// 画笔音符：点选空白步时写入的音符。
+    brush_note: u8,
+    /// 音长（gate 占步长比例）。
+    gate: f64,
+    /// 速度（BPM，UI/时间计算用 f64）。
+    bpm: f64,
     gain: f64,
     cutoff_hz: f64,
     resonance: f64,
@@ -147,6 +162,10 @@ impl ResoZApp {
     pub fn new(engine: AudioEngine, config: UiConfig) -> Self {
         let mut app = Self {
             engine,
+            pattern: Pattern::default(),
+            brush_note: 60,
+            gate: 0.8,
+            bpm: 120.0,
             gain: config.gain.clamp(*GAIN_RANGE.start(), *GAIN_RANGE.end()),
             cutoff_hz: 12_000.0,
             resonance: 0.2,
@@ -166,6 +185,7 @@ impl ResoZApp {
             close_sent: false,
         };
         app.push_params();
+        app.send_pattern();
         if let Some(note) = config.auto_play_note {
             app.send_note_on(note, 1.0);
         }
@@ -246,15 +266,49 @@ impl ResoZApp {
         }
     }
 
-    fn transport_panel(&self, ui: &mut egui::Ui) {
+    /// 发送音序器命令到音频线程。
+    fn send_sequencer(&mut self, cmd: SequencerCommand) {
+        self.engine.send(EngineCommand::Sequencer(cmd));
+    }
+
+    /// 把模式文档整体转换为引擎侧表示并下发（`Copy` 数组，零堆分配）。
+    fn send_pattern(&mut self) {
+        let mut steps = [SequencerStep::default(); PATTERN_STEPS];
+        for (i, step) in self.pattern.steps.iter().enumerate() {
+            steps[i] = SequencerStep {
+                enabled: step.enabled,
+                note: step.note,
+                velocity: step.velocity,
+            };
+        }
+        self.send_sequencer(SequencerCommand::SetPattern(steps));
+    }
+
+    fn transport_panel(&mut self, ui: &mut egui::Ui) {
+        let playing = self.engine.is_playing();
         egui::Panel::top("resoz_transport").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.add_enabled(false, egui::Button::new("▶ 播放"))
-                    .on_disabled_hover_text("走带控制在后续路线图接入");
-                ui.add_enabled(false, egui::Button::new("■ 停止"))
-                    .on_disabled_hover_text("走带控制在后续路线图接入");
+                let mut play_btn = egui::Button::new("▶ 播放");
+                if playing {
+                    play_btn = play_btn.fill(egui::Color32::DARK_GREEN);
+                }
+                if ui.add(play_btn).clicked() {
+                    self.send_sequencer(SequencerCommand::Play);
+                }
+                if ui.button("■ 停止").clicked() {
+                    self.send_sequencer(SequencerCommand::Stop);
+                }
                 ui.separator();
-                ui.label("120.0 BPM");
+                ui.label("速度");
+                let bpm = ui.add(
+                    egui::DragValue::new(&mut self.bpm)
+                        .range(*BPM_RANGE.start()..=*BPM_RANGE.end())
+                        .speed(0.5)
+                        .suffix(" BPM"),
+                );
+                if bpm.changed() {
+                    self.send_sequencer(SequencerCommand::SetBpm(convert::to_f32(self.bpm)));
+                }
                 ui.separator();
                 ui.weak("ResoZ — Rust DAW");
             });
@@ -372,6 +426,7 @@ impl ResoZApp {
                     ui.end_row();
                 });
 
+            self.sequencer_section(ui);
             self.keyboard_section(ui);
 
             ui.add_space(10.0);
@@ -383,6 +438,108 @@ impl ResoZApp {
             );
             ui.weak(format!("峰值 {peak:.3} —— AtomicF32 回传，峰值保持 600 ms"));
         });
+    }
+
+    /// 16 步音序器网格：左键点选/切换（画笔音符），右键清除；
+    /// 播放时以黄色边框高亮当前步进。
+    fn sequencer_section(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("步进音序器");
+            ui.label("画笔音符");
+            ui.add(
+                egui::DragValue::new(&mut self.brush_note)
+                    .range(0..=127)
+                    .speed(0.2),
+            );
+            ui.monospace(note_name(self.brush_note));
+            ui.separator();
+            ui.label("音长");
+            let gate = ui.add(
+                egui::Slider::new(&mut self.gate, *GATE_RANGE.start()..=*GATE_RANGE.end())
+                    .text("%"),
+            );
+            if gate.changed() {
+                self.send_sequencer(SequencerCommand::SetGate(convert::to_f32(self.gate)));
+            }
+            if ui.button("清空").clicked() {
+                self.pattern = Pattern::default();
+                self.send_pattern();
+            }
+            if ui.button("全部 C4").clicked() {
+                self.pattern.steps.fill(resoz_model::Step {
+                    enabled: true,
+                    note: 60,
+                    velocity: 0.9,
+                });
+                self.send_pattern();
+            }
+        });
+
+        let playing = self.engine.is_playing();
+        let current = self.engine.current_step();
+        let mut cells: [Option<egui::Response>; PATTERN_STEPS] = std::array::from_fn(|_| None);
+        // 先收集本帧的编辑动作，循环结束后统一写回并发送
+        // （避免迭代器借用与 send_pattern 的可变借用冲突）。
+        let mut edits: [(bool, bool, u8); PATTERN_STEPS] = [(false, false, 0); PATTERN_STEPS];
+        ui.horizontal(|ui| {
+            for (i, step) in self.pattern.steps.iter().enumerate() {
+                if i > 0 && i % 4 == 0 {
+                    ui.separator();
+                }
+                let label = if step.enabled {
+                    note_name(step.note)
+                } else {
+                    "·".to_string()
+                };
+                let mut button = egui::Button::new(egui::RichText::new(label).size(11.0));
+                if step.enabled {
+                    button = button.fill(egui::Color32::from_rgb(64, 122, 82));
+                } else if i % 4 == 0 {
+                    button = button.fill(egui::Color32::from_gray(58));
+                }
+                let response = ui.add_sized([36.0, 28.0], button);
+                if response.clicked() {
+                    if step.enabled && step.note == self.brush_note {
+                        // 已是画笔音符的步再点一次 = 取消。
+                        edits[i] = (true, false, step.note);
+                    } else {
+                        // 空步写入画笔音符；已有其他音符的步改写为画笔音符。
+                        edits[i] = (true, true, self.brush_note);
+                    }
+                }
+                if response.secondary_clicked() {
+                    edits[i] = (true, false, step.note);
+                }
+                cells[i] = Some(response);
+            }
+        });
+        if edits.iter().any(|(edit, _, _)| *edit) {
+            for (i, (edit, enabled, note)) in edits.iter().enumerate() {
+                if *edit {
+                    self.pattern.steps[i] = resoz_model::Step {
+                        enabled: *enabled,
+                        note: *note,
+                        velocity: 0.9,
+                    };
+                }
+            }
+            self.send_pattern();
+        }
+
+        // 播放位置高亮（引擎原子量回传，每块更新一次）。
+        if playing {
+            let idx = (current as usize) % PATTERN_STEPS;
+            if let Some(Some(response)) = cells.get(idx) {
+                ui.painter().rect_stroke(
+                    response.rect,
+                    4.0,
+                    egui::Stroke::new(2.0, egui::Color32::YELLOW),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
     }
 
     /// 虚拟键盘：屏幕按键（按下发声、松开停音）+ 八度切换。

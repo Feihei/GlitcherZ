@@ -2038,6 +2038,7 @@ dependencies = [
  "eframe",
  "log",
  "resoz-engine",
+ "resoz-model",
 ]
 
 [[package]]
