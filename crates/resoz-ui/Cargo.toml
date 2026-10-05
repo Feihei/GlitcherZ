@@ -1,0 +1,9 @@
+[package]
+name = "resoz-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ResoZ egui 界面：走带、音序器、钢琴卷帘、混音器"
+
+# 路线图第 2 步在此接入 eframe / egui。

@@ -1,0 +1,13 @@
+[package]
+name = "resoz-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ResoZ 数据模型：轨道、片段、自动化与项目文件"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+ron = { workspace = true }

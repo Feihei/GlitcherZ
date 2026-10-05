@@ -1,0 +1,10 @@
+# Rust 构建产物（Cargo.lock 属于可执行项目，提交）
+/target
+
+# IDE
+.idea/
+.vscode/
+
+# 操作系统
+.DS_Store
+Thumbs.db

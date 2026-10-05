@@ -1,0 +1,15 @@
+[package]
+name = "resoz-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ResoZ DAW 应用入口"
+
+[[bin]]
+name = "resoz"
+path = "src/main.rs"
+
+[dependencies]
+resoz-engine = { workspace = true }
+env_logger = { workspace = true }
