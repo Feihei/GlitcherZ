@@ -109,7 +109,7 @@ cargo build --release -p resoz-app
 ## 路线图（按顺序实施，勿跳步）
 
 1. ✅ `cpal` 输出正弦波（验证音频管线）
-2. ⬜ `egui` 集成 + 参数滑块实时控制正弦波频率（验证跨线程通信）
+2. ✅ `egui` 集成 + 参数滑块实时控制正弦波频率（验证跨线程通信）
 3. ⬜ 音量包络 + 简单滤波器（第一个完整合成器）
 4. ⬜ 步进音序器（16 步，触发合成器）
 5. ⬜ 多轨 + 混音器 + 简单效果器链
@@ -121,17 +121,21 @@ cargo build --release -p resoz-app
 
 ## 当前状态与下一步
 
-**当前进度**：路线图第 1 步已完成（2026-10-05）。
+**当前进度**：路线图第 2 步已完成（2026-10-05）。
 
 已落地：
 - workspace 四 crate 骨架（`resoz-model` / `resoz-engine` / `resoz-ui` / `resoz-app`）；
 - `resoz-engine::realtime`：`AudioBuffer`（预分配平面缓冲）、`Processor` trait、`ProcessorChain`、`BlockRunner`（固定 128 样本块拆分 + 块边界命令消费 + `AtomicF32`/`AtomicU64` 状态回传）、`SineProcessor`、`GainProcessor`；
-- `resoz-app`：440 Hz 正弦波输出，支持 `--freq` / `--gain` / `--seconds` / `--list-devices`。
+- `resoz-ui`：eframe 0.36（**glow 渲染后端**）主窗口——顶栏走带占位、中央正弦音源面板（对数频率滑块 + 主增益滑块 + 峰值电平表）、底部状态栏（设备/采样率/播放位置）；滑块拖动经 `EngineCommand` 队列实时控频，`request_repaint_after(50ms)` 驱动音频显示刷新；
+- `resoz-app`：`--freq` / `--gain` / `--seconds`（N 秒后自动关窗，冒烟测试用）/ `--list-devices`。
 
-**下一步任务**（路线图第 2 步：egui 集成）：
-- [ ] `resoz-ui` 接入 `eframe`，搭建主窗口骨架（顶栏走带 + 中央面板占位）
-- [ ] 频率/增益滑块 → `EngineCommand` 命令队列 → 音频线程（验证 60fps UI ↔ 实时参数）
-- [ ] 峰值电平表（消费 `AtomicF32` 回传）
+版本注意：cpal 0.18（错误统一 `cpal::Error`、`SampleRate` 为 u32 别名、设备名走 `Display`）；egui 0.36（`App::ui(&mut Ui)` 取代 `update(ctx)`、面板统一为 `egui::Panel::top/bottom` 且 `show` 接收 `&mut Ui`）。
+
+**下一步任务**（路线图第 3 步：音量包络 + 简单滤波器）：
+- [ ] ADSR 音量包络（`Processor`，含音符事件命令 `NoteOn`/`NoteOff`）
+- [ ] 状态变量滤波器 SVF（低通/高通/带通，截止频率与 Q 参数化）
+- [ ] 整合为完整合成器 `Processor`（振荡器 → 包络 → 滤波器），附标准测试
+- [ ] 每个新模块：静音输入→输出静音、满幅输入→无 NaN/Inf
 
 ---
 

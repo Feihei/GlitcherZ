@@ -1,17 +1,12 @@
 #![forbid(unsafe_code)]
 
-//! ResoZ 桌面应用入口。
-//!
-//! 当前实现路线图第 1 步：通过 cpal 输出 440 Hz 正弦波，验证音频管线
-//! 与 UI→音频 的无锁命令队列。GUI（egui）在路线图第 2 步接入。
+//! ResoZ 桌面应用入口：启动音频引擎（resoz-engine）并打开主窗口
+//! （resoz-ui）。当前为路线图第 2 步 —— egui 集成 + 滑块实时控频。
 
 use std::process::ExitCode;
-use std::thread::sleep;
 use std::time::Duration;
 
 use resoz_engine::AudioEngine;
-use resoz_engine::convert;
-use resoz_engine::realtime::{EngineCommand, ParamId};
 
 /// 命令行参数（手动解析，保持依赖最小）。
 struct Args {
@@ -38,58 +33,37 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let mut engine = match AudioEngine::start() {
+    let engine = match AudioEngine::start() {
         Ok(engine) => engine,
         Err(err) => {
             eprintln!("启动音频引擎失败：{err}");
             return ExitCode::FAILURE;
         }
     };
-
     let info = engine.info().clone();
     println!(
-        "输出设备：{}（{} Hz，{} 声道，固定块 128 样本）",
+        "输出设备：{}（{} Hz，{} 声道）",
         info.device_name, info.sample_rate, info.out_channels
     );
 
-    // 经无锁命令队列下发参数，验证 UI → 音频线程的通信路径
-    // （音频线程在下一个块边界应用）。
-    engine.send(EngineCommand::SetParam {
-        id: ParamId::SineFrequency,
-        value: convert::to_f32(args.freq_hz),
-    });
-    engine.send(EngineCommand::SetParam {
-        id: ParamId::MasterGain,
-        value: convert::to_f32(args.gain),
-    });
+    let ui_config = resoz_ui::UiConfig {
+        freq_hz: args.freq_hz,
+        gain: args.gain,
+        auto_close_after: args.seconds.map(|s| Duration::from_secs_f64(s.max(0.0))),
+    };
 
-    match args.seconds {
-        Some(seconds) => {
-            let seconds = seconds.max(0.0);
-            println!("播放 {seconds:.2} 秒 {:.1} Hz 正弦波…", args.freq_hz);
-            sleep(Duration::from_secs_f64(seconds));
-        }
-        None => {
-            println!("正在播放 {:.1} Hz 正弦波，按 Ctrl+C 退出。", args.freq_hz);
-            loop {
-                sleep(Duration::from_secs(1));
-                println!(
-                    "  峰值电平 {:.3}　播放位置 {:.1} s",
-                    engine.peak_level(),
-                    engine.position_seconds()
-                );
-            }
-        }
+    if let Err(err) = resoz_ui::run(engine, ui_config) {
+        eprintln!("主窗口异常退出：{err}");
+        return ExitCode::FAILURE;
     }
-
-    println!("结束。峰值电平 {:.3}", engine.peak_level());
     ExitCode::SUCCESS
 }
 
 fn print_usage() {
     println!(
         "用法: resoz [--freq <Hz>] [--gain <0.0-1.0>] [--seconds <秒>] [--list-devices]\n\
-         默认：440 Hz 正弦波持续播放，Ctrl+C 退出。"
+         默认：打开主窗口，正弦音源 440 Hz 持续发声，关闭窗口退出。\n\
+         --seconds 指定 N 秒后自动关窗（冒烟测试用）。"
     );
 }
 

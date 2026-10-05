@@ -12,4 +12,5 @@ path = "src/main.rs"
 
 [dependencies]
 resoz-engine = { workspace = true }
+resoz-ui = { workspace = true }
 env_logger = { workspace = true }
