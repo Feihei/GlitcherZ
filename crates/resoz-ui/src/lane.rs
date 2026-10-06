@@ -21,11 +21,13 @@ pub struct LaneState {
 }
 
 /// 参数轴元数据：(最小值, 最大值, 是否对数)。
-fn axis(param: AutoParam) -> (f32, f32, bool) {
+fn axis(param: &AutoParam) -> (f32, f32, bool) {
     match param {
         AutoParam::TrackGain => (0.0, 1.5, false),
         AutoParam::TrackPan => (-1.0, 1.0, false),
         AutoParam::FilterCutoff => (20.0, 18_000.0, true),
+        // 插件参数值域未知：按 0..1 归一显示（插件自行解释）。
+        AutoParam::PluginParam { .. } => (0.0, 1.0, false),
     }
 }
 
@@ -62,7 +64,7 @@ pub fn show(
     state: &mut LaneState,
 ) -> bool {
     let loop_ticks = loop_ticks.max(TICKS_PER_STEP).max(1);
-    let (min, max, log) = axis(automation.param);
+    let (min, max, log) = axis(&automation.param);
     let mut edited = false;
 
     let width = ui.available_width();
@@ -196,7 +198,7 @@ mod tests {
 
     #[test]
     fn axis_roundtrip_linear() {
-        let (min, max, log) = super::axis(AutoParam::TrackGain);
+        let (min, max, log) = super::axis(&AutoParam::TrackGain);
         assert!(!log);
         let norm = to_norm(0.75, min, max, log);
         assert!((from_norm(norm, min, max, log) - 0.75).abs() < 1e-6);
@@ -204,7 +206,7 @@ mod tests {
 
     #[test]
     fn axis_roundtrip_log() {
-        let (min, max, log) = super::axis(AutoParam::FilterCutoff);
+        let (min, max, log) = super::axis(&AutoParam::FilterCutoff);
         assert!(log);
         let norm = to_norm(1_200.0, min, max, log);
         assert!((from_norm(norm, min, max, log) - 1_200.0).abs() < 1.0);
@@ -212,7 +214,7 @@ mod tests {
 
     #[test]
     fn values_clamped_to_axis() {
-        let (min, max, log) = super::axis(AutoParam::TrackPan);
+        let (min, max, log) = super::axis(&AutoParam::TrackPan);
         assert!(to_norm(-99.0, min, max, log) <= 0.0);
         assert!(to_norm(99.0, min, max, log) >= 1.0);
     }

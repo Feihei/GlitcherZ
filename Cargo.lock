@@ -2140,6 +2140,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "log",
+ "resoz-clap-host",
  "resoz-engine",
  "resoz-model",
  "rfd",

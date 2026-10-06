@@ -8,14 +8,28 @@ use crate::realtime::delay::DelayProcessor;
 use crate::realtime::gain::GainProcessor;
 use crate::realtime::processor::{Processor, ProcessorChain};
 use crate::realtime::synth::SynthProcessor;
+use crate::realtime::voice::VoiceUpdate;
 
-/// 单条轨道：处理链（音源 → 效果器）+ 混音参数 + 预分配缓冲。
+/// 声源插槽：内置合成器或已实例化的外部节点（CLAP 乐器）。
+enum VoiceSlot {
+    Builtin,
+    External,
+}
+
+/// 单条轨道：声源插槽 + 效果器链 + 混音参数 + 预分配缓冲。
 ///
 /// 轨道增益 / 声像 / 静音不走 `Processor`，而是混音求和时直接应用
 /// —— 少一层节点，命令路由也直观（[`ParamId::TrackGain`] 等在本
 /// 结构上落地，其余参数转发给内部链）。
+///
+/// 声源双槽预分配：内置合成器常驻，外部节点（CLAP 乐器）由控制侧
+/// 构造后经 [`VoiceUpdate`] 队列装入——换装只做 `Option` 指针写入，
+/// 音频线程零分配。
 pub struct TrackStrip {
-    chain: ProcessorChain,
+    builtin_voice: SynthProcessor,
+    external_voice: Option<Box<dyn Processor>>,
+    active_voice: VoiceSlot,
+    effects: ProcessorChain,
     scratch: AudioBuffer,
     gain: f32,
     pan: f32,
@@ -23,13 +37,15 @@ pub struct TrackStrip {
 }
 
 impl TrackStrip {
-    /// 构造一条轨道：`SynthProcessor → DelayProcessor`。**非 RT-safe**。
+    /// 构造一条轨道：内置声源 → `DelayProcessor`。**非 RT-safe**。
     pub fn new(sample_rate: f32, block_size: usize) -> Self {
-        let mut chain = ProcessorChain::new();
-        chain.push(Box::new(SynthProcessor::new(sample_rate)));
-        chain.push(Box::new(DelayProcessor::new(sample_rate)));
+        let mut effects = ProcessorChain::new();
+        effects.push(Box::new(DelayProcessor::new(sample_rate)));
         Self {
-            chain,
+            builtin_voice: SynthProcessor::new(sample_rate),
+            external_voice: None,
+            active_voice: VoiceSlot::Builtin,
+            effects,
             scratch: AudioBuffer::new(2, block_size.max(1)),
             gain: 0.8,
             pan: 0.0,
@@ -37,8 +53,26 @@ impl TrackStrip {
         }
     }
 
-    /// 轨道参数：混音三项在本结构落地，其余转发给链（音源/效果器）。
-    /// RT-safe。
+    /// 应用一次声源结构更新（来自声源更新队列）。RT-safe：无分配。
+    pub fn apply_voice_update(&mut self, update: VoiceUpdate) {
+        match update {
+            VoiceUpdate::Clap { track, node } => {
+                if track < NUM_TRACKS {
+                    self.external_voice = Some(node);
+                    self.active_voice = VoiceSlot::External;
+                }
+            }
+            VoiceUpdate::Builtin { track } => {
+                if track < NUM_TRACKS {
+                    self.active_voice = VoiceSlot::Builtin;
+                    // 外部节点留驻（Option 保留），切回时无需重建。
+                }
+            }
+        }
+    }
+
+    /// 轨道参数：混音三项在本结构落地；插件参数只路由给外部声源；
+    /// 其余转发给内置声源与效果器链。RT-safe。
     pub fn set_param(&mut self, id: ParamId, value: f32) {
         match id {
             ParamId::TrackGain => {
@@ -52,15 +86,31 @@ impl TrackStrip {
                 }
             }
             ParamId::TrackMute => self.muted = value >= 0.5,
+            ParamId::PluginParam(_) => {
+                if let Some(voice) = self.external_voice.as_mut() {
+                    let _ = voice.set_param(id, value);
+                }
+            }
             _ => {
-                let _ = self.chain.set_param(id, value);
+                let _ = self.builtin_voice.set_param(id, value);
+                let _ = self.effects.set_param(id, value);
             }
         }
     }
 
-    /// 向该轨音源发音符事件。RT-safe。
+    /// 向该轨当前声源发音符事件（内置与外部都响应；未启动的外部声源
+    /// 稍后换装时自带状态，本处静默忽略）。RT-safe。
     pub fn note_event(&mut self, event: NoteEvent) -> bool {
-        self.chain.note_event(event)
+        let handled = match self.active_voice {
+            VoiceSlot::Builtin => self.builtin_voice.note_event(event),
+            VoiceSlot::External => self
+                .external_voice
+                .as_mut()
+                .map(|voice| voice.note_event(event))
+                .unwrap_or(false),
+        };
+        // 内置声源未消费的事件也无需转发给外部：两套声源状态独立。
+        handled
     }
 
     /// 线性声像律：p = 0 → (1, 1)；p = ±1 → 单边全量。
@@ -77,7 +127,16 @@ impl TrackStrip {
         let frames = self.scratch.capacity().min(ctx.frames);
         self.scratch.set_len(frames);
         self.scratch.clear();
-        self.chain.process(ctx, &mut self.scratch);
+        match self.active_voice {
+            VoiceSlot::Builtin => self.builtin_voice.process(ctx, &mut self.scratch),
+            VoiceSlot::External => {
+                // 外部声源未装入时保持静音（scratch 已清零）。
+                if let Some(voice) = self.external_voice.as_mut() {
+                    voice.process(ctx, &mut self.scratch);
+                }
+            }
+        }
+        self.effects.process(ctx, &mut self.scratch);
         if self.muted {
             return 0.0;
         }
@@ -191,6 +250,16 @@ impl Mixer {
     /// 主链参数。RT-safe。
     pub fn master_set_param(&mut self, id: ParamId, value: f32) -> bool {
         self.master_chain.set_param(id, value)
+    }
+
+    /// 轨道声源换装（越界轨道忽略）。RT-safe：无分配。
+    pub fn apply_voice_update(&mut self, update: VoiceUpdate) {
+        let track = match &update {
+            VoiceUpdate::Clap { track, .. } | VoiceUpdate::Builtin { track } => *track,
+        };
+        if let Some(strip) = self.tracks.get_mut(track) {
+            strip.apply_voice_update(update);
+        }
     }
 
     /// 只读访问混音后的主缓冲（供 BlockRunner 交错写出）。RT-safe。

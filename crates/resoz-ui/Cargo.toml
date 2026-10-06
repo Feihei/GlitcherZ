@@ -14,6 +14,7 @@ description = "ResoZ egui 界面：走带、音序器、钢琴卷帘、混音器
 eframe = { workspace = true, features = ["glow", "persistence"] }
 log = { workspace = true }
 rfd = { workspace = true }
+resoz-clap-host = { workspace = true }
 serde = { workspace = true }
 resoz-engine = { workspace = true }
 resoz-model = { workspace = true }

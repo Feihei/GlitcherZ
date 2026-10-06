@@ -40,6 +40,7 @@ pub mod sequencer;
 pub mod sine;
 pub mod svf;
 pub mod synth;
+pub mod voice;
 
 /// 固定处理块大小（样本数）。见 AGENTS.md「处理图」（建议 64 或 128）。
 pub const FIXED_BLOCK_SIZE: usize = 128;
@@ -67,3 +68,4 @@ pub use sequencer::{
 pub use sine::SineProcessor;
 pub use svf::{FilterMode, SvfProcessor};
 pub use synth::{SynthProcessor, note_to_frequency};
+pub use voice::{VOICE_QUEUE_CAPACITY, VoiceUpdate, voice_channel};

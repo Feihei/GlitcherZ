@@ -250,6 +250,22 @@ impl Default for Clip {
     }
 }
 
+/// 轨道声源：内置合成器或 CLAP 插件（乐器）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VoiceSpec {
+    /// 内置合成器（默认，旧项目文件向前兼容）。
+    #[default]
+    Builtin,
+    /// CLAP 插件声源：动态库路径 + 插件 ID（实例化在非实时线程）。
+    Clap {
+        #[serde(default)]
+        path: String,
+        #[serde(default)]
+        plugin_id: String,
+    },
+}
+
 /// 轨道音源：16 步步进模式或钢琴卷帘片段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum TrackSource {
@@ -275,6 +291,9 @@ pub struct Track {
     /// 音源选择。
     #[serde(default)]
     pub source: TrackSource,
+    /// 声源（内置合成器或 CLAP 插件）。
+    #[serde(default)]
+    pub voice: VoiceSpec,
     /// 轨道增益（线性，0..1.5）。
     #[serde(default = "default_track_gain")]
     pub gain: f32,
@@ -310,6 +329,7 @@ impl Default for Track {
             pattern: Pattern::default(),
             clip: Clip::default(),
             source: TrackSource::default(),
+            voice: VoiceSpec::default(),
             gain: default_track_gain(),
             pan: 0.0,
             muted: false,
@@ -321,7 +341,7 @@ impl Default for Track {
 }
 
 /// 可自动化的轨道参数。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub enum AutoParam {
     /// 轨道增益（线性，0..1.5）。
     #[default]
@@ -330,6 +350,15 @@ pub enum AutoParam {
     TrackPan,
     /// 滤波器截止频率（Hz，20..18000，UI 对数轴）。
     FilterCutoff,
+    /// CLAP 插件参数（自动化桥接到 `ParamValueEvent`；name 供 UI 显示）。
+    PluginParam {
+        /// 插件侧参数 ID。
+        #[serde(default)]
+        param_id: u32,
+        /// 参数显示名（编辑期快照，序列化保存）。
+        #[serde(default)]
+        name: String,
+    },
 }
 
 /// 自动化锚点：tick 位置 + 参数真实值。

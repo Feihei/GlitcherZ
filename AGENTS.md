@@ -121,7 +121,7 @@ cargo build --release -p resoz-app
 
 ## 当前状态与下一步
 
-**当前进度**：路线图第 9 步进行中（2026-10-07）——宿主骨架已落地，轨道集成待做。用户明确期望：**乐器（合成器）插件优先，效果器其次，自动化必须桥接到插件参数**。
+**当前进度**：路线图第 9 步完成（2026-10-07）。用户明确期望已落实：**乐器（合成器）插件为一等声源，自动化桥接到插件参数**；效果器宿主待 CLAP 处理图扩展时复用同一通道。
 
 已落地：
 - workspace 四 crate 骨架（`resoz-model` / `resoz-engine` / `resoz-ui` / `resoz-app`）；
@@ -134,6 +134,9 @@ cargo build --release -p resoz-app
   - `resoz-test-plugin`（cdylib）：clack-plugin 单音正弦乐器 fixture（`org.resoz.sine`，instrument+stereo 特性），供宿主端到端测试；
   - **`resoz-clap-host` crate**（唯一允许 unsafe 的边界 = `raw::load_entry`，模块级 SAFETY 文档 + 无效文件测试）：`clap_search_paths`/`scan_clap_files`（标准目录 + `RESOZ_CLAP_PATH`）/`list_clap_plugins`（描述枚举 + instrument 特性识别）；`ClapInstance::spawn_rt(path, id, config)` 控制线程加载→实例化→激活，产出守卫 `ClapInstanceGuard`（持有动态库+实例，必须与节点同寿命）+ `ClapNode`；
   - **`ClapNode` 实现 `resoz-engine::realtime::Processor`**：音符/参数经定容事件槽（`MAX_PENDING_EVENTS=32`）暂存，每块以 `NoteOn/OffEvent`/`ParamValueEvent` 发出（块粒度）；`ParamId::PluginParam(u32)` 已加入参数空间（自动化桥接的落点）；音频经构造期预分配的 `AudioPorts` + 立体声临时缓冲渲染回 `AudioBuffer`；首块自动 `start_processing`，任何失败输出静音（无 panic）；处理用统一 `PluginAudioProcessor`（`as_started_mut`/`start_processing` 运行时切换）；
+  - **轨道声源集成（第 9 步收尾）**：`realtime::voice` —— `VoiceUpdate` 结构更新队列（rtrb 携 `Box<dyn Processor>`，**非 Copy**，控制侧分配/实时侧块边界只消费）；`TrackStrip` 声源**双槽预分配**（内置 `SynthProcessor` 常驻 + `external_voice: Option<Box<dyn Processor>>`，换装=指针写入零分配）；`AudioEngine::set_external_voice/set_builtin_voice`；UI 侧 `voice_guards` 注册表持有 `ClapInstanceGuard`（**不可提前丢弃**——卸载动态库会使实时节点悬空，进程退出统一回收）；
+  - **自动化桥接端到端**（引擎集成测试锁定）：自动化曲线 → `AutoParam::PluginParam{param_id}` → `ParamId::PluginParam` → 求值器 → `TrackStrip`（`PluginParam` 只路由外部声源）→ `ClapNode` → `ParamValueEvent` → 插件生效；测试含换装→参数写入→自动化爬坡→切回内置全流程；
+  - model：`Track.voice: VoiceSpec`（`Builtin | Clap{path, plugin_id}`，serde tagged 随项目序列化，`apply_track_voice` 加载后自动装填）；
   - 分层决定：**engine 保持零 CLAP 依赖**——clap-host 依赖 engine（实现其 Processor trait）；轨道声源集成将走 `Box<dyn Processor>` 结构更新队列（非 Copy 队列，控制侧分配/实时侧只消费），避免在音频线程实例化插件；
   - 版本注意：clack 0.2（`clack-extensions` 宿主侧 trait 需 `clack-host` feature；`Pckn::new` 需显式 u16/u32 字面量；`start_processing` 返回 `&mut Started`；`PluginInstance::new` 收 `&CStr`）；
 - **自动化（第 8 步）**：`resoz-model` 的 `Automation`（`AutoParam` = 音量/声像/截止 + `AutoPoint{tick,value}` 有序列表，线性插值、两端保持端值）挂 `Track.automations`；引擎侧 `RtAutomation`（定容 64 锚点 Copy）经 `SetAutomation` 命令 upsert（同参替换/空槽插入/空曲线=删除，每轨 ≤4 条）；求值器在 `BlockRunner` 每块**仅播放中**按"循环后的音乐位置"（步进源=一小节、卷帘源=片段 loop_ticks 取模）采样并经混音器内部路径直写参数（不走命令队列）；UI 在走带停止沿重推手动参数实现"停止后回到手动值"；
@@ -144,13 +147,12 @@ cargo build --release -p resoz-app
 
 版本注意：cpal 0.18；egui 0.36（`App::ui(&mut Ui)`、`egui::Panel`、`Response` 无 `pressed/released` 用 `is_pointer_button_down_on`、`DragValue::range(RangeInclusive)`、`Painter::rect_stroke(rect, radius, stroke, StrokeKind)`）。
 
-**下一步任务**（第 9 步收尾：轨道声源集成）：
-- [ ] 结构更新队列：`rtrb<VoiceUpdate>`（携带 `Box<dyn Processor>`，非 Copy）——控制侧实例化、实时侧块边界换装，绕开"音频线程禁止加载插件"
-- [ ] `TrackStrip` 声源插槽：内置 `SynthProcessor` | `ClapNode`（两槽预分配，块边界切换零分配），效果器链保持独立
-- [ ] `resoz-model`：`Track.voice`（`VoiceSpec::Builtin | Clap{path, plugin_id}`，serde tagged）+ `AutoParam::PluginParam{param_id, name}`，随项目文件序列化
-- [ ] `AudioEngine::set_track_voice` + 已装插件参数列表查询（UI 面板数据源）
-- [ ] 自动化桥接端到端：自动化泳道写插件参数 → 求值器 → `ParamValueEvent` → 插件生效（引擎集成测试）
-- [ ] UI：轨道声源选择器（列出内置 + 扫描到的乐器）+ 插件参数面板雏形
+**下一步任务**（第 10 步：VST3 插件宿主，及第 9 步遗留打磨）：
+- [ ] VST3 宿主（可复用 clap-host 的 ClapNode→Processor 适配模式）
+- [ ] CLAP 插件参数**枚举**（clack 主线程生命周期接线，UI 参数面板数据源；当前参数面板仅显示已知参数）
+- [ ] CLAP 效果器节点（处理图插入式，复用 VoiceUpdate 通道）
+- [ ] 插件状态保存/加载（state extension → ProjectFile）
+- [ ] 声源守卫安全回收（引用计数/确认换装后丢弃，替代进程退出统一回收）
 
 ---
 

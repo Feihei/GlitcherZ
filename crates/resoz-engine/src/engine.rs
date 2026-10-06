@@ -11,7 +11,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::convert;
 use crate::realtime::{
     BlockRunner, COMMAND_QUEUE_CAPACITY, EngineCommand, FIXED_BLOCK_SIZE, Feedback, Mixer,
-    Sequencer, command_channel,
+    Sequencer, VoiceUpdate, command_channel, voice_channel,
 };
 
 /// 引擎的基础信息（UI 显示用）。
@@ -39,6 +39,7 @@ pub enum EngineError {
 pub struct AudioEngine {
     _stream: cpal::Stream,
     commands: rtrb::Producer<EngineCommand>,
+    voices: rtrb::Producer<VoiceUpdate>,
     feedback: Feedback,
     info: AudioEngineInfo,
 }
@@ -69,6 +70,7 @@ impl AudioEngine {
 
         let feedback = Feedback::new();
         let sequencer = Sequencer::new(sample_rate_f32);
+        let (voice_tx, voice_rx) = voice_channel();
         let mut runner = BlockRunner::new(
             FIXED_BLOCK_SIZE,
             stream_config.channels as usize,
@@ -76,6 +78,7 @@ impl AudioEngine {
             mixer,
             sequencer,
             command_rx,
+            voice_rx,
             feedback.clone(),
         );
 
@@ -96,6 +99,7 @@ impl AudioEngine {
         Ok(Self {
             _stream: stream,
             commands,
+            voices: voice_tx,
             feedback,
             info: AudioEngineInfo {
                 device_name,
@@ -129,6 +133,28 @@ impl AudioEngine {
     /// 音序器是否播放中。
     pub fn is_playing(&self) -> bool {
         self.feedback.playing.load(Ordering::Relaxed)
+    }
+
+    /// 将指定轨道的声源换装为外部节点（如 CLAP 乐器）。
+    /// 节点由调用方在**非实时线程**构造；音频线程在下一个块边界换装。
+    /// 返回 `false` 表示队列满或越界（命令被丢弃）。
+    pub fn set_external_voice(
+        &mut self,
+        track: usize,
+        node: Box<dyn crate::realtime::Processor>,
+    ) -> bool {
+        if track >= crate::realtime::NUM_TRACKS {
+            return false;
+        }
+        self.voices.push(VoiceUpdate::Clap { track, node }).is_ok()
+    }
+
+    /// 将指定轨道的声源恢复为内置合成器。
+    pub fn set_builtin_voice(&mut self, track: usize) -> bool {
+        if track >= crate::realtime::NUM_TRACKS {
+            return false;
+        }
+        self.voices.push(VoiceUpdate::Builtin { track }).is_ok()
     }
 
     /// 指定轨道的 post-fader 峰值电平（越界返回 0）。

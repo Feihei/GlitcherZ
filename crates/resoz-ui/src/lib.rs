@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
+use resoz_clap_host::{ClapInstance, ClapInstanceConfig};
 use resoz_engine::AudioEngine;
 use resoz_engine::convert;
 use resoz_engine::realtime::{
@@ -30,7 +31,7 @@ use resoz_engine::realtime::{
 };
 use resoz_model::{
     AutoParam, Automation, PATTERN_STEPS, Pattern, Project, TICKS_PER_BAR,
-    TrackSource as ModelTrackSource,
+    TrackSource as ModelTrackSource, VoiceSpec,
 };
 
 pub mod lane;
@@ -142,6 +143,17 @@ const UI_STATE_KEY: &str = "resoz_ui_state";
 /// 状态栏消息显示时长。
 const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(8);
 
+/// 一个已装填的 CLAP 声源守卫。
+///
+/// 字段仅诊断/未来清理策略使用；守卫**不可提前丢弃**——卸载动态库
+/// 会使实时侧节点悬空（见 `voice_guards` 注释）。
+#[allow(dead_code)]
+struct ClapInstanceGuardEntry {
+    track: usize,
+    plugin_id: String,
+    _guard: resoz_clap_host::ClapInstanceGuard,
+}
+
 /// 峰值电平表：峰值保持 600 ms 后回落，视觉上更容易读。
 #[derive(Debug)]
 struct PeakMeter {
@@ -205,6 +217,11 @@ pub struct ResoZApp {
     title_sent: String,
     /// 上一帧的走带状态（用于检测停止沿 → 恢复手动参数）。
     was_playing: bool,
+    /// CLAP 插件实例守卫注册表：guard 丢弃会卸载插件动态库，使实时侧
+    /// 节点悬空，故统一持有至窗口关闭（进程退出统一回收）。
+    voice_guards: Vec<ClapInstanceGuardEntry>,
+    /// 已扫描的 CLAP 乐器列表（懒扫描缓存）。
+    clap_plugins: Option<Vec<resoz_clap_host::ClapPluginInfo>>,
     /// 诊断标志：`ui()` 是否已进入过（仅日志用）。
     first_frame_logged: bool,
     /// 诊断标志：是否已发出关闭命令（仅日志用）。
@@ -244,6 +261,8 @@ impl ResoZApp {
             window_title: "ResoZ".to_string(),
             title_sent: String::new(),
             was_playing: false,
+            voice_guards: Vec::new(),
+            clap_plugins: None,
             first_frame_logged: false,
             close_sent: false,
         };
@@ -282,6 +301,7 @@ impl ResoZApp {
             for curve in curves {
                 self.send_automation(track, &curve);
             }
+            self.apply_track_voice(track);
         }
     }
 
@@ -340,6 +360,7 @@ impl ResoZApp {
                 AutoParam::TrackGain => ParamId::TrackGain,
                 AutoParam::TrackPan => ParamId::TrackPan,
                 AutoParam::FilterCutoff => ParamId::FilterCutoff,
+                AutoParam::PluginParam { param_id, .. } => ParamId::PluginParam(param_id),
             },
             enabled: curve.enabled,
             ..resoz_engine::realtime::RtAutomation::default()
@@ -453,6 +474,64 @@ impl ResoZApp {
     /// 设置一条状态栏消息（超时自动消失）。
     fn set_message(&mut self, text: String) {
         self.status_message = Some((text, Instant::now()));
+    }
+
+    /// 给轨道装填 CLAP 乐器声源：非实时实例化 → 引擎换装 → 守卫注册。
+    /// 失败时记日志并回退内置声源。
+    fn load_clap_voice(&mut self, track: usize, path: &str, plugin_id: &str) {
+        match ClapInstance::spawn_rt(
+            std::path::Path::new(path),
+            plugin_id,
+            ClapInstanceConfig {
+                sample_rate: self.engine.info().sample_rate,
+                max_frames: 128,
+            },
+        ) {
+            Ok(instance) => {
+                let ClapInstance { guard, node } = instance;
+                if self.engine.set_external_voice(track, Box::new(node)) {
+                    self.voice_guards.push(ClapInstanceGuardEntry {
+                        track,
+                        plugin_id: plugin_id.to_string(),
+                        _guard: guard,
+                    });
+                    log::info!("轨道 {} 已装填 CLAP 声源：{plugin_id}", track + 1);
+                } else {
+                    log::error!("声源队列满：轨道 {} 装填失败", track + 1);
+                }
+            }
+            Err(err) => {
+                log::error!("实例化 CLAP 插件 {plugin_id} 失败：{err}");
+                self.set_message(format!("插件加载失败：{err}"));
+            }
+        }
+    }
+
+    /// 将文档中的声源规格应用到引擎（初始下发 / 项目加载后）。
+    fn apply_track_voice(&mut self, track: usize) {
+        match self.project.tracks[track].voice.clone() {
+            VoiceSpec::Builtin => {
+                self.engine.set_builtin_voice(track);
+            }
+            VoiceSpec::Clap { path, plugin_id } => {
+                if !path.is_empty() && !plugin_id.is_empty() {
+                    self.load_clap_voice(track, &path, &plugin_id);
+                }
+            }
+        }
+    }
+
+    /// 已扫描的 CLAP 乐器（懒加载）。
+    fn scanned_instruments(&mut self) -> &[resoz_clap_host::ClapPluginInfo] {
+        if self.clap_plugins.is_none() {
+            self.clap_plugins = Some(
+                resoz_clap_host::list_clap_plugins()
+                    .into_iter()
+                    .filter(|info| info.is_instrument)
+                    .collect(),
+            );
+        }
+        self.clap_plugins.as_deref().unwrap_or(&[])
     }
 
     fn send_sequencer(&mut self, cmd: SequencerCommand) {
@@ -653,6 +732,40 @@ impl ResoZApp {
                 self.project.tracks[sel].name.clone()
             };
             ui.heading(format!("合成器 — {track_title}"));
+            ui.horizontal(|ui| {
+                ui.label("声源");
+                let is_clap = matches!(self.project.tracks[sel].voice, VoiceSpec::Clap { .. });
+                if ui.selectable_label(!is_clap, "内置合成器").clicked() {
+                    self.project.tracks[sel].voice = VoiceSpec::Builtin;
+                    self.engine.set_builtin_voice(sel);
+                }
+                // 先收集选择，菜单闭包结束后再装填（避免借用冲突）。
+                let mut picked: Option<(String, String)> = None;
+                ui.menu_button("CLAP 乐器…", |ui| {
+                    let empty: Vec<resoz_clap_host::ClapPluginInfo> = Vec::new();
+                    let plugins = self.scanned_instruments();
+                    let list = if plugins.is_empty() { &empty } else { plugins };
+                    if list.is_empty() {
+                        ui.weak("（未发现乐器插件；可用 RESOZ_CLAP_PATH 指定目录）");
+                    }
+                    for info in list {
+                        if ui.button(&info.name).clicked() {
+                            picked = Some((info.path.display().to_string(), info.id.clone()));
+                            ui.close();
+                        }
+                    }
+                });
+                if let Some((path, plugin_id)) = picked {
+                    self.project.tracks[sel].voice = VoiceSpec::Clap {
+                        path: path.clone(),
+                        plugin_id: plugin_id.clone(),
+                    };
+                    self.load_clap_voice(sel, &path, &plugin_id);
+                }
+                if is_clap {
+                    ui.weak("（外部乐器插件）");
+                }
+            });
             ui.weak("正弦波 → ADSR 包络 → SVF 滤波器 → 延迟（每轨独立）—— 改动实时送达音频线程");
             ui.add_space(8.0);
 
@@ -1061,7 +1174,7 @@ impl ResoZApp {
                 {
                     Some(curve) => curve.enabled = enabled,
                     None => track.automations.push(Automation {
-                        param: self.lane_param,
+                        param: self.lane_param.clone(),
                         enabled,
                         points: Vec::new(),
                     }),
@@ -1084,7 +1197,7 @@ impl ResoZApp {
             .any(|curve| curve.param == self.lane_param)
         {
             self.project.tracks[sel].automations.push(Automation {
-                param: self.lane_param,
+                param: self.lane_param.clone(),
                 ..Automation::default()
             });
         }
