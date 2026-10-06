@@ -121,7 +121,7 @@ cargo build --release -p resoz-app
 
 ## 当前状态与下一步
 
-**当前进度**：路线图第 8 步已完成（2026-10-05）。
+**当前进度**：路线图第 9 步进行中（2026-10-07）——宿主骨架已落地，轨道集成待做。用户明确期望：**乐器（合成器）插件优先，效果器其次，自动化必须桥接到插件参数**。
 
 已落地：
 - workspace 四 crate 骨架（`resoz-model` / `resoz-engine` / `resoz-ui` / `resoz-app`）；
@@ -130,6 +130,12 @@ cargo build --release -p resoz-app
 - 完整合成器链（每轨）：正弦振荡器 + 线性 ADSR → TPT SVF（低通/高通/带通）→ 反馈延迟（`DelayProcessor`：预分配环形缓冲 1 s 上限、feedback ≤ 0.9、反规范数冲洗、每声道独立写指针）；
 - `Sequencer`（音频线程块边界采样时钟调度）：**纯窗口扫描**模型——只维护音乐位置（tick，1 四分音符 = 96），每块把 `[t0, t1)` 内到期事件一次性调度出来；BPM 变化只改未来速率（音乐位置不跳），循环回绕由窗口映射推导；**每轨双音源**（16 步步进模式 / 钢琴卷帘片段，`SetSource` 切换），卷帘音符按自身 start/length 触发；事件按 `(track, NoteEvent)` 送入对应轨道（≤1 块 ≈ 2.7 ms 抖动，逐样本偏移待后续）；
 - **项目文件（第 7 步）**：`resoz-model::file` —— `ProjectFile{version: u32, project}`（当前 `PROJECT_VERSION = 1`），`save_project`（RON pretty）/ `load_project` / `parse_project`；解析前用 `ron::Value` 探测顶层结构（含 `project`/`version` 键 → 包装格式，否则回退裸 `Project` 开发期格式——serde 会把裸格式的字段当未知字段"成功"忽略，必须先探测）；程序化 `Default` 全部手写（派生 Default 会绕过 serde 字段默认值，曾导致 gate/tempo 为 0 的真 bug）；定长数组（`[Track; 4]`/`[Step; 16]`）在 RON 里是**圆括号**（serde tuple 路径），方括号只用于 `Vec`；
+- **CLAP 宿主骨架（第 9 步进行中）**：
+  - `resoz-test-plugin`（cdylib）：clack-plugin 单音正弦乐器 fixture（`org.resoz.sine`，instrument+stereo 特性），供宿主端到端测试；
+  - **`resoz-clap-host` crate**（唯一允许 unsafe 的边界 = `raw::load_entry`，模块级 SAFETY 文档 + 无效文件测试）：`clap_search_paths`/`scan_clap_files`（标准目录 + `RESOZ_CLAP_PATH`）/`list_clap_plugins`（描述枚举 + instrument 特性识别）；`ClapInstance::spawn_rt(path, id, config)` 控制线程加载→实例化→激活，产出守卫 `ClapInstanceGuard`（持有动态库+实例，必须与节点同寿命）+ `ClapNode`；
+  - **`ClapNode` 实现 `resoz-engine::realtime::Processor`**：音符/参数经定容事件槽（`MAX_PENDING_EVENTS=32`）暂存，每块以 `NoteOn/OffEvent`/`ParamValueEvent` 发出（块粒度）；`ParamId::PluginParam(u32)` 已加入参数空间（自动化桥接的落点）；音频经构造期预分配的 `AudioPorts` + 立体声临时缓冲渲染回 `AudioBuffer`；首块自动 `start_processing`，任何失败输出静音（无 panic）；处理用统一 `PluginAudioProcessor`（`as_started_mut`/`start_processing` 运行时切换）；
+  - 分层决定：**engine 保持零 CLAP 依赖**——clap-host 依赖 engine（实现其 Processor trait）；轨道声源集成将走 `Box<dyn Processor>` 结构更新队列（非 Copy 队列，控制侧分配/实时侧只消费），避免在音频线程实例化插件；
+  - 版本注意：clack 0.2（`clack-extensions` 宿主侧 trait 需 `clack-host` feature；`Pckn::new` 需显式 u16/u32 字面量；`start_processing` 返回 `&mut Started`；`PluginInstance::new` 收 `&CStr`）；
 - **自动化（第 8 步）**：`resoz-model` 的 `Automation`（`AutoParam` = 音量/声像/截止 + `AutoPoint{tick,value}` 有序列表，线性插值、两端保持端值）挂 `Track.automations`；引擎侧 `RtAutomation`（定容 64 锚点 Copy）经 `SetAutomation` 命令 upsert（同参替换/空槽插入/空曲线=删除，每轨 ≤4 条）；求值器在 `BlockRunner` 每块**仅播放中**按"循环后的音乐位置"（步进源=一小节、卷帘源=片段 loop_ticks 取模）采样并经混音器内部路径直写参数（不走命令队列）；UI 在走带停止沿重推手动参数实现"停止后回到手动值"；
 - `resoz-ui`：📂 打开 / 💾 保存（无路径时转另存为）/ 最近文件菜单（eframe `persistence` feature 存 RON，容量 8）；窗口标题随当前文件更新；状态栏消息（8 秒自动消失）报告保存/打开成败；`Ctrl+S` / `Ctrl+O` 快捷键（优先于演奏键盘映射）；`--open <文件>` 启动加载；
 - `resoz-model`：`Project`（metadata + gate + master_gain + 4×`Track`）；`Track` = 名称 + `Pattern` + `Clip`（`Note{start,length,note,velocity}` 列表 + loop_ticks，tick 基准：`TICKS_PER_QUARTER=96`/步=24/小节=384）+ 音源枚举 + 混音（增益/声像/静音）+ `SynthParams` + `DelayParams`，全部 serde/RON + 字段级 `#[serde(default)]`；引擎侧镜像 `RtClip`（定容 128 音符 `Copy`，超容截断）经 `SetClip` 命令整块下发；
@@ -138,11 +144,13 @@ cargo build --release -p resoz-app
 
 版本注意：cpal 0.18；egui 0.36（`App::ui(&mut Ui)`、`egui::Panel`、`Response` 无 `pressed/released` 用 `is_pointer_button_down_on`、`DragValue::range(RangeInclusive)`、`Painter::rect_stroke(rect, radius, stroke, StrokeKind)`）。
 
-**下一步任务**（路线图第 9 步：CLAP 插件宿主）：
-- [ ] `clap-sys`/`clap` 绑定选型与宿主骨架（扫描插件、实例化、音频端口接线）
-- [ ] 处理图支持外部插件节点（参数桥接 + 事件桥接，遵守实时铁律：插件加载仅在非实时线程）
-- [ ] 轨道链可插入 CLAP 效果器（UI 选择器 + 参数面板雏形）
-- [ ] 自动化/走带事件送入插件（`clap_event` transport/param）
+**下一步任务**（第 9 步收尾：轨道声源集成）：
+- [ ] 结构更新队列：`rtrb<VoiceUpdate>`（携带 `Box<dyn Processor>`，非 Copy）——控制侧实例化、实时侧块边界换装，绕开"音频线程禁止加载插件"
+- [ ] `TrackStrip` 声源插槽：内置 `SynthProcessor` | `ClapNode`（两槽预分配，块边界切换零分配），效果器链保持独立
+- [ ] `resoz-model`：`Track.voice`（`VoiceSpec::Builtin | Clap{path, plugin_id}`，serde tagged）+ `AutoParam::PluginParam{param_id, name}`，随项目文件序列化
+- [ ] `AudioEngine::set_track_voice` + 已装插件参数列表查询（UI 面板数据源）
+- [ ] 自动化桥接端到端：自动化泳道写插件参数 → 求值器 → `ParamValueEvent` → 插件生效（引擎集成测试）
+- [ ] UI：轨道声源选择器（列出内置 + 扫描到的乐器）+ 插件参数面板雏形
 
 ---
 

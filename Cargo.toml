@@ -5,6 +5,8 @@ members = [
     "crates/resoz-engine",
     "crates/resoz-ui",
     "crates/resoz-app",
+    "crates/resoz-test-plugin",
+    "crates/resoz-clap-host",
 ]
 
 [workspace.package]
@@ -30,8 +32,23 @@ env_logger = "0.11"
 # 序列化（项目文件，RON）
 serde = { version = "1", features = ["derive"] }
 ron = "0.12"
+# CLAP 插件宿主（安全封装；插件加载仅在非实时线程）
+clack-host = "0.2"
+clack-common = "0.2"
+clack-extensions = { version = "0.2", features = [
+    "params",
+    "note-ports",
+    "audio-ports",
+    "log",
+    "tail",
+    "clack-host",
+] }
+# 动态库加载（CLAP 插件扫描）
+libloading = "0.8"
 
+clack-plugin = "0.2"
 resoz-model = { path = "crates/resoz-model" }
+resoz-clap-host = { path = "crates/resoz-clap-host" }
 resoz-engine = { path = "crates/resoz-engine" }
 resoz-ui = { path = "crates/resoz-ui" }
 

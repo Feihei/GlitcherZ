@@ -1,0 +1,15 @@
+[package]
+name = "resoz-test-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ResoZ 测试用 CLAP 正弦乐器插件"
+
+[lib]
+# CLAP 插件 = cdylib 动态库
+crate-type = ["cdylib"]
+
+[dependencies]
+clack-plugin = { workspace = true }
+clack-common = { workspace = true }

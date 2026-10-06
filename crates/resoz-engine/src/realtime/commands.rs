@@ -47,6 +47,8 @@ pub enum ParamId {
     DelayFeedback,
     /// 延迟湿声混合比（0..1）。
     DelayMix,
+    /// CLAP 插件参数（载荷为插件侧参数 ID）。
+    PluginParam(u32),
 }
 
 /// 音符事件（MIDI 语义）。`note` 为 MIDI 音符编号（69 = A4），`velocity`
