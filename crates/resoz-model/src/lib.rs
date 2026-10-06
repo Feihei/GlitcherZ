@@ -10,6 +10,12 @@
 //! - 模型是"文档"，引擎是"播放器"：本 crate 不依赖 `resoz-engine`，
 //!   引擎也不依赖本 crate —— 由 `resoz-app` / `resoz-ui` 做转换粘合。
 
+pub mod file;
+
+pub use file::{
+    ModelError, PROJECT_VERSION, ProjectFile, load_project, parse_project, save_project,
+};
+
 /// 步进音序器的步数。
 pub const PATTERN_STEPS: usize = 16;
 
@@ -148,7 +154,7 @@ impl Default for SynthParams {
 }
 
 /// 每轨延迟效果参数（`mix = 0` 表示旁通）。
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DelayParams {
     /// 延迟时间（秒，0.005..1）。
     #[serde(default = "default_delay_time")]
@@ -167,6 +173,16 @@ fn default_delay_time() -> f32 {
 
 fn default_delay_feedback() -> f32 {
     0.35
+}
+
+impl Default for DelayParams {
+    fn default() -> Self {
+        Self {
+            time_s: default_delay_time(),
+            feedback: default_delay_feedback(),
+            mix: 0.0,
+        }
+    }
 }
 
 /// 音符时间基准：每四分音符的 tick 数（1/96 四分音符 ≈ 10.4 ms @120 BPM）。
@@ -301,7 +317,7 @@ impl Default for Track {
 }
 
 /// 多轨项目文档。
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Project {
     /// 项目元数据（名称、速度等）。
     #[serde(default)]
@@ -325,8 +341,19 @@ fn default_master_gain() -> f32 {
     0.8
 }
 
+impl Default for Project {
+    fn default() -> Self {
+        Self {
+            metadata: ProjectMetadata::default(),
+            gate: default_gate(),
+            master_gain: default_master_gain(),
+            tracks: std::array::from_fn(|_| Track::default()),
+        }
+    }
+}
+
 /// 项目级元数据。
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProjectMetadata {
     /// 项目名。
     #[serde(default)]
@@ -338,6 +365,15 @@ pub struct ProjectMetadata {
 
 fn default_tempo() -> f64 {
     120.0
+}
+
+impl Default for ProjectMetadata {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            tempo_bpm: default_tempo(),
+        }
+    }
 }
 
 #[cfg(test)]

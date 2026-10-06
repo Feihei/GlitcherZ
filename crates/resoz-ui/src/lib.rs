@@ -17,6 +17,7 @@
 
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -101,8 +102,15 @@ fn note_name(note: u8) -> String {
     format!("{}{octave}", NOTE_NAMES[(note % 12) as usize])
 }
 
+/// 路径 → 显示名（文件名，失败则整条路径）。
+fn display_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 /// UI 启动参数。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UiConfig {
     /// 初始主增益，会被钳制进 0..1.5。
     pub gain: f64,
@@ -110,7 +118,25 @@ pub struct UiConfig {
     pub auto_play_note: Option<u8>,
     /// 启动后自动关闭窗口（冒烟测试用；`None` = 手动关闭）。
     pub auto_close_after: Option<Duration>,
+    /// 启动时加载的项目文件（`--open`）。
+    pub open_path: Option<PathBuf>,
 }
+
+/// 经 eframe 持久化存储（`persistence` feature）保存的 UI 状态。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct UiState {
+    /// 最近打开的项目文件（新在前，最多 [`RECENT_FILES_MAX`] 条）。
+    recent_files: Vec<PathBuf>,
+}
+
+/// 最近文件列表容量上限。
+const RECENT_FILES_MAX: usize = 8;
+
+/// eframe 存储中 [`UiState`] 的键名。
+const UI_STATE_KEY: &str = "resoz_ui_state";
+
+/// 状态栏消息显示时长。
+const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(8);
 
 /// 峰值电平表：峰值保持 600 ms 后回落，视觉上更容易读。
 #[derive(Debug)]
@@ -159,6 +185,16 @@ pub struct ResoZApp {
     meter: PeakMeter,
     opened_at: Instant,
     auto_close_after: Option<Duration>,
+    /// 当前项目文件路径（`None` = 未保存过，保存时弹对话框）。
+    project_path: Option<PathBuf>,
+    /// 最近打开的项目文件（持久化）。
+    recent: Vec<PathBuf>,
+    /// 状态栏消息（文本 + 出现时刻，超时自动消失）。
+    status_message: Option<(String, Instant)>,
+    /// 期望的窗口标题。
+    window_title: String,
+    /// 已发送给窗口系统的标题（避免每帧重发命令）。
+    title_sent: String,
     /// 诊断标志：`ui()` 是否已进入过（仅日志用）。
     first_frame_logged: bool,
     /// 诊断标志：是否已发出关闭命令（仅日志用）。
@@ -166,9 +202,13 @@ pub struct ResoZApp {
 }
 
 impl ResoZApp {
-    /// 构造窗口应用，并把整个项目文档的参数经命令队列下发
-    /// （下一个音频块边界生效）。
-    pub fn new(engine: AudioEngine, config: UiConfig) -> Self {
+    /// 构造窗口应用，恢复持久化的最近文件，并把整个项目文档的参数
+    /// 经命令队列下发（下一个音频块边界生效）。
+    pub fn new(cc: &eframe::CreationContext<'_>, engine: AudioEngine, config: UiConfig) -> Self {
+        let ui_state: UiState = cc
+            .storage
+            .and_then(|storage| eframe::get_value(storage, UI_STATE_KEY))
+            .unwrap_or_default();
         let project = Project {
             master_gain: config.gain.clamp(0.0, 1.5) as f32,
             ..Project::default()
@@ -186,12 +226,20 @@ impl ResoZApp {
             meter: PeakMeter::new(),
             opened_at: Instant::now(),
             auto_close_after: config.auto_close_after,
+            project_path: None,
+            recent: ui_state.recent_files,
+            status_message: None,
+            window_title: "ResoZ".to_string(),
+            title_sent: String::new(),
             first_frame_logged: false,
             close_sent: false,
         };
         app.push_all_params();
         if let Some(note) = config.auto_play_note {
             app.send_note_on(note, 1.0);
+        }
+        if let Some(path) = config.open_path {
+            app.do_open(path);
         }
         app
     }
@@ -281,6 +329,88 @@ impl ResoZApp {
         steps
     }
 
+    /// 保存到当前路径；从未保存过则弹出"另存为"对话框。
+    fn save_project(&mut self) {
+        match self.project_path.clone() {
+            Some(path) => self.do_save(path),
+            None => self.save_project_as(),
+        }
+    }
+
+    /// "另存为"：弹出保存对话框。
+    fn save_project_as(&mut self) {
+        let Some(mut path) = rfd::FileDialog::new()
+            .add_filter("ResoZ 项目", &["rez"])
+            .set_file_name("未命名.rez")
+            .save_file()
+        else {
+            return;
+        };
+        path.set_extension("rez");
+        self.do_save(path);
+    }
+
+    /// "打开"：弹出文件选择对话框。
+    fn open_project_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("ResoZ 项目", &["rez"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.do_open(path);
+    }
+
+    /// 写盘并更新最近文件 / 标题 / 状态消息。
+    fn do_save(&mut self, path: PathBuf) {
+        match resoz_model::save_project(&self.project, &path) {
+            Ok(()) => {
+                self.project_path = Some(path.clone());
+                self.push_recent(path.clone());
+                self.window_title = format!("ResoZ — {}", display_name(&path));
+                self.set_message(format!("已保存 {}", path.display()));
+                log::info!("项目已保存：{}", path.display());
+            }
+            Err(err) => {
+                self.set_message(format!("保存失败：{err}"));
+                log::error!("保存项目失败：{err}");
+            }
+        }
+    }
+
+    /// 读盘、替换文档并把全部参数重新下发音频线程。
+    fn do_open(&mut self, path: PathBuf) {
+        match resoz_model::load_project(&path) {
+            Ok(project) => {
+                self.project = project;
+                self.project_path = Some(path.clone());
+                self.push_recent(path.clone());
+                self.selected_track = 0;
+                self.roll_state = piano_roll::RollState::new();
+                self.push_all_params();
+                self.window_title = format!("ResoZ — {}", display_name(&path));
+                self.set_message(format!("已打开 {}", path.display()));
+                log::info!("项目已打开：{}", path.display());
+            }
+            Err(err) => {
+                self.set_message(format!("打开失败：{err}"));
+                log::error!("打开项目失败：{err}");
+            }
+        }
+    }
+
+    /// 最近文件去重置顶并截断。
+    fn push_recent(&mut self, path: PathBuf) {
+        self.recent.retain(|p| p != &path);
+        self.recent.insert(0, path);
+        self.recent.truncate(RECENT_FILES_MAX);
+    }
+
+    /// 设置一条状态栏消息（超时自动消失）。
+    fn set_message(&mut self, text: String) {
+        self.status_message = Some((text, Instant::now()));
+    }
+
     fn send_sequencer(&mut self, cmd: SequencerCommand) {
         self.engine.send(EngineCommand::Sequencer(cmd));
     }
@@ -321,6 +451,7 @@ impl ResoZApp {
                 key,
                 pressed,
                 repeat,
+                modifiers,
                 ..
             } = event
             else {
@@ -328,6 +459,22 @@ impl ResoZApp {
             };
             if repeat {
                 continue;
+            }
+            // 快捷键优先于演奏映射（Ctrl+S 保存 / Ctrl+O 打开）。
+            if modifiers.ctrl && pressed {
+                match key {
+                    egui::Key::S => {
+                        self.save_project();
+                        continue;
+                    }
+                    egui::Key::O => {
+                        self.open_project_dialog();
+                        continue;
+                    }
+                    _ => {
+                        continue; // 其他 Ctrl 组合不触发音符
+                    }
+                }
             }
             match (key, pressed) {
                 (egui::Key::Z, true) => {
@@ -380,12 +527,30 @@ impl ResoZApp {
                     )));
                 }
                 ui.separator();
+                if ui.button("📂 打开").clicked() {
+                    self.open_project_dialog();
+                }
+                if ui.button("💾 保存").clicked() {
+                    self.save_project();
+                }
+                ui.menu_button("最近文件", |ui| {
+                    if self.recent.is_empty() {
+                        ui.weak("（空）");
+                    }
+                    let recent = self.recent.clone();
+                    for path in recent {
+                        if ui.button(display_name(&path)).clicked() {
+                            self.do_open(path);
+                        }
+                    }
+                });
+                ui.separator();
                 ui.weak("ResoZ — Rust DAW");
             });
         });
     }
 
-    fn status_panel(&self, ui: &mut egui::Ui) {
+    fn status_panel(&mut self, ui: &mut egui::Ui) {
         let info = self.engine.info().clone();
         let position = self.engine.position_seconds();
         let note_text = self
@@ -404,6 +569,11 @@ impl ResoZApp {
                 }
             })
             .unwrap_or_else(|| "—".to_string());
+        // 状态消息（超时自动消失）。
+        let message = self
+            .status_message
+            .take_if(|(_, at)| at.elapsed() < STATUS_MESSAGE_TTL);
+
         egui::Panel::bottom("resoz_status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("设备：{}", info.device_name));
@@ -418,6 +588,10 @@ impl ResoZApp {
                 ui.label(format!("音符：{note_text}"));
                 ui.separator();
                 ui.label(format!("位置 {:.1} s", position));
+                if let Some((text, _)) = message {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::LIGHT_BLUE, text);
+                }
             });
         });
     }
@@ -863,6 +1037,17 @@ impl ResoZApp {
 }
 
 impl eframe::App for ResoZApp {
+    // eframe persistence：关窗与定期回调，保存最近文件列表。
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(
+            storage,
+            UI_STATE_KEY,
+            &UiState {
+                recent_files: self.recent.clone(),
+            },
+        );
+    }
+
     // eframe 0.36：App trait 的入口从 update(ctx) 变为 ui(&mut Ui)；
     // 顶/底面板直接作用在根 Ui 上，剩余空间即中央区域。
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -880,6 +1065,13 @@ impl eframe::App for ResoZApp {
                 log::info!("到达自动关闭时限，请求退出");
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
+        }
+
+        // 窗口标题只在变化时重发（打开/保存时更新）。
+        if self.window_title != self.title_sent {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Title(self.window_title.clone()));
+            self.title_sent = self.window_title.clone();
         }
 
         self.transport_panel(ui);
@@ -904,6 +1096,6 @@ pub fn run(engine: AudioEngine, config: UiConfig) -> eframe::Result<()> {
     eframe::run_native(
         "ResoZ",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(ResoZApp::new(engine, config)))),
+        Box::new(move |cc| Ok(Box::new(ResoZApp::new(cc, engine, config)))),
     )
 }

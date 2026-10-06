@@ -4,6 +4,7 @@
 //! （resoz-ui）。当前为路线图第 3 步 —— 完整合成器（ADSR 包络 +
 //! SVF 滤波器）与虚拟键盘。
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -15,6 +16,8 @@ struct Args {
     note: u8,
     /// 启动静默（不自动触发音符）。
     no_autoplay: bool,
+    /// 启动时加载的项目文件。
+    open: Option<PathBuf>,
     gain: f64,
     seconds: Option<f64>,
     list_devices: bool,
@@ -54,6 +57,7 @@ fn main() -> ExitCode {
         gain: args.gain,
         auto_play_note: (!args.no_autoplay).then_some(args.note),
         auto_close_after: args.seconds.map(|s| Duration::from_secs_f64(s.max(0.0))),
+        open_path: args.open,
     };
 
     if let Err(err) = resoz_ui::run(engine, ui_config) {
@@ -76,6 +80,7 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Args {
     let mut args = Args {
         note: 69,
         no_autoplay: false,
+        open: None,
         gain: 0.8,
         seconds: None,
         list_devices: false,
@@ -99,6 +104,11 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Args {
                 }
             }
             "--no-autoplay" => args.no_autoplay = true,
+            "--open" => {
+                if let Some(v) = it.next() {
+                    args.open = Some(PathBuf::from(v));
+                }
+            }
             "--gain" => {
                 if let Some(v) = it.next().and_then(|s| s.parse().ok()) {
                     args.gain = v;

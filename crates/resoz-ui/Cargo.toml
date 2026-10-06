@@ -10,7 +10,10 @@ description = "ResoZ egui 界面：走带、音序器、钢琴卷帘、混音器
 # Windows 上 wgpu/Vulkan 初始化可能被失效的注入层（如 RenderDoc）卡住；
 # glow（OpenGL）更轻且启动快，作为默认渲染后端。
 # （workspace 中 eframe 已 default-features = false + default_fonts。）
-eframe = { workspace = true, features = ["glow"] }
+# persistence：eframe 内建存储（RON），用于持久化最近文件列表
+eframe = { workspace = true, features = ["glow", "persistence"] }
 log = { workspace = true }
+rfd = { workspace = true }
+serde = { workspace = true }
 resoz-engine = { workspace = true }
 resoz-model = { workspace = true }
