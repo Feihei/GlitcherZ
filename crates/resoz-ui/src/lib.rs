@@ -28,8 +28,12 @@ use resoz_engine::realtime::{
     EngineCommand, MAX_CLIP_NOTES, NoteEvent, ParamId, RtClip, RtNote, SequencerCommand,
     SequencerStep, TrackSource,
 };
-use resoz_model::{PATTERN_STEPS, Pattern, Project, TrackSource as ModelTrackSource};
+use resoz_model::{
+    AutoParam, Automation, PATTERN_STEPS, Pattern, Project, TICKS_PER_BAR,
+    TrackSource as ModelTrackSource,
+};
 
+pub mod lane;
 pub mod piano_roll;
 
 /// 滤波器截止频率滑块范围（对数刻度）。
@@ -172,6 +176,10 @@ pub struct ResoZApp {
     selected_track: usize,
     /// 钢琴卷帘的跨帧状态（滚动/拖拽）。
     roll_state: piano_roll::RollState,
+    /// 自动化泳道当前编辑的参数。
+    lane_param: AutoParam,
+    /// 自动化泳道的跨帧状态（拖拽）。
+    lane_state: lane::LaneState,
     /// 画笔音符：点选空白步时写入的音符。
     brush_note: u8,
     /// 八度基准（C 的 MIDI 编号，默认 60 = C4）。
@@ -195,6 +203,8 @@ pub struct ResoZApp {
     window_title: String,
     /// 已发送给窗口系统的标题（避免每帧重发命令）。
     title_sent: String,
+    /// 上一帧的走带状态（用于检测停止沿 → 恢复手动参数）。
+    was_playing: bool,
     /// 诊断标志：`ui()` 是否已进入过（仅日志用）。
     first_frame_logged: bool,
     /// 诊断标志：是否已发出关闭命令（仅日志用）。
@@ -218,6 +228,8 @@ impl ResoZApp {
             project,
             selected_track: 0,
             roll_state: piano_roll::RollState::new(),
+            lane_param: AutoParam::TrackGain,
+            lane_state: lane::LaneState::default(),
             brush_note: 60,
             octave_base: 60,
             held_notes: HashSet::new(),
@@ -231,6 +243,7 @@ impl ResoZApp {
             status_message: None,
             window_title: "ResoZ".to_string(),
             title_sent: String::new(),
+            was_playing: false,
             first_frame_logged: false,
             close_sent: false,
         };
@@ -265,6 +278,10 @@ impl ResoZApp {
                 ModelTrackSource::Clip => TrackSource::Clip,
             };
             self.send_sequencer(SequencerCommand::SetSource { track, source });
+            let curves = self.project.tracks[track].automations.clone();
+            for curve in curves {
+                self.send_automation(track, &curve);
+            }
         }
     }
 
@@ -314,6 +331,33 @@ impl ResoZApp {
     fn send_clip(&mut self, track: usize) {
         let clip = self.rt_clip(track);
         self.send_sequencer(SequencerCommand::SetClip { track, clip });
+    }
+
+    /// 文档自动化曲线 → 引擎表示（超容量截断）并下发。
+    fn send_automation(&mut self, track: usize, curve: &Automation) {
+        let mut rt = resoz_engine::realtime::RtAutomation {
+            param: match curve.param {
+                AutoParam::TrackGain => ParamId::TrackGain,
+                AutoParam::TrackPan => ParamId::TrackPan,
+                AutoParam::FilterCutoff => ParamId::FilterCutoff,
+            },
+            enabled: curve.enabled,
+            ..resoz_engine::realtime::RtAutomation::default()
+        };
+        for point in curve
+            .points
+            .iter()
+            .take(resoz_engine::realtime::MAX_AUTO_POINTS)
+        {
+            rt.push(resoz_engine::realtime::RtAutoPoint {
+                tick: point.tick,
+                value: point.value,
+            });
+        }
+        self.send_sequencer(SequencerCommand::SetAutomation {
+            track,
+            automation: rt,
+        });
     }
 
     /// 文档模式 → 引擎表示（`Copy` 数组，零堆分配）。
@@ -685,6 +729,7 @@ impl ResoZApp {
 
             self.sequencer_section(ui);
             self.clip_section(ui);
+            self.automation_section(ui);
             self.keyboard_section(ui);
 
             ui.add_space(10.0);
@@ -982,6 +1027,98 @@ impl ResoZApp {
         }
     }
 
+    /// 自动化泳道（编辑选中轨道的曲线；编辑即时下发音频线程）。
+    fn automation_section(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.add_space(4.0);
+        let sel = self.selected_track;
+        ui.horizontal(|ui| {
+            ui.label("自动化");
+            for (name, param) in [
+                ("音量", AutoParam::TrackGain),
+                ("声像", AutoParam::TrackPan),
+                ("截止", AutoParam::FilterCutoff),
+            ] {
+                if ui
+                    .selectable_label(self.lane_param == param, name)
+                    .clicked()
+                {
+                    self.lane_param = param;
+                }
+            }
+            let mut enabled = self.project.tracks[sel]
+                .automations
+                .iter()
+                .find(|curve| curve.param == self.lane_param)
+                .map(|curve| curve.enabled)
+                .unwrap_or(false);
+            if ui.checkbox(&mut enabled, "启用").changed() {
+                let track = &mut self.project.tracks[sel];
+                match track
+                    .automations
+                    .iter_mut()
+                    .find(|curve| curve.param == self.lane_param)
+                {
+                    Some(curve) => curve.enabled = enabled,
+                    None => track.automations.push(Automation {
+                        param: self.lane_param,
+                        enabled,
+                        points: Vec::new(),
+                    }),
+                }
+                let curve = track
+                    .automations
+                    .iter()
+                    .find(|curve| curve.param == self.lane_param)
+                    .cloned()
+                    .expect("上一步已确保存在");
+                self.send_automation(sel, &curve);
+            }
+            ui.weak("点按加锚点 · 拖拽移动 · 右键删除");
+        });
+
+        // 确保泳道对应的曲线存在（空曲线 = 无自动化）。
+        if !self.project.tracks[sel]
+            .automations
+            .iter()
+            .any(|curve| curve.param == self.lane_param)
+        {
+            self.project.tracks[sel].automations.push(Automation {
+                param: self.lane_param,
+                ..Automation::default()
+            });
+        }
+
+        let loop_ticks = match self.project.tracks[sel].source {
+            ModelTrackSource::Clip => self.project.tracks[sel].clip.loop_ticks,
+            _ => TICKS_PER_BAR,
+        };
+        let playhead = self.engine.musical_ticks();
+        let playing = self.engine.is_playing();
+        let curve = self.project.tracks[sel]
+            .automations
+            .iter_mut()
+            .find(|curve| curve.param == self.lane_param)
+            .expect("上一步已确保存在");
+        let edited = lane::show(
+            ui,
+            curve,
+            loop_ticks,
+            playhead,
+            playing,
+            &mut self.lane_state,
+        );
+        if edited {
+            let curve = self.project.tracks[sel]
+                .automations
+                .iter()
+                .find(|curve| curve.param == self.lane_param)
+                .cloned()
+                .expect("上一步已确保存在");
+            self.send_automation(sel, &curve);
+        }
+    }
+
     /// 虚拟键盘：屏幕按键（按下发声、松开停音）+ 八度切换。
     fn keyboard_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
@@ -1073,6 +1210,15 @@ impl eframe::App for ResoZApp {
                 .send_viewport_cmd(egui::ViewportCommand::Title(self.window_title.clone()));
             self.title_sent = self.window_title.clone();
         }
+
+        // 走带停止沿：自动化不再覆盖，恢复各轨手动参数值。
+        let playing = self.engine.is_playing();
+        if self.was_playing && !playing {
+            for track in 0..self.project.tracks.len() {
+                self.push_track_params(track);
+            }
+        }
+        self.was_playing = playing;
 
         self.transport_panel(ui);
         self.status_panel(ui);

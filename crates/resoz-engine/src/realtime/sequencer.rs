@@ -6,6 +6,7 @@
 //! 循环回绕由窗口映射推导，无需行进式时钟簿记。
 
 use crate::realtime::NUM_TRACKS;
+use crate::realtime::automation::{MAX_AUTOMATIONS, RtAutomation};
 use crate::realtime::commands::NoteEvent;
 use crate::realtime::context::ProcessContext;
 
@@ -111,6 +112,7 @@ pub struct Sequencer {
     sources: [TrackSource; NUM_TRACKS],
     patterns: [[SequencerStep; PATTERN_STEPS]; NUM_TRACKS],
     clips: [RtClip; NUM_TRACKS],
+    automations: [[RtAutomation; MAX_AUTOMATIONS]; NUM_TRACKS],
     /// 各轨待发送的 NoteOff（gate/时长结束的绝对采样位置 + 音符）。
     pending_offs: [Option<(u64, u8)>; NUM_TRACKS],
 }
@@ -131,6 +133,7 @@ impl Sequencer {
             sources: [TrackSource::default(); NUM_TRACKS],
             patterns: [[SequencerStep::default(); PATTERN_STEPS]; NUM_TRACKS],
             clips: [RtClip::default(); NUM_TRACKS],
+            automations: [[RtAutomation::default(); MAX_AUTOMATIONS]; NUM_TRACKS],
             pending_offs: [None; NUM_TRACKS],
         }
     }
@@ -209,6 +212,38 @@ impl Sequencer {
     pub fn set_source(&mut self, track: usize, source: TrackSource) {
         if let Some(slot) = self.sources.get_mut(track) {
             *slot = source;
+        }
+    }
+
+    /// 按参数 upsert 一条自动化曲线：存在同参数曲线则整体替换，
+    /// 否则占用第一个空槽（`point_count == 0`）；全满时丢弃。
+    /// 传空曲线即"删除该参数的自动化"。越界轨道忽略。RT-safe。
+    pub fn set_automation(&mut self, track: usize, automation: RtAutomation) {
+        let Some(slots) = self.automations.get_mut(track) else {
+            return;
+        };
+        if let Some(slot) = slots.iter_mut().find(|slot| slot.param == automation.param) {
+            *slot = automation;
+            return;
+        }
+        if let Some(slot) = slots.iter_mut().find(|slot| !slot.is_active()) {
+            *slot = automation;
+        }
+    }
+
+    /// 只读访问某条轨道的全部自动化曲线（供求值器采样）。RT-safe。
+    pub fn track_automations(&self, track: usize) -> &[RtAutomation] {
+        self.automations
+            .get(track)
+            .map_or(&[], |slots| slots.as_slice())
+    }
+
+    /// 该轨当前的循环长度（tick）：卷帘音源用片段循环长，步进音源
+    /// 固定一小节。自动化求值按此取模，使曲线与音源同步循环。RT-safe。
+    pub fn track_loop_ticks(&self, track: usize) -> u32 {
+        match self.sources.get(track) {
+            Some(TrackSource::Clip) => self.clips[track].loop_ticks,
+            _ => TICKS_PER_STEP * PATTERN_STEPS as u32,
         }
     }
 

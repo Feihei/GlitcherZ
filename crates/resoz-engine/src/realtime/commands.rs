@@ -2,6 +2,7 @@
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use crate::realtime::automation::RtAutomation;
 use crate::realtime::sequencer::{PATTERN_STEPS, RtClip, SequencerStep, TrackSource};
 
 /// 控制命令队列的默认容量。满载时新命令被发送方丢弃（见
@@ -85,6 +86,11 @@ pub enum SequencerCommand {
     SetClip { track: usize, clip: RtClip },
     /// 切换某条轨道的音源（步进模式 / 卷帘片段）。
     SetSource { track: usize, source: TrackSource },
+    /// 按参数 upsert 一条自动化曲线（空曲线 = 删除）。
+    SetAutomation {
+        track: usize,
+        automation: RtAutomation,
+    },
 }
 
 /// UI / 控制线程 → 音频线程的控制命令。

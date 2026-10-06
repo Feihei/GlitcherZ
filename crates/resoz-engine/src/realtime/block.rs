@@ -146,6 +146,8 @@ impl BlockRunner {
 
         // 3. 音序器调度：到期音符事件直接送入对应轨道（块边界精度）。
         //    拆字段借用，让 sequencer 与 mixer 同时可变。
+        //    自动化取本块起始位置（块内音频以起点近似）。
+        let position_before = self.sequencer.position_ticks();
         let Self {
             sequencer, mixer, ..
         } = self;
@@ -153,10 +155,17 @@ impl BlockRunner {
             mixer.track_note(track, event);
         });
 
-        // 4. 混音器处理一个块（各轨并行 → 求和 → 主链）。
+        // 4. 自动化求值（仅播放中）：按循环后的音乐位置采样各轨曲线，
+        //    经混音器内部路径直写参数（不走命令队列）；停止时最后一次
+        //    手动值保持生效（由 UI 在走带停止沿重推手动参数）。
+        if self.sequencer.is_playing() {
+            self.evaluate_automation(position_before);
+        }
+
+        // 5. 混音器处理一个块（各轨并行 → 求和 → 主链）。
         let levels = self.mixer.process_block(&ctx);
 
-        // 5. 状态回传。
+        // 6. 状态回传。
         self.feedback.level.store(levels.master);
         for (slot, value) in self.feedback.track_levels.iter().zip(levels.tracks) {
             slot.store(value);
@@ -176,6 +185,23 @@ impl BlockRunner {
 
         self.played_samples += frames as u64;
         self.scratch_pos = 0;
+    }
+
+    /// 采样并应用全部轨道的自动化曲线。RT-safe（无分配）。
+    fn evaluate_automation(&mut self, position_ticks: f64) {
+        for track in 0..crate::realtime::NUM_TRACKS {
+            let loop_ticks = self.sequencer.track_loop_ticks(track);
+            let tick = if loop_ticks > 0 {
+                position_ticks % f64::from(loop_ticks)
+            } else {
+                position_ticks
+            };
+            for curve in self.sequencer.track_automations(track) {
+                if let Some(value) = curve.value_at(tick) {
+                    self.mixer.track_set_param(track, curve.param, value);
+                }
+            }
+        }
     }
 
     fn apply_command(&mut self, cmd: EngineCommand) {
@@ -216,6 +242,9 @@ impl BlockRunner {
             SequencerCommand::SetSource { track, source } => {
                 self.sequencer.set_source(track, source);
             }
+            SequencerCommand::SetAutomation { track, automation } => {
+                self.sequencer.set_automation(track, automation);
+            }
         }
     }
 
@@ -236,6 +265,7 @@ mod tests {
     use rtrb::Producer;
 
     use super::{BlockRunner, Feedback};
+    use crate::realtime::automation::{RtAutoPoint, RtAutomation};
     use crate::realtime::commands::{
         EngineCommand, NoteEvent, ParamId, SequencerCommand, command_channel,
     };
@@ -456,6 +486,59 @@ mod tests {
         let mut out = vec![0.0f32; 22_050];
         runner.render_interleaved(&mut out);
         assert!(feedback.level.load() < 1e-9, "未按播放时音序器不应发声");
+    }
+
+    #[test]
+    fn automation_drives_track_gain_during_playback() {
+        let (mut runner, mut tx, feedback) = make_runner(128, 2);
+        // 增益曲线：tick 0 = 1.0 → tick 96 = 0.0（120 BPM / 44.1 kHz ≈ 0.5 s）。
+        let mut curve = RtAutomation {
+            param: ParamId::TrackGain,
+            enabled: true,
+            ..RtAutomation::default()
+        };
+        curve.push(RtAutoPoint {
+            tick: 0,
+            value: 1.0,
+        });
+        curve.push(RtAutoPoint {
+            tick: 96,
+            value: 0.0,
+        });
+        tx.push(EngineCommand::Sequencer(SequencerCommand::SetAutomation {
+            track: 0,
+            automation: curve,
+        }))
+        .expect("队列未满");
+        tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
+            .expect("队列未满");
+        // 注意：Play 会清理手动音符，故音符事件需在 Play 之后入队。
+        note_on_69(&mut tx);
+
+        let mut chunk = vec![0.0f32; 4410 * 2]; // 0.1 s
+        let mut early_max = 0.0f32;
+        for _ in 0..2 {
+            runner.render_interleaved(&mut chunk);
+            early_max = early_max.max(feedback.track_levels[0].load());
+        }
+        assert!(
+            early_max > 0.3,
+            "自动化起点附近增益 ≈ 1，应有较大电平：{early_max}"
+        );
+
+        // 中间 0.3 s 忽略（曲线衰减段），之后增益已归零。
+        for _ in 0..3 {
+            runner.render_interleaved(&mut chunk);
+        }
+        let mut late_max = 0.0f32;
+        for _ in 0..5 {
+            runner.render_interleaved(&mut chunk);
+            late_max = late_max.max(feedback.track_levels[0].load());
+        }
+        assert!(
+            late_max < 0.02,
+            "0.5 s 后自动化增益归零，电平应近静音：{late_max}"
+        );
     }
 
     #[test]

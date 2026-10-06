@@ -26,6 +26,7 @@
 //!   固定块、在块边界消费命令、回传状态。
 
 pub mod atomic;
+pub mod automation;
 pub mod block;
 pub mod buffer;
 pub mod commands;
@@ -47,6 +48,7 @@ pub const FIXED_BLOCK_SIZE: usize = 128;
 pub const NUM_TRACKS: usize = 4;
 
 pub use atomic::AtomicF32;
+pub use automation::{MAX_AUTO_POINTS, MAX_AUTOMATIONS, RtAutoPoint, RtAutomation};
 pub use block::{BlockRunner, Feedback};
 pub use buffer::AudioBuffer;
 pub use commands::{

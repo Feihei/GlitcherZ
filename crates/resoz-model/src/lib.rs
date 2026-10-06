@@ -290,6 +290,9 @@ pub struct Track {
     /// 延迟效果参数。
     #[serde(default)]
     pub delay: DelayParams,
+    /// 自动化曲线（每条作用于一个参数；可缺省）。
+    #[serde(default)]
+    pub automations: Vec<Automation>,
 }
 
 fn default_track_gain() -> f32 {
@@ -312,7 +315,107 @@ impl Default for Track {
             muted: false,
             synth: SynthParams::default(),
             delay: DelayParams::default(),
+            automations: Vec::new(),
         }
+    }
+}
+
+/// 可自动化的轨道参数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum AutoParam {
+    /// 轨道增益（线性，0..1.5）。
+    #[default]
+    TrackGain,
+    /// 轨道声像（-1..1）。
+    TrackPan,
+    /// 滤波器截止频率（Hz，20..18000，UI 对数轴）。
+    FilterCutoff,
+}
+
+/// 自动化锚点：tick 位置 + 参数真实值。
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct AutoPoint {
+    /// 位置（tick，相对循环起点）。
+    #[serde(default)]
+    pub tick: u32,
+    /// 参数值（真实单位，非归一化）。
+    #[serde(default)]
+    pub value: f32,
+}
+
+/// 一条自动化曲线。
+///
+/// 锚点按 tick 升序存放；取值在相邻锚点间线性插值，两端外保持端值。
+/// 空曲线或未启用时不产生任何自动化。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct Automation {
+    /// 作用的目标参数。
+    #[serde(default)]
+    pub param: AutoParam,
+    /// 是否启用。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 锚点（按 tick 升序）。
+    #[serde(default)]
+    pub points: Vec<AutoPoint>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Automation {
+    /// 在 `tick` 处取值：空/未启用返回 `None`；两点间线性插值；
+    /// 首尾之外钳到端点值。要求锚点有序（编辑接口负责维护）。
+    pub fn value_at(&self, tick: f64) -> Option<f32> {
+        if !self.enabled || self.points.is_empty() {
+            return None;
+        }
+        let first = self.points[0];
+        let last = *self.points.last()?;
+        if tick <= f64::from(first.tick) {
+            return Some(first.value);
+        }
+        if tick >= f64::from(last.tick) {
+            return Some(last.value);
+        }
+        // 线性扫描即可：锚点数有限，调用频率为每块每曲线一次。
+        for window in self.points.windows(2) {
+            let (a, b) = (window[0], window[1]);
+            if tick < f64::from(b.tick) {
+                let span = f64::from(b.tick) - f64::from(a.tick);
+                let ratio = if span > 0.0 {
+                    (tick - f64::from(a.tick)) / span
+                } else {
+                    0.0
+                };
+                return Some(a.value + (b.value - a.value) * ratio as f32);
+            }
+        }
+        Some(last.value)
+    }
+
+    /// 插入或更新锚点（同 tick 覆盖），并保持按 tick 升序。
+    pub fn upsert_point(&mut self, point: AutoPoint) {
+        self.points.retain(|p| p.tick != point.tick);
+        let pos = self.points.partition_point(|p| p.tick < point.tick);
+        self.points.insert(pos, point);
+    }
+
+    /// 移除 `tick` 容差范围内最近的锚点；命中返回 `true`。
+    pub fn remove_near(&mut self, tick: u32, tolerance: u32) -> bool {
+        let Some(best) = self
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.tick.abs_diff(tick) <= tolerance)
+            .min_by_key(|(_, p)| p.tick.abs_diff(tick))
+            .map(|(index, _)| index)
+        else {
+            return false;
+        };
+        self.points.remove(best);
+        true
     }
 }
 
@@ -379,8 +482,8 @@ impl Default for ProjectMetadata {
 #[cfg(test)]
 mod tests {
     use super::{
-        Clip, DelayParams, NUM_TRACKS, Note, PATTERN_STEPS, Pattern, Project, Step, SynthParams,
-        TICKS_PER_BAR, TICKS_PER_STEP, Track, TrackSource,
+        AutoParam, AutoPoint, Automation, Clip, DelayParams, NUM_TRACKS, Note, PATTERN_STEPS,
+        Pattern, Project, Step, SynthParams, TICKS_PER_BAR, TICKS_PER_STEP, Track, TrackSource,
     };
 
     #[test]
@@ -477,6 +580,111 @@ mod tests {
         assert_eq!(back.source, TrackSource::Steps);
         assert!(back.clip.notes.is_empty());
         assert_eq!(back.clip.loop_ticks, TICKS_PER_BAR);
+    }
+
+    #[test]
+    fn automation_value_at_segments() {
+        let mut auto = Automation {
+            param: AutoParam::TrackGain,
+            enabled: true,
+            points: vec![
+                AutoPoint {
+                    tick: 0,
+                    value: 1.0,
+                },
+                AutoPoint {
+                    tick: 96,
+                    value: 0.5,
+                },
+                AutoPoint {
+                    tick: 192,
+                    value: 0.0,
+                },
+            ],
+        };
+        assert!((auto.value_at(0.0).unwrap() - 1.0).abs() < 1e-6);
+        assert!(
+            (auto.value_at(48.0).unwrap() - 0.75).abs() < 1e-6,
+            "线性中点"
+        );
+        assert!((auto.value_at(192.0).unwrap()).abs() < 1e-6);
+        assert!(
+            (auto.value_at(1_000.0).unwrap()).abs() < 1e-6,
+            "尾外保持端值"
+        );
+        assert!(
+            (auto.value_at(-5.0).unwrap() - 1.0).abs() < 1e-6,
+            "首外保持端值"
+        );
+
+        auto.enabled = false;
+        assert!(auto.value_at(48.0).is_none(), "未启用不产生自动化");
+        auto.points.clear();
+        auto.enabled = true;
+        assert!(auto.value_at(48.0).is_none(), "空曲线不产生自动化");
+    }
+
+    #[test]
+    fn automation_upsert_keeps_order() {
+        let mut auto = Automation::default();
+        auto.upsert_point(AutoPoint {
+            tick: 96,
+            value: 0.5,
+        });
+        auto.upsert_point(AutoPoint {
+            tick: 0,
+            value: 1.0,
+        });
+        auto.upsert_point(AutoPoint {
+            tick: 48,
+            value: 0.75,
+        });
+        auto.upsert_point(AutoPoint {
+            tick: 48,
+            value: 0.8,
+        }); // 同 tick 覆盖
+        let ticks: Vec<u32> = auto.points.iter().map(|p| p.tick).collect();
+        assert_eq!(ticks, vec![0, 48, 96], "锚点应保持升序且同 tick 覆盖");
+        assert!((auto.points[1].value - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn automation_remove_near() {
+        let mut auto = Automation::default();
+        auto.upsert_point(AutoPoint {
+            tick: 48,
+            value: 0.5,
+        });
+        assert!(auto.remove_near(50, 6), "容差内应命中");
+        assert!(auto.points.is_empty());
+        assert!(!auto.remove_near(0, 6), "空曲线删除返回 false");
+    }
+
+    #[test]
+    fn automation_ron_roundtrip() {
+        let auto = Automation {
+            param: AutoParam::FilterCutoff,
+            enabled: true,
+            points: vec![
+                AutoPoint {
+                    tick: 0,
+                    value: 12_000.0,
+                },
+                AutoPoint {
+                    tick: 192,
+                    value: 200.0,
+                },
+            ],
+        };
+        let text = ron::ser::to_string(&auto).expect("序列化失败");
+        let back: Automation = ron::from_str(&text).expect("反序列化失败");
+        assert_eq!(auto, back);
+    }
+
+    #[test]
+    fn track_automations_default_empty() {
+        let track = Track::default();
+        assert!(track.automations.is_empty(), "旧文件向前兼容：无自动化");
     }
 
     #[test]
