@@ -18,8 +18,10 @@
 //!   队列发出，值按 **VST3 归一化语义（0..1）** 传递——自动化求值
 //!   器写入的插件参数由此天然桥接（与 CLAP 的原始值语义不同，UI 层
 //!   展示插件参数时须经控制器做归一化换算，见路线图备注）；
-//! - **音频**：乐器插件（无输入总线）渲染到节点内预分配的立体声
-//!   临时缓冲，再拷贝进 [`AudioBuffer`]（kSample32 单精度）。
+//! - **音频**：乐器（无音频输入总线）渲染到节点内预分配的立体声
+//!   临时缓冲；效果器（有音频输入总线）自动接通输入通路（引擎缓冲
+//!   → 独立输入缓冲 → 插件 → 独立输出缓冲 → 拷回引擎缓冲）。均为
+//!   kSample32 单精度。
 //!
 //! 生命周期：
 //! - [`Vst3InstanceGuard`] 持有动态库与全部插件 COM 对象，**必须与
@@ -399,6 +401,11 @@ pub struct Vst3Node {
     input_param_changes: *mut Vst::IParameterChanges,
     /// 插件音频处理器（与 component 同一 COM 对象的接口视图）。
     audio_processor: ComPtr<Steinberg::Vst::IAudioProcessor>,
+    /// 插件是否声明音频输入总线（效果器 true / 乐器 false）。
+    has_audio_input: bool,
+    /// 输入通路临时缓冲（仅效果器使用；构造期预分配）。
+    in_l: Box<[f32]>,
+    in_r: Box<[f32]>,
     out_l: Box<[f32]>,
     out_r: Box<[f32]>,
     pending: [PendingVst3Event; MAX_PENDING_EVENTS],
@@ -506,6 +513,11 @@ impl Vst3Instance {
         }
 
         // 5. 构造实时节点（全部预分配在此完成）。
+        // 是否有音频输入总线（效果器为真；乐器为假）——查询须在
+        // component 移入守卫之前完成。
+        let has_audio_input = unsafe {
+            component.getBusCount(Vst::MediaTypes_::kAudio, Vst::BusDirections_::kInput) > 0
+        };
         let frames = config.max_frames.max(FIXED_BLOCK_SIZE as u32) as usize;
         let event_list = ComWrapper::new(HostEventList::new());
         let input_events = event_list
@@ -540,6 +552,9 @@ impl Vst3Instance {
             input_events,
             input_param_changes,
             audio_processor,
+            has_audio_input,
+            in_l: vec![0.0; frames].into_boxed_slice(),
+            in_r: vec![0.0; frames].into_boxed_slice(),
             out_l: vec![0.0; frames].into_boxed_slice(),
             out_r: vec![0.0; frames].into_boxed_slice(),
             pending: [PendingVst3Event::NoteOff { note: 0 }; MAX_PENDING_EVENTS],
@@ -585,10 +600,20 @@ fn create_instance<I: Interface>(
     }
 }
 
-/// 激活组件的全部音频输出与事件输入总线。
+/// 激活组件的全部音频输入/输出与事件输入总线。
 fn activate_buses(component: &ComPtr<Steinberg::Vst::IComponent>) {
     // SAFETY: 组件已 initialize；总线信息按规范枚举。
     unsafe {
+        let audio_inputs =
+            component.getBusCount(Vst::MediaTypes_::kAudio, Vst::BusDirections_::kInput);
+        for index in 0..audio_inputs {
+            let _ = component.activateBus(
+                Vst::MediaTypes_::kAudio,
+                Vst::BusDirections_::kInput,
+                index,
+                1,
+            );
+        }
         let audio_outputs =
             component.getBusCount(Vst::MediaTypes_::kAudio, Vst::BusDirections_::kOutput);
         for index in 0..audio_outputs {
@@ -677,7 +702,8 @@ impl Processor for Vst3Node {
         self.pending_count = 0;
 
         // 2. 音频缓冲 + 处理上下文 + ProcessData（全部栈上）。
-        let (out_l, out_r) = (&mut self.out_l[..frames], &mut self.out_r[..frames]);
+        let out_l = &mut self.out_l[..frames];
+        let out_r = &mut self.out_r[..frames];
         out_l.fill(0.0);
         out_r.fill(0.0);
         let mut channel_ptrs: [*mut f32; 2] = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
@@ -688,6 +714,43 @@ impl Processor for Vst3Node {
                 channelBuffers32: channel_ptrs.as_mut_ptr(),
             },
         }];
+
+        // 效果器：把引擎缓冲内容拷入独立输入缓冲（输出写独立缓冲、
+        // 最后整体拷回，避免插件就地读写混叠）。
+        let has_audio_input = self.has_audio_input;
+        let mut input_channel_ptrs: [*mut f32; 2] = [std::ptr::null_mut(), std::ptr::null_mut()];
+        let mut input_buses = [Vst::AudioBusBuffers {
+            numChannels: 2,
+            silenceFlags: 0,
+            __field0: Vst::AudioBusBuffers__type0 {
+                channelBuffers32: input_channel_ptrs.as_mut_ptr(),
+            },
+        }];
+        if has_audio_input {
+            // 引擎缓冲 → 输入通路缓冲（缺失声道填零）。
+            {
+                let in_l = &mut self.in_l[..frames];
+                let in_r = &mut self.in_r[..frames];
+                for (destination, channel_index) in [in_l, in_r].iter_mut().zip(0usize..) {
+                    if let Some(source) = buffer.channel(channel_index) {
+                        for (index, sample) in destination.iter_mut().enumerate() {
+                            *sample = source.get(index).copied().unwrap_or(0.0);
+                        }
+                    } else {
+                        destination.fill(0.0);
+                    }
+                }
+            }
+            // SAFETY/说明：input_channel_ptrs 的写入经 input_buses 的
+            // channelBuffers32 指针交给插件读取，编译器无法跨 FFI 看到
+            // 该读取，故允许 unused_assignments（误报）。
+            #[allow(unused_assignments)]
+            {
+                input_channel_ptrs[0] = self.in_l[..frames].as_mut_ptr();
+                input_channel_ptrs[1] = self.in_r[..frames].as_mut_ptr();
+            }
+        }
+
         let mut vst_context: Vst::ProcessContext = unsafe { std::mem::zeroed() };
         vst_context.sampleRate = f64::from(ctx.sample_rate);
         vst_context.projectTimeSamples = i64::try_from(ctx.playback_sample_pos).unwrap_or(i64::MAX);
@@ -696,9 +759,13 @@ impl Processor for Vst3Node {
             processMode: Vst::ProcessModes_::kRealtime,
             symbolicSampleSize: Vst::SymbolicSampleSizes_::kSample32,
             numSamples: frames as i32,
-            numInputs: 0,
+            numInputs: if has_audio_input { 1 } else { 0 },
             numOutputs: 1,
-            inputs: std::ptr::null_mut(),
+            inputs: if has_audio_input {
+                input_buses.as_mut_ptr()
+            } else {
+                std::ptr::null_mut()
+            },
             outputs: output_buses.as_mut_ptr(),
             inputParameterChanges: self.input_param_changes,
             outputParameterChanges: std::ptr::null_mut(),
@@ -780,13 +847,17 @@ mod tests {
     }
 
     fn spawn_test_plugin() -> Option<(Vst3Instance, ProcessContext)> {
+        spawn_test_class("5245534f5a53494e4500000000000001")
+    }
+
+    fn spawn_test_class(class_id: &str) -> Option<(Vst3Instance, ProcessContext)> {
         let Some(path) = test_plugin_path() else {
             eprintln!("跳过：VST3 测试插件 cdylib 未构建（请用 cargo test --workspace）");
             return None;
         };
         let instance = Vst3Instance::spawn_rt(
             &path,
-            "5245534f5a53494e4500000000000001",
+            class_id,
             Vst3InstanceConfig {
                 sample_rate: 48_000,
                 max_frames: 128,
@@ -877,6 +948,33 @@ mod tests {
         assert_eq!(gain.title, "Gain");
         assert!((gain.default_normalized - 0.5).abs() < 1e-9);
         assert!(gain.can_automate, "Gain 应标记为可自动化");
+    }
+
+    #[test]
+    fn end_to_end_gain_effect_processes_input() {
+        // 效果器类（"RESOZSINE" + 0x03）。
+        let Some((mut instance, ctx)) = spawn_test_class("5245534f5a53494e4500000000000003") else {
+            return;
+        };
+        let node = &mut instance.node;
+
+        // 输入 0.5 → 输出应为 0.25（固定增益 ×0.5）。
+        let mut buffer = AudioBuffer::new(2, 128);
+        buffer.set_len(128);
+        for channel_index in 0..2 {
+            for sample in buffer.channel_mut(channel_index).unwrap() {
+                *sample = 0.5;
+            }
+        }
+        node.process(&ctx, &mut buffer);
+        for channel_index in 0..2 {
+            for (index, sample) in buffer.channel(channel_index).unwrap().iter().enumerate() {
+                assert!(
+                    (sample - 0.25).abs() < 1e-6,
+                    "增益效果器应输出 0.25，实际 {sample}（声道 {channel_index} 样本 {index}）"
+                );
+            }
+        }
     }
 
     #[test]

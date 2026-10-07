@@ -1,22 +1,25 @@
 //! # resoz-test-vst3
 //!
-//! 测试用 VST3 正弦乐器插件（cdylib fixture，仅供 `resoz-vst3-host`
-//! 的端到端测试加载）。
+//! 测试用 VST3 插件集（cdylib fixture，仅供 `resoz-vst3-host` 的端到
+//! 端测试加载）。
 //!
 //! 结构（VST3 双对象模型的最小实现）：
-//! - `SineFactory`：IPluginFactory(2) —— 枚举一个乐器类；
+//! - `SineFactory`：IPluginFactory(2) —— 枚举乐器 + 效果器两个类；
 //! - `SineComponent`：IPluginBase + IComponent + IAudioProcessor +
 //!   IConnectionPoint —— A4 正弦乐器，NoteOn 触发、NoteOff 停止；
 //! - `SineController`：IPluginBase + IEditController + IConnectionPoint
-//!   —— 零参数的哑控制器。
+//!   —— 单个 Gain 参数（id 1，默认 0.5）；
+//! - `GainEffectComponent`：立体声直通增益效果器（输出 = 输入 × 0.5，
+//!   无事件输入总线），控制器复用 `SineController`。
 //!
 //! 导出符号：`GetPluginFactory` / `InitDll` / `ExitDll`（Windows 单
 //! 文件模块约定）。
 //!
 //! CID 用字面量字节数组定义（ASCII "RESOZSINE" + 序号），宿主测试
 //! 按同样的十六进制字符串引用，避免端序歧义：
-//! - 组件：`5245534f5a53494e4500000000000001`
+//! - 乐器组件：`5245534f5a53494e4500000000000001`
 //! - 控制器：`5245534f5a53494e4500000000000002`
+//! - 效果器组件：`5245534f5a53494e4500000000000003`
 
 #![allow(non_snake_case, non_upper_case_globals)]
 // COM 边界：vtable 签名由 SDK 绑定固定为 unsafe，插件实现同理。
@@ -45,8 +48,13 @@ const COMPONENT_CID: TUID = [
 const CONTROLLER_CID: TUID = [
     0x52, 0x45, 0x53, 0x4F, 0x5A, 0x53, 0x49, 0x4E, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
 ];
+/// 效果器组件 CID（"RESOZSINE" + 0x03）。
+const EFFECT_COMPONENT_CID: TUID = [
+    0x52, 0x45, 0x53, 0x4F, 0x5A, 0x53, 0x49, 0x4E, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+];
 
 const PLUGIN_NAME: &str = "ResoZ Sine VST3";
+const EFFECT_NAME: &str = "ResoZ Gain VST3";
 const VENDOR: &str = "ResoZ";
 
 /// A4 频率（与内置引擎测试约定一致）。
@@ -117,7 +125,7 @@ impl Steinberg::IPluginFactoryTrait for SineFactory {
     }
 
     unsafe fn countClasses(&self) -> Steinberg::int32 {
-        1
+        2
     }
 
     unsafe fn getClassInfo(
@@ -125,16 +133,22 @@ impl Steinberg::IPluginFactoryTrait for SineFactory {
         index: Steinberg::int32,
         info: *mut Steinberg::PClassInfo,
     ) -> Steinberg::tresult {
-        if index != 0 {
-            return Steinberg::kInvalidArgument;
-        }
         // SAFETY: 宿主按规范提供可写 PClassInfo。
         unsafe {
-            *info = Steinberg::PClassInfo {
-                cid: COMPONENT_CID,
-                cardinality: Steinberg::PClassInfo_::ClassCardinality_::kManyInstances,
-                category: c_field::<32>("Audio Module Class"),
-                name: c_field::<64>(PLUGIN_NAME),
+            *info = match index {
+                0 => Steinberg::PClassInfo {
+                    cid: COMPONENT_CID,
+                    cardinality: Steinberg::PClassInfo_::ClassCardinality_::kManyInstances,
+                    category: c_field::<32>("Audio Module Class"),
+                    name: c_field::<64>(PLUGIN_NAME),
+                },
+                1 => Steinberg::PClassInfo {
+                    cid: EFFECT_COMPONENT_CID,
+                    cardinality: Steinberg::PClassInfo_::ClassCardinality_::kManyInstances,
+                    category: c_field::<32>("Audio Module Class"),
+                    name: c_field::<64>(EFFECT_NAME),
+                },
+                _ => return Steinberg::kInvalidArgument,
             };
         }
         Steinberg::kResultOk
@@ -152,15 +166,13 @@ impl Steinberg::IPluginFactoryTrait for SineFactory {
             let requested: [u8; 16] = std::slice::from_raw_parts(cid as *const u8, 16)
                 .try_into()
                 .unwrap_or([0; 16]);
-            let component = requested
-                .iter()
-                .zip(COMPONENT_CID.iter())
-                .all(|(a, b)| (*a as i8) == *b);
-            let controller = requested
-                .iter()
-                .zip(CONTROLLER_CID.iter())
-                .all(|(a, b)| (*a as i8) == *b);
-            if component {
+            let matches = |pattern: &TUID| {
+                requested
+                    .iter()
+                    .zip(pattern.iter())
+                    .all(|(a, b)| (*a as i8) == *b)
+            };
+            if matches(&COMPONENT_CID) {
                 static COMPONENT: OnceLock<ComWrapper<SineComponent>> = OnceLock::new();
                 let wrapper = COMPONENT.get_or_init(|| ComWrapper::new(SineComponent::new()));
                 if let Some(ptr) = wrapper.to_com_ptr::<Vst::IComponent>() {
@@ -169,10 +181,19 @@ impl Steinberg::IPluginFactoryTrait for SineFactory {
                 }
                 return Steinberg::kResultFalse;
             }
-            if controller {
+            if matches(&CONTROLLER_CID) {
                 static CONTROLLER: OnceLock<ComWrapper<SineController>> = OnceLock::new();
                 let wrapper = CONTROLLER.get_or_init(|| ComWrapper::new(SineController));
                 if let Some(ptr) = wrapper.to_com_ptr::<Vst::IEditController>() {
+                    *obj = ptr.into_raw() as *mut c_void;
+                    return Steinberg::kResultOk;
+                }
+                return Steinberg::kResultFalse;
+            }
+            if matches(&EFFECT_COMPONENT_CID) {
+                static EFFECT: OnceLock<ComWrapper<GainEffectComponent>> = OnceLock::new();
+                let wrapper = EFFECT.get_or_init(|| ComWrapper::new(GainEffectComponent));
+                if let Some(ptr) = wrapper.to_com_ptr::<Vst::IComponent>() {
                     *obj = ptr.into_raw() as *mut c_void;
                     return Steinberg::kResultOk;
                 }
@@ -189,18 +210,20 @@ impl Steinberg::IPluginFactory2Trait for SineFactory {
         index: Steinberg::int32,
         info: *mut Steinberg::PClassInfo2,
     ) -> Steinberg::tresult {
-        if index != 0 {
-            return Steinberg::kInvalidArgument;
-        }
+        let (cid, name, sub_categories) = match index {
+            0 => (COMPONENT_CID, PLUGIN_NAME, "Instrument|Synth|Stereo"),
+            1 => (EFFECT_COMPONENT_CID, EFFECT_NAME, "Fx|Stereo"),
+            _ => return Steinberg::kInvalidArgument,
+        };
         // SAFETY: 宿主按规范提供可写 PClassInfo2。
         unsafe {
             *info = Steinberg::PClassInfo2 {
-                cid: COMPONENT_CID,
+                cid,
                 cardinality: Steinberg::PClassInfo_::ClassCardinality_::kManyInstances,
                 category: c_field::<32>("Audio Module Class"),
-                name: c_field::<64>(PLUGIN_NAME),
+                name: c_field::<64>(name),
                 classFlags: 0,
-                subCategories: c_field::<128>("Instrument|Synth|Stereo"),
+                subCategories: c_field::<128>(sub_categories),
                 vendor: c_field::<64>(VENDOR),
                 version: c_field::<64>("1.0.0"),
                 sdkVersion: c_field::<64>("VST 3.8.0"),
@@ -480,6 +503,225 @@ impl IAudioProcessorTrait for SineComponent {
 }
 
 impl IConnectionPointTrait for SineComponent {
+    unsafe fn connect(&self, _other: *mut Vst::IConnectionPoint) -> Steinberg::tresult {
+        Steinberg::kResultOk
+    }
+
+    unsafe fn disconnect(&self, _other: *mut Vst::IConnectionPoint) -> Steinberg::tresult {
+        Steinberg::kResultOk
+    }
+
+    unsafe fn notify(&self, _message: *mut Steinberg::Vst::IMessage) -> Steinberg::tresult {
+        Steinberg::kResultOk
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 增益效果器组件（立体声直通 ×0.5，无事件输入）
+// ---------------------------------------------------------------------------
+
+/// 立体声直通增益效果器：输出 = 输入 × 0.5（固定增益，供宿主端到端
+/// 测试断言输入通路）。控制器复用 `SineController`。
+struct GainEffectComponent;
+
+impl Class for GainEffectComponent {
+    type Interfaces = (
+        Steinberg::IPluginBase,
+        Vst::IComponent,
+        Vst::IAudioProcessor,
+        Vst::IConnectionPoint,
+    );
+}
+
+impl IPluginBaseTrait for GainEffectComponent {
+    unsafe fn initialize(&self, _context: *mut Steinberg::FUnknown) -> Steinberg::tresult {
+        Steinberg::kResultOk
+    }
+
+    unsafe fn terminate(&self) -> Steinberg::tresult {
+        Steinberg::kResultOk
+    }
+}
+
+impl IComponentTrait for GainEffectComponent {
+    unsafe fn getControllerClassId(&self, classId: *mut TUID) -> Steinberg::tresult {
+        // SAFETY: 宿主提供可写 TUID。
+        unsafe {
+            *classId = CONTROLLER_CID;
+        }
+        Steinberg::kResultOk
+    }
+
+    unsafe fn setIoMode(&self, _mode: Vst::IoMode) -> Steinberg::tresult {
+        Steinberg::kResultOk
+    }
+
+    unsafe fn getBusCount(
+        &self,
+        r#type: Vst::MediaType,
+        dir: Vst::BusDirection,
+    ) -> Steinberg::int32 {
+        match (r#type, dir) {
+            (Vst::MediaTypes_::kAudio, Vst::BusDirections_::kInput) => 1,
+            (Vst::MediaTypes_::kAudio, Vst::BusDirections_::kOutput) => 1,
+            _ => 0,
+        }
+    }
+
+    unsafe fn getBusInfo(
+        &self,
+        r#type: Vst::MediaType,
+        dir: Vst::BusDirection,
+        index: Steinberg::int32,
+        bus: *mut Vst::BusInfo,
+    ) -> Steinberg::tresult {
+        if index != 0 || r#type != Vst::MediaTypes_::kAudio {
+            return Steinberg::kInvalidArgument;
+        }
+        // SAFETY: 宿主提供可写 BusInfo。
+        unsafe {
+            *bus = Vst::BusInfo {
+                mediaType: r#type,
+                direction: dir,
+                channelCount: 2,
+                name: match dir {
+                    Vst::BusDirections_::kInput => utf16_field::<128>("Stereo In"),
+                    _ => utf16_field::<128>("Stereo Out"),
+                },
+                busType: Vst::BusTypes_::kMain,
+                flags: Vst::BusInfo_::BusFlags_::kDefaultActive as u32,
+            };
+        }
+        Steinberg::kResultOk
+    }
+
+    unsafe fn getRoutingInfo(
+        &self,
+        _inInfo: *mut Vst::RoutingInfo,
+        _outInfo: *mut Vst::RoutingInfo,
+    ) -> Steinberg::tresult {
+        Steinberg::kNotImplemented
+    }
+
+    unsafe fn activateBus(
+        &self,
+        _type: Vst::MediaType,
+        _dir: Vst::BusDirection,
+        _index: Steinberg::int32,
+        _state: Steinberg::TBool,
+    ) -> Steinberg::tresult {
+        Steinberg::kResultOk
+    }
+
+    unsafe fn setActive(&self, _state: Steinberg::TBool) -> Steinberg::tresult {
+        Steinberg::kResultOk
+    }
+
+    unsafe fn setState(&self, _state: *mut Steinberg::IBStream) -> Steinberg::tresult {
+        Steinberg::kNotImplemented
+    }
+
+    unsafe fn getState(&self, _state: *mut Steinberg::IBStream) -> Steinberg::tresult {
+        Steinberg::kNotImplemented
+    }
+}
+
+impl IAudioProcessorTrait for GainEffectComponent {
+    unsafe fn setBusArrangements(
+        &self,
+        inputs: *mut Vst::SpeakerArrangement,
+        numIns: Steinberg::int32,
+        outputs: *mut Vst::SpeakerArrangement,
+        numOuts: Steinberg::int32,
+    ) -> Steinberg::tresult {
+        // 只接受 1 入 / 1 出（立体声）。
+        const K_STEREO: Vst::SpeakerArrangement = 3; // L|R
+        if numIns == 1
+            && numOuts == 1
+            // SAFETY: 宿主按规范提供对应数量的可读元素。
+            && unsafe { *inputs } == K_STEREO
+            && unsafe { *outputs } == K_STEREO
+        {
+            return Steinberg::kResultTrue;
+        }
+        Steinberg::kResultFalse
+    }
+
+    unsafe fn getBusArrangement(
+        &self,
+        _dir: Vst::BusDirection,
+        _index: Steinberg::int32,
+        _arr: *mut Vst::SpeakerArrangement,
+    ) -> Steinberg::tresult {
+        Steinberg::kNotImplemented
+    }
+
+    unsafe fn canProcessSampleSize(
+        &self,
+        symbolicSampleSize: Steinberg::int32,
+    ) -> Steinberg::tresult {
+        if symbolicSampleSize == Vst::SymbolicSampleSizes_::kSample32 {
+            Steinberg::kResultTrue
+        } else {
+            Steinberg::kNotImplemented
+        }
+    }
+
+    unsafe fn getLatencySamples(&self) -> Steinberg::uint32 {
+        0
+    }
+
+    unsafe fn getTailSamples(&self) -> Steinberg::uint32 {
+        0
+    }
+
+    unsafe fn setupProcessing(&self, _setup: *mut Vst::ProcessSetup) -> Steinberg::tresult {
+        Steinberg::kResultOk
+    }
+
+    unsafe fn setProcessing(&self, _state: Steinberg::TBool) -> Steinberg::tresult {
+        Steinberg::kResultOk
+    }
+
+    unsafe fn process(&self, data: *mut Vst::ProcessData) -> Steinberg::tresult {
+        // SAFETY: 宿主按规范填充 ProcessData；输入可读、输出可写。
+        unsafe {
+            let data = &mut *data;
+            if data.numOutputs < 1
+                || data.outputs.is_null()
+                || data.numInputs < 1
+                || data.inputs.is_null()
+                || data.symbolicSampleSize != Vst::SymbolicSampleSizes_::kSample32
+            {
+                return Steinberg::kNotImplemented;
+            }
+            let frames = data.numSamples.max(0) as usize;
+            let input = &*data.inputs;
+            let output = &mut *data.outputs;
+            output.silenceFlags = 0;
+            let in_channels = (input.numChannels.max(0) as usize).min(2);
+            let out_channels = (output.numChannels.max(0) as usize).min(2);
+            for channel in 0..out_channels {
+                let out_base = *output.__field0.channelBuffers32.add(channel);
+                // 输出声道映射到输入声道（不足时复用最后一个输入声道）。
+                let in_channel = if in_channels == 0 {
+                    0
+                } else if channel < in_channels {
+                    channel
+                } else {
+                    in_channels - 1
+                };
+                let in_base = *input.__field0.channelBuffers32.add(in_channel);
+                for sample in 0..frames {
+                    *out_base.add(sample) = *in_base.add(sample) * 0.5;
+                }
+            }
+        }
+        Steinberg::kResultOk
+    }
+}
+
+impl IConnectionPointTrait for GainEffectComponent {
     unsafe fn connect(&self, _other: *mut Vst::IConnectionPoint) -> Steinberg::tresult {
         Steinberg::kResultOk
     }

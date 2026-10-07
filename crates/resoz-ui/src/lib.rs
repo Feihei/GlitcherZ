@@ -237,6 +237,8 @@ pub struct ResoZApp {
     clap_effects: Option<Vec<resoz_clap_host::ClapPluginInfo>>,
     /// 已扫描的 VST3 乐器列表（懒扫描缓存）。
     vst3_plugins: Option<Vec<resoz_vst3_host::Vst3PluginInfo>>,
+    /// 已扫描的 VST3 效果器列表（懒扫描缓存）。
+    vst3_effects: Option<Vec<resoz_vst3_host::Vst3PluginInfo>>,
     /// 各轨道 VST3 声源的参数列表（实例化时读出，键 = 轨道号）。
     /// 仅诊断/展示用；实际参数控制仍走 `PluginParam` 桥接。
     voice_params: HashMap<usize, Vec<resoz_vst3_host::Vst3ParamInfo>>,
@@ -283,6 +285,7 @@ impl ResoZApp {
             clap_plugins: None,
             clap_effects: None,
             vst3_plugins: None,
+            vst3_effects: None,
             voice_params: HashMap::new(),
             first_frame_logged: false,
             close_sent: false,
@@ -590,6 +593,19 @@ impl ResoZApp {
         self.vst3_plugins.as_deref().unwrap_or(&[])
     }
 
+    /// 已扫描的 VST3 效果器（懒加载）。
+    fn scanned_vst3_effects(&mut self) -> &[resoz_vst3_host::Vst3PluginInfo] {
+        if self.vst3_effects.is_none() {
+            self.vst3_effects = Some(
+                resoz_vst3_host::list_vst3_plugins()
+                    .into_iter()
+                    .filter(|info| !info.is_instrument)
+                    .collect(),
+            );
+        }
+        self.vst3_effects.as_deref().unwrap_or(&[])
+    }
+
     /// 给轨道装填 VST3 乐器声源：非实时实例化 → 引擎换装 → 守卫注册。
     /// 失败时记日志并提示（文档声源保持 Vst3，重新打开项目会重试）。
     fn load_vst3_voice(&mut self, track: usize, path: &str, class_id: &str) {
@@ -654,6 +670,38 @@ impl ResoZApp {
             Err(err) => {
                 log::error!("实例化 CLAP 效果器 {plugin_id} 失败：{err}");
                 self.set_message(format!("插件加载失败：{err}"));
+            }
+        }
+    }
+
+    /// 给轨道插入 VST3 效果器节点（非实时实例化 → 引擎换装 → 守卫注册）。
+    fn load_vst3_effect(&mut self, track: usize, path: &str, class_id: &str) {
+        match resoz_vst3_host::Vst3Instance::spawn_rt(
+            std::path::Path::new(path),
+            class_id,
+            resoz_vst3_host::Vst3InstanceConfig {
+                sample_rate: self.engine.info().sample_rate,
+                max_frames: 128,
+            },
+        ) {
+            Ok(instance) => {
+                let resoz_vst3_host::Vst3Instance { guard, node } = instance;
+                match self.engine.insert_external_effect(track, Box::new(node)) {
+                    Some(node_id) => {
+                        self.voice_guards.push(PluginGuardEntry {
+                            node_id,
+                            track,
+                            plugin_id: class_id.to_string(),
+                            _guard: PluginGuard::Vst3(guard),
+                        });
+                        log::info!("轨道 {} 已插入 VST3 效果器：{class_id}", track + 1);
+                    }
+                    None => log::error!("结构队列满：轨道 {} 插入效果器失败", track + 1),
+                }
+            }
+            Err(err) => {
+                log::error!("实例化 VST3 效果器 {class_id} 失败：{err}");
+                self.set_message(format!("VST3 插件加载失败：{err}"));
             }
         }
     }
@@ -942,6 +990,25 @@ impl ResoZApp {
                 }
                 if let Some((path, plugin_id)) = effect_picked {
                     self.load_clap_effect(sel, &path, &plugin_id);
+                }
+                let mut vst3_effect_picked: Option<(String, String)> = None;
+                ui.menu_button("VST3 效果器…", |ui| {
+                    let empty: Vec<resoz_vst3_host::Vst3PluginInfo> = Vec::new();
+                    let plugins = self.scanned_vst3_effects();
+                    let list = if plugins.is_empty() { &empty } else { plugins };
+                    if list.is_empty() {
+                        ui.weak("（未发现 VST3 效果器插件）");
+                    }
+                    for info in list {
+                        if ui.button(&info.name).clicked() {
+                            vst3_effect_picked =
+                                Some((info.path.display().to_string(), info.cid.clone()));
+                            ui.close();
+                        }
+                    }
+                });
+                if let Some((path, class_id)) = vst3_effect_picked {
+                    self.load_vst3_effect(sel, &path, &class_id);
                 }
             });
 
