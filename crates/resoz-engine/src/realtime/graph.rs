@@ -1,4 +1,5 @@
-//! 节点图（P1+P2）：可布线处理图核心、默认轨道拓扑与结构更新协议。
+//! 节点图（P1–P3）：可布线处理图核心、默认轨道拓扑、时间轴连线表
+//! 与结构更新协议。
 //!
 //! 取代旧 `Mixer` 固定拓扑（spec 见 `docs/spec/node-graph.md`）：
 //!
@@ -10,14 +11,18 @@
 //!   线程经 [`GraphUpdate`] 队列整体换入计划并做指针级增删，被移除的
 //!   节点（连同输出缓冲）经回收回执队列送回控制线程释放 —— 实时线程
 //!   **永不 drop 堆对象**。
-//! - **P1+P2 过渡定向**：`ExecPlan` 内置每轨 voice/delay/channel 槽位
-//!   路由表（P3 由时间轴节点的 MIDI/自动化连线表替代）。
+//! - **时间轴连线表（P3，D7）**：时间轴节点固定存在但不占音频节点——
+//!   MIDI 轨道经 [`ExecPlan::midi_targets`] 扇出到若干乐器节点（可多路
+//!   扇出）；自动化轨道经 [`ExecPlan::auto_routes`] 以 `(节点, 参数)`
+//!   为终点投递，曲线本身不含目标。
 //! - 默认拓扑复刻旧 Mixer：`声源 → 延迟 → 通道条 → 主输出`，通道条的
-//!   增益/声像/静音升级为真节点 [`ChannelStripProcessor`]。
+//!   增益/声像/静音升级为真节点 [`ChannelStripProcessor`]；每条 MIDI 轨
+//!   默认连到本轨声源。
 
 use rtrb::Producer;
 
 use crate::realtime::NUM_TRACKS;
+use crate::realtime::automation::MAX_AUTO_TRACKS;
 use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::{NoteEvent, ParamId};
 use crate::realtime::context::ProcessContext;
@@ -31,7 +36,7 @@ use crate::realtime::voice::RecycledNode;
 pub const MAX_NODES: usize = 64;
 /// 图容量上限（D1）：单节点最大入边数（超限拒绝连线）。
 pub const MAX_IN_EDGES: usize = 8;
-/// 无边哨兵值（`out_edge` / 轨道路由表的空槽标记）。
+/// 无边哨兵值（`out_edge` / 连线表的空槽标记）。
 pub const NO_EDGE: u16 = u16::MAX;
 /// 每轨外部效果器槽数（沿旧 `TrackStrip` 语义）。
 pub const EFFECT_SLOTS: usize = 4;
@@ -39,6 +44,28 @@ pub const EFFECT_SLOTS: usize = 4;
 pub const MAX_DEPLOYMENTS: usize = 4;
 /// 单次结构更新最多移除的节点数（≥ `EFFECT_SLOTS`）。
 pub const MAX_REMOVALS: usize = 8;
+/// 单条 MIDI 轨最多同时扇出的乐器节点数（D7）。
+pub const MAX_MIDI_FANOUT: usize = 4;
+
+/// 一条自动化连线的终点（D7）：目标节点槽位 + 目标参数。
+///
+/// 曲线不含目标；`slot == NO_EDGE` 表示该自动化轨道未连线（静默）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoRoute {
+    /// 目标节点槽位。
+    pub slot: u16,
+    /// 目标参数。
+    pub param: ParamId,
+}
+
+impl Default for AutoRoute {
+    fn default() -> Self {
+        Self {
+            slot: NO_EDGE,
+            param: ParamId::MasterGain,
+        }
+    }
+}
 
 /// 预编译执行计划：全 `Copy`，音频线程每块只按此遍历（D5）。
 ///
@@ -56,16 +83,23 @@ pub struct ExecPlan {
     pub in_counts: [u8; MAX_NODES],
     /// 主输出槽位（cpal 交错写出的数据源）。
     pub master_slot: u16,
-    /// 每轨声源槽位（P1+P2 过渡路由表，P3 由连线表替代）。
+    /// 每轨声源槽位（手动参数/电平的轨道寻址；音符投递见 `midi_targets`）。
     pub track_voice: [u16; NUM_TRACKS],
     /// 每轨延迟效果槽位。
     pub track_delay: [u16; NUM_TRACKS],
     /// 每轨通道条槽位（电平回传的计量点）。
     pub track_channel: [u16; NUM_TRACKS],
+    /// 时间轴 MIDI 轨连线表：每条 MIDI 轨扇出的目标槽位（仅前
+    /// `midi_target_counts[track]` 个有效）。
+    pub midi_targets: [[u16; MAX_MIDI_FANOUT]; NUM_TRACKS],
+    /// 各 MIDI 轨的有效扇出数。
+    pub midi_target_counts: [u8; NUM_TRACKS],
+    /// 时间轴自动化连线表：按自动化轨道索引的投递终点（D7）。
+    pub auto_routes: [AutoRoute; MAX_AUTO_TRACKS],
 }
 
 impl ExecPlan {
-    /// 空计划（无节点，输出静音）。
+    /// 空计划（无节点，输出静音，时间轴未连线）。
     pub const EMPTY: Self = Self {
         order: [0; MAX_NODES],
         order_len: 0,
@@ -75,6 +109,12 @@ impl ExecPlan {
         track_voice: [NO_EDGE; NUM_TRACKS],
         track_delay: [NO_EDGE; NUM_TRACKS],
         track_channel: [NO_EDGE; NUM_TRACKS],
+        midi_targets: [[NO_EDGE; MAX_MIDI_FANOUT]; NUM_TRACKS],
+        midi_target_counts: [0; NUM_TRACKS],
+        auto_routes: [AutoRoute {
+            slot: NO_EDGE,
+            param: ParamId::MasterGain,
+        }; MAX_AUTO_TRACKS],
     };
 }
 
@@ -251,18 +291,30 @@ impl RtGraph {
         peak
     }
 
-    /// 向某轨声源发音符事件（越界/空槽忽略）。RT-safe。
+    /// 向某条 MIDI 轨投递音符事件：按连线表扇出到全部目标乐器节点
+    /// （时间轴音序与键盘演奏共用此路径；未连线 = 静默）。RT-safe。
     pub fn track_note(&mut self, track: usize, event: NoteEvent) -> bool {
         if track >= NUM_TRACKS {
             return false;
         }
-        self.slot_note(self.plan.track_voice[track], event)
+        let count = self.plan.midi_target_counts[track] as usize;
+        // 连线表行是 `Copy`：先拷出避免借用与投递互斥。
+        let targets = self.plan.midi_targets[track];
+        let mut delivered = false;
+        for &slot in &targets[..count] {
+            delivered |= self.slot_note(slot, event);
+        }
+        delivered
     }
 
-    /// 释放所有声源当前音符（走带 play/stop 前调用）。RT-safe。
+    /// 释放所有连线目标当前音符（走带 play/stop 前调用）。RT-safe。
     pub fn note_off_all(&mut self) {
         for track in 0..NUM_TRACKS {
-            let _ = self.slot_note(self.plan.track_voice[track], NoteEvent::Off { note: 0 });
+            let count = self.plan.midi_target_counts[track] as usize;
+            let targets = self.plan.midi_targets[track];
+            for &slot in &targets[..count] {
+                let _ = self.slot_note(slot, NoteEvent::Off { note: 0 });
+            }
         }
     }
 
@@ -273,25 +325,33 @@ impl RtGraph {
             .is_some_and(|n| n.processor.note_event(event))
     }
 
+    /// 自动化轨道投递：查连线表把曲线值写给 `(目标节点, 目标参数)`
+    /// （终点在编译期已定，见 [`AutoRoute`]）。未连线/越界静默。RT-safe。
+    pub fn auto_set_param(&mut self, auto_index: usize, value: f32) {
+        let Some(&route) = self.plan.auto_routes.get(auto_index) else {
+            return;
+        };
+        if route.slot == NO_EDGE {
+            return;
+        }
+        let _ = self.slot_set_param(route.slot, route.param, value);
+    }
+
     /// 轨道参数路由（越界忽略）：混音三项 → 通道条；延迟三项 → 延迟；
     /// 音色/包络/滤波/插件参数 → 声源。与旧 `TrackStrip::set_param`
-    /// 语义一致。RT-safe。
+    /// 语义一致（手动参数保留轨道寻址，时间轴投递走连线表）。RT-safe。
     pub fn track_set_param(&mut self, track: usize, id: ParamId, value: f32) {
         if track >= NUM_TRACKS {
             return;
         }
-        let slot = match id {
-            ParamId::TrackGain | ParamId::TrackPan | ParamId::TrackMute => {
-                self.plan.track_channel[track]
-            }
-            ParamId::DelayTime | ParamId::DelayFeedback | ParamId::DelayMix => {
-                self.plan.track_delay[track]
-            }
-            ParamId::MasterGain => return,
-            _ => self.plan.track_voice[track],
-        };
-        if let Some(node) = self.slots.get_mut(slot as usize).and_then(|s| s.as_mut()) {
-            let _ = node.processor.set_param(id, value);
+        let slot = route_slot(
+            self.plan.track_voice[track],
+            self.plan.track_delay[track],
+            self.plan.track_channel[track],
+            id,
+        );
+        if slot != NO_EDGE {
+            let _ = self.slot_set_param(slot, id, value);
         }
     }
 
@@ -324,6 +384,18 @@ fn sum_into(dst: &mut AudioBuffer, src: &AudioBuffer) {
                 *d += s;
             }
         }
+    }
+}
+
+/// 按参数种类解析轨道内的目标槽位：混音三项 → 通道条；延迟三项 →
+/// 延迟；主增益无轨道归宿；其余（音色/包络/滤波/插件）→ 声源。
+/// 图运行侧与编译器共用的路由语义。
+fn route_slot(voice: u16, delay: u16, channel: u16, param: ParamId) -> u16 {
+    match param {
+        ParamId::TrackGain | ParamId::TrackPan | ParamId::TrackMute => channel,
+        ParamId::DelayTime | ParamId::DelayFeedback | ParamId::DelayMix => delay,
+        ParamId::MasterGain => NO_EDGE,
+        _ => voice,
     }
 }
 
@@ -414,17 +486,23 @@ impl Processor for ChannelStripProcessor {
 pub enum TopologyError {
     /// 目标轨道越界。
     InvalidTrack,
+    /// 目标节点槽位无效（越界或空槽）。
+    InvalidSlot,
+    /// 目标索引越界（自动化轨道索引）。
+    InvalidIndex,
     /// 无空闲槽位（容量 64 满）。
     NoFreeSlot,
     /// 拓扑含环（D10：拒绝）。
     Cycle,
     /// 某节点入边超限（> 8）。
     FanInOverflow,
+    /// MIDI 轨扇出超限（> [`MAX_MIDI_FANOUT`]）。
+    MidiFanOutOverflow,
 }
 
-/// 控制侧图状态（**非实时**）：槽位占用 + 出边表 + 轨道路由，负责
-/// 编译 [`ExecPlan`] 与生成 [`GraphUpdate`]。全 `Copy` —— 引擎在队列
-/// push 失败时可整快照回滚。
+/// 控制侧图状态（**非实时**）：槽位占用 + 出边表 + 轨道路由 + 时间轴
+/// 连线表，负责编译 [`ExecPlan`] 与生成 [`GraphUpdate`]。全 `Copy` ——
+/// 引擎在队列 push 失败时可整快照回滚。
 #[derive(Debug, Clone, Copy)]
 pub struct GraphCompiler {
     sample_rate: f32,
@@ -436,6 +514,11 @@ pub struct GraphCompiler {
     track_delay: [u16; NUM_TRACKS],
     track_channel: [u16; NUM_TRACKS],
     track_effects: [[u16; EFFECT_SLOTS]; NUM_TRACKS],
+    /// 时间轴 MIDI 轨连线表（扇出目标槽位）。
+    midi_targets: [[u16; MAX_MIDI_FANOUT]; NUM_TRACKS],
+    midi_target_counts: [u8; NUM_TRACKS],
+    /// 时间轴自动化连线表（终点 = (槽位, 参数)）。
+    auto_routes: [AutoRoute; MAX_AUTO_TRACKS],
     next_node_id: u64,
 }
 
@@ -453,6 +536,9 @@ impl GraphCompiler {
             track_delay: [NO_EDGE; NUM_TRACKS],
             track_channel: [NO_EDGE; NUM_TRACKS],
             track_effects: [[NO_EDGE; EFFECT_SLOTS]; NUM_TRACKS],
+            midi_targets: [[NO_EDGE; MAX_MIDI_FANOUT]; NUM_TRACKS],
+            midi_target_counts: [0; NUM_TRACKS],
+            auto_routes: [AutoRoute::default(); MAX_AUTO_TRACKS],
             next_node_id: 1,
         };
         let mut graph = RtGraph::new(block_size);
@@ -478,6 +564,9 @@ impl GraphCompiler {
             compiler.out_edge[voice as usize] = delay;
             compiler.out_edge[delay as usize] = channel;
             compiler.out_edge[channel as usize] = master;
+            // 时间轴默认布线：MIDI 轨 t → 本轨声源（复刻旧 Mixer 语义）。
+            compiler.midi_targets[t][0] = voice;
+            compiler.midi_target_counts[t] = 1;
 
             let voice_id = compiler.fresh_id();
             graph.install(
@@ -614,6 +703,9 @@ impl GraphCompiler {
         plan.track_voice = self.track_voice;
         plan.track_delay = self.track_delay;
         plan.track_channel = self.track_channel;
+        plan.midi_targets = self.midi_targets;
+        plan.midi_target_counts = self.midi_target_counts;
+        plan.auto_routes = self.auto_routes;
         Ok(plan)
     }
 
@@ -729,12 +821,97 @@ impl GraphCompiler {
         let plan = self.compile()?;
         Ok(self.build_update(plan, None, &removed[..removed_count]))
     }
+
+    /// 时间轴布线：把 MIDI 轨 `track` 连到目标节点槽位（扇出追加）。
+    /// 重复连线幂等返回；目标槽位必须已被占用。连线表不参与音频拓扑
+    /// 排序，故只会因扇出超限失败。
+    pub fn connect_midi(&mut self, track: usize, slot: u16) -> Result<GraphUpdate, TopologyError> {
+        if track >= NUM_TRACKS {
+            return Err(TopologyError::InvalidTrack);
+        }
+        if slot as usize >= MAX_NODES || !self.occupied[slot as usize] {
+            return Err(TopologyError::InvalidSlot);
+        }
+        if self.midi_targets[track][..self.midi_target_counts[track] as usize].contains(&slot) {
+            // 幂等：重复连线视为成功（返回当前计划）。
+            return Ok(self.build_update(self.compile()?, None, &[]));
+        }
+        let count = self.midi_target_counts[track] as usize;
+        if count >= MAX_MIDI_FANOUT {
+            return Err(TopologyError::MidiFanOutOverflow);
+        }
+        self.midi_targets[track][count] = slot;
+        self.midi_target_counts[track] += 1;
+        Ok(self.build_update(self.compile()?, None, &[]))
+    }
+
+    /// 时间轴布线：断开 MIDI 轨 `track` 到 `slot` 的连线（未连线幂等）。
+    pub fn disconnect_midi(
+        &mut self,
+        track: usize,
+        slot: u16,
+    ) -> Result<GraphUpdate, TopologyError> {
+        if track >= NUM_TRACKS {
+            return Err(TopologyError::InvalidTrack);
+        }
+        let count = self.midi_target_counts[track] as usize;
+        let Some(pos) = self.midi_targets[track][..count]
+            .iter()
+            .position(|&s| s == slot)
+        else {
+            return Ok(self.build_update(self.compile()?, None, &[]));
+        };
+        self.midi_targets[track].copy_within(pos + 1..count, pos);
+        self.midi_targets[track][count - 1] = NO_EDGE;
+        self.midi_target_counts[track] -= 1;
+        Ok(self.build_update(self.compile()?, None, &[]))
+    }
+
+    /// 时间轴布线：设定自动化轨道 `auto_index` 的投递终点。
+    ///
+    /// 终点以**轨道坐标** `(track, param)` 表达（P5 画布落地前 UI 的
+    /// 寻址方式），内部按参数种类解析为节点槽位（与
+    /// [`RtGraph::track_set_param`] 的路由语义一致）。重复设定即重定向。
+    pub fn set_auto_route(
+        &mut self,
+        auto_index: usize,
+        track: usize,
+        param: ParamId,
+    ) -> Result<GraphUpdate, TopologyError> {
+        if auto_index >= MAX_AUTO_TRACKS {
+            return Err(TopologyError::InvalidIndex);
+        }
+        if track >= NUM_TRACKS {
+            return Err(TopologyError::InvalidTrack);
+        }
+        let slot = route_slot(
+            self.track_voice[track],
+            self.track_delay[track],
+            self.track_channel[track],
+            param,
+        );
+        if slot == NO_EDGE {
+            return Err(TopologyError::InvalidSlot);
+        }
+        self.auto_routes[auto_index] = AutoRoute { slot, param };
+        Ok(self.build_update(self.compile()?, None, &[]))
+    }
+
+    /// 时间轴布线：断开自动化轨道 `auto_index` 的连线（未连线幂等）。
+    pub fn clear_auto_route(&mut self, auto_index: usize) -> Result<GraphUpdate, TopologyError> {
+        if auto_index >= MAX_AUTO_TRACKS {
+            return Err(TopologyError::InvalidIndex);
+        }
+        self.auto_routes[auto_index] = AutoRoute::default();
+        Ok(self.build_update(self.compile()?, None, &[]))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelStripProcessor, GraphCompiler, GraphUpdate, NUM_TRACKS, RtGraph, TopologyError,
+        ChannelStripProcessor, GraphCompiler, GraphUpdate, MAX_MIDI_FANOUT, NUM_TRACKS, RtGraph,
+        TopologyError,
     };
     use crate::realtime::buffer::AudioBuffer;
     use crate::realtime::commands::{NoteEvent, ParamId};
@@ -1157,5 +1334,106 @@ mod tests {
         // 图仍能正常处理。
         let levels = graph.process_block(&ctx());
         assert!(levels.master.is_finite());
+    }
+
+    // ---- 时间轴连线表（P3，D7） ----
+
+    #[test]
+    fn midi_fanout_delivers_to_all_connected_targets() {
+        let (mut compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let (mut recycle_tx, mut recycle_rx) = recycle_channel();
+        // 把 MIDI 轨 0 扇出到轨道 1 的声源：一个音符两轨齐鸣。
+        let update = compiler
+            .connect_midi(0, compiler.track_voice[1])
+            .expect("扇出连线应成功");
+        graph.apply_update(update, &mut recycle_tx);
+        assert!(drain_recycle(&mut recycle_rx).is_empty());
+        assert_eq!(graph.plan.midi_target_counts[0], 2);
+
+        graph.track_note(0, note_on(69));
+        let levels = graph.process_block(&ctx());
+        assert!(levels.tracks[0] > 0.05, "本轨声源应发声");
+        assert!(levels.tracks[1] > 0.05, "扇出目标声源也应发声");
+
+        // 断开后连线表回到单目标。
+        let update = compiler
+            .disconnect_midi(0, compiler.track_voice[1])
+            .expect("断开应成功");
+        graph.apply_update(update, &mut recycle_tx);
+        assert_eq!(graph.plan.midi_target_counts[0], 1);
+        assert_eq!(graph.plan.midi_targets[0][0], compiler.track_voice[0]);
+    }
+
+    #[test]
+    fn midi_fanout_is_capped_and_validated() {
+        let (mut compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        // 默认每轨 1 条；再加 3 条到达上限 4。
+        for t in 1..4usize {
+            let update = compiler
+                .connect_midi(0, compiler.track_voice[t])
+                .expect("上限内应成功");
+            graph.apply_update(update, &mut recycle_tx);
+        }
+        assert_eq!(graph.plan.midi_target_counts[0], MAX_MIDI_FANOUT as u8);
+        // 第 5 条被拒绝。
+        assert!(matches!(
+            compiler.connect_midi(0, compiler.master_slot),
+            Err(TopologyError::MidiFanOutOverflow)
+        ));
+        // 未占用的槽位拒绝。
+        assert!(matches!(
+            compiler.connect_midi(0, 13),
+            Err(TopologyError::InvalidSlot)
+        ));
+        // 越界轨道拒绝。
+        assert!(matches!(
+            compiler.connect_midi(NUM_TRACKS, compiler.track_voice[0]),
+            Err(TopologyError::InvalidTrack)
+        ));
+        // 重复连线幂等。
+        let update = compiler
+            .connect_midi(0, compiler.track_voice[1])
+            .expect("重复连线幂等");
+        graph.apply_update(update, &mut recycle_tx);
+        assert_eq!(graph.plan.midi_target_counts[0], MAX_MIDI_FANOUT as u8);
+    }
+
+    #[test]
+    fn auto_route_delivers_curve_values_to_target_param() {
+        let (mut compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let (mut recycle_tx, mut recycle_rx) = recycle_channel();
+        // 直流源 0.25 换装轨道 0 声源；自动化轨道 0 连到本轨通道条增益。
+        let (update, _) = expect_swap(
+            compiler.set_voice(0, Box::new(DcSource { value: 0.25 })),
+            "换装",
+        );
+        graph.apply_update(update, &mut recycle_tx);
+        assert_eq!(drain_recycle(&mut recycle_rx).len(), 1, "旧声源应被回收");
+        let update = compiler
+            .set_auto_route(0, 0, ParamId::TrackGain)
+            .expect("自动化连线应成功");
+        graph.apply_update(update, &mut recycle_tx);
+
+        // 曲线值 0.5 → 通道条增益 0.5 → 主输出 = 0.25 × 0.5。
+        graph.auto_set_param(0, 0.5);
+        let levels = graph.process_block(&ctx());
+        assert!(
+            (levels.master - 0.125).abs() < 1e-6,
+            "自动化应驱动通道条增益，实际 {}",
+            levels.master
+        );
+
+        // 未连线的自动化轨道静默。
+        graph.auto_set_param(1, 1.5);
+        let levels = graph.process_block(&ctx());
+        assert!((levels.master - 0.125).abs() < 1e-6);
+
+        // 断开后投递失效，增益保持最后值。
+        let update = compiler.clear_auto_route(0).expect("断开应成功");
+        graph.apply_update(update, &mut recycle_tx);
+        graph.auto_set_param(0, 1.5);
+        let levels = graph.process_block(&ctx());
+        assert!((levels.master - 0.125).abs() < 1e-6, "断开后不应再改参数");
     }
 }

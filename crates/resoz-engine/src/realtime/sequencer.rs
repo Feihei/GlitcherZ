@@ -6,7 +6,7 @@
 //! 循环回绕由窗口映射推导，无需行进式时钟簿记。
 
 use crate::realtime::NUM_TRACKS;
-use crate::realtime::automation::{MAX_AUTOMATIONS, RtAutomation};
+use crate::realtime::automation::{MAX_AUTO_TRACKS, RtAutoTrack};
 use crate::realtime::commands::NoteEvent;
 use crate::realtime::context::ProcessContext;
 
@@ -92,7 +92,11 @@ impl RtClip {
 
 /// 多轨音序器：一个全局走带时钟（BPM / gate / 音乐位置），
 /// 每条轨道独立的音源（步进模式或卷帘片段）与 gate 尾音，
-/// 按采样时钟在块边界把到期事件转成 `(轨道, NoteEvent)`。
+/// 按采样时钟在块边界把到期事件转成 `(MIDI 轨, NoteEvent)`。
+///
+/// 自动化轨道是与 MIDI 轨道并列的独立实体（D7）：[`Sequencer`] 只
+/// 持有它们的曲线与自带循环长度；投递目标由节点图的自动化连线表
+/// 决定，本结构不感知。
 ///
 /// 时钟以 tick 计（音乐位置），与采样时钟的换算由 BPM 推导；
 /// gate off 以绝对采样位置记录，落在包含它的块边界发出。
@@ -112,7 +116,8 @@ pub struct Sequencer {
     sources: [TrackSource; NUM_TRACKS],
     patterns: [[SequencerStep; PATTERN_STEPS]; NUM_TRACKS],
     clips: [RtClip; NUM_TRACKS],
-    automations: [[RtAutomation; MAX_AUTOMATIONS]; NUM_TRACKS],
+    /// 自动化轨道实体（独立于 MIDI 轨道，见 D7）。
+    autos: [RtAutoTrack; MAX_AUTO_TRACKS],
     /// 各轨待发送的 NoteOff（gate/时长结束的绝对采样位置 + 音符）。
     pending_offs: [Option<(u64, u8)>; NUM_TRACKS],
 }
@@ -133,7 +138,7 @@ impl Sequencer {
             sources: [TrackSource::default(); NUM_TRACKS],
             patterns: [[SequencerStep::default(); PATTERN_STEPS]; NUM_TRACKS],
             clips: [RtClip::default(); NUM_TRACKS],
-            automations: [[RtAutomation::default(); MAX_AUTOMATIONS]; NUM_TRACKS],
+            autos: [RtAutoTrack::default(); MAX_AUTO_TRACKS],
             pending_offs: [None; NUM_TRACKS],
         }
     }
@@ -215,36 +220,17 @@ impl Sequencer {
         }
     }
 
-    /// 按参数 upsert 一条自动化曲线：存在同参数曲线则整体替换，
-    /// 否则占用第一个空槽（`point_count == 0`）；全满时丢弃。
-    /// 传空曲线即"删除该参数的自动化"。越界轨道忽略。RT-safe。
-    pub fn set_automation(&mut self, track: usize, automation: RtAutomation) {
-        let Some(slots) = self.automations.get_mut(track) else {
-            return;
-        };
-        if let Some(slot) = slots.iter_mut().find(|slot| slot.param == automation.param) {
-            *slot = automation;
-            return;
-        }
-        if let Some(slot) = slots.iter_mut().find(|slot| !slot.is_active()) {
-            *slot = automation;
+    /// 整块替换一条自动化轨道（越界索引忽略；空曲线 = 清空该轨道）。
+    /// 曲线不含目标 —— 投递终点由节点图的自动化连线表决定。RT-safe。
+    pub fn set_auto_track(&mut self, index: usize, auto: RtAutoTrack) {
+        if let Some(slot) = self.autos.get_mut(index) {
+            *slot = auto;
         }
     }
 
-    /// 只读访问某条轨道的全部自动化曲线（供求值器采样）。RT-safe。
-    pub fn track_automations(&self, track: usize) -> &[RtAutomation] {
-        self.automations
-            .get(track)
-            .map_or(&[], |slots| slots.as_slice())
-    }
-
-    /// 该轨当前的循环长度（tick）：卷帘音源用片段循环长，步进音源
-    /// 固定一小节。自动化求值按此取模，使曲线与音源同步循环。RT-safe。
-    pub fn track_loop_ticks(&self, track: usize) -> u32 {
-        match self.sources.get(track) {
-            Some(TrackSource::Clip) => self.clips[track].loop_ticks,
-            _ => TICKS_PER_STEP * PATTERN_STEPS as u32,
-        }
+    /// 全部自动化轨道实体的只读访问（供求值器按连线表采样）。RT-safe。
+    pub fn auto_tracks(&self) -> &[RtAutoTrack; MAX_AUTO_TRACKS] {
+        &self.autos
     }
 
     /// 推进一个块：把窗口 `[t0, t1)`（tick）内到期的 gate off 与
@@ -417,6 +403,7 @@ mod tests {
         TrackSource,
     };
     use crate::realtime::NUM_TRACKS;
+    use crate::realtime::automation::{MAX_AUTO_TRACKS, RtAutoPoint, RtAutoTrack};
     use crate::realtime::commands::NoteEvent;
     use crate::realtime::context::ProcessContext;
 
@@ -697,5 +684,36 @@ mod tests {
         assert_eq!(seq.step_index(), 0);
         run(&mut seq, 5); // 6400 样本 = 25.6 tick：进入第 1 步
         assert_eq!(seq.step_index(), 1);
+    }
+
+    #[test]
+    fn auto_tracks_are_independent_entities() {
+        let mut seq = Sequencer::new(SR);
+        let mut auto = RtAutoTrack {
+            loop_ticks: 96, // 与 MIDI 轨道循环解耦（D7）
+            ..RtAutoTrack::default()
+        };
+        auto.curve.push(RtAutoPoint {
+            tick: 0,
+            value: 0.5,
+        });
+        seq.set_auto_track(5, auto);
+        seq.set_auto_track(MAX_AUTO_TRACKS, auto); // 越界索引忽略
+        let tracks = seq.auto_tracks();
+        assert_eq!(tracks[5].loop_ticks, 96);
+        assert_eq!(tracks[5].curve.point_count, 1);
+        assert!(
+            tracks
+                .iter()
+                .enumerate()
+                .all(|(i, t)| i == 5 || !t.curve.is_active()),
+            "其余自动化轨道应保持默认空曲线"
+        );
+        // MIDI 轨道不受自动化轨道写入影响：模式照常调度。
+        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
+        pattern[0] = step(60);
+        seq.set_pattern(0, pattern);
+        seq.play();
+        assert_eq!(ons(&run(&mut seq, 30)), vec![(0, 60)]);
     }
 }

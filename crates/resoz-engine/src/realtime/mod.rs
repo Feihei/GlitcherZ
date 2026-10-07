@@ -51,7 +51,10 @@ pub const FIXED_BLOCK_SIZE: usize = 128;
 pub const NUM_TRACKS: usize = 4;
 
 pub use atomic::AtomicF32;
-pub use automation::{MAX_AUTO_POINTS, MAX_AUTOMATIONS, RtAutoPoint, RtAutomation};
+pub use automation::{
+    DEFAULT_AUTO_LOOP_TICKS, MAX_AUTO_POINTS, MAX_AUTO_TRACKS, MAX_AUTOMATIONS, RtAutoPoint,
+    RtAutoTrack, RtAutomation,
+};
 pub use block::{BlockRunner, Feedback};
 pub use buffer::AudioBuffer;
 pub use commands::{
@@ -62,8 +65,8 @@ pub use delay::DelayProcessor;
 pub use envelope::AdsrProcessor;
 pub use gain::GainProcessor;
 pub use graph::{
-    ChannelStripProcessor, ExecPlan, GraphCompiler, GraphLevels, GraphUpdate, RtGraph,
-    TopologyError,
+    AutoRoute, ChannelStripProcessor, ExecPlan, GraphCompiler, GraphLevels, GraphUpdate,
+    MAX_MIDI_FANOUT, RtGraph, TopologyError,
 };
 pub use processor::{Processor, ProcessorChain};
 pub use sequencer::{

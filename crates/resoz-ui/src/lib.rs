@@ -377,15 +377,32 @@ impl ResoZApp {
         self.send_sequencer(SequencerCommand::SetClip { track, clip });
     }
 
-    /// 文档自动化曲线 → 引擎表示（超容量截断）并下发。
+    /// 文档自动化曲线 → 引擎自动化轨道实体（超容量截断）并下发，
+    /// 同时把连线终点 `(track, param)` 下发给引擎（D7：曲线不含目标，
+    /// 投递终点由图的自动化连线表决定）。
     fn send_automation(&mut self, track: usize, curve: &Automation) {
+        let param_id = match curve.param {
+            AutoParam::TrackGain => ParamId::TrackGain,
+            AutoParam::TrackPan => ParamId::TrackPan,
+            AutoParam::FilterCutoff => ParamId::FilterCutoff,
+            AutoParam::PluginParam { param_id, .. } => ParamId::PluginParam(param_id),
+        };
+        // 自动化轨道索引 = 轨道 × 每轨容量 + 文档内曲线槽位。文档 Vec
+        // 只追加/原位替换，槽位稳定；超出引擎容量的曲线暂不下发
+        //（P4 文档 v2 将显式建模自动化轨道实体）。
+        let Some(slot) = self.project.tracks[track]
+            .automations
+            .iter()
+            .position(|c| c.param == curve.param)
+        else {
+            return;
+        };
+        if slot >= resoz_engine::realtime::MAX_AUTOMATIONS {
+            log::warn!("轨道 {track} 自动化曲线数超过引擎容量，曲线未下发");
+            return;
+        }
+        let index = track * resoz_engine::realtime::MAX_AUTOMATIONS + slot;
         let mut rt = resoz_engine::realtime::RtAutomation {
-            param: match curve.param {
-                AutoParam::TrackGain => ParamId::TrackGain,
-                AutoParam::TrackPan => ParamId::TrackPan,
-                AutoParam::FilterCutoff => ParamId::FilterCutoff,
-                AutoParam::PluginParam { param_id, .. } => ParamId::PluginParam(param_id),
-            },
             enabled: curve.enabled,
             ..resoz_engine::realtime::RtAutomation::default()
         };
@@ -399,10 +416,20 @@ impl ResoZApp {
                 value: point.value,
             });
         }
-        self.send_sequencer(SequencerCommand::SetAutomation {
-            track,
-            automation: rt,
+        // 循环长度随泳道显示口径（卷帘片段长或一小节）；引擎侧自动化
+        // 轨道已与 MIDI 轨道音源解耦，P4 起由文档显式携带该值。
+        let loop_ticks = match self.project.tracks[track].source {
+            ModelTrackSource::Clip => self.project.tracks[track].clip.loop_ticks,
+            _ => TICKS_PER_BAR,
+        };
+        self.send_sequencer(SequencerCommand::SetAutoTrack {
+            index,
+            auto: resoz_engine::realtime::RtAutoTrack {
+                loop_ticks,
+                curve: rt,
+            },
         });
+        self.engine.set_auto_route(index, track, param_id);
     }
 
     /// 文档模式 → 引擎表示（`Copy` 数组，零堆分配）。

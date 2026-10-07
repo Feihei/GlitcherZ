@@ -155,8 +155,8 @@ pub struct CableDoc {
 
 ## 9. 分阶段实施（D9：P1+P2 连做）
 
-- [ ] **P1+P2 图核心 + 替换 Mixer**：`graph` 模块（NodeSlot/ExecPlan/RtGraph/求和遍历/事件槽）+ `SetGraph` 结构协议 + 差异回收 + ChannelStrip/主输出真节点；**一步替换 `[TrackStrip; 4]`**。验收：现 Mixer 全部数学测试以"默认图（复刻旧拓扑）"形式通过；新增图专项测试（多入边求和、悬空执行、播放中换图、回收计数、有环拒绝）。
-- [ ] **P3 时间轴入图**：时间轴节点 + MIDI 连线表投递 + 自动化轨道（无目标曲线）+ Automation 连线投递。验收：现有音序/自动化端到端测试经连线路径通过。
+- [x] **P1+P2 图核心 + 替换 Mixer**：`graph` 模块（NodeSlot/ExecPlan/RtGraph/求和遍历/事件槽）+ `SetGraph` 结构协议 + 差异回收 + ChannelStrip/主输出真节点；**一步替换 `[TrackStrip; 4]`**。验收：现 Mixer 全部数学测试以"默认图（复刻旧拓扑）"形式通过；新增图专项测试（多入边求和、悬空执行、播放中换图、回收计数、有环拒绝）。✅ 2026-10-08
+- [x] **P3 时间轴入图**：时间轴节点 + MIDI 连线表投递 + 自动化轨道（无目标曲线）+ Automation 连线投递。验收：现有音序/自动化端到端测试经连线路径通过。✅ 2026-10-08 —— 落地为 `ExecPlan::midi_targets`（每 MIDI 轨扇出 ≤4）+ `ExecPlan::auto_routes`（终点 = (槽位, 参数)，编译期经 `route_slot` 由 `(track, param)` 解析）；`RtAutomation` 退化为纯锚点，新增 `RtAutoTrack{loop_ticks=384, curve}` 独立实体；`GraphCompiler::connect_midi/disconnect_midi/set_auto_route/clear_auto_route`；结构队列扩容 8→64（项目加载一次性下发全部连线）。
 - [ ] **P4 model v2**：`Project` v2 + 保存/加载 + `node_id` 稳定性（编辑会话内单调，不跨文件持久复用）。验收：往返保存加载图结构无损。
 - [ ] **P5 UI 节点画布**：egui 自绘（平移/缩放/拉线/类型着色/删除联动），现有混音器面板逐步让位。前置依赖：CLAP 参数枚举（遗留任务升级为前置项，自动化线需要参数列表）。
 - [ ] **P6 反馈环路（可选）**：显式 1 块延迟反馈节点（128 样本 ≈ 2.7 ms），拓扑排序对其豁免。

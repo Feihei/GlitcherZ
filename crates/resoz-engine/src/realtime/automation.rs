@@ -1,12 +1,20 @@
-//! 自动化曲线（音频线程侧求值）。
-
-use crate::realtime::commands::ParamId;
+//! 自动化曲线与自动化轨道实体（音频线程侧求值）。
+//!
+//! D7（spec `docs/spec/node-graph.md`）：**自动化轨道是与 MIDI 轨道
+//! 并列的独立时间轴实体**——曲线只是纯锚点列表，不含目标参数；投递
+//! 目标完全由节点图的自动化连线表（`ExecPlan::auto_routes`）决定。
 
 /// 单条曲线的锚点容量上限（`Copy` 表示的容量约束，超容截断）。
 pub const MAX_AUTO_POINTS: usize = 64;
 
-/// 每条轨道最多同时容纳的曲线条数。
+/// 每条 MIDI 轨对应的自动化轨道数（时间轴实体索引的步长）。
 pub const MAX_AUTOMATIONS: usize = 4;
+
+/// 自动化轨道实体总数（`NUM_TRACKS × MAX_AUTOMATIONS`）。
+pub const MAX_AUTO_TRACKS: usize = 16;
+
+/// 自动化轨道默认循环长度（tick）：一小节（96 TPQN × 4 拍）。
+pub const DEFAULT_AUTO_LOOP_TICKS: u32 = 384;
 
 /// 自动化锚点（镜像 `resoz_model::AutoPoint`）。
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -17,13 +25,11 @@ pub struct RtAutoPoint {
     pub value: f32,
 }
 
-/// 一条自动化曲线（镜像 `resoz_model::Automation`，定容 `Copy`）。
+/// 一条自动化曲线：**纯锚点列表**（D7，不再内嵌目标参数）。
 ///
 /// 锚点按 tick 升序；取值在相邻锚点间线性插值，两端外保持端值。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RtAutomation {
-    /// 作用的目标参数（轨道定向参数：增益/声像/截止）。
-    pub param: ParamId,
     /// 是否启用。
     pub enabled: bool,
     /// 锚点（前 `point_count` 个有效，按 tick 升序）。
@@ -35,7 +41,6 @@ pub struct RtAutomation {
 impl Default for RtAutomation {
     fn default() -> Self {
         Self {
-            param: ParamId::TrackGain,
             enabled: true,
             points: [RtAutoPoint::default(); MAX_AUTO_POINTS],
             point_count: 0,
@@ -57,7 +62,7 @@ impl RtAutomation {
         self.enabled && self.point_count > 0
     }
 
-    /// 在 `tick`（已按轨道循环长度取模后的位置）处取值。
+    /// 在 `tick`（已按自动化轨道循环长度取模后的位置）处取值。
     /// 空曲线/未启用返回 `None`；线性插值；首尾外保持端值。RT-safe。
     pub fn value_at(&self, tick: f64) -> Option<f32> {
         if !self.is_active() {
@@ -87,14 +92,34 @@ impl RtAutomation {
     }
 }
 
+/// 一条自动化轨道实体：独立循环长度 + 纯锚点曲线（D7）。
+///
+/// `loop_ticks` 自带于轨道，与 MIDI 轨道音源的循环**解耦**（旧
+/// `Track.automations` 随音源循环的语义废止）；`0` = 不循环（跟随
+/// 全局走带位置）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RtAutoTrack {
+    /// 循环长度（tick）。
+    pub loop_ticks: u32,
+    /// 曲线（纯锚点，目标由连线表决定）。
+    pub curve: RtAutomation,
+}
+
+impl Default for RtAutoTrack {
+    fn default() -> Self {
+        Self {
+            loop_ticks: DEFAULT_AUTO_LOOP_TICKS,
+            curve: RtAutomation::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_AUTO_POINTS, RtAutoPoint, RtAutomation};
-    use crate::realtime::commands::ParamId;
+    use super::{DEFAULT_AUTO_LOOP_TICKS, MAX_AUTO_POINTS, RtAutoPoint, RtAutoTrack, RtAutomation};
 
     fn curve(points: &[(u32, f32)]) -> RtAutomation {
         let mut auto = RtAutomation {
-            param: ParamId::TrackGain,
             enabled: true,
             ..RtAutomation::default()
         };
@@ -137,5 +162,13 @@ mod tests {
             });
         }
         assert_eq!(auto.point_count, MAX_AUTO_POINTS);
+    }
+
+    #[test]
+    fn auto_track_defaults_to_one_bar_loop() {
+        let track = RtAutoTrack::default();
+        assert_eq!(track.loop_ticks, DEFAULT_AUTO_LOOP_TICKS);
+        assert_eq!(track.loop_ticks, 384);
+        assert!(!track.curve.is_active(), "默认曲线为空（未连线且无锚点）");
     }
 }

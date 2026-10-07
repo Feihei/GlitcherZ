@@ -2,7 +2,7 @@
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::realtime::automation::RtAutomation;
+use crate::realtime::automation::RtAutoTrack;
 use crate::realtime::sequencer::{PATTERN_STEPS, RtClip, SequencerStep, TrackSource};
 
 /// 控制命令队列的默认容量。满载时新命令被发送方丢弃（见
@@ -90,10 +90,15 @@ pub enum SequencerCommand {
     SetClip { track: usize, clip: RtClip },
     /// 切换某条轨道的音源（步进模式 / 卷帘片段）。
     SetSource { track: usize, source: TrackSource },
-    /// 按参数 upsert 一条自动化曲线（空曲线 = 删除）。
-    SetAutomation {
-        track: usize,
-        automation: RtAutomation,
+    /// 整块替换一条自动化轨道实体（空曲线 = 清空）。
+    ///
+    /// 曲线不含目标参数（D7）：投递终点 `(节点, 参数)` 由节点图的
+    /// 自动化连线表决定，经 `AudioEngine::set_auto_route` 设置。
+    SetAutoTrack {
+        /// 自动化轨道索引（0..[`crate::realtime::MAX_AUTO_TRACKS`]）。
+        index: usize,
+        /// 轨道实体（自带循环长度 + 纯锚点曲线）。
+        auto: RtAutoTrack,
     },
 }
 

@@ -24,8 +24,11 @@ pub struct RecycledNode {
     pub output: AudioBuffer,
 }
 
-/// 结构更新队列的默认容量（低频操作，8 足够）。
-pub const STRUCTURE_QUEUE_CAPACITY: usize = 8;
+/// 结构更新队列的默认容量。
+///
+/// 低频操作，但项目加载会一次性下发全部时间轴连线（最多 16 条自动化
+/// 连线 + 每轨声源恢复），取 64 留足富余。
+pub const STRUCTURE_QUEUE_CAPACITY: usize = 64;
 
 /// 节点回收回执队列的默认容量。
 pub const RECYCLE_QUEUE_CAPACITY: usize = 16;

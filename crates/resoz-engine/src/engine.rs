@@ -11,7 +11,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::convert;
 use crate::realtime::{
     BlockRunner, COMMAND_QUEUE_CAPACITY, EngineCommand, FIXED_BLOCK_SIZE, Feedback, GraphCompiler,
-    GraphUpdate, Sequencer, command_channel, recycle_channel, structure_channel,
+    GraphUpdate, ParamId, Sequencer, SequencerCommand, command_channel, recycle_channel,
+    structure_channel,
 };
 
 /// 引擎的基础信息（UI 显示用）。
@@ -245,6 +246,49 @@ impl AudioEngine {
                 }
             }
             Err(_) => false,
+        }
+    }
+
+    /// 整块替换一条自动化轨道实体（空曲线 = 清空；越界索引在实时侧
+    /// 忽略）。曲线不含目标 —— 投递终点经 [`AudioEngine::set_auto_route`]
+    /// 单独设定（D7）。
+    pub fn set_auto_track(&mut self, index: usize, auto: crate::realtime::RtAutoTrack) -> bool {
+        self.send(EngineCommand::Sequencer(SequencerCommand::SetAutoTrack {
+            index,
+            auto,
+        }))
+    }
+
+    /// 时间轴布线：把自动化轨道 `auto_index` 连到 `(track, param)` 指向
+    /// 的节点参数（P5 画布落地前以轨道坐标表达终点）。重复调用即重定向。
+    pub fn set_auto_route(&mut self, auto_index: usize, track: usize, param: ParamId) -> bool {
+        self.apply_plan_update(|compiler| compiler.set_auto_route(auto_index, track, param))
+    }
+
+    /// 时间轴布线：断开自动化轨道 `auto_index` 的连线。
+    pub fn clear_auto_route(&mut self, auto_index: usize) -> bool {
+        self.apply_plan_update(|compiler| compiler.clear_auto_route(auto_index))
+    }
+
+    /// 应用一次仅换计划的拓扑变更（连线表编辑等），队列满时回滚。
+    fn apply_plan_update(
+        &mut self,
+        edit: impl FnOnce(&mut GraphCompiler) -> Result<GraphUpdate, crate::realtime::TopologyError>,
+    ) -> bool {
+        let snapshot = self.compiler;
+        match edit(&mut self.compiler) {
+            Ok(update) => {
+                if self.structure.push(update).is_ok() {
+                    true
+                } else {
+                    self.compiler = snapshot;
+                    false
+                }
+            }
+            Err(_) => {
+                self.compiler = snapshot;
+                false
+            }
         }
     }
 

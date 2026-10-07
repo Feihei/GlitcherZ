@@ -59,8 +59,8 @@ impl Default for Feedback {
 /// 每个固定块的执行顺序（`run_next_block`）：
 /// 1. **块边界**消费全部待处理命令（队列空则立即返回）；
 /// 2. 应用结构更新（换计划 / 装卸节点，回收经回执队列）；
-/// 3. 音序器按采样时钟调度，到期音符事件直接送入对应轨道的声源节点；
-/// 4. 自动化求值（仅播放中），直写目标节点参数；
+/// 3. 音序器按采样时钟调度，到期音符事件按图的 MIDI 连线表扇出；
+/// 4. 自动化轨道求值（仅播放中），经自动化连线表投递目标参数；
 /// 5. 节点图按预编译拓扑序处理一个块（求和入边 → 原地处理）；
 /// 6. 回传峰值电平、播放位置、音序器步进与走带状态（原子量）。
 pub struct BlockRunner {
@@ -159,9 +159,9 @@ impl BlockRunner {
             playback_sample_pos: self.played_samples,
         };
 
-        // 3. 音序器调度：到期音符事件直接送入对应轨道的声源节点
-        //    （块边界精度）。拆字段借用，让 sequencer 与 graph 同时可变。
-        //    自动化取本块起始位置（块内音频以起点近似）。
+        // 3. 音序器调度：到期音符事件按图的 MIDI 连线表扇出到目标
+        //    乐器节点（块边界精度）。拆字段借用，让 sequencer 与 graph
+        //    同时可变。自动化取本块起始位置（块内音频以起点近似）。
         let position_before = self.sequencer.position_ticks();
         let Self {
             sequencer, graph, ..
@@ -170,9 +170,10 @@ impl BlockRunner {
             graph.track_note(track, event);
         });
 
-        // 4. 自动化求值（仅播放中）：按循环后的音乐位置采样各轨曲线，
-        //    经节点图路由表直写目标节点参数（不走命令队列）；停止时最后
-        //    一次手动值保持生效（由 UI 在走带停止沿重推手动参数）。
+        // 4. 自动化轨道求值（仅播放中）：各轨道按自带循环长度取模采样
+        //    曲线，经节点图的自动化连线表投递（曲线不含目标，D7）；
+        //    停止时最后一次手动值保持生效（由 UI 在走带停止沿重推手动
+        //    参数）。
         if self.sequencer.is_playing() {
             self.evaluate_automation(position_before);
         }
@@ -202,19 +203,17 @@ impl BlockRunner {
         self.scratch_pos = 0;
     }
 
-    /// 采样并应用全部轨道的自动化曲线。RT-safe（无分配）。
+    /// 采样并应用全部自动化轨道的曲线：各轨道按自带 `loop_ticks` 取模
+    /// （`0` = 跟随全局走带位置），投递终点由图的连线表决定。RT-safe。
     fn evaluate_automation(&mut self, position_ticks: f64) {
-        for track in 0..crate::realtime::NUM_TRACKS {
-            let loop_ticks = self.sequencer.track_loop_ticks(track);
-            let tick = if loop_ticks > 0 {
-                position_ticks % f64::from(loop_ticks)
+        for (index, auto) in self.sequencer.auto_tracks().iter().enumerate() {
+            let tick = if auto.loop_ticks > 0 {
+                position_ticks % f64::from(auto.loop_ticks)
             } else {
                 position_ticks
             };
-            for curve in self.sequencer.track_automations(track) {
-                if let Some(value) = curve.value_at(tick) {
-                    self.graph.track_set_param(track, curve.param, value);
-                }
+            if let Some(value) = auto.curve.value_at(tick) {
+                self.graph.auto_set_param(index, value);
             }
         }
     }
@@ -257,8 +256,8 @@ impl BlockRunner {
             SequencerCommand::SetSource { track, source } => {
                 self.sequencer.set_source(track, source);
             }
-            SequencerCommand::SetAutomation { track, automation } => {
-                self.sequencer.set_automation(track, automation);
+            SequencerCommand::SetAutoTrack { index, auto } => {
+                self.sequencer.set_auto_track(index, auto);
             }
         }
     }
@@ -280,7 +279,7 @@ mod tests {
     use rtrb::Producer;
 
     use super::{BlockRunner, Feedback};
-    use crate::realtime::automation::{RtAutoPoint, RtAutomation};
+    use crate::realtime::automation::{RtAutoPoint, RtAutoTrack, RtAutomation};
     use crate::realtime::buffer::AudioBuffer;
     use crate::realtime::commands::{
         EngineCommand, NoteEvent, ParamId, SequencerCommand, command_channel,
@@ -518,10 +517,10 @@ mod tests {
 
     #[test]
     fn automation_drives_track_gain_during_playback() {
-        let (mut runner, mut tx, _voice_tx, feedback, _compiler) = make_runner(128, 2);
+        let (mut runner, mut tx, mut structure_tx, feedback, mut compiler) = make_runner(128, 2);
         // 增益曲线：tick 0 = 1.0 → tick 96 = 0.0（120 BPM / 44.1 kHz ≈ 0.5 s）。
+        // 自动化轨道 0（自带一小节循环）连到轨道 0 通道条增益。
         let mut curve = RtAutomation {
-            param: ParamId::TrackGain,
             enabled: true,
             ..RtAutomation::default()
         };
@@ -533,11 +532,18 @@ mod tests {
             tick: 96,
             value: 0.0,
         });
-        tx.push(EngineCommand::Sequencer(SequencerCommand::SetAutomation {
-            track: 0,
-            automation: curve,
+        tx.push(EngineCommand::Sequencer(SequencerCommand::SetAutoTrack {
+            index: 0,
+            auto: RtAutoTrack {
+                loop_ticks: 384,
+                curve,
+            },
         }))
         .expect("队列未满");
+        let update = compiler
+            .set_auto_route(0, 0, ParamId::TrackGain)
+            .expect("自动化连线应成功");
+        structure_tx.push(update).expect("结构队列未满");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
             .expect("队列未满");
         // 注意：Play 会清理手动音符，故音符事件需在 Play 之后入队。
@@ -600,14 +606,14 @@ mod tests {
 
     #[test]
     fn voice_swap_and_automation_bridge_to_plugin_params() {
-        let (mut runner, mut tx, mut voice_tx, feedback, mut compiler) = make_runner(128, 2);
+        let (mut runner, mut tx, mut structure_tx, feedback, mut compiler) = make_runner(128, 2);
 
         // 1. 换装外部声源（模拟 CLAP 乐器节点）：初始参数 0 → 静音。
         let (update, _id) = match compiler.set_voice(0, Box::new(ParamEcho { value: 0.0 })) {
             Ok(pair) => pair,
             Err(_) => panic!("换装外部声源"),
         };
-        voice_tx.push(update).expect("声源队列未满");
+        structure_tx.push(update).expect("结构队列未满");
         let mut chunk = vec![0.0f32; 1024 * 2];
         runner.render_interleaved(&mut chunk);
         assert!(
@@ -630,9 +636,9 @@ mod tests {
             feedback.track_levels[0].load()
         );
 
-        // 3. 自动化桥接：曲线驱动 PluginParam（0 → 1 over 384 tick）。
+        // 3. 自动化桥接：曲线驱动 PluginParam（0 → 1 over 384 tick），
+        //    自动化轨道 0 连到轨道 0 声源（ParamEcho）的插件参数 1。
         let mut curve = RtAutomation {
-            param: ParamId::PluginParam(1),
             enabled: true,
             ..RtAutomation::default()
         };
@@ -644,11 +650,18 @@ mod tests {
             tick: 384,
             value: 1.0,
         });
-        tx.push(EngineCommand::Sequencer(SequencerCommand::SetAutomation {
-            track: 0,
-            automation: curve,
+        tx.push(EngineCommand::Sequencer(SequencerCommand::SetAutoTrack {
+            index: 0,
+            auto: RtAutoTrack {
+                loop_ticks: 384,
+                curve,
+            },
         }))
         .expect("队列未满");
+        let update = compiler
+            .set_auto_route(0, 0, ParamId::PluginParam(1))
+            .expect("自动化连线应成功");
+        structure_tx.push(update).expect("结构队列未满");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
             .expect("队列未满");
 
@@ -674,7 +687,7 @@ mod tests {
 
         // 4. 切回内置声源：内置合成器无音符 → 静音。
         let update = compiler.activate_builtin_voice(0).expect("切回内置声源");
-        voice_tx.push(update).expect("声源队列未满");
+        structure_tx.push(update).expect("结构队列未满");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Stop))
             .expect("队列未满");
         runner.render_interleaved(&mut chunk);
