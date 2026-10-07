@@ -15,7 +15,7 @@
 //! 只在 UI 线程被触碰，永不进入音频回调。模型与引擎互不依赖，发送前
 //! 在此完成文档 → 引擎表示的转换。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -237,6 +237,9 @@ pub struct ResoZApp {
     clap_effects: Option<Vec<resoz_clap_host::ClapPluginInfo>>,
     /// 已扫描的 VST3 乐器列表（懒扫描缓存）。
     vst3_plugins: Option<Vec<resoz_vst3_host::Vst3PluginInfo>>,
+    /// 各轨道 VST3 声源的参数列表（实例化时读出，键 = 轨道号）。
+    /// 仅诊断/展示用；实际参数控制仍走 `PluginParam` 桥接。
+    voice_params: HashMap<usize, Vec<resoz_vst3_host::Vst3ParamInfo>>,
     /// 诊断标志：`ui()` 是否已进入过（仅日志用）。
     first_frame_logged: bool,
     /// 诊断标志：是否已发出关闭命令（仅日志用）。
@@ -280,6 +283,7 @@ impl ResoZApp {
             clap_plugins: None,
             clap_effects: None,
             vst3_plugins: None,
+            voice_params: HashMap::new(),
             first_frame_logged: false,
             close_sent: false,
         };
@@ -530,9 +534,11 @@ impl ResoZApp {
     fn apply_track_voice(&mut self, track: usize) {
         match self.project.tracks[track].voice.clone() {
             VoiceSpec::Builtin => {
+                self.voice_params.remove(&track);
                 self.engine.set_builtin_voice(track);
             }
             VoiceSpec::Clap { path, plugin_id } => {
+                self.voice_params.remove(&track);
                 if !path.is_empty() && !plugin_id.is_empty() {
                     self.load_clap_voice(track, &path, &plugin_id);
                 }
@@ -597,8 +603,11 @@ impl ResoZApp {
         ) {
             Ok(instance) => {
                 let resoz_vst3_host::Vst3Instance { guard, node } = instance;
+                // 控制侧枚举参数列表（守卫移入注册表前读出）。
+                let params = guard.parameters();
                 match self.engine.set_external_voice(track, Box::new(node)) {
                     Some(node_id) => {
+                        self.voice_params.insert(track, params);
                         self.voice_guards.push(PluginGuardEntry {
                             node_id,
                             track,
@@ -853,6 +862,7 @@ impl ResoZApp {
                 let is_external = matches!(voice, VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. });
                 if ui.selectable_label(!is_external, "内置合成器").clicked() {
                     self.project.tracks[sel].voice = VoiceSpec::Builtin;
+                    self.voice_params.remove(&sel);
                     self.engine.set_builtin_voice(sel);
                 }
                 // 先收集选择，菜单闭包结束后再装填（避免借用冲突）。
@@ -934,6 +944,35 @@ impl ResoZApp {
                     self.load_clap_effect(sel, &path, &plugin_id);
                 }
             });
+
+            // VST3 插件参数列表（实例化时控制侧读出；展示默认归一化值）。
+            if let Some(params) = self.voice_params.get(&sel) {
+                if !params.is_empty() {
+                    egui::CollapsingHeader::new(format!("插件参数（{}）", params.len()))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::Grid::new("vst3_params")
+                                .num_columns(3)
+                                .spacing([16.0, 4.0])
+                                .show(ui, |ui| {
+                                    for param in params {
+                                        ui.label(&param.title);
+                                        ui.weak(format!("id {}", param.id));
+                                        ui.weak(format!(
+                                            "默认 {:.3}{}",
+                                            param.default_normalized,
+                                            if param.can_automate {
+                                                ""
+                                            } else {
+                                                "（不可自动化）"
+                                            }
+                                        ));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+            }
             ui.weak("正弦波 → ADSR 包络 → SVF 滤波器 → 延迟（每轨独立）—— 改动实时送达音频线程");
             ui.add_space(8.0);
 

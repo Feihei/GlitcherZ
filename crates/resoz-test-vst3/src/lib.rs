@@ -532,15 +532,31 @@ impl IEditControllerTrait for SineController {
     }
 
     unsafe fn getParameterCount(&self) -> Steinberg::int32 {
-        0
+        1
     }
 
     unsafe fn getParameterInfo(
         &self,
-        _paramIndex: Steinberg::int32,
-        _info: *mut Vst::ParameterInfo,
+        paramIndex: Steinberg::int32,
+        info: *mut Vst::ParameterInfo,
     ) -> Steinberg::tresult {
-        Steinberg::kInvalidArgument
+        if paramIndex != 0 {
+            return Steinberg::kInvalidArgument;
+        }
+        // SAFETY: 宿主保证 info 指向可写的 ParameterInfo。
+        unsafe {
+            (*info) = Vst::ParameterInfo {
+                id: 1,
+                title: utf16_field::<128>("Gain"),
+                shortTitle: utf16_field::<128>("Gain"),
+                units: utf16_field::<128>(""),
+                stepCount: 0,
+                defaultNormalizedValue: 0.5,
+                unitId: 0,
+                flags: Vst::ParameterInfo_::ParameterFlags_::kCanAutomate,
+            };
+        }
+        Steinberg::kResultOk
     }
 
     unsafe fn getParamStringByValue(

@@ -314,6 +314,55 @@ impl Vst3InstanceGuard {
             let _ = self.component.terminate();
         }
     }
+
+    /// 枚举控制器全部参数（控制侧调用，非 RT-safe）。
+    ///
+    /// 供 UI 展示参数列表与后续自动化选参；值为归一化 0..1 语义。
+    pub fn parameters(&self) -> Vec<Vst3ParamInfo> {
+        // SAFETY: controller 存活（守卫持有）；info 由插件按 SDK 约定
+        // 填充（title 为 NUL 结尾 UTF-16），逐项读取后立即转 Rust 字符串。
+        unsafe {
+            let count = self.controller.getParameterCount().max(0);
+            let mut out = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                let mut info: Steinberg::Vst::ParameterInfo = std::mem::zeroed();
+                if !tresult_ok(self.controller.getParameterInfo(index, &mut info)) {
+                    continue;
+                }
+                out.push(Vst3ParamInfo {
+                    id: info.id,
+                    title: utf16_to_string(&info.title),
+                    default_normalized: info.defaultNormalizedValue,
+                    can_automate: info.flags
+                        & Steinberg::Vst::ParameterInfo_::ParameterFlags_::kCanAutomate
+                        != 0,
+                });
+            }
+            out
+        }
+    }
+}
+
+/// 插件参数描述（控制侧枚举，见 [`Vst3InstanceGuard::parameters`]）。
+#[derive(Debug, Clone)]
+pub struct Vst3ParamInfo {
+    /// 插件侧参数 ID（`ParamId::PluginParam` 的载荷）。
+    pub id: u32,
+    /// 参数标题（UTF-16 转换，可能为空）。
+    pub title: String,
+    /// 归一化默认值（0..1）。
+    pub default_normalized: f64,
+    /// 是否可自动化（VST3 `kCanAutomate` 标志）。
+    pub can_automate: bool,
+}
+
+/// NUL 结尾 UTF-16 字段 → Rust 字符串（超长截断至字段长度内）。
+fn utf16_to_string(field: &[Steinberg::char16]) -> String {
+    let len = field
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(field.len());
+    String::from_utf16_lossy(&field[..len])
 }
 
 impl Drop for Vst3InstanceGuard {
@@ -814,6 +863,20 @@ mod tests {
                 .all(|sample| sample.abs() < 1e-9),
             "NoteOff 后应静音"
         );
+    }
+
+    #[test]
+    fn parameter_enumeration_reports_gain() {
+        let Some((instance, _ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        let params = instance.guard.parameters();
+        assert_eq!(params.len(), 1, "测试插件应暴露 1 个参数");
+        let gain = &params[0];
+        assert_eq!(gain.id, 1);
+        assert_eq!(gain.title, "Gain");
+        assert!((gain.default_normalized - 0.5).abs() < 1e-9);
+        assert!(gain.can_automate, "Gain 应标记为可自动化");
     }
 
     #[test]
