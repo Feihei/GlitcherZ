@@ -1433,6 +1433,36 @@ impl ResoZApp {
                     self.lane_param = param;
                 }
             }
+            // 插件参数目标（VST3 声源装填后可用；曲线值语义 = 归一化
+            // 0..1，与 Vst3Node 的 PluginParam 桥接一致）。
+            let mut plugin_picked: Option<AutoParam> = None;
+            if let Some(params) = self.voice_params.get(&sel) {
+                if !params.is_empty() {
+                    let current_name = match &self.lane_param {
+                        AutoParam::PluginParam { name, .. } => Some(name.clone()),
+                        _ => None,
+                    };
+                    ui.menu_button(current_name.as_deref().unwrap_or("插件参数…"), |ui| {
+                        for param in params {
+                            let label = if param.title.is_empty() {
+                                format!("参数 {}", param.id)
+                            } else {
+                                param.title.clone()
+                            };
+                            if ui.button(&label).clicked() {
+                                plugin_picked = Some(AutoParam::PluginParam {
+                                    param_id: param.id,
+                                    name: label,
+                                });
+                                ui.close();
+                            }
+                        }
+                    });
+                }
+            }
+            if let Some(param) = plugin_picked {
+                self.lane_param = param;
+            }
             let mut enabled = self.project.tracks[sel]
                 .automations
                 .iter()
@@ -1460,6 +1490,9 @@ impl ResoZApp {
                     .cloned()
                     .expect("上一步已确保存在");
                 self.send_automation(sel, &curve);
+            }
+            if let AutoParam::PluginParam { name, .. } = &self.lane_param {
+                ui.weak(format!("目标：{name}"));
             }
             ui.weak("点按加锚点 · 拖拽移动 · 右键删除");
         });
