@@ -327,6 +327,19 @@ impl ResoZApp {
             }
             self.apply_track_voice(track);
         }
+        // 节点图连线（v2）：MIDI 跨轨扇出。
+        for link in self.project.graph.midi_links.clone() {
+            if !self
+                .engine
+                .connect_midi_track(link.from_track, link.to_track)
+            {
+                log::warn!(
+                    "MIDI 连线 ({}, {}) 下发失败（扇出超限或队列满）",
+                    link.from_track,
+                    link.to_track
+                );
+            }
+        }
     }
 
     /// 下发一条轨道的全部参数（音色 / 延迟 / 混音）。
@@ -416,12 +429,9 @@ impl ResoZApp {
                 value: point.value,
             });
         }
-        // 循环长度随泳道显示口径（卷帘片段长或一小节）；引擎侧自动化
-        // 轨道已与 MIDI 轨道音源解耦，P4 起由文档显式携带该值。
-        let loop_ticks = match self.project.tracks[track].source {
-            ModelTrackSource::Clip => self.project.tracks[track].clip.loop_ticks,
-            _ => TICKS_PER_BAR,
-        };
+        // 循环长度由文档显式携带（v2：`Automation::loop_ticks`），泳道
+        // 显示时会随轨道音源口径同步回写该值。
+        let loop_ticks = curve.loop_ticks;
         self.send_sequencer(SequencerCommand::SetAutoTrack {
             index,
             auto: resoz_engine::realtime::RtAutoTrack {
@@ -1507,7 +1517,7 @@ impl ResoZApp {
                     None => track.automations.push(Automation {
                         param: self.lane_param.clone(),
                         enabled,
-                        points: Vec::new(),
+                        ..Automation::default()
                     }),
                 }
                 let curve = track
@@ -1536,6 +1546,8 @@ impl ResoZApp {
             });
         }
 
+        // 泳道循环长度随轨道音源口径，并同步回写文档（v2：文档显式
+        // 携带 `loop_ticks`，保存时记录最近使用的口径）。
         let loop_ticks = match self.project.tracks[sel].source {
             ModelTrackSource::Clip => self.project.tracks[sel].clip.loop_ticks,
             _ => TICKS_PER_BAR,
@@ -1547,6 +1559,7 @@ impl ResoZApp {
             .iter_mut()
             .find(|curve| curve.param == self.lane_param)
             .expect("上一步已确保存在");
+        curve.loop_ticks = loop_ticks;
         let edited = lane::show(
             ui,
             curve,

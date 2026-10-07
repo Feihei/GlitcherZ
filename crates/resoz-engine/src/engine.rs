@@ -270,6 +270,29 @@ impl AudioEngine {
         self.apply_plan_update(|compiler| compiler.clear_auto_route(auto_index))
     }
 
+    /// 时间轴布线：把 MIDI 轨 `from_track` 的音符事件额外扇出到
+    /// `to_track` 的声源节点（默认图已含本轨自连；P5 画布落地前以
+    /// 轨道坐标表达连线）。重复连线幂等；扇出超限返回 `false`。
+    pub fn connect_midi_track(&mut self, from_track: usize, to_track: usize) -> bool {
+        self.apply_plan_update(|compiler| {
+            compiler
+                .voice_slot(to_track)
+                .ok_or(crate::realtime::TopologyError::InvalidTrack)
+                .and_then(|slot| compiler.connect_midi(from_track, slot))
+        })
+    }
+
+    /// 时间轴布线：断开 MIDI 轨 `from_track` 到 `to_track` 声源的扇出
+    /// （本轨自连是默认图一部分，不可断开）。
+    pub fn disconnect_midi_track(&mut self, from_track: usize, to_track: usize) -> bool {
+        self.apply_plan_update(|compiler| {
+            compiler
+                .voice_slot(to_track)
+                .ok_or(crate::realtime::TopologyError::InvalidTrack)
+                .and_then(|slot| compiler.disconnect_midi(from_track, slot))
+        })
+    }
+
     /// 应用一次仅换计划的拓扑变更（连线表编辑等），队列满时回滚。
     fn apply_plan_update(
         &mut self,

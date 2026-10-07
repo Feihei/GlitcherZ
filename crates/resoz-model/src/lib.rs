@@ -383,17 +383,39 @@ pub struct AutoPoint {
 ///
 /// 锚点按 tick 升序存放；取值在相邻锚点间线性插值，两端外保持端值。
 /// 空曲线或未启用时不产生任何自动化。
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+///
+/// v2（D7）：曲线不含目标参数的寻址职责变化见 [`AutoParam`]；循环
+/// 长度 [`Automation::loop_ticks`] 由文档显式携带（与 MIDI 轨道音源
+/// 循环解耦，引擎侧 `RtAutoTrack` 同语义）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Automation {
-    /// 作用的目标参数。
+    /// 作用的目标参数（同时充当自动化连线的终点，见 `AutoParam`）。
     #[serde(default)]
     pub param: AutoParam,
     /// 是否启用。
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 循环长度（tick）：求值位置按此取模。默认一小节（384）。
+    #[serde(default = "default_loop_ticks")]
+    pub loop_ticks: u32,
     /// 锚点（按 tick 升序）。
     #[serde(default)]
     pub points: Vec<AutoPoint>,
+}
+
+fn default_loop_ticks() -> u32 {
+    TICKS_PER_BAR
+}
+
+impl Default for Automation {
+    fn default() -> Self {
+        Self {
+            param: AutoParam::default(),
+            enabled: default_true(),
+            loop_ticks: default_loop_ticks(),
+            points: Vec::new(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -455,6 +477,70 @@ impl Automation {
     }
 }
 
+/// 节点图的文档表示（v2，spec `docs/spec/node-graph.md` §7 的过渡形态）。
+///
+/// 当前引擎的图拓扑仍是"默认每轨链 + 效果槽 + 轨道坐标连线表"（P3
+/// 落地形态），自由节点与 `node_id` 端口要等 P5 画布落地，因此 v2 文档
+/// 只序列化当下可编辑、且无法从其他字段推导的图状态：
+///
+/// - [`GraphDoc::midi_links`]：MIDI 轨跨轨扇出（默认图已含"本轨连本轨
+///   声源"，此处只记录额外连线）；
+/// - 自动化连线的终点 `(track, param)` 可由曲线的 `param` 与其槽位
+///   推导，不重复存储。
+///
+/// P5 引入 `node_id` 端口后，此结构将扩展为 spec §7 的
+/// `nodes + cables` 完整形态。
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct GraphDoc {
+    /// MIDI 跨轨连线：`from_track` 的音符事件额外扇出到 `to_track`
+    /// 的声源节点。上限 [`GraphDoc::MAX_MIDI_LINKS`]。
+    #[serde(default)]
+    pub midi_links: Vec<MidiLink>,
+}
+
+impl GraphDoc {
+    /// MIDI 连线容量上限（引擎侧每轨扇出 ≤ 4，含默认自连）。
+    pub const MAX_MIDI_LINKS: usize = 16;
+
+    /// 加载期校验：越界轨道或超容量直接报错（文件层是最后防线，
+    /// 不静默截断）。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.midi_links.len() > Self::MAX_MIDI_LINKS {
+            return Err(format!(
+                "MIDI 连线数 {} 超过上限 {}",
+                self.midi_links.len(),
+                Self::MAX_MIDI_LINKS
+            ));
+        }
+        for link in &self.midi_links {
+            if link.from_track >= NUM_TRACKS || link.to_track >= NUM_TRACKS {
+                return Err(format!(
+                    "MIDI 连线 ({}, {}) 越界：轨道数 = {}",
+                    link.from_track, link.to_track, NUM_TRACKS
+                ));
+            }
+            if link.from_track == link.to_track {
+                return Err(format!(
+                    "MIDI 连线 ({}, {}) 冗余：默认图已含本轨自连",
+                    link.from_track, link.to_track
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 一条 MIDI 跨轨连线（默认自连之外的部分）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MidiLink {
+    /// 事件源 MIDI 轨。
+    #[serde(default)]
+    pub from_track: usize,
+    /// 目标声源所在的 MIDI 轨。
+    #[serde(default)]
+    pub to_track: usize,
+}
+
 /// 多轨项目文档。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Project {
@@ -470,6 +556,9 @@ pub struct Project {
     /// 轨道。
     #[serde(default)]
     pub tracks: [Track; NUM_TRACKS],
+    /// 节点图文档（v2 新增；默认 = 无额外连线）。
+    #[serde(default)]
+    pub graph: GraphDoc,
 }
 
 fn default_gate() -> f32 {
@@ -487,6 +576,7 @@ impl Default for Project {
             gate: default_gate(),
             master_gain: default_master_gain(),
             tracks: std::array::from_fn(|_| Track::default()),
+            graph: GraphDoc::default(),
         }
     }
 }
@@ -623,21 +713,22 @@ mod tests {
         let mut auto = Automation {
             param: AutoParam::TrackGain,
             enabled: true,
-            points: vec![
-                AutoPoint {
-                    tick: 0,
-                    value: 1.0,
-                },
-                AutoPoint {
-                    tick: 96,
-                    value: 0.5,
-                },
-                AutoPoint {
-                    tick: 192,
-                    value: 0.0,
-                },
-            ],
+            ..Automation::default()
         };
+        auto.points = vec![
+            AutoPoint {
+                tick: 0,
+                value: 1.0,
+            },
+            AutoPoint {
+                tick: 96,
+                value: 0.5,
+            },
+            AutoPoint {
+                tick: 192,
+                value: 0.0,
+            },
+        ];
         assert!((auto.value_at(0.0).unwrap() - 1.0).abs() < 1e-6);
         assert!(
             (auto.value_at(48.0).unwrap() - 0.75).abs() < 1e-6,
@@ -701,6 +792,7 @@ mod tests {
         let auto = Automation {
             param: AutoParam::FilterCutoff,
             enabled: true,
+            loop_ticks: 384,
             points: vec![
                 AutoPoint {
                     tick: 0,

@@ -13,8 +13,12 @@ use std::path::Path;
 
 use crate::Project;
 
-/// 项目文件格式的当前版本。
-pub const PROJECT_VERSION: u32 = 1;
+/// 项目文件格式的当前版本（v2：节点图文档 + 自动化轨道显式循环长度）。
+///
+/// 兼容策略（Q5 决策）：**不做 v1 读路径**——v2 结构变更（`graph` 字段、
+/// `Automation::loop_ticks`）靠 serde 字段级默认值自然容忍缺失；v1 文件
+/// 里的自动化曲线加载后循环长度取默认一小节。
+pub const PROJECT_VERSION: u32 = 2;
 
 fn default_version() -> u32 {
     PROJECT_VERSION
@@ -40,6 +44,8 @@ pub enum ModelError {
     Parse(#[from] ron::error::SpannedError),
     #[error("项目文件序列化失败：{0}")]
     Serialize(#[from] ron::error::Error),
+    #[error("项目文件图结构非法：{0}")]
+    InvalidGraph(String),
 }
 
 /// 把项目保存为 `.rez` 文件（RON pretty 格式）。**非实时**（磁盘 IO）。
@@ -76,9 +82,15 @@ pub fn parse_project(text: &str) -> Result<Project, ModelError> {
 
     if is_wrapped {
         let file: ProjectFile = ron::from_str(text)?;
+        file.project
+            .graph
+            .validate()
+            .map_err(ModelError::InvalidGraph)?;
         return Ok(file.project);
     }
-    Ok(ron::from_str::<Project>(text)?)
+    let project: Project = ron::from_str(text)?;
+    project.graph.validate().map_err(ModelError::InvalidGraph)?;
+    Ok(project)
 }
 
 /// 从磁盘加载项目。**非实时**（磁盘 IO）。
@@ -90,7 +102,10 @@ pub fn load_project(path: &Path) -> Result<Project, ModelError> {
 #[cfg(test)]
 mod tests {
     use super::{PROJECT_VERSION, ProjectFile, load_project, parse_project, save_project};
-    use crate::{Clip, Note, Pattern, Project, Step, Track, TrackSource};
+    use crate::{
+        AutoParam, AutoPoint, Automation, Clip, GraphDoc, MidiLink, ModelError, Note, Pattern,
+        Project, Step, Track, TrackSource,
+    };
 
     fn demo_project() -> Project {
         let mut project = Project::default();
@@ -118,6 +133,20 @@ mod tests {
         };
         project.tracks[2].muted = true;
         project.tracks[2].pan = -0.5;
+        // v2 图状态：跨轨扇出 + 自动化轨道显式循环长度。
+        project.graph.midi_links.push(MidiLink {
+            from_track: 0,
+            to_track: 1,
+        });
+        project.tracks[3].automations.push(Automation {
+            param: AutoParam::TrackGain,
+            enabled: true,
+            loop_ticks: 192,
+            points: vec![AutoPoint {
+                tick: 0,
+                value: 1.0,
+            }],
+        });
         project
     }
 
@@ -187,5 +216,67 @@ mod tests {
             Step::default(),
             "Step::default 与 serde 字段默认值一致"
         );
+    }
+
+    #[test]
+    fn missing_graph_field_defaults_to_empty() {
+        // v1 文件（无 graph 字段）加载：图文档取默认（无额外连线），
+        // 自动化曲线缺 loop_ticks 时取默认一小节。
+        let text = r#"(
+    version: 1,
+    project: (
+        tracks: (
+            (
+                automations: [(param: TrackGain, enabled: true, points: [])],
+            ), (), (), (),
+        ),
+    ),
+)"#;
+        let loaded = parse_project(text).expect("v1 文件应被字段级默认值容忍");
+        assert!(loaded.graph.midi_links.is_empty());
+        assert_eq!(loaded.tracks[0].automations[0].loop_ticks, 384);
+    }
+
+    #[test]
+    fn invalid_graph_links_are_rejected() {
+        // 越界轨道：报错而非截断（文件层是最后防线）。
+        let text = r#"(
+    version: 2,
+    project: (
+        graph: (midi_links: [(from_track: 0, to_track: 9)]),
+        tracks: ((), (), (), ()),
+    ),
+)"#;
+        assert!(matches!(
+            parse_project(text),
+            Err(ModelError::InvalidGraph(_))
+        ));
+        // 本轨自连冗余：同样拒绝。
+        let text = r#"(
+    version: 2,
+    project: (
+        graph: (midi_links: [(from_track: 2, to_track: 2)]),
+        tracks: ((), (), (), ()),
+    ),
+)"#;
+        assert!(matches!(
+            parse_project(text),
+            Err(ModelError::InvalidGraph(_))
+        ));
+    }
+
+    #[test]
+    fn graph_doc_validate_bounds() {
+        let mut graph = GraphDoc::default();
+        graph.midi_links.push(MidiLink {
+            from_track: 0,
+            to_track: 1,
+        });
+        assert!(graph.validate().is_ok());
+        graph.midi_links.push(MidiLink {
+            from_track: 1,
+            to_track: 0,
+        });
+        assert!(graph.validate().is_ok());
     }
 }

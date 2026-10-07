@@ -604,6 +604,11 @@ impl GraphCompiler {
         id
     }
 
+    /// 某 MIDI 轨的声源槽位（供控制侧把轨道坐标连线解析成槽位坐标）。
+    pub fn voice_slot(&self, track: usize) -> Option<u16> {
+        self.track_voice.get(track).copied()
+    }
+
     fn alloc_slot(&mut self) -> u16 {
         let slot = self
             .occupied
