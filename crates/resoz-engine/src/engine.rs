@@ -11,7 +11,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::convert;
 use crate::realtime::{
     BlockRunner, COMMAND_QUEUE_CAPACITY, EngineCommand, FIXED_BLOCK_SIZE, Feedback, Mixer,
-    Sequencer, VoiceUpdate, command_channel, voice_channel,
+    Sequencer, VoiceUpdate, command_channel, recycle_channel, structure_channel,
 };
 
 /// 引擎的基础信息（UI 显示用）。
@@ -40,6 +40,10 @@ pub struct AudioEngine {
     _stream: cpal::Stream,
     commands: rtrb::Producer<EngineCommand>,
     voices: rtrb::Producer<VoiceUpdate>,
+    /// 节点回收消费端：UI 定期 [`AudioEngine::reclaim_nodes`] 排空，
+    /// 释放旧插件节点与对应守卫。
+    recycle: rtrb::Consumer<crate::realtime::RecycledNode>,
+    next_node_id: u64,
     feedback: Feedback,
     info: AudioEngineInfo,
 }
@@ -70,7 +74,8 @@ impl AudioEngine {
 
         let feedback = Feedback::new();
         let sequencer = Sequencer::new(sample_rate_f32);
-        let (voice_tx, voice_rx) = voice_channel();
+        let (voice_tx, voice_rx) = structure_channel();
+        let (recycle_tx, recycle_rx) = recycle_channel();
         let mut runner = BlockRunner::new(
             FIXED_BLOCK_SIZE,
             stream_config.channels as usize,
@@ -79,6 +84,7 @@ impl AudioEngine {
             sequencer,
             command_rx,
             voice_rx,
+            recycle_tx,
             feedback.clone(),
         );
 
@@ -100,6 +106,8 @@ impl AudioEngine {
             _stream: stream,
             commands,
             voices: voice_tx,
+            recycle: recycle_rx,
+            next_node_id: 1,
             feedback,
             info: AudioEngineInfo {
                 device_name,
@@ -136,17 +144,73 @@ impl AudioEngine {
     }
 
     /// 将指定轨道的声源换装为外部节点（如 CLAP 乐器）。
-    /// 节点由调用方在**非实时线程**构造；音频线程在下一个块边界换装。
-    /// 返回 `false` 表示队列满或越界（命令被丢弃）。
+    /// 节点由调用方在**非实时线程**构造；音频线程在下一个块边界换装，
+    /// 被替换的旧节点经回执队列送回，由 [`AudioEngine::reclaim_nodes`]
+    /// 交还控制线程释放。
+    /// 返回分配的节点 ID；`None` 表示队列满或越界（命令被丢弃）。
     pub fn set_external_voice(
         &mut self,
         track: usize,
         node: Box<dyn crate::realtime::Processor>,
-    ) -> bool {
+    ) -> Option<u64> {
+        if track >= crate::realtime::NUM_TRACKS {
+            return None;
+        }
+        let node_id = self.next_node_id;
+        self.next_node_id += 1;
+        self.voices
+            .push(VoiceUpdate::Clap {
+                track,
+                node_id,
+                node,
+            })
+            .ok()
+            .map(|_| node_id)
+    }
+
+    /// 向指定轨道效果器槽追加外部节点（如 CLAP 效果器）。
+    /// 返回分配的节点 ID；`None` 表示队列满/越界（槽满时节点经回收
+    /// 队列退回，节点被释放）。
+    pub fn insert_external_effect(
+        &mut self,
+        track: usize,
+        node: Box<dyn crate::realtime::Processor>,
+    ) -> Option<u64> {
+        if track >= crate::realtime::NUM_TRACKS {
+            return None;
+        }
+        let node_id = self.next_node_id;
+        self.next_node_id += 1;
+        self.voices
+            .push(VoiceUpdate::InsertEffect {
+                track,
+                node_id,
+                node,
+            })
+            .ok()
+            .map(|_| node_id)
+    }
+
+    /// 清空指定轨道的全部外部效果器节点（节点经回执队列回收）。
+    pub fn clear_external_effects(&mut self, track: usize) -> bool {
         if track >= crate::realtime::NUM_TRACKS {
             return false;
         }
-        self.voices.push(VoiceUpdate::Clap { track, node }).is_ok()
+        self.voices
+            .push(VoiceUpdate::ClearEffects { track })
+            .is_ok()
+    }
+
+    /// 排空节点回收回执队列：在**控制线程**释放旧节点并返回其 ID
+    /// （调用方据此丢弃配对的插件守卫，安全卸载动态库）。
+    pub fn reclaim_nodes(&mut self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        while let Ok(recycled) = self.recycle.pop() {
+            let crate::realtime::RecycledNode { node_id, node } = recycled;
+            drop(node); // 控制线程释放：实时铁律仅约束音频回调
+            ids.push(node_id);
+        }
+        ids
     }
 
     /// 将指定轨道的声源恢复为内置合成器。

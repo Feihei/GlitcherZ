@@ -68,4 +68,6 @@ pub use sequencer::{
 pub use sine::SineProcessor;
 pub use svf::{FilterMode, SvfProcessor};
 pub use synth::{SynthProcessor, note_to_frequency};
-pub use voice::{VOICE_QUEUE_CAPACITY, VoiceUpdate, voice_channel};
+pub use voice::{
+    RecycledNode, STRUCTURE_QUEUE_CAPACITY, VoiceUpdate, recycle_channel, structure_channel,
+};

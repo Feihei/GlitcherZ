@@ -149,7 +149,11 @@ const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(8);
 /// 会使实时侧节点悬空（见 `voice_guards` 注释）。
 #[allow(dead_code)]
 struct ClapInstanceGuardEntry {
+    /// 与引擎侧节点 ID 配对（回收回执按此匹配守卫）。
+    node_id: u64,
+    #[allow(dead_code)]
     track: usize,
+    #[allow(dead_code)]
     plugin_id: String,
     _guard: resoz_clap_host::ClapInstanceGuard,
 }
@@ -222,6 +226,8 @@ pub struct ResoZApp {
     voice_guards: Vec<ClapInstanceGuardEntry>,
     /// 已扫描的 CLAP 乐器列表（懒扫描缓存）。
     clap_plugins: Option<Vec<resoz_clap_host::ClapPluginInfo>>,
+    /// 已扫描的 CLAP 效果器列表（懒扫描缓存）。
+    clap_effects: Option<Vec<resoz_clap_host::ClapPluginInfo>>,
     /// 诊断标志：`ui()` 是否已进入过（仅日志用）。
     first_frame_logged: bool,
     /// 诊断标志：是否已发出关闭命令（仅日志用）。
@@ -263,6 +269,7 @@ impl ResoZApp {
             was_playing: false,
             voice_guards: Vec::new(),
             clap_plugins: None,
+            clap_effects: None,
             first_frame_logged: false,
             close_sent: false,
         };
@@ -489,15 +496,17 @@ impl ResoZApp {
         ) {
             Ok(instance) => {
                 let ClapInstance { guard, node } = instance;
-                if self.engine.set_external_voice(track, Box::new(node)) {
-                    self.voice_guards.push(ClapInstanceGuardEntry {
-                        track,
-                        plugin_id: plugin_id.to_string(),
-                        _guard: guard,
-                    });
-                    log::info!("轨道 {} 已装填 CLAP 声源：{plugin_id}", track + 1);
-                } else {
-                    log::error!("声源队列满：轨道 {} 装填失败", track + 1);
+                match self.engine.set_external_voice(track, Box::new(node)) {
+                    Some(node_id) => {
+                        self.voice_guards.push(ClapInstanceGuardEntry {
+                            node_id,
+                            track,
+                            plugin_id: plugin_id.to_string(),
+                            _guard: guard,
+                        });
+                        log::info!("轨道 {} 已装填 CLAP 声源：{plugin_id}", track + 1);
+                    }
+                    None => log::error!("声源队列满：轨道 {} 装填失败", track + 1),
                 }
             }
             Err(err) => {
@@ -532,6 +541,51 @@ impl ResoZApp {
             );
         }
         self.clap_plugins.as_deref().unwrap_or(&[])
+    }
+
+    /// 已扫描的 CLAP 效果器（懒加载）。
+    fn scanned_effects(&mut self) -> &[resoz_clap_host::ClapPluginInfo] {
+        if self.clap_effects.is_none() {
+            self.clap_effects = Some(
+                resoz_clap_host::list_clap_plugins()
+                    .into_iter()
+                    .filter(|info| !info.is_instrument)
+                    .collect(),
+            );
+        }
+        self.clap_effects.as_deref().unwrap_or(&[])
+    }
+
+    /// 给轨道插入 CLAP 效果器节点（非实时实例化 → 引擎换装 → 守卫注册）。
+    fn load_clap_effect(&mut self, track: usize, path: &str, plugin_id: &str) {
+        match ClapInstance::spawn_rt(
+            std::path::Path::new(path),
+            plugin_id,
+            ClapInstanceConfig {
+                sample_rate: self.engine.info().sample_rate,
+                max_frames: 128,
+            },
+        ) {
+            Ok(instance) => {
+                let ClapInstance { guard, node } = instance;
+                match self.engine.insert_external_effect(track, Box::new(node)) {
+                    Some(node_id) => {
+                        self.voice_guards.push(ClapInstanceGuardEntry {
+                            node_id,
+                            track,
+                            plugin_id: plugin_id.to_string(),
+                            _guard: guard,
+                        });
+                        log::info!("轨道 {} 已插入 CLAP 效果器：{plugin_id}", track + 1);
+                    }
+                    None => log::error!("结构队列满：轨道 {} 插入效果器失败", track + 1),
+                }
+            }
+            Err(err) => {
+                log::error!("实例化 CLAP 效果器 {plugin_id} 失败：{err}");
+                self.set_message(format!("插件加载失败：{err}"));
+            }
+        }
     }
 
     fn send_sequencer(&mut self, cmd: SequencerCommand) {
@@ -764,6 +818,36 @@ impl ResoZApp {
                 }
                 if is_clap {
                     ui.weak("（外部乐器插件）");
+                }
+                ui.separator();
+                ui.label("效果器");
+                // 先收集选择，菜单闭包结束后再装填。
+                let mut effect_picked: Option<(String, String)> = None;
+                let mut clear_effects = false;
+                ui.menu_button("CLAP 效果器…", |ui| {
+                    if ui.button("清空全部效果器").clicked() {
+                        clear_effects = true;
+                        ui.close();
+                    }
+                    let empty: Vec<resoz_clap_host::ClapPluginInfo> = Vec::new();
+                    let plugins = self.scanned_effects();
+                    let list = if plugins.is_empty() { &empty } else { plugins };
+                    if list.is_empty() {
+                        ui.weak("（未发现效果器插件）");
+                    }
+                    for info in list {
+                        if ui.button(&info.name).clicked() {
+                            effect_picked =
+                                Some((info.path.display().to_string(), info.id.clone()));
+                            ui.close();
+                        }
+                    }
+                });
+                if clear_effects {
+                    self.engine.clear_external_effects(sel);
+                }
+                if let Some((path, plugin_id)) = effect_picked {
+                    self.load_clap_effect(sel, &path, &plugin_id);
                 }
             });
             ui.weak("正弦波 → ADSR 包络 → SVF 滤波器 → 延迟（每轨独立）—— 改动实时送达音频线程");
@@ -1322,6 +1406,12 @@ impl eframe::App for ResoZApp {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Title(self.window_title.clone()));
             self.title_sent = self.window_title.clone();
+        }
+
+        // 回收已卸装的插件节点：在控制线程释放，并按 node_id 丢弃
+        // 配对守卫（安全卸载动态库）。
+        for node_id in self.engine.reclaim_nodes() {
+            self.voice_guards.retain(|entry| entry.node_id != node_id);
         }
 
         // 走带停止沿：自动化不再覆盖，恢复各轨手动参数值。

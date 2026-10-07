@@ -10,7 +10,7 @@ use crate::realtime::commands::{EngineCommand, SequencerCommand};
 use crate::realtime::context::ProcessContext;
 use crate::realtime::mixer::Mixer;
 use crate::realtime::sequencer::Sequencer;
-use crate::realtime::voice::VoiceUpdate;
+use crate::realtime::voice::{RecycledNode, VoiceUpdate};
 
 /// 引擎 → UI 的状态回传句柄：与 [`BlockRunner`] 共享的一组原子量。
 ///
@@ -70,6 +70,7 @@ pub struct BlockRunner {
     scratch_pos: usize,
     commands: Consumer<EngineCommand>,
     voices: Consumer<VoiceUpdate>,
+    recycle: rtrb::Producer<RecycledNode>,
     feedback: Feedback,
     played_samples: u64,
 }
@@ -86,6 +87,7 @@ impl BlockRunner {
         sequencer: Sequencer,
         commands: Consumer<EngineCommand>,
         voices: Consumer<VoiceUpdate>,
+        recycle: rtrb::Producer<RecycledNode>,
         feedback: Feedback,
     ) -> Self {
         Self {
@@ -101,6 +103,7 @@ impl BlockRunner {
             scratch_pos: 0,
             commands,
             voices,
+            recycle,
             feedback,
             played_samples: 0,
         }
@@ -143,7 +146,7 @@ impl BlockRunner {
             self.apply_command(cmd);
         }
         while let Ok(update) = self.voices.pop() {
-            self.mixer.apply_voice_update(update);
+            self.mixer.apply_structure_update(update, &mut self.recycle);
         }
 
         // 2. 本块上下文（供音序器与混音器共用）。
@@ -300,7 +303,8 @@ mod tests {
         Feedback,
     ) {
         let (tx, rx) = command_channel(64);
-        let (voice_tx, voice_rx) = crate::realtime::voice::voice_channel();
+        let (voice_tx, voice_rx) = crate::realtime::voice::structure_channel();
+        let (_recycle_tx, _recycle_rx) = crate::realtime::voice::recycle_channel();
         let mixer = Mixer::new(SR, fixed_block);
         let feedback = Feedback::new();
         let sequencer = Sequencer::new(SR);
@@ -312,6 +316,7 @@ mod tests {
             sequencer,
             rx,
             voice_rx,
+            _recycle_tx,
             feedback.clone(),
         );
         (runner, tx, voice_tx, feedback)
@@ -599,6 +604,7 @@ mod tests {
         voice_tx
             .push(VoiceUpdate::Clap {
                 track: 0,
+                node_id: 1,
                 node: Box::new(ParamEcho { value: 0.0 }),
             })
             .expect("声源队列未满");

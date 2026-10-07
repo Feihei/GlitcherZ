@@ -8,7 +8,7 @@ use crate::realtime::delay::DelayProcessor;
 use crate::realtime::gain::GainProcessor;
 use crate::realtime::processor::{Processor, ProcessorChain};
 use crate::realtime::synth::SynthProcessor;
-use crate::realtime::voice::VoiceUpdate;
+use crate::realtime::voice::{RecycledNode, VoiceUpdate};
 
 /// 声源插槽：内置合成器或已实例化的外部节点（CLAP 乐器）。
 enum VoiceSlot {
@@ -16,20 +16,23 @@ enum VoiceSlot {
     External,
 }
 
-/// 单条轨道：声源插槽 + 效果器链 + 混音参数 + 预分配缓冲。
+/// 外部效果器槽容量（每轨最多 4 个 CLAP 效果器节点）。
+pub const EFFECT_SLOTS: usize = 4;
+
+/// 单条轨道：声源插槽 + 延迟 + 外部效果器槽 + 混音参数 + 预分配缓冲。
 ///
-/// 轨道增益 / 声像 / 静音不走 `Processor`，而是混音求和时直接应用
-/// —— 少一层节点，命令路由也直观（[`ParamId::TrackGain`] 等在本
-/// 结构上落地，其余参数转发给内部链）。
+/// 信号顺序：`声源（内置/外部）→ DelayProcessor → 外部效果器槽[0..4]`。
+/// 轨道增益 / 声像 / 静音不走 `Processor`，而是混音求和时直接应用。
 ///
-/// 声源双槽预分配：内置合成器常驻，外部节点（CLAP 乐器）由控制侧
-/// 构造后经 [`VoiceUpdate`] 队列装入——换装只做 `Option` 指针写入，
-/// 音频线程零分配。
+/// 声源与效果器槽全部**预分配**：外部节点（CLAP 插件）由控制侧构造
+/// 后经 [`VoiceUpdate`] 队列装入——换装只做 `Option` 指针写入，音频
+/// 线程零分配；被替换的旧节点经回收队列送回控制线程释放。
 pub struct TrackStrip {
     builtin_voice: SynthProcessor,
     external_voice: Option<Box<dyn Processor>>,
     active_voice: VoiceSlot,
-    effects: ProcessorChain,
+    delay: DelayProcessor,
+    effect_slots: [Option<Box<dyn Processor>>; EFFECT_SLOTS],
     scratch: AudioBuffer,
     gain: f32,
     pan: f32,
@@ -39,13 +42,12 @@ pub struct TrackStrip {
 impl TrackStrip {
     /// 构造一条轨道：内置声源 → `DelayProcessor`。**非 RT-safe**。
     pub fn new(sample_rate: f32, block_size: usize) -> Self {
-        let mut effects = ProcessorChain::new();
-        effects.push(Box::new(DelayProcessor::new(sample_rate)));
         Self {
             builtin_voice: SynthProcessor::new(sample_rate),
             external_voice: None,
             active_voice: VoiceSlot::Builtin,
-            effects,
+            delay: DelayProcessor::new(sample_rate),
+            effect_slots: [const { None }; EFFECT_SLOTS],
             scratch: AudioBuffer::new(2, block_size.max(1)),
             gain: 0.8,
             pan: 0.0,
@@ -53,13 +55,27 @@ impl TrackStrip {
         }
     }
 
-    /// 应用一次声源结构更新（来自声源更新队列）。RT-safe：无分配。
-    pub fn apply_voice_update(&mut self, update: VoiceUpdate) {
+    /// 应用一次声源/效果器结构更新（来自结构更新队列）。
+    /// `recycle` 为节点回执队列；push 失败时放弃本次卸装（保持现状，
+    /// 避免在实时线程 drop 堆对象）。RT-safe：无分配。
+    pub fn apply_voice_update(
+        &mut self,
+        update: VoiceUpdate,
+        recycle: &mut rtrb::Producer<RecycledNode>,
+    ) {
         match update {
-            VoiceUpdate::Clap { track, node } => {
-                if track < NUM_TRACKS {
-                    self.external_voice = Some(node);
-                    self.active_voice = VoiceSlot::External;
+            VoiceUpdate::Clap {
+                track,
+                node_id,
+                node,
+            } => {
+                if track >= NUM_TRACKS {
+                    return;
+                }
+                let old = self.external_voice.replace(node);
+                self.active_voice = VoiceSlot::External;
+                if let Some(old) = old {
+                    Self::recycle_or_keep(recycle, node_id, old);
                 }
             }
             VoiceUpdate::Builtin { track } => {
@@ -68,11 +84,46 @@ impl TrackStrip {
                     // 外部节点留驻（Option 保留），切回时无需重建。
                 }
             }
+            VoiceUpdate::InsertEffect {
+                track,
+                node_id,
+                node,
+            } => {
+                if track >= NUM_TRACKS {
+                    return;
+                }
+                match self.effect_slots.iter_mut().find(|slot| slot.is_none()) {
+                    Some(slot) => *slot = Some(node),
+                    // 槽满：节点经回收队列退回控制线程释放。
+                    None => Self::recycle_or_keep(recycle, node_id, node),
+                }
+            }
+            VoiceUpdate::ClearEffects { track } => {
+                if track >= NUM_TRACKS {
+                    return;
+                }
+                for slot in &mut self.effect_slots {
+                    if let Some(node) = slot.take() {
+                        Self::recycle_or_keep(recycle, 0, node);
+                    }
+                }
+            }
         }
     }
 
+    /// 旧节点入回收队列；队列满时放弃卸装（实时线程永不 drop 堆对象）。
+    fn recycle_or_keep(
+        recycle: &mut rtrb::Producer<RecycledNode>,
+        node_id: u64,
+        node: Box<dyn Processor>,
+    ) {
+        let _ = recycle.push(RecycledNode { node_id, node });
+    }
+
     /// 轨道参数：混音三项在本结构落地；插件参数只路由给外部声源；
-    /// 其余转发给内置声源与效果器链。RT-safe。
+    /// 其余转发给内置声源与延迟。RT-safe。
+    ///
+    /// 注：外部效果器节点的参数桥接待处理图节点 ID 引入后统一接入。
     pub fn set_param(&mut self, id: ParamId, value: f32) {
         match id {
             ParamId::TrackGain => {
@@ -93,7 +144,7 @@ impl TrackStrip {
             }
             _ => {
                 let _ = self.builtin_voice.set_param(id, value);
-                let _ = self.effects.set_param(id, value);
+                let _ = self.delay.set_param(id, value);
             }
         }
     }
@@ -101,16 +152,14 @@ impl TrackStrip {
     /// 向该轨当前声源发音符事件（内置与外部都响应；未启动的外部声源
     /// 稍后换装时自带状态，本处静默忽略）。RT-safe。
     pub fn note_event(&mut self, event: NoteEvent) -> bool {
-        let handled = match self.active_voice {
+        match self.active_voice {
             VoiceSlot::Builtin => self.builtin_voice.note_event(event),
             VoiceSlot::External => self
                 .external_voice
                 .as_mut()
                 .map(|voice| voice.note_event(event))
                 .unwrap_or(false),
-        };
-        // 内置声源未消费的事件也无需转发给外部：两套声源状态独立。
-        handled
+        }
     }
 
     /// 线性声像律：p = 0 → (1, 1)；p = ±1 → 单边全量。
@@ -136,7 +185,12 @@ impl TrackStrip {
                 }
             }
         }
-        self.effects.process(ctx, &mut self.scratch);
+        self.delay.process(ctx, &mut self.scratch);
+        for slot in &mut self.effect_slots {
+            if let Some(node) = slot.as_mut() {
+                node.process(ctx, &mut self.scratch);
+            }
+        }
         if self.muted {
             return 0.0;
         }
@@ -196,6 +250,7 @@ impl Mixer {
     }
 
     /// 处理一个块：清空主缓冲 → 各轨并行处理并混入 → 主链处理。
+    /// （节点回收只在块边界的结构更新时发生。）
     /// 返回电平快照。RT-safe。
     pub fn process_block(&mut self, ctx: &ProcessContext) -> MixerLevels {
         let frames = self.master_scratch.capacity().min(ctx.frames);
@@ -252,13 +307,20 @@ impl Mixer {
         self.master_chain.set_param(id, value)
     }
 
-    /// 轨道声源换装（越界轨道忽略）。RT-safe：无分配。
-    pub fn apply_voice_update(&mut self, update: VoiceUpdate) {
+    /// 应用一次声源/效果器结构更新（含旧节点回收）。RT-safe：无分配。
+    pub fn apply_structure_update(
+        &mut self,
+        update: VoiceUpdate,
+        recycle: &mut rtrb::Producer<RecycledNode>,
+    ) {
         let track = match &update {
-            VoiceUpdate::Clap { track, .. } | VoiceUpdate::Builtin { track } => *track,
+            VoiceUpdate::Clap { track, .. }
+            | VoiceUpdate::Builtin { track }
+            | VoiceUpdate::InsertEffect { track, .. }
+            | VoiceUpdate::ClearEffects { track } => *track,
         };
         if let Some(strip) = self.tracks.get_mut(track) {
-            strip.apply_voice_update(update);
+            strip.apply_voice_update(update, recycle);
         }
     }
 
