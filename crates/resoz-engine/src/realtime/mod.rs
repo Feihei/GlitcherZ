@@ -18,6 +18,8 @@
 //! - [`buffer`]：预分配平面缓冲 [`AudioBuffer`]；
 //! - [`context`]：每块上下文 [`ProcessContext`]；
 //! - [`processor`]：[`Processor`] trait 与 [`ProcessorChain`]；
+//! - [`graph`]：节点图核心（[`RtGraph`](graph::RtGraph)、[`ExecPlan`](graph::ExecPlan)、
+//!   结构更新协议与控制侧编译器）；
 //! - [`sine`] / [`gain`]：正弦音源与增益效果器（`Processor` 参考实现）；
 //! - [`envelope`] / [`svf`] / [`synth`]：ADSR 包络、SVF 滤波器与完整合成器；
 //! - [`commands`]：`rtrb` 命令队列与 [`EngineCommand`] / [`NoteEvent`] / [`ParamId`]；
@@ -34,7 +36,7 @@ pub mod context;
 pub mod delay;
 pub mod envelope;
 pub mod gain;
-pub mod mixer;
+pub mod graph;
 pub mod processor;
 pub mod sequencer;
 pub mod sine;
@@ -59,7 +61,10 @@ pub use context::ProcessContext;
 pub use delay::DelayProcessor;
 pub use envelope::AdsrProcessor;
 pub use gain::GainProcessor;
-pub use mixer::{Mixer, MixerLevels};
+pub use graph::{
+    ChannelStripProcessor, ExecPlan, GraphCompiler, GraphLevels, GraphUpdate, RtGraph,
+    TopologyError,
+};
 pub use processor::{Processor, ProcessorChain};
 pub use sequencer::{
     MAX_CLIP_NOTES, PATTERN_STEPS, RtClip, RtNote, Sequencer, SequencerStep, TICKS_PER_QUARTER,
@@ -68,6 +73,4 @@ pub use sequencer::{
 pub use sine::SineProcessor;
 pub use svf::{FilterMode, SvfProcessor};
 pub use synth::{SynthProcessor, note_to_frequency};
-pub use voice::{
-    RecycledNode, STRUCTURE_QUEUE_CAPACITY, VoiceUpdate, recycle_channel, structure_channel,
-};
+pub use voice::{RecycledNode, STRUCTURE_QUEUE_CAPACITY, recycle_channel, structure_channel};
