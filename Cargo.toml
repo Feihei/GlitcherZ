@@ -6,7 +6,9 @@ members = [
     "crates/resoz-ui",
     "crates/resoz-app",
     "crates/resoz-test-plugin",
+    "crates/resoz-test-vst3",
     "crates/resoz-clap-host",
+    "crates/resoz-vst3-host",
 ]
 
 [workspace.package]
@@ -43,12 +45,15 @@ clack-extensions = { version = "0.2", features = [
     "tail",
     "clack-host",
 ] }
-# 动态库加载（CLAP 插件扫描）
+# 动态库加载（CLAP/VST3 插件扫描）
 libloading = "0.8"
+# VST3 插件宿主（COM 绑定，预生成，无需官方 SDK）
+vst3 = "0.3"
 
 clack-plugin = "0.2"
 resoz-model = { path = "crates/resoz-model" }
 resoz-clap-host = { path = "crates/resoz-clap-host" }
+resoz-vst3-host = { path = "crates/resoz-vst3-host" }
 resoz-engine = { path = "crates/resoz-engine" }
 resoz-ui = { path = "crates/resoz-ui" }
 
