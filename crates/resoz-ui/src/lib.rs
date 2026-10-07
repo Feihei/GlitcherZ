@@ -143,19 +143,26 @@ const UI_STATE_KEY: &str = "resoz_ui_state";
 /// 状态栏消息显示时长。
 const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(8);
 
-/// 一个已装填的 CLAP 声源守卫。
+/// 外部插件实例守卫（CLAP / VST3）。
+#[allow(dead_code)] // 守卫仅为延长寿命持有，字段本身不读取
+enum PluginGuard {
+    Clap(resoz_clap_host::ClapInstanceGuard),
+    Vst3(resoz_vst3_host::Vst3InstanceGuard),
+}
+
+/// 一个已装填的外部插件声源/效果器守卫。
 ///
 /// 字段仅诊断/未来清理策略使用；守卫**不可提前丢弃**——卸载动态库
 /// 会使实时侧节点悬空（见 `voice_guards` 注释）。
 #[allow(dead_code)]
-struct ClapInstanceGuardEntry {
+struct PluginGuardEntry {
     /// 与引擎侧节点 ID 配对（回收回执按此匹配守卫）。
     node_id: u64,
     #[allow(dead_code)]
     track: usize,
     #[allow(dead_code)]
     plugin_id: String,
-    _guard: resoz_clap_host::ClapInstanceGuard,
+    _guard: PluginGuard,
 }
 
 /// 峰值电平表：峰值保持 600 ms 后回落，视觉上更容易读。
@@ -221,13 +228,15 @@ pub struct ResoZApp {
     title_sent: String,
     /// 上一帧的走带状态（用于检测停止沿 → 恢复手动参数）。
     was_playing: bool,
-    /// CLAP 插件实例守卫注册表：guard 丢弃会卸载插件动态库，使实时侧
-    /// 节点悬空，故统一持有至窗口关闭（进程退出统一回收）。
-    voice_guards: Vec<ClapInstanceGuardEntry>,
+    /// 外部插件（CLAP/VST3）实例守卫注册表：guard 丢弃会卸载插件动态库，
+    /// 使实时侧节点悬空，故统一持有至窗口关闭（进程退出统一回收）。
+    voice_guards: Vec<PluginGuardEntry>,
     /// 已扫描的 CLAP 乐器列表（懒扫描缓存）。
     clap_plugins: Option<Vec<resoz_clap_host::ClapPluginInfo>>,
     /// 已扫描的 CLAP 效果器列表（懒扫描缓存）。
     clap_effects: Option<Vec<resoz_clap_host::ClapPluginInfo>>,
+    /// 已扫描的 VST3 乐器列表（懒扫描缓存）。
+    vst3_plugins: Option<Vec<resoz_vst3_host::Vst3PluginInfo>>,
     /// 诊断标志：`ui()` 是否已进入过（仅日志用）。
     first_frame_logged: bool,
     /// 诊断标志：是否已发出关闭命令（仅日志用）。
@@ -270,6 +279,7 @@ impl ResoZApp {
             voice_guards: Vec::new(),
             clap_plugins: None,
             clap_effects: None,
+            vst3_plugins: None,
             first_frame_logged: false,
             close_sent: false,
         };
@@ -498,11 +508,11 @@ impl ResoZApp {
                 let ClapInstance { guard, node } = instance;
                 match self.engine.set_external_voice(track, Box::new(node)) {
                     Some(node_id) => {
-                        self.voice_guards.push(ClapInstanceGuardEntry {
+                        self.voice_guards.push(PluginGuardEntry {
                             node_id,
                             track,
                             plugin_id: plugin_id.to_string(),
-                            _guard: guard,
+                            _guard: PluginGuard::Clap(guard),
                         });
                         log::info!("轨道 {} 已装填 CLAP 声源：{plugin_id}", track + 1);
                     }
@@ -525,6 +535,11 @@ impl ResoZApp {
             VoiceSpec::Clap { path, plugin_id } => {
                 if !path.is_empty() && !plugin_id.is_empty() {
                     self.load_clap_voice(track, &path, &plugin_id);
+                }
+            }
+            VoiceSpec::Vst3 { path, class_id } => {
+                if !path.is_empty() && !class_id.is_empty() {
+                    self.load_vst3_voice(track, &path, &class_id);
                 }
             }
         }
@@ -556,6 +571,52 @@ impl ResoZApp {
         self.clap_effects.as_deref().unwrap_or(&[])
     }
 
+    /// 已扫描的 VST3 乐器（懒加载）。
+    fn scanned_vst3_instruments(&mut self) -> &[resoz_vst3_host::Vst3PluginInfo] {
+        if self.vst3_plugins.is_none() {
+            self.vst3_plugins = Some(
+                resoz_vst3_host::list_vst3_plugins()
+                    .into_iter()
+                    .filter(|info| info.is_instrument)
+                    .collect(),
+            );
+        }
+        self.vst3_plugins.as_deref().unwrap_or(&[])
+    }
+
+    /// 给轨道装填 VST3 乐器声源：非实时实例化 → 引擎换装 → 守卫注册。
+    /// 失败时记日志并提示（文档声源保持 Vst3，重新打开项目会重试）。
+    fn load_vst3_voice(&mut self, track: usize, path: &str, class_id: &str) {
+        match resoz_vst3_host::Vst3Instance::spawn_rt(
+            std::path::Path::new(path),
+            class_id,
+            resoz_vst3_host::Vst3InstanceConfig {
+                sample_rate: self.engine.info().sample_rate,
+                max_frames: 128,
+            },
+        ) {
+            Ok(instance) => {
+                let resoz_vst3_host::Vst3Instance { guard, node } = instance;
+                match self.engine.set_external_voice(track, Box::new(node)) {
+                    Some(node_id) => {
+                        self.voice_guards.push(PluginGuardEntry {
+                            node_id,
+                            track,
+                            plugin_id: class_id.to_string(),
+                            _guard: PluginGuard::Vst3(guard),
+                        });
+                        log::info!("轨道 {} 已装填 VST3 声源：{class_id}", track + 1);
+                    }
+                    None => log::error!("声源队列满：轨道 {} 装填失败", track + 1),
+                }
+            }
+            Err(err) => {
+                log::error!("实例化 VST3 插件 {class_id} 失败：{err}");
+                self.set_message(format!("VST3 插件加载失败：{err}"));
+            }
+        }
+    }
+
     /// 给轨道插入 CLAP 效果器节点（非实时实例化 → 引擎换装 → 守卫注册）。
     fn load_clap_effect(&mut self, track: usize, path: &str, plugin_id: &str) {
         match ClapInstance::spawn_rt(
@@ -570,11 +631,11 @@ impl ResoZApp {
                 let ClapInstance { guard, node } = instance;
                 match self.engine.insert_external_effect(track, Box::new(node)) {
                     Some(node_id) => {
-                        self.voice_guards.push(ClapInstanceGuardEntry {
+                        self.voice_guards.push(PluginGuardEntry {
                             node_id,
                             track,
                             plugin_id: plugin_id.to_string(),
-                            _guard: guard,
+                            _guard: PluginGuard::Clap(guard),
                         });
                         log::info!("轨道 {} 已插入 CLAP 效果器：{plugin_id}", track + 1);
                     }
@@ -788,8 +849,9 @@ impl ResoZApp {
             ui.heading(format!("合成器 — {track_title}"));
             ui.horizontal(|ui| {
                 ui.label("声源");
-                let is_clap = matches!(self.project.tracks[sel].voice, VoiceSpec::Clap { .. });
-                if ui.selectable_label(!is_clap, "内置合成器").clicked() {
+                let voice = &self.project.tracks[sel].voice;
+                let is_external = matches!(voice, VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. });
+                if ui.selectable_label(!is_external, "内置合成器").clicked() {
                     self.project.tracks[sel].voice = VoiceSpec::Builtin;
                     self.engine.set_builtin_voice(sel);
                 }
@@ -816,7 +878,29 @@ impl ResoZApp {
                     };
                     self.load_clap_voice(sel, &path, &plugin_id);
                 }
-                if is_clap {
+                let mut vst3_picked: Option<(String, String)> = None;
+                ui.menu_button("VST3 乐器…", |ui| {
+                    let empty: Vec<resoz_vst3_host::Vst3PluginInfo> = Vec::new();
+                    let plugins = self.scanned_vst3_instruments();
+                    let list = if plugins.is_empty() { &empty } else { plugins };
+                    if list.is_empty() {
+                        ui.weak("（未发现 VST3 插件；可用 RESOZ_VST3_PATH 指定目录）");
+                    }
+                    for info in list {
+                        if ui.button(&info.name).clicked() {
+                            vst3_picked = Some((info.path.display().to_string(), info.cid.clone()));
+                            ui.close();
+                        }
+                    }
+                });
+                if let Some((path, class_id)) = vst3_picked {
+                    self.project.tracks[sel].voice = VoiceSpec::Vst3 {
+                        path: path.clone(),
+                        class_id: class_id.clone(),
+                    };
+                    self.load_vst3_voice(sel, &path, &class_id);
+                }
+                if is_external {
                     ui.weak("（外部乐器插件）");
                 }
                 ui.separator();

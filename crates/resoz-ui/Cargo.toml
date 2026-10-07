@@ -15,6 +15,7 @@ eframe = { workspace = true, features = ["glow", "persistence"] }
 log = { workspace = true }
 rfd = { workspace = true }
 resoz-clap-host = { workspace = true }
+resoz-vst3-host = { workspace = true }
 serde = { workspace = true }
 resoz-engine = { workspace = true }
 resoz-model = { workspace = true }

@@ -250,7 +250,7 @@ impl Default for Clip {
     }
 }
 
-/// 轨道声源：内置合成器或 CLAP 插件（乐器）。
+/// 轨道声源：内置合成器、CLAP 或 VST3 插件（乐器）。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VoiceSpec {
@@ -263,6 +263,13 @@ pub enum VoiceSpec {
         path: String,
         #[serde(default)]
         plugin_id: String,
+    },
+    /// VST3 插件声源：.vst3 文件/Bundle 路径 + 类 CID（16 字节十六进制）。
+    Vst3 {
+        #[serde(default)]
+        path: String,
+        #[serde(default)]
+        class_id: String,
     },
 }
 
