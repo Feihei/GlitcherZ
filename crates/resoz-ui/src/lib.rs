@@ -205,7 +205,7 @@ impl PeakMeter {
     }
 }
 
-/// Which clip the inline editor (piano roll / curve lane) targets.
+/// Which clip the floating editor window (piano roll / curve lane) targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditTarget {
     Midi { track: usize, clip: usize },
@@ -227,8 +227,7 @@ pub struct ResoZApp {
     selected_auto: usize,
     /// Arrangement timeline cross-frame state (zoom/drag).
     timeline_state: timeline::TimelineState,
-    /// Which clip the inline editor (piano roll / curve lane) is targeting
-    /// (`None` = the track's first clip).
+    /// Which clip the floating editor window is targeting (`None` = closed).
     edit_clip: Option<EditTarget>,
     /// Piano roll cross-frame state (scroll/drag).
     roll_state: piano_roll::RollState,
@@ -1686,6 +1685,18 @@ impl ResoZApp {
         let playing = self.engine.is_playing();
         let selected_track = self.selected_track;
         let selected_auto = self.selected_auto;
+        let edit_target = self.edit_clip.map(|t| match t {
+            EditTarget::Midi { track, clip } => timeline::EditHighlight {
+                is_control: false,
+                track,
+                clip,
+            },
+            EditTarget::Control { track, clip } => timeline::EditHighlight {
+                is_control: true,
+                track,
+                clip,
+            },
+        });
         let actions = {
             let (midi, control, state) = (
                 &mut self.project.midi_tracks,
@@ -1703,6 +1714,7 @@ impl ResoZApp {
                     selected_auto,
                     playhead_ticks: playhead,
                     playing,
+                    edit_target,
                 },
             )
         };
@@ -1742,6 +1754,30 @@ impl ResoZApp {
             }
             timeline::TimelineAction::AddMidiTrack => self.add_midi_track(),
             timeline::TimelineAction::RemoveLastMidiTrack => self.remove_last_midi_track(),
+        }
+    }
+
+    /// Floating editor window for the clip targeted from the arrangement
+    /// timeline (double-click). Closing it (X / ✕) clears the edit target.
+    fn editor_window(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.edit_clip else {
+            return;
+        };
+        let title = match target {
+            EditTarget::Midi { .. } => "Piano Roll",
+            EditTarget::Control { .. } => "Curve Editor",
+        };
+        let mut open = true;
+        egui::Window::new(title)
+            .open(&mut open)
+            .default_width(760.0)
+            .default_height(360.0)
+            .show(ctx, |ui| match target {
+                EditTarget::Midi { track, clip } => self.midi_editor_body(ui, track, clip),
+                EditTarget::Control { track, clip } => self.control_editor_body(ui, track, clip),
+            });
+        if !open {
+            self.edit_clip = None;
         }
     }
 
@@ -2389,25 +2425,30 @@ impl ResoZApp {
         self.selected_track = self.selected_track.min(last.saturating_sub(1));
     }
 
-    /// Piano roll (edits the selected track's clip; edits are pushed to the audio thread
-    /// immediately).
-    ///
-    /// T3: edits the clip targeted from the arrangement timeline
-    /// (double-click); defaults to the track's first clip.
+    /// Piano roll hint (the editor itself lives in a floating window opened
+    /// by double-clicking a clip on the arrangement timeline).
     fn clip_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
-        let sel = self
-            .selected_track
-            .min(self.project.midi_tracks.len().saturating_sub(1));
+        ui.weak(
+            "Piano roll: double-click a MIDI clip in the Arrangement timeline \
+             (bottom panel) to open its editor window.",
+        );
+    }
+
+    /// Body of the floating piano-roll window: edits the targeted clip,
+    /// pushes edits to the audio thread immediately.
+    fn midi_editor_body(&mut self, ui: &mut egui::Ui, track: usize, clip_index: usize) {
+        let sel = track.min(self.project.midi_tracks.len().saturating_sub(1));
         if self.project.midi_tracks[sel].clips.is_empty() {
             self.project.midi_tracks[sel].clips.push(MidiClip::new(0));
             self.send_track_clips(sel);
         }
         let clip_count = self.project.midi_tracks[sel].clips.len();
-        let clip_index = match self.edit_clip {
-            Some(EditTarget::Midi { track, clip }) if track == sel && clip < clip_count => clip,
-            _ => 0,
+        let clip_index = if clip_index < clip_count {
+            clip_index
+        } else {
+            0
         };
         let track_name = if self.project.midi_tracks[sel].name.is_empty() {
             format!("Track {}", sel + 1)
@@ -2416,10 +2457,10 @@ impl ResoZApp {
         };
         ui.horizontal(|ui| {
             ui.label(format!(
-                "Piano Roll — {track_name} · clip {} (of {clip_count})",
+                "{track_name} · clip {} (of {clip_count})",
                 clip_index + 1
             ));
-            if self.edit_clip.is_some() && ui.button("✕ Close editor").clicked() {
+            if ui.button("✕ Close editor").clicked() {
                 self.edit_clip = None;
             }
         });
@@ -2565,10 +2606,18 @@ impl ResoZApp {
             ui.weak(format!("→ {current}"));
         });
 
-        // The lane edits the control clip targeted from the arrangement
-        // timeline (double-click); defaults to the track's first clip. The
-        // clip's own `loop_ticks` sets the editing width (T3: control clips
-        // are self-contained, no syncing from the MIDI track anymore).
+        // The curve editor lives in a floating window (double-click a control
+        // clip on the arrangement timeline); the clip's own `loop_ticks` sets
+        // the editing width.
+        ui.weak(
+            "Curve editor: double-click a control clip in the Arrangement \
+             timeline (bottom panel) to open its editor window.",
+        );
+    }
+
+    /// Body of the floating curve-editor window: edits the targeted control
+    /// clip, pushes edits to the audio thread immediately.
+    fn control_editor_body(&mut self, ui: &mut egui::Ui, index: usize, clip_index: usize) {
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
         let axis_param = self.project.graph.auto_endpoint(index).unwrap_or_default();
@@ -2579,13 +2628,10 @@ impl ResoZApp {
                 track.clips.push(resoz_model::ControlClip::new(0));
                 created = true;
             } else {
-                let clip_index = match self.edit_clip {
-                    Some(EditTarget::Control { track: t, clip })
-                        if t == index && clip < clip_count =>
-                    {
-                        clip
-                    }
-                    _ => 0,
+                let clip_index = if clip_index < clip_count {
+                    clip_index
+                } else {
+                    0
                 };
                 let clip = &mut track.clips[clip_index];
                 let loop_ticks = clip.loop_ticks;
@@ -2728,6 +2774,7 @@ impl eframe::App for ResoZApp {
         self.status_panel(ui);
         self.timeline_panel(ui);
         self.synth_panel(ui);
+        self.editor_window(ui.ctx());
 
         // Audio-driven displays (level meter, playback position, envelope) need periodic
         // repaints; without this, egui sleeps when idle and auto-close (smoke test) never fires.

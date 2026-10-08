@@ -93,6 +93,16 @@ pub enum TimelineAction {
 }
 
 /// Per-frame view inputs (immutable).
+/// The clip currently targeted by the floating editor window (highlighted on
+/// the timeline so a double-click gives immediate visual feedback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditHighlight {
+    /// `false` = MIDI row, `true` = control row.
+    pub is_control: bool,
+    pub track: usize,
+    pub clip: usize,
+}
+
 pub struct TimelineParams<'a> {
     /// Mute flags of the MIDI tracks (channel-strip node state).
     pub muted: &'a [bool],
@@ -100,6 +110,8 @@ pub struct TimelineParams<'a> {
     pub selected_auto: usize,
     pub playhead_ticks: f32,
     pub playing: bool,
+    /// Clip to outline as "being edited" (from the floating editor window).
+    pub edit_target: Option<EditHighlight>,
 }
 
 /// Placement semantics shared by MIDI and control clips.
@@ -153,6 +165,8 @@ struct RowColors {
     clip_fill: Color32,
     clip_stroke: Color32,
     clip_text: Color32,
+    /// Outline for the clip currently open in the editor window.
+    edit_highlight: Color32,
 }
 
 impl RowColors {
@@ -167,6 +181,7 @@ impl RowColors {
             },
             clip_stroke: Color32::from_rgb(140, 180, 240),
             clip_text: Color32::from_rgb(225, 235, 250),
+            edit_highlight: Color32::from_rgb(120, 225, 255),
         }
     }
 
@@ -181,6 +196,7 @@ impl RowColors {
             },
             clip_stroke: Color32::from_rgb(235, 195, 130),
             clip_text: Color32::from_rgb(250, 240, 220),
+            edit_highlight: Color32::from_rgb(255, 215, 110),
         }
     }
 }
@@ -285,6 +301,9 @@ pub fn show(
                 muted: p.muted.get(i).copied().unwrap_or(false),
                 selected: p.selected_track == i,
             };
+            let highlight = p
+                .edit_target
+                .and_then(|e| (!e.is_control && e.track == i).then_some(e.clip));
             lane_row(
                 ui,
                 state,
@@ -296,6 +315,7 @@ pub fn show(
                 content_px,
                 p.playhead_ticks,
                 RowColors::midi(p.selected_track == i),
+                highlight,
                 &|clip| format!("{} notes", clip.notes.len()),
             );
         }
@@ -309,6 +329,9 @@ pub fn show(
                     index: i,
                     selected: p.selected_auto == i,
                 };
+                let highlight = p
+                    .edit_target
+                    .and_then(|e| (e.is_control && e.track == i).then_some(e.clip));
                 lane_row(
                     ui,
                     state,
@@ -320,6 +343,7 @@ pub fn show(
                     content_px,
                     p.playhead_ticks,
                     RowColors::control(p.selected_auto == i),
+                    highlight,
                     &|clip| {
                         if clip.curve.is_empty() {
                             "empty".to_string()
@@ -347,6 +371,7 @@ fn lane_row<T: Placement>(
     content_px: f32,
     playhead_ticks: f32,
     colors: RowColors,
+    highlight: Option<usize>,
     clip_label: &dyn Fn(&T) -> String,
 ) {
     ui.horizontal(|ui| {
@@ -418,7 +443,7 @@ fn lane_row<T: Placement>(
         let tick_at = |x: f32| ((x - lane.left()) / px_per_tick).max(0.0);
 
         // Clip blocks.
-        for clip in clips.iter() {
+        for (index, clip) in clips.iter().enumerate() {
             let x0 = lane.left() + clip.start() as f32 * px_per_tick;
             let x1 = lane.left() + (clip.start() + clip.span()) as f32 * px_per_tick;
             let rect = Rect::from_min_max(
@@ -435,6 +460,14 @@ fn lane_row<T: Placement>(
                 Stroke::new(1.0, colors.clip_stroke),
                 StrokeKind::Inside,
             );
+            if highlight == Some(index) {
+                painter.rect_stroke(
+                    rect,
+                    3.0,
+                    Stroke::new(2.0, colors.edit_highlight),
+                    StrokeKind::Inside,
+                );
+            }
             painter.text(
                 pos2(rect.left() + 4.0, rect.center().y),
                 Align2::LEFT_CENTER,
