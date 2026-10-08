@@ -338,6 +338,7 @@ dependencies = [
  "bitflags 2.13.2",
  "clack-common",
  "clack-host",
+ "clack-plugin",
  "clap-sys",
 ]
 
@@ -2108,6 +2109,7 @@ dependencies = [
  "clack-common",
  "clack-extensions",
  "clack-host",
+ "clap-sys",
  "log",
  "resoz-engine",
  "thiserror 2.0.21",
@@ -2137,6 +2139,7 @@ name = "resoz-test-plugin"
 version = "0.1.0"
 dependencies = [
  "clack-common",
+ "clack-extensions",
  "clack-plugin",
 ]
 

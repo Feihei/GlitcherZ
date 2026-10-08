@@ -242,6 +242,9 @@ pub struct ResoZApp {
     /// 各轨道 VST3 声源的参数列表（实例化时读出，键 = 轨道号）。
     /// 仅诊断/展示用；实际参数控制仍走 `PluginParam` 桥接。
     voice_params: HashMap<usize, Vec<resoz_vst3_host::Vst3ParamInfo>>,
+    /// 各轨道 CLAP 声源的参数列表（实例化时读出，键 = 轨道号）。
+    /// 自动化连线目标数据源；曲线值语义 = 插件值域原始值。
+    clap_voice_params: HashMap<usize, Vec<resoz_clap_host::ClapParamInfo>>,
     /// 诊断标志：`ui()` 是否已进入过（仅日志用）。
     first_frame_logged: bool,
     /// 诊断标志：是否已发出关闭命令（仅日志用）。
@@ -287,6 +290,7 @@ impl ResoZApp {
             vst3_plugins: None,
             vst3_effects: None,
             voice_params: HashMap::new(),
+            clap_voice_params: HashMap::new(),
             first_frame_logged: false,
             close_sent: false,
         };
@@ -538,7 +542,8 @@ impl ResoZApp {
     }
 
     /// 给轨道装填 CLAP 乐器声源：非实时实例化 → 引擎换装 → 守卫注册。
-    /// 失败时记日志并回退内置声源。
+    /// 成功后顺带枚举插件参数（自动化连线目标的数据源）。失败时记日志
+    /// 并回退内置声源。
     fn load_clap_voice(&mut self, track: usize, path: &str, plugin_id: &str) {
         match ClapInstance::spawn_rt(
             std::path::Path::new(path),
@@ -549,6 +554,8 @@ impl ResoZApp {
             },
         ) {
             Ok(instance) => {
+                // 参数枚举需在实例被拆解前进行（守卫持有插件实例）。
+                let params = instance.list_params();
                 let ClapInstance { guard, node } = instance;
                 match self.engine.set_external_voice(track, Box::new(node)) {
                     Some(node_id) => {
@@ -558,6 +565,7 @@ impl ResoZApp {
                             plugin_id: plugin_id.to_string(),
                             _guard: PluginGuard::Clap(guard),
                         });
+                        self.clap_voice_params.insert(track, params);
                         log::info!("轨道 {} 已装填 CLAP 声源：{plugin_id}", track + 1);
                     }
                     None => log::error!("声源队列满：轨道 {} 装填失败", track + 1),
@@ -575,12 +583,15 @@ impl ResoZApp {
         match self.project.tracks[track].voice.clone() {
             VoiceSpec::Builtin => {
                 self.voice_params.remove(&track);
+                self.clap_voice_params.remove(&track);
                 self.engine.set_builtin_voice(track);
             }
             VoiceSpec::Clap { path, plugin_id } => {
                 self.voice_params.remove(&track);
                 if !path.is_empty() && !plugin_id.is_empty() {
                     self.load_clap_voice(track, &path, &plugin_id);
+                } else {
+                    self.clap_voice_params.remove(&track);
                 }
             }
             VoiceSpec::Vst3 { path, class_id } => {
@@ -1077,6 +1088,30 @@ impl ResoZApp {
                         });
                 }
             }
+
+            // CLAP 插件参数列表（实例化时经 params 扩展枚举）。
+            if let Some(params) = self.clap_voice_params.get(&sel) {
+                if !params.is_empty() {
+                    egui::CollapsingHeader::new(format!("插件参数 CLAP（{}）", params.len()))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::Grid::new("clap_params")
+                                .num_columns(3)
+                                .spacing([16.0, 4.0])
+                                .show(ui, |ui| {
+                                    for param in params {
+                                        ui.label(&param.name);
+                                        ui.weak(format!("id {}", param.id));
+                                        ui.weak(format!(
+                                            "默认 {:.3} [{:.3}..{:.3}]",
+                                            param.default_value, param.min_value, param.max_value
+                                        ));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+            }
             ui.weak("正弦波 → ADSR 包络 → SVF 滤波器 → 延迟（每轨独立）—— 改动实时送达音频线程");
             ui.add_space(8.0);
 
@@ -1470,16 +1505,41 @@ impl ResoZApp {
                     self.lane_param = param;
                 }
             }
-            // 插件参数目标（VST3 声源装填后可用；曲线值语义 = 归一化
-            // 0..1，与 Vst3Node 的 PluginParam 桥接一致）。
+            // 插件参数目标（CLAP/VST3 声源装填后可用）。曲线值语义：
+            // CLAP = 插件值域原始值；VST3 = 归一化 0..1（各宿主节点
+            // PluginParam 桥接的取值口径）。
             let mut plugin_picked: Option<AutoParam> = None;
-            if let Some(params) = self.voice_params.get(&sel) {
-                if !params.is_empty() {
-                    let current_name = match &self.lane_param {
-                        AutoParam::PluginParam { name, .. } => Some(name.clone()),
-                        _ => None,
-                    };
-                    ui.menu_button(current_name.as_deref().unwrap_or("插件参数…"), |ui| {
+            let has_plugin_params = self
+                .voice_params
+                .get(&sel)
+                .is_some_and(|params| !params.is_empty())
+                || self
+                    .clap_voice_params
+                    .get(&sel)
+                    .is_some_and(|params| !params.is_empty());
+            if has_plugin_params {
+                let current_name = match &self.lane_param {
+                    AutoParam::PluginParam { name, .. } => Some(name.clone()),
+                    _ => None,
+                };
+                ui.menu_button(current_name.as_deref().unwrap_or("插件参数…"), |ui| {
+                    if let Some(params) = self.clap_voice_params.get(&sel) {
+                        for param in params {
+                            let label = if param.name.is_empty() {
+                                format!("参数 {}", param.id)
+                            } else {
+                                param.name.clone()
+                            };
+                            if ui.button(&label).clicked() {
+                                plugin_picked = Some(AutoParam::PluginParam {
+                                    param_id: param.id,
+                                    name: label,
+                                });
+                                ui.close();
+                            }
+                        }
+                    }
+                    if let Some(params) = self.voice_params.get(&sel) {
                         for param in params {
                             let label = if param.title.is_empty() {
                                 format!("参数 {}", param.id)
@@ -1494,8 +1554,8 @@ impl ResoZApp {
                                 ui.close();
                             }
                         }
-                    });
-                }
+                    }
+                });
             }
             if let Some(param) = plugin_picked {
                 self.lane_param = param;

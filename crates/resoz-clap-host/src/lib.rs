@@ -7,7 +7,9 @@
 //! - 扫描 CLAP 插件目录（标准目录 + `RESOZ_CLAP_PATH` 环境变量）；
 //! - 枚举插件描述（ID / 名称 / 是否乐器）；
 //! - 在**非实时线程**实例化插件，产出可在音频回调中运行的
-//!   [`ClapNode`]（实时铁律约束适用于其 `process` 路径）。
+//!   [`ClapNode`]（实时铁律约束适用于其 `process` 路径）；
+//! - 枚举插件实例的参数列表（[`ClapInstance::list_params`]，params
+//!   扩展直调，见 `raw` 模块）。
 //!
 //! 桥接模型：
 //! - **音符**：[`Processor::note_event`] 把 `NoteOn/Off` 暂存进定容
@@ -69,6 +71,8 @@ pub enum HostError {
     HostInfo,
     #[error("插件缺少工厂或有效 ID")]
     NoPlugin,
+    #[error("插件未实现 params 扩展")]
+    NoParams,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +139,23 @@ pub struct ClapPluginInfo {
     pub name: String,
     /// 是否为乐器（合成器；`instrument` 特性标记）。
     pub is_instrument: bool,
+}
+
+/// 一个插件参数的元数据快照（实例化时经 params 扩展读出）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClapParamInfo {
+    /// 插件侧参数 ID（`ParamId::PluginParam` 桥接用）。
+    pub id: u32,
+    /// 显示名称。
+    pub name: String,
+    /// 模块路径（`/` 分隔，可空）。
+    pub module: String,
+    /// 最小值（插件值域）。
+    pub min_value: f64,
+    /// 最大值（插件值域）。
+    pub max_value: f64,
+    /// 默认值（插件值域）。
+    pub default_value: f64,
 }
 
 /// 枚举给定 `.clap` 动态库内的全部插件。加载失败的库被跳过并记日志。
@@ -337,6 +358,15 @@ impl ClapInstance {
             },
             node: ClapNode::new(processor, config),
         })
+    }
+
+    /// 枚举插件暴露的全部参数（元数据快照）。
+    ///
+    /// 在**非实时线程**调用（直调插件主线程回调）。插件未实现 params
+    /// 扩展时返回空列表；个别参数读取失败被跳过而非整体失败。
+    /// RT-safe 无关——本方法不触碰实时节点。
+    pub fn list_params(&self) -> Vec<ClapParamInfo> {
+        raw::enumerate_params(self.guard._instance.raw_instance())
     }
 }
 
@@ -627,6 +657,49 @@ mod tests {
             .expect("测试插件应被枚举");
         assert!(sine.is_instrument, "正弦插件应带 instrument 特性");
         assert_eq!(sine.name, "ResoZ Sine");
+    }
+
+    #[test]
+    fn lists_plugin_params() {
+        let Some((instance, _ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        let params = instance.list_params();
+        assert_eq!(params.len(), 1, "测试插件应暴露一个参数");
+        let param = &params[0];
+        assert_eq!(param.id, 1);
+        assert_eq!(param.name, "Amplitude");
+        assert!((param.min_value - 0.0).abs() < 1e-9);
+        assert!((param.max_value - 1.0).abs() < 1e-9);
+        assert!((param.default_value - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn param_value_shapes_output() {
+        let Some((mut instance, ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        let node = &mut instance.node;
+        let mut buffer = AudioBuffer::new(2, 128);
+        buffer.set_len(128);
+        buffer.clear();
+
+        // 振幅参数 0.25：NoteOn 后峰值应接近 0.25（正弦峰值）。
+        assert!(node.set_param(ParamId::PluginParam(1), 0.25));
+        assert!(node.note_event(NoteEvent::On {
+            note: 69,
+            velocity: 1.0
+        }));
+        node.process(&ctx, &mut buffer);
+        let peak = buffer
+            .channel(0)
+            .unwrap()
+            .iter()
+            .fold(0.0f32, |acc, s| acc.max(s.abs()));
+        assert!(
+            (peak - 0.25).abs() < 0.02,
+            "输出峰值应接近参数值 0.25，实际 {peak}"
+        );
     }
 
     #[test]

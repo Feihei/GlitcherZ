@@ -10,6 +10,7 @@ description = "ResoZ CLAP 插件宿主适配层：扫描、实例化与实时节
 clack-host = { workspace = true }
 clack-common = { workspace = true }
 clack-extensions = { workspace = true }
+clap-sys = "0.5"
 log = { workspace = true }
 thiserror = { workspace = true }
 resoz-engine = { workspace = true }
