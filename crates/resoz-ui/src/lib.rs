@@ -35,6 +35,7 @@ use resoz_model::{
     Pattern, PortRef, Project, SynthParams, TICKS_PER_BAR, VoiceSpec,
 };
 
+pub mod canvas;
 pub mod lane;
 pub mod piano_roll;
 
@@ -216,6 +217,8 @@ pub struct ResoZApp {
     roll_state: piano_roll::RollState,
     /// 自动化泳道的跨帧状态（拖拽）。
     lane_state: lane::LaneState,
+    /// 节点画布的跨帧状态（平移/缩放/选中/拖拽）。
+    canvas_state: canvas::CanvasState,
     /// 画笔音符：点选空白步时写入的音符。
     brush_note: u8,
     /// 八度基准（C 的 MIDI 编号，默认 60 = C4）。
@@ -287,6 +290,7 @@ impl ResoZApp {
             selected_auto: 0,
             roll_state: piano_roll::RollState::new(),
             lane_state: lane::LaneState::default(),
+            canvas_state: canvas::CanvasState::default(),
             brush_note: 60,
             octave_base: 60,
             held_notes: HashSet::new(),
@@ -730,6 +734,248 @@ impl ResoZApp {
             self.engine
                 .set_auto_route(index, engine_id, param_id_of(&param));
         }
+    }
+
+    // ---- 节点画布（P5d，spec §9 P5d）----
+
+    /// 节点画布一帧：视图 + 交互意图收集，动作统一落文档 + 引擎。
+    fn graph_canvas(&mut self, ui: &mut egui::Ui) {
+        let track_count = self.project.midi_tracks.len();
+        let auto_count = self.project.automation_tracks.len();
+        let actions = {
+            // 借用拆分：不可变快照（文档/插件参数表）交给画布，
+            // 可变的画布状态独立出借；动作收集完成后统一应用。
+            let doc = &self.project.graph;
+            let clap = &self.clap_voice_params;
+            let vst3 = &self.voice_params;
+            let options = move |node_id: u64| -> Vec<(String, AutoParam)> {
+                let mut v = Vec::new();
+                let Some(node) = doc.node_by_id(node_id) else {
+                    return v;
+                };
+                let track = node.track();
+                match node {
+                    NodeDoc::ChannelStrip { .. } => {
+                        v.push(("音量".to_string(), AutoParam::TrackGain));
+                        v.push(("声像".to_string(), AutoParam::TrackPan));
+                    }
+                    NodeDoc::Instrument { .. } => {
+                        v.push(("截止".to_string(), AutoParam::FilterCutoff));
+                        if let Some(params) = clap.get(&track) {
+                            for p in params {
+                                let label = if p.name.is_empty() {
+                                    format!("参数 {}", p.id)
+                                } else {
+                                    p.name.clone()
+                                };
+                                v.push((
+                                    format!("CLAP {label}"),
+                                    AutoParam::PluginParam {
+                                        param_id: p.id,
+                                        name: label,
+                                    },
+                                ));
+                            }
+                        }
+                        if let Some(params) = vst3.get(&track) {
+                            for p in params {
+                                let label = if p.title.is_empty() {
+                                    format!("参数 {}", p.id)
+                                } else {
+                                    p.title.clone()
+                                };
+                                v.push((
+                                    format!("VST3 {label}"),
+                                    AutoParam::PluginParam {
+                                        param_id: p.id,
+                                        name: label,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                v
+            };
+            canvas::show(
+                ui,
+                &mut self.canvas_state,
+                canvas::CanvasDeps {
+                    doc,
+                    track_count,
+                    auto_count,
+                    auto_options: &options,
+                },
+            )
+        };
+        self.apply_canvas_actions(actions);
+    }
+
+    /// 应用画布动作：文档与引擎同步（复用既有建图/连线方法）。
+    fn apply_canvas_actions(&mut self, actions: Vec<canvas::CanvasAction>) {
+        for action in actions {
+            match action {
+                canvas::CanvasAction::ConnectAudio { from_doc, to } => {
+                    // 文档去重（引擎侧 add_cable 本身幂等）。
+                    let dup = self.project.graph.cables.iter().any(|c| {
+                        c.kind == CableKind::Audio
+                            && c.from == PortRef::Node(from_doc)
+                            && c.to == to
+                    });
+                    if !dup {
+                        self.project
+                            .graph
+                            .cables
+                            .push(resoz_model::CableDoc::audio(from_doc, to.clone()));
+                    }
+                    let Some(&from_engine) = self.node_map.get(&from_doc) else {
+                        self.set_message("连线失败：源节点不在引擎图中".to_string());
+                        continue;
+                    };
+                    let to_engine = match &to {
+                        PortRef::Node(id) => self.node_map.get(id).copied(),
+                        PortRef::Master => Some(self.engine.master_node_id()),
+                        _ => None,
+                    };
+                    let Some(to_engine) = to_engine else {
+                        self.set_message("连线失败：目标节点不在引擎图中".to_string());
+                        continue;
+                    };
+                    if !self.engine.connect_nodes(from_engine, to_engine) {
+                        self.set_message("连线失败：成环 / 入边超限 / 队列满".to_string());
+                    }
+                }
+                canvas::CanvasAction::ConnectMidi { track, to_doc } => {
+                    let dup = self.project.graph.cables.iter().any(|c| {
+                        c.kind == CableKind::Midi
+                            && c.from == PortRef::MidiTrack(track)
+                            && c.to == PortRef::Node(to_doc)
+                    });
+                    if !dup {
+                        self.project
+                            .graph
+                            .cables
+                            .push(resoz_model::CableDoc::midi(track, to_doc));
+                    }
+                    if let Some(to_engine) = self.node_map.get(&to_doc).copied() {
+                        if !self.engine.connect_midi_node(track, to_engine) {
+                            self.set_message("MIDI 连线失败：扇出超限 / 队列满".to_string());
+                        }
+                    }
+                }
+                canvas::CanvasAction::ConnectAuto {
+                    index,
+                    to_doc,
+                    param,
+                } => {
+                    self.set_auto_endpoint(index, to_doc, param);
+                }
+                canvas::CanvasAction::DeleteCable(i) => {
+                    self.delete_cable(i);
+                }
+                canvas::CanvasAction::DeleteNode(doc_id) => {
+                    self.delete_graph_node(doc_id);
+                }
+                canvas::CanvasAction::SelectTrack(track) => {
+                    if track < self.project.midi_tracks.len() {
+                        self.selected_track = track;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 删除一条连线（文档下标 i；文档与引擎同步）。
+    fn delete_cable(&mut self, i: usize) {
+        let Some(cable) = self.project.graph.cables.get(i).cloned() else {
+            return;
+        };
+        match cable.kind {
+            CableKind::Audio => {
+                if let (PortRef::Node(from), Some(to_engine)) = (
+                    &cable.from,
+                    match &cable.to {
+                        PortRef::Node(id) => self.node_map.get(id).copied(),
+                        PortRef::Master => Some(self.engine.master_node_id()),
+                        _ => None,
+                    },
+                ) {
+                    if let Some(from_engine) = self.node_map.get(from).copied() {
+                        self.engine.disconnect_nodes(from_engine, to_engine);
+                    }
+                }
+            }
+            CableKind::Midi => {
+                if let (PortRef::MidiTrack(track), PortRef::Node(to_doc)) = (&cable.from, &cable.to)
+                {
+                    if let Some(to_engine) = self.node_map.get(to_doc).copied() {
+                        self.engine.disconnect_midi_node(*track, to_engine);
+                    }
+                }
+            }
+            CableKind::Automation => {
+                if let PortRef::AutoTrack(index) = cable.from {
+                    self.engine.clear_auto_route(index);
+                }
+            }
+        }
+        self.project.graph.cables.remove(i);
+    }
+
+    /// 删除一个节点：仅效果器开放（MVP）——引擎 `remove_node` 自带
+    /// 旁路语义（入边源×出边目标直连），文档镜像同一改接。
+    fn delete_graph_node(&mut self, doc_id: u64) {
+        let Some(node) = self.project.graph.node_by_id(doc_id) else {
+            return;
+        };
+        if !matches!(node, NodeDoc::Effect { .. }) {
+            self.set_message("画布暂只支持删除效果器节点（乐器/通道条由面板管理）".to_string());
+            return;
+        }
+        // 文档旁路对：入线源 × 出线目标（任意类型线一律移除，
+        // 音频直连对按引擎 remove_node 语义重建）。
+        let ins: Vec<PortRef> = self
+            .project
+            .graph
+            .cables
+            .iter()
+            .filter(|c| c.to == PortRef::Node(doc_id))
+            .map(|c| c.from.clone())
+            .collect();
+        let outs: Vec<PortRef> = self
+            .project
+            .graph
+            .cables
+            .iter()
+            .filter(|c| c.from == PortRef::Node(doc_id))
+            .map(|c| c.to.clone())
+            .collect();
+        let Some(&engine_id) = self.node_map.get(&doc_id) else {
+            return;
+        };
+        if !self.engine.remove_node(engine_id) {
+            self.set_message("节点移除失败（队列满）".to_string());
+            return;
+        }
+        self.project.graph.nodes.retain(|n| n.node_id() != doc_id);
+        self.project
+            .graph
+            .cables
+            .retain(|c| c.from != PortRef::Node(doc_id) && c.to != PortRef::Node(doc_id));
+        for from in &ins {
+            if !matches!(from, PortRef::Node(_)) {
+                continue; // 音频源只能是节点。
+            }
+            for to in &outs {
+                self.project
+                    .graph
+                    .cables
+                    .push(resoz_model::CableDoc::audio(from.clone(), to.clone()));
+            }
+        }
+        self.node_map.remove(&doc_id);
+        self.retire_guard(engine_id);
     }
 
     /// 文档模式 → 引擎表示（`Copy` 数组，零堆分配）。
@@ -1684,6 +1930,10 @@ impl ResoZApp {
                     }
                     ui.end_row();
                 });
+
+            ui.separator();
+            ui.add_space(4.0);
+            self.graph_canvas(ui);
 
             self.sequencer_section(ui);
             self.clip_section(ui);
