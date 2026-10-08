@@ -36,7 +36,7 @@
 - [x] P5a CLAP 参数枚举（clack 0.2 raw vtable 直调；测试插件 Amplitude 参数端到端）✅ 2026-10-08
 - [x] P5b 引擎寻址层 node_id 化 + 轨道定容 16（ExecPlan slot→node_id 表；cable 列表取代单出边；`SetMidiTrackCount` + add/remove_midi_track）✅ 2026-10-08
 - [x] P5c 模型完整形态（GraphDoc{nodes, cables} 终态，PROJECT_VERSION=3；Track 拆 MidiTrack + 图节点文档；automation_tracks 顶层化；D13 全显式：加载器经 add_node/connect_nodes 粒度按文档重建；双身份约定：文档 node_id 持久化、引擎侧 fresh_node_id + UI node_map 映射，插件守卫经退役区按回收回执释放）✅ 2026-10-08
-- [ ] P5d UI 节点画布（egui 自绘，前置全部就绪：P5b 寻址层 + P5a 参数枚举 + P5c 完整数据模型；画布面对 doc node_id + cables 编辑，经 node_map 落引擎）
+- [x] P5d UI 节点画布（`canvas.rs`：画布只做视图 + 交互意图，`CanvasAction` 统一落文档 + 引擎；平移/缩放/类型着色/贝塞尔连线分色/拉线端口类型校验/自动化拉线参数菜单/Delete 删除联动，效果器删除走旁路语义；节点位置会话内存不持久化）✅ 2026-10-08
 - [ ] P6 音频反馈环路（可选，1 块延迟节点）
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
