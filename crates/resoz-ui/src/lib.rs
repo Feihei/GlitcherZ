@@ -36,12 +36,13 @@ use resoz_engine::realtime::{
 };
 use resoz_model::{
     AutoParam, CableKind, ControlTrack, DelayParams, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS, MidiClip,
-    NodeDoc, PortRef, Project, SynthParams, TICKS_PER_BAR, VoiceSpec,
+    NodeDoc, PortRef, Project, SynthParams, VoiceSpec,
 };
 
 pub mod canvas;
 pub mod lane;
 pub mod piano_roll;
+pub mod timeline;
 
 /// Filter cutoff frequency slider range (logarithmic scale).
 pub const CUTOFF_RANGE: RangeInclusive<f32> = 20.0..=18_000.0;
@@ -204,6 +205,13 @@ impl PeakMeter {
     }
 }
 
+/// Which clip the inline editor (piano roll / curve lane) targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditTarget {
+    Midi { track: usize, clip: usize },
+    Control { track: usize, clip: usize },
+}
+
 /// Main window app. Owns the [`AudioEngine`]: closing the window drops the engine and stops the
 /// audio stream.
 pub struct ResoZApp {
@@ -217,6 +225,11 @@ pub struct ResoZApp {
     selected_track: usize,
     /// Automation track being edited.
     selected_auto: usize,
+    /// Arrangement timeline cross-frame state (zoom/drag).
+    timeline_state: timeline::TimelineState,
+    /// Which clip the inline editor (piano roll / curve lane) is targeting
+    /// (`None` = the track's first clip).
+    edit_clip: Option<EditTarget>,
     /// Piano roll cross-frame state (scroll/drag).
     roll_state: piano_roll::RollState,
     /// Automation lane cross-frame state (drag).
@@ -296,6 +309,8 @@ impl ResoZApp {
             node_map: HashMap::new(),
             selected_track: 0,
             selected_auto: 0,
+            timeline_state: timeline::TimelineState::default(),
+            edit_clip: None,
             roll_state: piano_roll::RollState::new(),
             lane_state: lane::LaneState::default(),
             canvas_state: canvas::CanvasState::default(),
@@ -1100,6 +1115,7 @@ impl ResoZApp {
                 self.push_recent(path.clone());
                 self.selected_track = 0;
                 self.selected_auto = 0;
+                self.edit_clip = None;
                 self.roll_state = piano_roll::RollState::new();
                 self.push_all_params();
                 self.window_title = format!("ResoZ — {}", display_name(&path));
@@ -1655,6 +1671,78 @@ impl ResoZApp {
                 ui.weak("ResoZ — Rust DAW");
             });
         });
+    }
+
+    /// Arrangement timeline panel (timeline spec T3): rows = tracks, clip
+    /// blocks with move/resize/insert/delete, double-click opens the editor.
+    fn timeline_panel(&mut self, ui: &mut egui::Ui) {
+        if self.project.midi_tracks.is_empty() && self.project.control_tracks.is_empty() {
+            return;
+        }
+        let muted: Vec<bool> = (0..self.project.midi_tracks.len())
+            .map(|i| self.track_strip_state(i).0)
+            .collect();
+        let playhead = self.engine.musical_ticks();
+        let playing = self.engine.is_playing();
+        let selected_track = self.selected_track;
+        let selected_auto = self.selected_auto;
+        let actions = {
+            let (midi, control, state) = (
+                &mut self.project.midi_tracks,
+                &mut self.project.control_tracks,
+                &mut self.timeline_state,
+            );
+            timeline::show(
+                ui,
+                state,
+                midi,
+                control,
+                timeline::TimelineParams {
+                    muted: &muted,
+                    selected_track,
+                    selected_auto,
+                    playhead_ticks: playhead,
+                    playing,
+                },
+            )
+        };
+        for action in actions {
+            self.apply_timeline_action(action);
+        }
+    }
+
+    /// Applies one timeline view action (engine pushes / cross-panel state).
+    fn apply_timeline_action(&mut self, action: timeline::TimelineAction) {
+        match action {
+            timeline::TimelineAction::MidiEdited(track) => self.send_track_clips(track),
+            timeline::TimelineAction::ControlEdited(index) => self.send_control_clips(index),
+            timeline::TimelineAction::SelectTrack(track) => {
+                self.selected_track = track;
+                self.edit_clip = None;
+            }
+            timeline::TimelineAction::SelectControlTrack(index) => {
+                self.selected_auto = index;
+                self.edit_clip = None;
+            }
+            timeline::TimelineAction::ToggleMute(track, muted) => {
+                if let Some(NodeDoc::ChannelStrip { muted: m, .. }) =
+                    self.project.graph.channel_strip_of_track_mut(track)
+                {
+                    *m = muted;
+                }
+                self.send_track_param(track, ParamId::TrackMute, if muted { 1.0 } else { 0.0 });
+            }
+            timeline::TimelineAction::OpenMidiEditor { track, clip } => {
+                self.selected_track = track;
+                self.edit_clip = Some(EditTarget::Midi { track, clip });
+            }
+            timeline::TimelineAction::OpenControlEditor { track, clip } => {
+                self.selected_auto = track;
+                self.edit_clip = Some(EditTarget::Control { track, clip });
+            }
+            timeline::TimelineAction::AddMidiTrack => self.add_midi_track(),
+            timeline::TimelineAction::RemoveLastMidiTrack => self.remove_last_midi_track(),
+        }
     }
 
     fn status_panel(&mut self, ui: &mut egui::Ui) {
@@ -2304,23 +2392,42 @@ impl ResoZApp {
     /// Piano roll (edits the selected track's clip; edits are pushed to the audio thread
     /// immediately).
     ///
-    /// T1 interim (timeline spec T3 will replace this): the roll edits the track's **first
-    /// clip**; an empty one-bar clip is created on demand so the roll is always usable.
+    /// T3: edits the clip targeted from the arrangement timeline
+    /// (double-click); defaults to the track's first clip.
     fn clip_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
         let sel = self
             .selected_track
             .min(self.project.midi_tracks.len().saturating_sub(1));
-        ui.label(format!("Piano Roll — Track {}", sel + 1));
         if self.project.midi_tracks[sel].clips.is_empty() {
             self.project.midi_tracks[sel].clips.push(MidiClip::new(0));
+            self.send_track_clips(sel);
         }
+        let clip_count = self.project.midi_tracks[sel].clips.len();
+        let clip_index = match self.edit_clip {
+            Some(EditTarget::Midi { track, clip }) if track == sel && clip < clip_count => clip,
+            _ => 0,
+        };
+        let track_name = if self.project.midi_tracks[sel].name.is_empty() {
+            format!("Track {}", sel + 1)
+        } else {
+            self.project.midi_tracks[sel].name.clone()
+        };
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "Piano Roll — {track_name} · clip {} (of {clip_count})",
+                clip_index + 1
+            ));
+            if self.edit_clip.is_some() && ui.button("✕ Close editor").clicked() {
+                self.edit_clip = None;
+            }
+        });
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
         let edited = piano_roll::show(
             ui,
-            &mut self.project.midi_tracks[sel].clips[0],
+            &mut self.project.midi_tracks[sel].clips[clip_index],
             &mut self.roll_state,
             playhead,
             playing,
@@ -2458,35 +2565,46 @@ impl ResoZApp {
             ui.weak(format!("→ {current}"));
         });
 
-        // The lane loop length follows the selected track's first MIDI clip and is written
-        // back to the control clip (T1 interim: the lane edits the track's first clip; the
-        // arrangement timeline view arrives in T3).
-        let loop_ticks = self.project.midi_tracks[sel]
-            .clips
-            .first()
-            .map(|c| c.loop_ticks)
-            .unwrap_or(TICKS_PER_BAR);
+        // The lane edits the control clip targeted from the arrangement
+        // timeline (double-click); defaults to the track's first clip. The
+        // clip's own `loop_ticks` sets the editing width (T3: control clips
+        // are self-contained, no syncing from the MIDI track anymore).
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
         let axis_param = self.project.graph.auto_endpoint(index).unwrap_or_default();
+        let mut created = false;
         if let Some(track) = self.project.control_tracks.get_mut(index) {
-            if track.clips.is_empty() {
+            let clip_count = track.clips.len();
+            if clip_count == 0 {
                 track.clips.push(resoz_model::ControlClip::new(0));
+                created = true;
+            } else {
+                let clip_index = match self.edit_clip {
+                    Some(EditTarget::Control { track: t, clip })
+                        if t == index && clip < clip_count =>
+                    {
+                        clip
+                    }
+                    _ => 0,
+                };
+                let clip = &mut track.clips[clip_index];
+                let loop_ticks = clip.loop_ticks;
+                let edited = lane::show(
+                    ui,
+                    clip,
+                    &axis_param,
+                    loop_ticks,
+                    playhead,
+                    playing,
+                    &mut self.lane_state,
+                );
+                if edited {
+                    self.send_control_clips(index);
+                }
             }
-            let clip = &mut track.clips[0];
-            clip.loop_ticks = loop_ticks;
-            let edited = lane::show(
-                ui,
-                clip,
-                &axis_param,
-                loop_ticks,
-                playhead,
-                playing,
-                &mut self.lane_state,
-            );
-            if edited {
-                self.send_control_clips(index);
-            }
+        }
+        if created {
+            self.send_control_clips(index);
         }
     }
 
@@ -2608,6 +2726,7 @@ impl eframe::App for ResoZApp {
 
         self.transport_panel(ui);
         self.status_panel(ui);
+        self.timeline_panel(ui);
         self.synth_panel(ui);
 
         // Audio-driven displays (level meter, playback position, envelope) need periodic
