@@ -32,6 +32,9 @@ related: [../plan.md, ../architecture.md]
 | D8 | 兼容性 | 不做 v1 迁移；`Project` v2 按节点图重新设计 |
 | D9 | 实施策略 | **P1+P2 连做**，不留两套引擎并存中间态 |
 | D10 | 环路 | 初期禁止：拓扑排序失败（有环）→ UI 拒绝该连线；P6 再议显式反馈节点 |
+| D11 | node_id 持久化 | `node_id` 随项目文件持久化（完整形态里 cables 跨会话引用节点的前提，补全 P4 过渡期"会话内单调不持久化"的临时口径）；加载后引擎编译器从文档 `max(node_id) + 1` 继续单调分配 |
+| D12 | 轨道动态化 | MIDI 轨 `Vec<MidiTrack>`（引擎侧定容 `MAX_MIDI_TRACKS = 16` + 活跃轨数控制侧下发；`midi_targets`/路由表/音序器全部扩容）；自动化轨道顶层 `Vec<AutomationTrack>`（引擎已定容 16） |
+| D13 | 默认图全显式 | 默认拓扑（每轨 `声源→延迟→通道条→主输出` + MIDI 自连）全部以 `nodes + cables` 写入项目文档；加载器**纯按文档重建**引擎图，`GraphCompiler::default_graph` 退役为"新建项目生成初始文档"的参考实现；文档与引擎一张皮 |
 
 ## 3. 节点类型与端口剖面
 
@@ -158,7 +161,10 @@ pub struct CableDoc {
 - [x] **P1+P2 图核心 + 替换 Mixer**：`graph` 模块（NodeSlot/ExecPlan/RtGraph/求和遍历/事件槽）+ `SetGraph` 结构协议 + 差异回收 + ChannelStrip/主输出真节点；**一步替换 `[TrackStrip; 4]`**。验收：现 Mixer 全部数学测试以"默认图（复刻旧拓扑）"形式通过；新增图专项测试（多入边求和、悬空执行、播放中换图、回收计数、有环拒绝）。✅ 2026-10-08
 - [x] **P3 时间轴入图**：时间轴节点 + MIDI 连线表投递 + 自动化轨道（无目标曲线）+ Automation 连线投递。验收：现有音序/自动化端到端测试经连线路径通过。✅ 2026-10-08 —— 落地为 `ExecPlan::midi_targets`（每 MIDI 轨扇出 ≤4）+ `ExecPlan::auto_routes`（终点 = (槽位, 参数)，编译期经 `route_slot` 由 `(track, param)` 解析）；`RtAutomation` 退化为纯锚点，新增 `RtAutoTrack{loop_ticks=384, curve}` 独立实体；`GraphCompiler::connect_midi/disconnect_midi/set_auto_route/clear_auto_route`；结构队列扩容 8→64（项目加载一次性下发全部连线）。
 - [x] **P4 model v2**：`Project` v2 + 保存/加载 + `node_id` 稳定性（编辑会话内单调，不跨文件持久复用）。验收：往返保存加载图结构无损。✅ 2026-10-08 —— **过渡形态落地**（完整 §7 形态随 P5 `node_id` 端口重构展开）：`PROJECT_VERSION = 2`，不做 v1 读路径（Q5；serde 字段级默认值自然容忍缺失字段）；`Project.graph: GraphDoc` 只序列化当下不可推导的图状态（`midi_links` 跨轨扇出，上限 16，加载期校验越界/自连/超容**报错不截断**）；自动化连线终点 `(track, param)` 可由曲线推导，不重复存储；`Automation::loop_ticks` 显式携带（默认一小节），泳道显示口径同步回写文档。`node_id` 已是会话内单调、不持久化，无需改动。
-- [ ] **P5 UI 节点画布**：egui 自绘（平移/缩放/拉线/类型着色/删除联动），现有混音器面板逐步让位。前置依赖：CLAP 参数枚举（遗留任务升级为前置项，自动化线需要参数列表）。
+- [x] **P5a CLAP 参数枚举**（自动化线的参数端前置项）：`ClapInstance::list_params()` 经 clack 0.2 `raw_instance()` vtable 直调实现（`PluginParams` 包装无读取方法，`resoz-clap-host/src/raw.rs` 为唯一 unsafe 边界）；UI 自动化选择器合并 CLAP/VST3 参数列表；测试插件补 `Amplitude` 参数端到端验证。✅ 2026-10-08
+- [ ] **P5b 引擎寻址层（node_id 端口 + 轨道定容 16）**：① `ExecPlan` 增 slot→node_id 表与 id→slot 解析，`RtGraph`/引擎公开 API 从轨道坐标升为 node_id 寻址；② 自动化连线终点与 MIDI 扇出目标显式 node_id 化（取代 `route_slot` 按参数种类猜终点的过渡语义）；③ 编译器出边单值 `out_edge` → 定容 cable 列表（§3"出边不设限"落地：一个输出口拉多根线；快照回滚的全 Copy 约束保持）；④ `NUM_TRACKS = 4` → `MAX_MIDI_TRACKS = 16` 定容 + 活跃轨数控制侧下发（D12：音序器 patterns/clips/pending_offs、路由表、电平表全跟进）。UI 仅最小跟进（现有面板继续工作，内部改走 node_id）。验收：默认拓扑下现有测试全绿；新增 node_id 寻址、多出边扇出、动态轨数专项测试。
+- [ ] **P5c 模型完整形态（GraphDoc v2 终态）**：`GraphDoc{nodes: Vec<NodeDoc>, cables: Vec<CableDoc>}`（`NodeDoc::{Instrument, Effect, ChannelStrip}` 携带 node_id 与参数，D11 持久化；`CableDoc{kind, from: PortRef, to: PortRef}`，Timeline/Master 以保留身份寻址）；`Track` 拆 `MidiTrack`（音符面）+ 节点文档（voice → Instrument、gain/pan/mute → ChannelStrip、delay → Effect）；`automation_tracks: Vec<AutomationTrack>` 顶层化（D12）；加载器**纯按文档重建**引擎图（D13 全显式，`default_graph` 退役为新建项目初始文档生成器）；UI 面板改 Vec 遍历与节点寻址。验收：往返无损；默认项目文档可完整重建默认图（逐步建图 API：add_node/connect 粒度）。
+- [ ] **P5d UI 节点画布**：egui 自绘（平移/缩放/拉线/类型着色/删除联动），现有混音器面板逐步让位。前置依赖：P5b 寻址层 + P5a 参数枚举（均就绪后画布只需面对 node_id + cables 数据模型）。
 - [ ] **P6 反馈环路（可选）**：显式 1 块延迟反馈节点（128 样本 ≈ 2.7 ms），拓扑排序对其豁免。
 
 ## 10. 开放问题（实施中再定，不阻塞 P1+P2）
