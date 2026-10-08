@@ -72,9 +72,9 @@ impl AudioEngine {
 
         let (commands, command_rx) = command_channel(COMMAND_QUEUE_CAPACITY);
 
-        // 初始处理图：默认拓扑（复刻旧 Mixer）：每轨 声源 → 延迟 → 通道条
-        // → 主输出。拓扑变更经 GraphUpdate 队列整体换入（spec D5）。
-        let (compiler, graph) = GraphCompiler::default_graph(sample_rate_f32, FIXED_BLOCK_SIZE);
+        // 初始处理图：仅主输出（P5c，D13 全显式）。项目文档经
+        // add_node / connect_nodes 粒度逐步建图（UI 层粘合）。
+        let (compiler, graph) = GraphCompiler::empty_graph(sample_rate_f32, FIXED_BLOCK_SIZE);
 
         let feedback = Feedback::new();
         let sequencer = Sequencer::new(sample_rate_f32);
@@ -337,6 +337,112 @@ impl AudioEngine {
         self.send(EngineCommand::Sequencer(
             SequencerCommand::SetMidiTrackCount(count),
         ))
+    }
+
+    // ---- 文档逐步建图 API（P5c，D13：加载器按文档重建引擎图）----
+
+    /// 分配下一个会话内单调 node_id（文档节点安装前取用；与文档
+    /// node_id 的映射由调用方维护）。
+    pub fn fresh_node_id(&mut self) -> u64 {
+        self.compiler.fresh_node_id()
+    }
+
+    /// 安装一个文档节点（显式 node_id，D11）。返回 `false` 表示
+    /// 非法 id / 重复 id / 槽位满 / 队列满（节点被释放，编译器已回滚）。
+    pub fn add_node(&mut self, node_id: u64, node: Box<dyn crate::realtime::Processor>) -> bool {
+        let snapshot = self.compiler;
+        match self.compiler.add_node(node_id, node) {
+            Ok(update) => {
+                if self.structure.push(update).is_ok() {
+                    true
+                } else {
+                    self.compiler = snapshot;
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// 装配轨道寻址表（文档三件套 node_id → 旧轨道坐标 API 的映射）。
+    pub fn register_track_chain(
+        &mut self,
+        track: usize,
+        voice: Option<u64>,
+        delay: Option<u64>,
+        channel: Option<u64>,
+    ) -> bool {
+        self.apply_plan_update(|compiler| {
+            compiler.register_track_chain(track, voice, delay, channel)
+        })
+    }
+
+    /// 节点间音频连线（node_id 寻址）。重复连线幂等。
+    pub fn connect_nodes(&mut self, from_id: u64, to_id: u64) -> bool {
+        self.apply_plan_update(|compiler| compiler.connect_nodes(from_id, to_id))
+    }
+
+    /// 断开节点间音频连线（未连线幂等）。
+    pub fn disconnect_nodes(&mut self, from_id: u64, to_id: u64) -> bool {
+        self.apply_plan_update(|compiler| compiler.disconnect_nodes(from_id, to_id))
+    }
+
+    /// 原位替换某节点的处理器（**保留 node_id**，D11）。旧处理器经
+    /// 回收回执释放；返回被保留的 node_id，`None` = 节点不存在/队列满
+    /// （节点被释放，编译器已回滚）。
+    pub fn replace_node(
+        &mut self,
+        node_id: u64,
+        node: Box<dyn crate::realtime::Processor>,
+    ) -> Option<u64> {
+        let snapshot = self.compiler;
+        match self.compiler.replace_node(node_id, node) {
+            Ok((update, kept)) => {
+                if self.structure.push(update).is_ok() {
+                    Some(kept)
+                } else {
+                    self.compiler = snapshot;
+                    None
+                }
+            }
+            Err(node) => {
+                drop(node);
+                None
+            }
+        }
+    }
+
+    /// 在既有连线 `from_id → to_id` 之间插入一个节点（显式 node_id）。
+    pub fn insert_node_between(
+        &mut self,
+        new_id: u64,
+        from_id: u64,
+        to_id: u64,
+        node: Box<dyn crate::realtime::Processor>,
+    ) -> bool {
+        let snapshot = self.compiler;
+        match self
+            .compiler
+            .insert_node_between(new_id, from_id, to_id, node)
+        {
+            Ok(update) => {
+                if self.structure.push(update).is_ok() {
+                    true
+                } else {
+                    self.compiler = snapshot;
+                    false
+                }
+            }
+            Err(node) => {
+                drop(node);
+                false
+            }
+        }
+    }
+
+    /// 移除一个节点（连同出入连线与路由表条目）。主输出不可删除（D6）。
+    pub fn remove_node(&mut self, node_id: u64) -> bool {
+        self.apply_plan_update(|compiler| compiler.remove_node(node_id))
     }
 
     /// 应用一次仅换计划的拓扑变更（连线表编辑等），队列满时回滚。

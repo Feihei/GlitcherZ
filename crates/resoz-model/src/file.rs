@@ -13,12 +13,13 @@ use std::path::Path;
 
 use crate::Project;
 
-/// 项目文件格式的当前版本（v2：节点图文档 + 自动化轨道显式循环长度）。
+/// 项目文件格式的当前版本（v3：GraphDoc 完整形态 nodes + cables，
+/// D11-D13；MIDI/自动化轨道顶层 Vec 化）。
 ///
-/// 兼容策略（Q5 决策）：**不做 v1 读路径**——v2 结构变更（`graph` 字段、
-/// `Automation::loop_ticks`）靠 serde 字段级默认值自然容忍缺失；v1 文件
-/// 里的自动化曲线加载后循环长度取默认一小节。
-pub const PROJECT_VERSION: u32 = 2;
+/// 兼容策略（Q5 决策）：**不做旧版读路径**——结构变更靠 serde 字段级
+/// 默认值自然容忍缺失；旧版文件里无法映射的字段（如旧 `tracks` 数组）
+/// 被忽略，加载结果为默认文档。
+pub const PROJECT_VERSION: u32 = 3;
 
 fn default_version() -> u32 {
     PROJECT_VERSION
@@ -50,6 +51,7 @@ pub enum ModelError {
 
 /// 把项目保存为 `.rez` 文件（RON pretty 格式）。**非实时**（磁盘 IO）。
 pub fn save_project(project: &Project, path: &Path) -> Result<(), ModelError> {
+    project.validate().map_err(ModelError::InvalidGraph)?;
     let file = ProjectFile {
         version: PROJECT_VERSION,
         project: project.clone(),
@@ -62,10 +64,9 @@ pub fn save_project(project: &Project, path: &Path) -> Result<(), ModelError> {
 /// 解析项目文件文本。
 ///
 /// 先用 `ron::Value` 探测顶层结构：含 `project` / `version` 键则按
-/// 标准 [`ProjectFile`] 包装解析，否则按裸 `Project`（第 4-6 步开发期
-/// 的临时格式）解析。不能只靠"`ProjectFile` 能否解析"判断——serde
-/// 会把裸 Project 的全部字段当未知字段忽略并"成功"产出空项目，
-/// 静默丢数据。
+/// 标准 [`ProjectFile`] 包装解析，否则按裸 `Project`（开发期临时格式）
+/// 解析。不能只靠"`ProjectFile` 能否解析"判断——serde 会把裸 Project
+/// 的全部字段当未知字段忽略并"成功"产出空项目，静默丢数据。
 pub fn parse_project(text: &str) -> Result<Project, ModelError> {
     let is_wrapped = ron::from_str::<ron::value::Value>(text)
         .ok()
@@ -80,16 +81,13 @@ pub fn parse_project(text: &str) -> Result<Project, ModelError> {
         })
         .unwrap_or(false);
 
-    if is_wrapped {
+    let project = if is_wrapped {
         let file: ProjectFile = ron::from_str(text)?;
         file.project
-            .graph
-            .validate()
-            .map_err(ModelError::InvalidGraph)?;
-        return Ok(file.project);
-    }
-    let project: Project = ron::from_str(text)?;
-    project.graph.validate().map_err(ModelError::InvalidGraph)?;
+    } else {
+        ron::from_str(text)?
+    };
+    project.validate().map_err(ModelError::InvalidGraph)?;
     Ok(project)
 }
 
@@ -103,18 +101,18 @@ pub fn load_project(path: &Path) -> Result<Project, ModelError> {
 mod tests {
     use super::{PROJECT_VERSION, ProjectFile, load_project, parse_project, save_project};
     use crate::{
-        AutoParam, AutoPoint, Automation, Clip, GraphDoc, MidiLink, ModelError, Note, Pattern,
-        Project, Step, Track, TrackSource,
+        AutoParam, AutoPoint, AutomationTrack, CableDoc, Clip, MASTER_NODE_ID, ModelError, Note,
+        Pattern, Project, TrackSource,
     };
 
     fn demo_project() -> Project {
         let mut project = Project::default();
         project.metadata.name = "测试项目".to_string();
         project.metadata.tempo_bpm = 140.0;
-        project.tracks[0].name = "贝斯".to_string();
-        project.tracks[0].pattern = Pattern::single_note(48);
-        project.tracks[1].source = TrackSource::Clip;
-        project.tracks[1].clip = Clip {
+        project.midi_tracks[0].name = "贝斯".to_string();
+        project.midi_tracks[0].pattern = Pattern::single_note(48);
+        project.midi_tracks[1].source = TrackSource::Clip;
+        project.midi_tracks[1].clip = Clip {
             loop_ticks: 384,
             notes: vec![
                 Note {
@@ -131,22 +129,20 @@ mod tests {
                 },
             ],
         };
-        project.tracks[2].muted = true;
-        project.tracks[2].pan = -0.5;
-        // v2 图状态：跨轨扇出 + 自动化轨道显式循环长度。
-        project.graph.midi_links.push(MidiLink {
-            from_track: 0,
-            to_track: 1,
-        });
-        project.tracks[3].automations.push(Automation {
-            param: AutoParam::TrackGain,
+        // 自动化轨道 0：循环一小节，连到轨道 0 通道条增益。
+        project.automation_tracks.push(AutomationTrack {
             enabled: true,
-            loop_ticks: 192,
+            loop_ticks: 384,
             points: vec![AutoPoint {
                 tick: 0,
                 value: 1.0,
             }],
         });
+        let strip = project.graph.channel_strip_of_track(0).unwrap().node_id();
+        project
+            .graph
+            .cables
+            .push(CableDoc::automation(0, strip, AutoParam::TrackGain));
         project
     }
 
@@ -176,16 +172,14 @@ mod tests {
 
     #[test]
     fn missing_track_fields_survive_load() {
-        // 模拟未来/手工编辑的文件：Track 只有 name。
+        // 模拟手工编辑的文件：midi_tracks 只有 name。
         let path = std::env::temp_dir().join(format!("resoz_compat_{}.rez", std::process::id()));
         std::fs::write(
             &path,
             r#"(
-    version: 1,
+    version: 3,
     project: (
-        tracks: (
-            (name: "只有名字"), (gain: 0.8), (gain: 0.8), (gain: 0.8),
-        ),
+        midi_tracks: [(name: "只有名字"), (), (), ()],
     ),
 )"#,
         )
@@ -193,14 +187,15 @@ mod tests {
         let loaded = load_project(&path).expect("加载失败");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(loaded.tracks[0].name, "只有名字");
-        assert!((loaded.tracks[0].gain - 0.8).abs() < 1e-6, "缺失字段取默认");
+        assert_eq!(loaded.midi_tracks[0].name, "只有名字");
         assert!((loaded.metadata.tempo_bpm - 120.0).abs() < 1e-9);
+        // graph 字段缺省 = 空图（文档说什么就是什么，D13）。
+        assert!(loaded.graph.nodes.is_empty());
     }
 
     #[test]
     fn bare_project_text_is_accepted() {
-        // 第 4-6 步开发期的裸 Project 格式应能直接读取。
+        // 开发期的裸 Project 格式应能直接读取。
         let project = demo_project();
         let text = ron::ser::to_string(&project).expect("序列化失败");
         let parsed = parse_project(&text).expect("解析失败");
@@ -208,55 +203,24 @@ mod tests {
     }
 
     #[test]
-    fn pattern_step_serde_defaults_still_hold() {
-        let track = Track::default();
-        assert_eq!(track.pattern.steps.len(), 16);
-        assert_eq!(
-            track.pattern.steps[0],
-            Step::default(),
-            "Step::default 与 serde 字段默认值一致"
-        );
-    }
-
-    #[test]
-    fn missing_graph_field_defaults_to_empty() {
-        // v1 文件（无 graph 字段）加载：图文档取默认（无额外连线），
-        // 自动化曲线缺 loop_ticks 时取默认一小节。
+    fn invalid_graph_is_rejected_on_load() {
+        // 连线引用不存在的节点：报错而非截断（文件层是最后防线）。
+        // 注意：PortRef 经 rename_all 序列化为 snake_case（node/master）。
         let text = r#"(
-    version: 1,
+    version: 3,
     project: (
-        tracks: (
-            (
-                automations: [(param: TrackGain, enabled: true, points: [])],
-            ), (), (), (),
-        ),
-    ),
-)"#;
-        let loaded = parse_project(text).expect("v1 文件应被字段级默认值容忍");
-        assert!(loaded.graph.midi_links.is_empty());
-        assert_eq!(loaded.tracks[0].automations[0].loop_ticks, 384);
-    }
-
-    #[test]
-    fn invalid_graph_links_are_rejected() {
-        // 越界轨道：报错而非截断（文件层是最后防线）。
-        let text = r#"(
-    version: 2,
-    project: (
-        graph: (midi_links: [(from_track: 0, to_track: 9)]),
-        tracks: ((), (), (), ()),
+        graph: (cables: [(kind: audio, from: node(99), to: master)]),
     ),
 )"#;
         assert!(matches!(
             parse_project(text),
             Err(ModelError::InvalidGraph(_))
         ));
-        // 本轨自连冗余：同样拒绝。
+        // 越界的自动化轨端口。
         let text = r#"(
-    version: 2,
+    version: 3,
     project: (
-        graph: (midi_links: [(from_track: 2, to_track: 2)]),
-        tracks: ((), (), (), ()),
+        graph: (cables: [(kind: automation, from: auto_track(3), to: node(2))]),
     ),
 )"#;
         assert!(matches!(
@@ -266,17 +230,17 @@ mod tests {
     }
 
     #[test]
-    fn graph_doc_validate_bounds() {
-        let mut graph = GraphDoc::default();
-        graph.midi_links.push(MidiLink {
-            from_track: 0,
-            to_track: 1,
-        });
-        assert!(graph.validate().is_ok());
-        graph.midi_links.push(MidiLink {
-            from_track: 1,
-            to_track: 0,
-        });
-        assert!(graph.validate().is_ok());
+    fn reserved_master_node_id_is_rejected() {
+        let text = r#"(
+    version: 3,
+    project: (
+        graph: (nodes: [(type: "channel_strip", node_id: 1, track: 0)]),
+    ),
+)"#;
+        assert!(matches!(
+            parse_project(text),
+            Err(ModelError::InvalidGraph(_))
+        ));
+        let _ = MASTER_NODE_ID;
     }
 }

@@ -2,14 +2,14 @@
 
 //! # resoz-ui
 //!
-//! ResoZ 的 egui 界面：走带控制、步进音序器、钢琴卷帘、混音器。
+//! ResoZ 的 egui 界面：走带控制、步进音序器、钢琴卷帘、混音器、
+//! 自动化泳道。
 //!
-//! 当前（路线图第 6 步）：多轨主窗口 —— 4 条轨道，每轨独立合成器
-//! （滤波器/ADSR/延迟）、16 步音序模式或钢琴卷帘片段（可切换）与
-//! 混音条（静音/推子/声像/电平表）。UI 持有 `resoz_model::Project`
-//! 文档并把它当作参数面板状态；所有改动经
-//! [`resoz_engine::realtime::EngineCommand`] 轨道定向命令实时送往
-//! 音频线程。
+//! P5c（spec `docs/spec/node-graph.md` D13）：引擎图**纯按项目文档
+//! 重建**——`ResoZApp` 持有 `Project` 文档，加载/新建时经
+//! `apply_document` 以 `add_node` / `connect_nodes` 粒度逐步建图；
+//! 文档 node_id 是持久化身份（D11），引擎侧身份为会话内单调分配的
+//! `engine_id`（映射见 `node_map`，会话内不复用已回收 id）。
 //!
 //! 分层说明：本 crate 直接依赖 engine 的非实时控制端——`AudioEngine`
 //! 只在 UI 线程被触碰，永不进入音频回调。模型与引擎互不依赖，发送前
@@ -26,12 +26,13 @@ use resoz_clap_host::{ClapInstance, ClapInstanceConfig};
 use resoz_engine::AudioEngine;
 use resoz_engine::convert;
 use resoz_engine::realtime::{
-    EngineCommand, MAX_CLIP_NOTES, NoteEvent, ParamId, RtClip, RtNote, SequencerCommand,
-    SequencerStep, TrackSource,
+    ChannelStripProcessor, DelayProcessor, EngineCommand, MAX_AUTO_POINTS, MAX_CLIP_NOTES,
+    NoteEvent, ParamId, Processor, RtAutoPoint, RtAutoTrack, RtAutomation, RtClip, RtNote,
+    SequencerCommand, SequencerStep, SynthProcessor, TrackSource,
 };
 use resoz_model::{
-    AutoParam, Automation, PATTERN_STEPS, Pattern, Project, TICKS_PER_BAR,
-    TrackSource as ModelTrackSource, VoiceSpec,
+    AutoParam, AutomationTrack, CableKind, DelayParams, MAX_AUTO_TRACKS, NodeDoc, PATTERN_STEPS,
+    Pattern, PortRef, Project, SynthParams, TICKS_PER_BAR, VoiceSpec,
 };
 
 pub mod lane;
@@ -114,6 +115,16 @@ fn display_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// 文档自动化参数 → 引擎参数 ID。
+fn param_id_of(param: &AutoParam) -> ParamId {
+    match param {
+        AutoParam::TrackGain => ParamId::TrackGain,
+        AutoParam::TrackPan => ParamId::TrackPan,
+        AutoParam::FilterCutoff => ParamId::FilterCutoff,
+        AutoParam::PluginParam { param_id, .. } => ParamId::PluginParam(*param_id),
+    }
+}
+
 /// UI 启动参数。
 #[derive(Debug, Clone, Default)]
 pub struct UiConfig {
@@ -150,13 +161,13 @@ enum PluginGuard {
     Vst3(resoz_vst3_host::Vst3InstanceGuard),
 }
 
-/// 一个已装填的外部插件声源/效果器守卫。
+/// 一个已装填的外部插件声源/效果器守卫（node_id 为**引擎侧**身份）。
 ///
-/// 字段仅诊断/未来清理策略使用；守卫**不可提前丢弃**——卸载动态库
-/// 会使实时侧节点悬空（见 `voice_guards` 注释）。
+/// 守卫**不可提前丢弃**——卸载动态库会使实时侧节点悬空。被换下/
+/// 随文档移除的守卫转入 `retiring_guards`，经回收回执按序释放。
 #[allow(dead_code)]
 struct PluginGuardEntry {
-    /// 与引擎侧节点 ID 配对（回收回执按此匹配守卫）。
+    /// 与引擎侧节点 ID 配对（回收回执按此匹配）。
     node_id: u64,
     #[allow(dead_code)]
     track: usize,
@@ -195,12 +206,14 @@ pub struct ResoZApp {
     engine: AudioEngine,
     /// 项目文档（UI 持有模型状态，见 AGENTS.md「线程模型」）。
     project: Project,
+    /// 文档 node_id → 引擎 node_id（会话内单调，重载文档即全部换新）。
+    node_map: HashMap<u64, u64>,
     /// 正在编辑的轨道（合成器/音序器/键盘的目标）。
     selected_track: usize,
+    /// 正在编辑的自动化轨道。
+    selected_auto: usize,
     /// 钢琴卷帘的跨帧状态（滚动/拖拽）。
     roll_state: piano_roll::RollState,
-    /// 自动化泳道当前编辑的参数。
-    lane_param: AutoParam,
     /// 自动化泳道的跨帧状态（拖拽）。
     lane_state: lane::LaneState,
     /// 画笔音符：点选空白步时写入的音符。
@@ -228,9 +241,12 @@ pub struct ResoZApp {
     title_sent: String,
     /// 上一帧的走带状态（用于检测停止沿 → 恢复手动参数）。
     was_playing: bool,
-    /// 外部插件（CLAP/VST3）实例守卫注册表：guard 丢弃会卸载插件动态库，
-    /// 使实时侧节点悬空，故统一持有至窗口关闭（进程退出统一回收）。
+    /// 在役外部插件守卫（CLAP/VST3）：guard 丢弃会卸载插件动态库，
+    /// 使实时侧节点悬空，故持有至节点被换下为止。
     voice_guards: Vec<PluginGuardEntry>,
+    /// 已换下/随旧文档移除的守卫：等实时侧回收回执到达后再丢弃
+    /// （动态库必须活到旧节点真正离开处理图）。
+    retiring_guards: Vec<PluginGuardEntry>,
     /// 已扫描的 CLAP 乐器列表（懒扫描缓存）。
     clap_plugins: Option<Vec<resoz_clap_host::ClapPluginInfo>>,
     /// 已扫描的 CLAP 效果器列表（懒扫描缓存）。
@@ -252,8 +268,8 @@ pub struct ResoZApp {
 }
 
 impl ResoZApp {
-    /// 构造窗口应用，恢复持久化的最近文件，并把整个项目文档的参数
-    /// 经命令队列下发（下一个音频块边界生效）。
+    /// 构造窗口应用，恢复持久化的最近文件，并把整个项目文档经
+    /// 逐步建图 + 命令队列下发（下一个音频块边界生效）。
     pub fn new(cc: &eframe::CreationContext<'_>, engine: AudioEngine, config: UiConfig) -> Self {
         let ui_state: UiState = cc
             .storage
@@ -266,9 +282,10 @@ impl ResoZApp {
         let mut app = Self {
             engine,
             project,
+            node_map: HashMap::new(),
             selected_track: 0,
+            selected_auto: 0,
             roll_state: piano_roll::RollState::new(),
-            lane_param: AutoParam::TrackGain,
             lane_state: lane::LaneState::default(),
             brush_note: 60,
             octave_base: 60,
@@ -285,6 +302,7 @@ impl ResoZApp {
             title_sent: String::new(),
             was_playing: false,
             voice_guards: Vec::new(),
+            retiring_guards: Vec::new(),
             clap_plugins: None,
             clap_effects: None,
             vst3_plugins: None,
@@ -304,8 +322,276 @@ impl ResoZApp {
         app
     }
 
+    // ---- 文档 → 引擎（D13 全显式：加载器纯按文档重建） ----
+
+    /// 把当前项目文档重建进引擎：移除旧节点 → 安装文档节点 →
+    /// 装配轨道寻址表 → 按文档连线 → 下发活跃轨数。
+    fn apply_document(&mut self) {
+        // 1) 移除上一份文档装进引擎的节点；其守卫全部转入退役区，
+        //    等回收回执按序释放（引擎 id 不复用，配对无歧义）。
+        let stale: Vec<u64> = self.node_map.values().copied().collect();
+        for engine_id in stale {
+            if self.engine.remove_node(engine_id) {
+                self.retire_guard(engine_id);
+            }
+        }
+        self.node_map.clear();
+        self.voice_params.clear();
+        self.clap_voice_params.clear();
+
+        // 2) 安装文档节点（外部插件失败 → 回退内置，保证链路完整）。
+        let sample_rate = self.engine.info().sample_rate;
+        let nodes = self.project.graph.nodes.clone();
+        for node in &nodes {
+            self.install_node(node, sample_rate);
+        }
+        //（install_node 以 u32 采样率实例化插件；内置处理器经 convert 转 f32。）
+
+        // 3) 装配轨道寻址表（手动参数/电平/键盘的轨道坐标寻址）。
+        for track in 0..self.project.midi_tracks.len() {
+            let resolve = |doc_id: Option<u64>| -> Option<u64> {
+                doc_id.and_then(|id| self.node_map.get(&id).copied())
+            };
+            let voice = resolve(
+                self.project
+                    .graph
+                    .instrument_of_track(track)
+                    .map(NodeDoc::node_id),
+            );
+            let delay = resolve(
+                self.project
+                    .graph
+                    .builtin_delay_of_track(track)
+                    .map(NodeDoc::node_id),
+            );
+            let channel = resolve(
+                self.project
+                    .graph
+                    .channel_strip_of_track(track)
+                    .map(NodeDoc::node_id),
+            );
+            if !self
+                .engine
+                .register_track_chain(track, voice, delay, channel)
+            {
+                log::warn!("轨道 {} 寻址表装配失败（节点缺失或队列满）", track + 1);
+            }
+        }
+
+        // 4) 按文档连线。
+        let master = self.engine.master_node_id();
+        let cables = self.project.graph.cables.clone();
+        for cable in &cables {
+            let from = match &cable.from {
+                PortRef::Node(id) => self.node_map.get(id).copied(),
+                _ => None,
+            };
+            let to_node = match &cable.to {
+                PortRef::Node(id) => self.node_map.get(id).copied(),
+                PortRef::Master => Some(master),
+                _ => None,
+            };
+            match cable.kind {
+                CableKind::Audio => {
+                    let (Some(from), Some(to)) = (from, to_node) else {
+                        log::warn!("音频线端点节点缺失，跳过：{cable:?}");
+                        continue;
+                    };
+                    if !self.engine.connect_nodes(from, to) {
+                        log::warn!("音频线 ({from} → {to}) 下发失败（成环/超限/队列满）");
+                    }
+                }
+                CableKind::Midi => {
+                    let PortRef::MidiTrack(track) = &cable.from else {
+                        continue;
+                    };
+                    let Some(to) = to_node else {
+                        log::warn!("MIDI 线目标节点缺失，跳过：{cable:?}");
+                        continue;
+                    };
+                    if !self.engine.connect_midi_node(*track, to) {
+                        log::warn!("MIDI 线（轨 {track} → {to}）下发失败（扇出超限/队列满）");
+                    }
+                }
+                CableKind::Automation => {
+                    let PortRef::AutoTrack(index) = &cable.from else {
+                        continue;
+                    };
+                    let Some(to) = to_node else {
+                        log::warn!("自动化线目标节点缺失，跳过：{cable:?}");
+                        continue;
+                    };
+                    if !self
+                        .engine
+                        .set_auto_route(*index, to, param_id_of(&cable.param))
+                    {
+                        log::warn!("自动化线（轨 {index} → {to}）下发失败");
+                    }
+                }
+            }
+        }
+
+        // 5) 活跃 MIDI 轨数（D12）。
+        self.engine
+            .set_midi_track_count(self.project.midi_tracks.len());
+    }
+
+    /// 安装一个文档节点：构造处理器（外部插件经非实时实例化）→
+    /// 引擎 `add_node`（引擎侧新 id）→ 登记映射与守卫。
+    fn install_node(&mut self, node: &NodeDoc, sample_rate: u32) {
+        let sr = convert::sample_rate_to_f32(sample_rate);
+        let doc_id = node.node_id();
+        let track = node.track();
+        let (processor, guard, plugin_label): (Box<dyn Processor>, Option<PluginGuard>, String) =
+            match node {
+                NodeDoc::Instrument { voice, .. } => match voice {
+                    VoiceSpec::Builtin => (Box::new(SynthProcessor::new(sr)), None, String::new()),
+                    VoiceSpec::Clap { path, plugin_id } => {
+                        match ClapInstance::spawn_rt(
+                            std::path::Path::new(path),
+                            plugin_id,
+                            ClapInstanceConfig {
+                                sample_rate,
+                                max_frames: 128,
+                            },
+                        ) {
+                            Ok(instance) => {
+                                // 参数枚举需在实例被拆解前进行（守卫持有插件实例）。
+                                let params = instance.list_params();
+                                let ClapInstance { guard, node } = instance;
+                                self.clap_voice_params.insert(track, params);
+                                (
+                                    Box::new(node),
+                                    Some(PluginGuard::Clap(guard)),
+                                    plugin_id.clone(),
+                                )
+                            }
+                            Err(err) => {
+                                log::error!("实例化 CLAP 插件 {plugin_id} 失败：{err}");
+                                self.clap_voice_params.remove(&track);
+                                (Box::new(SynthProcessor::new(sr)), None, String::new())
+                            }
+                        }
+                    }
+                    VoiceSpec::Vst3 { path, class_id } => {
+                        match resoz_vst3_host::Vst3Instance::spawn_rt(
+                            std::path::Path::new(path),
+                            class_id,
+                            resoz_vst3_host::Vst3InstanceConfig {
+                                sample_rate,
+                                max_frames: 128,
+                            },
+                        ) {
+                            Ok(instance) => {
+                                let resoz_vst3_host::Vst3Instance { guard, node } = instance;
+                                let params = guard.parameters();
+                                self.voice_params.insert(track, params);
+                                (
+                                    Box::new(node),
+                                    Some(PluginGuard::Vst3(guard)),
+                                    class_id.clone(),
+                                )
+                            }
+                            Err(err) => {
+                                log::error!("实例化 VST3 插件 {class_id} 失败：{err}");
+                                self.voice_params.remove(&track);
+                                (Box::new(SynthProcessor::new(sr)), None, String::new())
+                            }
+                        }
+                    }
+                },
+                NodeDoc::Effect { voice, .. } => match voice {
+                    VoiceSpec::Builtin => (Box::new(DelayProcessor::new(sr)), None, String::new()),
+                    VoiceSpec::Clap { path, plugin_id } => {
+                        match ClapInstance::spawn_rt(
+                            std::path::Path::new(path),
+                            plugin_id,
+                            ClapInstanceConfig {
+                                sample_rate,
+                                max_frames: 128,
+                            },
+                        ) {
+                            Ok(instance) => {
+                                let ClapInstance { guard, node } = instance;
+                                (
+                                    Box::new(node),
+                                    Some(PluginGuard::Clap(guard)),
+                                    plugin_id.clone(),
+                                )
+                            }
+                            Err(err) => {
+                                log::error!("实例化 CLAP 效果器 {plugin_id} 失败：{err}");
+                                (Box::new(DelayProcessor::new(sr)), None, String::new())
+                            }
+                        }
+                    }
+                    VoiceSpec::Vst3 { path, class_id } => {
+                        match resoz_vst3_host::Vst3Instance::spawn_rt(
+                            std::path::Path::new(path),
+                            class_id,
+                            resoz_vst3_host::Vst3InstanceConfig {
+                                sample_rate,
+                                max_frames: 128,
+                            },
+                        ) {
+                            Ok(instance) => {
+                                let resoz_vst3_host::Vst3Instance { guard, node } = instance;
+                                (
+                                    Box::new(node),
+                                    Some(PluginGuard::Vst3(guard)),
+                                    class_id.clone(),
+                                )
+                            }
+                            Err(err) => {
+                                log::error!("实例化 VST3 效果器 {class_id} 失败：{err}");
+                                (Box::new(DelayProcessor::new(sr)), None, String::new())
+                            }
+                        }
+                    }
+                },
+                NodeDoc::ChannelStrip { .. } => {
+                    (Box::new(ChannelStripProcessor::new()), None, String::new())
+                }
+            };
+        let engine_id = self.engine.fresh_node_id();
+        if self.engine.add_node(engine_id, processor) {
+            self.node_map.insert(doc_id, engine_id);
+            if let Some(guard) = guard {
+                self.voice_guards.push(PluginGuardEntry {
+                    node_id: engine_id,
+                    track,
+                    plugin_id: plugin_label,
+                    _guard: guard,
+                });
+            }
+        } else {
+            drop(guard); // 节点从未入图：立即丢弃守卫（动态库安全卸载）。
+            log::error!("文档节点 {doc_id} 安装失败（槽位满/队列满）");
+        }
+    }
+
+    /// 把某节点的在役守卫转入退役区（节点被换下/移除时调用；
+    /// 退役守卫等回收回执到达后释放）。
+    fn retire_guard(&mut self, engine_id: u64) {
+        let mut i = 0;
+        while i < self.voice_guards.len() {
+            if self.voice_guards[i].node_id == engine_id {
+                let entry = self.voice_guards.remove(i);
+                self.retiring_guards.push(entry);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// 文档 node_id → 引擎 node_id。
+    fn engine_id(&self, doc_id: u64) -> Option<u64> {
+        self.node_map.get(&doc_id).copied()
+    }
+
     /// 把项目文档的参数完整下发一遍（队列满载时命令被丢弃，可安全忽略）。
     fn push_all_params(&mut self) {
+        self.apply_document();
         self.engine.send(EngineCommand::SetParam {
             id: ParamId::MasterGain,
             value: self.project.master_gain,
@@ -314,60 +600,42 @@ impl ResoZApp {
             self.project.metadata.tempo_bpm,
         )));
         self.send_sequencer(SequencerCommand::SetGate(self.project.gate));
-        for track in 0..self.project.tracks.len() {
+        for track in 0..self.project.midi_tracks.len() {
             self.push_track_params(track);
             let steps = self.rt_pattern(track);
             self.send_sequencer(SequencerCommand::SetPattern { track, steps });
             let clip = self.rt_clip(track);
             self.send_sequencer(SequencerCommand::SetClip { track, clip });
-            let source = match self.project.tracks[track].source {
-                ModelTrackSource::Steps => TrackSource::Steps,
-                ModelTrackSource::Clip => TrackSource::Clip,
+            let source = match self.project.midi_tracks[track].source {
+                resoz_model::TrackSource::Steps => TrackSource::Steps,
+                resoz_model::TrackSource::Clip => TrackSource::Clip,
             };
             self.send_sequencer(SequencerCommand::SetSource { track, source });
-            let curves = self.project.tracks[track].automations.clone();
-            for curve in curves {
-                self.send_automation(track, &curve);
-            }
-            self.apply_track_voice(track);
         }
-        // 节点图连线（v2）：MIDI 跨轨扇出（node_id 寻址，P5b）。
-        for link in self.project.graph.midi_links.clone() {
-            let Some(target) = self.engine.voice_node_id(link.to_track) else {
-                log::warn!(
-                    "MIDI 连线 ({}, {}) 目标轨无声源，跳过",
-                    link.from_track,
-                    link.to_track
-                );
-                continue;
-            };
-            if !self.engine.connect_midi_node(link.from_track, target) {
-                log::warn!(
-                    "MIDI 连线 ({}, {}) 下发失败（扇出超限或队列满）",
-                    link.from_track,
-                    link.to_track
-                );
-            }
+        for index in 0..self.project.automation_tracks.len() {
+            self.send_auto_curve(index);
         }
     }
 
-    /// 下发一条轨道的全部参数（音色 / 延迟 / 混音）。
+    /// 下发一条轨道的全部参数（音色 / 延迟 / 混音；轨道寻址表已装配）。
     fn push_track_params(&mut self, track: usize) {
-        let t = &self.project.tracks[track];
+        let synth = self.synth_of_track(track).unwrap_or_default();
+        let delay = self.delay_of_track(track).unwrap_or_default();
+        let (muted, gain, pan) = self.track_strip_state(track);
         let params = [
-            (ParamId::FilterCutoff, t.synth.cutoff_hz),
-            (ParamId::FilterResonance, t.synth.resonance),
-            (ParamId::FilterMode, t.synth.filter_mode),
-            (ParamId::Attack, t.synth.attack_s),
-            (ParamId::Decay, t.synth.decay_s),
-            (ParamId::Sustain, t.synth.sustain),
-            (ParamId::Release, t.synth.release_s),
-            (ParamId::DelayTime, t.delay.time_s),
-            (ParamId::DelayFeedback, t.delay.feedback),
-            (ParamId::DelayMix, t.delay.mix),
-            (ParamId::TrackGain, t.gain),
-            (ParamId::TrackPan, t.pan),
-            (ParamId::TrackMute, if t.muted { 1.0 } else { 0.0 }),
+            (ParamId::FilterCutoff, synth.cutoff_hz),
+            (ParamId::FilterResonance, synth.resonance),
+            (ParamId::FilterMode, synth.filter_mode),
+            (ParamId::Attack, synth.attack_s),
+            (ParamId::Decay, synth.decay_s),
+            (ParamId::Sustain, synth.sustain),
+            (ParamId::Release, synth.release_s),
+            (ParamId::DelayTime, delay.time_s),
+            (ParamId::DelayFeedback, delay.feedback),
+            (ParamId::DelayMix, delay.mix),
+            (ParamId::TrackGain, gain),
+            (ParamId::TrackPan, pan),
+            (ParamId::TrackMute, if muted { 1.0 } else { 0.0 }),
         ];
         for (id, value) in params {
             self.engine
@@ -375,9 +643,116 @@ impl ResoZApp {
         }
     }
 
+    // ---- 文档字段便捷访问（节点图形态下的轨道面板数据源） ----
+
+    /// 某轨的内置合成器音色参数。
+    fn synth_of_track(&self, track: usize) -> Option<SynthParams> {
+        match self.project.graph.instrument_of_track(track)? {
+            NodeDoc::Instrument { synth, .. } => Some(*synth),
+            _ => None,
+        }
+    }
+
+    /// 某轨的内置合成器音色参数（可变）。
+    fn synth_mut(&mut self, track: usize) -> Option<&mut SynthParams> {
+        match self.project.graph.instrument_of_track_mut(track)? {
+            NodeDoc::Instrument { synth, .. } => Some(synth),
+            _ => None,
+        }
+    }
+
+    /// 某轨的内置延迟参数。
+    fn delay_of_track(&self, track: usize) -> Option<DelayParams> {
+        match self.project.graph.builtin_delay_of_track(track)? {
+            NodeDoc::Effect { delay, .. } => Some(*delay),
+            _ => None,
+        }
+    }
+
+    /// 某轨的内置延迟参数（可变）。
+    fn delay_mut(&mut self, track: usize) -> Option<&mut DelayParams> {
+        match self.project.graph.builtin_delay_of_track_mut(track)? {
+            NodeDoc::Effect { delay, .. } => Some(delay),
+            _ => None,
+        }
+    }
+
+    /// 某轨通道条状态：(静音, 增益, 声像)；无通道条节点时取默认。
+    fn track_strip_state(&self, track: usize) -> (bool, f32, f32) {
+        match self.project.graph.channel_strip_of_track(track) {
+            Some(NodeDoc::ChannelStrip {
+                gain, pan, muted, ..
+            }) => (*muted, *gain, *pan),
+            _ => (false, 0.8, 0.0),
+        }
+    }
+
+    // ---- 自动化轨道下发（D7/D12：曲线与连线终点分离） ----
+
+    /// 下发一条自动化轨道的曲线实体（终点由图的自动化连线表决定，
+    /// 经 `apply_document` / `set_auto_endpoint` 设置）。
+    fn send_auto_curve(&mut self, index: usize) {
+        let Some(track) = self.project.automation_tracks.get(index) else {
+            return;
+        };
+        let mut rt = RtAutomation {
+            enabled: track.enabled,
+            ..RtAutomation::default()
+        };
+        for point in track.points.iter().take(MAX_AUTO_POINTS) {
+            rt.push(RtAutoPoint {
+                tick: point.tick,
+                value: point.value,
+            });
+        }
+        self.send_sequencer(SequencerCommand::SetAutoTrack {
+            index,
+            auto: RtAutoTrack {
+                loop_ticks: track.loop_ticks,
+                curve: rt,
+            },
+        });
+    }
+
+    /// 重定向一条自动化轨道的连线终点（文档 cable 存**文档** node_id，
+    /// 引擎路由按 node_map 映射到引擎侧 id）。
+    fn set_auto_endpoint(&mut self, index: usize, doc_id: u64, param: AutoParam) {
+        self.project.graph.remove_auto_cable(index);
+        self.project
+            .graph
+            .cables
+            .push(resoz_model::CableDoc::automation(
+                index,
+                doc_id,
+                param.clone(),
+            ));
+        if let Some(engine_id) = self.engine_id(doc_id) {
+            self.engine
+                .set_auto_route(index, engine_id, param_id_of(&param));
+        }
+    }
+
+    /// 文档模式 → 引擎表示（`Copy` 数组，零堆分配）。
+    fn rt_pattern(&self, track: usize) -> [SequencerStep; PATTERN_STEPS] {
+        let mut steps = [SequencerStep::default(); PATTERN_STEPS];
+        for (i, step) in self.project.midi_tracks[track]
+            .pattern
+            .steps
+            .iter()
+            .enumerate()
+        {
+            steps[i] = SequencerStep {
+                enabled: step.enabled,
+                note: step.note,
+                velocity: step.velocity,
+            };
+        }
+        steps
+    }
+
     /// 文档片段 → 引擎表示（超容量截断，`Copy` 结构，零堆分配）。
     fn rt_clip(&self, track: usize) -> RtClip {
-        let clip = &self.project.tracks[track].clip;
+        let clip = &self.project.midi_tracks[track].clip;
         let mut rt = RtClip {
             loop_ticks: clip.loop_ticks,
             ..RtClip::default()
@@ -397,84 +772,6 @@ impl ResoZApp {
     fn send_clip(&mut self, track: usize) {
         let clip = self.rt_clip(track);
         self.send_sequencer(SequencerCommand::SetClip { track, clip });
-    }
-
-    /// 文档自动化曲线 → 引擎自动化轨道实体（超容量截断）并下发，
-    /// 同时把连线终点 `(track, param)` 下发给引擎（D7：曲线不含目标，
-    /// 投递终点由图的自动化连线表决定）。
-    fn send_automation(&mut self, track: usize, curve: &Automation) {
-        let param_id = match curve.param {
-            AutoParam::TrackGain => ParamId::TrackGain,
-            AutoParam::TrackPan => ParamId::TrackPan,
-            AutoParam::FilterCutoff => ParamId::FilterCutoff,
-            AutoParam::PluginParam { param_id, .. } => ParamId::PluginParam(param_id),
-        };
-        // 自动化轨道索引 = 轨道 × 每轨容量 + 文档内曲线槽位。文档 Vec
-        // 只追加/原位替换，槽位稳定；超出引擎容量的曲线暂不下发
-        //（P4 文档 v2 将显式建模自动化轨道实体）。
-        let Some(slot) = self.project.tracks[track]
-            .automations
-            .iter()
-            .position(|c| c.param == curve.param)
-        else {
-            return;
-        };
-        if slot >= resoz_engine::realtime::MAX_AUTOMATIONS {
-            log::warn!("轨道 {track} 自动化曲线数超过引擎容量，曲线未下发");
-            return;
-        }
-        let index = track * resoz_engine::realtime::MAX_AUTOMATIONS + slot;
-        let mut rt = resoz_engine::realtime::RtAutomation {
-            enabled: curve.enabled,
-            ..resoz_engine::realtime::RtAutomation::default()
-        };
-        for point in curve
-            .points
-            .iter()
-            .take(resoz_engine::realtime::MAX_AUTO_POINTS)
-        {
-            rt.push(resoz_engine::realtime::RtAutoPoint {
-                tick: point.tick,
-                value: point.value,
-            });
-        }
-        // 循环长度由文档显式携带（v2：`Automation::loop_ticks`），泳道
-        // 显示时会随轨道音源口径同步回写该值。
-        let loop_ticks = curve.loop_ticks;
-        self.send_sequencer(SequencerCommand::SetAutoTrack {
-            index,
-            auto: resoz_engine::realtime::RtAutoTrack {
-                loop_ticks,
-                curve: rt,
-            },
-        });
-        // 连线终点按参数种类解析到轨道链上的节点（node_id 寻址，P5b）：
-        // 混音两项 → 通道条；音色/插件参数 → 声源。P5c 文档完整形态后
-        // 终点直接来自 cables 文档，此处过渡。
-        let target = match curve.param {
-            AutoParam::TrackGain | AutoParam::TrackPan => self.engine.channel_node_id(track),
-            AutoParam::FilterCutoff | AutoParam::PluginParam { .. } => {
-                self.engine.voice_node_id(track)
-            }
-        };
-        let Some(node_id) = target else {
-            log::warn!("轨道 {track} 自动化终点节点不存在，连线未下发");
-            return;
-        };
-        self.engine.set_auto_route(index, node_id, param_id);
-    }
-
-    /// 文档模式 → 引擎表示（`Copy` 数组，零堆分配）。
-    fn rt_pattern(&self, track: usize) -> [SequencerStep; PATTERN_STEPS] {
-        let mut steps = [SequencerStep::default(); PATTERN_STEPS];
-        for (i, step) in self.project.tracks[track].pattern.steps.iter().enumerate() {
-            steps[i] = SequencerStep {
-                enabled: step.enabled,
-                note: step.note,
-                velocity: step.velocity,
-            };
-        }
-        steps
     }
 
     /// 保存到当前路径；从未保存过则弹出"另存为"对话框。
@@ -526,7 +823,7 @@ impl ResoZApp {
         }
     }
 
-    /// 读盘、替换文档并把全部参数重新下发音频线程。
+    /// 读盘、替换文档、按文档重建引擎图并重发全部参数。
     fn do_open(&mut self, path: PathBuf) {
         match resoz_model::load_project(&path) {
             Ok(project) => {
@@ -534,6 +831,7 @@ impl ResoZApp {
                 self.project_path = Some(path.clone());
                 self.push_recent(path.clone());
                 self.selected_track = 0;
+                self.selected_auto = 0;
                 self.roll_state = piano_roll::RollState::new();
                 self.push_all_params();
                 self.window_title = format!("ResoZ — {}", display_name(&path));
@@ -559,10 +857,51 @@ impl ResoZApp {
         self.status_message = Some((text, Instant::now()));
     }
 
-    /// 给轨道装填 CLAP 乐器声源：非实时实例化 → 引擎换装 → 守卫注册。
-    /// 成功后顺带枚举插件参数（自动化连线目标的数据源）。失败时记日志
-    /// 并回退内置声源。
+    /// 把选中轨道的声源恢复为内置合成器（原位替换，节点身份不变）。
+    fn set_builtin_instrument(&mut self, track: usize) {
+        if let Some(NodeDoc::Instrument { voice, .. }) =
+            self.project.graph.instrument_of_track_mut(track)
+        {
+            *voice = VoiceSpec::Builtin;
+        }
+        self.voice_params.remove(&track);
+        self.clap_voice_params.remove(&track);
+        let Some(doc_id) = self
+            .project
+            .graph
+            .instrument_of_track(track)
+            .map(NodeDoc::node_id)
+        else {
+            return;
+        };
+        let Some(engine_id) = self.engine_id(doc_id) else {
+            return;
+        };
+        let sample_rate = convert::sample_rate_to_f32(self.engine.info().sample_rate);
+        if self
+            .engine
+            .replace_node(engine_id, Box::new(SynthProcessor::new(sample_rate)))
+            .is_none()
+        {
+            log::error!("轨道 {} 声源恢复失败（节点缺失或队列满）", track + 1);
+        }
+    }
+
+    /// 给轨道装填 CLAP 乐器声源：非实时实例化 → 引擎原位替换 → 守卫登记。
+    /// 成功后顺带枚举插件参数（自动化连线目标的数据源）。
     fn load_clap_voice(&mut self, track: usize, path: &str, plugin_id: &str) {
+        let Some(doc_id) = self
+            .project
+            .graph
+            .instrument_of_track(track)
+            .map(NodeDoc::node_id)
+        else {
+            return;
+        };
+        let Some(engine_id) = self.engine_id(doc_id) else {
+            return;
+        };
+        self.retire_guard(engine_id);
         match ClapInstance::spawn_rt(
             std::path::Path::new(path),
             plugin_id,
@@ -575,18 +914,21 @@ impl ResoZApp {
                 // 参数枚举需在实例被拆解前进行（守卫持有插件实例）。
                 let params = instance.list_params();
                 let ClapInstance { guard, node } = instance;
-                match self.engine.set_external_voice(track, Box::new(node)) {
-                    Some(node_id) => {
-                        self.voice_guards.push(PluginGuardEntry {
-                            node_id,
-                            track,
-                            plugin_id: plugin_id.to_string(),
-                            _guard: PluginGuard::Clap(guard),
-                        });
-                        self.clap_voice_params.insert(track, params);
-                        log::info!("轨道 {} 已装填 CLAP 声源：{plugin_id}", track + 1);
-                    }
-                    None => log::error!("声源队列满：轨道 {} 装填失败", track + 1),
+                if self
+                    .engine
+                    .replace_node(engine_id, Box::new(node))
+                    .is_some()
+                {
+                    self.voice_guards.push(PluginGuardEntry {
+                        node_id: engine_id,
+                        track,
+                        plugin_id: plugin_id.to_string(),
+                        _guard: PluginGuard::Clap(guard),
+                    });
+                    self.clap_voice_params.insert(track, params);
+                    log::info!("轨道 {} 已装填 CLAP 声源：{plugin_id}", track + 1);
+                } else {
+                    log::error!("声源队列满：轨道 {} 装填失败", track + 1);
                 }
             }
             Err(err) => {
@@ -596,27 +938,246 @@ impl ResoZApp {
         }
     }
 
-    /// 将文档中的声源规格应用到引擎（初始下发 / 项目加载后）。
-    fn apply_track_voice(&mut self, track: usize) {
-        match self.project.tracks[track].voice.clone() {
-            VoiceSpec::Builtin => {
-                self.voice_params.remove(&track);
-                self.clap_voice_params.remove(&track);
-                self.engine.set_builtin_voice(track);
-            }
-            VoiceSpec::Clap { path, plugin_id } => {
-                self.voice_params.remove(&track);
-                if !path.is_empty() && !plugin_id.is_empty() {
-                    self.load_clap_voice(track, &path, &plugin_id);
+    /// 给轨道装填 VST3 乐器声源：非实时实例化 → 引擎原位替换 → 守卫登记。
+    fn load_vst3_voice(&mut self, track: usize, path: &str, class_id: &str) {
+        let Some(doc_id) = self
+            .project
+            .graph
+            .instrument_of_track(track)
+            .map(NodeDoc::node_id)
+        else {
+            return;
+        };
+        let Some(engine_id) = self.engine_id(doc_id) else {
+            return;
+        };
+        self.retire_guard(engine_id);
+        match resoz_vst3_host::Vst3Instance::spawn_rt(
+            std::path::Path::new(path),
+            class_id,
+            resoz_vst3_host::Vst3InstanceConfig {
+                sample_rate: self.engine.info().sample_rate,
+                max_frames: 128,
+            },
+        ) {
+            Ok(instance) => {
+                let resoz_vst3_host::Vst3Instance { guard, node } = instance;
+                // 控制侧枚举参数列表（守卫移入注册表前读出）。
+                let params = guard.parameters();
+                if self
+                    .engine
+                    .replace_node(engine_id, Box::new(node))
+                    .is_some()
+                {
+                    self.voice_params.insert(track, params);
+                    self.voice_guards.push(PluginGuardEntry {
+                        node_id: engine_id,
+                        track,
+                        plugin_id: class_id.to_string(),
+                        _guard: PluginGuard::Vst3(guard),
+                    });
+                    log::info!("轨道 {} 已装填 VST3 声源：{class_id}", track + 1);
                 } else {
-                    self.clap_voice_params.remove(&track);
+                    log::error!("声源队列满：轨道 {} 装填失败", track + 1);
                 }
             }
-            VoiceSpec::Vst3 { path, class_id } => {
-                if !path.is_empty() && !class_id.is_empty() {
-                    self.load_vst3_voice(track, &path, &class_id);
-                }
+            Err(err) => {
+                log::error!("实例化 VST3 插件 {class_id} 失败：{err}");
+                self.set_message(format!("VST3 插件加载失败：{err}"));
             }
+        }
+    }
+
+    /// 在轨道链末（通道条之前）插入一个外部效果器节点：引擎
+    /// `insert_node_between` + 文档同步（节点 + 旁路线改接）。
+    fn insert_effect_common(
+        &mut self,
+        track: usize,
+        voice: VoiceSpec,
+        plugin_label: String,
+        node: Box<dyn Processor>,
+        guard: PluginGuard,
+    ) {
+        let Some(strip_doc) = self
+            .project
+            .graph
+            .channel_strip_of_track(track)
+            .map(NodeDoc::node_id)
+        else {
+            log::error!("轨道 {} 无通道条节点，效果器插入失败", track + 1);
+            return;
+        };
+        let Some(strip_engine) = self.engine_id(strip_doc) else {
+            return;
+        };
+        // 找到当前直连通道条的音频线源（文档拓扑）。
+        let Some(in_from_doc) = self.project.graph.cables.iter().find_map(|c| {
+            if c.kind == CableKind::Audio && c.to == PortRef::Node(strip_doc) {
+                match c.from {
+                    PortRef::Node(id) => Some(id),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }) else {
+            log::error!("轨道 {} 通道条无入线，效果器插入失败", track + 1);
+            return;
+        };
+        let Some(in_from_engine) = self.engine_id(in_from_doc) else {
+            return;
+        };
+        let new_doc_id = self.project.graph.next_node_id();
+        let new_engine_id = self.engine.fresh_node_id();
+        if !self
+            .engine
+            .insert_node_between(new_engine_id, in_from_engine, strip_engine, node)
+        {
+            log::error!("结构队列满：轨道 {} 插入效果器失败", track + 1);
+            return;
+        }
+        // 文档同步：节点 + 旁路线改接。
+        self.project.graph.nodes.push(NodeDoc::Effect {
+            node_id: new_doc_id,
+            track,
+            voice,
+            delay: DelayParams::default(),
+        });
+        self.project.graph.cables.retain(|c| {
+            !(c.kind == CableKind::Audio
+                && c.from == PortRef::Node(in_from_doc)
+                && c.to == PortRef::Node(strip_doc))
+        });
+        self.project
+            .graph
+            .cables
+            .push(resoz_model::CableDoc::audio(in_from_doc, new_doc_id));
+        self.project
+            .graph
+            .cables
+            .push(resoz_model::CableDoc::audio(new_doc_id, strip_doc));
+        self.node_map.insert(new_doc_id, new_engine_id);
+        self.voice_guards.push(PluginGuardEntry {
+            node_id: new_engine_id,
+            track,
+            plugin_id: plugin_label,
+            _guard: guard,
+        });
+        log::info!("轨道 {} 已插入外部效果器", track + 1);
+    }
+
+    /// 给轨道插入 CLAP 效果器节点（非实时实例化 → 引擎插线 → 守卫登记）。
+    fn load_clap_effect(&mut self, track: usize, path: &str, plugin_id: &str) {
+        match ClapInstance::spawn_rt(
+            std::path::Path::new(path),
+            plugin_id,
+            ClapInstanceConfig {
+                sample_rate: self.engine.info().sample_rate,
+                max_frames: 128,
+            },
+        ) {
+            Ok(instance) => {
+                let ClapInstance { guard, node } = instance;
+                self.insert_effect_common(
+                    track,
+                    VoiceSpec::Clap {
+                        path: path.to_string(),
+                        plugin_id: plugin_id.to_string(),
+                    },
+                    plugin_id.to_string(),
+                    Box::new(node),
+                    PluginGuard::Clap(guard),
+                );
+            }
+            Err(err) => {
+                log::error!("实例化 CLAP 效果器 {plugin_id} 失败：{err}");
+                self.set_message(format!("插件加载失败：{err}"));
+            }
+        }
+    }
+
+    /// 给轨道插入 VST3 效果器节点（非实时实例化 → 引擎插线 → 守卫登记）。
+    fn load_vst3_effect(&mut self, track: usize, path: &str, class_id: &str) {
+        match resoz_vst3_host::Vst3Instance::spawn_rt(
+            std::path::Path::new(path),
+            class_id,
+            resoz_vst3_host::Vst3InstanceConfig {
+                sample_rate: self.engine.info().sample_rate,
+                max_frames: 128,
+            },
+        ) {
+            Ok(instance) => {
+                let resoz_vst3_host::Vst3Instance { guard, node } = instance;
+                self.insert_effect_common(
+                    track,
+                    VoiceSpec::Vst3 {
+                        path: path.to_string(),
+                        class_id: class_id.to_string(),
+                    },
+                    class_id.to_string(),
+                    Box::new(node),
+                    PluginGuard::Vst3(guard),
+                );
+            }
+            Err(err) => {
+                log::error!("实例化 VST3 效果器 {class_id} 失败：{err}");
+                self.set_message(format!("VST3 插件加载失败：{err}"));
+            }
+        }
+    }
+
+    /// 清空某轨全部外部效果器（内置延迟保留）：引擎旁路移除 + 文档同步。
+    fn clear_external_effects(&mut self, track: usize) {
+        while let Some(effect) = self.project.graph.nodes.iter().find(|n| {
+            n.track() == track
+                && match n {
+                    NodeDoc::Effect { voice, .. } => !matches!(voice, VoiceSpec::Builtin),
+                    _ => false,
+                }
+        }) {
+            let effect_doc = effect.node_id();
+            let Some(&effect_engine) = self.node_map.get(&effect_doc) else {
+                break;
+            };
+            // 文档线：入线源与出线目标（旁路直连对）。
+            let in_from = self.project.graph.cables.iter().find_map(|c| {
+                if c.kind == CableKind::Audio && c.to == PortRef::Node(effect_doc) {
+                    match c.from {
+                        PortRef::Node(id) => Some(id),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            });
+            let out_to = self.project.graph.cables.iter().find_map(|c| {
+                if c.kind == CableKind::Audio && c.from == PortRef::Node(effect_doc) {
+                    Some(c.to.clone())
+                } else {
+                    None
+                }
+            });
+            let (Some(in_from), Some(out_to)) = (in_from, out_to) else {
+                log::warn!("轨道 {track} 效果器 {effect_doc} 连线不完整，停止清理");
+                break;
+            };
+            if !self.engine.remove_node(effect_engine) {
+                break;
+            }
+            self.project
+                .graph
+                .nodes
+                .retain(|n| n.node_id() != effect_doc);
+            self.project.graph.cables.retain(|c| {
+                !(c.kind == CableKind::Audio
+                    && (c.from == PortRef::Node(effect_doc) || c.to == PortRef::Node(effect_doc)))
+            });
+            self.project
+                .graph
+                .cables
+                .push(resoz_model::CableDoc::audio(in_from, out_to));
+            self.node_map.remove(&effect_doc);
+            self.retire_guard(effect_engine);
         }
     }
 
@@ -670,106 +1231,6 @@ impl ResoZApp {
             );
         }
         self.vst3_effects.as_deref().unwrap_or(&[])
-    }
-
-    /// 给轨道装填 VST3 乐器声源：非实时实例化 → 引擎换装 → 守卫注册。
-    /// 失败时记日志并提示（文档声源保持 Vst3，重新打开项目会重试）。
-    fn load_vst3_voice(&mut self, track: usize, path: &str, class_id: &str) {
-        match resoz_vst3_host::Vst3Instance::spawn_rt(
-            std::path::Path::new(path),
-            class_id,
-            resoz_vst3_host::Vst3InstanceConfig {
-                sample_rate: self.engine.info().sample_rate,
-                max_frames: 128,
-            },
-        ) {
-            Ok(instance) => {
-                let resoz_vst3_host::Vst3Instance { guard, node } = instance;
-                // 控制侧枚举参数列表（守卫移入注册表前读出）。
-                let params = guard.parameters();
-                match self.engine.set_external_voice(track, Box::new(node)) {
-                    Some(node_id) => {
-                        self.voice_params.insert(track, params);
-                        self.voice_guards.push(PluginGuardEntry {
-                            node_id,
-                            track,
-                            plugin_id: class_id.to_string(),
-                            _guard: PluginGuard::Vst3(guard),
-                        });
-                        log::info!("轨道 {} 已装填 VST3 声源：{class_id}", track + 1);
-                    }
-                    None => log::error!("声源队列满：轨道 {} 装填失败", track + 1),
-                }
-            }
-            Err(err) => {
-                log::error!("实例化 VST3 插件 {class_id} 失败：{err}");
-                self.set_message(format!("VST3 插件加载失败：{err}"));
-            }
-        }
-    }
-
-    /// 给轨道插入 CLAP 效果器节点（非实时实例化 → 引擎换装 → 守卫注册）。
-    fn load_clap_effect(&mut self, track: usize, path: &str, plugin_id: &str) {
-        match ClapInstance::spawn_rt(
-            std::path::Path::new(path),
-            plugin_id,
-            ClapInstanceConfig {
-                sample_rate: self.engine.info().sample_rate,
-                max_frames: 128,
-            },
-        ) {
-            Ok(instance) => {
-                let ClapInstance { guard, node } = instance;
-                match self.engine.insert_external_effect(track, Box::new(node)) {
-                    Some(node_id) => {
-                        self.voice_guards.push(PluginGuardEntry {
-                            node_id,
-                            track,
-                            plugin_id: plugin_id.to_string(),
-                            _guard: PluginGuard::Clap(guard),
-                        });
-                        log::info!("轨道 {} 已插入 CLAP 效果器：{plugin_id}", track + 1);
-                    }
-                    None => log::error!("结构队列满：轨道 {} 插入效果器失败", track + 1),
-                }
-            }
-            Err(err) => {
-                log::error!("实例化 CLAP 效果器 {plugin_id} 失败：{err}");
-                self.set_message(format!("插件加载失败：{err}"));
-            }
-        }
-    }
-
-    /// 给轨道插入 VST3 效果器节点（非实时实例化 → 引擎换装 → 守卫注册）。
-    fn load_vst3_effect(&mut self, track: usize, path: &str, class_id: &str) {
-        match resoz_vst3_host::Vst3Instance::spawn_rt(
-            std::path::Path::new(path),
-            class_id,
-            resoz_vst3_host::Vst3InstanceConfig {
-                sample_rate: self.engine.info().sample_rate,
-                max_frames: 128,
-            },
-        ) {
-            Ok(instance) => {
-                let resoz_vst3_host::Vst3Instance { guard, node } = instance;
-                match self.engine.insert_external_effect(track, Box::new(node)) {
-                    Some(node_id) => {
-                        self.voice_guards.push(PluginGuardEntry {
-                            node_id,
-                            track,
-                            plugin_id: class_id.to_string(),
-                            _guard: PluginGuard::Vst3(guard),
-                        });
-                        log::info!("轨道 {} 已插入 VST3 效果器：{class_id}", track + 1);
-                    }
-                    None => log::error!("结构队列满：轨道 {} 插入效果器失败", track + 1),
-                }
-            }
-            Err(err) => {
-                log::error!("实例化 VST3 效果器 {class_id} 失败：{err}");
-                self.set_message(format!("VST3 插件加载失败：{err}"));
-            }
-        }
     }
 
     fn send_sequencer(&mut self, cmd: SequencerCommand) {
@@ -920,7 +1381,7 @@ impl ResoZApp {
             .unwrap_or_else(|| "—".to_string());
         let track_name = self
             .project
-            .tracks
+            .midi_tracks
             .get(self.selected_track)
             .map(|t| {
                 if t.name.is_empty() {
@@ -963,21 +1424,35 @@ impl ResoZApp {
 
         // eframe 0.36 的根 Ui 无边距；包一层 CentralPanel 保持默认观感。
         egui::CentralPanel::default().show(ui, |ui| {
-            let sel = self.selected_track;
-            let track_title = if self.project.tracks[sel].name.is_empty() {
+            if self.project.midi_tracks.is_empty() {
+                ui.heading("合成器");
+                ui.weak("（项目没有 MIDI 轨道）");
+                return;
+            }
+            let sel = self.selected_track.min(self.project.midi_tracks.len() - 1);
+            self.selected_track = sel;
+            let track_title = if self.project.midi_tracks[sel].name.is_empty() {
                 format!("轨道 {}", sel + 1)
             } else {
-                self.project.tracks[sel].name.clone()
+                self.project.midi_tracks[sel].name.clone()
             };
             ui.heading(format!("合成器 — {track_title}"));
             ui.horizontal(|ui| {
                 ui.label("声源");
-                let voice = &self.project.tracks[sel].voice;
-                let is_external = matches!(voice, VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. });
+                let is_external = self
+                    .project
+                    .graph
+                    .instrument_of_track(sel)
+                    .and_then(|n| match n {
+                        NodeDoc::Instrument { voice, .. } => Some(matches!(
+                            voice,
+                            VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. }
+                        )),
+                        _ => None,
+                    })
+                    .unwrap_or(false);
                 if ui.selectable_label(!is_external, "内置合成器").clicked() {
-                    self.project.tracks[sel].voice = VoiceSpec::Builtin;
-                    self.voice_params.remove(&sel);
-                    self.engine.set_builtin_voice(sel);
+                    self.set_builtin_instrument(sel);
                 }
                 // 先收集选择，菜单闭包结束后再装填（避免借用冲突）。
                 let mut picked: Option<(String, String)> = None;
@@ -996,10 +1471,14 @@ impl ResoZApp {
                     }
                 });
                 if let Some((path, plugin_id)) = picked {
-                    self.project.tracks[sel].voice = VoiceSpec::Clap {
-                        path: path.clone(),
-                        plugin_id: plugin_id.clone(),
-                    };
+                    if let Some(NodeDoc::Instrument { voice, .. }) =
+                        self.project.graph.instrument_of_track_mut(sel)
+                    {
+                        *voice = VoiceSpec::Clap {
+                            path: path.clone(),
+                            plugin_id: plugin_id.clone(),
+                        };
+                    }
                     self.load_clap_voice(sel, &path, &plugin_id);
                 }
                 let mut vst3_picked: Option<(String, String)> = None;
@@ -1018,10 +1497,14 @@ impl ResoZApp {
                     }
                 });
                 if let Some((path, class_id)) = vst3_picked {
-                    self.project.tracks[sel].voice = VoiceSpec::Vst3 {
-                        path: path.clone(),
-                        class_id: class_id.clone(),
-                    };
+                    if let Some(NodeDoc::Instrument { voice, .. }) =
+                        self.project.graph.instrument_of_track_mut(sel)
+                    {
+                        *voice = VoiceSpec::Vst3 {
+                            path: path.clone(),
+                            class_id: class_id.clone(),
+                        };
+                    }
                     self.load_vst3_voice(sel, &path, &class_id);
                 }
                 if is_external {
@@ -1052,7 +1535,7 @@ impl ResoZApp {
                     }
                 });
                 if clear_effects {
-                    self.engine.clear_external_effects(sel);
+                    self.clear_external_effects(sel);
                 }
                 if let Some((path, plugin_id)) = effect_picked {
                     self.load_clap_effect(sel, &path, &plugin_id);
@@ -1130,53 +1613,51 @@ impl ResoZApp {
                         });
                 }
             }
-            ui.weak("正弦波 → ADSR 包络 → SVF 滤波器 → 延迟（每轨独立）—— 改动实时送达音频线程");
+            ui.weak("节点图：声源 → 延迟 → 通道条 → 主输出（文档全显式，改动实时送达音频线程）");
             ui.add_space(8.0);
 
-            // 滤波器 / 包络（绑定到选中轨道的文档字段）。
+            // 滤波器 / 包络（绑定到选中轨道的文档节点字段）。
             egui::Grid::new("synth_params")
                 .num_columns(2)
                 .spacing([16.0, 8.0])
                 .show(ui, |ui| {
                     ui.label("截止频率");
+                    let mut cutoff = self.synth_of_track(sel).unwrap_or_default().cutoff_hz;
                     let r = ui.add(
-                        egui::Slider::new(
-                            &mut self.project.tracks[sel].synth.cutoff_hz,
-                            CUTOFF_RANGE,
-                        )
-                        .logarithmic(true)
-                        .text("Hz"),
+                        egui::Slider::new(&mut cutoff, CUTOFF_RANGE)
+                            .logarithmic(true)
+                            .text("Hz"),
                     );
                     if r.changed() {
-                        self.send_track_param(
-                            sel,
-                            ParamId::FilterCutoff,
-                            self.project.tracks[sel].synth.cutoff_hz,
-                        );
+                        if let Some(s) = self.synth_mut(sel) {
+                            s.cutoff_hz = cutoff;
+                        }
+                        self.send_track_param(sel, ParamId::FilterCutoff, cutoff);
                     }
                     ui.end_row();
 
                     ui.label("共振");
-                    let r = ui.add(egui::Slider::new(
-                        &mut self.project.tracks[sel].synth.resonance,
-                        RES_RANGE,
-                    ));
+                    let mut resonance = self.synth_of_track(sel).unwrap_or_default().resonance;
+                    let r = ui.add(egui::Slider::new(&mut resonance, RES_RANGE));
                     if r.changed() {
-                        self.send_track_param(
-                            sel,
-                            ParamId::FilterResonance,
-                            self.project.tracks[sel].synth.resonance,
-                        );
+                        if let Some(s) = self.synth_mut(sel) {
+                            s.resonance = resonance;
+                        }
+                        self.send_track_param(sel, ParamId::FilterResonance, resonance);
                     }
                     ui.end_row();
 
                     ui.label("滤波模式");
                     ui.horizontal(|ui| {
+                        let mode = self.synth_of_track(sel).unwrap_or_default().filter_mode;
                         for (name, value) in [("低通", 0.0), ("高通", 1.0), ("带通", 2.0)] {
-                            let selected =
-                                (self.project.tracks[sel].synth.filter_mode - value).abs() < 0.5;
-                            if ui.selectable_label(selected, name).clicked() {
-                                self.project.tracks[sel].synth.filter_mode = value;
+                            if ui
+                                .selectable_label((mode - value).abs() < 0.5, name)
+                                .clicked()
+                            {
+                                if let Some(s) = self.synth_mut(sel) {
+                                    s.filter_mode = value;
+                                }
                                 self.send_track_param(sel, ParamId::FilterMode, value);
                             }
                         }
@@ -1223,10 +1704,11 @@ impl ResoZApp {
     /// ADSR 四滑块（本地副本 + 写回，避免借用冲突）。
     fn adsr_sliders(&mut self, ui: &mut egui::Ui) {
         let sel = self.selected_track;
-        let mut a = self.project.tracks[sel].synth.attack_s;
-        let mut d = self.project.tracks[sel].synth.decay_s;
-        let mut s = self.project.tracks[sel].synth.sustain;
-        let mut r = self.project.tracks[sel].synth.release_s;
+        let synth = self.synth_of_track(sel).unwrap_or_default();
+        let mut a = synth.attack_s;
+        let mut d = synth.decay_s;
+        let mut s = synth.sustain;
+        let mut r = synth.release_s;
         ui.horizontal(|ui| {
             let sliders = [
                 ("A", &mut a, AD_RANGE, ParamId::Attack),
@@ -1241,18 +1723,21 @@ impl ResoZApp {
                 }
             }
         });
-        self.project.tracks[sel].synth.attack_s = a;
-        self.project.tracks[sel].synth.decay_s = d;
-        self.project.tracks[sel].synth.sustain = s;
-        self.project.tracks[sel].synth.release_s = r;
+        if let Some(synth) = self.synth_mut(sel) {
+            synth.attack_s = a;
+            synth.decay_s = d;
+            synth.sustain = s;
+            synth.release_s = r;
+        }
     }
 
     /// 延迟三滑块（湿声/时间/反馈）。
     fn delay_sliders(&mut self, ui: &mut egui::Ui) {
         let sel = self.selected_track;
-        let mut mix = self.project.tracks[sel].delay.mix;
-        let mut time = self.project.tracks[sel].delay.time_s;
-        let mut feedback = self.project.tracks[sel].delay.feedback;
+        let delay = self.delay_of_track(sel).unwrap_or_default();
+        let mut mix = delay.mix;
+        let mut time = delay.time_s;
+        let mut feedback = delay.feedback;
         ui.horizontal(|ui| {
             let sliders = [
                 ("湿声", &mut mix, DELAY_MIX_RANGE, ParamId::DelayMix),
@@ -1271,9 +1756,11 @@ impl ResoZApp {
                 }
             }
         });
-        self.project.tracks[sel].delay.mix = mix;
-        self.project.tracks[sel].delay.time_s = time;
-        self.project.tracks[sel].delay.feedback = feedback;
+        if let Some(delay) = self.delay_mut(sel) {
+            delay.mix = mix;
+            delay.time_s = time;
+            delay.feedback = feedback;
+        }
     }
 
     /// 发送一条轨道参数到音频线程。
@@ -1282,26 +1769,27 @@ impl ResoZApp {
             .send(EngineCommand::SetTrackParam { track, id, value });
     }
 
-    /// 混音器：每轨 选择 / 静音 / 电平表 / 推子 / 声像。
+    /// 混音器：每轨 选择 / 静音 / 电平表 / 推子 / 声像（Vec 遍历，
+    /// 数据源 = 文档通道条节点）。
     fn mixer_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
         ui.label("混音器");
 
         // 先收集编辑，循环后统一写回并发送（避免借用冲突）。
-        let num_tracks = self.project.tracks.len();
-        let mut mute_edits = [None; 4];
-        let mut gain_edits = [None; 4];
-        let mut pan_edits = [None; 4];
+        let num_tracks = self.project.midi_tracks.len();
+        let mut mute_edits: Vec<Option<bool>> = vec![None; num_tracks];
+        let mut gain_edits: Vec<Option<f32>> = vec![None; num_tracks];
+        let mut pan_edits: Vec<Option<f32>> = vec![None; num_tracks];
         let mut select_edits: Option<usize> = None;
 
         ui.horizontal(|ui| {
-            for i in 0..num_tracks.min(4) {
+            for i in 0..num_tracks {
                 ui.vertical(|ui| {
-                    let name = if self.project.tracks[i].name.is_empty() {
+                    let name = if self.project.midi_tracks[i].name.is_empty() {
                         format!("轨道 {}", i + 1)
                     } else {
-                        self.project.tracks[i].name.clone()
+                        self.project.midi_tracks[i].name.clone()
                     };
                     if ui
                         .selectable_label(self.selected_track == i, name)
@@ -1310,7 +1798,7 @@ impl ResoZApp {
                         select_edits = Some(i);
                     }
 
-                    let muted = self.project.tracks[i].muted;
+                    let (muted, _gain, _pan) = self.track_strip_state(i);
                     let mut btn = egui::Button::new(if muted { "静音" } else { "开" });
                     if muted {
                         btn = btn.fill(egui::Color32::from_rgb(140, 60, 50));
@@ -1332,7 +1820,7 @@ impl ResoZApp {
                     ui.painter()
                         .rect_filled(filled, 2.0, egui::Color32::from_rgb(70, 160, 90));
 
-                    let mut gain = self.project.tracks[i].gain;
+                    let mut gain = self.track_strip_state(i).1;
                     let fader = ui.add_sized(
                         [96.0, 110.0],
                         egui::Slider::new(&mut gain, TRACK_GAIN_RANGE).vertical(),
@@ -1341,7 +1829,7 @@ impl ResoZApp {
                         gain_edits[i] = Some(gain);
                     }
 
-                    let mut pan = self.project.tracks[i].pan;
+                    let mut pan = self.track_strip_state(i).2;
                     let pan_resp = ui.add_sized(
                         [96.0, 20.0],
                         egui::Slider::new(&mut pan, PAN_RANGE).text("声像"),
@@ -1350,7 +1838,7 @@ impl ResoZApp {
                         pan_edits[i] = Some(pan);
                     }
                 });
-                if i + 1 < num_tracks.min(4) {
+                if i + 1 < num_tracks {
                     ui.separator();
                 }
             }
@@ -1359,17 +1847,29 @@ impl ResoZApp {
         if let Some(i) = select_edits {
             self.selected_track = i;
         }
-        for i in 0..num_tracks.min(4) {
+        for i in 0..num_tracks {
             if let Some(muted) = mute_edits[i] {
-                self.project.tracks[i].muted = muted;
+                if let Some(NodeDoc::ChannelStrip { muted: m, .. }) =
+                    self.project.graph.channel_strip_of_track_mut(i)
+                {
+                    *m = muted;
+                }
                 self.send_track_param(i, ParamId::TrackMute, if muted { 1.0 } else { 0.0 });
             }
             if let Some(gain) = gain_edits[i] {
-                self.project.tracks[i].gain = gain;
+                if let Some(NodeDoc::ChannelStrip { gain: g, .. }) =
+                    self.project.graph.channel_strip_of_track_mut(i)
+                {
+                    *g = gain;
+                }
                 self.send_track_param(i, ParamId::TrackGain, gain);
             }
             if let Some(pan) = pan_edits[i] {
-                self.project.tracks[i].pan = pan;
+                if let Some(NodeDoc::ChannelStrip { pan: p, .. }) =
+                    self.project.graph.channel_strip_of_track_mut(i)
+                {
+                    *p = pan;
+                }
                 self.send_track_param(i, ParamId::TrackPan, pan);
             }
         }
@@ -1403,11 +1903,11 @@ impl ResoZApp {
                 self.send_sequencer(SequencerCommand::SetGate(self.project.gate));
             }
             if ui.button("清空").clicked() {
-                self.project.tracks[sel].pattern = Pattern::default();
+                self.project.midi_tracks[sel].pattern = Pattern::default();
                 self.send_pattern(sel);
             }
             if ui.button("全部 C4").clicked() {
-                self.project.tracks[sel]
+                self.project.midi_tracks[sel]
                     .pattern
                     .steps
                     .fill(resoz_model::Step {
@@ -1426,7 +1926,12 @@ impl ResoZApp {
         // （避免迭代器借用与 send_pattern 的可变借用冲突）。
         let mut edits: [(bool, bool, u8); PATTERN_STEPS] = [(false, false, 0); PATTERN_STEPS];
         ui.horizontal(|ui| {
-            for (i, step) in self.project.tracks[sel].pattern.steps.iter().enumerate() {
+            for (i, step) in self.project.midi_tracks[sel]
+                .pattern
+                .steps
+                .iter()
+                .enumerate()
+            {
                 if i > 0 && i % 4 == 0 {
                     ui.separator();
                 }
@@ -1460,7 +1965,7 @@ impl ResoZApp {
         if edits.iter().any(|(edit, _, _)| *edit) {
             for (i, (edit, enabled, note)) in edits.iter().enumerate() {
                 if *edit {
-                    self.project.tracks[sel].pattern.steps[i] = resoz_model::Step {
+                    self.project.midi_tracks[sel].pattern.steps[i] = resoz_model::Step {
                         enabled: *enabled,
                         note: *note,
                         velocity: 0.9,
@@ -1494,7 +1999,7 @@ impl ResoZApp {
         let playing = self.engine.is_playing();
         let edited = piano_roll::show(
             ui,
-            &mut self.project.tracks[sel].clip,
+            &mut self.project.midi_tracks[sel].clip,
             &mut self.roll_state,
             playhead,
             playing,
@@ -1504,156 +2009,164 @@ impl ResoZApp {
         }
     }
 
-    /// 自动化泳道（编辑选中轨道的曲线；编辑即时下发音频线程）。
+    /// 自动化轨道区（D12 顶层实体；每条曲线的投递终点由节点图连线决定）。
     fn automation_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
-        let sel = self.selected_track;
+        let auto_count = self.project.automation_tracks.len();
         ui.horizontal(|ui| {
-            ui.label("自动化");
-            for (name, param) in [
-                ("音量", AutoParam::TrackGain),
-                ("声像", AutoParam::TrackPan),
-                ("截止", AutoParam::FilterCutoff),
-            ] {
+            ui.label("自动化轨道");
+            for i in 0..auto_count {
                 if ui
-                    .selectable_label(self.lane_param == param, name)
+                    .selectable_label(self.selected_auto == i, format!("{}", i + 1))
                     .clicked()
                 {
-                    self.lane_param = param;
+                    self.selected_auto = i;
                 }
             }
-            // 插件参数目标（CLAP/VST3 声源装填后可用）。曲线值语义：
-            // CLAP = 插件值域原始值；VST3 = 归一化 0..1（各宿主节点
-            // PluginParam 桥接的取值口径）。
-            let mut plugin_picked: Option<AutoParam> = None;
-            let has_plugin_params = self
-                .voice_params
-                .get(&sel)
-                .is_some_and(|params| !params.is_empty())
-                || self
-                    .clap_voice_params
-                    .get(&sel)
-                    .is_some_and(|params| !params.is_empty());
-            if has_plugin_params {
-                let current_name = match &self.lane_param {
-                    AutoParam::PluginParam { name, .. } => Some(name.clone()),
-                    _ => None,
-                };
-                ui.menu_button(current_name.as_deref().unwrap_or("插件参数…"), |ui| {
-                    if let Some(params) = self.clap_voice_params.get(&sel) {
-                        for param in params {
-                            let label = if param.name.is_empty() {
-                                format!("参数 {}", param.id)
-                            } else {
-                                param.name.clone()
-                            };
-                            if ui.button(&label).clicked() {
-                                plugin_picked = Some(AutoParam::PluginParam {
-                                    param_id: param.id,
-                                    name: label,
-                                });
-                                ui.close();
-                            }
-                        }
-                    }
-                    if let Some(params) = self.voice_params.get(&sel) {
-                        for param in params {
-                            let label = if param.title.is_empty() {
-                                format!("参数 {}", param.id)
-                            } else {
-                                param.title.clone()
-                            };
-                            if ui.button(&label).clicked() {
-                                plugin_picked = Some(AutoParam::PluginParam {
-                                    param_id: param.id,
-                                    name: label,
-                                });
-                                ui.close();
-                            }
-                        }
-                    }
+            if ui.button("＋ 新增").clicked() && auto_count < MAX_AUTO_TRACKS {
+                self.project
+                    .automation_tracks
+                    .push(AutomationTrack::default());
+                self.selected_auto = auto_count;
+                self.send_auto_curve(self.selected_auto);
+            }
+            if ui.button("－ 删除").clicked() && auto_count > 0 {
+                let index = self.selected_auto.min(auto_count - 1);
+                self.project.automation_tracks.remove(index);
+                let _ = self.engine.clear_auto_route(index);
+                // 引擎侧该索引清空为空曲线。
+                self.send_sequencer(SequencerCommand::SetAutoTrack {
+                    index,
+                    auto: RtAutoTrack {
+                        loop_ticks: TICKS_PER_BAR,
+                        curve: RtAutomation::default(),
+                    },
                 });
+                self.selected_auto =
+                    index.min(self.project.automation_tracks.len().saturating_sub(1));
             }
-            if let Some(param) = plugin_picked {
-                self.lane_param = param;
-            }
-            let mut enabled = self.project.tracks[sel]
-                .automations
-                .iter()
-                .find(|curve| curve.param == self.lane_param)
-                .map(|curve| curve.enabled)
-                .unwrap_or(false);
-            if ui.checkbox(&mut enabled, "启用").changed() {
-                let track = &mut self.project.tracks[sel];
-                match track
-                    .automations
-                    .iter_mut()
-                    .find(|curve| curve.param == self.lane_param)
-                {
-                    Some(curve) => curve.enabled = enabled,
-                    None => track.automations.push(Automation {
-                        param: self.lane_param.clone(),
-                        enabled,
-                        ..Automation::default()
-                    }),
-                }
-                let curve = track
-                    .automations
-                    .iter()
-                    .find(|curve| curve.param == self.lane_param)
-                    .cloned()
-                    .expect("上一步已确保存在");
-                self.send_automation(sel, &curve);
-            }
-            if let AutoParam::PluginParam { name, .. } = &self.lane_param {
-                ui.weak(format!("目标：{name}"));
-            }
-            ui.weak("点按加锚点 · 拖拽移动 · 右键删除");
+            ui.weak("点按泳道加锚点 · 拖拽移动 · 右键删除");
         });
 
-        // 确保泳道对应的曲线存在（空曲线 = 无自动化）。
-        if !self.project.tracks[sel]
-            .automations
-            .iter()
-            .any(|curve| curve.param == self.lane_param)
+        if auto_count == 0 {
+            ui.weak("（无自动化轨道；点「＋ 新增」创建一条曲线）");
+            return;
+        }
+        let index = self.selected_auto.min(auto_count - 1);
+        let sel = self.selected_track;
+
+        // 终点选择：本轨通道条（音量/声像）、声源（截止/插件参数）。
+        // 选项携带**文档** node_id（cable 持久化身份），下发时映射。
+        let mut options: Vec<(String, u64, AutoParam)> = Vec::new();
+        if let Some(strip_doc) = self
+            .project
+            .graph
+            .channel_strip_of_track(sel)
+            .map(NodeDoc::node_id)
         {
-            self.project.tracks[sel].automations.push(Automation {
-                param: self.lane_param.clone(),
-                ..Automation::default()
-            });
+            options.push(("音量".to_string(), strip_doc, AutoParam::TrackGain));
+            options.push(("声像".to_string(), strip_doc, AutoParam::TrackPan));
+        }
+        if let Some(voice_doc) = self
+            .project
+            .graph
+            .instrument_of_track(sel)
+            .map(NodeDoc::node_id)
+        {
+            options.push(("截止".to_string(), voice_doc, AutoParam::FilterCutoff));
+            if let Some(params) = self.clap_voice_params.get(&sel) {
+                for param in params {
+                    let label = if param.name.is_empty() {
+                        format!("参数 {}", param.id)
+                    } else {
+                        param.name.clone()
+                    };
+                    options.push((
+                        format!("CLAP {label}"),
+                        voice_doc,
+                        AutoParam::PluginParam {
+                            param_id: param.id,
+                            name: label,
+                        },
+                    ));
+                }
+            }
+            if let Some(params) = self.voice_params.get(&sel) {
+                for param in params {
+                    let label = if param.title.is_empty() {
+                        format!("参数 {}", param.id)
+                    } else {
+                        param.title.clone()
+                    };
+                    options.push((
+                        format!("VST3 {label}"),
+                        voice_doc,
+                        AutoParam::PluginParam {
+                            param_id: param.id,
+                            name: label,
+                        },
+                    ));
+                }
+            }
         }
 
-        // 泳道循环长度随轨道音源口径，并同步回写文档（v2：文档显式
-        // 携带 `loop_ticks`，保存时记录最近使用的口径）。
-        let loop_ticks = match self.project.tracks[sel].source {
-            ModelTrackSource::Clip => self.project.tracks[sel].clip.loop_ticks,
+        let mut picked: Option<(u64, AutoParam)> = None;
+        ui.horizontal(|ui| {
+            ui.label("目标");
+            ui.menu_button("选择参数…", |ui| {
+                for (label, doc_id, param) in &options {
+                    if ui.button(label).clicked() {
+                        picked = Some((*doc_id, param.clone()));
+                        ui.close();
+                    }
+                }
+            });
+            if let Some((doc_id, param)) = picked {
+                self.set_auto_endpoint(index, doc_id, param);
+            }
+            // 当前终点显示。
+            let current = self
+                .project
+                .graph
+                .auto_endpoint(index)
+                .map(|param| match &param {
+                    AutoParam::TrackGain => "音量".to_string(),
+                    AutoParam::TrackPan => "声像".to_string(),
+                    AutoParam::FilterCutoff => "截止".to_string(),
+                    AutoParam::PluginParam { name, .. } => name.clone(),
+                })
+                .unwrap_or_else(|| "未连线".to_string());
+            ui.weak(format!("→ {current}"));
+            let mut enabled = self.project.automation_tracks[index].enabled;
+            if ui.checkbox(&mut enabled, "启用").changed() {
+                self.project.automation_tracks[index].enabled = enabled;
+                self.send_auto_curve(index);
+            }
+        });
+
+        // 泳道循环长度随轨道音源口径，并同步回写文档。
+        let loop_ticks = match self.project.midi_tracks[sel].source {
+            resoz_model::TrackSource::Clip => self.project.midi_tracks[sel].clip.loop_ticks,
             _ => TICKS_PER_BAR,
         };
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
-        let curve = self.project.tracks[sel]
-            .automations
-            .iter_mut()
-            .find(|curve| curve.param == self.lane_param)
-            .expect("上一步已确保存在");
-        curve.loop_ticks = loop_ticks;
-        let edited = lane::show(
-            ui,
-            curve,
-            loop_ticks,
-            playhead,
-            playing,
-            &mut self.lane_state,
-        );
-        if edited {
-            let curve = self.project.tracks[sel]
-                .automations
-                .iter()
-                .find(|curve| curve.param == self.lane_param)
-                .cloned()
-                .expect("上一步已确保存在");
-            self.send_automation(sel, &curve);
+        let axis_param = self.project.graph.auto_endpoint(index).unwrap_or_default();
+        if let Some(curve) = self.project.automation_tracks.get_mut(index) {
+            curve.loop_ticks = loop_ticks;
+            let edited = lane::show(
+                ui,
+                curve,
+                &axis_param,
+                loop_ticks,
+                playhead,
+                playing,
+                &mut self.lane_state,
+            );
+            if edited {
+                self.send_auto_curve(index);
+            }
         }
     }
 
@@ -1750,15 +2263,21 @@ impl eframe::App for ResoZApp {
         }
 
         // 回收已卸装的插件节点：在控制线程释放，并按 node_id 丢弃
-        // 配对守卫（安全卸载动态库）。
+        // 退役区里配对的守卫（安全卸载动态库；在役守卫不受影响）。
         for node_id in self.engine.reclaim_nodes() {
-            self.voice_guards.retain(|entry| entry.node_id != node_id);
+            if let Some(pos) = self
+                .retiring_guards
+                .iter()
+                .position(|entry| entry.node_id == node_id)
+            {
+                self.retiring_guards.remove(pos);
+            }
         }
 
         // 走带停止沿：自动化不再覆盖，恢复各轨手动参数值。
         let playing = self.engine.is_playing();
         if self.was_playing && !playing {
-            for track in 0..self.project.tracks.len() {
+            for track in 0..self.project.midi_tracks.len() {
                 self.push_track_params(track);
             }
         }

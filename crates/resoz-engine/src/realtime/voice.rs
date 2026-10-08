@@ -26,9 +26,9 @@ pub struct RecycledNode {
 
 /// 结构更新队列的默认容量。
 ///
-/// 低频操作，但项目加载会一次性下发全部时间轴连线（最多 16 条自动化
-/// 连线 + 每轨声源恢复），取 64 留足富余。
-pub const STRUCTURE_QUEUE_CAPACITY: usize = 64;
+/// 低频操作，但项目加载（P5c，D13 全显式）会一次性下发整个图的
+/// 逐步建图更新：最坏 64 节点 + 128 连线 ≈ 192 条，取 256 留足富余。
+pub const STRUCTURE_QUEUE_CAPACITY: usize = 256;
 
 /// 节点回收回执队列的默认容量。
 pub const RECYCLE_QUEUE_CAPACITY: usize = 16;

@@ -6,7 +6,7 @@
 
 use eframe::egui;
 
-use resoz_model::{AutoParam, AutoPoint, Automation, TICKS_PER_STEP};
+use resoz_model::{AutoParam, AutoPoint, AutomationTrack, TICKS_PER_STEP};
 
 /// 泳道高度（像素）。
 pub const LANE_HEIGHT: f32 = 96.0;
@@ -55,16 +55,19 @@ fn from_norm(norm: f32, min: f32, max: f32, log: bool) -> f32 {
 
 /// 绘制并交互一帧泳道。直接原地修改 `automation`，返回本帧是否编辑
 /// （调用方据此把曲线重新下发到音频线程）。
+///
+/// `param` 是连线终点参数（D7：曲线不含目标），仅用于纵轴值域映射。
 pub fn show(
     ui: &mut egui::Ui,
-    automation: &mut Automation,
+    automation: &mut AutomationTrack,
+    param: &AutoParam,
     loop_ticks: u32,
     playhead_ticks: f32,
     playing: bool,
     state: &mut LaneState,
 ) -> bool {
     let loop_ticks = loop_ticks.max(TICKS_PER_STEP).max(1);
-    let (min, max, log) = axis(&automation.param);
+    let (min, max, log) = axis(param);
     let mut edited = false;
 
     let width = ui.available_width();
@@ -131,7 +134,7 @@ pub fn show(
     }
 
     // 交互。
-    let hit_point = |pos: egui::Pos2, automation: &Automation| -> Option<usize> {
+    let hit_point = |pos: egui::Pos2, automation: &AutomationTrack| -> Option<usize> {
         automation.points.iter().position(|p| {
             let x = rect.left() + p.tick as f32 * ticks_to_x;
             let y = value_y(p.value);

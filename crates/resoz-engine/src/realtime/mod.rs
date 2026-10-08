@@ -71,7 +71,7 @@ pub use envelope::AdsrProcessor;
 pub use gain::GainProcessor;
 pub use graph::{
     AutoRoute, Cable, ChannelStripProcessor, ExecPlan, GraphCompiler, GraphLevels, GraphUpdate,
-    MAX_CABLES, MAX_MIDI_FANOUT, RtGraph, TopologyError,
+    MASTER_NODE_ID, MAX_CABLES, MAX_MIDI_FANOUT, RtGraph, TopologyError,
 };
 pub use processor::{Processor, ProcessorChain};
 pub use sequencer::{

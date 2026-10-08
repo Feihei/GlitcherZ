@@ -50,6 +50,10 @@ pub const MAX_REMOVALS: usize = 8;
 /// 单条 MIDI 轨最多同时扇出的乐器节点数（D7）。
 pub const MAX_MIDI_FANOUT: usize = 4;
 
+/// 主输出的保留 node_id（D6：固定存在、不可删除、不可改类型）。
+/// 文档节点（resoz-model）从 2 起分配，0 恒为无效哨兵。
+pub const MASTER_NODE_ID: u64 = 1;
+
 /// 单条音频连线（编译器侧）：源槽位 → 目标槽位。
 ///
 /// P5b：取代旧的单出边 `out_edge: [u16; MAX_NODES]`——一个输出口可以
@@ -562,13 +566,13 @@ pub struct GraphCompiler {
 }
 
 impl GraphCompiler {
-    /// 构建默认拓扑（复刻旧 Mixer）：主输出 + 每轨 `声源 → 延迟 → 通道条`。
-    /// **非 RT-safe**（分配处理器与缓冲），只在音频流启动前调用。
+    /// 构建空图：仅主输出（node_id = [`MASTER_NODE_ID`]）。
     ///
-    /// P5c 起（D13 全显式）退役为"新建项目生成初始文档"的参考实现：
-    /// 项目加载改由文档逐步建图（`add_midi_track` / `insert_effect` /
-    /// `connect_*` 粒度）。
-    pub fn default_graph(sample_rate: f32, block_size: usize) -> (Self, RtGraph) {
+    /// P5c 起（D13 全显式）这是引擎的启动形态：项目文档经
+    /// `add_node` / `register_track_chain` / `connect_nodes` 粒度
+    /// 逐步建图。**非 RT-safe**（分配处理器与缓冲），只在音频流
+    /// 启动前调用。
+    pub fn empty_graph(sample_rate: f32, block_size: usize) -> (Self, RtGraph) {
         let mut compiler = Self {
             sample_rate,
             block_size: block_size.max(1),
@@ -584,10 +588,9 @@ impl GraphCompiler {
             midi_targets: [[NO_EDGE; MAX_MIDI_FANOUT]; MAX_MIDI_TRACKS],
             midi_target_counts: [0; MAX_MIDI_TRACKS],
             auto_routes: [AutoRoute::default(); MAX_AUTO_TRACKS],
-            next_node_id: 1,
+            next_node_id: MASTER_NODE_ID,
         };
         let mut graph = RtGraph::new(block_size);
-        let bs = compiler.block_size;
 
         let master_id = compiler.fresh_id();
         let master = compiler.alloc_slot();
@@ -597,8 +600,22 @@ impl GraphCompiler {
             master as usize,
             master_id,
             Box::new(GainProcessor::new(1.0)),
-            AudioBuffer::new(2, bs),
+            AudioBuffer::new(2, compiler.block_size),
         );
+
+        graph.plan = compiler.compile().expect("master-only graph must compile");
+        (compiler, graph)
+    }
+
+    /// 构建默认拓扑（复刻旧 Mixer）：主输出 + 每轨 `声源 → 延迟 → 通道条`。
+    /// **非 RT-safe**（分配处理器与缓冲），只在音频流启动前调用。
+    ///
+    /// P5c 起（D13 全显式）退役为引擎测试/参考实现：生产路径由项目
+    /// 文档逐步建图（见 [`Self::empty_graph`]）。模型层的
+    /// `default_graph_doc` 是"新建项目初始文档"的权威生成器。
+    pub fn default_graph(sample_rate: f32, block_size: usize) -> (Self, RtGraph) {
+        let (mut compiler, mut graph) = Self::empty_graph(sample_rate, block_size);
+        let bs = compiler.block_size;
 
         for t in 0..DEFAULT_MIDI_TRACKS {
             let slots = compiler.allocate_track_chain(t);
@@ -673,6 +690,13 @@ impl GraphCompiler {
         let id = self.next_node_id;
         self.next_node_id += 1;
         id
+    }
+
+    /// 分配下一个会话内单调 node_id（文档重建路径用：UI 以此为引擎侧
+    /// 身份，文档 id → 引擎 id 的映射由调用方维护；会话内不复用已
+    /// 回收的 id，保证插件守卫配对无歧义）。
+    pub fn fresh_node_id(&mut self) -> u64 {
+        self.fresh_id()
     }
 
     /// node_id → 槽位解析（未分配 / 空槽返回 `None`）。node_id 0 恒无效。
@@ -1171,6 +1195,253 @@ impl GraphCompiler {
         self.auto_routes[auto_index] = AutoRoute::default();
         Ok(self.build_update(self.compile()?, Vec::new(), &[]))
     }
+
+    // ---- 文档逐步建图 API（P5c，D13 全显式：加载器按文档重建图）----
+
+    /// 安装一个文档节点（**显式 node_id**，D11：随文件持久化）。
+    ///
+    /// node_id 为 0（无效哨兵）或 1（主输出保留）→
+    /// [`TopologyError::InvalidSlot`]；重复 id 或槽位满同样报错。
+    /// 无论成败都会推进 `next_node_id`（保证后续 fresh 分配不撞文档 id）。
+    pub fn add_node(
+        &mut self,
+        node_id: u64,
+        node: Box<dyn Processor>,
+    ) -> Result<GraphUpdate, TopologyError> {
+        if node_id <= MASTER_NODE_ID {
+            return Err(TopologyError::InvalidSlot);
+        }
+        self.next_node_id = self.next_node_id.max(node_id + 1);
+        if self.node_slot(node_id).is_some() {
+            return Err(TopologyError::InvalidSlot);
+        }
+        let Some(free_idx) = self.occupied.iter().position(|&o| !o) else {
+            return Err(TopologyError::NoFreeSlot);
+        };
+        let free = free_idx as u16;
+        self.occupied[free as usize] = true;
+        self.slot_ids[free as usize] = node_id;
+        let plan = match self.compile() {
+            Ok(plan) => plan,
+            Err(_) => {
+                self.occupied[free as usize] = false;
+                self.slot_ids[free as usize] = 0;
+                return Err(TopologyError::Cycle);
+            }
+        };
+        Ok(self.build_update(plan, vec![(free, node_id, node)], &[]))
+    }
+
+    /// 装配轨道寻址表（P5c）：把文档里某轨的三件套 node_id 映射进
+    /// `track_voice` / `track_delay` / `track_channel`，使旧轨道坐标
+    /// API（手动参数、电平回传、键盘演奏）继续工作。任一角色缺省
+    /// （文档无对应节点）传 `None`，对应表项置空。轨道效果器表清空。
+    pub fn register_track_chain(
+        &mut self,
+        track: usize,
+        voice: Option<u64>,
+        delay: Option<u64>,
+        channel: Option<u64>,
+    ) -> Result<GraphUpdate, TopologyError> {
+        if track >= MAX_MIDI_TRACKS {
+            return Err(TopologyError::InvalidTrack);
+        }
+        let resolve = |compiler: &Self, id: Option<u64>| -> Result<u16, TopologyError> {
+            match id {
+                None => Ok(NO_EDGE),
+                Some(id) => compiler.node_slot(id).ok_or(TopologyError::InvalidSlot),
+            }
+        };
+        self.track_voice[track] = resolve(self, voice)?;
+        self.track_delay[track] = resolve(self, delay)?;
+        self.track_channel[track] = resolve(self, channel)?;
+        self.track_effects[track] = [NO_EDGE; EFFECT_SLOTS];
+        Ok(self.build_update(self.compile()?, Vec::new(), &[]))
+    }
+
+    /// 节点间音频连线（**node_id 寻址**，文档 cable 的引擎落点）。
+    /// 重复连线幂等；目标入边超限/成环/超容报错（失败即回滚）。
+    pub fn connect_nodes(
+        &mut self,
+        from_id: u64,
+        to_id: u64,
+    ) -> Result<GraphUpdate, TopologyError> {
+        let from = self.node_slot(from_id).ok_or(TopologyError::InvalidSlot)?;
+        let to = self.node_slot(to_id).ok_or(TopologyError::InvalidSlot)?;
+        if self.add_cable(from, to).is_err() {
+            return Err(TopologyError::TooManyCables);
+        }
+        match self.compile() {
+            Ok(plan) => Ok(self.build_update(plan, Vec::new(), &[])),
+            Err(err) => {
+                let _ = self.remove_cable(from, to);
+                Err(err)
+            }
+        }
+    }
+
+    /// 断开节点间音频连线（未连线幂等成功）。
+    pub fn disconnect_nodes(
+        &mut self,
+        from_id: u64,
+        to_id: u64,
+    ) -> Result<GraphUpdate, TopologyError> {
+        let from = self.node_slot(from_id).ok_or(TopologyError::InvalidSlot)?;
+        let to = self.node_slot(to_id).ok_or(TopologyError::InvalidSlot)?;
+        self.remove_cable(from, to);
+        Ok(self.build_update(self.compile()?, Vec::new(), &[]))
+    }
+
+    /// 原位替换某节点的处理器（**保留 node_id**，D11：节点身份不变，
+    /// 旧处理器经回收队列释放）。换装内置/插件声源与效果器共用此路径。
+    pub fn replace_node(
+        &mut self,
+        node_id: u64,
+        node: Box<dyn Processor>,
+    ) -> Result<(GraphUpdate, u64), Box<dyn Processor>> {
+        let Some(slot) = self.node_slot(node_id) else {
+            return Err(node);
+        };
+        let Ok(plan) = self.compile() else {
+            return Err(node);
+        };
+        // apply_update 先移除后安装：同槽位旧节点出队，新节点入队。
+        Ok((
+            self.build_update(plan, vec![(slot, node_id, node)], &[slot]),
+            node_id,
+        ))
+    }
+
+    /// 在既有连线 `from_id → to_id` 之间插入一个节点（文档外部效果器
+    /// 的引擎落点）。失败时原样交还 `node` 并恢复原连线。
+    pub fn insert_node_between(
+        &mut self,
+        new_id: u64,
+        from_id: u64,
+        to_id: u64,
+        node: Box<dyn Processor>,
+    ) -> Result<GraphUpdate, Box<dyn Processor>> {
+        if new_id <= MASTER_NODE_ID {
+            return Err(node);
+        }
+        self.next_node_id = self.next_node_id.max(new_id + 1);
+        let Some(from) = self.node_slot(from_id) else {
+            return Err(node);
+        };
+        let Some(to) = self.node_slot(to_id) else {
+            return Err(node);
+        };
+        if self.node_slot(new_id).is_some() {
+            return Err(node);
+        }
+        let Some(free_idx) = self.occupied.iter().position(|&o| !o) else {
+            return Err(node);
+        };
+        let free = free_idx as u16;
+        self.occupied[free as usize] = true;
+        self.slot_ids[free as usize] = new_id;
+        self.remove_cable(from, to);
+        if self
+            .add_cable(from, free)
+            .and_then(|()| self.add_cable(free, to))
+            .is_err()
+        {
+            self.rollback_splice(free, from, to);
+            return Err(node);
+        }
+        match self.compile() {
+            Ok(plan) => Ok(self.build_update(plan, vec![(free, new_id, node)], &[])),
+            Err(_) => {
+                self.rollback_splice(free, from, to);
+                Err(node)
+            }
+        }
+    }
+
+    /// [`Self::insert_node_between`] 的回滚：拆掉新槽位连线并恢复原线。
+    fn rollback_splice(&mut self, free: u16, from: u16, to: u16) {
+        self.remove_cables_touching(&[free]);
+        self.occupied[free as usize] = false;
+        self.slot_ids[free as usize] = 0;
+        let _ = self.add_cable(from, to);
+    }
+
+    /// 移除一个节点（**旁路语义**：其全部入边源与出边目标重新直连，
+    /// 信号路径自然恢复——外部效果器移除后即旁通）。自动化连线表与
+    /// MIDI 扇出表中指向它的条目一并清理。主输出不可删除（D6）。
+    pub fn remove_node(&mut self, node_id: u64) -> Result<GraphUpdate, TopologyError> {
+        let Some(slot) = self.node_slot(node_id) else {
+            return Err(TopologyError::InvalidSlot);
+        };
+        if slot == self.master_slot {
+            return Err(TopologyError::InvalidSlot);
+        }
+        // 旁路直连对（入边源 × 出边目标）。数量 ≤ 现有连线数，
+        // cable 容量不会因旁路而增加。
+        let mut bypass = [Cable { from: 0, to: 0 }; MAX_IN_EDGES * MAX_IN_EDGES];
+        let mut bypass_count = 0usize;
+        for cable in &self.cables[..self.cable_count] {
+            if cable.to == slot {
+                for out in &self.cables[..self.cable_count] {
+                    if out.from == slot
+                        && !self.has_cable(cable.from, out.to)
+                        && !bypass[..bypass_count]
+                            .iter()
+                            .any(|b| b.from == cable.from && b.to == out.to)
+                    {
+                        bypass[bypass_count] = Cable {
+                            from: cable.from,
+                            to: out.to,
+                        };
+                        bypass_count += 1;
+                    }
+                }
+            }
+        }
+        self.remove_cables_touching(&[slot]);
+        for bypass_cable in &bypass[..bypass_count] {
+            let _ = self.add_cable(bypass_cable.from, bypass_cable.to);
+        }
+        for track in 0..MAX_MIDI_TRACKS {
+            // MIDI 扇出表行内剔除。
+            let mut count = self.midi_target_counts[track] as usize;
+            let mut i = 0;
+            while i < count {
+                if self.midi_targets[track][i] == slot {
+                    self.midi_targets[track].copy_within(i + 1..count, i);
+                    self.midi_targets[track][count - 1] = NO_EDGE;
+                    self.midi_target_counts[track] -= 1;
+                    count -= 1;
+                } else {
+                    i += 1;
+                }
+            }
+            // 轨道寻址表与效果器表。
+            if self.track_voice[track] == slot {
+                self.track_voice[track] = NO_EDGE;
+            }
+            if self.track_delay[track] == slot {
+                self.track_delay[track] = NO_EDGE;
+            }
+            if self.track_channel[track] == slot {
+                self.track_channel[track] = NO_EDGE;
+            }
+            for effect in &mut self.track_effects[track] {
+                if *effect == slot {
+                    *effect = NO_EDGE;
+                }
+            }
+        }
+        for route in &mut self.auto_routes {
+            if route.slot == slot {
+                *route = AutoRoute::default();
+            }
+        }
+        self.occupied[slot as usize] = false;
+        self.slot_ids[slot as usize] = 0;
+        let plan = self.compile()?;
+        Ok(self.build_update(plan, Vec::new(), &[slot]))
+    }
 }
 
 /// 轨道三件套的处理器构造（`kind`: 0 = 声源 / 1 = 延迟 / 2 = 通道条）。
@@ -1186,7 +1457,7 @@ fn chain_processor(kind: usize, sample_rate: f32) -> Box<dyn Processor> {
 mod tests {
     use super::{
         ChannelStripProcessor, DEFAULT_MIDI_TRACKS, GraphCompiler, GraphUpdate, MAX_CABLES,
-        MAX_MIDI_FANOUT, MAX_MIDI_TRACKS, RtGraph, TopologyError,
+        MAX_MIDI_FANOUT, MAX_MIDI_TRACKS, NO_EDGE, RtGraph, TopologyError, chain_processor,
     };
     use crate::realtime::buffer::AudioBuffer;
     use crate::realtime::commands::{NoteEvent, ParamId};
@@ -1205,6 +1476,15 @@ mod tests {
     ) -> (GraphUpdate, u64) {
         match result {
             Ok(pair) => pair,
+            Err(_) => panic!("{msg}"),
+        }
+    }
+
+    /// `insert_node_between` 的 Err 载荷是 `Box<dyn Processor>`（无
+    /// `Debug`），测试里用本助手断言成功。
+    fn expect_update(result: Result<GraphUpdate, Box<dyn Processor>>, msg: &str) -> GraphUpdate {
+        match result {
+            Ok(update) => update,
             Err(_) => panic!("{msg}"),
         }
     }
@@ -1856,5 +2136,164 @@ mod tests {
         assert!(compiler.add_cable(60, 61).is_ok());
         let levels = graph.process_block(&ctx());
         assert!(levels.master.is_finite());
+    }
+
+    // ---- P5c：文档逐步建图 API ----
+
+    #[test]
+    fn document_rebuild_end_to_end() {
+        // D13：主输出空图 → 按文档 add_node / register / connect 重建。
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, mut recycle_rx) = recycle_channel();
+        let apply = |graph: &mut RtGraph, recycle_tx: &mut rtrb::Producer<RecycledNode>, update| {
+            graph.apply_update(update, recycle_tx);
+        };
+
+        let master = compiler.master_node_id();
+        for (id, kind) in [(2u64, 0usize), (3, 1), (4, 2)] {
+            let update = compiler
+                .add_node(id, chain_processor(kind, SR))
+                .expect("文档节点应能安装");
+            apply(&mut graph, &mut recycle_tx, update);
+        }
+        assert!(drain_recycle(&mut recycle_rx).is_empty());
+
+        // 轨道寻址表 + 音频连线 + MIDI 自连（全部 node_id 寻址）。
+        apply(
+            &mut graph,
+            &mut recycle_tx,
+            compiler
+                .register_track_chain(0, Some(2), Some(3), Some(4))
+                .expect("装配轨道表"),
+        );
+        for (from, to) in [(2, 3), (3, 4), (4, master)] {
+            apply(
+                &mut graph,
+                &mut recycle_tx,
+                compiler.connect_nodes(from, to).expect("文档连线"),
+            );
+        }
+        apply(
+            &mut graph,
+            &mut recycle_tx,
+            compiler.connect_midi(0, 2).expect("MIDI 自连"),
+        );
+
+        // 端到端：轨道 0 音符 → 声源 → 延迟 → 通道条 → 主输出。
+        assert!(graph.track_note(0, note_on(69)));
+        let levels = graph.process_block(&ctx());
+        assert!(levels.master > 0.05, "文档重建的图应能发声");
+        assert!(levels.tracks[0] > 0.05);
+    }
+
+    #[test]
+    fn add_node_rejects_reserved_and_duplicate_ids() {
+        let (mut compiler, _graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (_recycle_tx, mut recycle_rx) = recycle_channel();
+        // 0 = 无效哨兵；1 = 主输出保留（D6）。
+        assert!(compiler.add_node(0, chain_processor(2, SR)).is_err());
+        assert!(compiler.add_node(1, chain_processor(2, SR)).is_err());
+        assert!(drain_recycle(&mut recycle_rx).is_empty());
+
+        let update = compiler
+            .add_node(5, chain_processor(2, SR))
+            .expect("首次安装应成功");
+        let _ = update;
+        assert!(
+            compiler.add_node(5, chain_processor(2, SR)).is_err(),
+            "重复 node_id 应被拒绝"
+        );
+        // 失败的 add_node 也推进了 next_node_id：fresh 分配不会撞 5。
+        assert!(compiler.fresh_id() > 5);
+    }
+
+    #[test]
+    fn replace_node_keeps_identity_and_recycles_old() {
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, mut recycle_rx) = recycle_channel();
+        let master = compiler.master_node_id();
+        let update = compiler.add_node(2, chain_processor(0, SR)).expect("安装");
+        graph.apply_update(update, &mut recycle_tx);
+        // 通道条 + 连线（直流源直接进主输出便于断言）。
+        let update = compiler.add_node(3, chain_processor(2, SR)).expect("安装");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler.connect_nodes(2, 3).expect("连线");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler.connect_nodes(3, master).expect("连线");
+        graph.apply_update(update, &mut recycle_tx);
+
+        // 原位替换为直流源：node_id 2 保持不变。
+        let (update, kept) = expect_swap(
+            compiler.replace_node(2, Box::new(DcSource { value: 0.25 })),
+            "原位替换",
+        );
+        graph.apply_update(update, &mut recycle_tx);
+        assert_eq!(kept, 2);
+        // 旧处理器（内置合成器）以同一 node_id 出队回收。
+        assert_eq!(drain_recycle(&mut recycle_rx), vec![2]);
+        let levels = graph.process_block(&ctx());
+        assert!(
+            (levels.master - 0.25 * 0.8).abs() < 1e-6,
+            "替换后直流源应直通（通道条默认增益 0.8）"
+        );
+
+        // node_id 寻址参数在替换后仍然有效。
+        assert!(graph.node_set_param(3, ParamId::TrackGain, 0.5));
+        let levels = graph.process_block(&ctx());
+        assert!((levels.master - 0.125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn insert_and_remove_node_splices_cables() {
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, mut recycle_rx) = recycle_channel();
+        let master = compiler.master_node_id();
+        for (id, kind) in [(2u64, 0usize), (3, 1), (4, 2)] {
+            let update = compiler
+                .add_node(id, chain_processor(kind, SR))
+                .expect("安装");
+            graph.apply_update(update, &mut recycle_tx);
+        }
+        for (from, to) in [(2, 3), (3, 4), (4, master)] {
+            let update = compiler.connect_nodes(from, to).expect("连线");
+            graph.apply_update(update, &mut recycle_tx);
+        }
+
+        // 在声源(2)与延迟(3)之间插入外部效果器节点(5)。
+        let update = expect_update(
+            compiler.insert_node_between(5, 2, 3, Box::new(DcSource { value: 0.0 })),
+            "插入效果器",
+        );
+        graph.apply_update(update, &mut recycle_tx);
+        assert!(compiler.compile().is_ok(), "插入后拓扑应合法");
+        // 拓扑：2 → 5 → 3 → 4 → master（has_cable 收槽位，先解析）。
+        let s2 = compiler.node_slot(2).expect("声源槽位");
+        let s3 = compiler.node_slot(3).expect("延迟槽位");
+        let s5 = compiler.node_slot(5).expect("效果器槽位");
+        assert!(compiler.has_cable(s2, s5) && compiler.has_cable(s5, s3));
+        assert!(!compiler.has_cable(s2, s3));
+
+        // 移除节点 5：连线复原 2 → 3，回收出队。
+        let update = compiler.remove_node(5).expect("移除");
+        graph.apply_update(update, &mut recycle_tx);
+        assert_eq!(drain_recycle(&mut recycle_rx), vec![5]);
+        assert!(compiler.has_cable(s2, s3));
+        assert!(!compiler.has_cable(s2, s5));
+
+        // 移除主输出被拒绝（D6）。
+        assert!(compiler.remove_node(master).is_err());
+
+        // 自动化连线表条目随节点移除清理。
+        let update = compiler
+            .set_auto_route(0, 2, ParamId::TrackGain)
+            .expect("连线");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler.remove_node(2).expect("移除声源");
+        graph.apply_update(update, &mut recycle_tx);
+        assert_eq!(
+            compiler.compile().expect("计划").auto_routes[0].slot,
+            NO_EDGE,
+            "指向被移除节点的自动化连线应被清理"
+        );
     }
 }

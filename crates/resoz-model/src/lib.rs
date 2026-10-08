@@ -2,13 +2,20 @@
 
 //! # resoz-model
 //!
-//! ResoZ 数据模型：轨道、片段、自动化与项目文件（文档层）。
+//! ResoZ 数据模型：MIDI 轨道、自动化轨道、节点图与项目文件（文档层）。
 //!
 //! 约定（见 AGENTS.md「数据模型」）：
 //! - 所有类型必须 `Serialize + Deserialize`（RON 格式）；
 //! - 新增字段一律加 `#[serde(default)]`，保证旧项目文件向前兼容；
 //! - 模型是"文档"，引擎是"播放器"：本 crate 不依赖 `resoz-engine`，
 //!   引擎也不依赖本 crate —— 由 `resoz-app` / `resoz-ui` 做转换粘合。
+//!
+//! v3（spec `docs/spec/node-graph.md` §7 终态，D11-D13）：
+//! - `MidiTrack`（音符面）/ `AutomationTrack`（纯曲线）顶层 `Vec`（D12）；
+//! - `GraphDoc{nodes, cables}` 全显式：默认拓扑也写入文档，加载器纯按
+//!   文档重建引擎图（D13）；
+//! - `node_id` 随文件持久化（D11）；id 0 无效，id 1 = 主输出保留
+//!   （[`MASTER_NODE_ID`]），文档节点从 2 起。
 
 pub mod file;
 
@@ -19,8 +26,23 @@ pub use file::{
 /// 步进音序器的步数。
 pub const PATTERN_STEPS: usize = 16;
 
-/// 项目轨道数（第 5 步固定 4 轨；与引擎侧 `realtime::NUM_TRACKS` 保持一致）。
-pub const NUM_TRACKS: usize = 4;
+/// MIDI 轨道容量上限（D12；引擎侧定容同值）。
+pub const MAX_MIDI_TRACKS: usize = 16;
+
+/// 自动化轨道容量上限（D12；引擎侧 `MAX_AUTO_TRACKS` 同值）。
+pub const MAX_AUTO_TRACKS: usize = 16;
+
+/// 节点图容量上限（D1；引擎侧同值）。
+pub const MAX_NODES: usize = 64;
+
+/// 连线容量上限（D1；引擎侧同值）。
+pub const MAX_CABLES: usize = 128;
+
+/// 默认（新建项目）的 MIDI 轨道数。
+pub const DEFAULT_MIDI_TRACKS: usize = 4;
+
+/// 主输出的保留 node_id（D6：固定存在、不可删除、不入文档节点表）。
+pub const MASTER_NODE_ID: u64 = 1;
 
 /// 单个步进：开关 + 音符 + 力度。
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -108,7 +130,7 @@ pub struct SynthParams {
     #[serde(default = "default_decay")]
     pub decay_s: f32,
     /// 包络 Sustain（0..1）。
-    #[serde(default = "default_sustain")]
+    #[serde(default)]
     pub sustain: f32,
     /// 包络 Release（秒）。
     #[serde(default = "default_release")]
@@ -250,21 +272,24 @@ impl Default for Clip {
     }
 }
 
-/// 轨道声源：内置合成器、CLAP 或 VST3 插件（乐器）。
+/// 节点声源：内置（合成器/延迟）或 CLAP / VST3 插件。
+///
+/// 语义随节点类型而定：`Instrument` 节点的 `Builtin` = 内置合成器，
+/// `Effect` 节点的 `Builtin` = 内置延迟。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VoiceSpec {
-    /// 内置合成器（默认，旧项目文件向前兼容）。
+    /// 内置（默认，旧项目文件向前兼容）。
     #[default]
     Builtin,
-    /// CLAP 插件声源：动态库路径 + 插件 ID（实例化在非实时线程）。
+    /// CLAP 插件：动态库路径 + 插件 ID（实例化在非实时线程）。
     Clap {
         #[serde(default)]
         path: String,
         #[serde(default)]
         plugin_id: String,
     },
-    /// VST3 插件声源：.vst3 文件/Bundle 路径 + 类 CID（16 字节十六进制）。
+    /// VST3 插件：.vst3 文件/Bundle 路径 + 类 CID（16 字节十六进制）。
     Vst3 {
         #[serde(default)]
         path: String,
@@ -283,9 +308,12 @@ pub enum TrackSource {
     Clip,
 }
 
-/// 一条音轨：名称、音源（步进模式 / 卷帘片段）、音色与混音参数。
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Track {
+/// 一条 MIDI 轨的音符面（D12 v3：从旧 `Track` 拆出）。
+///
+/// 音色/混音/效果不再是轨道字段——它们是节点图里的
+/// [`NodeDoc::Instrument`] / [`NodeDoc::Effect`] / [`NodeDoc::ChannelStrip`]。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct MidiTrack {
     /// 轨道名（空则 UI 显示"轨道 N"）。
     #[serde(default)]
     pub name: String,
@@ -298,56 +326,12 @@ pub struct Track {
     /// 音源选择。
     #[serde(default)]
     pub source: TrackSource,
-    /// 声源（内置合成器或 CLAP 插件）。
-    #[serde(default)]
-    pub voice: VoiceSpec,
-    /// 轨道增益（线性，0..1.5）。
-    #[serde(default = "default_track_gain")]
-    pub gain: f32,
-    /// 声像（-1 = 全左，0 = 居中，1 = 全右；线性声像律）。
-    #[serde(default)]
-    pub pan: f32,
-    /// 静音。
-    #[serde(default)]
-    pub muted: bool,
-    /// 音色参数。
-    #[serde(default = "default_synth_params")]
-    pub synth: SynthParams,
-    /// 延迟效果参数。
-    #[serde(default)]
-    pub delay: DelayParams,
-    /// 自动化曲线（每条作用于一个参数；可缺省）。
-    #[serde(default)]
-    pub automations: Vec<Automation>,
 }
 
-fn default_track_gain() -> f32 {
-    0.8
-}
-
-fn default_synth_params() -> SynthParams {
-    SynthParams::default()
-}
-
-impl Default for Track {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            pattern: Pattern::default(),
-            clip: Clip::default(),
-            source: TrackSource::default(),
-            voice: VoiceSpec::default(),
-            gain: default_track_gain(),
-            pan: 0.0,
-            muted: false,
-            synth: SynthParams::default(),
-            delay: DelayParams::default(),
-            automations: Vec::new(),
-        }
-    }
-}
-
-/// 可自动化的轨道参数。
+/// 可自动化 / 可连线的节点参数（自动化连线终点负载）。
+///
+/// D7：自动化曲线本身不含目标——目标 `(node_id, param)` 由
+/// [`CableDoc`] 携带；本枚举即其中 `param` 的文档表示。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub enum AutoParam {
     /// 轨道增益（线性，0..1.5）。
@@ -379,19 +363,13 @@ pub struct AutoPoint {
     pub value: f32,
 }
 
-/// 一条自动化曲线。
+/// 一条自动化轨道（D7/D12 v3：顶层实体，纯锚点曲线，不含目标）。
 ///
 /// 锚点按 tick 升序存放；取值在相邻锚点间线性插值，两端外保持端值。
-/// 空曲线或未启用时不产生任何自动化。
-///
-/// v2（D7）：曲线不含目标参数的寻址职责变化见 [`AutoParam`]；循环
-/// 长度 [`Automation::loop_ticks`] 由文档显式携带（与 MIDI 轨道音源
-/// 循环解耦，引擎侧 `RtAutoTrack` 同语义）。
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Automation {
-    /// 作用的目标参数（同时充当自动化连线的终点，见 `AutoParam`）。
-    #[serde(default)]
-    pub param: AutoParam,
+/// 空曲线或未启用时不产生任何自动化。投递终点 `(node_id, param)` 由
+/// 节点图里的 [`CableKind::Automation`] 连线决定。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct AutomationTrack {
     /// 是否启用。
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -407,22 +385,11 @@ fn default_loop_ticks() -> u32 {
     TICKS_PER_BAR
 }
 
-impl Default for Automation {
-    fn default() -> Self {
-        Self {
-            param: AutoParam::default(),
-            enabled: default_true(),
-            loop_ticks: default_loop_ticks(),
-            points: Vec::new(),
-        }
-    }
-}
-
 fn default_true() -> bool {
     true
 }
 
-impl Automation {
+impl AutomationTrack {
     /// 在 `tick` 处取值：空/未启用返回 `None`；两点间线性插值；
     /// 首尾之外钳到端点值。要求锚点有序（编辑接口负责维护）。
     pub fn value_at(&self, tick: f64) -> Option<f32> {
@@ -477,71 +444,423 @@ impl Automation {
     }
 }
 
-/// 节点图的文档表示（v2，spec `docs/spec/node-graph.md` §7 的过渡形态）。
+/// 文档节点（spec §7 `NodeDoc`）：引擎图的节点身份 + 参数持久化。
 ///
-/// 当前引擎的图拓扑仍是"默认每轨链 + 效果槽 + 轨道坐标连线表"（P3
-/// 落地形态），自由节点与 `node_id` 端口要等 P5 画布落地，因此 v2 文档
-/// 只序列化当下可编辑、且无法从其他字段推导的图状态：
+/// `track` 是节点的**主属轨道**（哪个轨道的面板控制它）——引擎侧的
+/// 轨道路由表（手动参数/电平/键盘寻址）按此装配；真正的信号流向由
+/// [`GraphDoc::cables`] 决定，二者解耦。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NodeDoc {
+    /// 乐器节点（音频源头，MIDI 入口）。`Builtin` = 内置合成器。
+    Instrument {
+        /// 持久化节点 ID（≥ 2；1 = 主输出保留）。
+        #[serde(default)]
+        node_id: u64,
+        /// 主属轨道。
+        #[serde(default)]
+        track: usize,
+        /// 声源规格。
+        #[serde(default)]
+        voice: VoiceSpec,
+        /// 内置合成器音色（外部插件忽略）。
+        #[serde(default)]
+        synth: SynthParams,
+    },
+    /// 效果器节点（1 入 1 出）。`Builtin` = 内置延迟。
+    Effect {
+        /// 持久化节点 ID。
+        #[serde(default)]
+        node_id: u64,
+        /// 主属轨道。
+        #[serde(default)]
+        track: usize,
+        /// 效果器规格。
+        #[serde(default)]
+        voice: VoiceSpec,
+        /// 内置延迟参数（外部插件忽略）。
+        #[serde(default)]
+        delay: DelayParams,
+    },
+    /// 通道条节点（增益/声像/静音，≤8 入边求和）。
+    ChannelStrip {
+        /// 持久化节点 ID。
+        #[serde(default)]
+        node_id: u64,
+        /// 主属轨道。
+        #[serde(default)]
+        track: usize,
+        /// 轨道增益（线性，0..1.5）。
+        #[serde(default = "default_track_gain")]
+        gain: f32,
+        /// 声像（-1..1，线性声像律）。
+        #[serde(default)]
+        pan: f32,
+        /// 静音。
+        #[serde(default)]
+        muted: bool,
+    },
+}
+
+fn default_track_gain() -> f32 {
+    0.8
+}
+
+impl NodeDoc {
+    /// 节点 ID。
+    pub fn node_id(&self) -> u64 {
+        match self {
+            NodeDoc::Instrument { node_id, .. }
+            | NodeDoc::Effect { node_id, .. }
+            | NodeDoc::ChannelStrip { node_id, .. } => *node_id,
+        }
+    }
+
+    /// 主属轨道。
+    pub fn track(&self) -> usize {
+        match self {
+            NodeDoc::Instrument { track, .. }
+            | NodeDoc::Effect { track, .. }
+            | NodeDoc::ChannelStrip { track, .. } => *track,
+        }
+    }
+}
+
+/// 连线端口引用（spec §7 `PortRef`）。
 ///
-/// - [`GraphDoc::midi_links`]：MIDI 轨跨轨扇出（默认图已含"本轨连本轨
-///   声源"，此处只记录额外连线）；
-/// - 自动化连线的终点 `(track, param)` 可由曲线的 `param` 与其槽位
-///   推导，不重复存储。
+/// `Master` / `MidiTrack` / `AutoTrack` 是固定实体的保留身份（不入
+/// 节点表，加载器/引擎隐式补齐）；`Node` 引用文档节点。
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortRef {
+    /// 文档节点（node_id）。
+    Node(u64),
+    /// 主输出（固定节点，D6）。
+    #[default]
+    Master,
+    /// 时间轴 MIDI 轨出口（轨道下标）。
+    MidiTrack(usize),
+    /// 时间轴自动化轨出口（轨道下标）。
+    AutoTrack(usize),
+}
+
+/// 连线类型（D3）：与端口类型绑定，类型不匹配在加载期拒绝。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CableKind {
+    /// 音频线：节点输出 → 节点输入 / 主输出。
+    #[default]
+    Audio,
+    /// MIDI 线：时间轴 MIDI 轨 → 乐器节点。
+    Midi,
+    /// 自动化线：时间轴自动化轨 → 节点参数口。
+    Automation,
+}
+
+/// 文档连线（spec §7 `CableDoc`）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CableDoc {
+    /// 连线类型。
+    #[serde(default)]
+    pub kind: CableKind,
+    /// 源端口。
+    #[serde(default)]
+    pub from: PortRef,
+    /// 目标端口。
+    #[serde(default)]
+    pub to: PortRef,
+    /// 终点参数（仅 `kind = Automation` 时使用；D7）。
+    #[serde(default)]
+    pub param: AutoParam,
+}
+
+impl CableDoc {
+    /// 音频连线便捷构造。
+    pub fn audio(from: impl Into<PortRef>, to: impl Into<PortRef>) -> Self {
+        Self {
+            kind: CableKind::Audio,
+            from: from.into(),
+            to: to.into(),
+            param: AutoParam::default(),
+        }
+    }
+
+    /// MIDI 连线便捷构造。
+    pub fn midi(from_track: usize, to_node: u64) -> Self {
+        Self {
+            kind: CableKind::Midi,
+            from: PortRef::MidiTrack(from_track),
+            to: PortRef::Node(to_node),
+            param: AutoParam::default(),
+        }
+    }
+
+    /// 自动化连线便捷构造。
+    pub fn automation(from_track: usize, to_node: u64, param: AutoParam) -> Self {
+        Self {
+            kind: CableKind::Automation,
+            from: PortRef::AutoTrack(from_track),
+            to: PortRef::Node(to_node),
+            param,
+        }
+    }
+}
+
+impl From<u64> for PortRef {
+    fn from(node_id: u64) -> Self {
+        PortRef::Node(node_id)
+    }
+}
+
+/// 节点图的文档表示（v3 终态，spec §7）：全显式 nodes + cables。
 ///
-/// P5 引入 `node_id` 端口后，此结构将扩展为 spec §7 的
-/// `nodes + cables` 完整形态。
+/// 默认拓扑（每轨 `声源 → 延迟 → 通道条 → 主输出` + MIDI 自连）也
+/// 完整写入文档（D13）：加载器**纯按文档重建**引擎图，文档与引擎
+/// 一张皮。主输出与时间轴是固定实体，不出现在 `nodes` 里，连线以
+/// [`PortRef::Master`] / [`PortRef::MidiTrack`] / [`PortRef::AutoTrack`]
+/// 引用。
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct GraphDoc {
-    /// MIDI 跨轨连线：`from_track` 的音符事件额外扇出到 `to_track`
-    /// 的声源节点。上限 [`GraphDoc::MAX_MIDI_LINKS`]。
+    /// 节点表（≤ [`MAX_NODES`]；node_id 唯一且 ≥ 2）。
     #[serde(default)]
-    pub midi_links: Vec<MidiLink>,
+    pub nodes: Vec<NodeDoc>,
+    /// 连线表（≤ [`MAX_CABLES`]）。
+    #[serde(default)]
+    pub cables: Vec<CableDoc>,
 }
 
 impl GraphDoc {
-    /// MIDI 连线容量上限（引擎侧每轨扇出 ≤ 4，含默认自连）。
-    pub const MAX_MIDI_LINKS: usize = 16;
+    /// 文档内的下一个可用 node_id（max + 1，且不小于 2）。
+    pub fn next_node_id(&self) -> u64 {
+        self.nodes
+            .iter()
+            .map(NodeDoc::node_id)
+            .max()
+            .unwrap_or(MASTER_NODE_ID)
+            .max(MASTER_NODE_ID)
+            + 1
+    }
 
-    /// 加载期校验：越界轨道或超容量直接报错（文件层是最后防线，
-    /// 不静默截断）。
-    pub fn validate(&self) -> Result<(), String> {
-        if self.midi_links.len() > Self::MAX_MIDI_LINKS {
+    /// 按 node_id 查节点。
+    pub fn node_by_id(&self, node_id: u64) -> Option<&NodeDoc> {
+        self.nodes.iter().find(|n| n.node_id() == node_id)
+    }
+
+    /// 某轨道的乐器节点（首个 `track` 匹配的 `Instrument`）。
+    pub fn instrument_of_track(&self, track: usize) -> Option<&NodeDoc> {
+        self.nodes
+            .iter()
+            .find(|n| matches!(n, NodeDoc::Instrument { .. }) && n.track() == track)
+    }
+
+    /// 某轨道的内置延迟节点（延迟参数的文档宿主）。
+    pub fn builtin_delay_of_track(&self, track: usize) -> Option<&NodeDoc> {
+        self.nodes.iter().find(|n| {
+            matches!(
+                n,
+                NodeDoc::Effect {
+                    voice: VoiceSpec::Builtin,
+                    ..
+                }
+            ) && n.track() == track
+        })
+    }
+
+    /// 某轨道的首个效果器节点。
+    pub fn effect_of_track(&self, track: usize) -> Option<&NodeDoc> {
+        self.nodes
+            .iter()
+            .find(|n| matches!(n, NodeDoc::Effect { .. }) && n.track() == track)
+    }
+
+    /// 某轨道的通道条节点。
+    pub fn channel_strip_of_track(&self, track: usize) -> Option<&NodeDoc> {
+        self.nodes
+            .iter()
+            .find(|n| matches!(n, NodeDoc::ChannelStrip { .. }) && n.track() == track)
+    }
+
+    /// 某轨道的通道条节点（可变）。
+    pub fn channel_strip_of_track_mut(&mut self, track: usize) -> Option<&mut NodeDoc> {
+        self.nodes
+            .iter_mut()
+            .find(|n| matches!(n, NodeDoc::ChannelStrip { .. }) && n.track() == track)
+    }
+
+    /// 某轨道的乐器节点（可变）。
+    pub fn instrument_of_track_mut(&mut self, track: usize) -> Option<&mut NodeDoc> {
+        self.nodes
+            .iter_mut()
+            .find(|n| matches!(n, NodeDoc::Instrument { .. }) && n.track() == track)
+    }
+
+    /// 某轨道的内置延迟节点（可变）。
+    pub fn builtin_delay_of_track_mut(&mut self, track: usize) -> Option<&mut NodeDoc> {
+        self.nodes.iter_mut().find(|n| {
+            matches!(
+                n,
+                NodeDoc::Effect {
+                    voice: VoiceSpec::Builtin,
+                    ..
+                }
+            ) && n.track() == track
+        })
+    }
+
+    /// 自动化轨道 `index` 的连线终点参数（未连线返回 `None`）。
+    pub fn auto_endpoint(&self, index: usize) -> Option<AutoParam> {
+        self.cables.iter().find_map(|c| {
+            if c.kind == CableKind::Automation && c.from == PortRef::AutoTrack(index) {
+                Some(c.param.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// 移除自动化轨道 `index` 的连线（改终点前调用）。
+    pub fn remove_auto_cable(&mut self, index: usize) {
+        self.cables
+            .retain(|c| !(c.kind == CableKind::Automation && c.from == PortRef::AutoTrack(index)));
+    }
+
+    /// 加载期校验（文件层是最后防线，报错而非截断）。
+    ///
+    /// `midi_count` / `auto_count` 为项目当前的轨道数（端口引用越界
+    /// 即非法）。
+    pub fn validate(&self, midi_count: usize, auto_count: usize) -> Result<(), String> {
+        if self.nodes.len() > MAX_NODES {
+            return Err(format!("节点数 {} 超过上限 {MAX_NODES}", self.nodes.len()));
+        }
+        if self.cables.len() > MAX_CABLES {
             return Err(format!(
-                "MIDI 连线数 {} 超过上限 {}",
-                self.midi_links.len(),
-                Self::MAX_MIDI_LINKS
+                "连线数 {} 超过上限 {MAX_CABLES}",
+                self.cables.len()
             ));
         }
-        for link in &self.midi_links {
-            if link.from_track >= NUM_TRACKS || link.to_track >= NUM_TRACKS {
+        for (i, node_id) in self.nodes.iter().map(NodeDoc::node_id).enumerate() {
+            if node_id <= MASTER_NODE_ID {
                 return Err(format!(
-                    "MIDI 连线 ({}, {}) 越界：轨道数 = {}",
-                    link.from_track, link.to_track, NUM_TRACKS
+                    "节点 #{i} 的 node_id = {node_id} 非法（0 无效，1 = 主输出保留）"
                 ));
             }
-            if link.from_track == link.to_track {
-                return Err(format!(
-                    "MIDI 连线 ({}, {}) 冗余：默认图已含本轨自连",
-                    link.from_track, link.to_track
-                ));
+            if self.nodes[i + 1..].iter().any(|n| n.node_id() == node_id) {
+                return Err(format!("node_id {node_id} 重复"));
             }
+        }
+        let node_ids: Vec<u64> = self.nodes.iter().map(NodeDoc::node_id).collect();
+        for cable in &self.cables {
+            self.check_port(&cable.from, &node_ids, midi_count, auto_count)?;
+            self.check_port(&cable.to, &node_ids, midi_count, auto_count)?;
+            match cable.kind {
+                CableKind::Audio => {
+                    if !matches!(cable.from, PortRef::Node(_)) {
+                        return Err("音频线源端口必须是节点".to_string());
+                    }
+                    if !matches!(cable.to, PortRef::Node(_) | PortRef::Master) {
+                        return Err("音频线目标端口必须是节点或主输出".to_string());
+                    }
+                }
+                CableKind::Midi => {
+                    if !matches!(cable.from, PortRef::MidiTrack(_)) {
+                        return Err("MIDI 线源端口必须是时间轴 MIDI 轨".to_string());
+                    }
+                    match cable.to {
+                        PortRef::Node(id) => {
+                            if !self.nodes.iter().any(|n| {
+                                n.node_id() == id && matches!(n, NodeDoc::Instrument { .. })
+                            }) {
+                                return Err(format!("MIDI 线目标 node_id {id} 不是乐器节点"));
+                            }
+                        }
+                        _ => return Err("MIDI 线目标端口必须是乐器节点".to_string()),
+                    }
+                }
+                CableKind::Automation => {
+                    if !matches!(cable.from, PortRef::AutoTrack(_)) {
+                        return Err("自动化线源端口必须是时间轴自动化轨".to_string());
+                    }
+                    if !matches!(cable.to, PortRef::Node(_)) {
+                        return Err("自动化线目标端口必须是节点参数口".to_string());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_port(
+        &self,
+        port: &PortRef,
+        node_ids: &[u64],
+        midi_count: usize,
+        auto_count: usize,
+    ) -> Result<(), String> {
+        match port {
+            PortRef::Node(id) => {
+                if !node_ids.contains(id) {
+                    return Err(format!("连线引用了不存在的节点 node_id {id}"));
+                }
+            }
+            PortRef::MidiTrack(index) => {
+                if *index >= midi_count {
+                    return Err(format!("MIDI 轨端口 {index} 越界（轨道数 = {midi_count}）"));
+                }
+            }
+            PortRef::AutoTrack(index) => {
+                if *index >= auto_count {
+                    return Err(format!(
+                        "自动化轨端口 {index} 越界（轨道数 = {auto_count}）"
+                    ));
+                }
+            }
+            PortRef::Master => {}
         }
         Ok(())
     }
 }
 
-/// 一条 MIDI 跨轨连线（默认自连之外的部分）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MidiLink {
-    /// 事件源 MIDI 轨。
-    #[serde(default)]
-    pub from_track: usize,
-    /// 目标声源所在的 MIDI 轨。
-    #[serde(default)]
-    pub to_track: usize,
+/// 生成默认节点图文档（D13 全显式；`Project::default` 与新建项目用）：
+/// 每轨 `声源 → 延迟 → 通道条 → 主输出` + 本轨 MIDI 自连。
+///
+/// node_id 从 [`MASTER_NODE_ID`] + 1 起连续分配。
+pub fn default_graph_doc(track_count: usize) -> GraphDoc {
+    let mut nodes = Vec::new();
+    let mut cables = Vec::new();
+    let mut next_id = MASTER_NODE_ID + 1;
+    for track in 0..track_count {
+        let voice_id = next_id;
+        let delay_id = next_id + 1;
+        let strip_id = next_id + 2;
+        next_id += 3;
+        nodes.push(NodeDoc::Instrument {
+            node_id: voice_id,
+            track,
+            voice: VoiceSpec::Builtin,
+            synth: SynthParams::default(),
+        });
+        nodes.push(NodeDoc::Effect {
+            node_id: delay_id,
+            track,
+            voice: VoiceSpec::Builtin,
+            delay: DelayParams::default(),
+        });
+        nodes.push(NodeDoc::ChannelStrip {
+            node_id: strip_id,
+            track,
+            gain: default_track_gain(),
+            pan: 0.0,
+            muted: false,
+        });
+        cables.push(CableDoc::audio(voice_id, delay_id));
+        cables.push(CableDoc::audio(delay_id, strip_id));
+        cables.push(CableDoc::audio(strip_id, PortRef::Master));
+        cables.push(CableDoc::midi(track, voice_id));
+    }
+    GraphDoc { nodes, cables }
 }
 
-/// 多轨项目文档。
+/// 多轨项目文档（v3）。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Project {
     /// 项目元数据（名称、速度等）。
@@ -553,10 +872,13 @@ pub struct Project {
     /// 主输出增益（线性）。
     #[serde(default = "default_master_gain")]
     pub master_gain: f32,
-    /// 轨道。
+    /// MIDI 轨道（音符面，D12 动态化，上限 [`MAX_MIDI_TRACKS`]）。
     #[serde(default)]
-    pub tracks: [Track; NUM_TRACKS],
-    /// 节点图文档（v2 新增；默认 = 无额外连线）。
+    pub midi_tracks: Vec<MidiTrack>,
+    /// 自动化轨道（顶层实体，D7/D12，上限 [`MAX_AUTO_TRACKS`]）。
+    #[serde(default)]
+    pub automation_tracks: Vec<AutomationTrack>,
+    /// 节点图文档（D13 全显式）。
     #[serde(default)]
     pub graph: GraphDoc,
 }
@@ -575,9 +897,30 @@ impl Default for Project {
             metadata: ProjectMetadata::default(),
             gate: default_gate(),
             master_gain: default_master_gain(),
-            tracks: std::array::from_fn(|_| Track::default()),
-            graph: GraphDoc::default(),
+            midi_tracks: vec![MidiTrack::default(); DEFAULT_MIDI_TRACKS],
+            automation_tracks: Vec::new(),
+            graph: default_graph_doc(DEFAULT_MIDI_TRACKS),
         }
+    }
+}
+
+impl Project {
+    /// 项目级校验：轨道数上限 + 图结构（文件层最后防线）。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.midi_tracks.len() > MAX_MIDI_TRACKS {
+            return Err(format!(
+                "MIDI 轨道数 {} 超过上限 {MAX_MIDI_TRACKS}",
+                self.midi_tracks.len()
+            ));
+        }
+        if self.automation_tracks.len() > MAX_AUTO_TRACKS {
+            return Err(format!(
+                "自动化轨道数 {} 超过上限 {MAX_AUTO_TRACKS}",
+                self.automation_tracks.len()
+            ));
+        }
+        self.graph
+            .validate(self.midi_tracks.len(), self.automation_tracks.len())
     }
 }
 
@@ -608,8 +951,10 @@ impl Default for ProjectMetadata {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoParam, AutoPoint, Automation, Clip, DelayParams, NUM_TRACKS, Note, PATTERN_STEPS,
-        Pattern, Project, Step, SynthParams, TICKS_PER_BAR, TICKS_PER_STEP, Track, TrackSource,
+        AutoParam, AutoPoint, AutomationTrack, CableDoc, DEFAULT_MIDI_TRACKS, DelayParams,
+        GraphDoc, MASTER_NODE_ID, MAX_NODES, MidiTrack, NodeDoc, PATTERN_STEPS, Pattern, PortRef,
+        Project, Step, SynthParams, TICKS_PER_BAR, TICKS_PER_STEP, TrackSource, VoiceSpec,
+        default_graph_doc,
     };
 
     #[test]
@@ -636,84 +981,186 @@ mod tests {
     }
 
     #[test]
+    fn default_project_graph_is_fully_explicit() {
+        // D13：默认文档完整描述默认拓扑。
+        let project = Project::default();
+        assert_eq!(project.midi_tracks.len(), DEFAULT_MIDI_TRACKS);
+        let graph = &project.graph;
+        assert_eq!(graph.nodes.len(), DEFAULT_MIDI_TRACKS * 3);
+        // 每轨 4 条线：voice→delay→strip→master + midi 自连。
+        assert_eq!(graph.cables.len(), DEFAULT_MIDI_TRACKS * 4);
+        for t in 0..DEFAULT_MIDI_TRACKS {
+            let voice = graph.instrument_of_track(t).expect("声源应存在");
+            let delay = graph.builtin_delay_of_track(t).expect("延迟应存在");
+            let strip = graph.channel_strip_of_track(t).expect("通道条应存在");
+            assert_eq!(voice.node_id(), (MASTER_NODE_ID + 1) + (t as u64) * 3);
+            assert_eq!(strip.node_id(), (MASTER_NODE_ID + 3) + (t as u64) * 3);
+            let _ = delay;
+        }
+        assert!(project.validate().is_ok());
+    }
+
+    #[test]
     fn project_ron_roundtrip() {
         let mut project = Project::default();
         project.metadata.name = "demo".to_string();
-        project.tracks[0].name = "贝斯".to_string();
-        project.tracks[0].pattern = Pattern::single_note(48);
-        project.tracks[1].delay.mix = 0.4;
-        project.tracks[1].pan = -0.5;
+        project.midi_tracks[0].name = "贝斯".to_string();
+        project.midi_tracks[0].pattern = Pattern::single_note(48);
+        project.midi_tracks[1].source = TrackSource::Clip;
+        project.automation_tracks.push(AutomationTrack {
+            enabled: true,
+            loop_ticks: 192,
+            points: vec![AutoPoint {
+                tick: 0,
+                value: 1.0,
+            }],
+        });
+        // 自动化轨道 0 → 轨道 0 通道条增益。
+        let strip = project.graph.channel_strip_of_track(0).unwrap().node_id();
+        project
+            .graph
+            .cables
+            .push(CableDoc::automation(0, strip, AutoParam::TrackGain));
         let text = ron::to_string(&project).expect("序列化失败");
         let back: Project = ron::from_str(&text).expect("反序列化失败");
         assert_eq!(project, back);
+        assert!(back.validate().is_ok());
     }
 
     #[test]
     fn partial_project_falls_back_to_defaults() {
-        // 旧版项目文件只含 metadata：轨道数组与混音参数全部取默认。
+        // 手工编辑/未来文件：只写 metadata，其余取字段级默认（空轨道 +
+        // 空图——文档说什么就是什么，D13）。
         let back: Project = ron::from_str("(metadata: (tempo_bpm: 140))").expect("解析失败");
         assert!((back.metadata.tempo_bpm - 140.0).abs() < 1e-9);
-        assert_eq!(back.tracks.len(), NUM_TRACKS);
-        for track in &back.tracks {
-            assert!((track.gain - 0.8).abs() < 1e-6, "轨道增益默认 0.8");
-            assert!(!track.muted);
-            assert!((track.synth.cutoff_hz - 12_000.0).abs() < 1e-3);
-            assert!(track.delay.mix.abs() < 1e-6, "延迟默认旁通");
+        assert!(back.midi_tracks.is_empty());
+        assert!(back.graph.nodes.is_empty());
+        assert!(back.validate().is_ok(), "空轨道 + 空图是合法文档");
+    }
+
+    #[test]
+    fn graph_doc_validate_rejects_bad_structure() {
+        // 保留 id（1 = 主输出）。
+        let graph = GraphDoc {
+            nodes: vec![NodeDoc::ChannelStrip {
+                node_id: MASTER_NODE_ID,
+                track: 0,
+                gain: 0.8,
+                pan: 0.0,
+                muted: false,
+            }],
+            cables: Vec::new(),
+        };
+        assert!(graph.validate(1, 0).is_err());
+
+        // 重复 node_id。
+        let graph = GraphDoc {
+            nodes: vec![
+                NodeDoc::ChannelStrip {
+                    node_id: 2,
+                    track: 0,
+                    gain: 0.8,
+                    pan: 0.0,
+                    muted: false,
+                },
+                NodeDoc::ChannelStrip {
+                    node_id: 2,
+                    track: 1,
+                    gain: 0.8,
+                    pan: 0.0,
+                    muted: false,
+                },
+            ],
+            cables: Vec::new(),
+        };
+        assert!(graph.validate(2, 0).is_err());
+
+        // 连线引用不存在的节点。
+        let graph = GraphDoc {
+            nodes: Vec::new(),
+            cables: vec![CableDoc::audio(9, PortRef::Master)],
+        };
+        assert!(graph.validate(0, 0).is_err());
+
+        // MIDI 线目标不是乐器。
+        let graph = GraphDoc {
+            nodes: vec![NodeDoc::ChannelStrip {
+                node_id: 2,
+                track: 0,
+                gain: 0.8,
+                pan: 0.0,
+                muted: false,
+            }],
+            cables: vec![CableDoc::midi(0, 2)],
+        };
+        assert!(graph.validate(1, 0).is_err());
+
+        // 自动化线源端口越界。
+        let graph = GraphDoc {
+            nodes: vec![NodeDoc::ChannelStrip {
+                node_id: 2,
+                track: 0,
+                gain: 0.8,
+                pan: 0.0,
+                muted: false,
+            }],
+            cables: vec![CableDoc::automation(3, 2, AutoParam::TrackGain)],
+        };
+        assert!(graph.validate(1, 1).is_err());
+
+        // 节点容量超限。
+        let nodes: Vec<NodeDoc> = (0..=MAX_NODES)
+            .map(|i| NodeDoc::ChannelStrip {
+                node_id: 2 + i as u64,
+                track: 0,
+                gain: 0.8,
+                pan: 0.0,
+                muted: false,
+            })
+            .collect();
+        let graph = GraphDoc {
+            nodes,
+            cables: Vec::new(),
+        };
+        assert!(graph.validate(1, 0).is_err());
+    }
+
+    #[test]
+    fn next_node_id_and_track_lookups() {
+        let graph = default_graph_doc(2);
+        assert_eq!(graph.next_node_id(), (MASTER_NODE_ID + 1) + 2 * 3);
+        assert_eq!(
+            graph.instrument_of_track(1).map(NodeDoc::node_id),
+            Some(MASTER_NODE_ID + 4)
+        );
+        assert!(graph.instrument_of_track(2).is_none());
+        assert_eq!(graph.auto_endpoint(0), None);
+    }
+
+    #[test]
+    fn voice_spec_ron_roundtrip() {
+        for voice in [
+            VoiceSpec::Builtin,
+            VoiceSpec::Clap {
+                path: "a.clap".to_string(),
+                plugin_id: "x".to_string(),
+            },
+            VoiceSpec::Vst3 {
+                path: "b.vst3".to_string(),
+                class_id: "cid".to_string(),
+            },
+        ] {
+            let text = ron::to_string(&voice).expect("序列化失败");
+            let back: VoiceSpec = ron::from_str(&text).expect("反序列化失败");
+            assert_eq!(voice, back);
         }
     }
 
     #[test]
-    fn track_synth_and_delay_defaults_match_engine() {
-        let track = Track::default();
-        let s: SynthParams = ron::from_str("()").unwrap_or(track.synth);
-        assert!((s.sustain - 0.8).abs() < 1e-6);
-        let d: DelayParams = ron::from_str("()").unwrap_or(track.delay);
-        assert!((d.time_s - 0.3).abs() < 1e-6);
-        assert_eq!(track.pattern.steps.len(), PATTERN_STEPS);
-    }
-
-    #[test]
-    fn clip_ron_roundtrip() {
-        let mut clip = Clip::default();
-        clip.notes.push(Note {
-            start: 0,
-            length: 48,
-            note: 60,
-            velocity: 0.9,
-        });
-        clip.notes.push(Note {
-            start: 24,
-            length: 24,
-            note: 64,
-            velocity: 1.0,
-        });
-        let text = ron::to_string(&clip).expect("序列化失败");
-        let back: Clip = ron::from_str(&text).expect("反序列化失败");
-        assert_eq!(clip, back);
-    }
-
-    #[test]
-    fn note_partial_fields_use_defaults() {
-        let back: Note = ron::from_str("(start: 48, note: 72)").expect("解析失败");
-        assert_eq!(back.length, TICKS_PER_STEP, "音符时长默认一个 16 分音符");
-        assert!((back.velocity - 0.9).abs() < 1e-6);
-    }
-
-    #[test]
-    fn old_track_file_falls_back_to_steps_source() {
-        // 旧项目文件没有 source/clip 字段：应回退为步进音源 + 空片段。
-        let back: Track = ron::from_str(r#"(name: "旧轨道")"#).expect("解析失败");
-        assert_eq!(back.source, TrackSource::Steps);
-        assert!(back.clip.notes.is_empty());
-        assert_eq!(back.clip.loop_ticks, TICKS_PER_BAR);
-    }
-
-    #[test]
     fn automation_value_at_segments() {
-        let mut auto = Automation {
-            param: AutoParam::TrackGain,
+        let mut auto = AutomationTrack {
             enabled: true,
-            ..Automation::default()
+            ..AutomationTrack::default()
         };
         auto.points = vec![
             AutoPoint {
@@ -753,7 +1200,7 @@ mod tests {
 
     #[test]
     fn automation_upsert_keeps_order() {
-        let mut auto = Automation::default();
+        let mut auto = AutomationTrack::default();
         auto.upsert_point(AutoPoint {
             tick: 96,
             value: 0.5,
@@ -777,7 +1224,7 @@ mod tests {
 
     #[test]
     fn automation_remove_near() {
-        let mut auto = Automation::default();
+        let mut auto = AutomationTrack::default();
         auto.upsert_point(AutoPoint {
             tick: 48,
             value: 0.5,
@@ -788,37 +1235,42 @@ mod tests {
     }
 
     #[test]
-    fn automation_ron_roundtrip() {
-        let auto = Automation {
-            param: AutoParam::FilterCutoff,
-            enabled: true,
-            loop_ticks: 384,
-            points: vec![
-                AutoPoint {
-                    tick: 0,
-                    value: 12_000.0,
-                },
-                AutoPoint {
-                    tick: 192,
-                    value: 200.0,
-                },
-            ],
-        };
-        let text = ron::ser::to_string(&auto).expect("序列化失败");
-        let back: Automation = ron::from_str(&text).expect("反序列化失败");
-        assert_eq!(auto, back);
+    fn clip_ron_roundtrip() {
+        use super::{Clip, Note};
+        let mut clip = Clip::default();
+        clip.notes.push(Note {
+            start: 0,
+            length: 48,
+            note: 60,
+            velocity: 0.9,
+        });
+        clip.notes.push(Note {
+            start: 24,
+            length: 24,
+            note: 64,
+            velocity: 1.0,
+        });
+        let text = ron::to_string(&clip).expect("序列化失败");
+        let back: Clip = ron::from_str(&text).expect("反序列化失败");
+        assert_eq!(clip, back);
     }
 
     #[test]
-    fn track_automations_default_empty() {
-        let track = Track::default();
-        assert!(track.automations.is_empty(), "旧文件向前兼容：无自动化");
+    fn note_partial_fields_use_defaults() {
+        use super::Note;
+        let back: Note = ron::from_str("(start: 48, note: 72)").expect("解析失败");
+        assert_eq!(back.length, TICKS_PER_STEP, "音符时长默认一个 16 分音符");
+        assert!((back.velocity - 0.9).abs() < 1e-6);
     }
 
     #[test]
-    fn default_pattern_is_all_disabled() {
-        let pattern = Pattern::default();
-        assert_eq!(pattern.steps.len(), PATTERN_STEPS);
-        assert!(pattern.steps.iter().all(|s| !s.enabled));
+    fn midi_track_defaults_and_delay_params() {
+        let track = MidiTrack::default();
+        assert_eq!(track.source, TrackSource::Steps);
+        assert_eq!(track.pattern.steps.len(), PATTERN_STEPS);
+        assert_eq!(track.clip.loop_ticks, TICKS_PER_BAR);
+        let delay = DelayParams::default();
+        assert!(delay.mix.abs() < 1e-6, "延迟默认旁通");
+        let _synth: SynthParams = ron::from_str("()").unwrap_or_default();
     }
 }
