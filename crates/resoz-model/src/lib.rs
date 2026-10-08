@@ -310,13 +310,15 @@ pub enum VoiceSpec {
 }
 
 /// Track sound source: 16-step pattern or piano roll clip.
+///
+/// T0（timeline spec D14）: 默认源切为 `Clip`（此前 UI 从未提供切换控件，
+/// `Steps` 默认导致 piano roll 永不被调度）；Steps 将在 T1 随模型 v4 一并退役。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum TrackSource {
-    /// Step sequencer mode (default, forward compatible with old project
-    /// files).
-    #[default]
+    /// Step sequencer mode.
     Steps,
-    /// Piano roll clip.
+    /// Piano roll clip (default).
+    #[default]
     Clip,
 }
 
@@ -1350,7 +1352,7 @@ mod tests {
     #[test]
     fn midi_track_defaults_and_delay_params() {
         let track = MidiTrack::default();
-        assert_eq!(track.source, TrackSource::Steps);
+        assert_eq!(track.source, TrackSource::Clip);
         assert_eq!(track.pattern.steps.len(), PATTERN_STEPS);
         assert_eq!(track.clip.loop_ticks, TICKS_PER_BAR);
         let delay = DelayParams::default();

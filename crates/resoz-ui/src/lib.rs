@@ -32,11 +32,11 @@ use resoz_engine::convert;
 use resoz_engine::realtime::{
     ChannelStripProcessor, DelayProcessor, EngineCommand, MAX_AUTO_POINTS, MAX_CLIP_NOTES,
     NoteEvent, ParamId, Processor, RtAutoPoint, RtAutoTrack, RtAutomation, RtClip, RtNote,
-    SequencerCommand, SequencerStep, SynthProcessor, TrackSource,
+    SequencerCommand, SynthProcessor, TrackSource,
 };
 use resoz_model::{
-    AutoParam, AutomationTrack, CableKind, DelayParams, MAX_AUTO_TRACKS, NodeDoc, PATTERN_STEPS,
-    Pattern, PortRef, Project, SynthParams, TICKS_PER_BAR, VoiceSpec,
+    AutoParam, AutomationTrack, CableKind, DelayParams, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS, NodeDoc,
+    PortRef, Project, SynthParams, TICKS_PER_BAR, VoiceSpec,
 };
 
 pub mod canvas;
@@ -226,8 +226,6 @@ pub struct ResoZApp {
     lane_state: lane::LaneState,
     /// Node canvas cross-frame state (pan/zoom/selection/drag).
     canvas_state: canvas::CanvasState,
-    /// Brush note: the note written when clicking an empty step.
-    brush_note: u8,
     /// Octave base (MIDI number of C, default 60 = C4).
     octave_base: u8,
     /// Currently held notes (shared by on-screen keys and computer keys, for highlighting and
@@ -304,7 +302,6 @@ impl ResoZApp {
             roll_state: piano_roll::RollState::new(),
             lane_state: lane::LaneState::default(),
             canvas_state: canvas::CanvasState::default(),
-            brush_note: 60,
             octave_base: 60,
             held_notes: HashSet::new(),
             mouse_down_notes: HashSet::new(),
@@ -634,8 +631,6 @@ impl ResoZApp {
         self.send_sequencer(SequencerCommand::SetGate(self.project.gate));
         for track in 0..self.project.midi_tracks.len() {
             self.push_track_params(track);
-            let steps = self.rt_pattern(track);
-            self.send_sequencer(SequencerCommand::SetPattern { track, steps });
             let clip = self.rt_clip(track);
             self.send_sequencer(SequencerCommand::SetClip { track, clip });
             let source = match self.project.midi_tracks[track].source {
@@ -1019,24 +1014,6 @@ impl ResoZApp {
         }
         self.node_map.remove(&doc_id);
         self.retire_guard(engine_id);
-    }
-
-    /// Document pattern → engine representation (`Copy` array, zero heap allocation).
-    fn rt_pattern(&self, track: usize) -> [SequencerStep; PATTERN_STEPS] {
-        let mut steps = [SequencerStep::default(); PATTERN_STEPS];
-        for (i, step) in self.project.midi_tracks[track]
-            .pattern
-            .steps
-            .iter()
-            .enumerate()
-        {
-            steps[i] = SequencerStep {
-                enabled: step.enabled,
-                note: step.note,
-                velocity: step.velocity,
-            };
-        }
-        steps
     }
 
     /// Document clip → engine representation (truncated to capacity, `Copy` struct, zero heap
@@ -1551,12 +1528,6 @@ impl ResoZApp {
         self.engine.send(EngineCommand::Sequencer(cmd));
     }
 
-    /// Push the current pattern of one track.
-    fn send_pattern(&mut self, track: usize) {
-        let steps = self.rt_pattern(track);
-        self.send_sequencer(SequencerCommand::SetPattern { track, steps });
-    }
-
     fn send_note_on(&mut self, note: u8, velocity: f32) {
         let track = self.selected_track;
         self.engine.send(EngineCommand::Note {
@@ -2005,7 +1976,7 @@ impl ResoZApp {
             ui.add_space(4.0);
             self.graph_canvas(ui);
 
-            self.sequencer_section(ui);
+            self.mixer_section(ui);
             self.clip_section(ui);
             self.automation_section(ui);
             self.keyboard_section(ui);
@@ -2094,7 +2065,31 @@ impl ResoZApp {
     fn mixer_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
-        ui.label("Mixer");
+        let can_add = self.project.midi_tracks.len() < MAX_MIDI_TRACKS;
+        let can_remove = !self.project.midi_tracks.is_empty();
+        let mut add_clicked = false;
+        let mut remove_clicked = false;
+        ui.horizontal(|ui| {
+            ui.label("Mixer");
+            if ui
+                .add_enabled(can_add, egui::Button::new("＋ Track"))
+                .clicked()
+            {
+                add_clicked = true;
+            }
+            if ui
+                .add_enabled(can_remove, egui::Button::new("－ Track"))
+                .clicked()
+            {
+                remove_clicked = true;
+            }
+        });
+        if add_clicked {
+            self.add_midi_track();
+        }
+        if remove_clicked {
+            self.remove_last_midi_track();
+        }
 
         // Collect edits first; write back and send after the loop (avoids borrow conflicts).
         let num_tracks = self.project.midi_tracks.len();
@@ -2195,119 +2190,115 @@ impl ResoZApp {
         }
     }
 
-    /// 16-step sequencer grid (acts on the selected track).
-    fn sequencer_section(&mut self, ui: &mut egui::Ui) {
-        self.mixer_section(ui);
-        ui.separator();
-        ui.add_space(4.0);
-        let sel = self.selected_track;
-        ui.horizontal(|ui| {
-            ui.label(format!("Step Sequencer — Track {}", sel + 1));
-            ui.label("Paint Note");
-            ui.add(
-                egui::DragValue::new(&mut self.brush_note)
-                    .range(0..=127)
-                    .speed(0.2),
-            );
-            ui.monospace(note_name(self.brush_note));
-            ui.separator();
-            ui.label("Gate");
-            let gate = ui.add(
-                egui::Slider::new(
-                    &mut self.project.gate,
-                    *GATE_RANGE.start()..=*GATE_RANGE.end(),
-                )
-                .text("%"),
-            );
-            if gate.changed() {
-                self.send_sequencer(SequencerCommand::SetGate(self.project.gate));
-            }
-            if ui.button("Clear").clicked() {
-                self.project.midi_tracks[sel].pattern = Pattern::default();
-                self.send_pattern(sel);
-            }
-            if ui.button("All C4").clicked() {
-                self.project.midi_tracks[sel]
-                    .pattern
-                    .steps
-                    .fill(resoz_model::Step {
-                        enabled: true,
-                        note: 60,
-                        velocity: 0.9,
-                    });
-                self.send_pattern(sel);
-            }
-        });
-
-        let playing = self.engine.is_playing();
-        let current = self.engine.current_step();
-        let mut cells: [Option<egui::Response>; PATTERN_STEPS] = std::array::from_fn(|_| None);
-        // Collect this frame's edits first; write back and send after the loop (avoids the
-        // iterator borrow conflicting with send_pattern's mutable borrow).
-        let mut edits: [(bool, bool, u8); PATTERN_STEPS] = [(false, false, 0); PATTERN_STEPS];
-        ui.horizontal(|ui| {
-            for (i, step) in self.project.midi_tracks[sel]
-                .pattern
-                .steps
-                .iter()
-                .enumerate()
-            {
-                if i > 0 && i % 4 == 0 {
-                    ui.separator();
-                }
-                let label = if step.enabled {
-                    note_name(step.note)
-                } else {
-                    "·".to_string()
-                };
-                let mut button = egui::Button::new(egui::RichText::new(label).size(11.0));
-                if step.enabled {
-                    button = button.fill(egui::Color32::from_rgb(64, 122, 82));
-                } else if i % 4 == 0 {
-                    button = button.fill(egui::Color32::from_gray(58));
-                }
-                let response = ui.add_sized([36.0, 28.0], button);
-                if response.clicked() {
-                    if step.enabled && step.note == self.brush_note {
-                        // Clicking a step already holding the brush note again = clear it.
-                        edits[i] = (true, false, step.note);
-                    } else {
-                        // Empty steps get the brush note; steps with another note are rewritten
-                        // to the brush note.
-                        edits[i] = (true, true, self.brush_note);
-                    }
-                }
-                if response.secondary_clicked() {
-                    edits[i] = (true, false, step.note);
-                }
-                cells[i] = Some(response);
-            }
-        });
-        if edits.iter().any(|(edit, _, _)| *edit) {
-            for (i, (edit, enabled, note)) in edits.iter().enumerate() {
-                if *edit {
-                    self.project.midi_tracks[sel].pattern.steps[i] = resoz_model::Step {
-                        enabled: *enabled,
-                        note: *note,
-                        velocity: 0.9,
-                    };
-                }
-            }
-            self.send_pattern(sel);
+    /// 新增一条 MIDI 轨：文档三件套节点 + 连线（audio 链 + MIDI 自连）+
+    /// 引擎默认链（`add_midi_track`）+ node_map 映射 + 活跃轨数下发。
+    fn add_midi_track(&mut self) {
+        let track = self.project.midi_tracks.len();
+        if track >= MAX_MIDI_TRACKS {
+            return;
         }
+        let Some([voice_e, delay_e, strip_e]) = self.engine.add_midi_track() else {
+            self.set_message("Add track failed (engine slots or queue full)".to_string());
+            return;
+        };
+        // 文档侧新 id：从现有最大 node_id 之后分配（1 = 主输出保留）。
+        let next = self
+            .project
+            .graph
+            .nodes
+            .iter()
+            .map(|n| n.node_id())
+            .max()
+            .unwrap_or(1)
+            + 1;
+        let (voice_id, delay_id, strip_id) = (next, next + 1, next + 2);
+        self.project
+            .midi_tracks
+            .push(resoz_model::MidiTrack::default());
+        self.project.graph.nodes.push(NodeDoc::Instrument {
+            node_id: voice_id,
+            track,
+            voice: VoiceSpec::Builtin,
+            synth: SynthParams::default(),
+        });
+        self.project.graph.nodes.push(NodeDoc::Effect {
+            node_id: delay_id,
+            track,
+            voice: VoiceSpec::Builtin,
+            delay: DelayParams::default(),
+        });
+        self.project.graph.nodes.push(NodeDoc::ChannelStrip {
+            node_id: strip_id,
+            track,
+            gain: 0.8,
+            pan: 0.0,
+            muted: false,
+        });
+        self.project
+            .graph
+            .cables
+            .push(resoz_model::CableDoc::audio(voice_id, delay_id));
+        self.project
+            .graph
+            .cables
+            .push(resoz_model::CableDoc::audio(delay_id, strip_id));
+        self.project
+            .graph
+            .cables
+            .push(resoz_model::CableDoc::audio(strip_id, PortRef::Master));
+        self.project
+            .graph
+            .cables
+            .push(resoz_model::CableDoc::midi(track, voice_id));
+        self.node_map.insert(voice_id, voice_e);
+        self.node_map.insert(delay_id, delay_e);
+        self.node_map.insert(strip_id, strip_e);
+        self.engine
+            .set_midi_track_count(self.project.midi_tracks.len());
+        self.selected_track = track;
+    }
 
-        // Playback position highlight (engine atomic readback, updated once per block).
-        if playing {
-            let idx = (current as usize) % PATTERN_STEPS;
-            if let Some(Some(response)) = cells.get(idx) {
-                ui.painter().rect_stroke(
-                    response.rect,
-                    4.0,
-                    egui::Stroke::new(2.0, egui::Color32::YELLOW),
-                    egui::StrokeKind::Inside,
-                );
+    /// 删除最后一条 MIDI 轨（中间轨删除需重排轨道表与文档 track 字段，
+    /// 随 T3 编曲视图一起做）。引擎逐节点 bypass 移除 + 轨道表清理 +
+    /// 活跃轨数收缩；文档删节点与触及连线（含 MIDI 自连）。
+    fn remove_last_midi_track(&mut self) {
+        let Some(last) = self.project.midi_tracks.len().checked_sub(1) else {
+            return;
+        };
+        let doc_ids: Vec<u64> = self
+            .project
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.track() == last)
+            .map(|n| n.node_id())
+            .collect();
+        for doc_id in &doc_ids {
+            if let Some(&engine_id) = self.node_map.get(doc_id) {
+                if !self.engine.remove_node(engine_id) {
+                    log::warn!("Track node {engine_id} removal failed");
+                }
             }
+            self.node_map.remove(doc_id);
         }
+        if !self.engine.remove_midi_track(last) {
+            log::warn!("engine remove_midi_track({last}) failed");
+        }
+        self.engine.set_midi_track_count(last);
+        // 文档：删节点 + 删触及连线（含 MidiTrack(last) 自连；外部连到
+        // 本轨节点的扇出线因触及被删节点一并移除）。
+        let removed: HashSet<u64> = doc_ids.into_iter().collect();
+        self.project.graph.nodes.retain(|n| n.track() != last);
+        self.project.graph.cables.retain(|c| {
+            let touches_removed = match (&c.from, &c.to) {
+                (PortRef::Node(f), _) => removed.contains(f),
+                (_, PortRef::Node(t)) => removed.contains(t),
+                _ => false,
+            };
+            !touches_removed && c.from != PortRef::MidiTrack(last)
+        });
+        self.project.midi_tracks.pop();
+        self.selected_track = self.selected_track.min(last.saturating_sub(1));
     }
 
     /// Piano roll (edits the selected track's clip; edits are pushed to the audio thread
