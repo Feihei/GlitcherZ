@@ -8,3 +8,6 @@
 # 操作系统
 .DS_Store
 Thumbs.db
+
+# WorkBuddy 工作区数据（AI 会话日志、memory 等，不入库）
+.workbuddy/
