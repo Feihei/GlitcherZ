@@ -279,15 +279,18 @@ impl AudioEngine {
         }
     }
 
-    /// Replaces an automation track entity wholesale (empty curve = clear;
-    /// out-of-bounds indices are ignored on the real-time side). The curve has
-    /// no target — the routing endpoint is set separately via
-    /// [`AudioEngine::set_auto_route`] (D7).
-    pub fn set_auto_track(&mut self, index: usize, auto: crate::realtime::RtAutoTrack) -> bool {
-        self.send(EngineCommand::Sequencer(SequencerCommand::SetAutoTrack {
-            index,
-            auto,
-        }))
+    /// Replaces one control track's clip table wholesale (empty table = clear;
+    /// out-of-bounds indices are ignored on the real-time side). The curves
+    /// have no target — the routing endpoint is set separately via
+    /// [`AudioEngine::set_auto_route`] (D7/D17).
+    pub fn set_control_clips(
+        &mut self,
+        index: usize,
+        clips: [crate::realtime::RtControlClip; crate::realtime::MAX_TRACK_CLIPS],
+    ) -> bool {
+        self.send(EngineCommand::Sequencer(
+            SequencerCommand::SetControlClips { index, clips },
+        ))
     }
 
     /// Timeline wiring: connects automation track `auto_index` to a target

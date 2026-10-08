@@ -1,22 +1,27 @@
-//! Step sequencer and piano-roll scheduling (audio thread side, block-boundary
-//! sample clock, multi-track).
+//! Timeline clip scheduling (audio thread side, block-boundary sample clock,
+//! multi-track) — timeline spec T2 (D14-D16).
 //!
 //! The scheduling model is **pure window scanning**: the sequencer only keeps
-//! a musical position (in ticks), and each block schedules in one pass all
-//! steps/notes falling due within the `[t0, t1)` window.
+//! a musical position (in ticks) and the per-track clip tables; each block
+//! schedules in one pass all note occurrences falling due within the absolute
+//! tick window `[t0, t1)`. Clips are placed at absolute positions
+//! (`start_ticks`), stay audible for `span_ticks`, and their note content
+//! repeats every `loop_ticks` within the span (D14 tiling semantics — the
+//! UI presents one period for now).
+//!
 //! BPM changes only affect future rates (the position is counted in ticks, so
-//! the musical position is naturally preserved);
-//! loop wrap-around is derived from the window mapping, with no incremental
-//! clock bookkeeping.
+//! the musical position is naturally preserved); no incremental clock
+//! bookkeeping is kept.
+//!
+//! Arrangement end (D16): the latest clip end rounded up to a bar; playback
+//! stops automatically when the transport reaches it (pending note offs keep
+//! draining so the last notes release naturally). An empty arrangement
+//! (no clips at all) is unbounded and free-runs.
 
-use crate::realtime::DEFAULT_MIDI_TRACKS;
 use crate::realtime::MAX_MIDI_TRACKS;
-use crate::realtime::automation::{MAX_AUTO_TRACKS, RtAutoTrack};
+use crate::realtime::automation::{MAX_AUTO_TRACKS, RtControlClip};
 use crate::realtime::commands::NoteEvent;
 use crate::realtime::context::ProcessContext;
-
-/// Number of sequencer steps.
-pub const PATTERN_STEPS: usize = 16;
 
 /// Note time base: ticks per quarter note (consistent with the `resoz_model` convention).
 pub const TICKS_PER_QUARTER: u32 = 96;
@@ -24,33 +29,11 @@ pub const TICKS_PER_QUARTER: u32 = 96;
 /// Ticks per step (a sixteenth note).
 pub const TICKS_PER_STEP: u32 = 24;
 
-/// Maximum number of piano-roll notes (capacity constraint via `Copy` on the audio thread side).
-pub const MAX_CLIP_NOTES: usize = 128;
+/// Maximum number of notes per clip (D15; mirrors `resoz_model::MAX_CLIP_NOTES`).
+pub const MAX_CLIP_NOTES: usize = 64;
 
-/// Track sound source (engine-side representation, mirroring `resoz_model::TrackSource`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TrackSource {
-    /// 16-step pattern (default).
-    #[default]
-    Steps,
-    /// Piano-roll clip.
-    Clip,
-}
-
-/// Audio-thread-side representation of a single step.
-///
-/// Kept `Copy`: an entire pattern can be passed as one command through the
-/// lock-free queue in a single block, zero allocation on the real-time side.
-/// Mirrors `resoz_model::Step` (see AGENTS.md "Data Model").
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct SequencerStep {
-    /// Whether this step fires.
-    pub enabled: bool,
-    /// MIDI note number.
-    pub note: u8,
-    /// Velocity (0..1).
-    pub velocity: f32,
-}
+/// Maximum number of clips per track (D15; mirrors `resoz_model::MAX_CLIPS_PER_TRACK`).
+pub const MAX_TRACK_CLIPS: usize = 8;
 
 /// Audio-thread-side representation of a piano-roll note (mirrors `resoz_model::Note`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -65,28 +48,41 @@ pub struct RtNote {
     pub velocity: f32,
 }
 
-/// Audio-thread-side representation of a piano-roll clip (mirrors `resoz_model::Clip`, fixed-capacity `Copy`).
+/// Audio-thread-side representation of a MIDI clip placed on the arrangement
+/// timeline (mirrors `resoz_model::MidiClip`, fixed-capacity `Copy`; D14/D15).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RtClip {
-    /// Loop length (in ticks).
+pub struct RtMidiClip {
+    /// Absolute start position on the arrangement (in ticks).
+    pub start_ticks: u32,
+    /// How long the clip stays active (in ticks).
+    pub span_ticks: u32,
+    /// Content loop length (in ticks).
     pub loop_ticks: u32,
-    /// Note collection (the first `note_count` are valid).
+    /// Note collection (the first `note_count` are valid, relative to the clip start).
     pub notes: [RtNote; MAX_CLIP_NOTES],
     /// Number of valid notes.
     pub note_count: usize,
 }
 
-impl Default for RtClip {
+impl Default for RtMidiClip {
     fn default() -> Self {
         Self {
-            loop_ticks: TICKS_PER_STEP * PATTERN_STEPS as u32,
+            start_ticks: 0,
+            // span 0 = inactive: an all-default clip table is an EMPTY track
+            // (the scheduler skips span-0 clips); every real clip carries its
+            // own placement.
+            span_ticks: 0,
+            loop_ticks: TICKS_PER_BAR,
             notes: [RtNote::default(); MAX_CLIP_NOTES],
             note_count: 0,
         }
     }
 }
 
-impl RtClip {
+/// Ticks per bar (4/4) — default clip span/loop length.
+pub const TICKS_PER_BAR: u32 = TICKS_PER_STEP * 16;
+
+impl RtMidiClip {
     /// Appends a note; silently dropped beyond [`MAX_CLIP_NOTES`].
     pub fn push(&mut self, note: RtNote) {
         if self.note_count < MAX_CLIP_NOTES {
@@ -96,20 +92,20 @@ impl RtClip {
     }
 }
 
-/// Multi-track sequencer: one global transport clock (BPM / gate / musical
-/// position), per-track independent sound source (step mode or piano-roll
-/// clip) and gate tails, converting due events into `(MIDI track, NoteEvent)`
-/// at block boundaries on the sample clock.
+/// Multi-track sequencer over the arrangement timeline: one global transport
+/// clock (BPM / musical position), per-track clip tables and gate tails,
+/// converting due events into `(MIDI track, NoteEvent)` at block boundaries on
+/// the sample clock.
 ///
-/// Automation tracks are independent entities parallel to MIDI tracks (D7):
-/// [`Sequencer`] only holds their curves and their own loop lengths; the
-/// delivery target is determined by the node graph's automation routing
-/// table, which this struct knows nothing about.
+/// Control (automation) clips are independent entities parallel to MIDI
+/// tracks (D7/D17): [`Sequencer`] only holds their placements and curves; the
+/// delivery target is determined by the node graph's automation routing table
+/// and the delivery window by the clip span — this struct knows nothing about
+/// either.
 ///
 /// The clock is counted in ticks (musical position), converted to the sample
-/// clock via BPM;
-/// gate offs are recorded as absolute sample positions and emitted at the
-/// block boundary containing them.
+/// clock via BPM; note offs are recorded as absolute sample positions and
+/// emitted at the block boundary containing them.
 ///
 /// Precision note: events are emitted uniformly at the **block boundary**
 /// containing their moment (≤ 1 block ≈ 2.7 ms jitter @48 kHz / 128-block),
@@ -121,21 +117,21 @@ pub struct Sequencer {
     sample_rate: f32,
     playing: bool,
     bpm: f32,
-    /// Gate ratio of the step length (0.05..1, only used by the step source;
-    /// clips use note lengths).
-    gate: f32,
     position_ticks: f64,
     /// Active MIDI track count (D12 dynamic tracks: sent from the control side
     /// via `SetMidiTrackCount`, scheduling only scans `0..track_count`;
-    /// unconfigured tracks have default-empty patterns/clips).
+    /// unconfigured tracks have default-empty clip tables).
     track_count: usize,
-    sources: [TrackSource; MAX_MIDI_TRACKS],
-    patterns: [[SequencerStep; PATTERN_STEPS]; MAX_MIDI_TRACKS],
-    clips: [RtClip; MAX_MIDI_TRACKS],
-    /// Automation track entities (independent of MIDI tracks, see D7).
-    autos: [RtAutoTrack; MAX_AUTO_TRACKS],
+    /// Per-track clip tables (D15: ≤ [`MAX_TRACK_CLIPS`] clips each, batch
+    /// replaced via `SetTrackClips`).
+    clips: [[RtMidiClip; MAX_TRACK_CLIPS]; MAX_MIDI_TRACKS],
+    /// Per-control-track clip tables (D15/D17).
+    control_clips: [[RtControlClip; MAX_TRACK_CLIPS]; MAX_AUTO_TRACKS],
+    /// Arrangement end in ticks (D16: the latest clip end rounded up to a
+    /// bar); `0` = unbounded (empty arrangement, free run).
+    arrangement_end_ticks: u32,
     /// Per-track pending NoteOffs (absolute sample position where the
-    /// gate/length ends + note).
+    /// length ends + note).
     pending_offs: [Option<(u64, u8)>; MAX_MIDI_TRACKS],
 }
 
@@ -150,13 +146,11 @@ impl Sequencer {
             },
             playing: false,
             bpm: 120.0,
-            gate: 0.8,
             position_ticks: 0.0,
-            track_count: DEFAULT_MIDI_TRACKS,
-            sources: [TrackSource::default(); MAX_MIDI_TRACKS],
-            patterns: [[SequencerStep::default(); PATTERN_STEPS]; MAX_MIDI_TRACKS],
-            clips: [RtClip::default(); MAX_MIDI_TRACKS],
-            autos: [RtAutoTrack::default(); MAX_AUTO_TRACKS],
+            track_count: crate::realtime::DEFAULT_MIDI_TRACKS,
+            clips: [[RtMidiClip::default(); MAX_TRACK_CLIPS]; MAX_MIDI_TRACKS],
+            control_clips: [[RtControlClip::default(); MAX_TRACK_CLIPS]; MAX_AUTO_TRACKS],
+            arrangement_end_ticks: 0,
             pending_offs: [None; MAX_MIDI_TRACKS],
         }
     }
@@ -167,10 +161,10 @@ impl Sequencer {
     }
 
     /// Current step index (`⌊musical position / step length⌋ mod 16`, used by
-    /// the UI to highlight the "sounding step").
+    /// the UI as a coarse playhead hint).
     /// RT-safe.
     pub fn step_index(&self) -> usize {
-        (self.position_ticks / f64::from(TICKS_PER_STEP)).floor() as usize % PATTERN_STEPS
+        (self.position_ticks / f64::from(TICKS_PER_STEP)).floor() as usize % 16
     }
 
     /// Musical position (in ticks, accumulated from the play start). RT-safe.
@@ -189,7 +183,7 @@ impl Sequencer {
         f64::from(bpm) / 60.0 * f64::from(TICKS_PER_QUARTER) / f64::from(self.sample_rate)
     }
 
-    /// Play from step 0 (musical position reset to zero). RT-safe.
+    /// Play from position 0 (musical position reset to zero). RT-safe.
     pub fn play(&mut self) {
         self.playing = true;
         self.position_ticks = 0.0;
@@ -228,66 +222,71 @@ impl Sequencer {
         }
     }
 
-    /// Sets the gate ratio (0.05..1, non-finite values ignored). RT-safe.
-    pub fn set_gate(&mut self, gate: f32) {
-        if gate.is_finite() {
-            self.gate = gate.clamp(0.05, 1.0);
-        }
-    }
-
-    /// Replaces a track's step pattern in one block (out-of-range tracks ignored). RT-safe.
-    pub fn set_pattern(&mut self, track: usize, steps: [SequencerStep; PATTERN_STEPS]) {
-        if let Some(slot) = self.patterns.get_mut(track) {
-            *slot = steps;
-        }
-    }
-
-    /// Replaces a track's piano-roll clip in one block (out-of-range tracks ignored). RT-safe.
-    pub fn set_clip(&mut self, track: usize, clip: RtClip) {
+    /// Replaces one MIDI track's clip table in one block (D15 batch; out-of-range
+    /// tracks ignored). Also refreshes the arrangement end. RT-safe.
+    pub fn set_track_clips(&mut self, track: usize, clips: [RtMidiClip; MAX_TRACK_CLIPS]) {
         if let Some(slot) = self.clips.get_mut(track) {
-            *slot = clip;
+            *slot = clips;
+            self.refresh_arrangement_end();
         }
     }
 
-    /// Switches a track's sound source (out-of-range tracks ignored). RT-safe.
-    pub fn set_source(&mut self, track: usize, source: TrackSource) {
-        if let Some(slot) = self.sources.get_mut(track) {
-            *slot = source;
+    /// Replaces one control track's clip table in one block (D15 batch;
+    /// out-of-range indices ignored). Also refreshes the arrangement end. RT-safe.
+    pub fn set_control_clips(&mut self, index: usize, clips: [RtControlClip; MAX_TRACK_CLIPS]) {
+        if let Some(slot) = self.control_clips.get_mut(index) {
+            *slot = clips;
+            self.refresh_arrangement_end();
         }
     }
 
-    /// Replaces one automation track in a block (out-of-range indices ignored;
-    /// empty curve = clear the track).
-    /// The curve carries no target — the delivery endpoint is determined by the
-    /// node graph's automation routing table. RT-safe.
-    pub fn set_auto_track(&mut self, index: usize, auto: RtAutoTrack) {
-        if let Some(slot) = self.autos.get_mut(index) {
-            *slot = auto;
-        }
-    }
-
-    /// Read-only access to all automation track entities (for evaluators to
+    /// Read-only access to all control clip tables (for the block runner to
     /// sample per the routing table). RT-safe.
-    pub fn auto_tracks(&self) -> &[RtAutoTrack; MAX_AUTO_TRACKS] {
-        &self.autos
+    pub fn control_clips(&self) -> &[[RtControlClip; MAX_TRACK_CLIPS]; MAX_AUTO_TRACKS] {
+        &self.control_clips
     }
 
-    /// Advances one block: sends gate offs and note ons falling due within the
+    /// Arrangement end in ticks (D16; `0` = unbounded). RT-safe.
+    pub fn arrangement_end_ticks(&self) -> u32 {
+        self.arrangement_end_ticks
+    }
+
+    /// D16: arrangement end = the latest clip end (`start + span`) across all
+    /// MIDI and control clips, rounded up to a whole bar.
+    fn refresh_arrangement_end(&mut self) {
+        let mut latest: u32 = 0;
+        for track in &self.clips {
+            for clip in track {
+                latest = latest.max(clip.start_ticks.saturating_add(clip.span_ticks));
+            }
+        }
+        for track in &self.control_clips {
+            for clip in track {
+                latest = latest.max(clip.start_ticks.saturating_add(clip.span_ticks));
+            }
+        }
+        self.arrangement_end_ticks = if latest == 0 {
+            0
+        } else {
+            latest.div_ceil(TICKS_PER_BAR) * TICKS_PER_BAR
+        };
+    }
+
+    /// Advances one block: sends note offs and note ons falling due within the
     /// `[t0, t1)` (tick) window via `emit(track, event)` (offs before ons
-    /// within the same block).
+    /// within the same block). The window is clamped at the arrangement end
+    /// (D16): when the transport reaches it, scheduling stops and the
+    /// transport auto-stops; pending offs keep draining afterwards so the
+    /// last notes release naturally.
     /// RT-safe.
     pub fn advance(&mut self, ctx: &ProcessContext, emit: &mut dyn FnMut(usize, NoteEvent)) {
-        if !self.playing {
-            return;
-        }
         let tps = self.ticks_per_sample();
         let samples_per_tick = 1.0 / tps;
-        let dt_ticks = ctx.frames as f64 * tps;
-        let t0 = self.position_ticks;
-        let t1 = t0 + dt_ticks;
         let block_start = ctx.playback_sample_pos;
 
-        // 1. Due gate offs (before this block's note ons, keeping each track's handoff clean).
+        // 1. Due note offs — always processed, even after an auto-stop, so
+        //    the arrangement's final notes still release (offs before ons,
+        //    keeping each track's handoff clean).
         for (track, pending) in self.pending_offs.iter_mut().enumerate() {
             if let Some((time, note)) = *pending {
                 if time < block_start + ctx.frames as u64 {
@@ -297,24 +296,43 @@ impl Sequencer {
             }
         }
 
-        // 2. Schedule note ons within the window per track by sound source (scan active tracks only, D12).
-        for track in 0..self.track_count {
-            match self.sources[track] {
-                TrackSource::Steps => {
-                    self.schedule_steps(track, t0, t1, block_start, samples_per_tick, emit);
-                }
-                TrackSource::Clip => {
-                    self.schedule_clip(track, t0, t1, block_start, samples_per_tick, emit);
-                }
+        if !self.playing {
+            return;
+        }
+
+        // 2. This block's window, clamped at the arrangement end (D16).
+        let dt_ticks = ctx.frames as f64 * tps;
+        let t0 = self.position_ticks;
+        let mut t1 = t0 + dt_ticks;
+        let mut stop_at_end = false;
+        if self.arrangement_end_ticks > 0 {
+            let end = f64::from(self.arrangement_end_ticks);
+            if t1 >= end {
+                t1 = end;
+                stop_at_end = true;
+            }
+        }
+
+        // 3. Schedule note ons within the window per track (scan active tracks only, D12).
+        if t1 > t0 {
+            for track in 0..self.track_count {
+                self.schedule_track_clips(track, t0, t1, block_start, samples_per_tick, emit);
             }
         }
 
         self.position_ticks = t1;
+        if stop_at_end {
+            // Keep the pending offs: they drain in the following blocks and
+            // release the arrangement's last notes.
+            self.playing = false;
+        }
     }
 
-    /// Step source: steps starting within the window (24 ticks per step).
+    /// One track's clip table: for every clip audible in the window, note
+    /// occurrences (`start + m·loop + note.start`, strictly before the clip
+    /// end) starting within the window fire an On + a length-based pending Off.
     #[allow(clippy::too_many_arguments)]
-    fn schedule_steps(
+    fn schedule_track_clips(
         &mut self,
         track: usize,
         t0: f64,
@@ -323,97 +341,53 @@ impl Sequencer {
         samples_per_tick: f64,
         emit: &mut dyn FnMut(usize, NoteEvent),
     ) {
-        let step_ticks = f64::from(TICKS_PER_STEP);
-        // Steps starting exactly on the window boundary must also fire: ceil(t0) .. ceil(t1).
-        let first = (t0 / step_ticks).ceil() as i64;
-        let last = (t1 / step_ticks).ceil() as i64;
-        for k in first..last {
-            let start_tick = k as f64 * step_ticks;
-            if start_tick < t0 {
-                continue; // floating-point boundary guard
-            }
-            let pattern_index = (k as usize) % PATTERN_STEPS;
-            let step = self.patterns[track][pattern_index];
-            if !step.enabled {
+        let clips = self.clips[track];
+        for clip in &clips {
+            if clip.note_count == 0 || clip.loop_ticks == 0 || clip.span_ticks == 0 {
                 continue;
             }
-            let velocity = sanitize_velocity(step.velocity);
-            emit(
-                track,
-                NoteEvent::On {
-                    note: step.note,
-                    velocity,
-                },
-            );
-            // gate off time (tick) → absolute sample position.
-            let off_tick = start_tick + step_ticks * f64::from(self.gate);
-            self.set_pending_off(
-                track,
-                off_tick,
-                t0,
-                block_start,
-                samples_per_tick,
-                step.note,
-            );
-        }
-    }
-
-    /// Piano-roll source: note occurrences starting within the window
-    /// (including every occurrence across loop wrap-arounds).
-    #[allow(clippy::too_many_arguments)]
-    fn schedule_clip(
-        &mut self,
-        track: usize,
-        t0: f64,
-        t1: f64,
-        block_start: u64,
-        samples_per_tick: f64,
-        emit: &mut dyn FnMut(usize, NoteEvent),
-    ) {
-        let clip = self.clips[track];
-        if clip.loop_ticks == 0 || clip.note_count == 0 {
-            return;
-        }
-        let loop_ticks = f64::from(clip.loop_ticks);
-        for note in &clip.notes[..clip.note_count] {
-            let start_offset = f64::from(note.start_ticks);
-            let length = f64::from(note.length_ticks.max(1));
-            // The m-th occurrence is at m·L + s; find the first m with ≥ t0
-            // (may be negative, clamped to 0).
-            let mut m = ((t0 - start_offset) / loop_ticks).ceil();
-            if m < 0.0 {
-                m = 0.0;
-            }
-            loop {
-                let start_tick = m * loop_ticks + start_offset;
-                if start_tick >= t1 {
-                    break;
+            let start = f64::from(clip.start_ticks);
+            let clip_end = start + f64::from(clip.span_ticks);
+            let loop_ticks = f64::from(clip.loop_ticks);
+            for note in &clip.notes[..clip.note_count] {
+                let start_offset = f64::from(note.start_ticks);
+                let length = f64::from(note.length_ticks.max(1));
+                // The m-th occurrence is at start + m·loop + s; find the first
+                // m with an on-time ≥ t0 (may be negative, clamped to 0).
+                let mut m = ((t0 - start - start_offset) / loop_ticks).ceil();
+                if m < 0.0 {
+                    m = 0.0;
                 }
-                if start_tick >= t0 {
-                    let velocity = sanitize_velocity(note.velocity);
-                    emit(
-                        track,
-                        NoteEvent::On {
-                            note: note.note,
-                            velocity,
-                        },
-                    );
-                    let off_tick = start_tick + length;
-                    self.set_pending_off(
-                        track,
-                        off_tick,
-                        t0,
-                        block_start,
-                        samples_per_tick,
-                        note.note,
-                    );
+                loop {
+                    let on_tick = start + m * loop_ticks + start_offset;
+                    if on_tick >= t1 || on_tick >= clip_end {
+                        break; // past the window or past the clip span
+                    }
+                    if on_tick >= t0 {
+                        let velocity = sanitize_velocity(note.velocity);
+                        emit(
+                            track,
+                            NoteEvent::On {
+                                note: note.note,
+                                velocity,
+                            },
+                        );
+                        self.set_pending_off(
+                            track,
+                            on_tick + length,
+                            t0,
+                            block_start,
+                            samples_per_tick,
+                            note.note,
+                        );
+                    }
+                    m += 1.0;
                 }
-                m += 1.0;
             }
         }
     }
 
-    /// Records a gate off: converted to an absolute sample position, landing
+    /// Records a note off: converted to an absolute sample position, landing
     /// at least in the next block (guaranteeing the off comes after the on
     /// already emitted in the same block). RT-safe.
     #[allow(clippy::too_many_arguments)]
@@ -441,13 +415,9 @@ fn sanitize_velocity(velocity: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MAX_CLIP_NOTES, PATTERN_STEPS, RtClip, RtNote, Sequencer, SequencerStep, TICKS_PER_STEP,
-        TrackSource,
-    };
-    use crate::realtime::DEFAULT_MIDI_TRACKS;
+    use super::{MAX_CLIP_NOTES, MAX_TRACK_CLIPS, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR};
     use crate::realtime::MAX_MIDI_TRACKS;
-    use crate::realtime::automation::{MAX_AUTO_TRACKS, RtAutoPoint, RtAutoTrack};
+    use crate::realtime::automation::{MAX_AUTO_TRACKS, RtAutoPoint, RtControlClip};
     use crate::realtime::commands::NoteEvent;
     use crate::realtime::context::ProcessContext;
 
@@ -466,8 +436,15 @@ mod tests {
 
     /// Advances `blocks` blocks, collecting all (track, event) pairs.
     fn run(seq: &mut Sequencer, blocks: usize) -> Vec<Event> {
+        run_from(seq, 0, blocks)
+    }
+
+    /// Same as [`run`], but the fake sample clock continues from `start`
+    /// (pending offs are absolute sample positions — spanning several `run`
+    /// calls needs a continuous clock).
+    fn run_from(seq: &mut Sequencer, start: u64, blocks: usize) -> Vec<Event> {
         let mut events = Vec::new();
-        let mut pos = 0u64;
+        let mut pos = start;
         for _ in 0..blocks {
             seq.advance(&ctx(pos), &mut |track, event| {
                 events.push((track, event));
@@ -477,14 +454,6 @@ mod tests {
         events
     }
 
-    fn step(note: u8) -> SequencerStep {
-        SequencerStep {
-            enabled: true,
-            note,
-            velocity: 0.9,
-        }
-    }
-
     fn clip_note(start: u32, length: u32, note: u8) -> RtNote {
         RtNote {
             start_ticks: start,
@@ -492,6 +461,29 @@ mod tests {
             note,
             velocity: 0.9,
         }
+    }
+
+    /// One clip on one track: `start`/`span`/`loop` in ticks + notes.
+    fn place(
+        seq: &mut Sequencer,
+        track: usize,
+        start: u32,
+        span: u32,
+        loop_ticks: u32,
+        notes: &[RtNote],
+    ) {
+        let mut clip = RtMidiClip {
+            start_ticks: start,
+            span_ticks: span,
+            loop_ticks,
+            ..RtMidiClip::default()
+        };
+        for note in notes {
+            clip.push(*note);
+        }
+        let mut clips = [RtMidiClip::default(); MAX_TRACK_CLIPS];
+        clips[0] = clip;
+        seq.set_track_clips(track, clips);
     }
 
     fn ons(events: &[Event]) -> Vec<(usize, u8)> {
@@ -505,52 +497,17 @@ mod tests {
     }
 
     #[test]
-    fn plays_per_track_patterns_with_gate_offs() {
-        let mut seq = Sequencer::new(SR);
-        seq.set_bpm(120.0); // sixteenth note = 24 ticks = 6000 samples
-        let mut track0 = [SequencerStep::default(); PATTERN_STEPS];
-        track0[0] = step(60);
-        track0[1] = step(64);
-        let mut track1 = [SequencerStep::default(); PATTERN_STEPS];
-        track1[0] = step(72);
-        seq.set_pattern(0, track0);
-        seq.set_pattern(1, track1);
-        seq.play();
-
-        let events = run(&mut seq, 375); // 1 s
-        assert_eq!(
-            ons(&events),
-            vec![(0, 60), (1, 72), (0, 64)],
-            "both tracks should fire on the same clock"
-        );
-        let offs = events
-            .iter()
-            .filter(|(_, e)| matches!(e, NoteEvent::Off { .. }))
-            .count();
-        assert_eq!(offs, 3, "every note should have a gate off");
-        assert!(matches!(events[0], (0, NoteEvent::On { .. })));
-        assert!(matches!(events[1], (1, NoteEvent::On { .. })));
-    }
-
-    #[test]
-    fn disabled_steps_emit_nothing() {
-        let mut seq = Sequencer::new(SR);
-        seq.play();
-        let events = run(&mut seq, 375);
-        assert!(events.is_empty(), "fully disabled pattern should be silent");
-        // 48000 samples = 192 ticks = 8 steps.
-        assert_eq!(seq.step_index(), 8);
-    }
-
-    #[test]
     fn clip_notes_fire_at_their_positions_with_lengths() {
         let mut seq = Sequencer::new(SR);
         seq.set_bpm(120.0);
-        let mut clip = RtClip::default();
-        clip.push(clip_note(0, 24, 60));
-        clip.push(clip_note(24, 48, 64));
-        seq.set_clip(0, clip);
-        seq.set_source(0, TrackSource::Clip);
+        place(
+            &mut seq,
+            0,
+            0,
+            TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, 24, 60), clip_note(24, 48, 64)],
+        );
         seq.play();
 
         let events = run(&mut seq, 375);
@@ -559,7 +516,7 @@ mod tests {
             vec![(0, 60), (0, 64)],
             "notes should fire in order of start"
         );
-        // every note has an off (by its own length, not the gate).
+        // every note has an off (by its own length, not a gate).
         let offs = events
             .iter()
             .filter(|(_, e)| matches!(e, NoteEvent::Off { .. }))
@@ -568,47 +525,202 @@ mod tests {
     }
 
     #[test]
-    fn clip_loops_around() {
+    fn clip_plays_at_absolute_position() {
         let mut seq = Sequencer::new(SR);
         seq.set_bpm(120.0);
-        let mut clip = RtClip::default();
-        clip.push(clip_note(0, 24, 60));
-        seq.set_clip(0, clip);
-        seq.set_source(0, TrackSource::Clip);
+        // Clip placed on the second bar (384 ticks = 96_000 samples @120 BPM).
+        place(
+            &mut seq,
+            0,
+            384,
+            TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, 24, 72)],
+        );
         seq.play();
 
-        // Loop length 384 ticks = 96000 samples = 750 blocks; running 2.5 loops → fires 3 times.
-        let ons_count = run(&mut seq, 1_900)
-            .iter()
-            .filter(|(_, e)| matches!(e, NoteEvent::On { .. }))
-            .count();
-        assert_eq!(ons_count, 3, "clip should loop around per loop_ticks");
+        // First bar: silence.
+        assert!(
+            ons(&run(&mut seq, 375)).is_empty(),
+            "nothing should fire before the clip's absolute start"
+        );
+        // Continue into the second bar (no re-play: the transport keeps
+        // running): the note fires once at its absolute position.
+        let events = run(&mut seq, 400);
+        assert_eq!(ons(&events), vec![(0, 72)]);
+        // Position is beyond one bar and still inside the arrangement.
+        assert!(seq.position_ticks() >= f64::from(TICKS_PER_BAR));
+        assert!(seq.is_playing());
     }
 
     #[test]
-    fn source_switching_uses_only_active_source() {
+    fn clip_tiles_within_span_and_stops_at_span_end() {
         let mut seq = Sequencer::new(SR);
-        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
-        pattern[0] = step(48);
-        seq.set_pattern(0, pattern);
-        let mut clip = RtClip::default();
-        clip.push(clip_note(0, 24, 72));
-        seq.set_clip(0, clip);
+        seq.set_bpm(120.0);
+        // span = 2 × loop: the note fires twice (once per period), no third time.
+        place(
+            &mut seq,
+            0,
+            0,
+            2 * TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, 24, 60)],
+        );
         seq.play();
 
-        seq.set_source(0, TrackSource::Steps);
-        assert_eq!(ons(&run(&mut seq, 30)), vec![(0, 48)]);
+        // 2 bars = 768 ticks = 192_000 samples = 1_500 blocks; run 3 bars worth.
+        let fired: Vec<u8> = run(&mut seq, 2_255)
+            .iter()
+            .filter_map(|(t, e)| {
+                if *t == 0 {
+                    match e {
+                        NoteEvent::On { note, .. } => Some(*note),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            fired,
+            vec![60, 60],
+            "content should tile once per loop within the span, then stop"
+        );
+        // Auto-stop at the arrangement end (D16: 2 bars rounded up).
+        assert!(
+            !seq.is_playing(),
+            "transport should stop at the arrangement end"
+        );
+    }
 
+    #[test]
+    fn arrangement_end_is_latest_clip_end_ceiled_to_bar() {
+        let mut seq = Sequencer::new(SR);
+        place(
+            &mut seq,
+            0,
+            0,
+            TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, 24, 60)],
+        );
+        assert_eq!(seq.arrangement_end_ticks(), TICKS_PER_BAR);
+        // A later clip on another track extends the arrangement
+        // (480 + 96 = 576 → ceiled to 2 bars).
+        place(&mut seq, 1, 384 + 96, 96, 96, &[]);
+        assert_eq!(
+            seq.arrangement_end_ticks(),
+            2 * TICKS_PER_BAR,
+            "end = latest clip end ceiled to a bar"
+        );
+        // Control clips count too.
+        let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
+        clips[0] = RtControlClip {
+            start_ticks: 5 * TICKS_PER_BAR,
+            span_ticks: TICKS_PER_BAR,
+            ..RtControlClip::default()
+        };
+        seq.set_control_clips(0, clips);
+        assert_eq!(seq.arrangement_end_ticks(), 6 * TICKS_PER_BAR);
+        // Removing all content makes the arrangement unbounded again.
+        seq.set_track_clips(0, [RtMidiClip::default(); MAX_TRACK_CLIPS]);
+        seq.set_track_clips(1, [RtMidiClip::default(); MAX_TRACK_CLIPS]);
+        seq.set_control_clips(0, [RtControlClip::default(); MAX_TRACK_CLIPS]);
+        assert_eq!(seq.arrangement_end_ticks(), 0);
+    }
+
+    #[test]
+    fn auto_stop_keeps_pending_offs_draining() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        // One note right before the arrangement end: its off lands after the stop.
+        place(
+            &mut seq,
+            0,
+            0,
+            TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(TICKS_PER_BAR - 24, 48, 60)],
+        );
         seq.play();
-        seq.set_source(0, TrackSource::Clip);
-        assert_eq!(ons(&run(&mut seq, 30)), vec![(0, 72)]);
+        // @48 kHz: the stop lands in block 750 (384 ticks = 96_000 samples);
+        // run exactly up to it so the off (408 ticks = 102_000 samples) is
+        // still pending.
+        run(&mut seq, 750);
+
+        assert!(!seq.is_playing(), "auto-stopped at the arrangement end");
+        // The note's off (408 ticks = 102_000 samples) lands after the stop
+        // point: it must still drain in the following blocks.
+        let events = run_from(&mut seq, 750 * 128, 100);
+        assert!(
+            events
+                .iter()
+                .any(|(_, e)| matches!(e, NoteEvent::Off { .. })),
+            "the pending off should still fire after the auto-stop"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|(_, e)| matches!(e, NoteEvent::Off { .. })),
+            "no new note ons after the auto-stop"
+        );
+    }
+
+    #[test]
+    fn empty_arrangement_free_runs() {
+        let mut seq = Sequencer::new(SR);
+        seq.play();
+        run(&mut seq, 2_000);
+        assert!(
+            seq.is_playing(),
+            "an empty arrangement has no end: no auto-stop"
+        );
+        assert_eq!(seq.arrangement_end_ticks(), 0);
+    }
+
+    #[test]
+    fn two_tracks_fire_on_the_same_clock() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        place(
+            &mut seq,
+            0,
+            0,
+            TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, 24, 60)],
+        );
+        place(
+            &mut seq,
+            1,
+            0,
+            TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, 24, 72)],
+        );
+        seq.play();
+
+        // 100 blocks = 12_800 samples: covers both note offs (24 and 48 ticks
+        // → 6_000 and 12_000 samples).
+        let events = run(&mut seq, 100);
+        assert_eq!(
+            ons(&events),
+            vec![(0, 60), (1, 72)],
+            "both tracks fire on the same clock, in track order"
+        );
+        let offs = events
+            .iter()
+            .filter(|(_, e)| matches!(e, NoteEvent::Off { .. }))
+            .count();
+        assert_eq!(offs, 2, "every note should have a length-based off");
     }
 
     #[test]
     fn clip_over_capacity_is_truncated() {
-        let mut clip = RtClip::default();
+        let mut clip = RtMidiClip::default();
         for i in 0..(MAX_CLIP_NOTES + 10) {
-            clip.push(clip_note(i as u32 * TICKS_PER_STEP, 24, 60));
+            clip.push(clip_note(i as u32 * 24, 24, 60));
         }
         assert_eq!(
             clip.note_count, MAX_CLIP_NOTES,
@@ -631,50 +743,51 @@ mod tests {
     }
 
     #[test]
-    fn bpm_change_alters_step_rate() {
+    fn bpm_change_alters_event_rate() {
         let mut seq = Sequencer::new(SR);
-        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
-        for step_slot in &mut pattern {
-            *step_slot = step(60);
+        // 16 notes per bar (every 16th note), unbounded arrangement.
+        let mut clip = RtMidiClip {
+            span_ticks: 256 * 384,
+            loop_ticks: 384,
+            ..RtMidiClip::default()
+        };
+        for i in 0..16u32 {
+            clip.push(clip_note(i * 24, 24, 60));
         }
-        seq.set_pattern(0, pattern);
+        let mut clips = [RtMidiClip::default(); MAX_TRACK_CLIPS];
+        clips[0] = clip;
+        seq.set_track_clips(0, clips);
 
-        // 370 blocks = 47360 samples: at 120 BPM 189.44 ticks (8 steps),
-        // at 240 BPM 378.88 ticks (16 steps) — both windows avoid step boundaries.
         let count_ons = |events: &[Event]| {
             events
                 .iter()
                 .filter(|(_, e)| matches!(e, NoteEvent::On { .. }))
                 .count()
         };
+        // 1500 blocks = 192_000 samples = 768 ticks @120 BPM = 2 bars → 32 ons;
+        // at 240 BPM the same samples span 4 bars → 64 ons.
         seq.set_bpm(120.0);
         seq.play();
-        let slow = count_ons(&run(&mut seq, 370));
-
+        let slow = count_ons(&run(&mut seq, 1_500));
         seq.set_bpm(240.0);
         seq.play();
-        let fast = count_ons(&run(&mut seq, 370));
-        assert_eq!(
-            fast,
-            slow * 2,
-            "240 BPM fire rate should be exactly twice 120 BPM's"
-        );
+        let fast = count_ons(&run(&mut seq, 1_500));
+        assert_eq!(slow, 32);
+        assert_eq!(fast, 64, "240 BPM should fire exactly twice as many notes");
     }
 
     #[test]
     fn stop_quiets_every_track() {
         let mut seq = Sequencer::new(SR);
-        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
-        pattern[0] = step(60);
-        for track in 0..DEFAULT_MIDI_TRACKS {
-            seq.set_pattern(track, pattern);
+        for track in 0..4 {
+            place(&mut seq, track, 0, 256 * 384, 384, &[clip_note(0, 24, 60)]);
         }
         seq.play();
         let events = run(&mut seq, 1);
         assert_eq!(
             ons(&events).len(),
-            DEFAULT_MIDI_TRACKS,
-            "default four tracks should fire step 0 simultaneously"
+            4,
+            "the first four tracks should fire at position 0 simultaneously"
         );
 
         seq.stop();
@@ -684,47 +797,22 @@ mod tests {
     }
 
     #[test]
-    fn step_clock_wraps_every_16_steps() {
+    fn note_off_comes_before_next_note_on() {
         let mut seq = Sequencer::new(SR);
-        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
-        pattern[0] = step(60);
-        pattern[15] = step(72);
-        seq.set_pattern(0, pattern);
-        seq.play();
-
-        // 20 steps (480 ticks ≈ 120_000 samples) + margin: step 0 fires twice.
-        let fired: Vec<u8> = run(&mut seq, 950)
-            .iter()
-            .filter_map(|(t, e)| {
-                if *t == 0 {
-                    match e {
-                        NoteEvent::On { note, .. } => Some(*note),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert_eq!(
-            fired,
-            vec![60, 72, 60],
-            "step clock should wrap after 16 steps"
+        seq.set_bpm(120.0);
+        // Two consecutive 16th notes: on@0 (24 ticks), on@24; the first off
+        // must be emitted in the block before the second on.
+        place(
+            &mut seq,
+            0,
+            0,
+            256 * 384,
+            384,
+            &[clip_note(0, 24, 60), clip_note(24, 24, 64)],
         );
-    }
-
-    #[test]
-    fn gate_off_comes_before_next_note_on_at_full_gate() {
-        let mut seq = Sequencer::new(SR);
-        seq.set_gate(1.0);
-        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
-        pattern[0] = step(60);
-        pattern[1] = step(64);
-        seq.set_pattern(0, pattern);
         seq.play();
 
         let events = run(&mut seq, 60);
-        // 60 blocks = 7680 samples covers step 0 (on@0, off@5999) and step 1's on@6000.
         let kinds: Vec<&str> = events
             .iter()
             .map(|(_, e)| match e {
@@ -749,32 +837,43 @@ mod tests {
     }
 
     #[test]
-    fn auto_tracks_are_independent_entities() {
+    fn control_clips_are_independent_entities() {
         let mut seq = Sequencer::new(SR);
-        let mut auto = RtAutoTrack {
-            loop_ticks: 96, // decoupled from the MIDI track loop (D7)
-            ..RtAutoTrack::default()
+        let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
+        clips[5] = RtControlClip {
+            start_ticks: 0,
+            span_ticks: 384,
+            loop_ticks: 96, // decoupled from any MIDI clip loop (D7)
+            curve: {
+                let mut curve = crate::realtime::automation::RtAutomation::default();
+                curve.push(RtAutoPoint {
+                    tick: 0,
+                    value: 0.5,
+                });
+                curve
+            },
         };
-        auto.curve.push(RtAutoPoint {
-            tick: 0,
-            value: 0.5,
-        });
-        seq.set_auto_track(5, auto);
-        seq.set_auto_track(MAX_AUTO_TRACKS, auto); // out-of-range index ignored
-        let tracks = seq.auto_tracks();
-        assert_eq!(tracks[5].loop_ticks, 96);
-        assert_eq!(tracks[5].curve.point_count, 1);
+        seq.set_control_clips(5, clips);
+        seq.set_control_clips(MAX_AUTO_TRACKS, clips); // out-of-range index ignored
+        let tables = seq.control_clips();
+        assert_eq!(tables[5][5].loop_ticks, 96);
+        assert_eq!(tables[5][5].curve.point_count, 1);
         assert!(
-            tracks
+            tables
                 .iter()
                 .enumerate()
-                .all(|(i, t)| i == 5 || !t.curve.is_active()),
-            "other automation tracks should keep default empty curves"
+                .all(|(i, t)| i == 5 || !t[0].curve.is_active()),
+            "other control tracks should keep default empty curves"
         );
-        // MIDI tracks are unaffected by automation track writes: patterns schedule as usual.
-        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
-        pattern[0] = step(60);
-        seq.set_pattern(0, pattern);
+        assert!(
+            tables[5]
+                .iter()
+                .enumerate()
+                .all(|(i, c)| i == 5 || !c.curve.is_active()),
+            "other slots of track 5 should stay empty"
+        );
+        // Control clip writes do not disturb MIDI scheduling.
+        place(&mut seq, 0, 0, 256 * 384, 384, &[clip_note(0, 24, 60)]);
         seq.play();
         assert_eq!(ons(&run(&mut seq, 30)), vec![(0, 60)]);
     }
@@ -782,9 +881,7 @@ mod tests {
     #[test]
     fn track_count_gates_scheduling() {
         let mut seq = Sequencer::new(SR);
-        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
-        pattern[0] = step(60);
-        seq.set_pattern(5, pattern);
+        place(&mut seq, 5, 0, 256 * 384, 384, &[clip_note(0, 24, 60)]);
         seq.set_track_count(4);
         seq.play();
         assert!(
@@ -792,7 +889,7 @@ mod tests {
             "tracks beyond the active count should not schedule"
         );
         seq.set_track_count(8);
-        seq.play(); // reset the transport so step 0 falls back into the scheduling window
+        seq.play(); // reset the transport so position 0 falls back into the scheduling window
         assert_eq!(ons(&run(&mut seq, 30)), vec![(5, 60)]);
         // Clamped to the capacity limit.
         seq.set_track_count(MAX_MIDI_TRACKS + 10);

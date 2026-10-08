@@ -60,10 +60,7 @@ pub const MAX_MIDI_TRACKS: usize = 16;
 pub const DEFAULT_MIDI_TRACKS: usize = 4;
 
 pub use atomic::AtomicF32;
-pub use automation::{
-    DEFAULT_AUTO_LOOP_TICKS, MAX_AUTO_POINTS, MAX_AUTO_TRACKS, MAX_AUTOMATIONS, RtAutoPoint,
-    RtAutoTrack, RtAutomation,
-};
+pub use automation::{MAX_AUTO_POINTS, MAX_AUTO_TRACKS, RtAutoPoint, RtAutomation, RtControlClip};
 pub use block::{BlockRunner, Feedback};
 pub use buffer::AudioBuffer;
 pub use commands::{
@@ -79,8 +76,8 @@ pub use graph::{
 };
 pub use processor::{Processor, ProcessorChain};
 pub use sequencer::{
-    MAX_CLIP_NOTES, PATTERN_STEPS, RtClip, RtNote, Sequencer, SequencerStep, TICKS_PER_QUARTER,
-    TICKS_PER_STEP, TrackSource,
+    MAX_CLIP_NOTES, MAX_TRACK_CLIPS, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR,
+    TICKS_PER_QUARTER, TICKS_PER_STEP,
 };
 pub use sine::SineProcessor;
 pub use svf::{FilterMode, SvfProcessor};

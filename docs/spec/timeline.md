@@ -50,6 +50,6 @@ ControlClip: ( start_ticks, span_ticks, loop_ticks, curve: [AutoPoint] )
 
 - [x] **T0 快修**（不动数据模型）：默认音源切 `Clip`（piano roll 立即可听）；移除步进音序器 UI 区块；加/删 MIDI 轨按钮（引擎 `register_track_chain` / `remove_node` 已有，文档与引擎同步）。✅ `5915e99`
 - [x] **T1 模型 v4**：`MidiClip`/`ControlClip` + 校验 + 往返测试；`PROJECT_VERSION = 4`。Steps/Pattern/TrackSource/gate 退役，`AutomationTrack` → `ControlTrack`（clips 顶层化）；UI 过渡期 piano roll / lane 暂编**首 clip**，engine 仍按首 clip 循环调度（SetSource 强制 Clip），窗口调度重写归 T2。
-- [ ] **T2 引擎 timeline 调度**：`RtMidiClip`/`RtControlClip` 定容 + `SetTrackClips`/`SetControlClips` 命令 + 窗口调度 + 内容自适应停止 + automation clip 求值。
+- [x] **T2 引擎 timeline 调度**：`RtMidiClip`/`RtControlClip` 定容 + `SetTrackClips`/`SetControlClips` 命令 + 窗口调度 + 内容自适应停止 + automation clip 求值。✅ `Sequencer` 重写为绝对时间窗口扫描（clip 平铺 `start + k·loop`、span 边界截断、arrangement end 自动停但 pending off 继续放完）；`SetPattern/SetSource/SetGate/SetClip/SetAutoTrack` 全部退役（engine 默认 clip span=0=空表）；控制轨求值改为首个覆盖当前位置的 clip。
 - [ ] **T3 编曲视图**：`timeline.rs`——行 = 轨、clip 块（拖动移位/拖边调长/删除）、双击开编辑器（piano roll / lane 复用）、轨头（增删轨/静音/选择）、标尺与小节网格、播放头。
 - [ ] **T4 画布 timeline 节点**：显式 Timeline 节点（无输入、n 输出口、不可删除），per-track 源小节点从画布移除；`PortRef::MidiTrack/AutoTrack` 语义不变，纯呈现层合并。

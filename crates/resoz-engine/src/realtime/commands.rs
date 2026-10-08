@@ -2,8 +2,8 @@
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::realtime::automation::RtAutoTrack;
-use crate::realtime::sequencer::{PATTERN_STEPS, RtClip, SequencerStep, TrackSource};
+use crate::realtime::automation::RtControlClip;
+use crate::realtime::sequencer::{MAX_TRACK_CLIPS, RtMidiClip};
 
 /// Default capacity of the control command queue. When full, new commands are
 /// dropped by the sender (see
@@ -69,43 +69,34 @@ pub enum NoteEvent {
 
 /// Sequencer transport and configuration commands.
 ///
-/// `SetClip` carries an entire `Copy` clip (about 2 KB), making this enum
-/// significantly larger than the other variants — a deliberate trade-off for
-/// "zero heap allocation on the real-time side": the command queue allocates
-/// slots for the largest variant (1024 × ≈2 KB ≈ 2 MB, pre-allocated once).
-/// If clip size grows in the future, this could become a separate bulk data
-/// channel (non-real-time pre-written shared buffer + small command
-/// notification).
+/// `SetTrackClips` carries an entire `Copy` clip table (8 clips ≈ 6 KB),
+/// making this enum significantly larger than the other variants — a
+/// deliberate trade-off for "zero heap allocation on the real-time side": the
+/// command queue allocates slots for the largest variant (1024 × ≈6 KB ≈ 6 MB,
+/// pre-allocated once). If clip tables grow in the future, this could become a
+/// separate bulk data channel (non-real-time pre-written shared buffer + small
+/// command notification).
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy)]
 pub enum SequencerCommand {
-    /// Play from step 0 (the stream position at receive time is the clock origin).
+    /// Play from position 0 (the stream position at receive time is the clock origin).
     Play,
     /// Stop and release all tracks' current notes.
     Stop,
     /// Set BPM (20..300).
     SetBpm(f32),
-    /// Set the gate ratio of the step length (0.05..1).
-    SetGate(f32),
-    /// Replace a track's 16-step pattern in one block.
-    SetPattern {
+    /// Replace one MIDI track's clip table in one block (D15 batch Copy;
+    /// also refreshes the arrangement end, D16).
+    SetTrackClips {
         track: usize,
-        steps: [SequencerStep; PATTERN_STEPS],
+        clips: [RtMidiClip; MAX_TRACK_CLIPS],
     },
-    /// Replace a track's piano-roll clip in one block.
-    SetClip { track: usize, clip: RtClip },
-    /// Switch a track's sound source (step mode / piano-roll clip).
-    SetSource { track: usize, source: TrackSource },
-    /// Replace an automation track entity in one block (empty curve = clear).
-    ///
-    /// The curve carries no target parameter (D7): the delivery endpoint
-    /// `(node, parameter)` is determined by the node graph's automation routing
-    /// table, set via `AudioEngine::set_auto_route`.
-    SetAutoTrack {
-        /// Automation track index (0..[`crate::realtime::MAX_AUTO_TRACKS`]).
+    /// Replace one control track's clip table in one block (D15 batch Copy;
+    /// D17: the delivery endpoint stays decided by the automation routing
+    /// table, set via `AudioEngine::set_auto_route`).
+    SetControlClips {
         index: usize,
-        /// Track entity (its own loop length + pure anchor curve).
-        auto: RtAutoTrack,
+        clips: [RtControlClip; MAX_TRACK_CLIPS],
     },
     /// Set the active MIDI track count (D12 dynamic tracks; values beyond
     /// capacity are clamped on the real-time side).

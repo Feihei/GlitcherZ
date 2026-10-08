@@ -31,8 +31,8 @@ use resoz_engine::AudioEngine;
 use resoz_engine::convert;
 use resoz_engine::realtime::{
     ChannelStripProcessor, DelayProcessor, EngineCommand, MAX_AUTO_POINTS, MAX_CLIP_NOTES,
-    NoteEvent, ParamId, Processor, RtAutoPoint, RtAutoTrack, RtAutomation, RtClip, RtNote,
-    SequencerCommand, SynthProcessor, TrackSource,
+    MAX_TRACK_CLIPS, NoteEvent, ParamId, Processor, RtAutoPoint, RtAutomation, RtControlClip,
+    RtMidiClip, RtNote, SequencerCommand, SynthProcessor,
 };
 use resoz_model::{
     AutoParam, CableKind, ControlTrack, DelayParams, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS, MidiClip,
@@ -627,12 +627,10 @@ impl ResoZApp {
         )));
         for track in 0..self.project.midi_tracks.len() {
             self.push_track_params(track);
-            let clip = self.rt_clip(track);
-            self.send_sequencer(SequencerCommand::SetClip { track, clip });
-            self.force_clip_source(track);
+            self.send_track_clips(track);
         }
         for index in 0..self.project.control_tracks.len() {
-            self.send_auto_curve(index);
+            self.send_control_clips(index);
         }
     }
 
@@ -711,33 +709,31 @@ impl ResoZApp {
 
     // ---- Automation track dispatch (D7/D12: curve and cable endpoint are separated) ----
 
-    /// Push the curve entity of one control track (its endpoint is decided by the graph's
+    /// Push the clip table of one control track (its delivery endpoints are decided by the graph's
     /// automation cable table, set via `apply_document` / `set_auto_endpoint`).
-    ///
-    /// T1 interim conversion (timeline spec T2 will replace this): the engine still evaluates
-    /// one global-loop curve per track, so the **first clip** of the control track is sent.
-    fn send_auto_curve(&mut self, index: usize) {
+    fn send_control_clips(&mut self, index: usize) {
         let Some(track) = self.project.control_tracks.get(index) else {
             return;
         };
-        let mut rt = RtAutomation::default();
-        let mut loop_ticks = TICKS_PER_BAR;
-        if let Some(clip) = track.clips.first() {
-            loop_ticks = clip.loop_ticks;
+        // Document clips → engine representation (D15 batch Copy; over-capacity
+        // content is truncated, the document validator rejects it on save).
+        let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
+        for (slot, clip) in clips.iter_mut().zip(track.clips.iter()) {
+            let mut curve = RtAutomation::default();
             for point in clip.curve.iter().take(MAX_AUTO_POINTS) {
-                rt.push(RtAutoPoint {
+                curve.push(RtAutoPoint {
                     tick: point.tick,
                     value: point.value,
                 });
             }
+            *slot = RtControlClip {
+                start_ticks: clip.start_ticks,
+                span_ticks: clip.span_ticks,
+                loop_ticks: clip.loop_ticks,
+                curve,
+            };
         }
-        self.send_sequencer(SequencerCommand::SetAutoTrack {
-            index,
-            auto: RtAutoTrack {
-                loop_ticks,
-                curve: rt,
-            },
-        });
+        self.send_sequencer(SequencerCommand::SetControlClips { index, clips });
     }
 
     /// Redirect an automation track's cable endpoint (the document cable stores the **document**
@@ -1012,34 +1008,37 @@ impl ResoZApp {
         self.retire_guard(engine_id);
     }
 
-    /// Document clip → engine representation (truncated to capacity, `Copy` struct, zero heap
-    /// allocation).
-    ///
-    /// T1 interim conversion (timeline spec T2 will replace this): the engine still loops one
-    /// clip per track from the transport origin, so the track's **first clip** is sent.
-    fn rt_clip(&self, track: usize) -> RtClip {
-        let Some(clip) = self.project.midi_tracks[track].clips.first() else {
-            return RtClip::default();
-        };
-        let mut rt = RtClip {
-            loop_ticks: clip.loop_ticks,
-            ..RtClip::default()
-        };
-        for note in clip.notes.iter().take(MAX_CLIP_NOTES) {
-            rt.push(RtNote {
-                start_ticks: note.start,
-                length_ticks: note.length,
-                note: note.note,
-                velocity: note.velocity,
-            });
+    /// Document clip table → engine representation (D15 batch, truncated to capacity, `Copy`
+    /// structs, zero heap allocation).
+    fn rt_clips(&self, track: usize) -> [RtMidiClip; MAX_TRACK_CLIPS] {
+        let mut clips = [RtMidiClip::default(); MAX_TRACK_CLIPS];
+        for (slot, clip) in clips
+            .iter_mut()
+            .zip(self.project.midi_tracks[track].clips.iter())
+        {
+            let mut rt = RtMidiClip {
+                start_ticks: clip.start_ticks,
+                span_ticks: clip.span_ticks,
+                loop_ticks: clip.loop_ticks,
+                ..RtMidiClip::default()
+            };
+            for note in clip.notes.iter().take(MAX_CLIP_NOTES) {
+                rt.push(RtNote {
+                    start_ticks: note.start,
+                    length_ticks: note.length,
+                    note: note.note,
+                    velocity: note.velocity,
+                });
+            }
+            *slot = rt;
         }
-        rt
+        clips
     }
 
-    /// Push the current roll clip of one track.
-    fn send_clip(&mut self, track: usize) {
-        let clip = self.rt_clip(track);
-        self.send_sequencer(SequencerCommand::SetClip { track, clip });
+    /// Push the current clip table of one track (D15 batch).
+    fn send_track_clips(&mut self, track: usize) {
+        let clips = self.rt_clips(track);
+        self.send_sequencer(SequencerCommand::SetTrackClips { track, clips });
     }
 
     /// Save to the current path; if never saved, pop up the "Save As" dialog.
@@ -2256,18 +2255,7 @@ impl ResoZApp {
         self.node_map.insert(strip_id, strip_e);
         self.engine
             .set_midi_track_count(self.project.midi_tracks.len());
-        self.force_clip_source(track);
         self.selected_track = track;
-    }
-
-    /// Forces one track onto the clip source (the engine-side `TrackSource`
-    /// enum defaults to Steps until the T2 sequencer rewrite removes it; the
-    /// model no longer has a source concept, D14).
-    fn force_clip_source(&mut self, track: usize) {
-        self.send_sequencer(SequencerCommand::SetSource {
-            track,
-            source: TrackSource::Clip,
-        });
     }
 
     /// 删除最后一条 MIDI 轨（中间轨删除需重排轨道表与文档 track 字段，
@@ -2338,7 +2326,7 @@ impl ResoZApp {
             playing,
         );
         if edited {
-            self.send_clip(sel);
+            self.send_track_clips(sel);
         }
     }
 
@@ -2361,19 +2349,16 @@ impl ResoZApp {
             if ui.button("＋ Add").clicked() && auto_count < MAX_AUTO_TRACKS {
                 self.project.control_tracks.push(ControlTrack::default());
                 self.selected_auto = auto_count;
-                self.send_auto_curve(self.selected_auto);
+                self.send_control_clips(self.selected_auto);
             }
             if ui.button("－ Remove").clicked() && auto_count > 0 {
                 let index = self.selected_auto.min(auto_count - 1);
                 self.project.control_tracks.remove(index);
                 let _ = self.engine.clear_auto_route(index);
-                // Engine side: clear that index to an empty curve.
-                self.send_sequencer(SequencerCommand::SetAutoTrack {
+                // Engine side: clear that index to an empty clip table.
+                self.send_sequencer(SequencerCommand::SetControlClips {
                     index,
-                    auto: RtAutoTrack {
-                        loop_ticks: TICKS_PER_BAR,
-                        curve: RtAutomation::default(),
-                    },
+                    clips: [RtControlClip::default(); MAX_TRACK_CLIPS],
                 });
                 self.selected_auto = index.min(self.project.control_tracks.len().saturating_sub(1));
             }
@@ -2500,7 +2485,7 @@ impl ResoZApp {
                 &mut self.lane_state,
             );
             if edited {
-                self.send_auto_curve(index);
+                self.send_control_clips(index);
             }
         }
     }

@@ -220,18 +220,18 @@ impl BlockRunner {
         self.scratch_pos = 0;
     }
 
-    /// Samples and applies all automation tracks' curves: each track is reduced
-    /// modulo its own `loop_ticks` (`0` = follow the global transport position);
-    /// the delivery endpoint is determined by the graph's routing table. RT-safe.
+    /// Samples and applies all control tracks' clips: the first clip covering
+    /// the transport position delivers its curve value (D17: nothing is
+    /// delivered outside any clip span — the target keeps its last value);
+    /// the delivery endpoint is determined by the graph's routing table.
+    /// RT-safe.
     fn evaluate_automation(&mut self, position_ticks: f64) {
-        for (index, auto) in self.sequencer.auto_tracks().iter().enumerate() {
-            let tick = if auto.loop_ticks > 0 {
-                position_ticks % f64::from(auto.loop_ticks)
-            } else {
-                position_ticks
-            };
-            if let Some(value) = auto.curve.value_at(tick) {
-                self.graph.auto_set_param(index, value);
+        for (index, clips) in self.sequencer.control_clips().iter().enumerate() {
+            for clip in clips {
+                if let Some(value) = clip.value_at_absolute(position_ticks) {
+                    self.graph.auto_set_param(index, value);
+                    break;
+                }
             }
         }
     }
@@ -269,18 +269,11 @@ impl BlockRunner {
                 self.graph.note_off_all();
             }
             SequencerCommand::SetBpm(bpm) => self.sequencer.set_bpm(bpm),
-            SequencerCommand::SetGate(gate) => self.sequencer.set_gate(gate),
-            SequencerCommand::SetPattern { track, steps } => {
-                self.sequencer.set_pattern(track, steps);
+            SequencerCommand::SetTrackClips { track, clips } => {
+                self.sequencer.set_track_clips(track, clips);
             }
-            SequencerCommand::SetClip { track, clip } => {
-                self.sequencer.set_clip(track, clip);
-            }
-            SequencerCommand::SetSource { track, source } => {
-                self.sequencer.set_source(track, source);
-            }
-            SequencerCommand::SetAutoTrack { index, auto } => {
-                self.sequencer.set_auto_track(index, auto);
+            SequencerCommand::SetControlClips { index, clips } => {
+                self.sequencer.set_control_clips(index, clips);
             }
             SequencerCommand::SetMidiTrackCount(count) => {
                 self.sequencer.set_track_count(count);
@@ -306,7 +299,7 @@ mod tests {
     use rtrb::Producer;
 
     use super::{BlockRunner, Feedback};
-    use crate::realtime::automation::{RtAutoPoint, RtAutoTrack, RtAutomation};
+    use crate::realtime::automation::{RtAutoPoint, RtAutomation, RtControlClip};
     use crate::realtime::buffer::AudioBuffer;
     use crate::realtime::commands::{
         EngineCommand, NoteEvent, ParamId, SequencerCommand, command_channel,
@@ -314,7 +307,7 @@ mod tests {
     use crate::realtime::context::ProcessContext;
     use crate::realtime::graph::{GraphCompiler, GraphUpdate};
     use crate::realtime::processor::Processor;
-    use crate::realtime::sequencer::{PATTERN_STEPS, Sequencer, SequencerStep};
+    use crate::realtime::sequencer::{MAX_TRACK_CLIPS, RtMidiClip, RtNote, Sequencer};
     use crate::testing::count_positive_crossings;
 
     const SR: f32 = 44_100.0;
@@ -500,24 +493,37 @@ mod tests {
 
     /// Sequencer end-to-end: command queue sends pattern and transport →
     /// synthesizer sounds → state feedback.
+    /// Enqueues a one-clip table for a track: notes at `positions` (16th-note
+    /// grid, 24 ticks each), one bar loop, one bar span.
+    fn send_track_clips(tx: &mut Producer<EngineCommand>, track: usize, notes: &[(u32, u8)]) {
+        let mut clip = RtMidiClip {
+            span_ticks: 384,
+            loop_ticks: 384,
+            ..RtMidiClip::default()
+        };
+        for (start, note) in notes {
+            clip.push(RtNote {
+                start_ticks: *start,
+                length_ticks: 24,
+                note: *note,
+                velocity: 0.9,
+            });
+        }
+        let mut clips = [RtMidiClip::default(); MAX_TRACK_CLIPS];
+        clips[0] = clip;
+        tx.push(EngineCommand::Sequencer(SequencerCommand::SetTrackClips {
+            track,
+            clips,
+        }))
+        .expect("queue not full");
+    }
+
     #[test]
     fn sequencer_drives_synth_through_command_queue() {
         let (mut runner, mut tx, _voice_tx, feedback, _compiler) = make_runner(128, 2);
 
-        // Pattern: track 0 steps 0/2/4 fire A4; BPM 240.
-        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
-        for i in [0usize, 2, 4] {
-            pattern[i] = SequencerStep {
-                enabled: true,
-                note: 69,
-                velocity: 0.9,
-            };
-        }
-        tx.push(EngineCommand::Sequencer(SequencerCommand::SetPattern {
-            track: 0,
-            steps: pattern,
-        }))
-        .expect("queue not full");
+        // Clip: track 0 fires A4 at ticks 0/48/96; BPM 240.
+        send_track_clips(&mut tx, 0, &[(0, 69), (48, 69), (96, 69)]);
         tx.push(EngineCommand::Sequencer(SequencerCommand::SetBpm(240.0)))
             .expect("queue not full");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
@@ -547,23 +553,13 @@ mod tests {
             !feedback.playing.load(Ordering::Relaxed),
             "should no longer be playing after stopping"
         );
-        assert!(feedback.step.load(Ordering::Relaxed) < PATTERN_STEPS as u32);
+        assert!(feedback.step.load(Ordering::Relaxed) < 16);
     }
 
     #[test]
     fn silent_when_sequencer_not_playing() {
         let (mut runner, mut tx, _voice_tx, feedback, _compiler) = make_runner(128, 2);
-        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
-        pattern[0] = SequencerStep {
-            enabled: true,
-            note: 60,
-            velocity: 1.0,
-        };
-        tx.push(EngineCommand::Sequencer(SequencerCommand::SetPattern {
-            track: 0,
-            steps: pattern,
-        }))
-        .expect("queue not full");
+        send_track_clips(&mut tx, 0, &[(0, 60)]);
         let mut out = vec![0.0f32; 22_050];
         runner.render_interleaved(&mut out);
         assert!(
@@ -576,8 +572,8 @@ mod tests {
     fn automation_drives_track_gain_during_playback() {
         let (mut runner, mut tx, mut structure_tx, feedback, mut compiler) = make_runner(128, 2);
         // Gain curve: tick 0 = 1.0 → tick 96 = 0.0 (120 BPM / 44.1 kHz ≈ 0.5 s).
-        // Automation track 0 (with its own one-bar loop) connects to track 0's
-        // channel strip gain (addressed by node_id).
+        // Control track 0 (one clip covering bar 1, loop one bar) connects to
+        // track 0's channel strip gain (addressed by node_id).
         let channel_id = compiler
             .track_channel_node_id(0)
             .expect("channel strip node_id should exist");
@@ -593,13 +589,16 @@ mod tests {
             tick: 96,
             value: 0.0,
         });
-        tx.push(EngineCommand::Sequencer(SequencerCommand::SetAutoTrack {
-            index: 0,
-            auto: RtAutoTrack {
-                loop_ticks: 384,
-                curve,
-            },
-        }))
+        let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
+        clips[0] = RtControlClip {
+            start_ticks: 0,
+            span_ticks: 384,
+            loop_ticks: 384,
+            curve,
+        };
+        tx.push(EngineCommand::Sequencer(
+            SequencerCommand::SetControlClips { index: 0, clips },
+        ))
         .expect("queue not full");
         let update = compiler
             .set_auto_route(0, channel_id, ParamId::TrackGain)
@@ -718,13 +717,16 @@ mod tests {
             tick: 384,
             value: 1.0,
         });
-        tx.push(EngineCommand::Sequencer(SequencerCommand::SetAutoTrack {
-            index: 0,
-            auto: RtAutoTrack {
-                loop_ticks: 384,
-                curve,
-            },
-        }))
+        let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
+        clips[0] = RtControlClip {
+            start_ticks: 0,
+            span_ticks: 384,
+            loop_ticks: 384,
+            curve,
+        };
+        tx.push(EngineCommand::Sequencer(
+            SequencerCommand::SetControlClips { index: 0, clips },
+        ))
         .expect("queue not full");
         let update = compiler
             .set_auto_route(0, voice_id, ParamId::PluginParam(1))

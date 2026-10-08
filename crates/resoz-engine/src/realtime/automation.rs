@@ -1,26 +1,23 @@
-//! Automation curves and automation track entities (evaluated on the audio thread side).
+//! Automation curves and control clips (evaluated on the audio thread side).
 //!
-//! D7 (spec `docs/spec/node-graph.md`): **automation tracks are independent
-//! timeline entities parallel to MIDI tracks** — a curve is just a pure anchor
-//! list with no target parameter; the delivery target is entirely determined
-//! by the node graph's automation routing table (`ExecPlan::auto_routes`).
+//! D7/D17 (spec `docs/spec/node-graph.md`, `docs/spec/timeline.md`): control
+//! tracks are independent timeline entities parallel to MIDI tracks — a curve
+//! is just a pure anchor list with no target parameter; the delivery target is
+//! entirely determined by the node graph's automation routing table
+//! (`ExecPlan::auto_routes`), and the delivery window is decided by the
+//! [`RtControlClip`] placement (nothing is delivered outside the span).
 
 /// Anchor capacity limit for a single curve (capacity constraint via `Copy`; truncated beyond capacity).
 pub const MAX_AUTO_POINTS: usize = 64;
 
-/// Number of automation tracks per MIDI track (stride of the timeline entity index).
-pub const MAX_AUTOMATIONS: usize = 4;
-
-/// Total number of automation track entities (`NUM_TRACKS × MAX_AUTOMATIONS`).
+/// Total number of control track entities (D12; the model layer's
+/// `Vec<ControlTrack>` shares this limit).
 pub const MAX_AUTO_TRACKS: usize = 16;
-
-/// Default automation track loop length (in ticks): one bar (96 TPQN × 4 beats).
-pub const DEFAULT_AUTO_LOOP_TICKS: u32 = 384;
 
 /// Automation anchor (mirrors `resoz_model::AutoPoint`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct RtAutoPoint {
-    /// Position (in ticks, relative to the loop start).
+    /// Position (in ticks, relative to the clip start).
     pub tick: u32,
     /// Parameter value (in real units).
     pub value: f32,
@@ -65,7 +62,7 @@ impl RtAutomation {
     }
 
     /// Returns the value at `tick` (a position already reduced modulo the
-    /// automation track's loop length).
+    /// clip's loop length).
     /// Returns `None` for an empty/disabled curve; linear interpolation;
     /// endpoint values held outside the range. RT-safe.
     pub fn value_at(&self, tick: f64) -> Option<f32> {
@@ -96,32 +93,62 @@ impl RtAutomation {
     }
 }
 
-/// An automation track entity: independent loop length + pure anchor curve (D7).
-///
-/// `loop_ticks` is carried by the track itself and is **decoupled** from the
-/// loop of the MIDI track's sound source (the old `Track.automations`
-/// follow-the-source-loop semantics is retired); `0` = no loop (follows the
-/// global transport position).
+/// A control (automation) clip placed on the arrangement timeline
+/// (mirrors `resoz_model::ControlClip`, fixed-capacity `Copy`; D15/D17).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RtAutoTrack {
-    /// Loop length (in ticks).
+pub struct RtControlClip {
+    /// Absolute start position on the arrangement (in ticks).
+    pub start_ticks: u32,
+    /// How long the clip stays active (in ticks).
+    pub span_ticks: u32,
+    /// Content loop length (in ticks).
     pub loop_ticks: u32,
-    /// Curve (pure anchors; target determined by the routing table).
+    /// Anchor curve (pure anchors; target determined by the routing table).
     pub curve: RtAutomation,
 }
 
-impl Default for RtAutoTrack {
+impl Default for RtControlClip {
     fn default() -> Self {
         Self {
-            loop_ticks: DEFAULT_AUTO_LOOP_TICKS,
+            start_ticks: 0,
+            // span 0 = inactive: an all-default clip table is an EMPTY control
+            // track (nothing is delivered); every real clip carries its own
+            // placement.
+            span_ticks: 0,
+            loop_ticks: 384,
             curve: RtAutomation::default(),
         }
     }
 }
 
+impl RtControlClip {
+    /// Samples the value at the absolute transport position: `None` outside
+    /// `[start, start + span)` (D17: nothing is delivered outside the span,
+    /// the target keeps its last value); inside, the local position is
+    /// reduced modulo `loop_ticks` (periodic tiling, D14) and mapped through
+    /// the curve. RT-safe.
+    pub fn value_at_absolute(&self, position_ticks: f64) -> Option<f32> {
+        if self.span_ticks == 0 {
+            return None;
+        }
+        let start = f64::from(self.start_ticks);
+        let end = start + f64::from(self.span_ticks);
+        if position_ticks < start || position_ticks >= end {
+            return None;
+        }
+        let local = position_ticks - start;
+        let phase = if self.loop_ticks > 0 {
+            local % f64::from(self.loop_ticks)
+        } else {
+            local
+        };
+        self.curve.value_at(phase)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_AUTO_LOOP_TICKS, MAX_AUTO_POINTS, RtAutoPoint, RtAutoTrack, RtAutomation};
+    use super::{MAX_AUTO_POINTS, RtAutoPoint, RtAutomation, RtControlClip};
 
     fn curve(points: &[(u32, f32)]) -> RtAutomation {
         let mut auto = RtAutomation {
@@ -170,13 +197,54 @@ mod tests {
     }
 
     #[test]
-    fn auto_track_defaults_to_one_bar_loop() {
-        let track = RtAutoTrack::default();
-        assert_eq!(track.loop_ticks, DEFAULT_AUTO_LOOP_TICKS);
-        assert_eq!(track.loop_ticks, 384);
+    fn control_clip_default_is_inactive() {
+        let clip = RtControlClip::default();
+        assert_eq!(clip.start_ticks, 0);
+        assert_eq!(
+            clip.span_ticks, 0,
+            "the default clip is inactive (an all-default table = empty track)"
+        );
+        assert_eq!(clip.loop_ticks, 384);
         assert!(
-            !track.curve.is_active(),
+            !clip.curve.is_active(),
             "default curve is empty (unrouted and has no anchors)"
+        );
+    }
+
+    #[test]
+    fn control_clip_delivers_only_inside_span() {
+        let mut clip = RtControlClip {
+            start_ticks: 384, // second bar
+            span_ticks: 384,
+            loop_ticks: 384,
+            curve: curve(&[(0, 1.0), (384, 0.0)]),
+        };
+        // Before the clip: nothing is delivered (D17).
+        assert!(clip.value_at_absolute(0.0).is_none());
+        assert!(clip.value_at_absolute(383.9).is_none());
+        // Inside: loop phase maps the curve.
+        assert!((clip.value_at_absolute(384.0).unwrap() - 1.0).abs() < 1e-6);
+        assert!((clip.value_at_absolute(576.0).unwrap() - 0.5).abs() < 1e-6);
+        // From the clip end on: nothing again.
+        assert!(clip.value_at_absolute(768.0).is_none());
+
+        clip.span_ticks = 0; // degenerate clip delivers nothing
+        assert!(clip.value_at_absolute(400.0).is_none());
+    }
+
+    #[test]
+    fn control_clip_tiles_curve_within_span() {
+        // span = 2 × loop: the same phase value repeats in the second period.
+        let clip = RtControlClip {
+            start_ticks: 0,
+            span_ticks: 768,
+            loop_ticks: 384,
+            curve: curve(&[(0, 1.0), (96, 0.5)]),
+        };
+        assert!((clip.value_at_absolute(48.0).unwrap() - 0.75).abs() < 1e-6);
+        assert!(
+            (clip.value_at_absolute(432.0).unwrap() - 0.75).abs() < 1e-6,
+            "second period should map the same phase"
         );
     }
 }
