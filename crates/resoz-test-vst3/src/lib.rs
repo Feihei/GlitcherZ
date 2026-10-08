@@ -1,28 +1,33 @@
 //! # resoz-test-vst3
 //!
-//! 测试用 VST3 插件集（cdylib fixture，仅供 `resoz-vst3-host` 的端到
-//! 端测试加载）。
+//! Test VST3 plugin set (cdylib fixture, loaded only by the end-to-end
+//! tests of `resoz-vst3-host`).
 //!
-//! 结构（VST3 双对象模型的最小实现）：
-//! - `SineFactory`：IPluginFactory(2) —— 枚举乐器 + 效果器两个类；
-//! - `SineComponent`：IPluginBase + IComponent + IAudioProcessor +
-//!   IConnectionPoint —— A4 正弦乐器，NoteOn 触发、NoteOff 停止；
-//! - `SineController`：IPluginBase + IEditController + IConnectionPoint
-//!   —— 单个 Gain 参数（id 1，默认 0.5）；
-//! - `GainEffectComponent`：立体声直通增益效果器（输出 = 输入 × 0.5，
-//!   无事件输入总线），控制器复用 `SineController`。
+//! Structure (a minimal implementation of the VST3 dual-object model):
+//! - `SineFactory`: IPluginFactory(2) — enumerates an instrument and an
+//!   effect class;
+//! - `SineComponent`: IPluginBase + IComponent + IAudioProcessor +
+//!   IConnectionPoint — an A4 sine instrument, triggered by NoteOn and
+//!   stopped by NoteOff;
+//! - `SineController`: IPluginBase + IEditController + IConnectionPoint
+//!   — a single Gain parameter (id 1, default 0.5);
+//! - `GainEffectComponent`: stereo passthrough gain effect
+//!   (output = input × 0.5, no event input bus); the controller reuses
+//!   `SineController`.
 //!
-//! 导出符号：`GetPluginFactory` / `InitDll` / `ExitDll`（Windows 单
-//! 文件模块约定）。
+//! Export symbols: `GetPluginFactory` / `InitDll` / `ExitDll` (Windows
+//! single-file module convention).
 //!
-//! CID 用字面量字节数组定义（ASCII "RESOZSINE" + 序号），宿主测试
-//! 按同样的十六进制字符串引用，避免端序歧义：
-//! - 乐器组件：`5245534f5a53494e4500000000000001`
-//! - 控制器：`5245534f5a53494e4500000000000002`
-//! - 效果器组件：`5245534f5a53494e4500000000000003`
+//! CIDs are defined as literal byte arrays (ASCII "RESOZSINE" + a
+//! sequence number); host tests reference the same hex strings to avoid
+//! endianness ambiguity:
+//! - Instrument component: `5245534f5a53494e4500000000000001`
+//! - Controller: `5245534f5a53494e4500000000000002`
+//! - Effect component: `5245534f5a53494e4500000000000003`
 
 #![allow(non_snake_case, non_upper_case_globals)]
-// COM 边界：vtable 签名由 SDK 绑定固定为 unsafe，插件实现同理。
+// COM boundary: vtable signatures are fixed as unsafe by the SDK bindings;
+// plugin implementations likewise.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
@@ -37,18 +42,18 @@ use vst3::Steinberg::{self, IPluginBaseTrait, TUID};
 use vst3::{Class, ComRef, ComWrapper};
 
 // ---------------------------------------------------------------------------
-// 常量
+// Constants
 // ---------------------------------------------------------------------------
 
-/// 组件 CID（"RESOZSINE" + 0x01）。
+/// Component CID ("RESOZSINE" + 0x01).
 const COMPONENT_CID: TUID = [
     0x52, 0x45, 0x53, 0x4F, 0x5A, 0x53, 0x49, 0x4E, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
 ];
-/// 控制器 CID（"RESOZSINE" + 0x02）。
+/// Controller CID ("RESOZSINE" + 0x02).
 const CONTROLLER_CID: TUID = [
     0x52, 0x45, 0x53, 0x4F, 0x5A, 0x53, 0x49, 0x4E, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
 ];
-/// 效果器组件 CID（"RESOZSINE" + 0x03）。
+/// Effect component CID ("RESOZSINE" + 0x03).
 const EFFECT_COMPONENT_CID: TUID = [
     0x52, 0x45, 0x53, 0x4F, 0x5A, 0x53, 0x49, 0x4E, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
 ];
@@ -57,18 +62,18 @@ const PLUGIN_NAME: &str = "ResoZ Sine VST3";
 const EFFECT_NAME: &str = "ResoZ Gain VST3";
 const VENDOR: &str = "ResoZ";
 
-/// A4 频率（与内置引擎测试约定一致）。
+/// A4 frequency (consistent with the built-in engine test convention).
 const SINE_FREQ_HZ: f32 = 440.0;
 
-/// 复用 sample_rate（宿主 setupProcessing 传入；简化实现忽略，
-/// 测试固定 48 kHz）。
+/// Reuses sample_rate (passed in by the host's setupProcessing; the
+/// simplified implementation ignores it, tests fix it at 48 kHz).
 const SAMPLE_RATE: f32 = 48_000.0;
 
 // ---------------------------------------------------------------------------
-// 工具
+// Utilities
 // ---------------------------------------------------------------------------
 
-/// 把字符串填进 NUL 结尾的定长 char8 字段。
+/// Fills a string into a NUL-terminated fixed-length char8 field.
 fn c_field<const N: usize>(text: &str) -> [Steinberg::char8; N] {
     let mut out = [0 as Steinberg::char8; N];
     for (index, byte) in text.bytes().take(N - 1).enumerate() {
@@ -77,7 +82,7 @@ fn c_field<const N: usize>(text: &str) -> [Steinberg::char8; N] {
     out
 }
 
-/// 把字符串填进 NUL 结尾的定长 TChar（UTF-16）字段。
+/// Fills a string into a NUL-terminated fixed-length TChar (UTF-16) field.
 fn utf16_field<const N: usize>(text: &str) -> [Steinberg::char16; N] {
     let mut out = [0u16; N];
     for (index, unit) in text.encode_utf16().take(N - 1).enumerate() {
@@ -86,7 +91,7 @@ fn utf16_field<const N: usize>(text: &str) -> [Steinberg::char16; N] {
     out
 }
 
-/// 原子存取 f32（velocity/phase 的简化载体）。
+/// Atomic access to f32 (simplified carrier for velocity/phase).
 fn f32_bits_cell(value: &AtomicU32) -> f32 {
     f32::from_bits(value.load(Ordering::Relaxed))
 }
@@ -96,10 +101,10 @@ fn set_f32_bits_cell(cell: &AtomicU32, value: f32) {
 }
 
 // ---------------------------------------------------------------------------
-// 工厂
+// Factory
 // ---------------------------------------------------------------------------
 
-/// 单插件工厂。
+/// Single-plugin factory.
 struct SineFactory;
 
 impl Class for SineFactory {
@@ -112,7 +117,7 @@ impl Class for SineFactory {
 
 impl Steinberg::IPluginFactoryTrait for SineFactory {
     unsafe fn getFactoryInfo(&self, info: *mut Steinberg::PFactoryInfo) -> Steinberg::tresult {
-        // SAFETY: 宿主按规范提供可写 PFactoryInfo。
+        // SAFETY: The host provides a writable PFactoryInfo per spec.
         unsafe {
             *info = Steinberg::PFactoryInfo {
                 vendor: c_field::<64>(VENDOR),
@@ -133,7 +138,7 @@ impl Steinberg::IPluginFactoryTrait for SineFactory {
         index: Steinberg::int32,
         info: *mut Steinberg::PClassInfo,
     ) -> Steinberg::tresult {
-        // SAFETY: 宿主按规范提供可写 PClassInfo。
+        // SAFETY: The host provides a writable PClassInfo per spec.
         unsafe {
             *info = match index {
                 0 => Steinberg::PClassInfo {
@@ -160,8 +165,9 @@ impl Steinberg::IPluginFactoryTrait for SineFactory {
         _iid: Steinberg::FIDString,
         obj: *mut *mut c_void,
     ) -> Steinberg::tresult {
-        // SAFETY: cid 指向宿主提供的 16 字节 CID；返回 +1 引用计数的
-        // 接口指针（to_com_ptr），归宿主所有。
+        // SAFETY: cid points to the host-provided 16-byte CID; returns an
+        // interface pointer with a +1 reference count (to_com_ptr), owned
+        // by the host.
         unsafe {
             let requested: [u8; 16] = std::slice::from_raw_parts(cid as *const u8, 16)
                 .try_into()
@@ -215,7 +221,7 @@ impl Steinberg::IPluginFactory2Trait for SineFactory {
             1 => (EFFECT_COMPONENT_CID, EFFECT_NAME, "Fx|Stereo"),
             _ => return Steinberg::kInvalidArgument,
         };
-        // SAFETY: 宿主按规范提供可写 PClassInfo2。
+        // SAFETY: The host provides a writable PClassInfo2 per spec.
         unsafe {
             *info = Steinberg::PClassInfo2 {
                 cid,
@@ -248,10 +254,11 @@ impl Steinberg::IPluginFactory3Trait for SineFactory {
 }
 
 // ---------------------------------------------------------------------------
-// 组件（IComponent + IAudioProcessor）
+// Component (IComponent + IAudioProcessor)
 // ---------------------------------------------------------------------------
 
-/// A4 正弦乐器组件：NoteOn 触发、NoteOff 静音，单声部、立体声输出。
+/// A4 sine instrument component: triggered by NoteOn, silenced by NoteOff;
+/// single voice, stereo output.
 struct SineComponent {
     note_on: AtomicBool,
     velocity_bits: AtomicU32,
@@ -289,7 +296,7 @@ impl IPluginBaseTrait for SineComponent {
 
 impl IComponentTrait for SineComponent {
     unsafe fn getControllerClassId(&self, classId: *mut TUID) -> Steinberg::tresult {
-        // SAFETY: 宿主提供可写 TUID。
+        // SAFETY: The host provides a writable TUID.
         unsafe {
             *classId = CONTROLLER_CID;
         }
@@ -322,7 +329,7 @@ impl IComponentTrait for SineComponent {
         if index != 0 {
             return Steinberg::kInvalidArgument;
         }
-        // SAFETY: 宿主提供可写 BusInfo。
+        // SAFETY: The host provides a writable BusInfo.
         unsafe {
             *bus = Vst::BusInfo {
                 mediaType: r#type,
@@ -381,11 +388,11 @@ impl IAudioProcessorTrait for SineComponent {
         outputs: *mut Vst::SpeakerArrangement,
         numOuts: Steinberg::int32,
     ) -> Steinberg::tresult {
-        // 只接受 0 入 / 1 出（立体声）。
+        // Only accept 0 in / 1 out (stereo).
         const K_STEREO: Vst::SpeakerArrangement = 3; // L|R
         if numIns == 0
             && numOuts == 1
-            // SAFETY: 宿主按规范提供 numOuts 个可读元素。
+            // SAFETY: The host provides numOuts readable elements per spec.
             && unsafe { *outputs } == K_STEREO
         {
             return Steinberg::kResultTrue;
@@ -422,14 +429,15 @@ impl IAudioProcessorTrait for SineComponent {
     }
 
     unsafe fn setProcessing(&self, _state: Steinberg::TBool) -> Steinberg::tresult {
-        // 进入/退出处理态时复位相位，保证测试确定性。
+        // Reset the phase when entering/leaving the processing state to
+        // keep tests deterministic.
         self.phase_bits.store(0.0_f32.to_bits(), Ordering::Relaxed);
         Steinberg::kResultOk
     }
 
     unsafe fn process(&self, data: *mut Vst::ProcessData) -> Steinberg::tresult {
-        // SAFETY: 宿主按规范填充 ProcessData；输出指针在 numSamples
-        // 范围内可写。
+        // SAFETY: The host fills ProcessData per spec; output pointers are
+        // writable within numSamples.
         unsafe {
             let data = &mut *data;
             if data.numOutputs < 1
@@ -443,7 +451,7 @@ impl IAudioProcessorTrait for SineComponent {
             let channels = (bus.numChannels.max(0) as usize).min(2);
             bus.silenceFlags = 0;
 
-            // 消费宿主事件（NoteOn/NoteOff）。
+            // Consume host events (NoteOn/NoteOff).
             if !data.inputEvents.is_null() {
                 if let Some(events) = ComRef::<Vst::IEventList>::from_raw(data.inputEvents) {
                     let count = events.getEventCount();
@@ -455,7 +463,8 @@ impl IAudioProcessorTrait for SineComponent {
                                     let note_on = &event.__field0.noteOn;
                                     self.note_on.store(true, Ordering::Relaxed);
                                     set_f32_bits_cell(&self.velocity_bits, note_on.velocity);
-                                    // 复位相位保证测试确定性。
+                                    // Reset the phase to keep tests
+                                    // deterministic.
                                     self.phase_bits.store(0.0_f32.to_bits(), Ordering::Relaxed);
                                 }
                                 Vst::Event_::EventTypes_::kNoteOffEvent => {
@@ -517,11 +526,12 @@ impl IConnectionPointTrait for SineComponent {
 }
 
 // ---------------------------------------------------------------------------
-// 增益效果器组件（立体声直通 ×0.5，无事件输入）
+// Gain effect component (stereo passthrough ×0.5, no event input)
 // ---------------------------------------------------------------------------
 
-/// 立体声直通增益效果器：输出 = 输入 × 0.5（固定增益，供宿主端到端
-/// 测试断言输入通路）。控制器复用 `SineController`。
+/// Stereo passthrough gain effect: output = input × 0.5 (fixed gain, used
+/// by host end-to-end tests to assert the input path). The controller
+/// reuses `SineController`.
 struct GainEffectComponent;
 
 impl Class for GainEffectComponent {
@@ -545,7 +555,7 @@ impl IPluginBaseTrait for GainEffectComponent {
 
 impl IComponentTrait for GainEffectComponent {
     unsafe fn getControllerClassId(&self, classId: *mut TUID) -> Steinberg::tresult {
-        // SAFETY: 宿主提供可写 TUID。
+        // SAFETY: The host provides a writable TUID.
         unsafe {
             *classId = CONTROLLER_CID;
         }
@@ -578,7 +588,7 @@ impl IComponentTrait for GainEffectComponent {
         if index != 0 || r#type != Vst::MediaTypes_::kAudio {
             return Steinberg::kInvalidArgument;
         }
-        // SAFETY: 宿主提供可写 BusInfo。
+        // SAFETY: The host provides a writable BusInfo.
         unsafe {
             *bus = Vst::BusInfo {
                 mediaType: r#type,
@@ -634,11 +644,12 @@ impl IAudioProcessorTrait for GainEffectComponent {
         outputs: *mut Vst::SpeakerArrangement,
         numOuts: Steinberg::int32,
     ) -> Steinberg::tresult {
-        // 只接受 1 入 / 1 出（立体声）。
+        // Only accept 1 in / 1 out (stereo).
         const K_STEREO: Vst::SpeakerArrangement = 3; // L|R
         if numIns == 1
             && numOuts == 1
-            // SAFETY: 宿主按规范提供对应数量的可读元素。
+            // SAFETY: The host provides the corresponding number of
+            // readable elements per spec.
             && unsafe { *inputs } == K_STEREO
             && unsafe { *outputs } == K_STEREO
         {
@@ -684,7 +695,8 @@ impl IAudioProcessorTrait for GainEffectComponent {
     }
 
     unsafe fn process(&self, data: *mut Vst::ProcessData) -> Steinberg::tresult {
-        // SAFETY: 宿主按规范填充 ProcessData；输入可读、输出可写。
+        // SAFETY: The host fills ProcessData per spec; input readable,
+        // output writable.
         unsafe {
             let data = &mut *data;
             if data.numOutputs < 1
@@ -703,7 +715,8 @@ impl IAudioProcessorTrait for GainEffectComponent {
             let out_channels = (output.numChannels.max(0) as usize).min(2);
             for channel in 0..out_channels {
                 let out_base = *output.__field0.channelBuffers32.add(channel);
-                // 输出声道映射到输入声道（不足时复用最后一个输入声道）。
+                // Output channels map to input channels (reuse the last
+                // input channel when insufficient).
                 let in_channel = if in_channels == 0 {
                     0
                 } else if channel < in_channels {
@@ -736,10 +749,10 @@ impl IConnectionPointTrait for GainEffectComponent {
 }
 
 // ---------------------------------------------------------------------------
-// 控制器（IEditController，哑实现）
+// Controller (IEditController, dumb implementation)
 // ---------------------------------------------------------------------------
 
-/// 零参数哑控制器。
+/// Zero-parameter dumb controller.
 struct SineController;
 
 impl Class for SineController {
@@ -785,7 +798,8 @@ impl IEditControllerTrait for SineController {
         if paramIndex != 0 {
             return Steinberg::kInvalidArgument;
         }
-        // SAFETY: 宿主保证 info 指向可写的 ParameterInfo。
+        // SAFETY: The host guarantees info points to a writable
+        // ParameterInfo.
         unsafe {
             (*info) = Vst::ParameterInfo {
                 id: 1,
@@ -874,12 +888,12 @@ impl IConnectionPointTrait for SineController {
 }
 
 // ---------------------------------------------------------------------------
-// 模块入口（Windows 单文件模块约定）
+// Module entry points (Windows single-file module convention)
 // ---------------------------------------------------------------------------
 
 static FACTORY: OnceLock<ComWrapper<SineFactory>> = OnceLock::new();
 
-/// VST3 模块入口：返回 +1 引用计数的工厂指针。
+/// VST3 module entry: returns a factory pointer with a +1 reference count.
 #[unsafe(no_mangle)]
 pub extern "system" fn GetPluginFactory() -> *mut c_void {
     let factory = FACTORY.get_or_init(|| ComWrapper::new(SineFactory));
@@ -889,13 +903,15 @@ pub extern "system" fn GetPluginFactory() -> *mut c_void {
     }
 }
 
-/// Windows SDK 约定的模块初始化（简化实现：无全局状态）。
+/// Windows SDK convention module initialization (simplified: no global
+/// state).
 #[unsafe(no_mangle)]
 pub extern "system" fn InitDll() -> i32 {
     1
 }
 
-/// Windows SDK 约定的模块反初始化（工厂静态存活到进程退出）。
+/// Windows SDK convention module deinitialization (the factory lives
+/// statically until process exit).
 #[unsafe(no_mangle)]
 pub extern "system" fn ExitDll() -> i32 {
     0

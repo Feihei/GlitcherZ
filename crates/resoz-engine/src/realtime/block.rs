@@ -1,4 +1,4 @@
-//! 固定块处理调度：cpal 回调 ↔ 混音器的桥梁。
+//! Fixed-block processing dispatch: bridge between the cpal callback and the mixer.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -12,29 +12,29 @@ use crate::realtime::graph::{GraphLevels, GraphUpdate, RtGraph};
 use crate::realtime::sequencer::Sequencer;
 use crate::realtime::voice::RecycledNode;
 
-/// 引擎 → UI 的状态回传句柄：与 [`BlockRunner`] 共享的一组原子量。
+/// Engine → UI state feedback handle: a set of atomics shared with [`BlockRunner`].
 ///
-/// `BlockRunner` 在每个块边界写入，[`crate::engine::AudioEngine`] 持有
-/// 克隆副本供 UI 读取。
+/// `BlockRunner` writes at every block boundary; [`crate::engine::AudioEngine`]
+/// holds a clone for the UI to read.
 #[derive(Clone)]
 pub struct Feedback {
-    /// 主输出最近块峰值电平。
+    /// Peak level of the master output in the most recent block.
     pub level: Arc<AtomicF32>,
-    /// 播放位置（流启动以来的样本数）。
+    /// Playback position (samples since the stream started).
     pub position: Arc<AtomicU64>,
-    /// 音序器当前步进索引。
+    /// Sequencer's current step index.
     pub step: Arc<AtomicU32>,
-    /// 音序器走带状态。
+    /// Sequencer transport state.
     pub playing: Arc<AtomicBool>,
-    /// 音序器音乐位置（tick，自播放起点累计）。
+    /// Sequencer musical position (ticks, accumulated from the play start).
     pub position_ticks: Arc<AtomicF32>,
-    /// 各轨道 post-fader 峰值电平（定容 [`crate::realtime::MAX_MIDI_TRACKS`]，
-    /// 未配置轨恒为 0）。
+    /// Per-track post-fader peak levels (fixed capacity
+    /// [`crate::realtime::MAX_MIDI_TRACKS`], unconfigured tracks always 0).
     pub track_levels: [Arc<AtomicF32>; crate::realtime::MAX_MIDI_TRACKS],
 }
 
 impl Feedback {
-    /// 全零初始值。**非 RT-safe**，在启动音频流前调用。
+    /// All-zero initial value. **Not RT-safe**; call before starting the audio stream.
     pub fn new() -> Self {
         Self {
             level: Arc::new(AtomicF32::new(0.0)),
@@ -53,17 +53,25 @@ impl Default for Feedback {
     }
 }
 
-/// 把宿主（cpal）交来的任意长度交错缓冲区拆成固定块交给节点图执行，
-/// 再交错写回。实例在音频流启动前构造，随后 move 进音频回调线程，
-/// 其生命周期内独占音频线程。
+/// Splits the arbitrarily long interleaved buffer handed over by the host
+/// (cpal) into fixed blocks for the node graph to execute, then interleaves
+/// and writes back. Instances are constructed before the audio stream starts,
+/// then moved into the audio callback thread,
+/// exclusively owning the audio thread for their lifetime.
 ///
-/// 每个固定块的执行顺序（`run_next_block`）：
-/// 1. **块边界**消费全部待处理命令（队列空则立即返回）；
-/// 2. 应用结构更新（换计划 / 装卸节点，回收经回执队列）；
-/// 3. 音序器按采样时钟调度，到期音符事件按图的 MIDI 连线表扇出；
-/// 4. 自动化轨道求值（仅播放中），经自动化连线表投递目标参数；
-/// 5. 节点图按预编译拓扑序处理一个块（求和入边 → 原地处理）；
-/// 6. 回传峰值电平、播放位置、音序器步进与走带状态（原子量）。
+/// Execution order for each fixed block (`run_next_block`):
+/// 1. At the **block boundary**, consume all pending commands (return
+///    immediately if the queue is empty);
+/// 2. Apply structure updates (swap plans / attach-detach nodes, recycling via
+///    the receipt queue);
+/// 3. The sequencer schedules on the sample clock; due note events fan out
+///    along the graph's MIDI routing table;
+/// 4. Automation tracks are evaluated (only while playing), delivering target
+///    parameters via the automation routing table;
+/// 5. The node graph processes one block in precompiled topological order
+///    (sum inputs → process in place);
+/// 6. Report peak level, playback position, sequencer step, and transport
+///    state (atomics).
 pub struct BlockRunner {
     fixed_block: usize,
     out_channels: usize,
@@ -79,8 +87,10 @@ pub struct BlockRunner {
 }
 
 impl BlockRunner {
-    /// 构造。**非 RT-safe**（分配缓冲），必须在启动音频流前调用。
-    // 参数均为启动期一次性接线的队列端点/句柄，打包收益有限。
+    /// Constructs. **Not RT-safe** (allocates buffers); must be called before
+    /// starting the audio stream.
+    // All parameters are queue endpoints/handles wired once at startup; little
+    // benefit from bundling them.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         fixed_block: usize,
@@ -112,10 +122,12 @@ impl BlockRunner {
         }
     }
 
-    /// 渲染宿主给出的交错输出缓冲区。**RT-safe**（cpal 数据回调直接调用）。
+    /// Renders the interleaved output buffer provided by the host. **RT-safe**
+    /// (called directly from the cpal data callback).
     ///
-    /// 声道映射：源为立体声（L/R）；输出第 0/1 声道取 L/R，其余声道静音；
-    /// 单声道输出取 L。
+    /// Channel mapping: the source is stereo (L/R); output channels 0/1 take
+    /// L/R, remaining channels are silent;
+    /// mono output takes L.
     pub fn render_interleaved(&mut self, out: &mut [f32]) {
         for frame in out.chunks_mut(self.out_channels) {
             if self.scratch_pos >= self.graph_block_len() {
@@ -134,17 +146,18 @@ impl BlockRunner {
         }
     }
 
-    /// 当前主缓冲活动长度。
+    /// Active length of the current master buffer.
     fn graph_block_len(&self) -> usize {
         self.graph
             .master_channel(0)
             .map_or(0, |channel| channel.len())
     }
 
-    /// 执行一个固定块。只应在 [`BlockRunner::render_interleaved`] 内调用。
+    /// Executes one fixed block. Should only be called within [`BlockRunner::render_interleaved`].
     fn run_next_block(&mut self) {
-        // 1. 块边界：消费所有待处理命令与结构更新
-        //    （无锁队列，空则立即返回；换图零分配）。
+        // 1. Block boundary: consume all pending commands and structure updates
+        //    (lock-free queues, return immediately if empty; swapping graphs is
+        //    zero-allocation).
         while let Ok(cmd) = self.commands.pop() {
             self.apply_command(cmd);
         }
@@ -152,7 +165,7 @@ impl BlockRunner {
             self.graph.apply_update(update, &mut self.recycle);
         }
 
-        // 2. 本块上下文（供音序器与混音器共用）。
+        // 2. This block's context (shared by the sequencer and the mixer).
         let frames = self.fixed_block;
         let ctx = ProcessContext {
             sample_rate: self.sample_rate,
@@ -160,9 +173,11 @@ impl BlockRunner {
             playback_sample_pos: self.played_samples,
         };
 
-        // 3. 音序器调度：到期音符事件按图的 MIDI 连线表扇出到目标
-        //    乐器节点（块边界精度）。拆字段借用，让 sequencer 与 graph
-        //    同时可变。自动化取本块起始位置（块内音频以起点近似）。
+        // 3. Sequencer scheduling: due note events fan out along the graph's
+        //    MIDI routing table to the target instrument nodes (block-boundary
+        //    precision). Split field borrows so sequencer and graph can be
+        //    mutable at the same time. Automation uses the block's start
+        //    position (audio within the block approximated by the start).
         let position_before = self.sequencer.position_ticks();
         let Self {
             sequencer, graph, ..
@@ -171,18 +186,19 @@ impl BlockRunner {
             graph.track_note(track, event);
         });
 
-        // 4. 自动化轨道求值（仅播放中）：各轨道按自带循环长度取模采样
-        //    曲线，经节点图的自动化连线表投递（曲线不含目标，D7）；
-        //    停止时最后一次手动值保持生效（由 UI 在走带停止沿重推手动
-        //    参数）。
+        // 4. Automation track evaluation (only while playing): each track
+        //    samples its curve modulo its own loop length, delivered via the
+        //    node graph's automation routing table (curves carry no target, D7);
+        //    when stopped, the last manual value stays in effect (the UI
+        //    re-pushes manual parameters on the transport stop edge).
         if self.sequencer.is_playing() {
             self.evaluate_automation(position_before);
         }
 
-        // 5. 节点图处理一个块（拓扑序：求和入边 → 原地处理 → 主输出）。
+        // 5. The node graph processes one block (topological order: sum inputs → process in place → master output).
         let levels: GraphLevels = self.graph.process_block(&ctx);
 
-        // 6. 状态回传。
+        // 6. State feedback.
         self.feedback.level.store(levels.master);
         for (slot, value) in self.feedback.track_levels.iter().zip(levels.tracks) {
             slot.store(value);
@@ -204,8 +220,9 @@ impl BlockRunner {
         self.scratch_pos = 0;
     }
 
-    /// 采样并应用全部自动化轨道的曲线：各轨道按自带 `loop_ticks` 取模
-    /// （`0` = 跟随全局走带位置），投递终点由图的连线表决定。RT-safe。
+    /// Samples and applies all automation tracks' curves: each track is reduced
+    /// modulo its own `loop_ticks` (`0` = follow the global transport position);
+    /// the delivery endpoint is determined by the graph's routing table. RT-safe.
     fn evaluate_automation(&mut self, position_ticks: f64) {
         for (index, auto) in self.sequencer.auto_tracks().iter().enumerate() {
             let tick = if auto.loop_ticks > 0 {
@@ -222,7 +239,8 @@ impl BlockRunner {
     fn apply_command(&mut self, cmd: EngineCommand) {
         match cmd {
             EngineCommand::SetParam { id, value } => {
-                // 未被识别的参数静默丢弃（发送方负责只发送有效参数）。
+                // Unrecognized parameters are silently dropped (the sender is
+                // responsible for sending only valid parameters).
                 let _ = self.graph.master_set_param(id, value);
             }
             EngineCommand::SetTrackParam { track, id, value } => {
@@ -242,7 +260,8 @@ impl BlockRunner {
         match cmd {
             SequencerCommand::Play => {
                 self.sequencer.play();
-                // 清掉可能仍按住的手动音符，避免与音序声部叠加。
+                // Clear any manual notes that may still be held, avoiding
+                // overlap with sequencer voices.
                 self.graph.note_off_all();
             }
             SequencerCommand::Stop => {
@@ -269,7 +288,8 @@ impl BlockRunner {
         }
     }
 
-    /// 读取主缓冲中 `(声道, 位置)` 的样本；越界一律静音（不 panic）。
+    /// Reads the sample at `(channel, position)` from the master buffer;
+    /// out-of-range is always silent (no panic).
     fn sample_at(&self, ch: usize, pos: usize) -> f32 {
         self.graph
             .master_channel(ch)
@@ -299,7 +319,8 @@ mod tests {
 
     const SR: f32 = 44_100.0;
 
-    /// 测试台架：返回 (runner, 命令发送端, 结构更新发送端, 状态回传句柄, 图编译器)。
+    /// Test harness: returns (runner, command sender, structure update sender,
+    /// feedback handle, graph compiler).
     fn make_runner(
         fixed_block: usize,
         out_channels: usize,
@@ -330,7 +351,7 @@ mod tests {
         (runner, tx, graph_tx, feedback, compiler)
     }
 
-    /// 向轨道 0 触发 A4 音符（队列在下一个块边界被消费）。
+    /// Fires an A4 note on track 0 (queue consumed at the next block boundary).
     fn note_on_69(tx: &mut Producer<EngineCommand>) {
         tx.push(EngineCommand::Note {
             track: 0,
@@ -339,14 +360,15 @@ mod tests {
                 velocity: 1.0,
             },
         })
-        .expect("队列未满");
+        .expect("queue not full");
     }
 
     #[test]
     fn phase_continuity_across_arbitrary_host_blocks() {
         let (mut runner, mut tx, _voice_tx, _feedback, _compiler) = make_runner(128, 2);
         note_on_69(&mut tx);
-        // 用不整除固定块（377）的宿主缓冲渲染约 1 秒，验证拆块不破坏相位。
+        // Render about 1 second with host buffers not divisible by the fixed
+        // block (377), verifying block splitting does not break phase.
         let total_frames = 44_100usize;
         let mut interleaved = vec![0.0f32; total_frames * 2];
         let mut rendered = 0;
@@ -367,16 +389,22 @@ mod tests {
     fn channels_beyond_two_are_silent() {
         let (mut runner, mut tx, _voice_tx, _feedback, _compiler) = make_runner(128, 4);
         note_on_69(&mut tx);
-        let mut out = vec![7.0f32; 256 * 4]; // 预填非零，验证被覆盖/清零
+        let mut out = vec![7.0f32; 256 * 4]; // pre-filled non-zero, verifying it is overwritten/zeroed
         runner.render_interleaved(&mut out);
 
         let frame = |i: usize| (out[i * 4], out[i * 4 + 1], out[i * 4 + 2], out[i * 4 + 3]);
         let (l, r, c2, c3) = frame(10);
-        assert!(c2.abs() < 1e-12 && c3.abs() < 1e-12, "额外声道应为静音");
-        assert!((l - r).abs() < 1e-9, "单声道源下 L/R 内容一致");
+        assert!(
+            c2.abs() < 1e-12 && c3.abs() < 1e-12,
+            "extra channels must be silent"
+        );
+        assert!(
+            (l - r).abs() < 1e-9,
+            "L/R content should match for a mono source"
+        );
         assert!(
             l.abs() > 0.01 || out.iter().any(|s| s.abs() > 0.01),
-            "应有非静音输出"
+            "there should be non-silent output"
         );
     }
 
@@ -386,7 +414,10 @@ mod tests {
         note_on_69(&mut tx);
         let mut out = vec![0.0f32; 256];
         runner.render_interleaved(&mut out);
-        assert!(out.iter().any(|s| s.abs() > 0.01), "应有非静音输出");
+        assert!(
+            out.iter().any(|s| s.abs() > 0.01),
+            "there should be non-silent output"
+        );
     }
 
     #[test]
@@ -402,10 +433,11 @@ mod tests {
             id: ParamId::SineFrequency,
             value: 880.0,
         })
-        .expect("队列未满");
+        .expect("queue not full");
         runner.render_interleaved(&mut out[half_frames * 2..]);
 
-        // 后半段（0.75 s）应为 880 Hz → 660 次正向过零（±4 含过渡块误差）。
+        // Second half (0.75 s) should be 880 Hz → 660 positive zero crossings
+        // (±4 for transition-block error).
         let second_half: Vec<f32> = out[half_frames * 2..].iter().copied().step_by(2).collect();
         let crossings = count_positive_crossings(&second_half);
         assert!(
@@ -421,10 +453,17 @@ mod tests {
         let mut out = vec![0.0f32; 300 * 2];
         runner.render_interleaved(&mut out);
 
-        // 300 帧 → 消费 3 个块；position 为当前正在缓冲的块起点（第 3 块 = 256）。
+        // 300 frames → consumes 3 blocks; position is the start of the block
+        // currently being buffered (block 3 = 256).
         assert_eq!(feedback.position.load(Ordering::Relaxed), 256);
-        assert!(feedback.level.load() > 0.0, "有信号输出时峰值电平应为正");
-        assert!(feedback.track_levels[0].load() > 0.0, "轨道 0 电平应为正");
+        assert!(
+            feedback.level.load() > 0.0,
+            "peak level must be positive when signal is output"
+        );
+        assert!(
+            feedback.track_levels[0].load() > 0.0,
+            "track 0 level must be positive"
+        );
     }
 
     #[test]
@@ -438,12 +477,12 @@ mod tests {
             track: 0,
             event: NoteEvent::Off { note: 69 },
         })
-        .expect("队列未满");
-        runner.render_interleaved(&mut out); // release 0.2 s + 余量
+        .expect("queue not full");
+        runner.render_interleaved(&mut out); // release 0.2 s + margin
 
         assert!(
             feedback.level.load() < 0.02,
-            "NoteOff 后输出应衰减至静音，实际 {}",
+            "output should decay to silence after NoteOff, got {}",
             feedback.level.load()
         );
     }
@@ -453,15 +492,19 @@ mod tests {
         let (mut runner, _tx, _voice_tx, feedback, _compiler) = make_runner(128, 2);
         let mut out = vec![0.0f32; 1024 * 2];
         runner.render_interleaved(&mut out);
-        assert!(feedback.level.load() < 1e-9, "未触发音符时应为静音");
+        assert!(
+            feedback.level.load() < 1e-9,
+            "should be silent when no note is triggered"
+        );
     }
 
-    /// 音序器端到端：命令队列下发模式与走带 → 合成器发声 → 状态回传。
+    /// Sequencer end-to-end: command queue sends pattern and transport →
+    /// synthesizer sounds → state feedback.
     #[test]
     fn sequencer_drives_synth_through_command_queue() {
         let (mut runner, mut tx, _voice_tx, feedback, _compiler) = make_runner(128, 2);
 
-        // 模式：轨道 0 步 0/2/4 触发 A4；BPM 240。
+        // Pattern: track 0 steps 0/2/4 fire A4; BPM 240.
         let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
         for i in [0usize, 2, 4] {
             pattern[i] = SequencerStep {
@@ -474,31 +517,35 @@ mod tests {
             track: 0,
             steps: pattern,
         }))
-        .expect("队列未满");
+        .expect("queue not full");
         tx.push(EngineCommand::Sequencer(SequencerCommand::SetBpm(240.0)))
-            .expect("队列未满");
+            .expect("queue not full");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
-            .expect("队列未满");
+            .expect("queue not full");
 
-        let mut out = vec![0.0f32; 44_100]; // 1 s，单声道即可
+        let mut out = vec![0.0f32; 44_100]; // 1 s, mono is fine
         runner.render_interleaved(&mut out);
 
-        assert!(feedback.playing.load(Ordering::Relaxed), "应处于播放状态");
-        // 直接验证音频内容（level 原子量只反映最后一个块，结尾可能恰逢
-        // 新音符从零相位起音，不适合做"是否发声"的判据）。
+        assert!(
+            feedback.playing.load(Ordering::Relaxed),
+            "should be playing"
+        );
+        // Verify the audio content directly (the level atomic only reflects the
+        // last block; the end may coincide with a new note attacking from zero
+        // phase, making it a poor "is it sounding" criterion).
         let audio_peak = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
         assert!(
             audio_peak > 0.05,
-            "音序器触发后应有可闻输出，峰值 {audio_peak}"
+            "there should be audible output after the sequencer fires, peak {audio_peak}"
         );
 
-        // 停止 → 走带状态回传翻转为 false。
+        // Stop → transport state feedback flips to false.
         tx.push(EngineCommand::Sequencer(SequencerCommand::Stop))
-            .expect("队列未满");
+            .expect("queue not full");
         runner.render_interleaved(&mut out);
         assert!(
             !feedback.playing.load(Ordering::Relaxed),
-            "停止后应不再是播放状态"
+            "should no longer be playing after stopping"
         );
         assert!(feedback.step.load(Ordering::Relaxed) < PATTERN_STEPS as u32);
     }
@@ -516,20 +563,24 @@ mod tests {
             track: 0,
             steps: pattern,
         }))
-        .expect("队列未满");
+        .expect("queue not full");
         let mut out = vec![0.0f32; 22_050];
         runner.render_interleaved(&mut out);
-        assert!(feedback.level.load() < 1e-9, "未按播放时音序器不应发声");
+        assert!(
+            feedback.level.load() < 1e-9,
+            "the sequencer should not sound when play is not pressed"
+        );
     }
 
     #[test]
     fn automation_drives_track_gain_during_playback() {
         let (mut runner, mut tx, mut structure_tx, feedback, mut compiler) = make_runner(128, 2);
-        // 增益曲线：tick 0 = 1.0 → tick 96 = 0.0（120 BPM / 44.1 kHz ≈ 0.5 s）。
-        // 自动化轨道 0（自带一小节循环）连到轨道 0 通道条增益（node_id 寻址）。
+        // Gain curve: tick 0 = 1.0 → tick 96 = 0.0 (120 BPM / 44.1 kHz ≈ 0.5 s).
+        // Automation track 0 (with its own one-bar loop) connects to track 0's
+        // channel strip gain (addressed by node_id).
         let channel_id = compiler
             .track_channel_node_id(0)
-            .expect("通道条 node_id 应存在");
+            .expect("channel strip node_id should exist");
         let mut curve = RtAutomation {
             enabled: true,
             ..RtAutomation::default()
@@ -549,14 +600,14 @@ mod tests {
                 curve,
             },
         }))
-        .expect("队列未满");
+        .expect("queue not full");
         let update = compiler
             .set_auto_route(0, channel_id, ParamId::TrackGain)
-            .expect("自动化连线应成功");
-        structure_tx.push(update).expect("结构队列未满");
+            .expect("automation routing should succeed");
+        structure_tx.push(update).expect("structure queue not full");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
-            .expect("队列未满");
-        // 注意：Play 会清理手动音符，故音符事件需在 Play 之后入队。
+            .expect("queue not full");
+        // Note: Play clears manual notes, so note events must be enqueued after Play.
         note_on_69(&mut tx);
 
         let mut chunk = vec![0.0f32; 4410 * 2]; // 0.1 s
@@ -567,10 +618,10 @@ mod tests {
         }
         assert!(
             early_max > 0.3,
-            "自动化起点附近增益 ≈ 1，应有较大电平：{early_max}"
+            "gain ≈ 1 near the automation start, level should be large: {early_max}"
         );
 
-        // 中间 0.3 s 忽略（曲线衰减段），之后增益已归零。
+        // Skip the middle 0.3 s (curve decay segment); afterwards the gain has reached zero.
         for _ in 0..3 {
             runner.render_interleaved(&mut chunk);
         }
@@ -581,12 +632,13 @@ mod tests {
         }
         assert!(
             late_max < 0.02,
-            "0.5 s 后自动化增益归零，电平应近静音：{late_max}"
+            "after 0.5 s the automation gain reaches zero, level should be near-silent: {late_max}"
         );
     }
 
-    /// 测试用外部声源：把最后收到的插件参数值作为直流电平写入缓冲，
-    /// 便于观测参数桥接是否生效。
+    /// Test external sound source: writes the last received plugin parameter
+    /// value into the buffer as a DC level, making it easy to observe whether
+    /// parameter bridging works.
     struct ParamEcho {
         value: f32,
     }
@@ -618,38 +670,42 @@ mod tests {
     fn voice_swap_and_automation_bridge_to_plugin_params() {
         let (mut runner, mut tx, mut structure_tx, feedback, mut compiler) = make_runner(128, 2);
 
-        // 1. 换装外部声源（模拟 CLAP 乐器节点）：初始参数 0 → 静音。
+        // 1. Swap in the external sound source (simulating a CLAP instrument
+        // node): initial parameter 0 → silence.
         let (update, _id) = match compiler.set_voice(0, Box::new(ParamEcho { value: 0.0 })) {
             Ok(pair) => pair,
-            Err(_) => panic!("换装外部声源"),
+            Err(_) => panic!("swap in external sound source"),
         };
-        structure_tx.push(update).expect("结构队列未满");
+        structure_tx.push(update).expect("structure queue not full");
         let mut chunk = vec![0.0f32; 1024 * 2];
         runner.render_interleaved(&mut chunk);
         assert!(
             feedback.track_levels[0].load() < 1e-6,
-            "外部声源参数 0 应输出静音"
+            "external source with parameter 0 should output silence"
         );
 
-        // 2. 经命令队列写插件参数 → 外部声部电平跟随。
+        // 2. Write the plugin parameter via the command queue → external voice level follows.
         tx.push(EngineCommand::SetTrackParam {
             track: 0,
             id: ParamId::PluginParam(1),
             value: 0.5,
         })
-        .expect("队列未满");
+        .expect("queue not full");
         runner.render_interleaved(&mut chunk);
-        // post-fader 电平 = 参数 × 轨道增益(默认 0.8)。
+        // post-fader level = parameter × track gain (default 0.8).
         assert!(
             (feedback.track_levels[0].load() - 0.4).abs() < 0.01,
-            "插件参数 0.5 × 轨道增益 0.8 应为 0.4，实际 {}",
+            "plugin parameter 0.5 × track gain 0.8 should be 0.4, got {}",
             feedback.track_levels[0].load()
         );
 
-        // 3. 自动化桥接：曲线驱动 PluginParam（0 → 1 over 384 tick），
-        //    自动化轨道 0 连到轨道 0 声源（ParamEcho，node_id 为换装后
-        //    新分配的 ID）的插件参数 1。
-        let voice_id = compiler.track_voice_node_id(0).expect("换装后应有 node_id");
+        // 3. Automation bridging: the curve drives PluginParam (0 → 1 over 384
+        //    ticks), automation track 0 connects to track 0's sound source
+        //    (ParamEcho, node_id is the ID newly assigned after the swap)'s
+        //    plugin parameter 1.
+        let voice_id = compiler
+            .track_voice_node_id(0)
+            .expect("there should be a node_id after the swap");
         let mut curve = RtAutomation {
             enabled: true,
             ..RtAutomation::default()
@@ -669,16 +725,17 @@ mod tests {
                 curve,
             },
         }))
-        .expect("队列未满");
+        .expect("queue not full");
         let update = compiler
             .set_auto_route(0, voice_id, ParamId::PluginParam(1))
-            .expect("自动化连线应成功");
-        structure_tx.push(update).expect("结构队列未满");
+            .expect("automation routing should succeed");
+        structure_tx.push(update).expect("structure queue not full");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
-            .expect("队列未满");
+            .expect("queue not full");
 
-        // 循环 384 tick @120BPM/44.1kHz = 88.2k 样本 ≈ 2 s。
-        // 前 5 块（≈22 tick）测爬坡起点，中段丢弃，尾部（≈366 tick）测爬坡终点。
+        // Loop 384 ticks @120BPM/44.1kHz = 88.2k samples ≈ 2 s.
+        // First 5 blocks (≈22 ticks) probe the ramp start, the middle is
+        // discarded, and the tail (≈366 ticks) probes the ramp end.
         let mut early = 0.0f32;
         for _ in 0..5 {
             runner.render_interleaved(&mut chunk);
@@ -694,25 +751,28 @@ mod tests {
         }
         assert!(
             late > 0.5 && early < 0.2,
-            "自动化应驱动插件参数爬坡（含 0.8 轨道增益）：early={early}, late={late}"
+            "automation should drive the plugin parameter ramp (including 0.8 track gain): early={early}, late={late}"
         );
 
-        // 4. 切回内置声源：内置合成器无音符 → 静音。
-        let update = compiler.activate_builtin_voice(0).expect("切回内置声源");
-        structure_tx.push(update).expect("结构队列未满");
+        // 4. Switch back to the built-in sound source: the built-in
+        // synthesizer has no notes → silence.
+        let update = compiler
+            .activate_builtin_voice(0)
+            .expect("switch back to built-in sound source");
+        structure_tx.push(update).expect("structure queue not full");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Stop))
-            .expect("队列未满");
+            .expect("queue not full");
         runner.render_interleaved(&mut chunk);
         assert!(
             feedback.track_levels[0].load() < 1e-6,
-            "切回内置声源且无音符时应静音"
+            "should be silent when switched back to the built-in source with no notes"
         );
     }
 
     #[test]
     fn tracks_play_in_parallel() {
         let (mut runner, mut tx, _voice_tx, feedback, _compiler) = make_runner(128, 2);
-        // 两条轨道同时触发不同音符：两轨电平均应为正。
+        // Two tracks fire different notes simultaneously: both track levels should be positive.
         for (track, note) in [(0usize, 60u8), (1usize, 67u8)] {
             tx.push(EngineCommand::Note {
                 track,
@@ -721,15 +781,21 @@ mod tests {
                     velocity: 1.0,
                 },
             })
-            .expect("队列未满");
+            .expect("queue not full");
         }
         let mut out = vec![0.0f32; 4096 * 2];
         runner.render_interleaved(&mut out);
-        assert!(feedback.track_levels[0].load() > 0.0, "轨道 0 应有电平");
-        assert!(feedback.track_levels[1].load() > 0.0, "轨道 1 应有电平");
+        assert!(
+            feedback.track_levels[0].load() > 0.0,
+            "track 0 should have a level"
+        );
+        assert!(
+            feedback.track_levels[1].load() > 0.0,
+            "track 1 should have a level"
+        );
         assert!(
             feedback.track_levels[2].load() < 1e-9 && feedback.track_levels[3].load() < 1e-9,
-            "未使用的轨道应为静音"
+            "unused tracks must be silent"
         );
     }
 }

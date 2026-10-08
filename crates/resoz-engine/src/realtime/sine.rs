@@ -1,4 +1,4 @@
-//! 正弦波生成器。
+//! Sine wave generator.
 
 use std::f32::consts::TAU;
 
@@ -7,10 +7,11 @@ use crate::realtime::commands::ParamId;
 use crate::realtime::context::ProcessContext;
 use crate::realtime::processor::Processor;
 
-/// 正弦波生成器（路线图第 1 步的演示音源）。
+/// Sine wave generator (the demo instrument from roadmap step 1).
 ///
-/// 相位以 0..1 归一化累加并在每样本后包裹，避免大数值的浮点精度损失；
-/// 跨块相位连续（见单元测试）。
+/// Phase is accumulated normalized in 0..1 and wrapped after each sample,
+/// avoiding floating-point precision loss with large values; phase is
+/// continuous across blocks (see unit tests).
 pub struct SineProcessor {
     sample_rate: f32,
     phase: f32,
@@ -19,9 +20,10 @@ pub struct SineProcessor {
 }
 
 impl SineProcessor {
-    /// `sample_rate <= 0` 时回退 48 kHz（构造期容错，不在实时路径上）。
+    /// Falls back to 48 kHz when `sample_rate <= 0` (construction-time
+    /// tolerance, not on the real-time path).
     pub fn new(sample_rate: f32) -> Self {
-        debug_assert!(sample_rate > 0.0, "sample_rate 必须为正");
+        debug_assert!(sample_rate > 0.0, "sample_rate must be positive");
         Self {
             sample_rate: if sample_rate > 0.0 {
                 sample_rate
@@ -34,25 +36,27 @@ impl SineProcessor {
         }
     }
 
-    /// 当前频率（Hz）。RT-safe。
+    /// Current frequency (Hz). RT-safe.
     pub fn frequency(&self) -> f32 {
         self.frequency_hz
     }
 
-    /// 当前增益（线性）。RT-safe。
+    /// Current gain (linear). RT-safe.
     pub fn gain(&self) -> f32 {
         self.gain
     }
 
-    /// 设置频率：钳制到 `[0, sample_rate/2]`（奈奎斯特），非有限值忽略。
-    /// RT-safe。公开给合成器等组合节点改音高。
+    /// Sets frequency: clamped to `[0, sample_rate/2]` (Nyquist),
+    /// non-finite values ignored. RT-safe. Exposed so composite nodes such
+    /// as the synthesizer can change pitch.
     pub fn set_frequency(&mut self, hz: f32) {
         if hz.is_finite() {
             self.frequency_hz = hz.clamp(0.0, self.sample_rate * 0.5);
         }
     }
 
-    /// 设置增益：钳制到 `[0, 4]`（防炸耳/削波），非有限值忽略。RT-safe。
+    /// Sets gain: clamped to `[0, 4]` (ear/clipping protection), non-finite
+    /// values ignored. RT-safe.
     fn set_gain(&mut self, gain: f32) {
         if gain.is_finite() {
             self.gain = gain.clamp(0.0, 4.0);
@@ -70,7 +74,8 @@ impl Processor for SineProcessor {
         let gain = self.gain;
         let mut phase = self.phase;
 
-        // 先生成到第 0 声道，再复制到其余声道，避免逐声道重复计算 sin。
+        // Generate into channel 0 first, then copy to the remaining channels,
+        // avoiding recomputing sin per channel.
         if let Some(ch0) = buffer.channel_mut(0) {
             for slot in ch0.iter_mut() {
                 *slot = (TAU * phase).sin() * gain;
@@ -81,7 +86,8 @@ impl Processor for SineProcessor {
             }
         }
         for ch in 1..buffer.channels() {
-            // 逐声道复制：先取只读样本，再取可变槽位（避免同时持有两个借用）。
+            // Copy per channel: take the read-only sample first, then the
+            // mutable slot (avoids holding two borrows at once).
             for i in 0..frames {
                 let sample = buffer.channel(0).and_then(|c| c.get(i)).copied();
                 if let (Some(s), Some(dst)) =
@@ -128,7 +134,7 @@ mod tests {
         }
     }
 
-    /// 按固定块渲染 `blocks` 个块，返回第 0 声道的输出。
+    /// Renders `blocks` fixed-size blocks, returning the channel 0 output.
     fn render(sine: &mut SineProcessor, blocks: usize) -> Vec<f32> {
         let mut buf = AudioBuffer::new(1, 128);
         let mut collected = Vec::new();
@@ -144,7 +150,7 @@ mod tests {
     #[test]
     fn frequency_matches_zero_crossings() {
         let mut sine = SineProcessor::new(SR);
-        // 344 块 ≈ 0.9985 s @ 440 Hz → 约 439 次正向过零。
+        // 344 blocks ≈ 0.9985 s @ 440 Hz → about 439 positive zero crossings.
         let crossings = count_positive_crossings(&render(&mut sine, 344));
         assert!(
             (crossings as i64 - 440).abs() <= 2,
@@ -190,23 +196,33 @@ mod tests {
         assert!(sine.frequency().abs() < 1e-9);
 
         sine.set_param(ParamId::SineFrequency, f32::NAN);
-        assert!(sine.frequency().abs() < 1e-9, "非有限值应被忽略");
+        assert!(
+            sine.frequency().abs() < 1e-9,
+            "non-finite values should be ignored"
+        );
 
         sine.set_param(ParamId::SineFrequency, SR);
-        assert!((sine.frequency() - SR / 2.0).abs() < 1e-3, "钳制到奈奎斯特");
+        assert!(
+            (sine.frequency() - SR / 2.0).abs() < 1e-3,
+            "clamped to Nyquist"
+        );
 
         sine.set_param(ParamId::SineGain, f32::INFINITY);
-        assert!((sine.gain() - 0.25).abs() < 1e-9, "非有限增益应被忽略");
+        assert!(
+            (sine.gain() - 0.25).abs() < 1e-9,
+            "non-finite gain should be ignored"
+        );
 
         assert!(
             !sine.set_param(ParamId::MasterGain, 1.0),
-            "不响应的参数应返回 false"
+            "unhandled parameters should return false"
         );
     }
 
     #[test]
     fn phase_continuous_across_blocks() {
-        // 分块渲染与整段渲染的过零数应一致（±1）。
+        // Zero-crossing counts of chunked vs whole-buffer rendering should
+        // match (±1).
         let mut sine = SineProcessor::new(SR);
         let chunked = count_positive_crossings(&render(&mut sine, 50));
 

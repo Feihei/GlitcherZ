@@ -1,29 +1,38 @@
 //! # resoz-clap-host
 //!
-//! CLAP 插件宿主适配层（非实时基础设施）：ResoZ 引擎与 CLAP 插件
-//! 生态之间的桥梁。
+//! CLAP plugin host adaptation layer (non-real-time infrastructure): the
+//! bridge between the ResoZ engine and the CLAP plugin ecosystem.
 //!
-//! 职责：
-//! - 扫描 CLAP 插件目录（标准目录 + `RESOZ_CLAP_PATH` 环境变量）；
-//! - 枚举插件描述（ID / 名称 / 是否乐器）；
-//! - 在**非实时线程**实例化插件，产出可在音频回调中运行的
-//!   [`ClapNode`]（实时铁律约束适用于其 `process` 路径）；
-//! - 枚举插件实例的参数列表（[`ClapInstance::list_params`]，params
-//!   扩展直调，见 `raw` 模块）。
+//! Responsibilities:
+//! - Scans CLAP plugin directories (standard directories + the
+//!   `RESOZ_CLAP_PATH` environment variable);
+//! - Enumerates plugin descriptions (ID / name / whether it is an
+//!   instrument);
+//! - Instantiates plugins on a **non-real-time thread**, producing a
+//!   [`ClapNode`] that can run in the audio callback (the real-time iron
+//!   rules apply to its `process` path);
+//! - Enumerates the parameter list of a plugin instance
+//!   ([`ClapInstance::list_params`], direct calls via the params extension,
+//!   see the `raw` module).
 //!
-//! 桥接模型：
-//! - **音符**：[`Processor::note_event`] 把 `NoteOn/Off` 暂存进定容
-//!   事件槽，下一次 `process` 以 CLAP 输入事件发出（块粒度）；
-//! - **参数**：`ParamId::PluginParam(u32)` 同理以 `ParamValueEvent`
-//!   发出——自动化求值器写入的插件参数由此天然桥接；
-//! - **音频**：乐器插件（无输入端口）渲染到节点内预分配的立体声
-//!   临时缓冲，再拷贝进 [`AudioBuffer`]。
+//! Bridging model:
+//! - **Notes**: [`Processor::note_event`] stashes `NoteOn/Off` into a
+//!   fixed-capacity event slot; the next `process` emits them as CLAP input
+//!   events (block granularity);
+//! - **Parameters**: `ParamId::PluginParam(u32)` likewise emits a
+//!   `ParamValueEvent` — plugin parameters written by the automation
+//!   evaluator are bridged naturally this way;
+//! - **Audio**: instrument plugins (no input ports) render into the node's
+//!   pre-allocated stereo scratch buffer, which is then copied into the
+//!   [`AudioBuffer`].
 //!
-//! 插件动态库生命周期由 [`ClapInstanceGuard`] 承担，必须与
-//! [`ClapNode`] 同寿命（见 [`ClapInstance::spawn_rt`]）。
+//! The plugin dynamic library's lifetime is managed by
+//! [`ClapInstanceGuard`], which must live as long as the [`ClapNode`] (see
+//! [`ClapInstance::spawn_rt`]).
 
 #![deny(unsafe_code)]
-// unsafe 仅存在于 raw 模块（动态库加载边界），理由与验证见其文档。
+// unsafe exists only in the raw module (dynamic library loading boundary);
+// rationale and verification are in its docs.
 
 pub mod raw;
 
@@ -44,42 +53,44 @@ use resoz_engine::realtime::commands::ParamId;
 use resoz_engine::realtime::context::ProcessContext;
 use resoz_engine::realtime::processor::Processor;
 
-/// 一次 `process` 最多排队的桥接事件数（音符 + 参数合计）。
+/// Maximum number of bridging events queued per `process` (notes +
+/// parameters combined).
 pub const MAX_PENDING_EVENTS: usize = 32;
 
-/// 插件扫描目录环境变量的名字（`PATH` 风格分隔列表）。
+/// Name of the environment variable holding the plugin scan directories
+/// (`PATH`-style separated list).
 pub const CLAP_PATH_ENV: &str = "RESOZ_CLAP_PATH";
 
-/// 乐器插件的空输入端口缓冲类型（无音频输入）。
+/// Empty input port buffer type for instrument plugins (no audio input).
 type NoInputPorts = [AudioPortBuffer<
     std::iter::Empty<InputChannel<'static, f32>>,
     std::iter::Empty<InputChannel<'static, f64>>,
 >; 0];
 
-/// 宿主侧错误。
+/// Host-side error.
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
-    #[error("加载插件动态库失败：{0}")]
+    #[error("failed to load plugin dynamic library: {0}")]
     Load(#[source] PluginEntryError),
-    #[error("插件实例化失败：{0}")]
+    #[error("failed to instantiate plugin: {0}")]
     Instance(#[source] PluginInstanceError),
-    #[error("插件激活失败：{0}")]
+    #[error("failed to activate plugin: {0}")]
     Activate(#[source] PluginInstanceError),
-    #[error("插件处理启动失败：{0}")]
+    #[error("failed to start plugin processing: {0}")]
     Start(#[source] PluginInstanceError),
-    #[error("宿主信息构造失败")]
+    #[error("failed to construct host info")]
     HostInfo,
-    #[error("插件缺少工厂或有效 ID")]
+    #[error("plugin lacks a factory or a valid ID")]
     NoPlugin,
-    #[error("插件未实现 params 扩展")]
+    #[error("plugin does not implement the params extension")]
     NoParams,
 }
 
 // ---------------------------------------------------------------------------
-// 插件扫描
+// Plugin scanning
 // ---------------------------------------------------------------------------
 
-/// 平台相关的 CLAP 插件标准搜索目录。
+/// Platform-specific standard CLAP plugin search directories.
 fn standard_clap_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(program_files) = std::env::var_os("ProgramFiles") {
@@ -100,7 +111,8 @@ fn standard_clap_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// 全部搜索目录：`RESOZ_CLAP_PATH` 优先，其后是平台标准目录。
+/// All search directories: `RESOZ_CLAP_PATH` first, then the platform
+/// standard directories.
 pub fn clap_search_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(extra) = std::env::var_os(CLAP_PATH_ENV) {
@@ -110,7 +122,8 @@ pub fn clap_search_paths() -> Vec<PathBuf> {
     dirs
 }
 
-/// 扫描全部搜索目录下的 `.clap` 动态库文件（非递归，符合 CLAP 规范惯例）。
+/// Scans all search directories for `.clap` dynamic library files
+/// (non-recursive, following CLAP specification convention).
 pub fn scan_clap_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
     for dir in clap_search_paths() {
@@ -128,42 +141,44 @@ pub fn scan_clap_files() -> Vec<PathBuf> {
     files
 }
 
-/// 一个可实例化插件的描述信息。
+/// Description of an instantiable plugin.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClapPluginInfo {
-    /// 动态库路径。
+    /// Dynamic library path.
     pub path: PathBuf,
-    /// 插件唯一 ID（CLAP 规范要求稳定）。
+    /// Unique plugin ID (required by the CLAP spec to be stable).
     pub id: String,
-    /// 显示名称。
+    /// Display name.
     pub name: String,
-    /// 是否为乐器（合成器；`instrument` 特性标记）。
+    /// Whether it is an instrument (synthesizer; `instrument` feature tag).
     pub is_instrument: bool,
 }
 
-/// 一个插件参数的元数据快照（实例化时经 params 扩展读出）。
+/// Metadata snapshot of one plugin parameter (read via the params extension
+/// at instantiation time).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClapParamInfo {
-    /// 插件侧参数 ID（`ParamId::PluginParam` 桥接用）。
+    /// Plugin-side parameter ID (for the `ParamId::PluginParam` bridge).
     pub id: u32,
-    /// 显示名称。
+    /// Display name.
     pub name: String,
-    /// 模块路径（`/` 分隔，可空）。
+    /// Module path (`/`-separated, may be empty).
     pub module: String,
-    /// 最小值（插件值域）。
+    /// Minimum value (plugin value range).
     pub min_value: f64,
-    /// 最大值（插件值域）。
+    /// Maximum value (plugin value range).
     pub max_value: f64,
-    /// 默认值（插件值域）。
+    /// Default value (plugin value range).
     pub default_value: f64,
 }
 
-/// 枚举给定 `.clap` 动态库内的全部插件。加载失败的库被跳过并记日志。
+/// Enumerates all plugins in the given `.clap` dynamic library. Libraries
+/// that fail to load are skipped and logged.
 pub fn list_clap_plugins_in(path: &Path) -> Vec<ClapPluginInfo> {
     let entry = match raw::load_entry(path) {
         Ok(entry) => entry,
         Err(err) => {
-            log::warn!("跳过无法加载的 CLAP 插件 {}：{err}", path.display());
+            log::warn!("skipping unloadable CLAP plugin {}: {err}", path.display());
             return Vec::new();
         }
     };
@@ -197,7 +212,7 @@ pub fn list_clap_plugins_in(path: &Path) -> Vec<ClapPluginInfo> {
     infos
 }
 
-/// 扫描并枚举全部目录里的全部插件。
+/// Scans and enumerates all plugins in all directories.
 pub fn list_clap_plugins() -> Vec<ClapPluginInfo> {
     let mut infos = Vec::new();
     for path in scan_clap_files() {
@@ -207,7 +222,7 @@ pub fn list_clap_plugins() -> Vec<ClapPluginInfo> {
 }
 
 // ---------------------------------------------------------------------------
-// 宿主回调实现
+// Host callback implementations
 // ---------------------------------------------------------------------------
 
 struct ResoZHostShared;
@@ -226,7 +241,8 @@ impl HostLogImpl for ResoZHostShared {
 
 impl HostParamsImplShared for ResoZHostShared {
     fn request_flush(&self) {
-        // 简化宿主：插件请求 flush 时，下一次 process 会带上全部暂存事件。
+        // Simplified host: when the plugin requests a flush, the next process
+        // carries all stashed events.
     }
 }
 
@@ -253,28 +269,30 @@ impl HostHandlers for ResoZHostHandlers {
 }
 
 // ---------------------------------------------------------------------------
-// 实时节点
+// Real-time node
 // ---------------------------------------------------------------------------
 
-/// 暂存的桥接事件。
+/// A stashed bridging event.
 #[derive(Debug, Clone, Copy)]
 pub enum PendingClapEvent {
-    /// 音符按下。
+    /// Note pressed.
     NoteOn { note: u8, velocity: f32 },
-    /// 音符松开。
+    /// Note released.
     NoteOff { note: u8 },
-    /// 插件参数值（`ParamId::PluginParam` 桥接）。
+    /// Plugin parameter value (`ParamId::PluginParam` bridge).
     Param { id: u32, value: f32 },
 }
 
-/// 可在音频回调中运行的 CLAP 乐器节点。
+/// A CLAP instrument node that can run in the audio callback.
 ///
-/// 构造在非实时线程（[`ClapInstance::spawn_rt`]），随后 move 进音频
-/// 线程。`process` / `note_event` / `set_param` 均遵守实时铁律：
-/// 无分配（事件与缓冲全部构造期预分配）、无锁、无 panic。
+/// Constructed on a non-real-time thread ([`ClapInstance::spawn_rt`]), then
+/// moved into the audio thread. `process` / `note_event` / `set_param` all
+/// follow the real-time iron rules: no allocation (events and buffers are
+/// all pre-allocated at construction), no locks, no panics.
 pub struct ClapNode {
-    /// 统一状态处理器：内部在 Started/Stopped 间切换，`process` 可失败
-    /// （运行时检查），失败即输出静音。
+    /// Unified state processor: internally switches between
+    /// Started/Stopped; `process` may fail (runtime check) and outputs
+    /// silence on failure.
     processor: PluginAudioProcessor<ResoZHostHandlers>,
     input_events: EventBuffer,
     output_events: EventBuffer,
@@ -286,32 +304,34 @@ pub struct ClapNode {
     pending_count: usize,
 }
 
-/// 持有插件动态库与实例的守卫。**必须与 [`ClapNode`] 同寿命**：
-/// 丢守护卫会卸载插件动态库，使节点的处理指针悬空。
+/// Guard holding the plugin dynamic library and instance. **Must live as
+/// long as the [`ClapNode`]**: dropping the guard unloads the plugin dynamic
+/// library, leaving the node's processing pointers dangling.
 pub struct ClapInstanceGuard {
     _entry: PluginEntry,
     _instance: PluginInstance<ResoZHostHandlers>,
 }
 
-/// 一次性实例化产物：控制侧守卫 + 实时节点。
+/// One-shot instantiation result: control-side guard + real-time node.
 pub struct ClapInstance {
-    /// 控制侧存活守卫（UI/引擎线程持有）。
+    /// Control-side liveness guard (held by the UI / engine thread).
     pub guard: ClapInstanceGuard,
-    /// 实时侧节点（move 进音频线程）。
+    /// Real-time-side node (moved into the audio thread).
     pub node: ClapNode,
 }
 
-/// 实例化时的静态配置。
+/// Static configuration at instantiation time.
 pub struct ClapInstanceConfig {
-    /// 采样率（Hz）。
+    /// Sample rate (Hz).
     pub sample_rate: u32,
-    /// 最大块大小（应与 [`FIXED_BLOCK_SIZE`] 一致）。
+    /// Maximum block size (should match [`FIXED_BLOCK_SIZE`]).
     pub max_frames: u32,
 }
 
 impl ClapInstance {
-    /// 加载并激活插件，产出实时节点。**必须在非实时线程调用**
-    /// （涉及动态库加载与插件内部分配）。
+    /// Loads and activates the plugin, producing a real-time node. **Must be
+    /// called on a non-real-time thread** (involves dynamic library loading
+    /// and allocations inside the plugin).
     pub fn spawn_rt(
         path: &Path,
         plugin_id: &str,
@@ -347,8 +367,9 @@ impl ClapInstance {
                 },
             )
             .map_err(HostError::Activate)?;
-        // 简化宿主：在控制线程激活（未注册 thread-check 强制，与多数
-        // 简易宿主一致）；process 前需经 as_started_mut 启动。
+        // Simplified host: activated on the control thread (no thread-check
+        // enforcement registered, consistent with most simple hosts);
+        // processing must be started via as_started_mut before process.
         let processor: PluginAudioProcessor<ResoZHostHandlers> = stopped.into();
 
         Ok(Self {
@@ -360,11 +381,14 @@ impl ClapInstance {
         })
     }
 
-    /// 枚举插件暴露的全部参数（元数据快照）。
+    /// Enumerates all parameters exposed by the plugin (metadata snapshot).
     ///
-    /// 在**非实时线程**调用（直调插件主线程回调）。插件未实现 params
-    /// 扩展时返回空列表；个别参数读取失败被跳过而非整体失败。
-    /// RT-safe 无关——本方法不触碰实时节点。
+    /// Called on a **non-real-time thread** (directly invokes the plugin's
+    /// main-thread callbacks). Returns an empty list when the plugin does not
+    /// implement the params extension; individual parameter read failures are
+    /// skipped rather than failing the whole call.
+    /// RT-safety is irrelevant — this method does not touch the real-time
+    /// node.
     pub fn list_params(&self) -> Vec<ClapParamInfo> {
         raw::enumerate_params(self.guard._instance.raw_instance())
     }
@@ -391,7 +415,7 @@ impl ClapNode {
 
     fn stash(&mut self, event: PendingClapEvent) -> bool {
         if self.pending_count >= MAX_PENDING_EVENTS {
-            return false; // 满载丢弃（非关键路径）
+            return false; // dropped when full (non-critical path)
         }
         self.pending[self.pending_count] = event;
         self.pending_count += 1;
@@ -403,7 +427,7 @@ impl Processor for ClapNode {
     fn process(&mut self, ctx: &ProcessContext, buffer: &mut AudioBuffer) {
         let frames = ctx.frames.min(self.out_l.len()).min(buffer.capacity());
 
-        // 1. 暂存事件 → CLAP 输入事件（块粒度）。
+        // 1. Stashed events → CLAP input events (block granularity).
         self.input_events.clear();
         for event in &self.pending[..self.pending_count] {
             match *event {
@@ -432,8 +456,10 @@ impl Processor for ClapNode {
         self.pending_count = 0;
         self.output_events.clear();
 
-        // 2. 音频缓冲：乐器无输入；输出指向节点内预分配临时缓冲。
-        //    拆字段借用：两个声道缓冲与处理器同时可变。
+        // 2. Audio buffers: instruments have no input; output points at the
+        //    node's pre-allocated scratch buffer. Field-splitting borrow: the
+        //    two channel buffers and the processor are mutable at the same
+        //    time.
         let Self {
             out_l,
             out_r,
@@ -444,7 +470,7 @@ impl Processor for ClapNode {
             processor,
             ..
         } = self;
-        // 乐器无输入端口：空端口列表。
+        // Instruments have no input ports: empty port list.
         let no_inputs: NoInputPorts = [];
         let input_audio = input_ports.with_input_buffers(no_inputs);
         for channel in [&mut out_l[..frames], &mut out_r[..frames]] {
@@ -457,11 +483,12 @@ impl Processor for ClapNode {
             ),
         }]);
 
-        // 3. 调用插件。首次调用时启动处理；任何失败都让输出保持清零
-        //    （无 panic）。
+        // 3. Invoke the plugin. Processing starts on the first call; any
+        //    failure keeps the output zeroed (no panics).
         let started = match processor.as_started_mut() {
             Ok(started) => started,
-            // 停止态：尝试启动（首块）；再失败则保持静音。
+            // Stopped state: try to start (first block); keep silence on
+            // further failure.
             Err(_) => match processor.start_processing() {
                 Ok(started) => started,
                 Err(_) => return,
@@ -478,7 +505,8 @@ impl Processor for ClapNode {
             );
         }
 
-        // 4. 拷贝进引擎平面缓冲（越界防御性钳制，不 panic）。
+        // 4. Copy into the engine's planar buffer (defensive out-of-bounds
+        //    clamping, no panic).
         for (channel_index, source) in [&out_l[..frames], &out_r[..frames]].into_iter().enumerate()
         {
             if let Some(destination) = buffer.channel_mut(channel_index) {
@@ -528,7 +556,8 @@ mod tests {
 
     use std::path::PathBuf;
 
-    /// 测试插件的动态库路径（`cargo test --workspace` 会先构建 cdylib）。
+    /// Dynamic library path of the test plugin (`cargo test --workspace`
+    /// builds the cdylib first).
     fn test_plugin_path() -> Option<PathBuf> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/debug")
@@ -542,7 +571,7 @@ mod tests {
 
     fn spawn_test_plugin() -> Option<(ClapInstance, ProcessContext)> {
         let Some(path) = test_plugin_path() else {
-            eprintln!("跳过：测试插件 cdylib 未构建（请用 cargo test --workspace）");
+            eprintln!("skipped: test plugin cdylib not built (use cargo test --workspace)");
             return None;
         };
         let instance = ClapInstance::spawn_rt(
@@ -553,7 +582,7 @@ mod tests {
                 max_frames: 128,
             },
         )
-        .expect("实例化测试插件失败");
+        .expect("failed to instantiate the test plugin");
         let ctx = ProcessContext {
             sample_rate: 48_000.0,
             frames: 128,
@@ -569,7 +598,7 @@ mod tests {
         };
         let node = &mut instance.node;
 
-        // 未触发音符 → 静音。
+        // No note triggered → silence.
         let mut buffer = AudioBuffer::new(2, 128);
         buffer.set_len(128);
         buffer.clear();
@@ -580,10 +609,10 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|sample| sample.abs() < 1e-9),
-            "无音符时应静音"
+            "should be silent without a note"
         );
 
-        // NoteOn(A4) → 正弦输出，两声道一致。
+        // NoteOn(A4) → sine output, both channels identical.
         assert!(node.note_event(NoteEvent::On {
             note: 69,
             velocity: 1.0
@@ -594,17 +623,24 @@ mod tests {
             .unwrap()
             .iter()
             .fold(0.0f32, |acc, s| acc.max(s.abs()));
-        assert!(peak_l > 0.1, "NoteOn 后应有明显输出，峰值 {peak_l}");
-        // 两声道来自同一单声部渲染，内容应一致。
+        assert!(
+            peak_l > 0.1,
+            "should have notable output after NoteOn, peak {peak_l}"
+        );
+        // Both channels come from the same single-voice render; contents
+        // should be identical.
         let same = buffer
             .channel(1)
             .unwrap()
             .iter()
             .zip(buffer.channel(0).unwrap())
             .all(|(r, l)| (r - l).abs() < 1e-9);
-        assert!(same, "立体声两声道应一致（单声部源）");
+        assert!(
+            same,
+            "stereo channels should be identical (single-voice source)"
+        );
 
-        // NoteOff → 静音（乐器无释放尾音）。
+        // NoteOff → silence (the instrument has no release tail).
         assert!(node.note_event(NoteEvent::Off { note: 69 }));
         node.process(&ctx, &mut buffer);
         assert!(
@@ -613,7 +649,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|sample| sample.abs() < 1e-9),
-            "NoteOff 后应静音"
+            "should be silent after NoteOff"
         );
     }
 
@@ -624,9 +660,11 @@ mod tests {
         };
         let node = &mut instance.node;
 
-        // 插件参数被接受并入队（即使插件暂无参数实现，事件路径也畅通）。
+        // Plugin parameters are accepted and queued (even if the plugin has
+        // no parameter implementation yet, the event path works).
         assert!(node.set_param(ParamId::PluginParam(1), 0.5));
-        // 内置参数不被 ClapNode 消费（归内置节点管）。
+        // Built-in parameters are not consumed by ClapNode (they belong to
+        // built-in nodes).
         assert!(!node.set_param(ParamId::TrackGain, 0.5));
         assert!(!node.set_param(ParamId::FilterCutoff, 1_000.0));
 
@@ -640,22 +678,25 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|sample| sample.is_finite()),
-            "参数事件不应破坏渲染"
+            "parameter events should not break rendering"
         );
     }
 
     #[test]
     fn list_plugins_reports_our_sine() {
         let Some(path) = test_plugin_path() else {
-            eprintln!("跳过：测试插件 cdylib 未构建");
+            eprintln!("skipped: test plugin cdylib not built");
             return;
         };
         let infos: Vec<ClapPluginInfo> = list_clap_plugins_in(&path);
         let sine = infos
             .iter()
             .find(|info| info.id == "org.resoz.sine")
-            .expect("测试插件应被枚举");
-        assert!(sine.is_instrument, "正弦插件应带 instrument 特性");
+            .expect("the test plugin should be enumerated");
+        assert!(
+            sine.is_instrument,
+            "the sine plugin should carry the instrument feature"
+        );
         assert_eq!(sine.name, "ResoZ Sine");
     }
 
@@ -665,7 +706,11 @@ mod tests {
             return;
         };
         let params = instance.list_params();
-        assert_eq!(params.len(), 1, "测试插件应暴露一个参数");
+        assert_eq!(
+            params.len(),
+            1,
+            "the test plugin should expose one parameter"
+        );
         let param = &params[0];
         assert_eq!(param.id, 1);
         assert_eq!(param.name, "Amplitude");
@@ -684,7 +729,8 @@ mod tests {
         buffer.set_len(128);
         buffer.clear();
 
-        // 振幅参数 0.25：NoteOn 后峰值应接近 0.25（正弦峰值）。
+        // Amplitude parameter 0.25: after NoteOn the peak should be close to
+        // 0.25 (sine peak).
         assert!(node.set_param(ParamId::PluginParam(1), 0.25));
         assert!(node.note_event(NoteEvent::On {
             note: 69,
@@ -698,14 +744,14 @@ mod tests {
             .fold(0.0f32, |acc, s| acc.max(s.abs()));
         assert!(
             (peak - 0.25).abs() < 0.02,
-            "输出峰值应接近参数值 0.25，实际 {peak}"
+            "output peak should be close to the parameter value 0.25, got {peak}"
         );
     }
 
     #[test]
     fn invalid_plugin_fails_gracefully() {
         let bogus = std::env::temp_dir().join("resoz_bogus.clap");
-        std::fs::write(&bogus, b"not a dll").expect("写入失败");
+        std::fs::write(&bogus, b"not a dll").expect("write failed");
         let result = ClapInstance::spawn_rt(
             &bogus,
             "org.resoz.bogus",

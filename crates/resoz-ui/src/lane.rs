@@ -1,37 +1,39 @@
-//! 自动化泳道编辑器（egui 自绘）。
+//! Automation lane editor (egui self-drawn).
 //!
-//! 交互约定与钢琴卷帘一致：左键点空白加锚点（可顺手拖拽）、按住锚点
-//! 拖拽移动（横向时间吸附、纵向参数值）、右键删除最近锚点。纵轴按
-//! 参数真实值域映射（滤波截止用对数轴），曲线在锚点间线性插值。
+//! Interaction conventions match the piano roll: left-click on empty space to add an anchor
+//! (and drag it right away), drag an anchor to move it (time snaps horizontally, parameter
+//! value vertically), right-click to delete the nearest anchor. The vertical axis maps to the
+//! parameter's real value range (log axis for filter cutoff), and the curve is linearly
+//! interpolated between anchors.
 
 use eframe::egui;
 
 use resoz_model::{AutoParam, AutoPoint, AutomationTrack, TICKS_PER_STEP};
 
-/// 泳道高度（像素）。
+/// Lane height (pixels).
 pub const LANE_HEIGHT: f32 = 96.0;
 
-/// 时间吸附粒度（tick）——1/32 音符。
+/// Time snap granularity (tick) — a 1/32 note.
 pub const SNAP_TICKS: u32 = 12;
 
-/// 跨帧拖拽状态（被拖拽锚点的当前下标）。
+/// Cross-frame drag state (current index of the dragged anchor).
 #[derive(Debug, Default)]
 pub struct LaneState {
     drag: Option<usize>,
 }
 
-/// 参数轴元数据：(最小值, 最大值, 是否对数)。
+/// Parameter axis metadata: (min, max, logarithmic?).
 fn axis(param: &AutoParam) -> (f32, f32, bool) {
     match param {
         AutoParam::TrackGain => (0.0, 1.5, false),
         AutoParam::TrackPan => (-1.0, 1.0, false),
         AutoParam::FilterCutoff => (20.0, 18_000.0, true),
-        // 插件参数值域未知：按 0..1 归一显示（插件自行解释）。
+        // Plugin parameter range unknown: display normalized 0..1 (interpreted by the plugin).
         AutoParam::PluginParam { .. } => (0.0, 1.0, false),
     }
 }
 
-/// 真实值 → 0..1 归一化。
+/// Real value → 0..1 normalization.
 fn to_norm(value: f32, min: f32, max: f32, log: bool) -> f32 {
     let norm = if log {
         let (lo, hi) = (f64::from(min).log10(), f64::from(max).log10());
@@ -42,7 +44,7 @@ fn to_norm(value: f32, min: f32, max: f32, log: bool) -> f32 {
     norm.clamp(0.0, 1.0)
 }
 
-/// 0..1 归一化 → 真实值。
+/// 0..1 normalization → real value.
 fn from_norm(norm: f32, min: f32, max: f32, log: bool) -> f32 {
     let norm = norm.clamp(0.0, 1.0);
     if log {
@@ -53,10 +55,11 @@ fn from_norm(norm: f32, min: f32, max: f32, log: bool) -> f32 {
     }
 }
 
-/// 绘制并交互一帧泳道。直接原地修改 `automation`，返回本帧是否编辑
-/// （调用方据此把曲线重新下发到音频线程）。
+/// Draw and interact one frame of the lane. Modifies `automation` in place and returns whether
+/// an edit happened this frame (the caller then re-pushes the curve to the audio thread).
 ///
-/// `param` 是连线终点参数（D7：曲线不含目标），仅用于纵轴值域映射。
+/// `param` is the cable endpoint parameter (D7: the curve does not carry a target), used only
+/// for vertical axis range mapping.
 pub fn show(
     ui: &mut egui::Ui,
     automation: &mut AutomationTrack,
@@ -80,7 +83,7 @@ pub fn show(
     let value_y = |value: f32| rect.bottom() - to_norm(value, min, max, log) * LANE_HEIGHT;
     let y_value = |y: f32| from_norm((rect.bottom() - y) / LANE_HEIGHT, min, max, log);
 
-    // 背景 + 归一化中线。
+    // Background + normalized midline.
     painter.rect_filled(rect, 2.0, egui::Color32::from_gray(22));
     let mid = from_norm(0.5, min, max, log);
     painter.line_segment(
@@ -91,7 +94,7 @@ pub fn show(
         egui::Stroke::new(1.0, egui::Color32::from_gray(45)),
     );
 
-    // 曲线段（相邻锚点连线）。
+    // Curve segments (lines between adjacent anchors).
     let curve_color = egui::Color32::from_rgb(90, 160, 220);
     if automation.points.len() >= 2 {
         for window in automation.points.windows(2) {
@@ -111,7 +114,7 @@ pub fn show(
         }
     }
 
-    // 锚点。
+    // Anchors.
     for (index, point) in automation.points.iter().enumerate() {
         let x = rect.left() + point.tick as f32 * ticks_to_x;
         let y = value_y(point.value);
@@ -123,7 +126,7 @@ pub fn show(
         painter.circle_filled(egui::pos2(x, y), 4.0, color);
     }
 
-    // 播放头。
+    // Playhead.
     if playing {
         let pos = playhead_ticks.rem_euclid(loop_ticks as f32);
         let x = rect.left() + pos * ticks_to_x;
@@ -133,7 +136,7 @@ pub fn show(
         );
     }
 
-    // 交互。
+    // Interaction.
     let hit_point = |pos: egui::Pos2, automation: &AutomationTrack| -> Option<usize> {
         automation.points.iter().position(|p| {
             let x = rect.left() + p.tick as f32 * ticks_to_x;
@@ -162,7 +165,7 @@ pub fn show(
     if response.dragged() {
         if let (Some(pos), Some(index)) = (response.interact_pointer_pos(), state.drag) {
             if index < automation.points.len() {
-                // 先移除再 upsert：拖拽可能改变 tick 排序。
+                // Remove then upsert: dragging can change the tick ordering.
                 automation.points.remove(index);
                 automation.upsert_point(AutoPoint {
                     tick: snap((pos.x - rect.left()) / ticks_to_x).min(loop_ticks - 1),

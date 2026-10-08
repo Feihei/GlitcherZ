@@ -1,35 +1,38 @@
-//! ADSR 音量包络。
+//! ADSR volume envelope.
 
 use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::{NoteEvent, ParamId};
 use crate::realtime::context::ProcessContext;
 use crate::realtime::processor::Processor;
 
-/// 包络阶段。
+/// Envelope stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
-    /// 静默（无音符），输出 0。
+    /// Silent (no note), outputs 0.
     Idle,
-    /// 从当前电平升至峰值。
+    /// Rises from the current level to the peak.
     Attack,
-    /// 从峰值降至 sustain 电平。
+    /// Falls from the peak to the sustain level.
     Decay,
-    /// 维持 sustain 电平。
+    /// Holds the sustain level.
     Sustain,
-    /// 从当前电平衰减回 0。
+    /// Decays from the current level back to 0.
     Release,
 }
 
-/// ADSR 音量包络 —— 原地乘性效果器。
+/// ADSR volume envelope — an in-place multiplicative effect.
 ///
-/// 参数（均经 [`Processor::set_param`] 在块边界更新）：
-/// Attack / Decay / Release 为秒（0..10），Sustain 为 0..1 的相对电平。
-/// 峰值 = velocity（0..1，随 `NoteOn` 下发）。
+/// Parameters (all updated at block boundaries via [`Processor::set_param`]):
+/// Attack / Decay / Release are in seconds (0..10), Sustain is a relative
+/// level in 0..1.
+/// Peak = velocity (0..1, delivered with `NoteOn`).
 ///
-/// 实现细节：各阶段为**线性斜率**——Attack 恰在 A 秒末到达峰值，
-/// Decay 恰在 D 秒末到达 sustain，Release 从进入时的电平出发恰在
-/// R 秒末归零；时间参数为 0 的阶段在同一样本内直接跳过。所有路径
-/// RT-safe：无分配、无锁、无 panic。
+/// Implementation details: each stage uses a **linear slope** — Attack reaches
+/// the peak exactly at the end of A seconds, Decay reaches sustain exactly at
+/// the end of D seconds, and Release starts from the level at entry and reaches
+/// zero exactly at the end of R seconds; stages with a zero time parameter are
+/// skipped within the same sample. All paths
+/// RT-safe: no allocation, no locks, no panics.
 #[derive(Debug)]
 pub struct AdsrProcessor {
     sample_rate: f32,
@@ -39,17 +42,17 @@ pub struct AdsrProcessor {
     release_s: f32,
     velocity: f32,
     stage: Stage,
-    /// 当前包络电平，始终在 `[0, velocity]` 内。
+    /// Current envelope level, always within `[0, velocity]`.
     level: f32,
-    /// 进入 Release 时的每样本衰减量（保证 R 秒内恰好归零）。
+    /// Per-sample decay amount on entering Release (guarantees reaching exactly zero within R seconds).
     release_rate: f32,
 }
 
-/// 各阶段时间参数的允许上限（秒）。
+/// Allowed upper bound for stage time parameters (in seconds).
 const MAX_TIME_S: f32 = 10.0;
 
 impl AdsrProcessor {
-    /// `sample_rate <= 0` 时回退 48 kHz（构造期容错）。
+    /// Falls back to 48 kHz when `sample_rate <= 0` (construction-time tolerance).
     pub fn new(sample_rate: f32) -> Self {
         Self {
             sample_rate: if sample_rate > 0.0 {
@@ -68,13 +71,14 @@ impl AdsrProcessor {
         }
     }
 
-    /// 当前包络电平。RT-safe。
+    /// Current envelope level. RT-safe.
     pub fn level(&self) -> f32 {
         self.level
     }
 
-    /// 触发音符（进入 Attack，从当前电平续起 —— 释放中重触发即再起音）。
-    /// RT-safe。
+    /// Triggers a note (enters Attack, resuming from the current level —
+    /// retriggering during release re-attacks).
+    /// RT-safe.
     fn trigger(&mut self, velocity: f32) {
         self.velocity = if velocity.is_finite() {
             velocity.clamp(0.0, 1.0)
@@ -85,7 +89,7 @@ impl AdsrProcessor {
         self.stage = Stage::Attack;
     }
 
-    /// 松开音符（进入 Release；Idle 下无效）。RT-safe。
+    /// Releases the note (enters Release; no-op when Idle). RT-safe.
     fn release(&mut self) {
         if self.stage != Stage::Idle {
             self.release_rate = if self.release_s > 1e-6 && self.level > 0.0 {
@@ -97,8 +101,9 @@ impl AdsrProcessor {
         }
     }
 
-    /// 推进一个样本并返回包络电平。零时长的阶段在同一样本内跳过。
-    /// RT-safe。
+    /// Advances one sample and returns the envelope level. Zero-duration
+    /// stages are skipped within the same sample.
+    /// RT-safe.
     fn next_level(&mut self) -> f32 {
         let peak = self.velocity;
         loop {
@@ -132,7 +137,7 @@ impl AdsrProcessor {
                     return self.level;
                 }
                 Stage::Sustain => {
-                    // 每样本重算：sustain / velocity 中途变化也能跟随。
+                    // Recomputed per sample: tracks mid-note changes to sustain / velocity.
                     self.level = peak * self.sustain;
                     return self.level;
                 }
@@ -230,7 +235,7 @@ mod tests {
         }
     }
 
-    /// 满幅输入下渲染 `blocks` 个块，返回包络作用后的第 0 声道。
+    /// Renders `blocks` blocks with full-scale input and returns channel 0 after the envelope.
     fn render_with_full_scale(env: &mut AdsrProcessor, blocks: usize) -> Vec<f32> {
         let mut buf = AudioBuffer::new(1, BLOCK);
         let mut out = Vec::new();
@@ -254,7 +259,7 @@ mod tests {
         NoteEvent::Off { note: 69 }
     }
 
-    // 标准测试 1：静音输入 → 输出静音（即使包络处于 Attack）。
+    // Standard test 1: silent input → silent output (even while the envelope is in Attack).
     #[test]
     fn silence_in_silence_out() {
         let mut env = AdsrProcessor::new(SR);
@@ -268,7 +273,7 @@ mod tests {
         }
     }
 
-    // 标准测试 2：满幅输入 → 无 NaN/Inf，且电平不越界。
+    // Standard test 2: full-scale input → no NaN/Inf, and level stays in range.
     #[test]
     fn full_scale_stays_bounded_and_finite() {
         let mut env = AdsrProcessor::new(SR);
@@ -277,7 +282,7 @@ mod tests {
         assert!(out.iter().all(|s| s.is_finite()));
         assert!(
             out.iter().all(|s| (0.0..=1.0).contains(s)),
-            "包络电平应位于 [0,1]"
+            "envelope level must stay within [0,1]"
         );
     }
 
@@ -285,7 +290,7 @@ mod tests {
     fn attack_reaches_peak_in_configured_time() {
         let mut env = AdsrProcessor::new(SR);
         env.set_param(ParamId::Attack, 0.1); // 4800 samples
-        env.set_param(ParamId::Decay, 10.0); // 压低衰减速率，便于观测
+        env.set_param(ParamId::Decay, 10.0); // lower the decay rate for easier observation
         env.set_param(ParamId::Sustain, 1.0);
         env.note_event(note_on());
 
@@ -293,10 +298,10 @@ mod tests {
         let at_4800 = out[4_799];
         assert!(
             (at_4800 - 1.0).abs() < 0.05,
-            "attack 结束时应到达峰值，实际 {at_4800}"
+            "should reach the peak at the end of attack, got {at_4800}"
         );
-        let early = out[479]; // 1% 处应仍很小
-        assert!(early < 0.2, "attack 起始应接近 0，实际 {early}");
+        let early = out[479]; // should still be small at 1%
+        assert!(early < 0.2, "attack start should be near 0, got {early}");
     }
 
     #[test]
@@ -307,14 +312,14 @@ mod tests {
         env.set_param(ParamId::Sustain, 0.8);
         env.set_param(ParamId::Release, 0.2);
         env.note_event(note_on());
-        let _ = render_with_full_scale(&mut env, 20); // 2560 样本，早已进入 sustain
+        let _ = render_with_full_scale(&mut env, 20); // 2560 samples, long in sustain
 
         env.note_event(note_off());
-        let out = render_with_full_scale(&mut env, 80); // 10240 样本 > release 0.2 s
+        let out = render_with_full_scale(&mut env, 80); // 10240 samples > release 0.2 s
         let tail = &out[out.len() - BLOCK..];
         assert!(
             tail.iter().all(|s| s.abs() < 0.01),
-            "release 结束后应静音，尾部 {tail:?}"
+            "should be silent after release ends, tail {tail:?}"
         );
     }
 
@@ -329,14 +334,14 @@ mod tests {
         let _ = render_with_full_scale(&mut env, 20);
 
         env.note_event(note_off());
-        let during_release = render_with_full_scale(&mut env, 4); // 释放中
+        let during_release = render_with_full_scale(&mut env, 4); // during release
         assert!(during_release[during_release.len() - 1] < 0.8);
 
-        env.note_event(note_on()); // 释放中重触发
+        env.note_event(note_on()); // retrigger during release
         let retriggered = render_with_full_scale(&mut env, 2);
         assert!(
             retriggered[retriggered.len() - 1] > during_release[during_release.len() - 1],
-            "重触发后电平应回升"
+            "level should rise again after retrigger"
         );
     }
 
@@ -347,17 +352,20 @@ mod tests {
         assert!(env.set_param(ParamId::Sustain, 5.0));
         assert!(
             !env.set_param(ParamId::MasterGain, 1.0),
-            "不响应的参数应返回 false"
+            "unhandled parameters should return false"
         );
 
         env.set_param(ParamId::Attack, 0.0);
         env.set_param(ParamId::Decay, 0.0);
         env.note_event(NoteEvent::On {
             note: 60,
-            velocity: f32::NAN, // 非有限力度应回退为 1.0
+            velocity: f32::NAN, // non-finite velocity should fall back to 1.0
         });
         let out = render_with_full_scale(&mut env, 1);
-        assert!((out[out.len() - 1] - 1.0).abs() < 1e-6, "峰值应为 1.0");
+        assert!(
+            (out[out.len() - 1] - 1.0).abs() < 1e-6,
+            "peak should be 1.0"
+        );
     }
 
     #[test]
@@ -370,7 +378,7 @@ mod tests {
         let out = render_with_full_scale(&mut env, 1);
         assert!(
             (out[0] - 0.5).abs() < 1e-6,
-            "A/D 为 0 时第一样本应即 sustain 电平"
+            "with A/D at 0 the first sample should already be the sustain level"
         );
     }
 }

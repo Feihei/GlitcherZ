@@ -7,7 +7,7 @@ license.workspace = true
 description = "ResoZ test VST3 sine instrument plugin (cdylib fixture for resoz-vst3-host tests)"
 
 [lib]
-# VST3 插件 = cdylib 动态库（Windows 上单文件 .vst3 模块）
+# VST3 plugin = cdylib dynamic library (single-file .vst3 module on Windows)
 crate-type = ["cdylib"]
 
 [dependencies]

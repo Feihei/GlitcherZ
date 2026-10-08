@@ -1,4 +1,4 @@
-//! 状态变量滤波器（TPT / Simper SVF）。
+//! State-variable filter (TPT / Simper SVF).
 
 use std::f32::consts::PI;
 
@@ -7,51 +7,52 @@ use crate::realtime::commands::ParamId;
 use crate::realtime::context::ProcessContext;
 use crate::realtime::processor::Processor;
 
-/// 滤波器输出模式。
+/// Filter output mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterMode {
-    /// 低通（默认）。
+    /// Low-pass (default).
     #[default]
     LowPass,
-    /// 高通。
+    /// High-pass.
     HighPass,
-    /// 带通。
+    /// Band-pass.
     BandPass,
 }
 
-/// 状态变量滤波器（零延迟反馈 / TPT 结构，Simper SVF）。
+/// State-variable filter (zero-delay feedback / TPT topology, Simper SVF).
 ///
-/// 二阶（12 dB/oct），同时提供低通/高通/带通输出；共振以 Simper 的
-/// `res`（0..1，k = 2 - 2·res）参数化，`res → 1` 时趋于自激。
+/// Second order (12 dB/oct), providing low-pass/high-pass/band-pass outputs
+/// simultaneously; resonance is parameterized with Simper's `res` (0..1,
+/// k = 2 - 2·res), approaching self-oscillation as `res → 1`.
 ///
-/// 截止频率在处理时钳制到 `[20, min(20000, 0.45·sr)]`；状态在静音时
-/// 冲洗反规范数（denormal），避免 CPU 尖峰。所有路径 RT-safe。
+/// The cutoff frequency is clamped at process time to `[20, min(20000, 0.45·sr)]`;
+/// state is flushed of denormals when silent to avoid CPU spikes. All paths RT-safe.
 ///
-/// 状态按声道保存，最多 2 声道（与 [`AudioBuffer`] 在本管线中的实际
-/// 声道数一致）；超出 2 的声道不做处理。
+/// State is kept per channel, up to 2 channels (matching the actual channel
+/// count of [`AudioBuffer`] in this pipeline); channels beyond 2 are not processed.
 #[derive(Debug)]
 pub struct SvfProcessor {
     sample_rate: f32,
     mode: FilterMode,
     cutoff_hz: f32,
     resonance: f32,
-    /// 每声道状态（最多 2）。
+    /// Per-channel state (up to 2).
     ic1: [f32; 2],
     ic2: [f32; 2],
-    /// 每块重算的系数。
+    /// Coefficients recomputed per block.
     a1: f32,
     a2: f32,
     a3: f32,
     k: f32,
 }
 
-/// 防止共振打到自激的上限。
+/// Upper bound preventing resonance from reaching self-oscillation.
 const MAX_RESONANCE: f32 = 0.98;
-/// 冲洗反规范数的阈值。
+/// Threshold for flushing denormals.
 const DENORMAL_EPS: f32 = 1e-18;
 
 impl SvfProcessor {
-    /// `sample_rate <= 0` 时回退 48 kHz（构造期容错）。
+    /// Falls back to 48 kHz when `sample_rate <= 0` (construction-time tolerance).
     pub fn new(sample_rate: f32) -> Self {
         let mut svf = Self {
             sample_rate: if sample_rate > 0.0 {
@@ -73,7 +74,7 @@ impl SvfProcessor {
         svf
     }
 
-    /// 依据当前参数重算每块系数。RT-safe（纯浮点，无分支爆炸）。
+    /// Recomputes per-block coefficients from the current parameters. RT-safe (pure floating point, no pathological branching).
     fn update_coeffs(&mut self) {
         let nyquist = self.sample_rate * 0.5;
         let fc = self
@@ -88,7 +89,7 @@ impl SvfProcessor {
         self.a3 = g * self.a2;
     }
 
-    /// 冲洗反规范数状态。
+    /// Flushes denormal state.
     fn flush(state: &mut f32) {
         if state.abs() < DENORMAL_EPS {
             *state = 0.0;
@@ -115,8 +116,9 @@ impl Processor for SvfProcessor {
                     ic2 = 2.0 * v2 - ic2;
                     *sample = match mode {
                         FilterMode::LowPass => v2,
-                        // 带通乘 k 归一：中心频率增益恒为 1（模拟原型
-                        // s/(s²+ks+1) 的原始带通增益是 1/k，随 Q 变化）。
+                        // Band-pass normalized by multiplying k: unity gain at the
+                        // center frequency (the analog prototype s/(s²+ks+1) has a
+                        // raw band-pass gain of 1/k, which varies with Q).
                         FilterMode::BandPass => v1 * k,
                         FilterMode::HighPass => input - k * v1 - v2,
                     };
@@ -181,7 +183,7 @@ mod tests {
         }
     }
 
-    /// 把 `signal` 按固定块送入滤波器，返回滤波后的信号。
+    /// Feeds `signal` through the filter in fixed blocks and returns the filtered signal.
     fn run_through(svf: &mut SvfProcessor, signal: &[f32]) -> Vec<f32> {
         let mut buf = AudioBuffer::new(1, BLOCK);
         let mut out = Vec::with_capacity(signal.len());
@@ -203,16 +205,16 @@ mod tests {
         (samples.iter().map(|s| *s * *s).sum::<f32>() / samples.len() as f32).sqrt()
     }
 
-    // 标准测试 1：静音输入 → 输出静音。
+    // Standard test 1: silent input → silent output.
     #[test]
     fn silence_in_silence_out() {
         let mut svf = SvfProcessor::new(SR);
-        svf.set_param(ParamId::FilterResonance, 0.95); // 高共振下也不得自激出声
+        svf.set_param(ParamId::FilterResonance, 0.95); // must not self-oscillate even at high resonance
         let out = run_through(&mut svf, &vec![0.0; BLOCK * 8]);
         assert!(out.iter().all(|s| s.abs() < 1e-9));
     }
 
-    // 标准测试 2：满幅输入 → 无 NaN/Inf。
+    // Standard test 2: full-scale input → no NaN/Inf.
     #[test]
     fn full_scale_stays_finite_even_at_high_resonance() {
         let mut svf = SvfProcessor::new(SR);
@@ -223,7 +225,7 @@ mod tests {
         assert!(out.iter().all(|s| s.is_finite()));
         assert!(
             out.iter().fold(0.0f32, |a, s| a.max(s.abs())) < 100.0,
-            "共振输出应有界"
+            "resonant output must be bounded"
         );
     }
 
@@ -238,33 +240,39 @@ mod tests {
         let peak = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
         assert!(
             peak.is_finite() && peak < 10.0,
-            "冲激响应应有界，峰值 {peak}"
+            "impulse response must be bounded, peak {peak}"
         );
         let tail = &out[out.len() - BLOCK..];
         assert!(
             tail.iter().all(|s| s.abs() < 1e-3),
-            "高 Q 冲激响应应衰减干净"
+            "high-Q impulse response must decay cleanly"
         );
     }
 
     #[test]
     fn low_pass_attenuates_above_cutoff_and_passes_below() {
-        // 通带：440 Hz @ fc 8000 → 基本不衰减。
-        // （正弦 RMS = 0.707；尾部窗口约 1.17 个周期，再留余量。）
+        // Passband: 440 Hz @ fc 8000 → essentially unattenuated.
+        // (Sine RMS = 0.707; the tail window covers about 1.17 periods, plus margin.)
         let mut svf = SvfProcessor::new(SR);
         svf.set_param(ParamId::FilterCutoff, 8_000.0);
         svf.set_param(ParamId::FilterResonance, 0.1);
         let passed = run_through(&mut svf, &sine(440.0, 0.5));
         let tail_rms = rms(&passed[passed.len() - BLOCK..]);
-        assert!(tail_rms > 0.6, "通带 RMS 应接近 0.707，实际 {tail_rms}");
+        assert!(
+            tail_rms > 0.6,
+            "passband RMS should be near 0.707, got {tail_rms}"
+        );
 
-        // 阻带：1000 Hz @ fc 200 → 二阶强衰减。
+        // Stopband: 1000 Hz @ fc 200 → strong second-order attenuation.
         let mut svf = SvfProcessor::new(SR);
         svf.set_param(ParamId::FilterCutoff, 200.0);
         svf.set_param(ParamId::FilterResonance, 0.1);
         let blocked = run_through(&mut svf, &sine(1_000.0, 0.5));
         let tail_rms = rms(&blocked[blocked.len() - BLOCK..]);
-        assert!(tail_rms < 0.25, "阻带 RMS 应远小于 0.707，实际 {tail_rms}");
+        assert!(
+            tail_rms < 0.25,
+            "stopband RMS should be far below 0.707, got {tail_rms}"
+        );
     }
 
     #[test]
@@ -275,7 +283,10 @@ mod tests {
         svf.set_param(ParamId::FilterResonance, 0.1);
         let blocked = run_through(&mut svf, &sine(200.0, 0.5));
         let tail_rms = rms(&blocked[blocked.len() - BLOCK..]);
-        assert!(tail_rms < 0.2, "高通对低频应强衰减，实际 {tail_rms}");
+        assert!(
+            tail_rms < 0.2,
+            "high-pass must strongly attenuate low frequencies, got {tail_rms}"
+        );
     }
 
     #[test]
@@ -288,25 +299,28 @@ mod tests {
         let center_rms = rms(&centered[centered.len() - BLOCK..]);
         assert!(
             center_rms > 0.6,
-            "带通中心增益归一后应接近 0.707，实际 {center_rms}"
+            "band-pass RMS at the center frequency should be near 0.707 after normalization, got {center_rms}"
         );
 
-        // 远端（4000 Hz）按一阶 -6 dB/oct 滚降。
+        // Far end (4000 Hz) rolls off at first-order -6 dB/oct.
         let far = run_through(&mut svf, &sine(4_000.0, 0.5));
         let far_rms = rms(&far[far.len() - BLOCK..]);
-        assert!(far_rms < 0.2, "带通对远端频率应明显衰减，实际 {far_rms}");
+        assert!(
+            far_rms < 0.2,
+            "band-pass must clearly attenuate far-off frequencies, got {far_rms}"
+        );
     }
 
     #[test]
     fn dc_gain_is_unity_for_low_pass_and_zero_for_high_pass() {
-        let n = SR as usize; // 1 秒，充分收敛
+        let n = SR as usize; // 1 second, fully converged
 
         let mut lp = SvfProcessor::new(SR);
         lp.set_param(ParamId::FilterCutoff, 1_000.0);
         let out = run_through(&mut lp, &vec![1.0; n]);
         assert!(
             (out[out.len() - 1] - 1.0).abs() < 1e-3,
-            "低通直流增益应为 1，实际 {}",
+            "low-pass DC gain should be 1, got {}",
             out[out.len() - 1]
         );
 
@@ -316,7 +330,7 @@ mod tests {
         let out = run_through(&mut hp, &vec![1.0; n]);
         assert!(
             out[out.len() - 1].abs() < 1e-3,
-            "高通直流增益应为 0，实际 {}",
+            "high-pass DC gain should be 0, got {}",
             out[out.len() - 1]
         );
     }
@@ -336,7 +350,7 @@ mod tests {
         assert_eq!(svf.mode, FilterMode::HighPass);
         assert!(
             !svf.set_param(ParamId::MasterGain, 1.0),
-            "不响应的参数应返回 false"
+            "unhandled parameters should return false"
         );
     }
 }

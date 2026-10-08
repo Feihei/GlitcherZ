@@ -1,8 +1,10 @@
-//! 音频引擎的非实时控制端。
+//! The non-real-time control side of the audio engine.
 //!
-//! [`AudioEngine`] 拥有 cpal 输出流与命令队列的 producer；所有实时路径
-//! 代码都在 [`crate::realtime::BlockRunner`] 中，随流回调启动时 move 进
-//! 音频线程。UI / 控制代码永远不直接触碰实时数据。
+//! [`AudioEngine`] owns the cpal output stream and the producer end of the
+//! command queue; all real-time path code lives in
+//! [`crate::realtime::BlockRunner`], which is moved into the audio thread when
+//! the stream callback starts. UI / control code never touches real-time data
+//! directly.
 
 use std::sync::atomic::Ordering;
 
@@ -15,45 +17,53 @@ use crate::realtime::{
     structure_channel,
 };
 
-/// 引擎的基础信息（UI 显示用）。
+/// Basic engine info (for UI display).
 #[derive(Debug, Clone)]
 pub struct AudioEngineInfo {
-    /// 输出设备名（拿不到时为"未知设备"）。
+    /// Output device name ("unknown device" when unavailable).
     pub device_name: String,
-    /// 采样率（Hz）。
+    /// Sample rate (Hz).
     pub sample_rate: u32,
-    /// 输出声道数。
+    /// Number of output channels.
     pub out_channels: u16,
 }
 
-/// 引擎错误。应用层直接 `Display` 输出，不需要细分处理。
-/// （cpal 0.18 起所有设备/流错误统一为 `cpal::Error`，内部含 `ErrorKind`。）
+/// Engine error. The application layer can just `Display` it; no fine-grained
+/// handling is needed.
+/// (Since cpal 0.18, all device/stream errors are unified as `cpal::Error`,
+/// which contains an `ErrorKind` internally.)
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
-    #[error("没有可用的音频输出设备")]
+    #[error("no audio output device available")]
     NoOutputDevice,
-    #[error("音频设备错误: {0}")]
+    #[error("audio device error: {0}")]
     Device(#[from] cpal::Error),
 }
 
-/// 音频引擎。丢弃 [`AudioEngine`]（即丢弃内部的 `cpal::Stream`）即停止输出。
+/// The audio engine. Dropping [`AudioEngine`] (and thus the internal
+/// `cpal::Stream`) stops the output.
 pub struct AudioEngine {
     _stream: cpal::Stream,
     commands: rtrb::Producer<EngineCommand>,
-    /// 结构更新队列：图拓扑变更（换计划 / 装卸节点）的发送端。
+    /// Structure update queue: producer end for graph topology changes
+    /// (plan swaps / installing or removing nodes).
     structure: rtrb::Producer<GraphUpdate>,
-    /// 节点回收消费端：UI 定期 [`AudioEngine::reclaim_nodes`] 排空，
-    /// 释放旧插件节点与对应守卫。
+    /// Node recycling consumer end: the UI periodically drains it via
+    /// [`AudioEngine::reclaim_nodes`], releasing old plugin nodes and their
+    /// corresponding guards.
     recycle: rtrb::Consumer<crate::realtime::RecycledNode>,
-    /// 控制侧图状态（非实时）：拓扑权威副本 + 执行计划编译器。
-    /// 全 `Copy`，队列 push 失败时可整快照回滚。
+    /// Control-side graph state (non-real-time): authoritative topology copy +
+    /// execution plan compiler. Entirely `Copy`, so the whole snapshot can be
+    /// rolled back when a queue push fails.
     compiler: GraphCompiler,
     feedback: Feedback,
     info: AudioEngineInfo,
 }
 
 impl AudioEngine {
-    /// 使用宿主默认输出设备启动引擎。**必须在非实时线程调用**（构造期允许分配）。
+    /// Starts the engine on the host's default output device. **Must be
+    /// called on a non-real-time thread** (allocation is allowed during
+    /// construction).
     pub fn start() -> Result<Self, EngineError> {
         let host = cpal::default_host();
         let device = host
@@ -61,9 +71,10 @@ impl AudioEngine {
             .ok_or(EngineError::NoOutputDevice)?;
         let supported = device.default_output_config()?;
 
-        // 数据回调统一按 f32 处理；设备原生格式若不同，由 cpal 在回调边界转换。
+        // The data callback always works with f32; if the device's native
+        // format differs, cpal converts at the callback boundary.
         log::info!(
-            "设备默认格式 {:?}，以 f32 构建输出流",
+            "device default format {:?}, building output stream as f32",
             supported.sample_format()
         );
         let stream_config = supported.config();
@@ -72,8 +83,9 @@ impl AudioEngine {
 
         let (commands, command_rx) = command_channel(COMMAND_QUEUE_CAPACITY);
 
-        // 初始处理图：仅主输出（P5c，D13 全显式）。项目文档经
-        // add_node / connect_nodes 粒度逐步建图（UI 层粘合）。
+        // Initial processing graph: main output only (P5c, D13 fully
+        // explicit). The project document builds the graph step by step via
+        // add_node / connect_nodes granularity (UI layer glue).
         let (compiler, graph) = GraphCompiler::empty_graph(sample_rate_f32, FIXED_BLOCK_SIZE);
 
         let feedback = Feedback::new();
@@ -92,15 +104,17 @@ impl AudioEngine {
             feedback.clone(),
         );
 
-        // 数据回调：实时铁律约束的代码全部集中在 BlockRunner 内。
+        // Data callback: all code constrained by the real-time iron rules is
+        // concentrated inside BlockRunner.
         let stream = device.build_output_stream(
             stream_config,
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                 runner.render_interleaved(data);
             },
             move |err| {
-                // 错误回调不在数据路径上（设备热插拔等），允许日志。
-                log::error!("音频流错误: {err}");
+                // The error callback is not on the data path (device hotplug
+                // etc.), so logging is allowed.
+                log::error!("audio stream error: {err}");
             },
             None,
         )?;
@@ -121,37 +135,46 @@ impl AudioEngine {
         })
     }
 
-    /// 发送一条控制命令到音频线程（在下一个块边界生效）。
-    /// 返回 `false` 表示队列已满、命令被丢弃（非关键路径，可安全忽略）。
+    /// Sends a control command to the audio thread (takes effect at the next
+    /// block boundary).
+    /// Returns `false` when the queue is full and the command was dropped
+    /// (non-critical path, safe to ignore).
     pub fn send(&mut self, command: EngineCommand) -> bool {
         self.commands.push(command).is_ok()
     }
 
-    /// 最近一个音频块的峰值电平（两个声道取最大，约 0..1）。
+    /// Peak level of the most recent audio block (max of both channels,
+    /// roughly 0..1).
     pub fn peak_level(&self) -> f32 {
         self.feedback.level.load()
     }
 
-    /// 音序器当前步进索引（0..16，未播放时停留在最后一次位置）。
+    /// Current step index of the sequencer (0..16, stays at the last position
+    /// when not playing).
     pub fn current_step(&self) -> u32 {
         self.feedback.step.load(Ordering::Relaxed)
     }
 
-    /// 音序器音乐位置（tick，自播放起点累计；用于卷帘播放头）。
+    /// Musical position of the sequencer (ticks, accumulated from the play
+    /// start; used for the piano-roll playhead).
     pub fn musical_ticks(&self) -> f32 {
         self.feedback.position_ticks.load()
     }
 
-    /// 音序器是否播放中。
+    /// Whether the sequencer is playing.
     pub fn is_playing(&self) -> bool {
         self.feedback.playing.load(Ordering::Relaxed)
     }
 
-    /// 将指定轨道的声源换装为外部节点（如 CLAP 乐器）。
-    /// 节点由调用方在**非实时线程**构造；音频线程在下一个块边界换入，
-    /// 被替换的旧节点经回执队列送回，由 [`AudioEngine::reclaim_nodes`]
-    /// 交还控制线程释放。
-    /// 返回分配的节点 ID；`None` 表示越界或队列满（命令被丢弃）。
+    /// Swaps the instrument of the given track to an external node (e.g. a
+    /// CLAP instrument).
+    /// The node is constructed by the caller on a **non-real-time thread**;
+    /// the audio thread swaps it in at the next block boundary, and the
+    /// replaced old node is sent back through the receipt queue, to be
+    /// returned to the control thread for release by
+    /// [`AudioEngine::reclaim_nodes`].
+    /// Returns the allocated node ID; `None` means out of bounds or queue
+    /// full (command dropped).
     pub fn set_external_voice(
         &mut self,
         track: usize,
@@ -163,7 +186,8 @@ impl AudioEngine {
                 if self.structure.push(update).is_ok() {
                     Some(node_id)
                 } else {
-                    // 队列满：回滚编译器快照（update 随节点一同被丢弃）。
+                    // Queue full: roll back the compiler snapshot (the update
+                    // is dropped along with the node).
                     self.compiler = snapshot;
                     None
                 }
@@ -175,8 +199,10 @@ impl AudioEngine {
         }
     }
 
-    /// 向指定轨道效果链末端追加外部节点（如 CLAP 效果器）。
-    /// 返回分配的节点 ID；`None` 表示越界/槽满/队列满（节点被释放）。
+    /// Appends an external node to the end of the given track's effect chain
+    /// (e.g. a CLAP effect).
+    /// Returns the allocated node ID; `None` means out of bounds / slot full /
+    /// queue full (node released).
     pub fn insert_external_effect(
         &mut self,
         track: usize,
@@ -199,7 +225,8 @@ impl AudioEngine {
         }
     }
 
-    /// 清空指定轨道的全部外部效果器节点（节点经回执队列回收）。
+    /// Clears all external effect nodes of the given track (nodes are
+    /// recycled through the receipt queue).
     pub fn clear_external_effects(&mut self, track: usize) -> bool {
         let snapshot = self.compiler;
         match self.compiler.clear_effects(track) {
@@ -215,8 +242,10 @@ impl AudioEngine {
         }
     }
 
-    /// 排空节点回收回执队列：在**控制线程**释放旧节点（含输出缓冲）
-    /// 并返回其 ID（调用方据此丢弃配对的插件守卫，安全卸载动态库）。
+    /// Drains the node recycling receipt queue: releases old nodes (including
+    /// output buffers) on the **control thread** and returns their IDs (the
+    /// caller uses them to drop the paired plugin guards, safely unloading
+    /// dynamic libraries).
     pub fn reclaim_nodes(&mut self) -> Vec<u64> {
         let mut ids = Vec::new();
         while let Ok(recycled) = self.recycle.pop() {
@@ -225,15 +254,16 @@ impl AudioEngine {
                 node,
                 output,
             } = recycled;
-            drop(node); // 控制线程释放：实时铁律仅约束音频回调
+            drop(node); // Released on the control thread: the real-time iron rule only constrains the audio callback
             drop(output);
             ids.push(node_id);
         }
         ids
     }
 
-    /// 将指定轨道的声源恢复为内置合成器（旧外部节点经回执队列回收，
-    /// 切回插件时需重新实例化）。
+    /// Restores the given track's instrument to the built-in synthesizer (the
+    /// old external node is recycled through the receipt queue; it must be
+    /// re-instantiated when switching back to the plugin).
     pub fn set_builtin_voice(&mut self, track: usize) -> bool {
         let snapshot = self.compiler;
         match self.compiler.activate_builtin_voice(track) {
@@ -249,9 +279,10 @@ impl AudioEngine {
         }
     }
 
-    /// 整块替换一条自动化轨道实体（空曲线 = 清空；越界索引在实时侧
-    /// 忽略）。曲线不含目标 —— 投递终点经 [`AudioEngine::set_auto_route`]
-    /// 单独设定（D7）。
+    /// Replaces an automation track entity wholesale (empty curve = clear;
+    /// out-of-bounds indices are ignored on the real-time side). The curve has
+    /// no target — the routing endpoint is set separately via
+    /// [`AudioEngine::set_auto_route`] (D7).
     pub fn set_auto_track(&mut self, index: usize, auto: crate::realtime::RtAutoTrack) -> bool {
         self.send(EngineCommand::Sequencer(SequencerCommand::SetAutoTrack {
             index,
@@ -259,59 +290,67 @@ impl AudioEngine {
         }))
     }
 
-    /// 时间轴布线：把自动化轨道 `auto_index` 连到目标节点参数
-    /// （**node_id 寻址**，P5b）。重复调用即重定向。
+    /// Timeline wiring: connects automation track `auto_index` to a target
+    /// node parameter (**node_id addressing**, P5b). Calling again
+    /// re-routes.
     pub fn set_auto_route(&mut self, auto_index: usize, node_id: u64, param: ParamId) -> bool {
         self.apply_plan_update(|compiler| compiler.set_auto_route(auto_index, node_id, param))
     }
 
-    /// 时间轴布线：断开自动化轨道 `auto_index` 的连线。
+    /// Timeline wiring: disconnects automation track `auto_index`.
     pub fn clear_auto_route(&mut self, auto_index: usize) -> bool {
         self.apply_plan_update(|compiler| compiler.clear_auto_route(auto_index))
     }
 
-    /// 时间轴布线：把 MIDI 轨 `from_track` 的音符事件额外扇出到目标
-    /// 节点（**node_id 寻址**，P5b；默认图已含本轨自连）。重复连线幂等；
-    /// 扇出超限返回 `false`。
+    /// Timeline wiring: additionally fans out note events of MIDI track
+    /// `from_track` to the target node (**node_id addressing**, P5b; the
+    /// default graph already includes the track's self-connection).
+    /// Repeated connections are idempotent; returns `false` when the fan-out
+    /// limit is exceeded.
     pub fn connect_midi_node(&mut self, from_track: usize, node_id: u64) -> bool {
         self.apply_plan_update(|compiler| compiler.connect_midi(from_track, node_id))
     }
 
-    /// 时间轴布线：断开 MIDI 轨 `from_track` 到目标节点的扇出
-    /// （本轨自连是默认图一部分，不可断开）。
+    /// Timeline wiring: disconnects the fan-out from MIDI track `from_track`
+    /// to the target node (the track's self-connection is part of the default
+    /// graph and cannot be disconnected).
     pub fn disconnect_midi_node(&mut self, from_track: usize, node_id: u64) -> bool {
         self.apply_plan_update(|compiler| compiler.disconnect_midi(from_track, node_id))
     }
 
-    /// 按 node_id 定向设置节点参数（P5b：节点寻址的公开路径）。
-    /// 返回 `false` 表示队列满（命令被丢弃，非关键路径）。
+    /// Sets a node parameter directly by node_id (P5b: the public
+    /// node-addressed path).
+    /// Returns `false` when the queue is full (command dropped, non-critical
+    /// path).
     pub fn set_node_param(&mut self, node_id: u64, id: ParamId, value: f32) -> bool {
         self.send(EngineCommand::SetNodeParam { node_id, id, value })
     }
 
-    /// 某轨声源的 node_id（UI 把轨道坐标解析成节点寻址用）。
+    /// The node_id of a track's instrument (used by the UI to resolve track
+    /// coordinates into node addressing).
     pub fn voice_node_id(&self, track: usize) -> Option<u64> {
         self.compiler.track_voice_node_id(track)
     }
 
-    /// 某轨延迟节点的 node_id。
+    /// The node_id of a track's delay node.
     pub fn delay_node_id(&self, track: usize) -> Option<u64> {
         self.compiler.track_delay_node_id(track)
     }
 
-    /// 某轨通道条的 node_id。
+    /// The node_id of a track's channel strip.
     pub fn channel_node_id(&self, track: usize) -> Option<u64> {
         self.compiler.track_channel_node_id(track)
     }
 
-    /// 主输出节点的 node_id。
+    /// The node_id of the master output node.
     pub fn master_node_id(&self) -> u64 {
         self.compiler.master_node_id()
     }
 
-    /// 新增一条 MIDI 轨（默认三件套 + 本轨 MIDI 自连）。返回三个新
-    /// node_id `[voice, delay, channel]`；轨道/槽位/主输出入边容量满时
-    /// 返回 `None`（编译器已回滚）。
+    /// Adds a MIDI track (default trio + the track's MIDI self-connection).
+    /// Returns the three new node_ids `[voice, delay, channel]`; returns
+    /// `None` when track/slot/master-input-edge capacity is full (the compiler
+    /// has been rolled back).
     pub fn add_midi_track(&mut self) -> Option<[u64; 3]> {
         let snapshot = self.compiler;
         match self.compiler.add_midi_track() {
@@ -327,28 +366,33 @@ impl AudioEngine {
         }
     }
 
-    /// 拆除一条 MIDI 轨（三件套连同效果器一并回收）。
+    /// Tears down a MIDI track (the trio is recycled together with its
+    /// effects).
     pub fn remove_midi_track(&mut self, track: usize) -> bool {
         self.apply_plan_update(|compiler| compiler.remove_midi_track(track))
     }
 
-    /// 设置活跃 MIDI 轨数（D12；实时侧钳制到容量上限）。
+    /// Sets the number of active MIDI tracks (D12; clamped to the capacity
+    /// limit on the real-time side).
     pub fn set_midi_track_count(&mut self, count: usize) -> bool {
         self.send(EngineCommand::Sequencer(
             SequencerCommand::SetMidiTrackCount(count),
         ))
     }
 
-    // ---- 文档逐步建图 API（P5c，D13：加载器按文档重建引擎图）----
+    // ---- Document-driven graph building API (P5c, D13: the loader rebuilds
+    // the engine graph from the document) ----
 
-    /// 分配下一个会话内单调 node_id（文档节点安装前取用；与文档
-    /// node_id 的映射由调用方维护）。
+    /// Allocates the next session-monotonic node_id (taken before a document
+    /// node is installed; the mapping to document node_ids is maintained by
+    /// the caller).
     pub fn fresh_node_id(&mut self) -> u64 {
         self.compiler.fresh_node_id()
     }
 
-    /// 安装一个文档节点（显式 node_id，D11）。返回 `false` 表示
-    /// 非法 id / 重复 id / 槽位满 / 队列满（节点被释放，编译器已回滚）。
+    /// Installs a document node (explicit node_id, D11). Returns `false` for
+    /// an invalid id / duplicate id / full slots / full queue (the node is
+    /// released, the compiler has been rolled back).
     pub fn add_node(&mut self, node_id: u64, node: Box<dyn crate::realtime::Processor>) -> bool {
         let snapshot = self.compiler;
         match self.compiler.add_node(node_id, node) {
@@ -364,7 +408,8 @@ impl AudioEngine {
         }
     }
 
-    /// 装配轨道寻址表（文档三件套 node_id → 旧轨道坐标 API 的映射）。
+    /// Assembles the track addressing table (mapping from document trio
+    /// node_ids to the legacy track-coordinate API).
     pub fn register_track_chain(
         &mut self,
         track: usize,
@@ -377,19 +422,22 @@ impl AudioEngine {
         })
     }
 
-    /// 节点间音频连线（node_id 寻址）。重复连线幂等。
+    /// Audio connection between nodes (node_id addressing). Repeated
+    /// connections are idempotent.
     pub fn connect_nodes(&mut self, from_id: u64, to_id: u64) -> bool {
         self.apply_plan_update(|compiler| compiler.connect_nodes(from_id, to_id))
     }
 
-    /// 断开节点间音频连线（未连线幂等）。
+    /// Disconnects an audio connection between nodes (idempotent when not
+    /// connected).
     pub fn disconnect_nodes(&mut self, from_id: u64, to_id: u64) -> bool {
         self.apply_plan_update(|compiler| compiler.disconnect_nodes(from_id, to_id))
     }
 
-    /// 原位替换某节点的处理器（**保留 node_id**，D11）。旧处理器经
-    /// 回收回执释放；返回被保留的 node_id，`None` = 节点不存在/队列满
-    /// （节点被释放，编译器已回滚）。
+    /// Replaces a node's processor in place (**node_id preserved**, D11). The
+    /// old processor is released via the recycling receipt; returns the
+    /// preserved node_id, `None` = node does not exist / queue full (the node
+    /// is released, the compiler has been rolled back).
     pub fn replace_node(
         &mut self,
         node_id: u64,
@@ -412,7 +460,8 @@ impl AudioEngine {
         }
     }
 
-    /// 在既有连线 `from_id → to_id` 之间插入一个节点（显式 node_id）。
+    /// Inserts a node (explicit node_id) between an existing connection
+    /// `from_id → to_id`.
     pub fn insert_node_between(
         &mut self,
         new_id: u64,
@@ -440,12 +489,14 @@ impl AudioEngine {
         }
     }
 
-    /// 移除一个节点（连同出入连线与路由表条目）。主输出不可删除（D6）。
+    /// Removes a node (along with its incoming/outgoing connections and
+    /// routing table entries). The master output cannot be removed (D6).
     pub fn remove_node(&mut self, node_id: u64) -> bool {
         self.apply_plan_update(|compiler| compiler.remove_node(node_id))
     }
 
-    /// 应用一次仅换计划的拓扑变更（连线表编辑等），队列满时回滚。
+    /// Applies a plan-only topology change (connection table edits etc.),
+    /// rolling back when the queue is full.
     fn apply_plan_update(
         &mut self,
         edit: impl FnOnce(&mut GraphCompiler) -> Result<GraphUpdate, crate::realtime::TopologyError>,
@@ -467,7 +518,8 @@ impl AudioEngine {
         }
     }
 
-    /// 指定轨道的 post-fader 峰值电平（越界返回 0）。
+    /// Post-fader peak level of the given track (returns 0 when out of
+    /// bounds).
     pub fn track_level(&self, track: usize) -> f32 {
         self.feedback
             .track_levels
@@ -475,7 +527,7 @@ impl AudioEngine {
             .map_or(0.0, |level| level.load())
     }
 
-    /// 播放位置（秒，f64：时间计算用 f64）。
+    /// Playback position (seconds, f64: time calculations use f64).
     pub fn position_seconds(&self) -> f64 {
         convert::samples_to_seconds(
             self.feedback.position.load(Ordering::Relaxed),
@@ -483,13 +535,14 @@ impl AudioEngine {
         )
     }
 
-    /// 引擎信息。
+    /// Engine info.
     pub fn info(&self) -> &AudioEngineInfo {
         &self.info
     }
 }
 
-/// 枚举宿主的输出设备名（诊断用，非实时）。
+/// Enumerates the host's output device names (for diagnostics,
+/// non-real-time).
 pub fn available_outputs() -> Vec<String> {
     let host = cpal::default_host();
     let Ok(devices) = host.devices() else {

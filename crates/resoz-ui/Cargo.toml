@@ -4,13 +4,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ResoZ egui 界面：走带、音序器、钢琴卷帘、混音器"
+description = "ResoZ egui UI: transport, sequencer, piano roll, mixer"
 
 [dependencies]
-# Windows 上 wgpu/Vulkan 初始化可能被失效的注入层（如 RenderDoc）卡住；
-# glow（OpenGL）更轻且启动快，作为默认渲染后端。
-# （workspace 中 eframe 已 default-features = false + default_fonts。）
-# persistence：eframe 内建存储（RON），用于持久化最近文件列表
+# On Windows, wgpu/Vulkan initialization can hang on a stale injection layer
+# (e.g. RenderDoc); glow (OpenGL) is lighter and starts faster, so it is the
+# default render backend.
+# (eframe in the workspace is default-features = false + default_fonts.)
+# persistence: eframe built-in storage (RON), used to persist the recent-files list
 eframe = { workspace = true, features = ["glow", "persistence"] }
 log = { workspace = true }
 rfd = { workspace = true }

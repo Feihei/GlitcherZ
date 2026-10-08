@@ -1,9 +1,11 @@
-//! ResoZ 测试用 CLAP 插件：单音正弦乐器（含一个可自动化参数）。
+//! ResoZ test CLAP plugin: monophonic sine instrument (with one
+//! automatable parameter).
 //!
-//! 用途：端到端验证 ResoZ 的 CLAP 宿主——插件发现、实例化、音符事件
-//! 桥接与参数枚举。实现刻意保持最小：单声部（最后一个 NoteOn 获胜），
-//! 暴露一个 Amplitude 参数（ID 1，0..1，默认 0.5）供参数枚举与自动化
-//! 桥接验证。
+//! Purpose: end-to-end verification of ResoZ's CLAP host — plugin discovery,
+//! instantiation, note event bridging and parameter enumeration. The
+//! implementation is deliberately minimal: a single voice (the last NoteOn
+//! wins), exposing one Amplitude parameter (ID 1, 0..1, default 0.5) for
+//! parameter enumeration and automation bridge verification.
 
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,12 +22,13 @@ use clack_plugin::extensions::PluginExtensions;
 use clack_plugin::plugin::features::{INSTRUMENT, STEREO};
 use clack_plugin::prelude::*;
 
-/// Amplitude 参数的固定 ID。
+/// Fixed ID of the Amplitude parameter.
 const AMPLITUDE_PARAM_ID: u32 = 1;
-/// Amplitude 参数默认值。
+/// Default value of the Amplitude parameter.
 const AMPLITUDE_DEFAULT: f64 = 0.5;
 
-/// 插件共享状态（主线程 + 音频线程）：振幅，f64 位模式原子存储。
+/// Plugin shared state (main thread + audio thread): amplitude, stored
+/// atomically as an f64 bit pattern.
 pub struct SineShared {
     amplitude_bits: AtomicU64,
 }
@@ -44,7 +47,8 @@ impl SineShared {
     }
 }
 
-/// 音频线程侧：单声部正弦合成，振幅读自共享状态。
+/// Audio-thread side: monophonic sine synthesis, amplitude read from shared
+/// state.
 pub struct SineAudio<'a> {
     sample_rate: f32,
     phase: f32,
@@ -75,7 +79,8 @@ impl<'a> PluginAudioProcessor<'a, SineShared, SineMainThread<'a>> for SineAudio<
         mut audio: Audio,
         events: Events,
     ) -> Result<ProcessStatus, PluginError> {
-        // 1. 处理输入事件（块粒度简化：同一块起点应用）。
+        // 1. Handle input events (block-granularity simplification: applied
+        //    at the same block start).
         for event in events.input.iter() {
             if let Some(note_on) = event.as_event::<NoteOnEvent>() {
                 let key = match note_on.key() {
@@ -94,8 +99,9 @@ impl<'a> PluginAudioProcessor<'a, SineShared, SineMainThread<'a>> for SineAudio<
             }
         }
 
-        // 2. 渲染全部输出端口（无音符时静音）。相位按帧无状态推算，
-        //    每帧只推进一次（与声道遍历顺序无关）。
+        // 2. Render all output ports (silence without a note). Phase is
+        //    computed statelessly per frame, advancing only once per frame
+        //    (independent of channel traversal order).
         let frames = audio.frames_count() as usize;
         let amplitude = if self.gate {
             self.shared.amplitude() as f32
@@ -113,7 +119,8 @@ impl<'a> PluginAudioProcessor<'a, SineShared, SineMainThread<'a>> for SineAudio<
                 continue;
             };
             for channel_pair in channels {
-                // OutputOnly/InputOutput/InPlace 均直接解构出输出切片。
+                // OutputOnly/InputOutput/InPlace all destructure the output
+                // slice directly.
                 let buffer = match channel_pair {
                     ChannelPair::OutputOnly(buffer) => buffer,
                     ChannelPair::InputOutput(_, buffer) => buffer,
@@ -136,7 +143,7 @@ impl<'a> PluginAudioProcessor<'a, SineShared, SineMainThread<'a>> for SineAudio<
 }
 
 impl PluginAudioProcessorParams for SineAudio<'_> {
-    /// 非活动态的参数同步：把输入事件写入共享状态。
+    /// Parameter sync while inactive: writes input events into shared state.
     fn flush(
         &mut self,
         input_parameter_changes: &InputEvents,
@@ -152,7 +159,8 @@ impl PluginAudioProcessorParams for SineAudio<'_> {
     }
 }
 
-/// 主线程侧：参数元数据与取值查询（CLAP params 扩展实现）。
+/// Main-thread side: parameter metadata and value queries (CLAP params
+/// extension implementation).
 pub struct SineMainThread<'a> {
     shared: &'a SineShared,
 }
@@ -231,7 +239,7 @@ impl Plugin for SinePlugin {
 impl DefaultPluginFactory for SinePlugin {
     fn get_descriptor() -> PluginDescriptor {
         PluginDescriptor::new("org.resoz.sine", "ResoZ Sine")
-            .with_description("ResoZ 测试用正弦乐器")
+            .with_description("ResoZ test sine instrument")
             .with_features([INSTRUMENT, STEREO])
     }
 

@@ -1,55 +1,61 @@
-//! 项目文件（`.rez`）的读写。
+//! Reading and writing of the project file (`.rez`).
 //!
-//! 文件格式：RON 序列化的 [`ProjectFile`]（版本号 + 项目文档），
-//! pretty 输出便于手工检视与版本 diff。
+//! File format: RON-serialized [`ProjectFile`] (version number + project
+//! document); pretty output for easy manual inspection and version diffing.
 //!
-//! 向后兼容策略：`version` 记录文件格式版本；**新增字段一律经
-//! `#[serde(default)]` 提供默认值**（见 crate 文档约定），因此读取
-//! 旧版本文件时缺失字段自动升格；未知字段被 serde 忽略。当前所有
-//! 版本 ≤ [`PROJECT_VERSION`] 的文件按同一套字段级容错读取；若未来
-//! 出现需要破坏性迁移的版本，在此模块按 `version` 分支处理。
+//! Backward compatibility policy: `version` records the file format version;
+//! **new fields always get defaults via `#[serde(default)]`** (see the crate
+//! documentation conventions), so missing fields are automatically upgraded
+//! when reading older files; unknown fields are ignored by serde. Currently
+//! all files with a version ≤ [`PROJECT_VERSION`] are read with the same
+//! field-level tolerance; if a future version requires a destructive
+//! migration, handle it by branching on `version` in this module.
 
 use std::path::Path;
 
 use crate::Project;
 
-/// 项目文件格式的当前版本（v3：GraphDoc 完整形态 nodes + cables，
-/// D11-D13；MIDI/自动化轨道顶层 Vec 化）。
+/// Current version of the project file format (v3: GraphDoc full form
+/// nodes + cables, D11-D13; MIDI/automation tracks become top-level `Vec`s).
 ///
-/// 兼容策略（Q5 决策）：**不做旧版读路径**——结构变更靠 serde 字段级
-/// 默认值自然容忍缺失；旧版文件里无法映射的字段（如旧 `tracks` 数组）
-/// 被忽略，加载结果为默认文档。
+/// Compatibility policy (Q5 decision): **no legacy read paths** --
+/// structural changes are naturally tolerated via serde field-level defaults
+/// for missing fields; fields in old files that cannot be mapped (like the
+/// old `tracks` array) are ignored, and the loaded result is the default
+/// document.
 pub const PROJECT_VERSION: u32 = 3;
 
 fn default_version() -> u32 {
     PROJECT_VERSION
 }
 
-/// `.rez` 项目文件顶层结构：版本号 + 项目文档。
+/// Top-level structure of a `.rez` project file: version number + project
+/// document.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProjectFile {
-    /// 文件格式版本。
+    /// File format version.
     #[serde(default = "default_version")]
     pub version: u32,
-    /// 项目文档。
+    /// Project document.
     #[serde(default)]
     pub project: Project,
 }
 
-/// 模型层错误。
+/// Model layer error.
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
-    #[error("文件读写失败：{0}")]
+    #[error("file read/write failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("项目文件解析失败：{0}")]
+    #[error("project file parse failed: {0}")]
     Parse(#[from] ron::error::SpannedError),
-    #[error("项目文件序列化失败：{0}")]
+    #[error("project file serialization failed: {0}")]
     Serialize(#[from] ron::error::Error),
-    #[error("项目文件图结构非法：{0}")]
+    #[error("invalid project file graph structure: {0}")]
     InvalidGraph(String),
 }
 
-/// 把项目保存为 `.rez` 文件（RON pretty 格式）。**非实时**（磁盘 IO）。
+/// Saves the project as a `.rez` file (RON pretty format). **Not real-time**
+/// (disk IO).
 pub fn save_project(project: &Project, path: &Path) -> Result<(), ModelError> {
     project.validate().map_err(ModelError::InvalidGraph)?;
     let file = ProjectFile {
@@ -61,12 +67,15 @@ pub fn save_project(project: &Project, path: &Path) -> Result<(), ModelError> {
     Ok(())
 }
 
-/// 解析项目文件文本。
+/// Parses project file text.
 ///
-/// 先用 `ron::Value` 探测顶层结构：含 `project` / `version` 键则按
-/// 标准 [`ProjectFile`] 包装解析，否则按裸 `Project`（开发期临时格式）
-/// 解析。不能只靠"`ProjectFile` 能否解析"判断——serde 会把裸 Project
-/// 的全部字段当未知字段忽略并"成功"产出空项目，静默丢数据。
+/// First probes the top-level structure with `ron::Value`: if it contains
+/// the `project` / `version` keys it parses as the standard [`ProjectFile`]
+/// wrapper; otherwise it parses as a bare `Project` (development-time
+/// temporary format). You cannot rely only on "whether `ProjectFile` parses"
+/// -- serde would treat all fields of a bare Project as unknown fields,
+/// ignore them, and "successfully" produce an empty project, silently losing
+/// data.
 pub fn parse_project(text: &str) -> Result<Project, ModelError> {
     let is_wrapped = ron::from_str::<ron::value::Value>(text)
         .ok()
@@ -91,7 +100,7 @@ pub fn parse_project(text: &str) -> Result<Project, ModelError> {
     Ok(project)
 }
 
-/// 从磁盘加载项目。**非实时**（磁盘 IO）。
+/// Loads the project from disk. **Not real-time** (disk IO).
 pub fn load_project(path: &Path) -> Result<Project, ModelError> {
     let text = std::fs::read_to_string(path)?;
     parse_project(&text)
@@ -107,9 +116,9 @@ mod tests {
 
     fn demo_project() -> Project {
         let mut project = Project::default();
-        project.metadata.name = "测试项目".to_string();
+        project.metadata.name = "Test Project".to_string();
         project.metadata.tempo_bpm = 140.0;
-        project.midi_tracks[0].name = "贝斯".to_string();
+        project.midi_tracks[0].name = "Bass".to_string();
         project.midi_tracks[0].pattern = Pattern::single_note(48);
         project.midi_tracks[1].source = TrackSource::Clip;
         project.midi_tracks[1].clip = Clip {
@@ -129,7 +138,8 @@ mod tests {
                 },
             ],
         };
-        // 自动化轨道 0：循环一小节，连到轨道 0 通道条增益。
+        // Automation track 0: loops one bar, cabled to track 0's channel
+        // strip gain.
         project.automation_tracks.push(AutomationTrack {
             enabled: true,
             loop_ticks: 384,
@@ -146,66 +156,73 @@ mod tests {
         project
     }
 
-    // 端到端：保存 → 重新加载 → Project 相等（AGENTS.md 第 7 步要求）。
+    // End to end: save → reload → Project equal (required by AGENTS.md
+    // step 7).
     #[test]
     fn save_load_roundtrip() {
         let project = demo_project();
         let path = std::env::temp_dir().join(format!("resoz_roundtrip_{}.rez", std::process::id()));
 
-        save_project(&project, &path).expect("保存失败");
-        let loaded = load_project(&path).expect("加载失败");
+        save_project(&project, &path).expect("save failed");
+        let loaded = load_project(&path).expect("load failed");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(project, loaded, "保存→加载应完整还原项目");
+        assert_eq!(
+            project, loaded,
+            "save→load should fully restore the project"
+        );
     }
 
     #[test]
     fn saved_file_carries_version() {
         let path = std::env::temp_dir().join(format!("resoz_version_{}.rez", std::process::id()));
-        save_project(&Project::default(), &path).expect("保存失败");
-        let text = std::fs::read_to_string(&path).expect("读取失败");
+        save_project(&Project::default(), &path).expect("save failed");
+        let text = std::fs::read_to_string(&path).expect("read failed");
         let _ = std::fs::remove_file(&path);
 
-        let file: ProjectFile = ron::from_str(&text).expect("解析失败");
+        let file: ProjectFile = ron::from_str(&text).expect("parse failed");
         assert_eq!(file.version, PROJECT_VERSION);
     }
 
     #[test]
     fn missing_track_fields_survive_load() {
-        // 模拟手工编辑的文件：midi_tracks 只有 name。
+        // Simulates a hand-edited file: midi_tracks has only a name.
         let path = std::env::temp_dir().join(format!("resoz_compat_{}.rez", std::process::id()));
         std::fs::write(
             &path,
             r#"(
     version: 3,
     project: (
-        midi_tracks: [(name: "只有名字"), (), (), ()],
+        midi_tracks: [(name: "name only"), (), (), ()],
     ),
 )"#,
         )
-        .expect("写入失败");
-        let loaded = load_project(&path).expect("加载失败");
+        .expect("write failed");
+        let loaded = load_project(&path).expect("load failed");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(loaded.midi_tracks[0].name, "只有名字");
+        assert_eq!(loaded.midi_tracks[0].name, "name only");
         assert!((loaded.metadata.tempo_bpm - 120.0).abs() < 1e-9);
-        // graph 字段缺省 = 空图（文档说什么就是什么，D13）。
+        // Missing graph field = empty graph (whatever the document says, D13).
         assert!(loaded.graph.nodes.is_empty());
     }
 
     #[test]
     fn bare_project_text_is_accepted() {
-        // 开发期的裸 Project 格式应能直接读取。
+        // The development-time bare Project format should be readable
+        // directly.
         let project = demo_project();
-        let text = ron::ser::to_string(&project).expect("序列化失败");
-        let parsed = parse_project(&text).expect("解析失败");
+        let text = ron::ser::to_string(&project).expect("serialization failed");
+        let parsed = parse_project(&text).expect("parse failed");
         assert_eq!(project, parsed);
     }
 
     #[test]
     fn invalid_graph_is_rejected_on_load() {
-        // 连线引用不存在的节点：报错而非截断（文件层是最后防线）。
-        // 注意：PortRef 经 rename_all 序列化为 snake_case（node/master）。
+        // Cable references a nonexistent node: report an error instead of
+        // truncating (the file layer is the last line of defense).
+        // Note: PortRef is serialized as snake_case via rename_all
+        // (node/master).
         let text = r#"(
     version: 3,
     project: (
@@ -216,7 +233,7 @@ mod tests {
             parse_project(text),
             Err(ModelError::InvalidGraph(_))
         ));
-        // 越界的自动化轨端口。
+        // Automation track port out of range.
         let text = r#"(
     version: 3,
     project: (

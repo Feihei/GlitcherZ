@@ -1,12 +1,14 @@
-//! 节点画布（P5d MVP，spec §9 P5d）：egui 自绘节点图视图与连线编辑。
+//! Node canvas (P5d MVP, spec §9 P5d): egui self-drawn node graph view and cable editing.
 //!
-//! 职责边界：画布只做**视图 + 交互意图**——平移/缩放、节点框绘制
-//! （类型着色）、cable 连线绘制、拉线交互、选中与删除。所有副作用
-//! 经 [`CanvasAction`] 返回，由 `ResoZApp::apply_canvas_actions` 统一
-//! 落文档 + 引擎（画布不直接持有引擎/守卫）。
+//! Responsibility boundary: the canvas only does **view + interaction intent** — pan/zoom, node
+//! box drawing (color-coded by type), cable drawing, drag-to-connect interaction, selection and
+//! deletion. All side effects are returned via [`CanvasAction`] and applied to the document +
+//! engine in one place by `ResoZApp::apply_canvas_actions` (the canvas never touches the
+//! engine/guards directly).
 //!
-//! 坐标约定：节点位置存**图空间**坐标（会话内存，不持久化；P5c 双
-//! 身份约定——画布面对文档 node_id + 固定实体，不感知引擎 id）。
+//! Coordinate convention: node positions are stored in **graph space** (session memory, not
+//! persisted; P5c dual identity — the canvas deals with document node_ids + fixed entities and
+//! is unaware of engine ids).
 
 use std::collections::HashMap;
 
@@ -15,72 +17,76 @@ use egui::{Color32, FontId, Pos2, Rect, Sense, Vec2};
 
 use resoz_model::{AutoParam, CableKind, GraphDoc, NodeDoc, PortRef, VoiceSpec};
 
-/// 画布实体身份：文档节点 + 固定实体（主输出 / 时间轴源）。
+/// Canvas entity identity: document nodes + fixed entities (master output / timeline sources).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CanvasId {
-    /// 文档节点（持久化 node_id，≥ 2）。
+    /// Document node (persisted node_id, ≥ 2).
     Node(u64),
-    /// 主输出（保留身份，D6）。
+    /// Master output (reserved identity, D6).
     Master,
-    /// 时间轴 MIDI 轨出口。
+    /// Timeline MIDI track source.
     MidiTrack(usize),
-    /// 时间轴自动化轨出口。
+    /// Timeline automation track source.
     AutoTrack(usize),
 }
 
-/// 画布一帧内产生的交互意图（由调用方落库，画布不做副作用）。
+/// Interaction intents produced within one canvas frame (applied by the caller; the canvas has
+/// no side effects).
 #[derive(Debug, Clone)]
 pub enum CanvasAction {
-    /// 音频拉线：源文档节点 → 目标（节点或主输出）。
+    /// Audio cable drag: source document node → target (node or master output).
     ConnectAudio { from_doc: u64, to: PortRef },
-    /// MIDI 拉线：时间轴轨道 → 乐器文档节点。
+    /// MIDI cable drag: timeline track → instrument document node.
     ConnectMidi { track: usize, to_doc: u64 },
-    /// 自动化拉线（用户已从弹出菜单选定参数）。
+    /// Automation cable drag (parameter already picked by the user from the popup menu).
     ConnectAuto {
         index: usize,
         to_doc: u64,
         param: AutoParam,
     },
-    /// 删除连线（文档连线表下标）。
+    /// Delete a cable (index into the document cable table).
     DeleteCable(usize),
-    /// 删除节点（文档 node_id；仅效果器会被接受，调用方校验）。
+    /// Delete a node (document node_id; only effects are accepted, validated by the caller).
     DeleteNode(u64),
-    /// 把某节点的主属轨道设为当前编辑轨道。
+    /// Set a node's owning track as the current editing track.
     SelectTrack(usize),
 }
 
-/// 画布依赖的外部数据快照（不可变借用，规避借用冲突）。
+/// Snapshot of external data the canvas depends on (immutable borrows to avoid borrow conflicts).
 pub struct CanvasDeps<'a> {
-    /// 项目图文档（nodes + cables）。
+    /// Project graph document (nodes + cables).
     pub doc: &'a GraphDoc,
-    /// 活跃 MIDI 轨数。
+    /// Active MIDI track count.
     pub track_count: usize,
-    /// 自动化轨道数。
+    /// Automation track count.
     pub auto_count: usize,
-    /// 给定文档节点 id，返回可自动化的参数选项 `(标签, 参数)`。
+    /// Given a document node id, return automatable parameter options `(label, parameter)`.
     pub auto_options: &'a dyn Fn(u64) -> Vec<(String, AutoParam)>,
 }
 
-/// 拖拽中的连线（源 = 拖出的输出口所属实体）。
+/// Cable being dragged (source = the entity owning the dragged output port).
 #[derive(Debug, Clone, Copy)]
 struct CableDrag {
     from: CanvasId,
 }
 
-/// 画布跨帧状态。
+/// Canvas cross-frame state.
 #[derive(Debug, Default)]
 pub struct CanvasState {
-    /// 视口平移（图空间坐标，图原点在画布左上角时为 (0,0)）。
+    /// Viewport pan (graph-space coordinates; (0,0) when the graph origin is at the canvas
+    /// top-left).
     pan: Vec2,
-    /// 缩放系数（0.35..3.0）。
+    /// Zoom factor (0.35..3.0).
     zoom: f32,
-    /// 实体 → 图空间位置（会话内存；缺失时按轨道链自动布点）。
+    /// Entity → graph-space position (session memory; missing entries are auto-placed along
+    /// track chains).
     positions: HashMap<CanvasId, Pos2>,
-    /// 当前选中项（节点或连线）。
+    /// Current selection (node or cable).
     selection: Option<Selection>,
-    /// 进行中的拖拽。
+    /// Drag in progress.
     drag: Option<DragKind>,
-    /// 自动化拉线放下后待选参数：`(轨道下标, 目标文档节点, 弹出位置)`。
+    /// Parameters awaiting selection after dropping an automation cable drag: `(track index,
+    /// target document node, popup position)`.
     pending_auto: Option<(usize, u64, Pos2)>,
 }
 
@@ -92,30 +98,30 @@ enum Selection {
 
 #[derive(Debug, Clone, Copy)]
 enum DragKind {
-    /// 拖动视口。
+    /// Pan the viewport.
     Pan,
-    /// 拖动节点。
+    /// Drag a node.
     Node(CanvasId),
-    /// 拉线中（源输出口）。
+    /// Cable dragging in progress (source output port).
     Cable(CableDrag),
 }
 
-/// 音频节点框尺寸。
+/// Audio node box size.
 const NODE_SIZE: Vec2 = Vec2::new(150.0, 64.0);
-/// 时间轴源（MIDI / 自动化）框尺寸。
+/// Timeline source (MIDI / automation) box size.
 const SOURCE_SIZE: Vec2 = Vec2::new(132.0, 40.0);
-/// 画布固定高度。
+/// Fixed canvas height.
 const CANVAS_HEIGHT: f32 = 300.0;
-/// 输出口圆半径 / 命中半径。
+/// Output port circle radius / hit radius.
 const PORT_RADIUS: f32 = 6.0;
 const PORT_HIT_RADIUS: f32 = 12.0;
-/// 连线命中距离。
+/// Cable hit distance.
 const CABLE_HIT_DIST: f32 = 8.0;
-/// 缩放范围。
+/// Zoom range.
 const ZOOM_MIN: f32 = 0.35;
 const ZOOM_MAX: f32 = 3.0;
 
-/// 类型着色（spec P5d）：描边按类型区分，填充为深色底。
+/// Type coloring (spec P5d): stroke varies by type, fill is a dark base.
 fn node_color(id: CanvasId, doc: &GraphDoc) -> (Color32, Color32) {
     let stroke = match id {
         CanvasId::Master => Color32::from_rgb(230, 110, 90),
@@ -137,7 +143,7 @@ fn node_color(id: CanvasId, doc: &GraphDoc) -> (Color32, Color32) {
     (stroke, fill)
 }
 
-/// 连线颜色（按类型）。
+/// Cable color (by type).
 fn cable_color(kind: CableKind) -> Color32 {
     match kind {
         CableKind::Audio => Color32::from_rgb(150, 152, 160),
@@ -146,7 +152,7 @@ fn cable_color(kind: CableKind) -> Color32 {
     }
 }
 
-/// 实体框尺寸。
+/// Entity box size.
 fn size_of(id: CanvasId) -> Vec2 {
     match id {
         CanvasId::MidiTrack(_) | CanvasId::AutoTrack(_) => SOURCE_SIZE,
@@ -154,39 +160,41 @@ fn size_of(id: CanvasId) -> Vec2 {
     }
 }
 
-/// 实体标签。
+/// Entity label.
 fn label_of(id: CanvasId, doc: &GraphDoc) -> String {
     match id {
-        CanvasId::Master => "主输出".to_string(),
-        CanvasId::MidiTrack(t) => format!("MIDI 轨 {}", t + 1),
-        CanvasId::AutoTrack(i) => format!("自动化 {}", i + 1),
+        CanvasId::Master => "Master Out".to_string(),
+        CanvasId::MidiTrack(t) => format!("MIDI Track {}", t + 1),
+        CanvasId::AutoTrack(i) => format!("Automation {}", i + 1),
         CanvasId::Node(node_id) => match doc.node_by_id(node_id) {
             Some(NodeDoc::Instrument { voice, track, .. }) => match voice {
-                VoiceSpec::Builtin => format!("合成器 · 轨 {}", track + 1),
+                VoiceSpec::Builtin => format!("Synth · Track {}", track + 1),
                 VoiceSpec::Clap { plugin_id, .. } => {
                     format!("♪ {}", truncate(plugin_id, 16))
                 }
                 VoiceSpec::Vst3 { class_id, .. } => format!("♪ {}", truncate(class_id, 16)),
             },
             Some(NodeDoc::Effect { voice, track, .. }) => match voice {
-                VoiceSpec::Builtin => format!("延迟 · 轨 {}", track + 1),
+                VoiceSpec::Builtin => format!("Delay · Track {}", track + 1),
                 VoiceSpec::Clap { plugin_id, .. } => {
                     format!("Fx {}", truncate(plugin_id, 14))
                 }
                 VoiceSpec::Vst3 { class_id, .. } => format!("Fx {}", truncate(class_id, 14)),
             },
-            Some(NodeDoc::ChannelStrip { track, .. }) => format!("通道条 · 轨 {}", track + 1),
-            None => format!("节点 {node_id}"),
+            Some(NodeDoc::ChannelStrip { track, .. }) => {
+                format!("Channel Strip · Track {}", track + 1)
+            }
+            None => format!("Node {node_id}"),
         },
     }
 }
 
-/// 自动化连线终点参数的短标签。
+/// Short label for an automation cable endpoint parameter.
 fn auto_param_label(param: &AutoParam) -> String {
     match param {
-        AutoParam::TrackGain => "音量".to_string(),
-        AutoParam::TrackPan => "声像".to_string(),
-        AutoParam::FilterCutoff => "截止".to_string(),
+        AutoParam::TrackGain => "Volume".to_string(),
+        AutoParam::TrackPan => "Pan".to_string(),
+        AutoParam::FilterCutoff => "Cutoff".to_string(),
         AutoParam::PluginParam { name, .. } => name.clone(),
     }
 }
@@ -201,7 +209,7 @@ fn truncate(s: &str, max_chars: usize) -> String {
 }
 
 impl CanvasState {
-    /// 图空间 → 屏幕空间。
+    /// Graph space → screen space.
     fn to_screen(&self, rect_min: Pos2, p: Pos2) -> Pos2 {
         Pos2::new(
             rect_min.x + (p.x - self.pan.x) * self.zoom,
@@ -209,7 +217,7 @@ impl CanvasState {
         )
     }
 
-    /// 实体屏幕矩形（不存在位置时返回 `None`）。
+    /// Entity screen rect (returns `None` when no position exists).
     fn screen_rect(&self, rect_min: Pos2, id: CanvasId) -> Option<Rect> {
         let p = *self.positions.get(&id)?;
         Some(Rect::from_min_size(
@@ -218,7 +226,8 @@ impl CanvasState {
         ))
     }
 
-    /// 输出口屏幕位置（源与音频节点都有；主输出没有）。
+    /// Output port screen position (sources and audio nodes have one; the master output does
+    /// not).
     fn out_port_screen(&self, rect_min: Pos2, id: CanvasId) -> Option<Pos2> {
         match id {
             CanvasId::Master => None,
@@ -228,7 +237,7 @@ impl CanvasState {
         }
     }
 
-    /// 输入口屏幕位置（音频节点与主输出；源没有）。
+    /// Input port screen position (audio nodes and master output; sources do not).
     fn in_port_screen(&self, rect_min: Pos2, id: CanvasId) -> Option<Pos2> {
         match id {
             CanvasId::MidiTrack(_) | CanvasId::AutoTrack(_) => None,
@@ -238,11 +247,12 @@ impl CanvasState {
         }
     }
 
-    /// 补齐缺失实体的默认布点（不覆盖已有位置；清理失效条目）。
+    /// Fill in default placements for missing entities (never overwrites existing positions;
+    /// prunes stale entries).
     fn ensure_positions(&mut self, doc: &GraphDoc, track_count: usize, auto_count: usize) {
         let mut wanted: Vec<CanvasId> = Vec::new();
 
-        // 每轨一列：MIDI 源 → 乐器 → 效果器栈 → 通道条。
+        // One column per track: MIDI source → instrument → effect stack → channel strip.
         let mut effect_slot = vec![0usize; track_count];
         for node in &doc.nodes {
             let track = node.track().min(track_count.saturating_sub(1));
@@ -289,11 +299,11 @@ impl CanvasState {
             .entry(CanvasId::Master)
             .or_insert(Pos2::new(870.0, y_center));
 
-        // 清理已删除实体的位置，防 hashmap 无界增长。
+        // Prune positions of deleted entities to prevent unbounded hashmap growth.
         self.positions.retain(|id, _| wanted.contains(id));
     }
 
-    /// 命中输出口（屏幕距离）。
+    /// Hit-test an output port (screen distance).
     fn hit_out_port(&self, rect_min: Pos2, sp: Pos2) -> Option<CanvasId> {
         for &id in self.positions.keys() {
             if let Some(port) = self.out_port_screen(rect_min, id) {
@@ -305,7 +315,7 @@ impl CanvasState {
         None
     }
 
-    /// 命中实体框。
+    /// Hit-test an entity box.
     fn hit_node(&self, rect_min: Pos2, sp: Pos2) -> Option<CanvasId> {
         for &id in self.positions.keys() {
             if let Some(r) = self.screen_rect(rect_min, id) {
@@ -317,7 +327,7 @@ impl CanvasState {
         None
     }
 
-    /// 命中连线（返回文档连线表下标）。
+    /// Hit-test a cable (returns the index into the document cable table).
     fn hit_cable(&self, rect_min: Pos2, sp: Pos2, doc: &GraphDoc) -> Option<usize> {
         for (i, cable) in doc.cables.iter().enumerate() {
             let (Some(from), Some(to)) = (canvas_port_from(&cable.from), canvas_port_to(&cable.to))
@@ -340,17 +350,17 @@ impl CanvasState {
     }
 }
 
-/// `PortRef` → 连线源实体。
+/// `PortRef` → cable source entity.
 fn canvas_port_from(port: &PortRef) -> Option<CanvasId> {
     match port {
         PortRef::Node(id) => Some(CanvasId::Node(*id)),
         PortRef::MidiTrack(t) => Some(CanvasId::MidiTrack(*t)),
         PortRef::AutoTrack(i) => Some(CanvasId::AutoTrack(*i)),
-        PortRef::Master => None, // 主输出不是合法音频源。
+        PortRef::Master => None, // The master output is not a valid audio source.
     }
 }
 
-/// `PortRef` → 连线目标实体。
+/// `PortRef` → cable target entity.
 fn canvas_port_to(port: &PortRef) -> Option<CanvasId> {
     match port {
         PortRef::Node(id) => Some(CanvasId::Node(*id)),
@@ -359,7 +369,7 @@ fn canvas_port_to(port: &PortRef) -> Option<CanvasId> {
     }
 }
 
-/// 拉线类型 → 目标实体是否接受（端口类型规则，spec §7/D3）。
+/// Cable kind → whether the target entity accepts it (port type rules, spec §7/D3).
 fn accepts(kind: CableKind, target: CanvasId, doc: &GraphDoc) -> bool {
     if let CanvasId::Node(id) = target {
         let Some(node) = doc.node_by_id(id) else {
@@ -382,7 +392,7 @@ fn accepts(kind: CableKind, target: CanvasId, doc: &GraphDoc) -> bool {
     }
 }
 
-/// 三次贝塞尔控制点：水平伸出量随距离伸缩。
+/// Cubic bezier control points: horizontal extension scales with distance.
 fn bezier_controls(p0: Pos2, p3: Pos2) -> [Pos2; 4] {
     let dx = ((p3.x - p0.x).abs() * 0.5).clamp(40.0, 140.0);
     [
@@ -393,12 +403,12 @@ fn bezier_controls(p0: Pos2, p3: Pos2) -> [Pos2; 4] {
     ]
 }
 
-/// 两点线性插值。
+/// Linear interpolation between two points.
 fn lerp2(a: Pos2, b: Pos2, t: f32) -> Pos2 {
     Pos2::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
 }
 
-/// 贝塞尔均匀采样（命中检测用）。
+/// Uniform bezier sampling (for hit testing).
 fn bezier_points(c: [Pos2; 4], samples: usize) -> Vec<Pos2> {
     (0..=samples)
         .map(|i| {
@@ -414,29 +424,29 @@ fn bezier_points(c: [Pos2; 4], samples: usize) -> Vec<Pos2> {
         .collect()
 }
 
-/// 绘制一帧画布并收集交互意图。
+/// Draw one frame of the canvas and collect interaction intents.
 pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) -> Vec<CanvasAction> {
     let mut actions = Vec::new();
     let doc = deps.doc;
     state.ensure_positions(doc, deps.track_count, deps.auto_count);
 
-    // ---- 工具条 ----
+    // ---- Toolbar ----
     ui.horizontal(|ui| {
-        ui.strong("节点图");
+        ui.strong("Node Graph");
         if ui.button("－").clicked() {
             state.zoom = (state.zoom / 1.2).clamp(ZOOM_MIN, ZOOM_MAX);
         }
         if ui.button("＋").clicked() {
             state.zoom = (state.zoom * 1.2).clamp(ZOOM_MIN, ZOOM_MAX);
         }
-        if ui.button("复位").clicked() {
+        if ui.button("Reset").clicked() {
             state.pan = Vec2::ZERO;
             state.zoom = 1.0;
         }
-        ui.weak("拖背景平移 · Ctrl+滚轮缩放 · 拖输出口拉线 · 选中后 Delete 删除");
+        ui.weak("Drag bg to pan · Ctrl+wheel to zoom · drag ports to connect · select + Delete to remove");
     });
 
-    // ---- 画布 ----
+    // ---- Canvas ----
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), CANVAS_HEIGHT),
         Sense::click_and_drag(),
@@ -444,7 +454,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 2.0, Color32::from_rgb(22, 24, 28));
 
-    // Ctrl+滚轮缩放（指针锚定）。
+    // Ctrl+wheel zoom (anchored at the pointer).
     let zoom_delta = ui.ctx().input(|i| i.zoom_delta());
     if response.hovered() && zoom_delta != 0.0 {
         let old = state.zoom;
@@ -459,7 +469,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
     let drag_started = response.drag_started();
     let drag_stopped = response.drag_stopped();
 
-    // ---- 按下：命中检测并转入对应拖拽 ----
+    // ---- Press: hit-test and enter the matching drag ----
     if drag_started {
         let sp = pointer.unwrap_or(rect.min);
         if let Some(source) = state.hit_out_port(rect.min, sp) {
@@ -467,7 +477,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
             state.drag = Some(DragKind::Cable(CableDrag { from: source }));
         } else if let Some(id) = state.hit_node(rect.min, sp) {
             state.selection = Some(Selection::Node(id));
-            // 点节点顺带切换主编辑轨道（画布与面板联动）。
+            // Clicking a node also switches the main editing track (canvas-panel linkage).
             match id {
                 CanvasId::Node(node_id) => {
                     if let Some(node) = doc.node_by_id(node_id) {
@@ -487,7 +497,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
         }
     }
 
-    // ---- 拖拽进行中 ----
+    // ---- Drag in progress ----
     if response.dragged() {
         match state.drag {
             Some(DragKind::Pan) => {
@@ -502,7 +512,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
         }
     }
 
-    // ---- 拉线松开：命中目标并生成动作 ----
+    // ---- Cable drag released: hit-test the target and emit actions ----
     if drag_stopped {
         if let Some(DragKind::Cable(drag)) = state.drag.take() {
             if let Some(sp) = pointer {
@@ -521,7 +531,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
                         CanvasId::AutoTrack(index) => {
                             if accepts(CableKind::Automation, target, doc) && drag.from != target {
                                 if let CanvasId::Node(to_doc) = target {
-                                    // 参数在弹出菜单选定后再落线。
+                                    // The cable is committed after the parameter is picked in
+                                    // the popup menu.
                                     state.pending_auto =
                                         Some((index, to_doc, sp + Vec2::new(4.0, 4.0)));
                                 }
@@ -541,13 +552,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
                         }
                         CanvasId::Master => None,
                     };
-                    let _ = kind; // 类型不符：静默放弃（MVP 不弹提示）。
+                    let _ = kind; // Type mismatch: silently abandon (MVP shows no prompt).
                 }
             }
         }
     }
 
-    // ---- 绘制连线（节点之下）----
+    // ---- Draw cables (beneath nodes) ----
     for (i, cable) in doc.cables.iter().enumerate() {
         let (Some(from), Some(to)) = (canvas_port_from(&cable.from), canvas_port_to(&cable.to))
         else {
@@ -574,7 +585,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
             Color32::TRANSPARENT,
             stroke,
         ));
-        // 自动化线在中点标注终点参数。
+        // Label automation cables with the endpoint parameter at the midpoint.
         if cable.kind == CableKind::Automation {
             let mid = bezier_points(bezier_controls(p0, p3), 24)[12];
             painter.text(
@@ -587,7 +598,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
         }
     }
 
-    // ---- 拉线预览 ----
+    // ---- Cable drag preview ----
     if let Some(DragKind::Cable(drag)) = state.drag {
         if let (Some(sp), Some(p0)) = (pointer, state.out_port_screen(rect.min, drag.from)) {
             let kind = match drag.from {
@@ -601,7 +612,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
                 Color32::TRANSPARENT,
                 egui::Stroke::new(2.0, cable_color(kind).gamma_multiply(0.7)),
             ));
-            // 悬停目标高亮。
+            // Highlight the hovered target.
             if let Some(target) = state.hit_node(rect.min, sp) {
                 if accepts(kind, target, doc) && drag.from != target {
                     if let Some(r) = state.screen_rect(rect.min, target) {
@@ -617,7 +628,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
         }
     }
 
-    // ---- 绘制节点 ----
+    // ---- Draw nodes ----
     for (&id, &pos) in state.positions.iter() {
         let size = size_of(id);
         let min = state.to_screen(rect.min, pos);
@@ -654,7 +665,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
             Color32::from_rgb(225, 225, 228),
         );
 
-        // 输入口 / 输出口。
+        // Input / output ports.
         let port_color = if matches!(id, CanvasId::MidiTrack(_)) {
             cable_color(CableKind::Midi)
         } else if matches!(id, CanvasId::AutoTrack(_)) {
@@ -672,7 +683,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
         }
     }
 
-    // ---- Delete 删除选中项（悬停画布时）----
+    // ---- Delete removes the selection (while hovering the canvas) ----
     if response.hovered() && ui.ctx().input(|i| i.key_pressed(egui::Key::Delete)) {
         match state.selection {
             Some(Selection::Cable(i)) => {
@@ -687,7 +698,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
         }
     }
 
-    // ---- 自动化参数弹出菜单 ----
+    // ---- Automation parameter popup menu ----
     if let Some((index, to_doc, menu_pos)) = state.pending_auto {
         let options = (deps.auto_options)(to_doc);
         let mut picked: Option<AutoParam> = None;
@@ -697,7 +708,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(140.0);
-                    ui.strong("自动化目标参数");
+                    ui.strong("Automation Target Param");
                     for (label, param) in &options {
                         if ui.button(label).clicked() {
                             picked = Some(param.clone());
@@ -742,7 +753,7 @@ mod tests {
                 state
                     .positions
                     .contains_key(&CanvasId::Node(node.node_id())),
-                "文档节点 {} 应有位置",
+                "document node {} should have a position",
                 node.node_id()
             );
         }
@@ -763,16 +774,16 @@ mod tests {
         let strip = doc.channel_strip_of_track(0).unwrap().node_id();
         let delay = doc.builtin_delay_of_track(0).unwrap().node_id();
 
-        // 音频：效果器/通道条/主输出接受，乐器拒绝。
+        // Audio: effects/channel strips/master output accept; instruments reject.
         assert!(accepts(CableKind::Audio, CanvasId::Node(delay), doc));
         assert!(accepts(CableKind::Audio, CanvasId::Node(strip), doc));
         assert!(accepts(CableKind::Audio, CanvasId::Master, doc));
         assert!(!accepts(CableKind::Audio, CanvasId::Node(instrument), doc));
-        // MIDI：乐器接受，其余拒绝。
+        // MIDI: instruments accept; everything else rejects.
         assert!(accepts(CableKind::Midi, CanvasId::Node(instrument), doc));
         assert!(!accepts(CableKind::Midi, CanvasId::Node(strip), doc));
         assert!(!accepts(CableKind::Midi, CanvasId::Master, doc));
-        // 自动化：乐器/通道条接受。
+        // Automation: instruments/channel strips accept.
         assert!(accepts(CableKind::Automation, CanvasId::Node(strip), doc));
         assert!(accepts(
             CableKind::Automation,

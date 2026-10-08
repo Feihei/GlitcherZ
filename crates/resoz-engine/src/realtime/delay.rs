@@ -1,23 +1,27 @@
-//! 反馈延迟效果器。
+//! Feedback delay effect.
 
 use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::ParamId;
 use crate::realtime::context::ProcessContext;
 use crate::realtime::processor::Processor;
 
-/// 最大延迟时间（秒）——环形缓冲在构造期按此容量一次性预分配。
+/// Maximum delay time (seconds) — the ring buffers are pre-allocated once at
+/// this capacity during construction.
 pub const MAX_DELAY_S: f32 = 1.0;
 
-/// 反馈延迟（左右声道各一条预分配环形缓冲）。
+/// Feedback delay (one pre-allocated ring buffer per channel, L/R).
 ///
-/// 经典反馈延迟：`wet = ring[read]`，写入 `input + wet·feedback`，
-/// 输出 `dry·(1−mix) + wet·mix`。feedback 钳制到 ≤ 0.9 保证有界衰减；
-/// 写入时冲洗反规范数。延迟时间为整数样本（无插值），运行中改时间会
-/// 直接跳读到新位置（可闻，平滑处理留待后续）。所有路径 RT-safe。
+/// Classic feedback delay: `wet = ring[read]`, write `input + wet * feedback`,
+/// output `dry * (1 - mix) + wet * mix`. Feedback is clamped to <= 0.9 to keep
+/// the decay bounded; denormals are flushed on write. The delay time is an
+/// integer number of samples (no interpolation), so changing it at runtime
+/// jumps the read position instantly (audible; smoothing left for later).
+/// All paths are RT-safe.
 pub struct DelayProcessor {
     sample_rate: f32,
     rings: [Box<[f32]>; 2],
-    /// 每声道独立写指针（声道顺序处理，共享指针会使两环错位）。
+    /// Per-channel write pointer (channels are processed in order; sharing a
+    /// pointer would desynchronize the two rings).
     write_pos: [usize; 2],
     time_s: f32,
     feedback: f32,
@@ -25,7 +29,8 @@ pub struct DelayProcessor {
 }
 
 impl DelayProcessor {
-    /// `sample_rate <= 0` 时回退 48 kHz（构造期容错，分配只发生在这里）。
+    /// Falls back to 48 kHz when `sample_rate <= 0` (construction-time
+    /// tolerance; allocation only happens here).
     pub fn new(sample_rate: f32) -> Self {
         let sr = if sample_rate > 0.0 {
             sample_rate
@@ -46,12 +51,12 @@ impl DelayProcessor {
         }
     }
 
-    /// 当前湿声混合比。RT-safe。
+    /// Current wet mix ratio. RT-safe.
     pub fn mix(&self) -> f32 {
         self.mix
     }
 
-    /// 延迟长度（整数样本）。
+    /// Delay length (integer samples).
     fn delay_samples(&self) -> usize {
         let t = if self.time_s.is_finite() {
             self.time_s.clamp(0.005, MAX_DELAY_S)
@@ -85,7 +90,7 @@ impl Processor for DelayProcessor {
                 let wet = ring[read_pos];
                 let mut injected = input + wet * feedback;
                 if injected.abs() < 1e-18 {
-                    injected = 0.0; // 冲洗反规范数，避免静音尾巴吃 CPU
+                    injected = 0.0; // flush denormals so silent tails don't burn CPU
                 }
                 ring[write_pos] = injected;
                 *sample = input * (1.0 - mix) + wet * mix;
@@ -139,7 +144,7 @@ mod tests {
         }
     }
 
-    /// 把 `signal` 按块送入效果器，返回第 0 声道输出。
+    /// Pushes `signal` through the effect in blocks, returns channel-0 output.
     fn run_through(delay: &mut DelayProcessor, signal: &[f32]) -> Vec<f32> {
         let mut buf = AudioBuffer::new(1, 128);
         let mut out = Vec::with_capacity(signal.len());
@@ -152,7 +157,7 @@ mod tests {
         out
     }
 
-    // 标准测试 1：静音输入 → 输出静音（含高反馈）。
+    // Standard test 1: silence in -> silence out (including high feedback).
     #[test]
     fn silence_in_silence_out() {
         let mut delay = DelayProcessor::new(SR);
@@ -162,7 +167,7 @@ mod tests {
         assert!(out.iter().all(|s| s.abs() < 1e-9));
     }
 
-    // 标准测试 2：满幅输入 → 无 NaN/Inf。
+    // Standard test 2: full-scale input -> no NaN/Inf.
     #[test]
     fn full_scale_stays_finite() {
         let mut delay = DelayProcessor::new(SR);
@@ -182,7 +187,7 @@ mod tests {
             .map(|i| (TAU * 440.0 * i as f32 / SR).sin())
             .collect();
         let out = run_through(&mut delay, &signal);
-        assert_eq!(out, signal, "mix = 0 时应逐样本恒等");
+        assert_eq!(out, signal, "mix = 0 must be sample-exact passthrough");
     }
 
     #[test]
@@ -190,18 +195,24 @@ mod tests {
         let mut delay = DelayProcessor::new(SR);
         delay.set_param(ParamId::DelayMix, 1.0);
         delay.set_param(ParamId::DelayFeedback, 0.0);
-        delay.set_param(ParamId::DelayTime, 0.25); // 12_000 样本
+        delay.set_param(ParamId::DelayTime, 0.25); // 12_000 samples
 
         let mut signal = vec![0.0f32; 30_000];
         signal[0] = 1.0;
         let out = run_through(&mut delay, &signal);
-        assert!(out[0].abs() < 1e-9, "干声被 100% 湿声替换，t=0 应为静音");
-        assert!((out[12_000] - 1.0).abs() < 1e-6, "回声应恰在 0.25 s 处");
+        assert!(
+            out[0].abs() < 1e-9,
+            "dry signal is fully replaced at 100% wet; t=0 must be silent"
+        );
+        assert!(
+            (out[12_000] - 1.0).abs() < 1e-6,
+            "echo must land exactly at 0.25 s"
+        );
         assert!(
             out.iter()
                 .enumerate()
                 .all(|(i, s)| i == 12_000 || s.abs() < 1e-9),
-            "无反馈时应只有单个回声抽头"
+            "with zero feedback there must be a single echo tap"
         );
     }
 
@@ -210,14 +221,14 @@ mod tests {
         let mut delay = DelayProcessor::new(SR);
         delay.set_param(ParamId::DelayMix, 1.0);
         delay.set_param(ParamId::DelayFeedback, 0.5);
-        delay.set_param(ParamId::DelayTime, 0.25); // 12_000 样本
+        delay.set_param(ParamId::DelayTime, 0.25); // 12_000 samples
 
         let mut signal = vec![0.0f32; 48_000];
         signal[0] = 1.0;
         let out = run_through(&mut delay, &signal);
         assert!((out[12_000] - 1.0).abs() < 1e-6);
-        assert!((out[24_000] - 0.5).abs() < 1e-6, "第二抽头应为 0.5");
-        assert!((out[36_000] - 0.25).abs() < 1e-6, "第三抽头应为 0.25");
+        assert!((out[24_000] - 0.5).abs() < 1e-6, "second tap must be 0.5");
+        assert!((out[36_000] - 0.25).abs() < 1e-6, "third tap must be 0.25");
     }
 
     #[test]
@@ -225,15 +236,16 @@ mod tests {
         let mut delay = DelayProcessor::new(SR);
         delay.set_param(ParamId::DelayMix, 1.0);
         delay.set_param(ParamId::DelayFeedback, 0.0);
-        delay.set_param(ParamId::DelayTime, 0.05); // 2_400 样本
+        delay.set_param(ParamId::DelayTime, 0.05); // 2_400 samples
 
-        // 只给左声道一个冲激，右声道保持静音。
+        // Feed an impulse to the left channel only; keep the right silent.
         let mut buf = AudioBuffer::new(2, 128);
         buf.set_len(128);
         buf.channel_mut(0).unwrap()[0] = 1.0;
         delay.process(&ctx(128), &mut buf);
 
-        // 渲染跨过延迟点（2400 样本）后的块，右声道必须始终静音。
+        // Render blocks past the delay point (2400 samples); the right channel
+        // must stay silent throughout.
         let mut silence = AudioBuffer::new(2, 128);
         silence.set_len(128);
         silence.clear();
@@ -243,18 +255,19 @@ mod tests {
             silence.set_len(128);
             delay.process(&ctx(128), &mut silence);
             if block == 17 {
-                // 冲激块已消耗样本 [0,128)，此块覆盖 [2304, 2432)，
-                // 延迟点 2400 在块内偏移 96。
+                // The impulse block consumed samples [0, 128); this block
+                // covers [2304, 2432), so the delay point 2400 sits at
+                // offset 96 within the block.
                 left_at_delay = silence.channel(0).unwrap()[96];
             }
             assert!(
                 silence.channel(1).unwrap().iter().all(|s| s.abs() < 1e-9),
-                "右声道应保持静音"
+                "right channel must remain silent"
             );
         }
         assert!(
             (left_at_delay - 1.0).abs() < 1e-6,
-            "左声道回声应落在延迟点，实际 {left_at_delay}"
+            "left-channel echo must land on the delay point, got {left_at_delay}"
         );
     }
 
@@ -269,7 +282,7 @@ mod tests {
         assert!((delay.mix - 0.0).abs() < 1e-6);
         assert!(
             !delay.set_param(ParamId::MasterGain, 1.0),
-            "不响应的参数应返回 false"
+            "unhandled params must return false"
         );
     }
 }

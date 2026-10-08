@@ -2,18 +2,22 @@
 
 //! # resoz-ui
 //!
-//! ResoZ 的 egui 界面：走带控制、步进音序器、钢琴卷帘、混音器、
-//! 自动化泳道。
+//! ResoZ's egui UI: transport controls, step sequencer, piano roll,
+//! mixer, and automation lanes.
 //!
-//! P5c（spec `docs/spec/node-graph.md` D13）：引擎图**纯按项目文档
-//! 重建**——`ResoZApp` 持有 `Project` 文档，加载/新建时经
-//! `apply_document` 以 `add_node` / `connect_nodes` 粒度逐步建图；
-//! 文档 node_id 是持久化身份（D11），引擎侧身份为会话内单调分配的
-//! `engine_id`（映射见 `node_map`，会话内不复用已回收 id）。
+//! P5c (spec `docs/spec/node-graph.md` D13): the engine graph is
+//! **rebuilt purely from the project document** — `ResoZApp` owns the
+//! `Project` document; on load/new, `apply_document` builds the graph
+//! step by step at `add_node` / `connect_nodes` granularity. Document
+//! node_ids are persisted identities (D11); engine-side identities are
+//! monotonically assigned `engine_id`s within a session (see the
+//! `node_map` mapping; recycled ids are never reused in a session).
 //!
-//! 分层说明：本 crate 直接依赖 engine 的非实时控制端——`AudioEngine`
-//! 只在 UI 线程被触碰，永不进入音频回调。模型与引擎互不依赖，发送前
-//! 在此完成文档 → 引擎表示的转换。
+//! Layering: this crate talks directly to the engine's non-real-time
+//! control side — `AudioEngine` is only touched on the UI thread and
+//! never enters the audio callback. Model and engine are independent;
+//! document → engine representation conversion happens here before
+//! sending.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
@@ -39,43 +43,43 @@ pub mod canvas;
 pub mod lane;
 pub mod piano_roll;
 
-/// 滤波器截止频率滑块范围（对数刻度）。
+/// Filter cutoff frequency slider range (logarithmic scale).
 pub const CUTOFF_RANGE: RangeInclusive<f32> = 20.0..=18_000.0;
 
-/// 共振滑块范围（Simper SVF res）。
+/// Resonance slider range (Simper SVF res).
 pub const RES_RANGE: RangeInclusive<f32> = 0.0..=0.98;
 
-/// Attack / Decay 滑块范围（秒）。
+/// Attack / Decay slider range (seconds).
 pub const AD_RANGE: RangeInclusive<f32> = 0.0..=2.0;
 
-/// Sustain 滑块范围（相对电平）。
+/// Sustain slider range (relative level).
 pub const S_RANGE: RangeInclusive<f32> = 0.0..=1.0;
 
-/// Release 滑块范围（秒）。
+/// Release slider range (seconds).
 pub const R_RANGE: RangeInclusive<f32> = 0.0..=3.0;
 
-/// 延迟时间滑块范围（秒）。
+/// Delay time slider range (seconds).
 pub const DELAY_TIME_RANGE: RangeInclusive<f32> = 0.005..=1.0;
 
-/// 延迟反馈滑块范围。
+/// Delay feedback slider range.
 pub const DELAY_FB_RANGE: RangeInclusive<f32> = 0.0..=0.9;
 
-/// 延迟湿声滑块范围。
+/// Delay wet mix slider range.
 pub const DELAY_MIX_RANGE: RangeInclusive<f32> = 0.0..=1.0;
 
-/// 轨道推子范围（线性）。
+/// Track fader range (linear).
 pub const TRACK_GAIN_RANGE: RangeInclusive<f32> = 0.0..=1.5;
 
-/// 轨道声像滑块范围。
+/// Track pan slider range.
 pub const PAN_RANGE: RangeInclusive<f32> = -1.0..=1.0;
 
-/// BPM 可调范围（文档中为 f64：时间计算约定）。
+/// BPM adjustable range (f64 in the document: time computation convention).
 pub const BPM_RANGE: RangeInclusive<f64> = 20.0..=300.0;
 
-/// 音长（gate 占步长比例）滑块范围。
+/// Gate length (gate as fraction of step) slider range.
 pub const GATE_RANGE: RangeInclusive<f32> = 0.05..=1.0;
 
-/// 电脑键盘 → 半音偏移（相对八度基准，FL Studio 风格布局）。
+/// Computer keyboard → semitone offset (relative to the octave base, FL Studio-style layout).
 const KEYMAP: &[(egui::Key, u8)] = &[
     (egui::Key::A, 0),
     (egui::Key::W, 1),
@@ -96,27 +100,27 @@ const KEYMAP: &[(egui::Key, u8)] = &[
     (egui::Key::Semicolon, 16),
 ];
 
-/// 一个八度 13 个键（C 到下一组 C）的黑键半音位置。
+/// Semitone positions of black keys among the 13 keys of an octave (C to the next C).
 const BLACK_SEMIS: [u8; 5] = [1, 3, 6, 8, 10];
 
 const NOTE_NAMES: [&str; 12] = [
     "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
 ];
 
-/// MIDI 音符编号 → 音名（如 69 → "A4"）。
+/// MIDI note number → note name (e.g. 69 → "A4").
 fn note_name(note: u8) -> String {
     let octave = note as i32 / 12 - 1;
     format!("{}{octave}", NOTE_NAMES[(note % 12) as usize])
 }
 
-/// 路径 → 显示名（文件名，失败则整条路径）。
+/// Path → display name (file name; full path on failure).
 fn display_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// 文档自动化参数 → 引擎参数 ID。
+/// Document automation parameter → engine parameter ID.
 fn param_id_of(param: &AutoParam) -> ParamId {
     match param {
         AutoParam::TrackGain => ParamId::TrackGain,
@@ -126,49 +130,50 @@ fn param_id_of(param: &AutoParam) -> ParamId {
     }
 }
 
-/// UI 启动参数。
+/// UI startup parameters.
 #[derive(Debug, Clone, Default)]
 pub struct UiConfig {
-    /// 初始主增益，会被钳制进 0..1.5。
+    /// Initial master gain, clamped into 0..1.5.
     pub gain: f64,
-    /// 启动时自动触发的音符（演示/冒烟测试用；`None` = 静默启动）。
+    /// Note to trigger automatically at startup (for demos / smoke tests; `None` = silent start).
     pub auto_play_note: Option<u8>,
-    /// 启动后自动关闭窗口（冒烟测试用；`None` = 手动关闭）。
+    /// Auto-close the window after startup (for smoke tests; `None` = manual close).
     pub auto_close_after: Option<Duration>,
-    /// 启动时加载的项目文件（`--open`）。
+    /// Project file to load at startup (`--open`).
     pub open_path: Option<PathBuf>,
 }
 
-/// 经 eframe 持久化存储（`persistence` feature）保存的 UI 状态。
+/// UI state saved via eframe persisted storage (`persistence` feature).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct UiState {
-    /// 最近打开的项目文件（新在前，最多 [`RECENT_FILES_MAX`] 条）。
+    /// Recently opened project files (newest first, at most [`RECENT_FILES_MAX`] entries).
     recent_files: Vec<PathBuf>,
 }
 
-/// 最近文件列表容量上限。
+/// Capacity limit of the recent files list.
 const RECENT_FILES_MAX: usize = 8;
 
-/// eframe 存储中 [`UiState`] 的键名。
+/// Key for [`UiState`] in eframe storage.
 const UI_STATE_KEY: &str = "resoz_ui_state";
 
-/// 状态栏消息显示时长。
+/// Status bar message display duration.
 const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(8);
 
-/// 外部插件实例守卫（CLAP / VST3）。
-#[allow(dead_code)] // 守卫仅为延长寿命持有，字段本身不读取
+/// External plugin instance guard (CLAP / VST3).
+#[allow(dead_code)] // guard held only to extend lifetime; the field itself is never read
 enum PluginGuard {
     Clap(resoz_clap_host::ClapInstanceGuard),
     Vst3(resoz_vst3_host::Vst3InstanceGuard),
 }
 
-/// 一个已装填的外部插件声源/效果器守卫（node_id 为**引擎侧**身份）。
+/// A loaded external plugin instrument/effect guard (node_id is the **engine-side** identity).
 ///
-/// 守卫**不可提前丢弃**——卸载动态库会使实时侧节点悬空。被换下/
-/// 随文档移除的守卫转入 `retiring_guards`，经回收回执按序释放。
+/// Guards **must not be dropped early** — unloading the dynamic library would leave the real-time
+/// side node dangling. Guards swapped out or removed with the document move into
+/// `retiring_guards`, released in order via recycling receipts.
 #[allow(dead_code)]
 struct PluginGuardEntry {
-    /// 与引擎侧节点 ID 配对（回收回执按此匹配）。
+    /// Paired with the engine-side node ID (recycling receipts match on this).
     node_id: u64,
     #[allow(dead_code)]
     track: usize,
@@ -177,7 +182,7 @@ struct PluginGuardEntry {
     _guard: PluginGuard,
 }
 
-/// 峰值电平表：峰值保持 600 ms 后回落，视觉上更容易读。
+/// Peak level meter: the peak holds for 600 ms before falling back, which is easier to read visually.
 #[derive(Debug)]
 struct PeakMeter {
     held: f32,
@@ -192,7 +197,7 @@ impl PeakMeter {
         }
     }
 
-    /// 用引擎最新峰值刷新保持值（每帧调用）。UI 线程专用。
+    /// Refresh the held value with the engine's latest peak (called each frame). UI-thread only.
     fn update(&mut self, current: f32) {
         let now = Instant::now();
         if current >= self.held || now >= self.hold_until {
@@ -202,77 +207,85 @@ impl PeakMeter {
     }
 }
 
-/// 主窗口应用。拥有 [`AudioEngine`]：窗口关闭即引擎丢弃、音频流停止。
+/// Main window app. Owns the [`AudioEngine`]: closing the window drops the engine and stops the
+/// audio stream.
 pub struct ResoZApp {
     engine: AudioEngine,
-    /// 项目文档（UI 持有模型状态，见 AGENTS.md「线程模型」）。
+    /// Project document (the UI owns model state; see "Threading Model" in AGENTS.md).
     project: Project,
-    /// 文档 node_id → 引擎 node_id（会话内单调，重载文档即全部换新）。
+    /// Document node_id → engine node_id (monotonic within a session; reloading the document
+    /// replaces them all).
     node_map: HashMap<u64, u64>,
-    /// 正在编辑的轨道（合成器/音序器/键盘的目标）。
+    /// Track being edited (target of the synth/sequencer/keyboard).
     selected_track: usize,
-    /// 正在编辑的自动化轨道。
+    /// Automation track being edited.
     selected_auto: usize,
-    /// 钢琴卷帘的跨帧状态（滚动/拖拽）。
+    /// Piano roll cross-frame state (scroll/drag).
     roll_state: piano_roll::RollState,
-    /// 自动化泳道的跨帧状态（拖拽）。
+    /// Automation lane cross-frame state (drag).
     lane_state: lane::LaneState,
-    /// 节点画布的跨帧状态（平移/缩放/选中/拖拽）。
+    /// Node canvas cross-frame state (pan/zoom/selection/drag).
     canvas_state: canvas::CanvasState,
-    /// 画笔音符：点选空白步时写入的音符。
+    /// Brush note: the note written when clicking an empty step.
     brush_note: u8,
-    /// 八度基准（C 的 MIDI 编号，默认 60 = C4）。
+    /// Octave base (MIDI number of C, default 60 = C4).
     octave_base: u8,
-    /// 当前按住的音符（屏幕键 + 电脑键共用，用于高亮与去重）。
+    /// Currently held notes (shared by on-screen keys and computer keys, for highlighting and
+    /// de-duplication).
     held_notes: HashSet<u8>,
-    /// 本帧鼠标按住的屏幕键音符（用于按住/松开的边沿检测）。
+    /// On-screen key notes held by the mouse this frame (for press/release edge detection).
     mouse_down_notes: HashSet<u8>,
-    /// 最近触发的音符（状态栏显示用）。
+    /// Most recently triggered note (shown in the status bar).
     current_note: Option<u8>,
     meter: PeakMeter,
     opened_at: Instant,
     auto_close_after: Option<Duration>,
-    /// 当前项目文件路径（`None` = 未保存过，保存时弹对话框）。
+    /// Current project file path (`None` = never saved; a dialog pops up on save).
     project_path: Option<PathBuf>,
-    /// 最近打开的项目文件（持久化）。
+    /// Recently opened project files (persisted).
     recent: Vec<PathBuf>,
-    /// 状态栏消息（文本 + 出现时刻，超时自动消失）。
+    /// Status bar message (text + time shown; disappears automatically after a timeout).
     status_message: Option<(String, Instant)>,
-    /// 期望的窗口标题。
+    /// Desired window title.
     window_title: String,
-    /// 已发送给窗口系统的标题（避免每帧重发命令）。
+    /// Title already sent to the windowing system (avoids resending the command every frame).
     title_sent: String,
-    /// 上一帧的走带状态（用于检测停止沿 → 恢复手动参数）。
+    /// Transport state of the previous frame (to detect the stop edge → restore manual
+    /// parameters).
     was_playing: bool,
-    /// 在役外部插件守卫（CLAP/VST3）：guard 丢弃会卸载插件动态库，
-    /// 使实时侧节点悬空，故持有至节点被换下为止。
+    /// Active external plugin guards (CLAP/VST3): dropping a guard unloads the plugin's dynamic
+    /// library and leaves the real-time node dangling, so guards are held until the node is
+    /// swapped out.
     voice_guards: Vec<PluginGuardEntry>,
-    /// 已换下/随旧文档移除的守卫：等实时侧回收回执到达后再丢弃
-    /// （动态库必须活到旧节点真正离开处理图）。
+    /// Swapped-out / removed-with-old-document guards: dropped only after the real-time recycling
+    /// receipt arrives (the dynamic library must stay alive until the old node truly leaves the
+    /// processing graph).
     retiring_guards: Vec<PluginGuardEntry>,
-    /// 已扫描的 CLAP 乐器列表（懒扫描缓存）。
+    /// Scanned CLAP instrument list (lazy scan cache).
     clap_plugins: Option<Vec<resoz_clap_host::ClapPluginInfo>>,
-    /// 已扫描的 CLAP 效果器列表（懒扫描缓存）。
+    /// Scanned CLAP effect list (lazy scan cache).
     clap_effects: Option<Vec<resoz_clap_host::ClapPluginInfo>>,
-    /// 已扫描的 VST3 乐器列表（懒扫描缓存）。
+    /// Scanned VST3 instrument list (lazy scan cache).
     vst3_plugins: Option<Vec<resoz_vst3_host::Vst3PluginInfo>>,
-    /// 已扫描的 VST3 效果器列表（懒扫描缓存）。
+    /// Scanned VST3 effect list (lazy scan cache).
     vst3_effects: Option<Vec<resoz_vst3_host::Vst3PluginInfo>>,
-    /// 各轨道 VST3 声源的参数列表（实例化时读出，键 = 轨道号）。
-    /// 仅诊断/展示用；实际参数控制仍走 `PluginParam` 桥接。
+    /// Per-track VST3 instrument parameter lists (read at instantiation, keyed by track number).
+    /// For diagnostics/display only; actual parameter control still goes through the
+    /// `PluginParam` bridge.
     voice_params: HashMap<usize, Vec<resoz_vst3_host::Vst3ParamInfo>>,
-    /// 各轨道 CLAP 声源的参数列表（实例化时读出，键 = 轨道号）。
-    /// 自动化连线目标数据源；曲线值语义 = 插件值域原始值。
+    /// Per-track CLAP instrument parameter lists (read at instantiation, keyed by track number).
+    /// Data source for automation cable targets; curve value semantics = raw plugin-range values.
     clap_voice_params: HashMap<usize, Vec<resoz_clap_host::ClapParamInfo>>,
-    /// 诊断标志：`ui()` 是否已进入过（仅日志用）。
+    /// Diagnostic flag: whether `ui()` has been entered (logging only).
     first_frame_logged: bool,
-    /// 诊断标志：是否已发出关闭命令（仅日志用）。
+    /// Diagnostic flag: whether the close command has been sent (logging only).
     close_sent: bool,
 }
 
 impl ResoZApp {
-    /// 构造窗口应用，恢复持久化的最近文件，并把整个项目文档经
-    /// 逐步建图 + 命令队列下发（下一个音频块边界生效）。
+    /// Build the window app, restore persisted recent files, and push the whole project document
+    /// down via incremental graph building + the command queue (takes effect at the next audio
+    /// block boundary).
     pub fn new(cc: &eframe::CreationContext<'_>, engine: AudioEngine, config: UiConfig) -> Self {
         let ui_state: UiState = cc
             .storage
@@ -326,13 +339,15 @@ impl ResoZApp {
         app
     }
 
-    // ---- 文档 → 引擎（D13 全显式：加载器纯按文档重建） ----
+    // ---- Document → engine (D13 fully explicit: the loader rebuilds purely from the document) ----
 
-    /// 把当前项目文档重建进引擎：移除旧节点 → 安装文档节点 →
-    /// 装配轨道寻址表 → 按文档连线 → 下发活跃轨数。
+    /// Rebuild the current project document into the engine: remove old nodes → install document
+    /// nodes → assemble track addressing tables → connect cables per the document → push the
+    /// active track count.
     fn apply_document(&mut self) {
-        // 1) 移除上一份文档装进引擎的节点；其守卫全部转入退役区，
-        //    等回收回执按序释放（引擎 id 不复用，配对无歧义）。
+        // 1) Remove the nodes the previous document installed into the engine; all their guards
+        //    move to the retiring zone and are released in order once recycling receipts arrive
+        //    (engine ids are never reused, so pairing is unambiguous).
         let stale: Vec<u64> = self.node_map.values().copied().collect();
         for engine_id in stale {
             if self.engine.remove_node(engine_id) {
@@ -343,15 +358,18 @@ impl ResoZApp {
         self.voice_params.clear();
         self.clap_voice_params.clear();
 
-        // 2) 安装文档节点（外部插件失败 → 回退内置，保证链路完整）。
+        // 2) Install document nodes (external plugin failure → fall back to built-in, keeping the
+        //    chain intact).
         let sample_rate = self.engine.info().sample_rate;
         let nodes = self.project.graph.nodes.clone();
         for node in &nodes {
             self.install_node(node, sample_rate);
         }
-        //（install_node 以 u32 采样率实例化插件；内置处理器经 convert 转 f32。）
+        //(install_node instantiates plugins at the u32 sample rate; built-in processors convert
+        // to f32 via convert.)
 
-        // 3) 装配轨道寻址表（手动参数/电平/键盘的轨道坐标寻址）。
+        // 3) Assemble track addressing tables (track-coordinate addressing for manual
+        //    params/levels/keyboard).
         for track in 0..self.project.midi_tracks.len() {
             let resolve = |doc_id: Option<u64>| -> Option<u64> {
                 doc_id.and_then(|id| self.node_map.get(&id).copied())
@@ -378,11 +396,14 @@ impl ResoZApp {
                 .engine
                 .register_track_chain(track, voice, delay, channel)
             {
-                log::warn!("轨道 {} 寻址表装配失败（节点缺失或队列满）", track + 1);
+                log::warn!(
+                    "Track {} addressing table assembly failed (missing node or queue full)",
+                    track + 1
+                );
             }
         }
 
-        // 4) 按文档连线。
+        // 4) Connect cables per the document.
         let master = self.engine.master_node_id();
         let cables = self.project.graph.cables.clone();
         for cable in &cables {
@@ -398,11 +419,13 @@ impl ResoZApp {
             match cable.kind {
                 CableKind::Audio => {
                     let (Some(from), Some(to)) = (from, to_node) else {
-                        log::warn!("音频线端点节点缺失，跳过：{cable:?}");
+                        log::warn!("Audio cable endpoint node missing, skipping: {cable:?}");
                         continue;
                     };
                     if !self.engine.connect_nodes(from, to) {
-                        log::warn!("音频线 ({from} → {to}) 下发失败（成环/超限/队列满）");
+                        log::warn!(
+                            "Audio cable ({from} → {to}) dispatch failed (cycle / limit exceeded / queue full)"
+                        );
                     }
                 }
                 CableKind::Midi => {
@@ -410,11 +433,13 @@ impl ResoZApp {
                         continue;
                     };
                     let Some(to) = to_node else {
-                        log::warn!("MIDI 线目标节点缺失，跳过：{cable:?}");
+                        log::warn!("MIDI cable target node missing, skipping: {cable:?}");
                         continue;
                     };
                     if !self.engine.connect_midi_node(*track, to) {
-                        log::warn!("MIDI 线（轨 {track} → {to}）下发失败（扇出超限/队列满）");
+                        log::warn!(
+                            "MIDI cable (track {track} → {to}) dispatch failed (fan-out limit exceeded / queue full)"
+                        );
                     }
                 }
                 CableKind::Automation => {
@@ -422,26 +447,26 @@ impl ResoZApp {
                         continue;
                     };
                     let Some(to) = to_node else {
-                        log::warn!("自动化线目标节点缺失，跳过：{cable:?}");
+                        log::warn!("Automation cable target node missing, skipping: {cable:?}");
                         continue;
                     };
                     if !self
                         .engine
                         .set_auto_route(*index, to, param_id_of(&cable.param))
                     {
-                        log::warn!("自动化线（轨 {index} → {to}）下发失败");
+                        log::warn!("Automation cable (track {index} → {to}) dispatch failed");
                     }
                 }
             }
         }
 
-        // 5) 活跃 MIDI 轨数（D12）。
+        // 5) Active MIDI track count (D12).
         self.engine
             .set_midi_track_count(self.project.midi_tracks.len());
     }
 
-    /// 安装一个文档节点：构造处理器（外部插件经非实时实例化）→
-    /// 引擎 `add_node`（引擎侧新 id）→ 登记映射与守卫。
+    /// Install a document node: build the processor (external plugins instantiated
+    /// non-real-time) → engine `add_node` (new engine-side id) → register the mapping and guard.
     fn install_node(&mut self, node: &NodeDoc, sample_rate: u32) {
         let sr = convert::sample_rate_to_f32(sample_rate);
         let doc_id = node.node_id();
@@ -460,7 +485,8 @@ impl ResoZApp {
                             },
                         ) {
                             Ok(instance) => {
-                                // 参数枚举需在实例被拆解前进行（守卫持有插件实例）。
+                                // Parameter enumeration must happen before the instance is
+                                // destructured (the guard holds the plugin instance).
                                 let params = instance.list_params();
                                 let ClapInstance { guard, node } = instance;
                                 self.clap_voice_params.insert(track, params);
@@ -471,7 +497,7 @@ impl ResoZApp {
                                 )
                             }
                             Err(err) => {
-                                log::error!("实例化 CLAP 插件 {plugin_id} 失败：{err}");
+                                log::error!("Failed to instantiate CLAP plugin {plugin_id}: {err}");
                                 self.clap_voice_params.remove(&track);
                                 (Box::new(SynthProcessor::new(sr)), None, String::new())
                             }
@@ -497,7 +523,7 @@ impl ResoZApp {
                                 )
                             }
                             Err(err) => {
-                                log::error!("实例化 VST3 插件 {class_id} 失败：{err}");
+                                log::error!("Failed to instantiate VST3 plugin {class_id}: {err}");
                                 self.voice_params.remove(&track);
                                 (Box::new(SynthProcessor::new(sr)), None, String::new())
                             }
@@ -524,7 +550,7 @@ impl ResoZApp {
                                 )
                             }
                             Err(err) => {
-                                log::error!("实例化 CLAP 效果器 {plugin_id} 失败：{err}");
+                                log::error!("Failed to instantiate CLAP effect {plugin_id}: {err}");
                                 (Box::new(DelayProcessor::new(sr)), None, String::new())
                             }
                         }
@@ -547,7 +573,7 @@ impl ResoZApp {
                                 )
                             }
                             Err(err) => {
-                                log::error!("实例化 VST3 效果器 {class_id} 失败：{err}");
+                                log::error!("Failed to instantiate VST3 effect {class_id}: {err}");
                                 (Box::new(DelayProcessor::new(sr)), None, String::new())
                             }
                         }
@@ -569,13 +595,14 @@ impl ResoZApp {
                 });
             }
         } else {
-            drop(guard); // 节点从未入图：立即丢弃守卫（动态库安全卸载）。
-            log::error!("文档节点 {doc_id} 安装失败（槽位满/队列满）");
+            drop(guard); // Node never entered the graph: drop the guard immediately (safe unload
+            // of the dynamic library).
+            log::error!("Document node {doc_id} installation failed (slots full / queue full)");
         }
     }
 
-    /// 把某节点的在役守卫转入退役区（节点被换下/移除时调用；
-    /// 退役守卫等回收回执到达后释放）。
+    /// Move a node's active guard into the retiring zone (called when a node is swapped out or
+    /// removed; retiring guards are released once recycling receipts arrive).
     fn retire_guard(&mut self, engine_id: u64) {
         let mut i = 0;
         while i < self.voice_guards.len() {
@@ -588,12 +615,13 @@ impl ResoZApp {
         }
     }
 
-    /// 文档 node_id → 引擎 node_id。
+    /// Document node_id → engine node_id.
     fn engine_id(&self, doc_id: u64) -> Option<u64> {
         self.node_map.get(&doc_id).copied()
     }
 
-    /// 把项目文档的参数完整下发一遍（队列满载时命令被丢弃，可安全忽略）。
+    /// Push the full set of project document parameters (commands dropped on queue full are safe
+    /// to ignore).
     fn push_all_params(&mut self) {
         self.apply_document();
         self.engine.send(EngineCommand::SetParam {
@@ -621,7 +649,8 @@ impl ResoZApp {
         }
     }
 
-    /// 下发一条轨道的全部参数（音色 / 延迟 / 混音；轨道寻址表已装配）。
+    /// Push all parameters of one track (timbre / delay / mixing; track addressing tables already
+    /// assembled).
     fn push_track_params(&mut self, track: usize) {
         let synth = self.synth_of_track(track).unwrap_or_default();
         let delay = self.delay_of_track(track).unwrap_or_default();
@@ -647,9 +676,10 @@ impl ResoZApp {
         }
     }
 
-    // ---- 文档字段便捷访问（节点图形态下的轨道面板数据源） ----
+    // ---- Convenient accessors for document fields (data source for track panels in node-graph
+    // ---- form) ----
 
-    /// 某轨的内置合成器音色参数。
+    /// Built-in synth timbre parameters of a track.
     fn synth_of_track(&self, track: usize) -> Option<SynthParams> {
         match self.project.graph.instrument_of_track(track)? {
             NodeDoc::Instrument { synth, .. } => Some(*synth),
@@ -657,7 +687,7 @@ impl ResoZApp {
         }
     }
 
-    /// 某轨的内置合成器音色参数（可变）。
+    /// Built-in synth timbre parameters of a track (mutable).
     fn synth_mut(&mut self, track: usize) -> Option<&mut SynthParams> {
         match self.project.graph.instrument_of_track_mut(track)? {
             NodeDoc::Instrument { synth, .. } => Some(synth),
@@ -665,7 +695,7 @@ impl ResoZApp {
         }
     }
 
-    /// 某轨的内置延迟参数。
+    /// Built-in delay parameters of a track.
     fn delay_of_track(&self, track: usize) -> Option<DelayParams> {
         match self.project.graph.builtin_delay_of_track(track)? {
             NodeDoc::Effect { delay, .. } => Some(*delay),
@@ -673,7 +703,7 @@ impl ResoZApp {
         }
     }
 
-    /// 某轨的内置延迟参数（可变）。
+    /// Built-in delay parameters of a track (mutable).
     fn delay_mut(&mut self, track: usize) -> Option<&mut DelayParams> {
         match self.project.graph.builtin_delay_of_track_mut(track)? {
             NodeDoc::Effect { delay, .. } => Some(delay),
@@ -681,7 +711,8 @@ impl ResoZApp {
         }
     }
 
-    /// 某轨通道条状态：(静音, 增益, 声像)；无通道条节点时取默认。
+    /// Channel strip state of a track: (muted, gain, pan); defaults when there is no channel
+    /// strip node.
     fn track_strip_state(&self, track: usize) -> (bool, f32, f32) {
         match self.project.graph.channel_strip_of_track(track) {
             Some(NodeDoc::ChannelStrip {
@@ -691,10 +722,10 @@ impl ResoZApp {
         }
     }
 
-    // ---- 自动化轨道下发（D7/D12：曲线与连线终点分离） ----
+    // ---- Automation track dispatch (D7/D12: curve and cable endpoint are separated) ----
 
-    /// 下发一条自动化轨道的曲线实体（终点由图的自动化连线表决定，
-    /// 经 `apply_document` / `set_auto_endpoint` 设置）。
+    /// Push the curve entity of one automation track (its endpoint is decided by the graph's
+    /// automation cable table, set via `apply_document` / `set_auto_endpoint`).
     fn send_auto_curve(&mut self, index: usize) {
         let Some(track) = self.project.automation_tracks.get(index) else {
             return;
@@ -718,8 +749,8 @@ impl ResoZApp {
         });
     }
 
-    /// 重定向一条自动化轨道的连线终点（文档 cable 存**文档** node_id，
-    /// 引擎路由按 node_map 映射到引擎侧 id）。
+    /// Redirect an automation track's cable endpoint (the document cable stores the **document**
+    /// node_id; engine routing maps to the engine-side id via node_map).
     fn set_auto_endpoint(&mut self, index: usize, doc_id: u64, param: AutoParam) {
         self.project.graph.remove_auto_cable(index);
         self.project
@@ -736,15 +767,17 @@ impl ResoZApp {
         }
     }
 
-    // ---- 节点画布（P5d，spec §9 P5d）----
+    // ---- Node canvas (P5d, spec §9 P5d) ----
 
-    /// 节点画布一帧：视图 + 交互意图收集，动作统一落文档 + 引擎。
+    /// One frame of the node canvas: view + interaction-intent collection; actions are applied to
+    /// document + engine in one place.
     fn graph_canvas(&mut self, ui: &mut egui::Ui) {
         let track_count = self.project.midi_tracks.len();
         let auto_count = self.project.automation_tracks.len();
         let actions = {
-            // 借用拆分：不可变快照（文档/插件参数表）交给画布，
-            // 可变的画布状态独立出借；动作收集完成后统一应用。
+            // Borrow splitting: an immutable snapshot (document / plugin param tables) goes to
+            // the canvas while the mutable canvas state is borrowed separately; actions are
+            // applied in bulk after collection.
             let doc = &self.project.graph;
             let clap = &self.clap_voice_params;
             let vst3 = &self.voice_params;
@@ -756,15 +789,15 @@ impl ResoZApp {
                 let track = node.track();
                 match node {
                     NodeDoc::ChannelStrip { .. } => {
-                        v.push(("音量".to_string(), AutoParam::TrackGain));
-                        v.push(("声像".to_string(), AutoParam::TrackPan));
+                        v.push(("Volume".to_string(), AutoParam::TrackGain));
+                        v.push(("Pan".to_string(), AutoParam::TrackPan));
                     }
                     NodeDoc::Instrument { .. } => {
-                        v.push(("截止".to_string(), AutoParam::FilterCutoff));
+                        v.push(("Cutoff".to_string(), AutoParam::FilterCutoff));
                         if let Some(params) = clap.get(&track) {
                             for p in params {
                                 let label = if p.name.is_empty() {
-                                    format!("参数 {}", p.id)
+                                    format!("Param {}", p.id)
                                 } else {
                                     p.name.clone()
                                 };
@@ -780,7 +813,7 @@ impl ResoZApp {
                         if let Some(params) = vst3.get(&track) {
                             for p in params {
                                 let label = if p.title.is_empty() {
-                                    format!("参数 {}", p.id)
+                                    format!("Param {}", p.id)
                                 } else {
                                     p.title.clone()
                                 };
@@ -812,12 +845,13 @@ impl ResoZApp {
         self.apply_canvas_actions(actions);
     }
 
-    /// 应用画布动作：文档与引擎同步（复用既有建图/连线方法）。
+    /// Apply canvas actions: sync document and engine (reusing existing graph-build/connect
+    /// methods).
     fn apply_canvas_actions(&mut self, actions: Vec<canvas::CanvasAction>) {
         for action in actions {
             match action {
                 canvas::CanvasAction::ConnectAudio { from_doc, to } => {
-                    // 文档去重（引擎侧 add_cable 本身幂等）。
+                    // Document deduplication (engine-side add_cable is idempotent anyway).
                     let dup = self.project.graph.cables.iter().any(|c| {
                         c.kind == CableKind::Audio
                             && c.from == PortRef::Node(from_doc)
@@ -830,7 +864,9 @@ impl ResoZApp {
                             .push(resoz_model::CableDoc::audio(from_doc, to.clone()));
                     }
                     let Some(&from_engine) = self.node_map.get(&from_doc) else {
-                        self.set_message("连线失败：源节点不在引擎图中".to_string());
+                        self.set_message(
+                            "Connect failed: source node not in engine graph".to_string(),
+                        );
                         continue;
                     };
                     let to_engine = match &to {
@@ -839,11 +875,15 @@ impl ResoZApp {
                         _ => None,
                     };
                     let Some(to_engine) = to_engine else {
-                        self.set_message("连线失败：目标节点不在引擎图中".to_string());
+                        self.set_message(
+                            "Connect failed: target node not in engine graph".to_string(),
+                        );
                         continue;
                     };
                     if !self.engine.connect_nodes(from_engine, to_engine) {
-                        self.set_message("连线失败：成环 / 入边超限 / 队列满".to_string());
+                        self.set_message(
+                            "Connect failed: cycle / fan-in limit / queue full".to_string(),
+                        );
                     }
                 }
                 canvas::CanvasAction::ConnectMidi { track, to_doc } => {
@@ -860,7 +900,9 @@ impl ResoZApp {
                     }
                     if let Some(to_engine) = self.node_map.get(&to_doc).copied() {
                         if !self.engine.connect_midi_node(track, to_engine) {
-                            self.set_message("MIDI 连线失败：扇出超限 / 队列满".to_string());
+                            self.set_message(
+                                "MIDI connect failed: fan-out limit / queue full".to_string(),
+                            );
                         }
                     }
                 }
@@ -886,7 +928,7 @@ impl ResoZApp {
         }
     }
 
-    /// 删除一条连线（文档下标 i；文档与引擎同步）。
+    /// Delete a cable (document index i; document and engine stay in sync).
     fn delete_cable(&mut self, i: usize) {
         let Some(cable) = self.project.graph.cables.get(i).cloned() else {
             return;
@@ -923,18 +965,19 @@ impl ResoZApp {
         self.project.graph.cables.remove(i);
     }
 
-    /// 删除一个节点：仅效果器开放（MVP）——引擎 `remove_node` 自带
-    /// 旁路语义（入边源×出边目标直连），文档镜像同一改接。
+    /// Delete a node: effects only (MVP) — engine `remove_node` has built-in bypass semantics
+    /// (in-edge sources × out-edge targets become direct connections); the document mirrors the
+    /// same rewiring.
     fn delete_graph_node(&mut self, doc_id: u64) {
         let Some(node) = self.project.graph.node_by_id(doc_id) else {
             return;
         };
         if !matches!(node, NodeDoc::Effect { .. }) {
-            self.set_message("画布暂只支持删除效果器节点（乐器/通道条由面板管理）".to_string());
+            self.set_message("Canvas: only effect nodes can be removed (instruments/channel strips are panel-managed)".to_string());
             return;
         }
-        // 文档旁路对：入线源 × 出线目标（任意类型线一律移除，
-        // 音频直连对按引擎 remove_node 语义重建）。
+        // Document bypass pairs: in-cable sources × out-cable targets (all cable types are
+        // removed; audio direct-connection pairs are rebuilt per engine remove_node semantics).
         let ins: Vec<PortRef> = self
             .project
             .graph
@@ -955,7 +998,7 @@ impl ResoZApp {
             return;
         };
         if !self.engine.remove_node(engine_id) {
-            self.set_message("节点移除失败（队列满）".to_string());
+            self.set_message("Node removal failed (queue full)".to_string());
             return;
         }
         self.project.graph.nodes.retain(|n| n.node_id() != doc_id);
@@ -965,7 +1008,7 @@ impl ResoZApp {
             .retain(|c| c.from != PortRef::Node(doc_id) && c.to != PortRef::Node(doc_id));
         for from in &ins {
             if !matches!(from, PortRef::Node(_)) {
-                continue; // 音频源只能是节点。
+                continue; // Audio sources can only be nodes.
             }
             for to in &outs {
                 self.project
@@ -978,7 +1021,7 @@ impl ResoZApp {
         self.retire_guard(engine_id);
     }
 
-    /// 文档模式 → 引擎表示（`Copy` 数组，零堆分配）。
+    /// Document pattern → engine representation (`Copy` array, zero heap allocation).
     fn rt_pattern(&self, track: usize) -> [SequencerStep; PATTERN_STEPS] {
         let mut steps = [SequencerStep::default(); PATTERN_STEPS];
         for (i, step) in self.project.midi_tracks[track]
@@ -996,7 +1039,8 @@ impl ResoZApp {
         steps
     }
 
-    /// 文档片段 → 引擎表示（超容量截断，`Copy` 结构，零堆分配）。
+    /// Document clip → engine representation (truncated to capacity, `Copy` struct, zero heap
+    /// allocation).
     fn rt_clip(&self, track: usize) -> RtClip {
         let clip = &self.project.midi_tracks[track].clip;
         let mut rt = RtClip {
@@ -1014,13 +1058,13 @@ impl ResoZApp {
         rt
     }
 
-    /// 下发一条轨道的当前卷帘片段。
+    /// Push the current roll clip of one track.
     fn send_clip(&mut self, track: usize) {
         let clip = self.rt_clip(track);
         self.send_sequencer(SequencerCommand::SetClip { track, clip });
     }
 
-    /// 保存到当前路径；从未保存过则弹出"另存为"对话框。
+    /// Save to the current path; if never saved, pop up the "Save As" dialog.
     fn save_project(&mut self) {
         match self.project_path.clone() {
             Some(path) => self.do_save(path),
@@ -1028,11 +1072,11 @@ impl ResoZApp {
         }
     }
 
-    /// "另存为"：弹出保存对话框。
+    /// "Save As": pop up the save dialog.
     fn save_project_as(&mut self) {
         let Some(mut path) = rfd::FileDialog::new()
-            .add_filter("ResoZ 项目", &["rez"])
-            .set_file_name("未命名.rez")
+            .add_filter("ResoZ Project", &["rez"])
+            .set_file_name("Untitled.rez")
             .save_file()
         else {
             return;
@@ -1041,10 +1085,10 @@ impl ResoZApp {
         self.do_save(path);
     }
 
-    /// "打开"：弹出文件选择对话框。
+    /// "Open": pop up the file picker dialog.
     fn open_project_dialog(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("ResoZ 项目", &["rez"])
+            .add_filter("ResoZ Project", &["rez"])
             .pick_file()
         else {
             return;
@@ -1052,24 +1096,25 @@ impl ResoZApp {
         self.do_open(path);
     }
 
-    /// 写盘并更新最近文件 / 标题 / 状态消息。
+    /// Write to disk and update recent files / title / status message.
     fn do_save(&mut self, path: PathBuf) {
         match resoz_model::save_project(&self.project, &path) {
             Ok(()) => {
                 self.project_path = Some(path.clone());
                 self.push_recent(path.clone());
                 self.window_title = format!("ResoZ — {}", display_name(&path));
-                self.set_message(format!("已保存 {}", path.display()));
-                log::info!("项目已保存：{}", path.display());
+                self.set_message(format!("Saved {}", path.display()));
+                log::info!("Project saved: {}", path.display());
             }
             Err(err) => {
-                self.set_message(format!("保存失败：{err}"));
-                log::error!("保存项目失败：{err}");
+                self.set_message(format!("Save failed: {err}"));
+                log::error!("Failed to save project: {err}");
             }
         }
     }
 
-    /// 读盘、替换文档、按文档重建引擎图并重发全部参数。
+    /// Load from disk, replace the document, rebuild the engine graph per the document, and
+    /// re-push all parameters.
     fn do_open(&mut self, path: PathBuf) {
         match resoz_model::load_project(&path) {
             Ok(project) => {
@@ -1081,29 +1126,30 @@ impl ResoZApp {
                 self.roll_state = piano_roll::RollState::new();
                 self.push_all_params();
                 self.window_title = format!("ResoZ — {}", display_name(&path));
-                self.set_message(format!("已打开 {}", path.display()));
-                log::info!("项目已打开：{}", path.display());
+                self.set_message(format!("Opened {}", path.display()));
+                log::info!("Project opened: {}", path.display());
             }
             Err(err) => {
-                self.set_message(format!("打开失败：{err}"));
-                log::error!("打开项目失败：{err}");
+                self.set_message(format!("Open failed: {err}"));
+                log::error!("Failed to open project: {err}");
             }
         }
     }
 
-    /// 最近文件去重置顶并截断。
+    /// De-duplicate the recent files, move to front, and truncate.
     fn push_recent(&mut self, path: PathBuf) {
         self.recent.retain(|p| p != &path);
         self.recent.insert(0, path);
         self.recent.truncate(RECENT_FILES_MAX);
     }
 
-    /// 设置一条状态栏消息（超时自动消失）。
+    /// Set a status bar message (disappears automatically after a timeout).
     fn set_message(&mut self, text: String) {
         self.status_message = Some((text, Instant::now()));
     }
 
-    /// 把选中轨道的声源恢复为内置合成器（原位替换，节点身份不变）。
+    /// Restore the selected track's instrument to the built-in synth (in-place replacement,
+    /// node identity unchanged).
     fn set_builtin_instrument(&mut self, track: usize) {
         if let Some(NodeDoc::Instrument { voice, .. }) =
             self.project.graph.instrument_of_track_mut(track)
@@ -1129,12 +1175,16 @@ impl ResoZApp {
             .replace_node(engine_id, Box::new(SynthProcessor::new(sample_rate)))
             .is_none()
         {
-            log::error!("轨道 {} 声源恢复失败（节点缺失或队列满）", track + 1);
+            log::error!(
+                "Failed to restore instrument on track {} (missing node or queue full)",
+                track + 1
+            );
         }
     }
 
-    /// 给轨道装填 CLAP 乐器声源：非实时实例化 → 引擎原位替换 → 守卫登记。
-    /// 成功后顺带枚举插件参数（自动化连线目标的数据源）。
+    /// Load a CLAP instrument voice into the track: non-real-time instantiation → in-place engine
+    /// replacement → guard registration. On success, also enumerate plugin parameters (data
+    /// source for automation cable targets).
     fn load_clap_voice(&mut self, track: usize, path: &str, plugin_id: &str) {
         let Some(doc_id) = self
             .project
@@ -1157,7 +1207,8 @@ impl ResoZApp {
             },
         ) {
             Ok(instance) => {
-                // 参数枚举需在实例被拆解前进行（守卫持有插件实例）。
+                // Parameter enumeration must happen before the instance is destructured (the
+                // guard holds the plugin instance).
                 let params = instance.list_params();
                 let ClapInstance { guard, node } = instance;
                 if self
@@ -1172,19 +1223,20 @@ impl ResoZApp {
                         _guard: PluginGuard::Clap(guard),
                     });
                     self.clap_voice_params.insert(track, params);
-                    log::info!("轨道 {} 已装填 CLAP 声源：{plugin_id}", track + 1);
+                    log::info!("Track {} loaded CLAP voice: {plugin_id}", track + 1);
                 } else {
-                    log::error!("声源队列满：轨道 {} 装填失败", track + 1);
+                    log::error!("Voice queue full: failed to load track {}", track + 1);
                 }
             }
             Err(err) => {
-                log::error!("实例化 CLAP 插件 {plugin_id} 失败：{err}");
-                self.set_message(format!("插件加载失败：{err}"));
+                log::error!("Failed to instantiate CLAP plugin {plugin_id}: {err}");
+                self.set_message(format!("Plugin load failed: {err}"));
             }
         }
     }
 
-    /// 给轨道装填 VST3 乐器声源：非实时实例化 → 引擎原位替换 → 守卫登记。
+    /// Load a VST3 instrument voice into the track: non-real-time instantiation → in-place engine
+    /// replacement → guard registration.
     fn load_vst3_voice(&mut self, track: usize, path: &str, class_id: &str) {
         let Some(doc_id) = self
             .project
@@ -1208,7 +1260,8 @@ impl ResoZApp {
         ) {
             Ok(instance) => {
                 let resoz_vst3_host::Vst3Instance { guard, node } = instance;
-                // 控制侧枚举参数列表（守卫移入注册表前读出）。
+                // Enumerate the parameter list on the control side (read before the guard moves
+                // into the registry).
                 let params = guard.parameters();
                 if self
                     .engine
@@ -1222,20 +1275,20 @@ impl ResoZApp {
                         plugin_id: class_id.to_string(),
                         _guard: PluginGuard::Vst3(guard),
                     });
-                    log::info!("轨道 {} 已装填 VST3 声源：{class_id}", track + 1);
+                    log::info!("Track {} loaded VST3 voice: {class_id}", track + 1);
                 } else {
-                    log::error!("声源队列满：轨道 {} 装填失败", track + 1);
+                    log::error!("Voice queue full: failed to load track {}", track + 1);
                 }
             }
             Err(err) => {
-                log::error!("实例化 VST3 插件 {class_id} 失败：{err}");
-                self.set_message(format!("VST3 插件加载失败：{err}"));
+                log::error!("Failed to instantiate VST3 plugin {class_id}: {err}");
+                self.set_message(format!("VST3 plugin load failed: {err}"));
             }
         }
     }
 
-    /// 在轨道链末（通道条之前）插入一个外部效果器节点：引擎
-    /// `insert_node_between` + 文档同步（节点 + 旁路线改接）。
+    /// Insert an external effect node at the end of the track chain (before the channel strip):
+    /// engine `insert_node_between` + document sync (node + bypass cable rewiring).
     fn insert_effect_common(
         &mut self,
         track: usize,
@@ -1250,13 +1303,17 @@ impl ResoZApp {
             .channel_strip_of_track(track)
             .map(NodeDoc::node_id)
         else {
-            log::error!("轨道 {} 无通道条节点，效果器插入失败", track + 1);
+            log::error!(
+                "Track {} has no channel strip node; effect insertion failed",
+                track + 1
+            );
             return;
         };
         let Some(strip_engine) = self.engine_id(strip_doc) else {
             return;
         };
-        // 找到当前直连通道条的音频线源（文档拓扑）。
+        // Find the audio cable source currently connected directly to the channel strip
+        // (document topology).
         let Some(in_from_doc) = self.project.graph.cables.iter().find_map(|c| {
             if c.kind == CableKind::Audio && c.to == PortRef::Node(strip_doc) {
                 match c.from {
@@ -1267,7 +1324,10 @@ impl ResoZApp {
                 None
             }
         }) else {
-            log::error!("轨道 {} 通道条无入线，效果器插入失败", track + 1);
+            log::error!(
+                "Track {} channel strip has no input cable; effect insertion failed",
+                track + 1
+            );
             return;
         };
         let Some(in_from_engine) = self.engine_id(in_from_doc) else {
@@ -1279,10 +1339,13 @@ impl ResoZApp {
             .engine
             .insert_node_between(new_engine_id, in_from_engine, strip_engine, node)
         {
-            log::error!("结构队列满：轨道 {} 插入效果器失败", track + 1);
+            log::error!(
+                "Structure queue full: failed to insert effect on track {}",
+                track + 1
+            );
             return;
         }
-        // 文档同步：节点 + 旁路线改接。
+        // Document sync: node + bypass cable rewiring.
         self.project.graph.nodes.push(NodeDoc::Effect {
             node_id: new_doc_id,
             track,
@@ -1309,10 +1372,11 @@ impl ResoZApp {
             plugin_id: plugin_label,
             _guard: guard,
         });
-        log::info!("轨道 {} 已插入外部效果器", track + 1);
+        log::info!("Track {} inserted external effect", track + 1);
     }
 
-    /// 给轨道插入 CLAP 效果器节点（非实时实例化 → 引擎插线 → 守卫登记）。
+    /// Insert a CLAP effect node into the track (non-real-time instantiation → engine insertion →
+    /// guard registration).
     fn load_clap_effect(&mut self, track: usize, path: &str, plugin_id: &str) {
         match ClapInstance::spawn_rt(
             std::path::Path::new(path),
@@ -1336,13 +1400,14 @@ impl ResoZApp {
                 );
             }
             Err(err) => {
-                log::error!("实例化 CLAP 效果器 {plugin_id} 失败：{err}");
-                self.set_message(format!("插件加载失败：{err}"));
+                log::error!("Failed to instantiate CLAP effect {plugin_id}: {err}");
+                self.set_message(format!("Plugin load failed: {err}"));
             }
         }
     }
 
-    /// 给轨道插入 VST3 效果器节点（非实时实例化 → 引擎插线 → 守卫登记）。
+    /// Insert a VST3 effect node into the track (non-real-time instantiation → engine insertion →
+    /// guard registration).
     fn load_vst3_effect(&mut self, track: usize, path: &str, class_id: &str) {
         match resoz_vst3_host::Vst3Instance::spawn_rt(
             std::path::Path::new(path),
@@ -1366,13 +1431,14 @@ impl ResoZApp {
                 );
             }
             Err(err) => {
-                log::error!("实例化 VST3 效果器 {class_id} 失败：{err}");
-                self.set_message(format!("VST3 插件加载失败：{err}"));
+                log::error!("Failed to instantiate VST3 effect {class_id}: {err}");
+                self.set_message(format!("VST3 plugin load failed: {err}"));
             }
         }
     }
 
-    /// 清空某轨全部外部效果器（内置延迟保留）：引擎旁路移除 + 文档同步。
+    /// Clear all external effects of a track (built-in delay kept): engine bypass removal +
+    /// document sync.
     fn clear_external_effects(&mut self, track: usize) {
         while let Some(effect) = self.project.graph.nodes.iter().find(|n| {
             n.track() == track
@@ -1385,7 +1451,7 @@ impl ResoZApp {
             let Some(&effect_engine) = self.node_map.get(&effect_doc) else {
                 break;
             };
-            // 文档线：入线源与出线目标（旁路直连对）。
+            // Document cables: in-cable source and out-cable target (bypass direct pair).
             let in_from = self.project.graph.cables.iter().find_map(|c| {
                 if c.kind == CableKind::Audio && c.to == PortRef::Node(effect_doc) {
                     match c.from {
@@ -1404,7 +1470,9 @@ impl ResoZApp {
                 }
             });
             let (Some(in_from), Some(out_to)) = (in_from, out_to) else {
-                log::warn!("轨道 {track} 效果器 {effect_doc} 连线不完整，停止清理");
+                log::warn!(
+                    "Track {track} effect {effect_doc} has incomplete cables; stopping cleanup"
+                );
                 break;
             };
             if !self.engine.remove_node(effect_engine) {
@@ -1427,7 +1495,7 @@ impl ResoZApp {
         }
     }
 
-    /// 已扫描的 CLAP 乐器（懒加载）。
+    /// Scanned CLAP instruments (lazy).
     fn scanned_instruments(&mut self) -> &[resoz_clap_host::ClapPluginInfo] {
         if self.clap_plugins.is_none() {
             self.clap_plugins = Some(
@@ -1440,7 +1508,7 @@ impl ResoZApp {
         self.clap_plugins.as_deref().unwrap_or(&[])
     }
 
-    /// 已扫描的 CLAP 效果器（懒加载）。
+    /// Scanned CLAP effects (lazy).
     fn scanned_effects(&mut self) -> &[resoz_clap_host::ClapPluginInfo] {
         if self.clap_effects.is_none() {
             self.clap_effects = Some(
@@ -1453,7 +1521,7 @@ impl ResoZApp {
         self.clap_effects.as_deref().unwrap_or(&[])
     }
 
-    /// 已扫描的 VST3 乐器（懒加载）。
+    /// Scanned VST3 instruments (lazy).
     fn scanned_vst3_instruments(&mut self) -> &[resoz_vst3_host::Vst3PluginInfo] {
         if self.vst3_plugins.is_none() {
             self.vst3_plugins = Some(
@@ -1466,7 +1534,7 @@ impl ResoZApp {
         self.vst3_plugins.as_deref().unwrap_or(&[])
     }
 
-    /// 已扫描的 VST3 效果器（懒加载）。
+    /// Scanned VST3 effects (lazy).
     fn scanned_vst3_effects(&mut self) -> &[resoz_vst3_host::Vst3PluginInfo] {
         if self.vst3_effects.is_none() {
             self.vst3_effects = Some(
@@ -1483,7 +1551,7 @@ impl ResoZApp {
         self.engine.send(EngineCommand::Sequencer(cmd));
     }
 
-    /// 下发一条轨道的当前模式。
+    /// Push the current pattern of one track.
     fn send_pattern(&mut self, track: usize) {
         let steps = self.rt_pattern(track);
         self.send_sequencer(SequencerCommand::SetPattern { track, steps });
@@ -1508,10 +1576,10 @@ impl ResoZApp {
         self.held_notes.remove(&note);
     }
 
-    /// 处理电脑键盘演奏（FL Studio 风格布局，Z/X 切八度）。
+    /// Handle computer keyboard playing (FL Studio-style layout; Z/X shift octaves).
     ///
-    /// TODO：将来窗口里出现文本输入控件时，必须先判断键盘焦点，
-    /// 避免打字触发音符。
+    /// TODO: once text input widgets appear in the window, keyboard focus must be checked first
+    /// so typing does not trigger notes.
     fn handle_keyboard_input(&mut self, ctx: &egui::Context) {
         let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
         for event in events {
@@ -1528,7 +1596,7 @@ impl ResoZApp {
             if repeat {
                 continue;
             }
-            // 快捷键优先于演奏映射（Ctrl+S 保存 / Ctrl+O 打开）。
+            // Shortcuts take precedence over the playing map (Ctrl+S save / Ctrl+O open).
             if modifiers.ctrl && pressed {
                 match key {
                     egui::Key::S => {
@@ -1540,7 +1608,7 @@ impl ResoZApp {
                         continue;
                     }
                     _ => {
-                        continue; // 其他 Ctrl 组合不触发音符
+                        continue; // other Ctrl combos do not trigger notes
                     }
                 }
             }
@@ -1571,18 +1639,18 @@ impl ResoZApp {
         let playing = self.engine.is_playing();
         egui::Panel::top("resoz_transport").show(ui, |ui| {
             ui.horizontal(|ui| {
-                let mut play_btn = egui::Button::new("▶ 播放");
+                let mut play_btn = egui::Button::new("▶ Play");
                 if playing {
                     play_btn = play_btn.fill(egui::Color32::DARK_GREEN);
                 }
                 if ui.add(play_btn).clicked() {
                     self.send_sequencer(SequencerCommand::Play);
                 }
-                if ui.button("■ 停止").clicked() {
+                if ui.button("■ Stop").clicked() {
                     self.send_sequencer(SequencerCommand::Stop);
                 }
                 ui.separator();
-                ui.label("速度");
+                ui.label("Tempo");
                 let bpm = ui.add(
                     egui::DragValue::new(&mut self.project.metadata.tempo_bpm)
                         .range(*BPM_RANGE.start()..=*BPM_RANGE.end())
@@ -1595,15 +1663,15 @@ impl ResoZApp {
                     )));
                 }
                 ui.separator();
-                if ui.button("📂 打开").clicked() {
+                if ui.button("📂 Open").clicked() {
                     self.open_project_dialog();
                 }
-                if ui.button("💾 保存").clicked() {
+                if ui.button("💾 Save").clicked() {
                     self.save_project();
                 }
-                ui.menu_button("最近文件", |ui| {
+                ui.menu_button("Recent Files", |ui| {
                     if self.recent.is_empty() {
-                        ui.weak("（空）");
+                        ui.weak("(empty)");
                     }
                     let recent = self.recent.clone();
                     for path in recent {
@@ -1631,31 +1699,31 @@ impl ResoZApp {
             .get(self.selected_track)
             .map(|t| {
                 if t.name.is_empty() {
-                    format!("轨道 {}", self.selected_track + 1)
+                    format!("Track {}", self.selected_track + 1)
                 } else {
                     t.name.clone()
                 }
             })
             .unwrap_or_else(|| "—".to_string());
-        // 状态消息（超时自动消失）。
+        // Status message (disappears automatically after a timeout).
         let message = self
             .status_message
             .take_if(|(_, at)| at.elapsed() < STATUS_MESSAGE_TTL);
 
         egui::Panel::bottom("resoz_status").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(format!("设备：{}", info.device_name));
+                ui.label(format!("Device: {}", info.device_name));
                 ui.separator();
                 ui.label(format!(
-                    "{} Hz / {} 声道",
+                    "{} Hz / {} ch",
                     info.sample_rate, info.out_channels
                 ));
                 ui.separator();
-                ui.label(format!("编辑：{track_name}"));
+                ui.label(format!("Editing: {track_name}"));
                 ui.separator();
-                ui.label(format!("音符：{note_text}"));
+                ui.label(format!("Note: {note_text}"));
                 ui.separator();
-                ui.label(format!("位置 {:.1} s", position));
+                ui.label(format!("Pos {:.1} s", position));
                 if let Some((text, _)) = message {
                     ui.separator();
                     ui.colored_label(egui::Color32::LIGHT_BLUE, text);
@@ -1668,23 +1736,23 @@ impl ResoZApp {
         self.meter.update(self.engine.peak_level());
         let peak = self.meter.held;
 
-        // eframe 0.36 的根 Ui 无边距；包一层 CentralPanel 保持默认观感。
+        // In eframe 0.36 the root Ui has no margins; wrap a CentralPanel to keep the default look.
         egui::CentralPanel::default().show(ui, |ui| {
             if self.project.midi_tracks.is_empty() {
-                ui.heading("合成器");
-                ui.weak("（项目没有 MIDI 轨道）");
+                ui.heading("Synth");
+                ui.weak("(no MIDI tracks in project)");
                 return;
             }
             let sel = self.selected_track.min(self.project.midi_tracks.len() - 1);
             self.selected_track = sel;
             let track_title = if self.project.midi_tracks[sel].name.is_empty() {
-                format!("轨道 {}", sel + 1)
+                format!("Track {}", sel + 1)
             } else {
                 self.project.midi_tracks[sel].name.clone()
             };
-            ui.heading(format!("合成器 — {track_title}"));
+            ui.heading(format!("Synth — {track_title}"));
             ui.horizontal(|ui| {
-                ui.label("声源");
+                ui.label("Instrument");
                 let is_external = self
                     .project
                     .graph
@@ -1697,17 +1765,18 @@ impl ResoZApp {
                         _ => None,
                     })
                     .unwrap_or(false);
-                if ui.selectable_label(!is_external, "内置合成器").clicked() {
+                if ui.selectable_label(!is_external, "Built-in Synth").clicked() {
                     self.set_builtin_instrument(sel);
                 }
-                // 先收集选择，菜单闭包结束后再装填（避免借用冲突）。
+                // Collect the choice first; load after the menu closure ends (avoids borrow
+                // conflicts).
                 let mut picked: Option<(String, String)> = None;
-                ui.menu_button("CLAP 乐器…", |ui| {
+                ui.menu_button("CLAP Instruments…", |ui| {
                     let empty: Vec<resoz_clap_host::ClapPluginInfo> = Vec::new();
                     let plugins = self.scanned_instruments();
                     let list = if plugins.is_empty() { &empty } else { plugins };
                     if list.is_empty() {
-                        ui.weak("（未发现乐器插件；可用 RESOZ_CLAP_PATH 指定目录）");
+                        ui.weak("(no instrument plugins found; set RESOZ_CLAP_PATH to add dirs)");
                     }
                     for info in list {
                         if ui.button(&info.name).clicked() {
@@ -1728,12 +1797,12 @@ impl ResoZApp {
                     self.load_clap_voice(sel, &path, &plugin_id);
                 }
                 let mut vst3_picked: Option<(String, String)> = None;
-                ui.menu_button("VST3 乐器…", |ui| {
+                ui.menu_button("VST3 Instruments…", |ui| {
                     let empty: Vec<resoz_vst3_host::Vst3PluginInfo> = Vec::new();
                     let plugins = self.scanned_vst3_instruments();
                     let list = if plugins.is_empty() { &empty } else { plugins };
                     if list.is_empty() {
-                        ui.weak("（未发现 VST3 插件；可用 RESOZ_VST3_PATH 指定目录）");
+                        ui.weak("(no VST3 plugins found; set RESOZ_VST3_PATH to add dirs)");
                     }
                     for info in list {
                         if ui.button(&info.name).clicked() {
@@ -1754,15 +1823,15 @@ impl ResoZApp {
                     self.load_vst3_voice(sel, &path, &class_id);
                 }
                 if is_external {
-                    ui.weak("（外部乐器插件）");
+                    ui.weak("(external instrument plugin)");
                 }
                 ui.separator();
-                ui.label("效果器");
-                // 先收集选择，菜单闭包结束后再装填。
+                ui.label("Effects");
+                // Collect the choice first; load after the menu closure ends.
                 let mut effect_picked: Option<(String, String)> = None;
                 let mut clear_effects = false;
-                ui.menu_button("CLAP 效果器…", |ui| {
-                    if ui.button("清空全部效果器").clicked() {
+                ui.menu_button("CLAP Effects…", |ui| {
+                    if ui.button("Clear All Effects").clicked() {
                         clear_effects = true;
                         ui.close();
                     }
@@ -1770,7 +1839,7 @@ impl ResoZApp {
                     let plugins = self.scanned_effects();
                     let list = if plugins.is_empty() { &empty } else { plugins };
                     if list.is_empty() {
-                        ui.weak("（未发现效果器插件）");
+                        ui.weak("(no effect plugins found)");
                     }
                     for info in list {
                         if ui.button(&info.name).clicked() {
@@ -1787,12 +1856,12 @@ impl ResoZApp {
                     self.load_clap_effect(sel, &path, &plugin_id);
                 }
                 let mut vst3_effect_picked: Option<(String, String)> = None;
-                ui.menu_button("VST3 效果器…", |ui| {
+                ui.menu_button("VST3 Effects…", |ui| {
                     let empty: Vec<resoz_vst3_host::Vst3PluginInfo> = Vec::new();
                     let plugins = self.scanned_vst3_effects();
                     let list = if plugins.is_empty() { &empty } else { plugins };
                     if list.is_empty() {
-                        ui.weak("（未发现 VST3 效果器插件）");
+                        ui.weak("(no VST3 effect plugins found)");
                     }
                     for info in list {
                         if ui.button(&info.name).clicked() {
@@ -1807,10 +1876,11 @@ impl ResoZApp {
                 }
             });
 
-            // VST3 插件参数列表（实例化时控制侧读出；展示默认归一化值）。
+            // VST3 plugin parameter list (read on the control side at instantiation; displays
+            // default normalized values).
             if let Some(params) = self.voice_params.get(&sel) {
                 if !params.is_empty() {
-                    egui::CollapsingHeader::new(format!("插件参数（{}）", params.len()))
+                    egui::CollapsingHeader::new(format!("Plugin Params ({})", params.len()))
                         .default_open(false)
                         .show(ui, |ui| {
                             egui::Grid::new("vst3_params")
@@ -1821,12 +1891,12 @@ impl ResoZApp {
                                         ui.label(&param.title);
                                         ui.weak(format!("id {}", param.id));
                                         ui.weak(format!(
-                                            "默认 {:.3}{}",
+                                            "Default {:.3}{}",
                                             param.default_normalized,
                                             if param.can_automate {
                                                 ""
                                             } else {
-                                                "（不可自动化）"
+                                                "(not automatable)"
                                             }
                                         ));
                                         ui.end_row();
@@ -1836,10 +1906,10 @@ impl ResoZApp {
                 }
             }
 
-            // CLAP 插件参数列表（实例化时经 params 扩展枚举）。
+            // CLAP plugin parameter list (enumerated via the params extension at instantiation).
             if let Some(params) = self.clap_voice_params.get(&sel) {
                 if !params.is_empty() {
-                    egui::CollapsingHeader::new(format!("插件参数 CLAP（{}）", params.len()))
+                    egui::CollapsingHeader::new(format!("Plugin Params CLAP ({})", params.len()))
                         .default_open(false)
                         .show(ui, |ui| {
                             egui::Grid::new("clap_params")
@@ -1850,7 +1920,7 @@ impl ResoZApp {
                                         ui.label(&param.name);
                                         ui.weak(format!("id {}", param.id));
                                         ui.weak(format!(
-                                            "默认 {:.3} [{:.3}..{:.3}]",
+                                            "Default {:.3} [{:.3}..{:.3}]",
                                             param.default_value, param.min_value, param.max_value
                                         ));
                                         ui.end_row();
@@ -1859,15 +1929,15 @@ impl ResoZApp {
                         });
                 }
             }
-            ui.weak("节点图：声源 → 延迟 → 通道条 → 主输出（文档全显式，改动实时送达音频线程）");
+            ui.weak("Node graph: instrument -> delay -> channel strip -> master (doc-driven, changes go live)");
             ui.add_space(8.0);
 
-            // 滤波器 / 包络（绑定到选中轨道的文档节点字段）。
+            // Filter / envelope (bound to the selected track's document node fields).
             egui::Grid::new("synth_params")
                 .num_columns(2)
                 .spacing([16.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("截止频率");
+                    ui.label("Cutoff Freq");
                     let mut cutoff = self.synth_of_track(sel).unwrap_or_default().cutoff_hz;
                     let r = ui.add(
                         egui::Slider::new(&mut cutoff, CUTOFF_RANGE)
@@ -1882,7 +1952,7 @@ impl ResoZApp {
                     }
                     ui.end_row();
 
-                    ui.label("共振");
+                    ui.label("Resonance");
                     let mut resonance = self.synth_of_track(sel).unwrap_or_default().resonance;
                     let r = ui.add(egui::Slider::new(&mut resonance, RES_RANGE));
                     if r.changed() {
@@ -1893,10 +1963,10 @@ impl ResoZApp {
                     }
                     ui.end_row();
 
-                    ui.label("滤波模式");
+                    ui.label("Filter Mode");
                     ui.horizontal(|ui| {
                         let mode = self.synth_of_track(sel).unwrap_or_default().filter_mode;
-                        for (name, value) in [("低通", 0.0), ("高通", 1.0), ("带通", 2.0)] {
+                        for (name, value) in [("Low-pass", 0.0), ("High-pass", 1.0), ("Band-pass", 2.0)] {
                             if ui
                                 .selectable_label((mode - value).abs() < 0.5, name)
                                 .clicked()
@@ -1910,17 +1980,17 @@ impl ResoZApp {
                     });
                     ui.end_row();
 
-                    ui.label("音量包络");
+                    ui.label("Volume Envelope");
                     self.adsr_sliders(ui);
                     ui.end_row();
 
-                    ui.label("延迟");
+                    ui.label("Delay");
                     self.delay_sliders(ui);
                     ui.end_row();
 
-                    ui.label("主增益");
+                    ui.label("Master Gain");
                     let r = ui.add(
-                        egui::Slider::new(&mut self.project.master_gain, 0.0..=1.5).text("线性"),
+                        egui::Slider::new(&mut self.project.master_gain, 0.0..=1.5).text("Linear"),
                     );
                     if r.changed() {
                         self.engine.send(EngineCommand::SetParam {
@@ -1941,17 +2011,17 @@ impl ResoZApp {
             self.keyboard_section(ui);
 
             ui.add_space(10.0);
-            ui.label("主输出电平");
+            ui.label("Master Out Level");
             ui.add(
                 egui::ProgressBar::new(peak.clamp(0.0, 1.0))
                     .desired_height(16.0)
                     .show_percentage(),
             );
-            ui.weak(format!("峰值 {peak:.3} —— AtomicF32 回传，峰值保持 600 ms"));
+            ui.weak(format!("Peak {peak:.3} (AtomicF32 feedback, 600 ms hold)"));
         });
     }
 
-    /// ADSR 四滑块（本地副本 + 写回，避免借用冲突）。
+    /// ADSR four sliders (local copies + write-back, avoiding borrow conflicts).
     fn adsr_sliders(&mut self, ui: &mut egui::Ui) {
         let sel = self.selected_track;
         let synth = self.synth_of_track(sel).unwrap_or_default();
@@ -1981,7 +2051,7 @@ impl ResoZApp {
         }
     }
 
-    /// 延迟三滑块（湿声/时间/反馈）。
+    /// Delay three sliders (wet mix / time / feedback).
     fn delay_sliders(&mut self, ui: &mut egui::Ui) {
         let sel = self.selected_track;
         let delay = self.delay_of_track(sel).unwrap_or_default();
@@ -1990,10 +2060,10 @@ impl ResoZApp {
         let mut feedback = delay.feedback;
         ui.horizontal(|ui| {
             let sliders = [
-                ("湿声", &mut mix, DELAY_MIX_RANGE, ParamId::DelayMix),
-                ("时间", &mut time, DELAY_TIME_RANGE, ParamId::DelayTime),
+                ("Wet", &mut mix, DELAY_MIX_RANGE, ParamId::DelayMix),
+                ("Time", &mut time, DELAY_TIME_RANGE, ParamId::DelayTime),
                 (
-                    "反馈",
+                    "Feedback",
                     &mut feedback,
                     DELAY_FB_RANGE,
                     ParamId::DelayFeedback,
@@ -2013,20 +2083,20 @@ impl ResoZApp {
         }
     }
 
-    /// 发送一条轨道参数到音频线程。
+    /// Send one track parameter to the audio thread.
     fn send_track_param(&mut self, track: usize, id: ParamId, value: f32) {
         self.engine
             .send(EngineCommand::SetTrackParam { track, id, value });
     }
 
-    /// 混音器：每轨 选择 / 静音 / 电平表 / 推子 / 声像（Vec 遍历，
-    /// 数据源 = 文档通道条节点）。
+    /// Mixer: per-track selection / mute / level meter / fader / pan (Vec traversal; data source
+    /// = document channel strip nodes).
     fn mixer_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
-        ui.label("混音器");
+        ui.label("Mixer");
 
-        // 先收集编辑，循环后统一写回并发送（避免借用冲突）。
+        // Collect edits first; write back and send after the loop (avoids borrow conflicts).
         let num_tracks = self.project.midi_tracks.len();
         let mut mute_edits: Vec<Option<bool>> = vec![None; num_tracks];
         let mut gain_edits: Vec<Option<f32>> = vec![None; num_tracks];
@@ -2037,7 +2107,7 @@ impl ResoZApp {
             for i in 0..num_tracks {
                 ui.vertical(|ui| {
                     let name = if self.project.midi_tracks[i].name.is_empty() {
-                        format!("轨道 {}", i + 1)
+                        format!("Track {}", i + 1)
                     } else {
                         self.project.midi_tracks[i].name.clone()
                     };
@@ -2049,7 +2119,7 @@ impl ResoZApp {
                     }
 
                     let (muted, _gain, _pan) = self.track_strip_state(i);
-                    let mut btn = egui::Button::new(if muted { "静音" } else { "开" });
+                    let mut btn = egui::Button::new(if muted { "Mute" } else { "On" });
                     if muted {
                         btn = btn.fill(egui::Color32::from_rgb(140, 60, 50));
                     }
@@ -2057,7 +2127,7 @@ impl ResoZApp {
                         mute_edits[i] = Some(!muted);
                     }
 
-                    // post-fader 电平条。
+                    // Post-fader level bar.
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(96.0, 10.0), egui::Sense::hover());
                     ui.painter()
@@ -2082,7 +2152,7 @@ impl ResoZApp {
                     let mut pan = self.track_strip_state(i).2;
                     let pan_resp = ui.add_sized(
                         [96.0, 20.0],
-                        egui::Slider::new(&mut pan, PAN_RANGE).text("声像"),
+                        egui::Slider::new(&mut pan, PAN_RANGE).text("Pan"),
                     );
                     if pan_resp.changed() {
                         pan_edits[i] = Some(pan);
@@ -2125,15 +2195,15 @@ impl ResoZApp {
         }
     }
 
-    /// 16 步音序器网格（作用于选中轨道）。
+    /// 16-step sequencer grid (acts on the selected track).
     fn sequencer_section(&mut self, ui: &mut egui::Ui) {
         self.mixer_section(ui);
         ui.separator();
         ui.add_space(4.0);
         let sel = self.selected_track;
         ui.horizontal(|ui| {
-            ui.label(format!("步进音序器 — 轨道 {}", sel + 1));
-            ui.label("画笔音符");
+            ui.label(format!("Step Sequencer — Track {}", sel + 1));
+            ui.label("Paint Note");
             ui.add(
                 egui::DragValue::new(&mut self.brush_note)
                     .range(0..=127)
@@ -2141,7 +2211,7 @@ impl ResoZApp {
             );
             ui.monospace(note_name(self.brush_note));
             ui.separator();
-            ui.label("音长");
+            ui.label("Gate");
             let gate = ui.add(
                 egui::Slider::new(
                     &mut self.project.gate,
@@ -2152,11 +2222,11 @@ impl ResoZApp {
             if gate.changed() {
                 self.send_sequencer(SequencerCommand::SetGate(self.project.gate));
             }
-            if ui.button("清空").clicked() {
+            if ui.button("Clear").clicked() {
                 self.project.midi_tracks[sel].pattern = Pattern::default();
                 self.send_pattern(sel);
             }
-            if ui.button("全部 C4").clicked() {
+            if ui.button("All C4").clicked() {
                 self.project.midi_tracks[sel]
                     .pattern
                     .steps
@@ -2172,8 +2242,8 @@ impl ResoZApp {
         let playing = self.engine.is_playing();
         let current = self.engine.current_step();
         let mut cells: [Option<egui::Response>; PATTERN_STEPS] = std::array::from_fn(|_| None);
-        // 先收集本帧的编辑动作，循环结束后统一写回并发送
-        // （避免迭代器借用与 send_pattern 的可变借用冲突）。
+        // Collect this frame's edits first; write back and send after the loop (avoids the
+        // iterator borrow conflicting with send_pattern's mutable borrow).
         let mut edits: [(bool, bool, u8); PATTERN_STEPS] = [(false, false, 0); PATTERN_STEPS];
         ui.horizontal(|ui| {
             for (i, step) in self.project.midi_tracks[sel]
@@ -2199,10 +2269,11 @@ impl ResoZApp {
                 let response = ui.add_sized([36.0, 28.0], button);
                 if response.clicked() {
                     if step.enabled && step.note == self.brush_note {
-                        // 已是画笔音符的步再点一次 = 取消。
+                        // Clicking a step already holding the brush note again = clear it.
                         edits[i] = (true, false, step.note);
                     } else {
-                        // 空步写入画笔音符；已有其他音符的步改写为画笔音符。
+                        // Empty steps get the brush note; steps with another note are rewritten
+                        // to the brush note.
                         edits[i] = (true, true, self.brush_note);
                     }
                 }
@@ -2225,7 +2296,7 @@ impl ResoZApp {
             self.send_pattern(sel);
         }
 
-        // 播放位置高亮（引擎原子量回传，每块更新一次）。
+        // Playback position highlight (engine atomic readback, updated once per block).
         if playing {
             let idx = (current as usize) % PATTERN_STEPS;
             if let Some(Some(response)) = cells.get(idx) {
@@ -2239,12 +2310,13 @@ impl ResoZApp {
         }
     }
 
-    /// 钢琴卷帘（编辑选中轨道的片段；编辑即时下发音频线程）。
+    /// Piano roll (edits the selected track's clip; edits are pushed to the audio thread
+    /// immediately).
     fn clip_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
         let sel = self.selected_track;
-        ui.label(format!("钢琴卷帘 — 轨道 {}", sel + 1));
+        ui.label(format!("Piano Roll — Track {}", sel + 1));
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
         let edited = piano_roll::show(
@@ -2259,13 +2331,14 @@ impl ResoZApp {
         }
     }
 
-    /// 自动化轨道区（D12 顶层实体；每条曲线的投递终点由节点图连线决定）。
+    /// Automation track section (D12 top-level entities; each curve's delivery endpoint is
+    /// decided by node-graph cables).
     fn automation_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
         let auto_count = self.project.automation_tracks.len();
         ui.horizontal(|ui| {
-            ui.label("自动化轨道");
+            ui.label("Automation Tracks");
             for i in 0..auto_count {
                 if ui
                     .selectable_label(self.selected_auto == i, format!("{}", i + 1))
@@ -2274,18 +2347,18 @@ impl ResoZApp {
                     self.selected_auto = i;
                 }
             }
-            if ui.button("＋ 新增").clicked() && auto_count < MAX_AUTO_TRACKS {
+            if ui.button("＋ Add").clicked() && auto_count < MAX_AUTO_TRACKS {
                 self.project
                     .automation_tracks
                     .push(AutomationTrack::default());
                 self.selected_auto = auto_count;
                 self.send_auto_curve(self.selected_auto);
             }
-            if ui.button("－ 删除").clicked() && auto_count > 0 {
+            if ui.button("－ Remove").clicked() && auto_count > 0 {
                 let index = self.selected_auto.min(auto_count - 1);
                 self.project.automation_tracks.remove(index);
                 let _ = self.engine.clear_auto_route(index);
-                // 引擎侧该索引清空为空曲线。
+                // Engine side: clear that index to an empty curve.
                 self.send_sequencer(SequencerCommand::SetAutoTrack {
                     index,
                     auto: RtAutoTrack {
@@ -2296,18 +2369,20 @@ impl ResoZApp {
                 self.selected_auto =
                     index.min(self.project.automation_tracks.len().saturating_sub(1));
             }
-            ui.weak("点按泳道加锚点 · 拖拽移动 · 右键删除");
+            ui.weak("Click lane to add anchor · drag to move · right-click to delete");
         });
 
         if auto_count == 0 {
-            ui.weak("（无自动化轨道；点「＋ 新增」创建一条曲线）");
+            ui.weak("(no automation tracks; click '＋ Add' to create one)");
             return;
         }
         let index = self.selected_auto.min(auto_count - 1);
         let sel = self.selected_track;
 
-        // 终点选择：本轨通道条（音量/声像）、声源（截止/插件参数）。
-        // 选项携带**文档** node_id（cable 持久化身份），下发时映射。
+        // Endpoint selection: this track's channel strip (volume/pan) and instrument
+        // (cutoff/plugin parameters).
+        // Options carry the **document** node_id (the cable's persisted identity), mapped when
+        // dispatching.
         let mut options: Vec<(String, u64, AutoParam)> = Vec::new();
         if let Some(strip_doc) = self
             .project
@@ -2315,8 +2390,8 @@ impl ResoZApp {
             .channel_strip_of_track(sel)
             .map(NodeDoc::node_id)
         {
-            options.push(("音量".to_string(), strip_doc, AutoParam::TrackGain));
-            options.push(("声像".to_string(), strip_doc, AutoParam::TrackPan));
+            options.push(("Volume".to_string(), strip_doc, AutoParam::TrackGain));
+            options.push(("Pan".to_string(), strip_doc, AutoParam::TrackPan));
         }
         if let Some(voice_doc) = self
             .project
@@ -2324,11 +2399,11 @@ impl ResoZApp {
             .instrument_of_track(sel)
             .map(NodeDoc::node_id)
         {
-            options.push(("截止".to_string(), voice_doc, AutoParam::FilterCutoff));
+            options.push(("Cutoff".to_string(), voice_doc, AutoParam::FilterCutoff));
             if let Some(params) = self.clap_voice_params.get(&sel) {
                 for param in params {
                     let label = if param.name.is_empty() {
-                        format!("参数 {}", param.id)
+                        format!("Param {}", param.id)
                     } else {
                         param.name.clone()
                     };
@@ -2345,7 +2420,7 @@ impl ResoZApp {
             if let Some(params) = self.voice_params.get(&sel) {
                 for param in params {
                     let label = if param.title.is_empty() {
-                        format!("参数 {}", param.id)
+                        format!("Param {}", param.id)
                     } else {
                         param.title.clone()
                     };
@@ -2363,8 +2438,8 @@ impl ResoZApp {
 
         let mut picked: Option<(u64, AutoParam)> = None;
         ui.horizontal(|ui| {
-            ui.label("目标");
-            ui.menu_button("选择参数…", |ui| {
+            ui.label("Target");
+            ui.menu_button("Pick Parameter…", |ui| {
                 for (label, doc_id, param) in &options {
                     if ui.button(label).clicked() {
                         picked = Some((*doc_id, param.clone()));
@@ -2375,27 +2450,28 @@ impl ResoZApp {
             if let Some((doc_id, param)) = picked {
                 self.set_auto_endpoint(index, doc_id, param);
             }
-            // 当前终点显示。
+            // Current endpoint display.
             let current = self
                 .project
                 .graph
                 .auto_endpoint(index)
                 .map(|param| match &param {
-                    AutoParam::TrackGain => "音量".to_string(),
-                    AutoParam::TrackPan => "声像".to_string(),
-                    AutoParam::FilterCutoff => "截止".to_string(),
+                    AutoParam::TrackGain => "Volume".to_string(),
+                    AutoParam::TrackPan => "Pan".to_string(),
+                    AutoParam::FilterCutoff => "Cutoff".to_string(),
                     AutoParam::PluginParam { name, .. } => name.clone(),
                 })
-                .unwrap_or_else(|| "未连线".to_string());
+                .unwrap_or_else(|| "Not connected".to_string());
             ui.weak(format!("→ {current}"));
             let mut enabled = self.project.automation_tracks[index].enabled;
-            if ui.checkbox(&mut enabled, "启用").changed() {
+            if ui.checkbox(&mut enabled, "Enabled").changed() {
                 self.project.automation_tracks[index].enabled = enabled;
                 self.send_auto_curve(index);
             }
         });
 
-        // 泳道循环长度随轨道音源口径，并同步回写文档。
+        // The lane loop length follows the track's source size and is written back to the
+        // document.
         let loop_ticks = match self.project.midi_tracks[sel].source {
             resoz_model::TrackSource::Clip => self.project.midi_tracks[sel].clip.loop_ticks,
             _ => TICKS_PER_BAR,
@@ -2420,23 +2496,23 @@ impl ResoZApp {
         }
     }
 
-    /// 虚拟键盘：屏幕按键（按下发声、松开停音）+ 八度切换。
+    /// Virtual keyboard: on-screen keys (press to sound, release to stop) + octave switching.
     fn keyboard_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
         let sel = self.selected_track;
         ui.horizontal(|ui| {
-            ui.label(format!("键盘 — 轨道 {}", sel + 1));
-            if ui.button("− 八度").clicked() {
+            ui.label(format!("Keyboard — Track {}", sel + 1));
+            if ui.button("− Octave").clicked() {
                 self.octave_base = (self.octave_base.saturating_sub(12)).max(24);
             }
             let low = note_name(self.octave_base);
             let high = note_name(self.octave_base + 12);
             ui.monospace(format!("{low} – {high}"));
-            if ui.button("+ 八度").clicked() {
+            if ui.button("+ Octave").clicked() {
                 self.octave_base = (self.octave_base + 12).min(84);
             }
-            ui.weak("电脑键 A W S E D F T G Y H U J K O L P ;（Z / X 切八度）");
+            ui.weak("PC keys A W S E D F T G Y H U J K O L P ; (Z / X octave shift)");
         });
 
         ui.horizontal(|ui| {
@@ -2459,8 +2535,8 @@ impl ResoZApp {
                     button = button.fill(egui::Color32::from_gray(40));
                 }
                 let response = ui.add(button);
-                // 用"按住状态"的边沿检测（0.36 移除了 pressed/released）：
-                // 按下即发声，松开（含拖出按钮）即停音。
+                // Edge detection via the held state (0.36 removed pressed/released): press sounds
+                // the note, release (including dragging off the button) stops it.
                 let down = response.is_pointer_button_down_on();
                 if down && !self.mouse_down_notes.contains(&note) {
                     self.mouse_down_notes.insert(note);
@@ -2475,7 +2551,7 @@ impl ResoZApp {
 }
 
 impl eframe::App for ResoZApp {
-    // eframe persistence：关窗与定期回调，保存最近文件列表。
+    // eframe persistence: called on window close and periodically, saving the recent files list.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(
             storage,
@@ -2486,34 +2562,36 @@ impl eframe::App for ResoZApp {
         );
     }
 
-    // eframe 0.36：App trait 的入口从 update(ctx) 变为 ui(&mut Ui)；
-    // 顶/底面板直接作用在根 Ui 上，剩余空间即中央区域。
+    // eframe 0.36: the App trait entry point changed from update(ctx) to ui(&mut Ui);
+    // top/bottom panels act directly on the root Ui, and the remaining space is the central
+    // region.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if !self.first_frame_logged {
             self.first_frame_logged = true;
-            log::info!("UI 首帧渲染");
+            log::info!("UI first frame rendered");
         }
 
         self.handle_keyboard_input(ui.ctx());
 
-        // 冒烟测试用：到达自动关闭时限后请求退出。
+        // For smoke tests: request exit once the auto-close deadline is reached.
         if let Some(after) = self.auto_close_after {
             if !self.close_sent && self.opened_at.elapsed() >= after {
                 self.close_sent = true;
-                log::info!("到达自动关闭时限，请求退出");
+                log::info!("Auto-close deadline reached; requesting exit");
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
 
-        // 窗口标题只在变化时重发（打开/保存时更新）。
+        // Window title is resent only when changed (updated on open/save).
         if self.window_title != self.title_sent {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Title(self.window_title.clone()));
             self.title_sent = self.window_title.clone();
         }
 
-        // 回收已卸装的插件节点：在控制线程释放，并按 node_id 丢弃
-        // 退役区里配对的守卫（安全卸载动态库；在役守卫不受影响）。
+        // Recycle unloaded plugin nodes: released on the control thread, and the paired guard in
+        // the retiring zone is dropped by node_id (safe unload of the dynamic library; active
+        // guards are unaffected).
         for node_id in self.engine.reclaim_nodes() {
             if let Some(pos) = self
                 .retiring_guards
@@ -2524,7 +2602,8 @@ impl eframe::App for ResoZApp {
             }
         }
 
-        // 走带停止沿：自动化不再覆盖，恢复各轨手动参数值。
+        // Transport stop edge: automation no longer overrides; restore manual parameter values
+        // per track.
         let playing = self.engine.is_playing();
         if self.was_playing && !playing {
             for track in 0..self.project.midi_tracks.len() {
@@ -2537,13 +2616,13 @@ impl eframe::App for ResoZApp {
         self.status_panel(ui);
         self.synth_panel(ui);
 
-        // 音频驱动的显示（电平表、播放位置、包络）需要周期性重绘；
-        // 没有它，egui 在无交互时休眠，自动关窗（冒烟测试）也不会触发。
+        // Audio-driven displays (level meter, playback position, envelope) need periodic
+        // repaints; without this, egui sleeps when idle and auto-close (smoke test) never fires.
         ui.ctx().request_repaint_after(Duration::from_millis(50));
     }
 }
 
-/// 启动主窗口（阻塞至窗口关闭）。**必须在主线程调用。**
+/// Start the main window (blocks until the window closes). **Must be called on the main thread.**
 pub fn run(engine: AudioEngine, config: UiConfig) -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

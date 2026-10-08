@@ -1,142 +1,152 @@
-//! UI → 音频线程的无锁命令队列。
+//! Lock-free command queue from the UI to the audio thread.
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::realtime::automation::RtAutoTrack;
 use crate::realtime::sequencer::{PATTERN_STEPS, RtClip, SequencerStep, TrackSource};
 
-/// 控制命令队列的默认容量。满载时新命令被发送方丢弃（见
-/// [`crate::engine::AudioEngine::send`]），不会阻塞任何线程。
+/// Default capacity of the control command queue. When full, new commands are
+/// dropped by the sender (see
+/// [`crate::engine::AudioEngine::send`]); no thread is ever blocked.
 pub const COMMAND_QUEUE_CAPACITY: usize = 1024;
 
-/// 参数标识。每个 `Processor` 在 [`Processor::set_param`](crate::realtime::Processor::set_param)
-/// 中声明自己响应的参数。
+/// Parameter identifier. Each `Processor` declares the parameters it responds to
+/// in [`Processor::set_param`](crate::realtime::Processor::set_param).
 ///
-/// TODO(路线图第 5 步起)：引入图节点 ID，改为 `NodeTarget` 定向路由。
+/// TODO(from roadmap step 5 onward): introduce graph node IDs and switch to
+/// `NodeTarget`-directed routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamId {
-    /// 正弦音源频率（Hz）。
+    /// Sine source frequency (Hz).
     SineFrequency,
-    /// 正弦音源输出增益（线性）。
+    /// Sine source output gain (linear).
     SineGain,
-    /// 主输出增益（线性）。
+    /// Master output gain (linear).
     MasterGain,
-    /// 滤波器截止频率（Hz）。
+    /// Filter cutoff frequency (Hz).
     FilterCutoff,
-    /// 滤波器共振（Simper SVF 的 res，0..0.98）。
+    /// Filter resonance (Simper SVF's res, 0..0.98).
     FilterResonance,
-    /// 滤波器模式：0 = 低通，1 = 高通，2 = 带通。
+    /// Filter mode: 0 = low-pass, 1 = high-pass, 2 = band-pass.
     FilterMode,
-    /// 包络 Attack 时间（秒）。
+    /// Envelope attack time (seconds).
     Attack,
-    /// 包络 Decay 时间（秒）。
+    /// Envelope decay time (seconds).
     Decay,
-    /// 包络 Sustain 电平（0..1）。
+    /// Envelope sustain level (0..1).
     Sustain,
-    /// 包络 Release 时间（秒）。
+    /// Envelope release time (seconds).
     Release,
-    /// 轨道增益（线性，0..1.5）。
+    /// Track gain (linear, 0..1.5).
     TrackGain,
-    /// 轨道声像（-1..1，线性声像律）。
+    /// Track pan (-1..1, linear pan law).
     TrackPan,
-    /// 轨道静音（≥ 0.5 视为静音）。
+    /// Track mute (≥ 0.5 means muted).
     TrackMute,
-    /// 延迟时间（秒，0.005..1）。
+    /// Delay time (seconds, 0.005..1).
     DelayTime,
-    /// 延迟反馈（0..0.9）。
+    /// Delay feedback (0..0.9).
     DelayFeedback,
-    /// 延迟湿声混合比（0..1）。
+    /// Delay wet mix ratio (0..1).
     DelayMix,
-    /// 外部插件参数（载荷为插件侧参数 ID）。值统一为**归一化 0..1**
-    /// 语义：CLAP 与 VST3 节点均按各自宿主协议原样转发（两者恰好
-    /// 都是归一化模型），由各节点自行映射到插件实际参数范围。
+    /// External plugin parameter (payload is the plugin-side parameter ID).
+    /// Values uniformly carry the **normalized 0..1** semantic: CLAP and VST3
+    /// nodes both forward them as-is via their respective host protocols (both
+    /// happen to be normalized models), and each node maps them to the
+    /// plugin's actual parameter range itself.
     PluginParam(u32),
 }
 
-/// 音符事件（MIDI 语义）。`note` 为 MIDI 音符编号（69 = A4），`velocity`
-/// 为 0..1 的力度。
+/// Note event (MIDI semantics). `note` is the MIDI note number (69 = A4),
+/// `velocity` is the velocity in 0..1.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NoteEvent {
-    /// 按下音符：触发音源 + 包络进入 Attack。
+    /// Note pressed: triggers the sound source + envelope enters Attack.
     On { note: u8, velocity: f32 },
-    /// 松开音符：包络进入 Release。
+    /// Note released: envelope enters Release.
     Off { note: u8 },
 }
 
-/// 音序器走带与配置命令。
+/// Sequencer transport and configuration commands.
 ///
-/// `SetClip` 携带整条 `Copy` 片段（约 2 KB），使本枚举显著大于其余
-/// 变体 —— 这是"实时侧零堆分配"的有意取舍：命令队列按最大变体
-/// 分配槽位（1024 × ≈2 KB ≈ 2 MB，一次性预分配）。若未来片段体积
-/// 增长，可改为独立的批量数据通道（非实时侧预写共享缓冲 + 小命令
-/// 通知）。
+/// `SetClip` carries an entire `Copy` clip (about 2 KB), making this enum
+/// significantly larger than the other variants — a deliberate trade-off for
+/// "zero heap allocation on the real-time side": the command queue allocates
+/// slots for the largest variant (1024 × ≈2 KB ≈ 2 MB, pre-allocated once).
+/// If clip size grows in the future, this could become a separate bulk data
+/// channel (non-real-time pre-written shared buffer + small command
+/// notification).
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy)]
 pub enum SequencerCommand {
-    /// 从第 0 步开始播放（以接收时刻的流位置为时钟原点）。
+    /// Play from step 0 (the stream position at receive time is the clock origin).
     Play,
-    /// 停止并释放全部轨道当前音符。
+    /// Stop and release all tracks' current notes.
     Stop,
-    /// 设置 BPM（20..300）。
+    /// Set BPM (20..300).
     SetBpm(f32),
-    /// 设置 gate 占步长的比例（0.05..1）。
+    /// Set the gate ratio of the step length (0.05..1).
     SetGate(f32),
-    /// 整块替换某条轨道的 16 步模式。
+    /// Replace a track's 16-step pattern in one block.
     SetPattern {
         track: usize,
         steps: [SequencerStep; PATTERN_STEPS],
     },
-    /// 整块替换某条轨道的卷帘片段。
+    /// Replace a track's piano-roll clip in one block.
     SetClip { track: usize, clip: RtClip },
-    /// 切换某条轨道的音源（步进模式 / 卷帘片段）。
+    /// Switch a track's sound source (step mode / piano-roll clip).
     SetSource { track: usize, source: TrackSource },
-    /// 整块替换一条自动化轨道实体（空曲线 = 清空）。
+    /// Replace an automation track entity in one block (empty curve = clear).
     ///
-    /// 曲线不含目标参数（D7）：投递终点 `(节点, 参数)` 由节点图的
-    /// 自动化连线表决定，经 `AudioEngine::set_auto_route` 设置。
+    /// The curve carries no target parameter (D7): the delivery endpoint
+    /// `(node, parameter)` is determined by the node graph's automation routing
+    /// table, set via `AudioEngine::set_auto_route`.
     SetAutoTrack {
-        /// 自动化轨道索引（0..[`crate::realtime::MAX_AUTO_TRACKS`]）。
+        /// Automation track index (0..[`crate::realtime::MAX_AUTO_TRACKS`]).
         index: usize,
-        /// 轨道实体（自带循环长度 + 纯锚点曲线）。
+        /// Track entity (its own loop length + pure anchor curve).
         auto: RtAutoTrack,
     },
-    /// 设置活跃 MIDI 轨数（D12 动态轨数；超出容量的值被实时侧钳制）。
+    /// Set the active MIDI track count (D12 dynamic tracks; values beyond
+    /// capacity are clamped on the real-time side).
     SetMidiTrackCount(usize),
 }
 
-/// UI / 控制线程 → 音频线程的控制命令。
+/// Control commands from the UI / control thread to the audio thread.
 ///
-/// 必须保持 `Copy`：命令经无锁队列按值传递，**禁止携带堆分配**
-/// （`String` / `Vec` / `Box` 等）。
-#[allow(clippy::large_enum_variant)] // 见 SequencerCommand 的说明
+/// Must remain `Copy`: commands pass by value through the lock-free queue,
+/// **heap allocations are forbidden** (`String` / `Vec` / `Box`, etc.).
+#[allow(clippy::large_enum_variant)] // see the SequencerCommand notes
 #[derive(Debug, Clone, Copy)]
 pub enum EngineCommand {
-    /// 设置主链参数（主增益等全局参数）。
+    /// Set a master-chain parameter (global parameters such as master gain).
     SetParam { id: ParamId, value: f32 },
-    /// 设置指定轨道的参数（音色 / 包络 / 延迟 / 增益 / 声像 / 静音）。
+    /// Set a parameter of the given track (tone / envelope / delay / gain / pan / mute).
     SetTrackParam {
         track: usize,
         id: ParamId,
         value: f32,
     },
-    /// 向指定轨道的音源发送音符事件（键盘演奏等）。
+    /// Send a note event to the given track's sound source (keyboard playing, etc.).
     Note { track: usize, event: NoteEvent },
-    /// 音序器走带 / 配置。
+    /// Sequencer transport / configuration.
     Sequencer(SequencerCommand),
-    /// 按 node_id 定向设置节点参数（P5b：节点寻址路径；自动化连线与
-    /// 画布均以此为准）。
+    /// Set a node parameter addressed by node_id (P5b: node-addressed path;
+    /// both automation routing and the canvas treat this as authoritative).
     SetNodeParam {
-        /// 目标节点 ID（编译器分配，随结构更新对 UI 公开）。
+        /// Target node ID (assigned by the compiler, exposed to the UI via
+        /// structure updates).
         node_id: u64,
-        /// 参数。
+        /// Parameter.
         id: ParamId,
-        /// 参数值。
+        /// Parameter value.
         value: f32,
     },
 }
 
-/// 创建一对命令队列端点：producer 交给 UI / 控制线程，consumer 交给
-/// 音频线程（在块边界消费）。**非 RT-safe**，只在流启动前调用。
+/// Creates a pair of command queue endpoints: the producer goes to the UI /
+/// control thread, the consumer goes to the audio thread (consumed at block
+/// boundaries). **Not RT-safe**; call only before the stream starts.
 pub fn command_channel(capacity: usize) -> (Producer<EngineCommand>, Consumer<EngineCommand>) {
     RingBuffer::new(capacity)
 }
@@ -165,7 +175,7 @@ mod tests {
     #[test]
     fn fifo_order() {
         let (mut tx, mut rx) = command_channel(4);
-        tx.push(set_param(0.25)).expect("入队失败");
+        tx.push(set_param(0.25)).expect("push failed");
         tx.push(EngineCommand::Note {
             track: 0,
             event: NoteEvent::On {
@@ -173,8 +183,8 @@ mod tests {
                 velocity: 1.0,
             },
         })
-        .expect("入队失败");
-        tx.push(set_param(0.5)).expect("入队失败");
+        .expect("push failed");
+        tx.push(set_param(0.5)).expect("push failed");
         assert_eq!(rx.pop().ok().map(match_value), Some(0.25));
         assert!(matches!(
             rx.pop(),
@@ -184,7 +194,7 @@ mod tests {
             })
         ));
         assert_eq!(rx.pop().ok().map(match_value), Some(0.5));
-        assert!(rx.pop().is_err(), "空队列应返回 Err");
+        assert!(rx.pop().is_err(), "empty queue should return Err");
     }
 
     #[test]
@@ -192,8 +202,14 @@ mod tests {
         let (mut tx, mut rx) = command_channel(2);
         assert!(tx.push(set_param(1.0)).is_ok());
         assert!(tx.push(set_param(2.0)).is_ok());
-        assert!(tx.push(set_param(3.0)).is_err(), "容量 2 已满应返回 Err");
+        assert!(
+            tx.push(set_param(3.0)).is_err(),
+            "capacity 2 full should return Err"
+        );
         assert_eq!(rx.pop().ok().map(match_value), Some(1.0));
-        assert!(tx.push(set_param(3.0)).is_ok(), "弹出后应可继续入队");
+        assert!(
+            tx.push(set_param(3.0)).is_ok(),
+            "should accept pushes again after popping"
+        );
     }
 }

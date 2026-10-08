@@ -1,19 +1,26 @@
-//! 唯一允许 `unsafe` 的模块：CLAP 动态库加载与扩展 vtable 直调边界。
+//! The only module allowed to use `unsafe`: CLAP dynamic library loading and
+//! the extension vtable direct-call boundary.
 //!
-//! # SAFETY（模块级理由）
+//! # SAFETY (module-level rationale)
 //!
-//! - [`load_entry`] 仅封装 `clack_host::PluginEntry::load` —— clack 宿主
-//!   库保证：给定插件动态库路径后，加载期执行的插件入口回调处于受控
-//!   生命周期，且返回的 [`PluginEntry`] 值以 RAII 方式管理库句柄。
-//! - [`enumerate_params`]：clack 0.2 的 `clack_extensions::params`
-//!   插件侧包装类型未暴露读取方法，因此直接经 `clap_plugin
-//!   .get_extension` 取回 `clap_plugin_params` vtable 指针，按 C ABI
-//!   直调其 `count` / `get_info` 函数指针。函数指针由插件声明，CLAP
-//!   规范保证其于插件实例存活期内有效（实例由调用方
-//!   [`ClapInstanceGuard`] 持有）；插件回调自身的健全性由插件作者
-//!   负责（与所有 DAW 宿主一致）。
+//! - [`load_entry`] merely wraps `clack_host::PluginEntry::load` — the clack
+//!   host library guarantees that, given a plugin dynamic library path, the
+//!   plugin entry callbacks executed during loading have a controlled
+//!   lifetime, and the returned [`PluginEntry`] value manages the library
+//!   handle via RAII.
+//! - [`enumerate_params`]: the clack 0.2 `clack_extensions::params`
+//!   plugin-side wrapper types do not expose read methods, so the
+//!   `clap_plugin_params` vtable pointer is fetched directly via
+//!   `clap_plugin.get_extension` and its `count` / `get_info` function
+//!   pointers are called directly under the C ABI. The function pointers are
+//!   declared by the plugin; the CLAP specification guarantees they remain
+//!   valid for the plugin instance's lifetime (the instance is held by the
+//!   caller's [`ClapInstanceGuard`]); the soundness of the plugin callbacks
+//!   themselves is the plugin author's responsibility (as with all DAW
+//!   hosts).
 //!
-//! 行为验证见 crate `tests`（无效文件必须返回错误而非 UB）。
+//! Behavioral verification is in the crate's `tests` (invalid files must
+//! return errors, not UB).
 #![allow(unsafe_code)]
 
 use std::ffi::c_char;
@@ -27,17 +34,20 @@ use clap_sys::string_sizes::{CLAP_NAME_SIZE, CLAP_PATH_SIZE};
 
 use crate::ClapParamInfo;
 
-/// 从插件原始实例枚举全部参数元数据；未实现 params 扩展时返回空表。
+/// Enumerates all parameter metadata from a raw plugin instance; returns an
+/// empty list when the params extension is not implemented.
 ///
-/// # Safety（前置条件由调用方保证）
+/// # Safety (preconditions guaranteed by the caller)
 ///
-/// `plugin` 必须指向存活中的插件实例（[`ClapInstanceGuard`] 持有期间）。
+/// `plugin` must point to a live plugin instance (while held by
+/// [`ClapInstanceGuard`]).
 pub(crate) fn enumerate_params(plugin: &clap_plugin) -> Vec<ClapParamInfo> {
     let Some(get_extension) = plugin.get_extension else {
         return Vec::new();
     };
-    // SAFETY: plugin 指针存活（见前置条件）；回调按 CLAP 规范返回
-    // 指向插件声明的扩展结构（实例存活期内有效）。
+    // SAFETY: the plugin pointer is alive (see preconditions); the callback
+    // returns, per the CLAP spec, a pointer to the extension structure
+    // declared by the plugin (valid for the instance's lifetime).
     let ext_ptr = unsafe { get_extension(plugin as *const clap_plugin, CLAP_EXT_PARAMS.as_ptr()) };
     let Some(ext_ptr) = NonNull::new(ext_ptr as *mut clap_plugin_params) else {
         return Vec::new();
@@ -47,10 +57,10 @@ pub(crate) fn enumerate_params(plugin: &clap_plugin) -> Vec<ClapParamInfo> {
         plugin_ptr: plugin,
     };
     let mut infos = Vec::new();
-    // SAFETY: 扩展指针与插件实例均存活。
+    // SAFETY: both the extension pointer and the plugin instance are alive.
     let count = unsafe { ext.count() };
     for index in 0..count {
-        // SAFETY: 同上；index < count。
+        // SAFETY: same as above; index < count.
         if let Some(info) = unsafe { ext.param_info(index) } {
             infos.push(info);
         }
@@ -58,36 +68,41 @@ pub(crate) fn enumerate_params(plugin: &clap_plugin) -> Vec<ClapParamInfo> {
     infos
 }
 
-/// `clap.params` 扩展的原始 vtable 访问器（clack 0.2 的同名包装未暴露
-/// 读取方法）。
+/// Raw vtable accessor for the `clap.params` extension (the clack 0.2
+/// wrapper of the same name does not expose read methods).
 struct RawPluginParams<'a> {
     ext_ptr: NonNull<clap_plugin_params>,
     plugin_ptr: &'a clap_plugin,
 }
 
 impl RawPluginParams<'_> {
-    /// 插件暴露的参数个数。
+    /// Number of parameters exposed by the plugin.
     ///
     /// # Safety
     ///
-    /// 扩展指针必须来自存活中的插件实例。
+    /// The extension pointer must come from a live plugin instance.
     unsafe fn count(&self) -> u32 {
-        let count = self.vtable().count.expect("params vtable 缺少 count 回调");
-        // SAFETY: 回调指针由插件声明且规范保证非空；plugin 指针即扩展
-        // 来源实例。
+        let count = self
+            .vtable()
+            .count
+            .expect("params vtable lacks the count callback");
+        // SAFETY: the callback pointer is declared by the plugin and
+        // guaranteed non-null by the spec; the plugin pointer is the instance
+        // the extension came from.
         unsafe { count(self.plugin_ptr as *const clap_plugin) }
     }
 
-    /// 读取第 `index` 个参数的元数据；越界返回 `None`。
+    /// Reads the metadata of the `index`-th parameter; returns `None` when
+    /// out of bounds.
     ///
     /// # Safety
     ///
-    /// 扩展指针必须来自存活中的插件实例。
+    /// The extension pointer must come from a live plugin instance.
     unsafe fn param_info(&self, index: u32) -> Option<ClapParamInfo> {
         let get_info = self
             .vtable()
             .get_info
-            .expect("params vtable 缺少 get_info 回调");
+            .expect("params vtable lacks the get_info callback");
         let mut raw = clap_param_info {
             id: 0,
             flags: 0,
@@ -98,7 +113,8 @@ impl RawPluginParams<'_> {
             max_value: 0.0,
             default_value: 0.0,
         };
-        // SAFETY: 同上；缓冲为本函数栈上定容数组，回调按规范填充。
+        // SAFETY: same as above; the buffers are fixed-size arrays on this
+        // function's stack, filled by the callback per the spec.
         if !unsafe { get_info(self.plugin_ptr as *const clap_plugin, index, &mut raw) } {
             return None;
         }
@@ -113,13 +129,15 @@ impl RawPluginParams<'_> {
     }
 
     fn vtable(&self) -> &clap_plugin_params {
-        // SAFETY: 扩展指针来自 get_extension，指向插件声明的
-        // clap_plugin_params 结构，实例存活期内有效。
+        // SAFETY: the extension pointer comes from get_extension and points
+        // to the clap_plugin_params structure declared by the plugin, valid
+        // for the instance's lifetime.
         unsafe { self.ext_ptr.as_ref() }
     }
 }
 
-/// 定容 `c_char` 数组 → String（截断至首个 NUL；非法 UTF-8 宽容替换）。
+/// Fixed-capacity `c_char` array → String (truncated at the first NUL;
+/// invalid UTF-8 leniently replaced).
 fn c_char_array_to_string(buffer: &[c_char]) -> String {
     let bytes: Vec<u8> = buffer
         .split(|&b| b == 0)
@@ -131,9 +149,10 @@ fn c_char_array_to_string(buffer: &[c_char]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// 加载一个 CLAP 插件动态库。
+/// Loads a CLAP plugin dynamic library.
 pub(crate) fn load_entry(path: &Path) -> Result<PluginEntry, PluginEntryError> {
-    // SAFETY: 见模块文档。路径由上层扫描/用户提供，clack 负责入口
-    // 符号查找与版本校验，加载失败以 Err 返回而非 UB。
+    // SAFETY: see module docs. The path comes from the upper-layer scan or
+    // the user; clack handles entry symbol lookup and version checks, and
+    // load failures return Err rather than UB.
     unsafe { PluginEntry::load(path) }
 }

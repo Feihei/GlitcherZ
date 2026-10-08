@@ -1,36 +1,49 @@
-//! 宿主侧 COM 接口实现：插件在本块处理中回读的宿主对象。
+//! Host-side COM interface implementations: host objects read back by the
+//! plugin during block processing.
 //!
-//! - [`HostEventList`]：`IEventList` —— 插件读取本块的音符等事件；
-//! - [`HostParamValueQueue`]：`IParamValueQueue` —— 单个参数的
-//!   归一化值变化点；
-//! - [`HostParamChanges`]：`IParameterChanges` —— 参数队列的容器；
-//! - [`NoopComponentHandler`]：`IComponentHandler` 空实现（插件向
-//!   宿主回报参数编辑/重启请求时的接收方，简化宿主一律忽略）。
+//! - [`HostEventList`]: `IEventList` — note and other events the plugin
+//!   reads for the current block;
+//! - [`HostParamValueQueue`]: `IParamValueQueue` — normalized value change
+//!   points of a single parameter;
+//! - [`HostParamChanges`]: `IParameterChanges` — container of parameter
+//!   queues;
+//! - [`NoopComponentHandler`]: empty `IComponentHandler` implementation
+//!   (the receiver when the plugin reports parameter edits/restart requests
+//!   to the host; the simple host ignores all of them).
 //!
-//! # 实时约束
+//! # Real-time constraints
 //!
-//! 这些对象在构造期一次性预分配（`Box`/`Vec` 都在 `spawn_rt` 完成，
-//! 非实时路径），之后每块只做定容写入，无分配、无锁、无 panic。
-//! 内部可变性用 `Cell`/`UnsafeCell` 实现（COM 方法只接收 `&self`）：
+//! These objects are preallocated once at construction (`Box`/`Vec` are
+//! both done in `spawn_rt`, a non-realtime path); afterwards each block
+//! only does fixed-capacity writes, with no allocation, no locks, no
+//! panics. Interior mutability uses `Cell`/`UnsafeCell` (COM methods only
+//! receive `&self`):
 //!
-//! - 写入只发生在音频线程的块边界（`Vst3Node::process` 开头）；
-//! - 插件经 vtable 的读取也发生在同一音频线程的 `process` 调用内；
-//! - 控制线程仅构造与最终释放，不与音频线程并发访问。
+//! - Writes happen only at audio-thread block boundaries (start of
+//!   `Vst3Node::process`);
+//! - Reads by the plugin through the vtable also happen inside the same
+//!   audio-thread `process` call;
+//! - The control thread only constructs and finally drops; it never
+//!   accesses concurrently with the audio thread.
 //!
-//! 因此跨线程共享是安全的，`unsafe impl Send/Sync` 是对上述使用
-//! 约定的声明而非通用保证——这些类型不得泄漏到其它线程。
+//! Therefore cross-thread sharing is safe; `unsafe impl Send/Sync` is a
+//! declaration of the above usage contract, not a general guarantee —
+//! these types must not leak to other threads.
 //!
-//! # 指针布局说明
+//! # Pointer layout notes
 //!
-//! `ComWrapper` 产出的 COM 接口指针指向对象内嵌入的接口（vtable）
-//! 部分，**不能** cast 回 Rust 数据指针。因此：
+//! COM interface pointers produced by `ComWrapper` point to the embedded
+//! interface (vtable) part of the object and **cannot** be cast back to a
+//! Rust data pointer. Therefore:
 //!
-//! - 节点持有每个队列的 `ComWrapper<HostParamValueQueue>`（所有权）
-//!   并同时保存两个指针：Rust 数据指针（`&*wrapper`，供宿主内部
-//!   直调）与 COM 接口指针（`as_com_ref`，供 `getParameterData`
-//!   返回给插件）；
-//! - 两者都指向构造期稳定的 Arc 堆分配，随 `Vst3Node` 整体移动、
-//!   整体释放，不存在自引用悬空。
+//! - The node holds each queue's `ComWrapper<HostParamValueQueue>`
+//!   (ownership) and keeps two pointers: the Rust data pointer
+//!   (`&*wrapper`, for the host's internal direct calls) and the COM
+//!   interface pointer (`as_com_ref`, returned to the plugin by
+//!   `getParameterData`);
+//! - Both point to a construction-time-stable Arc heap allocation that
+//!   moves and drops together with `Vst3Node`; there is no
+//!   self-referential dangling.
 
 use std::cell::Cell;
 use std::ptr;
@@ -38,34 +51,39 @@ use std::ptr;
 use vst3::Class;
 use vst3::Steinberg::{self, Vst};
 
-/// 每块最多入队的事件数（音符 + 其它，桥接粒度为块）。
+/// Maximum events queued per block (notes + others; bridging granularity
+/// is a block).
 pub(crate) const MAX_EVENTS: i32 = 32;
-/// 每块最多提交变化的参数个数。
+/// Maximum number of parameters committed per block.
 pub(crate) const MAX_PARAM_QUEUES: usize = 8;
-/// 单参数每块最多变化点数。
+/// Maximum change points per parameter per block.
 pub(crate) const MAX_PARAM_POINTS: usize = 4;
 
 // ---------------------------------------------------------------------------
-// 事件列表
+// Event list
 // ---------------------------------------------------------------------------
 
-/// 宿主侧 `IEventList` 实现（构造期定容，无分配）。
+/// Host-side `IEventList` implementation (fixed capacity at construction,
+/// no allocation).
 pub(crate) struct HostEventList {
     events: std::cell::UnsafeCell<Box<[Vst::Event]>>,
     count: Cell<i32>,
 }
 
-// SAFETY: 见模块文档「实时约束」——全部读写都在音频线程内串行发生。
+// SAFETY: See the module documentation "Real-time constraints" — all reads
+// and writes happen serially on the audio thread.
 unsafe impl Send for HostEventList {}
 unsafe impl Sync for HostEventList {}
 
 impl HostEventList {
     pub(crate) fn new() -> Self {
-        // Event 含 union，构造期整体清零一次（非实时路径）。
+        // Event contains a union; zeroed wholesale once at construction
+        // (non-realtime path).
         let mut events = Vec::with_capacity(MAX_EVENTS as usize);
         for _ in 0..MAX_EVENTS {
-            // SAFETY: Event 是 repr(C) 的 Copy POD，全零值合法（type=0
-            // 仅在 count>0 时会被读取，而 count 初始为 0）。
+            // SAFETY: Event is a repr(C) Copy POD; an all-zero value is
+            // legal (type=0 is only read when count>0, and count starts
+            // at 0).
             events.push(unsafe { std::mem::zeroed() });
         }
         Self {
@@ -74,18 +92,19 @@ impl HostEventList {
         }
     }
 
-    /// 块边界清空（音频线程调用）。
+    /// Clears at the block boundary (called on the audio thread).
     pub(crate) fn clear(&self) {
         self.count.set(0);
     }
 
-    /// 入队一个事件；满载时丢弃（非关键路径）。
+    /// Enqueues one event; dropped when full (non-critical path).
     pub(crate) fn push(&self, event: Vst::Event) -> bool {
         let count = self.count.get();
         if count >= MAX_EVENTS {
             return false;
         }
-        // SAFETY: count < MAX_EVENTS，槽位必然存在；写入与读取同线程。
+        // SAFETY: count < MAX_EVENTS, so the slot must exist; write and
+        // read on the same thread.
         unsafe {
             (*self.events.get())[count as usize] = event;
         }
@@ -108,9 +127,11 @@ impl Steinberg::Vst::IEventListTrait for HostEventList {
         if index < 0 || index >= count {
             return Steinberg::kInvalidArgument;
         }
-        // SAFETY: index 已钳制在有效范围；e 由插件按规范提供且指向
-        // 可写 Event。越界/空指针属插件违反规范，此处不防御（与
-        // 所有 COM 调用约定一致）。
+        // SAFETY: index is already clamped to the valid range; e is
+        // provided by the plugin per spec and points to a writable Event.
+        // Out-of-range/null pointers are plugin spec violations and are
+        // not defended against here (consistent with all COM call
+        // conventions).
         unsafe {
             *e = (*self.events.get())[index as usize];
         }
@@ -118,29 +139,30 @@ impl Steinberg::Vst::IEventListTrait for HostEventList {
     }
 
     unsafe fn addEvent(&self, _e: *mut Vst::Event) -> Steinberg::tresult {
-        // 简化宿主：事件列表只读（宿主→插件方向），插件不应回写。
+        // Simple host: the event list is read-only (host→plugin direction);
+        // the plugin must not write back.
         Steinberg::kNotImplemented
     }
 }
 
 // ---------------------------------------------------------------------------
-// 参数变化
+// Parameter changes
 // ---------------------------------------------------------------------------
 
-/// 单个参数队列的内部数据。
+/// Internal data of a single parameter queue.
 struct QueueData {
     param_id: u32,
     count: i32,
-    /// (样本偏移, 归一化值)。
+    /// (sample offset, normalized value).
     points: [(i32, f64); MAX_PARAM_POINTS],
 }
 
-/// 宿主侧 `IParamValueQueue` 实现（定容）。
+/// Host-side `IParamValueQueue` implementation (fixed capacity).
 pub(crate) struct HostParamValueQueue {
     data: std::cell::UnsafeCell<QueueData>,
 }
 
-// SAFETY: 见模块文档「实时约束」。
+// SAFETY: See the module documentation "Real-time constraints".
 unsafe impl Send for HostParamValueQueue {}
 unsafe impl Sync for HostParamValueQueue {}
 
@@ -155,9 +177,10 @@ impl HostParamValueQueue {
         }
     }
 
-    /// 块边界重置并绑定参数 ID（音频线程调用）。
+    /// Resets at the block boundary and binds the parameter ID (called on
+    /// the audio thread).
     pub(crate) fn reset(&self, param_id: u32) {
-        // SAFETY: 同线程串行访问。
+        // SAFETY: same-thread serial access.
         unsafe {
             let data = &mut *self.data.get();
             data.param_id = param_id;
@@ -165,15 +188,16 @@ impl HostParamValueQueue {
         }
     }
 
-    /// 当前绑定的参数 ID（宿主内部直调用）。
+    /// Currently bound parameter ID (for the host's internal direct calls).
     pub(crate) fn current_id(&self) -> u32 {
-        // SAFETY: 同线程串行访问。
+        // SAFETY: same-thread serial access.
         unsafe { (*self.data.get()).param_id }
     }
 
-    /// 追加一个变化点；满载丢弃（每块一点足够）。
+    /// Appends one change point; dropped when full (one point per block is
+    /// enough).
     pub(crate) fn add(&self, sample_offset: i32, value: f64) -> bool {
-        // SAFETY: 同线程串行访问。
+        // SAFETY: same-thread serial access.
         unsafe {
             let data = &mut *self.data.get();
             if data.count >= MAX_PARAM_POINTS as i32 {
@@ -192,12 +216,12 @@ impl Class for HostParamValueQueue {
 
 impl Vst::IParamValueQueueTrait for HostParamValueQueue {
     unsafe fn getParameterId(&self) -> Vst::ParamID {
-        // SAFETY: 同线程串行访问。
+        // SAFETY: same-thread serial access.
         unsafe { (*self.data.get()).param_id }
     }
 
     unsafe fn getPointCount(&self) -> Steinberg::int32 {
-        // SAFETY: 同线程串行访问。
+        // SAFETY: same-thread serial access.
         unsafe { (*self.data.get()).count }
     }
 
@@ -207,7 +231,8 @@ impl Vst::IParamValueQueueTrait for HostParamValueQueue {
         sample_offset: *mut Steinberg::int32,
         value: *mut Vst::ParamValue,
     ) -> Steinberg::tresult {
-        // SAFETY: 同线程串行访问；输出指针由插件按规范提供。
+        // SAFETY: same-thread serial access; output pointers are provided
+        // by the plugin per spec.
         unsafe {
             let data = &*self.data.get();
             if index < 0 || index >= data.count {
@@ -226,32 +251,36 @@ impl Vst::IParamValueQueueTrait for HostParamValueQueue {
         _value: Vst::ParamValue,
         _index: *mut Steinberg::int32,
     ) -> Steinberg::tresult {
-        // 简化宿主：队列只读（宿主→插件方向），插件不应回写。
+        // Simple host: the queue is read-only (host→plugin direction); the
+        // plugin must not write back.
         Steinberg::kNotImplemented
     }
 }
 
-/// 一个队列槽位的双指针：Rust 数据（宿主内部直调）+ COM 接口
-/// （返回给插件）。生命周期由 `Vst3Node` 持有的所有权保证。
+/// Dual pointers of one queue slot: Rust data (for the host's internal
+/// direct calls) + COM interface (returned to the plugin). The lifetime is
+/// guaranteed by the ownership held by `Vst3Node`.
 pub(crate) struct QueueSlot {
-    /// `&*ComWrapper<HostParamValueQueue>`（Rust 数据）。
+    /// `&*ComWrapper<HostParamValueQueue>` (Rust data).
     pub(crate) data: *mut HostParamValueQueue,
-    /// 同一对象的 `IParamValueQueue` COM 接口指针。
+    /// The same object's `IParamValueQueue` COM interface pointer.
     pub(crate) com: *mut Vst::IParamValueQueue,
 }
 
-/// 宿主侧 `IParameterChanges` 实现：持有预分配队列槽位。
+/// Host-side `IParameterChanges` implementation: holds preallocated queue
+/// slots.
 pub(crate) struct HostParamChanges {
     slots: std::cell::UnsafeCell<Box<[QueueSlot]>>,
     count: Cell<i32>,
 }
 
-// SAFETY: 见模块文档「实时约束」。
+// SAFETY: See the module documentation "Real-time constraints".
 unsafe impl Send for HostParamChanges {}
 unsafe impl Sync for HostParamChanges {}
 
 impl HostParamChanges {
-    /// 构造时传入节点持有的队列对象双指针（顺序固定）。
+    /// Takes the dual pointers of the queue objects held by the node
+    /// (fixed order).
     pub(crate) fn new(slots: Vec<QueueSlot>) -> Self {
         Self {
             slots: std::cell::UnsafeCell::new(slots.into_boxed_slice()),
@@ -259,24 +288,27 @@ impl HostParamChanges {
         }
     }
 
-    /// 块边界重置全部槽位（音频线程调用）。
+    /// Resets all slots at the block boundary (called on the audio thread).
     pub(crate) fn clear(&self) {
         self.count.set(0);
     }
 
-    /// 提交一个参数的归一化值（本块一个点，样本偏移 0）。
+    /// Commits one parameter's normalized value (a single point in this
+    /// block, at sample offset 0).
     pub(crate) fn push(&self, param_id: u32, value: f64) -> bool {
         let count = self.count.get();
-        // SAFETY: 切片构造后长度不变；同线程串行访问。
+        // SAFETY: The slice length is fixed after construction; same-thread
+        // serial access.
         let slots = unsafe { &*self.slots.get() };
         if slots.is_empty() {
             return false;
         }
-        // 查找已有队列（同参数本块多次提交则追加/复用点）。
+        // Look up an existing queue (multiple commits for the same
+        // parameter in this block append/reuse points).
         let mut slot: usize = slots.len();
         for (index, entry) in slots[..count as usize].iter().enumerate() {
-            // SAFETY: entry.data 指向存活的 HostParamValueQueue
-            // （Vst3Node 持有所有权），生命周期覆盖本调用。
+            // SAFETY: entry.data points to a live HostParamValueQueue
+            // (Vst3Node holds ownership); its lifetime covers this call.
             if unsafe { (*entry.data).current_id() } == param_id {
                 slot = index;
                 break;
@@ -287,22 +319,23 @@ impl HostParamChanges {
                 return false;
             }
             slot = count as usize;
-            // SAFETY: 同上。
+            // SAFETY: as above.
             unsafe {
                 (*slots[slot].data).reset(param_id);
             }
             self.count.set(count + 1);
         }
-        // SAFETY: 同上。
+        // SAFETY: as above.
         unsafe { (*slots[slot].data).add(0, value) }
     }
 
-    /// 供 `IParameterChanges::getParameterData` 返回的 COM 指针。
+    /// COM pointer returned by `IParameterChanges::getParameterData`.
     ///
     /// # Safety
-    /// `index` 必须在 `[0, count)` 内（由 trait 实现钳制后调用）。
+    /// `index` must be within `[0, count)` (called after the trait
+    /// implementation clamps it).
     unsafe fn slot_com(&self, index: i32) -> *mut Vst::IParamValueQueue {
-        // SAFETY: 调用方已钳制 index；同线程串行访问。
+        // SAFETY: The caller has clamped index; same-thread serial access.
         unsafe { (*self.slots.get())[index as usize].com }
     }
 }
@@ -321,8 +354,9 @@ impl Vst::IParameterChangesTrait for HostParamChanges {
         if index < 0 || index >= count {
             return ptr::null_mut();
         }
-        // SAFETY: index 已钳制；返回的指针生命周期由 Vst3Node 保证
-        // 覆盖整个 process 调用（规范约定插件仅在调用内使用）。
+        // SAFETY: index is already clamped; the returned pointer's lifetime
+        // is guaranteed by Vst3Node to cover the entire process call (per
+        // spec, the plugin uses it only within the call).
         unsafe { self.slot_com(index) }
     }
 
@@ -331,16 +365,18 @@ impl Vst::IParameterChangesTrait for HostParamChanges {
         _id: *const Vst::ParamID,
         _index: *mut Steinberg::int32,
     ) -> *mut Vst::IParamValueQueue {
-        // 简化宿主：队列只读（宿主→插件方向），插件不应回写。
+        // Simple host: the queue is read-only (host→plugin direction); the
+        // plugin must not write back.
         ptr::null_mut()
     }
 }
 
 // ---------------------------------------------------------------------------
-// 空组件处理器
+// No-op component handler
 // ---------------------------------------------------------------------------
 
-/// 空的 `IComponentHandler`：插件回报参数编辑/重启请求时忽略。
+/// Empty `IComponentHandler`: ignores parameter edit/restart requests
+/// reported by the plugin.
 pub(crate) struct NoopComponentHandler;
 
 impl Class for NoopComponentHandler {

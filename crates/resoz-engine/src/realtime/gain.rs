@@ -1,27 +1,29 @@
-//! 线性增益效果器。
+//! Linear gain effect.
 
 use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::ParamId;
 use crate::realtime::context::ProcessContext;
 use crate::realtime::processor::Processor;
 
-/// 线性增益 —— 第一个效果器，也是最简单的 `Processor` 参考实现。
+/// Linear gain — the first effect and also the simplest `Processor`
+/// reference implementation.
 ///
-/// 带有标准效果器测试（AGENTS.md「测试」）：静音输入 → 输出静音；
-/// 满幅输入 → 无 NaN/Inf。
+/// Comes with the standard effect tests (AGENTS.md "Testing"): silent input →
+/// silent output; full-scale input → no NaN/Inf.
 pub struct GainProcessor {
     gain: f32,
 }
 
 impl GainProcessor {
-    /// 非有限值回退为 0（静音），避免 NaN 污染信号。
+    /// Non-finite values fall back to 0 (silence), avoiding NaN pollution of
+    /// the signal.
     pub fn new(gain: f32) -> Self {
         Self {
             gain: sanitize(gain),
         }
     }
 
-    /// 设置增益。非有限值忽略为静音。RT-safe。
+    /// Sets the gain. Non-finite values are ignored (silence). RT-safe.
     fn set_gain(&mut self, gain: f32) {
         self.gain = sanitize(gain);
     }
@@ -34,7 +36,7 @@ fn sanitize(gain: f32) -> f32 {
 impl Processor for GainProcessor {
     fn process(&mut self, _ctx: &ProcessContext, buffer: &mut AudioBuffer) {
         if self.gain == 1.0 {
-            return; // 恒等快速路径
+            return; // identity fast path
         }
         for ch in 0..buffer.channels() {
             if let Some(channel) = buffer.channel_mut(ch) {
@@ -72,7 +74,7 @@ mod tests {
         }
     }
 
-    // AGENTS.md 标准测试 1：静音输入 → 输出静音。
+    // AGENTS.md standard test 1: silent input → silent output.
     #[test]
     fn silence_in_silence_out() {
         let mut gain = GainProcessor::new(2.0);
@@ -85,7 +87,7 @@ mod tests {
         }
     }
 
-    // AGENTS.md 标准测试 2：满幅输入 → 无 NaN/Inf。
+    // AGENTS.md standard test 2: full-scale input → no NaN/Inf.
     #[test]
     fn full_scale_scales_without_nan() {
         let mut gain = GainProcessor::new(0.5);

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ResoZ 数据模型：轨道、片段、自动化与项目文件"
+description = "ResoZ data model: tracks, clips, automation, and the project file"
 
 [dependencies]
 ron = { workspace = true }

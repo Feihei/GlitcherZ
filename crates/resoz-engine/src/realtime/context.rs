@@ -1,18 +1,21 @@
-//! 每块处理上下文。
+//! Per-block processing context.
 
-/// 一个固定处理块的上下文。`Copy`，由音频线程在每个块边界构造。
+/// Context of one fixed processing block. `Copy`, constructed by the audio
+/// thread at each block boundary.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessContext {
-    /// 采样率（Hz）。
+    /// Sample rate (Hz).
     pub sample_rate: f32,
-    /// 本块样本数（≤ `AudioBuffer` 容量）。
+    /// Number of samples in this block (≤ `AudioBuffer` capacity).
     pub frames: usize,
-    /// 本块第一个样本的全局位置（自音频流启动起的累计样本数）。
+    /// Global position of the block's first sample (accumulated sample count
+    /// since the audio stream started).
     pub playback_sample_pos: u64,
 }
 
 impl ProcessContext {
-    /// 本块起始时间（秒）。时间计算统一用 f64（见 AGENTS.md「编码规范」）。
+    /// Block start time (seconds). Time calculations uniformly use f64 (see
+    /// AGENTS.md "Coding Standards").
     pub fn start_seconds(&self) -> f64 {
         crate::convert::samples_to_seconds(self.playback_sample_pos, self.sample_rate)
     }

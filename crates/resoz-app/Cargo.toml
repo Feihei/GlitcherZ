@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ResoZ DAW 应用入口"
+description = "ResoZ DAW application entry point"
 
 [[bin]]
 name = "resoz"

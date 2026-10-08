@@ -1,24 +1,28 @@
-//! f32（音频路径）与 f64（UI / 时间计算）之间转换的集中点。
+//! Central point for conversions between f32 (audio path) and f64 (UI / time
+//! calculations).
 //!
-//! 约定见 AGENTS.md「编码规范」：所有跨精度转换都应经过本模块，
-//! 便于审查与统一舍入行为。
+//! See AGENTS.md "Coding Standards" for the convention: all cross-precision
+//! conversions should go through this module for easier review and uniform
+//! rounding behavior.
 
-/// `f64 → f32`。
+/// `f64 → f32`.
 pub fn to_f32(value: f64) -> f32 {
     value as f32
 }
 
-/// `f32 → f64`。
+/// `f32 → f64`.
 pub fn to_f64(value: f32) -> f64 {
     value as f64
 }
 
-/// 采样率 u32 → f32（44100 / 48000 等常用采样率精确无损）。
+/// Sample rate u32 → f32 (common sample rates such as 44100 / 48000 convert
+/// losslessly and exactly).
 pub fn sample_rate_to_f32(sample_rate: u32) -> f32 {
     sample_rate as f32
 }
 
-/// 采样点数 → 秒（时间计算用 f64）。`sample_rate <= 0` 时返回 0。
+/// Sample count → seconds (time calculations use f64). Returns 0 when
+/// `sample_rate <= 0`.
 pub fn samples_to_seconds(samples: u64, sample_rate: f32) -> f64 {
     if sample_rate > 0.0 {
         samples as f64 / f64::from(sample_rate)
@@ -27,7 +31,8 @@ pub fn samples_to_seconds(samples: u64, sample_rate: f32) -> f64 {
     }
 }
 
-/// 秒 → 采样点数（向下取整）。输入非法（采样率非正或时间为负）时返回 0。
+/// Seconds → sample count (rounded down). Returns 0 for invalid input
+/// (non-positive sample rate or negative time).
 pub fn seconds_to_samples(seconds: f64, sample_rate: f32) -> u64 {
     if sample_rate > 0.0 && seconds > 0.0 {
         (seconds * f64::from(sample_rate)) as u64

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ResoZ CLAP 插件宿主适配层：扫描、实例化与实时节点桥接"
+description = "ResoZ CLAP plugin host adaptation layer: scanning, instantiation and real-time node bridging"
 
 [dependencies]
 clack-host = { workspace = true }

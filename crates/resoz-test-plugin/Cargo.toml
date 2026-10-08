@@ -4,10 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ResoZ 测试用 CLAP 正弦乐器插件"
+description = "ResoZ test CLAP sine instrument plugin"
 
 [lib]
-# CLAP 插件 = cdylib 动态库
+# CLAP plugins = cdylib dynamic libraries
 crate-type = ["cdylib"]
 
 [dependencies]

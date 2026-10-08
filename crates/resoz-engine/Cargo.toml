@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ResoZ 音频引擎：处理图、调度、合成器与效果器"
+description = "ResoZ audio engine: processing graph, scheduling, synthesizer and effects"
 
 [dependencies]
 cpal = { workspace = true }

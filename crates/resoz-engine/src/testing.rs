@@ -1,7 +1,8 @@
-//! 单元测试共享工具（仅测试构建编译）。
+//! Shared unit-test utilities (compiled only for test builds).
 
-/// 统计正向过零次数（prev ≤ 0 且当前 > 0），用于验证正弦频率：
-/// `f Hz` 的正弦波每秒恰好 `f` 次正向过零。
+/// Counts positive zero crossings (prev ≤ 0 and current > 0), used to verify
+/// sine frequency: a sine wave at `f Hz` crosses zero upward exactly `f`
+/// times per second.
 pub(crate) fn count_positive_crossings(samples: &[f32]) -> usize {
     let mut count = 0;
     let mut prev = 0.0f32;

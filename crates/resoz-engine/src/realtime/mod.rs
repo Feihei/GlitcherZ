@@ -1,31 +1,33 @@
-//! # 实时音频路径（Realtime）
+//! # Real-time audio path
 //!
-//! 本模块内所有会在**音频回调线程**上执行的代码必须遵守实时铁律
-//! （AGENTS.md「实时音频铁律」，最高优先级）：
+//! All code in this module that runs on the **audio callback thread** must obey
+//! the real-time iron rules (AGENTS.md "Real-Time Audio Iron Rules", highest priority):
 //!
-//! 1. **禁止内存分配/释放**（`Vec::new`、`Box::new`、`String`、`format!` 等）；
-//!    所有缓冲区在构造期（非实时线程）预分配。
-//! 2. **禁止锁**（`Mutex`、`RwLock`）；跨线程通信只允许无锁队列
-//!    （`rtrb`）与原子变量。
-//! 3. **禁止系统调用**：无文件 IO、无日志（`log!` / `println!`）、无插件加载。
-//! 4. **禁止 panic**：不使用 `expect` / `unwrap` / 可 panic 的索引等；
-//!    边界情况一律降级（静音输出、丢弃命令）。
+//! 1. **No allocation/deallocation** (`Vec::new`, `Box::new`, `String`, `format!`, etc.);
+//!    all buffers are pre-allocated at construction time (non-real-time thread).
+//! 2. **No locks** (`Mutex`, `RwLock`); cross-thread communication only through
+//!    lock-free queues (`rtrb`) and atomic variables.
+//! 3. **No syscalls**: no file IO, no logging (`log!` / `println!`), no plugin loading.
+//! 4. **No panics**: no `expect` / `unwrap` / panicking indexing, etc.;
+//!    edge cases always degrade gracefully (silent output, dropped commands).
 //!
-//! 公开方法在文档中以 **RT-safe** 标注是否可在音频回调上调用。
-//! 构造函数允许分配，但只能在非实时线程调用；完成后即 move 进音频线程。
+//! Public methods are marked **RT-safe** in their docs to indicate whether they
+//! may be called on the audio callback.
+//! Constructors may allocate, but must only be called on the non-real-time thread;
+//! once complete they are moved into the audio thread.
 //!
-//! 模块结构：
-//! - [`buffer`]：预分配平面缓冲 [`AudioBuffer`]；
-//! - [`context`]：每块上下文 [`ProcessContext`]；
-//! - [`processor`]：[`Processor`] trait 与 [`ProcessorChain`]；
-//! - [`graph`]：节点图核心（[`RtGraph`](graph::RtGraph)、[`ExecPlan`](graph::ExecPlan)、
-//!   结构更新协议与控制侧编译器）；
-//! - [`sine`] / [`gain`]：正弦音源与增益效果器（`Processor` 参考实现）；
-//! - [`envelope`] / [`svf`] / [`synth`]：ADSR 包络、SVF 滤波器与完整合成器；
-//! - [`commands`]：`rtrb` 命令队列与 [`EngineCommand`] / [`NoteEvent`] / [`ParamId`]；
-//! - [`atomic`]：[`AtomicF32`]（音频线程 → UI 的标量回传）；
-//! - [`block`]：[`BlockRunner`] —— 把宿主（cpal）任意长度的交错缓冲拆成
-//!   固定块、在块边界消费命令、回传状态。
+//! Module structure:
+//! - [`buffer`]: pre-allocated flat buffers ([`AudioBuffer`]);
+//! - [`context`]: per-block context ([`ProcessContext`]);
+//! - [`processor`]: the [`Processor`] trait and [`ProcessorChain`];
+//! - [`graph`]: node graph core ([`RtGraph`](graph::RtGraph), [`ExecPlan`](graph::ExecPlan),
+//!   structure update protocol, and control-side compiler);
+//! - [`sine`] / [`gain`]: sine oscillator source and gain effect (`Processor` reference implementations);
+//! - [`envelope`] / [`svf`] / [`synth`]: ADSR envelope, SVF filter, and full synthesizer;
+//! - [`commands`]: `rtrb` command queue and [`EngineCommand`] / [`NoteEvent`] / [`ParamId`];
+//! - [`atomic`]: [`AtomicF32`] (audio thread → UI scalar feedback);
+//! - [`block`]: [`BlockRunner`] — splits the host's (cpal) arbitrarily long interleaved
+//!   buffer into fixed blocks, consumes commands at block boundaries, and reports state back.
 
 pub mod atomic;
 pub mod automation;
@@ -44,15 +46,17 @@ pub mod svf;
 pub mod synth;
 pub mod voice;
 
-/// 固定处理块大小（样本数）。见 AGENTS.md「处理图」（建议 64 或 128）。
+/// Fixed processing block size (in samples). See AGENTS.md "Processing Graph" (64 or 128 recommended).
 pub const FIXED_BLOCK_SIZE: usize = 128;
 
-/// MIDI 轨道容量上限（D12 轨道动态化：模型层 `Vec<MidiTrack>` 同上限）。
-/// 活跃轨数由控制侧经 `SequencerCommand::SetMidiTrackCount` 下发，
-/// 未配置轨的图路由表全部为空槽（inert）。
+/// MIDI track capacity limit (D12 dynamic tracks: the model layer's `Vec<MidiTrack>`
+/// shares this limit).
+/// The active track count is sent from the control side via
+/// `SequencerCommand::SetMidiTrackCount`;
+/// graph routing tables for unconfigured tracks are entirely empty slots (inert).
 pub const MAX_MIDI_TRACKS: usize = 16;
 
-/// 默认（新建项目）的 MIDI 轨道数。
+/// Default (new project) MIDI track count.
 pub const DEFAULT_MIDI_TRACKS: usize = 4;
 
 pub use atomic::AtomicF32;

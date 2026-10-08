@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! ResoZ 桌面应用入口：启动音频引擎（resoz-engine）并打开主窗口
-//! （resoz-ui）。当前为路线图第 3 步 —— 完整合成器（ADSR 包络 +
-//! SVF 滤波器）与虚拟键盘。
+//! ResoZ desktop app entry point: starts the audio engine (resoz-engine) and
+//! opens the main window (resoz-ui). Currently roadmap step 3 -- full
+//! synthesizer (ADSR envelope + SVF filter) and virtual keyboard.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -10,13 +10,13 @@ use std::time::Duration;
 
 use resoz_engine::AudioEngine;
 
-/// 命令行参数（手动解析，保持依赖最小）。
+/// Command line arguments (parsed manually, keeping dependencies minimal).
 struct Args {
-    /// 启动自动触发的 MIDI 音符（69 = A4）。
+    /// MIDI note auto-triggered at startup (69 = A4).
     note: u8,
-    /// 启动静默（不自动触发音符）。
+    /// Start silent (do not auto-trigger a note).
     no_autoplay: bool,
-    /// 启动时加载的项目文件。
+    /// Project file loaded at startup.
     open: Option<PathBuf>,
     gain: f64,
     seconds: Option<f64>,
@@ -33,7 +33,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.list_devices {
-        println!("可用的输出设备：");
+        println!("Available output devices:");
         for name in resoz_engine::available_outputs() {
             println!("  - {name}");
         }
@@ -43,13 +43,13 @@ fn main() -> ExitCode {
     let engine = match AudioEngine::start() {
         Ok(engine) => engine,
         Err(err) => {
-            eprintln!("启动音频引擎失败：{err}");
+            eprintln!("Failed to start the audio engine: {err}");
             return ExitCode::FAILURE;
         }
     };
     let info = engine.info().clone();
     println!(
-        "输出设备：{}（{} Hz，{} 声道）",
+        "Output device: {} ({} Hz, {} channels)",
         info.device_name, info.sample_rate, info.out_channels
     );
 
@@ -61,7 +61,7 @@ fn main() -> ExitCode {
     };
 
     if let Err(err) = resoz_ui::run(engine, ui_config) {
-        eprintln!("主窗口异常退出：{err}");
+        eprintln!("Main window exited abnormally: {err}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
@@ -69,10 +69,10 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     println!(
-        "用法: resoz [--note <0-127>] [--no-autoplay] [--gain <0.0-1.0>] [--seconds <秒>] [--list-devices]\n\
-         默认：打开主窗口并自动触发 A4 音符（ sustain 长音），\n\
-         用屏幕键盘或电脑键盘（A W S E D …，Z/X 切八度）演奏，关闭窗口退出。\n\
-         --seconds 指定 N 秒后自动关窗（冒烟测试用）。"
+        "Usage: resoz [--note <0-127>] [--no-autoplay] [--gain <0.0-1.0>] [--seconds <secs>] [--list-devices]\n\
+         Defaults: opens the main window and auto-triggers an A4 note (sustained tone).\n\
+         Play with the on-screen keyboard or the computer keyboard (A W S E D ..., Z/X to shift octaves); close the window to quit.\n\
+         --seconds auto-closes the window after N seconds (for smoke tests)."
     );
 }
 
@@ -95,7 +95,8 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Args {
                 }
             }
             "--freq" => {
-                // 兼容旧参数：把频率换算成最近的 MIDI 音符。
+                // Legacy flag compatibility: convert the frequency to the
+                // nearest MIDI note.
                 if let Some(f) = it.next().and_then(|s| s.parse::<f64>().ok()) {
                     if f.is_finite() && f > 0.0 {
                         let note = (69.0 + 12.0 * (f / 440.0).log2()).round() as i32;
@@ -121,7 +122,7 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Args {
             }
             "--list-devices" => args.list_devices = true,
             "--help" | "-h" => args.help = true,
-            other => eprintln!("忽略未知参数：{other}（--help 查看用法）"),
+            other => eprintln!("Ignoring unknown argument: {other} (see --help for usage)"),
         }
     }
     args
