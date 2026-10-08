@@ -35,8 +35,8 @@ use resoz_engine::realtime::{
     SequencerCommand, SynthProcessor, TrackSource,
 };
 use resoz_model::{
-    AutoParam, AutomationTrack, CableKind, DelayParams, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS, NodeDoc,
-    PortRef, Project, SynthParams, TICKS_PER_BAR, VoiceSpec,
+    AutoParam, CableKind, ControlTrack, DelayParams, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS, MidiClip,
+    NodeDoc, PortRef, Project, SynthParams, TICKS_PER_BAR, VoiceSpec,
 };
 
 pub mod canvas;
@@ -75,9 +75,6 @@ pub const PAN_RANGE: RangeInclusive<f32> = -1.0..=1.0;
 
 /// BPM adjustable range (f64 in the document: time computation convention).
 pub const BPM_RANGE: RangeInclusive<f64> = 20.0..=300.0;
-
-/// Gate length (gate as fraction of step) slider range.
-pub const GATE_RANGE: RangeInclusive<f32> = 0.05..=1.0;
 
 /// Computer keyboard → semitone offset (relative to the octave base, FL Studio-style layout).
 const KEYMAP: &[(egui::Key, u8)] = &[
@@ -628,18 +625,13 @@ impl ResoZApp {
         self.send_sequencer(SequencerCommand::SetBpm(convert::to_f32(
             self.project.metadata.tempo_bpm,
         )));
-        self.send_sequencer(SequencerCommand::SetGate(self.project.gate));
         for track in 0..self.project.midi_tracks.len() {
             self.push_track_params(track);
             let clip = self.rt_clip(track);
             self.send_sequencer(SequencerCommand::SetClip { track, clip });
-            let source = match self.project.midi_tracks[track].source {
-                resoz_model::TrackSource::Steps => TrackSource::Steps,
-                resoz_model::TrackSource::Clip => TrackSource::Clip,
-            };
-            self.send_sequencer(SequencerCommand::SetSource { track, source });
+            self.force_clip_source(track);
         }
-        for index in 0..self.project.automation_tracks.len() {
+        for index in 0..self.project.control_tracks.len() {
             self.send_auto_curve(index);
         }
     }
@@ -719,26 +711,30 @@ impl ResoZApp {
 
     // ---- Automation track dispatch (D7/D12: curve and cable endpoint are separated) ----
 
-    /// Push the curve entity of one automation track (its endpoint is decided by the graph's
+    /// Push the curve entity of one control track (its endpoint is decided by the graph's
     /// automation cable table, set via `apply_document` / `set_auto_endpoint`).
+    ///
+    /// T1 interim conversion (timeline spec T2 will replace this): the engine still evaluates
+    /// one global-loop curve per track, so the **first clip** of the control track is sent.
     fn send_auto_curve(&mut self, index: usize) {
-        let Some(track) = self.project.automation_tracks.get(index) else {
+        let Some(track) = self.project.control_tracks.get(index) else {
             return;
         };
-        let mut rt = RtAutomation {
-            enabled: track.enabled,
-            ..RtAutomation::default()
-        };
-        for point in track.points.iter().take(MAX_AUTO_POINTS) {
-            rt.push(RtAutoPoint {
-                tick: point.tick,
-                value: point.value,
-            });
+        let mut rt = RtAutomation::default();
+        let mut loop_ticks = TICKS_PER_BAR;
+        if let Some(clip) = track.clips.first() {
+            loop_ticks = clip.loop_ticks;
+            for point in clip.curve.iter().take(MAX_AUTO_POINTS) {
+                rt.push(RtAutoPoint {
+                    tick: point.tick,
+                    value: point.value,
+                });
+            }
         }
         self.send_sequencer(SequencerCommand::SetAutoTrack {
             index,
             auto: RtAutoTrack {
-                loop_ticks: track.loop_ticks,
+                loop_ticks,
                 curve: rt,
             },
         });
@@ -768,7 +764,7 @@ impl ResoZApp {
     /// document + engine in one place.
     fn graph_canvas(&mut self, ui: &mut egui::Ui) {
         let track_count = self.project.midi_tracks.len();
-        let auto_count = self.project.automation_tracks.len();
+        let auto_count = self.project.control_tracks.len();
         let actions = {
             // Borrow splitting: an immutable snapshot (document / plugin param tables) goes to
             // the canvas while the mutable canvas state is borrowed separately; actions are
@@ -1018,8 +1014,13 @@ impl ResoZApp {
 
     /// Document clip → engine representation (truncated to capacity, `Copy` struct, zero heap
     /// allocation).
+    ///
+    /// T1 interim conversion (timeline spec T2 will replace this): the engine still loops one
+    /// clip per track from the transport origin, so the track's **first clip** is sent.
     fn rt_clip(&self, track: usize) -> RtClip {
-        let clip = &self.project.midi_tracks[track].clip;
+        let Some(clip) = self.project.midi_tracks[track].clips.first() else {
+            return RtClip::default();
+        };
         let mut rt = RtClip {
             loop_ticks: clip.loop_ticks,
             ..RtClip::default()
@@ -2255,7 +2256,18 @@ impl ResoZApp {
         self.node_map.insert(strip_id, strip_e);
         self.engine
             .set_midi_track_count(self.project.midi_tracks.len());
+        self.force_clip_source(track);
         self.selected_track = track;
+    }
+
+    /// Forces one track onto the clip source (the engine-side `TrackSource`
+    /// enum defaults to Steps until the T2 sequencer rewrite removes it; the
+    /// model no longer has a source concept, D14).
+    fn force_clip_source(&mut self, track: usize) {
+        self.send_sequencer(SequencerCommand::SetSource {
+            track,
+            source: TrackSource::Clip,
+        });
     }
 
     /// 删除最后一条 MIDI 轨（中间轨删除需重排轨道表与文档 track 字段，
@@ -2303,16 +2315,24 @@ impl ResoZApp {
 
     /// Piano roll (edits the selected track's clip; edits are pushed to the audio thread
     /// immediately).
+    ///
+    /// T1 interim (timeline spec T3 will replace this): the roll edits the track's **first
+    /// clip**; an empty one-bar clip is created on demand so the roll is always usable.
     fn clip_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
-        let sel = self.selected_track;
+        let sel = self
+            .selected_track
+            .min(self.project.midi_tracks.len().saturating_sub(1));
         ui.label(format!("Piano Roll — Track {}", sel + 1));
+        if self.project.midi_tracks[sel].clips.is_empty() {
+            self.project.midi_tracks[sel].clips.push(MidiClip::new(0));
+        }
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
         let edited = piano_roll::show(
             ui,
-            &mut self.project.midi_tracks[sel].clip,
+            &mut self.project.midi_tracks[sel].clips[0],
             &mut self.roll_state,
             playhead,
             playing,
@@ -2327,7 +2347,7 @@ impl ResoZApp {
     fn automation_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
-        let auto_count = self.project.automation_tracks.len();
+        let auto_count = self.project.control_tracks.len();
         ui.horizontal(|ui| {
             ui.label("Automation Tracks");
             for i in 0..auto_count {
@@ -2339,15 +2359,13 @@ impl ResoZApp {
                 }
             }
             if ui.button("＋ Add").clicked() && auto_count < MAX_AUTO_TRACKS {
-                self.project
-                    .automation_tracks
-                    .push(AutomationTrack::default());
+                self.project.control_tracks.push(ControlTrack::default());
                 self.selected_auto = auto_count;
                 self.send_auto_curve(self.selected_auto);
             }
             if ui.button("－ Remove").clicked() && auto_count > 0 {
                 let index = self.selected_auto.min(auto_count - 1);
-                self.project.automation_tracks.remove(index);
+                self.project.control_tracks.remove(index);
                 let _ = self.engine.clear_auto_route(index);
                 // Engine side: clear that index to an empty curve.
                 self.send_sequencer(SequencerCommand::SetAutoTrack {
@@ -2357,8 +2375,7 @@ impl ResoZApp {
                         curve: RtAutomation::default(),
                     },
                 });
-                self.selected_auto =
-                    index.min(self.project.automation_tracks.len().saturating_sub(1));
+                self.selected_auto = index.min(self.project.control_tracks.len().saturating_sub(1));
             }
             ui.weak("Click lane to add anchor · drag to move · right-click to delete");
         });
@@ -2454,27 +2471,28 @@ impl ResoZApp {
                 })
                 .unwrap_or_else(|| "Not connected".to_string());
             ui.weak(format!("→ {current}"));
-            let mut enabled = self.project.automation_tracks[index].enabled;
-            if ui.checkbox(&mut enabled, "Enabled").changed() {
-                self.project.automation_tracks[index].enabled = enabled;
-                self.send_auto_curve(index);
-            }
         });
 
-        // The lane loop length follows the track's source size and is written back to the
-        // document.
-        let loop_ticks = match self.project.midi_tracks[sel].source {
-            resoz_model::TrackSource::Clip => self.project.midi_tracks[sel].clip.loop_ticks,
-            _ => TICKS_PER_BAR,
-        };
+        // The lane loop length follows the selected track's first MIDI clip and is written
+        // back to the control clip (T1 interim: the lane edits the track's first clip; the
+        // arrangement timeline view arrives in T3).
+        let loop_ticks = self.project.midi_tracks[sel]
+            .clips
+            .first()
+            .map(|c| c.loop_ticks)
+            .unwrap_or(TICKS_PER_BAR);
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
         let axis_param = self.project.graph.auto_endpoint(index).unwrap_or_default();
-        if let Some(curve) = self.project.automation_tracks.get_mut(index) {
-            curve.loop_ticks = loop_ticks;
+        if let Some(track) = self.project.control_tracks.get_mut(index) {
+            if track.clips.is_empty() {
+                track.clips.push(resoz_model::ControlClip::new(0));
+            }
+            let clip = &mut track.clips[0];
+            clip.loop_ticks = loop_ticks;
             let edited = lane::show(
                 ui,
-                curve,
+                clip,
                 &axis_param,
                 loop_ticks,
                 playhead,

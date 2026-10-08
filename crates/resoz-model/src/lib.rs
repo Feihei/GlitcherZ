@@ -13,9 +13,18 @@
 //!   not depend on `resoz-engine`, and the engine does not depend on this
 //!   crate either -- `resoz-app` / `resoz-ui` do the conversion glue.
 //!
-//! v3 (spec `docs/spec/node-graph.md` §7 final state, D11-D13):
-//! - `MidiTrack` (note plane) / `AutomationTrack` (pure curve) become
-//!   top-level `Vec`s (D12);
+//! v4 (spec `docs/spec/timeline.md` §4, D14-D15):
+//! - `MidiTrack { name, clips: Vec<MidiClip> }` — a track holds up to
+//!   [`MAX_CLIPS_PER_TRACK`] clips placed on the arrangement timeline
+//!   (absolute `start_ticks`, `span_ticks`, content loops every
+//!   `loop_ticks` within the span);
+//! - `AutomationTrack` becomes `ControlTrack { name, clips:
+//!   Vec<ControlClip> }`, same clip placement semantics;
+//! - the step sequencer is retired (`Step` / `Pattern` / `TrackSource` /
+//!   per-track single `Clip` / project `gate` are gone);
+//! - validation rejects over-capacity documents (report, never truncate).
+//!
+//! v3 (spec `docs/spec/node-graph.md` §7, D11-D13, unchanged in v4):
 //! - `GraphDoc{nodes, cables}` fully explicit: the default topology is also
 //!   written into the document, and the loader rebuilds the engine graph
 //!   purely from the document (D13);
@@ -28,9 +37,6 @@ pub mod file;
 pub use file::{
     ModelError, PROJECT_VERSION, ProjectFile, load_project, parse_project, save_project,
 };
-
-/// Number of steps in the step sequencer.
-pub const PATTERN_STEPS: usize = 16;
 
 /// MIDI track capacity limit (D12; the engine side uses the same value).
 pub const MAX_MIDI_TRACKS: usize = 16;
@@ -45,6 +51,21 @@ pub const MAX_NODES: usize = 64;
 /// Cable capacity limit (D1; same value on the engine side).
 pub const MAX_CABLES: usize = 128;
 
+/// Clips per track capacity limit (D15; the engine side uses the same value).
+pub const MAX_CLIPS_PER_TRACK: usize = 8;
+
+/// Notes per MIDI clip capacity limit (D15; the engine side
+/// `MAX_CLIP_NOTES` uses the same value).
+pub const MAX_CLIP_NOTES: usize = 64;
+
+/// Anchor points per control clip capacity limit (the engine-side
+/// `MAX_AUTO_POINTS` uses the same value).
+pub const MAX_CURVE_POINTS: usize = 64;
+
+/// Arrangement length safety bound in bars (D16; guards pathological
+/// documents).
+pub const MAX_ARRANGEMENT_BARS: u32 = 256;
+
 /// Number of MIDI tracks in the default (new) project.
 pub const DEFAULT_MIDI_TRACKS: usize = 4;
 
@@ -52,73 +73,9 @@ pub const DEFAULT_MIDI_TRACKS: usize = 4;
 /// deleted, not listed in the document node table).
 pub const MASTER_NODE_ID: u64 = 1;
 
-/// A single step: switch + note + velocity.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Step {
-    /// Whether this step triggers.
-    #[serde(default)]
-    pub enabled: bool,
-    /// MIDI note number (69 = A4).
-    #[serde(default = "default_note")]
-    pub note: u8,
-    /// Velocity (0..1, audio-path parameters use f32).
-    #[serde(default = "default_velocity")]
-    pub velocity: f32,
-}
-
-fn default_note() -> u8 {
-    60
-}
-
+/// Default note velocity (used by serde field defaults).
 fn default_velocity() -> f32 {
     0.9
-}
-
-impl Default for Step {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            note: default_note(),
-            velocity: default_velocity(),
-        }
-    }
-}
-
-/// Step sequencer mode: 16-step monophonic track.
-///
-/// The fixed-length array (instead of a `Vec`) is intentional: `Pattern`
-/// stays `Copy`, so it can be sent to the audio thread via the lock-free
-/// command queue as a whole block, with no heap allocation at all.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Pattern {
-    #[serde(default = "default_steps")]
-    pub steps: [Step; PATTERN_STEPS],
-}
-
-fn default_steps() -> [Step; PATTERN_STEPS] {
-    [Step::default(); PATTERN_STEPS]
-}
-
-impl Default for Pattern {
-    fn default() -> Self {
-        Self {
-            steps: default_steps(),
-        }
-    }
-}
-
-impl Pattern {
-    /// Sets step 0 to the given note (convenience constructor, for
-    /// tests/demos).
-    pub fn single_note(note: u8) -> Self {
-        let mut steps = default_steps();
-        steps[0] = Step {
-            enabled: true,
-            note,
-            velocity: 0.9,
-        };
-        Self { steps }
-    }
 }
 
 /// Per-track synthesizer timbre parameters.
@@ -258,27 +215,155 @@ impl Default for Note {
     }
 }
 
-/// Piano roll clip: a set of notes + loop length.
+/// A MIDI clip placed on the arrangement timeline (D14/D15).
+///
+/// `start_ticks` is the absolute position on the arrangement; the clip is
+/// audible for `span_ticks` from there, and its note content repeats every
+/// `loop_ticks` within the span (D14 future tiling semantics: the scheduler
+/// already tiles, the UI presents one period for now). `notes` positions are
+/// relative to the clip start.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Clip {
-    /// Loop length (tick), defaults to one bar (4/4).
+pub struct MidiClip {
+    /// Absolute start position on the arrangement (tick).
+    #[serde(default)]
+    pub start_ticks: u32,
+    /// How long the clip stays active (tick), ≥ `loop_ticks`.
+    #[serde(default = "default_clip_span")]
+    pub span_ticks: u32,
+    /// Content loop length (tick), defaults to one bar (4/4).
     #[serde(default = "default_clip_loop")]
     pub loop_ticks: u32,
-    /// Note collection.
+    /// Note collection (relative to the clip start).
     #[serde(default)]
     pub notes: Vec<Note>,
+}
+
+fn default_clip_span() -> u32 {
+    TICKS_PER_BAR
 }
 
 fn default_clip_loop() -> u32 {
     TICKS_PER_BAR
 }
 
-impl Default for Clip {
+impl Default for MidiClip {
     fn default() -> Self {
         Self {
+            start_ticks: 0,
+            span_ticks: default_clip_span(),
             loop_ticks: default_clip_loop(),
             notes: Vec::new(),
         }
+    }
+}
+
+impl MidiClip {
+    /// Convenience constructor: one empty bar clip starting at `start_ticks`.
+    pub fn new(start_ticks: u32) -> Self {
+        Self {
+            start_ticks,
+            ..MidiClip::default()
+        }
+    }
+}
+
+/// A control (automation) clip placed on the arrangement timeline (D17).
+///
+/// Same placement semantics as [`MidiClip`]; outside the span nothing is
+/// delivered (the target keeps its last value). The delivery endpoint is
+/// decided by the node graph's automation cable, not by the clip.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ControlClip {
+    /// Absolute start position on the arrangement (tick).
+    #[serde(default)]
+    pub start_ticks: u32,
+    /// How long the clip stays active (tick), ≥ `loop_ticks`.
+    #[serde(default = "default_clip_span")]
+    pub span_ticks: u32,
+    /// Content loop length (tick), defaults to one bar (4/4).
+    #[serde(default = "default_clip_loop")]
+    pub loop_ticks: u32,
+    /// Anchor curve (ticks relative to the clip start, ascending).
+    #[serde(default)]
+    pub curve: Vec<AutoPoint>,
+}
+
+impl Default for ControlClip {
+    fn default() -> Self {
+        Self {
+            start_ticks: 0,
+            span_ticks: default_clip_span(),
+            loop_ticks: default_clip_loop(),
+            curve: Vec::new(),
+        }
+    }
+}
+
+impl ControlClip {
+    /// Convenience constructor: one empty bar clip starting at `start_ticks`.
+    pub fn new(start_ticks: u32) -> Self {
+        Self {
+            start_ticks,
+            ..ControlClip::default()
+        }
+    }
+
+    /// Samples the value at a clip-relative tick: returns `None` when the
+    /// curve is empty; linear interpolation between anchors; clamps to the
+    /// endpoint values outside both ends. Requires anchors to be ordered
+    /// (editing interfaces maintain this).
+    pub fn value_at(&self, tick: f64) -> Option<f32> {
+        if self.curve.is_empty() {
+            return None;
+        }
+        let first = self.curve[0];
+        let last = *self.curve.last()?;
+        if tick <= f64::from(first.tick) {
+            return Some(first.value);
+        }
+        if tick >= f64::from(last.tick) {
+            return Some(last.value);
+        }
+        // Linear scan is enough: the number of anchors is finite, and the
+        // call frequency is once per block per curve.
+        for window in self.curve.windows(2) {
+            let (a, b) = (window[0], window[1]);
+            if tick < f64::from(b.tick) {
+                let span = f64::from(b.tick) - f64::from(a.tick);
+                let ratio = if span > 0.0 {
+                    (tick - f64::from(a.tick)) / span
+                } else {
+                    0.0
+                };
+                return Some(a.value + (b.value - a.value) * ratio as f32);
+            }
+        }
+        Some(last.value)
+    }
+
+    /// Inserts or updates an anchor (overwrites the same tick), keeping
+    /// ascending tick order.
+    pub fn upsert_point(&mut self, point: AutoPoint) {
+        self.curve.retain(|p| p.tick != point.tick);
+        let pos = self.curve.partition_point(|p| p.tick < point.tick);
+        self.curve.insert(pos, point);
+    }
+
+    /// Removes the nearest anchor within the `tick` tolerance; returns
+    /// `true` on a hit.
+    pub fn remove_near(&mut self, tick: u32, tolerance: u32) -> bool {
+        let Some(best) = self
+            .curve
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.tick.abs_diff(tick) <= tolerance)
+            .min_by_key(|(_, p)| p.tick.abs_diff(tick))
+            .map(|(index, _)| index)
+        else {
+            return false;
+        };
+        self.curve.remove(best);
+        true
     }
 }
 
@@ -309,38 +394,21 @@ pub enum VoiceSpec {
     },
 }
 
-/// Track sound source: 16-step pattern or piano roll clip.
-///
-/// T0（timeline spec D14）: 默认源切为 `Clip`（此前 UI 从未提供切换控件，
-/// `Steps` 默认导致 piano roll 永不被调度）；Steps 将在 T1 随模型 v4 一并退役。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub enum TrackSource {
-    /// Step sequencer mode.
-    Steps,
-    /// Piano roll clip (default).
-    #[default]
-    Clip,
-}
-
-/// The note plane of one MIDI track (D12 v3: split out of the old `Track`).
+/// The note plane of one MIDI track (D12 v3 / v4 timeline).
 ///
 /// Timbre/mix/effects are no longer track fields -- they are the
 /// [`NodeDoc::Instrument`] / [`NodeDoc::Effect`] / [`NodeDoc::ChannelStrip`]
-/// nodes in the node graph.
+/// nodes in the node graph. Since v4 the track holds clips placed on the
+/// arrangement timeline (the per-track single `Clip` / step pattern /
+/// `TrackSource` are retired, D14).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct MidiTrack {
     /// Track name (if empty the UI shows "Track N").
     #[serde(default)]
     pub name: String,
-    /// The track's step pattern (played when `source = Steps`).
+    /// Clips on the arrangement timeline (≤ [`MAX_CLIPS_PER_TRACK`], D15).
     #[serde(default)]
-    pub pattern: Pattern,
-    /// The track's clip (played when `source = Clip`).
-    #[serde(default)]
-    pub clip: Clip,
-    /// Sound source selection.
-    #[serde(default)]
-    pub source: TrackSource,
+    pub clips: Vec<MidiClip>,
 }
 
 /// Automatable / cable-connected node parameter (automation cable endpoint
@@ -381,94 +449,19 @@ pub struct AutoPoint {
     pub value: f32,
 }
 
-/// One automation track (D7/D12 v3: top-level entity, pure anchor curve, no
-/// target).
+/// One control (automation) track (D7/D12/D17: top-level time container).
 ///
-/// Anchors are stored in ascending tick order; values are linearly
-/// interpolated between adjacent anchors, and clamped to the end values
-/// outside both ends. Empty curves or disabled tracks produce no automation.
-/// The delivery endpoint `(node_id, param)` is decided by the
-/// [`CableKind::Automation`] cable in the node graph.
+/// The track itself carries no target parameter and no global loop anymore --
+/// delivery endpoints are decided by [`CableKind::Automation`] cables in the
+/// node graph, and time is expressed by the [`ControlClip`]s placed on it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
-pub struct AutomationTrack {
-    /// Whether enabled.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Loop length (tick): evaluation positions are taken modulo this.
-    /// Defaults to one bar (384).
-    #[serde(default = "default_loop_ticks")]
-    pub loop_ticks: u32,
-    /// Anchors (ascending by tick).
+pub struct ControlTrack {
+    /// Track name (if empty the UI shows "Control N").
     #[serde(default)]
-    pub points: Vec<AutoPoint>,
-}
-
-fn default_loop_ticks() -> u32 {
-    TICKS_PER_BAR
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl AutomationTrack {
-    /// Samples the value at `tick`: returns `None` when empty/disabled;
-    /// linear interpolation between two points; clamps to the endpoint values
-    /// outside both ends. Requires anchors to be ordered (editing interfaces
-    /// maintain this).
-    pub fn value_at(&self, tick: f64) -> Option<f32> {
-        if !self.enabled || self.points.is_empty() {
-            return None;
-        }
-        let first = self.points[0];
-        let last = *self.points.last()?;
-        if tick <= f64::from(first.tick) {
-            return Some(first.value);
-        }
-        if tick >= f64::from(last.tick) {
-            return Some(last.value);
-        }
-        // Linear scan is enough: the number of anchors is finite, and the
-        // call frequency is once per block per curve.
-        for window in self.points.windows(2) {
-            let (a, b) = (window[0], window[1]);
-            if tick < f64::from(b.tick) {
-                let span = f64::from(b.tick) - f64::from(a.tick);
-                let ratio = if span > 0.0 {
-                    (tick - f64::from(a.tick)) / span
-                } else {
-                    0.0
-                };
-                return Some(a.value + (b.value - a.value) * ratio as f32);
-            }
-        }
-        Some(last.value)
-    }
-
-    /// Inserts or updates an anchor (overwrites the same tick), keeping
-    /// ascending tick order.
-    pub fn upsert_point(&mut self, point: AutoPoint) {
-        self.points.retain(|p| p.tick != point.tick);
-        let pos = self.points.partition_point(|p| p.tick < point.tick);
-        self.points.insert(pos, point);
-    }
-
-    /// Removes the nearest anchor within the `tick` tolerance; returns
-    /// `true` on a hit.
-    pub fn remove_near(&mut self, tick: u32, tolerance: u32) -> bool {
-        let Some(best) = self
-            .points
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.tick.abs_diff(tick) <= tolerance)
-            .min_by_key(|(_, p)| p.tick.abs_diff(tick))
-            .map(|(index, _)| index)
-        else {
-            return false;
-        };
-        self.points.remove(best);
-        true
-    }
+    pub name: String,
+    /// Clips on the arrangement timeline (≤ [`MAX_CLIPS_PER_TRACK`], D15).
+    #[serde(default)]
+    pub clips: Vec<ControlClip>,
 }
 
 /// Document node (spec §7 `NodeDoc`): node identity in the engine graph +
@@ -921,32 +914,24 @@ pub fn default_graph_doc(track_count: usize) -> GraphDoc {
     GraphDoc { nodes, cables }
 }
 
-/// Multi-track project document (v3).
+/// Multi-track project document (v4).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Project {
     /// Project metadata (name, tempo, etc.).
     #[serde(default)]
     pub metadata: ProjectMetadata,
-    /// Sequencer gate ratio of a step (0.05..1).
-    #[serde(default = "default_gate")]
-    pub gate: f32,
     /// Master output gain (linear).
     #[serde(default = "default_master_gain")]
     pub master_gain: f32,
     /// MIDI tracks (note plane, D12 dynamic, capped at [`MAX_MIDI_TRACKS`]).
     #[serde(default)]
     pub midi_tracks: Vec<MidiTrack>,
-    /// Automation tracks (top-level entities, D7/D12, capped at
-    /// [`MAX_AUTO_TRACKS`]).
+    /// Control (automation) tracks (D17, capped at [`MAX_AUTO_TRACKS`]).
     #[serde(default)]
-    pub automation_tracks: Vec<AutomationTrack>,
+    pub control_tracks: Vec<ControlTrack>,
     /// Node graph document (D13 fully explicit).
     #[serde(default)]
     pub graph: GraphDoc,
-}
-
-fn default_gate() -> f32 {
-    0.8
 }
 
 fn default_master_gain() -> f32 {
@@ -957,18 +942,21 @@ impl Default for Project {
     fn default() -> Self {
         Self {
             metadata: ProjectMetadata::default(),
-            gate: default_gate(),
             master_gain: default_master_gain(),
             midi_tracks: vec![MidiTrack::default(); DEFAULT_MIDI_TRACKS],
-            automation_tracks: Vec::new(),
+            control_tracks: Vec::new(),
             graph: default_graph_doc(DEFAULT_MIDI_TRACKS),
         }
     }
 }
 
+/// Maximum arrangement length in ticks (D16 safety bound).
+pub const MAX_ARRANGEMENT_TICKS: u64 = (MAX_ARRANGEMENT_BARS as u64) * (TICKS_PER_BAR as u64);
+
 impl Project {
-    /// Project-level validation: track count limits + graph structure (the
-    /// file layer is the last line of defense).
+    /// Project-level validation: track counts, clip capacities/placement and
+    /// graph structure (the file layer is the last line of defense; report
+    /// errors instead of truncating).
     pub fn validate(&self) -> Result<(), String> {
         if self.midi_tracks.len() > MAX_MIDI_TRACKS {
             return Err(format!(
@@ -976,15 +964,75 @@ impl Project {
                 self.midi_tracks.len()
             ));
         }
-        if self.automation_tracks.len() > MAX_AUTO_TRACKS {
+        if self.control_tracks.len() > MAX_AUTO_TRACKS {
             return Err(format!(
-                "automation track count {} exceeds the limit {MAX_AUTO_TRACKS}",
-                self.automation_tracks.len()
+                "control track count {} exceeds the limit {MAX_AUTO_TRACKS}",
+                self.control_tracks.len()
             ));
         }
+        for (ti, track) in self.midi_tracks.iter().enumerate() {
+            if track.clips.len() > MAX_CLIPS_PER_TRACK {
+                return Err(format!(
+                    "MIDI track #{ti} holds {} clips, exceeding the limit {MAX_CLIPS_PER_TRACK}",
+                    track.clips.len()
+                ));
+            }
+            for (ci, clip) in track.clips.iter().enumerate() {
+                if clip.notes.len() > MAX_CLIP_NOTES {
+                    return Err(format!(
+                        "MIDI track #{ti} clip #{ci} holds {} notes, exceeding the limit {MAX_CLIP_NOTES}",
+                        clip.notes.len()
+                    ));
+                }
+                check_clip_placement(ti, ci, clip.start_ticks, clip.span_ticks, clip.loop_ticks)?;
+            }
+        }
+        for (ti, track) in self.control_tracks.iter().enumerate() {
+            if track.clips.len() > MAX_CLIPS_PER_TRACK {
+                return Err(format!(
+                    "control track #{ti} holds {} clips, exceeding the limit {MAX_CLIPS_PER_TRACK}",
+                    track.clips.len()
+                ));
+            }
+            for (ci, clip) in track.clips.iter().enumerate() {
+                if clip.curve.len() > MAX_CURVE_POINTS {
+                    return Err(format!(
+                        "control track #{ti} clip #{ci} holds {} anchors, exceeding the limit {MAX_CURVE_POINTS}",
+                        clip.curve.len()
+                    ));
+                }
+                check_clip_placement(ti, ci, clip.start_ticks, clip.span_ticks, clip.loop_ticks)?;
+            }
+        }
         self.graph
-            .validate(self.midi_tracks.len(), self.automation_tracks.len())
+            .validate(self.midi_tracks.len(), self.control_tracks.len())
     }
+}
+
+/// Shared clip placement validation (D14/D15/D16).
+fn check_clip_placement(
+    track: usize,
+    clip: usize,
+    start_ticks: u32,
+    span_ticks: u32,
+    loop_ticks: u32,
+) -> Result<(), String> {
+    if loop_ticks == 0 {
+        return Err(format!(
+            "track #{track} clip #{clip} has loop_ticks = 0 (must be ≥ 1)"
+        ));
+    }
+    if span_ticks < loop_ticks {
+        return Err(format!(
+            "track #{track} clip #{clip} has span_ticks {span_ticks} < loop_ticks {loop_ticks}"
+        ));
+    }
+    if u64::from(start_ticks) + u64::from(span_ticks) > MAX_ARRANGEMENT_TICKS {
+        return Err(format!(
+            "track #{track} clip #{clip} ends beyond the {MAX_ARRANGEMENT_BARS}-bar arrangement bound"
+        ));
+    }
+    Ok(())
 }
 
 /// Project-level metadata.
@@ -1014,33 +1062,53 @@ impl Default for ProjectMetadata {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoParam, AutoPoint, AutomationTrack, CableDoc, DEFAULT_MIDI_TRACKS, DelayParams,
-        GraphDoc, MASTER_NODE_ID, MAX_NODES, MidiTrack, NodeDoc, PATTERN_STEPS, Pattern, PortRef,
-        Project, Step, SynthParams, TICKS_PER_BAR, TICKS_PER_STEP, TrackSource, VoiceSpec,
-        default_graph_doc,
+        AutoParam, AutoPoint, CableDoc, DEFAULT_MIDI_TRACKS, GraphDoc, MASTER_NODE_ID,
+        MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK,
+        MAX_NODES, MidiClip, MidiTrack, NodeDoc, PortRef, Project, SynthParams, TICKS_PER_BAR,
+        TICKS_PER_STEP, VoiceSpec, default_graph_doc,
     };
 
     #[test]
-    fn pattern_ron_roundtrip() {
-        let mut pattern = Pattern::default();
-        pattern.steps[0] = Step {
-            enabled: true,
-            note: 69,
-            velocity: 0.9,
+    fn midi_clip_ron_roundtrip() {
+        let mut clip = MidiClip {
+            start_ticks: 2 * TICKS_PER_BAR,
+            span_ticks: 4 * TICKS_PER_BAR,
+            ..MidiClip::default()
         };
-        pattern.steps[7].enabled = true;
-        let text = ron::to_string(&pattern).expect("serialization failed");
-        let back: Pattern = ron::from_str(&text).expect("deserialization failed");
-        assert_eq!(pattern, back);
+        clip.notes.push(super::Note {
+            start: 0,
+            length: 48,
+            note: 60,
+            velocity: 0.9,
+        });
+        clip.notes.push(super::Note {
+            start: 24,
+            length: 24,
+            note: 64,
+            velocity: 1.0,
+        });
+        let text = ron::to_string(&clip).expect("serialization failed");
+        let back: MidiClip = ron::from_str(&text).expect("deserialization failed");
+        assert_eq!(clip, back);
     }
 
     #[test]
-    fn step_partial_fields_use_defaults() {
-        // Only `note` is written: enabled/velocity take serde defaults when
-        // missing (old file compatibility).
-        let back: Step = ron::from_str("(note: 64)").expect("parse failed");
-        assert!(!back.enabled);
-        assert_eq!(back.note, 64);
+    fn midi_clip_partial_fields_use_defaults() {
+        // Only `start_ticks` written: span/loop default to one bar.
+        let back: MidiClip = ron::from_str("(start_ticks: 384)").expect("parse failed");
+        assert_eq!(back.start_ticks, 384);
+        assert_eq!(back.span_ticks, TICKS_PER_BAR);
+        assert_eq!(back.loop_ticks, TICKS_PER_BAR);
+        assert!(back.notes.is_empty());
+    }
+
+    #[test]
+    fn note_partial_fields_use_defaults() {
+        let back: super::Note = ron::from_str("(start: 48, note: 72)").expect("parse failed");
+        assert_eq!(
+            back.length, TICKS_PER_STEP,
+            "note length defaults to one 16th note"
+        );
         assert!((back.velocity - 0.9).abs() < 1e-6);
     }
 
@@ -1067,21 +1135,32 @@ mod tests {
     }
 
     #[test]
-    fn project_ron_roundtrip() {
+    fn project_ron_roundtrip_v4() {
         let mut project = Project::default();
         project.metadata.name = "demo".to_string();
         project.midi_tracks[0].name = "Bass".to_string();
-        project.midi_tracks[0].pattern = Pattern::single_note(48);
-        project.midi_tracks[1].source = TrackSource::Clip;
-        project.automation_tracks.push(AutomationTrack {
-            enabled: true,
-            loop_ticks: 192,
-            points: vec![AutoPoint {
-                tick: 0,
-                value: 1.0,
+        let mut clip = MidiClip::new(TICKS_PER_BAR);
+        clip.span_ticks = 2 * TICKS_PER_BAR;
+        clip.notes.push(super::Note {
+            start: 0,
+            length: 48,
+            note: 48,
+            velocity: 0.9,
+        });
+        project.midi_tracks[0].clips.push(clip);
+        project.control_tracks.push(super::ControlTrack {
+            name: "Gain Ride".to_string(),
+            clips: vec![super::ControlClip {
+                start_ticks: 0,
+                span_ticks: TICKS_PER_BAR,
+                loop_ticks: TICKS_PER_BAR,
+                curve: vec![AutoPoint {
+                    tick: 0,
+                    value: 1.0,
+                }],
             }],
         });
-        // Automation track 0 → track 0 channel strip gain.
+        // Control track 0 → track 0 channel strip gain.
         let strip = project.graph.channel_strip_of_track(0).unwrap().node_id();
         project
             .graph
@@ -1101,6 +1180,7 @@ mod tests {
         let back: Project = ron::from_str("(metadata: (tempo_bpm: 140))").expect("parse failed");
         assert!((back.metadata.tempo_bpm - 140.0).abs() < 1e-9);
         assert!(back.midi_tracks.is_empty());
+        assert!(back.control_tracks.is_empty());
         assert!(back.graph.nodes.is_empty());
         assert!(
             back.validate().is_ok(),
@@ -1227,136 +1307,189 @@ mod tests {
     }
 
     #[test]
-    fn automation_value_at_segments() {
-        let mut auto = AutomationTrack {
-            enabled: true,
-            ..AutomationTrack::default()
+    fn control_clip_value_at_segments() {
+        let mut clip = super::ControlClip {
+            curve: vec![
+                AutoPoint {
+                    tick: 0,
+                    value: 1.0,
+                },
+                AutoPoint {
+                    tick: 96,
+                    value: 0.5,
+                },
+                AutoPoint {
+                    tick: 192,
+                    value: 0.0,
+                },
+            ],
+            ..super::ControlClip::default()
         };
-        auto.points = vec![
-            AutoPoint {
-                tick: 0,
-                value: 1.0,
-            },
-            AutoPoint {
-                tick: 96,
-                value: 0.5,
-            },
-            AutoPoint {
-                tick: 192,
-                value: 0.0,
-            },
-        ];
-        assert!((auto.value_at(0.0).unwrap() - 1.0).abs() < 1e-6);
+        assert!((clip.value_at(0.0).unwrap() - 1.0).abs() < 1e-6);
         assert!(
-            (auto.value_at(48.0).unwrap() - 0.75).abs() < 1e-6,
+            (clip.value_at(48.0).unwrap() - 0.75).abs() < 1e-6,
             "linear midpoint"
         );
-        assert!((auto.value_at(192.0).unwrap()).abs() < 1e-6);
+        assert!((clip.value_at(192.0).unwrap()).abs() < 1e-6);
         assert!(
-            (auto.value_at(1_000.0).unwrap()).abs() < 1e-6,
+            (clip.value_at(1_000.0).unwrap()).abs() < 1e-6,
             "holds the end value past the tail"
         );
         assert!(
-            (auto.value_at(-5.0).unwrap() - 1.0).abs() < 1e-6,
+            (clip.value_at(-5.0).unwrap() - 1.0).abs() < 1e-6,
             "holds the end value before the head"
         );
 
-        auto.enabled = false;
+        clip.curve.clear();
         assert!(
-            auto.value_at(48.0).is_none(),
-            "disabled produces no automation"
-        );
-        auto.points.clear();
-        auto.enabled = true;
-        assert!(
-            auto.value_at(48.0).is_none(),
+            clip.value_at(48.0).is_none(),
             "empty curve produces no automation"
         );
     }
 
     #[test]
-    fn automation_upsert_keeps_order() {
-        let mut auto = AutomationTrack::default();
-        auto.upsert_point(AutoPoint {
+    fn control_clip_upsert_keeps_order() {
+        let mut clip = super::ControlClip::default();
+        clip.upsert_point(AutoPoint {
             tick: 96,
             value: 0.5,
         });
-        auto.upsert_point(AutoPoint {
+        clip.upsert_point(AutoPoint {
             tick: 0,
             value: 1.0,
         });
-        auto.upsert_point(AutoPoint {
+        clip.upsert_point(AutoPoint {
             tick: 48,
             value: 0.75,
         });
-        auto.upsert_point(AutoPoint {
+        clip.upsert_point(AutoPoint {
             tick: 48,
             value: 0.8,
         }); // Overwrites the same tick
-        let ticks: Vec<u32> = auto.points.iter().map(|p| p.tick).collect();
+        let ticks: Vec<u32> = clip.curve.iter().map(|p| p.tick).collect();
         assert_eq!(
             ticks,
             vec![0, 48, 96],
             "anchors stay ascending and the same tick overwrites"
         );
-        assert!((auto.points[1].value - 0.8).abs() < 1e-6);
+        assert!((clip.curve[1].value - 0.8).abs() < 1e-6);
     }
 
     #[test]
-    fn automation_remove_near() {
-        let mut auto = AutomationTrack::default();
-        auto.upsert_point(AutoPoint {
+    fn control_clip_remove_near() {
+        let mut clip = super::ControlClip::default();
+        clip.upsert_point(AutoPoint {
             tick: 48,
             value: 0.5,
         });
-        assert!(auto.remove_near(50, 6), "should hit within tolerance");
-        assert!(auto.points.is_empty());
+        assert!(clip.remove_near(50, 6), "should hit within tolerance");
+        assert!(clip.curve.is_empty());
         assert!(
-            !auto.remove_near(0, 6),
+            !clip.remove_near(0, 6),
             "removal on an empty curve returns false"
         );
     }
 
     #[test]
-    fn clip_ron_roundtrip() {
-        use super::{Clip, Note};
-        let mut clip = Clip::default();
-        clip.notes.push(Note {
-            start: 0,
-            length: 48,
-            note: 60,
-            velocity: 0.9,
-        });
-        clip.notes.push(Note {
-            start: 24,
-            length: 24,
-            note: 64,
-            velocity: 1.0,
-        });
-        let text = ron::to_string(&clip).expect("serialization failed");
-        let back: Clip = ron::from_str(&text).expect("deserialization failed");
-        assert_eq!(clip, back);
+    fn validate_rejects_too_many_clips() {
+        let mut project = Project::default();
+        for i in 0..=MAX_CLIPS_PER_TRACK {
+            project.midi_tracks[0]
+                .clips
+                .push(MidiClip::new((i as u32) * TICKS_PER_BAR));
+        }
+        let err = project.validate().expect_err("should reject");
+        assert!(err.contains("clips"), "unexpected error: {err}");
     }
 
     #[test]
-    fn note_partial_fields_use_defaults() {
-        use super::Note;
-        let back: Note = ron::from_str("(start: 48, note: 72)").expect("parse failed");
-        assert_eq!(
-            back.length, TICKS_PER_STEP,
-            "note length defaults to one 16th note"
-        );
-        assert!((back.velocity - 0.9).abs() < 1e-6);
+    fn validate_rejects_too_many_notes() {
+        let mut project = Project::default();
+        let mut clip = MidiClip::default();
+        for i in 0..=MAX_CLIP_NOTES {
+            clip.notes.push(super::Note {
+                start: (i as u32) * TICKS_PER_STEP,
+                ..super::Note::default()
+            });
+        }
+        project.midi_tracks[0].clips.push(clip);
+        let err = project.validate().expect_err("should reject");
+        assert!(err.contains("notes"), "unexpected error: {err}");
     }
 
     #[test]
-    fn midi_track_defaults_and_delay_params() {
+    fn validate_rejects_span_shorter_than_loop() {
+        let mut project = Project::default();
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: 0,
+            span_ticks: TICKS_PER_BAR,
+            loop_ticks: 2 * TICKS_PER_BAR,
+            notes: Vec::new(),
+        });
+        let err = project.validate().expect_err("should reject");
+        assert!(err.contains("span_ticks"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_loop() {
+        let mut project = Project::default();
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: 0,
+            span_ticks: TICKS_PER_BAR,
+            loop_ticks: 0,
+            notes: Vec::new(),
+        });
+        assert!(project.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_beyond_arrangement_bound() {
+        let mut project = Project::default();
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: u32::try_from(MAX_ARRANGEMENT_TICKS).unwrap(),
+            span_ticks: TICKS_PER_BAR,
+            loop_ticks: TICKS_PER_BAR,
+            notes: Vec::new(),
+        });
+        let err = project.validate().expect_err("should reject");
+        assert!(err.contains("bound"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_arrangement_ending_exactly_at_bound() {
+        let mut project = Project::default();
+        let last_start = u64::from(MAX_ARRANGEMENT_BARS - 1) * u64::from(TICKS_PER_BAR);
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: u32::try_from(last_start).unwrap(),
+            span_ticks: TICKS_PER_BAR,
+            loop_ticks: TICKS_PER_BAR,
+            notes: Vec::new(),
+        });
+        assert!(project.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_too_many_curve_points() {
+        let mut project = Project::default();
+        let mut clip = super::ControlClip::default();
+        for i in 0..=super::MAX_CURVE_POINTS {
+            clip.curve.push(AutoPoint {
+                tick: (i as u32) * TICKS_PER_STEP,
+                value: 0.5,
+            });
+        }
+        project.control_tracks.push(super::ControlTrack {
+            name: String::new(),
+            clips: vec![clip],
+        });
+        let err = project.validate().expect_err("should reject");
+        assert!(err.contains("anchors"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn midi_track_defaults() {
         let track = MidiTrack::default();
-        assert_eq!(track.source, TrackSource::Clip);
-        assert_eq!(track.pattern.steps.len(), PATTERN_STEPS);
-        assert_eq!(track.clip.loop_ticks, TICKS_PER_BAR);
-        let delay = DelayParams::default();
-        assert!(delay.mix.abs() < 1e-6, "delay defaults to bypass");
-        let _synth: SynthParams = ron::from_str("()").unwrap_or_default();
+        assert!(track.clips.is_empty());
+        let _ = SynthParams::default();
     }
 }

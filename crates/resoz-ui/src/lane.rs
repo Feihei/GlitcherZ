@@ -8,7 +8,7 @@
 
 use eframe::egui;
 
-use resoz_model::{AutoParam, AutoPoint, AutomationTrack, TICKS_PER_STEP};
+use resoz_model::{AutoParam, AutoPoint, ControlClip, TICKS_PER_STEP};
 
 /// Lane height (pixels).
 pub const LANE_HEIGHT: f32 = 96.0;
@@ -55,14 +55,14 @@ fn from_norm(norm: f32, min: f32, max: f32, log: bool) -> f32 {
     }
 }
 
-/// Draw and interact one frame of the lane. Modifies `automation` in place and returns whether
-/// an edit happened this frame (the caller then re-pushes the curve to the audio thread).
+/// Draw and interact one frame of the lane. Modifies `clip` in place and returns whether an edit
+/// happened this frame (the caller then re-pushes the curve to the audio thread).
 ///
 /// `param` is the cable endpoint parameter (D7: the curve does not carry a target), used only
 /// for vertical axis range mapping.
 pub fn show(
     ui: &mut egui::Ui,
-    automation: &mut AutomationTrack,
+    clip: &mut ControlClip,
     param: &AutoParam,
     loop_ticks: u32,
     playhead_ticks: f32,
@@ -96,8 +96,8 @@ pub fn show(
 
     // Curve segments (lines between adjacent anchors).
     let curve_color = egui::Color32::from_rgb(90, 160, 220);
-    if automation.points.len() >= 2 {
-        for window in automation.points.windows(2) {
+    if clip.curve.len() >= 2 {
+        for window in clip.curve.windows(2) {
             painter.line_segment(
                 [
                     egui::pos2(
@@ -115,7 +115,7 @@ pub fn show(
     }
 
     // Anchors.
-    for (index, point) in automation.points.iter().enumerate() {
+    for (index, point) in clip.curve.iter().enumerate() {
         let x = rect.left() + point.tick as f32 * ticks_to_x;
         let y = value_y(point.value);
         let color = if state.drag == Some(index) {
@@ -137,8 +137,8 @@ pub fn show(
     }
 
     // Interaction.
-    let hit_point = |pos: egui::Pos2, automation: &AutomationTrack| -> Option<usize> {
-        automation.points.iter().position(|p| {
+    let hit_point = |pos: egui::Pos2, clip: &ControlClip| -> Option<usize> {
+        clip.curve.iter().position(|p| {
             let x = rect.left() + p.tick as f32 * ticks_to_x;
             let y = value_y(p.value);
             (pos.x - x).abs() <= 6.0 && (pos.y - y).abs() <= 8.0
@@ -148,15 +148,15 @@ pub fn show(
 
     if response.drag_started() {
         if let Some(pos) = response.interact_pointer_pos() {
-            if let Some(index) = hit_point(pos, automation) {
+            if let Some(index) = hit_point(pos, clip) {
                 state.drag = Some(index);
             } else {
                 let tick = snap((pos.x - rect.left()) / ticks_to_x).min(loop_ticks - 1);
-                automation.upsert_point(AutoPoint {
+                clip.upsert_point(AutoPoint {
                     tick,
                     value: y_value(pos.y),
                 });
-                state.drag = automation.points.iter().position(|p| p.tick == tick);
+                state.drag = clip.curve.iter().position(|p| p.tick == tick);
                 edited = true;
             }
         }
@@ -164,15 +164,15 @@ pub fn show(
 
     if response.dragged() {
         if let (Some(pos), Some(index)) = (response.interact_pointer_pos(), state.drag) {
-            if index < automation.points.len() {
+            if index < clip.curve.len() {
                 // Remove then upsert: dragging can change the tick ordering.
-                automation.points.remove(index);
-                automation.upsert_point(AutoPoint {
+                clip.curve.remove(index);
+                clip.upsert_point(AutoPoint {
                     tick: snap((pos.x - rect.left()) / ticks_to_x).min(loop_ticks - 1),
                     value: y_value(pos.y),
                 });
-                state.drag = automation
-                    .points
+                state.drag = clip
+                    .curve
                     .iter()
                     .position(|p| p.tick == snap((pos.x - rect.left()) / ticks_to_x));
                 edited = true;
@@ -187,7 +187,7 @@ pub fn show(
     if response.secondary_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             let tick = ((pos.x - rect.left()) / ticks_to_x).max(0.0) as u32;
-            if automation.remove_near(tick, SNAP_TICKS / 2) {
+            if clip.remove_near(tick, SNAP_TICKS / 2) {
                 state.drag = None;
                 edited = true;
             }

@@ -15,15 +15,16 @@ use std::path::Path;
 
 use crate::Project;
 
-/// Current version of the project file format (v3: GraphDoc full form
-/// nodes + cables, D11-D13; MIDI/automation tracks become top-level `Vec`s).
+/// Current version of the project file format (v4: arrangement timeline
+/// clips — `MidiClip` / `ControlClip` per track, D14-D17; the step sequencer
+/// model is retired).
 ///
 /// Compatibility policy (Q5 decision): **no legacy read paths** --
 /// structural changes are naturally tolerated via serde field-level defaults
 /// for missing fields; fields in old files that cannot be mapped (like the
 /// old `tracks` array) are ignored, and the loaded result is the default
 /// document.
-pub const PROJECT_VERSION: u32 = 3;
+pub const PROJECT_VERSION: u32 = 4;
 
 fn default_version() -> u32 {
     PROJECT_VERSION
@@ -110,8 +111,8 @@ pub fn load_project(path: &Path) -> Result<Project, ModelError> {
 mod tests {
     use super::{PROJECT_VERSION, ProjectFile, load_project, parse_project, save_project};
     use crate::{
-        AutoParam, AutoPoint, AutomationTrack, CableDoc, Clip, MASTER_NODE_ID, ModelError, Note,
-        Pattern, Project, TrackSource,
+        AutoParam, AutoPoint, CableDoc, MASTER_NODE_ID, MidiClip, ModelError, Note, Project,
+        TICKS_PER_BAR,
     };
 
     fn demo_project() -> Project {
@@ -119,33 +120,35 @@ mod tests {
         project.metadata.name = "Test Project".to_string();
         project.metadata.tempo_bpm = 140.0;
         project.midi_tracks[0].name = "Bass".to_string();
-        project.midi_tracks[0].pattern = Pattern::single_note(48);
-        project.midi_tracks[1].source = TrackSource::Clip;
-        project.midi_tracks[1].clip = Clip {
-            loop_ticks: 384,
-            notes: vec![
-                Note {
-                    start: 0,
-                    length: 48,
-                    note: 60,
-                    velocity: 0.9,
-                },
-                Note {
-                    start: 24,
-                    length: 24,
-                    note: 64,
-                    velocity: 1.0,
-                },
-            ],
-        };
-        // Automation track 0: loops one bar, cabled to track 0's channel
-        // strip gain.
-        project.automation_tracks.push(AutomationTrack {
-            enabled: true,
-            loop_ticks: 384,
-            points: vec![AutoPoint {
-                tick: 0,
-                value: 1.0,
+        let mut clip = MidiClip::new(TICKS_PER_BAR);
+        clip.span_ticks = TICKS_PER_BAR;
+        clip.notes = vec![
+            Note {
+                start: 0,
+                length: 48,
+                note: 60,
+                velocity: 0.9,
+            },
+            Note {
+                start: 24,
+                length: 24,
+                note: 64,
+                velocity: 1.0,
+            },
+        ];
+        project.midi_tracks[0].clips.push(clip);
+        // Control track 0: one bar clip, cabled to track 0's channel strip
+        // gain.
+        project.control_tracks.push(crate::ControlTrack {
+            name: String::new(),
+            clips: vec![crate::ControlClip {
+                start_ticks: 0,
+                span_ticks: TICKS_PER_BAR,
+                loop_ticks: TICKS_PER_BAR,
+                curve: vec![AutoPoint {
+                    tick: 0,
+                    value: 1.0,
+                }],
             }],
         });
         let strip = project.graph.channel_strip_of_track(0).unwrap().node_id();
@@ -191,7 +194,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"(
-    version: 3,
+    version: 4,
     project: (
         midi_tracks: [(name: "name only"), (), (), ()],
     ),
@@ -224,7 +227,7 @@ mod tests {
         // Note: PortRef is serialized as snake_case via rename_all
         // (node/master).
         let text = r#"(
-    version: 3,
+    version: 4,
     project: (
         graph: (cables: [(kind: audio, from: node(99), to: master)]),
     ),
@@ -235,7 +238,7 @@ mod tests {
         ));
         // Automation track port out of range.
         let text = r#"(
-    version: 3,
+    version: 4,
     project: (
         graph: (cables: [(kind: automation, from: auto_track(3), to: node(2))]),
     ),
@@ -249,7 +252,7 @@ mod tests {
     #[test]
     fn reserved_master_node_id_is_rejected() {
         let text = r#"(
-    version: 3,
+    version: 4,
     project: (
         graph: (nodes: [(type: "channel_strip", node_id: 1, track: 0)]),
     ),

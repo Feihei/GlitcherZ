@@ -744,7 +744,7 @@ mod tests {
         let project = Project::default();
         let doc = &project.graph;
         let track_count = project.midi_tracks.len();
-        let auto_count = project.automation_tracks.len();
+        let auto_count = project.control_tracks.len();
         let mut state = CanvasState::default();
         state.ensure_positions(doc, track_count, auto_count);
 

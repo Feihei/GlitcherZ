@@ -13,7 +13,7 @@
 
 use eframe::egui;
 
-use resoz_model::{Clip, Note, TICKS_PER_QUARTER, TICKS_PER_STEP};
+use resoz_model::{MidiClip, Note, TICKS_PER_QUARTER, TICKS_PER_STEP};
 
 /// Height of each semitone row (pixels).
 pub const ROW_HEIGHT: f32 = 9.0;
@@ -64,7 +64,7 @@ fn is_black_key(note: i32) -> bool {
 /// happened this frame (the caller then re-pushes the clip to the audio thread).
 pub fn show(
     ui: &mut egui::Ui,
-    clip: &mut Clip,
+    clip: &mut MidiClip,
     state: &mut RollState,
     playhead_ticks: f32,
     playing: bool,
@@ -184,7 +184,7 @@ pub fn show(
             .round()
             .clamp(0.0, 127.0) as u8
     };
-    let hit_note = |pos: egui::Pos2, clip: &Clip| -> Option<usize> {
+    let hit_note = |pos: egui::Pos2, clip: &MidiClip| -> Option<usize> {
         let tick = pointer_tick(pos) as u32;
         let note = pointer_note(pos);
         clip.notes
