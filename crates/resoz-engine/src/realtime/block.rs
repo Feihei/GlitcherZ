@@ -77,7 +77,11 @@ pub struct BlockRunner {
     out_channels: usize,
     sample_rate: f32,
     graph: RtGraph,
-    sequencer: Sequencer,
+    /// Heap-allocated: with per-track clip tables (timeline T2) the struct is
+    /// ~200 KB, far too large for the main thread's stack as a plain field
+    /// (`AudioEngine::start` would overflow the 1 MB default). Constructed
+    /// once on a non-real-time thread; the audio callback only dereferences.
+    sequencer: Box<Sequencer>,
     scratch_pos: usize,
     commands: Consumer<EngineCommand>,
     structure: Consumer<GraphUpdate>,
@@ -112,7 +116,7 @@ impl BlockRunner {
                 48_000.0
             },
             graph,
-            sequencer,
+            sequencer: Box::new(sequencer),
             scratch_pos: 0,
             commands,
             structure,
