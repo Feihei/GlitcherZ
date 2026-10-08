@@ -259,10 +259,10 @@ impl AudioEngine {
         }))
     }
 
-    /// 时间轴布线：把自动化轨道 `auto_index` 连到 `(track, param)` 指向
-    /// 的节点参数（P5 画布落地前以轨道坐标表达终点）。重复调用即重定向。
-    pub fn set_auto_route(&mut self, auto_index: usize, track: usize, param: ParamId) -> bool {
-        self.apply_plan_update(|compiler| compiler.set_auto_route(auto_index, track, param))
+    /// 时间轴布线：把自动化轨道 `auto_index` 连到目标节点参数
+    /// （**node_id 寻址**，P5b）。重复调用即重定向。
+    pub fn set_auto_route(&mut self, auto_index: usize, node_id: u64, param: ParamId) -> bool {
+        self.apply_plan_update(|compiler| compiler.set_auto_route(auto_index, node_id, param))
     }
 
     /// 时间轴布线：断开自动化轨道 `auto_index` 的连线。
@@ -270,27 +270,73 @@ impl AudioEngine {
         self.apply_plan_update(|compiler| compiler.clear_auto_route(auto_index))
     }
 
-    /// 时间轴布线：把 MIDI 轨 `from_track` 的音符事件额外扇出到
-    /// `to_track` 的声源节点（默认图已含本轨自连；P5 画布落地前以
-    /// 轨道坐标表达连线）。重复连线幂等；扇出超限返回 `false`。
-    pub fn connect_midi_track(&mut self, from_track: usize, to_track: usize) -> bool {
-        self.apply_plan_update(|compiler| {
-            compiler
-                .voice_slot(to_track)
-                .ok_or(crate::realtime::TopologyError::InvalidTrack)
-                .and_then(|slot| compiler.connect_midi(from_track, slot))
-        })
+    /// 时间轴布线：把 MIDI 轨 `from_track` 的音符事件额外扇出到目标
+    /// 节点（**node_id 寻址**，P5b；默认图已含本轨自连）。重复连线幂等；
+    /// 扇出超限返回 `false`。
+    pub fn connect_midi_node(&mut self, from_track: usize, node_id: u64) -> bool {
+        self.apply_plan_update(|compiler| compiler.connect_midi(from_track, node_id))
     }
 
-    /// 时间轴布线：断开 MIDI 轨 `from_track` 到 `to_track` 声源的扇出
+    /// 时间轴布线：断开 MIDI 轨 `from_track` 到目标节点的扇出
     /// （本轨自连是默认图一部分，不可断开）。
-    pub fn disconnect_midi_track(&mut self, from_track: usize, to_track: usize) -> bool {
-        self.apply_plan_update(|compiler| {
-            compiler
-                .voice_slot(to_track)
-                .ok_or(crate::realtime::TopologyError::InvalidTrack)
-                .and_then(|slot| compiler.disconnect_midi(from_track, slot))
-        })
+    pub fn disconnect_midi_node(&mut self, from_track: usize, node_id: u64) -> bool {
+        self.apply_plan_update(|compiler| compiler.disconnect_midi(from_track, node_id))
+    }
+
+    /// 按 node_id 定向设置节点参数（P5b：节点寻址的公开路径）。
+    /// 返回 `false` 表示队列满（命令被丢弃，非关键路径）。
+    pub fn set_node_param(&mut self, node_id: u64, id: ParamId, value: f32) -> bool {
+        self.send(EngineCommand::SetNodeParam { node_id, id, value })
+    }
+
+    /// 某轨声源的 node_id（UI 把轨道坐标解析成节点寻址用）。
+    pub fn voice_node_id(&self, track: usize) -> Option<u64> {
+        self.compiler.track_voice_node_id(track)
+    }
+
+    /// 某轨延迟节点的 node_id。
+    pub fn delay_node_id(&self, track: usize) -> Option<u64> {
+        self.compiler.track_delay_node_id(track)
+    }
+
+    /// 某轨通道条的 node_id。
+    pub fn channel_node_id(&self, track: usize) -> Option<u64> {
+        self.compiler.track_channel_node_id(track)
+    }
+
+    /// 主输出节点的 node_id。
+    pub fn master_node_id(&self) -> u64 {
+        self.compiler.master_node_id()
+    }
+
+    /// 新增一条 MIDI 轨（默认三件套 + 本轨 MIDI 自连）。返回三个新
+    /// node_id `[voice, delay, channel]`；轨道/槽位/主输出入边容量满时
+    /// 返回 `None`（编译器已回滚）。
+    pub fn add_midi_track(&mut self) -> Option<[u64; 3]> {
+        let snapshot = self.compiler;
+        match self.compiler.add_midi_track() {
+            Ok((update, ids)) => {
+                if self.structure.push(update).is_ok() {
+                    Some(ids)
+                } else {
+                    self.compiler = snapshot;
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// 拆除一条 MIDI 轨（三件套连同效果器一并回收）。
+    pub fn remove_midi_track(&mut self, track: usize) -> bool {
+        self.apply_plan_update(|compiler| compiler.remove_midi_track(track))
+    }
+
+    /// 设置活跃 MIDI 轨数（D12；实时侧钳制到容量上限）。
+    pub fn set_midi_track_count(&mut self, count: usize) -> bool {
+        self.send(EngineCommand::Sequencer(
+            SequencerCommand::SetMidiTrackCount(count),
+        ))
     }
 
     /// 应用一次仅换计划的拓扑变更（连线表编辑等），队列满时回滚。

@@ -47,8 +47,13 @@ pub mod voice;
 /// 固定处理块大小（样本数）。见 AGENTS.md「处理图」（建议 64 或 128）。
 pub const FIXED_BLOCK_SIZE: usize = 128;
 
-/// 项目轨道数（第 5 步固定 4 轨；与 `resoz_model::NUM_TRACKS` 保持一致）。
-pub const NUM_TRACKS: usize = 4;
+/// MIDI 轨道容量上限（D12 轨道动态化：模型层 `Vec<MidiTrack>` 同上限）。
+/// 活跃轨数由控制侧经 `SequencerCommand::SetMidiTrackCount` 下发，
+/// 未配置轨的图路由表全部为空槽（inert）。
+pub const MAX_MIDI_TRACKS: usize = 16;
+
+/// 默认（新建项目）的 MIDI 轨道数。
+pub const DEFAULT_MIDI_TRACKS: usize = 4;
 
 pub use atomic::AtomicF32;
 pub use automation::{
@@ -65,8 +70,8 @@ pub use delay::DelayProcessor;
 pub use envelope::AdsrProcessor;
 pub use gain::GainProcessor;
 pub use graph::{
-    AutoRoute, ChannelStripProcessor, ExecPlan, GraphCompiler, GraphLevels, GraphUpdate,
-    MAX_MIDI_FANOUT, RtGraph, TopologyError,
+    AutoRoute, Cable, ChannelStripProcessor, ExecPlan, GraphCompiler, GraphLevels, GraphUpdate,
+    MAX_CABLES, MAX_MIDI_FANOUT, RtGraph, TopologyError,
 };
 pub use processor::{Processor, ProcessorChain};
 pub use sequencer::{

@@ -100,6 +100,8 @@ pub enum SequencerCommand {
         /// 轨道实体（自带循环长度 + 纯锚点曲线）。
         auto: RtAutoTrack,
     },
+    /// 设置活跃 MIDI 轨数（D12 动态轨数；超出容量的值被实时侧钳制）。
+    SetMidiTrackCount(usize),
 }
 
 /// UI / 控制线程 → 音频线程的控制命令。
@@ -121,6 +123,16 @@ pub enum EngineCommand {
     Note { track: usize, event: NoteEvent },
     /// 音序器走带 / 配置。
     Sequencer(SequencerCommand),
+    /// 按 node_id 定向设置节点参数（P5b：节点寻址路径；自动化连线与
+    /// 画布均以此为准）。
+    SetNodeParam {
+        /// 目标节点 ID（编译器分配，随结构更新对 UI 公开）。
+        node_id: u64,
+        /// 参数。
+        id: ParamId,
+        /// 参数值。
+        value: f32,
+    },
 }
 
 /// 创建一对命令队列端点：producer 交给 UI / 控制线程，consumer 交给
@@ -144,6 +156,7 @@ mod tests {
         match cmd {
             EngineCommand::SetParam { value, .. } => value,
             EngineCommand::SetTrackParam { value, .. } => value,
+            EngineCommand::SetNodeParam { value, .. } => value,
             EngineCommand::Note { .. } => f32::NAN,
             EngineCommand::Sequencer(_) => f32::NAN,
         }

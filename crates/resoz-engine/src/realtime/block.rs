@@ -28,8 +28,9 @@ pub struct Feedback {
     pub playing: Arc<AtomicBool>,
     /// 音序器音乐位置（tick，自播放起点累计）。
     pub position_ticks: Arc<AtomicF32>,
-    /// 各轨道 post-fader 峰值电平。
-    pub track_levels: [Arc<AtomicF32>; crate::realtime::NUM_TRACKS],
+    /// 各轨道 post-fader 峰值电平（定容 [`crate::realtime::MAX_MIDI_TRACKS`]，
+    /// 未配置轨恒为 0）。
+    pub track_levels: [Arc<AtomicF32>; crate::realtime::MAX_MIDI_TRACKS],
 }
 
 impl Feedback {
@@ -227,6 +228,9 @@ impl BlockRunner {
             EngineCommand::SetTrackParam { track, id, value } => {
                 self.graph.track_set_param(track, id, value);
             }
+            EngineCommand::SetNodeParam { node_id, id, value } => {
+                self.graph.node_set_param(node_id, id, value);
+            }
             EngineCommand::Note { track, event } => {
                 self.graph.track_note(track, event);
             }
@@ -258,6 +262,9 @@ impl BlockRunner {
             }
             SequencerCommand::SetAutoTrack { index, auto } => {
                 self.sequencer.set_auto_track(index, auto);
+            }
+            SequencerCommand::SetMidiTrackCount(count) => {
+                self.sequencer.set_track_count(count);
             }
         }
     }
@@ -519,7 +526,10 @@ mod tests {
     fn automation_drives_track_gain_during_playback() {
         let (mut runner, mut tx, mut structure_tx, feedback, mut compiler) = make_runner(128, 2);
         // 增益曲线：tick 0 = 1.0 → tick 96 = 0.0（120 BPM / 44.1 kHz ≈ 0.5 s）。
-        // 自动化轨道 0（自带一小节循环）连到轨道 0 通道条增益。
+        // 自动化轨道 0（自带一小节循环）连到轨道 0 通道条增益（node_id 寻址）。
+        let channel_id = compiler
+            .track_channel_node_id(0)
+            .expect("通道条 node_id 应存在");
         let mut curve = RtAutomation {
             enabled: true,
             ..RtAutomation::default()
@@ -541,7 +551,7 @@ mod tests {
         }))
         .expect("队列未满");
         let update = compiler
-            .set_auto_route(0, 0, ParamId::TrackGain)
+            .set_auto_route(0, channel_id, ParamId::TrackGain)
             .expect("自动化连线应成功");
         structure_tx.push(update).expect("结构队列未满");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
@@ -637,7 +647,9 @@ mod tests {
         );
 
         // 3. 自动化桥接：曲线驱动 PluginParam（0 → 1 over 384 tick），
-        //    自动化轨道 0 连到轨道 0 声源（ParamEcho）的插件参数 1。
+        //    自动化轨道 0 连到轨道 0 声源（ParamEcho，node_id 为换装后
+        //    新分配的 ID）的插件参数 1。
+        let voice_id = compiler.track_voice_node_id(0).expect("换装后应有 node_id");
         let mut curve = RtAutomation {
             enabled: true,
             ..RtAutomation::default()
@@ -659,7 +671,7 @@ mod tests {
         }))
         .expect("队列未满");
         let update = compiler
-            .set_auto_route(0, 0, ParamId::PluginParam(1))
+            .set_auto_route(0, voice_id, ParamId::PluginParam(1))
             .expect("自动化连线应成功");
         structure_tx.push(update).expect("结构队列未满");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))

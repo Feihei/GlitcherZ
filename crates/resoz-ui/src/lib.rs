@@ -331,12 +331,17 @@ impl ResoZApp {
             }
             self.apply_track_voice(track);
         }
-        // 节点图连线（v2）：MIDI 跨轨扇出。
+        // 节点图连线（v2）：MIDI 跨轨扇出（node_id 寻址，P5b）。
         for link in self.project.graph.midi_links.clone() {
-            if !self
-                .engine
-                .connect_midi_track(link.from_track, link.to_track)
-            {
+            let Some(target) = self.engine.voice_node_id(link.to_track) else {
+                log::warn!(
+                    "MIDI 连线 ({}, {}) 目标轨无声源，跳过",
+                    link.from_track,
+                    link.to_track
+                );
+                continue;
+            };
+            if !self.engine.connect_midi_node(link.from_track, target) {
                 log::warn!(
                     "MIDI 连线 ({}, {}) 下发失败（扇出超限或队列满）",
                     link.from_track,
@@ -443,7 +448,20 @@ impl ResoZApp {
                 curve: rt,
             },
         });
-        self.engine.set_auto_route(index, track, param_id);
+        // 连线终点按参数种类解析到轨道链上的节点（node_id 寻址，P5b）：
+        // 混音两项 → 通道条；音色/插件参数 → 声源。P5c 文档完整形态后
+        // 终点直接来自 cables 文档，此处过渡。
+        let target = match curve.param {
+            AutoParam::TrackGain | AutoParam::TrackPan => self.engine.channel_node_id(track),
+            AutoParam::FilterCutoff | AutoParam::PluginParam { .. } => {
+                self.engine.voice_node_id(track)
+            }
+        };
+        let Some(node_id) = target else {
+            log::warn!("轨道 {track} 自动化终点节点不存在，连线未下发");
+            return;
+        };
+        self.engine.set_auto_route(index, node_id, param_id);
     }
 
     /// 文档模式 → 引擎表示（`Copy` 数组，零堆分配）。

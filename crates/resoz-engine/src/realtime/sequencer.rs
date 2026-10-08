@@ -5,7 +5,8 @@
 //! BPM 变化只影响未来速率（位置以 tick 计，音乐位置天然保持），
 //! 循环回绕由窗口映射推导，无需行进式时钟簿记。
 
-use crate::realtime::NUM_TRACKS;
+use crate::realtime::DEFAULT_MIDI_TRACKS;
+use crate::realtime::MAX_MIDI_TRACKS;
 use crate::realtime::automation::{MAX_AUTO_TRACKS, RtAutoTrack};
 use crate::realtime::commands::NoteEvent;
 use crate::realtime::context::ProcessContext;
@@ -113,13 +114,16 @@ pub struct Sequencer {
     /// gate 占步长的比例（0.05..1，仅步进音源使用；卷帘用音符时长）。
     gate: f32,
     position_ticks: f64,
-    sources: [TrackSource; NUM_TRACKS],
-    patterns: [[SequencerStep; PATTERN_STEPS]; NUM_TRACKS],
-    clips: [RtClip; NUM_TRACKS],
+    /// 活跃 MIDI 轨数（D12 动态轨数：控制侧经 `SetMidiTrackCount` 下发，
+    /// 调度只扫描 `0..track_count`；未配置轨的 patterns/clips 为默认空）。
+    track_count: usize,
+    sources: [TrackSource; MAX_MIDI_TRACKS],
+    patterns: [[SequencerStep; PATTERN_STEPS]; MAX_MIDI_TRACKS],
+    clips: [RtClip; MAX_MIDI_TRACKS],
     /// 自动化轨道实体（独立于 MIDI 轨道，见 D7）。
     autos: [RtAutoTrack; MAX_AUTO_TRACKS],
     /// 各轨待发送的 NoteOff（gate/时长结束的绝对采样位置 + 音符）。
-    pending_offs: [Option<(u64, u8)>; NUM_TRACKS],
+    pending_offs: [Option<(u64, u8)>; MAX_MIDI_TRACKS],
 }
 
 impl Sequencer {
@@ -135,11 +139,12 @@ impl Sequencer {
             bpm: 120.0,
             gate: 0.8,
             position_ticks: 0.0,
-            sources: [TrackSource::default(); NUM_TRACKS],
-            patterns: [[SequencerStep::default(); PATTERN_STEPS]; NUM_TRACKS],
-            clips: [RtClip::default(); NUM_TRACKS],
+            track_count: DEFAULT_MIDI_TRACKS,
+            sources: [TrackSource::default(); MAX_MIDI_TRACKS],
+            patterns: [[SequencerStep::default(); PATTERN_STEPS]; MAX_MIDI_TRACKS],
+            clips: [RtClip::default(); MAX_MIDI_TRACKS],
             autos: [RtAutoTrack::default(); MAX_AUTO_TRACKS],
-            pending_offs: [None; NUM_TRACKS],
+            pending_offs: [None; MAX_MIDI_TRACKS],
         }
     }
 
@@ -174,14 +179,30 @@ impl Sequencer {
     pub fn play(&mut self) {
         self.playing = true;
         self.position_ticks = 0.0;
-        self.pending_offs = [None; NUM_TRACKS];
+        self.pending_offs = [None; MAX_MIDI_TRACKS];
     }
 
     /// 停止调度并清空全部 gate 尾音。
     /// 调用方应向所有轨道发 `NoteOff` 释放包络。RT-safe。
     pub fn stop(&mut self) {
         self.playing = false;
-        self.pending_offs = [None; NUM_TRACKS];
+        self.pending_offs = [None; MAX_MIDI_TRACKS];
+    }
+
+    /// 设置活跃 MIDI 轨数（钳到 [`MAX_MIDI_TRACKS`]；缩轨时更高编号轨
+    /// 的 gate 尾音一并清除）。RT-safe。
+    pub fn set_track_count(&mut self, count: usize) {
+        self.track_count = count.min(MAX_MIDI_TRACKS);
+        if self.pending_offs.len() > self.track_count {
+            for pending in self.pending_offs[self.track_count..].iter_mut() {
+                *pending = None;
+            }
+        }
+    }
+
+    /// 当前活跃 MIDI 轨数。RT-safe。
+    pub fn track_count(&self) -> usize {
+        self.track_count
     }
 
     /// 设置 BPM（20..300，非有限值忽略）。音乐位置以 tick 计，
@@ -257,8 +278,8 @@ impl Sequencer {
             }
         }
 
-        // 2. 各轨按音源调度窗口内的音符 on。
-        for track in 0..NUM_TRACKS {
+        // 2. 各轨按音源调度窗口内的音符 on（只扫活跃轨，D12）。
+        for track in 0..self.track_count {
             match self.sources[track] {
                 TrackSource::Steps => {
                     self.schedule_steps(track, t0, t1, block_start, samples_per_tick, emit);
@@ -402,7 +423,8 @@ mod tests {
         MAX_CLIP_NOTES, PATTERN_STEPS, RtClip, RtNote, Sequencer, SequencerStep, TICKS_PER_STEP,
         TrackSource,
     };
-    use crate::realtime::NUM_TRACKS;
+    use crate::realtime::DEFAULT_MIDI_TRACKS;
+    use crate::realtime::MAX_MIDI_TRACKS;
     use crate::realtime::automation::{MAX_AUTO_TRACKS, RtAutoPoint, RtAutoTrack};
     use crate::realtime::commands::NoteEvent;
     use crate::realtime::context::ProcessContext;
@@ -612,12 +634,16 @@ mod tests {
         let mut seq = Sequencer::new(SR);
         let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
         pattern[0] = step(60);
-        for track in 0..NUM_TRACKS {
+        for track in 0..DEFAULT_MIDI_TRACKS {
             seq.set_pattern(track, pattern);
         }
         seq.play();
         let events = run(&mut seq, 1);
-        assert_eq!(ons(&events).len(), NUM_TRACKS, "四轨应同时触发第 0 步");
+        assert_eq!(
+            ons(&events).len(),
+            DEFAULT_MIDI_TRACKS,
+            "默认四轨应同时触发第 0 步"
+        );
 
         seq.stop();
         let events = run(&mut seq, 375);
@@ -715,5 +741,25 @@ mod tests {
         seq.set_pattern(0, pattern);
         seq.play();
         assert_eq!(ons(&run(&mut seq, 30)), vec![(0, 60)]);
+    }
+
+    #[test]
+    fn track_count_gates_scheduling() {
+        let mut seq = Sequencer::new(SR);
+        let mut pattern = [SequencerStep::default(); PATTERN_STEPS];
+        pattern[0] = step(60);
+        seq.set_pattern(5, pattern);
+        seq.set_track_count(4);
+        seq.play();
+        assert!(
+            ons(&run(&mut seq, 30)).is_empty(),
+            "活跃轨数之外的轨不应调度"
+        );
+        seq.set_track_count(8);
+        seq.play(); // 重新归零走带，让步 0 重新落进调度窗口
+        assert_eq!(ons(&run(&mut seq, 30)), vec![(5, 60)]);
+        // 钳制到容量上限。
+        seq.set_track_count(MAX_MIDI_TRACKS + 10);
+        assert_eq!(seq.track_count(), MAX_MIDI_TRACKS);
     }
 }
