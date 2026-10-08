@@ -11,3 +11,6 @@ Thumbs.db
 
 # WorkBuddy 工作区数据（AI 会话日志、memory 等，不入库）
 .workbuddy/
+
+# 工作暂存（一次性脚本等，不入库）
+working_files/
