@@ -53,6 +53,7 @@ resoz/
 
 ## 编码规范
 
+- **语言约定**：代码注释、doc comment、日志、UI 文案、错误消息一律**英文**（用户要求：egui 默认字体无 CJK 字形）；术语以 `docs/glossary.md` 为准，新概念先登记再使用。`docs/` 与本文件等项目文档可用中文。
 - `cargo clippy -- -D warnings` 必须零警告。
 - `cargo fmt` 格式化所有代码。
 - 禁止 `unsafe`，除非：模块顶部有 `// SAFETY:` 注释 + 理由 + 测试。当前允许的边界仅 `resoz-clap-host` / `resoz-vst3-host` 的插件绑定层。
@@ -90,6 +91,7 @@ cargo build --release -p resoz-app
 | 文档 | 内容 | 何时读 |
 | :--- | :--- | :--- |
 | `docs/architecture.md` | 架构约定：线程模型、处理图、数据模型 | 动引擎/模型代码前 |
+| `docs/glossary.md` | 术语表：中英对照 + 文案风格约定 | 写注释/日志/UI 文案、引入新概念前 |
 | `docs/implementation.md` | 已落地模块的实现要点、协议细节、版本 gotchas | 改现有功能、排查问题时 |
 | `docs/plan.md` | 路线图、当前状态、遗留任务、进行中的方向 | 规划下一步、同步进度时 |
 | `docs/spec/` | 特性 spec（节点图架构 spec 进行中） | 实施对应特性前 |
