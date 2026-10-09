@@ -17,17 +17,21 @@ use egui::{Color32, FontId, Pos2, Rect, Sense, Vec2};
 
 use resoz_model::{AutoParam, CableKind, GraphDoc, NodeDoc, PortRef, VoiceSpec};
 
-/// Canvas entity identity: document nodes + fixed entities (master output / timeline sources).
+/// Canvas entity identity: document nodes + fixed entities (master output /
+/// the arrangement timeline).
+///
+/// T4 (spec `docs/spec/timeline.md`): the per-track source boxes merged into
+/// **one explicit Timeline node** — no inputs, `n` outputs (n = MIDI tracks +
+/// control tracks), undeletable. `PortRef::MidiTrack/AutoTrack` semantics are
+/// unchanged; this is a pure presentation-layer merge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CanvasId {
     /// Document node (persisted node_id, ≥ 2).
     Node(u64),
     /// Master output (reserved identity, D6).
     Master,
-    /// Timeline MIDI track source.
-    MidiTrack(usize),
-    /// Timeline automation track source.
-    AutoTrack(usize),
+    /// The arrangement timeline (one box; one output port per track).
+    Timeline,
 }
 
 /// Interaction intents produced within one canvas frame (applied by the caller; the canvas has
@@ -64,10 +68,12 @@ pub struct CanvasDeps<'a> {
     pub auto_options: &'a dyn Fn(u64) -> Vec<(String, AutoParam)>,
 }
 
-/// Cable being dragged (source = the entity owning the dragged output port).
+/// Cable being dragged (source = the entity + output port owning the drag).
 #[derive(Debug, Clone, Copy)]
 struct CableDrag {
     from: CanvasId,
+    /// Output port index (only [`CanvasId::Timeline`] has more than one).
+    port: usize,
 }
 
 /// Canvas cross-frame state.
@@ -108,8 +114,10 @@ enum DragKind {
 
 /// Audio node box size.
 const NODE_SIZE: Vec2 = Vec2::new(150.0, 64.0);
-/// Timeline source (MIDI / automation) box size.
-const SOURCE_SIZE: Vec2 = Vec2::new(132.0, 40.0);
+/// Timeline box size per output port row (width fixed, height scales).
+const TIMELINE_WIDTH: f32 = 150.0;
+const TIMELINE_ROW_HEIGHT: f32 = 26.0;
+const TIMELINE_MIN_HEIGHT: f32 = 40.0;
 /// Fixed canvas height.
 const CANVAS_HEIGHT: f32 = 300.0;
 /// Output port circle radius / hit radius.
@@ -121,12 +129,34 @@ const CABLE_HIT_DIST: f32 = 8.0;
 const ZOOM_MIN: f32 = 0.35;
 const ZOOM_MAX: f32 = 3.0;
 
+/// Timeline output port count (MIDI tracks first, then control tracks).
+fn timeline_port_count(midi_count: usize, auto_count: usize) -> usize {
+    midi_count + auto_count
+}
+
+/// A timeline output port index → its `PortRef` (0..midi = MIDI tracks).
+fn timeline_port_ref(port: usize, midi_count: usize) -> PortRef {
+    if port < midi_count {
+        PortRef::MidiTrack(port)
+    } else {
+        PortRef::AutoTrack(port - midi_count)
+    }
+}
+
+/// Timeline box size (height scales with the port count).
+fn timeline_size(midi_count: usize, auto_count: usize) -> Vec2 {
+    Vec2::new(
+        TIMELINE_WIDTH,
+        (TIMELINE_ROW_HEIGHT * timeline_port_count(midi_count, auto_count) as f32 + 14.0)
+            .max(TIMELINE_MIN_HEIGHT),
+    )
+}
+
 /// Type coloring (spec P5d): stroke varies by type, fill is a dark base.
 fn node_color(id: CanvasId, doc: &GraphDoc) -> (Color32, Color32) {
     let stroke = match id {
         CanvasId::Master => Color32::from_rgb(230, 110, 90),
-        CanvasId::MidiTrack(_) => Color32::from_rgb(90, 200, 110),
-        CanvasId::AutoTrack(_) => Color32::from_rgb(230, 190, 70),
+        CanvasId::Timeline => Color32::from_rgb(170, 120, 225),
         CanvasId::Node(id) => match doc.node_by_id(id) {
             Some(NodeDoc::Instrument { .. }) => Color32::from_rgb(90, 160, 220),
             Some(NodeDoc::Effect { .. }) => Color32::from_rgb(220, 150, 70),
@@ -136,8 +166,7 @@ fn node_color(id: CanvasId, doc: &GraphDoc) -> (Color32, Color32) {
     };
     let fill = match id {
         CanvasId::Master => Color32::from_rgb(52, 32, 30),
-        CanvasId::MidiTrack(_) => Color32::from_rgb(28, 44, 30),
-        CanvasId::AutoTrack(_) => Color32::from_rgb(48, 42, 24),
+        CanvasId::Timeline => Color32::from_rgb(38, 30, 50),
         CanvasId::Node(_) => Color32::from_rgb(34, 38, 46),
     };
     (stroke, fill)
@@ -153,9 +182,9 @@ fn cable_color(kind: CableKind) -> Color32 {
 }
 
 /// Entity box size.
-fn size_of(id: CanvasId) -> Vec2 {
+fn size_of(id: CanvasId, midi_count: usize, auto_count: usize) -> Vec2 {
     match id {
-        CanvasId::MidiTrack(_) | CanvasId::AutoTrack(_) => SOURCE_SIZE,
+        CanvasId::Timeline => timeline_size(midi_count, auto_count),
         _ => NODE_SIZE,
     }
 }
@@ -164,8 +193,7 @@ fn size_of(id: CanvasId) -> Vec2 {
 fn label_of(id: CanvasId, doc: &GraphDoc) -> String {
     match id {
         CanvasId::Master => "Master Out".to_string(),
-        CanvasId::MidiTrack(t) => format!("MIDI Track {}", t + 1),
-        CanvasId::AutoTrack(i) => format!("Automation {}", i + 1),
+        CanvasId::Timeline => "Timeline".to_string(),
         CanvasId::Node(node_id) => match doc.node_by_id(node_id) {
             Some(NodeDoc::Instrument { voice, track, .. }) => match voice {
                 VoiceSpec::Builtin => format!("Synth · Track {}", track + 1),
@@ -218,47 +246,77 @@ impl CanvasState {
     }
 
     /// Entity screen rect (returns `None` when no position exists).
-    fn screen_rect(&self, rect_min: Pos2, id: CanvasId) -> Option<Rect> {
+    fn screen_rect(
+        &self,
+        rect_min: Pos2,
+        id: CanvasId,
+        midi_count: usize,
+        auto_count: usize,
+    ) -> Option<Rect> {
         let p = *self.positions.get(&id)?;
         Some(Rect::from_min_size(
             self.to_screen(rect_min, p),
-            size_of(id),
+            size_of(id, midi_count, auto_count),
         ))
     }
 
-    /// Output port screen position (sources and audio nodes have one; the master output does
-    /// not).
-    fn out_port_screen(&self, rect_min: Pos2, id: CanvasId) -> Option<Pos2> {
+    /// Output ports of one entity: `(port index, screen position)` pairs. The
+    /// timeline exposes one port per track spread along its right edge; audio
+    /// nodes have a single port; the master output has none.
+    fn out_ports_screen(
+        &self,
+        rect_min: Pos2,
+        id: CanvasId,
+        midi_count: usize,
+        auto_count: usize,
+    ) -> Vec<(usize, Pos2)> {
+        let Some(r) = self.screen_rect(rect_min, id, midi_count, auto_count) else {
+            return Vec::new();
+        };
         match id {
-            CanvasId::Master => None,
-            other => self
-                .screen_rect(rect_min, other)
-                .map(|r| Pos2::new(r.right(), r.center().y)),
+            CanvasId::Master => Vec::new(),
+            CanvasId::Timeline => {
+                let n = timeline_port_count(midi_count, auto_count);
+                (0..n)
+                    .map(|i| {
+                        let y = r.top() + (i as f32 + 0.5) * (r.height() / n.max(1) as f32);
+                        (i, Pos2::new(r.right(), y))
+                    })
+                    .collect()
+            }
+            CanvasId::Node(_) => vec![(0, Pos2::new(r.right(), r.center().y))],
         }
     }
 
-    /// Input port screen position (audio nodes and master output; sources do not).
-    fn in_port_screen(&self, rect_min: Pos2, id: CanvasId) -> Option<Pos2> {
+    /// Input port screen position (audio nodes and master output; the timeline
+    /// has none — it is a pure source, D14/T4).
+    fn in_port_screen(
+        &self,
+        rect_min: Pos2,
+        id: CanvasId,
+        midi_count: usize,
+        auto_count: usize,
+    ) -> Option<Pos2> {
         match id {
-            CanvasId::MidiTrack(_) | CanvasId::AutoTrack(_) => None,
+            CanvasId::Timeline => None,
             other => self
-                .screen_rect(rect_min, other)
+                .screen_rect(rect_min, other, midi_count, auto_count)
                 .map(|r| Pos2::new(r.left(), r.center().y)),
         }
     }
 
     /// Fill in default placements for missing entities (never overwrites existing positions;
     /// prunes stale entries).
-    fn ensure_positions(&mut self, doc: &GraphDoc, track_count: usize, auto_count: usize) {
+    fn ensure_positions(&mut self, doc: &GraphDoc, track_count: usize, _auto_count: usize) {
         let mut wanted: Vec<CanvasId> = Vec::new();
 
-        // One column per track: MIDI source → instrument → effect stack → channel strip.
+        // One column per track: instrument → effect stack → channel strip.
         let mut effect_slot = vec![0usize; track_count];
         for node in &doc.nodes {
             let track = node.track().min(track_count.saturating_sub(1));
             let y = 32.0 + track as f32 * 132.0;
             let (id, pos) = match node {
-                NodeDoc::Instrument { .. } => (CanvasId::Node(node.node_id()), Pos2::new(200.0, y)),
+                NodeDoc::Instrument { .. } => (CanvasId::Node(node.node_id()), Pos2::new(260.0, y)),
                 NodeDoc::Effect { voice, .. } => {
                     let k = if matches!(voice, VoiceSpec::Builtin) {
                         0
@@ -268,47 +326,45 @@ impl CanvasState {
                     effect_slot[track] += 1;
                     (
                         CanvasId::Node(node.node_id()),
-                        Pos2::new(420.0, y + k as f32 * 64.0),
+                        Pos2::new(480.0, y + k as f32 * 64.0),
                     )
                 }
                 NodeDoc::ChannelStrip { .. } => {
-                    (CanvasId::Node(node.node_id()), Pos2::new(640.0, y))
+                    (CanvasId::Node(node.node_id()), Pos2::new(700.0, y))
                 }
             };
             wanted.push(id);
             self.positions.entry(id).or_insert(pos);
         }
-        for t in 0..track_count {
-            let id = CanvasId::MidiTrack(t);
-            wanted.push(id);
-            self.positions
-                .entry(id)
-                .or_insert(Pos2::new(16.0, 32.0 + t as f32 * 132.0));
-        }
-        let y_bottom = 32.0 + track_count as f32 * 132.0 + 24.0;
-        for i in 0..auto_count {
-            let id = CanvasId::AutoTrack(i);
-            wanted.push(id);
-            self.positions
-                .entry(id)
-                .or_insert(Pos2::new(16.0, y_bottom + i as f32 * 56.0));
-        }
+
+        // The single explicit Timeline node (T4), top-left of the graph.
+        wanted.push(CanvasId::Timeline);
+        self.positions
+            .entry(CanvasId::Timeline)
+            .or_insert(Pos2::new(16.0, 32.0));
+
         wanted.push(CanvasId::Master);
         let y_center = (32.0 + track_count.max(1) as f32 * 132.0) * 0.5;
         self.positions
             .entry(CanvasId::Master)
-            .or_insert(Pos2::new(870.0, y_center));
+            .or_insert(Pos2::new(930.0, y_center));
 
         // Prune positions of deleted entities to prevent unbounded hashmap growth.
         self.positions.retain(|id, _| wanted.contains(id));
     }
 
-    /// Hit-test an output port (screen distance).
-    fn hit_out_port(&self, rect_min: Pos2, sp: Pos2) -> Option<CanvasId> {
+    /// Hit-test an output port (screen distance) → `(entity, port index)`.
+    fn hit_out_port(
+        &self,
+        rect_min: Pos2,
+        sp: Pos2,
+        midi_count: usize,
+        auto_count: usize,
+    ) -> Option<(CanvasId, usize)> {
         for &id in self.positions.keys() {
-            if let Some(port) = self.out_port_screen(rect_min, id) {
-                if port.distance(sp) <= PORT_HIT_RADIUS {
-                    return Some(id);
+            for (port, p) in self.out_ports_screen(rect_min, id, midi_count, auto_count) {
+                if p.distance(sp) <= PORT_HIT_RADIUS {
+                    return Some((id, port));
                 }
             }
         }
@@ -316,9 +372,15 @@ impl CanvasState {
     }
 
     /// Hit-test an entity box.
-    fn hit_node(&self, rect_min: Pos2, sp: Pos2) -> Option<CanvasId> {
+    fn hit_node(
+        &self,
+        rect_min: Pos2,
+        sp: Pos2,
+        midi_count: usize,
+        auto_count: usize,
+    ) -> Option<CanvasId> {
         for &id in self.positions.keys() {
-            if let Some(r) = self.screen_rect(rect_min, id) {
+            if let Some(r) = self.screen_rect(rect_min, id, midi_count, auto_count) {
                 if r.contains(sp) {
                     return Some(id);
                 }
@@ -328,15 +390,26 @@ impl CanvasState {
     }
 
     /// Hit-test a cable (returns the index into the document cable table).
-    fn hit_cable(&self, rect_min: Pos2, sp: Pos2, doc: &GraphDoc) -> Option<usize> {
+    fn hit_cable(
+        &self,
+        rect_min: Pos2,
+        sp: Pos2,
+        doc: &GraphDoc,
+        midi_count: usize,
+        auto_count: usize,
+    ) -> Option<usize> {
         for (i, cable) in doc.cables.iter().enumerate() {
-            let (Some(from), Some(to)) = (canvas_port_from(&cable.from), canvas_port_to(&cable.to))
-            else {
+            let (Some((from, from_port)), Some(to)) = (
+                canvas_port_from(&cable.from, midi_count),
+                canvas_port_to(&cable.to),
+            ) else {
                 continue;
             };
-            let (Some(p0), Some(p3)) = (
-                self.out_port_screen(rect_min, from),
-                self.in_port_screen(rect_min, to),
+            let (Some((_, p0)), Some(p3)) = (
+                self.out_ports_screen(rect_min, from, midi_count, auto_count)
+                    .into_iter()
+                    .find(|(k, _)| *k == from_port),
+                self.in_port_screen(rect_min, to, midi_count, auto_count),
             ) else {
                 continue;
             };
@@ -350,12 +423,13 @@ impl CanvasState {
     }
 }
 
-/// `PortRef` → cable source entity.
-fn canvas_port_from(port: &PortRef) -> Option<CanvasId> {
+/// `PortRef` → cable source entity + output port index (`midi_count` = MIDI
+/// track count; timeline ports are MIDI tracks first, then control tracks).
+fn canvas_port_from(port: &PortRef, midi_count: usize) -> Option<(CanvasId, usize)> {
     match port {
-        PortRef::Node(id) => Some(CanvasId::Node(*id)),
-        PortRef::MidiTrack(t) => Some(CanvasId::MidiTrack(*t)),
-        PortRef::AutoTrack(i) => Some(CanvasId::AutoTrack(*i)),
+        PortRef::Node(id) => Some((CanvasId::Node(*id), 0)),
+        PortRef::MidiTrack(t) => Some((CanvasId::Timeline, *t)),
+        PortRef::AutoTrack(i) => Some((CanvasId::Timeline, midi_count + i)),
         PortRef::Master => None, // The master output is not a valid audio source.
     }
 }
@@ -469,26 +543,26 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
     let drag_started = response.drag_started();
     let drag_stopped = response.drag_stopped();
 
+    // Shorthands for the port geometry (the timeline box grows with tracks).
+    let (midi_count, auto_count) = (deps.track_count, deps.auto_count);
+
     // ---- Press: hit-test and enter the matching drag ----
     if drag_started {
         let sp = pointer.unwrap_or(rect.min);
-        if let Some(source) = state.hit_out_port(rect.min, sp) {
+        if let Some((source, port)) = state.hit_out_port(rect.min, sp, midi_count, auto_count) {
             state.selection = None;
-            state.drag = Some(DragKind::Cable(CableDrag { from: source }));
-        } else if let Some(id) = state.hit_node(rect.min, sp) {
+            state.drag = Some(DragKind::Cable(CableDrag { from: source, port }));
+        } else if let Some(id) = state.hit_node(rect.min, sp, midi_count, auto_count) {
             state.selection = Some(Selection::Node(id));
-            // Clicking a node also switches the main editing track (canvas-panel linkage).
-            match id {
-                CanvasId::Node(node_id) => {
-                    if let Some(node) = doc.node_by_id(node_id) {
-                        actions.push(CanvasAction::SelectTrack(node.track()));
-                    }
+            // Clicking a node also switches the main editing track (canvas-panel linkage);
+            // the timeline / master are fixed entities with no track binding.
+            if let CanvasId::Node(node_id) = id {
+                if let Some(node) = doc.node_by_id(node_id) {
+                    actions.push(CanvasAction::SelectTrack(node.track()));
                 }
-                CanvasId::MidiTrack(t) => actions.push(CanvasAction::SelectTrack(t)),
-                _ => {}
             }
             state.drag = Some(DragKind::Node(id));
-        } else if let Some(i) = state.hit_cable(rect.min, sp, doc) {
+        } else if let Some(i) = state.hit_cable(rect.min, sp, doc, midi_count, auto_count) {
             state.selection = Some(Selection::Cable(i));
             state.drag = None;
         } else {
@@ -516,28 +590,31 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
     if drag_stopped {
         if let Some(DragKind::Cable(drag)) = state.drag.take() {
             if let Some(sp) = pointer {
-                if let Some(target) = state.hit_node(rect.min, sp) {
-                    let kind = match drag.from {
-                        CanvasId::MidiTrack(t) => {
-                            if accepts(CableKind::Midi, target, doc) {
-                                if let CanvasId::Node(to_doc) = target {
-                                    actions.push(CanvasAction::ConnectMidi { track: t, to_doc });
+                if let Some(target) = state.hit_node(rect.min, sp, midi_count, auto_count) {
+                    match drag.from {
+                        // Timeline port: MIDI tracks first, then control tracks
+                        // (mapping lives in `timeline_port_ref`).
+                        CanvasId::Timeline => {
+                            match timeline_port_ref(drag.port, midi_count) {
+                                PortRef::MidiTrack(track) => {
+                                    if accepts(CableKind::Midi, target, doc)
+                                        && let CanvasId::Node(to_doc) = target
+                                    {
+                                        actions.push(CanvasAction::ConnectMidi { track, to_doc });
+                                    }
                                 }
-                                None
-                            } else {
-                                Some(CableKind::Midi)
-                            }
-                        }
-                        CanvasId::AutoTrack(index) => {
-                            if accepts(CableKind::Automation, target, doc) && drag.from != target {
-                                if let CanvasId::Node(to_doc) = target {
-                                    // The cable is committed after the parameter is picked in
-                                    // the popup menu.
-                                    state.pending_auto =
-                                        Some((index, to_doc, sp + Vec2::new(4.0, 4.0)));
+                                PortRef::AutoTrack(index) => {
+                                    if accepts(CableKind::Automation, target, doc)
+                                        && let CanvasId::Node(to_doc) = target
+                                    {
+                                        // The cable is committed after the parameter is
+                                        // picked in the popup menu.
+                                        state.pending_auto =
+                                            Some((index, to_doc, sp + Vec2::new(4.0, 4.0)));
+                                    }
                                 }
+                                _ => {}
                             }
-                            None
                         }
                         CanvasId::Node(from_doc) => {
                             if accepts(CableKind::Audio, target, doc) && drag.from != target {
@@ -548,11 +625,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
                                 };
                                 actions.push(CanvasAction::ConnectAudio { from_doc, to });
                             }
-                            None
                         }
-                        CanvasId::Master => None,
-                    };
-                    let _ = kind; // Type mismatch: silently abandon (MVP shows no prompt).
+                        CanvasId::Master => {}
+                    }
                 }
             }
         }
@@ -560,13 +635,18 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
 
     // ---- Draw cables (beneath nodes) ----
     for (i, cable) in doc.cables.iter().enumerate() {
-        let (Some(from), Some(to)) = (canvas_port_from(&cable.from), canvas_port_to(&cable.to))
-        else {
+        let (Some((from, from_port)), Some(to)) = (
+            canvas_port_from(&cable.from, midi_count),
+            canvas_port_to(&cable.to),
+        ) else {
             continue;
         };
-        let (Some(p0), Some(p3)) = (
-            state.out_port_screen(rect.min, from),
-            state.in_port_screen(rect.min, to),
+        let (Some((_, p0)), Some(p3)) = (
+            state
+                .out_ports_screen(rect.min, from, midi_count, auto_count)
+                .into_iter()
+                .find(|(k, _)| *k == from_port),
+            state.in_port_screen(rect.min, to, midi_count, auto_count),
         ) else {
             continue;
         };
@@ -600,28 +680,42 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
 
     // ---- Cable drag preview ----
     if let Some(DragKind::Cable(drag)) = state.drag {
-        if let (Some(sp), Some(p0)) = (pointer, state.out_port_screen(rect.min, drag.from)) {
-            let kind = match drag.from {
-                CanvasId::MidiTrack(_) => CableKind::Midi,
-                CanvasId::AutoTrack(_) => CableKind::Automation,
-                _ => CableKind::Audio,
-            };
-            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
-                bezier_controls(p0, sp),
-                false,
-                Color32::TRANSPARENT,
-                egui::Stroke::new(2.0, cable_color(kind).gamma_multiply(0.7)),
-            ));
-            // Highlight the hovered target.
-            if let Some(target) = state.hit_node(rect.min, sp) {
-                if accepts(kind, target, doc) && drag.from != target {
-                    if let Some(r) = state.screen_rect(rect.min, target) {
-                        painter.rect_stroke(
-                            r,
-                            4.0,
-                            egui::Stroke::new(2.0, Color32::WHITE),
-                            egui::StrokeKind::Outside,
-                        );
+        let kind = match drag.from {
+            CanvasId::Timeline => {
+                if drag.port < midi_count {
+                    CableKind::Midi
+                } else {
+                    CableKind::Automation
+                }
+            }
+            CanvasId::Node(_) => CableKind::Audio,
+            CanvasId::Master => CableKind::Audio,
+        };
+        if let Some(sp) = pointer {
+            let p0 = state
+                .out_ports_screen(rect.min, drag.from, midi_count, auto_count)
+                .into_iter()
+                .find(|(k, _)| *k == drag.port)
+                .map(|(_, p)| p);
+            if let Some(p0) = p0 {
+                painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                    bezier_controls(p0, sp),
+                    false,
+                    Color32::TRANSPARENT,
+                    egui::Stroke::new(2.0, cable_color(kind).gamma_multiply(0.7)),
+                ));
+                // Highlight the hovered target.
+                if let Some(target) = state.hit_node(rect.min, sp, midi_count, auto_count) {
+                    if accepts(kind, target, doc) && drag.from != target {
+                        if let Some(r) = state.screen_rect(rect.min, target, midi_count, auto_count)
+                        {
+                            painter.rect_stroke(
+                                r,
+                                4.0,
+                                egui::Stroke::new(2.0, Color32::WHITE),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
                     }
                 }
             }
@@ -630,7 +724,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
 
     // ---- Draw nodes ----
     for (&id, &pos) in state.positions.iter() {
-        let size = size_of(id);
+        let size = size_of(id, midi_count, auto_count);
         let min = state.to_screen(rect.min, pos);
         let r = Rect::from_min_size(min, size * state.zoom);
         if !r.intersects(rect) {
@@ -648,36 +742,42 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
 
         let text = label_of(id, doc);
         let text_pos = match id {
-            CanvasId::MidiTrack(_) | CanvasId::AutoTrack(_) => r.center(),
+            CanvasId::Timeline => Pos2::new(r.center().x, r.top() + 12.0),
             _ => Pos2::new(r.center().x, r.top() + 18.0),
         };
         painter.text(
             text_pos,
             egui::Align2::CENTER_CENTER,
             text,
-            FontId::proportional(
-                if matches!(id, CanvasId::MidiTrack(_) | CanvasId::AutoTrack(_)) {
-                    12.0
-                } else {
-                    13.0
-                },
-            ),
+            FontId::proportional(13.0),
             Color32::from_rgb(225, 225, 228),
         );
 
-        // Input / output ports.
-        let port_color = if matches!(id, CanvasId::MidiTrack(_)) {
-            cable_color(CableKind::Midi)
-        } else if matches!(id, CanvasId::AutoTrack(_)) {
-            cable_color(CableKind::Automation)
-        } else {
-            cable_color(CableKind::Audio)
-        };
-        if let Some(p) = state.out_port_screen(rect.min, id) {
+        // Output ports (the timeline draws one per track with a small label).
+        for (port, p) in state.out_ports_screen(rect.min, id, midi_count, auto_count) {
+            let port_color = match id {
+                CanvasId::Timeline if port < midi_count => cable_color(CableKind::Midi),
+                CanvasId::Timeline => cable_color(CableKind::Automation),
+                _ => cable_color(CableKind::Audio),
+            };
             painter.circle_filled(p, PORT_RADIUS, port_color);
             painter.circle_stroke(p, PORT_RADIUS, egui::Stroke::new(1.0, Color32::BLACK));
+            if let CanvasId::Timeline = id {
+                let label = if port < midi_count {
+                    format!("T{}", port + 1)
+                } else {
+                    format!("A{}", port - midi_count + 1)
+                };
+                painter.text(
+                    Pos2::new(p.x - 10.0, p.y),
+                    egui::Align2::RIGHT_CENTER,
+                    label,
+                    FontId::proportional(10.0),
+                    Color32::from_gray(170),
+                );
+            }
         }
-        if let Some(p) = state.in_port_screen(rect.min, id) {
+        if let Some(p) = state.in_port_screen(rect.min, id, midi_count, auto_count) {
             painter.circle_filled(p, PORT_RADIUS, Color32::from_gray(90));
             painter.circle_stroke(p, PORT_RADIUS, egui::Stroke::new(1.0, Color32::BLACK));
         }
@@ -758,12 +858,42 @@ mod tests {
             );
         }
         assert!(state.positions.contains_key(&CanvasId::Master));
-        for t in 0..track_count {
-            assert!(state.positions.contains_key(&CanvasId::MidiTrack(t)));
-        }
-        for i in 0..auto_count {
-            assert!(state.positions.contains_key(&CanvasId::AutoTrack(i)));
-        }
+        // T4: one explicit Timeline entity instead of per-track source boxes.
+        assert!(state.positions.contains_key(&CanvasId::Timeline));
+        assert_eq!(
+            state
+                .positions
+                .keys()
+                .filter(|id| **id == CanvasId::Timeline)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn timeline_ports_map_to_track_refs() {
+        // 2 MIDI + 3 control tracks → 5 ports: 0..2 = MIDI, 2..5 = control.
+        assert_eq!(
+            timeline_port_ref(0, 2),
+            PortRef::MidiTrack(0),
+            "port 0 = MIDI track 0"
+        );
+        assert_eq!(
+            timeline_port_ref(1, 2),
+            PortRef::MidiTrack(1),
+            "port 1 = MIDI track 1"
+        );
+        assert_eq!(
+            timeline_port_ref(2, 2),
+            PortRef::AutoTrack(0),
+            "port 2 = control track 0"
+        );
+        assert_eq!(
+            timeline_port_ref(4, 2),
+            PortRef::AutoTrack(2),
+            "port 4 = control track 2"
+        );
+        assert_eq!(timeline_port_count(2, 3), 5);
     }
 
     #[test]
