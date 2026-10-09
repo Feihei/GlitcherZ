@@ -123,7 +123,7 @@ pub enum EngineCommand {
     /// Sequencer transport / configuration.
     Sequencer(SequencerCommand),
     /// Set a node parameter addressed by node_id (P5b: node-addressed path;
-    /// both automation routing and the canvas treat this as authoritative).
+    /// both automation routing and the patch treat this as authoritative).
     SetNodeParam {
         /// Target node ID (assigned by the compiler, exposed to the UI via
         /// structure updates).

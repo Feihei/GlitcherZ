@@ -39,8 +39,8 @@ use resoz_model::{
     NodeDoc, PortRef, Project, SynthParams, VoiceSpec,
 };
 
-pub mod canvas;
 pub mod lane;
+pub mod patch;
 pub mod piano_roll;
 pub mod timeline;
 
@@ -218,8 +218,8 @@ enum MainView {
     /// Arrangement timeline (default view: the DAW's home screen).
     #[default]
     Timeline,
-    /// Node graph canvas (full-height, dedicated view).
-    Canvas,
+    /// Node patch graph (full-height, dedicated view).
+    Patch,
     /// Synth params + mixer + clip/automation editors + keyboard.
     Synth,
 }
@@ -245,8 +245,8 @@ pub struct ResoZApp {
     roll_state: piano_roll::RollState,
     /// Automation lane cross-frame state (drag).
     lane_state: lane::LaneState,
-    /// Node canvas cross-frame state (pan/zoom/selection/drag).
-    canvas_state: canvas::CanvasState,
+    /// Node patch cross-frame state (pan/zoom/selection/drag).
+    patch_state: patch::PatchState,
     /// Active main view (tab bar).
     view: MainView,
     /// Octave base (MIDI number of C, default 60 = C4).
@@ -326,7 +326,7 @@ impl ResoZApp {
             edit_clip: None,
             roll_state: piano_roll::RollState::new(),
             lane_state: lane::LaneState::default(),
-            canvas_state: canvas::CanvasState::default(),
+            patch_state: patch::PatchState::default(),
             view: MainView::default(),
             octave_base: 60,
             held_notes: HashSet::new(),
@@ -783,16 +783,16 @@ impl ResoZApp {
         }
     }
 
-    // ---- Node canvas (P5d, spec §9 P5d) ----
+    // ---- Node patch (P5d, spec §9 P5d) ----
 
-    /// One frame of the node canvas: view + interaction-intent collection; actions are applied to
+    /// One frame of the node patch: view + interaction-intent collection; actions are applied to
     /// document + engine in one place.
-    fn graph_canvas(&mut self, ui: &mut egui::Ui) {
+    fn graph_patch(&mut self, ui: &mut egui::Ui) {
         let track_count = self.project.midi_tracks.len();
         let auto_count = self.project.control_tracks.len();
         let actions = {
             // Borrow splitting: an immutable snapshot (document / plugin param tables) goes to
-            // the canvas while the mutable canvas state is borrowed separately; actions are
+            // the patch while the mutable patch state is borrowed separately; actions are
             // applied in bulk after collection.
             let doc = &self.project.graph;
             let clap = &self.clap_voice_params;
@@ -847,10 +847,10 @@ impl ResoZApp {
                 }
                 v
             };
-            canvas::show(
+            patch::show(
                 ui,
-                &mut self.canvas_state,
-                canvas::CanvasDeps {
+                &mut self.patch_state,
+                patch::PatchDeps {
                     doc,
                     track_count,
                     auto_count,
@@ -858,15 +858,15 @@ impl ResoZApp {
                 },
             )
         };
-        self.apply_canvas_actions(actions);
+        self.apply_patch_actions(actions);
     }
 
-    /// Apply canvas actions: sync document and engine (reusing existing graph-build/connect
+    /// Apply patch actions: sync document and engine (reusing existing graph-build/connect
     /// methods).
-    fn apply_canvas_actions(&mut self, actions: Vec<canvas::CanvasAction>) {
+    fn apply_patch_actions(&mut self, actions: Vec<patch::PatchAction>) {
         for action in actions {
             match action {
-                canvas::CanvasAction::ConnectAudio { from_doc, to } => {
+                patch::PatchAction::ConnectAudio { from_doc, to } => {
                     // Document deduplication (engine-side add_cable is idempotent anyway).
                     let dup = self.project.graph.cables.iter().any(|c| {
                         c.kind == CableKind::Audio
@@ -902,7 +902,7 @@ impl ResoZApp {
                         );
                     }
                 }
-                canvas::CanvasAction::ConnectMidi { track, to_doc } => {
+                patch::PatchAction::ConnectMidi { track, to_doc } => {
                     let dup = self.project.graph.cables.iter().any(|c| {
                         c.kind == CableKind::Midi
                             && c.from == PortRef::MidiTrack(track)
@@ -922,20 +922,20 @@ impl ResoZApp {
                         }
                     }
                 }
-                canvas::CanvasAction::ConnectAuto {
+                patch::PatchAction::ConnectAuto {
                     index,
                     to_doc,
                     param,
                 } => {
                     self.set_auto_endpoint(index, to_doc, param);
                 }
-                canvas::CanvasAction::DeleteCable(i) => {
+                patch::PatchAction::DeleteCable(i) => {
                     self.delete_cable(i);
                 }
-                canvas::CanvasAction::DeleteNode(doc_id) => {
+                patch::PatchAction::DeleteNode(doc_id) => {
                     self.delete_graph_node(doc_id);
                 }
-                canvas::CanvasAction::SelectTrack(track) => {
+                patch::PatchAction::SelectTrack(track) => {
                     if track < self.project.midi_tracks.len() {
                         self.selected_track = track;
                     }
@@ -989,7 +989,7 @@ impl ResoZApp {
             return;
         };
         if !matches!(node, NodeDoc::Effect { .. }) {
-            self.set_message("Canvas: only effect nodes can be removed (instruments/channel strips are panel-managed)".to_string());
+            self.set_message("Patch: only effect nodes can be removed (instruments/channel strips are panel-managed)".to_string());
             return;
         }
         // Document bypass pairs: in-cable sources × out-cable targets (all cable types are
@@ -1694,7 +1694,7 @@ impl ResoZApp {
         egui::Panel::top("resoz_views").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.view, MainView::Timeline, "Timeline");
-                ui.selectable_value(&mut self.view, MainView::Canvas, "Canvas");
+                ui.selectable_value(&mut self.view, MainView::Patch, "Patch");
                 ui.selectable_value(&mut self.view, MainView::Synth, "Synth / Mixer");
             });
         });
@@ -2811,14 +2811,14 @@ impl eframe::App for ResoZApp {
         self.view_tabs(ui);
 
         // Central content per view. Every view owns the full central area; the
-        // tab bar decides which one is shown (fixes the old "canvas buried
+        // tab bar decides which one is shown (fixes the old "patch buried
         // mid-scroll in the synth panel" layout that had no scrollbar).
         match self.view {
             MainView::Timeline => {
                 egui::CentralPanel::default().show(ui, |ui| self.timeline_panel(ui));
             }
-            MainView::Canvas => {
-                egui::CentralPanel::default().show(ui, |ui| self.graph_canvas(ui));
+            MainView::Patch => {
+                egui::CentralPanel::default().show(ui, |ui| self.graph_patch(ui));
             }
             MainView::Synth => self.synth_panel(ui),
         }

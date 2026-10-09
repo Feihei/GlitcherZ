@@ -399,7 +399,7 @@ impl RtGraph {
     }
 
     /// Targeted parameter delivery by node_id (P5b: the public node-addressed
-    /// path; both the canvas and automation cables follow this). RT-safe.
+    /// path; both the patch and patch cables follow this). RT-safe.
     pub fn node_set_param(&mut self, node_id: u64, id: ParamId, value: f32) -> bool {
         for slot in self.slots.iter_mut().flatten() {
             if slot.node_id == node_id {
@@ -413,7 +413,7 @@ impl RtGraph {
     /// channel strip; the delay trio → delay; timbre/envelope/filter/plugin
     /// parameters → instrument. **Transitional path** — after P5b only the
     /// mixer panel's manual parameters still use it (retired when the P5d
-    /// canvas lands); timeline delivery always goes through the node_id
+    /// patch lands); timeline delivery always goes through the node_id
     /// routing table. RT-safe.
     pub fn track_set_param(&mut self, track: usize, id: ParamId, value: f32) {
         if track >= MAX_MIDI_TRACKS {
@@ -1262,7 +1262,7 @@ impl GraphCompiler {
     /// The destination is expressed as a **node_id** (P5b: replaces the
     /// transitional semantics of guessing the destination by parameter kind;
     /// the UI resolves addressing based on the node chosen in the
-    /// canvas/panel). Setting again simply redirects.
+    /// patch/panel). Setting again simply redirects.
     pub fn set_auto_route(
         &mut self,
         auto_index: usize,
