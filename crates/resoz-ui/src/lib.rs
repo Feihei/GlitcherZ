@@ -1164,6 +1164,8 @@ impl ResoZApp {
 
     /// Write to disk and update recent files / title / status message.
     fn do_save(&mut self, path: PathBuf) {
+        // Persist the patch canvas layout (view data) with the project.
+        self.project.graph.layout = self.patch_state.export_layout(&self.project.graph);
         match resoz_model::save_project(&self.project, &path) {
             Ok(()) => {
                 self.project_path = Some(path.clone());
@@ -1185,6 +1187,9 @@ impl ResoZApp {
         match resoz_model::load_project(&path) {
             Ok(project) => {
                 self.project = project;
+                // Seed the patch view from the persisted layout (session positions of
+                // the previous document are dropped).
+                self.patch_state.import_layout(&self.project.graph.layout);
                 self.project_path = Some(path.clone());
                 self.push_recent(path.clone());
                 self.selected_track = 0;

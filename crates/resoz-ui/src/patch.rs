@@ -6,16 +6,16 @@
 //! effects are returned via [`PatchAction`] and applied to the document + engine in one place
 //! by `ResoZApp::apply_patch_actions` (the patch never touches the engine/guards directly).
 //!
-//! Coordinate convention: node positions are stored in **graph space** (session memory, not
-//! persisted; P5c dual identity — the patch deals with document node_ids + fixed entities and
-//! is unaware of engine ids).
+//! Coordinate convention: node positions are stored in **graph space** and persisted with
+//! the project (`GraphDoc::layout`, exported on save / imported on load; P5c dual identity
+//! — the patch deals with document node_ids + fixed entities and is unaware of engine ids).
 
 use std::collections::HashMap;
 
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Sense, Vec2};
 
-use resoz_model::{AutoParam, CableKind, GraphDoc, NodeDoc, PortRef, VoiceSpec};
+use resoz_model::{AutoParam, CableKind, GraphDoc, LayoutDoc, NodeDoc, PortRef, VoiceSpec};
 
 /// Patch entity identity: document nodes + fixed entities (master output /
 /// the arrangement timeline).
@@ -418,6 +418,42 @@ impl PatchState {
     /// committing an [`PatchAction::AddNode`]; `ensure_positions` never overwrites it).
     pub fn place_node(&mut self, node_id: u64, at: Pos2) {
         self.positions.insert(PatchId::Node(node_id), at);
+    }
+
+    /// Snapshot the current positions into a document layout (called by the glue right
+    /// before saving). Only entities that still exist are exported; stale node entries
+    /// (already deleted from the document) are dropped.
+    pub fn export_layout(&self, doc: &GraphDoc) -> LayoutDoc {
+        let mut layout = LayoutDoc::default();
+        for (id, p) in &self.positions {
+            match *id {
+                PatchId::Node(node_id) => {
+                    if doc.node_by_id(node_id).is_some() {
+                        layout.nodes.insert(node_id, [p.x, p.y]);
+                    }
+                }
+                PatchId::Timeline => layout.timeline = Some([p.x, p.y]),
+                PatchId::Master => layout.master = Some([p.x, p.y]),
+            }
+        }
+        layout
+    }
+
+    /// Seed positions from a document layout (called after load / new project;
+    /// clears the session view state — missing entries fall back to auto-placement
+    /// on the next `ensure_positions`).
+    pub fn import_layout(&mut self, layout: &LayoutDoc) {
+        self.positions.clear();
+        for (node_id, xy) in &layout.nodes {
+            self.positions
+                .insert(PatchId::Node(*node_id), Pos2::new(xy[0], xy[1]));
+        }
+        if let Some([x, y]) = layout.timeline {
+            self.positions.insert(PatchId::Timeline, Pos2::new(x, y));
+        }
+        if let Some([x, y]) = layout.master {
+            self.positions.insert(PatchId::Master, Pos2::new(x, y));
+        }
     }
 
     /// Hit-test an output port (screen distance) → `(entity, port index)`.
@@ -1153,6 +1189,43 @@ mod tests {
         state.ensure_positions(doc, project.midi_tracks.len(), project.control_tracks.len());
 
         assert_eq!(state.positions.get(&PatchId::Node(new_id)), Some(&at));
+    }
+
+    /// Layout export/import: stale ids are dropped, existing positions roundtrip.
+    #[test]
+    fn export_layout_filters_stale_and_roundtrips() {
+        let mut project = Project::default();
+        let id = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::ChannelStrip {
+            node_id: id,
+            track: 0,
+            gain: 0.8,
+            pan: 0.0,
+            muted: false,
+        });
+        let doc = &project.graph;
+        let mut state = PatchState::default();
+        state.ensure_positions(doc, project.midi_tracks.len(), project.control_tracks.len());
+        // Stale entry: a node id that is no longer in the document.
+        state
+            .positions
+            .insert(PatchId::Node(9999), Pos2::new(1.0, 2.0));
+
+        let layout = state.export_layout(doc);
+        assert!(layout.nodes.contains_key(&id), "live node exported");
+        assert!(!layout.nodes.contains_key(&9999), "stale id dropped");
+        assert!(layout.timeline.is_some());
+        assert!(layout.master.is_some());
+
+        let mut fresh = PatchState::default();
+        fresh.import_layout(&layout);
+        for (want_id, want_p) in &state.positions {
+            if *want_id == PatchId::Node(9999) {
+                assert!(!fresh.positions.contains_key(want_id));
+            } else {
+                assert_eq!(fresh.positions.get(want_id), Some(want_p));
+            }
+        }
     }
 
     #[test]

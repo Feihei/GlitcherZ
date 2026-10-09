@@ -156,6 +156,10 @@ mod tests {
             .graph
             .cables
             .push(CableDoc::automation(0, strip, AutoParam::TrackGain));
+        // Patch canvas layout (view data; roundtrip must preserve it).
+        project.graph.layout.nodes.insert(strip, [700.0, 32.0]);
+        project.graph.layout.timeline = Some([16.0, 32.0]);
+        project.graph.layout.master = Some([930.0, 200.0]);
         project
     }
 
@@ -208,6 +212,9 @@ mod tests {
         assert!((loaded.metadata.tempo_bpm - 120.0).abs() < 1e-9);
         // Missing graph field = empty graph (whatever the document says, D13).
         assert!(loaded.graph.nodes.is_empty());
+        // Missing layout field = empty layout (UI falls back to auto-placement).
+        assert!(loaded.graph.layout.nodes.is_empty());
+        assert!(loaded.graph.layout.timeline.is_none());
     }
 
     #[test]

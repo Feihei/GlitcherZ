@@ -32,6 +32,8 @@
 //!   id 1 = master output reserved ([`MASTER_NODE_ID`]), document nodes
 //!   start from 2.
 
+use std::collections::BTreeMap;
+
 pub mod file;
 
 pub use file::{
@@ -655,6 +657,28 @@ pub struct GraphDoc {
     /// Cable table (≤ [`MAX_CABLES`]).
     #[serde(default)]
     pub cables: Vec<CableDoc>,
+    /// Patch canvas layout (pure view data, not part of the signal topology;
+    /// missing entries fall back to UI auto-placement).
+    #[serde(default)]
+    pub layout: LayoutDoc,
+}
+
+/// Patch canvas layout: entity positions in graph space, egui-free
+/// (`[f32; 2]` = (x, y) graph units).
+///
+/// Entries referencing nonexistent node ids are tolerated (the UI prunes
+/// them); [`BTreeMap`] keeps serialized output deterministic.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct LayoutDoc {
+    /// Document node positions (keyed by node_id).
+    #[serde(default)]
+    pub nodes: BTreeMap<u64, [f32; 2]>,
+    /// Timeline box position.
+    #[serde(default)]
+    pub timeline: Option<[f32; 2]>,
+    /// Master output box position.
+    #[serde(default)]
+    pub master: Option<[f32; 2]>,
 }
 
 impl GraphDoc {
@@ -911,7 +935,11 @@ pub fn default_graph_doc(track_count: usize) -> GraphDoc {
         cables.push(CableDoc::audio(strip_id, PortRef::Master));
         cables.push(CableDoc::midi(track, voice_id));
     }
-    GraphDoc { nodes, cables }
+    GraphDoc {
+        nodes,
+        cables,
+        layout: LayoutDoc::default(),
+    }
 }
 
 /// Multi-track project document (v4).
@@ -1200,6 +1228,7 @@ mod tests {
                 muted: false,
             }],
             cables: Vec::new(),
+            ..Default::default()
         };
         assert!(graph.validate(1, 0).is_err());
 
@@ -1222,6 +1251,7 @@ mod tests {
                 },
             ],
             cables: Vec::new(),
+            ..Default::default()
         };
         assert!(graph.validate(2, 0).is_err());
 
@@ -1229,6 +1259,7 @@ mod tests {
         let graph = GraphDoc {
             nodes: Vec::new(),
             cables: vec![CableDoc::audio(9, PortRef::Master)],
+            ..Default::default()
         };
         assert!(graph.validate(0, 0).is_err());
 
@@ -1242,6 +1273,7 @@ mod tests {
                 muted: false,
             }],
             cables: vec![CableDoc::midi(0, 2)],
+            ..Default::default()
         };
         assert!(graph.validate(1, 0).is_err());
 
@@ -1255,6 +1287,7 @@ mod tests {
                 muted: false,
             }],
             cables: vec![CableDoc::automation(3, 2, AutoParam::TrackGain)],
+            ..Default::default()
         };
         assert!(graph.validate(1, 1).is_err());
 
@@ -1271,6 +1304,7 @@ mod tests {
         let graph = GraphDoc {
             nodes,
             cables: Vec::new(),
+            ..Default::default()
         };
         assert!(graph.validate(1, 0).is_err());
     }
