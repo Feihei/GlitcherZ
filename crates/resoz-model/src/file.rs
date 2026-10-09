@@ -15,16 +15,18 @@ use std::path::Path;
 
 use crate::Project;
 
-/// Current version of the project file format (v4: arrangement timeline
-/// clips — `MidiClip` / `ControlClip` per track, D14-D17; the step sequencer
-/// model is retired).
+/// Current version of the project file format (v5: single-input semantics +
+/// mixer node — `NodeDoc::Mixer` absorbs the ChannelStrip, `CableDoc.in_port`
+/// binds cables to mixer channels, D14-D21).
 ///
 /// Compatibility policy (Q5 decision): **no legacy read paths** --
 /// structural changes are naturally tolerated via serde field-level defaults
 /// for missing fields; fields in old files that cannot be mapped (like the
 /// old `tracks` array) are ignored, and the loaded result is the default
-/// document.
-pub const PROJECT_VERSION: u32 = 4;
+/// document. v4 documents additionally go through [`Project::migrate`]
+/// (ChannelStrip → mixer, master multi-input → synthetic mixer) before
+/// validation.
+pub const PROJECT_VERSION: u32 = 5;
 
 fn default_version() -> u32 {
     PROJECT_VERSION
@@ -97,6 +99,8 @@ pub fn parse_project(text: &str) -> Result<Project, ModelError> {
     } else {
         ron::from_str(text)?
     };
+    let mut project = project;
+    project.migrate();
     project.validate().map_err(ModelError::InvalidGraph)?;
     Ok(project)
 }
@@ -111,8 +115,8 @@ pub fn load_project(path: &Path) -> Result<Project, ModelError> {
 mod tests {
     use super::{PROJECT_VERSION, ProjectFile, load_project, parse_project, save_project};
     use crate::{
-        AutoParam, AutoPoint, CableDoc, MASTER_NODE_ID, MidiClip, ModelError, Note, Project,
-        TICKS_PER_BAR,
+        AutoParam, AutoPoint, CableDoc, MASTER_NODE_ID, MidiClip, ModelError, NodeDoc, Note,
+        Project, TICKS_PER_BAR,
     };
 
     fn demo_project() -> Project {
@@ -137,8 +141,8 @@ mod tests {
             },
         ];
         project.midi_tracks[0].clips.push(clip);
-        // Control track 0: one bar clip, cabled to track 0's channel strip
-        // gain.
+        // Control track 0: one bar clip, cabled to the global mixer's
+        // channel 0 gain.
         project.control_tracks.push(crate::ControlTrack {
             name: String::new(),
             clips: vec![crate::ControlClip {
@@ -151,13 +155,13 @@ mod tests {
                 }],
             }],
         });
-        let strip = project.graph.channel_strip_of_track(0).unwrap().node_id();
+        let mixer = project.graph.first_mixer().unwrap().node_id();
         project
             .graph
             .cables
-            .push(CableDoc::automation(0, strip, AutoParam::TrackGain));
+            .push(CableDoc::automation(0, mixer, AutoParam::TrackGain));
         // Patch canvas layout (view data; roundtrip must preserve it).
-        project.graph.layout.nodes.insert(strip, [700.0, 32.0]);
+        project.graph.layout.nodes.insert(mixer, [700.0, 32.0]);
         project.graph.layout.timeline = Some([16.0, 32.0]);
         project.graph.layout.master = Some([930.0, 200.0]);
         project
@@ -269,5 +273,88 @@ mod tests {
             Err(ModelError::InvalidGraph(_))
         ));
         let _ = MASTER_NODE_ID;
+    }
+
+    // ---- v4 → v5 migration (P5f: single-input + mixer) ----
+
+    #[test]
+    fn v4_strip_and_master_fanin_migrate_to_mixer() {
+        // A v4-style document: per-track strip cabled to master (4× summing
+        // into master was legal under the old D4, illegal under D16).
+        let text = r#"(
+    version: 4,
+    project: (
+        midi_tracks: [(), (), (), ()],
+        graph: (
+            nodes: [
+                (type: "instrument", node_id: 2, track: 0),
+                (type: "effect", node_id: 3, track: 0),
+                (type: "channel_strip", node_id: 4, track: 0, gain: 0.6, pan: -0.5, muted: true),
+                (type: "instrument", node_id: 5, track: 1),
+                (type: "effect", node_id: 6, track: 1),
+                (type: "channel_strip", node_id: 7, track: 1),
+            ],
+            cables: [
+                (kind: audio, from: node(2), to: node(3)),
+                (kind: audio, from: node(3), to: node(4)),
+                (kind: audio, from: node(4), to: master),
+                (kind: audio, from: node(5), to: node(6)),
+                (kind: audio, from: node(6), to: node(7)),
+                (kind: audio, from: node(7), to: master),
+                (kind: midi, from: midi_track(0), to: node(2)),
+            ],
+        ),
+    ),
+)"#;
+        let project = parse_project(text).expect("v4 document should migrate and load");
+        // No strip remains; both strips became 2-channel mixers.
+        assert!(
+            !project
+                .graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n, crate::NodeDoc::ChannelStrip { .. }))
+        );
+        let mixers: Vec<_> = project.graph.mixers().collect();
+        assert_eq!(
+            mixers.len(),
+            3,
+            "two converted strips + one synthetic master mixer"
+        );
+        let NodeDoc::Mixer {
+            channels, inputs, ..
+        } = mixers[0]
+        else {
+            panic!("expected a mixer node");
+        };
+        assert_eq!(*inputs, 2);
+        assert_eq!(channels.len(), 2);
+        assert!((channels[0].gain - 0.6).abs() < 1e-6);
+        assert!((channels[0].pan + 0.5).abs() < 1e-6);
+        assert!(channels[0].muted, "strip mute should carry into channel 0");
+
+        // Master received 2 cables → a synthetic mixer now absorbs them.
+        let master_ins = project
+            .graph
+            .cables
+            .iter()
+            .filter(|c| c.kind == crate::CableKind::Audio && c.to == crate::PortRef::Master)
+            .count();
+        assert_eq!(master_ins, 1, "master must be single-input after migration");
+        let synth_mixer = project
+            .graph
+            .cables
+            .iter()
+            .find(|c| c.kind == crate::CableKind::Audio && c.to == crate::PortRef::Master)
+            .and_then(|c| match c.from {
+                crate::PortRef::Node(id) => Some(id),
+                _ => None,
+            })
+            .expect("the single master feed should come from the synthetic mixer");
+        assert!(project.graph.node_by_id(synth_mixer).unwrap().is_mixer());
+        // Re-validating the migrated document passes (idempotent shape).
+        project
+            .validate()
+            .expect("migrated document should validate");
     }
 }

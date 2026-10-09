@@ -50,8 +50,13 @@ pub const MAX_AUTO_TRACKS: usize = 16;
 /// Node graph capacity limit (D1; same value on the engine side).
 pub const MAX_NODES: usize = 64;
 
-/// Cable capacity limit (D1; same value on the engine side).
-pub const MAX_CABLES: usize = 128;
+/// Cable capacity limit (D1; same value on the engine side; P5f: 256 — a
+/// full 32-channel mixer consumes 32 cables on its own).
+pub const MAX_CABLES: usize = 256;
+
+/// Mixer node capacity limits (P5f D15/D21): channel count 2..=32.
+pub const MIN_MIXER_CHANNELS: usize = 2;
+pub const MAX_MIXER_CHANNELS: usize = 32;
 
 /// Clips per track capacity limit (D15; the engine side uses the same value).
 pub const MAX_CLIPS_PER_TRACK: usize = 8;
@@ -466,6 +471,35 @@ pub struct ControlTrack {
     pub clips: Vec<ControlClip>,
 }
 
+/// One mixer channel's console state (P5f D15/D21: a virtual channel strip —
+/// the stage-console metaphor; channel state is decoupled from cabling).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MixerChannel {
+    /// Channel gain (linear, 0..1.5).
+    #[serde(default = "default_track_gain")]
+    pub gain: f32,
+    /// Channel pan (-1..1, linear pan law).
+    #[serde(default)]
+    pub pan: f32,
+    /// Channel mute.
+    #[serde(default)]
+    pub muted: bool,
+    /// Channel solo (any solo mutes all non-soloed channels of the mixer).
+    #[serde(default)]
+    pub solo: bool,
+}
+
+impl Default for MixerChannel {
+    fn default() -> Self {
+        Self {
+            gain: default_track_gain(),
+            pan: 0.0,
+            muted: false,
+            solo: false,
+        }
+    }
+}
+
 /// Document node (spec §7 `NodeDoc`): node identity in the engine graph +
 /// parameter persistence.
 ///
@@ -507,7 +541,33 @@ pub enum NodeDoc {
         #[serde(default)]
         delay: DelayParams,
     },
-    /// Channel strip node (gain/pan/mute, sums ≤8 input edges).
+    /// Mixer node (P5f D15/D21): the explicit summing point. Absorbs the old
+    /// ChannelStrip — per-channel gain/pan/mute/solo faders + an output
+    /// pan/mute stage; channels are managed by add/remove buttons
+    /// ([`MIN_MIXER_CHANNELS`]..=[`MAX_MIXER_CHANNELS`]) and decoupled from
+    /// cabling (unplugging never loses fader settings).
+    Mixer {
+        /// Persisted node ID.
+        #[serde(default)]
+        node_id: u64,
+        /// Owning track (grouping only; a mixer usually serves many tracks).
+        #[serde(default)]
+        track: usize,
+        /// Channel (input port) count, 2..=32 (D21: add/remove buttons).
+        #[serde(default = "default_mixer_inputs")]
+        inputs: u8,
+        /// Per-channel console state; `len() == inputs as usize`.
+        #[serde(default)]
+        channels: Vec<MixerChannel>,
+        /// Output-stage pan (-1..1, linear law).
+        #[serde(default)]
+        out_pan: f32,
+        /// Output-stage mute.
+        #[serde(default)]
+        out_muted: bool,
+    },
+    /// Legacy v4 channel strip — load-only (the v4→v5 migration converts it
+    /// into a 2-channel [`NodeDoc::Mixer`]); new documents never emit it.
     ChannelStrip {
         /// Persisted node ID.
         #[serde(default)]
@@ -527,6 +587,10 @@ pub enum NodeDoc {
     },
 }
 
+fn default_mixer_inputs() -> u8 {
+    MIN_MIXER_CHANNELS as u8
+}
+
 fn default_track_gain() -> f32 {
     0.8
 }
@@ -537,6 +601,7 @@ impl NodeDoc {
         match self {
             NodeDoc::Instrument { node_id, .. }
             | NodeDoc::Effect { node_id, .. }
+            | NodeDoc::Mixer { node_id, .. }
             | NodeDoc::ChannelStrip { node_id, .. } => *node_id,
         }
     }
@@ -546,8 +611,14 @@ impl NodeDoc {
         match self {
             NodeDoc::Instrument { track, .. }
             | NodeDoc::Effect { track, .. }
+            | NodeDoc::Mixer { track, .. }
             | NodeDoc::ChannelStrip { track, .. } => *track,
         }
+    }
+
+    /// Whether this node is a mixer (the only multi-input node, D14/D15).
+    pub fn is_mixer(&self) -> bool {
+        matches!(self, NodeDoc::Mixer { .. })
     }
 }
 
@@ -599,6 +670,11 @@ pub struct CableDoc {
     /// Endpoint parameter (only used when `kind = Automation`; D7).
     #[serde(default)]
     pub param: AutoParam,
+    /// Destination channel (P5f D17): mixer input port index when `to` is a
+    /// mixer node (persisted so fader ↔ cable binding survives edits); 0 for
+    /// every other target.
+    #[serde(default)]
+    pub in_port: u8,
 }
 
 impl CableDoc {
@@ -609,6 +685,15 @@ impl CableDoc {
             from: from.into(),
             to: to.into(),
             param: AutoParam::default(),
+            in_port: 0,
+        }
+    }
+
+    /// Audio cable landing on a specific mixer channel (P5f D17).
+    pub fn audio_to_channel(from: impl Into<PortRef>, to: impl Into<PortRef>, in_port: u8) -> Self {
+        Self {
+            in_port,
+            ..CableDoc::audio(from, to)
         }
     }
 
@@ -619,6 +704,7 @@ impl CableDoc {
             from: PortRef::MidiTrack(from_track),
             to: PortRef::Node(to_node),
             param: AutoParam::default(),
+            in_port: 0,
         }
     }
 
@@ -629,6 +715,7 @@ impl CableDoc {
             from: PortRef::AutoTrack(from_track),
             to: PortRef::Node(to_node),
             param,
+            in_port: 0,
         }
     }
 }
@@ -698,6 +785,11 @@ impl GraphDoc {
         self.nodes.iter().find(|n| n.node_id() == node_id)
     }
 
+    /// Finds a node by node_id (mutable).
+    pub fn node_by_id_mut(&mut self, node_id: u64) -> Option<&mut NodeDoc> {
+        self.nodes.iter_mut().find(|n| n.node_id() == node_id)
+    }
+
     /// The instrument node of a track (first `Instrument` whose `track`
     /// matches).
     pub fn instrument_of_track(&self, track: usize) -> Option<&NodeDoc> {
@@ -727,11 +819,38 @@ impl GraphDoc {
             .find(|n| matches!(n, NodeDoc::Effect { .. }) && n.track() == track)
     }
 
-    /// The channel strip node of a track.
+    /// The channel strip node of a track (legacy v4 documents only).
     pub fn channel_strip_of_track(&self, track: usize) -> Option<&NodeDoc> {
         self.nodes
             .iter()
             .find(|n| matches!(n, NodeDoc::ChannelStrip { .. }) && n.track() == track)
+    }
+
+    /// All mixer nodes (P5f: the explicit summing points).
+    pub fn mixers(&self) -> impl Iterator<Item = &NodeDoc> {
+        self.nodes.iter().filter(|n| n.is_mixer())
+    }
+
+    /// The first mixer node (the "global mixer" of the default topology).
+    pub fn first_mixer(&self) -> Option<&NodeDoc> {
+        self.mixers().next()
+    }
+
+    /// The first free input channel of mixer `mixer_id` (D17: cables may land
+    /// on any free channel; `None` when the node is not a mixer or all
+    /// channels are taken).
+    pub fn first_free_channel(&self, mixer_id: u64) -> Option<u8> {
+        let inputs = match self.node_by_id(mixer_id)? {
+            NodeDoc::Mixer { inputs, .. } => *inputs as usize,
+            _ => return None,
+        };
+        let used: Vec<usize> = self
+            .cables
+            .iter()
+            .filter(|c| c.kind == CableKind::Audio && c.to == PortRef::Node(mixer_id))
+            .map(|c| c.in_port as usize)
+            .collect();
+        (0..inputs).find(|ch| !used.contains(ch)).map(|ch| ch as u8)
     }
 
     /// The channel strip node of a track (mutable).
@@ -809,6 +928,35 @@ impl GraphDoc {
             }
         }
         let node_ids: Vec<u64> = self.nodes.iter().map(NodeDoc::node_id).collect();
+        // Mixer channel integrity (P5f D15/D21).
+        for node in &self.nodes {
+            if let NodeDoc::Mixer {
+                node_id,
+                inputs,
+                channels,
+                ..
+            } = node
+            {
+                let inputs = *inputs as usize;
+                if !(MIN_MIXER_CHANNELS..=MAX_MIXER_CHANNELS).contains(&inputs) {
+                    return Err(format!(
+                        "mixer node {node_id} has {inputs} inputs (allowed {MIN_MIXER_CHANNELS}..={MAX_MIXER_CHANNELS})"
+                    ));
+                }
+                if channels.len() != inputs {
+                    return Err(format!(
+                        "mixer node {node_id} has {} channels but {} inputs",
+                        channels.len(),
+                        inputs
+                    ));
+                }
+            }
+        }
+        // Single-input discipline (P5f D14/D16): audio cables into one
+        // destination — only mixers accept multiple (≤ 32 with unique
+        // in_port); everything else ≤ 1, master included.
+        let mut audio_in_count: std::collections::BTreeMap<u64, usize> = Default::default();
+        let mut mixer_ports: std::collections::BTreeMap<u64, Vec<u8>> = Default::default();
         for cable in &self.cables {
             self.check_port(&cable.from, &node_ids, midi_count, auto_count)?;
             self.check_port(&cable.to, &node_ids, midi_count, auto_count)?;
@@ -817,11 +965,58 @@ impl GraphDoc {
                     if !matches!(cable.from, PortRef::Node(_)) {
                         return Err("audio cable source port must be a node".to_string());
                     }
-                    if !matches!(cable.to, PortRef::Node(_) | PortRef::Master) {
-                        return Err(
-                            "audio cable target port must be a node or the master output"
-                                .to_string(),
-                        );
+                    let dest_key = match &cable.to {
+                        PortRef::Node(id) => *id,
+                        PortRef::Master => MASTER_NODE_ID,
+                        _ => {
+                            return Err(
+                                "audio cable target port must be a node or the master output"
+                                    .to_string(),
+                            );
+                        }
+                    };
+                    if dest_key == MASTER_NODE_ID {
+                        // Master (D16): single input; in_port must be 0.
+                        if cable.in_port != 0 {
+                            return Err(
+                                "master input has no channel ports (in_port must be 0)".to_string()
+                            );
+                        }
+                    } else if let Some(NodeDoc::Mixer { inputs, .. }) = self.node_by_id(dest_key) {
+                        if cable.in_port as usize >= *inputs as usize {
+                            return Err(format!(
+                                "audio cable targets mixer {dest_key} channel {} out of range (inputs = {inputs})",
+                                cable.in_port
+                            ));
+                        }
+                        let ports = mixer_ports.entry(dest_key).or_default();
+                        if ports.contains(&cable.in_port) {
+                            return Err(format!(
+                                "mixer {dest_key} channel {} receives multiple cables",
+                                cable.in_port
+                            ));
+                        }
+                        ports.push(cable.in_port);
+                    } else {
+                        if cable.in_port != 0 {
+                            return Err(format!(
+                                "non-mixer node {dest_key} has no channel ports (in_port must be 0)"
+                            ));
+                        }
+                    }
+                    let count = audio_in_count.entry(dest_key).or_insert(0);
+                    *count += 1;
+                    let limit = if dest_key == MASTER_NODE_ID {
+                        1
+                    } else if matches!(self.node_by_id(dest_key), Some(NodeDoc::Mixer { .. })) {
+                        MAX_MIXER_CHANNELS
+                    } else {
+                        1
+                    };
+                    if *count > limit {
+                        return Err(format!(
+                            "node {dest_key} receives {count} audio cables (limit {limit}, D14/D16: only mixers sum multiple inputs)"
+                        ));
                     }
                 }
                 CableKind::Midi => {
@@ -897,20 +1092,20 @@ impl GraphDoc {
     }
 }
 
-/// Generates the default node graph document (D13 fully explicit; used by
-/// `Project::default` and new projects): per track `voice → delay → channel
-/// strip → master output` + this track's MIDI self-connection.
+/// Generates the default node graph document (P5f D18): per track
+/// `voice → delay → mixer.ch[i]` + one global mixer (`inputs =
+/// max(track_count, 2)`) → master output + this track's MIDI self-connection.
 ///
 /// node_ids are allocated consecutively starting from [`MASTER_NODE_ID`] + 1.
 pub fn default_graph_doc(track_count: usize) -> GraphDoc {
     let mut nodes = Vec::new();
     let mut cables = Vec::new();
     let mut next_id = MASTER_NODE_ID + 1;
+    let mut delay_ids = Vec::new();
     for track in 0..track_count {
         let voice_id = next_id;
         let delay_id = next_id + 1;
-        let strip_id = next_id + 2;
-        next_id += 3;
+        next_id += 2;
         nodes.push(NodeDoc::Instrument {
             node_id: voice_id,
             track,
@@ -923,18 +1118,25 @@ pub fn default_graph_doc(track_count: usize) -> GraphDoc {
             voice: VoiceSpec::Builtin,
             delay: DelayParams::default(),
         });
-        nodes.push(NodeDoc::ChannelStrip {
-            node_id: strip_id,
-            track,
-            gain: default_track_gain(),
-            pan: 0.0,
-            muted: false,
-        });
         cables.push(CableDoc::audio(voice_id, delay_id));
-        cables.push(CableDoc::audio(delay_id, strip_id));
-        cables.push(CableDoc::audio(strip_id, PortRef::Master));
         cables.push(CableDoc::midi(track, voice_id));
+        delay_ids.push(delay_id);
     }
+    // One global mixer: one channel per track (D21 minimum 2).
+    let inputs = track_count.max(MIN_MIXER_CHANNELS);
+    let mixer_id = next_id;
+    nodes.push(NodeDoc::Mixer {
+        node_id: mixer_id,
+        track: 0,
+        inputs: inputs as u8,
+        channels: vec![MixerChannel::default(); inputs],
+        out_pan: 0.0,
+        out_muted: false,
+    });
+    for (ch, delay_id) in delay_ids.iter().enumerate() {
+        cables.push(CableDoc::audio_to_channel(*delay_id, mixer_id, ch as u8));
+    }
+    cables.push(CableDoc::audio(mixer_id, PortRef::Master));
     GraphDoc {
         nodes,
         cables,
@@ -982,6 +1184,81 @@ impl Default for Project {
 pub const MAX_ARRANGEMENT_TICKS: u64 = (MAX_ARRANGEMENT_BARS as u64) * (TICKS_PER_BAR as u64);
 
 impl Project {
+    /// Migrates older document shapes to the current one (v4 → v5, P5f):
+    ///
+    /// 1. Every legacy [`NodeDoc::ChannelStrip`] becomes a 2-channel
+    ///    [`NodeDoc::Mixer`] (channel 0 carries the strip's gain/pan/mute).
+    ///    Cables keep targeting the same node_id; automation cables that
+    ///    targeted strip parameters (TrackGain/TrackPan) now target a mixer
+    ///    node the engine ignores — acceptable for a one-time migration.
+    /// 2. If the master output receives multiple audio cables (legal under
+    ///    v4's ≤8 implicit summing, illegal under D16), a synthetic mixer is
+    ///    inserted to absorb them: each old master cable is rewired onto its
+    ///    own mixer channel.
+    ///
+    /// Idempotent: migrated documents pass through unchanged. Call before
+    /// [`Project::validate`].
+    pub fn migrate(&mut self) {
+        // 1) ChannelStrip → Mixer.
+        for node in &mut self.graph.nodes {
+            if let NodeDoc::ChannelStrip {
+                node_id,
+                track,
+                gain,
+                pan,
+                muted,
+            } = node
+            {
+                let converted = NodeDoc::Mixer {
+                    node_id: *node_id,
+                    track: *track,
+                    inputs: MIN_MIXER_CHANNELS as u8,
+                    channels: vec![
+                        MixerChannel {
+                            gain: *gain,
+                            pan: *pan,
+                            muted: *muted,
+                            solo: false,
+                        },
+                        MixerChannel::default(),
+                    ],
+                    out_pan: 0.0,
+                    out_muted: false,
+                };
+                *node = converted;
+            }
+        }
+
+        // 2) Master multi-input → synthetic mixer.
+        let master_ins: Vec<usize> = self
+            .graph
+            .cables
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.kind == CableKind::Audio && c.to == PortRef::Master)
+            .map(|(i, _)| i)
+            .collect();
+        if master_ins.len() > 1 {
+            let inputs = master_ins.len().min(MAX_MIXER_CHANNELS);
+            let mixer_id = self.graph.next_node_id();
+            self.graph.nodes.push(NodeDoc::Mixer {
+                node_id: mixer_id,
+                track: 0,
+                inputs: inputs as u8,
+                channels: vec![MixerChannel::default(); inputs],
+                out_pan: 0.0,
+                out_muted: false,
+            });
+            for (ch, cable_idx) in master_ins.iter().enumerate().take(inputs) {
+                self.graph.cables[*cable_idx].to = PortRef::Node(mixer_id);
+                self.graph.cables[*cable_idx].in_port = ch as u8;
+            }
+            self.graph
+                .cables
+                .push(CableDoc::audio(mixer_id, PortRef::Master));
+        }
+    }
+
     /// Project-level validation: track counts, clip capacities/placement and
     /// graph structure (the file layer is the last line of defense; report
     /// errors instead of truncating).
@@ -1142,28 +1419,37 @@ mod tests {
 
     #[test]
     fn default_project_graph_is_fully_explicit() {
-        // D13: the default document fully describes the default topology.
+        // D13/D18: the default document fully describes the default topology
+        // (per-track voice → delay + one global mixer → master).
         let project = Project::default();
         assert_eq!(project.midi_tracks.len(), DEFAULT_MIDI_TRACKS);
         let graph = &project.graph;
-        assert_eq!(graph.nodes.len(), DEFAULT_MIDI_TRACKS * 3);
-        // 4 cables per track: voice→delay→strip→master + midi self-connection.
-        assert_eq!(graph.cables.len(), DEFAULT_MIDI_TRACKS * 4);
+        assert_eq!(
+            graph.nodes.len(),
+            DEFAULT_MIDI_TRACKS * 2 + 1,
+            "two nodes per track + the global mixer"
+        );
+        // Cables: voice→delay + midi self-connection per track, then
+        // delay→mixer.ch per track + mixer→master.
+        assert_eq!(graph.cables.len(), DEFAULT_MIDI_TRACKS * 3 + 1);
         for t in 0..DEFAULT_MIDI_TRACKS {
             let voice = graph.instrument_of_track(t).expect("voice should exist");
             let delay = graph.builtin_delay_of_track(t).expect("delay should exist");
-            let strip = graph
-                .channel_strip_of_track(t)
-                .expect("channel strip should exist");
-            assert_eq!(voice.node_id(), (MASTER_NODE_ID + 1) + (t as u64) * 3);
-            assert_eq!(strip.node_id(), (MASTER_NODE_ID + 3) + (t as u64) * 3);
-            let _ = delay;
+            assert_eq!(voice.node_id(), (MASTER_NODE_ID + 1) + (t as u64) * 2);
+            let landing = graph
+                .cables
+                .iter()
+                .find(|c| c.from == PortRef::Node(delay.node_id()))
+                .expect("delay should feed the mixer");
+            assert_eq!(landing.in_port, t as u8, "track t lands on channel t");
         }
+        let mixer = graph.first_mixer().expect("global mixer should exist");
+        assert!(matches!(mixer, NodeDoc::Mixer { inputs: 4, .. }));
         assert!(project.validate().is_ok());
     }
 
     #[test]
-    fn project_ron_roundtrip_v4() {
+    fn project_ron_roundtrip_v5() {
         let mut project = Project::default();
         project.metadata.name = "demo".to_string();
         project.midi_tracks[0].name = "Bass".to_string();
@@ -1188,12 +1474,12 @@ mod tests {
                 }],
             }],
         });
-        // Control track 0 → track 0 channel strip gain.
-        let strip = project.graph.channel_strip_of_track(0).unwrap().node_id();
+        // Control track 0 → global mixer (channel 0 gain).
+        let mixer = project.graph.first_mixer().unwrap().node_id();
         project
             .graph
             .cables
-            .push(CableDoc::automation(0, strip, AutoParam::TrackGain));
+            .push(CableDoc::automation(0, mixer, AutoParam::TrackGain));
         let text = ron::to_string(&project).expect("serialization failed");
         let back: Project = ron::from_str(&text).expect("deserialization failed");
         assert_eq!(project, back);
@@ -1312,10 +1598,11 @@ mod tests {
     #[test]
     fn next_node_id_and_track_lookups() {
         let graph = default_graph_doc(2);
-        assert_eq!(graph.next_node_id(), (MASTER_NODE_ID + 1) + 2 * 3);
+        // ids: track0 voice=2 delay=3, track1 voice=4 delay=5, mixer=6.
+        assert_eq!(graph.next_node_id(), 7);
         assert_eq!(
             graph.instrument_of_track(1).map(NodeDoc::node_id),
-            Some(MASTER_NODE_ID + 4)
+            Some(MASTER_NODE_ID + 3)
         );
         assert!(graph.instrument_of_track(2).is_none());
         assert_eq!(graph.auto_endpoint(0), None);

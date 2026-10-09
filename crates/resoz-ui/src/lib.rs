@@ -31,12 +31,14 @@ use resoz_engine::AudioEngine;
 use resoz_engine::convert;
 use resoz_engine::realtime::{
     ChannelStripProcessor, DelayProcessor, EngineCommand, MAX_AUTO_POINTS, MAX_CLIP_NOTES,
-    MAX_TRACK_CLIPS, NoteEvent, ParamId, Processor, RtAutoPoint, RtAutomation, RtControlClip,
-    RtMidiClip, RtNote, SequencerCommand, SynthProcessor,
+    MAX_TRACK_CLIPS, MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent,
+    ParamId, Processor, RtAutoPoint, RtAutomation, RtControlClip, RtMidiClip, RtNote,
+    SequencerCommand, SynthProcessor,
 };
 use resoz_model::{
-    AutoParam, CableKind, ControlTrack, DelayParams, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS, MAX_NODES,
-    MidiClip, NodeDoc, PortRef, Project, SynthParams, VoiceSpec,
+    AutoParam, CableKind, ControlTrack, DelayParams, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS,
+    MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, MidiClip, NodeDoc, PortRef, Project,
+    SynthParams, VoiceSpec,
 };
 
 pub mod lane;
@@ -416,7 +418,9 @@ impl ResoZApp {
                         log::warn!("Audio cable endpoint node missing, skipping: {cable:?}");
                         continue;
                     };
-                    if !self.engine.connect_nodes(from, to) {
+                    // D17: the cable binds to the target's input port (the
+                    // mixer channel; 0 for single-input nodes / master).
+                    if !self.engine.connect_nodes(from, to, cable.in_port) {
                         log::warn!(
                             "Audio cable ({from} → {to}) dispatch failed (cycle / limit exceeded / queue full)"
                         );
@@ -573,12 +577,41 @@ impl ResoZApp {
                         }
                     }
                 },
+                NodeDoc::Mixer {
+                    channels,
+                    out_pan,
+                    out_muted,
+                    ..
+                } => {
+                    // P5f D15/D21: engine mixer from the document's console state.
+                    let eng: Vec<EngineMixerChannel> = channels
+                        .iter()
+                        .map(|c| EngineMixerChannel {
+                            gain: c.gain,
+                            pan: c.pan,
+                            muted: c.muted,
+                            solo: c.solo,
+                        })
+                        .collect();
+                    (
+                        Box::new(MixerProcessor::with_channels(&eng, *out_pan, *out_muted)),
+                        None,
+                        String::new(),
+                    )
+                }
                 NodeDoc::ChannelStrip { .. } => {
                     (Box::new(ChannelStripProcessor::new()), None, String::new())
                 }
             };
         let engine_id = self.engine.fresh_node_id();
-        if self.engine.add_node(engine_id, processor) {
+        // D15: the mixer is the only multi-input node; the engine compiler
+        // uses the kind for fan-in validation + cable→channel binding.
+        let kind = if node.is_mixer() {
+            NodeKind::Mixer
+        } else {
+            NodeKind::Plain
+        };
+        if self.engine.add_node(engine_id, kind, processor) {
             self.node_map.insert(doc_id, engine_id);
             if let Some(guard) = guard {
                 self.voice_guards.push(PluginGuardEntry {
@@ -614,16 +647,10 @@ impl ResoZApp {
                 .builtin_delay_of_track(track)
                 .map(NodeDoc::node_id),
         );
-        let channel = resolve(
-            self.project
-                .graph
-                .channel_strip_of_track(track)
-                .map(NodeDoc::node_id),
-        );
-        if !self
-            .engine
-            .register_track_chain(track, voice, delay, channel)
-        {
+        // P5f: no per-track strip anymore — the engine's per-track "channel"
+        // slot is the metering point (the chain end = the built-in delay);
+        // fader state lives on mixer channels addressed via node params.
+        if !self.engine.register_track_chain(track, voice, delay, delay) {
             log::warn!(
                 "Track {} addressing table assembly failed (missing node or queue full)",
                 track + 1
@@ -665,17 +692,18 @@ impl ResoZApp {
             self.push_track_params(track);
             self.send_track_clips(track);
         }
+        self.push_mixer_params();
         for index in 0..self.project.control_tracks.len() {
             self.send_control_clips(index);
         }
     }
 
-    /// Push all parameters of one track (timbre / delay / mixing; track addressing tables already
-    /// assembled).
+    /// Push all parameters of one track (timbre / delay; track addressing tables already
+    /// assembled). Fader state no longer rides the track path — it lives on
+    /// mixer channels (pushed by [`Self::push_mixer_params`]).
     fn push_track_params(&mut self, track: usize) {
         let synth = self.synth_of_track(track).unwrap_or_default();
         let delay = self.delay_of_track(track).unwrap_or_default();
-        let (muted, gain, pan) = self.track_strip_state(track);
         let params = [
             (ParamId::FilterCutoff, synth.cutoff_hz),
             (ParamId::FilterResonance, synth.resonance),
@@ -687,13 +715,63 @@ impl ResoZApp {
             (ParamId::DelayTime, delay.time_s),
             (ParamId::DelayFeedback, delay.feedback),
             (ParamId::DelayMix, delay.mix),
-            (ParamId::TrackGain, gain),
-            (ParamId::TrackPan, pan),
-            (ParamId::TrackMute, if muted { 1.0 } else { 0.0 }),
         ];
         for (id, value) in params {
             self.engine
                 .send(EngineCommand::SetTrackParam { track, id, value });
+        }
+    }
+
+    /// Push every mixer node's console state to the engine (P5f D15/D20:
+    /// fader moves ride the node param path, `ParamId::MixerGain(ch)` etc.).
+    fn push_mixer_params(&mut self) {
+        let mixers: Vec<NodeDoc> = self
+            .project
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.is_mixer())
+            .cloned()
+            .collect();
+        for mixer in mixers {
+            let NodeDoc::Mixer {
+                node_id,
+                channels,
+                out_pan,
+                out_muted,
+                ..
+            } = mixer
+            else {
+                continue;
+            };
+            let Some(&engine_id) = self.node_map.get(&node_id) else {
+                continue;
+            };
+            for (i, ch) in channels.iter().enumerate() {
+                let i = i as u8;
+                for (id, value) in [
+                    (ParamId::MixerGain(i), ch.gain),
+                    (ParamId::MixerPan(i), ch.pan),
+                    (ParamId::MixerMute(i), if ch.muted { 1.0 } else { 0.0 }),
+                    (ParamId::MixerSolo(i), if ch.solo { 1.0 } else { 0.0 }),
+                ] {
+                    self.engine.send(EngineCommand::SetNodeParam {
+                        node_id: engine_id,
+                        id,
+                        value,
+                    });
+                }
+            }
+            for (id, value) in [
+                (ParamId::MixerOutPan, out_pan),
+                (ParamId::MixerOutMute, if out_muted { 1.0 } else { 0.0 }),
+            ] {
+                self.engine.send(EngineCommand::SetNodeParam {
+                    node_id: engine_id,
+                    id,
+                    value,
+                });
+            }
         }
     }
 
@@ -732,14 +810,51 @@ impl ResoZApp {
         }
     }
 
-    /// Channel strip state of a track: (muted, gain, pan); defaults when there is no channel
-    /// strip node.
-    fn track_strip_state(&self, track: usize) -> (bool, f32, f32) {
-        match self.project.graph.channel_strip_of_track(track) {
-            Some(NodeDoc::ChannelStrip {
-                gain, pan, muted, ..
-            }) => (*muted, *gain, *pan),
-            _ => (false, 0.8, 0.0),
+    /// Track → mixer channel mapping (P5f D17/D18): walk the track's audio
+    /// chain from the built-in delay downstream until a cable lands on a
+    /// mixer node; returns `(mixer doc node_id, channel index)`. `None` when
+    /// the track is not routed into any mixer.
+    fn track_channel_target(&self, track: usize) -> Option<(u64, u8)> {
+        let mut cur = self
+            .project
+            .graph
+            .builtin_delay_of_track(track)
+            .map(NodeDoc::node_id)?;
+        for _ in 0..MAX_NODES {
+            let cable = self
+                .project
+                .graph
+                .cables
+                .iter()
+                .find(|c| c.kind == CableKind::Audio && c.from == PortRef::Node(cur))?;
+            let PortRef::Node(next) = cable.to else {
+                return None; // routed straight to master / timeline — no mixer
+            };
+            if self
+                .project
+                .graph
+                .node_by_id(next)
+                .is_some_and(|n| n.is_mixer())
+            {
+                return Some((next, cable.in_port));
+            }
+            cur = next;
+        }
+        None
+    }
+
+    /// State of the mixer channel a track feeds: `(muted, gain, pan)`;
+    /// defaults when the track is not routed into a mixer.
+    fn track_mixer_channel_state(&self, track: usize) -> (bool, f32, f32) {
+        match self.track_channel_target(track) {
+            Some((mixer_doc, ch)) => match self.project.graph.node_by_id(mixer_doc) {
+                Some(NodeDoc::Mixer { channels, .. }) => channels
+                    .get(ch as usize)
+                    .map(|c| (c.muted, c.gain, c.pan))
+                    .unwrap_or((false, 0.8, 0.0)),
+                _ => (false, 0.8, 0.0),
+            },
+            None => (false, 0.8, 0.0),
         }
     }
 
@@ -810,47 +925,40 @@ impl ResoZApp {
                     return v;
                 };
                 let track = node.track();
-                match node {
-                    NodeDoc::ChannelStrip { .. } => {
-                        v.push(("Volume".to_string(), AutoParam::TrackGain));
-                        v.push(("Pan".to_string(), AutoParam::TrackPan));
-                    }
-                    NodeDoc::Instrument { .. } => {
-                        v.push(("Cutoff".to_string(), AutoParam::FilterCutoff));
-                        if let Some(params) = clap.get(&track) {
-                            for p in params {
-                                let label = if p.name.is_empty() {
-                                    format!("Param {}", p.id)
-                                } else {
-                                    p.name.clone()
-                                };
-                                v.push((
-                                    format!("CLAP {label}"),
-                                    AutoParam::PluginParam {
-                                        param_id: p.id,
-                                        name: label,
-                                    },
-                                ));
-                            }
-                        }
-                        if let Some(params) = vst3.get(&track) {
-                            for p in params {
-                                let label = if p.title.is_empty() {
-                                    format!("Param {}", p.id)
-                                } else {
-                                    p.title.clone()
-                                };
-                                v.push((
-                                    format!("VST3 {label}"),
-                                    AutoParam::PluginParam {
-                                        param_id: p.id,
-                                        name: label,
-                                    },
-                                ));
-                            }
+                if let NodeDoc::Instrument { .. } = node {
+                    v.push(("Cutoff".to_string(), AutoParam::FilterCutoff));
+                    if let Some(params) = clap.get(&track) {
+                        for p in params {
+                            let label = if p.name.is_empty() {
+                                format!("Param {}", p.id)
+                            } else {
+                                p.name.clone()
+                            };
+                            v.push((
+                                format!("CLAP {label}"),
+                                AutoParam::PluginParam {
+                                    param_id: p.id,
+                                    name: label,
+                                },
+                            ));
                         }
                     }
-                    _ => {}
+                    if let Some(params) = vst3.get(&track) {
+                        for p in params {
+                            let label = if p.title.is_empty() {
+                                format!("Param {}", p.id)
+                            } else {
+                                p.title.clone()
+                            };
+                            v.push((
+                                format!("VST3 {label}"),
+                                AutoParam::PluginParam {
+                                    param_id: p.id,
+                                    name: label,
+                                },
+                            ));
+                        }
+                    }
                 }
                 v
             };
@@ -879,8 +987,12 @@ impl ResoZApp {
                 patch::PatchAction::InsertNode { cable, kind, at } => {
                     self.insert_node_in_cable(cable, kind, at);
                 }
-                patch::PatchAction::ConnectAudio { from_doc, to } => {
-                    self.connect_audio(from_doc, to);
+                patch::PatchAction::ConnectAudio {
+                    from_doc,
+                    to,
+                    in_port,
+                } => {
+                    self.connect_audio(from_doc, to, in_port);
                 }
                 patch::PatchAction::ConnectMidi { track, to_doc } => {
                     let dup = self.project.graph.cables.iter().any(|c| {
@@ -957,12 +1069,13 @@ impl ResoZApp {
                 voice: VoiceSpec::Builtin,
                 delay: DelayParams::default(),
             },
-            patch::AddNodeKind::ChannelStrip => NodeDoc::ChannelStrip {
+            patch::AddNodeKind::Mixer => NodeDoc::Mixer {
                 node_id,
                 track,
-                gain: 0.8,
-                pan: 0.0,
-                muted: false,
+                inputs: MIN_MIXER_CHANNELS as u8,
+                channels: vec![Default::default(); MIN_MIXER_CHANNELS],
+                out_pan: 0.0,
+                out_muted: false,
             },
         };
         let sample_rate = self.engine.info().sample_rate;
@@ -994,13 +1107,8 @@ impl ResoZApp {
             self.set_message("Insert failed: only audio cables accept inserted nodes".to_string());
             return;
         }
-        if !matches!(
-            kind,
-            patch::AddNodeKind::Effect | patch::AddNodeKind::ChannelStrip
-        ) {
-            self.set_message(
-                "Insert failed: only effects / channel strips can be inserted".to_string(),
-            );
+        if !matches!(kind, patch::AddNodeKind::Effect | patch::AddNodeKind::Mixer) {
+            self.set_message("Insert failed: only effects / mixers can be inserted".to_string());
             return;
         }
         let PortRef::Node(from_doc) = cable.from else {
@@ -1011,22 +1119,32 @@ impl ResoZApp {
             return;
         };
         self.delete_cable(cable_index);
-        self.connect_audio(from_doc, PortRef::Node(new_id));
-        self.connect_audio(new_id, cable.to.clone());
+        self.connect_audio(from_doc, PortRef::Node(new_id), 0);
+        // Preserve the original channel binding when the downstream target is
+        // a mixer (D17).
+        self.connect_audio(new_id, cable.to.clone(), cable.in_port);
     }
 
     /// Connect an audio cable (document deduplication + engine edge; both stay in sync).
-    fn connect_audio(&mut self, from_doc: u64, to: PortRef) {
+    /// `in_port` binds the cable to the target's input port (the mixer channel
+    /// for mixers, D17; 0 for single-input nodes / master).
+    fn connect_audio(&mut self, from_doc: u64, to: PortRef, in_port: u8) {
         // Document deduplication (engine-side add_cable is idempotent anyway).
-        let dup =
-            self.project.graph.cables.iter().any(|c| {
-                c.kind == CableKind::Audio && c.from == PortRef::Node(from_doc) && c.to == to
-            });
+        let dup = self.project.graph.cables.iter().any(|c| {
+            c.kind == CableKind::Audio
+                && c.from == PortRef::Node(from_doc)
+                && c.to == to
+                && c.in_port == in_port
+        });
         if !dup {
             self.project
                 .graph
                 .cables
-                .push(resoz_model::CableDoc::audio(from_doc, to.clone()));
+                .push(resoz_model::CableDoc::audio_to_channel(
+                    from_doc,
+                    to.clone(),
+                    in_port,
+                ));
         }
         let Some(&from_engine) = self.node_map.get(&from_doc) else {
             self.set_message("Connect failed: source node not in engine graph".to_string());
@@ -1041,7 +1159,7 @@ impl ResoZApp {
             self.set_message("Connect failed: target node not in engine graph".to_string());
             return;
         };
-        if !self.engine.connect_nodes(from_engine, to_engine) {
+        if !self.engine.connect_nodes(from_engine, to_engine, in_port) {
             self.set_message("Connect failed: cycle / fan-in limit / queue full".to_string());
         }
     }
@@ -1083,27 +1201,40 @@ impl ResoZApp {
         self.project.graph.cables.remove(i);
     }
 
-    /// Delete a document node (any instrument / effect / channel strip; the master output is
-    /// not a document node and is never deletable) — engine `remove_node` has built-in bypass
-    /// semantics (in-edge sources × out-edge targets become direct connections); the document
-    /// mirrors the same rewiring. MIDI / automation cables touching the node are simply
-    /// removed (a deleted instrument loses its MIDI feed; a deleted parameter target loses
-    /// its automation cable). The owning track's addressing table is refreshed afterwards.
+    /// Delete a document node (any instrument / effect / mixer; the master output is
+    /// not a document node and is never deletable) — engine `remove_node` bypasses
+    /// single-input nodes (in-edge sources × out-edge targets become direct
+    /// connections) and **drops the cables of multi-input nodes** (D19: only
+    /// nodes with ≤1 audio in-edge get bypass rewiring; deleting a mixer just
+    /// disconnects its feeders). The document mirrors the same semantics. MIDI /
+    /// automation cables touching the node are simply removed (a deleted
+    /// instrument loses its MIDI feed; a deleted parameter target loses its
+    /// automation cable). The owning track's addressing table is refreshed afterwards.
     fn delete_graph_node(&mut self, doc_id: u64) {
         let Some(node) = self.project.graph.node_by_id(doc_id) else {
             return;
         };
         let track = node.track();
-        // Document bypass pairs: in-cable sources × out-cable targets (all cable types are
-        // removed; audio direct-connection pairs are rebuilt per engine remove_node semantics).
-        let ins: Vec<PortRef> = self
+        let audio_in_count = self
             .project
             .graph
             .cables
             .iter()
-            .filter(|c| c.to == PortRef::Node(doc_id))
-            .map(|c| c.from.clone())
-            .collect();
+            .filter(|c| c.kind == CableKind::Audio && c.to == PortRef::Node(doc_id))
+            .count();
+        // Document bypass pairs: in-cable sources × out-cable targets (audio
+        // only; skipped for multi-input nodes — D19 mixer/master deletion).
+        let ins: Vec<PortRef> = if audio_in_count <= 1 {
+            self.project
+                .graph
+                .cables
+                .iter()
+                .filter(|c| c.kind == CableKind::Audio && c.to == PortRef::Node(doc_id))
+                .map(|c| c.from.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let outs: Vec<PortRef> = self
             .project
             .graph
@@ -1112,6 +1243,16 @@ impl ResoZApp {
             .filter(|c| c.from == PortRef::Node(doc_id))
             .map(|c| c.to.clone())
             .collect();
+        // The port the deleted node occupied on its downstream target (the
+        // mixer channel to preserve in bypass pairs, D17).
+        let out_port = self
+            .project
+            .graph
+            .cables
+            .iter()
+            .find(|c| c.kind == CableKind::Audio && c.from == PortRef::Node(doc_id))
+            .map(|c| c.in_port)
+            .unwrap_or(0);
         let Some(&engine_id) = self.node_map.get(&doc_id) else {
             return;
         };
@@ -1129,10 +1270,28 @@ impl ResoZApp {
                 continue; // Audio sources can only be nodes.
             }
             for to in &outs {
+                // Preserve the mixer channel binding when the bypass target is
+                // a mixer (D17); non-mixer targets must carry in_port 0.
+                let port = match to {
+                    PortRef::Node(to_id)
+                        if self
+                            .project
+                            .graph
+                            .node_by_id(*to_id)
+                            .is_some_and(|n| n.is_mixer()) =>
+                    {
+                        out_port
+                    }
+                    _ => 0,
+                };
                 self.project
                     .graph
                     .cables
-                    .push(resoz_model::CableDoc::audio(from.clone(), to.clone()));
+                    .push(resoz_model::CableDoc::audio_to_channel(
+                        from.clone(),
+                        to.clone(),
+                        port,
+                    ));
             }
         }
         self.node_map.remove(&doc_id);
@@ -1404,8 +1563,9 @@ impl ResoZApp {
         }
     }
 
-    /// Insert an external effect node at the end of the track chain (before the channel strip):
-    /// engine `insert_node_between` + document sync (node + bypass cable rewiring).
+    /// Insert an external effect node at the end of the track chain (before the
+    /// mixer channel / master landing): engine `insert_node_between` + document
+    /// sync (node + splice rewiring preserving the downstream in_port, D17).
     fn insert_effect_common(
         &mut self,
         track: usize,
@@ -1414,47 +1574,64 @@ impl ResoZApp {
         node: Box<dyn Processor>,
         guard: PluginGuard,
     ) {
-        let Some(strip_doc) = self
+        let Some(delay_doc) = self
             .project
             .graph
-            .channel_strip_of_track(track)
+            .builtin_delay_of_track(track)
             .map(NodeDoc::node_id)
         else {
             log::error!(
-                "Track {} has no channel strip node; effect insertion failed",
+                "Track {} has no built-in delay node; effect insertion failed",
                 track + 1
             );
             return;
         };
-        let Some(strip_engine) = self.engine_id(strip_doc) else {
-            return;
-        };
-        // Find the audio cable source currently connected directly to the channel strip
-        // (document topology).
-        let Some(in_from_doc) = self.project.graph.cables.iter().find_map(|c| {
-            if c.kind == CableKind::Audio && c.to == PortRef::Node(strip_doc) {
-                match c.from {
-                    PortRef::Node(id) => Some(id),
-                    _ => None,
+        // Walk the audio chain from the delay to its LAST node (P5f: the chain
+        // ends at the mixer channel / master landing, not a channel strip).
+        let mut last_doc = delay_doc;
+        let downstream = loop {
+            let Some(cable) = self
+                .project
+                .graph
+                .cables
+                .iter()
+                .find(|c| c.kind == CableKind::Audio && c.from == PortRef::Node(last_doc))
+                .cloned()
+            else {
+                log::error!(
+                    "Track {} chain is dangling after node {last_doc}; effect insertion failed",
+                    track + 1
+                );
+                return;
+            };
+            match &cable.to {
+                PortRef::Node(next_id)
+                    if !self
+                        .project
+                        .graph
+                        .node_by_id(*next_id)
+                        .is_some_and(|n| n.is_mixer()) =>
+                {
+                    last_doc = *next_id;
                 }
-            } else {
-                None
+                _ => break cable, // mixer / master landing: splice here
             }
-        }) else {
-            log::error!(
-                "Track {} channel strip has no input cable; effect insertion failed",
-                track + 1
-            );
+        };
+        let PortRef::Node(downstream_doc) = downstream.to else {
+            log::error!("Track {} chain landing is not a node", track + 1);
             return;
         };
-        let Some(in_from_engine) = self.engine_id(in_from_doc) else {
+        let Some(last_engine) = self.engine_id(last_doc) else {
+            return;
+        };
+        let Some(downstream_engine) = self.engine_id(downstream_doc) else {
             return;
         };
         let new_doc_id = self.project.graph.next_node_id();
         let new_engine_id = self.engine.fresh_node_id();
         if !self
             .engine
-            .insert_node_between(new_engine_id, in_from_engine, strip_engine, node)
+            .insert_node_between(new_engine_id, last_engine, downstream_engine, node)
         {
             log::error!(
                 "Structure queue full: failed to insert effect on track {}",
@@ -1462,7 +1639,8 @@ impl ResoZApp {
             );
             return;
         }
-        // Document sync: node + bypass cable rewiring.
+        // Document sync: node + splice rewiring (the downstream cable keeps its
+        // in_port — the mixer channel binding, D17).
         self.project.graph.nodes.push(NodeDoc::Effect {
             node_id: new_doc_id,
             track,
@@ -1471,17 +1649,22 @@ impl ResoZApp {
         });
         self.project.graph.cables.retain(|c| {
             !(c.kind == CableKind::Audio
-                && c.from == PortRef::Node(in_from_doc)
-                && c.to == PortRef::Node(strip_doc))
+                && c.from == PortRef::Node(last_doc)
+                && c.to == PortRef::Node(downstream_doc)
+                && c.in_port == downstream.in_port)
         });
         self.project
             .graph
             .cables
-            .push(resoz_model::CableDoc::audio(in_from_doc, new_doc_id));
+            .push(resoz_model::CableDoc::audio(last_doc, new_doc_id));
         self.project
             .graph
             .cables
-            .push(resoz_model::CableDoc::audio(new_doc_id, strip_doc));
+            .push(resoz_model::CableDoc::audio_to_channel(
+                new_doc_id,
+                PortRef::Node(downstream_doc),
+                downstream.in_port,
+            ));
         self.node_map.insert(new_doc_id, new_engine_id);
         self.voice_guards.push(PluginGuardEntry {
             node_id: new_engine_id,
@@ -1815,7 +1998,7 @@ impl ResoZApp {
             return;
         }
         let muted: Vec<bool> = (0..self.project.midi_tracks.len())
-            .map(|i| self.track_strip_state(i).0)
+            .map(|i| self.track_mixer_channel_state(i).0)
             .collect();
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
@@ -1873,12 +2056,22 @@ impl ResoZApp {
                 self.edit_clip = None;
             }
             timeline::TimelineAction::ToggleMute(track, muted) => {
-                if let Some(NodeDoc::ChannelStrip { muted: m, .. }) =
-                    self.project.graph.channel_strip_of_track_mut(track)
-                {
-                    *m = muted;
+                // P5f: mute lives on the track's mixer channel (D15), not a strip.
+                if let Some((mixer_doc, ch)) = self.track_channel_target(track) {
+                    if let Some(NodeDoc::Mixer { channels, .. }) =
+                        self.project.graph.node_by_id_mut(mixer_doc)
+                        && let Some(c) = channels.get_mut(ch as usize)
+                    {
+                        c.muted = muted;
+                    }
+                    if let Some(&engine_id) = self.node_map.get(&mixer_doc) {
+                        self.engine.send(EngineCommand::SetNodeParam {
+                            node_id: engine_id,
+                            id: ParamId::MixerMute(ch),
+                            value: if muted { 1.0 } else { 0.0 },
+                        });
+                    }
                 }
-                self.send_track_param(track, ParamId::TrackMute, if muted { 1.0 } else { 0.0 });
             }
             timeline::TimelineAction::OpenMidiEditor { track, clip } => {
                 self.selected_track = track;
@@ -2171,7 +2364,7 @@ impl ResoZApp {
                         });
                 }
             }
-            ui.weak("Node graph: instrument -> delay -> channel strip -> master (doc-driven, changes go live)");
+            ui.weak("Node graph: instrument -> delay -> mixer channels -> master (doc-driven, changes go live)");
             ui.add_space(8.0);
 
             // Filter / envelope (bound to the selected track's document node fields).
@@ -2330,74 +2523,141 @@ impl ResoZApp {
             .send(EngineCommand::SetTrackParam { track, id, value });
     }
 
-    /// Mixer: per-track selection / mute / level meter / fader / pan (Vec traversal; data source
-    /// = document channel strip nodes).
+    /// Mixer console (P5f D15/D21, stage-console metaphor): one column per
+    /// mixer channel — solo / mute / level meter / fader / pan — plus channel
+    /// add/remove buttons (2..=32, D21) and the output pan/mute stage. The
+    /// channel a track feeds is labeled with the track name; data source =
+    /// the first (global) mixer document node.
     fn mixer_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
-        let can_add = self.project.midi_tracks.len() < MAX_MIDI_TRACKS;
-        let can_remove = !self.project.midi_tracks.is_empty();
-        let mut add_clicked = false;
-        let mut remove_clicked = false;
+        let can_add_track = self.project.midi_tracks.len() < MAX_MIDI_TRACKS;
+        let can_remove_track = !self.project.midi_tracks.is_empty();
+        let mut add_track_clicked = false;
+        let mut remove_track_clicked = false;
         ui.horizontal(|ui| {
             ui.label("Mixer");
             if ui
-                .add_enabled(can_add, egui::Button::new("+ Track"))
+                .add_enabled(can_add_track, egui::Button::new("+ Track"))
                 .clicked()
             {
-                add_clicked = true;
+                add_track_clicked = true;
             }
             if ui
-                .add_enabled(can_remove, egui::Button::new("- Track"))
+                .add_enabled(can_remove_track, egui::Button::new("- Track"))
                 .clicked()
             {
-                remove_clicked = true;
+                remove_track_clicked = true;
             }
         });
-        if add_clicked {
+        if add_track_clicked {
             self.add_midi_track();
         }
-        if remove_clicked {
+        if remove_track_clicked {
             self.remove_last_midi_track();
         }
 
+        let Some(mixer_doc) = self
+            .project
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.is_mixer())
+            .map(NodeDoc::node_id)
+        else {
+            ui.weak("(no mixer node — add one in the Patch view)");
+            return;
+        };
+        let mixer_engine = self.engine_id(mixer_doc);
+        let NodeDoc::Mixer {
+            inputs,
+            channels,
+            out_pan,
+            out_muted,
+            ..
+        } = self
+            .project
+            .graph
+            .node_by_id(mixer_doc)
+            .cloned()
+            .unwrap_or_else(|| NodeDoc::Mixer {
+                node_id: mixer_doc,
+                track: 0,
+                inputs: MIN_MIXER_CHANNELS as u8,
+                channels: vec![Default::default(); MIN_MIXER_CHANNELS],
+                out_pan: 0.0,
+                out_muted: false,
+            })
+        else {
+            return;
+        };
+
+        // Reverse map: channel → the track feeding it (for the column label +
+        // the level meter, whose point is the track's chain end).
+        let mut channel_track: Vec<Option<usize>> = vec![None; inputs as usize];
+        for (t, _) in self.project.midi_tracks.iter().enumerate() {
+            if let Some((mid, ch)) = self.track_channel_target(t)
+                && mid == mixer_doc
+                && (ch as usize) < channel_track.len()
+            {
+                channel_track[ch as usize] = Some(t);
+            }
+        }
+
         // Collect edits first; write back and send after the loop (avoids borrow conflicts).
-        let num_tracks = self.project.midi_tracks.len();
-        let mut mute_edits: Vec<Option<bool>> = vec![None; num_tracks];
-        let mut gain_edits: Vec<Option<f32>> = vec![None; num_tracks];
-        let mut pan_edits: Vec<Option<f32>> = vec![None; num_tracks];
-        let mut select_edits: Option<usize> = None;
+        let n = inputs as usize;
+        let mut solo_edits: Vec<Option<bool>> = vec![None; n];
+        let mut mute_edits: Vec<Option<bool>> = vec![None; n];
+        let mut gain_edits: Vec<Option<f32>> = vec![None; n];
+        let mut pan_edits: Vec<Option<f32>> = vec![None; n];
+        let mut add_ch_clicked = false;
+        let mut remove_ch_clicked = false;
+        let mut out_mute_edit: Option<bool> = None;
+        let mut out_pan_edit: Option<f32> = None;
 
         ui.horizontal(|ui| {
-            for i in 0..num_tracks {
+            for (ch_idx, ch) in channels.iter().enumerate() {
                 ui.vertical(|ui| {
-                    let name = if self.project.midi_tracks[i].name.is_empty() {
-                        format!("Track {}", i + 1)
-                    } else {
-                        self.project.midi_tracks[i].name.clone()
+                    let name = match channel_track.get(ch_idx).copied().flatten() {
+                        Some(t) if self.project.midi_tracks[t].name.is_empty() => {
+                            format!("Ch {} · T{}", ch_idx + 1, t + 1)
+                        }
+                        Some(t) => {
+                            format!("Ch {} · {}", ch_idx + 1, self.project.midi_tracks[t].name)
+                        }
+                        None => format!("Ch {}", ch_idx + 1),
                     };
-                    if ui
-                        .selectable_label(self.selected_track == i, name)
-                        .clicked()
-                    {
-                        select_edits = Some(i);
-                    }
+                    ui.weak(name);
 
-                    let (muted, _gain, _pan) = self.track_strip_state(i);
-                    let mut btn = egui::Button::new(if muted { "Mute" } else { "On" });
-                    if muted {
-                        btn = btn.fill(egui::Color32::from_rgb(140, 60, 50));
-                    }
-                    if ui.add_sized([72.0, 22.0], btn).clicked() {
-                        mute_edits[i] = Some(!muted);
-                    }
+                    // Solo / mute row.
+                    ui.horizontal(|ui| {
+                        let mut solo_btn = egui::Button::new(if ch.solo { "S" } else { "s" });
+                        if ch.solo {
+                            solo_btn = solo_btn.fill(egui::Color32::from_rgb(200, 170, 60));
+                        }
+                        if ui.add_sized([32.0, 20.0], solo_btn).clicked() {
+                            solo_edits[ch_idx] = Some(!ch.solo);
+                        }
+                        let mut mute_btn = egui::Button::new(if ch.muted { "M" } else { "m" });
+                        if ch.muted {
+                            mute_btn = mute_btn.fill(egui::Color32::from_rgb(140, 60, 50));
+                        }
+                        if ui.add_sized([32.0, 20.0], mute_btn).clicked() {
+                            mute_edits[ch_idx] = Some(!ch.muted);
+                        }
+                    });
 
-                    // Post-fader level bar.
+                    // Post-fader level bar (metering point = the feeding track's chain end).
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(96.0, 10.0), egui::Sense::hover());
                     ui.painter()
                         .rect_filled(rect, 2.0, egui::Color32::from_gray(40));
-                    let level = self.engine.track_level(i).clamp(0.0, 1.0);
+                    let level = channel_track
+                        .get(ch_idx)
+                        .copied()
+                        .flatten()
+                        .map(|t| self.engine.track_level(t).clamp(0.0, 1.0))
+                        .unwrap_or(0.0);
                     let filled = egui::Rect::from_min_size(
                         rect.min,
                         egui::vec2(rect.width() * level, rect.height()),
@@ -2405,69 +2665,236 @@ impl ResoZApp {
                     ui.painter()
                         .rect_filled(filled, 2.0, egui::Color32::from_rgb(70, 160, 90));
 
-                    let mut gain = self.track_strip_state(i).1;
+                    // Fader + pan.
+                    let mut gain = ch.gain;
                     let fader = ui.add_sized(
                         [96.0, 110.0],
                         egui::Slider::new(&mut gain, TRACK_GAIN_RANGE).vertical(),
                     );
                     if fader.changed() {
-                        gain_edits[i] = Some(gain);
+                        gain_edits[ch_idx] = Some(gain);
                     }
-
-                    let mut pan = self.track_strip_state(i).2;
+                    let mut pan = ch.pan;
                     let pan_resp = ui.add_sized(
                         [96.0, 20.0],
                         egui::Slider::new(&mut pan, PAN_RANGE).text("Pan"),
                     );
                     if pan_resp.changed() {
-                        pan_edits[i] = Some(pan);
+                        pan_edits[ch_idx] = Some(pan);
                     }
                 });
-                if i + 1 < num_tracks {
+                if ch_idx + 1 < channels.len() {
                     ui.separator();
                 }
             }
+
+            // ---- Channel add / remove (D21) ----
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.weak("Channels");
+                if ui
+                    .add_enabled(
+                        (inputs as usize) < MAX_MIXER_CHANNELS,
+                        egui::Button::new("+ Ch"),
+                    )
+                    .clicked()
+                {
+                    add_ch_clicked = true;
+                }
+                if ui
+                    .add_enabled(
+                        (inputs as usize) > MIN_MIXER_CHANNELS,
+                        egui::Button::new("- Ch"),
+                    )
+                    .clicked()
+                {
+                    remove_ch_clicked = true;
+                }
+
+                // Output stage.
+                ui.add_space(8.0);
+                ui.weak("Out");
+                let mut out_btn = egui::Button::new(if out_muted { "M" } else { "m" });
+                if out_muted {
+                    out_btn = out_btn.fill(egui::Color32::from_rgb(140, 60, 50));
+                }
+                if ui.add_sized([72.0, 22.0], out_btn).clicked() {
+                    out_mute_edit = Some(!out_muted);
+                }
+                let mut op = out_pan;
+                let op_resp = ui.add_sized(
+                    [96.0, 20.0],
+                    egui::Slider::new(&mut op, PAN_RANGE).text("Pan"),
+                );
+                if op_resp.changed() {
+                    out_pan_edit = Some(op);
+                }
+            });
         });
 
-        if let Some(i) = select_edits {
-            self.selected_track = i;
-        }
-        for i in 0..num_tracks {
+        // ---- Apply edits (document + engine node-param path, D20) ----
+        let send_mixer = |ui_app: &mut Self, id: ParamId, value: f32| {
+            if let Some(engine_id) = mixer_engine {
+                ui_app.engine.send(EngineCommand::SetNodeParam {
+                    node_id: engine_id,
+                    id,
+                    value,
+                });
+            }
+        };
+        let apply_channel = |ui_app: &mut Self, f: &dyn Fn(&mut NodeDoc)| {
+            if let Some(node) = ui_app.project.graph.node_by_id_mut(mixer_doc) {
+                f(node);
+            }
+        };
+        for i in 0..n {
+            let i8 = i as u8;
+            if let Some(solo) = solo_edits[i] {
+                apply_channel(self, &|node| {
+                    if let NodeDoc::Mixer { channels, .. } = node
+                        && let Some(c) = channels.get_mut(i)
+                    {
+                        c.solo = solo;
+                    }
+                });
+                send_mixer(self, ParamId::MixerSolo(i8), if solo { 1.0 } else { 0.0 });
+            }
             if let Some(muted) = mute_edits[i] {
-                if let Some(NodeDoc::ChannelStrip { muted: m, .. }) =
-                    self.project.graph.channel_strip_of_track_mut(i)
-                {
-                    *m = muted;
-                }
-                self.send_track_param(i, ParamId::TrackMute, if muted { 1.0 } else { 0.0 });
+                apply_channel(self, &|node| {
+                    if let NodeDoc::Mixer { channels, .. } = node
+                        && let Some(c) = channels.get_mut(i)
+                    {
+                        c.muted = muted;
+                    }
+                });
+                send_mixer(self, ParamId::MixerMute(i8), if muted { 1.0 } else { 0.0 });
             }
             if let Some(gain) = gain_edits[i] {
-                if let Some(NodeDoc::ChannelStrip { gain: g, .. }) =
-                    self.project.graph.channel_strip_of_track_mut(i)
-                {
-                    *g = gain;
-                }
-                self.send_track_param(i, ParamId::TrackGain, gain);
+                apply_channel(self, &|node| {
+                    if let NodeDoc::Mixer { channels, .. } = node
+                        && let Some(c) = channels.get_mut(i)
+                    {
+                        c.gain = gain;
+                    }
+                });
+                send_mixer(self, ParamId::MixerGain(i8), gain);
             }
             if let Some(pan) = pan_edits[i] {
-                if let Some(NodeDoc::ChannelStrip { pan: p, .. }) =
-                    self.project.graph.channel_strip_of_track_mut(i)
-                {
+                apply_channel(self, &|node| {
+                    if let NodeDoc::Mixer { channels, .. } = node
+                        && let Some(c) = channels.get_mut(i)
+                    {
+                        c.pan = pan;
+                    }
+                });
+                send_mixer(self, ParamId::MixerPan(i8), pan);
+            }
+        }
+        if let Some(muted) = out_mute_edit {
+            apply_channel(self, &|node| {
+                if let NodeDoc::Mixer { out_muted: m, .. } = node {
+                    *m = muted;
+                }
+            });
+            send_mixer(self, ParamId::MixerOutMute, if muted { 1.0 } else { 0.0 });
+        }
+        if let Some(pan) = out_pan_edit {
+            apply_channel(self, &|node| {
+                if let NodeDoc::Mixer { out_pan: p, .. } = node {
                     *p = pan;
                 }
-                self.send_track_param(i, ParamId::TrackPan, pan);
+            });
+            send_mixer(self, ParamId::MixerOutPan, pan);
+        }
+        if add_ch_clicked {
+            self.mixer_add_channel(mixer_doc);
+        }
+        if remove_ch_clicked {
+            self.mixer_remove_channel(mixer_doc);
+        }
+    }
+
+    /// Grow the mixer by one channel (D21): document inputs+channels (+1
+    /// default channel) + engine param sync so the new slot's weights match.
+    fn mixer_add_channel(&mut self, mixer_doc: u64) {
+        let Some(NodeDoc::Mixer { inputs, .. }) = self.project.graph.node_by_id_mut(mixer_doc)
+        else {
+            return;
+        };
+        if *inputs as usize >= MAX_MIXER_CHANNELS {
+            self.set_message(format!("Channel limit reached ({MAX_MIXER_CHANNELS})"));
+            return;
+        }
+        *inputs += 1;
+        if let Some(NodeDoc::Mixer { channels, .. }) = self.project.graph.node_by_id_mut(mixer_doc)
+        {
+            channels.push(Default::default());
+        }
+        // Engine sync: the mixer processor has fixed 32 slots — push the new
+        // channel's state so its summing weights are (re)computed.
+        if let (Some(engine_id), Some(NodeDoc::Mixer { channels, .. })) = (
+            self.engine_id(mixer_doc),
+            self.project.graph.node_by_id(mixer_doc),
+        ) {
+            let ch = (channels.len() - 1) as u8;
+            if let Some(c) = channels.last() {
+                for (id, value) in [
+                    (ParamId::MixerGain(ch), c.gain),
+                    (ParamId::MixerPan(ch), c.pan),
+                    (ParamId::MixerMute(ch), if c.muted { 1.0 } else { 0.0 }),
+                    (ParamId::MixerSolo(ch), if c.solo { 1.0 } else { 0.0 }),
+                ] {
+                    self.engine.send(EngineCommand::SetNodeParam {
+                        node_id: engine_id,
+                        id,
+                        value,
+                    });
+                }
             }
         }
     }
 
-    /// 新增一条 MIDI 轨：文档三件套节点 + 连线（audio 链 + MIDI 自连）+
+    /// Shrink the mixer by one channel (D21): rejected when the last channel
+    /// still has an audio cable landed on it (occupied ports are protected).
+    fn mixer_remove_channel(&mut self, mixer_doc: u64) {
+        // Read the channel count first (immutable borrow; the mutation happens
+        // after the cable scan).
+        let Some(NodeDoc::Mixer { inputs, .. }) = self.project.graph.node_by_id(mixer_doc) else {
+            return;
+        };
+        if *inputs as usize <= MIN_MIXER_CHANNELS {
+            return;
+        }
+        let last = *inputs - 1;
+        let occupied = self.project.graph.cables.iter().any(|c| {
+            c.kind == CableKind::Audio && c.to == PortRef::Node(mixer_doc) && c.in_port == last
+        });
+        if occupied {
+            self.set_message(format!(
+                "Cannot remove channel {}: a cable is connected to it",
+                last + 1
+            ));
+            return;
+        }
+        if let Some(NodeDoc::Mixer {
+            inputs, channels, ..
+        }) = self.project.graph.node_by_id_mut(mixer_doc)
+        {
+            *inputs = last;
+            channels.pop();
+        }
+    }
+
+    /// 新增一条 MIDI 轨：文档两件套节点（voice + delay，P5f D18 不再有
+    /// strip）+ 连线（voice→delay + delay→mixer.ch[i] + MIDI 自连）+
     /// 引擎默认链（`add_midi_track`）+ node_map 映射 + 活跃轨数下发。
+    /// mixer 通道满员时自动扩容（D21 上限 32）。
     fn add_midi_track(&mut self) {
         let track = self.project.midi_tracks.len();
         if track >= MAX_MIDI_TRACKS {
             return;
         }
-        let Some([voice_e, delay_e, strip_e]) = self.engine.add_midi_track() else {
+        let Some([voice_e, delay_e]) = self.engine.add_midi_track() else {
             self.set_message("Add track failed (engine slots or queue full)".to_string());
             return;
         };
@@ -2481,7 +2908,7 @@ impl ResoZApp {
             .max()
             .unwrap_or(1)
             + 1;
-        let (voice_id, delay_id, strip_id) = (next, next + 1, next + 2);
+        let (voice_id, delay_id) = (next, next + 1);
         self.project
             .midi_tracks
             .push(resoz_model::MidiTrack::default());
@@ -2497,13 +2924,6 @@ impl ResoZApp {
             voice: VoiceSpec::Builtin,
             delay: DelayParams::default(),
         });
-        self.project.graph.nodes.push(NodeDoc::ChannelStrip {
-            node_id: strip_id,
-            track,
-            gain: 0.8,
-            pan: 0.0,
-            muted: false,
-        });
         self.project
             .graph
             .cables
@@ -2511,26 +2931,50 @@ impl ResoZApp {
         self.project
             .graph
             .cables
-            .push(resoz_model::CableDoc::audio(delay_id, strip_id));
-        self.project
-            .graph
-            .cables
-            .push(resoz_model::CableDoc::audio(strip_id, PortRef::Master));
-        self.project
-            .graph
-            .cables
             .push(resoz_model::CableDoc::midi(track, voice_id));
+        // D18: wire the chain end into the global mixer's first free channel
+        // (growing the mixer when it is full).
+        if let Some(mixer_doc) = self
+            .project
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.is_mixer())
+            .map(NodeDoc::node_id)
+        {
+            let ch = match self.project.graph.first_free_channel(mixer_doc) {
+                Some(ch) => ch,
+                None => {
+                    self.mixer_add_channel(mixer_doc);
+                    (self.project.graph.first_free_channel(mixer_doc)).unwrap_or(u8::MAX)
+                }
+            };
+            if ch != u8::MAX {
+                self.project
+                    .graph
+                    .cables
+                    .push(resoz_model::CableDoc::audio_to_channel(
+                        delay_id,
+                        PortRef::Node(mixer_doc),
+                        ch,
+                    ));
+                if let Some(mixer_engine) = self.engine_id(mixer_doc) {
+                    self.engine.connect_nodes(delay_e, mixer_engine, ch);
+                }
+            }
+        }
         self.node_map.insert(voice_id, voice_e);
         self.node_map.insert(delay_id, delay_e);
-        self.node_map.insert(strip_id, strip_e);
         self.engine
             .set_midi_track_count(self.project.midi_tracks.len());
         self.selected_track = track;
+        self.push_track_params(track);
     }
 
     /// 删除最后一条 MIDI 轨（中间轨删除需重排轨道表与文档 track 字段，
     /// 随 T3 编曲视图一起做）。引擎逐节点 bypass 移除 + 轨道表清理 +
-    /// 活跃轨数收缩；文档删节点与触及连线（含 MIDI 自连）。
+    /// 活跃轨数收缩；文档删节点与触及连线（含 MIDI 自连）。mixer 节点
+    /// （track 0）不属于任何轨，必须排除（P5f D15）。
     fn remove_last_midi_track(&mut self) {
         let Some(last) = self.project.midi_tracks.len().checked_sub(1) else {
             return;
@@ -2540,7 +2984,7 @@ impl ResoZApp {
             .graph
             .nodes
             .iter()
-            .filter(|n| n.track() == last)
+            .filter(|n| n.track() == last && !n.is_mixer())
             .map(|n| n.node_id())
             .collect();
         for doc_id in &doc_ids {
@@ -2666,20 +3110,11 @@ impl ResoZApp {
         let index = self.selected_auto.min(auto_count - 1);
         let sel = self.selected_track;
 
-        // Endpoint selection: this track's channel strip (volume/pan) and instrument
-        // (cutoff/plugin parameters).
+        // Endpoint selection: this track's instrument (cutoff / plugin
+        // parameters). Mixer-fader automation is deferred (P5f decision).
         // Options carry the **document** node_id (the cable's persisted identity), mapped when
         // dispatching.
         let mut options: Vec<(String, u64, AutoParam)> = Vec::new();
-        if let Some(strip_doc) = self
-            .project
-            .graph
-            .channel_strip_of_track(sel)
-            .map(NodeDoc::node_id)
-        {
-            options.push(("Volume".to_string(), strip_doc, AutoParam::TrackGain));
-            options.push(("Pan".to_string(), strip_doc, AutoParam::TrackPan));
-        }
         if let Some(voice_doc) = self
             .project
             .graph

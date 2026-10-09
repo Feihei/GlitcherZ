@@ -350,11 +350,18 @@ impl AudioEngine {
         self.compiler.master_node_id()
     }
 
-    /// Adds a MIDI track (default trio + the track's MIDI self-connection).
-    /// Returns the three new node_ids `[voice, delay, channel]`; returns
-    /// `None` when track/slot/master-input-edge capacity is full (the compiler
-    /// has been rolled back).
-    pub fn add_midi_track(&mut self) -> Option<[u64; 3]> {
+    /// The node_id of the first node of the given kind (P5f: the UI finds the
+    /// global mixer node this way).
+    pub fn node_id_of_kind(&self, kind: crate::realtime::NodeKind) -> Option<u64> {
+        self.compiler.node_id_of_kind(kind)
+    }
+
+    /// Adds a MIDI track (default pair + the track's MIDI self-connection;
+    /// P5f D18: mixing happens on explicit mixer nodes — the caller wires
+    /// `delay → mixer.ch[i]`). Returns the two new node_ids `[voice, delay]`;
+    /// returns `None` when track/slot capacity is full (the compiler has been
+    /// rolled back).
+    pub fn add_midi_track(&mut self) -> Option<[u64; 2]> {
         let snapshot = self.compiler;
         match self.compiler.add_midi_track() {
             Ok((update, ids)) => {
@@ -393,12 +400,19 @@ impl AudioEngine {
         self.compiler.fresh_node_id()
     }
 
-    /// Installs a document node (explicit node_id, D11). Returns `false` for
+    /// Installs a document node (explicit node_id, D11). `kind` sets the
+    /// node's compile-time input discipline (P5f D14/D16: only mixer nodes
+    /// accept multiple in-edges). Returns `false` for
     /// an invalid id / duplicate id / full slots / full queue (the node is
     /// released, the compiler has been rolled back).
-    pub fn add_node(&mut self, node_id: u64, node: Box<dyn crate::realtime::Processor>) -> bool {
+    pub fn add_node(
+        &mut self,
+        node_id: u64,
+        kind: crate::realtime::NodeKind,
+        node: Box<dyn crate::realtime::Processor>,
+    ) -> bool {
         let snapshot = self.compiler;
-        match self.compiler.add_node(node_id, node) {
+        match self.compiler.add_node(node_id, kind, node) {
             Ok(update) => {
                 if self.structure.push(update).is_ok() {
                     true
@@ -425,10 +439,11 @@ impl AudioEngine {
         })
     }
 
-    /// Audio connection between nodes (node_id addressing). Repeated
+    /// Audio connection between nodes (node_id addressing). `in_port` is the
+    /// destination mixer channel (D17; 0 for non-mixer targets). Repeated
     /// connections are idempotent.
-    pub fn connect_nodes(&mut self, from_id: u64, to_id: u64) -> bool {
-        self.apply_plan_update(|compiler| compiler.connect_nodes(from_id, to_id))
+    pub fn connect_nodes(&mut self, from_id: u64, to_id: u64, in_port: u8) -> bool {
+        self.apply_plan_update(|compiler| compiler.connect_nodes(from_id, to_id, in_port))
     }
 
     /// Disconnects an audio connection between nodes (idempotent when not

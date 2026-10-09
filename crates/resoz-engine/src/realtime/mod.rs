@@ -39,6 +39,7 @@ pub mod delay;
 pub mod envelope;
 pub mod gain;
 pub mod graph;
+pub mod mixer;
 pub mod processor;
 pub mod sequencer;
 pub mod sine;
@@ -72,9 +73,10 @@ pub use envelope::AdsrProcessor;
 pub use gain::GainProcessor;
 pub use graph::{
     AutoRoute, Cable, ChannelStripProcessor, ExecPlan, GraphCompiler, GraphLevels, GraphUpdate,
-    MASTER_NODE_ID, MAX_CABLES, MAX_MIDI_FANOUT, RtGraph, TopologyError,
+    MASTER_NODE_ID, MAX_CABLES, MAX_MIDI_FANOUT, NodeKind, RtGraph, TopologyError,
 };
-pub use processor::{Processor, ProcessorChain};
+pub use mixer::{MixerChannel, MixerProcessor};
+pub use processor::{ChannelWeights, MAX_WEIGHT_CHANNELS, Processor, ProcessorChain};
 pub use sequencer::{
     MAX_CLIP_NOTES, MAX_TRACK_CLIPS, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR,
     TICKS_PER_QUARTER, TICKS_PER_STEP,

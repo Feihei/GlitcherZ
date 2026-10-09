@@ -4,6 +4,15 @@ use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::{NoteEvent, ParamId};
 use crate::realtime::context::ProcessContext;
 
+/// Max channel count a per-input-weighted node (the mixer) can address
+/// (D15: mixer inputs 2..=32; equals the graph's `MAX_IN_EDGES`).
+pub const MAX_WEIGHT_CHANNELS: usize = 32;
+
+/// Per-input-channel effective L/R summing weights (D20/D21): index =
+/// in-edge channel (`CableDoc.in_port`), value = `[left, right]` multiplier
+/// applied while the graph sums that edge into the node's buffer.
+pub type ChannelWeights = [[f32; 2]; MAX_WEIGHT_CHANNELS];
+
 /// Processing graph node.
 ///
 /// `process` runs on the audio callback thread; implementations must follow
@@ -15,6 +24,15 @@ use crate::realtime::context::ProcessContext;
 pub trait Processor: Send {
     /// Processes one fixed block.
     fn process(&mut self, ctx: &ProcessContext, buffer: &mut AudioBuffer);
+
+    /// Per-input-channel summing weights (D20): `Some` = the graph applies
+    /// these L/R weights while summing each in-edge into this node's buffer
+    /// (mixer nodes: per-channel gain/pan/mute/solo); `None` (the default) =
+    /// unit weights, plain summing. Fader moves ride the parameter path below
+    /// — they never trigger a topology rebuild (D5).
+    fn input_weights(&self) -> Option<&ChannelWeights> {
+        None
+    }
 
     /// Applies one parameter update at a block boundary (from the control
     /// command queue).

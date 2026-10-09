@@ -573,14 +573,15 @@ mod tests {
     }
 
     #[test]
-    fn automation_drives_track_gain_during_playback() {
+    fn automation_drives_mixer_gain_during_playback() {
         let (mut runner, mut tx, mut structure_tx, feedback, mut compiler) = make_runner(128, 2);
         // Gain curve: tick 0 = 1.0 → tick 96 = 0.0 (120 BPM / 44.1 kHz ≈ 0.5 s).
         // Control track 0 (one clip covering bar 1, loop one bar) connects to
-        // track 0's channel strip gain (addressed by node_id).
-        let channel_id = compiler
-            .track_channel_node_id(0)
-            .expect("channel strip node_id should exist");
+        // the global mixer's channel 0 gain (addressed by node_id; P5f D18:
+        // track 0's chain feeds mixer channel 0 in the default graph).
+        let mixer_id = compiler
+            .node_id_of_kind(crate::realtime::NodeKind::Mixer)
+            .expect("global mixer node_id should exist");
         let mut curve = RtAutomation {
             enabled: true,
             ..RtAutomation::default()
@@ -605,7 +606,7 @@ mod tests {
         ))
         .expect("queue not full");
         let update = compiler
-            .set_auto_route(0, channel_id, ParamId::TrackGain)
+            .set_auto_route(0, mixer_id, ParamId::MixerGain(0))
             .expect("automation routing should succeed");
         structure_tx.push(update).expect("structure queue not full");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
@@ -617,7 +618,7 @@ mod tests {
         let mut early_max = 0.0f32;
         for _ in 0..2 {
             runner.render_interleaved(&mut chunk);
-            early_max = early_max.max(feedback.track_levels[0].load());
+            early_max = early_max.max(feedback.level.load());
         }
         assert!(
             early_max > 0.3,
@@ -631,7 +632,7 @@ mod tests {
         let mut late_max = 0.0f32;
         for _ in 0..5 {
             runner.render_interleaved(&mut chunk);
-            late_max = late_max.max(feedback.track_levels[0].load());
+            late_max = late_max.max(feedback.level.load());
         }
         assert!(
             late_max < 0.02,
@@ -695,10 +696,11 @@ mod tests {
         })
         .expect("queue not full");
         runner.render_interleaved(&mut chunk);
-        // post-fader level = parameter × track gain (default 0.8).
+        // metering point = track chain end (delay, dry pass-through; P5f
+        // removed the per-track strip) → level = parameter × 1.0.
         assert!(
-            (feedback.track_levels[0].load() - 0.4).abs() < 0.01,
-            "plugin parameter 0.5 × track gain 0.8 should be 0.4, got {}",
+            (feedback.track_levels[0].load() - 0.5).abs() < 0.01,
+            "plugin parameter 0.5 should read 0.5 at the chain end, got {}",
             feedback.track_levels[0].load()
         );
 

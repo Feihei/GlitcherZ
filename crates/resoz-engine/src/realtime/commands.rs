@@ -49,6 +49,19 @@ pub enum ParamId {
     DelayFeedback,
     /// Delay wet mix ratio (0..1).
     DelayMix,
+    /// Mixer channel gain (payload = channel index 0..32, linear 0..1.5; D15).
+    MixerGain(u8),
+    /// Mixer channel pan (payload = channel index; -1..1, linear law).
+    MixerPan(u8),
+    /// Mixer channel mute (payload = channel index; ≥ 0.5 = muted).
+    MixerMute(u8),
+    /// Mixer channel solo (payload = channel index; ≥ 0.5 = soloed; any solo
+    /// mutes all non-soloed channels of the same mixer, D21).
+    MixerSolo(u8),
+    /// Mixer output-stage pan (-1..1, linear law).
+    MixerOutPan,
+    /// Mixer output-stage mute (≥ 0.5 = muted).
+    MixerOutMute,
     /// External plugin parameter (payload is the plugin-side parameter ID).
     /// Values uniformly carry the **normalized 0..1** semantic: CLAP and VST3
     /// nodes both forward them as-is via their respective host protocols (both

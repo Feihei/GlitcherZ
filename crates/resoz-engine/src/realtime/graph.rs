@@ -36,16 +36,20 @@ use crate::realtime::commands::{NoteEvent, ParamId};
 use crate::realtime::context::ProcessContext;
 use crate::realtime::delay::DelayProcessor;
 use crate::realtime::gain::GainProcessor;
-use crate::realtime::processor::Processor;
+use crate::realtime::mixer::MixerProcessor;
+use crate::realtime::processor::{ChannelWeights, Processor};
 use crate::realtime::synth::SynthProcessor;
 use crate::realtime::voice::RecycledNode;
 
 /// Graph capacity limit (D1): node count.
 pub const MAX_NODES: usize = 64;
-/// Graph capacity limit (D1): cable count (P5b: fixed-capacity compiler-side cable list).
-pub const MAX_CABLES: usize = 128;
-/// Graph capacity limit (D1): max in-edges per node (cables rejected beyond the limit).
-pub const MAX_IN_EDGES: usize = 8;
+/// Graph capacity limit (D1): cable count (P5f: 256 — a full 32-channel
+/// mixer consumes 32 cables on its own).
+pub const MAX_CABLES: usize = 256;
+/// Graph capacity limit (P5f D14/D15): max in-edges per node — only mixer
+/// nodes can reach this; every other node takes ≤ 1 in-edge (D14) and the
+/// master output exactly 1 (D16), enforced at compile time via [`NodeKind`].
+pub const MAX_IN_EDGES: usize = 32;
 /// Sentinel value for "no edge" (empty slot marker in `out_edge` / cable tables).
 pub const NO_EDGE: u16 = u16::MAX;
 /// Number of external effect slots per track (following the old `TrackStrip` semantics).
@@ -73,6 +77,31 @@ pub struct Cable {
     pub from: u16,
     /// Destination node slot.
     pub to: u16,
+    /// Destination channel (D17): mixer input port index for mixer targets
+    /// (drives the per-channel summing weights); 0 for every other target.
+    pub in_port: u8,
+}
+
+/// Input discipline of a slot (P5f D14/D16): governs the compile-time
+/// in-edge limit. Tracked per slot by the compiler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    /// Ordinary node: ≤ 1 audio in-edge (instruments take 0 anyway).
+    Plain,
+    /// Mixer node: ≤ [`MAX_IN_EDGES`] audio in-edges, unique `in_port` per edge.
+    Mixer,
+    /// Master output: exactly ≤ 1 audio in-edge (D16).
+    Master,
+}
+
+impl NodeKind {
+    /// Compile-time in-edge limit for this node kind.
+    pub fn max_in(self) -> usize {
+        match self {
+            NodeKind::Mixer => MAX_IN_EDGES,
+            NodeKind::Plain | NodeKind::Master => 1,
+        }
+    }
 }
 
 /// Destination of one automation cable (D7): target node slot + target parameter.
@@ -110,6 +139,10 @@ pub struct ExecPlan {
     /// Audio in-edges of each slot (source slot indices; only the first
     /// `in_counts[slot]` entries are valid).
     pub in_edges: [[u16; MAX_IN_EDGES]; MAX_NODES],
+    /// Per-in-edge destination channel (D17/D20): `in_ports[slot][i]` is the
+    /// mixer channel the i-th in-edge lands on (drives the per-channel
+    /// summing weights; 0 for non-mixer targets).
+    pub in_ports: [[u8; MAX_IN_EDGES]; MAX_NODES],
     /// In-edge count of each slot.
     pub in_counts: [u8; MAX_NODES],
     /// Node ID of each slot (P5b: public addressing key; slots are an
@@ -141,6 +174,7 @@ impl ExecPlan {
         order: [0; MAX_NODES],
         order_len: 0,
         in_edges: [[NO_EDGE; MAX_IN_EDGES]; MAX_NODES],
+        in_ports: [[0; MAX_IN_EDGES]; MAX_NODES],
         in_counts: [0; MAX_NODES],
         node_ids: [0; MAX_NODES],
         master_slot: 0,
@@ -312,9 +346,25 @@ impl RtGraph {
             node.output.set_len(frames);
             node.output.clear();
             let count = self.plan.in_counts[s] as usize;
-            for &src in &self.plan.in_edges[s][..count] {
+            // Copy the edge tables out (arrays are `Copy`) so summing does not
+            // borrow `self` while `self.slots` is being mutated.
+            let edges = self.plan.in_edges[s];
+            let ports = self.plan.in_ports[s];
+            // D20: per-channel weights come from the destination processor
+            // (mixer nodes); `None` = unit weights. Split borrow: `processor`
+            // is read while `output` is written — disjoint fields of the
+            // taken-out node.
+            let weights: Option<&ChannelWeights> = node.processor.input_weights();
+            for (i, &src) in edges[..count].iter().enumerate() {
                 if let Some(src_node) = self.slots[src as usize].as_ref() {
-                    sum_into(&mut node.output, &src_node.output);
+                    match weights {
+                        Some(w) => sum_into_weighted(
+                            &mut node.output,
+                            &src_node.output,
+                            w[ports[i] as usize],
+                        ),
+                        None => sum_into(&mut node.output, &src_node.output),
+                    }
                 }
             }
             node.processor.process(ctx, &mut node.output);
@@ -464,6 +514,22 @@ fn sum_into(dst: &mut AudioBuffer, src: &AudioBuffer) {
     }
 }
 
+/// Weighted variant of [`sum_into`] (D20): channel 0 is scaled by `weight[0]`,
+/// channel 1 by `weight[1]` before accumulating. RT-safe (pure FMA loop).
+fn sum_into_weighted(dst: &mut AudioBuffer, src: &AudioBuffer, weight: [f32; 2]) {
+    for (ch, w) in weight
+        .iter()
+        .enumerate()
+        .take(dst.channels().min(src.channels()))
+    {
+        if let (Some(d), Some(s)) = (dst.channel_mut(ch), src.channel(ch)) {
+            for (d, s) in d.iter_mut().zip(s.iter()) {
+                *d += s * w;
+            }
+        }
+    }
+}
+
 /// Resolves the destination slot within a track by parameter kind: the mixer
 /// trio → channel strip; the delay trio → delay; master gain has no track
 /// home; the rest (timbre/envelope/filter/plugin) → instrument.
@@ -595,6 +661,8 @@ pub struct GraphCompiler {
     /// Slot → node_id (P5b public addressing key; empty slots are 0, real
     /// IDs start at 1).
     slot_ids: [u64; MAX_NODES],
+    /// Slot → node kind (P5f D14/D16: compile-time in-edge discipline).
+    kinds: [NodeKind; MAX_NODES],
     /// Audio cable list (`from → to`, deduplicated; P5b replaces the
     /// single-out-edge `out_edge`).
     cables: [Cable; MAX_CABLES],
@@ -626,7 +694,12 @@ impl GraphCompiler {
             block_size: block_size.max(1),
             occupied: [false; MAX_NODES],
             slot_ids: [0; MAX_NODES],
-            cables: [Cable { from: 0, to: 0 }; MAX_CABLES],
+            kinds: [NodeKind::Plain; MAX_NODES],
+            cables: [Cable {
+                from: 0,
+                to: 0,
+                in_port: 0,
+            }; MAX_CABLES],
             cable_count: 0,
             master_slot: 0,
             track_voice: [NO_EDGE; MAX_MIDI_TRACKS],
@@ -644,6 +717,7 @@ impl GraphCompiler {
         let master = compiler.alloc_slot();
         compiler.master_slot = master;
         compiler.slot_ids[master as usize] = master_id;
+        compiler.kinds[master as usize] = NodeKind::Master;
         graph.install(
             master as usize,
             master_id,
@@ -655,8 +729,8 @@ impl GraphCompiler {
         (compiler, graph)
     }
 
-    /// Builds the default topology (mirrors the old mixer): master output +
-    /// per-track `instrument → delay → channel strip`.
+    /// Builds the reference topology (P5f D18): master output + per-track
+    /// `instrument → delay → mixer.ch[i]` + one global mixer → master.
     /// **Not RT-safe** (allocates processors and buffers); call only before
     /// the audio stream starts.
     ///
@@ -669,7 +743,8 @@ impl GraphCompiler {
         let (mut compiler, mut graph) = Self::empty_graph(sample_rate, block_size);
         let bs = compiler.block_size;
 
-        for t in 0..DEFAULT_MIDI_TRACKS {
+        let track_count = DEFAULT_MIDI_TRACKS;
+        for t in 0..track_count {
             let slots = compiler.allocate_track_chain(t);
             for (kind, &(slot, id)) in slots.iter().enumerate() {
                 graph.install(
@@ -681,6 +756,26 @@ impl GraphCompiler {
             }
         }
 
+        // The global mixer (D18): one channel per track.
+        let mixer_slot = compiler.alloc_slot();
+        compiler.kinds[mixer_slot as usize] = NodeKind::Mixer;
+        let mixer_id = compiler.fresh_id();
+        compiler.slot_ids[mixer_slot as usize] = mixer_id;
+        graph.install(
+            mixer_slot as usize,
+            mixer_id,
+            Box::new(MixerProcessor::new(track_count.max(2))),
+            AudioBuffer::new(2, bs),
+        );
+        for t in 0..track_count {
+            compiler
+                .add_cable(compiler.track_delay[t], mixer_slot, t as u8)
+                .expect("fresh chain cables");
+        }
+        compiler
+            .add_cable(mixer_slot, compiler.master_slot, 0)
+            .expect("fresh chain cables");
+
         // The default topology is acyclic by construction; failure means a
         // startup-time bug, so panicking directly is acceptable.
         graph.plan = compiler
@@ -689,34 +784,32 @@ impl GraphCompiler {
         (compiler, graph)
     }
 
-    /// Allocates the default trio for an (unconfigured) MIDI track: the
-    /// slots, node_ids, routing table entries, cables, and MIDI
-    /// self-connection of `instrument → delay → channel strip → master output`.
-    /// Returns `[(slot, node_id); 3]` (order: instrument / delay / channel strip).
+    /// Allocates the default pair for an (unconfigured) MIDI track: the
+    /// slots, node_ids, routing table entries and cables of
+    /// `instrument → delay` plus the track's MIDI self-connection
+    /// (P5f D18: mixing happens on explicit mixer nodes, wired by callers).
+    /// Returns `[(slot, node_id); 2]` (order: instrument / delay).
     /// Called only from construction/add-track paths (callers must ensure
-    /// capacity first).
-    fn allocate_track_chain(&mut self, track: usize) -> [(u16, u64); 3] {
+    /// capacity first). The metering table (`track_channel`) points at the
+    /// delay node — the track's chain end under D18.
+    fn allocate_track_chain(&mut self, track: usize) -> [(u16, u64); 2] {
         let voice = self.alloc_slot();
         let delay = self.alloc_slot();
-        let channel = self.alloc_slot();
         self.track_voice[track] = voice;
         self.track_delay[track] = delay;
-        self.track_channel[track] = channel;
-        // Cables: instrument → delay → channel strip → master output (acyclic
-        // by construction; panic acceptable).
-        self.add_cable(voice, delay).expect("fresh chain cables");
-        self.add_cable(delay, channel).expect("fresh chain cables");
-        self.add_cable(channel, self.master_slot)
-            .expect("fresh chain cables");
+        self.track_channel[track] = delay; // metering point = chain end (P5f)
+        // Cables: instrument → delay (acyclic by construction; panic ok).
+        self.add_cable(voice, delay, 0).expect("fresh chain cables");
         // Timeline default wiring: MIDI track t → its own instrument (mirrors
         // the old mixer semantics).
         self.midi_targets[track][0] = voice;
         self.midi_target_counts[track] = 1;
 
-        let mut out = [(0u16, 0u64); 3];
-        for (slot, entry) in [voice, delay, channel].into_iter().zip(out.iter_mut()) {
+        let mut out = [(0u16, 0u64); 2];
+        for (slot, entry) in [voice, delay].into_iter().zip(out.iter_mut()) {
             let id = self.fresh_id();
             self.slot_ids[slot as usize] = id;
+            self.kinds[slot as usize] = NodeKind::Plain;
             *entry = (slot, id);
         }
         out
@@ -724,16 +817,13 @@ impl GraphCompiler {
 
     /// Undoes [`Self::allocate_track_chain`] (the rollback path when compilation fails).
     fn deallocate_track_chain(&mut self, track: usize) {
-        let slots = [
-            self.track_voice[track],
-            self.track_delay[track],
-            self.track_channel[track],
-        ];
+        let slots = [self.track_voice[track], self.track_delay[track]];
         self.remove_cables_touching(&slots);
         for slot in slots {
             if slot != NO_EDGE {
                 self.occupied[slot as usize] = false;
                 self.slot_ids[slot as usize] = 0;
+                self.kinds[slot as usize] = NodeKind::Plain;
             }
         }
         self.track_voice[track] = NO_EDGE;
@@ -804,6 +894,16 @@ impl GraphCompiler {
         self.slot_ids[self.master_slot as usize]
     }
 
+    /// node_id of the first occupied slot of the given kind (P5f: the UI
+    /// finds the global mixer node this way). Empty when no such node exists.
+    pub fn node_id_of_kind(&self, kind: NodeKind) -> Option<u64> {
+        self.kinds
+            .iter()
+            .zip(self.occupied.iter())
+            .position(|(&k, &occupied)| k == kind && occupied)
+            .and_then(|slot| self.slot_ids.get(slot).copied().filter(|&id| id != 0))
+    }
+
     /// Number of currently configured MIDI tracks (the contiguous run of
     /// `track_voice` that is not `NO_EDGE`).
     pub fn midi_track_count(&self) -> usize {
@@ -821,16 +921,17 @@ impl GraphCompiler {
             .any(|c| c.from == from && c.to == to)
     }
 
-    /// Appends a cable (duplicate cables succeed idempotently). Returns
-    /// [`TopologyError::TooManyCables`] when full.
-    fn add_cable(&mut self, from: u16, to: u16) -> Result<(), TopologyError> {
+    /// Appends a cable (duplicate `(from, to)` pairs succeed idempotently
+    /// regardless of `in_port`). Returns [`TopologyError::TooManyCables`]
+    /// when full.
+    fn add_cable(&mut self, from: u16, to: u16, in_port: u8) -> Result<(), TopologyError> {
         if self.has_cable(from, to) {
             return Ok(());
         }
         if self.cable_count >= MAX_CABLES {
             return Err(TopologyError::TooManyCables);
         }
-        self.cables[self.cable_count] = Cable { from, to };
+        self.cables[self.cable_count] = Cable { from, to, in_port };
         self.cable_count += 1;
         Ok(())
     }
@@ -914,8 +1015,10 @@ impl GraphCompiler {
         }
     }
 
-    /// Compiles the execution plan: in-edge table + Kahn topological sort
-    /// (cycles / in-edge overflow rejected).
+    /// Compiles the execution plan: in-edge table (with per-edge destination
+    /// channels, D17) + Kahn topological sort. Compile-time input discipline
+    /// (P5f D14/D16): plain/master slots take ≤ 1 in-edge, mixer slots ≤
+    /// [`MAX_IN_EDGES`] — overflow rejects the whole plan.
     pub fn compile(&self) -> Result<ExecPlan, TopologyError> {
         let mut plan = ExecPlan::EMPTY;
         let mut in_counts = [0u8; MAX_NODES];
@@ -926,10 +1029,12 @@ impl GraphCompiler {
                 continue;
             }
             let d = cable.to as usize;
-            if in_counts[d] as usize >= MAX_IN_EDGES {
+            let limit = self.kinds[d].max_in();
+            if in_counts[d] as usize >= limit {
                 return Err(TopologyError::FanInOverflow);
             }
             plan.in_edges[d][in_counts[d] as usize] = cable.from;
+            plan.in_ports[d][in_counts[d] as usize] = cable.in_port;
             in_counts[d] += 1;
         }
 
@@ -1022,55 +1127,49 @@ impl GraphCompiler {
         Ok(self.build_update(plan, vec![(slot, node_id, node)], &[slot]))
     }
 
-    /// Appends an effect node to the end of a track's effect chain (before
-    /// the channel strip).
-    /// When no free slot exists, hands `node` back unchanged.
+    /// Appends an effect node at the end of a track's chain: spliced between
+    /// the track's delay node and its current downstream target (P5f: the
+    /// per-track strip is gone; the chain end feeds a mixer channel or
+    /// dangles). When no free slot exists, hands `node` back unchanged.
     pub fn insert_effect(
         &mut self,
         track: usize,
         node: Box<dyn Processor>,
     ) -> Result<(GraphUpdate, u64), Box<dyn Processor>> {
-        if track >= MAX_MIDI_TRACKS || self.track_channel[track] == NO_EDGE {
+        if track >= MAX_MIDI_TRACKS || self.track_delay[track] == NO_EDGE {
             return Err(node);
         }
         let Some(free_idx) = self.occupied.iter().position(|&o| !o) else {
             return Err(node);
         };
-        let channel = self.track_channel[track];
-        // Follow the chain to the last node directly connected to the channel
-        // strip, and insert the new effect between it and the strip.
-        let mut last = self.track_delay[track];
-        let mut hops = 0usize;
-        while !self.has_cable(last, channel) {
-            match self.cables[..self.cable_count]
-                .iter()
-                .find(|c| c.from == last)
-            {
-                Some(cable) => last = cable.to,
-                None => {
-                    // Topology corrupted (should not happen); abandon the insertion.
-                    return Err(node);
-                }
-            }
-            hops += 1;
-            if last == NO_EDGE || hops > MAX_NODES {
-                return Err(node);
-            }
-        }
+        let delay = self.track_delay[track];
+        // The delay's current downstream edge (if any) — the new effect is
+        // spliced into it.
+        let downstream = self.cables[..self.cable_count]
+            .iter()
+            .find(|c| c.from == delay)
+            .map(|c| (c.to, c.in_port));
 
         let free = free_idx as u16;
         self.occupied[free as usize] = true;
-        self.remove_cable(last, channel);
-        // Roll back on failure (keep the compiler and the running graph consistent).
-        if self
-            .add_cable(last, free)
-            .and_then(|()| self.add_cable(free, channel))
-            .is_err()
-        {
+        self.kinds[free as usize] = NodeKind::Plain;
+        if let Some((to, port)) = downstream {
+            self.remove_cable(delay, to);
+            if self
+                .add_cable(delay, free, 0)
+                .and_then(|()| self.add_cable(free, to, port))
+                .is_err()
+            {
+                self.occupied[free as usize] = false;
+                self.kinds[free as usize] = NodeKind::Plain;
+                let _ = self.remove_cable(delay, free);
+                let _ = self.remove_cable(free, to);
+                let _ = self.add_cable(delay, to, port);
+                return Err(node);
+            }
+        } else if self.add_cable(delay, free, 0).is_err() {
             self.occupied[free as usize] = false;
-            let _ = self.remove_cable(last, free);
-            let _ = self.remove_cable(free, channel);
-            let _ = self.add_cable(last, channel);
+            self.kinds[free as usize] = NodeKind::Plain;
             return Err(node);
         }
         if let Some(e) = self.track_effects[track]
@@ -1086,7 +1185,12 @@ impl GraphCompiler {
                 self.remove_cables_touching(&[free]);
                 self.occupied[free as usize] = false;
                 self.slot_ids[free as usize] = 0;
-                let _ = self.add_cable(last, channel);
+                self.kinds[free as usize] = NodeKind::Plain;
+                if let Some((to, port)) = downstream {
+                    let _ = self.add_cable(delay, to, port);
+                } else {
+                    let _ = self.remove_cable(delay, free);
+                }
                 if let Some(e) = self.track_effects[track].iter_mut().find(|e| **e == free) {
                     *e = NO_EDGE;
                 }
@@ -1105,8 +1209,29 @@ impl GraphCompiler {
         if track >= MAX_MIDI_TRACKS {
             return Err(TopologyError::InvalidTrack);
         }
-        let channel = self.track_channel[track];
         let delay = self.track_delay[track];
+        // Capture the first downstream node outside the effect table (where
+        // the chain must re-attach once the effects are gone).
+        let mut target = NO_EDGE;
+        let mut target_port = 0u8;
+        if delay != NO_EDGE {
+            let mut cur = delay;
+            for _ in 0..MAX_NODES {
+                let Some(next) = self.cables[..self.cable_count]
+                    .iter()
+                    .find(|c| c.from == cur)
+                else {
+                    break;
+                };
+                if self.track_effects[track].contains(&next.to) {
+                    cur = next.to;
+                } else {
+                    target = next.to;
+                    target_port = next.in_port;
+                    break;
+                }
+            }
+        }
         let mut removed = [0u16; MAX_REMOVALS];
         let mut removed_count = 0usize;
         for effect in self.track_effects[track] {
@@ -1116,46 +1241,51 @@ impl GraphCompiler {
                 self.remove_cables_touching(&[effect]);
                 self.occupied[effect as usize] = false;
                 self.slot_ids[effect as usize] = 0;
+                self.kinds[effect as usize] = NodeKind::Plain;
                 removed[removed_count] = effect;
                 removed_count += 1;
             }
         }
         self.track_effects[track] = [NO_EDGE; EFFECT_SLOTS];
-        if delay != NO_EDGE && channel != NO_EDGE && !self.has_cable(delay, channel) {
-            self.add_cable(delay, channel)?;
+        if delay != NO_EDGE
+            && target != NO_EDGE
+            && !self.cables[..self.cable_count]
+                .iter()
+                .any(|c| c.from == delay)
+        {
+            self.add_cable(delay, target, target_port)?;
         }
         let plan = self.compile()?;
         Ok(self.build_update(plan, Vec::new(), &removed[..removed_count]))
     }
 
-    /// Adds a MIDI track: installs the default trio (`instrument → delay →
-    /// channel strip → master output`) and writes the track's MIDI
-    /// self-connection. Returns `(structural update, [voice, delay, channel]
-    /// node_ids)`.
+    /// Adds a MIDI track: installs the default pair (`instrument → delay`)
+    /// and writes the track's MIDI self-connection (P5f D18: mixing happens
+    /// on explicit mixer nodes — callers wire `delay → mixer.ch[i]`).
+    /// Returns `(structural update, [voice, delay] node_ids)`.
     ///
     /// Track capacity full → [`TopologyError::NoFreeTrack`]; not enough slots
-    /// → [`TopologyError::NoFreeSlot`]; master output in-edge overflow
-    /// (> 8, see D4/D1) → [`TopologyError::FanInOverflow`] (the UI should
-    /// guide users to layer with summing nodes instead).
-    pub fn add_midi_track(&mut self) -> Result<(GraphUpdate, [u64; 3]), TopologyError> {
+    /// → [`TopologyError::NoFreeSlot`]; over-capacity cables →
+    /// [`TopologyError::TooManyCables`].
+    pub fn add_midi_track(&mut self) -> Result<(GraphUpdate, [u64; 2]), TopologyError> {
         let Some(track) = self.track_voice.iter().position(|&s| s == NO_EDGE) else {
             return Err(TopologyError::NoFreeTrack);
         };
         // Precheck capacity (alloc_slot panics when full, so it must be
         // blocked early).
-        if self.occupied.iter().filter(|&&o| !o).count() < 3 {
+        if self.occupied.iter().filter(|&&o| !o).count() < 2 {
             return Err(TopologyError::NoFreeSlot);
         }
-        if self.cable_count + 3 > MAX_CABLES {
+        if self.cable_count + 1 > MAX_CABLES {
             return Err(TopologyError::TooManyCables);
         }
         let slots = self.allocate_track_chain(track);
         let Ok(plan) = self.compile() else {
-            // Roll back the allocation (master output in-edge overflow, etc.).
+            // Rollback the allocation.
             self.deallocate_track_chain(track);
             return Err(TopologyError::FanInOverflow);
         };
-        let ids = [slots[0].1, slots[1].1, slots[2].1];
+        let ids = [slots[0].1, slots[1].1];
         let deployments: Vec<(u16, u64, Box<dyn Processor>)> = slots
             .into_iter()
             .enumerate()
@@ -1297,9 +1427,11 @@ impl GraphCompiler {
     /// [`TopologyError::InvalidSlot`]; duplicate ids or full slots error out
     /// as well. `next_node_id` advances regardless of success or failure
     /// (guaranteeing later fresh allocations never collide with document ids).
+    /// `kind` sets the node's compile-time input discipline (P5f D14/D16).
     pub fn add_node(
         &mut self,
         node_id: u64,
+        kind: NodeKind,
         node: Box<dyn Processor>,
     ) -> Result<GraphUpdate, TopologyError> {
         if node_id <= MASTER_NODE_ID {
@@ -1315,11 +1447,13 @@ impl GraphCompiler {
         let free = free_idx as u16;
         self.occupied[free as usize] = true;
         self.slot_ids[free as usize] = node_id;
+        self.kinds[free as usize] = kind;
         let plan = match self.compile() {
             Ok(plan) => plan,
             Err(_) => {
                 self.occupied[free as usize] = false;
                 self.slot_ids[free as usize] = 0;
+                self.kinds[free as usize] = NodeKind::Plain;
                 return Err(TopologyError::Cycle);
             }
         };
@@ -1356,17 +1490,19 @@ impl GraphCompiler {
     }
 
     /// Audio cable between nodes (**node_id addressing**, the engine landing
-    /// point of document cables).
+    /// point of document cables). `in_port` is the destination mixer channel
+    /// (D17; 0 for non-mixer targets).
     /// Duplicate connections are idempotent; destination in-edge overflow /
     /// cycles / over-capacity error out (rollback on failure).
     pub fn connect_nodes(
         &mut self,
         from_id: u64,
         to_id: u64,
+        in_port: u8,
     ) -> Result<GraphUpdate, TopologyError> {
         let from = self.node_slot(from_id).ok_or(TopologyError::InvalidSlot)?;
         let to = self.node_slot(to_id).ok_or(TopologyError::InvalidSlot)?;
-        if self.add_cable(from, to).is_err() {
+        if self.add_cable(from, to, in_port).is_err() {
             return Err(TopologyError::TooManyCables);
         }
         match self.compile() {
@@ -1442,31 +1578,40 @@ impl GraphCompiler {
         let free = free_idx as u16;
         self.occupied[free as usize] = true;
         self.slot_ids[free as usize] = new_id;
+        self.kinds[free as usize] = NodeKind::Plain;
+        // Preserve the original cable's destination channel when splicing:
+        // `from → (mixer, ch)` becomes `from → new → (mixer, ch)`.
+        let old_port = self.cables[..self.cable_count]
+            .iter()
+            .find(|c| c.from == from && c.to == to)
+            .map(|c| c.in_port)
+            .unwrap_or(0);
         self.remove_cable(from, to);
         if self
-            .add_cable(from, free)
-            .and_then(|()| self.add_cable(free, to))
+            .add_cable(from, free, 0)
+            .and_then(|()| self.add_cable(free, to, old_port))
             .is_err()
         {
-            self.rollback_splice(free, from, to);
+            self.rollback_splice(free, from, to, old_port);
             return Err(node);
         }
         match self.compile() {
             Ok(plan) => Ok(self.build_update(plan, vec![(free, new_id, node)], &[])),
             Err(_) => {
-                self.rollback_splice(free, from, to);
+                self.rollback_splice(free, from, to, old_port);
                 Err(node)
             }
         }
     }
 
     /// Rollback for [`Self::insert_node_between`]: removes the new slot's
-    /// cables and restores the original one.
-    fn rollback_splice(&mut self, free: u16, from: u16, to: u16) {
+    /// cables and restores the original one (with its destination channel).
+    fn rollback_splice(&mut self, free: u16, from: u16, to: u16, old_port: u8) {
         self.remove_cables_touching(&[free]);
         self.occupied[free as usize] = false;
         self.slot_ids[free as usize] = 0;
-        let _ = self.add_cable(from, to);
+        self.kinds[free as usize] = NodeKind::Plain;
+        let _ = self.add_cable(from, to, old_port);
     }
 
     /// Removes a node (**bypass semantics**: all its in-edge sources and
@@ -1481,32 +1626,44 @@ impl GraphCompiler {
         if slot == self.master_slot {
             return Err(TopologyError::InvalidSlot);
         }
-        // Bypass direct pairs (in-edge sources × out-edge destinations).
-        // Count ≤ current cable count, so cable capacity never grows due to
-        // bypassing.
-        let mut bypass = [Cable { from: 0, to: 0 }; MAX_IN_EDGES * MAX_IN_EDGES];
+        // D19 bypass semantics: only nodes with ≤ 1 in-edge are bypassed
+        // (in-edge sources × out-edge destinations become direct pairs).
+        // Multi-input nodes (mixers) have no meaningful bypass — their cables
+        // are simply dropped.
+        let in_count = self.cables[..self.cable_count]
+            .iter()
+            .filter(|c| c.to == slot)
+            .count();
+        let mut bypass = [Cable {
+            from: 0,
+            to: 0,
+            in_port: 0,
+        }; MAX_NODES];
         let mut bypass_count = 0usize;
-        for cable in &self.cables[..self.cable_count] {
-            if cable.to == slot {
-                for out in &self.cables[..self.cable_count] {
-                    if out.from == slot
-                        && !self.has_cable(cable.from, out.to)
-                        && !bypass[..bypass_count]
-                            .iter()
-                            .any(|b| b.from == cable.from && b.to == out.to)
-                    {
-                        bypass[bypass_count] = Cable {
-                            from: cable.from,
-                            to: out.to,
-                        };
-                        bypass_count += 1;
+        if in_count <= 1 {
+            for cable in &self.cables[..self.cable_count] {
+                if cable.to == slot {
+                    for out in &self.cables[..self.cable_count] {
+                        if out.from == slot
+                            && !self.has_cable(cable.from, out.to)
+                            && !bypass[..bypass_count]
+                                .iter()
+                                .any(|b| b.from == cable.from && b.to == out.to)
+                        {
+                            bypass[bypass_count] = Cable {
+                                from: cable.from,
+                                to: out.to,
+                                in_port: out.in_port,
+                            };
+                            bypass_count += 1;
+                        }
                     }
                 }
             }
         }
         self.remove_cables_touching(&[slot]);
         for bypass_cable in &bypass[..bypass_count] {
-            let _ = self.add_cable(bypass_cable.from, bypass_cable.to);
+            let _ = self.add_cable(bypass_cable.from, bypass_cable.to, bypass_cable.in_port);
         }
         for track in 0..MAX_MIDI_TRACKS {
             // Remove within the MIDI fan-out table row.
@@ -1545,6 +1702,7 @@ impl GraphCompiler {
         }
         self.occupied[slot as usize] = false;
         self.slot_ids[slot as usize] = 0;
+        self.kinds[slot as usize] = NodeKind::Plain;
         let plan = self.compile()?;
         Ok(self.build_update(plan, Vec::new(), &[slot]))
     }
@@ -1564,11 +1722,13 @@ fn chain_processor(kind: usize, sample_rate: f32) -> Box<dyn Processor> {
 mod tests {
     use super::{
         ChannelStripProcessor, DEFAULT_MIDI_TRACKS, GraphCompiler, GraphUpdate, MAX_CABLES,
-        MAX_MIDI_FANOUT, MAX_MIDI_TRACKS, NO_EDGE, RtGraph, TopologyError, chain_processor,
+        MAX_MIDI_FANOUT, MAX_MIDI_TRACKS, NO_EDGE, NodeKind, RtGraph, TopologyError,
+        chain_processor,
     };
     use crate::realtime::buffer::AudioBuffer;
     use crate::realtime::commands::{NoteEvent, ParamId};
     use crate::realtime::context::ProcessContext;
+    use crate::realtime::mixer::MixerProcessor;
     use crate::realtime::processor::Processor;
     use crate::realtime::voice::{RecycledNode, recycle_channel};
 
@@ -1626,6 +1786,13 @@ mod tests {
 
     // ---- default topology equivalence (ported from the old mixer tests) ----
 
+    /// The default graph's global mixer node_id (P5f D18).
+    fn default_mixer_id(compiler: &GraphCompiler) -> u64 {
+        compiler
+            .node_id_of_kind(NodeKind::Mixer)
+            .expect("default graph should carry a global mixer")
+    }
+
     #[test]
     fn note_plays_through_track_to_master() {
         let mut graph = default_graph();
@@ -1660,48 +1827,54 @@ mod tests {
     }
 
     #[test]
-    fn track_gain_scales_the_mix() {
-        let mut graph = default_graph();
+    fn mixer_gain_scales_the_mix() {
+        let (compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let mixer = default_mixer_id(&compiler);
         graph.track_note(0, note_on(69));
         for _ in 0..20 {
             graph.process_block(&ctx());
         }
         let full = graph.process_block(&ctx());
-        graph.track_set_param(0, ParamId::TrackGain, 0.4);
+        // Node-addressed fader (P5f: the mixer panel drives mixer channels
+        // through the parameter path, never a topology rebuild).
+        assert!(graph.node_set_param(mixer, ParamId::MixerGain(0), 0.4));
         let attenuated = graph.process_block(&ctx());
         let ratio = attenuated.master / full.master;
         assert!(
             (ratio - (0.4 / 0.8)).abs() < 0.1,
-            "master output should be roughly halved after halving the gain, ratio = {ratio}"
+            "master output should be roughly halved after halving the channel gain, ratio = {ratio}"
         );
     }
 
     #[test]
-    fn mute_silences_a_track_but_others_play() {
-        let mut graph = default_graph();
+    fn mute_silences_a_channel_but_pre_fader_still_runs() {
+        let (compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let mixer = default_mixer_id(&compiler);
         graph.track_note(0, note_on(60));
-        graph.track_note(1, note_on(64));
         for _ in 0..20 {
             graph.process_block(&ctx());
         }
-        graph.track_set_param(0, ParamId::TrackMute, 1.0);
+        assert!(graph.node_set_param(mixer, ParamId::MixerMute(0), 1.0));
         let levels = graph.process_block(&ctx());
         assert!(
-            levels.tracks[0].abs() < 1e-9,
-            "muted track's post-fader level should be 0"
+            levels.master.abs() < 1e-9,
+            "muted channel should not reach the master output"
         );
-        assert!(levels.tracks[1] > 0.05, "other tracks unaffected");
         assert!(
-            levels.master > 0.05,
-            "master output should still carry unmuted tracks' signal"
+            levels.tracks[0] > 0.05,
+            "the track's metering point (chain end) sits pre-mixer and still runs"
         );
+        assert!(graph.node_set_param(mixer, ParamId::MixerMute(0), 0.0));
+        let levels = graph.process_block(&ctx());
+        assert!(levels.master > 0.05, "unmuting restores the signal");
     }
 
     #[test]
-    fn pan_hard_left_puts_mono_source_only_in_left() {
-        let mut graph = default_graph();
+    fn channel_pan_hard_left_puts_mono_source_only_in_left() {
+        let (compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let mixer = default_mixer_id(&compiler);
         graph.track_note(0, note_on(69));
-        graph.track_set_param(0, ParamId::TrackPan, -1.0);
+        assert!(graph.node_set_param(mixer, ParamId::MixerPan(0), -1.0));
         graph.process_block(&ctx());
         let levels = graph.process_block(&ctx());
         assert!(levels.master > 0.05);
@@ -1924,7 +2097,7 @@ mod tests {
         // Artificially create a cycle: master output → track 0 instrument
         // (private fields, reachable only in tests).
         compiler
-            .add_cable(compiler.master_slot, compiler.track_voice[0])
+            .add_cable(compiler.master_slot, compiler.track_voice[0], 0)
             .expect("should be able to add a cable within capacity");
         assert!(matches!(compiler.compile(), Err(TopologyError::Cycle)));
     }
@@ -1932,19 +2105,29 @@ mod tests {
     #[test]
     fn compile_rejects_fan_in_overflow() {
         let (mut compiler, _graph) = GraphCompiler::default_graph(SR, BLOCK);
-        // 8 in-edges is the limit; the master output already has 4 by
-        // default, adding 5 more triggers the overflow.
-        for slot in 13..18usize {
-            compiler.occupied[slot] = true;
-            compiler.slot_ids[slot] = 900 + slot as u64;
-            compiler
-                .add_cable(slot as u16, compiler.master_slot)
-                .expect("add cable");
-        }
+        // D14: plain nodes take exactly one in-edge. Track 0's delay already
+        // has one (voice → delay); a second must be rejected at compile time.
+        let delay = compiler.track_delay[0];
+        compiler
+            .add_cable(compiler.track_voice[1], delay, 0)
+            .expect("add cable");
         assert!(matches!(
             compiler.compile(),
             Err(TopologyError::FanInOverflow)
         ));
+    }
+
+    #[test]
+    fn compile_accepts_multi_input_mixer_and_single_input_master() {
+        let (compiler, _graph) = GraphCompiler::default_graph(SR, BLOCK);
+        // D18 default graph: the mixer carries one in-edge per track (4) and
+        // the master exactly one (mixer → master) — both must compile.
+        assert!(compiler.compile().is_ok());
+        let mixer_in_count = compiler.cables[..compiler.cable_count]
+            .iter()
+            .filter(|c| compiler.kinds[c.to as usize] == NodeKind::Mixer)
+            .count();
+        assert_eq!(mixer_in_count, DEFAULT_MIDI_TRACKS);
     }
 
     #[test]
@@ -2138,8 +2321,8 @@ mod tests {
         let (mut compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
         let (mut recycle_tx, mut recycle_rx) = recycle_channel();
         // Swap track 0's instrument to a DC source of 0.25; automation track
-        // 0 connects to this track's channel strip gain (node_id addressing,
-        // replacing route_slot's destination guessing).
+        // 0 connects to the global mixer's channel 0 gain (node_id addressing;
+        // P5f D18: track 0's chain feeds mixer channel 0 by default).
         let (update, _) = expect_swap(
             compiler.set_voice(0, Box::new(DcSource { value: 0.25 })),
             "swap voice",
@@ -2150,11 +2333,9 @@ mod tests {
             1,
             "old instrument should be recycled"
         );
-        let channel_id = compiler
-            .track_channel_node_id(0)
-            .expect("channel strip should exist");
+        let mixer_id = default_mixer_id(&compiler);
         let update = compiler
-            .set_auto_route(0, channel_id, ParamId::TrackGain)
+            .set_auto_route(0, mixer_id, ParamId::MixerGain(0))
             .expect("automation cable should succeed");
         graph.apply_update(update, &mut recycle_tx);
 
@@ -2221,8 +2402,8 @@ mod tests {
         let (mut recycle_tx, mut recycle_rx) = recycle_channel();
         assert_eq!(compiler.midi_track_count(), DEFAULT_MIDI_TRACKS);
 
-        // Adding a track: returns three new node_ids; the new track can sound.
-        let (update, [voice_id, delay_id, channel_id]) =
+        // Adding a track: returns two new node_ids; the new track can sound.
+        let (update, [voice_id, delay_id]) =
             compiler.add_midi_track().expect("add track should succeed");
         graph.apply_update(update, &mut recycle_tx);
         assert!(
@@ -2232,7 +2413,6 @@ mod tests {
         assert_eq!(compiler.midi_track_count(), DEFAULT_MIDI_TRACKS + 1);
         assert_ne!(voice_id, 0);
         assert_ne!(delay_id, 0);
-        assert_ne!(channel_id, 0);
         assert_eq!(
             compiler.track_voice_node_id(DEFAULT_MIDI_TRACKS),
             Some(voice_id),
@@ -2245,15 +2425,15 @@ mod tests {
             "new track should be able to sound"
         );
 
-        // Removing a track: the trio is recycled and the routing table cleared.
+        // Removing a track: the pair is recycled and the routing table cleared.
         let update = compiler
             .remove_midi_track(DEFAULT_MIDI_TRACKS)
             .expect("remove track should succeed");
         graph.apply_update(update, &mut recycle_tx);
         assert_eq!(
             drain_recycle(&mut recycle_rx).len(),
-            3,
-            "the whole trio should be recycled"
+            2,
+            "the whole pair should be recycled"
         );
         assert_eq!(compiler.midi_track_count(), DEFAULT_MIDI_TRACKS);
         assert_eq!(compiler.track_voice_node_id(DEFAULT_MIDI_TRACKS), None);
@@ -2267,29 +2447,23 @@ mod tests {
     }
 
     #[test]
-    fn add_track_fails_when_master_fan_in_exhausted() {
+    fn add_track_fills_capacity_then_fails() {
         let (mut compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
         let (mut recycle_tx, _recycle_rx) = recycle_channel();
-        // The default master output already has 4 in-edges (D4 cap 8):
-        // adding 4 tracks reaches the cap.
-        for _ in 0..4 {
+        // P5f D18: adding tracks no longer touches the master (mixing happens
+        // on mixer nodes) — tracks can fill the whole 16-track capacity.
+        while compiler.midi_track_count() < MAX_MIDI_TRACKS {
             let (update, _) = compiler
                 .add_midi_track()
-                .expect("should succeed within the cap");
+                .expect("should succeed within the track capacity");
             graph.apply_update(update, &mut recycle_tx);
         }
-        assert_eq!(compiler.midi_track_count(), 8);
-        // The 9th track → master output in-edge overflow; compilation fails
-        // and the allocation rolls back.
+        assert_eq!(compiler.midi_track_count(), MAX_MIDI_TRACKS);
+        // The 17th track → NoFreeTrack.
         assert!(matches!(
             compiler.add_midi_track(),
-            Err(TopologyError::FanInOverflow)
+            Err(TopologyError::NoFreeTrack)
         ));
-        assert_eq!(
-            compiler.midi_track_count(),
-            8,
-            "track count unchanged after failure"
-        );
         // The graph still processes normally.
         graph.track_note(0, note_on(69));
         let levels = graph.process_block(&ctx());
@@ -2300,20 +2474,25 @@ mod tests {
     fn multi_out_fanout_sums_into_two_sinks() {
         let (mut compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
         let (mut recycle_tx, _recycle_rx) = recycle_channel();
-        // Multi-out edges: track 0's instrument additionally connects to
-        // track 1's channel strip (two cables from one output port).
+        // Multi-out edges: track 0's instrument additionally connects to the
+        // global mixer on channel 1 (two cables from one output port; only
+        // the mixer accepts a second in-edge — D14).
         let voice0 = compiler
             .track_voice_node_id(0)
             .expect("instrument should exist");
         let slot0 = compiler.node_slot(voice0).expect("slot should exist");
-        let channel1_slot = compiler.track_channel[1];
+        let mixer_slot = compiler
+            .kinds
+            .iter()
+            .position(|&k| k == NodeKind::Mixer)
+            .expect("mixer slot") as u16;
         compiler
-            .add_cable(slot0, channel1_slot)
+            .add_cable(slot0, mixer_slot, 1)
             .expect("second out-cable should succeed");
         compiler.compile().expect("topology should remain acyclic");
 
-        // DC source 0.25 → tracks 0 and 1 channel strips (each × 0.8) →
-        // master output 0.25 × 0.8 × 2.
+        // DC source 0.25 → mixer ch0 (via delay) and ch1 (direct), each
+        // channel × 0.8 → master output 0.25 × 0.8 × 2.
         let (update, _) = expect_swap(
             compiler.set_voice(0, Box::new(DcSource { value: 0.25 })),
             "swap voice",
@@ -2335,19 +2514,20 @@ mod tests {
         let mut i = 0u16;
         while compiler.cable_count < MAX_CABLES {
             compiler
-                .add_cable(60, 61 + i)
+                .add_cable(60, 100 + i, 0)
                 .expect("should succeed within capacity");
             i += 1;
         }
         assert_eq!(compiler.cable_count, MAX_CABLES);
-        // Adding one more unique cable when full → TooManyCables.
+        // Adding one more unique cable when full → TooManyCables (target 999
+        // is beyond the filler range 100..346).
         assert!(matches!(
-            compiler.add_cable(60, 300),
+            compiler.add_cable(60, 999, 0),
             Err(TopologyError::TooManyCables)
         ));
         // Duplicate connections remain idempotent (dedup takes precedence
         // over the capacity check).
-        assert!(compiler.add_cable(60, 61).is_ok());
+        assert!(compiler.add_cable(60, 100, 0).is_ok());
         let levels = graph.process_block(&ctx());
         assert!(levels.master.is_finite());
     }
@@ -2365,37 +2545,54 @@ mod tests {
         };
 
         let master = compiler.master_node_id();
-        for (id, kind) in [(2u64, 0usize), (3, 1), (4, 2)] {
-            let update = compiler
-                .add_node(id, chain_processor(kind, SR))
-                .expect("document node should install");
-            apply(&mut graph, &mut recycle_tx, update);
-        }
+        // 2 = instrument, 3 = delay, 4 = global mixer (D18).
+        let update = compiler
+            .add_node(2, NodeKind::Plain, chain_processor(0, SR))
+            .expect("document node should install");
+        apply(&mut graph, &mut recycle_tx, update);
+        let update = compiler
+            .add_node(3, NodeKind::Plain, chain_processor(1, SR))
+            .expect("document node should install");
+        apply(&mut graph, &mut recycle_tx, update);
+        let update = compiler
+            .add_node(4, NodeKind::Mixer, Box::new(MixerProcessor::new(2)))
+            .expect("document node should install");
+        apply(&mut graph, &mut recycle_tx, update);
         assert!(drain_recycle(&mut recycle_rx).is_empty());
 
         // Track addressing tables + audio cables + MIDI self-connection (all
-        // node_id addressed).
+        // node_id addressed). The metering point is the chain end (delay).
         apply(
             &mut graph,
             &mut recycle_tx,
             compiler
-                .register_track_chain(0, Some(2), Some(3), Some(4))
+                .register_track_chain(0, Some(2), Some(3), Some(3))
                 .expect("assemble track tables"),
         );
-        for (from, to) in [(2, 3), (3, 4), (4, master)] {
-            apply(
-                &mut graph,
-                &mut recycle_tx,
-                compiler.connect_nodes(from, to).expect("document cable"),
-            );
-        }
+        apply(
+            &mut graph,
+            &mut recycle_tx,
+            compiler.connect_nodes(2, 3, 0).expect("document cable"),
+        );
+        apply(
+            &mut graph,
+            &mut recycle_tx,
+            compiler.connect_nodes(3, 4, 0).expect("document cable"),
+        );
+        apply(
+            &mut graph,
+            &mut recycle_tx,
+            compiler
+                .connect_nodes(4, master, 0)
+                .expect("document cable"),
+        );
         apply(
             &mut graph,
             &mut recycle_tx,
             compiler.connect_midi(0, 2).expect("MIDI self-connection"),
         );
 
-        // End to end: track 0 note → instrument → delay → channel strip →
+        // End to end: track 0 note → instrument → delay → mixer ch0 →
         // master output.
         assert!(graph.track_note(0, note_on(69)));
         let levels = graph.process_block(&ctx());
@@ -2411,16 +2608,26 @@ mod tests {
         let (mut compiler, _graph) = GraphCompiler::empty_graph(SR, BLOCK);
         let (_recycle_tx, mut recycle_rx) = recycle_channel();
         // 0 = invalid sentinel; 1 = master output reserved (D6).
-        assert!(compiler.add_node(0, chain_processor(2, SR)).is_err());
-        assert!(compiler.add_node(1, chain_processor(2, SR)).is_err());
+        assert!(
+            compiler
+                .add_node(0, NodeKind::Plain, chain_processor(2, SR))
+                .is_err()
+        );
+        assert!(
+            compiler
+                .add_node(1, NodeKind::Plain, chain_processor(2, SR))
+                .is_err()
+        );
         assert!(drain_recycle(&mut recycle_rx).is_empty());
 
         let update = compiler
-            .add_node(5, chain_processor(2, SR))
+            .add_node(5, NodeKind::Plain, chain_processor(2, SR))
             .expect("first install should succeed");
         let _ = update;
         assert!(
-            compiler.add_node(5, chain_processor(2, SR)).is_err(),
+            compiler
+                .add_node(5, NodeKind::Plain, chain_processor(2, SR))
+                .is_err(),
             "duplicate node_id should be rejected"
         );
         // Even a failed add_node advanced next_node_id: fresh allocations
@@ -2434,18 +2641,18 @@ mod tests {
         let (mut recycle_tx, mut recycle_rx) = recycle_channel();
         let master = compiler.master_node_id();
         let update = compiler
-            .add_node(2, chain_processor(0, SR))
+            .add_node(2, NodeKind::Plain, chain_processor(0, SR))
             .expect("install");
         graph.apply_update(update, &mut recycle_tx);
         // Channel strip + cables (the DC source goes straight into the master
         // output for easy assertions).
         let update = compiler
-            .add_node(3, chain_processor(2, SR))
+            .add_node(3, NodeKind::Plain, chain_processor(2, SR))
             .expect("install");
         graph.apply_update(update, &mut recycle_tx);
-        let update = compiler.connect_nodes(2, 3).expect("cable");
+        let update = compiler.connect_nodes(2, 3, 0).expect("cable");
         graph.apply_update(update, &mut recycle_tx);
-        let update = compiler.connect_nodes(3, master).expect("cable");
+        let update = compiler.connect_nodes(3, master, 0).expect("cable");
         graph.apply_update(update, &mut recycle_tx);
 
         // In-place replacement with a DC source: node_id 2 stays unchanged.
@@ -2477,12 +2684,12 @@ mod tests {
         let master = compiler.master_node_id();
         for (id, kind) in [(2u64, 0usize), (3, 1), (4, 2)] {
             let update = compiler
-                .add_node(id, chain_processor(kind, SR))
+                .add_node(id, NodeKind::Plain, chain_processor(kind, SR))
                 .expect("install");
             graph.apply_update(update, &mut recycle_tx);
         }
         for (from, to) in [(2, 3), (3, 4), (4, master)] {
-            let update = compiler.connect_nodes(from, to).expect("cable");
+            let update = compiler.connect_nodes(from, to, 0).expect("cable");
             graph.apply_update(update, &mut recycle_tx);
         }
 

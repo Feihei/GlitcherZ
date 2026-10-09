@@ -44,8 +44,9 @@ pub enum AddNodeKind {
     Instrument,
     /// Effect node (built-in delay).
     Effect,
-    /// Channel strip node (gain / pan / mute).
-    ChannelStrip,
+    /// Mixer node (P5f D15/D21): the explicit multi-channel summing point;
+    /// absorbs the old ChannelStrip.
+    Mixer,
 }
 
 /// Interaction intents produced within one patch frame (applied by the caller; the patch has
@@ -56,7 +57,13 @@ pub enum PatchAction {
     /// node is born dangling (no cables; D6 dangling semantics) — the user wires it up.
     AddNode { kind: AddNodeKind, at: Pos2 },
     /// Audio cable drag: source document node → target (node or master output).
-    ConnectAudio { from_doc: u64, to: PortRef },
+    /// `in_port` binds the cable to the target's input port — the mixer channel
+    /// (D17; 0 for single-input nodes / master).
+    ConnectAudio {
+        from_doc: u64,
+        to: PortRef,
+        in_port: u8,
+    },
     /// MIDI cable drag: timeline track → instrument document node.
     ConnectMidi { track: usize, to_doc: u64 },
     /// Automation cable drag (parameter already picked by the user from the popup menu).
@@ -191,6 +198,10 @@ enum DragKind {
 
 /// Audio node box size.
 const NODE_SIZE: Vec2 = Vec2::new(150.0, 64.0);
+/// Mixer box minimum height (scales with channel/input port count).
+const NODE_HEIGHT_MIN: f32 = 64.0;
+/// Vertical spacing between mixer input ports (P5f: one port per channel).
+const PORT_SPACING: f32 = 30.0;
 /// Timeline box size per output port row (width fixed, height scales).
 const TIMELINE_WIDTH: f32 = 150.0;
 const TIMELINE_ROW_HEIGHT: f32 = 26.0;
@@ -242,7 +253,8 @@ fn node_color(id: PatchId, doc: &GraphDoc) -> (Color32, Color32) {
         PatchId::Node(id) => match doc.node_by_id(id) {
             Some(NodeDoc::Instrument { .. }) => Color32::from_rgb(90, 160, 220),
             Some(NodeDoc::Effect { .. }) => Color32::from_rgb(220, 150, 70),
-            Some(NodeDoc::ChannelStrip { .. }) => Color32::from_rgb(110, 190, 120),
+            Some(NodeDoc::Mixer { .. }) => Color32::from_rgb(110, 190, 120),
+            Some(NodeDoc::ChannelStrip { .. }) => Color32::from_gray(140),
             None => Color32::from_gray(120),
         },
     };
@@ -263,10 +275,18 @@ fn cable_color(kind: CableKind) -> Color32 {
     }
 }
 
-/// Entity box size.
-fn size_of(id: PatchId, midi_count: usize, auto_count: usize) -> Vec2 {
+/// Entity box size. Mixer boxes scale with the channel (input port) count so
+/// every channel gets its own input port dot on the left edge.
+fn size_of(id: PatchId, midi_count: usize, auto_count: usize, doc: &GraphDoc) -> Vec2 {
     match id {
         PatchId::Timeline => timeline_size(midi_count, auto_count),
+        PatchId::Node(node_id) => match doc.node_by_id(node_id) {
+            Some(NodeDoc::Mixer { inputs, .. }) => Vec2::new(
+                NODE_SIZE.x,
+                (NODE_HEIGHT_MIN).max(*inputs as f32 * PORT_SPACING + 20.0),
+            ),
+            _ => NODE_SIZE,
+        },
         _ => NODE_SIZE,
     }
 }
@@ -291,8 +311,9 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 }
                 VoiceSpec::Vst3 { class_id, .. } => format!("Fx {}", truncate(class_id, 14)),
             },
+            Some(NodeDoc::Mixer { inputs, .. }) => format!("Mixer · {} ch", inputs),
             Some(NodeDoc::ChannelStrip { track, .. }) => {
-                format!("Channel Strip · Track {}", track + 1)
+                format!("Strip (legacy) · Track {}", track + 1)
             }
             None => format!("Node {node_id}"),
         },
@@ -337,11 +358,12 @@ impl PatchState {
         id: PatchId,
         midi_count: usize,
         auto_count: usize,
+        doc: &GraphDoc,
     ) -> Option<Rect> {
         let p = *self.positions.get(&id)?;
         Some(Rect::from_min_size(
             self.to_screen(rect_min, p),
-            size_of(id, midi_count, auto_count) * self.zoom,
+            size_of(id, midi_count, auto_count, doc) * self.zoom,
         ))
     }
 
@@ -354,8 +376,9 @@ impl PatchState {
         id: PatchId,
         midi_count: usize,
         auto_count: usize,
+        doc: &GraphDoc,
     ) -> Vec<(usize, Pos2)> {
-        let Some(r) = self.screen_rect(rect_min, id, midi_count, auto_count) else {
+        let Some(r) = self.screen_rect(rect_min, id, midi_count, auto_count, doc) else {
             return Vec::new();
         };
         match id {
@@ -373,21 +396,41 @@ impl PatchState {
         }
     }
 
-    /// Input port screen position (audio nodes and master output; the timeline
-    /// has none — it is a pure source, D14/T4).
-    fn in_port_screen(
+    /// Input ports of one entity: `(channel index, screen position)` pairs
+    /// (P5f D17: a mixer exposes one port per channel spread along its left
+    /// edge; other nodes/master have the single port 0; the timeline has none
+    /// — it is a pure source, D14/T4).
+    fn in_ports_screen(
         &self,
         rect_min: Pos2,
         id: PatchId,
         midi_count: usize,
         auto_count: usize,
-    ) -> Option<Pos2> {
-        match id {
-            PatchId::Timeline => None,
-            other => self
-                .screen_rect(rect_min, other, midi_count, auto_count)
-                .map(|r| Pos2::new(r.left(), r.center().y)),
-        }
+        doc: &GraphDoc,
+    ) -> Vec<(u8, Pos2)> {
+        let Some(r) = self.screen_rect(rect_min, id, midi_count, auto_count, doc) else {
+            return Vec::new();
+        };
+        let n = match id {
+            PatchId::Timeline => return Vec::new(),
+            PatchId::Master => 1,
+            PatchId::Node(node_id) => match doc.node_by_id(node_id) {
+                Some(node) if node.is_mixer() => {
+                    if let NodeDoc::Mixer { inputs, .. } = node {
+                        *inputs as usize
+                    } else {
+                        1
+                    }
+                }
+                _ => 1,
+            },
+        };
+        (0..n)
+            .map(|i| {
+                let y = r.top() + (i as f32 + 0.5) * (r.height() / n.max(1) as f32);
+                (i as u8, Pos2::new(r.left(), y))
+            })
+            .collect()
     }
 
     /// Fill in default placements for missing entities (never overwrites existing positions;
@@ -395,7 +438,7 @@ impl PatchState {
     fn ensure_positions(&mut self, doc: &GraphDoc, track_count: usize, _auto_count: usize) {
         let mut wanted: Vec<PatchId> = Vec::new();
 
-        // One column per track: instrument → effect stack → channel strip.
+        // One column per track: instrument → effect stack → mixer.
         let mut effect_slot = vec![0usize; track_count];
         for node in &doc.nodes {
             let track = node.track().min(track_count.saturating_sub(1));
@@ -414,6 +457,7 @@ impl PatchState {
                         Pos2::new(480.0, y + k as f32 * 64.0),
                     )
                 }
+                NodeDoc::Mixer { .. } => (PatchId::Node(node.node_id()), Pos2::new(700.0, y)),
                 NodeDoc::ChannelStrip { .. } => {
                     (PatchId::Node(node.node_id()), Pos2::new(700.0, y))
                 }
@@ -487,9 +531,30 @@ impl PatchState {
         sp: Pos2,
         midi_count: usize,
         auto_count: usize,
+        doc: &GraphDoc,
     ) -> Option<(PatchId, usize)> {
         for &id in self.positions.keys() {
-            for (port, p) in self.out_ports_screen(rect_min, id, midi_count, auto_count) {
+            for (port, p) in self.out_ports_screen(rect_min, id, midi_count, auto_count, doc) {
+                if p.distance(sp) <= PORT_HIT_RADIUS {
+                    return Some((id, port));
+                }
+            }
+        }
+        None
+    }
+
+    /// Hit-test an input port (screen distance) → `(entity, channel index)`.
+    /// Used for mixer-channel-targeted cable drops (D17).
+    fn hit_in_port(
+        &self,
+        rect_min: Pos2,
+        sp: Pos2,
+        midi_count: usize,
+        auto_count: usize,
+        doc: &GraphDoc,
+    ) -> Option<(PatchId, u8)> {
+        for &id in self.positions.keys() {
+            for (port, p) in self.in_ports_screen(rect_min, id, midi_count, auto_count, doc) {
                 if p.distance(sp) <= PORT_HIT_RADIUS {
                     return Some((id, port));
                 }
@@ -505,9 +570,10 @@ impl PatchState {
         sp: Pos2,
         midi_count: usize,
         auto_count: usize,
+        doc: &GraphDoc,
     ) -> Option<PatchId> {
         for &id in self.positions.keys() {
-            if let Some(r) = self.screen_rect(rect_min, id, midi_count, auto_count) {
+            if let Some(r) = self.screen_rect(rect_min, id, midi_count, auto_count, doc) {
                 if r.contains(sp) {
                     return Some(id);
                 }
@@ -523,12 +589,13 @@ impl PatchState {
         marquee: Rect,
         midi_count: usize,
         auto_count: usize,
+        doc: &GraphDoc,
     ) -> Vec<PatchId> {
         self.positions
             .keys()
             .copied()
             .filter(|&id| {
-                self.screen_rect(rect_min, id, midi_count, auto_count)
+                self.screen_rect(rect_min, id, midi_count, auto_count, doc)
                     .is_some_and(|r| r.intersects(marquee))
             })
             .collect()
@@ -536,21 +603,28 @@ impl PatchState {
 
     /// Endpoint screen positions of a document cable → bezier control points
     /// (`None` when either endpoint has no position / the ports don't resolve).
+    /// The endpoint lands on the input port matching `cable.in_port` (D17:
+    /// the mixer channel the cable is bound to).
     fn cable_controls(
         &self,
         rect_min: Pos2,
         cable: &CableDoc,
         midi_count: usize,
         auto_count: usize,
+        doc: &GraphDoc,
     ) -> Option<[Pos2; 4]> {
         let (from, from_port) = patch_port_from(&cable.from, midi_count)?;
         let to = patch_port_to(&cable.to)?;
         let p0 = self
-            .out_ports_screen(rect_min, from, midi_count, auto_count)
+            .out_ports_screen(rect_min, from, midi_count, auto_count, doc)
             .into_iter()
             .find(|(k, _)| *k == from_port)?
             .1;
-        let p3 = self.in_port_screen(rect_min, to, midi_count, auto_count)?;
+        let p3 = self
+            .in_ports_screen(rect_min, to, midi_count, auto_count, doc)
+            .into_iter()
+            .find(|(k, _)| *k == cable.in_port)?
+            .1;
         Some(bezier_controls(p0, p3))
     }
 
@@ -564,7 +638,7 @@ impl PatchState {
         auto_count: usize,
     ) -> Option<usize> {
         for (i, cable) in doc.cables.iter().enumerate() {
-            let Some(c) = self.cable_controls(rect_min, cable, midi_count, auto_count) else {
+            let Some(c) = self.cable_controls(rect_min, cable, midi_count, auto_count, doc) else {
                 continue;
             };
             for pt in bezier_points(c, 24) {
@@ -586,7 +660,7 @@ impl PatchState {
         auto_count: usize,
     ) -> Option<usize> {
         for (i, cable) in doc.cables.iter().enumerate() {
-            let Some(c) = self.cable_controls(rect_min, cable, midi_count, auto_count) else {
+            let Some(c) = self.cable_controls(rect_min, cable, midi_count, auto_count, doc) else {
                 continue;
             };
             if bezier_points(c, 24)[12].distance(sp) <= MIDPOINT_HIT_RADIUS {
@@ -611,7 +685,7 @@ impl PatchState {
             return hits;
         }
         for (i, cable) in doc.cables.iter().enumerate() {
-            let Some(c) = self.cable_controls(rect_min, cable, midi_count, auto_count) else {
+            let Some(c) = self.cable_controls(rect_min, cable, midi_count, auto_count, doc) else {
                 continue;
             };
             'cable: for pt in bezier_points(c, 32) {
@@ -641,7 +715,7 @@ impl PatchState {
         auto_count: usize,
         shift: bool,
     ) -> Option<PatchId> {
-        if let Some(id) = self.hit_node(rect_min, sp, midi_count, auto_count) {
+        if let Some(id) = self.hit_node(rect_min, sp, midi_count, auto_count, doc) {
             if shift {
                 self.selection.toggle_node(id);
             } else if !self.selection.contains_node(id) {
@@ -716,15 +790,11 @@ fn accepts(kind: CableKind, target: PatchId, doc: &GraphDoc) -> bool {
         };
         match kind {
             CableKind::Audio => {
-                matches!(node, NodeDoc::Effect { .. } | NodeDoc::ChannelStrip { .. })
+                matches!(node, NodeDoc::Effect { .. } | NodeDoc::Mixer { .. })
             }
             CableKind::Midi => matches!(node, NodeDoc::Instrument { .. }),
-            CableKind::Automation => {
-                matches!(
-                    node,
-                    NodeDoc::Instrument { .. } | NodeDoc::ChannelStrip { .. }
-                )
-            }
+            // Mixer-fader automation is deferred (P5f decision): instruments only.
+            CableKind::Automation => matches!(node, NodeDoc::Instrument { .. }),
         }
     } else {
         matches!(target, PatchId::Master) && kind == CableKind::Audio
@@ -850,10 +920,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     // decisively; in-place presses are handled by the `clicked` path below.
     if drag_started {
         let sp = pointer.unwrap_or(rect.min);
-        if let Some((source, port)) = state.hit_out_port(rect.min, sp, midi_count, auto_count) {
+        if let Some((source, port)) = state.hit_out_port(rect.min, sp, midi_count, auto_count, doc)
+        {
             state.selection = Selection::default();
             state.drag = Some(DragKind::Cable(CableDrag { from: source, port }));
-        } else if let Some(id) = state.hit_node(rect.min, sp, midi_count, auto_count) {
+        } else if let Some(id) = state.hit_node(rect.min, sp, midi_count, auto_count, doc) {
             let picked = state.point_select(rect.min, sp, doc, midi_count, auto_count, shift);
             if !shift && let Some(track) = track_of_node(picked, doc) {
                 actions.push(PatchAction::SelectTrack(track));
@@ -909,8 +980,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             if ui.button("Effect (Delay)").clicked() {
                 picked_kind = Some(AddNodeKind::Effect);
             }
-            if ui.button("Channel Strip").clicked() {
-                picked_kind = Some(AddNodeKind::ChannelStrip);
+            if ui.button("Mixer").clicked() {
+                picked_kind = Some(AddNodeKind::Mixer);
             }
         });
     }
@@ -979,7 +1050,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         match state.drag.take() {
             Some(DragKind::Cable(drag)) => {
                 if let Some(sp) = pointer
-                    && let Some(target) = state.hit_node(rect.min, sp, midi_count, auto_count)
+                    && let Some(target) = state.hit_node(rect.min, sp, midi_count, auto_count, doc)
                 {
                     match drag.from {
                         // Timeline port: MIDI tracks first, then control tracks
@@ -1013,7 +1084,39 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                                     PatchId::Master => PortRef::Master,
                                     _ => PortRef::Master,
                                 };
-                                actions.push(PatchAction::ConnectAudio { from_doc, to });
+                                // D17: the cable binds to the target's input
+                                // port. Dropping on a mixer picks the exact
+                                // channel port when hit precisely, else the
+                                // first free channel; dropping anywhere else
+                                // is port 0. Reject when no channel is free
+                                // (or the precisely-hit port is occupied).
+                                let in_port = match target {
+                                    PatchId::Node(to_doc)
+                                        if doc.node_by_id(to_doc).is_some_and(|n| n.is_mixer()) =>
+                                    {
+                                        let exact = state
+                                            .hit_in_port(rect.min, sp, midi_count, auto_count, doc);
+                                        match exact {
+                                            Some((PatchId::Node(_), port)) => {
+                                                let occupied = doc.cables.iter().any(|c| {
+                                                    c.kind == CableKind::Audio
+                                                        && c.to == PortRef::Node(to_doc)
+                                                        && c.in_port == port
+                                                });
+                                                if occupied { None } else { Some(port) }
+                                            }
+                                            _ => doc.first_free_channel(to_doc),
+                                        }
+                                    }
+                                    _ => Some(0),
+                                };
+                                if let Some(in_port) = in_port {
+                                    actions.push(PatchAction::ConnectAudio {
+                                        from_doc,
+                                        to,
+                                        in_port,
+                                    });
+                                }
                             }
                         }
                         PatchId::Master => {}
@@ -1023,7 +1126,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             Some(DragKind::BoxSelect { start, add }) => {
                 if let Some(sp) = pointer {
                     let marquee = Rect::from_two_pos(start, sp);
-                    let hits = state.nodes_in_rect(rect.min, marquee, midi_count, auto_count);
+                    let hits = state.nodes_in_rect(rect.min, marquee, midi_count, auto_count, doc);
                     if add {
                         for id in hits {
                             if !state.selection.contains_node(id) {
@@ -1044,7 +1147,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
 
     // ---- Draw cables (beneath nodes) ----
     for (i, cable) in doc.cables.iter().enumerate() {
-        let Some(bez) = state.cable_controls(rect.min, cable, midi_count, auto_count) else {
+        let Some(bez) = state.cable_controls(rect.min, cable, midi_count, auto_count, doc) else {
             continue;
         };
         let selected = state.selection.cables.contains(&i);
@@ -1090,7 +1193,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     {
         for i in state.cables_crossing_path(rect.min, path, doc, midi_count, auto_count) {
             if let Some(bez) =
-                state.cable_controls(rect.min, &doc.cables[i], midi_count, auto_count)
+                state.cable_controls(rect.min, &doc.cables[i], midi_count, auto_count, doc)
             {
                 painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
                     bez,
@@ -1121,7 +1224,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         };
         if let Some(sp) = pointer {
             let p0 = state
-                .out_ports_screen(rect.min, drag.from, midi_count, auto_count)
+                .out_ports_screen(rect.min, drag.from, midi_count, auto_count, doc)
                 .into_iter()
                 .find(|(k, _)| *k == drag.port)
                 .map(|(_, p)| p);
@@ -1133,9 +1236,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     egui::Stroke::new(2.0, cable_color(kind).gamma_multiply(0.7)),
                 ));
                 // Highlight the hovered target.
-                if let Some(target) = state.hit_node(rect.min, sp, midi_count, auto_count) {
+                if let Some(target) = state.hit_node(rect.min, sp, midi_count, auto_count, doc) {
                     if accepts(kind, target, doc) && drag.from != target {
-                        if let Some(r) = state.screen_rect(rect.min, target, midi_count, auto_count)
+                        if let Some(r) =
+                            state.screen_rect(rect.min, target, midi_count, auto_count, doc)
                         {
                             painter.rect_stroke(
                                 r,
@@ -1152,7 +1256,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
 
     // ---- Draw nodes ----
     for &id in state.positions.keys() {
-        let Some(r) = state.screen_rect(rect.min, id, midi_count, auto_count) else {
+        let Some(r) = state.screen_rect(rect.min, id, midi_count, auto_count, doc) else {
             continue;
         };
         if !r.intersects(rect) {
@@ -1182,7 +1286,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         );
 
         // Output ports (the timeline draws one per track with a small label).
-        for (port, p) in state.out_ports_screen(rect.min, id, midi_count, auto_count) {
+        for (port, p) in state.out_ports_screen(rect.min, id, midi_count, auto_count, doc) {
             let port_color = match id {
                 PatchId::Timeline if port < midi_count => cable_color(CableKind::Midi),
                 PatchId::Timeline => cable_color(CableKind::Automation),
@@ -1205,7 +1309,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 );
             }
         }
-        if let Some(p) = state.in_port_screen(rect.min, id, midi_count, auto_count) {
+        // Input ports: mixers draw one per channel (P5f D17), other nodes /
+        // master the single port 0.
+        for (_, p) in state.in_ports_screen(rect.min, id, midi_count, auto_count, doc) {
             painter.circle_filled(p, PORT_RADIUS, Color32::from_gray(90));
             painter.circle_stroke(p, PORT_RADIUS, egui::Stroke::new(1.0, Color32::BLACK));
         }
@@ -1308,8 +1414,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     if is_audio && ui.button("Insert Effect (Delay)").clicked() {
                         picked = Some(CablePick::Insert(AddNodeKind::Effect));
                     }
-                    if is_audio && ui.button("Insert Channel Strip").clicked() {
-                        picked = Some(CablePick::Insert(AddNodeKind::ChannelStrip));
+                    if is_audio && ui.button("Insert Mixer").clicked() {
+                        picked = Some(CablePick::Insert(AddNodeKind::Mixer));
                     }
                     if ui.button("Delete Cable").clicked() {
                         picked = Some(CablePick::Delete);
@@ -1392,12 +1498,13 @@ mod tests {
     fn place_node_position_survives_ensure_positions() {
         let mut project = Project::default();
         let new_id = project.graph.next_node_id();
-        project.graph.nodes.push(NodeDoc::ChannelStrip {
+        project.graph.nodes.push(NodeDoc::Mixer {
             node_id: new_id,
             track: 0,
-            gain: 0.8,
-            pan: 0.0,
-            muted: false,
+            inputs: 2,
+            channels: vec![Default::default(); 2],
+            out_pan: 0.0,
+            out_muted: false,
         });
         let doc = &project.graph;
         let mut state = PatchState::default();
@@ -1415,12 +1522,13 @@ mod tests {
     fn export_layout_filters_stale_and_roundtrips() {
         let mut project = Project::default();
         let id = project.graph.next_node_id();
-        project.graph.nodes.push(NodeDoc::ChannelStrip {
+        project.graph.nodes.push(NodeDoc::Mixer {
             node_id: id,
             track: 0,
-            gain: 0.8,
-            pan: 0.0,
-            muted: false,
+            inputs: 2,
+            channels: vec![Default::default(); 2],
+            out_pan: 0.0,
+            out_muted: false,
         });
         let doc = &project.graph;
         let mut state = PatchState::default();
@@ -1452,11 +1560,11 @@ mod tests {
     #[test]
     fn cut_path_hits_crossing_cable_only() {
         let mut project = Project::default();
-        let strip = project.graph.channel_strip_of_track(0).unwrap().node_id();
+        let mixer = project.graph.first_mixer().unwrap().node_id();
         project
             .graph
             .cables
-            .push(CableDoc::audio(strip, PortRef::Master));
+            .push(CableDoc::audio(mixer, PortRef::Master));
         let idx = project.graph.cables.len() - 1;
         let doc = &project.graph;
         let (midi, auto) = (project.midi_tracks.len(), project.control_tracks.len());
@@ -1465,7 +1573,7 @@ mod tests {
 
         let rect_min = Pos2::ZERO; // pan = 0, zoom = 1 → screen == graph space
         let bez = state
-            .cable_controls(rect_min, &doc.cables[idx], midi, auto)
+            .cable_controls(rect_min, &doc.cables[idx], midi, auto, doc)
             .expect("cable endpoints resolve");
         let path = bezier_points(bez, 8);
         let hits = state.cables_crossing_path(rect_min, &path, doc, midi, auto);
@@ -1523,20 +1631,25 @@ mod tests {
         let project = Project::default();
         let doc = &project.graph;
         let instrument = doc.instrument_of_track(0).unwrap().node_id();
-        let strip = doc.channel_strip_of_track(0).unwrap().node_id();
+        let mixer = doc.first_mixer().unwrap().node_id();
         let delay = doc.builtin_delay_of_track(0).unwrap().node_id();
 
-        // Audio: effects/channel strips/master output accept; instruments reject.
+        // Audio: effects/mixers/master output accept; instruments reject.
         assert!(accepts(CableKind::Audio, PatchId::Node(delay), doc));
-        assert!(accepts(CableKind::Audio, PatchId::Node(strip), doc));
+        assert!(accepts(CableKind::Audio, PatchId::Node(mixer), doc));
         assert!(accepts(CableKind::Audio, PatchId::Master, doc));
         assert!(!accepts(CableKind::Audio, PatchId::Node(instrument), doc));
         // MIDI: instruments accept; everything else rejects.
         assert!(accepts(CableKind::Midi, PatchId::Node(instrument), doc));
-        assert!(!accepts(CableKind::Midi, PatchId::Node(strip), doc));
+        assert!(!accepts(CableKind::Midi, PatchId::Node(mixer), doc));
         assert!(!accepts(CableKind::Midi, PatchId::Master, doc));
-        // Automation: instruments/channel strips accept.
-        assert!(accepts(CableKind::Automation, PatchId::Node(strip), doc));
+        // Automation: instruments accept (mixer-fader automation deferred).
+        assert!(accepts(
+            CableKind::Automation,
+            PatchId::Node(instrument),
+            doc
+        ));
+        assert!(!accepts(CableKind::Automation, PatchId::Node(mixer), doc));
         assert!(accepts(
             CableKind::Automation,
             PatchId::Node(instrument),
