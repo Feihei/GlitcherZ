@@ -84,7 +84,7 @@
 | 项目文件 | project file | `.rez`（RON 格式） |
 | 持久化 | persisted | eframe storage / 文档序列化语境 |
 | 冒烟测试 | smoke test | `--seconds` 自动关窗跑通 |
-| 节点画布 | node canvas | P5d 的图视图编辑器 |
+| 节点画布 | node patch | P5d 的 patch 图视图编辑器（Pure Data 语境，连线图叫 patch） |
 | 钢琴卷帘 | piano roll | 音符片段编辑器 |
 | 步进音序器 | step sequencer | 16 步网格编辑器 |
 | 混音器 | mixer | 多轨电平/推子区 |
