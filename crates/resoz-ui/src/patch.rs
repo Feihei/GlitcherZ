@@ -2,9 +2,9 @@
 //!
 //! Responsibility boundary: the patch only does **view + interaction intent** — pan (middle
 //! drag)/zoom (wheel), node box drawing (color-coded by type), cable drawing, drag-to-connect
-//! interaction, point/marquee selection and deletion. All side effects are returned via
-//! [`PatchAction`] and applied to the document + engine in one place by
-//! `ResoZApp::apply_patch_actions` (the patch never touches the engine/guards directly).
+//! interaction, point/marquee selection and deletion, right-click node adding. All side
+//! effects are returned via [`PatchAction`] and applied to the document + engine in one place
+//! by `ResoZApp::apply_patch_actions` (the patch never touches the engine/guards directly).
 //!
 //! Coordinate convention: node positions are stored in **graph space** (session memory, not
 //! persisted; P5c dual identity — the patch deals with document node_ids + fixed entities and
@@ -34,10 +34,24 @@ pub enum PatchId {
     Timeline,
 }
 
+/// Kind of node the user wants to add via the patch context menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddNodeKind {
+    /// Instrument node (built-in synth voice, MIDI entry).
+    Instrument,
+    /// Effect node (built-in delay).
+    Effect,
+    /// Channel strip node (gain / pan / mute).
+    ChannelStrip,
+}
+
 /// Interaction intents produced within one patch frame (applied by the caller; the patch has
 /// no side effects).
 #[derive(Debug, Clone)]
 pub enum PatchAction {
+    /// Add a new node of `kind` at graph-space position `at` (right-click menu). The new
+    /// node is born dangling (no cables; D6 dangling semantics) — the user wires it up.
+    AddNode { kind: AddNodeKind, at: Pos2 },
     /// Audio cable drag: source document node → target (node or master output).
     ConnectAudio { from_doc: u64, to: PortRef },
     /// MIDI cable drag: timeline track → instrument document node.
@@ -50,7 +64,8 @@ pub enum PatchAction {
     },
     /// Delete a cable (index into the document cable table).
     DeleteCable(usize),
-    /// Delete a node (document node_id; only effects are accepted, validated by the caller).
+    /// Delete a node (document node_id; any instrument / effect / channel strip is
+    /// deletable — master / timeline are fixed and never selected as document nodes).
     DeleteNode(u64),
     /// Set a node's owning track as the current editing track.
     SelectTrack(usize),
@@ -95,6 +110,9 @@ pub struct PatchState {
     /// Parameters awaiting selection after dropping an automation cable drag: `(track index,
     /// target document node, popup position)`.
     pending_auto: Option<(usize, u64, Pos2)>,
+    /// Graph-space position where the add-node context menu was opened (consumed when a
+    /// node kind is picked).
+    add_menu_at: Option<Pos2>,
 }
 
 impl Default for PatchState {
@@ -106,6 +124,7 @@ impl Default for PatchState {
             selection: Selection::default(),
             drag: None,
             pending_auto: None,
+            add_menu_at: None,
         }
     }
 }
@@ -395,6 +414,12 @@ impl PatchState {
         self.positions.retain(|id, _| wanted.contains(id));
     }
 
+    /// Set the graph-space position of a freshly added node (called by the glue after
+    /// committing an [`PatchAction::AddNode`]; `ensure_positions` never overwrites it).
+    pub fn place_node(&mut self, node_id: u64, at: Pos2) {
+        self.positions.insert(PatchId::Node(node_id), at);
+    }
+
     /// Hit-test an output port (screen distance) → `(entity, port index)`.
     fn hit_out_port(
         &self,
@@ -630,7 +655,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             state.pan = Vec2::ZERO;
             state.zoom = 1.0;
         }
-        ui.weak("Click to select · drag bg to box-select · middle-drag to pan · scroll to zoom · drag ports to connect · Delete to remove");
+        ui.weak("Right-click to add node · click to select · drag bg to box-select · middle-drag to pan · scroll to zoom · drag ports to connect · Delete to remove");
     });
 
     // ---- Patch ----
@@ -717,6 +742,39 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         if !shift && let Some(track) = track_of_node(picked, doc) {
             actions.push(PatchAction::SelectTrack(track));
         }
+    }
+
+    // ---- Right-click: add-node context menu (any position; the new node appears where
+    // the user clicked) ----
+    if response.secondary_clicked()
+        && let Some(sp) = pointer
+    {
+        state.add_menu_at = Some(Pos2::new(
+            state.pan.x + (sp.x - rect.min.x) / state.zoom,
+            state.pan.y + (sp.y - rect.min.y) / state.zoom,
+        ));
+    }
+    // egui manages the open/close lifecycle (Escape / click elsewhere close it); the
+    // closure runs only while the menu is open. egui 0.36's `context_menu` closure
+    // returns `()`, so the pick is collected through a captured outer variable.
+    let mut picked_kind: Option<AddNodeKind> = None;
+    response.context_menu(|ui| {
+        ui.set_min_width(120.0);
+        ui.strong("Add Node");
+        if ui.button("Instrument").clicked() {
+            picked_kind = Some(AddNodeKind::Instrument);
+        }
+        if ui.button("Effect (Delay)").clicked() {
+            picked_kind = Some(AddNodeKind::Effect);
+        }
+        if ui.button("Channel Strip").clicked() {
+            picked_kind = Some(AddNodeKind::ChannelStrip);
+        }
+    });
+    if let Some(kind) = picked_kind
+        && let Some(at) = state.add_menu_at.take()
+    {
+        actions.push(PatchAction::AddNode { kind, at });
     }
 
     // ---- Drag in progress ----
@@ -1070,6 +1128,31 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A freshly added node's placed position must survive `ensure_positions`
+    /// (the auto-placement only fills *missing* entries). Mirrors the real glue
+    /// order: document node pushed first, then `place_node`.
+    #[test]
+    fn place_node_position_survives_ensure_positions() {
+        let mut project = Project::default();
+        let new_id = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::ChannelStrip {
+            node_id: new_id,
+            track: 0,
+            gain: 0.8,
+            pan: 0.0,
+            muted: false,
+        });
+        let doc = &project.graph;
+        let mut state = PatchState::default();
+        state.ensure_positions(doc, project.midi_tracks.len(), project.control_tracks.len());
+
+        let at = Pos2::new(555.0, 77.0);
+        state.place_node(new_id, at);
+        state.ensure_positions(doc, project.midi_tracks.len(), project.control_tracks.len());
+
+        assert_eq!(state.positions.get(&PatchId::Node(new_id)), Some(&at));
     }
 
     #[test]

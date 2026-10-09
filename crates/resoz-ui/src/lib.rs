@@ -35,8 +35,8 @@ use resoz_engine::realtime::{
     RtMidiClip, RtNote, SequencerCommand, SynthProcessor,
 };
 use resoz_model::{
-    AutoParam, CableKind, ControlTrack, DelayParams, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS, MidiClip,
-    NodeDoc, PortRef, Project, SynthParams, VoiceSpec,
+    AutoParam, CableKind, ControlTrack, DelayParams, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS, MAX_NODES,
+    MidiClip, NodeDoc, PortRef, Project, SynthParams, VoiceSpec,
 };
 
 pub mod lane;
@@ -394,36 +394,7 @@ impl ResoZApp {
         // 3) Assemble track addressing tables (track-coordinate addressing for manual
         //    params/levels/keyboard).
         for track in 0..self.project.midi_tracks.len() {
-            let resolve = |doc_id: Option<u64>| -> Option<u64> {
-                doc_id.and_then(|id| self.node_map.get(&id).copied())
-            };
-            let voice = resolve(
-                self.project
-                    .graph
-                    .instrument_of_track(track)
-                    .map(NodeDoc::node_id),
-            );
-            let delay = resolve(
-                self.project
-                    .graph
-                    .builtin_delay_of_track(track)
-                    .map(NodeDoc::node_id),
-            );
-            let channel = resolve(
-                self.project
-                    .graph
-                    .channel_strip_of_track(track)
-                    .map(NodeDoc::node_id),
-            );
-            if !self
-                .engine
-                .register_track_chain(track, voice, delay, channel)
-            {
-                log::warn!(
-                    "Track {} addressing table assembly failed (missing node or queue full)",
-                    track + 1
-                );
-            }
+            self.register_track_chain(track);
         }
 
         // 4) Connect cables per the document.
@@ -621,6 +592,42 @@ impl ResoZApp {
             drop(guard); // Node never entered the graph: drop the guard immediately (safe unload
             // of the dynamic library).
             log::error!("Document node {doc_id} installation failed (slots full / queue full)");
+        }
+    }
+
+    /// Re-assemble one track's engine addressing table (manual params/level/keyboard
+    /// addressing) from the document roles + `node_map`. Called after document rebuild and
+    /// whenever a node filling a track role is added or removed.
+    fn register_track_chain(&mut self, track: usize) {
+        let resolve = |doc_id: Option<u64>| -> Option<u64> {
+            doc_id.and_then(|id| self.node_map.get(&id).copied())
+        };
+        let voice = resolve(
+            self.project
+                .graph
+                .instrument_of_track(track)
+                .map(NodeDoc::node_id),
+        );
+        let delay = resolve(
+            self.project
+                .graph
+                .builtin_delay_of_track(track)
+                .map(NodeDoc::node_id),
+        );
+        let channel = resolve(
+            self.project
+                .graph
+                .channel_strip_of_track(track)
+                .map(NodeDoc::node_id),
+        );
+        if !self
+            .engine
+            .register_track_chain(track, voice, delay, channel)
+        {
+            log::warn!(
+                "Track {} addressing table assembly failed (missing node or queue full)",
+                track + 1
+            );
         }
     }
 
@@ -866,6 +873,9 @@ impl ResoZApp {
     fn apply_patch_actions(&mut self, actions: Vec<patch::PatchAction>) {
         for action in actions {
             match action {
+                patch::PatchAction::AddNode { kind, at } => {
+                    self.add_patch_node(kind, at);
+                }
                 patch::PatchAction::ConnectAudio { from_doc, to } => {
                     // Document deduplication (engine-side add_cable is idempotent anyway).
                     let dup = self.project.graph.cables.iter().any(|c| {
@@ -944,6 +954,53 @@ impl ResoZApp {
         }
     }
 
+    /// Add a new document node from the patch context menu: allocate the next document
+    /// node_id, install the processor into the engine (born dangling — no cables; D6),
+    /// place it on the patch at the click position, and refresh the owning track's
+    /// addressing table. The new node's owning track is the currently selected track.
+    fn add_patch_node(&mut self, kind: patch::AddNodeKind, at: egui::Pos2) {
+        if self.project.graph.nodes.len() >= MAX_NODES {
+            self.set_message("Add node failed: node table full (64)".to_string());
+            return;
+        }
+        let node_id = self.project.graph.next_node_id();
+        let track = self
+            .selected_track
+            .min(self.project.midi_tracks.len().saturating_sub(1));
+        let node = match kind {
+            patch::AddNodeKind::Instrument => NodeDoc::Instrument {
+                node_id,
+                track,
+                voice: VoiceSpec::Builtin,
+                synth: SynthParams::default(),
+            },
+            patch::AddNodeKind::Effect => NodeDoc::Effect {
+                node_id,
+                track,
+                voice: VoiceSpec::Builtin,
+                delay: DelayParams::default(),
+            },
+            patch::AddNodeKind::ChannelStrip => NodeDoc::ChannelStrip {
+                node_id,
+                track,
+                gain: 0.8,
+                pan: 0.0,
+                muted: false,
+            },
+        };
+        let sample_rate = self.engine.info().sample_rate;
+        self.project.graph.nodes.push(node.clone());
+        self.install_node(&node, sample_rate);
+        if !self.node_map.contains_key(&node_id) {
+            // Engine slot/queue full: roll the document back so doc and engine stay one.
+            self.project.graph.nodes.pop();
+            self.set_message("Add node failed (engine slots or queue full)".to_string());
+            return;
+        }
+        self.patch_state.place_node(node_id, at);
+        self.register_track_chain(track);
+    }
+
     /// Delete a cable (document index i; document and engine stay in sync).
     fn delete_cable(&mut self, i: usize) {
         let Some(cable) = self.project.graph.cables.get(i).cloned() else {
@@ -981,17 +1038,17 @@ impl ResoZApp {
         self.project.graph.cables.remove(i);
     }
 
-    /// Delete a node: effects only (MVP) — engine `remove_node` has built-in bypass semantics
-    /// (in-edge sources × out-edge targets become direct connections); the document mirrors the
-    /// same rewiring.
+    /// Delete a document node (any instrument / effect / channel strip; the master output is
+    /// not a document node and is never deletable) — engine `remove_node` has built-in bypass
+    /// semantics (in-edge sources × out-edge targets become direct connections); the document
+    /// mirrors the same rewiring. MIDI / automation cables touching the node are simply
+    /// removed (a deleted instrument loses its MIDI feed; a deleted parameter target loses
+    /// its automation cable). The owning track's addressing table is refreshed afterwards.
     fn delete_graph_node(&mut self, doc_id: u64) {
         let Some(node) = self.project.graph.node_by_id(doc_id) else {
             return;
         };
-        if !matches!(node, NodeDoc::Effect { .. }) {
-            self.set_message("Patch: only effect nodes can be removed (instruments/channel strips are panel-managed)".to_string());
-            return;
-        }
+        let track = node.track();
         // Document bypass pairs: in-cable sources × out-cable targets (all cable types are
         // removed; audio direct-connection pairs are rebuilt per engine remove_node semantics).
         let ins: Vec<PortRef> = self
@@ -1035,6 +1092,9 @@ impl ResoZApp {
         }
         self.node_map.remove(&doc_id);
         self.retire_guard(engine_id);
+        // The deleted node may have filled a role (voice / delay / channel) in the track
+        // addressing table — refresh it from the remaining document nodes.
+        self.register_track_chain(track);
     }
 
     /// Document clip table → engine representation (D15 batch, truncated to capacity, `Copy`
