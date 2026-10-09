@@ -521,8 +521,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut CanvasState, deps: CanvasDeps<'_>) ->
     });
 
     // ---- Canvas ----
+    // Fill the remaining central-panel height (dedicated Canvas view); fall back
+    // to the fixed minimum when the available space is smaller.
     let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), CANVAS_HEIGHT),
+        Vec2::new(
+            ui.available_width(),
+            ui.available_height().max(CANVAS_HEIGHT),
+        ),
         Sense::click_and_drag(),
     );
     let painter = ui.painter_at(rect);

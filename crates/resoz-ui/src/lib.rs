@@ -212,6 +212,18 @@ enum EditTarget {
     Control { track: usize, clip: usize },
 }
 
+/// Main view switch (tab bar under the transport panel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum MainView {
+    /// Arrangement timeline (default view: the DAW's home screen).
+    #[default]
+    Timeline,
+    /// Node graph canvas (full-height, dedicated view).
+    Canvas,
+    /// Synth params + mixer + clip/automation editors + keyboard.
+    Synth,
+}
+
 /// Main window app. Owns the [`AudioEngine`]: closing the window drops the engine and stops the
 /// audio stream.
 pub struct ResoZApp {
@@ -235,6 +247,8 @@ pub struct ResoZApp {
     lane_state: lane::LaneState,
     /// Node canvas cross-frame state (pan/zoom/selection/drag).
     canvas_state: canvas::CanvasState,
+    /// Active main view (tab bar).
+    view: MainView,
     /// Octave base (MIDI number of C, default 60 = C4).
     octave_base: u8,
     /// Currently held notes (shared by on-screen keys and computer keys, for highlighting and
@@ -313,6 +327,7 @@ impl ResoZApp {
             roll_state: piano_roll::RollState::new(),
             lane_state: lane::LaneState::default(),
             canvas_state: canvas::CanvasState::default(),
+            view: MainView::default(),
             octave_base: 60,
             held_notes: HashSet::new(),
             mouse_down_notes: HashSet::new(),
@@ -1674,6 +1689,17 @@ impl ResoZApp {
 
     /// Arrangement timeline panel (timeline spec T3): rows = tracks, clip
     /// blocks with move/resize/insert/delete, double-click opens the editor.
+    /// Main view tab bar (stacks under the transport panel).
+    fn view_tabs(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("resoz_views").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.view, MainView::Timeline, "Timeline");
+                ui.selectable_value(&mut self.view, MainView::Canvas, "Canvas");
+                ui.selectable_value(&mut self.view, MainView::Synth, "Synth / Mixer");
+            });
+        });
+    }
+
     fn timeline_panel(&mut self, ui: &mut egui::Ui) {
         if self.project.midi_tracks.is_empty() && self.project.control_tracks.is_empty() {
             return;
@@ -1818,7 +1844,16 @@ impl ResoZApp {
                 ui.separator();
                 ui.label(format!("Note: {note_text}"));
                 ui.separator();
-                ui.label(format!("Pos {:.1} s", position));
+                // Musical transport position (bar.beat, from the sequencer's tick counter —
+                // frozen while stopped). The raw seconds counter is engine uptime (audio
+                // callback keeps rendering silent blocks), kept as a secondary diagnostic.
+                let ticks = self.engine.musical_ticks();
+                let tpb = resoz_model::TICKS_PER_BAR as f32;
+                let bar = (ticks / tpb).floor().max(0.0);
+                let beat = (ticks - bar * tpb) / (tpb / 4.0) + 1.0;
+                ui.label(format!("Pos {}.{}", bar as u32 + 1, beat));
+                ui.separator();
+                ui.label(format!("Uptime {:.1} s", position));
                 if let Some((text, _)) = message {
                     ui.separator();
                     ui.colored_label(egui::Color32::LIGHT_BLUE, text);
@@ -1838,6 +1873,8 @@ impl ResoZApp {
                 ui.weak("(no MIDI tracks in project)");
                 return;
             }
+            // Long parameter stack: without a scroll area the content clips with no scrollbar.
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             let sel = self.selected_track.min(self.project.midi_tracks.len() - 1);
             self.selected_track = sel;
             let track_title = if self.project.midi_tracks[sel].name.is_empty() {
@@ -2097,8 +2134,6 @@ impl ResoZApp {
                 });
 
             ui.separator();
-            ui.add_space(4.0);
-            self.graph_canvas(ui);
 
             self.mixer_section(ui);
             self.clip_section(ui);
@@ -2113,6 +2148,7 @@ impl ResoZApp {
                     .show_percentage(),
             );
             ui.weak(format!("Peak {peak:.3} (AtomicF32 feedback, 600 ms hold)"));
+            });
         });
     }
 
@@ -2772,8 +2808,20 @@ impl eframe::App for ResoZApp {
 
         self.transport_panel(ui);
         self.status_panel(ui);
-        self.timeline_panel(ui);
-        self.synth_panel(ui);
+        self.view_tabs(ui);
+
+        // Central content per view. Every view owns the full central area; the
+        // tab bar decides which one is shown (fixes the old "canvas buried
+        // mid-scroll in the synth panel" layout that had no scrollbar).
+        match self.view {
+            MainView::Timeline => {
+                egui::CentralPanel::default().show(ui, |ui| self.timeline_panel(ui));
+            }
+            MainView::Canvas => {
+                egui::CentralPanel::default().show(ui, |ui| self.graph_canvas(ui));
+            }
+            MainView::Synth => self.synth_panel(ui),
+        }
         self.editor_window(ui.ctx());
 
         // Audio-driven displays (level meter, playback position, envelope) need periodic
