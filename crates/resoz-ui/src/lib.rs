@@ -876,41 +876,11 @@ impl ResoZApp {
                 patch::PatchAction::AddNode { kind, at } => {
                     self.add_patch_node(kind, at);
                 }
+                patch::PatchAction::InsertNode { cable, kind, at } => {
+                    self.insert_node_in_cable(cable, kind, at);
+                }
                 patch::PatchAction::ConnectAudio { from_doc, to } => {
-                    // Document deduplication (engine-side add_cable is idempotent anyway).
-                    let dup = self.project.graph.cables.iter().any(|c| {
-                        c.kind == CableKind::Audio
-                            && c.from == PortRef::Node(from_doc)
-                            && c.to == to
-                    });
-                    if !dup {
-                        self.project
-                            .graph
-                            .cables
-                            .push(resoz_model::CableDoc::audio(from_doc, to.clone()));
-                    }
-                    let Some(&from_engine) = self.node_map.get(&from_doc) else {
-                        self.set_message(
-                            "Connect failed: source node not in engine graph".to_string(),
-                        );
-                        continue;
-                    };
-                    let to_engine = match &to {
-                        PortRef::Node(id) => self.node_map.get(id).copied(),
-                        PortRef::Master => Some(self.engine.master_node_id()),
-                        _ => None,
-                    };
-                    let Some(to_engine) = to_engine else {
-                        self.set_message(
-                            "Connect failed: target node not in engine graph".to_string(),
-                        );
-                        continue;
-                    };
-                    if !self.engine.connect_nodes(from_engine, to_engine) {
-                        self.set_message(
-                            "Connect failed: cycle / fan-in limit / queue full".to_string(),
-                        );
-                    }
+                    self.connect_audio(from_doc, to);
                 }
                 patch::PatchAction::ConnectMidi { track, to_doc } => {
                     let dup = self.project.graph.cables.iter().any(|c| {
@@ -959,9 +929,16 @@ impl ResoZApp {
     /// place it on the patch at the click position, and refresh the owning track's
     /// addressing table. The new node's owning track is the currently selected track.
     fn add_patch_node(&mut self, kind: patch::AddNodeKind, at: egui::Pos2) {
+        self.create_patch_node(kind, at);
+    }
+
+    /// Create + install a patch node (returns the new document node_id; `None` when the
+    /// node table is full or the engine install failed — the document is rolled back so
+    /// doc and engine stay in sync).
+    fn create_patch_node(&mut self, kind: patch::AddNodeKind, at: egui::Pos2) -> Option<u64> {
         if self.project.graph.nodes.len() >= MAX_NODES {
             self.set_message("Add node failed: node table full (64)".to_string());
-            return;
+            return None;
         }
         let node_id = self.project.graph.next_node_id();
         let track = self
@@ -995,10 +972,78 @@ impl ResoZApp {
             // Engine slot/queue full: roll the document back so doc and engine stay one.
             self.project.graph.nodes.pop();
             self.set_message("Add node failed (engine slots or queue full)".to_string());
-            return;
+            return None;
         }
         self.patch_state.place_node(node_id, at);
         self.register_track_chain(track);
+        Some(node_id)
+    }
+
+    /// Insert a new node into an existing audio cable: `A → B` becomes `A → new → B`
+    /// (cable-midpoint menu). The new node is placed where the user clicked.
+    fn insert_node_in_cable(
+        &mut self,
+        cable_index: usize,
+        kind: patch::AddNodeKind,
+        at: egui::Pos2,
+    ) {
+        let Some(cable) = self.project.graph.cables.get(cable_index).cloned() else {
+            return;
+        };
+        if cable.kind != CableKind::Audio {
+            self.set_message("Insert failed: only audio cables accept inserted nodes".to_string());
+            return;
+        }
+        if !matches!(
+            kind,
+            patch::AddNodeKind::Effect | patch::AddNodeKind::ChannelStrip
+        ) {
+            self.set_message(
+                "Insert failed: only effects / channel strips can be inserted".to_string(),
+            );
+            return;
+        }
+        let PortRef::Node(from_doc) = cable.from else {
+            self.set_message("Insert failed: cable has no node source".to_string());
+            return;
+        };
+        let Some(new_id) = self.create_patch_node(kind, at) else {
+            return;
+        };
+        self.delete_cable(cable_index);
+        self.connect_audio(from_doc, PortRef::Node(new_id));
+        self.connect_audio(new_id, cable.to.clone());
+    }
+
+    /// Connect an audio cable (document deduplication + engine edge; both stay in sync).
+    fn connect_audio(&mut self, from_doc: u64, to: PortRef) {
+        // Document deduplication (engine-side add_cable is idempotent anyway).
+        let dup =
+            self.project.graph.cables.iter().any(|c| {
+                c.kind == CableKind::Audio && c.from == PortRef::Node(from_doc) && c.to == to
+            });
+        if !dup {
+            self.project
+                .graph
+                .cables
+                .push(resoz_model::CableDoc::audio(from_doc, to.clone()));
+        }
+        let Some(&from_engine) = self.node_map.get(&from_doc) else {
+            self.set_message("Connect failed: source node not in engine graph".to_string());
+            return;
+        };
+        let to_engine = match &to {
+            PortRef::Node(id) => self.node_map.get(id).copied(),
+            PortRef::Master => Some(self.engine.master_node_id()),
+            _ => None,
+        };
+        let Some(to_engine) = to_engine else {
+            self.set_message("Connect failed: target node not in engine graph".to_string());
+            return;
+        };
+        if !self.engine.connect_nodes(from_engine, to_engine) {
+            self.set_message("Connect failed: cycle / fan-in limit / queue full".to_string());
+        }
     }
 
     /// Delete a cable (document index i; document and engine stay in sync).

@@ -2,7 +2,8 @@
 //!
 //! Responsibility boundary: the patch only does **view + interaction intent** — pan (middle
 //! drag)/zoom (wheel), node box drawing (color-coded by type), cable drawing, drag-to-connect
-//! interaction, point/marquee selection and deletion, right-click node adding. All side
+//! interaction, point/marquee selection and deletion, right-click node adding, Ctrl+right-drag
+//! cable cutting (Blender-style knife) and cable-midpoint insert/delete menus. All side
 //! effects are returned via [`PatchAction`] and applied to the document + engine in one place
 //! by `ResoZApp::apply_patch_actions` (the patch never touches the engine/guards directly).
 //!
@@ -15,7 +16,9 @@ use std::collections::HashMap;
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Sense, Vec2};
 
-use resoz_model::{AutoParam, CableKind, GraphDoc, LayoutDoc, NodeDoc, PortRef, VoiceSpec};
+use resoz_model::{
+    AutoParam, CableDoc, CableKind, GraphDoc, LayoutDoc, NodeDoc, PortRef, VoiceSpec,
+};
 
 /// Patch entity identity: document nodes + fixed entities (master output /
 /// the arrangement timeline).
@@ -67,6 +70,14 @@ pub enum PatchAction {
     /// Delete a node (document node_id; any instrument / effect / channel strip is
     /// deletable — master / timeline are fixed and never selected as document nodes).
     DeleteNode(u64),
+    /// Insert a new node of `kind` into the audio cable at document index `cable`,
+    /// replacing `A → B` with `A → new → B` (cable-midpoint menu). `at` = graph-space
+    /// position where the user clicked (the new node is placed there).
+    InsertNode {
+        cable: usize,
+        kind: AddNodeKind,
+        at: Pos2,
+    },
     /// Set a node's owning track as the current editing track.
     SelectTrack(usize),
 }
@@ -113,6 +124,12 @@ pub struct PatchState {
     /// Graph-space position where the add-node context menu was opened (consumed when a
     /// node kind is picked).
     add_menu_at: Option<Pos2>,
+    /// Ctrl + right-drag cable cut in progress: screen-space pointer path.
+    cut_path: Option<Vec<Pos2>>,
+    /// Cable-midpoint menu awaiting a pick: `(cable index, popup screen position,
+    /// graph-space insert position, frame it was opened)`. `u64::MAX` marks "opened this
+    /// frame" so the same-frame click does not immediately close it.
+    pending_cable_menu: Option<(usize, Pos2, Pos2, u64)>,
 }
 
 impl Default for PatchState {
@@ -125,6 +142,8 @@ impl Default for PatchState {
             drag: None,
             pending_auto: None,
             add_menu_at: None,
+            cut_path: None,
+            pending_cable_menu: None,
         }
     }
 }
@@ -178,11 +197,16 @@ const TIMELINE_ROW_HEIGHT: f32 = 26.0;
 const TIMELINE_MIN_HEIGHT: f32 = 40.0;
 /// Fixed patch height.
 const CANVAS_HEIGHT: f32 = 300.0;
-/// Output port circle radius / hit radius.
+/// Output port circle radius / hit radius (generous so port drags are easy to start).
 const PORT_RADIUS: f32 = 6.0;
-const PORT_HIT_RADIUS: f32 = 12.0;
+const PORT_HIT_RADIUS: f32 = 18.0;
 /// Cable hit distance.
 const CABLE_HIT_DIST: f32 = 8.0;
+/// Cable-cut hit distance (pointer path within this distance of a cable severs it).
+const CUT_HIT_DIST: f32 = 10.0;
+/// Cable midpoint control dot radius / hit radius.
+const MIDPOINT_RADIUS: f32 = 4.0;
+const MIDPOINT_HIT_RADIUS: f32 = 10.0;
 /// Zoom range.
 const ZOOM_MIN: f32 = 0.35;
 const ZOOM_MAX: f32 = 3.0;
@@ -510,6 +534,26 @@ impl PatchState {
             .collect()
     }
 
+    /// Endpoint screen positions of a document cable → bezier control points
+    /// (`None` when either endpoint has no position / the ports don't resolve).
+    fn cable_controls(
+        &self,
+        rect_min: Pos2,
+        cable: &CableDoc,
+        midi_count: usize,
+        auto_count: usize,
+    ) -> Option<[Pos2; 4]> {
+        let (from, from_port) = patch_port_from(&cable.from, midi_count)?;
+        let to = patch_port_to(&cable.to)?;
+        let p0 = self
+            .out_ports_screen(rect_min, from, midi_count, auto_count)
+            .into_iter()
+            .find(|(k, _)| *k == from_port)?
+            .1;
+        let p3 = self.in_port_screen(rect_min, to, midi_count, auto_count)?;
+        Some(bezier_controls(p0, p3))
+    }
+
     /// Hit-test a cable (returns the index into the document cable table).
     fn hit_cable(
         &self,
@@ -520,27 +564,66 @@ impl PatchState {
         auto_count: usize,
     ) -> Option<usize> {
         for (i, cable) in doc.cables.iter().enumerate() {
-            let (Some((from, from_port)), Some(to)) = (
-                patch_port_from(&cable.from, midi_count),
-                patch_port_to(&cable.to),
-            ) else {
+            let Some(c) = self.cable_controls(rect_min, cable, midi_count, auto_count) else {
                 continue;
             };
-            let (Some((_, p0)), Some(p3)) = (
-                self.out_ports_screen(rect_min, from, midi_count, auto_count)
-                    .into_iter()
-                    .find(|(k, _)| *k == from_port),
-                self.in_port_screen(rect_min, to, midi_count, auto_count),
-            ) else {
-                continue;
-            };
-            for pt in bezier_points(bezier_controls(p0, p3), 24) {
+            for pt in bezier_points(c, 24) {
                 if pt.distance(sp) <= CABLE_HIT_DIST {
                     return Some(i);
                 }
             }
         }
         None
+    }
+
+    /// Hit-test a cable midpoint control dot (returns the cable index).
+    fn hit_cable_midpoint(
+        &self,
+        rect_min: Pos2,
+        sp: Pos2,
+        doc: &GraphDoc,
+        midi_count: usize,
+        auto_count: usize,
+    ) -> Option<usize> {
+        for (i, cable) in doc.cables.iter().enumerate() {
+            let Some(c) = self.cable_controls(rect_min, cable, midi_count, auto_count) else {
+                continue;
+            };
+            if bezier_points(c, 24)[12].distance(sp) <= MIDPOINT_HIT_RADIUS {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// All cables whose sampled curve passes within [`CUT_HIT_DIST`] of the
+    /// screen-space pointer path (Blender-style knife hit test).
+    fn cables_crossing_path(
+        &self,
+        rect_min: Pos2,
+        path: &[Pos2],
+        doc: &GraphDoc,
+        midi_count: usize,
+        auto_count: usize,
+    ) -> Vec<usize> {
+        let mut hits = Vec::new();
+        if path.len() < 2 {
+            return hits;
+        }
+        for (i, cable) in doc.cables.iter().enumerate() {
+            let Some(c) = self.cable_controls(rect_min, cable, midi_count, auto_count) else {
+                continue;
+            };
+            'cable: for pt in bezier_points(c, 32) {
+                for seg in path.windows(2) {
+                    if dist_point_seg(pt, seg[0], seg[1]) <= CUT_HIT_DIST {
+                        hits.push(i);
+                        break 'cable;
+                    }
+                }
+            }
+        }
+        hits
     }
 
     /// Point-select at screen position `sp`, shared by the press-drag path and
@@ -568,6 +651,14 @@ impl PatchState {
                 };
             }
             Some(id)
+        } else if let Some(i) = self.hit_cable_midpoint(rect_min, sp, doc, midi_count, auto_count) {
+            // Click on a cable's midpoint control dot: open the insert/delete menu.
+            let graph_at = Pos2::new(
+                self.pan.x + (sp.x - rect_min.x) / self.zoom,
+                self.pan.y + (sp.y - rect_min.y) / self.zoom,
+            );
+            self.pending_cable_menu = Some((i, sp + Vec2::new(4.0, 4.0), graph_at, u64::MAX));
+            None
         } else if let Some(i) = self.hit_cable(rect_min, sp, doc, midi_count, auto_count) {
             if shift {
                 self.selection.toggle_cable(i);
@@ -656,6 +747,17 @@ fn lerp2(a: Pos2, b: Pos2, t: f32) -> Pos2 {
     Pos2::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
 }
 
+/// Shortest distance from point `p` to the segment `a → b`.
+fn dist_point_seg(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let len2 = ab.dot(ab);
+    if len2 <= f32::EPSILON {
+        return p.distance(a);
+    }
+    let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+    p.distance(a + ab * t)
+}
+
 /// Uniform bezier sampling (for hit testing).
 fn bezier_points(c: [Pos2; 4], samples: usize) -> Vec<Pos2> {
     (0..=samples)
@@ -691,7 +793,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             state.pan = Vec2::ZERO;
             state.zoom = 1.0;
         }
-        ui.weak("Right-click to add node · click to select · drag bg to box-select · middle-drag to pan · scroll to zoom · drag ports to connect · Delete to remove");
+        ui.weak("Right-click to add node · Ctrl+right-drag to cut cables · click a cable dot to insert/delete · click to select · drag bg to box-select · middle-drag to pan · scroll to zoom · drag ports to connect · Delete to remove");
     });
 
     // ---- Patch ----
@@ -738,6 +840,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     let drag_started = response.drag_started_by(egui::PointerButton::Primary);
     let drag_stopped = response.drag_stopped_by(egui::PointerButton::Primary);
     let shift = ui.ctx().input(|i| i.modifiers.shift);
+    let ctrl = ui.ctx().input(|i| i.modifiers.ctrl);
 
     // Shorthands for the port geometry (the timeline box grows with tracks).
     let (midi_count, auto_count) = (deps.track_count, deps.auto_count);
@@ -781,8 +884,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     }
 
     // ---- Right-click: add-node context menu (any position; the new node appears where
-    // the user clicked) ----
+    // the user clicked). With Ctrl held the right button belongs to the cable-cut
+    // interaction instead (Blender-style knife) and the menu is suppressed. ----
     if response.secondary_clicked()
+        && !ctrl
         && let Some(sp) = pointer
     {
         state.add_menu_at = Some(Pos2::new(
@@ -794,23 +899,57 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     // closure runs only while the menu is open. egui 0.36's `context_menu` closure
     // returns `()`, so the pick is collected through a captured outer variable.
     let mut picked_kind: Option<AddNodeKind> = None;
-    response.context_menu(|ui| {
-        ui.set_min_width(120.0);
-        ui.strong("Add Node");
-        if ui.button("Instrument").clicked() {
-            picked_kind = Some(AddNodeKind::Instrument);
-        }
-        if ui.button("Effect (Delay)").clicked() {
-            picked_kind = Some(AddNodeKind::Effect);
-        }
-        if ui.button("Channel Strip").clicked() {
-            picked_kind = Some(AddNodeKind::ChannelStrip);
-        }
-    });
+    if !(response.secondary_clicked() && ctrl) {
+        response.context_menu(|ui| {
+            ui.set_min_width(120.0);
+            ui.strong("Add Node");
+            if ui.button("Instrument").clicked() {
+                picked_kind = Some(AddNodeKind::Instrument);
+            }
+            if ui.button("Effect (Delay)").clicked() {
+                picked_kind = Some(AddNodeKind::Effect);
+            }
+            if ui.button("Channel Strip").clicked() {
+                picked_kind = Some(AddNodeKind::ChannelStrip);
+            }
+        });
+    }
     if let Some(kind) = picked_kind
         && let Some(at) = state.add_menu_at.take()
     {
         actions.push(PatchAction::AddNode { kind, at });
+    }
+
+    // ---- Ctrl + right-drag: cut cables the pointer path crosses ----
+    if response.drag_started_by(egui::PointerButton::Secondary) && ctrl {
+        state.cut_path = Some(pointer.map(|p| vec![p]).unwrap_or_default());
+    }
+    if state.cut_path.is_some()
+        && response.dragged_by(egui::PointerButton::Secondary)
+        && let Some(sp) = pointer
+    {
+        let path = state.cut_path.as_mut().expect("checked above");
+        if path.last() != Some(&sp) {
+            path.push(sp);
+        }
+        if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+            state.cut_path = None;
+        }
+    }
+    if response.drag_stopped_by(egui::PointerButton::Secondary) {
+        if let Some(path) = state.cut_path.take()
+            && path.len() >= 2
+        {
+            let mut cuts = state.cables_crossing_path(rect.min, &path, doc, midi_count, auto_count);
+            cuts.sort_unstable();
+            cuts.dedup();
+            // Descending index order: each removal shifts later document indices.
+            for i in cuts.into_iter().rev() {
+                actions.push(PatchAction::DeleteCable(i));
+            }
+        }
+        // Cable indices may have shifted; drop any stale cable selection.
+        state.selection.cables.clear();
     }
 
     // ---- Drag in progress ----
@@ -905,19 +1044,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
 
     // ---- Draw cables (beneath nodes) ----
     for (i, cable) in doc.cables.iter().enumerate() {
-        let (Some((from, from_port)), Some(to)) = (
-            patch_port_from(&cable.from, midi_count),
-            patch_port_to(&cable.to),
-        ) else {
-            continue;
-        };
-        let (Some((_, p0)), Some(p3)) = (
-            state
-                .out_ports_screen(rect.min, from, midi_count, auto_count)
-                .into_iter()
-                .find(|(k, _)| *k == from_port),
-            state.in_port_screen(rect.min, to, midi_count, auto_count),
-        ) else {
+        let Some(bez) = state.cable_controls(rect.min, cable, midi_count, auto_count) else {
             continue;
         };
         let selected = state.selection.cables.contains(&i);
@@ -930,22 +1057,53 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             },
         );
         painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
-            bezier_controls(p0, p3),
+            bez,
             false,
             Color32::TRANSPARENT,
             stroke,
         ));
-        // Label automation cables with the endpoint parameter at the midpoint.
+        let mid = bezier_points(bez, 24)[12];
+        // Label automation cables with the endpoint parameter above the midpoint.
         if cable.kind == CableKind::Automation {
-            let mid = bezier_points(bezier_controls(p0, p3), 24)[12];
             painter.text(
-                mid + Vec2::new(0.0, -10.0),
+                mid + Vec2::new(0.0, -12.0),
                 egui::Align2::CENTER_CENTER,
                 auto_param_label(&cable.param),
                 FontId::proportional(11.0),
                 cable_color(CableKind::Automation),
             );
         }
+        // Midpoint control dot (click → insert node / delete cable menu).
+        let hovered = pointer.is_some_and(|sp| sp.distance(mid) <= MIDPOINT_HIT_RADIUS);
+        let r = if hovered {
+            MIDPOINT_RADIUS + 2.0
+        } else {
+            MIDPOINT_RADIUS
+        };
+        painter.circle_filled(mid, r, cable_color(cable.kind));
+        painter.circle_stroke(mid, r, egui::Stroke::new(1.0, Color32::BLACK));
+    }
+
+    // ---- Cable-cut visuals: pointer path + cables about to be severed ----
+    if let Some(path) = &state.cut_path
+        && path.len() >= 2
+    {
+        for i in state.cables_crossing_path(rect.min, path, doc, midi_count, auto_count) {
+            if let Some(bez) =
+                state.cable_controls(rect.min, &doc.cables[i], midi_count, auto_count)
+            {
+                painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                    bez,
+                    false,
+                    Color32::TRANSPARENT,
+                    egui::Stroke::new(4.0, Color32::from_rgb(230, 70, 70)),
+                ));
+            }
+        }
+        painter.add(egui::Shape::line(
+            path.clone(),
+            egui::Stroke::new(1.5, Color32::from_rgb(230, 70, 70)),
+        ));
     }
 
     // ---- Cable drag preview ----
@@ -1121,6 +1279,67 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         }
     }
 
+    // ---- Cable midpoint menu (click the control dot): insert node / delete ----
+    // Stamp the opening frame first so the click that opened the menu (any_click in
+    // the same frame) does not close it immediately.
+    if let Some((_, _, _, frame)) = &mut state.pending_cable_menu
+        && *frame == u64::MAX
+    {
+        *frame = ui.ctx().cumulative_frame_nr();
+    }
+    if let Some((cable_i, menu_pos, at, opened)) = state.pending_cable_menu {
+        #[derive(Clone, Copy)]
+        enum CablePick {
+            Insert(AddNodeKind),
+            Delete,
+        }
+        let mut picked: Option<CablePick> = None;
+        egui::Area::new(egui::Id::new("resoz_patch_cable_menu"))
+            .fixed_pos(menu_pos)
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(140.0);
+                    ui.strong("Cable");
+                    let is_audio = doc
+                        .cables
+                        .get(cable_i)
+                        .is_some_and(|c| c.kind == CableKind::Audio);
+                    if is_audio && ui.button("Insert Effect (Delay)").clicked() {
+                        picked = Some(CablePick::Insert(AddNodeKind::Effect));
+                    }
+                    if is_audio && ui.button("Insert Channel Strip").clicked() {
+                        picked = Some(CablePick::Insert(AddNodeKind::ChannelStrip));
+                    }
+                    if ui.button("Delete Cable").clicked() {
+                        picked = Some(CablePick::Delete);
+                    }
+                });
+            });
+        match picked {
+            Some(CablePick::Insert(kind)) => {
+                actions.push(PatchAction::InsertNode {
+                    cable: cable_i,
+                    kind,
+                    at,
+                });
+                state.pending_cable_menu = None;
+            }
+            Some(CablePick::Delete) => {
+                actions.push(PatchAction::DeleteCable(cable_i));
+                state.pending_cable_menu = None;
+            }
+            None => {
+                let close = ui
+                    .ctx()
+                    .input(|i| i.pointer.any_click() || i.key_pressed(egui::Key::Escape));
+                if close && ui.ctx().cumulative_frame_nr() != opened {
+                    state.pending_cable_menu = None;
+                }
+            }
+        }
+    }
+
     actions
 }
 
@@ -1226,6 +1445,51 @@ mod tests {
                 assert_eq!(fresh.positions.get(want_id), Some(want_p));
             }
         }
+    }
+
+    /// Cable-cut hit test: a path hugging a cable's curve hits it; a far-away path
+    /// hits nothing.
+    #[test]
+    fn cut_path_hits_crossing_cable_only() {
+        let mut project = Project::default();
+        let strip = project.graph.channel_strip_of_track(0).unwrap().node_id();
+        project
+            .graph
+            .cables
+            .push(CableDoc::audio(strip, PortRef::Master));
+        let idx = project.graph.cables.len() - 1;
+        let doc = &project.graph;
+        let (midi, auto) = (project.midi_tracks.len(), project.control_tracks.len());
+        let mut state = PatchState::default();
+        state.ensure_positions(doc, midi, auto);
+
+        let rect_min = Pos2::ZERO; // pan = 0, zoom = 1 → screen == graph space
+        let bez = state
+            .cable_controls(rect_min, &doc.cables[idx], midi, auto)
+            .expect("cable endpoints resolve");
+        let path = bezier_points(bez, 8);
+        let hits = state.cables_crossing_path(rect_min, &path, doc, midi, auto);
+        assert!(hits.contains(&idx), "path along the cable must hit it");
+
+        let far = [Pos2::new(-3000.0, -3000.0), Pos2::new(-2500.0, -2500.0)];
+        assert!(
+            state
+                .cables_crossing_path(rect_min, &far, doc, midi, auto)
+                .is_empty(),
+            "a path far from all cables must hit nothing"
+        );
+    }
+
+    #[test]
+    fn dist_point_seg_basics() {
+        let a = Pos2::new(0.0, 0.0);
+        let b = Pos2::new(10.0, 0.0);
+        assert_eq!(dist_point_seg(Pos2::new(5.0, 3.0), a, b), 3.0);
+        assert_eq!(dist_point_seg(Pos2::new(-4.0, 0.0), a, b), 4.0);
+        // Beyond the end: clamps to the endpoint b.
+        assert_eq!(dist_point_seg(Pos2::new(15.0, 0.0), a, b), 5.0);
+        assert!((dist_point_seg(Pos2::new(15.0, 4.0), a, b) - 41.0f32.sqrt()).abs() < 1e-4);
+        assert_eq!(dist_point_seg(Pos2::new(1.0, 0.0), a, a), 1.0);
     }
 
     #[test]
