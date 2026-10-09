@@ -1784,7 +1784,7 @@ impl ResoZApp {
     }
 
     /// Floating editor window for the clip targeted from the arrangement
-    /// timeline (double-click). Closing it (X / ✕) clears the edit target.
+    /// timeline (double-click). Closing it (X / ×) clears the edit target.
     fn editor_window(&mut self, ctx: &egui::Context) {
         let Some(target) = self.edit_clip else {
             return;
@@ -2232,13 +2232,13 @@ impl ResoZApp {
         ui.horizontal(|ui| {
             ui.label("Mixer");
             if ui
-                .add_enabled(can_add, egui::Button::new("＋ Track"))
+                .add_enabled(can_add, egui::Button::new("+ Track"))
                 .clicked()
             {
                 add_clicked = true;
             }
             if ui
-                .add_enabled(can_remove, egui::Button::new("－ Track"))
+                .add_enabled(can_remove, egui::Button::new("- Track"))
                 .clicked()
             {
                 remove_clicked = true;
@@ -2496,7 +2496,7 @@ impl ResoZApp {
                 "{track_name} · clip {} (of {clip_count})",
                 clip_index + 1
             ));
-            if ui.button("✕ Close editor").clicked() {
+            if ui.button("× Close editor").clicked() {
                 self.edit_clip = None;
             }
         });
@@ -2530,12 +2530,12 @@ impl ResoZApp {
                     self.selected_auto = i;
                 }
             }
-            if ui.button("＋ Add").clicked() && auto_count < MAX_AUTO_TRACKS {
+            if ui.button("+ Add").clicked() && auto_count < MAX_AUTO_TRACKS {
                 self.project.control_tracks.push(ControlTrack::default());
                 self.selected_auto = auto_count;
                 self.send_control_clips(self.selected_auto);
             }
-            if ui.button("－ Remove").clicked() && auto_count > 0 {
+            if ui.button("- Remove").clicked() && auto_count > 0 {
                 let index = self.selected_auto.min(auto_count - 1);
                 self.project.control_tracks.remove(index);
                 let _ = self.engine.clear_auto_route(index);
@@ -2550,7 +2550,7 @@ impl ResoZApp {
         });
 
         if auto_count == 0 {
-            ui.weak("(no automation tracks; click '＋ Add' to create one)");
+            ui.weak("(no automation tracks; click '+ Add' to create one)");
             return;
         }
         let index = self.selected_auto.min(auto_count - 1);
@@ -2639,7 +2639,7 @@ impl ResoZApp {
                     AutoParam::PluginParam { name, .. } => name.clone(),
                 })
                 .unwrap_or_else(|| "Not connected".to_string());
-            ui.weak(format!("→ {current}"));
+            ui.weak(format!("-> {current}"));
         });
 
         // The curve editor lives in a floating window (double-click a control

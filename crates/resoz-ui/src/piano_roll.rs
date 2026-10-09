@@ -74,10 +74,10 @@ pub fn show(
 
     // Toolbar: scrolling + hints.
     ui.horizontal(|ui| {
-        if ui.button("▲").clicked() {
+        if ui.button("^").clicked() {
             state.top_note = (state.top_note + 12.0).min(127.0);
         }
-        if ui.button("▼").clicked() {
+        if ui.button("v").clicked() {
             state.top_note = (state.top_note - 12.0).max(VISIBLE_ROWS as f32);
         }
         ui.weak("LMB draw/drag · RMB delete · wheel scrolls pitch");

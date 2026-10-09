@@ -245,17 +245,17 @@ pub fn show(
         // Toolbar: zoom + track add/remove + hints.
         ui.horizontal(|ui| {
             ui.strong("Arrangement");
-            if ui.button("－").on_hover_text("Zoom out").clicked() {
+            if ui.button("-").on_hover_text("Zoom out").clicked() {
                 state.px_per_bar = (state.px_per_bar / 1.3).max(14.0);
             }
-            if ui.button("＋").on_hover_text("Zoom in").clicked() {
+            if ui.button("+").on_hover_text("Zoom in").clicked() {
                 state.px_per_bar = (state.px_per_bar * 1.3).min(280.0);
             }
             ui.separator();
-            if ui.button("＋ Track").clicked() {
+            if ui.button("+ Track").clicked() {
                 actions.push(TimelineAction::AddMidiTrack);
             }
-            if ui.button("－ Track").clicked() {
+            if ui.button("- Track").clicked() {
                 actions.push(TimelineAction::RemoveLastMidiTrack);
             }
             ui.weak("Drag move · edge resize · dbl-click insert/edit · right-click delete");

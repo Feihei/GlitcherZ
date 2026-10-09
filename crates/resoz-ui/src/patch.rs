@@ -620,10 +620,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     // ---- Toolbar ----
     ui.horizontal(|ui| {
         ui.strong("Node Graph");
-        if ui.button("－").clicked() {
+        if ui.button("-").clicked() {
             state.zoom = (state.zoom / 1.2).clamp(ZOOM_MIN, ZOOM_MAX);
         }
-        if ui.button("＋").clicked() {
+        if ui.button("+").clicked() {
             state.zoom = (state.zoom * 1.2).clamp(ZOOM_MIN, ZOOM_MAX);
         }
         if ui.button("Reset").clicked() {
