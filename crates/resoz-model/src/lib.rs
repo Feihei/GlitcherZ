@@ -81,9 +81,13 @@ pub const DEFAULT_MIDI_TRACKS: usize = 4;
 pub const MASTER_NODE_ID: u64 = 1;
 
 /// Default note velocity (used by serde field defaults).
-fn default_velocity() -> f32 {
-    0.9
-}
+///
+/// Velocities are integers 1..=127, matching the MIDI wire format; the audio
+/// thread divides by 127 when synthesizing.
+pub const DEFAULT_VELOCITY: u8 = 100;
+
+/// Lowest MIDI velocity (a note-off; silence).
+pub const MIN_VELOCITY: u8 = 1;
 
 /// Per-track synthesizer timbre parameters.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -181,34 +185,75 @@ impl Default for DelayParams {
     }
 }
 
-/// Note time base: ticks per quarter note (1/96 quarter ≈ 10.4 ms @120 BPM).
-pub const TICKS_PER_QUARTER: u32 = 96;
+/// Note time base: ticks per quarter note.
+///
+/// 960 PPQ is the Standard MIDI File convention and the de-facto industry
+/// standard (`PPQ` in most DAWs). It divides evenly for 1/64 triplets (80
+/// ticks), which a coarser base cannot express without rounding error.
+pub const TICKS_PER_QUARTER: u32 = 960;
 
 /// Ticks per step (16th note).
-pub const TICKS_PER_STEP: u32 = 24;
+pub const TICKS_PER_STEP: u32 = TICKS_PER_QUARTER / 4;
 
-/// Ticks per bar (4/4) = 16 steps × 24.
+/// Ticks per bar (4/4) = 16 steps × 240.
 pub const TICKS_PER_BAR: u32 = TICKS_PER_STEP * 16;
 
 /// A note block in the piano roll.
+///
+/// Tick positions are signed so that drag gestures can carry a negative
+/// intermediate value without a clamp round-trip; they are clamped to `>= 0`
+/// before reaching the audio thread (see `Note::start_clamped`).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Note {
     /// Start position (tick, relative to clip start).
     #[serde(default)]
-    pub start: u32,
-    /// Length (tick).
+    pub start: i64,
+    /// Length (tick), always `>= 1`.
     #[serde(default = "default_note_length")]
-    pub length: u32,
+    pub length: i64,
     /// MIDI note number.
-    #[serde(default)]
+    #[serde(default = "default_note")]
     pub note: u8,
-    /// Velocity (0..1).
+    /// Note-on velocity, 1..=127 (MIDI wire range).
     #[serde(default = "default_velocity")]
-    pub velocity: f32,
+    pub velocity: u8,
+    /// MIDI channel, 0..=15.
+    #[serde(default)]
+    pub channel: u8,
 }
 
-fn default_note_length() -> u32 {
-    TICKS_PER_STEP
+fn default_note_length() -> i64 {
+    i64::from(TICKS_PER_STEP)
+}
+
+fn default_note() -> u8 {
+    60
+}
+
+fn default_velocity() -> u8 {
+    DEFAULT_VELOCITY
+}
+
+impl Note {
+    /// Tick at which the note ends (`start + length`, saturating).
+    pub fn end(&self) -> i64 {
+        self.start.saturating_add(self.length)
+    }
+
+    /// Start clamped into the valid range for the audio thread.
+    pub fn start_clamped(&self) -> u32 {
+        self.start.clamp(0, i64::from(u32::MAX)) as u32
+    }
+
+    /// Length clamped to at least one tick and into `u32` range.
+    pub fn length_clamped(&self) -> u32 {
+        self.length.clamp(1, i64::from(u32::MAX)) as u32
+    }
+
+    /// Velocity normalized to 0.0..=1.0 for the synthesizer.
+    pub fn velocity_f32(&self) -> f32 {
+        f32::from(self.velocity.clamp(MIN_VELOCITY, 127)) / 127.0
+    }
 }
 
 impl Default for Note {
@@ -216,8 +261,9 @@ impl Default for Note {
         Self {
             start: 0,
             length: default_note_length(),
-            note: 60,
-            velocity: default_velocity(),
+            note: default_note(),
+            velocity: DEFAULT_VELOCITY,
+            channel: 0,
         }
     }
 }
@@ -1370,7 +1416,7 @@ mod tests {
         AutoParam, AutoPoint, CableDoc, DEFAULT_MIDI_TRACKS, GraphDoc, MASTER_NODE_ID,
         MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK,
         MAX_NODES, MidiClip, MidiTrack, NodeDoc, PortRef, Project, SynthParams, TICKS_PER_BAR,
-        TICKS_PER_STEP, VoiceSpec, default_graph_doc,
+        TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec, default_graph_doc,
     };
 
     #[test]
@@ -1382,15 +1428,17 @@ mod tests {
         };
         clip.notes.push(super::Note {
             start: 0,
-            length: 48,
+            length: 480,
             note: 60,
-            velocity: 0.9,
+            velocity: super::DEFAULT_VELOCITY,
+            channel: 0,
         });
         clip.notes.push(super::Note {
-            start: 24,
-            length: 24,
+            start: 240,
+            length: 240,
             note: 64,
-            velocity: 1.0,
+            velocity: 127,
+            channel: 0,
         });
         let text = ron::to_string(&clip).expect("serialization failed");
         let back: MidiClip = ron::from_str(&text).expect("deserialization failed");
@@ -1411,10 +1459,55 @@ mod tests {
     fn note_partial_fields_use_defaults() {
         let back: super::Note = ron::from_str("(start: 48, note: 72)").expect("parse failed");
         assert_eq!(
-            back.length, TICKS_PER_STEP,
+            back.length,
+            i64::from(TICKS_PER_STEP),
             "note length defaults to one 16th note"
         );
-        assert!((back.velocity - 0.9).abs() < 1e-6);
+        assert_eq!(back.velocity, super::DEFAULT_VELOCITY);
+        assert_eq!(back.channel, 0);
+        assert_eq!(back.note, 72);
+    }
+
+    #[test]
+    fn tick_base_divides_note_values_exactly() {
+        // M1: the whole reason for 960 PPQ — every common subdivision must land
+        // on a whole tick, including triplets (which a 96 PPQ base cannot do).
+        assert_eq!(TICKS_PER_QUARTER, 960);
+        assert_eq!(TICKS_PER_STEP, 240);
+        assert_eq!(TICKS_PER_BAR, 3840);
+        // 1/64 triplet = quarter / 6.
+        assert_eq!(TICKS_PER_QUARTER / 6, 160);
+        // Dotted 1/16 = 16th * 3/2.
+        assert_eq!(TICKS_PER_STEP * 3 / 2, 360);
+        // Triplet 1/8 = quarter / 3.
+        assert_eq!(TICKS_PER_QUARTER / 3, 320);
+    }
+
+    #[test]
+    fn note_end_uses_saturating_add() {
+        let n = super::Note {
+            start: i64::MAX - 2,
+            length: i64::MAX,
+            ..super::Note::default()
+        };
+        assert_eq!(n.end(), i64::MAX, "end() saturates instead of overflowing");
+    }
+
+    #[test]
+    fn note_clamps_signed_drag_values_for_the_audio_thread() {
+        // Drag gestures produce negative intermediates; the audio thread only
+        // ever sees non-negative, in-range values.
+        let n = super::Note {
+            start: -500,
+            length: 0,
+            note: 200,
+            channel: 99,
+            velocity: 0,
+        };
+        assert_eq!(n.start_clamped(), 0, "negative start clamps to 0");
+        assert_eq!(n.length_clamped(), 1, "zero length clamps to one tick");
+        assert_eq!(n.velocity_f32(), f32::from(super::MIN_VELOCITY) / 127.0);
+        assert_eq!(super::Note { velocity: 127, ..n }.velocity_f32(), 1.0);
     }
 
     #[test]
@@ -1457,9 +1550,10 @@ mod tests {
         clip.span_ticks = 2 * TICKS_PER_BAR;
         clip.notes.push(super::Note {
             start: 0,
-            length: 48,
+            length: 480,
             note: 48,
-            velocity: 0.9,
+            velocity: super::DEFAULT_VELOCITY,
+            channel: 0,
         });
         project.midi_tracks[0].clips.push(clip);
         project.control_tracks.push(super::ControlTrack {
@@ -1729,7 +1823,7 @@ mod tests {
         let mut clip = MidiClip::default();
         for i in 0..=MAX_CLIP_NOTES {
             clip.notes.push(super::Note {
-                start: (i as u32) * TICKS_PER_STEP,
+                start: (i as i64) * i64::from(TICKS_PER_STEP),
                 ..super::Note::default()
             });
         }

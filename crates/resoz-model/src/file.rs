@@ -129,15 +129,17 @@ mod tests {
         clip.notes = vec![
             Note {
                 start: 0,
-                length: 48,
+                length: 480,
                 note: 60,
-                velocity: 0.9,
+                velocity: crate::DEFAULT_VELOCITY,
+                channel: 0,
             },
             Note {
-                start: 24,
-                length: 24,
+                start: 240,
+                length: 240,
                 note: 64,
-                velocity: 1.0,
+                velocity: 127,
+                channel: 0,
             },
         ];
         project.midi_tracks[0].clips.push(clip);

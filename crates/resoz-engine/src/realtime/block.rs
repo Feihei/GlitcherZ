@@ -311,7 +311,10 @@ mod tests {
     use crate::realtime::context::ProcessContext;
     use crate::realtime::graph::{GraphCompiler, GraphUpdate};
     use crate::realtime::processor::Processor;
-    use crate::realtime::sequencer::{MAX_TRACK_CLIPS, RtMidiClip, RtNote, Sequencer};
+    use crate::realtime::sequencer::{
+        MAX_TRACK_CLIPS, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR, TICKS_PER_QUARTER,
+        TICKS_PER_STEP,
+    };
     use crate::testing::count_positive_crossings;
 
     const SR: f32 = 44_100.0;
@@ -498,19 +501,20 @@ mod tests {
     /// Sequencer end-to-end: command queue sends pattern and transport →
     /// synthesizer sounds → state feedback.
     /// Enqueues a one-clip table for a track: notes at `positions` (16th-note
-    /// grid, 24 ticks each), one bar loop, one bar span.
+    /// grid), one bar loop, one bar span.
     fn send_track_clips(tx: &mut Producer<EngineCommand>, track: usize, notes: &[(u32, u8)]) {
         let mut clip = RtMidiClip {
-            span_ticks: 384,
-            loop_ticks: 384,
+            span_ticks: TICKS_PER_BAR,
+            loop_ticks: TICKS_PER_BAR,
             ..RtMidiClip::default()
         };
         for (start, note) in notes {
             clip.push(RtNote {
                 start_ticks: *start,
-                length_ticks: 24,
+                length_ticks: TICKS_PER_STEP,
                 note: *note,
-                velocity: 0.9,
+                channel: 0,
+                velocity: 100,
             });
         }
         let mut clips = [RtMidiClip::default(); MAX_TRACK_CLIPS];
@@ -575,7 +579,8 @@ mod tests {
     #[test]
     fn automation_drives_mixer_gain_during_playback() {
         let (mut runner, mut tx, mut structure_tx, feedback, mut compiler) = make_runner(128, 2);
-        // Gain curve: tick 0 = 1.0 → tick 96 = 0.0 (120 BPM / 44.1 kHz ≈ 0.5 s).
+        // Gain curve: tick 0 = 1.0 → tick = one quarter note = 0.0
+        // (120 BPM / 44.1 kHz ≈ 0.5 s).
         // Control track 0 (one clip covering bar 1, loop one bar) connects to
         // the global mixer's channel 0 gain (addressed by node_id; P5f D18:
         // track 0's chain feeds mixer channel 0 in the default graph).
@@ -591,14 +596,14 @@ mod tests {
             value: 1.0,
         });
         curve.push(RtAutoPoint {
-            tick: 96,
+            tick: TICKS_PER_QUARTER,
             value: 0.0,
         });
         let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
         clips[0] = RtControlClip {
             start_ticks: 0,
-            span_ticks: 384,
-            loop_ticks: 384,
+            span_ticks: TICKS_PER_BAR,
+            loop_ticks: TICKS_PER_BAR,
             curve,
         };
         tx.push(EngineCommand::Sequencer(
@@ -704,8 +709,8 @@ mod tests {
             feedback.track_levels[0].load()
         );
 
-        // 3. Automation bridging: the curve drives PluginParam (0 → 1 over 384
-        //    ticks), automation track 0 connects to track 0's sound source
+        // 3. Automation bridging: the curve drives PluginParam (0 → 1 over one
+        //    bar), automation track 0 connects to track 0's sound source
         //    (ParamEcho, node_id is the ID newly assigned after the swap)'s
         //    plugin parameter 1.
         let voice_id = compiler
@@ -720,14 +725,14 @@ mod tests {
             value: 0.0,
         });
         curve.push(RtAutoPoint {
-            tick: 384,
+            tick: TICKS_PER_BAR,
             value: 1.0,
         });
         let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
         clips[0] = RtControlClip {
             start_ticks: 0,
-            span_ticks: 384,
-            loop_ticks: 384,
+            span_ticks: TICKS_PER_BAR,
+            loop_ticks: TICKS_PER_BAR,
             curve,
         };
         tx.push(EngineCommand::Sequencer(
@@ -741,9 +746,9 @@ mod tests {
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
             .expect("queue not full");
 
-        // Loop 384 ticks @120BPM/44.1kHz = 88.2k samples ≈ 2 s.
-        // First 5 blocks (≈22 ticks) probe the ramp start, the middle is
-        // discarded, and the tail (≈366 ticks) probes the ramp end.
+        // Loop one bar @120BPM/44.1kHz = 88.2k samples ≈ 2 s.
+        // First 5 blocks probe the ramp start, the middle is
+        // discarded, and the tail probes the ramp end.
         let mut early = 0.0f32;
         for _ in 0..5 {
             runner.render_interleaved(&mut chunk);

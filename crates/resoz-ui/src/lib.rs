@@ -1324,12 +1324,13 @@ impl ResoZApp {
                 ..RtMidiClip::default()
             };
             for note in clip.notes.iter().take(MAX_CLIP_NOTES) {
-                rt.push(RtNote {
-                    start_ticks: note.start,
-                    length_ticks: note.length,
-                    note: note.note,
-                    velocity: note.velocity,
-                });
+                rt.push(RtNote::new(
+                    note.start,
+                    note.length,
+                    note.note,
+                    note.channel,
+                    note.velocity,
+                ));
             }
             *slot = rt;
         }

@@ -25,10 +25,10 @@ pub const ROLL_HEIGHT: f32 = ROW_HEIGHT * 32.0;
 const VISIBLE_ROWS: i32 = (ROLL_HEIGHT / ROW_HEIGHT) as i32;
 
 /// Time snap granularity (tick) — a 1/64 note.
-pub const SNAP_TICKS: u32 = 6;
+pub const SNAP_TICKS: i64 = TICKS_PER_QUARTER as i64 / 16;
 
 /// Default duration of a new note (tick) — a 16th note.
-const DEFAULT_NOTE_LENGTH: u32 = TICKS_PER_STEP;
+const DEFAULT_NOTE_LENGTH: i64 = TICKS_PER_STEP as i64;
 
 /// State persisted across frames (scroll position + note being dragged).
 #[derive(Debug, Default)]
@@ -152,11 +152,18 @@ pub fn show(
         let x = rect.left() + note.start as f32 * ticks_to_x;
         let w = (note.length as f32 * ticks_to_x).max(3.0);
         let dragging = state.drag.as_ref().is_some_and(|d| d.index == index);
-        let fill = if dragging {
+        // Brightness encodes velocity (M1: velocity is an integer 1..=127).
+        let k = 0.45 + 0.55 * f32::from(note.velocity) / 127.0;
+        let base = if dragging {
             egui::Color32::from_rgb(120, 200, 140)
         } else {
             egui::Color32::from_rgb(64, 160, 96)
         };
+        let fill = egui::Color32::from_rgb(
+            (base.r() as f32 * k) as u8,
+            (base.g() as f32 * k) as u8,
+            (base.b() as f32 * k) as u8,
+        );
         painter.rect_filled(
             egui::Rect::from_min_max(
                 egui::pos2(x, y + 1.0),
@@ -185,13 +192,14 @@ pub fn show(
             .clamp(0.0, 127.0) as u8
     };
     let hit_note = |pos: egui::Pos2, clip: &MidiClip| -> Option<usize> {
-        let tick = pointer_tick(pos) as u32;
+        let tick = pointer_tick(pos) as i64;
         let note = pointer_note(pos);
         clip.notes
             .iter()
-            .position(|n| n.note == note && tick >= n.start && tick < n.start + n.length)
+            .position(|n| n.note == note && tick >= n.start && tick < n.end())
     };
-    let snap = |ticks: f32| -> u32 { (ticks / SNAP_TICKS as f32).round() as u32 * SNAP_TICKS };
+    let snap =
+        |ticks: f32| -> i64 { ((ticks / SNAP_TICKS as f32).round() as i64).max(0) * SNAP_TICKS };
 
     if response.drag_started() {
         if let Some(pos) = response.interact_pointer_pos() {
@@ -203,12 +211,13 @@ pub fn show(
                 });
             } else {
                 // Press on empty space: create a note and start dragging.
-                let start = snap(pointer_tick(pos)).min(loop_ticks - 1);
+                let start = snap(pointer_tick(pos)).min(loop_ticks as i64 - 1);
                 clip.notes.push(Note {
                     start,
                     length: DEFAULT_NOTE_LENGTH,
                     note: pointer_note(pos),
-                    velocity: 0.9,
+                    velocity: resoz_model::DEFAULT_VELOCITY,
+                    channel: 0,
                 });
                 state.drag = Some(DragNote {
                     index: clip.notes.len() - 1,
@@ -223,7 +232,7 @@ pub fn show(
         if let (Some(pos), Some(drag)) = (response.interact_pointer_pos(), &state.drag) {
             if let Some(note) = clip.notes.get_mut(drag.index) {
                 let start = snap(pointer_tick(pos) - drag.grab_offset_ticks)
-                    .min(loop_ticks.saturating_sub(1));
+                    .clamp(0, loop_ticks as i64 - 1);
                 if note.start != start || note.note != pointer_note(pos) {
                     note.start = start;
                     note.note = pointer_note(pos);

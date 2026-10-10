@@ -78,7 +78,7 @@ pub use graph::{
 pub use mixer::{MixerChannel, MixerProcessor};
 pub use processor::{ChannelWeights, MAX_WEIGHT_CHANNELS, Processor, ProcessorChain};
 pub use sequencer::{
-    MAX_CLIP_NOTES, MAX_TRACK_CLIPS, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR,
+    MAX_CLIP_NOTES, MAX_TRACK_CLIPS, MIN_VELOCITY, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR,
     TICKS_PER_QUARTER, TICKS_PER_STEP,
 };
 pub use sine::SineProcessor;

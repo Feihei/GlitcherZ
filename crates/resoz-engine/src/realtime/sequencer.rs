@@ -23,11 +23,23 @@ use crate::realtime::automation::{MAX_AUTO_TRACKS, RtControlClip};
 use crate::realtime::commands::NoteEvent;
 use crate::realtime::context::ProcessContext;
 
-/// Note time base: ticks per quarter note (consistent with the `resoz_model` convention).
-pub const TICKS_PER_QUARTER: u32 = 96;
+/// Note time base: ticks per quarter note.
+///
+/// The engine crate deliberately does **not** depend on `resoz-model` (the
+/// audio thread must stay independent of the document layer), so this mirrors
+/// `resoz_model::TICKS_PER_QUARTER`. `tests/tick_base.rs` locks the two in
+/// step — 960 PPQ is the Standard MIDI File convention and divides evenly for
+/// 1/64 triplets.
+pub const TICKS_PER_QUARTER: u32 = 960;
 
 /// Ticks per step (a sixteenth note).
-pub const TICKS_PER_STEP: u32 = 24;
+pub const TICKS_PER_STEP: u32 = TICKS_PER_QUARTER / 4;
+
+/// Ticks per bar (4/4) — default clip span/loop length.
+pub const TICKS_PER_BAR: u32 = TICKS_PER_STEP * 16;
+
+/// Lowest note-on velocity (a note-off; silence).
+pub const MIN_VELOCITY: u8 = 1;
 
 /// Maximum number of notes per clip (D15; mirrors `resoz_model::MAX_CLIP_NOTES`).
 pub const MAX_CLIP_NOTES: usize = 64;
@@ -36,16 +48,42 @@ pub const MAX_CLIP_NOTES: usize = 64;
 pub const MAX_TRACK_CLIPS: usize = 8;
 
 /// Audio-thread-side representation of a piano-roll note (mirrors `resoz_model::Note`).
+///
+/// Unsigned ticks and a normalized velocity: the audio thread never sees the
+/// signed drag intermediates, and clamping happens once at the document edge.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct RtNote {
     /// Start position (in ticks, relative to the clip start).
     pub start_ticks: u32,
-    /// Length (in ticks).
+    /// Length (in ticks), always `>= 1`.
     pub length_ticks: u32,
     /// MIDI note number.
     pub note: u8,
-    /// Velocity (0..1).
-    pub velocity: f32,
+    /// MIDI channel.
+    pub channel: u8,
+    /// Velocity, 1..=127 (MIDI wire range).
+    pub velocity: u8,
+}
+
+impl RtNote {
+    /// Builds the audio-thread form from raw document values, clamping the
+    /// signed tick range and validating the MIDI ranges. The caller (the UI
+    /// layer, which does see `resoz_model`) converts types; the audio thread
+    /// only ever sees non-negative, in-range values.
+    pub fn new(start_ticks: i64, length_ticks: i64, note: u8, channel: u8, velocity: u8) -> Self {
+        Self {
+            start_ticks: start_ticks.clamp(0, i64::from(u32::MAX)) as u32,
+            length_ticks: length_ticks.clamp(1, i64::from(u32::MAX)) as u32,
+            note: note.min(127),
+            channel: channel.min(15),
+            velocity: velocity.clamp(MIN_VELOCITY, 127),
+        }
+    }
+
+    /// Velocity normalized to 0.0..=1.0 for the synthesizer.
+    pub fn velocity_f32(&self) -> f32 {
+        f32::from(self.velocity.clamp(MIN_VELOCITY, 127)) / 127.0
+    }
 }
 
 /// Audio-thread-side representation of a MIDI clip placed on the arrangement
@@ -78,9 +116,6 @@ impl Default for RtMidiClip {
         }
     }
 }
-
-/// Ticks per bar (4/4) — default clip span/loop length.
-pub const TICKS_PER_BAR: u32 = TICKS_PER_STEP * 16;
 
 impl RtMidiClip {
     /// Appends a note; silently dropped beyond [`MAX_CLIP_NOTES`].
@@ -364,7 +399,7 @@ impl Sequencer {
                         break; // past the window or past the clip span
                     }
                     if on_tick >= t0 {
-                        let velocity = sanitize_velocity(note.velocity);
+                        let velocity = note.velocity_f32();
                         emit(
                             track,
                             NoteEvent::On {
@@ -405,17 +440,12 @@ impl Sequencer {
     }
 }
 
-fn sanitize_velocity(velocity: f32) -> f32 {
-    if velocity.is_finite() {
-        velocity.clamp(0.0, 1.0)
-    } else {
-        0.9
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CLIP_NOTES, MAX_TRACK_CLIPS, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR};
+    use super::{
+        MAX_CLIP_NOTES, MAX_TRACK_CLIPS, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR,
+        TICKS_PER_QUARTER, TICKS_PER_STEP,
+    };
     use crate::realtime::MAX_MIDI_TRACKS;
     use crate::realtime::automation::{MAX_AUTO_TRACKS, RtAutoPoint, RtControlClip};
     use crate::realtime::commands::NoteEvent;
@@ -459,7 +489,8 @@ mod tests {
             start_ticks: start,
             length_ticks: length,
             note,
-            velocity: 0.9,
+            channel: 0,
+            velocity: 100,
         }
     }
 
@@ -506,7 +537,10 @@ mod tests {
             0,
             TICKS_PER_BAR,
             TICKS_PER_BAR,
-            &[clip_note(0, 24, 60), clip_note(24, 48, 64)],
+            &[
+                clip_note(0, TICKS_PER_STEP, 60),
+                clip_note(TICKS_PER_STEP, 2 * TICKS_PER_STEP, 64),
+            ],
         );
         seq.play();
 
@@ -528,14 +562,14 @@ mod tests {
     fn clip_plays_at_absolute_position() {
         let mut seq = Sequencer::new(SR);
         seq.set_bpm(120.0);
-        // Clip placed on the second bar (384 ticks = 96_000 samples @120 BPM).
+        // Clip placed on the second bar (1 bar = 96_000 samples @120 BPM).
         place(
             &mut seq,
             0,
-            384,
             TICKS_PER_BAR,
             TICKS_PER_BAR,
-            &[clip_note(0, 24, 72)],
+            TICKS_PER_BAR,
+            &[clip_note(0, TICKS_PER_STEP, 72)],
         );
         seq.play();
 
@@ -564,7 +598,7 @@ mod tests {
             0,
             2 * TICKS_PER_BAR,
             TICKS_PER_BAR,
-            &[clip_note(0, 24, 60)],
+            &[clip_note(0, TICKS_PER_STEP, 60)],
         );
         seq.play();
 
@@ -603,12 +637,19 @@ mod tests {
             0,
             TICKS_PER_BAR,
             TICKS_PER_BAR,
-            &[clip_note(0, 24, 60)],
+            &[clip_note(0, TICKS_PER_STEP, 60)],
         );
         assert_eq!(seq.arrangement_end_ticks(), TICKS_PER_BAR);
         // A later clip on another track extends the arrangement
-        // (480 + 96 = 576 → ceiled to 2 bars).
-        place(&mut seq, 1, 384 + 96, 96, 96, &[]);
+        // (1.25 bar + quarter = 5 bars → ceiled to... 2 bars).
+        place(
+            &mut seq,
+            1,
+            TICKS_PER_BAR + TICKS_PER_QUARTER,
+            TICKS_PER_QUARTER,
+            TICKS_PER_QUARTER,
+            &[],
+        );
         assert_eq!(
             seq.arrangement_end_ticks(),
             2 * TICKS_PER_BAR,
@@ -641,18 +682,26 @@ mod tests {
             0,
             TICKS_PER_BAR,
             TICKS_PER_BAR,
-            &[clip_note(TICKS_PER_BAR - 24, 48, 60)],
+            &[clip_note(
+                TICKS_PER_BAR - TICKS_PER_STEP,
+                2 * TICKS_PER_STEP,
+                60,
+            )],
         );
         seq.play();
-        // @48 kHz: the stop lands in block 750 (384 ticks = 96_000 samples);
-        // run exactly up to it so the off (408 ticks = 102_000 samples) is
-        // still pending.
-        run(&mut seq, 750);
-
+        // Run up to the auto-stop. The exact block is not asserted: the
+        // position counter is f64 and accumulates a sub-block error, so the
+        // stop can land one block either side of the arithmetic value.
+        let mut blocks = 0usize;
+        while seq.is_playing() && blocks < 1_500 {
+            run(&mut seq, 1);
+            blocks += 1;
+        }
         assert!(!seq.is_playing(), "auto-stopped at the arrangement end");
-        // The note's off (408 ticks = 102_000 samples) lands after the stop
-        // point: it must still drain in the following blocks.
-        let events = run_from(&mut seq, 750 * 128, 100);
+
+        // The note's off (one bar + 1/16) lands after the stop point: it must
+        // still drain in the following blocks.
+        let events = run_from(&mut seq, blocks as u64 * BLOCK as u64, 100);
         assert!(
             events
                 .iter()
@@ -689,7 +738,7 @@ mod tests {
             0,
             TICKS_PER_BAR,
             TICKS_PER_BAR,
-            &[clip_note(0, 24, 60)],
+            &[clip_note(0, TICKS_PER_STEP, 60)],
         );
         place(
             &mut seq,
@@ -697,7 +746,7 @@ mod tests {
             0,
             TICKS_PER_BAR,
             TICKS_PER_BAR,
-            &[clip_note(0, 24, 72)],
+            &[clip_note(0, TICKS_PER_STEP, 72)],
         );
         seq.play();
 
@@ -720,7 +769,7 @@ mod tests {
     fn clip_over_capacity_is_truncated() {
         let mut clip = RtMidiClip::default();
         for i in 0..(MAX_CLIP_NOTES + 10) {
-            clip.push(clip_note(i as u32 * 24, 24, 60));
+            clip.push(clip_note(i as u32 * TICKS_PER_STEP, TICKS_PER_STEP, 60));
         }
         assert_eq!(
             clip.note_count, MAX_CLIP_NOTES,
@@ -747,12 +796,12 @@ mod tests {
         let mut seq = Sequencer::new(SR);
         // 16 notes per bar (every 16th note), unbounded arrangement.
         let mut clip = RtMidiClip {
-            span_ticks: 256 * 384,
-            loop_ticks: 384,
+            span_ticks: 256 * TICKS_PER_BAR,
+            loop_ticks: TICKS_PER_BAR,
             ..RtMidiClip::default()
         };
         for i in 0..16u32 {
-            clip.push(clip_note(i * 24, 24, 60));
+            clip.push(clip_note(i * TICKS_PER_STEP, TICKS_PER_STEP, 60));
         }
         let mut clips = [RtMidiClip::default(); MAX_TRACK_CLIPS];
         clips[0] = clip;
@@ -764,7 +813,7 @@ mod tests {
                 .filter(|(_, e)| matches!(e, NoteEvent::On { .. }))
                 .count()
         };
-        // 1500 blocks = 192_000 samples = 768 ticks @120 BPM = 2 bars → 32 ons;
+        // 1500 blocks = 192_000 samples = 2 bars @120 BPM → 32 ons;
         // at 240 BPM the same samples span 4 bars → 64 ons.
         seq.set_bpm(120.0);
         seq.play();
@@ -780,7 +829,14 @@ mod tests {
     fn stop_quiets_every_track() {
         let mut seq = Sequencer::new(SR);
         for track in 0..4 {
-            place(&mut seq, track, 0, 256 * 384, 384, &[clip_note(0, 24, 60)]);
+            place(
+                &mut seq,
+                track,
+                0,
+                256 * TICKS_PER_BAR,
+                TICKS_PER_BAR,
+                &[clip_note(0, TICKS_PER_STEP, 60)],
+            );
         }
         seq.play();
         let events = run(&mut seq, 1);
@@ -800,15 +856,18 @@ mod tests {
     fn note_off_comes_before_next_note_on() {
         let mut seq = Sequencer::new(SR);
         seq.set_bpm(120.0);
-        // Two consecutive 16th notes: on@0 (24 ticks), on@24; the first off
+        // Two consecutive 16th notes: on@0, on@1/16; the first off
         // must be emitted in the block before the second on.
         place(
             &mut seq,
             0,
             0,
-            256 * 384,
-            384,
-            &[clip_note(0, 24, 60), clip_note(24, 24, 64)],
+            256 * TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[
+                clip_note(0, TICKS_PER_STEP, 60),
+                clip_note(TICKS_PER_STEP, TICKS_PER_STEP, 64),
+            ],
         );
         seq.play();
 
@@ -842,7 +901,7 @@ mod tests {
         let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
         clips[5] = RtControlClip {
             start_ticks: 0,
-            span_ticks: 384,
+            span_ticks: TICKS_PER_BAR,
             loop_ticks: 96, // decoupled from any MIDI clip loop (D7)
             curve: {
                 let mut curve = crate::realtime::automation::RtAutomation::default();
@@ -873,7 +932,14 @@ mod tests {
             "other slots of track 5 should stay empty"
         );
         // Control clip writes do not disturb MIDI scheduling.
-        place(&mut seq, 0, 0, 256 * 384, 384, &[clip_note(0, 24, 60)]);
+        place(
+            &mut seq,
+            0,
+            0,
+            256 * TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, TICKS_PER_STEP, 60)],
+        );
         seq.play();
         assert_eq!(ons(&run(&mut seq, 30)), vec![(0, 60)]);
     }
@@ -881,7 +947,14 @@ mod tests {
     #[test]
     fn track_count_gates_scheduling() {
         let mut seq = Sequencer::new(SR);
-        place(&mut seq, 5, 0, 256 * 384, 384, &[clip_note(0, 24, 60)]);
+        place(
+            &mut seq,
+            5,
+            0,
+            256 * TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, TICKS_PER_STEP, 60)],
+        );
         seq.set_track_count(4);
         seq.play();
         assert!(
