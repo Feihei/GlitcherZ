@@ -143,7 +143,7 @@ pub fn show(
     }
 
     // 3. Note blocks.
-    for (index, note) in clip.notes.iter().enumerate() {
+    for (index, note) in clip.notes().iter().enumerate() {
         let note_i = i32::from(note.note);
         if !(min_note..=top_note).contains(&note_i) {
             continue;
@@ -194,7 +194,7 @@ pub fn show(
     let hit_note = |pos: egui::Pos2, clip: &MidiClip| -> Option<usize> {
         let tick = pointer_tick(pos) as i64;
         let note = pointer_note(pos);
-        clip.notes
+        clip.notes()
             .iter()
             .position(|n| n.note == note && tick >= n.start && tick < n.end())
     };
@@ -204,7 +204,7 @@ pub fn show(
     if response.drag_started() {
         if let Some(pos) = response.interact_pointer_pos() {
             if let Some(index) = hit_note(pos, clip) {
-                let grab_offset = pointer_tick(pos) - clip.notes[index].start as f32;
+                let grab_offset = pointer_tick(pos) - clip.notes()[index].start as f32;
                 state.drag = Some(DragNote {
                     index,
                     grab_offset_ticks: grab_offset,
@@ -212,7 +212,7 @@ pub fn show(
             } else {
                 // Press on empty space: create a note and start dragging.
                 let start = snap(pointer_tick(pos)).min(loop_ticks as i64 - 1);
-                clip.notes.push(Note {
+                clip.notes_mut().push(Note {
                     start,
                     length: DEFAULT_NOTE_LENGTH,
                     note: pointer_note(pos),
@@ -220,7 +220,7 @@ pub fn show(
                     channel: 0,
                 });
                 state.drag = Some(DragNote {
-                    index: clip.notes.len() - 1,
+                    index: clip.notes().len() - 1,
                     grab_offset_ticks: 0.0,
                 });
                 edited = true;
@@ -230,7 +230,7 @@ pub fn show(
 
     if response.dragged() {
         if let (Some(pos), Some(drag)) = (response.interact_pointer_pos(), &state.drag) {
-            if let Some(note) = clip.notes.get_mut(drag.index) {
+            if let Some(note) = clip.notes_mut().get_mut(drag.index) {
                 let start = snap(pointer_tick(pos) - drag.grab_offset_ticks)
                     .clamp(0, loop_ticks as i64 - 1);
                 if note.start != start || note.note != pointer_note(pos) {
@@ -249,7 +249,7 @@ pub fn show(
     if response.secondary_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if let Some(index) = hit_note(pos, clip) {
-                clip.notes.remove(index);
+                clip.notes_mut().remove(index);
                 state.drag = None;
                 edited = true;
             }

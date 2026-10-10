@@ -268,12 +268,148 @@ impl Default for Note {
     }
 }
 
+/// Kind of a continuous / channel controller event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CtrlKind {
+    /// Control change with the controller number 0..=127. Value 0..=127.
+    Cc(u8),
+    /// Pitch bend. Value is centred: -8192..=8191 (0 = no bend).
+    PitchBend,
+    /// Channel (mono) aftertouch. Value 0..=127.
+    ChannelPressure,
+    /// Polyphonic aftertouch for the given pitch. Value 0..=127.
+    PolyPressure(u8),
+    /// Program change. Value is the program number 0..=127.
+    Program,
+}
+
+impl CtrlKind {
+    /// Sort/group key so events of the same kind sit together.
+    pub fn group_key(self) -> (u8, u8) {
+        match self {
+            CtrlKind::Cc(n) => (0, n),
+            CtrlKind::PitchBend => (1, 0),
+            CtrlKind::ChannelPressure => (2, 0),
+            CtrlKind::PolyPressure(p) => (3, p),
+            CtrlKind::Program => (4, 0),
+        }
+    }
+}
+
+/// A controller / channel event at a tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CtrlEvent {
+    /// Absolute position within the sequence (tick).
+    pub tick: i64,
+    /// MIDI channel 0..=15.
+    pub channel: u8,
+    /// Which controller this drives.
+    pub kind: CtrlKind,
+    /// Value in the controller's own range (see [`CtrlKind`]).
+    pub value: i32,
+}
+
+/// The MIDI content of a clip: notes plus controller events (M1.3).
+///
+/// Controller events are stored alongside notes rather than inside them
+/// because they are independent of pitch and length — the same model serves
+/// a note-only roll today and CC lanes later.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Sequence {
+    /// Notes, kept sorted by [`Sequence::sort`].
+    #[serde(default)]
+    pub notes: Vec<Note>,
+    /// Controller events, kept sorted by tick.
+    #[serde(default)]
+    pub ctrls: Vec<CtrlEvent>,
+}
+
+impl Sequence {
+    /// Restores the sort invariant: notes by
+    /// `(start, pitch, channel, length, velocity)`, controller events by tick.
+    ///
+    /// **Callers holding note indices across a mutation must re-resolve them
+    /// afterwards** — sorting permutes the vector, so an index-based selection
+    /// is only valid for the pre-sort order.
+    pub fn sort(&mut self) {
+        self.notes
+            .sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
+        // Stable, so same-tick controller events keep their relative order.
+        self.ctrls.sort_by_key(|c| c.tick);
+    }
+
+    /// The last tick covered by any note end or controller event (0 when
+    /// empty).
+    pub fn end_tick(&self) -> i64 {
+        let notes = self.notes.iter().map(Note::end).max();
+        let ctrls = self.ctrls.iter().map(|c| c.tick).max();
+        match (notes, ctrls) {
+            (Some(a), Some(b)) => a.max(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => 0,
+        }
+    }
+
+    /// Notes whose start lies in `[start, end)`.
+    pub fn notes_in(&self, start: i64, end: i64) -> impl Iterator<Item = &Note> {
+        self.notes
+            .iter()
+            .filter(move |n| n.start >= start && n.start < end)
+    }
+
+    /// Notes that sound anywhere inside `[start, end)`.
+    pub fn notes_overlapping(&self, start: i64, end: i64) -> impl Iterator<Item = &Note> {
+        self.notes
+            .iter()
+            .filter(move |n| n.start < end && n.end() > start)
+    }
+
+    /// Drops events a synthesizer could never reproduce: duplicate notes (same
+    /// channel, pitch and start — the longest wins) and duplicate controller
+    /// events (same tick, channel and kind — the last wins, matching what a
+    /// synth would end up playing). Returns how many events were removed.
+    ///
+    /// Imported files routinely contain these from layered takes or quantized
+    /// collisions; without this pass the editor shows notes that cannot be
+    /// deleted by any selection-based operation.
+    pub fn remove_duplicates(&mut self) -> usize {
+        let before = self.notes.len() + self.ctrls.len();
+
+        // Longest first inside each (start, pitch, channel) group, then keep
+        // the head of each run.
+        self.notes.sort_by(|a, b| {
+            (a.start, a.note, a.channel, b.length).cmp(&(b.start, b.note, b.channel, a.length))
+        });
+        self.notes.dedup_by(|later, kept| {
+            later.start == kept.start && later.note == kept.note && later.channel == kept.channel
+        });
+
+        let mut kept: Vec<CtrlEvent> = Vec::with_capacity(self.ctrls.len());
+        for c in self.ctrls.drain(..) {
+            // Only events at the same tick (the tail of `kept`) can match.
+            let slot = kept
+                .iter_mut()
+                .rev()
+                .take_while(|k| k.tick == c.tick)
+                .find(|k| k.channel == c.channel && k.kind.group_key() == c.kind.group_key());
+            match slot {
+                Some(slot) => *slot = c,
+                None => kept.push(c),
+            }
+        }
+        self.ctrls = kept;
+
+        self.sort();
+        before - (self.notes.len() + self.ctrls.len())
+    }
+}
+
 /// A MIDI clip placed on the arrangement timeline (D14/D15).
 ///
 /// `start_ticks` is the absolute position on the arrangement; the clip is
 /// audible for `span_ticks` from there, and its note content repeats every
 /// `loop_ticks` within the span (D14 future tiling semantics: the scheduler
-/// already tiles, the UI presents one period for now). `notes` positions are
+/// already tiles, the UI presents one period for now). Sequence positions are
 /// relative to the clip start.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MidiClip {
@@ -286,9 +422,67 @@ pub struct MidiClip {
     /// Content loop length (tick), defaults to one bar (4/4).
     #[serde(default = "default_clip_loop")]
     pub loop_ticks: u32,
-    /// Note collection (relative to the clip start).
+    /// Note and controller content (relative to the clip start).
+    ///
+    /// Nested rather than flattened: `serde(flatten)` breaks RON's
+    /// tuple-struct form, which the file tests and hand-written fixtures rely
+    /// on.
     #[serde(default)]
-    pub notes: Vec<Note>,
+    pub sequence: Sequence,
+    /// v5 documents stored notes directly on the clip. Read-only: the loader
+    /// moves them into [`MidiClip::sequence`] and rescales the ticks
+    /// (96 PPQ → 960 PPQ). Never written back.
+    #[serde(default, rename = "notes", skip_serializing)]
+    pub legacy_notes: Vec<LegacyNote>,
+}
+
+/// A v5 note, kept only so old files can be read.
+///
+/// v5 stored `start`/`length` as `u32` ticks at 96 PPQ and `velocity` as
+/// `f32` in 0..1; v6 uses `i64` ticks at 960 PPQ and `u8` in 1..=127.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LegacyNote {
+    /// Start position (tick, relative to clip start).
+    #[serde(default)]
+    pub start: u32,
+    /// Length (tick).
+    #[serde(default = "default_legacy_note_length")]
+    pub length: u32,
+    /// MIDI note number.
+    #[serde(default = "default_note")]
+    pub note: u8,
+    /// Velocity (0..1).
+    #[serde(default = "default_legacy_velocity")]
+    pub velocity: f32,
+}
+
+/// v5's `TICKS_PER_STEP`: a 16th note at 96 PPQ.
+pub const LEGACY_TICKS_PER_STEP: u32 = 24;
+
+fn default_legacy_note_length() -> u32 {
+    LEGACY_TICKS_PER_STEP
+}
+
+fn default_legacy_velocity() -> f32 {
+    0.9
+}
+
+impl LegacyNote {
+    /// Rescales to the current model: ticks ×10, velocity 0..1 → 1..=127.
+    pub fn upgrade(&self) -> Note {
+        Note {
+            start: i64::from(self.start) * 10,
+            length: (i64::from(self.length) * 10).max(1),
+            note: self.note,
+            velocity: if self.velocity.is_finite() {
+                let scaled = (self.velocity.clamp(0.0, 1.0) * 127.0).round() as i64;
+                scaled.clamp(i64::from(MIN_VELOCITY), 127) as u8
+            } else {
+                DEFAULT_VELOCITY
+            },
+            channel: 0,
+        }
+    }
 }
 
 fn default_clip_span() -> u32 {
@@ -305,7 +499,8 @@ impl Default for MidiClip {
             start_ticks: 0,
             span_ticks: default_clip_span(),
             loop_ticks: default_clip_loop(),
-            notes: Vec::new(),
+            sequence: Sequence::default(),
+            legacy_notes: Vec::new(),
         }
     }
 }
@@ -317,6 +512,29 @@ impl MidiClip {
             start_ticks,
             ..MidiClip::default()
         }
+    }
+
+    /// Read-only access to the clip's notes.
+    pub fn notes(&self) -> &[Note] {
+        &self.sequence.notes
+    }
+
+    /// Mutable access to the clip's notes.
+    ///
+    /// The caller is responsible for restoring [`Sequence::sort`]'s invariant
+    /// afterwards if the mutation can break it.
+    pub fn notes_mut(&mut self) -> &mut Vec<Note> {
+        &mut self.sequence.notes
+    }
+
+    /// Number of notes in the clip.
+    pub fn note_count(&self) -> usize {
+        self.sequence.notes.len()
+    }
+
+    /// Restores the sequence sort invariant.
+    pub fn sort(&mut self) {
+        self.sequence.sort();
     }
 }
 
@@ -1305,6 +1523,49 @@ impl Project {
         }
     }
 
+    /// Upgrades a v5 document to v6: the tick base moves from 96 PPQ to 960
+    /// PPQ and notes move from the clip into [`MidiClip::sequence`].
+    ///
+    /// Every tick in the document is multiplied by 10 — clip placement and
+    /// span, note starts and lengths, automation anchors. Values are clamped
+    /// rather than rejected: a v5 document was already bounded by
+    /// `MAX_ARRANGEMENT_BARS`, and the bound is expressed in bars, so the
+    /// rescaled document still validates.
+    ///
+    /// Idempotent: a v6 document has `legacy_notes == None` and already-960
+    /// ticks, so this is a no-op. Only call it for documents whose
+    /// `version < 6`.
+    pub fn migrate_v5_to_v6(&mut self) {
+        fn scale(t: &mut u32) {
+            *t = t.saturating_mul(10);
+        }
+
+        for track in &mut self.midi_tracks {
+            for clip in &mut track.clips {
+                scale(&mut clip.start_ticks);
+                scale(&mut clip.span_ticks);
+                scale(&mut clip.loop_ticks);
+                if !clip.legacy_notes.is_empty() {
+                    let mut seq = std::mem::take(&mut clip.sequence);
+                    seq.notes = clip.legacy_notes.iter().map(LegacyNote::upgrade).collect();
+                    seq.sort();
+                    clip.sequence = seq;
+                }
+                clip.legacy_notes.clear();
+            }
+        }
+        for track in &mut self.control_tracks {
+            for clip in &mut track.clips {
+                scale(&mut clip.start_ticks);
+                scale(&mut clip.span_ticks);
+                scale(&mut clip.loop_ticks);
+                for point in &mut clip.curve {
+                    scale(&mut point.tick);
+                }
+            }
+        }
+    }
+
     /// Project-level validation: track counts, clip capacities/placement and
     /// graph structure (the file layer is the last line of defense; report
     /// errors instead of truncating).
@@ -1329,10 +1590,10 @@ impl Project {
                 ));
             }
             for (ci, clip) in track.clips.iter().enumerate() {
-                if clip.notes.len() > MAX_CLIP_NOTES {
+                if clip.notes().len() > MAX_CLIP_NOTES {
                     return Err(format!(
                         "MIDI track #{ti} clip #{ci} holds {} notes, exceeding the limit {MAX_CLIP_NOTES}",
-                        clip.notes.len()
+                        clip.notes().len()
                     ));
                 }
                 check_clip_placement(ti, ci, clip.start_ticks, clip.span_ticks, clip.loop_ticks)?;
@@ -1426,14 +1687,14 @@ mod tests {
             span_ticks: 4 * TICKS_PER_BAR,
             ..MidiClip::default()
         };
-        clip.notes.push(super::Note {
+        clip.notes_mut().push(super::Note {
             start: 0,
             length: 480,
             note: 60,
             velocity: super::DEFAULT_VELOCITY,
             channel: 0,
         });
-        clip.notes.push(super::Note {
+        clip.notes_mut().push(super::Note {
             start: 240,
             length: 240,
             note: 64,
@@ -1452,7 +1713,7 @@ mod tests {
         assert_eq!(back.start_ticks, 384);
         assert_eq!(back.span_ticks, TICKS_PER_BAR);
         assert_eq!(back.loop_ticks, TICKS_PER_BAR);
-        assert!(back.notes.is_empty());
+        assert!(back.notes().is_empty());
     }
 
     #[test]
@@ -1466,6 +1727,176 @@ mod tests {
         assert_eq!(back.velocity, super::DEFAULT_VELOCITY);
         assert_eq!(back.channel, 0);
         assert_eq!(back.note, 72);
+    }
+
+    #[test]
+    fn sequence_sort_orders_notes_deterministically() {
+        use super::{CtrlEvent, CtrlKind, Sequence};
+        let mut seq = Sequence {
+            notes: vec![
+                super::Note {
+                    start: 240,
+                    note: 60,
+                    ..Default::default()
+                },
+                super::Note {
+                    start: 0,
+                    note: 64,
+                    ..Default::default()
+                },
+                super::Note {
+                    start: 0,
+                    note: 60,
+                    ..Default::default()
+                },
+            ],
+            ctrls: vec![
+                CtrlEvent {
+                    tick: 480,
+                    channel: 0,
+                    kind: CtrlKind::Cc(7),
+                    value: 100,
+                },
+                CtrlEvent {
+                    tick: 0,
+                    channel: 0,
+                    kind: CtrlKind::Cc(11),
+                    value: 64,
+                },
+            ],
+        };
+        seq.sort();
+        let notes: Vec<(i64, u8)> = seq.notes.iter().map(|n| (n.start, n.note)).collect();
+        assert_eq!(notes, vec![(0, 60), (0, 64), (240, 60)]);
+        let ticks: Vec<i64> = seq.ctrls.iter().map(|c| c.tick).collect();
+        assert_eq!(ticks, vec![0, 480]);
+    }
+
+    #[test]
+    fn remove_duplicates_keeps_the_longest_note() {
+        use super::Sequence;
+        let mut seq = Sequence {
+            notes: vec![
+                super::Note {
+                    start: 0,
+                    length: 240,
+                    note: 60,
+                    ..Default::default()
+                },
+                super::Note {
+                    start: 0,
+                    length: 960,
+                    note: 60,
+                    ..Default::default()
+                },
+                super::Note {
+                    start: 0,
+                    length: 480,
+                    note: 60,
+                    ..Default::default()
+                },
+                // Same start/pitch but another channel: not a duplicate.
+                super::Note {
+                    start: 0,
+                    length: 240,
+                    note: 60,
+                    channel: 1,
+                    ..Default::default()
+                },
+            ],
+            ctrls: vec![],
+        };
+        assert_eq!(seq.remove_duplicates(), 2, "two stacked duplicates dropped");
+        assert_eq!(seq.notes.len(), 2);
+        assert_eq!(seq.notes[0].length, 960, "the longest survives");
+        assert_eq!(seq.notes[0].channel, 0, "sorted back to channel 0 first");
+        assert_eq!(seq.notes[1].channel, 1);
+    }
+
+    #[test]
+    fn remove_duplicates_keeps_the_last_controller_event() {
+        use super::{CtrlEvent, CtrlKind, Sequence};
+        let mut seq = Sequence {
+            notes: vec![],
+            ctrls: vec![
+                CtrlEvent {
+                    tick: 0,
+                    channel: 0,
+                    kind: CtrlKind::Cc(7),
+                    value: 10,
+                },
+                CtrlEvent {
+                    tick: 0,
+                    channel: 0,
+                    kind: CtrlKind::Cc(7),
+                    value: 90,
+                },
+                // Different tick: kept.
+                CtrlEvent {
+                    tick: 0,
+                    channel: 0,
+                    kind: CtrlKind::Cc(8),
+                    value: 50,
+                },
+                // Different controller: kept.
+                CtrlEvent {
+                    tick: 0,
+                    channel: 0,
+                    kind: CtrlKind::PitchBend,
+                    value: 0,
+                },
+            ],
+        };
+        assert_eq!(seq.remove_duplicates(), 1);
+        assert_eq!(seq.ctrls.len(), 3);
+        // The later value wins — that is what a synth would end up playing.
+        let cc7 = seq
+            .ctrls
+            .iter()
+            .find(|c| c.kind == CtrlKind::Cc(7))
+            .unwrap();
+        assert_eq!(cc7.value, 90);
+    }
+
+    #[test]
+    fn sequence_queries_respect_the_half_open_range() {
+        use super::Sequence;
+        let seq = Sequence {
+            notes: vec![
+                super::Note {
+                    start: 0,
+                    length: 100,
+                    note: 60,
+                    ..Default::default()
+                },
+                super::Note {
+                    start: 100,
+                    length: 100,
+                    note: 62,
+                    ..Default::default()
+                },
+                super::Note {
+                    start: 200,
+                    length: 100,
+                    note: 64,
+                    ..Default::default()
+                },
+            ],
+            ctrls: vec![],
+        };
+        // `notes_in` keys on the start tick: the note starting exactly at the
+        // upper bound is excluded.
+        assert_eq!(seq.notes_in(0, 200).count(), 2);
+        // `notes_overlapping` keys on sounding anywhere inside: the note
+        // starting at 100 is still sounding at the boundary.
+        assert_eq!(seq.notes_overlapping(0, 200).count(), 2);
+        assert_eq!(seq.notes_overlapping(150, 250).count(), 2);
+        assert_eq!(seq.end_tick(), 300);
+    }
+
+    #[test]
+    fn empty_sequence_end_tick_is_zero() {
+        assert_eq!(super::Sequence::default().end_tick(), 0);
     }
 
     #[test]
@@ -1548,7 +1979,7 @@ mod tests {
         project.midi_tracks[0].name = "Bass".to_string();
         let mut clip = MidiClip::new(TICKS_PER_BAR);
         clip.span_ticks = 2 * TICKS_PER_BAR;
-        clip.notes.push(super::Note {
+        clip.notes_mut().push(super::Note {
             start: 0,
             length: 480,
             note: 48,
@@ -1822,7 +2253,7 @@ mod tests {
         let mut project = Project::default();
         let mut clip = MidiClip::default();
         for i in 0..=MAX_CLIP_NOTES {
-            clip.notes.push(super::Note {
+            clip.notes_mut().push(super::Note {
                 start: (i as i64) * i64::from(TICKS_PER_STEP),
                 ..super::Note::default()
             });
@@ -1839,7 +2270,7 @@ mod tests {
             start_ticks: 0,
             span_ticks: TICKS_PER_BAR,
             loop_ticks: 2 * TICKS_PER_BAR,
-            notes: Vec::new(),
+            ..MidiClip::default()
         });
         let err = project.validate().expect_err("should reject");
         assert!(err.contains("span_ticks"), "unexpected error: {err}");
@@ -1852,7 +2283,7 @@ mod tests {
             start_ticks: 0,
             span_ticks: TICKS_PER_BAR,
             loop_ticks: 0,
-            notes: Vec::new(),
+            ..MidiClip::default()
         });
         assert!(project.validate().is_err());
     }
@@ -1864,7 +2295,7 @@ mod tests {
             start_ticks: u32::try_from(MAX_ARRANGEMENT_TICKS).unwrap(),
             span_ticks: TICKS_PER_BAR,
             loop_ticks: TICKS_PER_BAR,
-            notes: Vec::new(),
+            ..MidiClip::default()
         });
         let err = project.validate().expect_err("should reject");
         assert!(err.contains("bound"), "unexpected error: {err}");
@@ -1878,7 +2309,7 @@ mod tests {
             start_ticks: u32::try_from(last_start).unwrap(),
             span_ticks: TICKS_PER_BAR,
             loop_ticks: TICKS_PER_BAR,
-            notes: Vec::new(),
+            ..MidiClip::default()
         });
         assert!(project.validate().is_ok());
     }

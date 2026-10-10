@@ -316,7 +316,7 @@ pub fn show(
                 p.playhead_ticks,
                 RowColors::midi(p.selected_track == i),
                 highlight,
-                &|clip| format!("{} notes", clip.notes.len()),
+                &|clip| format!("{} notes", clip.notes().len()),
             );
         }
 

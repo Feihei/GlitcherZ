@@ -15,18 +15,14 @@ use std::path::Path;
 
 use crate::Project;
 
-/// Current version of the project file format (v5: single-input semantics +
-/// mixer node — `NodeDoc::Mixer` absorbs the ChannelStrip, `CableDoc.in_port`
-/// binds cables to mixer channels, D14-D21).
+/// Current version of the project file format (v6: MIDI tick base 96 → 960
+/// PPQ and notes moved from the clip into `MidiClip::sequence` — M1).
 ///
-/// Compatibility policy (Q5 decision): **no legacy read paths** --
-/// structural changes are naturally tolerated via serde field-level defaults
-/// for missing fields; fields in old files that cannot be mapped (like the
-/// old `tracks` array) are ignored, and the loaded result is the default
-/// document. v4 documents additionally go through [`Project::migrate`]
-/// (ChannelStrip → mixer, master multi-input → synthetic mixer) before
-/// validation.
-pub const PROJECT_VERSION: u32 = 5;
+/// v5 and older documents go through [`Project::migrate_v5_to_v6`] (ticks
+/// ×10, legacy notes folded into the sequence); v4 documents additionally go
+/// through [`Project::migrate`] (ChannelStrip → mixer, master multi-input →
+/// synthetic mixer).
+pub const PROJECT_VERSION: u32 = 6;
 
 fn default_version() -> u32 {
     PROJECT_VERSION
@@ -80,27 +76,28 @@ pub fn save_project(project: &Project, path: &Path) -> Result<(), ModelError> {
 /// ignore them, and "successfully" produce an empty project, silently losing
 /// data.
 pub fn parse_project(text: &str) -> Result<Project, ModelError> {
-    let is_wrapped = ron::from_str::<ron::value::Value>(text)
-        .ok()
-        .map(|value| match value {
-            ron::value::Value::Map(map) => map.keys().any(|key| {
-                matches!(
-                    key,
-                    ron::value::Value::String(key) if key == "project" || key == "version"
-                )
-            }),
-            _ => false,
-        })
-        .unwrap_or(false);
+    let wrapped = ron::from_str::<ron::value::Value>(text).ok().map(|value| {
+        matches!(value, ron::value::Value::Map(ref map) if map.keys().any(|key| {
+            matches!(
+                key,
+                ron::value::Value::String(key) if key == "project" || key == "version"
+            )
+        }))
+    });
 
-    let project = if is_wrapped {
-        let file: ProjectFile = ron::from_str(text)?;
-        file.project
-    } else {
-        ron::from_str(text)?
+    let (mut project, version) = match wrapped {
+        // The bare-`Project` development format carries no version, so it is
+        // read as current.
+        Some(true) => {
+            let file: ProjectFile = ron::from_str(text)?;
+            (file.project, file.version)
+        }
+        _ => (ron::from_str(text)?, PROJECT_VERSION),
     };
-    let mut project = project;
     project.migrate();
+    if version < PROJECT_VERSION {
+        project.migrate_v5_to_v6();
+    }
     project.validate().map_err(ModelError::InvalidGraph)?;
     Ok(project)
 }
@@ -126,7 +123,7 @@ mod tests {
         project.midi_tracks[0].name = "Bass".to_string();
         let mut clip = MidiClip::new(TICKS_PER_BAR);
         clip.span_ticks = TICKS_PER_BAR;
-        clip.notes = vec![
+        clip.sequence.notes = vec![
             Note {
                 start: 0,
                 length: 480,
@@ -358,5 +355,127 @@ mod tests {
         project
             .validate()
             .expect("migrated document should validate");
+    }
+
+    /// A v5 document: notes live directly on the clip, ticks are 96 PPQ and
+    /// velocity is 0..1. Loading must preserve the musical result.
+    const V5_DOC: &str = r#"(
+    version: 5,
+    project: (
+        midi_tracks: [
+            (
+                name: "Lead",
+                clips: [
+                    (
+                        start_ticks: 384,
+                        span_ticks: 384,
+                        loop_ticks: 384,
+                        notes: [
+                            (start: 0, length: 48, note: 60, velocity: 0.9),
+                            (start: 24, length: 24, note: 64, velocity: 1.0),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+        control_tracks: [
+            (
+                name: "Ride",
+                clips: [
+                    (
+                        start_ticks: 192,
+                        span_ticks: 384,
+                        loop_ticks: 384,
+                        curve: [(tick: 0, value: 0.0), (tick: 96, value: 1.0)],
+                    ),
+                ],
+            ),
+        ],
+    ),
+)"#;
+
+    #[test]
+    fn v5_ticks_are_rescaled_by_ten() {
+        let project = parse_project(V5_DOC).expect("v5 document should migrate and load");
+        let clip = &project.midi_tracks[0].clips[0];
+        // 384 ticks @96 PPQ = one bar → 3840 @960 PPQ, still one bar.
+        assert_eq!(clip.start_ticks, 3840);
+        assert_eq!(clip.span_ticks, 3840);
+        assert_eq!(clip.loop_ticks, 3840);
+        assert_eq!(clip.start_ticks, crate::TICKS_PER_BAR);
+        // Automation clips and their anchors rescale too.
+        let ctrl = &project.control_tracks[0].clips[0];
+        assert_eq!(ctrl.start_ticks, 1920);
+        let ticks: Vec<u32> = ctrl.curve.iter().map(|p| p.tick).collect();
+        assert_eq!(ticks, vec![0, 960]);
+    }
+
+    #[test]
+    fn v5_notes_move_into_the_sequence_with_midi_velocity() {
+        let project = parse_project(V5_DOC).expect("v5 document should migrate and load");
+        let clip = &project.midi_tracks[0].clips[0];
+        assert_eq!(clip.notes().len(), 2, "legacy notes must not be lost");
+        assert!(
+            clip.legacy_notes.is_empty(),
+            "the legacy field is consumed, not carried"
+        );
+        // Notes are sorted by (start, note) after the upgrade.
+        let first = &clip.notes()[0];
+        assert_eq!((first.start, first.note, first.length), (0, 60, 480));
+        assert_eq!(first.velocity, 114, "0.9 × 127 = 114.3, rounded to 114");
+        let second = &clip.notes()[1];
+        assert_eq!((second.start, second.note, second.length), (240, 64, 240));
+        assert_eq!(second.velocity, 127, "1.0 × 127 is the maximum");
+        assert!(
+            clip.sequence
+                .notes
+                .windows(2)
+                .all(|w| (w[0].start, w[0].note) <= (w[1].start, w[1].note)),
+            "the sort invariant must hold after migration"
+        );
+    }
+
+    #[test]
+    fn v6_documents_are_left_alone() {
+        let mut project = Project::default();
+        project.midi_tracks[0]
+            .clips
+            .push(MidiClip::new(TICKS_PER_BAR));
+        let text = ron::ser::to_string_pretty(
+            &ProjectFile {
+                version: PROJECT_VERSION,
+                project: project.clone(),
+            },
+            ron::ser::PrettyConfig::new(),
+        )
+        .expect("serialize");
+        let back = parse_project(&text).expect("current document should load");
+        assert_eq!(
+            back.midi_tracks[0].clips[0].start_ticks, TICKS_PER_BAR,
+            "a v6 document must not be rescaled again"
+        );
+        assert_eq!(back.midi_tracks.len(), project.midi_tracks.len());
+    }
+
+    #[test]
+    fn legacy_velocity_of_zero_becomes_the_lowest_note_on() {
+        // A v5 velocity of 0 means a silent note; in MIDI wire terms the
+        // lowest legal note-on is 1, never 0 (that is a note-off).
+        let legacy = crate::LegacyNote {
+            start: 0,
+            length: 24,
+            note: 60,
+            velocity: 0.0,
+        };
+        assert_eq!(legacy.upgrade().velocity, crate::MIN_VELOCITY);
+        let nan = crate::LegacyNote {
+            velocity: f32::NAN,
+            ..legacy
+        };
+        assert_eq!(
+            nan.upgrade().velocity,
+            crate::DEFAULT_VELOCITY,
+            "a non-finite velocity falls back to the default"
+        );
     }
 }

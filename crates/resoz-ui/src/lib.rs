@@ -1323,7 +1323,7 @@ impl ResoZApp {
                 loop_ticks: clip.loop_ticks,
                 ..RtMidiClip::default()
             };
-            for note in clip.notes.iter().take(MAX_CLIP_NOTES) {
+            for note in clip.notes().iter().take(MAX_CLIP_NOTES) {
                 rt.push(RtNote::new(
                     note.start,
                     note.length,
