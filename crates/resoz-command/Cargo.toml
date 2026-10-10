@@ -1,0 +1,13 @@
+[package]
+name = "resoz-command"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ResoZ command registry: transactional edits and undo history over the project document"
+
+[dependencies]
+resoz-model = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+thiserror = { workspace = true }

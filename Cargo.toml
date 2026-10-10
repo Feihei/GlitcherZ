@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/resoz-model",
+    "crates/resoz-command",
     "crates/resoz-engine",
     "crates/resoz-ui",
     "crates/resoz-app",
@@ -52,6 +53,7 @@ vst3 = "0.3"
 
 clack-plugin = "0.2"
 resoz-model = { path = "crates/resoz-model" }
+resoz-command = { path = "crates/resoz-command" }
 resoz-clap-host = { path = "crates/resoz-clap-host" }
 resoz-vst3-host = { path = "crates/resoz-vst3-host" }
 resoz-engine = { path = "crates/resoz-engine" }

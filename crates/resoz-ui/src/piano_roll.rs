@@ -10,10 +10,16 @@
 //! The timeline is fixed to "stretch the whole loop across the available width"
 //! (fit-to-width); no zoom yet. The time snap granularity is [`SNAP_TICKS`]. The playhead is
 //! driven by the musical position read back from the engine.
+//!
+//! **This module does not mutate the document.** It draws the clip read-only
+//! and returns [`RollIntent`]s, which the caller runs as commands so that every
+//! edit is undoable (M1.4). Dragging in particular emits one intent per frame
+//! and is expected to be run through `execute_merged`, so a whole drag is a
+//! single undo step.
 
 use eframe::egui;
 
-use resoz_model::{MidiClip, Note, TICKS_PER_QUARTER, TICKS_PER_STEP};
+use resoz_model::{MidiClip, TICKS_PER_QUARTER, TICKS_PER_STEP};
 
 /// Height of each semitone row (pixels).
 pub const ROW_HEIGHT: f32 = 9.0;
@@ -29,6 +35,17 @@ pub const SNAP_TICKS: i64 = TICKS_PER_QUARTER as i64 / 16;
 
 /// Default duration of a new note (tick) — a 16th note.
 const DEFAULT_NOTE_LENGTH: i64 = TICKS_PER_STEP as i64;
+
+/// An edit the roll wants performed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RollIntent {
+    /// Create a note and return its index (after sorting).
+    AddNote { note: u8, start: i64, length: i64 },
+    /// Change one field of the note at `index`.
+    EditNote { index: usize, note: u8, start: i64 },
+    /// Remove the notes at these indices.
+    DeleteNotes { indices: Vec<usize> },
+}
 
 /// State persisted across frames (scroll position + note being dragged).
 #[derive(Debug, Default)]
@@ -54,23 +71,49 @@ impl RollState {
             drag: None,
         }
     }
+
+    /// Starts dragging the note now at `index`.
+    ///
+    /// Called after a note is created: the roll cannot know the note's sorted
+    /// index until the command that added it reports back.
+    pub fn set_drag_target(&mut self, index: usize, grab_offset_ticks: f32) {
+        self.drag = Some(DragNote {
+            index,
+            grab_offset_ticks,
+        });
+    }
+
+    /// Whether a drag gesture is in progress.
+    pub fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// Abandons any drag in progress.
+    ///
+    /// Called before undo/redo: the held index refers to a document that is
+    /// about to change underneath it.
+    pub fn clear_drag(&mut self) {
+        self.drag = None;
+    }
 }
 
 fn is_black_key(note: i32) -> bool {
     matches!(note.rem_euclid(12), 1 | 3 | 6 | 8 | 10)
 }
 
-/// Draw and interact one frame of the roll. Modifies `clip` in place and returns whether an edit
-/// happened this frame (the caller then re-pushes the clip to the audio thread).
+/// Draw one frame of the roll and return the edits the gesture produced.
+///
+/// `clip` is read-only. Returns at most one intent per frame; a drag emits an
+/// [`RollIntent::EditNote`] on every frame it moves.
 pub fn show(
     ui: &mut egui::Ui,
-    clip: &mut MidiClip,
+    clip: &MidiClip,
     state: &mut RollState,
     playhead_ticks: f32,
     playing: bool,
-) -> bool {
+) -> Option<RollIntent> {
+    let mut intent = None;
     let loop_ticks = clip.loop_ticks.max(TICKS_PER_STEP).max(1);
-    let mut edited = false;
 
     // Toolbar: scrolling + hints.
     ui.horizontal(|ui| {
@@ -142,8 +185,8 @@ pub fn show(
         tick += TICKS_PER_STEP;
     }
 
-    // 3. Note blocks.
-    for (index, note) in clip.notes().iter().enumerate() {
+    // 3. Note blocks, shaded by velocity (M1: velocity is 1..=127).
+    for note in clip.notes() {
         let note_i = i32::from(note.note);
         if !(min_note..=top_note).contains(&note_i) {
             continue;
@@ -151,14 +194,16 @@ pub fn show(
         let y = rect.top() + (top_note as f32 - note.note as f32) * ROW_HEIGHT;
         let x = rect.left() + note.start as f32 * ticks_to_x;
         let w = (note.length as f32 * ticks_to_x).max(3.0);
-        let dragging = state.drag.as_ref().is_some_and(|d| d.index == index);
-        // Brightness encodes velocity (M1: velocity is an integer 1..=127).
-        let k = 0.45 + 0.55 * f32::from(note.velocity) / 127.0;
+        let dragging = state
+            .drag
+            .as_ref()
+            .is_some_and(|d| d.index < clip.notes().len() && clip.notes()[d.index] == *note);
         let base = if dragging {
             egui::Color32::from_rgb(120, 200, 140)
         } else {
             egui::Color32::from_rgb(64, 160, 96)
         };
+        let k = 0.45 + 0.55 * f32::from(note.velocity) / 127.0;
         let fill = egui::Color32::from_rgb(
             (base.r() as f32 * k) as u8,
             (base.g() as f32 * k) as u8,
@@ -184,7 +229,7 @@ pub fn show(
         );
     }
 
-    // 5. Interaction.
+    // 5. Interaction → intents.
     let pointer_tick = |pos: egui::Pos2| ((pos.x - rect.left()) / ticks_to_x).max(0.0);
     let pointer_note = |pos: egui::Pos2| {
         (top_note as f32 - (pos.y - rect.top()) / ROW_HEIGHT)
@@ -203,40 +248,43 @@ pub fn show(
 
     if response.drag_started() {
         if let Some(pos) = response.interact_pointer_pos() {
-            if let Some(index) = hit_note(pos, clip) {
-                let grab_offset = pointer_tick(pos) - clip.notes()[index].start as f32;
-                state.drag = Some(DragNote {
-                    index,
-                    grab_offset_ticks: grab_offset,
-                });
-            } else {
-                // Press on empty space: create a note and start dragging.
-                let start = snap(pointer_tick(pos)).min(loop_ticks as i64 - 1);
-                clip.notes_mut().push(Note {
-                    start,
-                    length: DEFAULT_NOTE_LENGTH,
-                    note: pointer_note(pos),
-                    velocity: resoz_model::DEFAULT_VELOCITY,
-                    channel: 0,
-                });
-                state.drag = Some(DragNote {
-                    index: clip.notes().len() - 1,
-                    grab_offset_ticks: 0.0,
-                });
-                edited = true;
+            match hit_note(pos, clip) {
+                Some(index) => {
+                    let grab_offset = pointer_tick(pos) - clip.notes()[index].start as f32;
+                    state.drag = Some(DragNote {
+                        index,
+                        grab_offset_ticks: grab_offset,
+                    });
+                }
+                None => {
+                    // Press on empty space: ask for a note, then drag it. The
+                    // note does not exist yet, so the drag index is unknown
+                    // until the command reports back — until then the pointer
+                    // offset is applied to the creation tick directly.
+                    let start = snap(pointer_tick(pos)).min(loop_ticks as i64 - 1);
+                    intent = Some(RollIntent::AddNote {
+                        note: pointer_note(pos),
+                        start,
+                        length: DEFAULT_NOTE_LENGTH,
+                    });
+                }
             }
         }
     }
 
     if response.dragged() {
         if let (Some(pos), Some(drag)) = (response.interact_pointer_pos(), &state.drag) {
-            if let Some(note) = clip.notes_mut().get_mut(drag.index) {
+            if drag.index < clip.notes().len() {
+                let current = clip.notes()[drag.index];
                 let start = snap(pointer_tick(pos) - drag.grab_offset_ticks)
                     .clamp(0, loop_ticks as i64 - 1);
-                if note.start != start || note.note != pointer_note(pos) {
-                    note.start = start;
-                    note.note = pointer_note(pos);
-                    edited = true;
+                let pitch = pointer_note(pos);
+                if current.start != start || current.note != pitch {
+                    intent = Some(RollIntent::EditNote {
+                        index: drag.index,
+                        note: pitch,
+                        start,
+                    });
                 }
             }
         }
@@ -249,19 +297,19 @@ pub fn show(
     if response.secondary_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if let Some(index) = hit_note(pos, clip) {
-                clip.notes_mut().remove(index);
-                state.drag = None;
-                edited = true;
+                intent = Some(RollIntent::DeleteNotes {
+                    indices: vec![index],
+                });
             }
         }
     }
 
-    edited
+    intent
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RollState, is_black_key};
+    use super::{ROLL_HEIGHT, ROW_HEIGHT, RollState, SNAP_TICKS, TICKS_PER_STEP, is_black_key};
 
     #[test]
     fn black_key_detection() {
@@ -282,5 +330,14 @@ mod tests {
             "initial view top is C6"
         );
         assert!(state.drag.is_none());
+    }
+
+    #[test]
+    fn snap_granularity_is_a_64th_note() {
+        // M1: at 960 PPQ a 1/64 note is 60 ticks (was 6 at 96 PPQ). It must
+        // divide a 16th evenly so grid lines land on note subdivisions.
+        assert_eq!(SNAP_TICKS, 60);
+        assert_eq!(TICKS_PER_STEP as i64 % SNAP_TICKS, 0);
+        assert_eq!(ROLL_HEIGHT, ROW_HEIGHT * 32.0);
     }
 }

@@ -18,5 +18,7 @@ rfd = { workspace = true }
 resoz-clap-host = { workspace = true }
 resoz-vst3-host = { workspace = true }
 serde = { workspace = true }
+serde_json = "1"
 resoz-engine = { workspace = true }
 resoz-model = { workspace = true }
+resoz-command = { workspace = true }
