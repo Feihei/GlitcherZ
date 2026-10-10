@@ -71,12 +71,37 @@ impl Default for TimelineState {
 }
 
 /// One action for the caller (engine pushes / cross-panel state changes).
+///
+/// Clip edits carry their data (`is_control` picks the track table): the
+/// timeline is a view and must not mutate the document — the caller turns
+/// these into undoable edits (M1.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimelineAction {
     /// A MIDI track's clips changed; re-push to the engine.
     MidiEdited(usize),
     /// A control track's clips changed; re-push to the engine.
     ControlEdited(usize),
+    /// Create a clip on a track at the snapped start tick.
+    AddClip {
+        is_control: bool,
+        track: usize,
+        start_ticks: u32,
+    },
+    /// Move and/or resize a clip (one frame of a drag; the caller merges the
+    /// gesture into a single undo step).
+    MoveResizeClip {
+        is_control: bool,
+        track: usize,
+        clip: usize,
+        start_ticks: u32,
+        span_ticks: u32,
+    },
+    /// Delete the clip at `clip`.
+    RemoveClip {
+        is_control: bool,
+        track: usize,
+        clip: usize,
+    },
     SelectTrack(usize),
     SelectControlTrack(usize),
     ToggleMute(usize, bool),
@@ -118,9 +143,6 @@ pub struct TimelineParams<'a> {
 trait Placement {
     fn start(&self) -> u32;
     fn span(&self) -> u32;
-    fn set_start(&mut self, ticks: u32);
-    fn set_span(&mut self, ticks: u32);
-    fn new_at(start_ticks: u32) -> Self;
 }
 
 impl Placement for MidiClip {
@@ -130,15 +152,6 @@ impl Placement for MidiClip {
     fn span(&self) -> u32 {
         self.span_ticks
     }
-    fn set_start(&mut self, ticks: u32) {
-        self.start_ticks = ticks;
-    }
-    fn set_span(&mut self, ticks: u32) {
-        self.span_ticks = ticks;
-    }
-    fn new_at(start_ticks: u32) -> Self {
-        MidiClip::new(start_ticks)
-    }
 }
 
 impl Placement for ControlClip {
@@ -147,15 +160,6 @@ impl Placement for ControlClip {
     }
     fn span(&self) -> u32 {
         self.span_ticks
-    }
-    fn set_start(&mut self, ticks: u32) {
-        self.start_ticks = ticks;
-    }
-    fn set_span(&mut self, ticks: u32) {
-        self.span_ticks = ticks;
-    }
-    fn new_at(start_ticks: u32) -> Self {
-        ControlClip::new(start_ticks)
     }
 }
 
@@ -219,8 +223,8 @@ enum HeaderKind {
 pub fn show(
     ui: &mut egui::Ui,
     state: &mut TimelineState,
-    midi_tracks: &mut [MidiTrack],
-    control_tracks: &mut [ControlTrack],
+    midi_tracks: &[MidiTrack],
+    control_tracks: &[ControlTrack],
     p: TimelineParams<'_>,
 ) -> Vec<TimelineAction> {
     let mut actions = Vec::new();
@@ -289,7 +293,7 @@ pub fn show(
         });
 
         // MIDI rows.
-        for (i, track) in midi_tracks.iter_mut().enumerate() {
+        for (i, track) in midi_tracks.iter().enumerate() {
             let name = if track.name.is_empty() {
                 format!("Track {}", i + 1)
             } else {
@@ -310,7 +314,7 @@ pub fn show(
                 &mut actions,
                 header,
                 RowKind::Midi(i),
-                &mut track.clips,
+                &track.clips,
                 px_per_tick,
                 content_px,
                 p.playhead_ticks,
@@ -324,7 +328,7 @@ pub fn show(
         if !control_tracks.is_empty() {
             ui.add_space(4.0);
             ui.weak("Control tracks (delivery endpoint = node-graph cable)");
-            for (i, track) in control_tracks.iter_mut().enumerate() {
+            for (i, track) in control_tracks.iter().enumerate() {
                 let header = HeaderKind::Control {
                     index: i,
                     selected: p.selected_auto == i,
@@ -338,7 +342,7 @@ pub fn show(
                     &mut actions,
                     header,
                     RowKind::Control(i),
-                    &mut track.clips,
+                    &track.clips,
                     px_per_tick,
                     content_px,
                     p.playhead_ticks,
@@ -366,7 +370,7 @@ fn lane_row<T: Placement>(
     actions: &mut Vec<TimelineAction>,
     header: HeaderKind,
     row: RowKind,
-    clips: &mut Vec<T>,
+    clips: &[T],
     px_per_tick: f32,
     content_px: f32,
     playhead_ticks: f32,
@@ -489,8 +493,8 @@ fn lane_row<T: Placement>(
             );
         }
 
-        // Interactions.
-        let mut edited = false;
+        // Interactions (all edits are emitted as actions; nothing mutates the
+        // document here).
 
         // Double-click: open the clip's editor, or insert a new clip on empty
         // space.
@@ -510,8 +514,15 @@ fn lane_row<T: Placement>(
                     }
                 } else if clips.len() < MAX_CLIPS_PER_TRACK {
                     let bound = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - TICKS_PER_BAR;
-                    clips.push(T::new_at(snap_bar(tick).min(bound)));
-                    edited = true;
+                    let (is_control, track) = match row {
+                        RowKind::Midi(t) => (false, t),
+                        RowKind::Control(t) => (true, t),
+                    };
+                    actions.push(TimelineAction::AddClip {
+                        is_control,
+                        track,
+                        start_ticks: snap_bar(tick).min(bound),
+                    });
                 }
             }
         }
@@ -547,8 +558,17 @@ fn lane_row<T: Placement>(
                         let limit = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - span;
                         let start = snap_bar(tick_at(pos.x) - grab_ticks).min(limit);
                         if clips[clip].start() != start {
-                            clips[clip].set_start(start);
-                            edited = true;
+                            let (is_control, track) = match row {
+                                RowKind::Midi(t) => (false, t),
+                                RowKind::Control(t) => (true, t),
+                            };
+                            actions.push(TimelineAction::MoveResizeClip {
+                                is_control,
+                                track,
+                                clip,
+                                start_ticks: start,
+                                span_ticks: span,
+                            });
                         }
                     }
                     Some(Drag::Resize { clip, .. }) if clip < clips.len() => {
@@ -557,8 +577,17 @@ fn lane_row<T: Placement>(
                         let span = snap_bar(tick_at(pos.x) - start as f32)
                             .clamp(TICKS_PER_BAR, limit.max(TICKS_PER_BAR));
                         if clips[clip].span() != span {
-                            clips[clip].set_span(span);
-                            edited = true;
+                            let (is_control, track) = match row {
+                                RowKind::Midi(t) => (false, t),
+                                RowKind::Control(t) => (true, t),
+                            };
+                            actions.push(TimelineAction::MoveResizeClip {
+                                is_control,
+                                track,
+                                clip,
+                                start_ticks: start,
+                                span_ticks: span,
+                            });
                         }
                     }
                     _ => {}
@@ -574,17 +603,17 @@ fn lane_row<T: Placement>(
         if response.secondary_clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
                 if let Some(index) = hit_clip(clips, tick_at(pos.x)) {
-                    clips.remove(index);
+                    let (is_control, track) = match row {
+                        RowKind::Midi(t) => (false, t),
+                        RowKind::Control(t) => (true, t),
+                    };
+                    actions.push(TimelineAction::RemoveClip {
+                        is_control,
+                        track,
+                        clip: index,
+                    });
                     state.drag = None;
-                    edited = true;
                 }
-            }
-        }
-
-        if edited {
-            match row {
-                RowKind::Midi(t) => actions.push(TimelineAction::MidiEdited(t)),
-                RowKind::Control(t) => actions.push(TimelineAction::ControlEdited(t)),
             }
         }
     });

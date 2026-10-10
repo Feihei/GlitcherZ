@@ -36,9 +36,9 @@ use resoz_engine::realtime::{
     SequencerCommand, SynthProcessor,
 };
 use resoz_model::{
-    AutoParam, CableKind, ControlTrack, DelayParams, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS,
-    MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, MidiClip, NodeDoc, PortRef, Project,
-    SynthParams, VoiceSpec,
+    AutoParam, CableKind, ControlClip, ControlTrack, DelayParams, MAX_AUTO_TRACKS,
+    MAX_CLIPS_PER_TRACK, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS,
+    MidiClip, NodeDoc, PortRef, Project, SynthParams, VoiceSpec,
 };
 
 pub mod lane;
@@ -787,10 +787,48 @@ impl ResoZApp {
 
     /// Mutable document access.
     ///
-    /// **Not undoable.** Prefer [`ResoZApp::execute`]; this exists for the
-    /// call sites that have not been moved to a command yet.
+    /// Pair with [`ResoZApp::begin_edit`] + [`ResoZApp::commit_edit`] to make
+    /// the edit undoable. Calling this bare leaves no history entry.
     pub fn project_mut(&mut self) -> &mut Project {
         self.session.project_mut()
+    }
+
+    /// Captures a snapshot ahead of an out-of-band edit.
+    ///
+    /// ```text
+    /// let before = self.begin_edit();
+    /// ... mutate through self.project_mut() ...
+    /// self.commit_edit("Add Node", before);
+    /// ```
+    pub fn begin_edit(&self) -> std::sync::Arc<Project> {
+        self.session.project_arc()
+    }
+
+    /// Records the edit started by [`ResoZApp::begin_edit`] as one undo step.
+    ///
+    /// A no-op edit (the document did not actually change) records nothing.
+    /// Does **not** touch the engine: keep each call site's existing
+    /// engine-sync calls, which know what part of the state to refresh.
+    pub fn commit_edit(&mut self, label: &str, before: std::sync::Arc<Project>) {
+        self.session.push_undo(label, before);
+    }
+
+    /// Captures a snapshot for a parameter gesture (fader/drag-value edits).
+    ///
+    /// Consecutive changed-frames sharing `key` collapse into one undo step.
+    /// End the gesture with [`ResoZApp::end_param_edit`] when the drag stops.
+    pub fn begin_param_edit(&self) -> std::sync::Arc<Project> {
+        self.session.project_arc()
+    }
+
+    /// Records one frame of a parameter gesture (a no-op mid-gesture).
+    pub fn commit_param_edit(&mut self, label: &str, before: std::sync::Arc<Project>, key: &str) {
+        self.session.push_undo_merged(label, before, key);
+    }
+
+    /// Ends a parameter gesture started via [`ResoZApp::commit_param_edit`].
+    pub fn end_param_edit(&mut self) {
+        self.session.end_merge();
     }
 
     /// Runs a command transactionally (undoable, panic-safe).
@@ -930,6 +968,7 @@ impl ResoZApp {
     /// Redirect an automation track's cable endpoint (the document cable stores the **document**
     /// node_id; engine routing maps to the engine-side id via node_map).
     fn set_auto_endpoint(&mut self, index: usize, doc_id: u64, param: AutoParam) {
+        let before = self.begin_edit();
         self.project_mut().graph.remove_auto_cable(index);
         self.project_mut()
             .graph
@@ -939,6 +978,7 @@ impl ResoZApp {
                 doc_id,
                 param.clone(),
             ));
+        self.commit_edit("Route Automation", before);
         if let Some(engine_id) = self.engine_id(doc_id) {
             self.engine
                 .set_auto_route(index, engine_id, param_id_of(&param));
@@ -1048,10 +1088,12 @@ impl ResoZApp {
                             && c.to == PortRef::Node(to_doc)
                     });
                     if !dup {
+                        let before = self.begin_edit();
                         self.project_mut()
                             .graph
                             .cables
                             .push(resoz_model::CableDoc::midi(track, to_doc));
+                        self.commit_edit("Connect MIDI", before);
                     }
                     if let Some(to_engine) = self.node_map.get(&to_doc).copied() {
                         if !self.engine.connect_midi_node(track, to_engine) {
@@ -1126,14 +1168,16 @@ impl ResoZApp {
             },
         };
         let sample_rate = self.engine.info().sample_rate;
+        let before = self.begin_edit();
         self.project_mut().graph.nodes.push(node.clone());
         self.install_node(&node, sample_rate);
         if !self.node_map.contains_key(&node_id) {
             // Engine slot/queue full: roll the document back so doc and engine stay one.
-            self.project_mut().graph.nodes.pop();
+            self.session.restore(before);
             self.set_message("Add node failed (engine slots or queue full)".to_string());
             return None;
         }
+        self.commit_edit("Add Node", before);
         self.patch_state.place_node(node_id, at);
         self.register_track_chain(track);
         Some(node_id)
@@ -1176,6 +1220,7 @@ impl ResoZApp {
     /// `in_port` binds the cable to the target's input port (the mixer channel
     /// for mixers, D17; 0 for single-input nodes / master).
     fn connect_audio(&mut self, from_doc: u64, to: PortRef, in_port: u8) {
+        let before = self.begin_edit();
         // Strict single-input slots (D14): a new cable into an occupied
         // `(to, in_port)` slot disconnects the old cable (engine `add_cable`
         // mirrors this). Same source → same slot is an idempotent no-op.
@@ -1217,6 +1262,7 @@ impl ResoZApp {
         if !self.engine.connect_nodes(from_engine, to_engine, in_port) {
             self.set_message("Connect failed: cycle / fan-in limit / queue full".to_string());
         }
+        self.commit_edit("Connect Audio", before);
     }
 
     /// Delete a cable (document index i; document and engine stay in sync).
@@ -1253,7 +1299,9 @@ impl ResoZApp {
                 }
             }
         }
+        let before = self.begin_edit();
         self.project_mut().graph.cables.remove(i);
+        self.commit_edit("Delete Cable", before);
     }
 
     /// Delete a document node (any instrument / effect / mixer; the master output is
@@ -1315,6 +1363,7 @@ impl ResoZApp {
             self.set_message("Node removal failed (queue full)".to_string());
             return;
         }
+        let before = self.begin_edit();
         self.project_mut()
             .graph
             .nodes
@@ -1354,6 +1403,7 @@ impl ResoZApp {
         }
         self.node_map.remove(&doc_id);
         self.retire_guard(engine_id);
+        self.commit_edit("Delete Node", before);
         // The deleted node may have filled a role (voice / delay / channel) in the track
         // addressing table — refresh it from the remaining document nodes.
         self.register_track_chain(track);
@@ -1410,8 +1460,12 @@ impl ResoZApp {
     /// [`ResoZApp::project_mut`] are not in the history yet.
     pub fn undo(&mut self) {
         self.roll_state.clear_drag();
+        self.lane_state.clear_drag();
         if self.session.undo() {
-            self.push_all_clips();
+            // Undo can restore any kind of edit (a deleted node, a rerouted
+            // cable), so the engine gets the full rebuild, not just clip
+            // tables.
+            self.apply_document();
         } else {
             self.set_message("Nothing to undo".to_string());
         }
@@ -1420,8 +1474,9 @@ impl ResoZApp {
     /// Reapplies the last undone edit (Ctrl+Y).
     pub fn redo(&mut self) {
         self.roll_state.clear_drag();
+        self.lane_state.clear_drag();
         if self.session.redo() {
-            self.push_all_clips();
+            self.apply_document();
         } else {
             self.set_message("Nothing to redo".to_string());
         }
@@ -1524,6 +1579,7 @@ impl ResoZApp {
     /// Restore the selected track's instrument to the built-in synth (in-place replacement,
     /// node identity unchanged).
     fn set_builtin_instrument(&mut self, track: usize) {
+        let before = self.begin_edit();
         if let Some(NodeDoc::Instrument { voice, .. }) =
             self.project_mut().graph.instrument_of_track_mut(track)
         {
@@ -1553,6 +1609,7 @@ impl ResoZApp {
                 track + 1
             );
         }
+        self.commit_edit("Set Instrument Voice", before);
     }
 
     /// Load a CLAP instrument voice into the track: non-real-time instantiation → in-place engine
@@ -1738,6 +1795,7 @@ impl ResoZApp {
         }
         // Document sync: node + splice rewiring (the downstream cable keeps its
         // in_port — the mixer channel binding, D17).
+        let before = self.begin_edit();
         self.project_mut().graph.nodes.push(NodeDoc::Effect {
             node_id: new_doc_id,
             track,
@@ -1769,6 +1827,7 @@ impl ResoZApp {
             plugin_id: plugin_label,
             _guard: guard,
         });
+        self.commit_edit("Insert Effect", before);
         log::info!("Track {} inserted external effect", track + 1);
     }
 
@@ -1837,6 +1896,7 @@ impl ResoZApp {
     /// Clear all external effects of a track (built-in delay kept): engine bypass removal +
     /// document sync.
     fn clear_external_effects(&mut self, track: usize) {
+        let before = self.begin_edit();
         while let Some(effect) = self.project().graph.nodes.iter().find(|n| {
             n.track() == track
                 && match n {
@@ -1890,6 +1950,7 @@ impl ResoZApp {
             self.node_map.remove(&effect_doc);
             self.retire_guard(effect_engine);
         }
+        self.commit_edit("Clear External Effects", before);
     }
 
     /// Scanned CLAP instruments (lazy).
@@ -2051,6 +2112,7 @@ impl ResoZApp {
                 }
                 ui.separator();
                 ui.label("Tempo");
+                let before = self.begin_param_edit();
                 let bpm = ui.add(
                     egui::DragValue::new(&mut self.project_mut().metadata.tempo_bpm)
                         .range(*BPM_RANGE.start()..=*BPM_RANGE.end())
@@ -2058,9 +2120,18 @@ impl ResoZApp {
                         .suffix(" BPM"),
                 );
                 if bpm.changed() {
+                    // One drag = one undo step; keyboard nudges are separate steps.
+                    if bpm.dragged() {
+                        self.commit_param_edit("Tempo", before, "tempo");
+                    } else {
+                        self.commit_edit("Tempo", before);
+                    }
                     self.send_sequencer(SequencerCommand::SetBpm(convert::to_f32(
                         self.project().metadata.tempo_bpm,
                     )));
+                }
+                if bpm.drag_stopped() {
+                    self.end_param_edit();
                 }
                 ui.separator();
                 if ui.button("📂 Open").clicked() {
@@ -2128,8 +2199,10 @@ impl ResoZApp {
                 timeline_state: state,
                 ..
             } = self;
-            let project = session.project_mut();
-            let (midi, control) = (&mut project.midi_tracks, &mut project.control_tracks);
+            // Read-only: the timeline is a view now; its edit actions come
+            // back as data and are applied (undoably) below.
+            let project = session.project();
+            let (midi, control) = (&project.midi_tracks, &project.control_tracks);
             timeline::show(
                 ui,
                 state,
@@ -2166,12 +2239,14 @@ impl ResoZApp {
             timeline::TimelineAction::ToggleMute(track, muted) => {
                 // P5f: mute lives on the track's mixer channel (D15), not a strip.
                 if let Some((mixer_doc, ch)) = self.track_channel_target(track) {
+                    let before = self.begin_edit();
                     if let Some(NodeDoc::Mixer { channels, .. }) =
                         self.project_mut().graph.node_by_id_mut(mixer_doc)
                         && let Some(c) = channels.get_mut(ch as usize)
                     {
                         c.muted = muted;
                     }
+                    self.commit_edit("Toggle Mute", before);
                     if let Some(&engine_id) = self.node_map.get(&mixer_doc) {
                         self.engine.send(EngineCommand::SetNodeParam {
                             node_id: engine_id,
@@ -2191,6 +2266,135 @@ impl ResoZApp {
             }
             timeline::TimelineAction::AddMidiTrack => self.add_midi_track(),
             timeline::TimelineAction::RemoveLastMidiTrack => self.remove_last_midi_track(),
+            timeline::TimelineAction::AddClip {
+                is_control,
+                track,
+                start_ticks,
+            } => self.timeline_add_clip(is_control, track, start_ticks),
+            timeline::TimelineAction::MoveResizeClip {
+                is_control,
+                track,
+                clip,
+                start_ticks,
+                span_ticks,
+            } => self.timeline_move_resize_clip(is_control, track, clip, start_ticks, span_ticks),
+            timeline::TimelineAction::RemoveClip {
+                is_control,
+                track,
+                clip,
+            } => self.timeline_remove_clip(is_control, track, clip),
+        }
+    }
+
+    /// Timeline clip edits: the view sends data, these apply it undoably.
+    /// A drag frame goes through `commit_param_edit` with the gesture key, so
+    /// one drag is one undo step.
+    fn timeline_add_clip(&mut self, is_control: bool, track: usize, start_ticks: u32) {
+        let before = self.begin_edit();
+        let added = if is_control {
+            self.project_mut()
+                .control_tracks
+                .get_mut(track)
+                .map(|t| {
+                    if t.clips.len() < MAX_CLIPS_PER_TRACK {
+                        t.clips.push(ControlClip::new(start_ticks));
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false)
+        } else {
+            self.project_mut()
+                .midi_tracks
+                .get_mut(track)
+                .map(|t| {
+                    if t.clips.len() < MAX_CLIPS_PER_TRACK {
+                        t.clips.push(MidiClip::new(start_ticks));
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false)
+        };
+        if added {
+            self.commit_edit("Add Clip", before);
+            self.sync_clip_row(is_control, track);
+        }
+    }
+
+    fn timeline_move_resize_clip(
+        &mut self,
+        is_control: bool,
+        track: usize,
+        clip: usize,
+        start_ticks: u32,
+        span_ticks: u32,
+    ) {
+        let before = self.begin_edit();
+        let moved = if is_control {
+            self.project_mut()
+                .control_tracks
+                .get_mut(track)
+                .and_then(|t| t.clips.get_mut(clip))
+                .map(|c| {
+                    let changed = c.start_ticks != start_ticks || c.span_ticks != span_ticks;
+                    c.start_ticks = start_ticks;
+                    c.span_ticks = span_ticks;
+                    changed
+                })
+                .unwrap_or(false)
+        } else {
+            self.project_mut()
+                .midi_tracks
+                .get_mut(track)
+                .and_then(|t| t.clips.get_mut(clip))
+                .map(|c| {
+                    let changed = c.start_ticks != start_ticks || c.span_ticks != span_ticks;
+                    c.start_ticks = start_ticks;
+                    c.span_ticks = span_ticks;
+                    changed
+                })
+                .unwrap_or(false)
+        };
+        if moved {
+            // One drag = one undo step, even across dozens of frames.
+            self.commit_param_edit(
+                "Move Clip",
+                before,
+                &format!("timeline:{}:{}:{}", is_control, track, clip),
+            );
+        }
+    }
+
+    fn timeline_remove_clip(&mut self, is_control: bool, track: usize, clip: usize) {
+        let before = self.begin_edit();
+        let removed = if is_control {
+            self.project_mut()
+                .control_tracks
+                .get_mut(track)
+                .map(|t| t.clips.remove(clip))
+                .is_some()
+        } else {
+            self.project_mut()
+                .midi_tracks
+                .get_mut(track)
+                .map(|t| t.clips.remove(clip))
+                .is_some()
+        };
+        if removed {
+            self.commit_edit("Delete Clip", before);
+            self.sync_clip_row(is_control, track);
+        }
+    }
+
+    /// Re-pushes one timeline row's clip table after an undoable edit.
+    fn sync_clip_row(&mut self, is_control: bool, index: usize) {
+        if is_control {
+            self.send_control_clips(index);
+        } else {
+            self.send_track_clips(index);
         }
     }
 
@@ -2329,6 +2533,7 @@ impl ResoZApp {
                     }
                 });
                 if let Some((path, plugin_id)) = picked {
+                    let before = self.begin_edit();
                     if let Some(NodeDoc::Instrument { voice, .. }) =
                         self.project_mut().graph.instrument_of_track_mut(sel)
                     {
@@ -2338,6 +2543,7 @@ impl ResoZApp {
                         };
                     }
                     self.load_clap_voice(sel, &path, &plugin_id);
+                    self.commit_edit("Load CLAP Instrument", before);
                 }
                 let mut vst3_picked: Option<(String, String)> = None;
                 ui.menu_button("VST3 Instruments…", |ui| {
@@ -2355,6 +2561,7 @@ impl ResoZApp {
                     }
                 });
                 if let Some((path, class_id)) = vst3_picked {
+                    let before = self.begin_edit();
                     if let Some(NodeDoc::Instrument { voice, .. }) =
                         self.project_mut().graph.instrument_of_track_mut(sel)
                     {
@@ -2362,8 +2569,10 @@ impl ResoZApp {
                             path: path.clone(),
                             class_id: class_id.clone(),
                         };
+
                     }
                     self.load_vst3_voice(sel, &path, &class_id);
+                    self.commit_edit("Load VST3 Instrument", before);
                 }
                 if is_external {
                     ui.weak("(external instrument plugin)");
@@ -2488,9 +2697,11 @@ impl ResoZApp {
                             .text("Hz"),
                     );
                     if r.changed() {
+                        let before = self.begin_param_edit();
                         if let Some(s) = self.synth_mut(sel) {
                             s.cutoff_hz = cutoff;
                         }
+                        self.commit_param_edit("Filter Cutoff", before, "synth-cutoff");
                         self.send_track_param(sel, ParamId::FilterCutoff, cutoff);
                     }
                     ui.end_row();
@@ -2499,9 +2710,11 @@ impl ResoZApp {
                     let mut resonance = self.synth_of_track(sel).unwrap_or_default().resonance;
                     let r = ui.add(egui::Slider::new(&mut resonance, RES_RANGE));
                     if r.changed() {
+                        let before = self.begin_param_edit();
                         if let Some(s) = self.synth_mut(sel) {
                             s.resonance = resonance;
                         }
+                        self.commit_param_edit("Filter Resonance", before, "synth-res");
                         self.send_track_param(sel, ParamId::FilterResonance, resonance);
                     }
                     ui.end_row();
@@ -2514,9 +2727,11 @@ impl ResoZApp {
                                 .selectable_label((mode - value).abs() < 0.5, name)
                                 .clicked()
                             {
+                                let before = self.begin_edit();
                                 if let Some(s) = self.synth_mut(sel) {
                                     s.filter_mode = value;
                                 }
+                                self.commit_edit("Filter Mode", before);
                                 self.send_track_param(sel, ParamId::FilterMode, value);
                             }
                         }
@@ -2532,14 +2747,19 @@ impl ResoZApp {
                     ui.end_row();
 
                     ui.label("Master Gain");
+                    let before = self.begin_param_edit();
                     let r = ui.add(
                         egui::Slider::new(&mut self.project_mut().master_gain, 0.0..=1.5).text("Linear"),
                     );
                     if r.changed() {
+                        self.commit_param_edit("Master Gain", before, "master-gain");
                         self.engine.send(EngineCommand::SetParam {
                             id: ParamId::MasterGain,
                             value: self.project().master_gain,
                         });
+                    }
+                    if r.drag_stopped() {
+                        self.end_param_edit();
                     }
                     ui.end_row();
                 });
@@ -2585,12 +2805,14 @@ impl ResoZApp {
                 }
             }
         });
+        let before = self.begin_param_edit();
         if let Some(synth) = self.synth_mut(sel) {
             synth.attack_s = a;
             synth.decay_s = d;
             synth.sustain = s;
             synth.release_s = r;
         }
+        self.commit_param_edit("Envelope", before, "synth-adsr");
     }
 
     /// Delay three sliders (wet mix / time / feedback).
@@ -2618,11 +2840,13 @@ impl ResoZApp {
                 }
             }
         });
+        let before = self.begin_param_edit();
         if let Some(delay) = self.delay_mut(sel) {
             delay.mix = mix;
             delay.time_s = time;
             delay.feedback = feedback;
         }
+        self.commit_param_edit("Delay Params", before, "delay-params");
     }
 
     /// Send one track parameter to the audio thread.
@@ -2850,15 +3074,17 @@ impl ResoZApp {
                 });
             }
         };
-        let apply_channel = |ui_app: &mut Self, f: &dyn Fn(&mut NodeDoc)| {
+        let apply_channel = |ui_app: &mut Self, label: &str, f: &dyn Fn(&mut NodeDoc)| {
+            let before = ui_app.begin_edit();
             if let Some(node) = ui_app.project_mut().graph.node_by_id_mut(mixer_doc) {
                 f(node);
             }
+            ui_app.commit_edit(label, before);
         };
         for i in 0..n {
             let i8 = i as u8;
             if let Some(solo) = solo_edits[i] {
-                apply_channel(self, &|node| {
+                apply_channel(self, "Mixer Solo", &|node| {
                     if let NodeDoc::Mixer { channels, .. } = node
                         && let Some(c) = channels.get_mut(i)
                     {
@@ -2868,7 +3094,7 @@ impl ResoZApp {
                 send_mixer(self, ParamId::MixerSolo(i8), if solo { 1.0 } else { 0.0 });
             }
             if let Some(muted) = mute_edits[i] {
-                apply_channel(self, &|node| {
+                apply_channel(self, "Mixer Mute", &|node| {
                     if let NodeDoc::Mixer { channels, .. } = node
                         && let Some(c) = channels.get_mut(i)
                     {
@@ -2878,7 +3104,7 @@ impl ResoZApp {
                 send_mixer(self, ParamId::MixerMute(i8), if muted { 1.0 } else { 0.0 });
             }
             if let Some(gain) = gain_edits[i] {
-                apply_channel(self, &|node| {
+                apply_channel(self, "Mixer Gain", &|node| {
                     if let NodeDoc::Mixer { channels, .. } = node
                         && let Some(c) = channels.get_mut(i)
                     {
@@ -2888,7 +3114,7 @@ impl ResoZApp {
                 send_mixer(self, ParamId::MixerGain(i8), gain);
             }
             if let Some(pan) = pan_edits[i] {
-                apply_channel(self, &|node| {
+                apply_channel(self, "Mixer Pan", &|node| {
                     if let NodeDoc::Mixer { channels, .. } = node
                         && let Some(c) = channels.get_mut(i)
                     {
@@ -2899,7 +3125,7 @@ impl ResoZApp {
             }
         }
         if let Some(muted) = out_mute_edit {
-            apply_channel(self, &|node| {
+            apply_channel(self, "Mixer Out Mute", &|node| {
                 if let NodeDoc::Mixer { out_muted: m, .. } = node {
                     *m = muted;
                 }
@@ -2907,7 +3133,7 @@ impl ResoZApp {
             send_mixer(self, ParamId::MixerOutMute, if muted { 1.0 } else { 0.0 });
         }
         if let Some(pan) = out_pan_edit {
-            apply_channel(self, &|node| {
+            apply_channel(self, "Mixer Out Pan", &|node| {
                 if let NodeDoc::Mixer { out_pan: p, .. } = node {
                     *p = pan;
                 }
@@ -2925,6 +3151,7 @@ impl ResoZApp {
     /// Grow the mixer by one channel (D21): document inputs+channels (+1
     /// default channel) + engine param sync so the new slot's weights match.
     fn mixer_add_channel(&mut self, mixer_doc: u64) {
+        let before = self.begin_edit();
         let Some(NodeDoc::Mixer { inputs, .. }) =
             self.project_mut().graph.node_by_id_mut(mixer_doc)
         else {
@@ -2962,6 +3189,7 @@ impl ResoZApp {
                 }
             }
         }
+        self.commit_edit("Add Mixer Channel", before);
     }
 
     /// Shrink the mixer by one channel (D21): rejected when the last channel
@@ -2986,6 +3214,7 @@ impl ResoZApp {
             ));
             return;
         }
+        let before = self.begin_edit();
         if let Some(NodeDoc::Mixer {
             inputs, channels, ..
         }) = self.project_mut().graph.node_by_id_mut(mixer_doc)
@@ -2993,6 +3222,7 @@ impl ResoZApp {
             *inputs = last;
             channels.pop();
         }
+        self.commit_edit("Remove Mixer Channel", before);
     }
 
     /// 新增一条 MIDI 轨：文档两件套节点（voice + delay，P5f D18 不再有
@@ -3008,6 +3238,11 @@ impl ResoZApp {
             self.set_message("Add track failed (engine slots or queue full)".to_string());
             return;
         };
+        // One undo step for the whole operation: the mixer may grow inside
+        // (mixer_add_channel is itself undoable), and its sub-step must not
+        // split the history.
+        let before = self.begin_edit();
+        self.session.suspend_history();
         // 文档侧新 id：从现有最大 node_id 之后分配（1 = 主输出保留）。
         let next = self
             .project()
@@ -3079,6 +3314,8 @@ impl ResoZApp {
             .set_midi_track_count(self.project().midi_tracks.len());
         self.selected_track = track;
         self.push_track_params(track);
+        self.session.resume_history();
+        self.commit_edit("Add MIDI Track", before);
     }
 
     /// 删除最后一条 MIDI 轨（中间轨删除需重排轨道表与文档 track 字段，
@@ -3089,6 +3326,7 @@ impl ResoZApp {
         let Some(last) = self.project().midi_tracks.len().checked_sub(1) else {
             return;
         };
+        let before = self.begin_edit();
         let doc_ids: Vec<u64> = self
             .project()
             .graph
@@ -3123,6 +3361,7 @@ impl ResoZApp {
         });
         self.project_mut().midi_tracks.pop();
         self.selected_track = self.selected_track.min(last.saturating_sub(1));
+        self.commit_edit("Remove MIDI Track", before);
     }
 
     /// Piano roll hint (the editor itself lives in a floating window opened
@@ -3141,9 +3380,11 @@ impl ResoZApp {
     fn midi_editor_body(&mut self, ui: &mut egui::Ui, track: usize, clip_index: usize) {
         let sel = track.min(self.project().midi_tracks.len().saturating_sub(1));
         if self.project().midi_tracks[sel].clips.is_empty() {
+            let before = self.begin_edit();
             self.project_mut().midi_tracks[sel]
                 .clips
                 .push(MidiClip::new(0));
+            self.commit_edit("New Clip", before);
             self.send_track_clips(sel);
         }
         let clip_count = self.project().midi_tracks[sel].clips.len();
@@ -3254,15 +3495,19 @@ impl ResoZApp {
                 }
             }
             if ui.button("+ Add").clicked() && auto_count < MAX_AUTO_TRACKS {
+                let before = self.begin_edit();
                 self.project_mut()
                     .control_tracks
                     .push(ControlTrack::default());
+                self.commit_edit("Add Automation Track", before);
                 self.selected_auto = auto_count;
                 self.send_control_clips(self.selected_auto);
             }
             if ui.button("- Remove").clicked() && auto_count > 0 {
                 let index = self.selected_auto.min(auto_count - 1);
+                let before = self.begin_edit();
                 self.project_mut().control_tracks.remove(index);
+                self.commit_edit("Remove Automation Track", before);
                 let _ = self.engine.clear_auto_route(index);
                 // Engine side: clear that index to an empty clip table.
                 self.send_sequencer(SequencerCommand::SetControlClips {
@@ -3378,45 +3623,73 @@ impl ResoZApp {
             .graph
             .auto_endpoint(index)
             .unwrap_or_default();
-        let mut created = false;
-        // Destructured: `project_mut()` borrows all of `self`, which would
-        // collide with the `&mut self.lane_state` below.
-        let Self {
-            session,
-            lane_state,
-            ..
-        } = self;
-        let Some(track) = session.project_mut().control_tracks.get_mut(index) else {
+        if self
+            .project()
+            .control_tracks
+            .get(index)
+            .is_none_or(|t| t.clips.is_empty())
+        {
+            let before = self.begin_edit();
+            self.project_mut().control_tracks[index]
+                .clips
+                .push(resoz_model::ControlClip::new(0));
+            self.commit_edit("New Clip", before);
+            self.send_control_clips(index);
             return;
-        };
-        let clip_count = track.clips.len();
-        if clip_count == 0 {
-            track.clips.push(resoz_model::ControlClip::new(0));
-            created = true;
-        } else {
-            let clip_index = if clip_index < clip_count {
-                clip_index
-            } else {
-                0
-            };
-            let clip = &mut track.clips[clip_index];
-            let loop_ticks = clip.loop_ticks;
-            let edited = lane::show(
+        }
+        let clip_count = self.project().control_tracks[index].clips.len();
+        let clip_index = clip_index.min(clip_count - 1);
+        let intent = {
+            // Destructured: `project()` borrows all of `self`, which would
+            // collide with the `&mut self.lane_state` below.
+            let Self {
+                session,
+                lane_state,
+                ..
+            } = self;
+            let clip = &session.project().control_tracks[index].clips[clip_index];
+            lane::show(
                 ui,
                 clip,
                 &axis_param,
-                loop_ticks,
+                clip.loop_ticks,
                 playhead,
                 playing,
                 lane_state,
-            );
-            if edited {
-                self.send_control_clips(index);
+            )
+        };
+        let Some(intent) = intent else {
+            return;
+        };
+        // Apply the intent undoably. A drag frame merges into one undo step;
+        // the new anchor index is fed back so the drag keeps tracking it.
+        let before = self.begin_edit();
+        let new_drag = match intent {
+            lane::LaneIntent::UpsertPoint { tick, value } => {
+                let clip = &mut self.project_mut().control_tracks[index].clips[clip_index];
+                clip.upsert_point(resoz_model::AutoPoint { tick, value });
+                let at = clip.curve.iter().position(|p| p.tick == tick);
+                let dragging = self.lane_state.is_dragging();
+                if dragging {
+                    self.commit_param_edit(
+                        "Edit Anchor",
+                        before,
+                        &format!("lane:{index}:{clip_index}"),
+                    );
+                } else {
+                    self.commit_edit("Add Anchor", before);
+                }
+                at
             }
-        }
-        if created {
-            self.send_control_clips(index);
-        }
+            lane::LaneIntent::RemoveNear { tick } => {
+                let clip = &mut self.project_mut().control_tracks[index].clips[clip_index];
+                clip.remove_near(tick, lane::SNAP_TICKS / 2);
+                self.commit_edit("Delete Anchor", before);
+                None
+            }
+        };
+        self.lane_state.set_drag(new_drag);
+        self.send_control_clips(index);
     }
 
     /// Virtual keyboard: on-screen keys (press to sound, release to stop) + octave switching.

@@ -93,6 +93,8 @@ pub struct Session {
     /// Whether there are unsaved changes.
     dirty: bool,
     history_limit: usize,
+    /// Nesting counter for [`Session::suspend_history`].
+    suspend_depth: u32,
 }
 
 impl Default for Session {
@@ -112,6 +114,7 @@ impl Session {
             revision: 1,
             dirty: false,
             history_limit: DEFAULT_HISTORY_LIMIT,
+            suspend_depth: 0,
         }
     }
 
@@ -212,6 +215,9 @@ impl Session {
     /// This also ends any gesture in progress: an out-of-band edit and a
     /// merged gesture cannot share one step.
     pub fn push_undo(&mut self, label: &str, before: Arc<Project>) {
+        if self.suspend_depth > 0 {
+            return;
+        }
         self.end_merge();
         if Arc::ptr_eq(&before, &self.doc) {
             return;
@@ -222,6 +228,55 @@ impl Session {
         });
         self.redo.clear();
         self.trim_history();
+    }
+
+    /// Like [`Session::push_undo`], but consecutive calls sharing `key`
+    /// collapse into one step — the out-of-band twin of
+    /// [`Session::execute_merged`].
+    ///
+    /// Use for parameter drags: the first changed frame records the
+    /// pre-gesture snapshot, later frames are no-ops. End the gesture with
+    /// [`Session::end_merge`] so the next drag of the same control starts a
+    /// fresh step.
+    pub fn push_undo_merged(&mut self, label: &str, before: Arc<Project>, key: &str) {
+        if self.merge_key.as_deref() == Some(key) {
+            return; // mid-gesture: the first frame's snapshot still stands
+        }
+        self.push_undo(label, before);
+        // `push_undo` ends merges, so the key must be set afterwards.
+        self.merge_key = Some(key.to_string());
+    }
+
+    /// Restores the document to a snapshot without touching the history.
+    ///
+    /// For rolling back a multi-step edit whose engine side failed; the
+    /// document and the engine must stay one.
+    pub fn restore(&mut self, snapshot: Arc<Project>) {
+        if Arc::ptr_eq(&snapshot, &self.doc) {
+            return;
+        }
+        self.doc = snapshot;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Suspends history recording (nesting counter).
+    ///
+    /// A compound edit ("Add MIDI Track" grows the mixer, which is itself an
+    /// undoable edit) must cost one undo step, not one per sub-operation.
+    /// Call [`Session::resume_history`] exactly once per suspend; while the
+    /// counter is above zero, undo steps are silently dropped.
+    pub fn suspend_history(&mut self) {
+        self.suspend_depth += 1;
+    }
+
+    /// Ends one level of history suspension.
+    pub fn resume_history(&mut self) {
+        self.suspend_depth = self.suspend_depth.saturating_sub(1);
+    }
+
+    /// Whether history recording is currently suspended.
+    pub fn history_suspended(&self) -> bool {
+        self.suspend_depth > 0
     }
 
     /// Reverts the most recent step. Returns `false` when there is none.
@@ -281,7 +336,7 @@ impl Session {
 
         match attempt {
             Ok(Ok(value)) => {
-                if spec.undoable && !Arc::ptr_eq(&before, &self.doc) {
+                if spec.undoable && !self.history_suspended() && !Arc::ptr_eq(&before, &self.doc) {
                     self.undo.push(HistoryEntry {
                         label: spec.label.to_string(),
                         doc: before,

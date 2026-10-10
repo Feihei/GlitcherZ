@@ -251,3 +251,69 @@ fn no_command_panics_on_a_populated_document() {
         }
     }
 }
+
+#[test]
+fn suspend_history_hides_nested_steps() {
+    let mut session = session_with_notes();
+    session.suspend_history();
+    session
+        .execute("midi.note_edit", &json!({ "index": 0, "velocity": 40 }))
+        .unwrap();
+    let before = session.project_arc();
+    // A direct edit during suspension records nothing...
+    session.project_mut().metadata.name = "renamed".into();
+    session.push_undo("Nested Edit", before);
+    session.resume_history();
+    assert!(
+        session.undo_history().is_empty(),
+        "suspended edits leave no undo steps"
+    );
+    assert_eq!(session.project().metadata.name, "renamed");
+}
+
+#[test]
+fn push_undo_merged_collapses_out_of_band_gestures() {
+    let mut session = session_with_notes();
+    let mut velocity = 90;
+    for _ in 0..5 {
+        velocity -= 10;
+        let before = session.project_arc();
+        session.project_mut().midi_tracks[0].clips[0].notes_mut()[0].velocity = velocity;
+        session.push_undo_merged("Fader", before, "fader:0");
+    }
+    session.end_merge();
+    assert_eq!(
+        session.undo_history(),
+        vec!["Fader"],
+        "five frames, one step"
+    );
+    assert!(session.undo());
+    assert_eq!(
+        session.project().midi_tracks[0].clips[0].notes()[0].velocity,
+        100
+    );
+}
+
+#[test]
+fn restore_rolls_back_without_touching_history() {
+    let mut session = session_with_notes();
+    session
+        .execute("midi.note_edit", &json!({ "index": 0, "velocity": 40 }))
+        .unwrap();
+    let snapshot = session.project_arc();
+    session
+        .execute("midi.note_edit", &json!({ "index": 1, "velocity": 20 }))
+        .unwrap();
+    assert_eq!(session.undo_history().len(), 2);
+
+    session.restore(snapshot);
+    assert_eq!(
+        session.undo_history().len(),
+        2,
+        "restore is not an undo step"
+    );
+    assert_eq!(
+        session.project().midi_tracks[0].clips[0].notes()[0].velocity,
+        40
+    );
+}

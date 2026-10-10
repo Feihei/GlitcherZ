@@ -5,21 +5,56 @@
 //! value vertically), right-click to delete the nearest anchor. The vertical axis maps to the
 //! parameter's real value range (log axis for filter cutoff), and the curve is linearly
 //! interpolated between anchors.
+//!
+//! Like the piano roll, this module is a view: it reads the clip and returns
+//! [`LaneIntent`]s; the caller applies them undoably and feeds the new drag
+//! index back via [`LaneState::set_drag`]. Dragging emits one intent per frame
+//! and is meant to run through a merged undo gesture.
 
 use eframe::egui;
 
-use resoz_model::{AutoParam, AutoPoint, ControlClip, TICKS_PER_STEP};
+use resoz_model::{AutoParam, ControlClip, TICKS_PER_STEP};
 
 /// Lane height (pixels).
 pub const LANE_HEIGHT: f32 = 96.0;
 
-/// Time snap granularity (tick) — a 1/32 note.
-pub const SNAP_TICKS: u32 = 12;
+/// Time snap granularity (tick) — a 1/32 note (240 ticks at 960 PPQ).
+///
+/// (Was 12 at 96 PPQ; missed in the M1.1 rescale because nothing here derived
+/// from `TICKS_PER_STEP`.)
+pub const SNAP_TICKS: u32 = resoz_model::TICKS_PER_STEP / 2;
+
+/// An edit the lane wants performed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LaneIntent {
+    /// Insert or move an anchor (one frame of a drag included).
+    UpsertPoint { tick: u32, value: f32 },
+    /// Delete the anchor nearest to `tick`.
+    RemoveNear { tick: u32 },
+}
 
 /// Cross-frame drag state (current index of the dragged anchor).
 #[derive(Debug, Default)]
 pub struct LaneState {
     drag: Option<usize>,
+}
+
+impl LaneState {
+    /// Re-resolves the drag target after an intent was applied: upserting can
+    /// reorder the curve, so the index the caller returns is authoritative.
+    pub fn set_drag(&mut self, index: Option<usize>) {
+        self.drag = index;
+    }
+
+    /// Whether a drag gesture is in progress.
+    pub fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// Drops any drag in progress (before undo/redo).
+    pub fn clear_drag(&mut self) {
+        self.drag = None;
+    }
 }
 
 /// Parameter axis metadata: (min, max, logarithmic?).
@@ -62,16 +97,16 @@ fn from_norm(norm: f32, min: f32, max: f32, log: bool) -> f32 {
 /// for vertical axis range mapping.
 pub fn show(
     ui: &mut egui::Ui,
-    clip: &mut ControlClip,
+    clip: &ControlClip,
     param: &AutoParam,
     loop_ticks: u32,
     playhead_ticks: f32,
     playing: bool,
     state: &mut LaneState,
-) -> bool {
+) -> Option<LaneIntent> {
     let loop_ticks = loop_ticks.max(TICKS_PER_STEP).max(1);
     let (min, max, log) = axis(param);
-    let mut edited = false;
+    let mut intent: Option<LaneIntent> = None;
 
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(
@@ -152,12 +187,10 @@ pub fn show(
                 state.drag = Some(index);
             } else {
                 let tick = snap((pos.x - rect.left()) / ticks_to_x).min(loop_ticks - 1);
-                clip.upsert_point(AutoPoint {
+                intent = Some(LaneIntent::UpsertPoint {
                     tick,
                     value: y_value(pos.y),
                 });
-                state.drag = clip.curve.iter().position(|p| p.tick == tick);
-                edited = true;
             }
         }
     }
@@ -165,17 +198,10 @@ pub fn show(
     if response.dragged() {
         if let (Some(pos), Some(index)) = (response.interact_pointer_pos(), state.drag) {
             if index < clip.curve.len() {
-                // Remove then upsert: dragging can change the tick ordering.
-                clip.curve.remove(index);
-                clip.upsert_point(AutoPoint {
+                intent = Some(LaneIntent::UpsertPoint {
                     tick: snap((pos.x - rect.left()) / ticks_to_x).min(loop_ticks - 1),
                     value: y_value(pos.y),
                 });
-                state.drag = clip
-                    .curve
-                    .iter()
-                    .position(|p| p.tick == snap((pos.x - rect.left()) / ticks_to_x));
-                edited = true;
             }
         }
     }
@@ -187,14 +213,11 @@ pub fn show(
     if response.secondary_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             let tick = ((pos.x - rect.left()) / ticks_to_x).max(0.0) as u32;
-            if clip.remove_near(tick, SNAP_TICKS / 2) {
-                state.drag = None;
-                edited = true;
-            }
+            intent = Some(LaneIntent::RemoveNear { tick });
         }
     }
 
-    edited
+    intent
 }
 
 #[cfg(test)]
