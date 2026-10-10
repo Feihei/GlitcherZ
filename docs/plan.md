@@ -65,9 +65,15 @@
 - [x] **M1.5 项目文件迁移** ✅ 2026-10-10。`PROJECT_VERSION` 5→6。`Project::migrate_v5_to_v6()`：所有 tick ×10（clip start/span/loop、音符 start/length、自动化锚点），v5 的 `notes` 折进 `sequence`，velocity 0..1 → 1..=127（0 → `MIN_VELOCITY=1`，NaN → `DEFAULT_VELOCITY`）。v6 文档不动（幂等）。
       `parse_project` 按 `version < PROJECT_VERSION` 分支触发。
       **坑**：`Option<Vec<LegacyNote>>` 在 RON 里必须写 `Some([...])`，缺失字段直接 `ExpectedOption` 报错 → 改用裸 `Vec` + `#[serde(default, rename="notes", skip_serializing)]`。
-- [ ] **M1.4 新 crate `resoz-command`**：命令注册表（id/label/menu/shortcut/params/enabled/run/undoable）+ `execute()`（`catch_unwind` 捕panic 并回滚、失败强制回滚不留半成品）+ `execute_merged(id, params, key)` 手势合并 + `Arc` CoW 快照 undo。
-      内置自检测试：所有命令用空参数跑一遍不许 panic（照抄 soundcraft 的 `every_command_survives_empty_params`）。
-      **注意**：undo 需要快照整个文档，但我们的 `Project` 目前是普通 struct（soundcraft 用 `Arc<Session>`）。落地时要么给 `Project` 套 `Arc`，要么先只做 execute + 回滚，undo 留到有实际需求时。
+- [x] **M1.4 新 crate `resoz-command`** ✅ 2026-10-10（commit `0e87044`）。采用方案 A：文档移入 `Arc<Project>`，`Session` 持有文档 + undo/redo 栈 + 手势状态，快照 = 一次原子引用计数自增。
+      `Session::execute` 三条保证：① 命令**报错后回滚**（不留半成品）；② **panic 被 `catch_unwind` 捕获并回滚**（不是崩溃）；③ 每条命令记录一步 undo（`Arc` 克隆，O(1)）。
+      `execute_merged(id, params, key)` 合并同 key 的连续调用（保留首个快照、丢弃后续）→ **一次拖动 = 一步 undo**，这是手感命门。
+      命令注册表：`CommandSpec{id,label,menu,shortcut,params,enabled,run,undoable}` + `cmd!`/`cmd!(noundo ...)` 宏。首批 6 条 MIDI 命令（add/edit/delete/move/change_velocity/query）。
+      **piano_roll 改造**：不再直接改文档，改为返回 `RollIntent`（AddNote/EditNote/DeleteNotes），由 app 走命令执行。`note_add` **返回新 index** —— 排序会置换 vector，否则拖拽目标会指错音符。
+      `Ctrl+Z` / `Ctrl+Y` 绑定 undo / redo。undo/redo 后 `push_all_clips()` 重推 clip 表（音频线程持副本）。
+      自检测试：`every_command_survives_empty_params` + `no_command_panics_on_a_populated_document`（空参数/有数据两种情况都不许 panic）。
+
+> **M1 全部完成**。遗留：约 110 处文档修改仍走 `ResoZApp::project_mut()`（**不可撤销**），是有意为之的过渡状态 —— 命令层和历史已就位，迁移是机械工作。`project_mut()` 的 doc comment 已标注这一点。
 
 **M1 验收**：`cargo test --workspace` 全绿；旧 `.rez` 文件加载后 tick 语义不变；命令层空参数自检通过。
 

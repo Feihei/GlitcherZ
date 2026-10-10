@@ -32,6 +32,7 @@ resoz/
 ├── crates/
 │   ├── resoz-engine/       # 音频引擎：处理图、调度、合成器、效果器
 │   ├── resoz-model/        # 数据模型：轨道、片段、自动化、项目文件
+│   ├── resoz-command/      # 命令注册表：事务性编辑 + undo 历史（持有 Arc<Project>）
 │   ├── resoz-ui/           # egui 界面：走带、音序器、钢琴卷帘、混音器
 │   ├── resoz-clap-host/    # CLAP 插件宿主：扫描 / 实例化 / 守卫管理
 │   ├── resoz-vst3-host/    # VST3 插件宿主：架构镜像 clap-host
@@ -59,6 +60,10 @@ resoz/
 - 禁止 `unsafe`，除非：模块顶部有 `// SAFETY:` 注释 + 理由 + 测试。当前允许的边界仅 `resoz-clap-host` / `resoz-vst3-host` 的插件绑定层。
 - 浮点数统一使用 `f32`（音频路径）/ `f64`（UI 与时间计算），转换点集中在 `resoz-engine::convert`。
 - 错误处理：应用层用 `thiserror` 定义错误枚举，不使用 `anyhow` 跨 crate 边界。
+- **UI 层不得直接修改 model**：所有编辑经 `resoz_command::Session::execute`（报错/panic 自动回滚，且记录 undo）。拖拽等连续手势用 `execute_merged(id, params, key)`，保证一次拖动 = 一步撤销。
+  `ResoZApp::project_mut()` 是过渡期的逃生口，**不可撤销** —— 新代码不要用它。
+  组件层（如钢琴卷帘）只读文档 + 返回意图（intent），由 app 层翻译成命令。
+- **MIDI ops 纯函数化**：签名一律 `fn(&mut [Note], Options)`，原地修改、**不改变 slice 长度**（故可作用于选区），不碰 clip/track/context；随机部分走 seeded XorShift 保可测可复现。
 
 ## 测试
 
