@@ -14,3 +14,6 @@ Thumbs.db
 
 # 工作暂存（一次性脚本等，不入库）
 working_files/
+
+# 参考
+.ref/
