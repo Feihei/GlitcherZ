@@ -56,13 +56,18 @@
 - [x] **M1.2 `Note` 字段对齐** ✅ 2026-10-10。`velocity: f32`(0..1) → `u8`(1..127)，`DEFAULT_VELOCITY=100` / `MIN_VELOCITY=1`；`start`/`length`: `u32` → `i64`；新增 `channel: u8`。
       `Note` 新增 `end()` / `start_clamped()` / `length_clamped()` / `velocity_f32()`；`RtNote` 新增 `new(i64,…)` 在引擎边界一次性 clamp，**音频线程不再需要 NaN 防护**（原 `sanitize_velocity` 已删——整数 velocity 不可能是 NaN）。
       piano_roll 音符亮度改为编码力度（`0.45 + 0.55*vel/127`）。
-- [ ] **M1.3 `Sequence { notes, ctrls }`** 取代裸 `Vec<Note>`，为 CC/PitchBend/Aftertouch 留位（D2）。
-      `sort()` 不变量：`notes` 按 `(start, pitch, channel, length, velocity)`；`remove_duplicates()` 处理导入脏数据（同 `(channel,pitch,start)` 保留最长）。
-      **已知坑**：sort 后 `Vec<usize>` 选择集索引失效，命令须返回新 index。
-- [ ] **M1.4 新 crate `resoz-command`**：命令注册表（id/label/menu/shortcut/params/enabled/run/undoable）+ `execute()`（`catch_unwind` 捕 panic 并回滚、失败强制回滚不留半成品）+ `execute_merged(id, params, key)` 手势合并 + `Arc` CoW 快照 undo。
+- [x] **M1.3 `Sequence { notes, ctrls }`** ✅ 2026-10-10。取代裸 `Vec<Note>`，为 CC/PitchBend/Aftertouch 留位（D2）。新增 `CtrlEvent`/`CtrlKind`（`group_key()` 供分组排序）。
+      `sort()` 不变量：notes 按 `(start, note, channel, length, velocity)`（注意我们的字段叫 `note` 不是 soundcraft 的 `pitch`），ctrls 按 tick **稳定**排序。
+      `remove_duplicates()`：同 `(channel,note,start)` 保留最长；同 `(tick,channel,kind)` 保留最后一个（=合成器实际发声值）。
+      另加 `end_tick()` / `notes_in()`（按 start 命中）/`notes_overlapping()`（按发声区间相交）。
+      **坑（已在 doc comment 标注）**：sort 后 `Vec<usize>` 选择集索引失效，持有索引的调用方必须重新解析。
+      ⚠️ 试过 `#[serde(flatten)]` 让旧 `notes` 字段自动兼容——**不行**，flatten 破坏 RON 的 tuple struct 语法，`midi_clip_partial_fields_use_defaults` 直接解析失败。改为嵌套 `sequence` 字段 + 迁移。
+- [x] **M1.5 项目文件迁移** ✅ 2026-10-10。`PROJECT_VERSION` 5→6。`Project::migrate_v5_to_v6()`：所有 tick ×10（clip start/span/loop、音符 start/length、自动化锚点），v5 的 `notes` 折进 `sequence`，velocity 0..1 → 1..=127（0 → `MIN_VELOCITY=1`，NaN → `DEFAULT_VELOCITY`）。v6 文档不动（幂等）。
+      `parse_project` 按 `version < PROJECT_VERSION` 分支触发。
+      **坑**：`Option<Vec<LegacyNote>>` 在 RON 里必须写 `Some([...])`，缺失字段直接 `ExpectedOption` 报错 → 改用裸 `Vec` + `#[serde(default, rename="notes", skip_serializing)]`。
+- [ ] **M1.4 新 crate `resoz-command`**：命令注册表（id/label/menu/shortcut/params/enabled/run/undoable）+ `execute()`（`catch_unwind` 捕panic 并回滚、失败强制回滚不留半成品）+ `execute_merged(id, params, key)` 手势合并 + `Arc` CoW 快照 undo。
       内置自检测试：所有命令用空参数跑一遍不许 panic（照抄 soundcraft 的 `every_command_survives_empty_params`）。
-- [ ] **M1.5 项目文件迁移**：PPQ 变更 + `Note` 字段变更 → `PROJECT_VERSION` 5→6，在 `file.rs` 按 `version` 分支迁移旧 tick 值（×10）。v4→v5 已有先例可循。
-      迁移仅在 `version <= 5` 时触发；`save_project` 写6。
+      **注意**：undo 需要快照整个文档，但我们的 `Project` 目前是普通 struct（soundcraft 用 `Arc<Session>`）。落地时要么给 `Project` 套 `Arc`，要么先只做 execute + 回滚，undo 留到有实际需求时。
 
 **M1 验收**：`cargo test --workspace` 全绿；旧 `.rez` 文件加载后 tick 语义不变；命令层空参数自检通过。
 
