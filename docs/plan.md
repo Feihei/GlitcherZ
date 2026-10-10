@@ -45,6 +45,58 @@
 - [ ] P5f 单输入语义 + Mixer 节点（D14–D21）：spec v2 评审通过（docs/spec/node-graph.md）。决议：master 也单输入；strip 退役并入 mixer——per-channel gain/pan/mute/solo（舞台调音台方式）+ 输出级 pan/mute；通道数按钮手动增减 2..32（拔线不丢设置，连线可落任意空通道）；v3→v4 加载期自动迁移；默认图改全局 mixer 拓扑；推子自动化后续版本。实现拆分见 spec §9 P5f（引擎 → model v4 → UI → 轨寻址/metering）
 - [ ] P6 音频反馈环路（可选，1 块延迟节点）
 
+## 新方向：MIDI 编辑能力对标 SoundCraft（M1–M3）
+
+2026-10-10 调研 `.ref/soundcraft`（对标 Pro Tools），完整报告见 `ref-soundcraft-midi.md`。SoundCraft 的 MIDI Editor 本身仅 354 行，真正可借鉴的是周边基础设施。按依赖顺序分三步，**M1 不做完不要开 M2**——M2 的多选/框选依赖 M1 的稳定索引，M3 的 ops 要在 M1 的数据模型上做。
+
+### M1 地基：数据模型 + 命令层（breaking change，单独 commit）
+
+- [x] **M1.1 PPQ 96 → 960** ✅ 2026-10-10。`TICKS_PER_QUARTER`=960 / `TICKS_PER_STEP`=240 / `TICKS_PER_BAR`=3840（后者改为派生，不再硬编码）。**顺带修隐患**：`realtime/sequencer.rs` 原先在 27/30/83 行**重复定义**三份常量，engine 侧改为单一来源；新增 `resoz-ui/tests/tick_base_consistency.rs` 锁住两侧一致（engine 刻意不依赖 model，实时线程与文档层解耦，故用测试而非 `pub use` 约束）。
+      960 的收益已用测试锁定：1/64 三连音 = 160 tick（整除）、附点 1/16 = 360、1/8 三连音 = 320，96 PPQ 下这些无法精确表达。
+- [x] **M1.2 `Note` 字段对齐** ✅ 2026-10-10。`velocity: f32`(0..1) → `u8`(1..127)，`DEFAULT_VELOCITY=100` / `MIN_VELOCITY=1`；`start`/`length`: `u32` → `i64`；新增 `channel: u8`。
+      `Note` 新增 `end()` / `start_clamped()` / `length_clamped()` / `velocity_f32()`；`RtNote` 新增 `new(i64,…)` 在引擎边界一次性 clamp，**音频线程不再需要 NaN 防护**（原 `sanitize_velocity` 已删——整数 velocity 不可能是 NaN）。
+      piano_roll 音符亮度改为编码力度（`0.45 + 0.55*vel/127`）。
+- [ ] **M1.3 `Sequence { notes, ctrls }`** 取代裸 `Vec<Note>`，为 CC/PitchBend/Aftertouch 留位（D2）。
+      `sort()` 不变量：`notes` 按 `(start, pitch, channel, length, velocity)`；`remove_duplicates()` 处理导入脏数据（同 `(channel,pitch,start)` 保留最长）。
+      **已知坑**：sort 后 `Vec<usize>` 选择集索引失效，命令须返回新 index。
+- [ ] **M1.4 新 crate `resoz-command`**：命令注册表（id/label/menu/shortcut/params/enabled/run/undoable）+ `execute()`（`catch_unwind` 捕 panic 并回滚、失败强制回滚不留半成品）+ `execute_merged(id, params, key)` 手势合并 + `Arc` CoW 快照 undo。
+      内置自检测试：所有命令用空参数跑一遍不许 panic（照抄 soundcraft 的 `every_command_survives_empty_params`）。
+- [ ] **M1.5 项目文件迁移**：PPQ 变更 + `Note` 字段变更 → `PROJECT_VERSION` 5→6，在 `file.rs` 按 `version` 分支迁移旧 tick 值（×10）。v4→v5 已有先例可循。
+      迁移仅在 `version <= 5` 时触发；`save_project` 写6。
+
+**M1 验收**：`cargo test --workspace` 全绿；旧 `.rez` 文件加载后 tick 语义不变；命令层空参数自检通过。
+
+> **M1.1/M1.2 过程中的发现（2026-10-10）**：`auto_stop_keeps_pending_offs_draining` 测试原本硬断言"自动停止发生在第 750 个 block"。PPQ ×10 后实测停在**第 751** 个——位置计数器是 f64，每块累加 `dt_ticks` 会积累亚块误差。原断言在 96 PPQ 下是**侥幸通过**的。已改为"循环直到 `is_playing()` 为假"的不依赖具体 block 的写法。**教训：涉及时间推进的测试不要硬编码 block 数**，PPQ 或 tempo 变更时这类断言会静默失效。
+
+### M2 编辑交互（依赖 M1）
+
+- [ ] **M2.1 `GridValue`** 替代 `piano_roll.rs` 硬编码的 `SNAP_TICKS: u32 = 6`。枚举含 NoteValue(含附点/三连音)/Seconds/Frames/Samples。
+      **关键**：网格线必须**从每个 bar line 重新计数**，否则 3/4、5/4、7/8 拍号下与小节线错位。
+- [ ] **M2.2 多选 + 橡皮筋框选** + Shift/Ctrl 追加选择。
+- [ ] **M2.3 方向键微调**：上下半音（Shift = 八度）、左右移动一格。
+- [ ] **M2.4 velocity lane**（soundcraft 约 20 行，直接抄）+ 拖动接 `execute_merged`（一次拖动 = 一步 undo，这是手感命门）。
+- [ ] **M2.5 音符亮度编码力度**（`0.45 + 0.55 * vel/127`），零成本可视化。
+
+### M3 编辑能力（依赖 M1 数据模型）
+
+- [ ] **M3.1 `ops.rs` 纯函数**：全部原地改、**不改 slice 长度**（故可作用于选区）、转调只 clamp 0..=127 **不 drop 音符**、随机部分走 seeded XorShift（保可测可复现）。
+- [ ] **M3.2 量化**：8 个 `QuantizeOptions`。`exclude_within` 容差窗口最实用（已准的音不动，只拉跑偏的）。
+      **swing 坑**：不是简单偏移，而是在 k-1/k/k+1 三条候选线里搜最近。
+- [ ] **M3.3 力度**：Set/Add/Scale/Limit + `Ramp`（线性渐变，做crescendo）+ `Humanize`（随机±）。
+- [ ] **M3.4 时值**：Set/Add/Scale + `Legato{gap}` + `RemoveOverlap`（同 pitch 重叠截断，旋律线单音化）。
+- [ ] **M3.5 SMF 导入导出**（soundcraft 541 行，边界清单见报告）。**趁早做**，`Sequence` 结构还会变。
+- [ ] **M3.6 Event List 窗口**（`egui::Grid` 约 120 行：Start/Note/Vel/Length 表格 + DragValue 精确编辑）。
+
+### 明确不做（已评估）
+
+- **Score Editor 五线谱**：soundcraft 自述"readable sketch rather than an engraving engine"，价值不如把piano roll 做扎实。
+- **command journal / macro recording**：暂无 macro 需求。
+
+### M1 顺带补AGENTS.md 实时铁律
+
+1. **UI 层不得直接修改 model**，所有编辑经 `execute(cmd_id, params)`，以便统一撤销/回滚/审计。
+2. **MIDI ops 纯函数化 + 确定性随机**：签名一律 `fn(&mut [Note], Options)`，不碰 clip/track/context，可脱离 DAW 单独测试。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：
