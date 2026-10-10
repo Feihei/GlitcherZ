@@ -60,9 +60,11 @@ resoz/
 - 禁止 `unsafe`，除非：模块顶部有 `// SAFETY:` 注释 + 理由 + 测试。当前允许的边界仅 `resoz-clap-host` / `resoz-vst3-host` 的插件绑定层。
 - 浮点数统一使用 `f32`（音频路径）/ `f64`（UI 与时间计算），转换点集中在 `resoz-engine::convert`。
 - 错误处理：应用层用 `thiserror` 定义错误枚举，不使用 `anyhow` 跨 crate 边界。
-- **UI 层不得直接修改 model**：所有编辑经 `resoz_command::Session::execute`（报错/panic 自动回滚，且记录 undo）。拖拽等连续手势用 `execute_merged(id, params, key)`，保证一次拖动 = 一步撤销。
-  `ResoZApp::project_mut()` 是过渡期的逃生口，**不可撤销** —— 新代码不要用它。
-  组件层（如钢琴卷帘）只读文档 + 返回意图（intent），由 app 层翻译成命令。
+- **UI 层不得直接修改 model**：两种等价路径，都记录 undo——
+  ① 命令：`ResoZApp::execute(id, params)`（报错/panic 自动回滚）；连续手势用 `execute_merged(id, params, key)`；
+  ② 编辑守卫：`let before = self.begin_edit(); ... project_mut() 修改 ...; self.commit_edit(label, before)`。参数拖动用 `begin_param_edit`/`commit_param_edit(label, before, key)` + 拖动结束 `end_param_edit()`。
+  复合操作（内部会触发其他可撤销编辑）先 `session.suspend_history()`，收尾 `resume_history()` 再 commit——只记外层一步。
+  组件层（钢琴卷帘/timeline/automation lane）**只读文档 + 返回意图**（`RollIntent`/`TimelineAction`/`LaneIntent`），由 app 层翻译成命令或守卫编辑；组件不得持有 `&mut` 文档。
 - **MIDI ops 纯函数化**：签名一律 `fn(&mut [Note], Options)`，原地修改、**不改变 slice 长度**（故可作用于选区），不碰 clip/track/context；随机部分走 seeded XorShift 保可测可复现。
 
 ## 测试

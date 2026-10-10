@@ -787,8 +787,10 @@ impl ResoZApp {
 
     /// Mutable document access.
     ///
-    /// Pair with [`ResoZApp::begin_edit`] + [`ResoZApp::commit_edit`] to make
-    /// the edit undoable. Calling this bare leaves no history entry.
+    /// Bare access records no undo step. Wrap the edit in
+    /// [`ResoZApp::begin_edit`] / [`ResoZApp::commit_edit`] (or run a command
+    /// via [`ResoZApp::execute`]); the AGENTS.md rule "UI 层不得直接修改
+    /// model" means every call site must be inside such a guard.
     pub fn project_mut(&mut self) -> &mut Project {
         self.session.project_mut()
     }

@@ -73,7 +73,12 @@
       `Ctrl+Z` / `Ctrl+Y` 绑定 undo / redo。undo/redo 后 `push_all_clips()` 重推 clip 表（音频线程持副本）。
       自检测试：`every_command_survives_empty_params` + `no_command_panics_on_a_populated_document`（空参数/有数据两种情况都不许 panic）。
 
-> **M1 全部完成**。遗留：约 110 处文档修改仍走 `ResoZApp::project_mut()`（**不可撤销**），是有意为之的过渡状态 —— 命令层和历史已就位，迁移是机械工作。`project_mut()` 的 doc comment 已标注这一点。
+> **M1 全部完成**。全部文档修改已迁移到可撤销路径（commit `9d380bb`）：每个编辑点 `begin_edit()` 快照 → `project_mut()` 修改 → `commit_edit(label)` 记一步 undo（无实际变化不记录，`Arc::ptr_eq` 判定）。
+      两个新原语：`push_undo_merged(key)`（带外编辑的手势合并——tempo/master gain 拖动一次拖 = 一步）、`suspend_history()`（嵌套编辑只记外层一步——加 MIDI 轨可能扩 mixer）+ `restore(snapshot)`（引擎侧失败回滚，不进历史）。
+      **timeline 与 automation lane 也改造为纯视图**：`TimelineAction` 新增 `AddClip/MoveResizeClip/RemoveClip`，lane 返回 `LaneIntent`，由 app 走守卫执行；clip 拖动经手势键合并为一步。
+      undo/redo 后 `apply_document()` 全量重建引擎图（undo 可能恢复节点/连线变化，不只是 clip 表）。
+      **顺带修 M1.1 漏网**：lane 的 `SNAP_TICKS=12` 还是 96 PPQ 值（不派生自常量所以没被重算），改为 `TICKS_PER_STEP / 2` 派生。
+      唯一例外：`do_save` 写 layout（保存不是编辑）。`ResoZApp::project_mut()` 仍存在，但新代码一律走守卫。
 
 **M1 验收**：`cargo test --workspace` 全绿；旧 `.rez` 文件加载后 tick 语义不变；命令层空参数自检通过。
 
