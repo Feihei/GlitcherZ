@@ -68,8 +68,7 @@
 | 播放头 | playhead | 当前播放位置指示 |
 | 片段 | clip | 钢琴卷帘编辑的音符集合 |
 | 音符 | note | MIDI 音符；音名如 `A4` |
-| 音长 | gate | 音符占步长的比例；不用 length/gate time 混称 |
-| 步进 | step | 步进音序器的格 |
+| 延音尾 | gate tail | 音符 off 事件前的延续播放（pending off 机制）；项目级"音长 gate"已随 Steps 退役，音符收尾用自身 length |
 | 循环长度 | loop length | tick 数（默认 384） |
 | 吸附 | snap | 时间/音高网格量化 |
 | 自动化 | automation | 参数随时间的曲线 |
@@ -86,7 +85,6 @@
 | 冒烟测试 | smoke test | `--seconds` 自动关窗跑通 |
 | 节点画布 | node patch | P5d 的 patch 图视图编辑器（Pure Data 语境，连线图叫 patch） |
 | 钢琴卷帘 | piano roll | 音符片段编辑器 |
-| 步进音序器 | step sequencer | 16 步网格编辑器 |
 | 混音器 | mixer | 多轨电平/推子区 |
 | 走带控制 | transport bar | 顶部播放/速度/文件工具条 |
 
