@@ -1129,7 +1129,15 @@ impl ResoZApp {
     /// `in_port` binds the cable to the target's input port (the mixer channel
     /// for mixers, D17; 0 for single-input nodes / master).
     fn connect_audio(&mut self, from_doc: u64, to: PortRef, in_port: u8) {
-        // Document deduplication (engine-side add_cable is idempotent anyway).
+        // Strict single-input slots (D14): a new cable into an occupied
+        // `(to, in_port)` slot disconnects the old cable (engine `add_cable`
+        // mirrors this). Same source → same slot is an idempotent no-op.
+        self.project.graph.cables.retain(|c| {
+            !(c.kind == CableKind::Audio
+                && c.to == to
+                && c.in_port == in_port
+                && c.from != PortRef::Node(from_doc))
+        });
         let dup = self.project.graph.cables.iter().any(|c| {
             c.kind == CableKind::Audio
                 && c.from == PortRef::Node(from_doc)

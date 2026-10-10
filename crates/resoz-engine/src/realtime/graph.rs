@@ -921,19 +921,41 @@ impl GraphCompiler {
             .any(|c| c.from == from && c.to == to)
     }
 
-    /// Appends a cable (duplicate `(from, to)` pairs succeed idempotently
-    /// regardless of `in_port`). Returns [`TopologyError::TooManyCables`]
-    /// when full.
+    /// Appends a cable. Every audio input slot holds exactly one cable
+    /// (strict single-input, D14): a new cable onto an occupied `(to,
+    /// in_port)` slot disconnects the previous one. Exact duplicates are
+    /// idempotent. Returns [`TopologyError::TooManyCables`] when full.
     fn add_cable(&mut self, from: u16, to: u16, in_port: u8) -> Result<(), TopologyError> {
-        if self.has_cable(from, to) {
+        if self.cables[..self.cable_count]
+            .iter()
+            .any(|c| c.from == from && c.to == to && c.in_port == in_port)
+        {
             return Ok(());
         }
+        self.remove_cables_to_port(to, in_port);
         if self.cable_count >= MAX_CABLES {
             return Err(TopologyError::TooManyCables);
         }
         self.cables[self.cable_count] = Cable { from, to, in_port };
         self.cable_count += 1;
         Ok(())
+    }
+
+    /// Removes every cable entering the input slot `(to, in_port)` (strict
+    /// single-input replacement; returns how many were removed).
+    fn remove_cables_to_port(&mut self, to: u16, in_port: u8) -> usize {
+        let mut removed = 0;
+        let mut i = 0;
+        while i < self.cable_count {
+            if self.cables[i].to == to && self.cables[i].in_port == in_port {
+                self.cables.copy_within(i + 1..self.cable_count, i);
+                self.cable_count -= 1;
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        removed
     }
 
     /// Removes one cable (idempotent, returns `false` when not connected).
@@ -2103,18 +2125,33 @@ mod tests {
     }
 
     #[test]
-    fn compile_rejects_fan_in_overflow() {
+    fn add_cable_replaces_occupied_input_slot() {
         let (mut compiler, _graph) = GraphCompiler::default_graph(SR, BLOCK);
-        // D14: plain nodes take exactly one in-edge. Track 0's delay already
-        // has one (voice → delay); a second must be rejected at compile time.
+        // Strict single-input (D14): a new cable onto an occupied input slot
+        // disconnects the old one instead of failing at compile time.
         let delay = compiler.track_delay[0];
         compiler
             .add_cable(compiler.track_voice[1], delay, 0)
             .expect("add cable");
-        assert!(matches!(
-            compiler.compile(),
-            Err(TopologyError::FanInOverflow)
-        ));
+        assert!(compiler.compile().is_ok());
+        // The slot carries exactly one in-edge now (from track 1's voice).
+        let in_edges: Vec<_> = compiler.cables[..compiler.cable_count]
+            .iter()
+            .filter(|c| c.to == delay)
+            .collect();
+        assert_eq!(in_edges.len(), 1);
+        assert_eq!(in_edges[0].from, compiler.track_voice[1]);
+        // Exact duplicates are idempotent (no second edge).
+        compiler
+            .add_cable(compiler.track_voice[1], delay, 0)
+            .expect("idempotent");
+        assert_eq!(
+            compiler.cables[..compiler.cable_count]
+                .iter()
+                .filter(|c| c.to == delay)
+                .count(),
+            1
+        );
     }
 
     #[test]

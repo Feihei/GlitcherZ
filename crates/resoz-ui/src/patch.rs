@@ -1088,23 +1088,17 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                                 // port. Dropping on a mixer picks the exact
                                 // channel port when hit precisely, else the
                                 // first free channel; dropping anywhere else
-                                // is port 0. Reject when no channel is free
-                                // (or the precisely-hit port is occupied).
+                                // is port 0. Slots are strictly single-input
+                                // (D14): the new cable replaces the old one
+                                // on the same slot; no free channel → reject.
                                 let in_port = match target {
                                     PatchId::Node(to_doc)
                                         if doc.node_by_id(to_doc).is_some_and(|n| n.is_mixer()) =>
                                     {
-                                        let exact = state
-                                            .hit_in_port(rect.min, sp, midi_count, auto_count, doc);
-                                        match exact {
-                                            Some((PatchId::Node(_), port)) => {
-                                                let occupied = doc.cables.iter().any(|c| {
-                                                    c.kind == CableKind::Audio
-                                                        && c.to == PortRef::Node(to_doc)
-                                                        && c.in_port == port
-                                                });
-                                                if occupied { None } else { Some(port) }
-                                            }
+                                        match state
+                                            .hit_in_port(rect.min, sp, midi_count, auto_count, doc)
+                                        {
+                                            Some((PatchId::Node(_), port)) => Some(port),
                                             _ => doc.first_free_channel(to_doc),
                                         }
                                     }
