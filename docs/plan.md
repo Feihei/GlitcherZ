@@ -97,11 +97,13 @@
 
 ### M3 编辑能力（依赖 M1 数据模型）
 
-- [ ] **M3.1 `ops.rs` 纯函数**：全部原地改、**不改 slice 长度**（故可作用于选区）、转调只 clamp 0..=127 **不 drop 音符**、随机部分走 seeded XorShift（保可测可复现）。
-- [ ] **M3.2 量化**：8 个 `QuantizeOptions`。`exclude_within` 容差窗口最实用（已准的音不动，只拉跑偏的）。
-      **swing 坑**：不是简单偏移，而是在 k-1/k/k+1 三条候选线里搜最近。
-- [ ] **M3.3 力度**：Set/Add/Scale/Limit + `Ramp`（线性渐变，做crescendo）+ `Humanize`（随机±）。
-- [ ] **M3.4 时值**：Set/Add/Scale + `Legato{gap}` + `RemoveOverlap`（同 pitch 重叠截断，旋律线单音化）。
+- [x] **M3.1 `ops.rs` 纯函数**（2026-10-11，`resoz-model/src/ops.rs`，commit `8616ce0`）：`transpose` / `apply_velocity` / `apply_duration` / `quantize`，全部 `fn(&mut [Note], Options)` 原地改、不改长度；clamp 不 drop；随机走 XorShift64*（`DEFAULT_SEED=0x5EED_50DC_4AF7_0001`，`*_with_seed` 可传种子）。
+      **选区形式**：`apply_to_selected(notes, indices, op)` 复制-变换-写回，ramp/legato 的顺序只在选区内计算（"作用于选区"语义）。调用方负责 re-sort。
+- [x] **M3.2 量化**：8 个 `QuantizeOptions` 齐全。`exclude_within` 容差窗口（半格的分数）；`strength` 插值；**swing 按报告实现**——奇数线延迟 `swing·grid/3`，最近线在 k-1/k/k+1 三候选里搜（报告特别警告过别写成简单偏移，测试 `swing_searches_three_candidate_lines` 锁定）。
+      命令 `midi.quantize {track, clip, indices?, grid_ticks?, strength?, swing?, include_within?, exclude_within?, quantize_ends?, preserve_duration?, random?}`。
+- [x] **M3.3 力度**：`VelocityOp::{Set,Add,Scale,Limit,Ramp,Humanize}`；Ramp 按 start 时间线性渐变（crescendo），Humanize 走种子随机。命令 `midi.velocity_op {op: set|add|scale|limit|ramp|humanize}`。
+- [x] **M3.4 时值**：`DurationOp::{Set,Add,Scale,Legato{gap},RemoveOverlap}`；Legato 延到下一音前 gap（时间序，选区内）；RemoveOverlap 同 pitch 重叠截断。命令 `midi.duration_op {op: set|add|scale|legato|remove_overlap}`。
+      **注意**：pitch/length 都是排序键，四条命令执行后都 re-sort。
 - [ ] **M3.5 SMF 导入导出**（soundcraft 541 行，边界清单见报告）。**趁早做**，`Sequence` 结构还会变。
 - [ ] **M3.6 Event List 窗口**（`egui::Grid` 约 120 行：Start/Note/Vel/Length 表格 + DragValue 精确编辑）。
 
