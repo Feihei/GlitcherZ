@@ -104,8 +104,9 @@
 - [x] **M3.3 力度**：`VelocityOp::{Set,Add,Scale,Limit,Ramp,Humanize}`；Ramp 按 start 时间线性渐变（crescendo），Humanize 走种子随机。命令 `midi.velocity_op {op: set|add|scale|limit|ramp|humanize}`。
 - [x] **M3.4 时值**：`DurationOp::{Set,Add,Scale,Legato{gap},RemoveOverlap}`；Legato 延到下一音前 gap（时间序，选区内）；RemoveOverlap 同 pitch 重叠截断。命令 `midi.duration_op {op: set|add|scale|legato|remove_overlap}`。
       **注意**：pitch/length 都是排序键，四条命令执行后都 re-sort。
-- [ ] **M3.5 SMF 导入导出**（soundcraft 541 行，边界清单见报告）。**趁早做**，`Sequence` 结构还会变。
-- [ ] **M3.6 Event List 窗口**（`egui::Grid` 约 120 行：Start/Note/Vel/Length 表格 + DragValue 精确编辑）。
+- [x] **M3.5 SMF 导入导出**（2026-10-11，`resoz-model/src/smf.rs`，commit `7832286`）：format 1，division=960 与内部 PPQ 一致（**双向零换算**）。导出：clip 按 absolute 位置平铺 loop、conductor 轨写 tempo/拍号；导入：报告边界清单全覆盖（running status / vel-0=off / 同 pitch FIFO 配对 / 悬挂音轨末闭合 / 零长强制 1 / SMPTE 按 120BPM 约定 / 畸形报错带字节 offset / MAX_TRACKS+MAX_EVENTS 上限），导入后 `remove_duplicates` 语义的排序去重。
+      **语义要点**：format 1 的 conductor 轨（纯 meta）折叠进全局 tempo 不生成轨道；clip 挂在最早音符的绝对 tick、notes 相对化（保持 arrangement 位置）。
+- [x] **M3.6 Event List 窗口**（2026-10-11，`resoz-ui/src/event_list.rs`）：`egui::Grid` 表格 Start/Note/Vel/Length/Ch + 每行删除；Note 列 `custom_formatter` 显示 "C4" 风格音名（编辑值仍是半音数）。DragValue `from_get_set(Option<f64>)` 收集每帧变更到一个 partial `NoteEdit` → `midi.note_edit` 合并手势（一拖=一步 undo）。放在 roll 下方 CollapsingHeader。
 
 ### 明确不做（已评估）
 
