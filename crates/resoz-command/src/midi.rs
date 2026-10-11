@@ -60,8 +60,155 @@ pub fn specs() -> Vec<crate::CommandSpec> {
             crate::registry::has_notes,
             change_velocity
         ),
+        crate::cmd!(
+            "midi.quantize",
+            "Quantize",
+            ["Midi", "Event"],
+            None,
+            "{track, clip, indices?, grid_ticks?, strength? 0..1, swing? 0..1, include_within? 0..1, exclude_within? 0..1, quantize_ends?, preserve_duration?, random? 0..1}",
+            always,
+            quantize_cmd
+        ),
+        crate::cmd!(
+            "midi.transpose",
+            "Transpose",
+            ["Midi", "Event"],
+            None,
+            "{track, clip, indices?, semitones}",
+            always,
+            transpose_cmd
+        ),
+        crate::cmd!(
+            "midi.velocity_op",
+            "Velocity Op",
+            ["Midi", "Event"],
+            None,
+            "{track, clip, indices?, op: set|add|scale|limit|ramp|humanize, value?, from?, to?, min?, max?}",
+            always,
+            velocity_op_cmd
+        ),
+        crate::cmd!(
+            "midi.duration_op",
+            "Duration Op",
+            ["Midi", "Event"],
+            None,
+            "{track, clip, indices?, op: set|add|scale|legato|remove_overlap, value?, gap?}",
+            always,
+            duration_op_cmd
+        ),
         crate::cmd!(noundo "midi.query", "Query Notes", [], None, "{track, clip}", always, query),
     ]
+}
+
+/// The `indices` parameter, or every note when absent (whole-clip operation).
+fn indices_or_all(params: &Value, len: usize) -> Vec<usize> {
+    let selected = indices(params, "indices");
+    if selected.is_empty() {
+        (0..len).collect()
+    } else {
+        selected
+    }
+}
+
+fn quantize_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let options = resoz_model::QuantizeOptions {
+        grid_ticks: i64_or(params, "grid_ticks", i64::from(resoz_model::TICKS_PER_STEP)),
+        strength: crate::registry::f64_or(params, "strength", 1.0) as f32,
+        swing: crate::registry::f64_or(params, "swing", 0.0) as f32,
+        include_within: crate::registry::f64_or(params, "include_within", 1.0) as f32,
+        exclude_within: crate::registry::f64_or(params, "exclude_within", 0.0) as f32,
+        quantize_ends: params
+            .get("quantize_ends")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        preserve_duration: params
+            .get("preserve_duration")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        random: crate::registry::f64_or(params, "random", 0.0) as f32,
+    };
+    let notes = notes_mut(session, "midi.quantize", params)?;
+    let selected = indices_or_all(params, notes.len());
+    resoz_model::apply_to_selected(notes, &selected, |slice| {
+        resoz_model::quantize(slice, &options)
+    });
+    notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
+    Ok(json!({ "quantized": selected.len() }))
+}
+
+fn transpose_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let semitones = i64_or(params, "semitones", 0).clamp(-127, 127) as i32;
+    let notes = notes_mut(session, "midi.transpose", params)?;
+    let selected = indices_or_all(params, notes.len());
+    resoz_model::apply_to_selected(notes, &selected, |slice| {
+        resoz_model::transpose(slice, semitones)
+    });
+    // Pitch is part of the sort key: same-start notes may reorder.
+    notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
+    Ok(json!({ "transposed": selected.len() }))
+}
+
+fn velocity_op_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let name = params.get("op").and_then(Value::as_str).unwrap_or("");
+    let op = match name {
+        "set" => resoz_model::VelocityOp::Set(i64_or(params, "value", 100).clamp(1, 127) as u8),
+        "add" => resoz_model::VelocityOp::Add(i64_or(params, "value", 0).clamp(-126, 126) as i32),
+        "scale" => {
+            resoz_model::VelocityOp::Scale(crate::registry::f64_or(params, "value", 1.0) as f32)
+        }
+        "limit" => resoz_model::VelocityOp::Limit {
+            min: i64_or(params, "min", 1).clamp(1, 127) as u8,
+            max: i64_or(params, "max", 127).clamp(1, 127) as u8,
+        },
+        "ramp" => resoz_model::VelocityOp::Ramp {
+            from: i64_or(params, "from", 40).clamp(1, 127) as u8,
+            to: i64_or(params, "to", 100).clamp(1, 127) as u8,
+        },
+        "humanize" => {
+            resoz_model::VelocityOp::Humanize(i64_or(params, "value", 20).clamp(0, 126) as u8)
+        }
+        other => {
+            return Err(bad_params(
+                "midi.velocity_op",
+                format!("`op` must be set|add|scale|limit|ramp|humanize, got {other:?}"),
+            ));
+        }
+    };
+    let notes = notes_mut(session, "midi.velocity_op", params)?;
+    let selected = indices_or_all(params, notes.len());
+    resoz_model::apply_to_selected(notes, &selected, |slice| {
+        resoz_model::apply_velocity(slice, &op, resoz_model::DEFAULT_SEED)
+    });
+    notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
+    Ok(json!({ "changed": selected.len() }))
+}
+
+fn duration_op_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let name = params.get("op").and_then(Value::as_str).unwrap_or("");
+    let op = match name {
+        "set" => resoz_model::DurationOp::Set(i64_or(params, "value", 240)),
+        "add" => resoz_model::DurationOp::Add(i64_or(params, "value", 0)),
+        "scale" => {
+            resoz_model::DurationOp::Scale(crate::registry::f64_or(params, "value", 1.0) as f32)
+        }
+        "legato" => resoz_model::DurationOp::Legato {
+            gap: i64_or(params, "gap", 0),
+        },
+        "remove_overlap" => resoz_model::DurationOp::RemoveOverlap,
+        other => {
+            return Err(bad_params(
+                "midi.duration_op",
+                format!("`op` must be set|add|scale|legato|remove_overlap, got {other:?}"),
+            ));
+        }
+    };
+    let notes = notes_mut(session, "midi.duration_op", params)?;
+    let selected = indices_or_all(params, notes.len());
+    resoz_model::apply_to_selected(notes, &selected, |slice| {
+        resoz_model::apply_duration(slice, &op)
+    });
+    notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
+    Ok(json!({ "changed": selected.len() }))
 }
 
 /// Mutable clip at `track`/`clip` from the parameters.

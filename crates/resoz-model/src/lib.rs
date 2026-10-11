@@ -35,9 +35,14 @@
 use std::collections::BTreeMap;
 
 pub mod file;
+pub mod ops;
 
 pub use file::{
     ModelError, PROJECT_VERSION, ProjectFile, load_project, parse_project, save_project,
+};
+pub use ops::{
+    DEFAULT_SEED, DurationOp, QuantizeOptions, VelocityOp, apply_duration, apply_to_selected,
+    apply_velocity, quantize, transpose,
 };
 
 /// MIDI track capacity limit (D12; the engine side uses the same value).

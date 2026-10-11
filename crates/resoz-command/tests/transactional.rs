@@ -317,3 +317,80 @@ fn restore_rolls_back_without_touching_history() {
         40
     );
 }
+
+#[test]
+fn quantize_respects_the_selection() {
+    let mut session = session_with_notes();
+    // Three notes at 0 / 250 / 500 (only some on the grid).
+    session.project_mut().midi_tracks[0].clips[0].notes_mut()[1].start = 250;
+    session.project_mut().midi_tracks[0].clips[0].notes_mut()[2].start = 500;
+    session
+        .execute(
+            "midi.quantize",
+            &json!({ "track": 0, "clip": 0, "indices": [1], "grid_ticks": 240 }),
+        )
+        .unwrap();
+    let notes = session.project().midi_tracks[0].clips[0].notes();
+    assert_eq!(notes[0].start, 0, "unselected: untouched");
+    assert_eq!(notes[1].start, 240, "selected: pulled to the line");
+    assert_eq!(notes[2].start, 500, "unselected: untouched");
+
+    // Undo restores the pre-quantize position.
+    assert!(session.undo());
+    let notes = session.project().midi_tracks[0].clips[0].notes();
+    assert_eq!(notes[1].start, 250);
+}
+
+#[test]
+fn velocity_ramp_follows_time_order_within_the_selection() {
+    let mut session = session_with_notes();
+    session.project_mut().midi_tracks[0].clips[0].notes_mut()[0].start = 480;
+    session
+        .execute(
+            "midi.velocity_op",
+            &json!({ "track": 0, "clip": 0, "op": "ramp", "from": 40, "to": 100 }),
+        )
+        .unwrap();
+    let mut by_start: Vec<(i64, u8)> = session.project().midi_tracks[0].clips[0]
+        .notes()
+        .iter()
+        .map(|n| (n.start, n.velocity))
+        .collect();
+    by_start.sort_unstable();
+    let velocities: Vec<u8> = by_start.into_iter().map(|(_, v)| v).collect();
+    assert!(
+        velocities.first() < velocities.last(),
+        "crescendo by time order"
+    );
+}
+
+#[test]
+fn legato_extends_each_note_to_the_next() {
+    let mut session = session_with_notes();
+    session
+        .execute(
+            "midi.duration_op",
+            &json!({ "track": 0, "clip": 0, "op": "legato", "gap": 0 }),
+        )
+        .unwrap();
+    let notes = session.project().midi_tracks[0].clips[0].notes();
+    for window in notes.windows(2) {
+        assert_eq!(
+            window[0].start + window[0].length,
+            window[1].start,
+            "each note ends exactly where the next begins"
+        );
+    }
+}
+
+#[test]
+fn unknown_op_names_are_rejected_without_panicking() {
+    let mut session = session_with_notes();
+    let error = session
+        .execute(
+            "midi.velocity_op",
+            &json!({ "track": 0, "clip": 0, "op": "explode" }),
+        )
+        .expect_err("unknown op must be a bad-params error");
+    assert!(error.to_string().contains("set|add|scale"));
+}
