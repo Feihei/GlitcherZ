@@ -86,12 +86,14 @@
 
 ### M2 编辑交互（依赖 M1）
 
-- [ ] **M2.1 `GridValue`** 替代 `piano_roll.rs` 硬编码的 `SNAP_TICKS: u32 = 6`。枚举含 NoteValue(含附点/三连音)/Seconds/Frames/Samples。
-      **关键**：网格线必须**从每个 bar line 重新计数**，否则 3/4、5/4、7/8 拍号下与小节线错位。
-- [ ] **M2.2 多选 + 橡皮筋框选** + Shift/Ctrl 追加选择。
-- [ ] **M2.3 方向键微调**：上下半音（Shift = 八度）、左右移动一格。
-- [ ] **M2.4 velocity lane**（soundcraft 约 20 行，直接抄）+ 拖动接 `execute_merged`（一次拖动 = 一步 undo，这是手感命门）。
-- [ ] **M2.5 音符亮度编码力度**（`0.45 + 0.55 * vel/127`），零成本可视化。
+- [x] **M2.1 `GridValue`**（2026-10-11，`resoz-ui/src/grid.rs`）：`Note(NoteValue{division, dotted, triplet})` + `Seconds/Frames/Samples`（后三个 UI 暂不暴露，换算公式 `ticks = t·bpm·ppq/60` 与采样率无关；测试锁定 1/64T=40 tick 等精度）。roll 工具栏 ComboBox 选网格。
+      **网格线从每个 bar line 重新计数**（bar 内循环 `tick += grid_ticks`），拍号变化不会错位。
+      顺带：960 PPQ 下旧 `SNAP_TICKS` 常量被枚举取代；三连音网格不再有舍入误差（96 PPQ 时代 1/8T=8 tick 是近似值）。
+- [x] **M2.2 多选 + 橡皮筋框选** + Shift/Ctrl 追加（2026-10-11）：`RollState.selection: Vec<usize>`。约定：点击音符单选（修饰键=toggle）、空处**按下即拖=框选**、**原地点击=建音符**（阈值 4px 区分）。拖动移动**整个选区**。
+      **核心不变量**：选区索引在"统一 delta 移动 + 稳定排序"下保持有效——roll 侧 `clamped_move` 把 delta 钳到选区内边界（越界钳制若不对称会置换排序、索引漂移），专门测试锁定。删除/撤销后 `clear_gesture()` 全清。
+- [x] **M2.3 方向键微调**（2026-10-11）：roll `request_focus()` 后响应 Arrow——上下半音（Shift=八度）、左右一格网格；走 `notes_move` 同一合并手势。
+- [x] **M2.4 velocity lane**（2026-10-11）：roll 下方 48px lane，力度条与音符同 x 映射、同高亮色。拖动发 `SetVelocities{updates}`（绝对值 map）→ `change_velocity` 新增 `set_each` 参数 → `execute_merged` 合并为一步 undo。有选区时整个选区跟随指针；无选区时扫过的音符被"刷"上力度。
+- [x] **M2.5 音符亮度编码力度**：M1.2 已随 velocity u8 化落地（`0.45 + 0.55·vel/127`）。
 
 ### M3 编辑能力（依赖 M1 数据模型）
 
