@@ -180,20 +180,37 @@ fn change_velocity(session: &mut Session, params: &Value) -> crate::Result<Value
         .get("scale")
         .and_then(Value::as_f64)
         .filter(|f| f.is_finite());
-    if set.is_none() && add.is_none() && scale.is_none() {
+    // `set_each` carries absolute per-note values ({"3": 90, ...}) — the
+    // velocity lane's drag emits one frame with many targets, each at the
+    // pointer height. Exempt from the set/add/scale requirement below.
+    let set_each: Vec<(usize, i64)> = params
+        .get("set_each")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(k, v)| Some((k.parse::<usize>().ok()?, v.as_i64()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if set.is_none() && add.is_none() && scale.is_none() && set_each.is_empty() {
         return Err(bad_params(
             "midi.change_velocity",
-            "give `set`, `add` or `scale`",
+            "give `set`, `add`, `scale` or `set_each`",
         ));
     }
     let notes = notes_mut(session, "midi.change_velocity", params)?;
     let lo = i64::from(resoz_model::MIN_VELOCITY);
     let mut changed = 0usize;
     for (index, note) in notes.iter_mut().enumerate() {
-        if !selected.contains(&index) {
+        let next = if let Some(value) = set_each
+            .iter()
+            .find(|(target, _)| *target == index)
+            .map(|(_, value)| *value)
+        {
+            value
+        } else if !selected.contains(&index) {
             continue;
-        }
-        let next = if let Some(value) = set {
+        } else if let Some(value) = set {
             value
         } else if let Some(value) = add {
             i64::from(note.velocity) + value

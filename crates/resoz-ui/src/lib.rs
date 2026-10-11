@@ -41,6 +41,7 @@ use resoz_model::{
     MidiClip, NodeDoc, PortRef, Project, SynthParams, VoiceSpec,
 };
 
+pub mod grid;
 pub mod lane;
 pub mod patch;
 pub mod piano_roll;
@@ -1461,7 +1462,8 @@ impl ResoZApp {
     /// Only command-recorded steps are undoable; edits made through
     /// [`ResoZApp::project_mut`] are not in the history yet.
     pub fn undo(&mut self) {
-        self.roll_state.clear_drag();
+        // Undo/redo invalidates every held index: drag, selection, marquee.
+        self.roll_state.clear_gesture();
         self.lane_state.clear_drag();
         if self.session.undo() {
             // Undo can restore any kind of edit (a deleted node, a rerouted
@@ -1475,7 +1477,8 @@ impl ResoZApp {
 
     /// Reapplies the last undone edit (Ctrl+Y).
     pub fn redo(&mut self) {
-        self.roll_state.clear_drag();
+        // Undo/redo invalidates every held index: drag, selection, marquee.
+        self.roll_state.clear_gesture();
         self.lane_state.clear_drag();
         if self.session.redo() {
             self.apply_document();
@@ -3435,6 +3438,7 @@ impl ResoZApp {
         use piano_roll::RollIntent;
         use serde_json::json;
 
+        let mut selection_changed = false;
         let result = match intent {
             RollIntent::AddNote {
                 note,
@@ -3448,31 +3452,58 @@ impl ResoZApp {
                         "note": note, "start_ticks": start, "length_ticks": length,
                     }),
                 );
-                // The new note's sorted index becomes the drag target.
+                // The new note becomes the whole selection (its sorted index
+                // is authoritative; the old selection's indices are stale).
                 if let Ok(value) = outcome {
                     if let Some(index) = value["index"].as_u64() {
-                        self.roll_state.set_drag_target(index as usize, 0.0);
+                        self.roll_state.select_only(index as usize);
                     }
                 }
                 return;
             }
-            RollIntent::EditNote { index, note, start } => {
-                // Merged: consecutive frames of one drag collapse into a single
-                // undo step that restores the note as it was before the drag.
+            RollIntent::MoveNotes {
+                indices,
+                delta_start,
+                delta_note,
+            } => {
+                // Merged: consecutive frames of one drag (or key-nudge burst)
+                // collapse into a single undo step. `indices` stay valid
+                // because the roll clamps the delta uniformly (see
+                // `RollIntent::MoveNotes`).
                 self.execute_merged(
-                    "midi.note_edit",
+                    "midi.notes_move",
                     &json!({
-                        "track": track, "clip": clip, "index": index,
-                        "note": note, "start_ticks": start,
+                        "track": track, "clip": clip, "indices": indices,
+                        "ticks": delta_start, "semitones": delta_note,
                     }),
-                    &format!("roll:{track}:{clip}:{index}"),
+                    &format!("roll-move:{track}:{clip}"),
                 )
             }
-            RollIntent::DeleteNotes { indices } => self.execute(
-                "midi.note_delete",
-                &json!({ "track": track, "clip": clip, "indices": indices }),
-            ),
+            RollIntent::DeleteNotes { indices } => {
+                // Deletion permutes the indices: the selection is stale after.
+                selection_changed = true;
+                self.execute(
+                    "midi.note_delete",
+                    &json!({ "track": track, "clip": clip, "indices": indices }),
+                )
+            }
+            RollIntent::SetVelocities { updates } => {
+                // Absolute per-note values; velocity changes never re-sort, so
+                // the indices survive the gesture.
+                let set_each: serde_json::Map<String, serde_json::Value> = updates
+                    .into_iter()
+                    .map(|(index, velocity)| (index.to_string(), json!(velocity)))
+                    .collect();
+                self.execute_merged(
+                    "midi.change_velocity",
+                    &json!({ "track": track, "clip": clip, "set_each": set_each }),
+                    &format!("roll-vel:{track}:{clip}"),
+                )
+            }
         };
+        if selection_changed {
+            self.roll_state.selection.clear();
+        }
         if result.is_ok() {
             self.send_track_clips(track);
         } else if let Err(error) = result {
