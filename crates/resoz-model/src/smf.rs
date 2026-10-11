@@ -261,7 +261,6 @@ fn parse_track(
     ticks_per_quarter: i64,
     track_index: usize,
 ) -> Result<MidiTrack, SmfError> {
-    let _ = ticks_per_quarter; // division is already our tick base
     let mut cursor = Cursor {
         bytes: payload,
         offset: 0,
@@ -359,6 +358,17 @@ fn parse_track(
                 channel,
             });
         }
+    }
+
+    // Rescale from the file's division to ours (960). Most real files use
+    // 96/192/384/480, all of which divide 960 exactly; anything else rounds.
+    // Absolute ticks are scaled (not deltas) so rounding error does not
+    // accumulate along the timeline.
+    let our = i64::from(crate::TICKS_PER_QUARTER);
+    let rescale = |ticks: i64| ticks * our / ticks_per_quarter.max(1);
+    for note in &mut notes {
+        note.start = rescale(note.start);
+        note.length = rescale(note.length);
     }
 
     // Import hygiene: dedupe before the editor ever sees the file.
@@ -541,6 +551,27 @@ mod tests {
             "FIFO: on@0 ends at 200"
         );
         assert_eq!((notes[1].start, notes[1].length), (100, 200));
+    }
+
+    #[test]
+    fn import_rescales_foreign_divisions() {
+        // A 480-PPQ file: a quarter note is 480 ticks there, 960 here.
+        let mut bytes = header(1, 480);
+        let mut track = vec![0x00, 0x90, 60, 100];
+        track.extend_from_slice(&vlq(480)); // one quarter @480
+        track.extend_from_slice(&[0x80, 60, 0]);
+        track.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        bytes.extend_from_slice(b"MTrk");
+        bytes.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&track);
+
+        let tracks = import_smf(&bytes).expect("parse");
+        let notes = &tracks[0].clips[0].sequence.notes;
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            notes[0].length, 960,
+            "480 ticks @480PPQ = one quarter = 960 here"
+        );
     }
 
     #[test]
