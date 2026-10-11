@@ -41,6 +41,7 @@ use resoz_model::{
     MidiClip, NodeDoc, PortRef, Project, SynthParams, VoiceSpec,
 };
 
+pub mod event_list;
 pub mod grid;
 pub mod lane;
 pub mod patch;
@@ -3430,6 +3431,64 @@ impl ResoZApp {
         // one undo step.
         if let Some(intent) = intent {
             self.apply_roll_intent(sel, clip_index, intent);
+        }
+
+        // Event List (M3.6): spreadsheet-style precision editing under the roll.
+        egui::CollapsingHeader::new("Event List")
+            .default_open(false)
+            .show(ui, |ui| {
+                let list_intent = {
+                    let clip = &self.project().midi_tracks[sel].clips[clip_index];
+                    event_list::show(ui, clip)
+                };
+                if let Some(list_intent) = list_intent {
+                    self.apply_event_list_intent(sel, clip_index, list_intent);
+                }
+            });
+    }
+
+    /// Runs an Event List edit as a command (M1.4 contract).
+    fn apply_event_list_intent(
+        &mut self,
+        track: usize,
+        clip: usize,
+        intent: event_list::EventListIntent,
+    ) {
+        use serde_json::json;
+        let result = match intent {
+            event_list::EventListIntent::Edit(edit) => {
+                // Only pass the fields the drag actually touched.
+                let mut params = json!({
+                    "track": track, "clip": clip, "index": edit.index,
+                });
+                let object = params.as_object_mut().expect("object literal");
+                if let Some(start) = edit.start {
+                    object.insert("start_ticks".into(), json!(start));
+                }
+                if let Some(note) = edit.note {
+                    object.insert("note".into(), json!(note));
+                }
+                if let Some(velocity) = edit.velocity {
+                    object.insert("velocity".into(), json!(velocity));
+                }
+                if let Some(length) = edit.length {
+                    object.insert("length_ticks".into(), json!(length));
+                }
+                self.execute_merged(
+                    "midi.note_edit",
+                    &params,
+                    &format!("event:{track}:{clip}:{}", edit.index),
+                )
+            }
+            event_list::EventListIntent::Delete { index } => self.execute(
+                "midi.note_delete",
+                &json!({ "track": track, "clip": clip, "indices": [index] }),
+            ),
+        };
+        if result.is_ok() {
+            self.send_track_clips(track);
+        } else if let Err(error) = result {
+            self.set_message(format!("Edit failed: {error}"));
         }
     }
 

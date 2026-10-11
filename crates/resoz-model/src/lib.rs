@@ -36,6 +36,7 @@ use std::collections::BTreeMap;
 
 pub mod file;
 pub mod ops;
+pub mod smf;
 
 pub use file::{
     ModelError, PROJECT_VERSION, ProjectFile, load_project, parse_project, save_project,
