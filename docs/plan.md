@@ -107,6 +107,9 @@
 - [x] **M3.5 SMF 导入导出**（2026-10-11，`resoz-model/src/smf.rs`，commit `7832286`）：format 1，division=960 与内部 PPQ 一致（**双向零换算**）。导出：clip 按 absolute 位置平铺 loop、conductor 轨写 tempo/拍号；导入：报告边界清单全覆盖（running status / vel-0=off / 同 pitch FIFO 配对 / 悬挂音轨末闭合 / 零长强制 1 / SMPTE 按 120BPM 约定 / 畸形报错带字节 offset / MAX_TRACKS+MAX_EVENTS 上限），导入后 `remove_duplicates` 语义的排序去重。
       **语义要点**：format 1 的 conductor 轨（纯 meta）折叠进全局 tempo 不生成轨道；clip 挂在最早音符的绝对 tick、notes 相对化（保持 arrangement 位置）。
 - [x] **M3.6 Event List 窗口**（2026-10-11，`resoz-ui/src/event_list.rs`）：`egui::Grid` 表格 Start/Note/Vel/Length/Ch + 每行删除；Note 列 `custom_formatter` 显示 "C4" 风格音名（编辑值仍是半音数）。DragValue `from_get_set(Option<f64>)` 收集每帧变更到一个 partial `NoteEdit` → `midi.note_edit` 合并手势（一拖=一步 undo）。放在 roll 下方 CollapsingHeader。
+- [x] **M3.7 绘制手势 + Edit 标签页**（2026-10-12，`resoz-ui/src/piano_roll.rs` + `lib.rs`，commit `425302d`）：用户实测发现"拖动创建音符后沿时间轴漂移"——旧手势 press-drag 是"创建+整体移动"，音符跟着指针跑。改为主流 DAW 约定：**按下处 note on、释放处 note off**（起点/音高固定在按下点，只有末尾跟随指针、吸附网格、最短一格、不超 loop）。新增 `RollIntent::ResizeEnd{index, length_ticks, gesture}` → `midi.note_edit` 合并手势；`gesture` id 让 AddNote + 各帧 ResizeEnd 共享一个 undo key（一次绘制=一步 undo，两次绘制互不合并）；`note_edit` 返回的新 index 经 `RollState::retarget` 回填选区（排序可能置换 index）。顺带补上两处死交互：空处单击=加默认长音符、音符上单击=选中（Shift/Ctrl toggle），此前只有 drag_started 分支、纯点击无响应。
+      **Edit 标签页**：`MainView::Edit` 取代浮动编辑器窗口——双击 timeline clip 经 `set_edit_target`（清 roll 手势，旧选区 index 指向旧 clip）直接跳转 Edit tab；两个编辑器头部加 ←/→ clip 导航 + × Close；无目标时显示提示 + "编辑选中轨 clip 1" 按钮；删轨时清理指向被删轨的 edit target + `midi_tracks` 为空的防护。
+      **顺带修复**：`apply_roll_intent` 的 AddNote 分支早退跳过 `send_track_clips`，新画的音符不进引擎、不发声，直到下一次无关编辑推 clip 表。
 
 ### 明确不做（已评估）
 
