@@ -394,3 +394,92 @@ fn unknown_op_names_are_rejected_without_panicking() {
         .expect_err("unknown op must be a bad-params error");
     assert!(error.to_string().contains("set|add|scale"));
 }
+
+#[test]
+fn notes_move_returns_the_moved_notes_new_indices() {
+    let mut session = session_with_notes();
+    // Note 0 (start 0) jumps right past notes 1 and 2 (starts 240/480): its
+    // sorted index must follow the note, not the slot it used to occupy.
+    // 500 rather than 480: note 2 already lives at 480 and wins the tie on
+    // pitch, which would make the new index 1.
+    let outcome = session
+        .execute(
+            "midi.notes_move",
+            &json!({ "track": 0, "clip": 0, "indices": [0], "ticks": 500 }),
+        )
+        .expect("move should succeed");
+
+    assert_eq!(outcome["indices"], json!([2]));
+    let all = notes(&session);
+    assert_eq!(all[2].start, 500);
+    assert_eq!(all[2].note, 60, "the moved note kept its pitch");
+}
+
+#[test]
+fn notes_edit_delta_resizes_and_tracks_indices() {
+    let mut session = session_with_notes();
+    // Trim note 3's left edge one grid cell while keeping its end fixed:
+    // start -240, length +240.
+    let outcome = session
+        .execute(
+            "midi.notes_edit_delta",
+            &json!({ "indices": [3], "delta_start": -240, "delta_length": 240 }),
+        )
+        .expect("resize should succeed");
+    assert_eq!(outcome["indices"], json!([3]));
+    let all = notes(&session);
+    assert_eq!(all[3].start, 480);
+    assert_eq!(all[3].length, 480);
+
+    // Clamping: a start below zero floors at 0 and length grows to match.
+    // (Note 3 is F4 at 480 after the trim above; pulling it to 0 re-sorts it
+    // ahead of D4 — the returned indices track that.)
+    let outcome = session
+        .execute(
+            "midi.notes_edit_delta",
+            &json!({ "indices": [3], "delta_start": -480, "delta_length": 480 }),
+        )
+        .expect("clamped resize should succeed");
+    let at = outcome["indices"][0].as_u64().unwrap() as usize;
+    let all = notes(&session);
+    assert_eq!(all[at].start, 0);
+    assert_eq!(all[at].length, 960);
+}
+
+#[test]
+fn notes_edit_delta_requires_a_real_delta() {
+    let mut session = session_with_notes();
+    let error = session
+        .execute("midi.notes_edit_delta", &json!({ "indices": [0] }))
+        .expect_err("a zero delta is a no-op call, not an edit");
+    assert!(matches!(error, CommandError::BadParams { .. }));
+}
+
+#[test]
+fn notes_duplicate_copies_the_selection_and_reports_the_copies() {
+    let mut session = session_with_notes();
+    let before = notes(&session);
+
+    let outcome = session
+        .execute("midi.notes_duplicate", &json!({ "indices": [0, 1] }))
+        .expect("duplicate should succeed");
+    assert_eq!(outcome["created"], 2);
+
+    let all = notes(&session);
+    assert_eq!(all.len(), 6, "two copies were appended");
+    let indices: Vec<usize> = outcome["indices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as usize)
+        .collect();
+    assert_eq!(indices.len(), 2);
+    // Each reported slot holds a value-equal twin of the original (twins are
+    // interchangeable; the UI cannot tell the copy from the original).
+    for (slot, original) in indices.iter().zip(&before) {
+        assert_eq!(&all[*slot], original);
+    }
+    // Undo removes exactly the copies.
+    assert!(session.undo());
+    assert_eq!(notes(&session), before);
+}

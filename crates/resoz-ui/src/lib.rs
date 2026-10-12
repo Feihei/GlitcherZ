@@ -3552,9 +3552,9 @@ impl ResoZApp {
         use serde_json::json;
 
         let mut selection_changed = false;
-        // A press-draw gesture shares one undo key across its frames: the
-        // creating `note_add` and every `note_edit` resize collapse into a
-        // single step (one draw = one undo).
+        // Draw gestures share one undo key across their frames: the creating
+        // `note_add` and every resize frame collapse into a single step (one
+        // gesture = one undo).
         let draw_key = |gesture: u64| format!("roll-draw:{track}:{clip}:{gesture}");
         let mut created: Option<usize> = None;
         let result = match intent {
@@ -3584,44 +3584,74 @@ impl ResoZApp {
                 outcome
             }
             RollIntent::ResizeEnd {
-                index,
-                length_ticks,
+                delta_ticks,
                 gesture,
             } => {
                 let outcome = self.execute_merged(
-                    "midi.note_edit",
+                    "midi.notes_edit_delta",
                     &json!({
-                        "track": track, "clip": clip,
-                        "index": index, "length_ticks": length_ticks,
+                        "track": track, "clip": clip, "indices": self.roll_state.selection.clone(),
+                        "delta_length": delta_ticks,
                     }),
                     &draw_key(gesture),
                 );
-                // The edit re-sorts the clip: re-point the selection at where
-                // the note landed so the rest of the drag keeps tracking it.
-                if let Ok(value) = &outcome
-                    && let Some(new_index) = value["index"].as_u64()
-                {
-                    self.roll_state.retarget(new_index as usize);
-                }
+                self.reselect_from(&outcome);
+                outcome
+            }
+            RollIntent::ResizeStart {
+                delta_ticks,
+                gesture,
+            } => {
+                // Ends follow the starts (mirrored length delta) — that is
+                // what a left-edge trim means.
+                let outcome = self.execute_merged(
+                    "midi.notes_edit_delta",
+                    &json!({
+                        "track": track, "clip": clip, "indices": self.roll_state.selection.clone(),
+                        "delta_start": delta_ticks, "delta_length": -delta_ticks,
+                    }),
+                    &draw_key(gesture),
+                );
+                self.reselect_from(&outcome);
                 outcome
             }
             RollIntent::MoveNotes {
                 indices,
                 delta_start,
                 delta_note,
+                gesture,
             } => {
-                // Merged: consecutive frames of one drag (or key-nudge burst)
-                // collapse into a single undo step. `indices` stay valid
-                // because the roll clamps the delta uniformly (see
-                // `RollIntent::MoveNotes`).
-                self.execute_merged(
+                // Merged: consecutive frames of one drag collapse into a
+                // single undo step (per-gesture key); a burst of arrow-key
+                // nudges merges under a shared key. The command reports where
+                // the moved notes landed (crossing unselected notes permutes
+                // the sort), and the selection follows them.
+                let key = match gesture {
+                    Some(id) => format!("roll-move:{track}:{clip}:{id}"),
+                    None => format!("roll-nudge:{track}:{clip}"),
+                };
+                let outcome = self.execute_merged(
                     "midi.notes_move",
                     &json!({
                         "track": track, "clip": clip, "indices": indices,
                         "ticks": delta_start, "semitones": delta_note,
                     }),
-                    &format!("roll-move:{track}:{clip}"),
-                )
+                    &key,
+                );
+                self.reselect_from(&outcome);
+                outcome
+            }
+            RollIntent::Duplicate { indices, gesture } => {
+                // Ctrl + drag: copy the selection, select the copies (the
+                // command reports their indices), and merge the copy with the
+                // move frames of the same drag — one press = one undo step.
+                let outcome = self.execute_merged(
+                    "midi.notes_duplicate",
+                    &json!({ "track": track, "clip": clip, "indices": indices }),
+                    &format!("roll-move:{track}:{clip}:{gesture}"),
+                );
+                self.reselect_from(&outcome);
+                outcome
             }
             RollIntent::DeleteNotes { indices } => {
                 // Deletion permutes the indices: the selection is stale after.
@@ -3655,6 +3685,23 @@ impl ResoZApp {
             self.send_track_clips(track);
         } else if let Err(error) = result {
             self.set_message(format!("Edit failed: {error}"));
+        }
+    }
+
+    /// Re-selects the notes a command just edited: the command reports the
+    /// edited notes' new (post-sort) indices, so the selection keeps tracking
+    /// the right notes even when the sort permuted them.
+    fn reselect_from(&mut self, outcome: &resoz_command::Result<serde_json::Value>) {
+        if let Ok(value) = outcome
+            && let Some(list) = value["indices"].as_array()
+        {
+            let indices: Vec<usize> = list
+                .iter()
+                .filter_map(|entry| entry.as_u64().map(|index| index as usize))
+                .collect();
+            if !indices.is_empty() {
+                self.roll_state.selection = indices;
+            }
         }
     }
 

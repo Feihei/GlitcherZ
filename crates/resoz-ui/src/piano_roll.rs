@@ -1,7 +1,8 @@
 //! Piano roll editor component (egui self-drawn).
 //!
 //! Interaction conventions (mainstream DAW muscle memory):
-//! - Left-click on empty space: add a note of the default length (a 16th);
+//! - Left-click on empty space: deselect (a stray click never paints a
+//!   note); double-click: insert a note of the default length (a 16th);
 //! - Left-click on a note: select it (Shift/Ctrl toggles it in/out of the
 //!   selection);
 //! - Press-and-drag on empty space: **draw** a note — note on at the press
@@ -9,8 +10,10 @@
 //!   gesture began; only the end follows the pointer (snapped to the grid);
 //! - Shift/Ctrl + drag on empty space: rubber-band selection (adds to the
 //!   current selection);
-//! - Left-drag on a note: move the whole selection (uniform delta, so the
-//!   sorted indices of the selection stay valid — see `MoveNotes`);
+//! - Left-drag on a note: move the whole selection;
+//! - Ctrl + drag on a note: copy the selection and drag the copies;
+//! - Drag a note's left/right edge (the pointer turns into a horizontal
+//!   resize cursor within 5 px): trim that edge of the whole selection;
 //! - Right-click: delete the note under the pointer, or the whole selection
 //!   if that note is part of it;
 //! - Arrow keys (when the roll has focus): nudge the selection — up/down a
@@ -31,7 +34,7 @@
 use eframe::egui;
 
 use crate::grid::GridValue;
-use resoz_model::{MidiClip, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP};
+use resoz_model::{MidiClip, Note, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP};
 
 pub use crate::grid::NoteValue;
 
@@ -53,6 +56,10 @@ const DEFAULT_NOTE_LENGTH: i64 = TICKS_PER_STEP as i64;
 /// Accent color for selected notes / velocity bars.
 const SELECTED: egui::Color32 = egui::Color32::from_rgb(240, 190, 80);
 
+/// Pointer distance (px) to a note's start/end that turns a grab into an
+/// edge trim instead of a move.
+const EDGE_PX: f32 = 5.0;
+
 /// An edit the roll wants performed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RollIntent {
@@ -67,24 +74,31 @@ pub enum RollIntent {
         length: i64,
         gesture: u64,
     },
-    /// Set the length of the note at `index` — one frame of a draw gesture
-    /// (note on at the press point, note off at the pointer). `gesture` is
-    /// the id of the `AddNote` that created the note.
-    ResizeEnd {
-        index: usize,
-        length_ticks: i64,
-        gesture: u64,
-    },
+    /// One frame of an end trim (draw gesture or right-edge drag): stretch
+    /// the end of every selected note by `delta_ticks`. The command clamps
+    /// per note (length ≥ 1) and reports where each note ended up.
+    ResizeEnd { delta_ticks: i64, gesture: u64 },
+    /// One frame of a start trim (left-edge drag): shift the start of every
+    /// selected note by `delta_ticks`, ends following (the command applies
+    /// the mirrored length delta). Clamped per note (start ≥ 0, length ≥ 1).
+    ResizeStart { delta_ticks: i64, gesture: u64 },
     /// Move the notes at `indices` by a uniform delta (ticks / semitones).
     ///
-    /// A uniform delta preserves the sort order (the sort is stable and every
-    /// key shifts equally), so the caller's selection indices stay valid
-    /// across frames — the invariant the whole selection UX rests on.
+    /// `gesture` is `Some` for drag frames (each drag is its own undo step)
+    /// and `None` for arrow-key nudges (a burst of nudges merges into one).
+    /// A uniform delta can still permute the sort against *unselected*
+    /// notes, so the command reports the moved notes' new indices and the
+    /// caller re-derives the selection from them.
     MoveNotes {
         indices: Vec<usize>,
         delta_start: i64,
         delta_note: i8,
+        gesture: Option<u64>,
     },
+    /// Copy the selected notes (Ctrl + drag). The command reports the
+    /// copies' indices; the caller selects them, and the move frames of the
+    /// same drag share `gesture`, so copy + move is a single undo step.
+    Duplicate { indices: Vec<usize>, gesture: u64 },
     /// Remove the notes at these indices.
     DeleteNotes { indices: Vec<usize> },
     /// Set absolute velocities (index, velocity) pairs.
@@ -119,21 +133,26 @@ pub struct RollState {
 enum DragKind {
     /// Move the whole selection (grab on an existing note).
     Move,
-    /// Draw the length of a just-created note: note on at the press point,
-    /// note off at the release point — start/pitch fixed, end follows the
-    /// pointer.
+    /// Trim the start edge (left-edge drag).
+    ResizeStart,
+    /// Draw the length of a just-created note (note on at the press point,
+    /// note off at the release point) or trim the end edge (right-edge
+    /// drag): the end follows the pointer.
     ResizeEnd,
 }
 
 #[derive(Debug)]
 struct DragSelection {
+    /// The note the gesture grabbed (draw: the fresh note; edge trim / move:
+    /// the note under the press).
+    index: usize,
     /// Pointer tick at grab time (f32; snapping happens per frame).
     grab_tick: f32,
     /// Pointer pitch at grab time.
     grab_note: u8,
     kind: DragKind,
-    /// Gesture id shared with the `AddNote` that created the note, so a
-    /// whole press-draw-release is a single undo step.
+    /// Gesture id: one drag is one undo step (the id is part of the undo
+    /// merge key, and `AddNote`/`Duplicate` frames carry the same id).
     gesture: u64,
 }
 
@@ -178,6 +197,7 @@ impl RollState {
         self.selection = vec![index];
         if let Some(grab) = self.awaiting_create.take() {
             self.drag = Some(DragSelection {
+                index,
                 grab_tick: grab.grab_tick,
                 grab_note: grab.grab_note,
                 kind: DragKind::ResizeEnd,
@@ -264,7 +284,7 @@ pub fn show(
                 }
             });
         ui.weak(
-            "click: add·select · drag: draw·move · Shift+drag: band · RMB: delete · arrows: nudge · wheel: pitch",
+            "click: select · dbl-click: insert · drag: draw·move · note edges: trim · Ctrl+drag: copy · Shift+drag: band · RMB: delete · arrows: nudge",
         );
     });
 
@@ -454,10 +474,13 @@ pub fn show(
     let modifiers = ui.ctx().input(|i| i.modifiers);
     let additive = modifiers.shift || modifiers.ctrl;
 
-    // A plain click (no drag): select the note under the pointer, or add a
-    // default-length note on empty space. Guarded against the (theoretical)
-    // same-frame drag so a draw never also adds a second note.
-    if response.clicked() && !response.drag_started() {
+    // A plain click (no drag): select the note under the pointer; on empty
+    // space, deselect — or insert a default note on the second click of a
+    // double-click. Creation deliberately requires a drag or a double-click,
+    // so a stray click meant as "clear the selection" never paints a note.
+    // (egui only reports drag_started once the pointer moved, so click and
+    // drag are already disambiguated.)
+    if response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             match hit_note(pos) {
                 Some(index) => {
@@ -471,13 +494,20 @@ pub fn show(
                         state.selection = vec![index];
                     }
                 }
+                None if additive => {} // modifier click on empty: leave the selection alone
                 None => {
-                    intent = Some(RollIntent::AddNote {
-                        note: pointer_note(pos),
-                        start: snap(pointer_tick(pos)).min(loop_ticks - 1),
-                        length: DEFAULT_NOTE_LENGTH,
-                        gesture: state.next_gesture(),
-                    });
+                    if response.double_clicked() {
+                        // No awaiting_create: a follow-up drag would have
+                        // fired drag_started (draw) instead of a click.
+                        intent = Some(RollIntent::AddNote {
+                            note: pointer_note(pos),
+                            start: snap(pointer_tick(pos)).min(loop_ticks - 1),
+                            length: DEFAULT_NOTE_LENGTH,
+                            gesture: state.next_gesture(),
+                        });
+                    } else {
+                        state.selection.clear();
+                    }
                 }
             }
         }
@@ -515,32 +545,92 @@ pub fn show(
                 0,
                 delta_note,
                 loop_ticks,
+                None,
             ));
+        }
+    }
+
+    // Edge-trim affordance: hovering near a note's start/end turns the
+    // pointer into a horizontal resize cursor.
+    if response.hovered()
+        && state.drag.is_none()
+        && let Some(pos) = response.hover_pos()
+        && let Some(index) = hit_note(pos)
+    {
+        let note = &clip.notes()[index];
+        let x0 = rect.left() + note.start as f32 * ticks_to_x;
+        let x1 = x0 + (note.length as f32 * ticks_to_x).max(3.0);
+        if edge_zone(pos.x, x0, x1).is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
     }
 
     if response.drag_started() {
         if let Some(pos) = response.interact_pointer_pos() {
+            // Edge-trim affordance is checked first: within EDGE_PX of a
+            // note's start/end the grab trims that edge instead of moving.
+            let edge = hit_note(pos).and_then(|index| {
+                let note = &clip.notes()[index];
+                let x0 = rect.left() + note.start as f32 * ticks_to_x;
+                let x1 = x0 + (note.length as f32 * ticks_to_x).max(3.0);
+                edge_zone(pos.x, x0, x1)
+            });
             match hit_note(pos) {
                 Some(index) => {
-                    // Clicking a note (re)selects it — or toggles it into an
-                    // existing selection with a modifier held.
-                    if additive {
-                        if let Some(at) = state.selection.iter().position(|i| *i == index) {
-                            state.selection.remove(at);
-                        } else {
-                            state.selection.push(index);
+                    // Ctrl + drag (no edge): duplicate the selection — or the
+                    // grabbed note alone — and drag the copies. A plain
+                    // Ctrl+click still toggles the selection (that is a
+                    // click, handled above; a drag never is).
+                    if modifiers.ctrl && edge.is_none() {
+                        if !state.selection.contains(&index) {
+                            state.selection = vec![index];
                         }
-                    } else if !state.selection.contains(&index) {
-                        state.selection = vec![index];
-                    }
-                    if !state.selection.is_empty() {
+                        let gesture = state.next_gesture();
+                        intent = Some(RollIntent::Duplicate {
+                            indices: state.selection.clone(),
+                            gesture,
+                        });
                         state.drag = Some(DragSelection {
+                            index,
                             grab_tick: pointer_tick(pos),
                             grab_note: pointer_note(pos),
                             kind: DragKind::Move,
-                            gesture: 0,
+                            gesture,
                         });
+                    } else if let Some(kind) = edge {
+                        // Edge grab on an unselected note selects just it; on
+                        // a selected note it trims the whole selection.
+                        if !state.selection.contains(&index) {
+                            state.selection = vec![index];
+                        }
+                        state.drag = Some(DragSelection {
+                            index,
+                            grab_tick: pointer_tick(pos),
+                            grab_note: pointer_note(pos),
+                            kind,
+                            gesture: state.next_gesture(),
+                        });
+                    } else {
+                        // Plain grab: move. Shift toggles the grabbed note
+                        // into/out of the selection first.
+                        if modifiers.shift {
+                            if let Some(at) = state.selection.iter().position(|i| *i == index) {
+                                state.selection.remove(at);
+                            } else {
+                                state.selection.push(index);
+                            }
+                        } else if !state.selection.contains(&index) {
+                            state.selection = vec![index];
+                        }
+                        if !state.selection.is_empty() {
+                            state.drag = Some(DragSelection {
+                                index,
+                                grab_tick: pointer_tick(pos),
+                                grab_note: pointer_note(pos),
+                                kind: DragKind::Move,
+                                gesture: state.next_gesture(),
+                            });
+                        }
                     }
                 }
                 None => {
@@ -599,24 +689,37 @@ pub fn show(
                                     .clamp(i16::from(i8::MIN) as i32, i16::from(i8::MAX) as i32)
                                     as i8,
                                 loop_ticks,
+                                Some(drag.gesture),
                             ));
                         }
                     }
                     DragKind::ResizeEnd => {
-                        // Drawing: the note's start and pitch are fixed at
-                        // the press point; only the end follows the pointer
-                        // (note off on release). The end is snapped, never
-                        // shorter than one grid cell, never past the loop.
-                        if let Some(&index) = state.selection.first()
-                            && let Some(note) = clip.notes().get(index)
-                        {
+                        // Drawing / right-edge trim: the grabbed note's end
+                        // follows the pointer (snapped, at least one grid
+                        // cell, never past the loop); the whole selection
+                        // stretches by the same delta.
+                        if let Some(note) = clip.notes().get(drag.index) {
                             let end =
                                 draw_end(note.start, pointer_tick(pos), grid_ticks, loop_ticks);
-                            let length = (end - note.start).max(1);
-                            if length != note.length {
+                            let delta = end - note.end();
+                            if delta != 0 {
                                 intent = Some(RollIntent::ResizeEnd {
-                                    index,
-                                    length_ticks: length,
+                                    delta_ticks: delta,
+                                    gesture: drag.gesture,
+                                });
+                            }
+                        }
+                    }
+                    DragKind::ResizeStart => {
+                        // Left-edge trim: the grabbed note's start follows the
+                        // pointer (snapped, never past its own end); the whole
+                        // selection shifts its starts by the same delta.
+                        if let Some(note) = clip.notes().get(drag.index) {
+                            let start = trim_start(note, pointer_tick(pos), grid_ticks);
+                            let delta = start - note.start;
+                            if delta != 0 {
+                                intent = Some(RollIntent::ResizeStart {
+                                    delta_ticks: delta,
                                     gesture: drag.gesture,
                                 });
                             }
@@ -722,15 +825,37 @@ fn draw_end(start: i64, pointer_tick: f32, grid_ticks: i64, loop_ticks: i64) -> 
         .min(loop_ticks.max(start + 1))
 }
 
+/// Start tick of a left-edge trim: the pointer snapped to the grid, never
+/// past the note's own end (min length one tick), never negative.
+fn trim_start(note: &Note, pointer_tick: f32, grid_ticks: i64) -> i64 {
+    snap_ticks(pointer_tick, grid_ticks)
+        .min(note.start + note.length - 1)
+        .max(0)
+}
+
+/// Which edge of a note (in pixels) the pointer is on, if either — a grab
+/// there trims that edge instead of moving the note.
+fn edge_zone(x: f32, left: f32, right: f32) -> Option<DragKind> {
+    if (x - left).abs() <= EDGE_PX {
+        Some(DragKind::ResizeStart)
+    } else if (x - right).abs() <= EDGE_PX {
+        Some(DragKind::ResizeEnd)
+    } else {
+        None
+    }
+}
+
 /// A uniform move clamped on the UI side so no note crosses the engine's
-/// clamp boundary: asymmetric clamping would permute the sort order and
-/// invalidate the selection indices (see `MoveNotes`).
+/// clamp boundary (asymmetric clamping would permute the sort order).
+/// Crossings against *unselected* notes can still happen; the command
+/// reports the moved notes' new indices and the caller re-selects them.
 fn clamped_move(
     clip: &MidiClip,
     indices: &[usize],
     raw_start_delta: i64,
     raw_note_delta: i8,
     loop_ticks: i64,
+    gesture: Option<u64>,
 ) -> RollIntent {
     let notes = clip.notes();
     let mut delta_start = raw_start_delta;
@@ -755,6 +880,7 @@ fn clamped_move(
         indices: indices.to_vec(),
         delta_start,
         delta_note: delta_note.clamp(i64::from(i8::MIN), i64::from(i8::MAX)) as i8,
+        gesture,
     }
 }
 
@@ -770,8 +896,8 @@ fn grid_label(grid: &GridValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AwaitCreate, DragKind, ROLL_HEIGHT, ROW_HEIGHT, RollIntent, RollState, clamped_move,
-        draw_end, is_black_key, snap_ticks,
+        AwaitCreate, DragKind, EDGE_PX, ROLL_HEIGHT, ROW_HEIGHT, RollIntent, RollState,
+        clamped_move, draw_end, edge_zone, is_black_key, snap_ticks, trim_start,
     };
     use crate::grid::{GridValue, NoteValue};
     use resoz_model::{MidiClip, Note, TICKS_PER_STEP};
@@ -823,26 +949,26 @@ mod tests {
         let loop_ticks = 960;
 
         // Dragging everything left cannot pull the first note below 0...
-        let intent = clamped_move(&clip, &[0, 1, 2], -480, 0, loop_ticks);
+        let intent = clamped_move(&clip, &[0, 1, 2], -480, 0, loop_ticks, None);
         let RollIntent::MoveNotes { delta_start, .. } = intent else {
             panic!("expected a move");
         };
         assert_eq!(delta_start, 0, "the note at 0 blocks the whole move");
 
         // ...or right past the loop end.
-        let intent = clamped_move(&clip, &[0, 1, 2], 480, 0, loop_ticks);
+        let intent = clamped_move(&clip, &[0, 1, 2], 480, 0, loop_ticks, None);
         let RollIntent::MoveNotes { delta_start, .. } = intent else {
             panic!("expected a move");
         };
         assert_eq!(delta_start, 960 - 1 - 480, "limited by the latest note");
 
         // Pitch: the 0-note blocks downward, the 127-note blocks upward.
-        let intent = clamped_move(&clip, &[0, 1, 2], 0, -5, loop_ticks);
+        let intent = clamped_move(&clip, &[0, 1, 2], 0, -5, loop_ticks, None);
         let RollIntent::MoveNotes { delta_note, .. } = intent else {
             panic!("expected a move");
         };
         assert_eq!(delta_note, 0);
-        let intent = clamped_move(&clip, &[0, 1, 2], 0, 5, loop_ticks);
+        let intent = clamped_move(&clip, &[0, 1, 2], 0, 5, loop_ticks, None);
         let RollIntent::MoveNotes { delta_note, .. } = intent else {
             panic!("expected a move");
         };
@@ -850,10 +976,11 @@ mod tests {
     }
 
     #[test]
-    fn uniform_move_preserves_sort_order() {
-        // The invariant the selection UX rests on: shifting every note by the
-        // same delta must not change the stable-sorted order, so the
-        // selection's indices survive the command's re-sort.
+    fn uniform_move_preserves_relative_order_within_the_selection() {
+        // Shifting every note by the same delta keeps their relative order
+        // (stable sort, equal key shift). Crossings against *unselected*
+        // notes can still permute the global order — the command's returned
+        // indices cover that case; this pins the within-selection invariant.
         let mut notes: Vec<Note> = (0..8)
             .map(|i| {
                 note(
@@ -957,5 +1084,44 @@ mod tests {
         state.selection.clear();
         state.retarget(1);
         assert!(state.selection.is_empty());
+    }
+
+    #[test]
+    fn trim_start_snaps_and_never_crosses_the_note_end() {
+        let subject = note(480, 240, 60); // ends at 720
+        // Pointer well before the start: snaps to the grid line at 240.
+        assert_eq!(trim_start(&subject, 300.0, 240), 240);
+        // Pointer past the end: clamped to end - 1 (min length one tick).
+        assert_eq!(trim_start(&subject, 900.0, 240), 719);
+        // Pointer before zero: floored at 0.
+        assert_eq!(trim_start(&subject, -50.0, 240), 0);
+    }
+
+    #[test]
+    fn edge_zone_only_fires_near_the_note_edges() {
+        assert_eq!(edge_zone(3.0, 0.0, 100.0), Some(DragKind::ResizeStart));
+        assert_eq!(edge_zone(97.0, 0.0, 100.0), Some(DragKind::ResizeEnd));
+        assert_eq!(edge_zone(50.0, 0.0, 100.0), None, "the middle is a move");
+        assert_eq!(
+            edge_zone(EDGE_PX + 0.5, 0.0, 100.0),
+            None,
+            "just outside the zone is a move"
+        );
+    }
+
+    #[test]
+    fn resolve_created_starts_a_draw_drag_with_the_gesture_id() {
+        let mut state = RollState::new();
+        state.awaiting_create = Some(AwaitCreate {
+            grab_tick: 120.0,
+            grab_note: 64,
+            gesture: 7,
+        });
+        state.resolve_created(3);
+        assert_eq!(state.selection, vec![3]);
+        let drag = state.drag.as_ref().expect("draw drag should start");
+        assert_eq!(drag.index, 3);
+        assert_eq!(drag.kind, DragKind::ResizeEnd);
+        assert_eq!(drag.gesture, 7);
     }
 }

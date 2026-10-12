@@ -47,9 +47,27 @@ pub fn specs() -> Vec<crate::CommandSpec> {
             "Move Notes",
             ["Midi"],
             None,
-            "{track, clip, indices: [n], ticks?: 0, semitones?: 0}",
+            "{track, clip, indices: [n], ticks?: 0, semitones?: 0} → {indices: [n]}",
             always,
             notes_move
+        ),
+        crate::cmd!(
+            "midi.notes_edit_delta",
+            "Resize Notes",
+            ["Midi"],
+            None,
+            "{track, clip, indices: [n], delta_start?: 0, delta_length?: 0} → {indices: [n]}",
+            always,
+            notes_edit_delta
+        ),
+        crate::cmd!(
+            "midi.notes_duplicate",
+            "Duplicate Notes",
+            ["Midi"],
+            Some("Duplicate"),
+            "{track, clip, indices: [n]} → {indices: [n]}",
+            always,
+            notes_duplicate
         ),
         crate::cmd!(
             "midi.change_velocity",
@@ -241,6 +259,26 @@ fn index_of(notes: &[Note], note: &Note) -> usize {
     notes.iter().position(|n| n == note).unwrap_or(0)
 }
 
+/// New positions of `edited` notes after a sort: for each edited note in
+/// order, the first not-yet-claimed equal note. Value-equal twins are
+/// interchangeable, so first-match assignment is always valid — this is how
+/// an index-based selection survives a command that re-sorts the clip.
+fn locate(notes: &[Note], edited: &[Note]) -> Vec<usize> {
+    let mut claimed = vec![false; notes.len()];
+    let mut found = Vec::with_capacity(edited.len());
+    for want in edited {
+        if let Some((at, _)) = notes
+            .iter()
+            .enumerate()
+            .find(|(at, note)| !claimed[*at] && *note == want)
+        {
+            claimed[at] = true;
+            found.push(at);
+        }
+    }
+    found
+}
+
 fn note_add(session: &mut Session, params: &Value) -> crate::Result<Value> {
     let note = Note {
         start: i64_or(params, "start_ticks", 0).max(0),
@@ -309,14 +347,70 @@ fn notes_move(session: &mut Session, params: &Value) -> crate::Result<Value> {
     let ticks = i64_or(params, "ticks", 0);
     let semitones = i64_or(params, "semitones", 0);
     let notes = notes_mut(session, "midi.notes_move", params)?;
+    // The mutated values are what we relocate after the sort: the caller's
+    // selection indices go stale the moment notes cross each other.
+    let mut moved = Vec::with_capacity(selected.len());
     for (index, note) in notes.iter_mut().enumerate() {
         if selected.contains(&index) {
             note.start = (note.start + ticks).max(0);
             note.note = (i64::from(note.note) + semitones).clamp(0, 127) as u8;
+            moved.push(*note);
         }
     }
     notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
-    Ok(json!({ "moved": selected.len() }))
+    Ok(json!({ "moved": moved.len(), "indices": locate(notes, &moved) }))
+}
+
+/// Uniform resize of the selection: `delta_start` shifts every start (trim
+/// the left edge), `delta_length` stretches every end (right edge / draw).
+/// Per-note clamping (start ≥ 0, length ≥ 1) may swallow part of the delta;
+/// the returned indices track where each edited note ended up.
+fn notes_edit_delta(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let selected = indices(params, "indices");
+    if selected.is_empty() {
+        return Err(bad_params("midi.notes_edit_delta", "`indices` is required"));
+    }
+    let delta_start = i64_or(params, "delta_start", 0);
+    let delta_length = i64_or(params, "delta_length", 0);
+    if delta_start == 0 && delta_length == 0 {
+        return Err(bad_params(
+            "midi.notes_edit_delta",
+            "at least one of `delta_start`, `delta_length` must be nonzero",
+        ));
+    }
+    let notes = notes_mut(session, "midi.notes_edit_delta", params)?;
+    let mut edited = Vec::with_capacity(selected.len());
+    for (index, note) in notes.iter_mut().enumerate() {
+        if selected.contains(&index) {
+            note.start = (note.start + delta_start).max(0);
+            note.length = (note.length + delta_length).max(1);
+            edited.push(*note);
+        }
+    }
+    notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
+    Ok(json!({ "edited": edited.len(), "indices": locate(notes, &edited) }))
+}
+
+/// Copies of the selected notes (Ctrl + drag in the piano roll). Returns the
+/// copies' new indices so the UI can select and drag *them* — value-equal to
+/// the originals, so first-match assignment places them on the twin slots.
+fn notes_duplicate(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let selected = indices(params, "indices");
+    let notes = notes_mut(session, "midi.notes_duplicate", params)?;
+    let copies: Vec<Note> = selected
+        .iter()
+        .filter_map(|index| notes.get(*index))
+        .copied()
+        .collect();
+    if copies.is_empty() {
+        return Err(bad_params(
+            "midi.notes_duplicate",
+            "`indices` must name existing notes",
+        ));
+    }
+    notes.extend(copies.iter().copied());
+    notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
+    Ok(json!({ "created": copies.len(), "indices": locate(notes, &copies) }))
 }
 
 fn change_velocity(session: &mut Session, params: &Value) -> crate::Result<Value> {
