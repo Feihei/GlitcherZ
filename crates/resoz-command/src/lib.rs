@@ -10,6 +10,9 @@
 //!    caught at the boundary and the document is rolled back.
 //! 3. **Undo is O(1) per step.** History entries are whole-document
 //!    snapshots; pushing one clones an [`Arc`], not the [`Project`].
+//! 4. **Every mutation leaves a replayable trace.** Journaled commands append
+//!    their `(id, params)` to [`Session::journal`], the record macros and
+//!    agent scripting replay — see [`JournalEntry`].
 //!
 //! Continuous gestures (a fader drag, dragging a note's velocity) must not
 //! produce one undo step per frame. [`Session::execute_merged`] collapses
@@ -19,6 +22,16 @@
 //! Commands receive plain data ([`serde_json::Value`]) rather than closures so
 //! that the registry stays enumerable — see [`CommandInfo`] for the
 //! self-describing form the UI and tests walk.
+
+// The command boundary must never panic outside `execute`'s catch_unwind.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unimplemented,
+    clippy::todo,
+    clippy::unreachable
+)]
 
 use std::sync::Arc;
 
@@ -35,6 +48,15 @@ pub use registry::{
 
 /// Default number of undo steps retained.
 pub const DEFAULT_HISTORY_LIMIT: usize = 200;
+
+/// Default number of retained journal entries.
+///
+/// Merged gestures (fader drags, velocity painting) journal one entry per
+/// frame, so the journal is trimmed instead of growing unbounded.
+pub const DEFAULT_JOURNAL_LIMIT: usize = 500;
+
+/// One journaled command invocation: `(command id, params)`.
+pub type JournalEntry = (String, Value);
 
 /// A command-layer failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -95,6 +117,8 @@ pub struct Session {
     history_limit: usize,
     /// Nesting counter for [`Session::suspend_history`].
     suspend_depth: u32,
+    /// Parameterized log of executed commands (macro recording / agent replay).
+    journal: Vec<JournalEntry>,
 }
 
 impl Default for Session {
@@ -115,6 +139,7 @@ impl Session {
             dirty: false,
             history_limit: DEFAULT_HISTORY_LIMIT,
             suspend_depth: 0,
+            journal: Vec::new(),
         }
     }
 
@@ -144,6 +169,7 @@ impl Session {
         self.undo.clear();
         self.redo.clear();
         self.merge_key = None;
+        self.journal.clear();
         self.revision = self.revision.wrapping_add(1);
         self.dirty = false;
     }
@@ -279,6 +305,37 @@ impl Session {
         self.suspend_depth > 0
     }
 
+    /// The journal of executed commands, oldest first.
+    ///
+    /// Every command whose [`CommandSpec::journal`] flag is set appends its
+    /// `(id, params)` here on success — including `noundo` mutations (there
+    /// is no undo to replay them, so the journal is the only record) and
+    /// every frame of a merged gesture. Queries are not recorded.
+    pub fn journal(&self) -> &[JournalEntry] {
+        &self.journal
+    }
+
+    /// Drains the journal, leaving it empty.
+    ///
+    /// For exporting a macro or replaying the session elsewhere: take the
+    /// entries and hand the buffer back to the log.
+    pub fn take_journal(&mut self) -> Vec<JournalEntry> {
+        std::mem::take(&mut self.journal)
+    }
+
+    /// Discards all journal entries.
+    pub fn clear_journal(&mut self) {
+        self.journal.clear();
+    }
+
+    fn record_journal(&mut self, id: &str, params: &Value) {
+        self.journal.push((id.to_string(), params.clone()));
+        let excess = self.journal.len().saturating_sub(DEFAULT_JOURNAL_LIMIT);
+        if excess > 0 {
+            self.journal.drain(..excess);
+        }
+    }
+
     /// Reverts the most recent step. Returns `false` when there is none.
     pub fn undo(&mut self) -> bool {
         self.end_merge();
@@ -343,6 +400,9 @@ impl Session {
                     });
                     self.redo.clear();
                     self.trim_history();
+                }
+                if spec.journal {
+                    self.record_journal(id, &params);
                 }
                 Ok(value)
             }
@@ -422,5 +482,98 @@ impl Session {
     /// Ends the gesture started by [`Session::execute_merged`].
     pub fn end_merge(&mut self) {
         self.merge_key = None;
+    }
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+    use resoz_model::{MidiClip, Note, Project};
+    use serde_json::json;
+
+    fn session_with_note() -> Session {
+        let mut project = Project::default();
+        let mut clip = MidiClip::default();
+        clip.notes_mut().push(Note::default());
+        project.midi_tracks[0].clips.push(clip);
+        Session::new(project)
+    }
+
+    #[test]
+    fn successful_commands_are_journaled_with_params() {
+        let mut session = session_with_note();
+        session
+            .execute("midi.note_add", &json!({ "start_ticks": 480 }))
+            .unwrap();
+        assert_eq!(session.journal().len(), 1);
+        assert_eq!(session.journal()[0].0, "midi.note_add");
+        assert_eq!(session.journal()[0].1["start_ticks"], 480);
+    }
+
+    #[test]
+    fn queries_and_failed_commands_leave_no_entry() {
+        let mut session = session_with_note();
+        session
+            .execute("midi.query", &json!({ "track": 0, "clip": 0 }))
+            .unwrap();
+        assert!(session.journal().is_empty(), "queries are not journaled");
+
+        // Out-of-range index: the command errors, nothing is recorded.
+        let error = session.execute("midi.note_edit", &json!({ "index": 99, "velocity": 100 }));
+        assert!(error.is_err());
+        assert!(
+            session.journal().is_empty(),
+            "failed commands are not journaled"
+        );
+    }
+
+    #[test]
+    fn merged_gestures_journal_each_frame() {
+        let mut session = session_with_note();
+        for velocity in [40u8, 70, 100] {
+            session
+                .execute_merged(
+                    "midi.note_edit",
+                    &json!({ "index": 0, "velocity": velocity }),
+                    "v",
+                )
+                .unwrap();
+        }
+        session.end_merge();
+        assert_eq!(
+            session.undo_history().len(),
+            1,
+            "one gesture, one undo step"
+        );
+        assert_eq!(
+            session.journal().len(),
+            3,
+            "each frame is a real invocation"
+        );
+        assert_eq!(
+            session.journal()[2].1["velocity"],
+            100,
+            "last frame wins on replay"
+        );
+    }
+
+    #[test]
+    fn take_journal_drains_and_replace_clears() {
+        let mut session = session_with_note();
+        session
+            .execute("midi.note_add", &json!({ "start_ticks": 480 }))
+            .unwrap();
+        let taken = session.take_journal();
+        assert_eq!(taken.len(), 1);
+        assert!(session.journal().is_empty(), "take drains the buffer");
+
+        session
+            .execute("midi.note_add", &json!({ "start_ticks": 960 }))
+            .unwrap();
+        session.replace(Project::default());
+        assert!(
+            session.journal().is_empty(),
+            "a new document starts a fresh journal"
+        );
     }
 }

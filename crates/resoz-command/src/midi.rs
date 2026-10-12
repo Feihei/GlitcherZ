@@ -96,7 +96,7 @@ pub fn specs() -> Vec<crate::CommandSpec> {
             always,
             duration_op_cmd
         ),
-        crate::cmd!(noundo "midi.query", "Query Notes", [], None, "{track, clip}", always, query),
+        crate::cmd!(query "midi.query", "Query Notes", [], None, "{track, clip}", always, query),
     ]
 }
 
@@ -362,7 +362,10 @@ fn change_velocity(session: &mut Session, params: &Value) -> crate::Result<Value
         } else if let Some(value) = add {
             i64::from(note.velocity) + value
         } else {
-            (f64::from(note.velocity) * scale.expect("checked above")).round() as i64
+            // The guard above rejects the call unless one of `set`/`add`/
+            // `scale`/`set_each` is present, so `scale` is `Some` here;
+            // 1.0 is a no-op fallback rather than a panic if that changes.
+            (f64::from(note.velocity) * scale.unwrap_or(1.0)).round() as i64
         };
         note.velocity = next.clamp(lo, 127) as u8;
         changed += 1;

@@ -1,0 +1,7 @@
+# Clippy lints that are allowed in test code only.
+# The deny lists in each crate's lib.rs enforce panic-free library code;
+# tests may freely unwrap/expect/panic.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

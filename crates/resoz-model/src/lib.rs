@@ -1,4 +1,14 @@
 #![forbid(unsafe_code)]
+// The model is pure data and must never panic: a panic inside a command is
+// caught by resoz-command and rolled back, but preventing it here is cheaper.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unimplemented,
+    clippy::todo,
+    clippy::unreachable
+)]
 
 //! # resoz-model
 //!

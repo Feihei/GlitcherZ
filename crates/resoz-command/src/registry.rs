@@ -37,6 +37,12 @@ pub struct CommandSpec {
     pub run: Run,
     /// Whether the command records an undo step.
     pub undoable: bool,
+    /// Whether the command is appended to the session journal on success.
+    ///
+    /// Undoable mutations and one-way (noundo) mutations journal; pure
+    /// queries do not. The journal is the replayable record for macros and
+    /// agent scripting.
+    pub journal: bool,
 }
 
 impl std::fmt::Debug for CommandSpec {
@@ -45,6 +51,7 @@ impl std::fmt::Debug for CommandSpec {
             .field("id", &self.id)
             .field("label", &self.label)
             .field("undoable", &self.undoable)
+            .field("journal", &self.journal)
             .finish()
     }
 }
@@ -78,11 +85,25 @@ impl CommandSpec {
     }
 }
 
-/// `cmd!(id, label, [menu…], shortcut, params, enabled, run)` — an undoable
-/// command. `cmd!(noundo …)` for queries and transport moves, which have no
-/// meaningful "before" state.
+/// `cmd!(id, label, [menu…], shortcut, params, enabled, run)` — an undoable,
+/// journaled command. `cmd!(noundo …)` for one-way mutations (transport
+/// moves, window toggles): no undo step, but still journaled so macros can
+/// replay them. `cmd!(query …)` for pure reads: neither undo nor journal.
 #[macro_export]
 macro_rules! cmd {
+    (query $id:literal, $label:literal, [$($m:literal),*], $sc:expr, $params:literal, $en:expr, $run:expr) => {
+        $crate::CommandSpec {
+            id: $id,
+            label: $label,
+            menu: &[$($m),*],
+            shortcut: $sc,
+            params: $params,
+            enabled: $en,
+            run: $run,
+            undoable: false,
+            journal: false,
+        }
+    };
     (noundo $id:literal, $label:literal, [$($m:literal),*], $sc:expr, $params:literal, $en:expr, $run:expr) => {
         $crate::CommandSpec {
             id: $id,
@@ -93,6 +114,7 @@ macro_rules! cmd {
             enabled: $en,
             run: $run,
             undoable: false,
+            journal: true,
         }
     };
     ($id:literal, $label:literal, [$($m:literal),*], $sc:expr, $params:literal, $en:expr, $run:expr) => {
@@ -105,6 +127,7 @@ macro_rules! cmd {
             enabled: $en,
             run: $run,
             undoable: true,
+            journal: true,
         }
     };
 }
@@ -275,5 +298,12 @@ mod tests {
         let query = find_command("midi.query").expect("registered");
         assert!(query.info(&session).enabled);
         assert!(!query.undoable, "a query has no before state");
+        assert!(!query.journal, "a query leaves no journal entry");
+        assert!(
+            command_specs()
+                .iter()
+                .all(|c| c.journal || c.id == "midi.query"),
+            "every non-query command is journaled"
+        );
     }
 }
