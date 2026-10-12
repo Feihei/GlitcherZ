@@ -1,8 +1,9 @@
 //! Piano roll editor component (egui self-drawn).
 //!
 //! Interaction conventions:
-//! - Left-click on empty space: create a note snapped to the grid (selected);
-//! - Left-drag on empty space: rubber-band selection (Shift/Ctrl adds to the
+//! - Left-click / press-and-drag on empty space: create a note snapped to
+//!   the grid and drag it around right away;
+//! - Shift/Ctrl + drag on empty space: rubber-band selection (adds to the
 //!   current selection);
 //! - Left-drag on a note: move the whole selection (uniform delta, so the
 //!   sorted indices of the selection stay valid — see `MoveNotes`);
@@ -42,10 +43,6 @@ pub const LANE_HEIGHT: f32 = 48.0;
 /// Number of visible rows.
 const VISIBLE_ROWS: i32 = (ROLL_HEIGHT / ROW_HEIGHT) as i32;
 
-/// Pointer travel (pixels) that turns a press on empty space into a marquee
-/// instead of a note creation.
-const MARQUEE_THRESHOLD: f32 = 4.0;
-
 /// Default duration of a new note (tick) — a 16th note.
 const DEFAULT_NOTE_LENGTH: i64 = TICKS_PER_STEP as i64;
 
@@ -84,11 +81,12 @@ pub struct RollState {
     pub selection: Vec<usize>,
     /// Selection drag in progress (uniform move of all selected notes).
     drag: Option<DragSelection>,
-    /// Rubber band in progress.
+    /// Rubber band in progress (Shift/Ctrl + drag on empty space).
     marquee: Option<Marquee>,
-    /// Left button pressed on empty space, not yet decided: a click creates a
-    /// note, a drag becomes a marquee.
-    press: Option<Press>,
+    /// A note was just requested on empty space; the roll does not know its
+    /// sorted index until the command reports back, but a drag on the new
+    /// note must start immediately — the grab point is kept here.
+    awaiting_create: Option<AwaitCreate>,
 }
 
 #[derive(Debug)]
@@ -103,14 +101,15 @@ struct DragSelection {
 struct Marquee {
     origin: egui::Pos2,
     current: egui::Pos2,
-    /// Shift/Ctrl held at press time: extend the existing selection.
+    /// Always true today: the marquee only exists under Shift/Ctrl and
+    /// extends the existing selection.
     additive: bool,
 }
 
 #[derive(Debug)]
-struct Press {
-    origin: egui::Pos2,
-    additive: bool,
+struct AwaitCreate {
+    grab_tick: f32,
+    grab_note: u8,
 }
 
 impl RollState {
@@ -126,13 +125,21 @@ impl RollState {
             selection: Vec::new(),
             drag: None,
             marquee: None,
-            press: None,
+            awaiting_create: None,
         }
     }
 
-    /// Replaces the selection with `index` (the note a gesture just created).
-    pub fn select_only(&mut self, index: usize) {
+    /// Replaces the selection with `index` (the note a gesture just created)
+    /// and, if that creation came from a press-and-drag on empty space,
+    /// starts dragging the new note right away.
+    pub fn resolve_created(&mut self, index: usize) {
         self.selection = vec![index];
+        if let Some(grab) = self.awaiting_create.take() {
+            self.drag = Some(DragSelection {
+                grab_tick: grab.grab_tick,
+                grab_note: grab.grab_note,
+            });
+        }
     }
 
     /// Whether a drag or marquee gesture is in progress.
@@ -147,7 +154,7 @@ impl RollState {
     pub fn clear_gesture(&mut self) {
         self.drag = None;
         self.marquee = None;
-        self.press = None;
+        self.awaiting_create = None;
         self.selection.clear();
     }
 }
@@ -197,7 +204,7 @@ pub fn show(
                     }
                 }
             });
-        ui.weak("draw · drag marquee · RMB delete · arrows nudge · wheel pitch");
+        ui.weak("click/drag: draw & move · Shift+drag: select · RMB: delete · arrows: nudge · wheel: pitch");
     });
 
     let width = ui.available_width();
@@ -444,10 +451,30 @@ pub fn show(
                     }
                 }
                 None => {
-                    state.press = Some(Press {
-                        origin: pos,
-                        additive,
-                    });
+                    if additive {
+                        // Shift/Ctrl + drag on empty space: rubber band.
+                        state.marquee = Some(Marquee {
+                            origin: pos,
+                            current: pos,
+                            additive: true,
+                        });
+                    } else {
+                        // Press on empty space: create a note right away and
+                        // keep dragging it. The note's sorted index is
+                        // unknown until the command reports back, so the
+                        // grab point parks in `awaiting_create` and
+                        // `resolve_created` starts the drag.
+                        let start = snap(pointer_tick(pos)).min(loop_ticks - 1);
+                        intent = Some(RollIntent::AddNote {
+                            note: pointer_note(pos),
+                            start,
+                            length: DEFAULT_NOTE_LENGTH,
+                        });
+                        state.awaiting_create = Some(AwaitCreate {
+                            grab_tick: pointer_tick(pos),
+                            grab_note: pointer_note(pos),
+                        });
+                    }
                 }
             }
         }
@@ -471,15 +498,6 @@ pub fn show(
                         loop_ticks,
                     ));
                 }
-            } else if let Some(press) = &mut state.press {
-                if pos.distance(press.origin) > MARQUEE_THRESHOLD {
-                    state.marquee = Some(Marquee {
-                        origin: press.origin,
-                        current: pos,
-                        additive: press.additive,
-                    });
-                    state.press = None;
-                }
             } else if let Some(marquee) = &mut state.marquee {
                 marquee.current = pos;
             }
@@ -487,15 +505,6 @@ pub fn show(
     }
 
     if response.drag_stopped() {
-        // A press that never became a marquee was a click: create a note.
-        if let Some(press) = state.press.take() {
-            let start = snap(pointer_tick(press.origin)).min(loop_ticks - 1);
-            intent = Some(RollIntent::AddNote {
-                note: pointer_note(press.origin),
-                start,
-                length: DEFAULT_NOTE_LENGTH,
-            });
-        }
         // A finished marquee selects what it covers.
         if let Some(marquee) = state.marquee.take() {
             let band = egui::Rect::from_two_pos(marquee.origin, marquee.current);
@@ -526,6 +535,11 @@ pub fn show(
             }
         }
         state.drag = None;
+        // A plain click on empty space created a note and never dragged it:
+        // drop the parked grab point so no drag starts from a stale gesture.
+        if state.awaiting_create.is_some() {
+            state.awaiting_create = None;
+        }
     }
 
     if response.secondary_clicked() {

@@ -3513,9 +3513,11 @@ impl ResoZApp {
                 );
                 // The new note becomes the whole selection (its sorted index
                 // is authoritative; the old selection's indices are stale).
+                // resolve_created also starts the drag if the creation came
+                // from a press-and-draw on empty space.
                 if let Ok(value) = outcome {
                     if let Some(index) = value["index"].as_u64() {
-                        self.roll_state.select_only(index as usize);
+                        self.roll_state.resolve_created(index as usize);
                     }
                 }
                 return;
