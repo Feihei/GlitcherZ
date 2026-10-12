@@ -115,6 +115,7 @@
       - **端点修剪**：音符左右边缘 ±5px（`EDGE_PX`）内按下拖动 = 修剪该端（hover 显示 ↔ 光标）；抓取未选中音符的边缘 = 只修剪它，抓取已选中音符的边缘 = 整个选区一起拉伸。`RollIntent::ResizeStart/ResizeEnd{delta_ticks, gesture}` → 新命令 `midi.notes_edit_delta{indices, delta_start, delta_length}`（左缘 trim 传镜像 length delta，端点跟随；per-note 钳制 start≥0/length≥1）。
       - **拖动复制**：Ctrl+音符拖动 = 复制选区并拖动副本（Ctrl+单击仍是 toggle 加选——click 与 drag 由 egui 区分）。新命令 `midi.notes_duplicate` 返回副本新索引；复制与后续 move 帧共享 `roll-move:{t}:{c}:{g}` undo key（一次复制拖动=一步 undo）。
       - **选区重映射**：`notes_move`/`notes_edit_delta`/`notes_duplicate` 统一返回编辑过的音符排序后新索引（`locate()`：按值+已消费标记匹配，值相等孪音符可互换）；lib.rs `reselect_from` 用返回索引重设选区——修复了移动跨过未选中音符时排序置换、旧选区 index 指错音符的潜在 bug。MoveNotes 的 undo key 带 gesture id（每次拖动独立 undo 步），方向键 nudge 用共享 `roll-nudge:{t}:{c}` key（连续按键合并）。
+      - **边界规则（用户确认）**：手势由按下位置决定，选区不改变空白语义——**移动必须抓在音符上**（选区内/未选中皆可，后者先选中它），空白拖动永远=画（无论有无选区）。有选区时空白拖动画出新音符并选中它，不算矛盾：抓取即意图声明，抓空=画一笔，Ctrl+Z 一步退掉。
 
 ### 明确不做（已评估）
 
