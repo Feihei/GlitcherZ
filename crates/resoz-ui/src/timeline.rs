@@ -6,7 +6,7 @@
 //! - drag a clip body → move (snapped to bars);
 //! - drag its right edge → resize (≥ 1 bar, snapped to bars);
 //! - double-click an empty lane spot → insert a one-bar clip;
-//! - double-click a clip → open its editor (piano roll / curve lane);
+//! - double-click a clip → jump to the Edit tab (piano roll / curve lane);
 //! - right-click a clip → delete;
 //! - header: click to select the track, toggle mute (MIDI rows only).
 //!

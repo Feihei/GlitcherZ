@@ -222,6 +222,9 @@ enum MainView {
     /// Arrangement timeline (default view: the DAW's home screen).
     #[default]
     Timeline,
+    /// Clip editor (piano roll / curve lane) for the targeted clip;
+    /// double-clicking a clip in the timeline jumps here.
+    Edit,
     /// Node patch graph (full-height, dedicated view).
     Patch,
     /// Synth params + mixer + clip/automation editors + keyboard.
@@ -2170,6 +2173,7 @@ impl ResoZApp {
         egui::Panel::top("resoz_views").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.view, MainView::Timeline, "Timeline");
+                ui.selectable_value(&mut self.view, MainView::Edit, "Edit");
                 ui.selectable_value(&mut self.view, MainView::Patch, "Patch");
                 ui.selectable_value(&mut self.view, MainView::Synth, "Synth / Mixer");
             });
@@ -2264,11 +2268,14 @@ impl ResoZApp {
             }
             timeline::TimelineAction::OpenMidiEditor { track, clip } => {
                 self.selected_track = track;
-                self.edit_clip = Some(EditTarget::Midi { track, clip });
+                // Double-click jumps straight to the editor.
+                self.set_edit_target(EditTarget::Midi { track, clip });
+                self.view = MainView::Edit;
             }
             timeline::TimelineAction::OpenControlEditor { track, clip } => {
                 self.selected_auto = track;
-                self.edit_clip = Some(EditTarget::Control { track, clip });
+                self.set_edit_target(EditTarget::Control { track, clip });
+                self.view = MainView::Edit;
             }
             timeline::TimelineAction::AddMidiTrack => self.add_midi_track(),
             timeline::TimelineAction::RemoveLastMidiTrack => self.remove_last_midi_track(),
@@ -2404,28 +2411,37 @@ impl ResoZApp {
         }
     }
 
-    /// Floating editor window for the clip targeted from the arrangement
-    /// timeline (double-click). Closing it (X / ×) clears the edit target.
-    fn editor_window(&mut self, ctx: &egui::Context) {
+    /// Edit tab: the clip editor as a main view (double-clicking a clip in
+    /// the timeline jumps here). With no targeted clip it offers the
+    /// selected track's first clip.
+    fn edit_panel(&mut self, ui: &mut egui::Ui) {
         let Some(target) = self.edit_clip else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(48.0);
+                ui.heading("Edit");
+                ui.add_space(8.0);
+                ui.label("Double-click a clip in the Timeline to edit it here.");
+                ui.add_space(12.0);
+                if !self.project().midi_tracks.is_empty() {
+                    let track = self
+                        .selected_track
+                        .min(self.project().midi_tracks.len() - 1);
+                    let name = if self.project().midi_tracks[track].name.is_empty() {
+                        format!("Track {}", track + 1)
+                    } else {
+                        self.project().midi_tracks[track].name.clone()
+                    };
+                    if ui.button(format!("Edit {name} · clip 1")).clicked() {
+                        self.set_edit_target(EditTarget::Midi { track, clip: 0 });
+                    }
+                }
+            });
             return;
         };
-        let title = match target {
-            EditTarget::Midi { .. } => "Piano Roll",
-            EditTarget::Control { .. } => "Curve Editor",
-        };
-        let mut open = true;
-        egui::Window::new(title)
-            .open(&mut open)
-            .default_width(760.0)
-            .default_height(360.0)
-            .show(ctx, |ui| match target {
-                EditTarget::Midi { track, clip } => self.midi_editor_body(ui, track, clip),
-                EditTarget::Control { track, clip } => self.control_editor_body(ui, track, clip),
-            });
-        if !open {
-            self.edit_clip = None;
-        }
+        egui::ScrollArea::vertical().show(ui, |ui| match target {
+            EditTarget::Midi { track, clip } => self.midi_editor_body(ui, track, clip),
+            EditTarget::Control { track, clip } => self.control_editor_body(ui, track, clip),
+        });
     }
 
     fn status_panel(&mut self, ui: &mut egui::Ui) {
@@ -3367,24 +3383,42 @@ impl ResoZApp {
         });
         self.project_mut().midi_tracks.pop();
         self.selected_track = self.selected_track.min(last.saturating_sub(1));
+        // The editor may have targeted the removed track's clip.
+        if let Some(EditTarget::Midi { track, .. }) = self.edit_clip
+            && track == last
+        {
+            self.edit_clip = None;
+        }
         self.commit_edit("Remove MIDI Track", before);
     }
 
-    /// Piano roll hint (the editor itself lives in a floating window opened
-    /// by double-clicking a clip on the arrangement timeline).
+    /// Piano roll hint (the editor itself lives in the Edit tab; double-click
+    /// a MIDI clip on the arrangement timeline to jump there).
     fn clip_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(4.0);
         ui.weak(
             "Piano roll: double-click a MIDI clip in the Arrangement timeline \
-             (bottom panel) to open its editor window.",
+             (bottom panel) — it opens in the Edit tab.",
         );
     }
 
-    /// Body of the floating piano-roll window: edits the targeted clip,
+    /// Points the Edit tab at `target`, dropping any in-flight roll gesture:
+    /// selection indices refer to the clip that was being edited.
+    fn set_edit_target(&mut self, target: EditTarget) {
+        self.roll_state.clear_gesture();
+        self.edit_clip = Some(target);
+    }
+
+    /// Body of the piano-roll editor (Edit tab): edits the targeted clip,
     /// pushes edits to the audio thread immediately.
     fn midi_editor_body(&mut self, ui: &mut egui::Ui, track: usize, clip_index: usize) {
-        let sel = track.min(self.project().midi_tracks.len().saturating_sub(1));
+        if self.project().midi_tracks.is_empty() {
+            // The target track was removed underneath the editor.
+            self.edit_clip = None;
+            return;
+        }
+        let sel = track.min(self.project().midi_tracks.len() - 1);
         if self.project().midi_tracks[sel].clips.is_empty() {
             let before = self.begin_edit();
             self.project_mut().midi_tracks[sel]
@@ -3409,7 +3443,27 @@ impl ResoZApp {
                 "{track_name} · clip {} (of {clip_count})",
                 clip_index + 1
             ));
-            if ui.button("× Close editor").clicked() {
+            if ui
+                .add_enabled(clip_index > 0, egui::Button::new("←"))
+                .on_hover_text("Previous clip")
+                .clicked()
+            {
+                self.set_edit_target(EditTarget::Midi {
+                    track: sel,
+                    clip: clip_index - 1,
+                });
+            }
+            if ui
+                .add_enabled(clip_index + 1 < clip_count, egui::Button::new("→"))
+                .on_hover_text("Next clip")
+                .clicked()
+            {
+                self.set_edit_target(EditTarget::Midi {
+                    track: sel,
+                    clip: clip_index + 1,
+                });
+            }
+            if ui.button("× Close").clicked() {
                 self.edit_clip = None;
             }
         });
@@ -3498,29 +3552,58 @@ impl ResoZApp {
         use serde_json::json;
 
         let mut selection_changed = false;
+        // A press-draw gesture shares one undo key across its frames: the
+        // creating `note_add` and every `note_edit` resize collapse into a
+        // single step (one draw = one undo).
+        let draw_key = |gesture: u64| format!("roll-draw:{track}:{clip}:{gesture}");
+        let mut created: Option<usize> = None;
         let result = match intent {
             RollIntent::AddNote {
                 note,
                 start,
                 length,
+                gesture,
             } => {
-                let outcome = self.execute(
+                let outcome = self.execute_merged(
                     "midi.note_add",
                     &json!({
                         "track": track, "clip": clip,
                         "note": note, "start_ticks": start, "length_ticks": length,
                     }),
+                    &draw_key(gesture),
                 );
                 // The new note becomes the whole selection (its sorted index
                 // is authoritative; the old selection's indices are stale).
-                // resolve_created also starts the drag if the creation came
-                // from a press-and-draw on empty space.
-                if let Ok(value) = outcome {
-                    if let Some(index) = value["index"].as_u64() {
-                        self.roll_state.resolve_created(index as usize);
-                    }
+                // resolve_created also starts the draw-drag if the creation
+                // came from a press-draw on empty space.
+                created = outcome
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value["index"].as_u64())
+                    .map(|index| index as usize);
+                outcome
+            }
+            RollIntent::ResizeEnd {
+                index,
+                length_ticks,
+                gesture,
+            } => {
+                let outcome = self.execute_merged(
+                    "midi.note_edit",
+                    &json!({
+                        "track": track, "clip": clip,
+                        "index": index, "length_ticks": length_ticks,
+                    }),
+                    &draw_key(gesture),
+                );
+                // The edit re-sorts the clip: re-point the selection at where
+                // the note landed so the rest of the drag keeps tracking it.
+                if let Ok(value) = &outcome
+                    && let Some(new_index) = value["index"].as_u64()
+                {
+                    self.roll_state.retarget(new_index as usize);
                 }
-                return;
+                outcome
             }
             RollIntent::MoveNotes {
                 indices,
@@ -3562,6 +3645,9 @@ impl ResoZApp {
                 )
             }
         };
+        if let Some(index) = created {
+            self.roll_state.resolve_created(index);
+        }
         if selection_changed {
             self.roll_state.selection.clear();
         }
@@ -3698,20 +3784,80 @@ impl ResoZApp {
             ui.weak(format!("-> {current}"));
         });
 
-        // The curve editor lives in a floating window (double-click a control
-        // clip on the arrangement timeline); the clip's own `loop_ticks` sets
-        // the editing width.
+        // The curve editor lives in the Edit tab (double-click a control clip
+        // on the arrangement timeline to jump there); the clip's own
+        // `loop_ticks` sets the editing width.
         ui.weak(
             "Curve editor: double-click a control clip in the Arrangement \
-             timeline (bottom panel) to open its editor window.",
+             timeline (bottom panel) — it opens in the Edit tab.",
         );
     }
 
-    /// Body of the floating curve-editor window: edits the targeted control
-    /// clip, pushes edits to the audio thread immediately.
+    /// Body of the curve editor (Edit tab): edits the targeted control clip,
+    /// pushes edits to the audio thread immediately.
     fn control_editor_body(&mut self, ui: &mut egui::Ui, index: usize, clip_index: usize) {
+        if self.project().control_tracks.is_empty() {
+            // The target track was removed underneath the editor.
+            self.edit_clip = None;
+            return;
+        }
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
+        // Header: track name + clip navigation + close.
+        let track_count = self.project().control_tracks.len();
+        let index = index.min(track_count.saturating_sub(1));
+        let track_name = self
+            .project()
+            .control_tracks
+            .get(index)
+            .map(|t| {
+                if t.name.is_empty() {
+                    format!("Control {}", index + 1)
+                } else {
+                    t.name.clone()
+                }
+            })
+            .unwrap_or_else(|| format!("Control {}", index + 1));
+        let clip_count = self
+            .project()
+            .control_tracks
+            .get(index)
+            .map(|t| t.clips.len())
+            .unwrap_or(0);
+        let clip_index = if clip_count == 0 {
+            0
+        } else {
+            clip_index.min(clip_count - 1)
+        };
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{track_name} · clip {} (of {clip_count})",
+                clip_index + 1
+            ));
+            if ui
+                .add_enabled(clip_index > 0, egui::Button::new("←"))
+                .on_hover_text("Previous clip")
+                .clicked()
+            {
+                self.set_edit_target(EditTarget::Control {
+                    track: index,
+                    clip: clip_index - 1,
+                });
+            }
+            if ui
+                .add_enabled(clip_index + 1 < clip_count, egui::Button::new("→"))
+                .on_hover_text("Next clip")
+                .clicked()
+            {
+                self.set_edit_target(EditTarget::Control {
+                    track: index,
+                    clip: clip_index + 1,
+                });
+            }
+            if ui.button("× Close").clicked() {
+                self.edit_clip = None;
+            }
+        });
         let axis_param = self
             .project_mut()
             .graph
@@ -3731,8 +3877,6 @@ impl ResoZApp {
             self.send_control_clips(index);
             return;
         }
-        let clip_count = self.project().control_tracks[index].clips.len();
-        let clip_index = clip_index.min(clip_count - 1);
         let intent = {
             // Destructured: `project()` borrows all of `self`, which would
             // collide with the `&mut self.lane_state` below.
@@ -3913,12 +4057,14 @@ impl eframe::App for ResoZApp {
             MainView::Timeline => {
                 egui::CentralPanel::default().show(ui, |ui| self.timeline_panel(ui));
             }
+            MainView::Edit => {
+                egui::CentralPanel::default().show(ui, |ui| self.edit_panel(ui));
+            }
             MainView::Patch => {
                 egui::CentralPanel::default().show(ui, |ui| self.graph_patch(ui));
             }
             MainView::Synth => self.synth_panel(ui),
         }
-        self.editor_window(ui.ctx());
 
         // Audio-driven displays (level meter, playback position, envelope) need periodic
         // repaints; without this, egui sleeps when idle and auto-close (smoke test) never fires.
