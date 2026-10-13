@@ -3680,16 +3680,20 @@ impl ResoZApp {
                 self.reselect_from(&outcome);
                 outcome
             }
-            RollIntent::SplitNotes { tick, gesture } => {
-                // The Cut command: one invocation is one undo step. The
-                // selection follows the halves (plus any untouched selected
-                // note), as the command reports them.
+            RollIntent::SplitNotes { cuts, gesture } => {
+                // The Cut command: one invocation (a knife stroke's batch or
+                // a single click cut) is one undo step; the selection
+                // follows the halves, as the command reports them. The cuts
+                // name their own notes — the knife needs no pre-selection.
+                let cuts: Vec<serde_json::Value> = cuts
+                    .iter()
+                    .map(|(index, tick)| json!({ "index": index, "tick": tick }))
+                    .collect();
                 let outcome = self.execute_merged(
                     "midi.notes_split",
                     &json!({
                         "track": track, "clip": clip,
-                        "indices": self.roll_state.selection.clone(),
-                        "tick": tick,
+                        "cuts": cuts,
                     }),
                     &format!("roll-cut:{track}:{clip}:{gesture}"),
                 );

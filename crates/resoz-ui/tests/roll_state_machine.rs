@@ -16,9 +16,7 @@
 
 use eframe::egui;
 use resoz_model::{MidiClip, Note, Sequence, TICKS_PER_BAR};
-use resoz_ui::piano_roll::{
-    Axis, PendingCmd, ROW_HEIGHT, RollIntent, RollMode, RollState, StretchEdge,
-};
+use resoz_ui::piano_roll::{ROW_HEIGHT, RollIntent, RollMode, RollState};
 
 const SCREEN: egui::Vec2 = egui::vec2(800.0, 600.0);
 
@@ -225,6 +223,42 @@ impl Fixture {
             key_event(key, modifiers),
         ])
     }
+
+    /// A modal transform: the pointer parks at `from` (the grab point),
+    /// the command key arms it, the pointer sweeps to `to` (an optional
+    /// qualifier key tapped mid-modal), and a click confirms. Returns
+    /// every intent the frames emitted — the confirm intent is last.
+    fn modal(
+        &mut self,
+        key: egui::Key,
+        from: egui::Pos2,
+        to: egui::Pos2,
+        qualifier: Option<egui::Key>,
+    ) -> Vec<RollIntent> {
+        let mut intents = Vec::new();
+        intents.extend(self.frame(vec![hover(from)]));
+        intents.extend(self.tap_key(key));
+        intents.extend(self.frame(vec![hover(to)]));
+        if let Some(q) = qualifier {
+            intents.extend(self.tap_key(q));
+        }
+        intents.extend(self.click(to));
+        intents
+    }
+
+    /// The confirming intent of a modal sweep (the last MoveNotes /
+    /// ScaleNotes / Resize intent a `modal()` run produced).
+    fn confirm_of(intents: &[RollIntent]) -> Option<&RollIntent> {
+        intents.iter().rev().find(|intent| {
+            matches!(
+                intent,
+                RollIntent::MoveNotes { .. }
+                    | RollIntent::ScaleNotes { .. }
+                    | RollIntent::ResizeEnd { .. }
+                    | RollIntent::ResizeStart { .. }
+            )
+        })
+    }
 }
 
 fn hover(pos: egui::Pos2) -> egui::Event {
@@ -344,269 +378,279 @@ fn esc_leaves_draw_mode() {
     assert!(!has_add_note(&intents), "got {intents:?}");
 }
 
-// ---- One-shot command family: Grab ---------------------------------------------------------
+// ---- Modal command family: Grab ------------------------------------------------------------
 
 #[test]
-fn armed_grab_moves_the_selection_with_an_x_axis_lock() {
+fn a_modal_grab_follows_the_pointer_and_confirms_with_a_click() {
     let mut f = Fixture::new();
     f.state.selection = vec![0, 1];
+
+    let intents = f.modal(egui::Key::G, f.pos(240.0, 61), f.pos(960.0, 55), None);
+    let confirmed = Fixture::confirm_of(&intents).expect("the click confirms the move");
+    match confirmed {
+        RollIntent::MoveNotes {
+            delta_start,
+            delta_note,
+            gesture: Some(_),
+            ..
+        } => {
+            assert_eq!(
+                (*delta_start, *delta_note),
+                (720, -6),
+                "a free move carries both axes"
+            );
+        }
+        other => panic!("expected a move, got {other:?}"),
+    }
+    assert!(!f.state.modal_active(), "the confirm clears the modal");
+}
+
+#[test]
+fn a_modal_grab_locks_the_x_axis() {
+    let mut f = Fixture::new();
+    f.state.selection = vec![0, 1];
+
+    // X pressed mid-modal: only the time component survives.
+    let intents = f.modal(
+        egui::Key::G,
+        f.pos(240.0, 61),
+        f.pos(960.0, 55),
+        Some(egui::Key::X),
+    );
+    match Fixture::confirm_of(&intents).expect("the click confirms") {
+        RollIntent::MoveNotes {
+            delta_start,
+            delta_note,
+            ..
+        } => {
+            assert_eq!(*delta_note, 0, "X locks the pitch axis");
+            assert_eq!(*delta_start, 720, "time still moves");
+        }
+        other => panic!("expected a move, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_modal_grab_locks_the_y_axis() {
+    let mut f = Fixture::new();
+    f.state.selection = vec![0, 1];
+
+    let intents = f.modal(
+        egui::Key::G,
+        f.pos(240.0, 61),
+        f.pos(960.0, 55),
+        Some(egui::Key::Y),
+    );
+    match Fixture::confirm_of(&intents).expect("the click confirms") {
+        RollIntent::MoveNotes {
+            delta_start,
+            delta_note,
+            ..
+        } => {
+            assert_eq!(*delta_start, 0, "Y locks the time axis");
+            assert_eq!(*delta_note, -6, "pitch still moves");
+        }
+        other => panic!("expected a move, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_axis_lock_can_switch_mid_modal() {
+    let mut f = Fixture::new();
+    f.state.selection = vec![0, 1];
+    f.frame(vec![hover(f.pos(240.0, 61))]);
     f.tap_key(egui::Key::G);
+    assert!(f.state.modal_active(), "the grab is modal right away");
+
+    // Sweep freely, then lock time mid-modal and keep sweeping.
+    f.frame(vec![hover(f.pos(480.0, 55))]);
     f.tap_key(egui::Key::X);
-    assert_eq!(
-        f.state.pending,
-        Some(PendingCmd::Grab {
-            axis: Some(Axis::Time)
-        })
-    );
-
-    // A diagonal drag: only the time component may survive.
-    let intents = f.drag(f.pos(240.0, 61), f.pos(960.0, 55));
-    let moves: Vec<_> = intents
-        .iter()
-        .filter(|intent| matches!(intent, RollIntent::MoveNotes { .. }))
-        .collect();
-    assert!(
-        !moves.is_empty(),
-        "an armed grab must move: got {intents:?}"
-    );
-    for intent in moves {
-        let RollIntent::MoveNotes {
-            delta_start,
-            delta_note,
-            ..
-        } = intent
-        else {
-            unreachable!()
-        };
-        assert_eq!(*delta_note, 0, "X locks the pitch axis");
-        assert!(*delta_start > 0, "time still moves");
-    }
-    assert_eq!(f.state.pending, None, "the command is consumed by its drag");
-}
-
-#[test]
-fn armed_grab_moves_the_selection_with_a_y_axis_lock() {
-    let mut f = Fixture::new();
-    f.state.selection = vec![0, 1];
-    f.tap_key(egui::Key::G);
-    f.tap_key(egui::Key::Y);
-
-    let intents = f.drag(f.pos(240.0, 61), f.pos(960.0, 55));
-    let moves: Vec<_> = intents
-        .iter()
-        .filter(|intent| matches!(intent, RollIntent::MoveNotes { .. }))
-        .collect();
-    assert!(!moves.is_empty(), "got {intents:?}");
-    for intent in moves {
-        let RollIntent::MoveNotes {
-            delta_start,
-            delta_note,
-            ..
-        } = intent
-        else {
-            unreachable!()
-        };
-        assert_eq!(*delta_start, 0, "Y locks the time axis");
-        assert!(*delta_note < 0, "pitch still moves");
-    }
-}
-
-#[test]
-fn an_axis_lock_can_switch_mid_drag() {
-    let mut f = Fixture::new();
-    f.state.selection = vec![0, 1];
-    f.tap_key(egui::Key::G);
-
-    // First frames: a free diagonal move.
-    let mut intents = Vec::new();
-    intents.extend(f.frame(vec![hover(f.pos(240.0, 61))]));
-    intents.extend(f.frame(vec![
-        hover(f.pos(240.0, 61)),
-        press(f.pos(240.0, 61), true, egui::Modifiers::default()),
-    ]));
-    intents.extend(f.frame(vec![hover(f.pos(480.0, 55))]));
-    let free = intents.iter().find_map(|intent| match intent {
+    f.frame(vec![hover(f.pos(720.0, 55))]);
+    let intents = f.click(f.pos(720.0, 55));
+    match Fixture::confirm_of(&intents).expect("the click confirms") {
         RollIntent::MoveNotes {
             delta_start,
             delta_note,
             ..
-        } => Some((*delta_start, *delta_note)),
-        _ => None,
-    });
-    assert_eq!(free, Some((240, -6)), "a free move carries both axes");
-
-    // Lock time mid-drag: the pitch walks back to the grab position. The
-    // compensation lands on the key frame itself — the drag keeps
-    // reporting `dragged` there, so no pointer movement is needed.
-    let locked = f.tap_key(egui::Key::X).and_then(|intent| match intent {
-        RollIntent::MoveNotes {
-            delta_start,
-            delta_note,
-            ..
-        } => Some((delta_start, delta_note)),
-        _ => None,
-    });
-    assert_eq!(
-        locked,
-        Some((0, 6)),
-        "the locked axis compensates back to the grab pitch"
-    );
-
-    // …and the free axis keeps tracking the pointer afterwards.
-    let moved = f
-        .frame(vec![hover(f.pos(720.0, 55))])
-        .and_then(|intent| match intent {
-            RollIntent::MoveNotes {
-                delta_start,
-                delta_note,
-                ..
-            } => Some((delta_start, delta_note)),
-            _ => None,
-        });
-    assert_eq!(
-        moved,
-        Some((240, 0)),
-        "time still moves, pitch stays locked"
-    );
+        } => {
+            // The lock zeroes the pitch target: the confirm applies only
+            // the time component (snap(720) - snap(240)).
+            assert_eq!((*delta_start, *delta_note), (480, 0));
+        }
+        other => panic!("expected a move, got {other:?}"),
+    }
 }
 
-// ---- One-shot command family: Scale --------------------------------------------------------
+// ---- Modal command family: Scale ------------------------------------------------------------
 
 #[test]
-fn armed_scale_stretches_the_selection_around_the_bbox_center() {
+fn a_modal_scale_scales_around_the_bbox_start() {
     let mut f = Fixture::new();
-    f.state.selection = vec![0, 1]; // bbox [0..720], pivot 360
-    f.tap_key(egui::Key::S);
+    f.state.selection = vec![0, 1]; // bbox [0..720], pivot = 0 (the start)
 
-    // Grab 360 ticks right of the pivot, then drag twice as far.
-    let intents = f.drag(f.pos(720.0, 70), f.pos(1080.0, 70));
-    let scaled = intents.iter().find_map(|intent| match intent {
+    // Grab 720 ticks right of the pivot; the pointer twice as far doubles.
+    let intents = f.modal(egui::Key::S, f.pos(720.0, 70), f.pos(1440.0, 70), None);
+    match Fixture::confirm_of(&intents).expect("the click confirms") {
         RollIntent::ScaleNotes {
             pivot_tick, factor, ..
-        } => Some((*pivot_tick, *factor)),
-        _ => None,
-    });
-    assert_eq!(scaled, Some((360, 2.0)), "got {intents:?}");
-    assert_eq!(f.state.pending, None, "the command is consumed by its drag");
+        } => {
+            assert_eq!(*pivot_tick, 0, "the pivot is the bbox start");
+            assert!((factor - 2.0).abs() < 0.01, "got {factor}");
+        }
+        other => panic!("expected a scale, got {other:?}"),
+    }
+    assert!(!f.state.modal_active());
 }
 
-// ---- One-shot command family: Stretch ------------------------------------------------------
+// ---- Modal command family: Stretch -----------------------------------------------------------
 
 #[test]
-fn armed_stretch_pulls_the_end_edge_by_default() {
+fn a_modal_stretch_pulls_the_end_edge_by_default() {
     let mut f = Fixture::new();
     f.state.selection = vec![0, 1]; // bbox [0..720]
-    f.tap_key(egui::Key::T);
 
-    let intents = f.drag(f.pos(240.0, 61), f.pos(1200.0, 61));
-    let last = intents.iter().rev().find_map(|intent| match intent {
-        RollIntent::ResizeEnd { delta_ticks, .. } => Some(*delta_ticks),
-        _ => None,
-    });
-    assert_eq!(
-        last,
-        Some(480),
-        "bbox right edge 720 → 1200: got {intents:?}"
-    );
+    let intents = f.modal(egui::Key::T, f.pos(240.0, 61), f.pos(1200.0, 61), None);
+    match Fixture::confirm_of(&intents).expect("the click confirms") {
+        RollIntent::ResizeEnd { delta_ticks, .. } => {
+            assert_eq!(*delta_ticks, 480, "bbox right edge 720 -> 1200");
+        }
+        other => panic!("expected an end stretch, got {other:?}"),
+    }
 }
 
 #[test]
-fn t_s_switches_the_stretch_to_the_start_edge() {
+fn t_s_switches_the_stretch_to_the_start_edge_mid_modal() {
     let mut f = Fixture::new();
     f.state.selection = vec![0, 1];
-    f.tap_key(egui::Key::T);
-    f.tap_key(egui::Key::S);
-    assert_eq!(
-        f.state.pending,
-        Some(PendingCmd::Stretch {
-            edge: StretchEdge::Start
-        })
-    );
 
-    let intents = f.drag(f.pos(240.0, 61), f.pos(480.0, 61));
-    let last = intents.iter().rev().find_map(|intent| match intent {
-        RollIntent::ResizeStart { delta_ticks, .. } => Some(*delta_ticks),
-        _ => None,
-    });
-    assert_eq!(last, Some(480), "bbox left edge 0 → 480: got {intents:?}");
+    let intents = f.modal(
+        egui::Key::T,
+        f.pos(240.0, 61),
+        f.pos(480.0, 61),
+        Some(egui::Key::S),
+    );
+    match Fixture::confirm_of(&intents).expect("the click confirms") {
+        RollIntent::ResizeStart { delta_ticks, .. } => {
+            assert_eq!(*delta_ticks, 480, "bbox left edge 0 -> 480");
+        }
+        other => panic!("expected a start trim, got {other:?}"),
+    }
 }
 
-// ---- One-shot command family: Cut ----------------------------------------------------------
+// ---- Command family: the knife (K) -----------------------------------------------------------
 
 #[test]
-fn armed_cut_splits_the_selection_at_the_pointer() {
+fn the_knife_cuts_without_any_selection() {
     let mut f = Fixture::new();
-    f.state.selection = vec![0]; // note [0..240]
+    f.state.selection.clear(); // the knife is a position tool, not a selection one
     f.tap_key(egui::Key::K);
+    assert!(f.state.knife_armed, "K arms without a selection");
 
-    let intents = f.click(f.pos(120.0, 60));
+    let intents = f.click(f.pos(120.0, 60)); // inside note A [0..240]
     assert!(
         intents
             .iter()
-            .any(|intent| matches!(intent, RollIntent::SplitNotes { tick: 120, .. })),
-        "got {intents:?}"
+            .any(|intent| matches!(intent, RollIntent::SplitNotes { cuts, .. } if cuts.as_slice() == [(0, 120)])),
+        "every note spanning the tick is cut: got {intents:?}"
     );
-    assert_eq!(f.state.pending, None, "one invocation, one cut");
+    assert!(!f.state.knife_armed, "one click, one cut batch");
 }
 
 #[test]
-fn a_cut_drag_cuts_once_at_the_press_point() {
+fn a_knife_stroke_cuts_along_the_swept_path() {
     let mut f = Fixture::new();
-    f.state.selection = vec![0];
+    f.state.selection.clear();
     f.tap_key(egui::Key::K);
 
-    let intents = f.drag(f.pos(120.0, 60), f.pos(600.0, 60));
+    // Sweep along note A's row: one cut, in the middle of the covered span
+    // ([60..180] ticks -> 120).
+    let intents = f.drag(f.pos(60.0, 60), f.pos(180.0, 60));
     let cuts: Vec<_> = intents
         .iter()
         .filter(|intent| matches!(intent, RollIntent::SplitNotes { .. }))
         .collect();
-    assert_eq!(cuts.len(), 1, "one stroke = one cut: got {intents:?}");
+    assert_eq!(cuts.len(), 1, "the batch lands on release: got {intents:?}");
     assert!(
-        matches!(cuts[0], RollIntent::SplitNotes { tick: 120, .. }),
-        "the cut lands at the press point, not the release"
+        matches!(&cuts[0], RollIntent::SplitNotes { cuts, .. } if cuts.as_slice() == [(0, 120)]),
+        "got {:?}",
+        cuts[0]
     );
-    assert_eq!(f.state.pending, None);
+    assert!(!f.state.knife_armed, "one stroke per arming");
 }
 
 #[test]
-fn a_cut_with_nothing_under_the_pointer_is_a_no_op() {
+fn a_knife_stroke_across_two_rows_cuts_both_notes() {
     let mut f = Fixture::new();
-    f.state.selection = vec![0];
+    f.state.selection.clear();
+
+    // Stroke 1 sweeps along A's row ([60..180] -> mid 120); re-arm;
+    // stroke 2 sweeps along B's row ([520..680] -> mid 600).
     f.tap_key(egui::Key::K);
-    f.click(f.pos(1000.0, 70)); // no selected note spans tick 1000
+    let intents = f.drag(f.pos(60.0, 60), f.pos(180.0, 60));
+    assert!(
+        intents
+            .iter()
+            .any(|intent| matches!(intent, RollIntent::SplitNotes { cuts, .. } if cuts.as_slice() == [(0, 120)])),
+        "got {intents:?}"
+    );
+    f.tap_key(egui::Key::K);
+    let intents = f.drag(f.pos(520.0, 62), f.pos(680.0, 62));
+    assert!(
+        intents
+            .iter()
+            .any(|intent| matches!(intent, RollIntent::SplitNotes { cuts, .. } if cuts.as_slice() == [(1, 600)])),
+        "got {intents:?}"
+    );
+}
+
+#[test]
+fn a_knife_click_with_nothing_under_it_is_a_no_op() {
+    let mut f = Fixture::new();
+    f.state.selection.clear();
+    f.tap_key(egui::Key::K);
+    f.click(f.pos(1000.0, 70)); // no note spans tick 1000
     assert_eq!(
         f.state.take_status(),
-        Some("Cut: no selected note at the pointer".to_string())
+        Some("Cut: nothing under the knife".to_string())
     );
-    assert_eq!(f.state.pending, None, "the command is consumed either way");
+    assert!(!f.state.knife_armed, "the arming is consumed either way");
 }
 
-// ---- One-shot command family: Duplicate ----------------------------------------------------
+// ---- Command family: Duplicate ----------------------------------------------------------------
 
 #[test]
-fn shift_d_duplicates_and_arms_grab() {
+fn shift_d_duplicates_and_moves_the_copies_in_a_modal() {
     let mut f = Fixture::new();
     f.state.selection = vec![0, 1];
 
+    f.frame(vec![hover(f.pos(240.0, 61))]); // the grab point
     let armed = f.tap_key_with(egui::Key::D, shift());
-    assert!(
-        matches!(armed, Some(RollIntent::Duplicate { .. })),
-        "got {armed:?}"
-    );
-    assert_eq!(
-        f.state.pending,
-        Some(PendingCmd::Grab { axis: None }),
-        "the duplicate arms Grab on the copies"
-    );
+    let dup_gesture = match &armed {
+        Some(RollIntent::Duplicate { gesture, .. }) => *gesture,
+        other => panic!("expected a duplicate, got {other:?}"),
+    };
+    assert!(f.state.modal_active(), "the copies move in a modal Grab");
 
-    // The drag that follows moves the copies (the copy and the move share
-    // the gesture id, so it is all one undo step).
-    let intents = f.drag(f.pos(240.0, 61), f.pos(480.0, 61));
-    assert!(has_move(&intents), "got {intents:?}");
-    assert_eq!(f.state.pending, None);
+    // Sweep + confirm: the confirming move shares the duplicate's gesture
+    // id, so copy + move is one undo step.
+    f.frame(vec![hover(f.pos(480.0, 61))]);
+    let intents = f.click(f.pos(480.0, 61));
+    let confirm_gesture = intents.iter().find_map(|intent| match intent {
+        RollIntent::MoveNotes {
+            delta_start,
+            gesture: Some(g),
+            ..
+        } => Some((*delta_start, *g)),
+        _ => None,
+    });
+    assert_eq!(
+        confirm_gesture,
+        Some((240, dup_gesture)),
+        "the copy and the move are one gesture: got {intents:?}"
+    );
 }
 
-// ---- Command family edge cases -------------------------------------------------------------
+// ---- Command family edge cases -----------------------------------------------------------------
 
 #[test]
 fn transforms_on_an_empty_selection_are_no_ops_with_a_message() {
@@ -616,76 +660,142 @@ fn transforms_on_an_empty_selection_are_no_ops_with_a_message() {
         (egui::Key::G, "Grab: nothing selected"),
         (egui::Key::S, "Scale: nothing selected"),
         (egui::Key::T, "Stretch: nothing selected"),
-        (egui::Key::K, "Cut: nothing selected"),
     ] {
         f.tap_key(key);
-        assert_eq!(f.state.pending, None, "{key:?} must not arm");
+        assert!(!f.state.modal_active(), "{key:?} must not arm");
         assert_eq!(f.state.take_status(), Some(message.to_string()));
     }
+    // K needs no selection: it arms, and an empty click explains itself.
+    f.tap_key(egui::Key::K);
+    assert!(f.state.knife_armed);
+    assert_eq!(f.state.take_status(), None);
+    f.click(f.pos(1000.0, 70));
+    assert_eq!(
+        f.state.take_status(),
+        Some("Cut: nothing under the knife".to_string())
+    );
+
     // And an empty drag stays a marquee — nothing is painted or moved.
     let intents = f.drag(f.pos(1000.0, 70), f.pos(1400.0, 70));
     assert!(intents.is_empty(), "got {intents:?}");
 }
 
 #[test]
-fn esc_cancels_the_armed_command_before_it_runs() {
+fn esc_cancels_the_modal_before_anything_is_applied() {
     let mut f = Fixture::new();
     f.state.selection = vec![0, 1];
+    f.frame(vec![hover(f.pos(240.0, 61))]);
     f.tap_key(egui::Key::G);
     f.tap_key(egui::Key::Escape);
-    assert_eq!(f.state.pending, None);
+    assert!(!f.state.modal_active());
 
     // The drag that would have moved the selection is a plain marquee now.
     let intents = f.drag(f.pos(1000.0, 70), f.pos(1400.0, 70));
     assert!(
         !has_move(&intents),
-        "a cancelled command must not run: got {intents:?}"
+        "a cancelled modal must not run: got {intents:?}"
     );
 }
 
 #[test]
-fn a_plain_click_cancels_an_armed_transform() {
+fn rmb_cancels_the_modal_instead_of_deleting() {
     let mut f = Fixture::new();
     f.state.selection = vec![0, 1];
+    f.frame(vec![hover(f.pos(240.0, 61))]);
     f.tap_key(egui::Key::G);
-    f.click(f.pos(60.0, 60)); // note A's body
-    assert_eq!(f.state.pending, None);
-    assert_eq!(f.state.selection, vec![0], "the click still selects");
+    f.frame(vec![hover(f.pos(480.0, 61))]);
+
+    // RMB press + release over note A.
+    let pos = f.pos(60.0, 60);
+    f.frame(vec![hover(pos)]);
+    f.frame(vec![
+        hover(pos),
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        },
+    ]);
+    f.frame(vec![hover(pos)]);
+    let intents = f.frame(vec![
+        hover(pos),
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        },
+    ]);
+    assert!(
+        !intents
+            .iter()
+            .any(|intent| matches!(intent, RollIntent::DeleteNotes { .. })),
+        "RMB during a modal cancels, never deletes: got {intents:?}"
+    );
+    assert!(!f.state.modal_active(), "the modal is cancelled");
+    assert_eq!(f.state.selection, vec![0, 1]);
 }
 
 #[test]
-fn other_keys_are_ignored_while_a_command_is_pending() {
+fn a_click_confirms_the_modal_rather_than_selecting() {
     let mut f = Fixture::new();
     f.state.selection = vec![0, 1];
+    f.frame(vec![hover(f.pos(240.0, 61))]);
+    f.tap_key(egui::Key::G);
+
+    // A click on note A confirms the transform; it never re-selects.
+    let intents = f.click(f.pos(60.0, 60));
+    assert!(
+        has_move(&intents),
+        "the click is the confirmation: got {intents:?}"
+    );
+    assert_eq!(
+        f.state.selection,
+        vec![0, 1],
+        "a confirming click does not change the selection"
+    );
+}
+
+#[test]
+fn other_keys_are_ignored_while_a_modal_owns_the_keyboard() {
+    let mut f = Fixture::new();
+    f.state.selection = vec![0, 1];
+    f.frame(vec![hover(f.pos(240.0, 61))]);
     f.tap_key(egui::Key::T);
     f.tap_key(egui::Key::G); // ignored: the family never chains
-    assert_eq!(
-        f.state.pending,
-        Some(PendingCmd::Stretch {
-            edge: StretchEdge::End
-        })
-    );
-    // ...but the qualifier still applies.
+    assert!(f.state.modal_active(), "the stretch modal survives");
+
+    // ...but the qualifier still applies: `s` flips the stretch to its
+    // start edge.
+    f.frame(vec![hover(f.pos(480.0, 61))]);
     f.tap_key(egui::Key::S);
-    assert_eq!(
-        f.state.pending,
-        Some(PendingCmd::Stretch {
-            edge: StretchEdge::Start
-        })
+    let intents = f.click(f.pos(480.0, 61));
+    assert!(
+        intents.iter().any(|intent| matches!(
+            intent,
+            RollIntent::ResizeStart {
+                delta_ticks: 480,
+                ..
+            }
+        )),
+        "got {intents:?}"
     );
 }
 
 #[test]
-fn d_cancels_a_pending_transform_and_toggles_the_mode() {
+fn d_is_ignored_during_a_modal_and_toggles_after_cancelling() {
     let mut f = Fixture::new();
     f.state.selection = vec![0, 1];
+    f.frame(vec![hover(f.pos(240.0, 61))]);
     f.tap_key(egui::Key::G);
     f.tap_key(egui::Key::D);
-    assert_eq!(
-        f.state.pending, None,
-        "the state command cancels the transform"
-    );
-    assert_eq!(f.state.mode, RollMode::Draw);
+    assert!(f.state.modal_active(), "d does not chain into a modal");
+    assert_eq!(f.state.mode, RollMode::Select, "nor does it toggle");
+
+    f.tap_key(egui::Key::Escape);
+    f.tap_key(egui::Key::D);
+    assert_eq!(f.state.mode, RollMode::Draw, "free again after the cancel");
 }
 
 #[test]
@@ -693,10 +803,12 @@ fn the_command_family_runs_in_draw_mode_too() {
     let mut f = Fixture::new();
     f.tap_key(egui::Key::D);
     f.state.selection = vec![0, 1];
-    f.tap_key(egui::Key::G);
-    f.tap_key(egui::Key::X);
-
-    let intents = f.drag(f.pos(240.0, 61), f.pos(960.0, 55));
+    let intents = f.modal(
+        egui::Key::G,
+        f.pos(240.0, 61),
+        f.pos(960.0, 55),
+        Some(egui::Key::X),
+    );
     assert!(
         intents
             .iter()
@@ -707,6 +819,37 @@ fn the_command_family_runs_in_draw_mode_too() {
         f.state.mode,
         RollMode::Draw,
         "a command never changes the persistent mode"
+    );
+}
+
+// ---- Keyboard hygiene: Delete, arrows, key consumption ------------------------------------------
+
+#[test]
+fn the_delete_key_removes_the_selection() {
+    let mut f = Fixture::new();
+    f.state.selection = vec![0, 1];
+    let intent = f.tap_key(egui::Key::Delete);
+    assert!(
+        matches!(intent, Some(RollIntent::DeleteNotes { ref indices }) if indices.as_slice() == [0, 1]),
+        "got {intent:?}"
+    );
+}
+
+#[test]
+fn arrows_nudge_repeatedly_without_losing_focus() {
+    let mut f = Fixture::new();
+    f.state.selection = vec![0, 1];
+    // Two taps in a row: the first must not move focus away from the roll
+    // (egui's arrow focus navigation), or the second would be swallowed.
+    let first = f.tap_key(egui::Key::ArrowUp);
+    let second = f.tap_key(egui::Key::ArrowUp);
+    assert!(
+        matches!(&first, Some(RollIntent::MoveNotes { delta_note: 1, .. })),
+        "got {first:?}"
+    );
+    assert!(
+        matches!(&second, Some(RollIntent::MoveNotes { delta_note: 1, .. })),
+        "the second tap must still nudge: got {second:?}"
     );
 }
 
@@ -727,7 +870,7 @@ fn the_gesture_shortcuts_still_work_without_arming_anything() {
         _ => None,
     });
     assert_eq!(moved, Some((240, 4)), "got {intents:?}");
-    assert_eq!(f.state.pending, None, "a gesture never arms a command");
+    assert!(!f.state.modal_active(), "a gesture never arms a command");
 
     // Drag the note's right edge: an end trim.
     f.state.selection = vec![0];
@@ -736,7 +879,7 @@ fn the_gesture_shortcuts_still_work_without_arming_anything() {
         RollIntent::ResizeEnd { delta_ticks, .. } => Some(*delta_ticks),
         _ => None,
     });
-    assert_eq!(trimmed, Some(240), "note end 240 → 480: got {intents:?}");
+    assert_eq!(trimmed, Some(240), "note end 240 -> 480: got {intents:?}");
 }
 
 #[test]

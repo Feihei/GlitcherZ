@@ -559,13 +559,13 @@ fn notes_scale_rejects_a_non_positive_factor_or_empty_selection() {
 }
 
 #[test]
-fn notes_split_cuts_the_selection_at_the_tick() {
+fn notes_split_cuts_the_named_note_at_the_tick() {
     let mut session = session_with_notes();
     // Note 0 is [0..240] at pitch 60, velocity 100. Cut at 120.
     let outcome = session
         .execute(
             "midi.notes_split",
-            &json!({ "track": 0, "clip": 0, "indices": [0], "tick": 120 }),
+            &json!({ "track": 0, "clip": 0, "cuts": [{ "index": 0, "tick": 120 }] }),
         )
         .expect("split should succeed");
     assert_eq!(outcome["split"], 1);
@@ -589,13 +589,43 @@ fn notes_split_cuts_the_selection_at_the_tick() {
 }
 
 #[test]
-fn notes_split_leaves_notes_outside_the_tick_alone_but_selected() {
+fn notes_split_dices_one_note_into_several_pieces() {
+    let mut session = session_with_notes();
+    // Two ticks on one note: the knife's batch form.
+    let outcome = session
+        .execute(
+            "midi.notes_split",
+            &json!({ "track": 0, "clip": 0, "cuts": [
+                { "index": 0, "tick": 80 }, { "index": 0, "tick": 160 },
+            ]}),
+        )
+        .expect("split should succeed");
+    assert_eq!(outcome["split"], 2, "both ticks landed inside the note");
+
+    let all = notes(&session);
+    assert_eq!(all.len(), 6, "one note became three");
+    let indices: Vec<usize> = outcome["indices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as usize)
+        .collect();
+    assert_eq!(indices.len(), 3);
+    let mut starts: Vec<i64> = indices.iter().map(|i| all[*i].start).collect();
+    starts.sort_unstable();
+    assert_eq!(starts, vec![0, 80, 160]);
+}
+
+#[test]
+fn notes_split_leaves_notes_outside_the_tick_alone() {
     let mut session = session_with_notes();
     // Cut at 500: only note 2 ([480..720]) spans it; note 0 does not.
     let outcome = session
         .execute(
             "midi.notes_split",
-            &json!({ "track": 0, "clip": 0, "indices": [0, 2], "tick": 500 }),
+            &json!({ "track": 0, "clip": 0, "cuts": [
+                { "index": 0, "tick": 500 }, { "index": 2, "tick": 500 },
+            ]}),
         )
         .expect("split should succeed");
     assert_eq!(outcome["split"], 1, "exactly one note was cut");
@@ -608,13 +638,8 @@ fn notes_split_leaves_notes_outside_the_tick_alone_but_selected() {
         .iter()
         .map(|v| v.as_u64().unwrap() as usize)
         .collect();
-    assert_eq!(
-        indices.len(),
-        3,
-        "both halves plus the untouched selected note"
-    );
+    assert_eq!(indices.len(), 2, "only the halves of the cut note");
     let starts: Vec<i64> = indices.iter().map(|i| all[*i].start).collect();
-    assert!(starts.contains(&0), "the untouched note stays selected");
     assert!(starts.contains(&480) && starts.contains(&500));
 }
 
@@ -625,7 +650,7 @@ fn notes_split_on_a_boundary_cuts_nothing() {
     let outcome = session
         .execute(
             "midi.notes_split",
-            &json!({ "track": 0, "clip": 0, "indices": [0], "tick": 0 }),
+            &json!({ "track": 0, "clip": 0, "cuts": [{ "index": 0, "tick": 0 }] }),
         )
         .expect("a boundary cut is a no-op, not an error");
     assert_eq!(outcome["split"], 0);
@@ -633,14 +658,14 @@ fn notes_split_on_a_boundary_cuts_nothing() {
 }
 
 #[test]
-fn notes_split_requires_a_selection_and_a_tick() {
+fn notes_split_requires_cuts() {
     let mut session = session_with_notes();
     let error = session
-        .execute("midi.notes_split", &json!({ "tick": 120 }))
-        .expect_err("split needs indices");
+        .execute("midi.notes_split", &json!({}))
+        .expect_err("split needs cuts");
     assert!(matches!(error, CommandError::BadParams { .. }));
     let error = session
-        .execute("midi.notes_split", &json!({ "indices": [0] }))
-        .expect_err("split needs a tick");
+        .execute("midi.notes_split", &json!({ "cuts": [] }))
+        .expect_err("an empty cut list is not an edit");
     assert!(matches!(error, CommandError::BadParams { .. }));
 }

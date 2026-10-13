@@ -3,17 +3,21 @@
 //! Interaction model (M4, see `docs/spec/editing-model.md`): the semantic
 //! decision source is **discrete state**, not the pointer position.
 //!
-//! - **Persistent state** — [`RollMode::Select`] (a left-drag moves the
-//!   selection, trims edges, or marquees on empty space) and
+//! - **Persistent state** — [`RollMode::Select`] (a left-drag tweaks: moves
+//!   the selection, trims edges, or marquees on empty space) and
 //!   [`RollMode::Draw`] (sticky `d`, Esc exits: a drag on empty space
 //!   paints a note). The mode never changes by itself.
-//! - **One-shot command family** — `g` Grab (X/Y axis lock), `s` Scale,
+//! - **Modal command family** — `g` Grab (X/Y axis lock), `s` Scale,
 //!   `t` Stretch (`t+s` = start edge), `k` Cut, `Shift+d` duplicate +
-//!   Grab. Keys arm a [`PendingCmd`]; the next drag/click executes it;
-//!   Esc cancels. Commands act on the selection and work in both modes.
+//!   Grab. G/S/T/Shift+D enter a Blender-style modal transform the moment
+//!   they are pressed: the selection follows the pointer live (drawn as
+//!   ghosts — nothing is applied), LMB confirms, RMB/Esc cancels. `k`
+//!   arms the knife: its stroke cuts every note it crosses, where it
+//!   crosses (no pre-selection needed). Commands work in both modes.
 //! - **Gesture shortcuts** — dragging a note moves, dragging its edge
 //!   trims, Ctrl+drag copies: the unlimited forms of G/T/Shift+D, so the
-//!   highest-frequency edits never need a key press.
+//!   highest-frequency edits never need a key press. Dragging *is* the
+//!   tweak gesture — the modal commands never wait for one.
 //!
 //! Mainstream DAW muscle memory preserved: double-click on empty space
 //! inserts a default-length note; Shift/Ctrl click toggles selection;
@@ -83,6 +87,7 @@ const MIN_SCALE_K: f32 = 0.02;
 /// One frame's relevant key presses (the M4 command family).
 #[derive(Default)]
 struct Keys {
+    shift_d: bool,
     escape: bool,
     d: bool,
     g: bool,
@@ -91,7 +96,7 @@ struct Keys {
     k: bool,
     x: bool,
     y: bool,
-    shift: bool,
+    delete: bool,
 }
 
 /// An edit the roll wants performed.
@@ -135,20 +140,25 @@ pub enum RollIntent {
     Duplicate { indices: Vec<usize>, gesture: u64 },
     /// One frame of a time scale (the Scale command's drag): stretch the
     /// selection by `factor` around `pivot_tick` (the selection bbox
-    /// center, frozen at grab time). The UI emits only the increment still
-    /// owed (`target_k / applied_k`), so the frames do not compound; the
-    /// command clamps per note (start ≥ 0, length ≥ 1) and reports where
-    /// the notes landed.
+    /// *start*, frozen at grab time — scaling from the start keeps the
+    /// notes' relative layout intact). The UI emits only the increment
+    /// still owed (`target_k / applied_k`), so the frames do not compound;
+    /// the command clamps per note (start ≥ 0, length ≥ 1) and reports
+    /// where the notes landed.
     ScaleNotes {
         pivot_tick: i64,
         factor: f32,
         gesture: u64,
     },
-    /// Cut the selection at `tick` (the Cut command): every selected note
-    /// spanning the tick splits into two halves, pitch/velocity/channel
+    /// Cut notes at ticks (the Cut command / the knife stroke's batch):
+    /// every `(index, tick)` splits the note at `index` (still spanning
+    /// `tick` at execution time) into two halves, pitch/velocity/channel
     /// preserved. One invocation is one undo step; the pointer tick is
     /// taken unsnapped — cutting is a precision operation, not a grid one.
-    SplitNotes { tick: i64, gesture: u64 },
+    SplitNotes {
+        cuts: Vec<(usize, i64)>,
+        gesture: u64,
+    },
     /// Remove the notes at these indices.
     DeleteNotes { indices: Vec<usize> },
     /// Set absolute velocities (index, velocity) pairs.
@@ -166,8 +176,11 @@ pub struct RollState {
     pub selection: Vec<usize>,
     /// Persistent mode: what a left-drag on the roll means (M4).
     pub mode: RollMode,
-    /// Armed one-shot command awaiting its drag/click (M4).
-    pub pending: Option<PendingCmd>,
+    /// The live modal transform (G/S/T/Shift+D), if any: the selection
+    /// follows the pointer as ghosts until LMB confirms or RMB/Esc cancels.
+    modal: Option<Modal>,
+    /// Whether the knife (K) is armed: its next stroke cuts what it crosses.
+    pub knife_armed: bool,
     /// One-frame status message for a no-op (empty selection, Cut with
     /// nothing under the pointer); the caller drains it into the app's
     /// status bar via [`RollState::take_status`].
@@ -179,6 +192,9 @@ pub struct RollState {
     /// Rubber band in progress (drag on empty space in Select mode;
     /// Shift/Ctrl makes it additive).
     marquee: Option<Marquee>,
+    /// The active knife stroke (armed `k` + a drag): cuts gather along the
+    /// path and land as one batch on release.
+    knife: Option<KnifeStroke>,
     /// A note was just requested on empty space; the roll does not know its
     /// sorted index until the command reports back, but the draw-drag must
     /// start immediately — the gesture id is kept here.
@@ -226,73 +242,243 @@ pub enum StretchEdge {
     End,
 }
 
-/// A one-shot command awaiting its drag/click (M4). Armed by a key press,
-/// consumed by the next gesture, cancelled by Esc; it never changes the
-/// persistent [`RollMode`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PendingCmd {
-    /// Move the selection; `axis` is the live lock (X/Y, mid-drag too).
-    Grab { axis: Option<Axis> },
-    /// Time-scale the selection around the bbox center.
-    Scale,
-    /// Trim the selection's bbox edge.
-    Stretch { edge: StretchEdge },
-    /// Split the selection at the pointer tick.
-    Cut,
+/// A live modal transform (M4a.4, Blender-style): armed by `g`/`s`/`t`/
+/// `Shift+d`, it follows the pointer as soon as it exists — drawn as
+/// ghosts, applying nothing — and LMB confirms it (one final intent),
+/// RMB/Esc cancels it (nothing to undo: the preview never touched the
+/// document). Because nothing is applied mid-modal, the selection indices
+/// stay valid throughout and the final intent can be computed in one shot.
+#[derive(Debug)]
+pub struct Modal {
+    kind: ModalKind,
+    /// Pointer tick at arm time (the move's zero point).
+    grab_tick: f32,
+    /// Pointer pitch at arm time.
+    grab_note: u8,
+    /// One modal = one undo step; Shift+D's duplicate shares the id.
+    gesture: u64,
 }
 
-impl PendingCmd {
+/// What a [`Modal`] does to the selection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ModalKind {
+    /// Move the selection; `axis` is the live lock (X/Y, Blender
+    /// convention: X = time only, Y = pitch only).
+    Move { axis: Option<Axis> },
+    /// Time-scale the selection around the bbox *start* (frozen at arm).
+    Scale {
+        pivot_tick: i64,
+        /// Pointer distance to the pivot at arm time (ticks, ≥ 1), so the
+        /// live factor starts at 1.
+        grab_dist: f32,
+        max_k: f32,
+    },
+    /// Trim the selection bbox edge.
+    Stretch { edge: StretchEdge, lo: i64, hi: i64 },
+}
+
+impl Modal {
     /// Short chip label for the toolbar (qualifiers included).
-    fn label(self) -> &'static str {
-        match self {
-            PendingCmd::Grab { axis: None } => "G",
-            PendingCmd::Grab {
+    fn label(&self) -> &'static str {
+        match self.kind {
+            ModalKind::Move { axis: None } => "G",
+            ModalKind::Move {
                 axis: Some(Axis::Time),
             } => "G·X",
-            PendingCmd::Grab {
+            ModalKind::Move {
                 axis: Some(Axis::Pitch),
             } => "G·Y",
-            PendingCmd::Scale => "S",
-            PendingCmd::Stretch {
+            ModalKind::Scale { .. } => "S",
+            ModalKind::Stretch {
                 edge: StretchEdge::End,
+                ..
             } => "T",
-            PendingCmd::Stretch {
+            ModalKind::Stretch {
                 edge: StretchEdge::Start,
+                ..
             } => "T·S",
-            PendingCmd::Cut => "K",
         }
     }
+
+    /// Applies an axis qualifier (X/Y) to the move. Pressing the active
+    /// axis again releases the lock; the other axis takes over.
+    fn apply_axis(&mut self, axis: Axis) {
+        if let ModalKind::Move { axis: locked } = &mut self.kind {
+            *locked = if *locked == Some(axis) {
+                None
+            } else {
+                Some(axis)
+            };
+        }
+    }
+
+    /// The transform's live geometry for one pointer position: what the
+    /// ghosts should show, and what a confirming click would apply.
+    fn frame(
+        &self,
+        clip: &MidiClip,
+        selection: &[usize],
+        pointer_tick: f32,
+        pointer_note: u8,
+        grid_ticks: i64,
+        loop_ticks: i64,
+    ) -> ModalFrame {
+        match self.kind {
+            ModalKind::Move { axis } => {
+                let want_start =
+                    snap_ticks(pointer_tick, grid_ticks) - snap_ticks(self.grab_tick, grid_ticks);
+                let want_note = i64::from(pointer_note) - i64::from(self.grab_note);
+                // An axis lock zeroes that axis' target (pressing it again
+                // walks the preview back to the grab position).
+                let (want_start, want_note) = match axis {
+                    Some(Axis::Time) => (want_start, 0),
+                    Some(Axis::Pitch) => (0, want_note),
+                    None => (want_start, want_note),
+                };
+                let (delta_start, delta_note) =
+                    clamped_move_deltas(clip, selection, want_start, want_note, loop_ticks);
+                ModalFrame {
+                    delta_start,
+                    delta_note,
+                    scale_k: 1.0,
+                    pivot_tick: 0,
+                    edge: None,
+                }
+            }
+            ModalKind::Scale {
+                pivot_tick,
+                grab_dist,
+                max_k,
+            } => {
+                // Unsnapped on purpose — scale is continuous, and the spec
+                // forbids grid snapping for it.
+                let dist = (pointer_tick - pivot_tick as f32).abs();
+                let scale_k = (dist / grab_dist).clamp(MIN_SCALE_K, max_k);
+                ModalFrame {
+                    delta_start: 0,
+                    delta_note: 0,
+                    scale_k,
+                    pivot_tick,
+                    edge: None,
+                }
+            }
+            ModalKind::Stretch { edge, lo, hi } => {
+                let delta = match edge {
+                    StretchEdge::End => draw_end(lo, pointer_tick, grid_ticks, loop_ticks) - hi,
+                    StretchEdge::Start => trim_start(hi, pointer_tick, grid_ticks) - lo,
+                };
+                ModalFrame {
+                    delta_start: 0,
+                    delta_note: 0,
+                    scale_k: 1.0,
+                    pivot_tick: 0,
+                    edge: Some((edge, delta)),
+                }
+            }
+        }
+    }
+
+    /// The single intent that applies the whole transform — or `None` when
+    /// the pointer never left the grab point (a no-op must not spend an
+    /// undo step).
+    fn finalize(
+        &self,
+        clip: &MidiClip,
+        selection: &[usize],
+        frame: ModalFrame,
+        loop_ticks: i64,
+    ) -> Option<RollIntent> {
+        match self.kind {
+            ModalKind::Move { .. } if frame.delta_start != 0 || frame.delta_note != 0 => {
+                Some(clamped_move(
+                    clip,
+                    selection,
+                    frame.delta_start,
+                    frame.delta_note,
+                    loop_ticks,
+                    Some(self.gesture),
+                ))
+            }
+            ModalKind::Scale { pivot_tick, .. } if (frame.scale_k - 1.0).abs() > f32::EPSILON => {
+                Some(RollIntent::ScaleNotes {
+                    pivot_tick,
+                    factor: frame.scale_k,
+                    gesture: self.gesture,
+                })
+            }
+            ModalKind::Stretch {
+                edge: StretchEdge::End,
+                ..
+            } if frame.edge.is_some_and(|(_, delta)| delta != 0) => Some(RollIntent::ResizeEnd {
+                delta_ticks: frame.edge.unwrap().1,
+                gesture: self.gesture,
+            }),
+            ModalKind::Stretch {
+                edge: StretchEdge::Start,
+                ..
+            } if frame.edge.is_some_and(|(_, delta)| delta != 0) => Some(RollIntent::ResizeStart {
+                delta_ticks: frame.edge.unwrap().1,
+                gesture: self.gesture,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// One pointer position's worth of [`Modal`] geometry (for the ghost
+/// preview and the confirming click's final intent).
+#[derive(Debug, Clone, Copy)]
+struct ModalFrame {
+    /// Move: the clamped total offset from the grab point.
+    delta_start: i64,
+    delta_note: i8,
+    /// Scale: the factor around `pivot_tick` (1.0 = untouched).
+    scale_k: f32,
+    pivot_tick: i64,
+    /// Stretch: the edge and its snapped total delta (0 = untouched).
+    edge: Option<(StretchEdge, i64)>,
+}
+
+impl ModalFrame {
+    /// Whether the frame would leave the notes where they are.
+    fn is_identity(&self) -> bool {
+        self.delta_start == 0
+            && self.delta_note == 0
+            && (self.scale_k - 1.0).abs() <= f32::EPSILON
+            && self.edge.is_none_or(|(_, delta)| delta == 0)
+    }
+}
+
+/// An armed knife (`k`) stroke: the path the pointer sweeps cuts every
+/// note it crosses, where it crosses — no pre-selection needed. The cuts
+/// gather during the stroke and land as one batch on release (one stroke
+/// = one undo step): split commands re-sort the clip, so applying
+/// mid-stroke would invalidate the very indices the next frame's segment
+/// test uses.
+#[derive(Debug)]
+struct KnifeStroke {
+    /// Where the previous frame's segment ended.
+    last: egui::Pos2,
+    gesture: u64,
+    /// `(note index, cut tick)` pairs gathered so far — the first crossing
+    /// of a note wins. Indices are safe: nothing mutates mid-stroke.
+    cuts: Vec<(usize, i64)>,
+    /// The swept path, for the stroke's visual feedback.
+    path: Vec<egui::Pos2>,
 }
 
 /// Which kind of drag a [`DragSelection`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DragKind {
-    /// Move the whole selection (grab on an existing note, or the armed
-    /// Grab command). `axis` is the live lock; `None` is a free move.
+    /// Move the whole selection (a grab on an existing note). `axis` is
+    /// the live lock; `None` is a free move (X/Y applies mid-drag too).
     Move { axis: Option<Axis> },
-    /// Trim the start edge (left-edge drag, or `t+s`).
+    /// Trim the start edge (left-edge drag).
     ResizeStart,
     /// Draw the length of a just-created note (note on at the press point,
     /// note off at the release point) or trim the end edge (right-edge
-    /// drag, or bare `t`): the end follows the pointer.
+    /// drag): the end follows the pointer.
     ResizeEnd,
-    /// Time-scale the selection (the armed Scale command); the scale state
-    /// lives in [`DragSelection::scale`].
-    Scale,
-}
-
-/// Scale-drag state: the pivot (selection bbox center) is frozen at grab
-/// time, and `applied_factor` tracks the scale the document has already
-/// been told about, so each frame emits only the increment still owed
-/// (`target_k / applied_factor`). `max_k` keeps the stretched bbox inside
-/// the loop, mirroring how a move clamps against the loop end.
-#[derive(Debug)]
-struct ScaleGesture {
-    pivot_tick: i64,
-    /// Pointer distance to the pivot at grab time (ticks, ≥ 1).
-    grab_dist: f32,
-    applied_factor: f32,
-    max_k: f32,
 }
 
 /// One in-flight drag (move, trim, or scale).
@@ -334,8 +520,6 @@ struct DragSelection {
     /// Cumulative pitch shift (semitones) already handed to the command.
     applied_note: i64,
     kind: DragKind,
-    /// Scale state, set only for [`DragKind::Scale`].
-    scale: Option<ScaleGesture>,
     /// Gesture id: one drag is one undo step (the id is part of the undo
     /// merge key, and `AddNote`/`Duplicate` frames carry the same id).
     gesture: u64,
@@ -354,8 +538,8 @@ impl DragSelection {
         )
     }
 
-    /// Anchors a gesture on explicit start/end ticks (the armed Stretch
-    /// command's selection bbox edge, which names no single note).
+    /// Anchors a gesture on explicit start/end ticks (a bbox-anchored
+    /// gesture that names no single note).
     fn at(
         anchor_start: i64,
         anchor_end: i64,
@@ -373,16 +557,7 @@ impl DragSelection {
             applied_end: 0,
             applied_note: 0,
             kind,
-            scale: None,
             gesture,
-        }
-    }
-
-    /// Starts a scale gesture on the frozen pivot / grab distance.
-    fn scaled(scale: ScaleGesture, grab_tick: f32, grab_note: u8, gesture: u64) -> Self {
-        Self {
-            scale: Some(scale),
-            ..Self::at(0, 0, grab_tick, grab_note, DragKind::Scale, gesture)
         }
     }
 
@@ -425,10 +600,12 @@ impl RollState {
             }),
             selection: Vec::new(),
             mode: RollMode::Select,
-            pending: None,
+            modal: None,
+            knife_armed: false,
             status: None,
             drag: None,
             marquee: None,
+            knife: None,
             awaiting_create: None,
             draw_seq: 0,
         }
@@ -465,12 +642,17 @@ impl RollState {
         self.draw_seq
     }
 
-    /// Whether a drag or marquee gesture is in progress.
+    /// Whether a drag, marquee, modal transform or knife stroke is in
+    /// progress.
     pub fn is_dragging(&self) -> bool {
-        self.drag.is_some() || self.marquee.is_some()
+        self.drag.is_some()
+            || self.marquee.is_some()
+            || self.modal.is_some()
+            || self.knife.is_some()
     }
 
-    /// Drops every gesture, the armed command and the selection.
+    /// Drops every gesture, the modal transform, the knife and the
+    /// selection.
     ///
     /// Called before undo/redo (and after deletions): the held indices refer
     /// to a document that changed underneath them. The persistent mode
@@ -479,7 +661,9 @@ impl RollState {
         self.drag = None;
         self.marquee = None;
         self.awaiting_create = None;
-        self.pending = None;
+        self.modal = None;
+        self.knife = None;
+        self.knife_armed = false;
         self.selection.clear();
     }
 
@@ -488,31 +672,25 @@ impl RollState {
         self.status.take()
     }
 
+    /// Whether a modal transform is live (G/S/T/Shift+D following the
+    /// pointer, awaiting LMB confirm or RMB/Esc cancel).
+    pub fn modal_active(&self) -> bool {
+        self.modal.is_some()
+    }
+
     /// Records a one-frame status message for the app's status bar.
     fn note_status(&mut self, message: impl Into<String>) {
         self.status = Some(message.into());
     }
 
-    /// Arms a one-shot command, or explains why it cannot be armed (an
-    /// empty selection makes every transform a no-op).
-    fn arm(&mut self, command: PendingCmd) {
-        if self.selection.is_empty() {
-            self.note_status(match command {
-                PendingCmd::Grab { .. } => "Grab: nothing selected",
-                PendingCmd::Scale => "Scale: nothing selected",
-                PendingCmd::Stretch { .. } => "Stretch: nothing selected",
-                PendingCmd::Cut => "Cut: nothing selected",
-            });
-            return;
-        }
-        self.pending = Some(command);
-    }
-
-    /// Esc: cancel the armed command; else leave Draw mode; else clear the
-    /// selection. The priority keeps a command cancellable without also
-    /// losing the selection it was about to act on.
+    /// Esc: cancel the modal transform (nothing has been applied — the
+    /// preview never touched the document); else cancel the knife; else
+    /// leave Draw mode; else clear the selection. The priority keeps a
+    /// running interaction cancellable without side effects on the mode or
+    /// selection it was about to act on.
     fn escape(&mut self) {
-        if self.pending.take().is_some() {
+        if self.modal.take().is_some() || self.knife.take().is_some() || self.knife_armed {
+            self.knife_armed = false;
             return;
         }
         if self.mode == RollMode::Draw {
@@ -522,24 +700,15 @@ impl RollState {
         }
     }
 
-    /// Applies an axis qualifier (X/Y) to the running move drag, or to the
-    /// armed Grab while no drag owns the pointer yet. Pressing the active
-    /// axis again releases the lock (Blender convention); the other axis
-    /// takes over.
+    /// Applies an axis qualifier (X/Y) to the running modal move or the
+    /// running tweak drag. Pressing the active axis again releases the
+    /// lock (Blender convention); the other axis takes over.
     fn apply_axis(&mut self, axis: Axis) {
-        // The running drag wins over the armed command: an armed Grab
-        // keeps its `pending` entry alive until the drag stops, so
-        // checking the pending first would lock a stale entry and leave
-        // the actual move free.
-        if let Some(drag) = &mut self.drag
+        if let Some(modal) = &mut self.modal {
+            modal.apply_axis(axis);
+        } else if let Some(drag) = &mut self.drag
             && let DragKind::Move { axis: locked } = &mut drag.kind
         {
-            *locked = if *locked == Some(axis) {
-                None
-            } else {
-                Some(axis)
-            };
-        } else if let Some(PendingCmd::Grab { axis: locked }) = &mut self.pending {
             *locked = if *locked == Some(axis) {
                 None
             } else {
@@ -615,21 +784,34 @@ pub fn show(
         {
             state.mode = state.mode.toggled();
         }
-        if let Some(command) = state.pending {
+        // The live modal transform beside the mode chip (with its
+        // qualifiers); clicking it cancels. Otherwise, the armed knife.
+        let modal_label = state.modal.as_ref().map(Modal::label);
+        if let Some(label) = modal_label {
             if ui
                 .add(
                     egui::Label::new(
-                        egui::RichText::new(command.label())
-                            .color(egui::Color32::YELLOW)
-                            .strong(),
+                        egui::RichText::new(label).color(egui::Color32::YELLOW).strong(),
                     )
                     .sense(egui::Sense::click()),
                 )
-                .on_hover_text("Armed command — drag to run it, Esc to cancel")
+                .on_hover_text("Modal transform — the selection follows the pointer · LMB confirms · RMB/Esc cancels")
                 .clicked()
             {
-                state.pending = None;
+                state.modal = None;
             }
+        } else if state.knife_armed
+            && ui
+                .add(
+                    egui::Label::new(
+                        egui::RichText::new("K").color(egui::Color32::YELLOW).strong(),
+                    )
+                    .sense(egui::Sense::click()),
+                )
+                .on_hover_text("Knife armed — a stroke cuts every note it crosses · Esc cancels")
+                .clicked()
+        {
+            state.knife_armed = false;
         }
         // The hint must never overflow the panel: an overflowing child
         // expands the ui's available rect (egui grows `max_rect` to include
@@ -638,7 +820,7 @@ pub fn show(
         ui.add(
             egui::Label::new(
                 egui::RichText::new(
-                    "click: select · drag: move·band · dbl-click: insert · edges: trim · Ctrl+drag: copy · d: draw · g move · s scale · t stretch · k cut · RMB: delete · arrows: nudge",
+                    "click: select · drag: tweak · dbl-click: insert · edges: trim · Ctrl+drag: copy · d: draw · G move · S scale · T stretch (LMB ok · RMB/Esc cancel) · K knife · Del del · RMB: delete · arrows: nudge",
                 )
                 .weak(),
             )
@@ -672,6 +854,37 @@ pub fn show(
     let painter = ui.painter_at(rect);
     let top_note = state.top_note.round() as i32;
     let min_note = top_note - VISIBLE_ROWS + 1;
+
+    // ---- Pointer → tick/pitch helpers (the keyboard section needs them
+    // for the modal grab point; the interaction sections below reuse them).
+    let pointer_tick = |pos: egui::Pos2| ((pos.x - rect.left()) / ticks_to_x).max(0.0);
+    let pointer_note = |pos: egui::Pos2| {
+        (top_note as f32 - (pos.y - rect.top()) / ROW_HEIGHT)
+            .round()
+            .clamp(0.0, 127.0) as u8
+    };
+    let hit_note = |pos: egui::Pos2| note_at(clip, pos, rect, ticks_to_x, top_note);
+    let snap = |ticks: f32| -> i64 { snap_ticks(ticks, grid_ticks) };
+    let modifiers = ui.ctx().input(|i| i.modifiers);
+    let additive = modifiers.shift || modifiers.ctrl;
+
+    // Live modal geometry: computed from the pointer's latest position (a
+    // modal transform follows the mouse even outside the roll), feeding the
+    // ghost preview drawn below and the confirming click's final intent.
+    let modal_frame = state.modal.as_ref().map(|modal| {
+        let pos = ui
+            .ctx()
+            .input(|i| i.pointer.latest_pos())
+            .unwrap_or_else(|| rect.center());
+        modal.frame(
+            clip,
+            &state.selection,
+            pointer_tick(pos),
+            pointer_note(pos),
+            grid_ticks,
+            loop_ticks,
+        )
+    });
 
     // 1. Row background (black keys darker).
     for note in min_note..=top_note {
@@ -743,6 +956,26 @@ pub fn show(
         painter.rect_filled(note_rect(rect, note, ticks_to_x, y), 2.0, fill);
     }
 
+    // 3b. Modal ghosts: the selection at its transformed geometry. Preview
+    // only — nothing is applied until the confirming click, so cancelling
+    // costs nothing.
+    if let Some(frame) = &modal_frame
+        && !frame.is_identity()
+    {
+        for index in &state.selection {
+            let Some(note) = clip.notes().get(*index) else {
+                continue;
+            };
+            let ghost = modal_ghost(note, frame);
+            let y = rect.top() + (top_note as f32 - f32::from(ghost.note)) * ROW_HEIGHT;
+            painter.rect_filled(
+                note_rect(rect, &ghost, ticks_to_x, y),
+                2.0,
+                egui::Color32::from_rgba_unmultiplied(240, 190, 80, 110),
+            );
+        }
+    }
+
     // 4. Rubber band.
     if let Some(marquee) = &state.marquee {
         let band = egui::Rect::from_two_pos(marquee.origin, marquee.current);
@@ -757,6 +990,16 @@ pub fn show(
             egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 140, 220)),
             egui::StrokeKind::Inside,
         );
+    }
+
+    // 4b. Knife stroke trail (the cuts themselves land on release).
+    if let Some(knife) = &state.knife
+        && knife.path.len() > 1
+    {
+        painter.add(egui::Shape::line(
+            knife.path.clone(),
+            egui::Stroke::new(1.5, egui::Color32::from_rgb(240, 190, 80)),
+        ));
     }
 
     // 5. Playhead (musical position modulo loop length).
@@ -805,36 +1048,45 @@ pub fn show(
         );
     }
 
-    // ---- Keyboard: mode + one-shot command family (M4a). ----
+    // ---- Keyboard: mode + the modal command family (M4a). ----
     // Gated on focus so the keys never leak into text fields elsewhere.
-    // Axis qualifiers also apply mid-drag (Blender convention); the rest of
-    // the family is ignored while a drag owns the pointer.
+    // Axis qualifiers also apply mid-transform (Blender convention); the
+    // rest of the family is ignored while a modal or a stroke owns the
+    // pointer.
     if response.has_focus() {
-        // Claim Escape from egui's focus machinery: by default a focused
-        // widget *surrenders* focus the moment Escape is pressed (it is
-        // cleared in `Memory::begin_pass`, before any widget is laid out),
-        // so the roll would never see the key that cancels its armed
-        // command. The filter is read next frame, which is fine — focus
-        // persists until something else takes it.
+        // Claim the keys egui's focus machinery would otherwise steal:
+        // Escape makes a focused widget *surrender* focus before any
+        // widget is laid out (cleared in `Memory::begin_pass`), and the
+        // arrows move focus instead of reaching the widget (the roll
+        // nudges with them). The filter is read next frame, which is fine
+        // — focus persists until something else takes it.
         ui.memory_mut(|m| {
             m.set_focus_lock_filter(
                 response.id,
                 egui::EventFilter {
                     escape: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
                     ..Default::default()
                 },
             );
         });
-        let keys = ui.ctx().input(|i| Keys {
-            escape: i.key_pressed(egui::Key::Escape),
-            d: i.key_pressed(egui::Key::D),
-            g: i.key_pressed(egui::Key::G),
-            s: i.key_pressed(egui::Key::S),
-            t: i.key_pressed(egui::Key::T),
-            k: i.key_pressed(egui::Key::K),
-            x: i.key_pressed(egui::Key::X),
-            y: i.key_pressed(egui::Key::Y),
-            shift: i.modifiers.shift,
+        // Every handled key is *consumed*, so it cannot bubble into egui's
+        // focus machinery or other widgets (an unconsumed press is what
+        // produces the system beep on some platforms). `consume_key`
+        // matches modifiers logically (extra Shift/Alt ignored), so the
+        // more specific Shift+D must be consumed before the plain `d`.
+        let keys = ui.ctx().input_mut(|i| Keys {
+            shift_d: i.consume_key(egui::Modifiers::SHIFT, egui::Key::D),
+            escape: i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+            d: i.consume_key(egui::Modifiers::NONE, egui::Key::D),
+            g: i.consume_key(egui::Modifiers::NONE, egui::Key::G),
+            s: i.consume_key(egui::Modifiers::NONE, egui::Key::S),
+            t: i.consume_key(egui::Modifiers::NONE, egui::Key::T),
+            k: i.consume_key(egui::Modifiers::NONE, egui::Key::K),
+            x: i.consume_key(egui::Modifiers::NONE, egui::Key::X),
+            y: i.consume_key(egui::Modifiers::NONE, egui::Key::Y),
+            delete: i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
         });
         if keys.x {
             state.apply_axis(Axis::Time);
@@ -842,88 +1094,158 @@ pub fn show(
         if keys.y {
             state.apply_axis(Axis::Pitch);
         }
-        if state.drag.is_none() {
-            if keys.escape {
-                state.escape();
-            } else if keys.d && keys.shift && state.pending.is_none() {
-                // Shift+D: copy the selection, then arm Grab on the copies.
-                // The copy and the move frames of the following drag share
-                // one gesture id, so the whole thing is one undo step.
-                let gesture = state.next_gesture();
-                intent = Some(RollIntent::Duplicate {
-                    indices: state.selection.clone(),
-                    gesture,
-                });
-                state.pending = Some(PendingCmd::Grab { axis: None });
-            } else if keys.d {
-                // A state command cancels a pending transform first, then
-                // toggles the mode.
-                state.pending = None;
-                state.mode = state.mode.toggled();
-            } else if let Some(PendingCmd::Stretch { .. }) = state.pending {
-                // `s` during a pending Stretch is the start-edge qualifier,
-                // not the Scale command — context disambiguation.
-                if keys.s {
-                    state.pending = Some(PendingCmd::Stretch {
+        // The modal grabs from wherever the pointer is right now.
+        let arm_pos = ui
+            .ctx()
+            .input(|i| i.pointer.latest_pos())
+            .or_else(|| response.hover_pos())
+            .unwrap_or_else(|| response.rect.center());
+        if keys.escape {
+            state.escape();
+        } else if let Some(modal) = &mut state.modal {
+            // A modal transform owns the keyboard: only the qualifiers
+            // answer (`s` flips a Stretch to its start edge), everything
+            // else is ignored — the command family never chains.
+            if keys.s && matches!(modal.kind, ModalKind::Stretch { .. }) {
+                if let ModalKind::Stretch { lo, hi, .. } = modal.kind {
+                    modal.kind = ModalKind::Stretch {
                         edge: StretchEdge::Start,
-                    });
-                }
-            } else if state.pending.is_none() {
-                if keys.g {
-                    state.arm(PendingCmd::Grab { axis: None });
-                } else if keys.s {
-                    state.arm(PendingCmd::Scale);
-                } else if keys.t {
-                    state.arm(PendingCmd::Stretch {
-                        edge: StretchEdge::End,
-                    });
-                } else if keys.k {
-                    state.arm(PendingCmd::Cut);
+                        lo,
+                        hi,
+                    };
                 }
             }
-            // Any other key during a pending command is ignored: the
-            // command family never chains.
+        } else if state.knife.is_some() || state.drag.is_some() {
+            // A knife stroke or a tweak drag owns the pointer; the family
+            // never chains.
+        } else {
+            if keys.shift_d {
+                if state.selection.is_empty() {
+                    state.note_status("Duplicate: nothing selected");
+                } else {
+                    // Shift+D: copy the selection, then move the copies in
+                    // a modal Grab. The duplicate command and the confirming
+                    // move share one gesture id — one undo step.
+                    let gesture = state.next_gesture();
+                    intent = Some(RollIntent::Duplicate {
+                        indices: state.selection.clone(),
+                        gesture,
+                    });
+                    state.modal = Some(Modal {
+                        kind: ModalKind::Move { axis: None },
+                        grab_tick: pointer_tick(arm_pos),
+                        grab_note: pointer_note(arm_pos),
+                        gesture,
+                    });
+                }
+            } else if keys.d {
+                // A state command cancels the armed knife first, then
+                // toggles the mode.
+                state.knife_armed = false;
+                state.mode = state.mode.toggled();
+            } else if keys.g {
+                if state.selection.is_empty() {
+                    state.note_status("Grab: nothing selected");
+                } else {
+                    state.modal = Some(Modal {
+                        kind: ModalKind::Move { axis: None },
+                        grab_tick: pointer_tick(arm_pos),
+                        grab_note: pointer_note(arm_pos),
+                        gesture: state.next_gesture(),
+                    });
+                }
+            } else if keys.s {
+                match selection_bbox(clip, &state.selection) {
+                    Some((lo, hi)) => {
+                        let grab_tick = pointer_tick(arm_pos);
+                        state.modal = Some(Modal {
+                            kind: ModalKind::Scale {
+                                // The pivot is the bbox *start*: scaling from
+                                // the start keeps the notes' relative layout
+                                // intact (nothing sits left of it).
+                                pivot_tick: lo,
+                                grab_dist: (grab_tick - lo as f32).abs().max(1.0),
+                                max_k: scale_max_k(lo, hi, loop_ticks),
+                            },
+                            grab_tick,
+                            grab_note: pointer_note(arm_pos),
+                            gesture: state.next_gesture(),
+                        });
+                    }
+                    None => state.note_status("Scale: nothing selected"),
+                }
+            } else if keys.t {
+                match selection_bbox(clip, &state.selection) {
+                    Some((lo, hi)) => {
+                        let grab_tick = pointer_tick(arm_pos);
+                        state.modal = Some(Modal {
+                            kind: ModalKind::Stretch {
+                                edge: StretchEdge::End,
+                                lo,
+                                hi,
+                            },
+                            grab_tick,
+                            grab_note: pointer_note(arm_pos),
+                            gesture: state.next_gesture(),
+                        });
+                    }
+                    None => state.note_status("Stretch: nothing selected"),
+                }
+            } else if keys.k {
+                state.knife_armed = true;
+            } else if keys.delete && !state.selection.is_empty() {
+                intent = Some(RollIntent::DeleteNotes {
+                    indices: state.selection.clone(),
+                });
+            }
         }
     }
 
     // ---- Interaction → intents. ----
-    let pointer_tick = |pos: egui::Pos2| ((pos.x - rect.left()) / ticks_to_x).max(0.0);
-    let pointer_note = |pos: egui::Pos2| {
-        (top_note as f32 - (pos.y - rect.top()) / ROW_HEIGHT)
-            .round()
-            .clamp(0.0, 127.0) as u8
-    };
-    let hit_note = |pos: egui::Pos2| note_at(clip, pos, rect, ticks_to_x, top_note);
-    let snap = |ticks: f32| -> i64 { snap_ticks(ticks, grid_ticks) };
-    let modifiers = ui.ctx().input(|i| i.modifiers);
-    let additive = modifiers.shift || modifiers.ctrl;
+    // (The pointer helpers live above the keyboard section, which needs
+    // them for the modal grab point.)
 
-    // A plain click (no drag): the armed Cut consumes it (one cut at the
-    // pointer tick); otherwise select the note under the pointer, or on
-    // empty space deselect — or insert a default note on the second click
-    // of a double-click. Creation deliberately requires a drag (draw mode)
-    // or a double-click, so a stray click meant as "clear the selection"
-    // never paints a note. (egui only reports drag_started once the
-    // pointer moved, so click and drag are already disambiguated.)
+    // A plain click (no drag): a modal transform consumes it as the
+    // *confirmation* (LMB anywhere fixes the geometry); an armed knife
+    // consumes it as a zero-length stroke (one cut through every note
+    // spanning the pointer tick, no pre-selection needed); otherwise it
+    // selects the note under the pointer, or on empty space deselects —
+    // or inserts a default note on the second click of a double-click.
+    // Creation deliberately requires a drag (draw mode) or a double-click,
+    // so a stray click meant as "clear the selection" never paints a note.
+    // (egui only reports drag_started once the pointer moved, so click and
+    // drag are already disambiguated.)
     if response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            if matches!(state.pending, Some(PendingCmd::Cut)) {
-                // One invocation = one cut; the command is consumed whether
-                // or not a selected note actually spans the tick.
+            if let Some(modal) = state.modal.take() {
+                let frame = modal.frame(
+                    clip,
+                    &state.selection,
+                    pointer_tick(pos),
+                    pointer_note(pos),
+                    grid_ticks,
+                    loop_ticks,
+                );
+                intent = modal.finalize(clip, &state.selection, frame, loop_ticks);
+            } else if state.knife_armed {
                 let tick = pointer_tick(pos).round() as i64;
-                if cut_spans(clip, &state.selection, tick) {
+                let cuts: Vec<(usize, i64)> = clip
+                    .notes()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| n.start < tick && tick < n.end())
+                    .map(|(index, _)| (index, tick))
+                    .collect();
+                if cuts.is_empty() {
+                    state.note_status("Cut: nothing under the knife");
+                } else {
                     intent = Some(RollIntent::SplitNotes {
-                        tick,
+                        cuts,
                         gesture: state.next_gesture(),
                     });
-                } else {
-                    state.note_status("Cut: no selected note at the pointer");
                 }
-                state.pending = None;
+                state.knife_armed = false;
             } else {
-                // Any other click cancels an armed transform (the click is
-                // a selection intent, not a zero-delta transform).
-                state.pending = None;
                 match hit_note(pos) {
                     Some(index) => {
                         if additive {
@@ -956,14 +1278,19 @@ pub fn show(
         }
     }
 
-    // Arrow-key nudging (M2.3) — only while the roll holds focus.
+    // Arrow-key nudging (M2.3) — only while the roll holds focus. The keys
+    // are *consumed*: with the focus lock filter above they cannot move
+    // focus away from the roll, and consuming them keeps egui's built-in
+    // arrow navigation from firing at all, so nudging works continuously.
+    // (consume_key matches modifiers logically — Shift+arrow still reads
+    // as the bare arrow here, with `modifiers` supplying the octave.)
     if response.has_focus() {
-        let (down, up, left, right, shift) = ui.ctx().input(|i| {
+        let (down, up, left, right, shift) = ui.ctx().input_mut(|i| {
             (
-                i.key_pressed(egui::Key::ArrowDown),
-                i.key_pressed(egui::Key::ArrowUp),
-                i.key_pressed(egui::Key::ArrowLeft),
-                i.key_pressed(egui::Key::ArrowRight),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
                 i.modifiers.shift,
             )
         });
@@ -993,19 +1320,28 @@ pub fn show(
         }
     }
 
-    // Edge-trim affordance: hovering near a note's start/end turns the
-    // pointer into a horizontal resize cursor. Draw mode and the armed Cut
-    // show a crosshair on empty space (precision aiming).
-    if response.hovered() && state.drag.is_none() {
+    // Cursor affordances: a modal transform shows what it does (move /
+    // resize); hovering near a note's start/end turns the pointer into a
+    // horizontal resize cursor; draw mode and the armed knife show a
+    // crosshair (precision aiming).
+    if let Some(modal) = &state.modal {
+        ui.ctx().set_cursor_icon(match modal.kind {
+            ModalKind::Move { .. } => egui::CursorIcon::Move,
+            ModalKind::Stretch { .. } | ModalKind::Scale { .. } => {
+                egui::CursorIcon::ResizeHorizontal
+            }
+        });
+    } else if response.hovered() && state.drag.is_none() {
         if let Some(pos) = response.hover_pos() {
-            if let Some(index) = hit_note(pos) {
+            if state.knife_armed {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            } else if let Some(index) = hit_note(pos) {
                 let note = &clip.notes()[index];
                 let (x0, x1) = note_edges(rect, note, ticks_to_x);
                 if edge_zone(pos.x, x0, x1).is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
-            } else if state.mode == RollMode::Draw || matches!(state.pending, Some(PendingCmd::Cut))
-            {
+            } else if state.mode == RollMode::Draw {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             }
         }
@@ -1027,73 +1363,20 @@ pub fn show(
             .input(|i| i.pointer.press_origin())
             .or_else(|| response.interact_pointer_pos());
         if let Some(pos) = press {
-            if let Some(command) = state.pending {
-                // An armed command owns the drag: it acts on the existing
-                // selection (an empty one was refused at arm time) and never
-                // re-selects by press point. The drag may start anywhere in
-                // the roll — the command already knows its target.
-                let gesture = state.next_gesture();
-                let bbox = selection_bbox(clip, &state.selection);
-                match command {
-                    PendingCmd::Grab { axis } => {
-                        state.drag = Some(DragSelection::at(
-                            0,
-                            0,
-                            pointer_tick(pos),
-                            pointer_note(pos),
-                            DragKind::Move { axis },
-                            gesture,
-                        ));
-                    }
-                    PendingCmd::Scale => {
-                        if let Some((lo, hi)) = bbox {
-                            let scale =
-                                scale_gesture((lo + hi) / 2, hi, pointer_tick(pos), loop_ticks);
-                            state.drag = Some(DragSelection::scaled(
-                                scale,
-                                pointer_tick(pos),
-                                pointer_note(pos),
-                                gesture,
-                            ));
-                        } else {
-                            // Defensive: arm() refuses an empty selection.
-                            state.pending = None;
-                        }
-                    }
-                    PendingCmd::Stretch { edge } => {
-                        if let Some((lo, hi)) = bbox {
-                            // The bbox edge is the anchor (no single note was
-                            // grabbed); both edges of the box stretch with it.
-                            state.drag = Some(DragSelection::at(
-                                lo,
-                                hi,
-                                pointer_tick(pos),
-                                pointer_note(pos),
-                                match edge {
-                                    StretchEdge::Start => DragKind::ResizeStart,
-                                    StretchEdge::End => DragKind::ResizeEnd,
-                                },
-                                gesture,
-                            ));
-                        } else {
-                            state.pending = None;
-                        }
-                    }
-                    PendingCmd::Cut => {
-                        // A drag also cuts once, at the press point ("one
-                        // stroke = one cut"; multi-cut is explicitly out of
-                        // scope for M4).
-                        let tick = pointer_tick(pos).round() as i64;
-                        if cut_spans(clip, &state.selection, tick) {
-                            intent = Some(RollIntent::SplitNotes { tick, gesture });
-                        } else {
-                            state.note_status("Cut: no selected note at the pointer");
-                        }
-                        state.pending = None;
-                    }
-                }
+            if state.modal.is_some() {
+                // A modal transform follows the pointer by itself; a drag
+                // during one is ignored — LMB confirms, RMB/Esc cancels.
+            } else if state.knife_armed {
+                // Knife stroke start: cuts gather along the swept path and
+                // land as one batch on release.
+                state.knife = Some(KnifeStroke {
+                    last: pos,
+                    gesture: state.next_gesture(),
+                    cuts: Vec::new(),
+                    path: vec![pos],
+                });
             } else {
-                // No armed command: classify by the press point × mode.
+                // No modal, no knife: classify by the press point × mode.
                 // Edge-trim affordance is checked first: within EDGE_PX of a
                 // note's start/end the grab trims that edge instead of moving.
                 let edge = hit_note(pos).and_then(|index| {
@@ -1216,7 +1499,23 @@ pub fn show(
     // point, so nothing is lost).
     if response.dragged() && !(response.drag_started() && intent.is_some()) {
         if let Some(pos) = response.interact_pointer_pos() {
-            if let Some(drag) = &mut state.drag {
+            if let Some(knife) = &mut state.knife {
+                // Knife stroke: the frame's segment cuts every note it
+                // crosses, where it crosses. Cuts only gather here — they
+                // land as one batch on release (see `drag_stopped`).
+                let from = knife.last;
+                knife.last = pos;
+                knife.path.push(pos);
+                for (index, note) in clip.notes().iter().enumerate() {
+                    if knife.cuts.iter().any(|(cut, _)| *cut == index) {
+                        continue; // one cut per note per stroke
+                    }
+                    if let Some(tick) = knife_crossing(from, pos, rect, note, ticks_to_x, top_note)
+                    {
+                        knife.cuts.push((index, tick));
+                    }
+                }
+            } else if let Some(drag) = &mut state.drag {
                 // Every branch below computes the *absolute* target the
                 // gesture is asking for, then emits only the increment
                 // still owed (`target - applied`). Commands apply relative
@@ -1300,27 +1599,6 @@ pub fn show(
                             });
                         }
                     }
-                    DragKind::Scale => {
-                        // Time scale: k = pointer distance to the pivot over
-                        // the grab distance. Unsapped on purpose — scale is
-                        // continuous, and the spec forbids grid snapping for
-                        // it. The emitted factor is the increment still owed
-                        // (`target_k / applied_factor`), so frames do not
-                        // compound; the command clamps per note.
-                        if let Some(scale) = drag.scale.as_mut() {
-                            let dist = (pointer_tick(pos) - scale.pivot_tick as f32).abs();
-                            let target_k = (dist / scale.grab_dist).clamp(MIN_SCALE_K, scale.max_k);
-                            let factor = target_k / scale.applied_factor;
-                            if (factor - 1.0).abs() > f32::EPSILON {
-                                scale.applied_factor = target_k;
-                                intent = Some(RollIntent::ScaleNotes {
-                                    pivot_tick: scale.pivot_tick,
-                                    factor,
-                                    gesture: drag.gesture,
-                                });
-                            }
-                        }
-                    }
                 }
             } else if let Some(marquee) = &mut state.marquee {
                 marquee.current = pos;
@@ -1353,10 +1631,18 @@ pub fn show(
             }
         }
         state.drag = None;
-        // A one-shot command's drag is its execution, so the command is
-        // consumed. (A gesture drag never arms a command, so any pending
-        // command here belonged to the drag that just ended.)
-        state.pending = None;
+        // A knife stroke ends here: the gathered cuts land as one batch
+        // (one undo step). One stroke per arming — a stroke that crossed
+        // nothing just disarms.
+        if let Some(knife) = state.knife.take() {
+            state.knife_armed = false;
+            if !knife.cuts.is_empty() {
+                intent = Some(RollIntent::SplitNotes {
+                    cuts: knife.cuts,
+                    gesture: knife.gesture,
+                });
+            }
+        }
         // A press-draw that never actually moved (or whose note creation
         // failed) leaves a parked grab point; drop it so no drag starts
         // from a stale gesture.
@@ -1365,7 +1651,11 @@ pub fn show(
 
     if response.secondary_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            if let Some(index) = hit_note(pos) {
+            if state.modal.take().is_some() || state.knife.take().is_some() || state.knife_armed {
+                // RMB cancels a modal transform or the knife (Blender), and
+                // never deletes while one is running.
+                state.knife_armed = false;
+            } else if let Some(index) = hit_note(pos) {
                 let indices = if state.selection.contains(&index) {
                     state.selection.clone()
                 } else {
@@ -1446,14 +1736,48 @@ fn edge_zone(x: f32, left: f32, right: f32) -> Option<DragKind> {
     }
 }
 
-/// Whether any selected note spans `tick` (the Cut command's guard: a cut
-/// with nothing to cut is a no-op, not an edit).
-fn cut_spans(clip: &MidiClip, selection: &[usize], tick: i64) -> bool {
-    selection.iter().any(|index| {
-        clip.notes()
-            .get(*index)
-            .is_some_and(|note| note.start < tick && tick < note.end())
-    })
+/// Where a knife stroke segment crosses `note`, if it does: the tick at
+/// the segment's crossing of the note's row centreline (a slash through
+/// the row), or — for a segment travelling along the note's own row — the
+/// middle of the overlap with the note's drawn span. Unsnapped: cutting is
+/// a precision operation, not a grid one. `None` when the segment never
+/// enters the note (including when it merely touches the note's boundary,
+/// which would cut off a zero-length half).
+fn knife_crossing(
+    from: egui::Pos2,
+    to: egui::Pos2,
+    rect: egui::Rect,
+    note: &Note,
+    ticks_to_x: f32,
+    top: i32,
+) -> Option<i64> {
+    let row_top = rect.top() + (top as f32 - f32::from(note.note)) * ROW_HEIGHT;
+    let centre = row_top + ROW_HEIGHT / 2.0;
+    let x_left = rect.left() + note.start as f32 * ticks_to_x;
+    let x_right = x_left + (note.length as f32 * ticks_to_x).max(3.0);
+    let cut_at = |x: f32| -> Option<i64> {
+        let tick = ((x - rect.left()) / ticks_to_x).round() as i64;
+        (tick > note.start && tick < note.end()).then_some(tick)
+    };
+
+    let (ya, yb) = (from.y, to.y);
+    if ya != yb && (ya.min(yb)..=ya.max(yb)).contains(&centre) {
+        // A slash crossing the row: where the segment meets the centreline.
+        let t = (centre - ya) / (yb - ya);
+        let x = from.x + (to.x - from.x) * t;
+        return (x_left..x_right).contains(&x).then_some(x).and_then(cut_at);
+    }
+    // Sweeping along the note's own row: cut in the middle of the span the
+    // segment covered.
+    let band = row_top..=(row_top + ROW_HEIGHT);
+    if band.contains(&ya) && band.contains(&yb) {
+        let lo = from.x.min(to.x).max(x_left);
+        let hi = from.x.max(to.x).min(x_right);
+        if hi > lo {
+            return cut_at((lo + hi) / 2.0);
+        }
+    }
+    None
 }
 
 /// Start / end of the selection's bounding box — the Stretch command's
@@ -1470,27 +1794,47 @@ fn selection_bbox(clip: &MidiClip, selection: &[usize]) -> Option<(i64, i64)> {
     (lo <= hi).then_some((lo, hi))
 }
 
-/// Frozen scale state at grab time: the pivot (selection bbox center), the
-/// pointer's distance to it (≥ 1 tick, so the live factor starts at ≤ 1),
-/// and the largest factor that keeps the scaled bbox inside the loop
-/// (mirroring how a move clamps against the loop end).
-///
-/// Only the loop end gets a ceiling: the left side is clamped per note by
-/// the command (start ≥ 0), which *pins* the leftmost notes at zero while
-/// the rest keeps stretching — a left-side ceiling instead would freeze
-/// the whole gesture for any selection that touches tick 0.
-fn scale_gesture(pivot: i64, hi: i64, pointer_tick: f32, loop_ticks: i64) -> ScaleGesture {
-    let max_k = if hi > pivot {
-        (loop_ticks - pivot) as f32 / (hi - pivot) as f32
+/// Largest scale factor that keeps the scaled bbox inside the loop (the
+/// pivot is the bbox *start*; nothing sits left of it, so there is no
+/// left-side ceiling — the command's per-note clamps are all the floor the
+/// gesture needs).
+fn scale_max_k(lo: i64, hi: i64, loop_ticks: i64) -> f32 {
+    if hi > lo {
+        (loop_ticks - lo) as f32 / (hi - lo) as f32
     } else {
         f32::INFINITY
-    };
-    ScaleGesture {
-        pivot_tick: pivot,
-        grab_dist: (pointer_tick - pivot as f32).abs().max(1.0),
-        applied_factor: 1.0,
-        max_k,
     }
+}
+
+/// The ghost of a note under one modal frame: the geometry the preview
+/// draws (and the confirming click applies). Mirrors the command's per-note
+/// clamps so the preview never promises more than the document will do.
+fn modal_ghost(note: &Note, frame: &ModalFrame) -> Note {
+    let mut ghost = *note;
+    if let Some((edge, delta)) = frame.edge
+        && delta != 0
+    {
+        match edge {
+            StretchEdge::End => ghost.length = (ghost.length + delta).max(1),
+            StretchEdge::Start => {
+                let end = ghost.end();
+                ghost.start = (ghost.start + delta).clamp(0, end - 1);
+                ghost.length = end - ghost.start;
+            }
+        }
+    }
+    if (frame.scale_k - 1.0).abs() > f32::EPSILON {
+        let pivot = frame.pivot_tick as f32;
+        ghost.start = (pivot + (ghost.start as f32 - pivot) * frame.scale_k)
+            .round()
+            .max(0.0) as i64;
+        ghost.length = ((ghost.length as f32 * frame.scale_k).round() as i64).max(1);
+    }
+    if frame.delta_start != 0 || frame.delta_note != 0 {
+        ghost.start = (ghost.start + frame.delta_start).max(0);
+        ghost.note = (i32::from(ghost.note) + i32::from(frame.delta_note)).clamp(0, 127) as u8;
+    }
+    ghost
 }
 
 /// The note whose hit-testing rectangle covers `pos`, if any.
@@ -1553,9 +1897,34 @@ fn clamped_move(
     loop_ticks: i64,
     gesture: Option<u64>,
 ) -> RollIntent {
+    let (delta_start, delta_note) = clamped_move_deltas(
+        clip,
+        indices,
+        raw_start_delta,
+        i64::from(raw_note_delta),
+        loop_ticks,
+    );
+    RollIntent::MoveNotes {
+        indices: indices.to_vec(),
+        delta_start,
+        delta_note,
+        gesture,
+    }
+}
+
+/// The clamp half of [`clamped_move`], shared with the modal preview (a
+/// ghost must never promise a position the confirming intent would clamp
+/// away).
+fn clamped_move_deltas(
+    clip: &MidiClip,
+    indices: &[usize],
+    raw_start_delta: i64,
+    raw_note_delta: i64,
+    loop_ticks: i64,
+) -> (i64, i8) {
     let notes = clip.notes();
     let mut delta_start = raw_start_delta;
-    let mut delta_note = i64::from(raw_note_delta);
+    let mut delta_note = raw_note_delta;
     for index in indices {
         if let Some(note) = notes.get(*index) {
             delta_start = delta_start.max(-note.start);
@@ -1572,12 +1941,10 @@ fn clamped_move(
             delta_start = delta_start.min(loop_ticks - 1 - note.start);
         }
     }
-    RollIntent::MoveNotes {
-        indices: indices.to_vec(),
+    (
         delta_start,
-        delta_note: delta_note.clamp(i64::from(i8::MIN), i64::from(i8::MAX)) as i8,
-        gesture,
-    }
+        delta_note.clamp(i64::from(i8::MIN), i64::from(i8::MAX)) as i8,
+    )
 }
 
 fn grid_label(grid: &GridValue) -> String {
@@ -1592,10 +1959,10 @@ fn grid_label(grid: &GridValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AwaitCreate, Axis, DragKind, DragSelection, EDGE_PX, HIT_SLOP, MIN_SCALE_K, PendingCmd,
-        ROLL_HEIGHT, ROW_HEIGHT, RollIntent, RollMode, RollState, StretchEdge, clamped_move,
-        cut_spans, draw_end, edge_zone, is_black_key, note_at, note_rect, scale_gesture,
-        selection_bbox, snap_ticks, trim_start,
+        AwaitCreate, Axis, DragKind, DragSelection, EDGE_PX, HIT_SLOP, Modal, ModalFrame,
+        ModalKind, ROLL_HEIGHT, ROW_HEIGHT, RollIntent, RollMode, RollState, StretchEdge,
+        clamped_move, draw_end, edge_zone, is_black_key, knife_crossing, modal_ghost, note_at,
+        note_rect, scale_max_k, selection_bbox, snap_ticks, trim_start,
     };
     use crate::grid::{GridValue, NoteValue};
     use eframe::egui;
@@ -2023,92 +2390,146 @@ mod tests {
         assert_eq!(drag.anchor_end, 360);
     }
 
-    // ---- M4 state machine: mode, one-shot command family, qualifiers ----
+    // ---- M4 state machine: mode, the modal command family, qualifiers ----
+
+    fn move_modal(grab_tick: f32, grab_note: u8) -> Modal {
+        Modal {
+            kind: ModalKind::Move { axis: None },
+            grab_tick,
+            grab_note,
+            gesture: 1,
+        }
+    }
 
     #[test]
-    fn roll_state_starts_in_select_mode_with_nothing_armed() {
+    fn roll_state_starts_in_select_mode_with_nothing_running() {
         let mut state = RollState::new();
         assert_eq!(state.mode, RollMode::Select);
-        assert_eq!(state.pending, None);
+        assert!(!state.modal_active());
+        assert!(!state.knife_armed);
         assert_eq!(state.take_status(), None);
     }
 
     #[test]
-    fn escape_cancels_the_command_then_leaves_draw_then_clears() {
+    fn escape_cancels_the_modal_then_the_knife_then_draw_then_clears() {
         let mut state = RollState::new();
         state.selection = vec![0];
         state.mode = RollMode::Draw;
-        state.pending = Some(PendingCmd::Grab { axis: None });
+        state.modal = Some(move_modal(120.0, 60));
 
-        // 1. The armed command goes first (the selection it would act on
-        //    survives).
+        // 1. The modal goes first — cancelling costs nothing (a preview
+        //    never touched the document), so the selection survives.
         state.escape();
-        assert_eq!(state.pending, None);
-        assert_eq!(state.mode, RollMode::Draw, "the mode is not a command");
+        assert!(!state.modal_active());
+        assert_eq!(state.mode, RollMode::Draw);
         assert_eq!(state.selection, vec![0]);
 
-        // 2. Then Draw mode exits.
+        // 2. Then the armed knife disarms.
+        state.knife_armed = true;
+        state.escape();
+        assert!(!state.knife_armed);
+        assert_eq!(state.mode, RollMode::Draw);
+
+        // 3. Then Draw mode exits.
         state.escape();
         assert_eq!(state.mode, RollMode::Select);
 
-        // 3. Then the selection clears.
+        // 4. Then the selection clears.
         state.escape();
         assert!(state.selection.is_empty());
     }
 
     #[test]
-    fn arm_refuses_transforms_on_an_empty_selection() {
-        let mut state = RollState::new();
-        for (command, message) in [
-            (PendingCmd::Grab { axis: None }, "Grab: nothing selected"),
-            (PendingCmd::Scale, "Scale: nothing selected"),
-            (
-                PendingCmd::Stretch {
-                    edge: StretchEdge::End,
+    fn modal_labels_carry_their_qualifiers() {
+        assert_eq!(move_modal(0.0, 60).label(), "G");
+        assert_eq!(
+            Modal {
+                kind: ModalKind::Move {
+                    axis: Some(Axis::Time)
                 },
-                "Stretch: nothing selected",
-            ),
-            (PendingCmd::Cut, "Cut: nothing selected"),
-        ] {
-            state.arm(command);
-            assert_eq!(state.pending, None, "{command:?} must not arm");
-            assert_eq!(state.take_status(), Some(message.to_string()));
-        }
-        // With a selection the same commands arm.
-        state.selection = vec![0];
-        state.arm(PendingCmd::Grab { axis: None });
-        assert_eq!(state.pending, Some(PendingCmd::Grab { axis: None }));
+                ..move_modal(0.0, 60)
+            }
+            .label(),
+            "G·X"
+        );
+        assert_eq!(
+            Modal {
+                kind: ModalKind::Move {
+                    axis: Some(Axis::Pitch)
+                },
+                ..move_modal(0.0, 60)
+            }
+            .label(),
+            "G·Y"
+        );
+        assert_eq!(
+            Modal {
+                kind: ModalKind::Scale {
+                    pivot_tick: 0,
+                    grab_dist: 1.0,
+                    max_k: 1.0
+                },
+                ..move_modal(0.0, 60)
+            }
+            .label(),
+            "S"
+        );
+        assert_eq!(
+            Modal {
+                kind: ModalKind::Stretch {
+                    edge: StretchEdge::End,
+                    lo: 0,
+                    hi: 0
+                },
+                ..move_modal(0.0, 60)
+            }
+            .label(),
+            "T"
+        );
+        assert_eq!(
+            Modal {
+                kind: ModalKind::Stretch {
+                    edge: StretchEdge::Start,
+                    lo: 0,
+                    hi: 0
+                },
+                ..move_modal(0.0, 60)
+            }
+            .label(),
+            "T·S"
+        );
     }
 
     #[test]
-    fn axis_qualifiers_toggle_on_the_armed_grab_and_the_running_drag() {
+    fn axis_qualifiers_toggle_on_the_modal_move_and_the_running_drag() {
         let mut state = RollState::new();
-        state.selection = vec![0];
-        state.arm(PendingCmd::Grab { axis: None });
+        state.modal = Some(move_modal(120.0, 60));
 
         state.apply_axis(Axis::Time);
+        let modal = state.modal.as_ref().expect("modal alive");
         assert_eq!(
-            state.pending,
-            Some(PendingCmd::Grab {
+            modal.kind,
+            ModalKind::Move {
                 axis: Some(Axis::Time)
-            })
+            }
         );
         // The same key again releases the lock...
         state.apply_axis(Axis::Time);
-        assert_eq!(state.pending, Some(PendingCmd::Grab { axis: None }));
+        let modal = state.modal.as_ref().expect("modal alive");
+        assert_eq!(modal.kind, ModalKind::Move { axis: None });
         // ...and the other axis takes over.
         state.apply_axis(Axis::Pitch);
+        let modal = state.modal.as_ref().expect("modal alive");
         assert_eq!(
-            state.pending,
-            Some(PendingCmd::Grab {
+            modal.kind,
+            ModalKind::Move {
                 axis: Some(Axis::Pitch)
-            })
+            }
         );
 
-        // Mid-drag: the lock lands on the running move — even though the
-        // armed Grab that started it is still pending (it is only
-        // consumed at drag_stopped).
-        let armed_before = state.pending;
+        // Mid-tweak-drag: the lock lands on the running move (X/Y also
+        // works without any modal).
+        state.modal = None;
         state.drag = Some(DragSelection::anchored(
             &note(0, 240, 60),
             0.0,
@@ -2123,10 +2544,6 @@ mod tests {
                 axis: Some(Axis::Time)
             })
         );
-        assert_eq!(
-            state.pending, armed_before,
-            "the stale armed entry is left alone — the drag owns the lock"
-        );
         state.apply_axis(Axis::Time);
         assert_eq!(
             state.drag.as_ref().map(|drag| drag.kind),
@@ -2135,38 +2552,165 @@ mod tests {
     }
 
     #[test]
-    fn pending_command_labels_carry_their_qualifiers() {
-        assert_eq!(PendingCmd::Grab { axis: None }.label(), "G");
-        assert_eq!(
-            PendingCmd::Grab {
-                axis: Some(Axis::Time)
+    fn a_modal_move_finalizes_with_the_clamped_total() {
+        let mut clip = MidiClip::default();
+        clip.sequence.notes = vec![note(0, 240, 60)];
+        clip.loop_ticks = 3840;
+        let modal = move_modal(240.0, 60);
+
+        // The pointer walked one grid cell right and four semitones up.
+        let frame = modal.frame(&clip, &[0], 480.0, 64, 240, 3840);
+        assert_eq!((frame.delta_start, frame.delta_note), (240, 4));
+        let intent = modal
+            .finalize(&clip, &[0], frame, 3840)
+            .expect("a real move");
+        assert!(matches!(
+            intent,
+            RollIntent::MoveNotes {
+                delta_start: 240,
+                delta_note: 4,
+                gesture: Some(1),
+                ..
             }
-            .label(),
-            "G·X"
-        );
-        assert_eq!(
-            PendingCmd::Grab {
-                axis: Some(Axis::Pitch)
+        ));
+
+        // A pointer parked on the grab point confirms nothing: a no-op
+        // must not spend an undo step.
+        let frame = modal.frame(&clip, &[0], 240.0, 60, 240, 3840);
+        assert_eq!(modal.finalize(&clip, &[0], frame, 3840), None);
+
+        // The move clamps against the loop end (snap(4000) = 4080 → a
+        // want of 3840 ticks, clamped to 3839).
+        let frame = modal.frame(&clip, &[0], 4000.0, 60, 240, 3840);
+        let intent = modal.finalize(&clip, &[0], frame, 3840).expect("clamps");
+        match intent {
+            RollIntent::MoveNotes { delta_start, .. } => assert_eq!(delta_start, 3839),
+            other => panic!("expected a move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_modal_scale_finalizes_around_the_bbox_start() {
+        // Selection bbox [0..720]; the pivot is the bbox *start* (0), so
+        // scaling keeps the notes' relative layout intact. Grabbed 360
+        // ticks right of the pivot; the pointer twice as far doubles the
+        // selection in one final factor.
+        let mut clip = MidiClip::default();
+        clip.sequence.notes = vec![note(0, 240, 60), note(480, 240, 62)];
+        clip.loop_ticks = 3840;
+        let modal = Modal {
+            kind: ModalKind::Scale {
+                pivot_tick: 0,
+                grab_dist: 360.0,
+                max_k: scale_max_k(0, 720, 3840),
+            },
+            grab_tick: 360.0,
+            grab_note: 60,
+            gesture: 3,
+        };
+        let frame = modal.frame(&clip, &[0, 1], 720.0, 60, 240, 3840);
+        assert!((frame.scale_k - 2.0).abs() < 1e-6);
+        let intent = modal
+            .finalize(&clip, &[0, 1], frame, 3840)
+            .expect("a real scale");
+        assert!(matches!(
+            intent,
+            RollIntent::ScaleNotes { pivot_tick: 0, factor, gesture: 3 }
+                if (factor - 2.0).abs() < 1e-6
+        ));
+
+        // A no-op scale (factor exactly 1) spends no undo step.
+        let frame = modal.frame(&clip, &[0, 1], 360.0, 60, 240, 3840);
+        assert_eq!(modal.finalize(&clip, &[0, 1], frame, 3840), None);
+    }
+
+    #[test]
+    fn a_modal_stretch_trims_the_snapped_bbox_edge() {
+        let mut clip = MidiClip::default();
+        clip.sequence.notes = vec![note(0, 240, 60), note(480, 240, 62)];
+        clip.loop_ticks = 3840;
+        // bbox [0..720]; bare `t` pulls the end edge.
+        let mut modal = Modal {
+            kind: ModalKind::Stretch {
+                edge: StretchEdge::End,
+                lo: 0,
+                hi: 720,
+            },
+            grab_tick: 240.0,
+            grab_note: 60,
+            gesture: 4,
+        };
+        let frame = modal.frame(&clip, &[0, 1], 1200.0, 60, 240, 3840);
+        assert_eq!(frame.edge, Some((StretchEdge::End, 480)));
+        let intent = modal
+            .finalize(&clip, &[0, 1], frame, 3840)
+            .expect("a real stretch");
+        assert!(matches!(
+            intent,
+            RollIntent::ResizeEnd {
+                delta_ticks: 480,
+                gesture: 4
             }
-            .label(),
-            "G·Y"
-        );
-        assert_eq!(PendingCmd::Scale.label(), "S");
-        assert_eq!(
-            PendingCmd::Stretch {
-                edge: StretchEdge::End
+        ));
+
+        // `t+s` flips the edge: the start follows the pointer, snapped to
+        // the grid, never past the bbox end.
+        modal.kind = ModalKind::Stretch {
+            edge: StretchEdge::Start,
+            lo: 0,
+            hi: 720,
+        };
+        let frame = modal.frame(&clip, &[0, 1], 480.0, 60, 240, 3840);
+        assert_eq!(frame.edge, Some((StretchEdge::Start, 480)));
+        let intent = modal
+            .finalize(&clip, &[0, 1], frame, 3840)
+            .expect("a real trim");
+        assert!(matches!(
+            intent,
+            RollIntent::ResizeStart {
+                delta_ticks: 480,
+                gesture: 4
             }
-            .label(),
-            "T"
-        );
-        assert_eq!(
-            PendingCmd::Stretch {
-                edge: StretchEdge::Start
-            }
-            .label(),
-            "T·S"
-        );
-        assert_eq!(PendingCmd::Cut.label(), "K");
+        ));
+
+        // A pointer at the edge confirms nothing.
+        let frame = modal.frame(&clip, &[0, 1], 0.0, 60, 240, 3840);
+        assert_eq!(modal.finalize(&clip, &[0, 1], frame, 3840), None);
+    }
+
+    #[test]
+    fn modal_ghosts_preview_the_transformed_geometry() {
+        let frame = ModalFrame {
+            delta_start: 240,
+            delta_note: 2,
+            scale_k: 1.0,
+            pivot_tick: 0,
+            edge: None,
+        };
+        let ghost = modal_ghost(&note(0, 240, 60), &frame);
+        assert_eq!((ghost.start, ghost.length, ghost.note), (240, 240, 62));
+
+        // Scale around the pivot, start kept at the pivot, length ≥ 1.
+        let frame = ModalFrame {
+            delta_start: 0,
+            delta_note: 0,
+            scale_k: 0.5,
+            pivot_tick: 480,
+            edge: None,
+        };
+        let ghost = modal_ghost(&note(480, 240, 60), &frame);
+        assert_eq!((ghost.start, ghost.length), (480, 120));
+
+        // A start-edge trim keeps the end pinned.
+        let frame = ModalFrame {
+            delta_start: 0,
+            delta_note: 0,
+            scale_k: 1.0,
+            pivot_tick: 0,
+            edge: Some((StretchEdge::Start, 100)),
+        };
+        let ghost = modal_ghost(&note(0, 240, 60), &frame);
+        assert_eq!((ghost.start, ghost.end()), (100, 240));
     }
 
     #[test]
@@ -2176,22 +2720,43 @@ mod tests {
     }
 
     #[test]
-    fn cut_spans_only_notes_that_straddle_the_tick() {
+    fn knife_crossing_slashes_through_the_row_centreline() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0));
         let mut clip = MidiClip::default();
-        clip.sequence.notes = vec![note(0, 240, 60), note(480, 240, 62)];
-        assert!(cut_spans(&clip, &[0], 120), "strictly inside the note");
-        assert!(
-            !cut_spans(&clip, &[0], 0),
-            "tick on the start would leave a zero-length half"
-        );
-        assert!(!cut_spans(&clip, &[0], 240), "tick on the end likewise");
-        assert!(!cut_spans(&clip, &[0], 300), "past the note");
-        assert!(!cut_spans(&clip, &[1], 120), "before the note");
-        assert!(
-            !cut_spans(&clip, &[], 120),
-            "an empty selection has nothing to cut"
-        );
-        assert!(!cut_spans(&clip, &[9], 120), "a stale index is not a panic");
+        clip.sequence.notes = vec![note(0, 240, 60)]; // x span 0..24 px at 0.1 px/tick
+        let ttx = 0.1f32;
+        let top = 60;
+        let n = &clip.notes()[0];
+        let row_top = rect.top();
+        let centre = row_top + ROW_HEIGHT / 2.0;
+
+        // A vertical slash at tick 120 crosses the row centreline inside.
+        let to = egui::pos2(12.0, centre + 20.0);
+        let from = egui::pos2(12.0, centre - 20.0);
+        assert_eq!(knife_crossing(from, to, rect, n, ttx, top), Some(120));
+
+        // Crossing the row outside the note's span cuts nothing (the
+        // centreline meet is at x = 35 px → tick 350, past the note).
+        let from = egui::pos2(40.0, centre - 20.0);
+        let to_outside = egui::pos2(30.0, centre + 20.0);
+        assert_eq!(knife_crossing(from, to_outside, rect, n, ttx, top), None);
+
+        // Touching the note's boundary would cut off a zero-length half
+        // (the centreline meet is at tick 0 exactly).
+        let from = egui::pos2(-12.0, centre - 20.0);
+        let to_edge = egui::pos2(12.0, centre + 20.0);
+        assert_eq!(knife_crossing(from, to_edge, rect, n, ttx, top), None);
+
+        // A sweep along the note's own row cuts in the middle of the
+        // covered span: overlap [2..20] px → tick 110.
+        let from = egui::pos2(2.0, centre);
+        let to = egui::pos2(20.0, centre);
+        assert_eq!(knife_crossing(from, to, rect, n, ttx, top), Some(110));
+
+        // A segment nowhere near the row.
+        let from = egui::pos2(2.0, centre + 5.0 * ROW_HEIGHT);
+        let to = egui::pos2(20.0, centre + 5.0 * ROW_HEIGHT);
+        assert_eq!(knife_crossing(from, to, rect, n, ttx, top), None);
     }
 
     #[test]
@@ -2205,44 +2770,8 @@ mod tests {
     }
 
     #[test]
-    fn scale_gesture_freezes_the_pivot_and_the_loop_ceiling() {
-        // Selection [0..720] in a one-bar loop, grabbed 360 ticks right of
-        // the pivot (360).
-        let gesture = scale_gesture(360, 720, 720.0, 3840);
-        assert_eq!(gesture.pivot_tick, 360);
-        assert_eq!(gesture.grab_dist, 360.0);
-        assert_eq!(gesture.applied_factor, 1.0);
-        // The far edge may not pass the loop end: (3840-360)/360.
-        assert!((gesture.max_k - 3480.0 / 360.0).abs() < 1e-3);
-
-        // A grab exactly on the pivot keeps a 1-tick floor, so the live
-        // factor still starts at (or below) 1 instead of dividing by zero.
-        let on_pivot = scale_gesture(360, 720, 360.0, 3840);
-        assert_eq!(on_pivot.grab_dist, 1.0);
-    }
-
-    #[test]
-    fn a_scale_drag_emits_only_the_increment_still_owed() {
-        // Same compounding guard as the move: the emitted factors must
-        // multiply to the pointer's total displacement factor, not sum.
-        // Grabbed 360 ticks right of the pivot (360), so the live factor
-        // starts at 1 and doubles as the pointer walks away.
-        let mut scale = scale_gesture(360, 720, 720.0, 3840);
-        let mut product = 1.0f32;
-        for pointer_tick in [1080.0, 1440.0, 1800.0] {
-            let dist = (pointer_tick - scale.pivot_tick as f32).abs();
-            let target_k = (dist / scale.grab_dist).clamp(MIN_SCALE_K, scale.max_k);
-            let factor = target_k / scale.applied_factor;
-            scale.applied_factor = target_k;
-            product *= factor;
-        }
-        assert!(
-            (product - 4.0).abs() < 1e-3,
-            "k walked 1 → 2 → 3 → 4, got {product}"
-        );
-        // Holding still owes nothing.
-        let dist = (1800.0 - scale.pivot_tick as f32).abs();
-        let target_k = (dist / scale.grab_dist).clamp(MIN_SCALE_K, scale.max_k);
-        assert!((target_k / scale.applied_factor - 1.0).abs() < f32::EPSILON);
+    fn scale_max_k_caps_the_stretch_at_the_loop_end() {
+        assert!((scale_max_k(0, 720, 3840) - 3840.0 / 720.0).abs() < 1e-3);
+        assert!((scale_max_k(240, 720, 3840) - 3600.0 / 480.0).abs() < 1e-3);
     }
 }

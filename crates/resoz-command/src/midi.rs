@@ -83,7 +83,7 @@ pub fn specs() -> Vec<crate::CommandSpec> {
             "Split Notes",
             ["Midi"],
             Some("Split"),
-            "{track, clip, indices: [n], tick} → {split: n, indices: [n]}",
+            "{track, clip, cuts: [{index, tick}]} → {split: n, indices: [n]}",
             always,
             notes_split
         ),
@@ -470,42 +470,69 @@ fn notes_scale(session: &mut Session, params: &Value) -> crate::Result<Value> {
 /// the tick stay selected, so the result reads as "the same selection,
 /// cut where I clicked".
 fn notes_split(session: &mut Session, params: &Value) -> crate::Result<Value> {
-    let selected = indices(params, "indices");
-    if selected.is_empty() {
-        return Err(bad_params("midi.notes_split", "`indices` is required"));
+    use std::collections::BTreeMap;
+    // `cuts`: [{"index": n, "tick": t}, ...] — one entry per cut point. The
+    // knife gathers several in one stroke; a single cut is a one-entry
+    // list. Multiple ticks on one note dice it into several pieces.
+    let cuts: BTreeMap<usize, Vec<i64>> = params
+        .get("cuts")
+        .and_then(Value::as_array)
+        .map(|list| {
+            let mut map: BTreeMap<usize, Vec<i64>> = BTreeMap::new();
+            for cut in list {
+                if let (Some(index), Some(tick)) = (
+                    cut.get("index").and_then(Value::as_u64),
+                    cut.get("tick").and_then(Value::as_i64),
+                ) {
+                    map.entry(index as usize).or_default().push(tick.max(0));
+                }
+            }
+            map
+        })
+        .unwrap_or_default();
+    if cuts.is_empty() {
+        return Err(bad_params("midi.notes_split", "`cuts` is required"));
     }
-    if params.get("tick").and_then(Value::as_i64).is_none() {
-        return Err(bad_params("midi.notes_split", "`tick` is required"));
-    }
-    let tick = i64_or(params, "tick", 0).max(0);
     let notes = notes_mut(session, "midi.notes_split", params)?;
-    // Rebuild the vector: a split replaces one note with two, so the
+    // Rebuild the vector: a split replaces one note with several, so the
     // length changes and the in-place op contract does not apply here.
     let mut cut = 0usize;
-    let mut rebuilt: Vec<Note> = Vec::with_capacity(notes.len() + selected.len());
-    let mut results: Vec<Note> = Vec::with_capacity(selected.len());
+    let mut rebuilt: Vec<Note> = Vec::with_capacity(notes.len() + cuts.len());
+    let mut results: Vec<Note> = Vec::new();
     for (index, note) in notes.iter().enumerate() {
-        let chosen = selected.contains(&index);
-        if chosen && note.start < tick && tick < note.end() {
-            let left = Note {
-                length: tick - note.start,
-                ..*note
-            };
-            let right = Note {
-                start: tick,
-                length: note.end() - tick,
-                ..*note
-            };
-            results.push(left);
-            results.push(right);
-            rebuilt.push(left);
-            rebuilt.push(right);
-            cut += 1;
-        } else {
-            if chosen {
-                results.push(*note);
+        match cuts.get(&index) {
+            None => rebuilt.push(*note),
+            Some(ticks) => {
+                let mut sorted: Vec<i64> = ticks.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                // Dice the note at every valid tick, in order.
+                let mut pieces: Vec<Note> = vec![*note];
+                for tick in sorted {
+                    let Some(last) = pieces.last().copied() else {
+                        continue; // unreachable: a note always starts with one piece
+                    };
+                    if last.start < tick && tick < last.end() {
+                        pieces.pop();
+                        pieces.push(Note {
+                            length: tick - last.start,
+                            ..last
+                        });
+                        pieces.push(Note {
+                            start: tick,
+                            length: last.end() - tick,
+                            ..last
+                        });
+                        cut += 1;
+                    }
+                }
+                if pieces.len() > 1 {
+                    results.extend(pieces.iter().copied());
+                    rebuilt.extend(pieces);
+                } else {
+                    rebuilt.push(*note);
+                }
             }
-            rebuilt.push(*note);
         }
     }
     *notes = rebuilt;
