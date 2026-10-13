@@ -3486,6 +3486,11 @@ impl ResoZApp {
         if let Some(intent) = intent {
             self.apply_roll_intent(sel, clip_index, intent);
         }
+        // A no-op explanation (e.g. an armed transform with an empty
+        // selection) reaches the app's status bar.
+        if let Some(status) = self.roll_state.take_status() {
+            self.set_message(status);
+        }
 
         // Event List (M3.6): spreadsheet-style precision editing under the roll.
         egui::CollapsingHeader::new("Event List")
@@ -3651,6 +3656,42 @@ impl ResoZApp {
                     "midi.notes_duplicate",
                     &json!({ "track": track, "clip": clip, "indices": indices }),
                     &format!("roll-move:{track}:{clip}:{gesture}"),
+                );
+                self.reselect_from(&outcome);
+                outcome
+            }
+            RollIntent::ScaleNotes {
+                pivot_tick,
+                factor,
+                gesture,
+            } => {
+                // The Scale command's drag: frames merge under a per-gesture
+                // key (one drag = one undo step), and the command reports
+                // where the scaled notes landed after the re-sort.
+                let outcome = self.execute_merged(
+                    "midi.notes_scale",
+                    &json!({
+                        "track": track, "clip": clip,
+                        "indices": self.roll_state.selection.clone(),
+                        "pivot_tick": pivot_tick, "factor": factor,
+                    }),
+                    &format!("roll-scale:{track}:{clip}:{gesture}"),
+                );
+                self.reselect_from(&outcome);
+                outcome
+            }
+            RollIntent::SplitNotes { tick, gesture } => {
+                // The Cut command: one invocation is one undo step. The
+                // selection follows the halves (plus any untouched selected
+                // note), as the command reports them.
+                let outcome = self.execute_merged(
+                    "midi.notes_split",
+                    &json!({
+                        "track": track, "clip": clip,
+                        "indices": self.roll_state.selection.clone(),
+                        "tick": tick,
+                    }),
+                    &format!("roll-cut:{track}:{clip}:{gesture}"),
                 );
                 self.reselect_from(&outcome);
                 outcome
