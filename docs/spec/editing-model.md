@@ -100,14 +100,18 @@ M3.8 边界规则"空白拖动永远=画"**废除**：空拖在 Select 态回归
 | :--- | :--- | :--- |
 | 常驻态 | Select | Select |
 | 粘性命令 | D | —（无） |
-| 一次性命令 | G · S · T · K · Shift+D | G · T · K（**S 砍掉**，多选后做 M4b） |
+| 一次性命令 | G · S · T · K · Shift+D | G · T · K · Shift+D（**S 砍掉**；Shift+D 为 M4b 补齐） |
 
 时间轴差异（用户确认 + 推导）：
 
 - **S 砍掉**：clip 只是时间容器，内容时间伸缩没有音乐语义；要伸缩内容回 piano roll 对着音符做；
 - **无 Draw**（2026-10-13 用户指认）：粘性 D 的唯一存在理由是输入爆发，clip 摆放无此场景；双击空白轨=建 1 bar clip（T3 已有），拖缘/T 调长。Logic 式"拖出创建"不作为一期——若补，作一次性命令而非粘性态；
-- **K**：在指针处把 clip 切成两个（`clip_split`）；
-- **clip 多选（Box 框选 + G 整体移动）拆为 M4b**：跨轨移动语义、批量 undo key、重叠拒绝需单独决策；多选落地后空拖=跨轨框选（与 roll Select 态同构）。
+- **K**：K 唤起切刀（可连续切），点击把指针下 clip 在整 bar 吸附处切成两个；两半各 ≥1 bar，否则一帧状态提示拒绝；内容为 loop 克隆（两半同 loop）；
+- **clip 多选（M4b 已交付）**：点击/Ctrl 追加/跨轨框选；Delete 批删一步 undo；
+- **G（M4b 决策）**：自由移动 = 时间 bar delta + 同类轨 row delta（刚性整体移动，行 delta 全局钳制不逐 clip）；X 切换时间锁（只水平）；
+- **T（M4b 决策）**：默认拉终点，Shift+T 拉起点；bar 对齐、≥1 bar、不出编排边界；
+- **Shift+D（M4b 决策）**：克隆选区进入 grab 式模态，LMB 落定副本、RMB/Esc 副本不落盘；落定后选区转移到副本；
+- **重叠策略（M4b 决策）**：部分重叠允许（LMMS 式弱起场景）；目标**完全覆盖**既有 clip 时该 clip 留原位 + 状态提示，批次其余照常落下。
 
 ## 5. 撤销与合并
 
@@ -135,6 +139,7 @@ M3.8 边界规则"空白拖动永远=画"**废除**：空拖在 Select 态回归
 | 命令 `midi.notes_scale` | `{indices, pivot_tick, factor}`；factor 由 UI 算（k=指针距/抓取距，pivot=选区 bbox 起点），命令层钳制 |
 | 命令 `midi.notes_split` | `{cuts: [{index, tick}]}`：按各 tick 切分指定音符（pitch/velocity 保留，两半 length≥1）；单击=单项，knife stroke=批量 |
 | 命令 `clip_split` | `{track, clip, tick}`：clip 在 tick 处切为两个（span 校验 ≤8/轨） |
+| 批量动作（M4b） | `SplitClip` / `MoveClipsBatch`（`relocate_in`：源轨降序 remove + 目的轨 append，append 不位移索引）/ `StretchClipsBatch` / `DuplicateClipsBatch`——各一步 undo；满轨静默拒绝 |
 | 交互状态机 | `RollState` / `TimelineState` 增 `state: Select`（roll 另有 `Draw`）+ `modal`（G/S/T/Shift+D 模态变换，ghost 预览）+ `knife_armed`/`knife`（K）；按 `consume_key` 消费已处理按键 |
 | 视觉反馈 | 工具栏/状态栏显示常驻态与模态命令 chip（含限定键高亮）；模态 ghost 预览、knife 划痕；cursor 随落点/状态变化 |
 | 测试 | 状态 × 落点 × 限定键 → intent 映射矩阵测试；模态 LMB 落定/RMB·Esc 取消；knife 轨迹切割（含无选区）；Delete 键；箭头连续 nudge；空选区 no-op |
@@ -145,13 +150,12 @@ velocity lane 保持独立手势（刷力度），不进状态机。
 
 - Reaper 式全可配置 modifier 矩阵；
 - FL/Pro Tools 式常驻工具组（双态 + 命令族已覆盖其场景）；
-- Blender 式 knife 多段连切（K 一次调用一批切口；逐点连切未来可评估 `Shift+k`）；
-- 时间轴 clip 多选（M4b）。
+- Blender 式 knife 多段连切（K 一次调用一批切口；逐点连切未来可评估 `Shift+k`）。
 
 ## 8. 分阶段
 
-- [ ] **M4a 钢琴窗**：状态机（Select/Draw）+ G/S/T/Shift+D/K + 视觉反馈 + 映射矩阵测试
-- [ ] **M4b 时间轴**：Select/T/K + clip 多选 + G（无 D、无 S）
+- [x] **M4a 钢琴窗**：状态机（Select/Draw）+ G/S/T/Shift+D/K + 视觉反馈 + 映射矩阵测试（2026-10-13 交付，M4a.4 实测修订为模态语义）
+- [x] **M4b 时间轴**：Select/T/K + clip 多选 + Shift+D + G（无 S；2026-10-13 交付）
 - [ ] **未来命令族扩展**：quantize / legato / glue / transpose = 同族零侵入
 
 ## 附：主流 DAW 交互家族（选型依据 2026-10-13）

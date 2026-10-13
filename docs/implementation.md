@@ -124,6 +124,23 @@
 - **Scale pivot 改为选区 bbox 起点**（原 bbox 中心）：从起点缩放保证音符间相对关系不动（起点左侧没有音符，命令层钳制形同虚设——正确性白拿）。
 - **按键卫生**：所有已处理按键 `consume_key`（modifiers 逻辑匹配，Shift+D 先于 d 消费）；`EventFilter` 扩到 `horizontal_arrows/vertical_arrows: true`——egui 的箭头焦点导航正是"上下箭头 nudge 一次后焦点逃逸"的根源；K 键 beep 疑似未消费按键在 Windows 的系统 beep，消费后待复测。新增 Delete 键删除选区。
 
+**M4a.5–M4a.7 实测连环修订**（同日）：
+
+- **M4a.5 ghost 可见性**：模态期间选中原音符全不透明会把半透明 ghost 盖住（S/T 起点附近最明显）。按 Blender 惯例改为原位调暗（alpha 60）、预览实色（ghost alpha 110→170）；identity 帧（刚按键未动）不触发调暗。
+- **M4a.6 焦点门可视化**："D/G/T/S 全部无响应、指针正常"——排查结论是 `has_focus()` 门不可见（夹具因校准点击天然有焦点，焦点门从未被测试覆盖；代码层无回归路径）。两处落地：工具栏无焦点时显示黄色提示 chip（`RollState.had_focus` 记上帧）；焦点获取从"分类为 click 才请求"加固为**任意按下即获焦**（慢按住既非 click 也非 drag 的边角）。诊断分叉：按 D 有声=焦点门关；无声=事件没到 egui（OS/输入法层；winit 在 Windows 建窗即禁 IME，egui-winit 只在 TextEdit 获焦时开 IME）。
+- **M4a.7 虚拟钢琴让键**：roll 获焦后 D/G/T/S/K 同时是 FL 布局琴键会发声。roll 把 widget id 注册进 `RollState`，app 的电脑键盘处理经 `owns_keyboard_focus(ctx)`（egui `Memory::has_focus` 实时查询，无帧延迟、无 stale）跳过 note-on；note-off 仍放行防卡音。规则一句话：**点了 roll 键盘归编辑器，点别处归虚拟钢琴**。
+
+#### M4b 时间轴命令族（选区 → 切刀 → 模态 → 复制）
+
+四段交付，全部复用 M4a 的模态机制与 M4b.1 的焦点管线；决策项（spec §4）用户拍板：**G=自由移动+X 锁时间；重叠=部分允许、完全拒绝；K 吸附整 bar；Shift+D 复制纳入时间轴**。
+
+- **M4b.1 选区模型**：`ClipSel{is_control, track, clip}` 跨轨选区；跨行框选由各行上报自己段内命中、`show()` 帧末统一合并——**带必须在看到 `drag_stopped` 的行之后延迟一帧清除**（`marquee_ending`），否则同帧行序靠后的行会丢末帧命中。焦点管线对齐 roll（任意按下即获焦 + Escape filter + 焦点 chip + 虚拟钢琴门控扩展）。Delete 批删 `RemoveClipsBatch`（每轨索引降序应用防位移，一步 undo）。
+- **M4b.2 切刀**：K 唤起（切换式，可连续切），点击在 `snap_bar` 处切开；两侧各 ≥1 bar 否则一帧状态提示拒绝。`split_clip_in` 纯函数：左半保留 start 缩短 span，右半克隆内容（loop 语义两半同 loop）插在 index+1。armed 期间指针归切刀（无拖动无框选）。
+- **M4b.3 模态 G/T**：G = 时间 bar delta + 同类轨 row delta 的**刚性移动**（行 delta 全局钳制不逐 clip，组内相对关系不动）；X 切时间锁。T 默认拉终点、Shift+T 拉起点（bar 对齐、≥1 bar、不出编排边界）。ghost 经**行几何注册表**跨行绘制（目标可落同类任意行，行先注册 `lane` rect，ghost 帧行末统一画）；原位变暗 alpha 60（M4a.5 惯例）。落定校验 `filter_covered`：目标**完全覆盖**既有（非移动）clip 时该 clip 留原位+提示，批次其余照常落下（部分重叠允许）。`relocate_in`：每源轨降序 remove + 目的轨 append——**append 不位移任何剩余索引**，跨轨移动因此不需要索引重映射。
+- **M4b.4 Shift+D**：克隆选区进入 grab 式模态（`ModalKind::Duplicate` 与 Grab 共享 `grab_targets` 数学与 X 锁），LMB 落定 `DuplicateClipsBatch`（内容克隆 append 到目标轨、选区转移到副本），RMB/Esc 副本不落盘。
+
+测试抓到的真 bug：stretch 首版把 **bar 数当 tick 直接加**（`bar_delta` 未乘 `TICKS_PER_BAR`），位移量小 3840 倍——纯函数单测（指针 3 bar → 期望整 bar 对齐）当场抓住。教训照旧：几何数学全部收进纯函数并单测，UI 只做取值与绘制。
+
 ### 命令集（轨道定向）
 
 - `SetParam`（主链）/ `SetTrackParam{track}` / `Note{track}` / `Sequencer(Play|Stop|SetBpm|SetGate|SetPattern{track}|SetClip|SetSource|SetAutomation)`；模式整块 `Copy` 数组经队列传递。
