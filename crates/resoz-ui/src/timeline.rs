@@ -46,6 +46,47 @@ pub struct ClipSel {
     pub clip: usize,
 }
 
+/// One move of the G modal (M4b.3): the clip at `from` lands on `to_track`
+/// (same kind only) at `start_ticks`. One action = one undo step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipMove {
+    pub from: ClipSel,
+    pub to_track: usize,
+    pub start_ticks: u32,
+}
+
+/// One span edit of the T modal (M4b.3): the clip at `sel` gets a new
+/// `start_ticks`/`span_ticks` (bar-aligned, ≥ 1 bar, same track).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipSpanEdit {
+    pub sel: ClipSel,
+    pub start_ticks: u32,
+    pub span_ticks: u32,
+}
+
+/// Modal transform kind (Blender-style, M4b.3): armed by G/T, the ghost
+/// follows the pointer, LMB finalizes, RMB/Esc cancels with zero cost
+/// (the document is not touched until the finalize).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModalKind {
+    /// G: free move — bar delta in time + row delta (same kind only).
+    /// X toggles the time lock (row delta forced to 0).
+    Grab { time_locked: bool },
+    /// T: stretch the end edge of every selected clip (Shift+T: the start
+    /// edge). Bar delta only.
+    Stretch { start_edge: bool },
+}
+
+/// Live modal state. `origin` snapshots the selection at arm time; since
+/// nothing mutates the document during the modal, those indices stay valid.
+#[derive(Debug, Clone)]
+struct Modal {
+    kind: ModalKind,
+    origin: Vec<ClipSel>,
+    /// Pointer position when the modal was armed.
+    grab: Pos2,
+}
+
 /// Which row kind a drag belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowKind {
@@ -112,6 +153,14 @@ pub struct TimelineState {
     /// One-frame status message (invalid cut explanation); the toolbar
     /// drains it the same frame it is set.
     status: Option<String>,
+    /// Live modal transform (G/T), if any.
+    modal: Option<Modal>,
+    /// Set when a lane row sees the modal-confirming LMB click; show()
+    /// finalizes after all rows have run and clears the flag.
+    modal_confirm: bool,
+    /// Set when a lane row sees a modal-cancelling RMB; show() clears the
+    /// modal after all rows have run.
+    modal_cancel: bool,
 }
 
 impl Default for TimelineState {
@@ -126,6 +175,9 @@ impl Default for TimelineState {
             focus_id: None,
             knife_armed: false,
             status: None,
+            modal: None,
+            modal_confirm: false,
+            modal_cancel: false,
         }
     }
 }
@@ -184,6 +236,15 @@ pub enum TimelineAction {
         track: usize,
         clip: usize,
         at_ticks: u32,
+    },
+    /// Move every clip in the list (G modal finalize; may cross tracks of
+    /// the same kind). One undo step.
+    MoveClipsBatch {
+        moves: Vec<ClipMove>,
+    },
+    /// Stretch every clip in the list (T modal finalize). One undo step.
+    StretchClipsBatch {
+        spans: Vec<ClipSpanEdit>,
     },
     SelectTrack(usize),
     SelectControlTrack(usize),
@@ -283,6 +344,171 @@ pub(crate) fn split_clip_in<T: Placement + Clone>(
     clips[index].set_span(at - start);
     clips.insert(index + 1, right);
     true
+}
+
+/// Looks up a selected clip's (start, span) across both track kinds.
+fn clip_geometry(
+    midi_tracks: &[MidiTrack],
+    control_tracks: &[ControlTrack],
+    sel: ClipSel,
+) -> Option<(u32, u32)> {
+    if sel.is_control {
+        let c = control_tracks.get(sel.track)?.clips.get(sel.clip)?;
+        Some((c.start(), c.span()))
+    } else {
+        let c = midi_tracks.get(sel.track)?.clips.get(sel.clip)?;
+        Some((c.start(), c.span()))
+    }
+}
+
+/// Clamps a row delta so the whole selection stays inside its kind's rows
+/// (rigid move: one delta for everyone, clamped globally, not per clip).
+fn clamp_row_delta(row_delta: i32, sel: &[ClipSel], rows: usize) -> i32 {
+    if sel.is_empty() || rows == 0 {
+        return 0;
+    }
+    let min_t = sel.iter().map(|s| s.track).min().unwrap_or(0);
+    let max_t = sel.iter().map(|s| s.track).max().unwrap_or(0);
+    let lo = -(min_t as i32);
+    let hi = (rows - 1) as i32 - max_t as i32;
+    row_delta.clamp(lo.min(0), hi.max(0))
+}
+
+/// Whether `target` (start, span) completely covers any clip in `existing`
+/// (start, span) — the refused case (M4b decision: partial overlap is
+/// allowed for pickups, total coverage buries an existing clip).
+fn fully_covers(target: (u32, u32), existing: &[(u32, u32)]) -> bool {
+    let t_end = target.0 + target.1;
+    existing
+        .iter()
+        .any(|(s, sp)| *s >= target.0 && *s + *sp <= t_end)
+}
+
+/// All clips of a track as (start, span) pairs, skipping every index in
+/// `skip` (the moving set's own originals do not block their targets).
+fn track_spans<T: Placement>(clips: &[T], skip: &[usize]) -> Vec<(u32, u32)> {
+    clips
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !skip.contains(i))
+        .map(|(_, c)| (c.start(), c.span()))
+        .collect()
+}
+
+/// The G modal's per-clip targets. `None` when the pointer is unavailable
+/// (no ghost this frame) or the modal is not a Grab.
+fn grab_targets(
+    modal: &Modal,
+    ptr: Option<Pos2>,
+    px_per_bar: f32,
+    rows_midi: usize,
+    rows_control: usize,
+    midi_tracks: &[MidiTrack],
+    control_tracks: &[ControlTrack],
+) -> Option<Vec<ClipMove>> {
+    let ModalKind::Grab { time_locked } = modal.kind else {
+        return None;
+    };
+    let ptr = ptr?;
+    let bar_delta = ((ptr.x - modal.grab.x) / px_per_bar).round() as i64;
+    let mut row_delta = ((ptr.y - modal.grab.y) / ROW_HEIGHT).round() as i32;
+    let is_control = modal.origin.first().map(|s| s.is_control).unwrap_or(false);
+    let rows = if is_control { rows_control } else { rows_midi };
+    row_delta = clamp_row_delta(row_delta, &modal.origin, rows);
+    if time_locked {
+        row_delta = 0;
+    }
+    Some(
+        modal
+            .origin
+            .iter()
+            .filter_map(|sel| {
+                let (start, _) = clip_geometry(midi_tracks, control_tracks, *sel)?;
+                let to_track = (sel.track as i32 + row_delta).max(0) as usize;
+                let new_start = (start as i64 + bar_delta * TICKS_PER_BAR as i64).max(0) as u32;
+                Some(ClipMove {
+                    from: *sel,
+                    to_track,
+                    start_ticks: new_start,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The T modal's per-clip span edits (bar-aligned, ≥ 1 bar, within the
+/// arrangement). `None` when the pointer is unavailable or not a Stretch.
+fn stretch_targets(
+    modal: &Modal,
+    ptr: Option<Pos2>,
+    px_per_bar: f32,
+    midi_tracks: &[MidiTrack],
+    control_tracks: &[ControlTrack],
+) -> Option<Vec<ClipSpanEdit>> {
+    let ModalKind::Stretch { start_edge } = modal.kind else {
+        return None;
+    };
+    let ptr = ptr?;
+    let bar_delta = ((ptr.x - modal.grab.x) / px_per_bar).round() as i64;
+    let tick_delta = bar_delta * TICKS_PER_BAR as i64;
+    let bar = TICKS_PER_BAR as i64;
+    let max_end = MAX_ARRANGEMENT_BARS as i64 * bar;
+    Some(
+        modal
+            .origin
+            .iter()
+            .filter_map(|sel| {
+                let (start, span) = clip_geometry(midi_tracks, control_tracks, *sel)?;
+                let (new_start, new_span) = if start_edge {
+                    let d = tick_delta.clamp(-(start as i64), span as i64 - bar);
+                    ((start as i64 + d) as u32, (span as i64 - d) as u32)
+                } else {
+                    let d = tick_delta.clamp(bar - span as i64, max_end - (start + span) as i64);
+                    (start, (span as i64 + d) as u32)
+                };
+                Some(ClipSpanEdit {
+                    sel: *sel,
+                    start_ticks: new_start,
+                    span_ticks: new_span,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// One modal target awaiting overlap validation: the clip at `sel` wants
+/// the (start, span) rectangle on row `to_track` (kind in `is_control`).
+type ModalTarget = (ClipSel, (u32, u32), usize, bool);
+
+/// Post-finalize validation for a move/stretch batch (M4b decision ②):
+/// clips whose target completely covers an existing (non-moving) clip are
+/// refused and stay at their origin; the rest go through.
+fn filter_covered(
+    targets: Vec<ModalTarget>,
+    midi_tracks: &[MidiTrack],
+    control_tracks: &[ControlTrack],
+) -> (Vec<ModalTarget>, usize) {
+    let moving: Vec<ClipSel> = targets.iter().map(|(sel, _, _, _)| *sel).collect();
+    let mut kept = Vec::new();
+    let mut refused = 0;
+    for (sel, target, to_track, is_control) in targets {
+        let skip: Vec<usize> = moving
+            .iter()
+            .filter(|m| m.is_control == is_control && m.track == to_track)
+            .map(|m| m.clip)
+            .collect();
+        let existing = if is_control {
+            track_spans(&control_tracks[to_track].clips, &skip)
+        } else {
+            track_spans(&midi_tracks[to_track].clips, &skip)
+        };
+        if fully_covers(target, &existing) {
+            refused += 1;
+        } else {
+            kept.push((sel, target, to_track, is_control));
+        }
+    }
+    (kept, refused)
 }
 
 struct RowColors {
@@ -397,6 +623,38 @@ pub fn show(
                     .color(Color32::from_rgb(240, 190, 80)),
             );
         }
+        match &state.modal {
+            Some(Modal {
+                kind: ModalKind::Grab { time_locked },
+                ..
+            }) => {
+                ui.weak(
+                    egui::RichText::new(format!(
+                        "Move: LMB drop · RMB / Esc cancel{}",
+                        if *time_locked {
+                            " · X: time lock ON (vertical disabled)"
+                        } else {
+                            " · X: lock time"
+                        }
+                    ))
+                    .color(Color32::from_rgb(140, 200, 250)),
+                );
+            }
+            Some(Modal {
+                kind: ModalKind::Stretch { start_edge },
+                ..
+            }) => {
+                ui.weak(
+                    egui::RichText::new(if *start_edge {
+                        "Stretch start: LMB drop · RMB / Esc cancel · T: other edge"
+                    } else {
+                        "Stretch end: LMB drop · RMB / Esc cancel · Shift+T: pull start"
+                    })
+                    .color(Color32::from_rgb(140, 200, 250)),
+                );
+            }
+            None => {}
+        }
         if let Some(msg) = state.status.take() {
             ui.weak(egui::RichText::new(msg).color(Color32::YELLOW));
         }
@@ -432,6 +690,9 @@ pub fn show(
         // of the band covers; show() combines them into the selection once
         // all rows have run (M4b: the band may span several rows).
         let mut marquee_hits = Vec::new();
+        // Row geometry registry for the modal ghosts (they can land on any
+        // row of the same kind, so they are drawn after all rows have run).
+        let mut geom: Vec<(RowKind, Rect)> = Vec::new();
         state.had_focus = false;
 
         // MIDI rows.
@@ -455,6 +716,7 @@ pub fn show(
                 state,
                 &mut actions,
                 &mut marquee_hits,
+                &mut geom,
                 header,
                 RowKind::Midi(i),
                 &track.clips,
@@ -484,6 +746,7 @@ pub fn show(
                     state,
                     &mut actions,
                     &mut marquee_hits,
+                    &mut geom,
                     header,
                     RowKind::Control(i),
                     &track.clips,
@@ -531,6 +794,148 @@ pub fn show(
             state.marquee = None;
             state.marquee_ending = false;
         }
+
+        // Modal transform (M4b.3): finalize on the confirming click, cancel
+        // on RMB, otherwise draw the ghosts (they may land on any row of
+        // the same kind, so they go through the geometry registry).
+        if state.modal.is_some() {
+            let ptr = ui.ctx().pointer_hover_pos();
+            let px_per_bar = state.px_per_bar;
+            if state.modal_cancel || state.modal_confirm {
+                if state.modal_confirm {
+                    if let Some(m) = &state.modal {
+                        match m.kind {
+                            ModalKind::Grab { .. } => {
+                                if let Some(moves) = grab_targets(
+                                    m, ptr, px_per_bar, midi_tracks.len(),
+                                    control_tracks.len(), midi_tracks, control_tracks,
+                                ) {
+                                    let targets: Vec<_> = moves
+                                        .into_iter()
+                                        .filter_map(|mv| {
+                                            let (_, span) = clip_geometry(
+                                                midi_tracks, control_tracks, mv.from,
+                                            )?;
+                                            Some((
+                                                mv.from,
+                                                (mv.start_ticks, span),
+                                                mv.to_track,
+                                                mv.from.is_control,
+                                            ))
+                                        })
+                                        .collect();
+                                    let (kept, refused) = filter_covered(
+                                        targets, midi_tracks, control_tracks,
+                                    );
+                                    if refused > 0 {
+                                        state.status = Some(format!(
+                                            "{refused} clip(s) held: target fully covers an existing clip"
+                                        ));
+                                    }
+                                    if !kept.is_empty() {
+                                        actions.push(TimelineAction::MoveClipsBatch {
+                                            moves: kept
+                                                .into_iter()
+                                                .map(|(from, (start_ticks, _), to_track, _)| {
+                                                    ClipMove { from, to_track, start_ticks }
+                                                })
+                                                .collect(),
+                                        });
+                                    }
+                                }
+                            }
+                            ModalKind::Stretch { .. } => {
+                                if let Some(spans) = stretch_targets(
+                                    m, ptr, px_per_bar, midi_tracks, control_tracks,
+                                ) {
+                                    let targets: Vec<_> = spans
+                                        .iter()
+                                        .map(|e| {
+                                            (
+                                                e.sel,
+                                                (e.start_ticks, e.span_ticks),
+                                                e.sel.track,
+                                                e.sel.is_control,
+                                            )
+                                        })
+                                        .collect();
+                                    let (kept, refused) = filter_covered(
+                                        targets, midi_tracks, control_tracks,
+                                    );
+                                    if refused > 0 {
+                                        state.status = Some(format!(
+                                            "{refused} clip(s) held: target fully covers an existing clip"
+                                        ));
+                                    }
+                                    if !kept.is_empty() {
+                                        actions.push(TimelineAction::StretchClipsBatch {
+                                            spans: kept
+                                                .into_iter()
+                                                .map(|(sel, (start_ticks, span_ticks), _, _)| {
+                                                    ClipSpanEdit { sel, start_ticks, span_ticks }
+                                                })
+                                                .collect(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                state.modal = None;
+                state.modal_confirm = false;
+                state.modal_cancel = false;
+            } else if let Some(m) = &state.modal {
+                // Ghost preview: solid blocks at each target (alpha 170),
+                // over dimmed originals (the rows already drew them dim).
+                let targets = match m.kind {
+                    ModalKind::Grab { .. } => grab_targets(
+                        m, ptr, px_per_bar, midi_tracks.len(), control_tracks.len(),
+                        midi_tracks, control_tracks,
+                    )
+                    .map(|ms| {
+                        ms.into_iter()
+                            .filter_map(|mv| {
+                                let (_, span) =
+                                    clip_geometry(midi_tracks, control_tracks, mv.from)?;
+                                Some((mv.from.is_control, mv.to_track, mv.start_ticks, span))
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                    ModalKind::Stretch { .. } => stretch_targets(
+                        m, ptr, px_per_bar, midi_tracks, control_tracks,
+                    )
+                    .map(|es| {
+                        es.into_iter()
+                            .map(|e| (e.sel.is_control, e.sel.track, e.start_ticks, e.span_ticks))
+                            .collect::<Vec<_>>()
+                    }),
+                };
+                if let Some(targets) = targets {
+                    for (is_control, track, start, span) in targets {
+                        let Some((_, lane)) = geom
+                            .iter()
+                            .find(|(row, _)| row.key() == (is_control, track))
+                        else {
+                            continue;
+                        };
+                        let x0 = lane.left() + start as f32 * px_per_tick;
+                        let x1 = lane.left() + (start + span) as f32 * px_per_tick;
+                        let rect = Rect::from_min_max(
+                            pos2(x0 + 1.0, lane.top() + 2.0),
+                            pos2(x1 - 1.0, lane.bottom() - 2.0),
+                        );
+                        let ghost = if is_control {
+                            Color32::from_rgba_unmultiplied(235, 195, 130, 170)
+                        } else {
+                            Color32::from_rgba_unmultiplied(140, 180, 240, 170)
+                        };
+                        let painter = ui.painter_at(*lane);
+                        painter.rect_filled(rect, 3.0, ghost);
+                    }
+                }
+            }
+        }
     });
     actions
 }
@@ -542,6 +947,7 @@ fn lane_row<T: Placement>(
     state: &mut TimelineState,
     actions: &mut Vec<TimelineAction>,
     marquee_hits: &mut Vec<(RowKind, Vec<usize>)>,
+    geom: &mut Vec<(RowKind, Rect)>,
     header: HeaderKind,
     row: RowKind,
     clips: &[T],
@@ -613,6 +1019,7 @@ fn lane_row<T: Placement>(
         }
         let painter = ui.painter_at(lane);
         painter.rect_filled(lane, 0.0, colors.lane_bg);
+        geom.push((row, lane));
 
         // Bar grid.
         let bars = (content_px / px_per_tick / TICKS_PER_BAR as f32).ceil() as u32;
@@ -642,7 +1049,24 @@ fn lane_row<T: Placement>(
             if rect.right() < lane.left() || rect.left() > lane.right() || rect.width() < 2.0 {
                 continue;
             }
-            painter.rect_filled(rect, 3.0, colors.clip_fill);
+            // Modal convention (M4a.5): originals dim while the ghost is
+            // live, so the preview stays visible where they overlap.
+            let selected = state.selection.contains(&ClipSel {
+                is_control,
+                track,
+                clip: index,
+            });
+            let fill = if selected && state.modal.is_some() {
+                Color32::from_rgba_unmultiplied(
+                    colors.clip_fill.r(),
+                    colors.clip_fill.g(),
+                    colors.clip_fill.b(),
+                    60,
+                )
+            } else {
+                colors.clip_fill
+            };
+            painter.rect_filled(rect, 3.0, fill);
             painter.rect_stroke(
                 rect,
                 3.0,
@@ -690,7 +1114,7 @@ fn lane_row<T: Placement>(
 
         // Knife (K armed): an LMB click cuts the clip under the pointer at
         // the bar-snapped position; the knife stays armed for more cuts.
-        if state.knife_armed && response.clicked() {
+        if state.knife_armed && state.modal.is_none() && response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
                 if clips.len() >= MAX_CLIPS_PER_TRACK {
                     state.status = Some("this track is full — cannot split".to_string());
@@ -732,8 +1156,8 @@ fn lane_row<T: Placement>(
         }
 
         // Double-click: open the clip's editor, or insert a new clip on empty
-        // space.
-        if response.double_clicked() {
+        // space. Not while a modal owns the pointer.
+        if response.double_clicked() && state.modal.is_none() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let tick = tick_at(pos.x);
                 if let Some(index) = hit_clip(clips, tick) {
@@ -764,9 +1188,9 @@ fn lane_row<T: Placement>(
 
         // Drag start: on a clip, pick move vs resize by the grab zone at
         // the right edge (and select it if it was not); on empty space,
-        // start a rubber band (M4b selection). While the knife is armed the
-        // pointer is its: no drags, no bands — clicks cut instead.
-        if response.drag_started() && !state.knife_armed {
+        // start a rubber band (M4b selection). While the knife is armed or
+        // a modal is live the pointer belongs to them: no drags, no bands.
+        if response.drag_started() && !state.knife_armed && state.modal.is_none() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let tick = tick_at(pos.x);
                 if let Some(index) = hit_clip(clips, tick) {
@@ -903,9 +1327,20 @@ fn lane_row<T: Placement>(
             }
         }
 
+        // Modal pointer handling: LMB click confirms, RMB cancels (and
+        // suppresses delete while the modal is live).
+        if state.modal.is_some() {
+            if response.clicked() {
+                state.modal_confirm = true;
+            }
+            if response.secondary_clicked() {
+                state.modal_cancel = true;
+            }
+        }
+
         // Right-click: cancel a live band, disarm the knife, otherwise
         // delete the clip under the pointer.
-        if response.secondary_clicked() {
+        if response.secondary_clicked() && state.modal.is_none() {
             if state.knife_armed {
                 state.knife_armed = false;
             } else if let Some(pos) = response.interact_pointer_pos() {
@@ -944,16 +1379,48 @@ fn lane_row<T: Placement>(
             let knife = ui
                 .ctx()
                 .input_mut(|i| i.consume_key(Modifiers::NONE, Key::K));
+            // Shift+T must be consumed before plain T (consume_key ignores
+            // the shift qualifier when matching).
+            let shift_t = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::T));
+            let t = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(Modifiers::NONE, Key::T));
+            let g = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(Modifiers::NONE, Key::G));
+            let x = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(Modifiers::NONE, Key::X));
             if knife {
                 state.knife_armed = !state.knife_armed;
+                state.modal = None;
+            }
+            // X toggles the time lock while a Grab modal is live.
+            if x {
+                if let Some(modal) = &mut state.modal {
+                    if let ModalKind::Grab { time_locked } = &mut modal.kind {
+                        *time_locked = !*time_locked;
+                    }
+                }
+            }
+            // Arm G/T (Blender-style modal; arming one tool clears the other).
+            if (g || t || shift_t) && state.modal.is_none() {
+                state.knife_armed = false;
+                arm_modal(state, ui.ctx(), g, shift_t);
             }
             if escape {
-                state.selection.clear();
-                state.marquee = None;
-                state.marquee_ending = false;
-                state.knife_armed = false;
+                if state.modal.is_some() {
+                    state.modal = None;
+                } else {
+                    state.selection.clear();
+                    state.marquee = None;
+                    state.marquee_ending = false;
+                    state.knife_armed = false;
+                }
             }
-            if delete && !state.selection.is_empty() {
+            if delete && state.modal.is_none() && !state.selection.is_empty() {
                 actions.push(TimelineAction::RemoveClipsBatch {
                     clips: state.selection.clone(),
                 });
@@ -961,6 +1428,37 @@ fn lane_row<T: Placement>(
             }
         }
     });
+}
+
+/// Arms a G/T modal from the current selection (M4b.3). G requires a
+/// single track kind (cross-kind moves are meaningless); both need a
+/// non-empty selection and a pointer position to grab from.
+fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, grab: bool, start_edge: bool) {
+    if state.selection.is_empty() {
+        state.status = Some("nothing selected — G / T need a selection".to_string());
+        return;
+    }
+    let Some(ptr) = ctx.pointer_hover_pos() else {
+        return;
+    };
+    if grab {
+        let first = state.selection[0].is_control;
+        if state.selection.iter().any(|s| s.is_control != first) {
+            state.status = Some("mixed selection: G moves one track kind at a time".to_string());
+            return;
+        }
+        state.modal = Some(Modal {
+            kind: ModalKind::Grab { time_locked: false },
+            origin: state.selection.clone(),
+            grab: ptr,
+        });
+    } else {
+        state.modal = Some(Modal {
+            kind: ModalKind::Stretch { start_edge },
+            origin: state.selection.clone(),
+            grab: ptr,
+        });
+    }
 }
 
 fn hit_clip<T: Placement>(clips: &[T], tick: f32) -> Option<usize> {
@@ -1081,6 +1579,122 @@ mod tests {
             .collect();
         assert!(!split_clip_in(&mut clips, TICKS_PER_BAR, 0));
         assert_eq!(clips.len(), MAX_CLIPS_PER_TRACK);
-        let _ = Sequence::default();
+    }
+
+    #[test]
+    fn row_delta_clamps_globally_not_per_clip() {
+        // Selection on rows 0 and 1 of three rows: delta +2 must clamp to
+        // +1 so the whole group fits, not push row 1 out.
+        let sel = vec![
+            ClipSel {
+                is_control: false,
+                track: 0,
+                clip: 0,
+            },
+            ClipSel {
+                is_control: false,
+                track: 1,
+                clip: 0,
+            },
+        ];
+        assert_eq!(clamp_row_delta(2, &sel, 3), 1);
+        // Track 0 anchors the group: no downward move at all.
+        assert_eq!(clamp_row_delta(-5, &sel, 3), 0);
+        // Selection on rows 1 and 2 can move down by one, not further.
+        let low = vec![
+            ClipSel {
+                is_control: false,
+                track: 1,
+                clip: 0,
+            },
+            ClipSel {
+                is_control: false,
+                track: 2,
+                clip: 0,
+            },
+        ];
+        assert_eq!(clamp_row_delta(-1, &low, 3), -1);
+        assert_eq!(clamp_row_delta(-5, &low, 3), -1);
+    }
+
+    #[test]
+    fn full_coverage_is_refused_but_crossing_is_not() {
+        // Target 0..8 fully covers 2..4: refused.
+        assert!(fully_covers((0, 8), &[(2, 2)]));
+        // Target 0..4 crosses 2..6: partial overlap, allowed.
+        assert!(!fully_covers((0, 4), &[(2, 4)]));
+        // Touching edges are not coverage.
+        assert!(!fully_covers((0, 4), &[(4, 2)]));
+    }
+
+    #[test]
+    fn grab_moves_by_bars_and_rows_within_kind() {
+        let midi = vec![MidiTrack {
+            clips: vec![clip(2 * TICKS_PER_BAR, 2 * TICKS_PER_BAR)],
+            ..MidiTrack::default()
+        }];
+        let modal = Modal {
+            kind: ModalKind::Grab { time_locked: false },
+            origin: vec![ClipSel {
+                is_control: false,
+                track: 0,
+                clip: 0,
+            }],
+            grab: pos2(100.0, 100.0),
+        };
+        // Pointer 1.6 bars right, one row down.
+        let ptr = pos2(100.0 + 1.6 * 56.0, 100.0 + ROW_HEIGHT);
+        let targets = grab_targets(&modal, Some(ptr), 56.0, 2, 1, &midi, &[]).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].to_track, 1);
+        // 1.6 bars → rounds to 2 bars.
+        assert_eq!(targets[0].start_ticks, 4 * TICKS_PER_BAR);
+        // Time lock kills the vertical delta only.
+        let locked = Modal {
+            kind: ModalKind::Grab { time_locked: true },
+            ..modal.clone()
+        };
+        let targets = grab_targets(&locked, Some(ptr), 56.0, 2, 1, &midi, &[]).unwrap();
+        assert_eq!(targets[0].to_track, 0);
+        assert_eq!(targets[0].start_ticks, 4 * TICKS_PER_BAR);
+    }
+
+    #[test]
+    fn stretch_keeps_one_bar_minimum() {
+        let midi = vec![MidiTrack {
+            clips: vec![clip(2 * TICKS_PER_BAR, 2 * TICKS_PER_BAR)],
+            ..MidiTrack::default()
+        }];
+        let grab = pos2(0.0, 0.0);
+        // End edge, pointer 3 bars left: span would go negative → clamps
+        // to one bar.
+        let end = Modal {
+            kind: ModalKind::Stretch { start_edge: false },
+            origin: vec![ClipSel {
+                is_control: false,
+                track: 0,
+                clip: 0,
+            }],
+            grab,
+        };
+        let targets =
+            stretch_targets(&end, Some(pos2(-3.0 * 56.0, 0.0)), 56.0, &midi, &[]).unwrap();
+        assert_eq!(targets[0].span_ticks, TICKS_PER_BAR);
+        assert_eq!(targets[0].start_ticks, 2 * TICKS_PER_BAR);
+        // Start edge, pointer 3 bars right: start would pass the end →
+        // clamps to one bar remaining.
+        let start = Modal {
+            kind: ModalKind::Stretch { start_edge: true },
+            origin: vec![ClipSel {
+                is_control: false,
+                track: 0,
+                clip: 0,
+            }],
+            grab,
+        };
+        let targets =
+            stretch_targets(&start, Some(pos2(3.0 * 56.0, 0.0)), 56.0, &midi, &[]).unwrap();
+        assert_eq!(targets[0].start_ticks, 3 * TICKS_PER_BAR);
+        assert_eq!(targets[0].span_ticks, TICKS_PER_BAR);
     }
 }

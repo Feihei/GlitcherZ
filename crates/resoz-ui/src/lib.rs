@@ -313,6 +313,59 @@ pub struct ResoZApp {
     close_sent: bool,
 }
 
+/// One track's clip table view, for relocate_in.
+type ClipTables<'a, T> = &'a mut [&'a mut Vec<T>];
+
+/// Moves clips across the clip tables of one track kind (M4b.3 G modal).
+/// Per source table the indices are removed descending, then re-appended
+/// at their destinations with the new start — appending cannot shift any
+/// remaining index. `moves`: (from_table, from_index, to_table, new_start).
+/// Returns the touched table indices. Destinations beyond
+/// MAX_CLIPS_PER_TRACK silently drop the clip.
+type MoveSpec = (usize, usize, usize, u32);
+
+fn relocate_in<T: timeline::Placement>(
+    tables: ClipTables<'_, T>,
+    moves: &[MoveSpec],
+) -> Vec<usize> {
+    // (from_table, [(from_index, to_table, new_start)])
+    #[allow(clippy::type_complexity)]
+    let mut by_from: Vec<(usize, Vec<(usize, usize, u32)>)> = Vec::new();
+    for &(from, index, to, start) in moves {
+        match by_from.iter_mut().find(|(k, _)| *k == from) {
+            Some((_, v)) => v.push((index, to, start)),
+            None => by_from.push((from, vec![(index, to, start)])),
+        }
+    }
+    let mut touched = Vec::new();
+    for (from, mut items) in by_from {
+        items.sort_unstable_by_key(|(index, _, _)| std::cmp::Reverse(*index));
+        let mut taken: Vec<(usize, T)> = Vec::new();
+        {
+            let src: &mut Vec<T> = tables[from];
+            for (index, to, start) in items {
+                if index < src.len() {
+                    let mut c = src.remove(index);
+                    c.set_start(start);
+                    taken.push((to, c));
+                    if !touched.contains(&from) {
+                        touched.push(from);
+                    }
+                }
+            }
+        }
+        for (to, c) in taken {
+            if !touched.contains(&to) {
+                touched.push(to);
+            }
+            if tables[to].len() < MAX_CLIPS_PER_TRACK {
+                tables[to].push(c);
+            }
+        }
+    }
+    touched
+}
+
 impl ResoZApp {
     /// Build the window app, restore persisted recent files, and push the whole project document
     /// down via incremental graph building + the command queue (takes effect at the next audio
@@ -2315,6 +2368,12 @@ impl ResoZApp {
                 clip,
                 at_ticks,
             } => self.timeline_split_clip(is_control, track, clip, at_ticks),
+            timeline::TimelineAction::MoveClipsBatch { moves } => {
+                self.timeline_move_clips_batch(moves)
+            }
+            timeline::TimelineAction::StretchClipsBatch { spans } => {
+                self.timeline_stretch_clips_batch(spans)
+            }
         }
     }
 
@@ -2516,6 +2575,114 @@ impl ResoZApp {
                 if s.is_control == is_control && s.track == track && s.clip > clip {
                     s.clip += 1;
                 }
+            }
+        }
+    }
+
+    /// G-modal finalize: moves every clip in ONE undo step (may cross
+    /// tracks of the same kind). Sources are removed descending per track,
+    /// then re-appended at their destinations with the new start —
+    /// appending cannot shift any remaining index.
+    fn timeline_move_clips_batch(&mut self, moves: Vec<timeline::ClipMove>) {
+        if moves.is_empty() {
+            return;
+        }
+        let before = self.begin_edit();
+        let mut touched = Vec::new();
+        {
+            let project = self.project_mut();
+            for (is_control, kind_moves) in [
+                (
+                    false,
+                    moves
+                        .iter()
+                        .filter(|m| !m.from.is_control)
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    true,
+                    moves
+                        .iter()
+                        .filter(|m| m.from.is_control)
+                        .collect::<Vec<_>>(),
+                ),
+            ] {
+                if kind_moves.is_empty() {
+                    continue;
+                }
+                let spec: Vec<(usize, usize, usize, u32)> = kind_moves
+                    .iter()
+                    .map(|m| (m.from.track, m.from.clip, m.to_track, m.start_ticks))
+                    .collect();
+                let rows = if is_control {
+                    let mut tables: Vec<&mut Vec<ControlClip>> = project
+                        .control_tracks
+                        .iter_mut()
+                        .map(|t| &mut t.clips)
+                        .collect();
+                    relocate_in(tables.as_mut_slice(), &spec)
+                } else {
+                    let mut tables: Vec<&mut Vec<MidiClip>> = project
+                        .midi_tracks
+                        .iter_mut()
+                        .map(|t| &mut t.clips)
+                        .collect();
+                    relocate_in(tables.as_mut_slice(), &spec)
+                };
+                for r in rows {
+                    touched.push((is_control, r));
+                }
+            }
+        }
+        if !touched.is_empty() {
+            self.commit_edit("Move Clips", before);
+            for (is_control, track) in touched {
+                self.sync_clip_row(is_control, track);
+            }
+        }
+    }
+
+    /// T-modal finalize: stretches every clip in ONE undo step (same
+    /// track, bar-aligned spans validated by the view).
+    fn timeline_stretch_clips_batch(&mut self, spans: Vec<timeline::ClipSpanEdit>) {
+        if spans.is_empty() {
+            return;
+        }
+        let before = self.begin_edit();
+        let mut touched = Vec::new();
+        {
+            let project = self.project_mut();
+            for e in &spans {
+                let changed = if e.sel.is_control {
+                    project
+                        .control_tracks
+                        .get_mut(e.sel.track)
+                        .and_then(|t| t.clips.get_mut(e.sel.clip))
+                        .map(|c| {
+                            c.start_ticks = e.start_ticks;
+                            c.span_ticks = e.span_ticks;
+                        })
+                        .is_some()
+                } else {
+                    project
+                        .midi_tracks
+                        .get_mut(e.sel.track)
+                        .and_then(|t| t.clips.get_mut(e.sel.clip))
+                        .map(|c| {
+                            c.start_ticks = e.start_ticks;
+                            c.span_ticks = e.span_ticks;
+                        })
+                        .is_some()
+                };
+                if changed && !touched.contains(&(e.sel.is_control, e.sel.track)) {
+                    touched.push((e.sel.is_control, e.sel.track));
+                }
+            }
+        }
+        if !touched.is_empty() {
+            self.commit_edit("Stretch Clips", before);
+            for (is_control, track) in touched {
+                self.sync_clip_row(is_control, track);
             }
         }
     }
