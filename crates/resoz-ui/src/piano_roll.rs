@@ -191,6 +191,10 @@ pub struct RollState {
     /// is focus-gated, so a dead D/G/T/S is either this or no key events
     /// reaching egui at all (OS / IME level).
     had_focus: bool,
+    /// The roll widget's id, registered each frame so the app can ask
+    /// egui whether the roll owns keyboard focus right now — command
+    /// keys (G/T/S/D/K...) must not also trigger the virtual piano.
+    focus_id: Option<egui::Id>,
     /// Selection drag in progress (uniform move of all selected notes, a
     /// trim of either edge, a time scale, or a draw gesture setting a
     /// fresh note's length).
@@ -610,6 +614,7 @@ impl RollState {
             knife_armed: false,
             status: None,
             had_focus: false,
+            focus_id: None,
             drag: None,
             marquee: None,
             knife: None,
@@ -677,6 +682,22 @@ impl RollState {
     /// Takes the pending status message (a no-op explanation), if any.
     pub fn take_status(&mut self) -> Option<String> {
         self.status.take()
+    }
+
+    /// Whether the roll widget owns keyboard focus *right now*, per egui's
+    /// own memory (no frame lag; `false` once the roll stops being laid
+    /// out — egui's dead-mans-switch drops its focus). The app gates the
+    /// virtual piano on this: while the roll is focused, the computer
+    /// keyboard drives the command family, not the notes.
+    pub fn owns_keyboard_focus(&self, ctx: &egui::Context) -> bool {
+        self.focus_id
+            .is_some_and(|id| ctx.memory(|m| m.has_focus(id)))
+    }
+
+    /// The roll widget's id as of the most recent frame, for tests and
+    /// focus surgery (`Memory::surrender_focus`).
+    pub fn focus_id(&self) -> Option<egui::Id> {
+        self.focus_id
     }
 
     /// Whether a modal transform is live (G/S/T/Shift+D following the
@@ -859,6 +880,7 @@ pub fn show(
         response.request_focus();
     }
     state.had_focus = response.has_focus();
+    state.focus_id = Some(response.id);
 
     // Wheel: scroll the pitch view vertically.
     if response.hovered() {

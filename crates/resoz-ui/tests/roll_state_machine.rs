@@ -853,6 +853,27 @@ fn arrows_nudge_repeatedly_without_losing_focus() {
     );
 }
 
+#[test]
+fn keyboard_ownership_tracks_egui_focus_exactly() {
+    // The app gates the virtual piano on `owns_keyboard_focus`; it must
+    // mirror egui's own focus state with no frame lag and no staleness.
+    let mut f = Fixture::new();
+    // The fixture's calibration clicks already focus the roll.
+    assert!(
+        f.state.owns_keyboard_focus(&f.ctx),
+        "a focused roll owns the keyboard"
+    );
+    if let Some(id) = f.state.focus_id() {
+        f.ctx.memory_mut(|m| m.surrender_focus(id));
+    }
+    // egui settles focus at end of pass; run one frame so memory catches up.
+    f.frame(vec![]);
+    assert!(
+        !f.state.owns_keyboard_focus(&f.ctx),
+        "a roll without focus does not own the keyboard"
+    );
+}
+
 // ---- Gesture shortcuts (the unlimited forms of G / T / Shift+D) ---------------------------
 
 #[test]

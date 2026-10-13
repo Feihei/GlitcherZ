@@ -2039,9 +2039,13 @@ impl ResoZApp {
 
     /// Handle computer keyboard playing (FL Studio-style layout; Z/X shift octaves).
     ///
-    /// TODO: once text input widgets appear in the window, keyboard focus must be checked first
-    /// so typing does not trigger notes.
+    /// While the piano roll owns keyboard focus, the computer keyboard
+    /// drives the roll's command family (G/T/S/D/K...) instead — note-ons
+    /// are suppressed; note-offs still pass so held notes never stick.
+    /// Text input widgets (none yet besides DragValue edits) still need
+    /// the same treatment.
     fn handle_keyboard_input(&mut self, ctx: &egui::Context) {
+        let roll_owns_focus = self.roll_state.owns_keyboard_focus(ctx);
         let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
         for event in events {
             let egui::Event::Key {
@@ -2093,6 +2097,11 @@ impl ResoZApp {
                     if let Some((_, semi)) = KEYMAP.iter().find(|(k, _)| *k == key) {
                         let note = self.octave_base + semi;
                         if pressed {
+                            if roll_owns_focus {
+                                // The roll owns this key (modal command /
+                                // mode toggle); do not also play a note.
+                                continue;
+                            }
                             if !self.held_notes.contains(&note) {
                                 self.send_note_on(note, 0.9);
                             }
@@ -4040,7 +4049,7 @@ impl ResoZApp {
             if ui.button("+ Octave").clicked() {
                 self.octave_base = (self.octave_base + 12).min(84);
             }
-            ui.weak("PC keys A W S E D F T G Y H U J K O L P ; (Z / X octave shift)");
+            ui.weak("PC keys A W S E D F T G Y H U J K O L P ; (Z / X octave shift) — off while the piano roll has focus");
         });
 
         ui.horizontal(|ui| {
