@@ -77,6 +77,34 @@
 - 走带 + BPM、**自动化泳道**（`lane` 自绘组件：参数三选 + 启用开关 + 锚点点按/拖拽/右键删除，播放头走线，截止频率对数轴）、**混音器面板**（轨道选择/静音/post-fader 电平条/竖直推子/声像）、16 步网格（播放位置黄色描边）、**钢琴卷帘编辑器**（`piano_roll` 自绘组件：点空白绘制、拖拽移动、右键删除、滚轮滚动音高、播放头走线；fit-to-width 时间轴、1/64 吸附）、画笔音符/音长、滤波器/ADSR/延迟面板（作用于选中轨道）、虚拟键盘（屏幕 + 电脑键盘）、主输出电平表；
 - 音序器音乐位置经 `Feedback.position_ticks`（AtomicF32）回传驱动播放头。
 
+#### 钢琴卷帘拖动协议（`piano_roll::DragSelection`）
+
+拖动手势**不持有音符索引**，改为「冻结锚点 + 增量发射」，两条不变量：
+
+- **冻结锚点**：抓取瞬间把音符的 `start` / `end` 存进 `anchor_start` / `anchor_end`。每条 MIDI 命令结束都会`sort_by_key` 重排 clip，索引在第一帧之后就失效了；锚点让手势始终跟着用户真正抓住的那个音符。
+- **增量发射**：每帧计算**绝对目标**，只发出 `目标 - 已累计` 的差额（`applied_start` / `applied_end` / `applied_note`）。命令侧是相对增量（`start + ticks`），若每帧重发抓取点起的总偏移会按 1+2+3+… 复利累加，音符会「飞走」。
+
+`clamped_move` 可能吞掉部分 delta，因此累加的是**实际生效值**（从返回的 `MoveNotes` 里读回），不是请求值。`resolve_created` 改为接收新音符的 `start` / `length`（`note_add` 刚建时的几何），不再靠索引回读。
+
+#### 命中判定必须与绘制共用同一套几何
+
+音符的**绘制矩形**由 `note_rect()` 独占定义，`note_at()`（命中）、`note_edges()`（边缘 trim 判定）、marquee 相交测试全部复用它。绘制与命中一旦各写一份就会静默分叉：
+
+- tick 区间判定（`start <= tick < end`）与绘制的 `max(3.0)` 最小宽度不一致——短音符看起来比它的 tick 区间宽；
+- 左闭右开区间**排除了右边缘本身**，于是拖尾落在空白处，触发"新建音符"而不是拉伸末端。
+
+命中矩形在绘制矩形之外再扩 `HIT_SLOP`（x 4 px / y 1 px）——音符末端是 1–2 px 的瞄准目标，按下点经常落在绘制矩形外侧几像素，没有宽容度就会被判成空白。`note_edges()`（trim 的视觉边缘）与绘制保持精确、不带 slop。
+
+`edge_zone` 的两个 8 px（`EDGE_PX`）区在窄音符上会重叠，此时按**离哪条边更近**决定，避免拖头却拉伸尾。
+
+#### 手势分类必须用按下点，不能用 `drag_started` 帧的指针位置
+
+**这是"拖头变移动、拖尾变新建"的真正根因。** egui 要等指针移动超过 `max_click_dist`（默认 6 pt）才报告 `drag_started`，因此该帧的 `interact_pointer_pos()` 已经比按下点滑出 6+ pt：抓在音符头部的判定读成"音符中部"（→ 整体移动），抓在尾部外侧的判定读成"空白"（→ 新建音符）。移动之所以碰巧正常，只是因为音符够宽、滑出 6 pt 后仍在中部。
+
+修法：`drag_started` 分支改读 `input(|i| i.pointer.press_origin())`（"Where did the current click/drag originate?"），命中判定、边缘判定、移动锚点全部以**按下点**为准。副作用是移动锚点也变精确了——音符第一帧就贴合指针，不再先跳 6 pt。该契约由 `tests/egui_event_semantics.rs::drag_started_keeps_the_press_point_separate_from_the_current_pos` 钉住（若未来 egui 改掉 6 pt 阈值语义，测试先红）。
+
+`clicked()` 帧不能这么改——`press_origin` 在松开后变 `None`，click 判定继续用 `interact_pointer_pos()`（egui 的 click 要求移动 < 6 pt，位置足够接近按下点）。
+
 ### 命令集（轨道定向）
 
 - `SetParam`（主链）/ `SetTrackParam{track}` / `Note{track}` / `Sequencer(Play|Stop|SetBpm|SetGate|SetPattern{track}|SetClip|SetSource|SetAutomation)`；模式整块 `Copy` 数组经队列传递。

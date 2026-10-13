@@ -19,6 +19,8 @@ struct Probe {
     hovered: bool,
     smooth_y: f32,
     zoom_delta: f32,
+    press_origin: Option<egui::Pos2>,
+    interact_pos: Option<egui::Pos2>,
 }
 
 /// Run one egui frame with the given events and probe the patch-like widget.
@@ -51,6 +53,10 @@ fn frame(ctx: &egui::Context, events: Vec<egui::Event>, t: f64) -> Probe {
         });
         p.smooth_y = ctx.input(|i| i.smooth_scroll_delta.y);
         p.zoom_delta = ctx.input(|i| i.zoom_delta());
+        let (origin, interact) =
+            ctx.input(|i| (i.pointer.press_origin(), i.pointer.interact_pos()));
+        p.press_origin = origin;
+        p.interact_pos = interact;
     });
     out.textures_delta.clear();
     p
@@ -128,6 +134,43 @@ fn press_plus_movement_starts_a_drag() {
     assert!(
         moved.drag_started_primary && moved.dragged,
         "moving 10pt (> max_click_dist 6pt) must start a drag"
+    );
+}
+
+/// The piano roll classifies a grab (move / trim / draw) by where the
+/// press *landed*. That only works because `press_origin` still reports
+/// the press point on the `drag_started` frame — `interact_pos` has
+/// already travelled past `max_click_dist` by then, which is exactly how
+/// edge grabs used to degrade into moves and tail grabs into new notes.
+#[test]
+fn drag_started_keeps_the_press_point_separate_from_the_current_pos() {
+    let ctx = egui::Context::default();
+    frame(&ctx, vec![hover(CENTER)], 0.0);
+    frame(
+        &ctx,
+        vec![
+            hover(CENTER),
+            press(egui::PointerButton::Primary, CENTER, true),
+        ],
+        0.1,
+    );
+    let dragged_to = egui::pos2(CENTER.x + 12.0, CENTER.y);
+    let moved = frame(&ctx, vec![hover(dragged_to)], 0.2);
+
+    assert!(moved.drag_started_primary);
+    assert_eq!(
+        moved.press_origin,
+        Some(CENTER),
+        "press_origin must be where the button went down, not where it is now"
+    );
+    assert_eq!(
+        moved.interact_pos,
+        Some(dragged_to),
+        "interact_pos is the live position — the one a grab must NOT be classified by"
+    );
+    assert_ne!(
+        moved.press_origin, moved.interact_pos,
+        "if these ever agree on the drag_started frame, the 6pt threshold is gone"
     );
 }
 

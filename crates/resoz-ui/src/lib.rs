@@ -3556,7 +3556,7 @@ impl ResoZApp {
         // `note_add` and every resize frame collapse into a single step (one
         // gesture = one undo).
         let draw_key = |gesture: u64| format!("roll-draw:{track}:{clip}:{gesture}");
-        let mut created: Option<usize> = None;
+        let mut created: Option<(usize, i64, i64)> = None;
         let result = match intent {
             RollIntent::AddNote {
                 note,
@@ -3575,12 +3575,14 @@ impl ResoZApp {
                 // The new note becomes the whole selection (its sorted index
                 // is authoritative; the old selection's indices are stale).
                 // resolve_created also starts the draw-drag if the creation
-                // came from a press-draw on empty space.
+                // came from a press-draw on empty space. The geometry travels
+                // with the index so the drag can anchor on it without
+                // indexing into the freshly re-sorted clip.
                 created = outcome
                     .as_ref()
                     .ok()
                     .and_then(|value| value["index"].as_u64())
-                    .map(|index| index as usize);
+                    .map(|index| (index as usize, start, length));
                 outcome
             }
             RollIntent::ResizeEnd {
@@ -3675,8 +3677,8 @@ impl ResoZApp {
                 )
             }
         };
-        if let Some(index) = created {
-            self.roll_state.resolve_created(index);
+        if let Some((index, start, length)) = created {
+            self.roll_state.resolve_created(index, start, length);
         }
         if selection_changed {
             self.roll_state.selection.clear();

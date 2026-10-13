@@ -58,7 +58,21 @@ const SELECTED: egui::Color32 = egui::Color32::from_rgb(240, 190, 80);
 
 /// Pointer distance (px) to a note's start/end that turns a grab into an
 /// edge trim instead of a move.
-const EDGE_PX: f32 = 5.0;
+///
+/// Sized against [`ROW_HEIGHT`] (9 px): a note body only has to clear this
+/// on *both* sides to offer a move zone. The grab is classified by the
+/// *press* point (see the `drag_started` branch below), so this width is
+/// the true grab target — no slack for `drag_started`'s late report is
+/// needed here.
+const EDGE_PX: f32 = 8.0;
+
+/// Extra forgiveness around a note's drawn rectangle, for hit-testing only.
+/// A note's tail is a 1–2 px target, so a press aimed at it routinely
+/// lands a few pixels *outside* the drawn rect; without slack that reads
+/// as empty space and paints a new note. The x slack is generous because
+/// the tail is hard to hit; the y slack only fills the 1 px gutter
+/// between pitch rows.
+const HIT_SLOP: egui::Vec2 = egui::vec2(4.0, 1.0);
 
 /// An edit the roll wants performed.
 #[derive(Debug, Clone, PartialEq)]
@@ -141,19 +155,71 @@ enum DragKind {
     ResizeEnd,
 }
 
+/// One in-flight drag (move, or a trim of either edge).
+///
+/// The grabbed note's geometry is **frozen here at grab time** and the
+/// per-frame intent is the increment still owed (`target - applied`).
+/// Both halves matter:
+///
+/// - *Frozen anchor* — every command re-sorts the clip, so a held index
+///   stops pointing at the grabbed note after the first frame. Deriving
+///   the target from the anchor instead of re-reading `clip.notes()[i]`
+///   keeps a trim attached to the note the user grabbed.
+/// - *Incremental* — commands apply *relative* deltas (`start + ticks`).
+///   Re-emitting the grab-relative total every frame would compound
+///   (1 + 2 + 3 + … grid cells), so the note would run away from the
+///   pointer instead of tracking it.
 #[derive(Debug)]
 struct DragSelection {
-    /// The note the gesture grabbed (draw: the fresh note; edge trim / move:
-    /// the note under the press).
-    index: usize,
+    /// Start tick of the grabbed note at grab time. A move offsets from
+    /// it; a right-edge trim holds it still (it is the base for the
+    /// minimum-length floor).
+    anchor_start: i64,
+    /// End tick of the grabbed note at grab time. A right-edge trim
+    /// offsets from it; a left-edge trim holds it still (the command
+    /// mirrors the length delta, so the end never moves).
+    anchor_end: i64,
     /// Pointer tick at grab time (f32; snapping happens per frame).
     grab_tick: f32,
     /// Pointer pitch at grab time.
     grab_note: u8,
+    /// Cumulative start shift (ticks) already handed to the command.
+    applied_start: i64,
+    /// Cumulative end shift (ticks) already handed to the command.
+    applied_end: i64,
+    /// Cumulative pitch shift (semitones) already handed to the command.
+    applied_note: i64,
     kind: DragKind,
     /// Gesture id: one drag is one undo step (the id is part of the undo
     /// merge key, and `AddNote`/`Duplicate` frames carry the same id).
     gesture: u64,
+}
+
+impl DragSelection {
+    /// Anchors a gesture on `note`, frozen as it is at grab time.
+    fn anchored(note: &Note, grab_tick: f32, grab_note: u8, kind: DragKind, gesture: u64) -> Self {
+        Self {
+            anchor_start: note.start,
+            anchor_end: note.start + note.length,
+            grab_tick,
+            grab_note,
+            applied_start: 0,
+            applied_end: 0,
+            applied_note: 0,
+            kind,
+            gesture,
+        }
+    }
+
+    /// The grabbed note's start / end / pitch as the document has them
+    /// *right now* (anchor plus everything already applied).
+    fn current_start(&self) -> i64 {
+        self.anchor_start + self.applied_start
+    }
+
+    fn current_end(&self) -> i64 {
+        self.anchor_end + self.applied_end
+    }
 }
 
 #[derive(Debug)]
@@ -190,28 +256,28 @@ impl RollState {
         }
     }
 
-    /// Replaces the selection with `index` (the note a gesture just created)
-    /// and, if that creation came from a press-and-draw on empty space,
-    /// starts drawing the new note's length right away.
-    pub fn resolve_created(&mut self, index: usize) {
+    /// Replaces the selection with `index` (the note a gesture just
+    /// created) and, if that creation came from a press-and-draw on empty
+    /// space, starts drawing the new note's length right away.
+    ///
+    /// `start` / `length` describe the note as it was just created, so
+    /// the draw-drag can anchor on it without waiting for (or indexing
+    /// into) the re-sorted clip.
+    pub fn resolve_created(&mut self, index: usize, start: i64, length: i64) {
         self.selection = vec![index];
         if let Some(grab) = self.awaiting_create.take() {
-            self.drag = Some(DragSelection {
-                index,
-                grab_tick: grab.grab_tick,
-                grab_note: grab.grab_note,
-                kind: DragKind::ResizeEnd,
-                gesture: grab.gesture,
-            });
-        }
-    }
-
-    /// Re-points the selection at `index` — a command re-sorted the clip and
-    /// reported where the note being edited landed, so the rest of the
-    /// gesture keeps tracking the right note.
-    pub fn retarget(&mut self, index: usize) {
-        if let Some(slot) = self.selection.first_mut() {
-            *slot = index;
+            let anchor = Note {
+                start,
+                length,
+                ..Note::default()
+            };
+            self.drag = Some(DragSelection::anchored(
+                &anchor,
+                grab.grab_tick,
+                grab.grab_note,
+                DragKind::ResizeEnd,
+                grab.gesture,
+            ));
         }
     }
 
@@ -367,8 +433,6 @@ pub fn show(
             continue;
         }
         let y = rect.top() + (top_note as f32 - note.note as f32) * ROW_HEIGHT;
-        let x = rect.left() + note.start as f32 * ticks_to_x;
-        let w = (note.length as f32 * ticks_to_x).max(3.0);
         let selected = state.selection.contains(&index);
         let dragging = state.drag.is_some() && selected;
         let base = if dragging {
@@ -384,14 +448,7 @@ pub fn show(
             (base.g() as f32 * k) as u8,
             (base.b() as f32 * k) as u8,
         );
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(x, y + 1.0),
-                egui::pos2(x + w, y + ROW_HEIGHT - 1.0),
-            ),
-            2.0,
-            fill,
-        );
+        painter.rect_filled(note_rect(rect, note, ticks_to_x, y), 2.0, fill);
     }
 
     // 4. Rubber band.
@@ -463,13 +520,7 @@ pub fn show(
             .round()
             .clamp(0.0, 127.0) as u8
     };
-    let hit_note = |pos: egui::Pos2| -> Option<usize> {
-        let tick = pointer_tick(pos) as i64;
-        let note = pointer_note(pos);
-        clip.notes()
-            .iter()
-            .position(|n| n.note == note && tick >= n.start && tick < n.end())
-    };
+    let hit_note = |pos: egui::Pos2| note_at(clip, pos, rect, ticks_to_x, top_note);
     let snap = |ticks: f32| -> i64 { snap_ticks(ticks, grid_ticks) };
     let modifiers = ui.ctx().input(|i| i.modifiers);
     let additive = modifiers.shift || modifiers.ctrl;
@@ -558,25 +609,35 @@ pub fn show(
         && let Some(index) = hit_note(pos)
     {
         let note = &clip.notes()[index];
-        let x0 = rect.left() + note.start as f32 * ticks_to_x;
-        let x1 = x0 + (note.length as f32 * ticks_to_x).max(3.0);
+        let (x0, x1) = note_edges(rect, note, ticks_to_x);
         if edge_zone(pos.x, x0, x1).is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
     }
 
     if response.drag_started() {
-        if let Some(pos) = response.interact_pointer_pos() {
+        // Classify the grab by where the press *landed*, never by where the
+        // pointer is on this frame. egui only reports `drag_started` once
+        // the pointer has travelled past `max_click_dist` (6 pt), so
+        // `interact_pointer_pos()` here is already 6+ pt past the press:
+        // a grab that began on a note's edge reads as a body grab (→ move),
+        // and one that began just past the tail as empty space (→ draw a
+        // new note). `press_origin` is the press point itself.
+        let press = ui
+            .ctx()
+            .input(|i| i.pointer.press_origin())
+            .or_else(|| response.interact_pointer_pos());
+        if let Some(pos) = press {
             // Edge-trim affordance is checked first: within EDGE_PX of a
             // note's start/end the grab trims that edge instead of moving.
             let edge = hit_note(pos).and_then(|index| {
                 let note = &clip.notes()[index];
-                let x0 = rect.left() + note.start as f32 * ticks_to_x;
-                let x1 = x0 + (note.length as f32 * ticks_to_x).max(3.0);
+                let (x0, x1) = note_edges(rect, note, ticks_to_x);
                 edge_zone(pos.x, x0, x1)
             });
             match hit_note(pos) {
                 Some(index) => {
+                    let grabbed = clip.notes()[index];
                     // Ctrl + drag (no edge): duplicate the selection — or the
                     // grabbed note alone — and drag the copies. A plain
                     // Ctrl+click still toggles the selection (that is a
@@ -590,26 +651,26 @@ pub fn show(
                             indices: state.selection.clone(),
                             gesture,
                         });
-                        state.drag = Some(DragSelection {
-                            index,
-                            grab_tick: pointer_tick(pos),
-                            grab_note: pointer_note(pos),
-                            kind: DragKind::Move,
+                        state.drag = Some(DragSelection::anchored(
+                            &grabbed,
+                            pointer_tick(pos),
+                            pointer_note(pos),
+                            DragKind::Move,
                             gesture,
-                        });
+                        ));
                     } else if let Some(kind) = edge {
                         // Edge grab on an unselected note selects just it; on
                         // a selected note it trims the whole selection.
                         if !state.selection.contains(&index) {
                             state.selection = vec![index];
                         }
-                        state.drag = Some(DragSelection {
-                            index,
-                            grab_tick: pointer_tick(pos),
-                            grab_note: pointer_note(pos),
+                        state.drag = Some(DragSelection::anchored(
+                            &grabbed,
+                            pointer_tick(pos),
+                            pointer_note(pos),
                             kind,
-                            gesture: state.next_gesture(),
-                        });
+                            state.next_gesture(),
+                        ));
                     } else {
                         // Plain grab: move. Shift toggles the grabbed note
                         // into/out of the selection first.
@@ -623,13 +684,13 @@ pub fn show(
                             state.selection = vec![index];
                         }
                         if !state.selection.is_empty() {
-                            state.drag = Some(DragSelection {
-                                index,
-                                grab_tick: pointer_tick(pos),
-                                grab_note: pointer_note(pos),
-                                kind: DragKind::Move,
-                                gesture: state.next_gesture(),
-                            });
+                            state.drag = Some(DragSelection::anchored(
+                                &grabbed,
+                                pointer_tick(pos),
+                                pointer_note(pos),
+                                DragKind::Move,
+                                state.next_gesture(),
+                            ));
                         }
                     }
                 }
@@ -670,59 +731,80 @@ pub fn show(
 
     if response.dragged() {
         if let Some(pos) = response.interact_pointer_pos() {
-            if let Some(drag) = &state.drag {
+            if let Some(drag) = &mut state.drag {
+                // Every branch below computes the *absolute* target the
+                // gesture is asking for, then emits only the increment
+                // still owed (`target - applied`). Commands apply relative
+                // deltas, so emitting the whole grab-relative offset every
+                // frame would compound (1 + 2 + 3 + …) and the note would
+                // run away from the pointer instead of tracking it.
                 match drag.kind {
                     DragKind::Move => {
                         // Uniform move of the whole selection. The delta is
                         // clamped on the UI side so no note hits the engine's
                         // clamp asymmetrically (that would permute the sort
                         // and invalidate the selection).
-                        let raw_start_delta = snap(pointer_tick(pos)) - snap(drag.grab_tick);
-                        let raw_note_delta =
-                            i32::from(pointer_note(pos)) - i32::from(drag.grab_note);
-                        if raw_start_delta != 0 || raw_note_delta != 0 {
-                            intent = Some(clamped_move(
+                        let want_start = snap(pointer_tick(pos)) - snap(drag.grab_tick);
+                        let want_note = i64::from(pointer_note(pos)) - i64::from(drag.grab_note);
+                        let delta_start = want_start - drag.applied_start;
+                        let delta_note = want_note - drag.applied_note;
+                        if delta_start != 0 || delta_note != 0 {
+                            let step = clamped_move(
                                 clip,
                                 &state.selection,
-                                raw_start_delta,
-                                raw_note_delta
-                                    .clamp(i16::from(i8::MIN) as i32, i16::from(i8::MAX) as i32)
+                                delta_start,
+                                delta_note
+                                    .clamp(i16::from(i8::MIN) as i64, i16::from(i8::MAX) as i64)
                                     as i8,
                                 loop_ticks,
                                 Some(drag.gesture),
-                            ));
+                            );
+                            // Accumulate what was *actually* applied (the
+                            // clamp may have swallowed part of it), so the
+                            // next frame's increment stays exact.
+                            if let RollIntent::MoveNotes {
+                                delta_start,
+                                delta_note,
+                                ..
+                            } = &step
+                            {
+                                drag.applied_start += delta_start;
+                                drag.applied_note += i64::from(*delta_note);
+                            }
+                            intent = Some(step);
                         }
                     }
                     DragKind::ResizeEnd => {
                         // Drawing / right-edge trim: the grabbed note's end
                         // follows the pointer (snapped, at least one grid
                         // cell, never past the loop); the whole selection
-                        // stretches by the same delta.
-                        if let Some(note) = clip.notes().get(drag.index) {
-                            let end =
-                                draw_end(note.start, pointer_tick(pos), grid_ticks, loop_ticks);
-                            let delta = end - note.end();
-                            if delta != 0 {
-                                intent = Some(RollIntent::ResizeEnd {
-                                    delta_ticks: delta,
-                                    gesture: drag.gesture,
-                                });
-                            }
+                        // stretches by the same delta. The start is the
+                        // frozen anchor — a right-edge trim never moves it.
+                        let start = drag.current_start();
+                        let target = draw_end(start, pointer_tick(pos), grid_ticks, loop_ticks);
+                        let delta = target - drag.current_end();
+                        if delta != 0 {
+                            drag.applied_end += delta;
+                            intent = Some(RollIntent::ResizeEnd {
+                                delta_ticks: delta,
+                                gesture: drag.gesture,
+                            });
                         }
                     }
                     DragKind::ResizeStart => {
                         // Left-edge trim: the grabbed note's start follows the
                         // pointer (snapped, never past its own end); the whole
-                        // selection shifts its starts by the same delta.
-                        if let Some(note) = clip.notes().get(drag.index) {
-                            let start = trim_start(note, pointer_tick(pos), grid_ticks);
-                            let delta = start - note.start;
-                            if delta != 0 {
-                                intent = Some(RollIntent::ResizeStart {
-                                    delta_ticks: delta,
-                                    gesture: drag.gesture,
-                                });
-                            }
+                        // selection shifts its starts by the same delta. The
+                        // end stays put — the command mirrors the length.
+                        let end = drag.current_end();
+                        let target = trim_start(end, pointer_tick(pos), grid_ticks);
+                        let delta = target - drag.current_start();
+                        if delta != 0 {
+                            drag.applied_start += delta;
+                            intent = Some(RollIntent::ResizeStart {
+                                delta_ticks: delta,
+                                gesture: drag.gesture,
+                            });
                         }
                     }
                 }
@@ -741,14 +823,8 @@ pub fn show(
                 .iter()
                 .enumerate()
                 .filter(|(_, n)| {
-                    let x0 = rect.left() + n.start as f32 * ticks_to_x;
-                    let x1 = x0 + (n.length as f32 * ticks_to_x).max(3.0);
                     let y0 = rect.top() + (top_note as f32 - n.note as f32) * ROW_HEIGHT;
-                    let note_rect = egui::Rect::from_min_max(
-                        egui::pos2(x0, y0),
-                        egui::pos2(x1, y0 + ROW_HEIGHT),
-                    );
-                    band.intersects(note_rect)
+                    band.intersects(note_rect(rect, n, ticks_to_x, y0))
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -826,23 +902,78 @@ fn draw_end(start: i64, pointer_tick: f32, grid_ticks: i64, loop_ticks: i64) -> 
 }
 
 /// Start tick of a left-edge trim: the pointer snapped to the grid, never
-/// past the note's own end (min length one tick), never negative.
-fn trim_start(note: &Note, pointer_tick: f32, grid_ticks: i64) -> i64 {
-    snap_ticks(pointer_tick, grid_ticks)
-        .min(note.start + note.length - 1)
-        .max(0)
+/// past the note's own end (min length one tick), never negative. `end` is
+/// the grabbed note's *current* end — the trim's fixed boundary.
+fn trim_start(end: i64, pointer_tick: f32, grid_ticks: i64) -> i64 {
+    snap_ticks(pointer_tick, grid_ticks).min(end - 1).max(0)
 }
 
 /// Which edge of a note (in pixels) the pointer is on, if either — a grab
 /// there trims that edge instead of moving the note.
+///
+/// The two zones never overlap: a note narrower than `2 * EDGE_PX` is all
+/// edge, and resolves to the edge the pointer is *closer* to. Without that
+/// tie-break a wide-ish grab on a short note would pick whichever branch
+/// is tested first, so trimming the head would sometimes stretch the tail
+/// instead.
 fn edge_zone(x: f32, left: f32, right: f32) -> Option<DragKind> {
-    if (x - left).abs() <= EDGE_PX {
+    let d_start = (x - left).abs();
+    let d_end = (x - right).abs();
+    if d_start <= EDGE_PX && d_start <= d_end {
         Some(DragKind::ResizeStart)
-    } else if (x - right).abs() <= EDGE_PX {
+    } else if d_end <= EDGE_PX {
         Some(DragKind::ResizeEnd)
     } else {
         None
     }
+}
+
+/// The note whose hit-testing rectangle covers `pos`, if any.
+///
+/// Hit-testing mirrors **drawing** (`note_rect`) plus [`HIT_SLOP`]: the
+/// same pixels, not a tick range. A tick-range test (`start <= tick <
+/// end`) disagrees with the drawn width in two ways that both read as
+/// bugs to the user — the minimum 3 px width makes short notes look wider
+/// than their ticks, and the half-open range excludes the right edge
+/// itself, so grabbing a note's tail lands on empty space and paints a
+/// *new* note there. The slop keeps the last few pixels of aim error on
+/// the note instead of falling through to the draw-on-empty gesture.
+fn note_at(
+    clip: &MidiClip,
+    pos: egui::Pos2,
+    rect: egui::Rect,
+    ticks_to_x: f32,
+    top: i32,
+) -> Option<usize> {
+    clip.notes().iter().position(|n| {
+        let y = rect.top() + (top as f32 - f32::from(n.note)) * ROW_HEIGHT;
+        note_hit_rect(rect, n, ticks_to_x, y).contains(pos)
+    })
+}
+
+/// The on-screen rectangle a note is painted into. The single source of
+/// truth for both painting and hit-testing, so the two can never drift.
+fn note_rect(rect: egui::Rect, note: &Note, ticks_to_x: f32, y: f32) -> egui::Rect {
+    let x = rect.left() + note.start as f32 * ticks_to_x;
+    let w = (note.length as f32 * ticks_to_x).max(3.0);
+    egui::Rect::from_min_max(
+        egui::pos2(x, y + 1.0),
+        egui::pos2(x + w, y + ROW_HEIGHT - 1.0),
+    )
+}
+
+/// Left / right pixel edges of a note's drawn rectangle. Edge trims are
+/// measured against these — the *visual* edges, without slop.
+fn note_edges(rect: egui::Rect, note: &Note, ticks_to_x: f32) -> (f32, f32) {
+    let x = rect.left() + note.start as f32 * ticks_to_x;
+    (x, x + (note.length as f32 * ticks_to_x).max(3.0))
+}
+
+/// The hit-testing rectangle: the drawn one plus [`HIT_SLOP`]. Kept
+/// separate from [`note_rect`] so painting and the edge zones stay exact
+/// — only *landing on* a note is forgiving.
+fn note_hit_rect(rect: egui::Rect, note: &Note, ticks_to_x: f32, y: f32) -> egui::Rect {
+    note_rect(rect, note, ticks_to_x, y).expand2(HIT_SLOP)
 }
 
 /// A uniform move clamped on the UI side so no note crosses the engine's
@@ -896,10 +1027,12 @@ fn grid_label(grid: &GridValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AwaitCreate, DragKind, EDGE_PX, ROLL_HEIGHT, ROW_HEIGHT, RollIntent, RollState,
-        clamped_move, draw_end, edge_zone, is_black_key, snap_ticks, trim_start,
+        AwaitCreate, DragKind, DragSelection, EDGE_PX, HIT_SLOP, ROLL_HEIGHT, ROW_HEIGHT,
+        RollIntent, RollState, clamped_move, draw_end, edge_zone, is_black_key, note_at, note_rect,
+        snap_ticks, trim_start,
     };
     use crate::grid::{GridValue, NoteValue};
+    use eframe::egui;
     use resoz_model::{MidiClip, Note, TICKS_PER_STEP};
 
     fn note(start: i64, length: i64, note: u8) -> Note {
@@ -1053,7 +1186,7 @@ mod tests {
             grab_note: 60,
             gesture: 7,
         });
-        state.resolve_created(3);
+        state.resolve_created(3, 0, TICKS_PER_STEP as i64);
         assert_eq!(state.selection, vec![3]);
         assert!(state.is_dragging());
         let drag = state.drag.as_ref().expect("a drag started");
@@ -1063,38 +1196,118 @@ mod tests {
             "a fresh note is drawn (end follows the pointer), not moved"
         );
         assert_eq!(drag.gesture, 7, "the draw keeps the creating gesture id");
+        assert_eq!(
+            (drag.anchor_start, drag.anchor_end),
+            (0, TICKS_PER_STEP as i64),
+            "the draw anchors on the note as it was created"
+        );
     }
 
     #[test]
     fn resolve_created_without_a_gesture_only_selects() {
         // A plain click's AddNote parks nothing, so no drag must start.
         let mut state = RollState::new();
-        state.resolve_created(5);
+        state.resolve_created(5, 240, 240);
         assert_eq!(state.selection, vec![5]);
         assert!(!state.is_dragging());
     }
 
     #[test]
-    fn retarget_repoints_the_selection() {
-        let mut state = RollState::new();
-        state.selection = vec![3];
-        state.retarget(9);
-        assert_eq!(state.selection, vec![9]);
-        // Nothing selected: retarget is a no-op, not a panic.
-        state.selection.clear();
-        state.retarget(1);
-        assert!(state.selection.is_empty());
+    fn trim_start_snaps_and_never_crosses_the_note_end() {
+        // The grabbed note ends at 720 (480 + 240).
+        // Pointer well before the start: snaps to the grid line at 240.
+        assert_eq!(trim_start(720, 300.0, 240), 240);
+        // Pointer past the end: clamped to end - 1 (min length one tick).
+        assert_eq!(trim_start(720, 900.0, 240), 719);
+        // Pointer before zero: floored at 0.
+        assert_eq!(trim_start(720, -50.0, 240), 0);
     }
 
+    // ---- Drag anchoring / increment (the "note flies away" regressions) ----
+
+    /// A drag's anchor is frozen at grab time, so a later re-sort of the
+    /// clip cannot make the gesture track a different note.
     #[test]
-    fn trim_start_snaps_and_never_crosses_the_note_end() {
-        let subject = note(480, 240, 60); // ends at 720
-        // Pointer well before the start: snaps to the grid line at 240.
-        assert_eq!(trim_start(&subject, 300.0, 240), 240);
-        // Pointer past the end: clamped to end - 1 (min length one tick).
-        assert_eq!(trim_start(&subject, 900.0, 240), 719);
-        // Pointer before zero: floored at 0.
-        assert_eq!(trim_start(&subject, -50.0, 240), 0);
+    fn a_drag_anchors_on_the_note_as_it_was_at_grab_time() {
+        let subject = note(480, 240, 60);
+        let drag = DragSelection::anchored(&subject, 500.0, 60, DragKind::ResizeEnd, 3);
+        assert_eq!(drag.anchor_start, 480);
+        assert_eq!(drag.anchor_end, 720);
+        assert_eq!(drag.current_start(), 480);
+        assert_eq!(drag.current_end(), 720);
+    }
+
+    /// The move bug: each frame used to re-emit the grab-relative total,
+    /// so the applied deltas compounded (1 + 2 + 3 + …) and the note ran
+    /// away from the pointer. The increment owed must shrink to zero as the
+    /// gesture catches up with the pointer.
+    #[test]
+    fn a_move_emits_only_the_increment_still_owed() {
+        let grid = TICKS_PER_STEP as i64;
+        let mut drag = DragSelection::anchored(&note(0, grid, 60), 0.0, 60, DragKind::Move, 1);
+        // The pointer walks one grid cell per frame; the note must land
+        // exactly under it, so the steps must sum to the displacement.
+        let mut sum = 0i64;
+        for cell in 1..=5 {
+            let want = cell * grid;
+            let step = want - drag.applied_start;
+            assert!(step > 0, "each frame still owes a positive increment");
+            drag.applied_start += step;
+            sum += step;
+        }
+        assert_eq!(
+            sum,
+            5 * grid,
+            "the applied deltas sum to the pointer displacement, not 1+2+…+5"
+        );
+        // Once the pointer stops, nothing more is owed.
+        assert_eq!(5 * grid - drag.applied_start, 0);
+    }
+
+    /// Same regression for the end trim: the frozen anchor plus the
+    /// accumulated increments must reproduce the pointer target exactly.
+    #[test]
+    fn an_end_trim_tracks_the_pointer_instead_of_running_away() {
+        let grid = TICKS_PER_STEP as i64;
+        let mut drag = DragSelection::anchored(&note(0, grid, 60), 0.0, 60, DragKind::ResizeEnd, 1);
+        for cell in 1..=5 {
+            let pointer = cell as f32 * grid as f32;
+            let target = draw_end(drag.current_start(), pointer, grid, 3840);
+            let delta = target - drag.current_end();
+            drag.applied_end += delta;
+        }
+        assert_eq!(
+            drag.current_end(),
+            5 * grid,
+            "the note's end sits under the pointer after five frames"
+        );
+        // A sixth frame at the same spot owes nothing.
+        let target = draw_end(drag.current_start(), 5.0 * grid as f32, grid, 3840);
+        assert_eq!(target - drag.current_end(), 0);
+    }
+
+    /// A left-edge trim keeps the end pinned and moves only the start, so
+    /// the boundary it clamps against never drifts.
+    #[test]
+    fn a_start_trim_pins_the_end_and_moves_only_the_start() {
+        let grid = TICKS_PER_STEP as i64;
+        let mut drag = DragSelection::anchored(
+            &note(4 * grid, grid, 60),
+            (4 * grid) as f32,
+            60,
+            DragKind::ResizeStart,
+            1,
+        );
+        let end = drag.current_end();
+        for cell in [3, 2, 1, 0] {
+            let target = trim_start(drag.current_end(), (cell * grid) as f32, grid);
+            drag.applied_start += target - drag.current_start();
+            assert_eq!(drag.current_end(), end, "a left trim never moves the end");
+        }
+        assert_eq!(drag.current_start(), 0);
+        // Pulling past the end clamps to end - 1 rather than inverting.
+        let target = trim_start(drag.current_end(), 9999.0, grid);
+        assert_eq!(target, end - 1);
     }
 
     #[test]
@@ -1109,6 +1322,116 @@ mod tests {
         );
     }
 
+    /// The head/tail grabs the user reported as broken. A note narrow
+    /// enough that both zones cover it must resolve to the *nearer* edge,
+    /// otherwise trimming the head stretches the tail.
+    #[test]
+    fn edge_zone_picks_the_nearer_edge_when_the_zones_overlap() {
+        // 10 px wide with EDGE_PX = 8: the zones overlap across the middle.
+        assert_eq!(EDGE_PX * 2.0, 16.0, "the fixture assumes 8 px zones");
+        // Grabbing at the left edge trims the start...
+        assert_eq!(edge_zone(1.0, 0.0, 10.0), Some(DragKind::ResizeStart));
+        // ...and at the right edge trims the end.
+        assert_eq!(edge_zone(9.0, 0.0, 10.0), Some(DragKind::ResizeEnd));
+        // The exact middle is equidistant; it must still resolve to one of
+        // them rather than falling through to a move.
+        let middle = edge_zone(5.0, 0.0, 10.0);
+        assert!(
+            matches!(
+                middle,
+                Some(DragKind::ResizeStart) | Some(DragKind::ResizeEnd)
+            ),
+            "the middle of a short note resolves to an edge, got {middle:?}"
+        );
+        // A note wide enough to have a body keeps its middle as a move.
+        assert_eq!(edge_zone(50.0, 0.0, 200.0), None);
+    }
+
+    /// The tail grab used to land on empty space and paint a *new* note:
+    /// the old tick-range hit test (`start <= tick < end`) excluded the
+    /// right edge that the 3 px minimum width had just drawn there.
+    #[test]
+    fn a_note_hit_test_matches_the_rectangle_it_is_drawn_into() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 200.0), egui::vec2(400.0, 200.0));
+        let mut clip = MidiClip::default();
+        // start 0, length 240; ticks_to_x = 1.0 → drawn 100.0 .. 340.0.
+        clip.sequence.notes = vec![note(0, 240, 60)];
+        let ticks_to_x = 1.0f32;
+        let top = 60i32;
+        let y = rect.top();
+
+        let drawn = note_rect(rect, &clip.notes()[0], ticks_to_x, y);
+        assert_eq!(drawn.left(), 100.0);
+        assert_eq!(drawn.right(), 340.0);
+
+        // Anywhere inside the drawn rectangle hits, including both edges.
+        for x in [drawn.left(), drawn.center().x, drawn.right() - 0.5] {
+            let pos = egui::pos2(x, drawn.center().y);
+            assert_eq!(
+                note_at(&clip, pos, rect, ticks_to_x, top),
+                Some(0),
+                "x={x} is inside the drawn rect and must hit"
+            );
+        }
+        // HIT_SLOP keeps an off-by-a-few-pixels tail grab on the note
+        // instead of letting it fall through to "draw a new note".
+        assert_eq!(
+            note_at(
+                &clip,
+                egui::pos2(drawn.right() + 1.0, drawn.center().y),
+                rect,
+                ticks_to_x,
+                top
+            ),
+            Some(0),
+            "a press a pixel past the tail still hits (aim error is not empty space)"
+        );
+        // Past the slack it really is empty space.
+        assert_eq!(
+            note_at(
+                &clip,
+                egui::pos2(drawn.right() + HIT_SLOP.x + 0.5, drawn.center().y),
+                rect,
+                ticks_to_x,
+                top
+            ),
+            None
+        );
+        // A neighbouring pitch row does not hit either (the y slack only
+        // fills this note's own row gutter).
+        assert_eq!(
+            note_at(
+                &clip,
+                egui::pos2(drawn.center().x, drawn.center().y + ROW_HEIGHT),
+                rect,
+                ticks_to_x,
+                top
+            ),
+            None
+        );
+    }
+
+    /// A short note is drawn at the 3 px minimum width, so a tick-range
+    /// test would place its tail short of where the user sees it.
+    #[test]
+    fn a_short_note_is_hit_across_its_full_drawn_width() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0));
+        let mut clip = MidiClip::default();
+        clip.sequence.notes = vec![note(0, 1, 60)];
+        // ticks_to_x = 0.1 → one tick is 0.1 px, floored to the 3 px minimum.
+        let ticks_to_x = 0.1f32;
+        let y = rect.top();
+        let drawn = note_rect(rect, &clip.notes()[0], ticks_to_x, y);
+        assert_eq!(drawn.width(), 3.0, "the minimum width is what gets drawn");
+        for x in [drawn.left() + 0.5, drawn.right() - 0.5] {
+            assert_eq!(
+                note_at(&clip, egui::pos2(x, drawn.center().y), rect, ticks_to_x, 60),
+                Some(0),
+                "x={x} within the drawn 3 px must hit the note"
+            );
+        }
+    }
+
     #[test]
     fn resolve_created_starts_a_draw_drag_with_the_gesture_id() {
         let mut state = RollState::new();
@@ -1117,11 +1440,14 @@ mod tests {
             grab_note: 64,
             gesture: 7,
         });
-        state.resolve_created(3);
+        state.resolve_created(3, 120, 240);
         assert_eq!(state.selection, vec![3]);
         let drag = state.drag.as_ref().expect("draw drag should start");
-        assert_eq!(drag.index, 3);
         assert_eq!(drag.kind, DragKind::ResizeEnd);
         assert_eq!(drag.gesture, 7);
+        // The drag anchors on the geometry, not on an index: the clip has
+        // just been re-sorted by note_add, so index 3 may name anything.
+        assert_eq!(drag.anchor_start, 120);
+        assert_eq!(drag.anchor_end, 360);
     }
 }
