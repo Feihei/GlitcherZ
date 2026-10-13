@@ -105,6 +105,18 @@
 
 `clicked()` 帧不能这么改——`press_origin` 在松开后变 `None`，click 判定继续用 `interact_pointer_pos()`（egui 的 click 要求移动 < 6 pt，位置足够接近按下点）。
 
+#### M4a 编辑交互模型（状态 × 目标 × 限定键）
+
+钢琴卷帘的语义决策源从"指针落点 × 修饰键"移到**离散状态**（spec 见 `spec/editing-model.md`）：常驻态只有 Select，`d` 切到粘性 Draw；G/S/T/K/Shift+D 是一次性命令族（`RollState::arm` 唤起、拖拽执行、Esc 取消、`drag_stopped` 消费）。映射矩阵由 `tests/roll_state_machine.rs` 的 22 项集成测试逐格钉住（合成事件灌进真实 egui 帧，断言发射的 intent）。
+
+落地时撞上三个 egui 0.36 契约，全部写进了测试脚手架的注释里：
+
+1. **合成帧的时间步长同时受两个阈值夹击**：`max_click_duration`（0.8 s）内不松开就不是 click（4 帧 click 的 press→release 跨 2 步，步长必须 < 0.4 s）；`max_double_click_delay`（0.3 s）内两次 click 会配对成双击（整次 click 跨 4 步，步长必须 > 0.075 s）。取 0.1 s/帧。用 1 s/帧会让**每次 click 都被判成 drag**（按住超时 → `is_decidedly_dragging`），症状是选择逻辑全走 drag_started 分支、`response.clicked()` 永不触发。
+2. **Escape 会被 egui 的焦点机制在半路拦截**：`Memory::begin_pass` 在任何 widget 布局之前就把 `focused_widget` 清空（除非该 widget 的 `EventFilter` 认领 Escape）。卷帘要靠 `set_focus_lock_filter(id, EventFilter { escape: true, .. })` 才能收到那个"取消命令"的按键。
+3. **`drag_started` 帧上 `dragged` 同时为真**：手势的装配 intent（Ctrl-drag 的 Duplicate、draw 的 AddNote）会被同帧的增量发射覆盖——一个 intent/帧的架构下，复制拖动自 M3.8 起一直是坏的（只移动、不复制，且无集成测试覆盖）。修法：`response.dragged() && !(response.drag_started() && intent.is_some())`，装配帧只装配，增量从下一帧开始。
+
+另修两个连带问题：工具栏提示文字过长会**撑大 ui 的可用宽度**（egui 每次分配后都把 `max_rect` 扩到包含子 rect，卷帘于是比面板还宽、画到屏幕外）——加 `.truncate()`；`apply_axis` 原先先锁 `pending` 命令，但 armed Grab 的 pending 要等 `drag_stopped` 才消费，mid-drag 按 X/Y 锁的是过期条目——改为运行中的 drag 优先。
+
 ### 命令集（轨道定向）
 
 - `SetParam`（主链）/ `SetTrackParam{track}` / `Note{track}` / `Sequencer(Play|Stop|SetBpm|SetGate|SetPattern{track}|SetClip|SetSource|SetAutomation)`；模式整块 `Copy` 数组经队列传递。
