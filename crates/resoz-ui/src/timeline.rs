@@ -55,6 +55,15 @@ pub struct ClipMove {
     pub start_ticks: u32,
 }
 
+/// One copy of the Shift+D modal (M4b.4): the content of the clip at
+/// `from` is cloned onto `to_track` (same kind only) at `start_ticks`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipDup {
+    pub from: ClipSel,
+    pub to_track: usize,
+    pub start_ticks: u32,
+}
+
 /// One span edit of the T modal (M4b.3): the clip at `sel` gets a new
 /// `start_ticks`/`span_ticks` (bar-aligned, ≥ 1 bar, same track).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +81,9 @@ enum ModalKind {
     /// G: free move — bar delta in time + row delta (same kind only).
     /// X toggles the time lock (row delta forced to 0).
     Grab { time_locked: bool },
+    /// Shift+D: duplicate the selection — the clones enter a grab-style
+    /// modal; the originals stay untouched until the drop.
+    Duplicate { time_locked: bool },
     /// T: stretch the end edge of every selected clip (Shift+T: the start
     /// edge). Bar delta only.
     Stretch { start_edge: bool },
@@ -246,6 +258,11 @@ pub enum TimelineAction {
     StretchClipsBatch {
         spans: Vec<ClipSpanEdit>,
     },
+    /// Clone every clip in the list onto its target (Shift+D finalize;
+    /// originals untouched). One undo step.
+    DuplicateClipsBatch {
+        dups: Vec<ClipDup>,
+    },
     SelectTrack(usize),
     SelectControlTrack(usize),
     ToggleMute(usize, bool),
@@ -395,8 +412,9 @@ fn track_spans<T: Placement>(clips: &[T], skip: &[usize]) -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// The G modal's per-clip targets. `None` when the pointer is unavailable
-/// (no ghost this frame) or the modal is not a Grab.
+/// The G / Shift+D modal's per-clip targets (moves and clones share the
+/// grab math). `None` when the pointer is unavailable (no ghost this
+/// frame) or the modal is a Stretch.
 fn grab_targets(
     modal: &Modal,
     ptr: Option<Pos2>,
@@ -406,7 +424,8 @@ fn grab_targets(
     midi_tracks: &[MidiTrack],
     control_tracks: &[ControlTrack],
 ) -> Option<Vec<ClipMove>> {
-    let ModalKind::Grab { time_locked } = modal.kind else {
+    let (ModalKind::Grab { time_locked } | ModalKind::Duplicate { time_locked }) = modal.kind
+    else {
         return None;
     };
     let ptr = ptr?;
@@ -641,6 +660,22 @@ pub fn show(
                 );
             }
             Some(Modal {
+                kind: ModalKind::Duplicate { time_locked },
+                ..
+            }) => {
+                ui.weak(
+                    egui::RichText::new(format!(
+                        "Duplicate: LMB drop the copies · RMB / Esc cancel{}",
+                        if *time_locked {
+                            " · X: time lock ON (vertical disabled)"
+                        } else {
+                            " · X: lock time"
+                        }
+                    ))
+                    .color(Color32::from_rgb(140, 200, 250)),
+                );
+            }
+            Some(Modal {
                 kind: ModalKind::Stretch { start_edge },
                 ..
             }) => {
@@ -805,7 +840,7 @@ pub fn show(
                 if state.modal_confirm {
                     if let Some(m) = &state.modal {
                         match m.kind {
-                            ModalKind::Grab { .. } => {
+                            ModalKind::Grab { .. } | ModalKind::Duplicate { .. } => {
                                 if let Some(moves) = grab_targets(
                                     m, ptr, px_per_bar, midi_tracks.len(),
                                     control_tracks.len(), midi_tracks, control_tracks,
@@ -832,15 +867,31 @@ pub fn show(
                                             "{refused} clip(s) held: target fully covers an existing clip"
                                         ));
                                     }
-                                    if !kept.is_empty() {
-                                        actions.push(TimelineAction::MoveClipsBatch {
-                                            moves: kept
-                                                .into_iter()
-                                                .map(|(from, (start_ticks, _), to_track, _)| {
-                                                    ClipMove { from, to_track, start_ticks }
-                                                })
-                                                .collect(),
-                                        });
+                                    match m.kind {
+                                        ModalKind::Duplicate { .. } => {
+                                            if !kept.is_empty() {
+                                                actions.push(TimelineAction::DuplicateClipsBatch {
+                                                    dups: kept
+                                                        .into_iter()
+                                                        .map(|(from, (start_ticks, _), to_track, _)| {
+                                                            ClipDup { from, to_track, start_ticks }
+                                                        })
+                                                        .collect(),
+                                                });
+                                            }
+                                        }
+                                        _ => {
+                                            if !kept.is_empty() {
+                                                actions.push(TimelineAction::MoveClipsBatch {
+                                                    moves: kept
+                                                        .into_iter()
+                                                        .map(|(from, (start_ticks, _), to_track, _)| {
+                                                            ClipMove { from, to_track, start_ticks }
+                                                        })
+                                                        .collect(),
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -889,7 +940,7 @@ pub fn show(
                 // Ghost preview: solid blocks at each target (alpha 170),
                 // over dimmed originals (the rows already drew them dim).
                 let targets = match m.kind {
-                    ModalKind::Grab { .. } => grab_targets(
+                    ModalKind::Grab { .. } | ModalKind::Duplicate { .. } => grab_targets(
                         m, ptr, px_per_bar, midi_tracks.len(), control_tracks.len(),
                         midi_tracks, control_tracks,
                     )
@@ -1390,6 +1441,11 @@ fn lane_row<T: Placement>(
             let g = ui
                 .ctx()
                 .input_mut(|i| i.consume_key(Modifiers::NONE, Key::G));
+            // Shift+D must be consumed before plain D would ever match
+            // (consume_key ignores the shift qualifier when matching).
+            let shift_d = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::D));
             let x = ui
                 .ctx()
                 .input_mut(|i| i.consume_key(Modifiers::NONE, Key::X));
@@ -1397,18 +1453,31 @@ fn lane_row<T: Placement>(
                 state.knife_armed = !state.knife_armed;
                 state.modal = None;
             }
-            // X toggles the time lock while a Grab modal is live.
+            // X toggles the time lock while a Grab / Duplicate modal is live.
             if x {
                 if let Some(modal) = &mut state.modal {
-                    if let ModalKind::Grab { time_locked } = &mut modal.kind {
-                        *time_locked = !*time_locked;
+                    match &mut modal.kind {
+                        ModalKind::Grab { time_locked } | ModalKind::Duplicate { time_locked } => {
+                            *time_locked = !*time_locked;
+                        }
+                        ModalKind::Stretch { .. } => {}
                     }
                 }
             }
-            // Arm G/T (Blender-style modal; arming one tool clears the other).
-            if (g || t || shift_t) && state.modal.is_none() {
+            // Arm G / Shift+D / T (Blender-style modal; arming one tool
+            // clears the other).
+            if (g || shift_d || t || shift_t) && state.modal.is_none() {
                 state.knife_armed = false;
-                arm_modal(state, ui.ctx(), g, shift_t);
+                let arm = if g {
+                    Arm::Grab
+                } else if shift_d {
+                    Arm::Duplicate
+                } else {
+                    Arm::Stretch {
+                        start_edge: shift_t,
+                    }
+                };
+                arm_modal(state, ui.ctx(), arm);
             }
             if escape {
                 if state.modal.is_some() {
@@ -1430,35 +1499,51 @@ fn lane_row<T: Placement>(
     });
 }
 
-/// Arms a G/T modal from the current selection (M4b.3). G requires a
-/// single track kind (cross-kind moves are meaningless); both need a
+/// Which modal G / Shift+D / T arms (M4b.3/4).
+enum Arm {
+    Grab,
+    Duplicate,
+    Stretch { start_edge: bool },
+}
+
+/// Arms a modal from the current selection. G and Shift+D require a
+/// single track kind (cross-kind moves are meaningless); all need a
 /// non-empty selection and a pointer position to grab from.
-fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, grab: bool, start_edge: bool) {
+fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
     if state.selection.is_empty() {
-        state.status = Some("nothing selected — G / T need a selection".to_string());
+        state.status =
+            Some("nothing selected \u{2014} G / Shift+D / T need a selection".to_string());
         return;
     }
     let Some(ptr) = ctx.pointer_hover_pos() else {
         return;
     };
-    if grab {
-        let first = state.selection[0].is_control;
-        if state.selection.iter().any(|s| s.is_control != first) {
-            state.status = Some("mixed selection: G moves one track kind at a time".to_string());
-            return;
+    let kind = match arm {
+        Arm::Grab => {
+            let first = state.selection[0].is_control;
+            if state.selection.iter().any(|s| s.is_control != first) {
+                state.status =
+                    Some("mixed selection: G moves one track kind at a time".to_string());
+                return;
+            }
+            ModalKind::Grab { time_locked: false }
         }
-        state.modal = Some(Modal {
-            kind: ModalKind::Grab { time_locked: false },
-            origin: state.selection.clone(),
-            grab: ptr,
-        });
-    } else {
-        state.modal = Some(Modal {
-            kind: ModalKind::Stretch { start_edge },
-            origin: state.selection.clone(),
-            grab: ptr,
-        });
-    }
+        Arm::Duplicate => {
+            let first = state.selection[0].is_control;
+            if state.selection.iter().any(|s| s.is_control != first) {
+                state.status =
+                    Some("mixed selection: Shift+D copies one track kind at a time".to_string());
+                return;
+            }
+            ModalKind::Duplicate { time_locked: false }
+        }
+        Arm::Stretch { start_edge } => ModalKind::Stretch { start_edge },
+    };
+    state.modal = Some(Modal {
+        kind,
+        origin: state.selection.clone(),
+        grab: ptr,
+    });
 }
 
 fn hit_clip<T: Placement>(clips: &[T], tick: f32) -> Option<usize> {

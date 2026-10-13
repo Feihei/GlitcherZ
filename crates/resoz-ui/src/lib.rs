@@ -2374,6 +2374,9 @@ impl ResoZApp {
             timeline::TimelineAction::StretchClipsBatch { spans } => {
                 self.timeline_stretch_clips_batch(spans)
             }
+            timeline::TimelineAction::DuplicateClipsBatch { dups } => {
+                self.timeline_duplicate_clips_batch(dups)
+            }
         }
     }
 
@@ -2684,6 +2687,84 @@ impl ResoZApp {
             for (is_control, track) in touched {
                 self.sync_clip_row(is_control, track);
             }
+        }
+    }
+
+    /// Shift+D finalize: clones every source clip's content onto its
+    /// target row/start in ONE undo step; the originals are untouched.
+    /// The selection then moves to the new copies (they are appended, so
+    /// their indices are the destination table's former lengths).
+    fn timeline_duplicate_clips_batch(&mut self, dups: Vec<timeline::ClipDup>) {
+        if dups.is_empty() {
+            return;
+        }
+        let before = self.begin_edit();
+        let mut new_sel = Vec::new();
+        let mut touched = Vec::new();
+        {
+            let project = self.project_mut();
+            for d in &dups {
+                if d.from.is_control {
+                    let Some(mut c) = project
+                        .control_tracks
+                        .get(d.from.track)
+                        .and_then(|t| t.clips.get(d.from.clip))
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    let Some(t) = project.control_tracks.get_mut(d.to_track) else {
+                        continue;
+                    };
+                    if t.clips.len() >= MAX_CLIPS_PER_TRACK {
+                        continue;
+                    }
+                    c.start_ticks = d.start_ticks;
+                    let index = t.clips.len();
+                    t.clips.push(c);
+                    new_sel.push(timeline::ClipSel {
+                        is_control: true,
+                        track: d.to_track,
+                        clip: index,
+                    });
+                    if !touched.contains(&(true, d.to_track)) {
+                        touched.push((true, d.to_track));
+                    }
+                } else {
+                    let Some(mut c) = project
+                        .midi_tracks
+                        .get(d.from.track)
+                        .and_then(|t| t.clips.get(d.from.clip))
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    let Some(t) = project.midi_tracks.get_mut(d.to_track) else {
+                        continue;
+                    };
+                    if t.clips.len() >= MAX_CLIPS_PER_TRACK {
+                        continue;
+                    }
+                    c.start_ticks = d.start_ticks;
+                    let index = t.clips.len();
+                    t.clips.push(c);
+                    new_sel.push(timeline::ClipSel {
+                        is_control: false,
+                        track: d.to_track,
+                        clip: index,
+                    });
+                    if !touched.contains(&(false, d.to_track)) {
+                        touched.push((false, d.to_track));
+                    }
+                }
+            }
+        }
+        if !new_sel.is_empty() {
+            self.commit_edit("Duplicate Clips", before);
+            for (is_control, track) in touched {
+                self.sync_clip_row(is_control, track);
+            }
+            self.timeline_state.selection = new_sel;
         }
     }
 
