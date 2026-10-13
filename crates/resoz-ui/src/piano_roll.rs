@@ -932,6 +932,10 @@ pub fn show(
     }
 
     // 3. Note blocks, shaded by velocity (M2.5); selected notes in the accent color.
+    // During a non-identity modal the selected originals are faded out so the
+    // ghost on top stays readable where the two overlap (Blender convention:
+    // origin dimmed, transform preview solid).
+    let modal_active = modal_frame.as_ref().is_some_and(|f| !f.is_identity());
     for (index, note) in clip.notes().iter().enumerate() {
         let note_i = i32::from(note.note);
         if !(min_note..=top_note).contains(&note_i) {
@@ -953,6 +957,11 @@ pub fn show(
             (base.g() as f32 * k) as u8,
             (base.b() as f32 * k) as u8,
         );
+        let fill = if modal_active && selected {
+            egui::Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 60)
+        } else {
+            fill
+        };
         painter.rect_filled(note_rect(rect, note, ticks_to_x, y), 2.0, fill);
     }
 
@@ -971,7 +980,7 @@ pub fn show(
             painter.rect_filled(
                 note_rect(rect, &ghost, ticks_to_x, y),
                 2.0,
-                egui::Color32::from_rgba_unmultiplied(240, 190, 80, 110),
+                egui::Color32::from_rgba_unmultiplied(240, 190, 80, 170),
             );
         }
     }
