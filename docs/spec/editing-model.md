@@ -1,6 +1,6 @@
 # 编辑交互模型 Spec（M4）
 
-> 状态：定稿（2026-10-13，经三轮拷问式 Q&A + 用户确认；同日两处修订：删 `t+e`、时间轴去 Draw）。
+> 状态：定稿（2026-10-13，经三轮拷问式 Q&A + 用户确认；同日三处修订：删 `t+e`、时间轴去 Draw、实测反馈改模态——见 §3.3）。
 > 上游：`plan.md` M1–M3（命令层 / ops / 手势合并已落地）、`spec/timeline.md`（clip 模型）。
 > 本 spec 定义 piano roll 与 timeline 的**编辑交互模型**，替换 M2.2–M3.8 演进出的全手势模型。
 
@@ -67,24 +67,32 @@ M3.8 边界规则"空白拖动永远=画"**废除**：空拖在 Select 态回归
 
 时间轴不设 Draw 态，clip 创建走双击（见 §4）。
 
-### 3.3 一次性命令族
+### 3.3 模态命令族（2026-10-13 实测反馈改定：Blender 式模态）
 
 | 命令 | 键 | 语义 | 限定键 | 命令层 |
 | :--- | :--- | :--- | :--- | :--- |
-| Grab | `g` | 移动选区 | `X`=只改时间 / `Y`=只改音高（mid-drag 可切换，Blender 惯例） | `midi.notes_move` / `MoveResizeClip` |
-| Scale | `s` | 时间缩放：`k = 指针距 pivot ÷ 抓取距 pivot`；pivot=选区包围盒中心；**不吸附网格**；长度钳 ≥1 tick | 无 | **新增 `midi.notes_scale`** |
-| Stretch | `t` | 缘拉伸，**默认拉终点**（修长度是高频场景） | `t+s`=拉起点 | `midi.notes_edit_delta` |
-| Cut | `k` | 切刀：点击/一次划过=在指针 tick 处切分；完成后回到**唤起时常驻态**（draw 态下切完继续画） | 无 | **新增 `midi.notes_split` / `clip_split`** |
-| Duplicate | `Shift+d` | 复制选区并移动：复制→选中副本→立即 arm Grab；复制与移动共享 gesture id=一步 undo | `X`/`Y` 同 Grab（随 arm 的 G 生效） | `midi.notes_duplicate` + `notes_move` |
+| Grab | `g` | 移动选区 | `X`=只改时间 / `Y`=只改音高（mid-modal 可切换，Blender 惯例） | `midi.notes_move` / `MoveResizeClip` |
+| Scale | `s` | 时间缩放：`k = 指针距 pivot ÷ 抓取距 pivot`；pivot=**选区包围盒起点**（从起点缩放保持音符间相对关系，2026-10-13 实测指认）；**不吸附网格**；长度钳 ≥1 tick | 无 | **新增 `midi.notes_scale`** |
+| Stretch | `t` | 缘拉伸，**默认拉终点**（修长度是高频场景） | `t+s`=拉起点（mid-modal 可切） | `midi.notes_edit_delta` |
+| Cut | `k` | 切刀：**沿划动轨迹切割所有被穿过的音符**（按轨迹与音符行交点取 tick），**无需预选**；单击=零长划（切过指针 tick 的全部音符）；切口在松开时一批落下（一次 stroke=一步 undo） | 无 | **新增 `midi.notes_split`（cuts 批量）/ `clip_split`** |
+| Duplicate | `Shift+d` | 复制选区并移动：复制→选中副本→立即进入模态 Grab；复制与确认移动共享 gesture id=一步 undo | `X`/`Y` 同 Grab | `midi.notes_duplicate` + `notes_move` |
+
+**G/S/T/Shift+D 的模态语义**（实测反馈：不要"按键后还要拖动"）：
+
+- 按键即进入模态：选区以 **ghost 半透明预览**实时跟随指针（逐帧重算，不写文档），LMB 单击**落定**（发射一次性 intent），RMB/Esc **取消**（预览未落盘，取消零成本、零 undo）；
+- **拖动不是模态的手势**——拖动是"没有 G 命令时"的 tweak 手势（§3.1 的双入口）；
+- 因模态期间文档不变，选区 index 全程有效，落定 intent 一步算完（无增量发射）；
+- 模态期间命令族不链接：`d/g/s/t/k` 被忽略（`s` 在 Stretch 模态内=start 限定），只有 X/Y/Esc/RMB 有响应。
 
 要点：
 
 - **bare=最常见变体，限定键=次常见变体**（统一规则）：G 最常见是自由移动，故 X/Y 做轴约束；T 最常见是拉终点，故 S 切起点。**`t+e` 已删除**——与裸 T 完全重合，纯冗余（2026-10-13 用户指认）。bare T 默认拉终点而非"指针在 bbox 左/右半侧决定"——后者把语义决策权交回指针位置（本模型要消除的），且窄选区不稳定。
 - **多选同时拉伸**（用户确认）：拉起点=所有选中音符 start 跟随指针（bbox 左缘）；拉终点=所有 length 延伸（bbox 右缘）。
 - **Shift+D 与 Ctrl+拖动复制的双入口**：Ctrl+拖=复制移动 gesture（M3.8 已有，保留为快捷方式）；Shift+D=显式命令形态。二者共享"一次复制拖动=一步 undo"。
-- **限定键的上下文消歧**：`s` 在无 pending 命令时=Scale 命令；在 `t` pending 时=Stretch 的 start 限定。pending 命令期间其他单键不再唤起新命令。
-- **状态命令取消 pending**：draw 态下按 d/其他状态命令先取消 pending 变换。
-- **空选区**：G/S/T = no-op（状态栏提示）；K 无落点 = no-op。
+- **限定键的上下文消歧**：`s` 在无命令时=Scale 模态；在 `t` 模态内=Stretch 的 start 限定。
+- **空选区**：G/S/T/Shift+D = no-op（状态栏提示）；K 不需要选区（位置工具），无落点 = no-op。
+- **Delete 键删除选区**（2026-10-13 实测反馈：RMB 之外补键盘路径）。
+- **按键消费**：roll 持焦时所有已处理按键 `consume_key`，`EventFilter` 认领 Escape/Tab/箭头——否则 egui 的箭头焦点导航会把焦点挪走（nudge 一次即失效），未消费按键在部分平台触发系统 beep。
 
 ## 4. 分编辑器工具集
 
@@ -107,7 +115,8 @@ M3.8 边界规则"空白拖动永远=画"**废除**：空拖在 Select 态回归
 
 - 一次拖动 = 一步 undo：`execute_merged` + gesture id；
 - 命令 + 后续拖动共享 gesture key：Shift+D 的复制与移动、K 的连续划切（一次调用内）；
-- 命令唤起后 Esc = 取消命令本身（无实际编辑则不记录 undo）；
+- 命令唤起后 Esc/RMB = 取消模态（ghost 预览未落盘，无实际编辑则不记录 undo）；
+- 落定（LMB）= 一次 intent = 一步 undo；K 一次 stroke 的全部切口一批落下 = 一步 undo；
 - undo/redo 后选区经 `reselect_from` 重解析（排序可能置换 index，M3.8 机制）。
 
 ## 6. 实现映射
@@ -123,12 +132,12 @@ M3.8 边界规则"空白拖动永远=画"**废除**：空拖在 Select 态回归
 
 | 项 | 内容 |
 | :--- | :--- |
-| 命令 `midi.notes_scale` | `{indices, pivot_tick, factor}`；factor 由 UI 算（k=指针距/抓取距），命令层钳制 |
-| 命令 `midi.notes_split` | `{indices?, tick}`：按 tick 切分选中音符（pitch/velocity 保留，两半 length≥1） |
+| 命令 `midi.notes_scale` | `{indices, pivot_tick, factor}`；factor 由 UI 算（k=指针距/抓取距，pivot=选区 bbox 起点），命令层钳制 |
+| 命令 `midi.notes_split` | `{cuts: [{index, tick}]}`：按各 tick 切分指定音符（pitch/velocity 保留，两半 length≥1）；单击=单项，knife stroke=批量 |
 | 命令 `clip_split` | `{track, clip, tick}`：clip 在 tick 处切为两个（span 校验 ≤8/轨） |
-| 交互状态机 | `RollState` / `TimelineState` 增 `state: Select`（roll 另有 `Draw`）+ `pending: Option<PendingCmd>`（含限定键） |
-| 视觉反馈 | 工具栏/状态栏显示常驻态与 pending 命令（含限定键高亮）；cursor 随落点/状态变化 |
-| 测试 | 状态 × 落点 × 限定键 → intent 映射矩阵单测；命令在 draw 态生效；Esc 语义；空选区 no-op |
+| 交互状态机 | `RollState` / `TimelineState` 增 `state: Select`（roll 另有 `Draw`）+ `modal`（G/S/T/Shift+D 模态变换，ghost 预览）+ `knife_armed`/`knife`（K）；按 `consume_key` 消费已处理按键 |
+| 视觉反馈 | 工具栏/状态栏显示常驻态与模态命令 chip（含限定键高亮）；模态 ghost 预览、knife 划痕；cursor 随落点/状态变化 |
+| 测试 | 状态 × 落点 × 限定键 → intent 映射矩阵测试；模态 LMB 落定/RMB·Esc 取消；knife 轨迹切割（含无选区）；Delete 键；箭头连续 nudge；空选区 no-op |
 
 velocity lane 保持独立手势（刷力度），不进状态机。
 
@@ -136,7 +145,7 @@ velocity lane 保持独立手势（刷力度），不进状态机。
 
 - Reaper 式全可配置 modifier 矩阵；
 - FL/Pro Tools 式常驻工具组（双态 + 命令族已覆盖其场景）；
-- Blender 式 knife 多段连切（K 一次调用一次切割；未来可评估 `Shift+k`）；
+- Blender 式 knife 多段连切（K 一次调用一批切口；逐点连切未来可评估 `Shift+k`）；
 - 时间轴 clip 多选（M4b）。
 
 ## 8. 分阶段

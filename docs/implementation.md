@@ -117,6 +117,13 @@
 
 另修两个连带问题：工具栏提示文字过长会**撑大 ui 的可用宽度**（egui 每次分配后都把 `max_rect` 扩到包含子 rect，卷帘于是比面板还宽、画到屏幕外）——加 `.truncate()`；`apply_axis` 原先先锁 `pending` 命令，但 armed Grab 的 pending 要等 `drag_stopped` 才消费，mid-drag 按 X/Y 锁的是过期条目——改为运行中的 drag 优先。
 
+**M4a.4 实测反馈修订**（同日，Blender 式模态改定，spec §3.3 同步）：
+
+- **G/S/T/Shift+D 改为模态**：不再"arm 后等拖拽"——按键即进入模态，选区以 ghost 半透明预览逐帧跟随指针（`Modal::frame` 纯几何计算，不写文档），LMB 落定（`Modal::finalize` 一步算出总量 intent），RMB/Esc 取消。因模态期间文档不变，选区 index 全程有效，无需快照/恢复命令；取消零成本是"预览不落盘"的直接红利。拖动回归纯 tweak 手势。
+- **K 改为轨迹切刀**：stroke 沿划动路径收集切口（`knife_crossing`：斜穿行取与行中线交点，同行扫过取覆盖区间中点；触边界不切，防零长半音符），**无需预选**；切口在 `drag_stopped` 一批落下（`SplitNotes { cuts: Vec<(usize, i64)> }`）——中途落盘会让 split 的重排序毁掉后续帧的 index 测试，批量是唯一安全形态。`midi.notes_split` 签名从 `{indices, tick}` 改为 `{cuts: [{index, tick}]}`。
+- **Scale pivot 改为选区 bbox 起点**（原 bbox 中心）：从起点缩放保证音符间相对关系不动（起点左侧没有音符，命令层钳制形同虚设——正确性白拿）。
+- **按键卫生**：所有已处理按键 `consume_key`（modifiers 逻辑匹配，Shift+D 先于 d 消费）；`EventFilter` 扩到 `horizontal_arrows/vertical_arrows: true`——egui 的箭头焦点导航正是"上下箭头 nudge 一次后焦点逃逸"的根源；K 键 beep 疑似未消费按键在 Windows 的系统 beep，消费后待复测。新增 Delete 键删除选区。
+
 ### 命令集（轨道定向）
 
 - `SetParam`（主链）/ `SetTrackParam{track}` / `Note{track}` / `Sequencer(Play|Stop|SetBpm|SetGate|SetPattern{track}|SetClip|SetSource|SetAutomation)`；模式整块 `Copy` 数组经队列传递。
