@@ -72,6 +72,26 @@ pub fn transpose(notes: &mut [Note], semitones: i32) {
     }
 }
 
+// ---- Time scale --------------------------------------------------------------------------
+
+/// Time-scales notes around `pivot_tick` (the piano roll's Scale command):
+/// every start moves to `pivot + (start - pivot) * factor` and every length
+/// multiplies by `factor`, so ends scale with starts. `factor` 1.0 is the
+/// identity; below 1 compresses the selection toward the pivot, above 1
+/// stretches it away — the pivot itself never moves.
+///
+/// Per-note clamping (start ≥ 0, length ≥ 1) may swallow part of a scale:
+/// a note squeezed against tick 0 stops there while the rest of the
+/// selection keeps moving. The op never drops, adds or reorders notes, so
+/// it keeps the slice-length contract of every op in this module.
+pub fn scale_notes(notes: &mut [Note], pivot_tick: i64, factor: f32) {
+    let pivot = pivot_tick as f32;
+    for note in notes {
+        note.start = round_i64(pivot + (note.start as f32 - pivot) * factor).max(0);
+        note.length = round_i64(note.length as f32 * factor).max(1);
+    }
+}
+
 // ---- Quantize ----------------------------------------------------------------------------
 
 /// Quantize parameters (8 knobs, Pro Tools "Event Operations / Quantize").
@@ -324,7 +344,7 @@ pub fn apply_duration(notes: &mut [Note], op: &DurationOp) {
 mod tests {
     use super::{
         DEFAULT_SEED, DurationOp, QuantizeOptions, VelocityOp, apply_duration, apply_to_selected,
-        apply_velocity, quantize, round_i64, transpose,
+        apply_velocity, quantize, round_i64, scale_notes, transpose,
     };
     use crate::Note;
 
@@ -569,5 +589,77 @@ mod tests {
         let mut notes = vec![note(0, 96, 60, 100)];
         apply_to_selected(&mut notes, &[0, 5, 9], |slice| transpose(slice, 1));
         assert_eq!(pitches(&notes), vec![61]);
+    }
+
+    #[test]
+    fn time_scale_stretches_starts_and_lengths_around_the_pivot() {
+        let mut notes = vec![note(240, 240, 60, 100), note(480, 240, 62, 100)];
+        scale_notes(&mut notes, 0, 2.0);
+        assert_eq!((notes[0].start, notes[0].length), (480, 480));
+        assert_eq!((notes[1].start, notes[1].length), (960, 480));
+    }
+
+    #[test]
+    fn time_scale_around_a_mid_selection_pivot_keeps_the_pivot_fixed() {
+        // Selection spans [240..720]; pivot at its center (480): the left
+        // half doubles away leftward, the right half rightward.
+        let mut notes = vec![note(240, 240, 60, 100), note(480, 240, 62, 100)];
+        scale_notes(&mut notes, 480, 2.0);
+        assert_eq!((notes[0].start, notes[0].length), (0, 480));
+        assert_eq!(
+            (notes[1].start, notes[1].length),
+            (480, 480),
+            "the pivot itself never moves"
+        );
+    }
+
+    #[test]
+    fn time_scale_below_one_compresses_toward_the_pivot() {
+        let mut notes = vec![note(240, 240, 60, 100), note(480, 240, 62, 100)];
+        scale_notes(&mut notes, 480, 0.5);
+        assert_eq!((notes[0].start, notes[0].length), (360, 120));
+        assert_eq!((notes[1].start, notes[1].length), (480, 120));
+    }
+
+    #[test]
+    fn time_scale_clamps_starts_and_lengths_per_note() {
+        // Squeezed against tick 0 the note stops there; the rest of the
+        // selection would keep moving.
+        let mut notes = vec![note(240, 240, 60, 100)];
+        scale_notes(&mut notes, 480, 8.0);
+        assert_eq!(notes[0].start, 0, "a start below zero floors at 0");
+        assert_eq!(notes[0].length, 1920, "240 × 8");
+
+        let mut tiny = vec![note(0, 240, 60, 100)];
+        scale_notes(&mut tiny, 0, 0.001);
+        assert_eq!(tiny[0].length, 1, "a collapsed length floors at one tick");
+    }
+
+    #[test]
+    fn time_scale_of_one_is_the_identity() {
+        let mut notes = vec![note(240, 240, 60, 100), note(960, 96, 62, 100)];
+        let before = notes.clone();
+        scale_notes(&mut notes, 480, 1.0);
+        assert_eq!(notes, before);
+    }
+
+    #[test]
+    fn time_scale_keeps_the_slice_length_and_touches_only_the_selection() {
+        // The ops contract: in place, never changes the slice length, so it
+        // can be applied to a selection.
+        let mut notes = vec![
+            note(0, 96, 60, 100),
+            note(240, 96, 62, 100),
+            note(480, 96, 64, 100),
+        ];
+        apply_to_selected(&mut notes, &[0, 2], |slice| scale_notes(slice, 240, 0.5));
+        assert_eq!(notes.len(), 3, "the slice length never changes");
+        assert_eq!((notes[0].start, notes[0].length), (120, 48));
+        assert_eq!(
+            (notes[1].start, notes[1].length),
+            (240, 96),
+            "the unselected note is untouched"
+        );
+        assert_eq!((notes[2].start, notes[2].length), (360, 48));
     }
 }

@@ -53,7 +53,7 @@ pub use file::{
 };
 pub use ops::{
     DEFAULT_SEED, DurationOp, QuantizeOptions, VelocityOp, apply_duration, apply_to_selected,
-    apply_velocity, quantize, transpose,
+    apply_velocity, quantize, scale_notes, transpose,
 };
 
 /// MIDI track capacity limit (D12; the engine side uses the same value).

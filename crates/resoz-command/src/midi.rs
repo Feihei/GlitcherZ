@@ -70,6 +70,24 @@ pub fn specs() -> Vec<crate::CommandSpec> {
             notes_duplicate
         ),
         crate::cmd!(
+            "midi.notes_scale",
+            "Scale Notes",
+            ["Midi"],
+            Some("Scale"),
+            "{track, clip, indices: [n], pivot_tick, factor} → {indices: [n]}",
+            always,
+            notes_scale
+        ),
+        crate::cmd!(
+            "midi.notes_split",
+            "Split Notes",
+            ["Midi"],
+            Some("Split"),
+            "{track, clip, indices: [n], tick} → {split: n, indices: [n]}",
+            always,
+            notes_split
+        ),
+        crate::cmd!(
             "midi.change_velocity",
             "Change Velocity",
             ["Midi", "Event"],
@@ -411,6 +429,88 @@ fn notes_duplicate(session: &mut Session, params: &Value) -> crate::Result<Value
     notes.extend(copies.iter().copied());
     notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
     Ok(json!({ "created": copies.len(), "indices": locate(notes, &copies) }))
+}
+
+/// Time-scales the selection around `pivot_tick` by `factor` (the piano
+/// roll's Scale command). The UI computes the factor from the pointer's
+/// distance to the pivot relative to the grab distance; the command
+/// clamps the result per note (start ≥ 0, length ≥ 1) and reports where
+/// the edited notes landed after the re-sort.
+fn notes_scale(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let selected = indices(params, "indices");
+    if selected.is_empty() {
+        return Err(bad_params("midi.notes_scale", "`indices` is required"));
+    }
+    let pivot_tick = i64_or(params, "pivot_tick", 0);
+    let factor = crate::registry::f64_or(params, "factor", 1.0) as f32;
+    if !factor.is_finite() || factor <= 0.0 {
+        return Err(bad_params(
+            "midi.notes_scale",
+            "`factor` must be a positive number",
+        ));
+    }
+    let notes = notes_mut(session, "midi.notes_scale", params)?;
+    resoz_model::apply_to_selected(notes, &selected, |slice| {
+        resoz_model::scale_notes(slice, pivot_tick, factor);
+    });
+    // The mutated values are what we relocate after the sort: the caller's
+    // selection indices go stale the moment notes cross each other.
+    let edited: Vec<Note> = selected
+        .iter()
+        .filter_map(|index| notes.get(*index).copied())
+        .collect();
+    notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
+    Ok(json!({ "scaled": edited.len(), "indices": locate(notes, &edited) }))
+}
+
+/// Splits every selected note that spans `tick` into two halves (the Cut
+/// command's `k`): pitch, velocity and channel are preserved on both
+/// halves. A note that starts or ends exactly on the tick is left alone —
+/// a zero-length half is unrepresentable. Selected notes that do not span
+/// the tick stay selected, so the result reads as "the same selection,
+/// cut where I clicked".
+fn notes_split(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let selected = indices(params, "indices");
+    if selected.is_empty() {
+        return Err(bad_params("midi.notes_split", "`indices` is required"));
+    }
+    if params.get("tick").and_then(Value::as_i64).is_none() {
+        return Err(bad_params("midi.notes_split", "`tick` is required"));
+    }
+    let tick = i64_or(params, "tick", 0).max(0);
+    let notes = notes_mut(session, "midi.notes_split", params)?;
+    // Rebuild the vector: a split replaces one note with two, so the
+    // length changes and the in-place op contract does not apply here.
+    let mut cut = 0usize;
+    let mut rebuilt: Vec<Note> = Vec::with_capacity(notes.len() + selected.len());
+    let mut results: Vec<Note> = Vec::with_capacity(selected.len());
+    for (index, note) in notes.iter().enumerate() {
+        let chosen = selected.contains(&index);
+        if chosen && note.start < tick && tick < note.end() {
+            let left = Note {
+                length: tick - note.start,
+                ..*note
+            };
+            let right = Note {
+                start: tick,
+                length: note.end() - tick,
+                ..*note
+            };
+            results.push(left);
+            results.push(right);
+            rebuilt.push(left);
+            rebuilt.push(right);
+            cut += 1;
+        } else {
+            if chosen {
+                results.push(*note);
+            }
+            rebuilt.push(*note);
+        }
+    }
+    *notes = rebuilt;
+    notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
+    Ok(json!({ "split": cut, "indices": locate(notes, &results) }))
 }
 
 fn change_velocity(session: &mut Session, params: &Value) -> crate::Result<Value> {

@@ -483,3 +483,164 @@ fn notes_duplicate_copies_the_selection_and_reports_the_copies() {
     assert!(session.undo());
     assert_eq!(notes(&session), before);
 }
+
+#[test]
+fn notes_scale_stretches_the_selection_around_the_pivot() {
+    let mut session = session_with_notes();
+    let before = notes(&session);
+    // Four notes spanning [0..960], pivot at the bbox center (480): the
+    // whole selection doubles away from the pivot in both directions.
+    let outcome = session
+        .execute(
+            "midi.notes_scale",
+            &json!({ "track": 0, "clip": 0, "indices": [0, 1, 2, 3], "pivot_tick": 480, "factor": 2.0 }),
+        )
+        .expect("scale should succeed");
+    assert_eq!(outcome["scaled"], 4);
+
+    let all = notes(&session);
+    // Notes 0 and 1 both land at start 0: note 0's computed start (-480)
+    // floors at the clamp, and note 1's own computed start is exactly 0.
+    // Sorted by (start, pitch): 60 before 62.
+    assert_eq!((all[0].start, all[0].length, all[0].note), (0, 480, 60));
+    assert_eq!((all[1].start, all[1].length, all[1].note), (0, 480, 61));
+    assert_eq!((all[2].start, all[2].length, all[2].note), (480, 480, 62));
+    assert_eq!((all[3].start, all[3].length, all[3].note), (960, 480, 63));
+
+    // The command reports where the edited notes landed (a re-sort may
+    // permute them), and the whole gesture is one undo step.
+    let indices: Vec<usize> = outcome["indices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as usize)
+        .collect();
+    assert_eq!(indices.len(), 4);
+    assert!(session.can_undo());
+    assert!(session.undo());
+    assert_eq!(notes(&session), before, "undo restores the notes exactly");
+}
+
+#[test]
+fn notes_scale_clamps_per_note() {
+    let mut session = session_with_notes();
+    // Note 0 ([0..240]) scaled ×8 around pivot 480 would start at -3360.
+    let outcome = session
+        .execute(
+            "midi.notes_scale",
+            &json!({ "track": 0, "clip": 0, "indices": [0], "pivot_tick": 480, "factor": 8.0 }),
+        )
+        .expect("scale should succeed");
+    let at = outcome["indices"][0].as_u64().unwrap() as usize;
+    let all = notes(&session);
+    assert_eq!(all[at].start, 0, "a start below zero floors at 0");
+    assert_eq!(all[at].length, 1920, "240 × 8");
+}
+
+#[test]
+fn notes_scale_rejects_a_non_positive_factor_or_empty_selection() {
+    let mut session = session_with_notes();
+    for factor in [0.0, -1.0] {
+        let error = session
+            .execute(
+                "midi.notes_scale",
+                &json!({ "indices": [0], "pivot_tick": 0, "factor": factor }),
+            )
+            .expect_err("a scale factor must be positive");
+        assert!(matches!(error, CommandError::BadParams { .. }));
+    }
+    let error = session
+        .execute(
+            "midi.notes_scale",
+            &json!({ "indices": [], "pivot_tick": 0, "factor": 2.0 }),
+        )
+        .expect_err("an empty selection is not an edit");
+    assert!(matches!(error, CommandError::BadParams { .. }));
+}
+
+#[test]
+fn notes_split_cuts_the_selection_at_the_tick() {
+    let mut session = session_with_notes();
+    // Note 0 is [0..240] at pitch 60, velocity 100. Cut at 120.
+    let outcome = session
+        .execute(
+            "midi.notes_split",
+            &json!({ "track": 0, "clip": 0, "indices": [0], "tick": 120 }),
+        )
+        .expect("split should succeed");
+    assert_eq!(outcome["split"], 1);
+
+    let all = notes(&session);
+    assert_eq!(all.len(), 5, "one note became two");
+    let indices: Vec<usize> = outcome["indices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as usize)
+        .collect();
+    assert_eq!(indices.len(), 2);
+    assert_eq!((all[indices[0]].start, all[indices[0]].length), (0, 120));
+    assert_eq!((all[indices[1]].start, all[indices[1]].length), (120, 120));
+    for slot in &indices {
+        assert_eq!(all[*slot].note, 60, "pitch preserved on both halves");
+        assert_eq!(all[*slot].velocity, 100, "velocity preserved");
+        assert_eq!(all[*slot].channel, 0, "channel preserved");
+    }
+}
+
+#[test]
+fn notes_split_leaves_notes_outside_the_tick_alone_but_selected() {
+    let mut session = session_with_notes();
+    // Cut at 500: only note 2 ([480..720]) spans it; note 0 does not.
+    let outcome = session
+        .execute(
+            "midi.notes_split",
+            &json!({ "track": 0, "clip": 0, "indices": [0, 2], "tick": 500 }),
+        )
+        .expect("split should succeed");
+    assert_eq!(outcome["split"], 1, "exactly one note was cut");
+
+    let all = notes(&session);
+    assert_eq!(all.len(), 5);
+    let indices: Vec<usize> = outcome["indices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as usize)
+        .collect();
+    assert_eq!(
+        indices.len(),
+        3,
+        "both halves plus the untouched selected note"
+    );
+    let starts: Vec<i64> = indices.iter().map(|i| all[*i].start).collect();
+    assert!(starts.contains(&0), "the untouched note stays selected");
+    assert!(starts.contains(&480) && starts.contains(&500));
+}
+
+#[test]
+fn notes_split_on_a_boundary_cuts_nothing() {
+    let mut session = session_with_notes();
+    // tick == start: the left half would be zero-length, so nothing is cut.
+    let outcome = session
+        .execute(
+            "midi.notes_split",
+            &json!({ "track": 0, "clip": 0, "indices": [0], "tick": 0 }),
+        )
+        .expect("a boundary cut is a no-op, not an error");
+    assert_eq!(outcome["split"], 0);
+    assert_eq!(notes(&session).len(), 4, "nothing was cut");
+}
+
+#[test]
+fn notes_split_requires_a_selection_and_a_tick() {
+    let mut session = session_with_notes();
+    let error = session
+        .execute("midi.notes_split", &json!({ "tick": 120 }))
+        .expect_err("split needs indices");
+    assert!(matches!(error, CommandError::BadParams { .. }));
+    let error = session
+        .execute("midi.notes_split", &json!({ "indices": [0] }))
+        .expect_err("split needs a tick");
+    assert!(matches!(error, CommandError::BadParams { .. }));
+}
