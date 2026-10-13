@@ -185,6 +185,12 @@ pub struct RollState {
     /// nothing under the pointer); the caller drains it into the app's
     /// status bar via [`RollState::take_status`].
     status: Option<String>,
+    /// Whether the roll owned keyboard focus on the previous frame. The
+    /// toolbar (drawn before the roll is allocated) reads it one frame
+    /// late to surface the invisible focus gate: every keyboard shortcut
+    /// is focus-gated, so a dead D/G/T/S is either this or no key events
+    /// reaching egui at all (OS / IME level).
+    had_focus: bool,
     /// Selection drag in progress (uniform move of all selected notes, a
     /// trim of either edge, a time scale, or a draw gesture setting a
     /// fresh note's length).
@@ -603,6 +609,7 @@ impl RollState {
             modal: None,
             knife_armed: false,
             status: None,
+            had_focus: false,
             drag: None,
             marquee: None,
             knife: None,
@@ -817,6 +824,16 @@ pub fn show(
         // expands the ui's available rect (egui grows `max_rect` to include
         // every allocated frame), and the roll below would then be laid out
         // wider than the panel itself. Truncating keeps it on one row.
+        if !state.had_focus {
+            // Keyboard shortcuts are focus-gated; make the invisible gate
+            // visible so "the keys do nothing" is diagnosable at a glance.
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("no keyboard focus — click the roll")
+                        .color(egui::Color32::YELLOW),
+                ),
+            );
+        }
         ui.add(
             egui::Label::new(
                 egui::RichText::new(
@@ -835,10 +852,13 @@ pub fn show(
     );
     // The roll owns keyboard focus while in use (arrow-key nudging); the
     // click itself is handled in the interaction section below (it needs
-    // the pointer→tick/pitch helpers defined there).
-    if response.clicked() {
+    // the pointer→tick/pitch helpers defined there). Any press counts —
+    // a slow press-and-hold is neither a click (too long) nor yet a drag
+    // (no movement), and focus must not depend on gesture classification.
+    if response.clicked() || response.is_pointer_button_down_on() {
         response.request_focus();
     }
+    state.had_focus = response.has_focus();
 
     // Wheel: scroll the pitch view vertically.
     if response.hovered() {
