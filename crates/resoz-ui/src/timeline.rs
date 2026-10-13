@@ -16,7 +16,10 @@
 //! back as [`TimelineAction`]s.
 
 use eframe::egui;
-use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, StrokeKind, Vec2, pos2};
+use egui::{
+    Align2, Color32, EventFilter, FontId, Id, Key, Modifiers, Pos2, Rect, Sense, Stroke,
+    StrokeKind, Vec2, pos2,
+};
 use resoz_model::{
     ControlClip, ControlTrack, MAX_ARRANGEMENT_BARS, MAX_CLIPS_PER_TRACK, MidiClip, MidiTrack,
     TICKS_PER_BAR,
@@ -32,12 +35,31 @@ const RULER_HEIGHT: f32 = 20.0;
 const EDGE_GRAB: f32 = 6.0;
 /// Minimum timeline content width (bars), even for an empty arrangement.
 const MIN_CONTENT_BARS: u32 = 16;
+/// Accent color for selected clips (matches the roll's selection family).
+const SELECTED: Color32 = Color32::from_rgb(240, 190, 80);
+
+/// One selected clip, addressed across the arrangement (M4b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipSel {
+    pub is_control: bool,
+    pub track: usize,
+    pub clip: usize,
+}
 
 /// Which row kind a drag belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowKind {
     Midi(usize),
     Control(usize),
+}
+
+impl RowKind {
+    fn key(self) -> (bool, usize) {
+        match self {
+            RowKind::Midi(t) => (false, t),
+            RowKind::Control(t) => (true, t),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,12 +75,36 @@ enum Drag {
     },
 }
 
+/// Rubber band in progress (screen coordinates; may span several rows).
+#[derive(Debug, Clone, Copy)]
+struct Marquee {
+    origin: Pos2,
+    current: Pos2,
+    /// Shift/Ctrl held when the band started: union with the pre-existing
+    /// selection instead of replacing it.
+    additive: bool,
+}
+
 /// Cross-frame interaction state.
 #[derive(Debug)]
 pub struct TimelineState {
     /// Horizontal zoom: pixels per bar.
     pub px_per_bar: f32,
     drag: Option<Drag>,
+    /// Selected clips across tracks (M4b).
+    pub selection: Vec<ClipSel>,
+    /// Rubber band in progress.
+    marquee: Option<Marquee>,
+    /// Set by the row that sees `drag_stopped` while a band is live; the
+    /// band is cleared only after show() has folded that frame's hits
+    /// (later rows must still report on the final frame).
+    marquee_ending: bool,
+    /// Whether any lane row owned keyboard focus last frame (toolbar hint).
+    had_focus: bool,
+    /// The focused lane row's widget id — the app asks egui whether it
+    /// still holds focus to gate the virtual piano against the command
+    /// keys (G/T/K/D collide with the FL layout).
+    focus_id: Option<Id>,
 }
 
 impl Default for TimelineState {
@@ -66,7 +112,21 @@ impl Default for TimelineState {
         Self {
             px_per_bar: 56.0,
             drag: None,
+            selection: Vec::new(),
+            marquee: None,
+            marquee_ending: false,
+            had_focus: false,
+            focus_id: None,
         }
+    }
+}
+
+impl TimelineState {
+    /// Whether a lane row owns keyboard focus *right now*, per egui (no
+    /// frame lag, no staleness once the timeline stops being laid out).
+    pub fn owns_keyboard_focus(&self, ctx: &egui::Context) -> bool {
+        self.focus_id
+            .is_some_and(|id| ctx.memory(|m| m.has_focus(id)))
     }
 }
 
@@ -75,7 +135,7 @@ impl Default for TimelineState {
 /// Clip edits carry their data (`is_control` picks the track table): the
 /// timeline is a view and must not mutate the document — the caller turns
 /// these into undoable edits (M1.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineAction {
     /// A MIDI track's clips changed; re-push to the engine.
     MidiEdited(usize),
@@ -101,6 +161,11 @@ pub enum TimelineAction {
         is_control: bool,
         track: usize,
         clip: usize,
+    },
+    /// Delete every clip in the list (one undo step; per track the indices
+    /// are applied descending by the caller).
+    RemoveClipsBatch {
+        clips: Vec<ClipSel>,
     },
     SelectTrack(usize),
     SelectControlTrack(usize),
@@ -262,8 +327,13 @@ pub fn show(
             if ui.button("- Track").clicked() {
                 actions.push(TimelineAction::RemoveLastMidiTrack);
             }
-            ui.weak("Drag move · edge resize · dbl-click insert/edit · right-click delete");
+            ui.weak("Drag move · edge resize · dbl-click insert/edit · right-click delete · marquee: select · Del: delete");
         });
+        // The focus chip mirrors the roll's: keyboard shortcuts are
+        // focus-gated, and the gate must be visible to be diagnosable.
+        if !state.had_focus {
+            ui.weak(egui::RichText::new("no keyboard focus — click the timeline").color(Color32::YELLOW));
+        }
 
         // Ruler: bar numbers over the content width.
         ui.horizontal(|ui| {
@@ -292,6 +362,12 @@ pub fn show(
             }
         });
 
+        // Marquee selection: every row reports the clips its lane segment
+        // of the band covers; show() combines them into the selection once
+        // all rows have run (M4b: the band may span several rows).
+        let mut marquee_hits = Vec::new();
+        state.had_focus = false;
+
         // MIDI rows.
         for (i, track) in midi_tracks.iter().enumerate() {
             let name = if track.name.is_empty() {
@@ -312,6 +388,7 @@ pub fn show(
                 ui,
                 state,
                 &mut actions,
+                &mut marquee_hits,
                 header,
                 RowKind::Midi(i),
                 &track.clips,
@@ -340,6 +417,7 @@ pub fn show(
                     ui,
                     state,
                     &mut actions,
+                    &mut marquee_hits,
                     header,
                     RowKind::Control(i),
                     &track.clips,
@@ -358,6 +436,35 @@ pub fn show(
                 );
             }
         }
+
+        // Fold the rows' marquee reports into the selection: replace with
+        // the band's hits, or union with what was selected when it started.
+        // An ending band folds this final frame first, then clears below.
+        if let Some(m) = &state.marquee {
+            let mut selection = if m.additive {
+                state.selection.clone()
+            } else {
+                Vec::new()
+            };
+            for (row, hits) in &marquee_hits {
+                let (is_control, track) = row.key();
+                for clip in hits {
+                    let sel = ClipSel {
+                        is_control,
+                        track,
+                        clip: *clip,
+                    };
+                    if !selection.contains(&sel) {
+                        selection.push(sel);
+                    }
+                }
+            }
+            state.selection = selection;
+        }
+        if state.marquee_ending {
+            state.marquee = None;
+            state.marquee_ending = false;
+        }
     });
     actions
 }
@@ -368,6 +475,7 @@ fn lane_row<T: Placement>(
     ui: &mut egui::Ui,
     state: &mut TimelineState,
     actions: &mut Vec<TimelineAction>,
+    marquee_hits: &mut Vec<(RowKind, Vec<usize>)>,
     header: HeaderKind,
     row: RowKind,
     clips: &[T],
@@ -428,6 +536,15 @@ fn lane_row<T: Placement>(
         // Lane surface.
         let (lane, response) =
             ui.allocate_exact_size(Vec2::new(content_px, ROW_HEIGHT), Sense::click_and_drag());
+        // The row owns keyboard focus while in use (command keys land in
+        // M4b.2+; the plumbing is here from the start). Any press counts.
+        if response.clicked() || response.is_pointer_button_down_on() {
+            response.request_focus();
+        }
+        if response.has_focus() {
+            state.had_focus = true;
+            state.focus_id = Some(response.id);
+        }
         let painter = ui.painter_at(lane);
         painter.rect_filled(lane, 0.0, colors.lane_bg);
 
@@ -445,6 +562,8 @@ fn lane_row<T: Placement>(
         }
 
         let tick_at = |x: f32| ((x - lane.left()) / px_per_tick).max(0.0);
+
+        let (is_control, track) = row.key();
 
         // Clip blocks.
         for (index, clip) in clips.iter().enumerate() {
@@ -464,6 +583,13 @@ fn lane_row<T: Placement>(
                 Stroke::new(1.0, colors.clip_stroke),
                 StrokeKind::Inside,
             );
+            if state.selection.contains(&ClipSel {
+                is_control,
+                track,
+                clip: index,
+            }) {
+                painter.rect_stroke(rect, 3.0, Stroke::new(2.0, SELECTED), StrokeKind::Inside);
+            }
             if highlight == Some(index) {
                 painter.rect_stroke(
                     rect,
@@ -527,11 +653,28 @@ fn lane_row<T: Placement>(
             }
         }
 
-        // Drag start: pick move vs resize by the grab zone at the right edge.
+        // Drag start: on a clip, pick move vs resize by the grab zone at
+        // the right edge (and select it if it was not); on empty space,
+        // start a rubber band (M4b selection).
         if response.drag_started() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let tick = tick_at(pos.x);
                 if let Some(index) = hit_clip(clips, tick) {
+                    let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                    let sel = ClipSel {
+                        is_control,
+                        track,
+                        clip: index,
+                    };
+                    if additive {
+                        if let Some(at) = state.selection.iter().position(|s| *s == sel) {
+                            state.selection.remove(at);
+                        } else {
+                            state.selection.push(sel);
+                        }
+                    } else if !state.selection.contains(&sel) {
+                        state.selection = vec![sel];
+                    }
                     let edge_x = lane.left()
                         + (clips[index].start() + clips[index].span()) as f32 * px_per_tick;
                     if (pos.x - edge_x).abs() <= EDGE_GRAB {
@@ -544,76 +687,158 @@ fn lane_row<T: Placement>(
                             grab_ticks: grab,
                         });
                     }
+                } else {
+                    let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                    state.marquee = Some(Marquee {
+                        origin: pos,
+                        current: pos,
+                        additive,
+                    });
                 }
             }
         }
 
         if response.dragged() {
             if let Some(pos) = response.interact_pointer_pos() {
-                match state.drag {
-                    Some(Drag::Move {
-                        clip, grab_ticks, ..
-                    }) if clip < clips.len() => {
-                        let span = clips[clip].span();
-                        let limit = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - span;
-                        let start = snap_bar(tick_at(pos.x) - grab_ticks).min(limit);
-                        if clips[clip].start() != start {
-                            let (is_control, track) = match row {
-                                RowKind::Midi(t) => (false, t),
-                                RowKind::Control(t) => (true, t),
-                            };
-                            actions.push(TimelineAction::MoveResizeClip {
-                                is_control,
-                                track,
-                                clip,
-                                start_ticks: start,
-                                span_ticks: span,
-                            });
+                if let Some(m) = state.marquee.as_mut() {
+                    m.current = pos;
+                } else {
+                    match state.drag {
+                        Some(Drag::Move {
+                            clip, grab_ticks, ..
+                        }) if clip < clips.len() => {
+                            let span = clips[clip].span();
+                            let limit = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - span;
+                            let start = snap_bar(tick_at(pos.x) - grab_ticks).min(limit);
+                            if clips[clip].start() != start {
+                                let (is_control, track) = match row {
+                                    RowKind::Midi(t) => (false, t),
+                                    RowKind::Control(t) => (true, t),
+                                };
+                                actions.push(TimelineAction::MoveResizeClip {
+                                    is_control,
+                                    track,
+                                    clip,
+                                    start_ticks: start,
+                                    span_ticks: span,
+                                });
+                            }
                         }
-                    }
-                    Some(Drag::Resize { clip, .. }) if clip < clips.len() => {
-                        let start = clips[clip].start();
-                        let limit = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - start;
-                        let span = snap_bar(tick_at(pos.x) - start as f32)
-                            .clamp(TICKS_PER_BAR, limit.max(TICKS_PER_BAR));
-                        if clips[clip].span() != span {
-                            let (is_control, track) = match row {
-                                RowKind::Midi(t) => (false, t),
-                                RowKind::Control(t) => (true, t),
-                            };
-                            actions.push(TimelineAction::MoveResizeClip {
-                                is_control,
-                                track,
-                                clip,
-                                start_ticks: start,
-                                span_ticks: span,
-                            });
+                        Some(Drag::Resize { clip, .. }) if clip < clips.len() => {
+                            let start = clips[clip].start();
+                            let limit = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - start;
+                            let span = snap_bar(tick_at(pos.x) - start as f32)
+                                .clamp(TICKS_PER_BAR, limit.max(TICKS_PER_BAR));
+                            if clips[clip].span() != span {
+                                let (is_control, track) = match row {
+                                    RowKind::Midi(t) => (false, t),
+                                    RowKind::Control(t) => (true, t),
+                                };
+                                actions.push(TimelineAction::MoveResizeClip {
+                                    is_control,
+                                    track,
+                                    clip,
+                                    start_ticks: start,
+                                    span_ticks: span,
+                                });
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
 
         if response.drag_stopped() {
             state.drag = None;
+            if state.marquee.is_some() {
+                state.marquee_ending = true;
+            }
         }
 
-        // Right-click: delete the clip under the pointer.
+        // Marquee hit reporting: every row contributes the clips its lane
+        // segment of the band covers, every frame the band is live.
+        if let Some(m) = &state.marquee {
+            let band = Rect::from_two_pos(m.origin, m.current);
+            let hits = clips
+                .iter()
+                .enumerate()
+                .filter(|(_, clip)| {
+                    let x0 = lane.left() + clip.start() as f32 * px_per_tick;
+                    let x1 = lane.left() + (clip.start() + clip.span()) as f32 * px_per_tick;
+                    Rect::from_min_max(pos2(x0, lane.top()), pos2(x1, lane.bottom()))
+                        .intersects(band)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            marquee_hits.push((row, hits));
+        }
+
+        // The band itself, clipped to this row's lane segment.
+        if let Some(m) = &state.marquee {
+            let band = Rect::from_two_pos(m.origin, m.current);
+            let segment = band.intersect(lane);
+            if segment.is_positive() {
+                painter.rect_filled(
+                    segment,
+                    0.0,
+                    Color32::from_rgba_unmultiplied(80, 140, 220, 40),
+                );
+                painter.rect_stroke(
+                    segment,
+                    0.0,
+                    Stroke::new(1.0, Color32::from_rgb(80, 140, 220)),
+                    StrokeKind::Inside,
+                );
+            }
+        }
+
+        // Right-click: cancel a live band, otherwise delete the clip under
+        // the pointer.
         if response.secondary_clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
-                if let Some(index) = hit_clip(clips, tick_at(pos.x)) {
-                    let (is_control, track) = match row {
-                        RowKind::Midi(t) => (false, t),
-                        RowKind::Control(t) => (true, t),
-                    };
-                    actions.push(TimelineAction::RemoveClip {
-                        is_control,
-                        track,
-                        clip: index,
-                    });
-                    state.drag = None;
+                if state.marquee.take().is_none() {
+                    if let Some(index) = hit_clip(clips, tick_at(pos.x)) {
+                        actions.push(TimelineAction::RemoveClip {
+                            is_control,
+                            track,
+                            clip: index,
+                        });
+                        state.drag = None;
+                    }
                 }
+            }
+        }
+
+        // Keyboard: focus-gated, roll-style. M4b.1 wires Escape (clear the
+        // selection / cancel the band) and Delete (remove the selection as
+        // one undo step); the command family lands in M4b.2+.
+        if response.has_focus() {
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    response.id,
+                    EventFilter {
+                        escape: true,
+                        ..Default::default()
+                    },
+                )
+            });
+            let escape = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+            let delete = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete));
+            if escape {
+                state.selection.clear();
+                state.marquee = None;
+                state.marquee_ending = false;
+            }
+            if delete && !state.selection.is_empty() {
+                actions.push(TimelineAction::RemoveClipsBatch {
+                    clips: state.selection.clone(),
+                });
+                state.selection.clear();
             }
         }
     });

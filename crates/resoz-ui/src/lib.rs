@@ -2045,7 +2045,8 @@ impl ResoZApp {
     /// Text input widgets (none yet besides DragValue edits) still need
     /// the same treatment.
     fn handle_keyboard_input(&mut self, ctx: &egui::Context) {
-        let roll_owns_focus = self.roll_state.owns_keyboard_focus(ctx);
+        let roll_owns_focus = self.roll_state.owns_keyboard_focus(ctx)
+            || self.timeline_state.owns_keyboard_focus(ctx);
         let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
         for event in events {
             let egui::Event::Key {
@@ -2305,6 +2306,9 @@ impl ResoZApp {
                 track,
                 clip,
             } => self.timeline_remove_clip(is_control, track, clip),
+            timeline::TimelineAction::RemoveClipsBatch { clips } => {
+                self.timeline_remove_clips_batch(clips)
+            }
         }
     }
 
@@ -2408,6 +2412,72 @@ impl ResoZApp {
         if removed {
             self.commit_edit("Delete Clip", before);
             self.sync_clip_row(is_control, track);
+        }
+    }
+
+    /// Deletes every clip in the list as ONE undo step. Per track the
+    /// indices are applied descending so earlier removals cannot shift
+    /// later ones (the timeline reports pre-removal indices).
+    fn timeline_remove_clips_batch(&mut self, clips: Vec<timeline::ClipSel>) {
+        if clips.is_empty() {
+            return;
+        }
+        let before = self.begin_edit();
+        let mut by_key: Vec<(bool, usize, Vec<usize>)> = Vec::new();
+        for c in clips {
+            if let Some((_, _, idxs)) = by_key
+                .iter_mut()
+                .find(|(k, t, _)| *k == c.is_control && *t == c.track)
+            {
+                idxs.push(c.clip);
+            } else {
+                by_key.push((c.is_control, c.track, vec![c.clip]));
+            }
+        }
+        let mut touched = Vec::new();
+        for (is_control, track, mut idxs) in by_key {
+            idxs.sort_unstable();
+            idxs.dedup();
+            let removed = if is_control {
+                self.project_mut()
+                    .control_tracks
+                    .get_mut(track)
+                    .map(|t| {
+                        let mut n = 0;
+                        for idx in idxs.iter().rev() {
+                            if *idx < t.clips.len() {
+                                t.clips.remove(*idx);
+                                n += 1;
+                            }
+                        }
+                        n
+                    })
+                    .unwrap_or(0)
+            } else {
+                self.project_mut()
+                    .midi_tracks
+                    .get_mut(track)
+                    .map(|t| {
+                        let mut n = 0;
+                        for idx in idxs.iter().rev() {
+                            if *idx < t.clips.len() {
+                                t.clips.remove(*idx);
+                                n += 1;
+                            }
+                        }
+                        n
+                    })
+                    .unwrap_or(0)
+            };
+            if removed > 0 {
+                touched.push((is_control, track));
+            }
+        }
+        if !touched.is_empty() {
+            self.commit_edit("Delete Clips", before);
+            for (is_control, track) in touched {
+                self.sync_clip_row(is_control, track);
+            }
         }
     }
 
