@@ -2309,6 +2309,12 @@ impl ResoZApp {
             timeline::TimelineAction::RemoveClipsBatch { clips } => {
                 self.timeline_remove_clips_batch(clips)
             }
+            timeline::TimelineAction::SplitClip {
+                is_control,
+                track,
+                clip,
+                at_ticks,
+            } => self.timeline_split_clip(is_control, track, clip, at_ticks),
         }
     }
 
@@ -2477,6 +2483,39 @@ impl ResoZApp {
             self.commit_edit("Delete Clips", before);
             for (is_control, track) in touched {
                 self.sync_clip_row(is_control, track);
+            }
+        }
+    }
+
+    /// Splits one clip at `at_ticks` as ONE undo step: the left half keeps
+    /// start + the shortened span, the right half is inserted right after
+    /// with cloned content (loop-based clips both play the same loop). The
+    /// selection is patched for the index shift (split entry dropped, later
+    /// indices on the row bumped).
+    fn timeline_split_clip(&mut self, is_control: bool, track: usize, clip: usize, at_ticks: u32) {
+        let before = self.begin_edit();
+        let split = if is_control {
+            self.project_mut()
+                .control_tracks
+                .get_mut(track)
+                .map(|t| timeline::split_clip_in(&mut t.clips, at_ticks, clip))
+                .unwrap_or(false)
+        } else {
+            self.project_mut()
+                .midi_tracks
+                .get_mut(track)
+                .map(|t| timeline::split_clip_in(&mut t.clips, at_ticks, clip))
+                .unwrap_or(false)
+        };
+        if split {
+            self.commit_edit("Split Clip", before);
+            self.sync_clip_row(is_control, track);
+            let sel = &mut self.timeline_state.selection;
+            sel.retain(|s| s.is_control != is_control || s.track != track || s.clip != clip);
+            for s in sel.iter_mut() {
+                if s.is_control == is_control && s.track == track && s.clip > clip {
+                    s.clip += 1;
+                }
             }
         }
     }

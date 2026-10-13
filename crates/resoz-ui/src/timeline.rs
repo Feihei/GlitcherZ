@@ -105,6 +105,13 @@ pub struct TimelineState {
     /// still holds focus to gate the virtual piano against the command
     /// keys (G/T/K/D collide with the FL layout).
     focus_id: Option<Id>,
+    /// Knife armed via K (M4b.2): the next LMB click cuts the clip under
+    /// the pointer at the bar-snapped position. Stays armed for multiple
+    /// cuts; Esc / RMB disarms.
+    knife_armed: bool,
+    /// One-frame status message (invalid cut explanation); the toolbar
+    /// drains it the same frame it is set.
+    status: Option<String>,
 }
 
 impl Default for TimelineState {
@@ -117,6 +124,8 @@ impl Default for TimelineState {
             marquee_ending: false,
             had_focus: false,
             focus_id: None,
+            knife_armed: false,
+            status: None,
         }
     }
 }
@@ -167,6 +176,15 @@ pub enum TimelineAction {
     RemoveClipsBatch {
         clips: Vec<ClipSel>,
     },
+    /// Split the clip at `clip` at `at_ticks` (bar-snapped by the view):
+    /// the left half keeps the start, the right half clones the content
+    /// (loop-based clips both play the same loop). One undo step.
+    SplitClip {
+        is_control: bool,
+        track: usize,
+        clip: usize,
+        at_ticks: u32,
+    },
     SelectTrack(usize),
     SelectControlTrack(usize),
     ToggleMute(usize, bool),
@@ -205,9 +223,11 @@ pub struct TimelineParams<'a> {
 }
 
 /// Placement semantics shared by MIDI and control clips.
-trait Placement {
+pub(crate) trait Placement {
     fn start(&self) -> u32;
     fn span(&self) -> u32;
+    fn set_start(&mut self, v: u32);
+    fn set_span(&mut self, v: u32);
 }
 
 impl Placement for MidiClip {
@@ -216,6 +236,12 @@ impl Placement for MidiClip {
     }
     fn span(&self) -> u32 {
         self.span_ticks
+    }
+    fn set_start(&mut self, v: u32) {
+        self.start_ticks = v;
+    }
+    fn set_span(&mut self, v: u32) {
+        self.span_ticks = v;
     }
 }
 
@@ -226,6 +252,37 @@ impl Placement for ControlClip {
     fn span(&self) -> u32 {
         self.span_ticks
     }
+    fn set_start(&mut self, v: u32) {
+        self.start_ticks = v;
+    }
+    fn set_span(&mut self, v: u32) {
+        self.span_ticks = v;
+    }
+}
+
+/// Splits `clips[index]` at `at` in place (M4b.2): the left half keeps the
+/// start with a shortened span, the right half is inserted at `index + 1`
+/// with cloned content (loop-based clips both play the same loop). Returns
+/// false untouched when the index is out of bounds, the track is full, or
+/// `at` is not strictly inside the clip.
+pub(crate) fn split_clip_in<T: Placement + Clone>(
+    clips: &mut Vec<T>,
+    at: u32,
+    index: usize,
+) -> bool {
+    let Some(c) = clips.get(index) else {
+        return false;
+    };
+    let (start, end) = (c.start(), c.start() + c.span());
+    if at <= start || at >= end || clips.len() >= MAX_CLIPS_PER_TRACK {
+        return false;
+    }
+    let mut right = clips[index].clone();
+    right.set_start(at);
+    right.set_span(end - at);
+    clips[index].set_span(at - start);
+    clips.insert(index + 1, right);
+    true
 }
 
 struct RowColors {
@@ -327,12 +384,21 @@ pub fn show(
             if ui.button("- Track").clicked() {
                 actions.push(TimelineAction::RemoveLastMidiTrack);
             }
-            ui.weak("Drag move · edge resize · dbl-click insert/edit · right-click delete · marquee: select · Del: delete");
+            ui.weak("Drag move · edge resize · dbl-click insert/edit · right-click delete · marquee: select · Del: delete · K: knife");
         });
         // The focus chip mirrors the roll's: keyboard shortcuts are
         // focus-gated, and the gate must be visible to be diagnosable.
         if !state.had_focus {
             ui.weak(egui::RichText::new("no keyboard focus — click the timeline").color(Color32::YELLOW));
+        }
+        if state.knife_armed {
+            ui.weak(
+                egui::RichText::new("Knife: click a clip to cut (bar-snapped) · Esc / right-click to stop")
+                    .color(Color32::from_rgb(240, 190, 80)),
+            );
+        }
+        if let Some(msg) = state.status.take() {
+            ui.weak(egui::RichText::new(msg).color(Color32::YELLOW));
         }
 
         // Ruler: bar numbers over the content width.
@@ -622,6 +688,49 @@ fn lane_row<T: Placement>(
         // Interactions (all edits are emitted as actions; nothing mutates the
         // document here).
 
+        // Knife (K armed): an LMB click cuts the clip under the pointer at
+        // the bar-snapped position; the knife stays armed for more cuts.
+        if state.knife_armed && response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if clips.len() >= MAX_CLIPS_PER_TRACK {
+                    state.status = Some("this track is full — cannot split".to_string());
+                } else {
+                    match knife_target(clips, tick_at(pos.x)) {
+                        Some((index, at)) => {
+                            actions.push(TimelineAction::SplitClip {
+                                is_control,
+                                track,
+                                clip: index,
+                                at_ticks: at,
+                            });
+                            state.selection.retain(|s| {
+                                s.is_control != is_control || s.track != track || s.clip != index
+                            });
+                        }
+                        None if hit_clip(clips, tick_at(pos.x)).is_some() => {
+                            state.status =
+                                Some("a cut needs at least one bar on both sides".to_string());
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+
+        // Knife preview: while armed, mark where the cut would land (the
+        // snapped bar line through the hovered lane).
+        if state.knife_armed && response.hovered() {
+            if let Some(pos) = response.hover_pos() {
+                let at = snap_bar(tick_at(pos.x));
+                let x = lane.left() + at as f32 * px_per_tick;
+                painter.line_segment(
+                    [pos2(x, lane.top()), pos2(x, lane.bottom())],
+                    Stroke::new(1.5, Color32::from_rgb(240, 190, 80)),
+                );
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+        }
+
         // Double-click: open the clip's editor, or insert a new clip on empty
         // space.
         if response.double_clicked() {
@@ -655,8 +764,9 @@ fn lane_row<T: Placement>(
 
         // Drag start: on a clip, pick move vs resize by the grab zone at
         // the right edge (and select it if it was not); on empty space,
-        // start a rubber band (M4b selection).
-        if response.drag_started() {
+        // start a rubber band (M4b selection). While the knife is armed the
+        // pointer is its: no drags, no bands — clicks cut instead.
+        if response.drag_started() && !state.knife_armed {
             if let Some(pos) = response.interact_pointer_pos() {
                 let tick = tick_at(pos.x);
                 if let Some(index) = hit_clip(clips, tick) {
@@ -793,10 +903,12 @@ fn lane_row<T: Placement>(
             }
         }
 
-        // Right-click: cancel a live band, otherwise delete the clip under
-        // the pointer.
+        // Right-click: cancel a live band, disarm the knife, otherwise
+        // delete the clip under the pointer.
         if response.secondary_clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
+            if state.knife_armed {
+                state.knife_armed = false;
+            } else if let Some(pos) = response.interact_pointer_pos() {
                 if state.marquee.take().is_none() {
                     if let Some(index) = hit_clip(clips, tick_at(pos.x)) {
                         actions.push(TimelineAction::RemoveClip {
@@ -829,10 +941,17 @@ fn lane_row<T: Placement>(
             let delete = ui
                 .ctx()
                 .input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete));
+            let knife = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(Modifiers::NONE, Key::K));
+            if knife {
+                state.knife_armed = !state.knife_armed;
+            }
             if escape {
                 state.selection.clear();
                 state.marquee = None;
                 state.marquee_ending = false;
+                state.knife_armed = false;
             }
             if delete && !state.selection.is_empty() {
                 actions.push(TimelineAction::RemoveClipsBatch {
@@ -850,8 +969,118 @@ fn hit_clip<T: Placement>(clips: &[T], tick: f32) -> Option<usize> {
         .position(|c| tick >= c.start() as f32 && tick < (c.start() + c.span()) as f32)
 }
 
+/// Knife targeting (M4b.2): resolve a click at `tick` into the clip index
+/// and a bar-snapped cut position, requiring at least one bar of clip on
+/// both sides of the cut. `None` when the click misses every clip or the
+/// snapped position is too close to either edge.
+fn knife_target<T: Placement>(clips: &[T], tick: f32) -> Option<(usize, u32)> {
+    let index = hit_clip(clips, tick)?;
+    let clip = &clips[index];
+    let at = snap_bar(tick);
+    let left_ok = at >= clip.start() + TICKS_PER_BAR;
+    let right_ok = at + TICKS_PER_BAR <= clip.start() + clip.span();
+    (left_ok && right_ok).then_some((index, at))
+}
+
 /// Snaps to the nearest whole bar (0 stays 0).
 fn snap_bar(ticks: f32) -> u32 {
     let bar = TICKS_PER_BAR as f32;
     ((ticks / bar).round().max(0.0) as u32) * TICKS_PER_BAR
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use resoz_model::Sequence;
+
+    fn clip(start: u32, span: u32) -> MidiClip {
+        MidiClip {
+            start_ticks: start,
+            span_ticks: span,
+            ..MidiClip::new(start)
+        }
+    }
+
+    #[test]
+    fn knife_targets_the_bar_line_under_the_pointer() {
+        let clips = vec![clip(0, 8 * TICKS_PER_BAR)];
+        // 2.6 bars in → snaps to bar 3.
+        let tick = 2.6 * TICKS_PER_BAR as f32;
+        assert_eq!(
+            knife_target(&clips, tick),
+            Some((0, 3 * TICKS_PER_BAR)),
+            "the cut lands on the nearest bar line"
+        );
+    }
+
+    #[test]
+    fn knife_rejects_cuts_without_a_bar_on_both_sides() {
+        let clips = vec![clip(0, 2 * TICKS_PER_BAR)];
+        // Middle of a 2-bar clip snaps to bar 1 — valid.
+        assert_eq!(
+            knife_target(&clips, TICKS_PER_BAR as f32),
+            Some((0, TICKS_PER_BAR))
+        );
+        // Near the start edge: snap lands on bar 0 → zero-length left half.
+        assert_eq!(knife_target(&clips, 0.2 * TICKS_PER_BAR as f32), None);
+        // Near the end edge: snap lands on the clip's end → zero right half.
+        assert_eq!(knife_target(&clips, 1.8 * TICKS_PER_BAR as f32), None);
+        // One-bar clips can never be split.
+        assert_eq!(
+            knife_target(
+                &[clip(4 * TICKS_PER_BAR, TICKS_PER_BAR)],
+                4.4 * TICKS_PER_BAR as f32
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn knife_misses_empty_lane() {
+        let clips = vec![clip(0, 4 * TICKS_PER_BAR)];
+        assert_eq!(knife_target(&clips, 6.0 * TICKS_PER_BAR as f32), None);
+    }
+
+    #[test]
+    fn split_halves_keep_start_end_and_content() {
+        let mut clips = vec![MidiClip {
+            start_ticks: 2 * TICKS_PER_BAR,
+            span_ticks: 4 * TICKS_PER_BAR,
+            ..MidiClip::new(2 * TICKS_PER_BAR)
+        }];
+        let original = clips[0].clone();
+        let at = 4 * TICKS_PER_BAR;
+        assert!(split_clip_in(&mut clips, at, 0));
+        assert_eq!(clips.len(), 2);
+        // Left: same start, span ends at the cut.
+        assert_eq!(clips[0].start_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(clips[0].span_ticks, 2 * TICKS_PER_BAR);
+        // Right: starts at the cut, runs to the old end, same loop/content.
+        assert_eq!(clips[1].start_ticks, at);
+        assert_eq!(clips[1].span_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(clips[1].loop_ticks, original.loop_ticks);
+        assert_eq!(clips[1].sequence, original.sequence);
+    }
+
+    #[test]
+    fn split_refuses_edges_and_out_of_bounds() {
+        let mut clips = vec![clip(0, 2 * TICKS_PER_BAR)];
+        assert!(!split_clip_in(&mut clips, 0, 0), "at the start");
+        assert!(
+            !split_clip_in(&mut clips, 2 * TICKS_PER_BAR, 0),
+            "at the end"
+        );
+        assert!(!split_clip_in(&mut clips, TICKS_PER_BAR, 5), "bad index");
+        assert_eq!(clips.len(), 1, "failed splits must not mutate");
+    }
+
+    #[test]
+    fn split_respects_the_per_track_cap() {
+        let mut clips: Vec<MidiClip> = (0..MAX_CLIPS_PER_TRACK)
+            .map(|i| clip(i as u32 * 2 * TICKS_PER_BAR, 2 * TICKS_PER_BAR))
+            .collect();
+        assert!(!split_clip_in(&mut clips, TICKS_PER_BAR, 0));
+        assert_eq!(clips.len(), MAX_CLIPS_PER_TRACK);
+        let _ = Sequence::default();
+    }
 }
