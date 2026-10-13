@@ -88,6 +88,24 @@
 | 混音器 | mixer | 多轨电平/推子区 |
 | 走带控制 | transport bar | 顶部播放/速度/文件工具条 |
 
+## 编辑交互（M4，spec/editing-model.md）
+
+| 中文 | 英文 | 约定 |
+| :--- | :--- | :--- |
+| 常驻状态 | persistent state | 编辑器中长期驻留的状态，决定左键拖动含义；只有 Select 一种 |
+| 粘性命令 | sticky command | 一次唤起、可连续同类操作、Esc 退出的命令；只有 Draw（`d`） |
+| 一次性命令 | one-shot command | 按键唤起、一次操作、Esc 取消、不改变常驻态；Grab/Scale/Stretch/Cut/Duplicate |
+| 命令族 | command family | 一次性命令的集合称谓；新变换能力按 spec §2 判据入族 |
+| 限定键 | qualifier key | 命令 pending 期间按下的上下文键：Grab 的 X/Y（轴锁定）、Stretch 的 S/E（起/终点） |
+| 选择态 | Select state | 默认常驻态；拖音符=移动、拖缘=trim、空拖=框选 |
+| 绘制态 | Draw state | `d` 进入的粘性命令态；空拖=画音符/clip |
+| 轴锁定 | axis lock | Grab 中按 X=只改时间 / Y=只改音高（Blender 惯例，mid-drag 可切换） |
+| 整体移动 | grab | 命令 `g`；与 Select 态"拖音符"为同一操作的双入口 |
+| 时间缩放 | scale | 命令 `s`；绕选区中心按比例伸缩起点与时值，不吸附网格 |
+| 缘拉伸 | stretch | 命令 `t`；默认拉终点，`t+s`/`t+e` 显式限定 |
+| 切分 | cut / split | 命令 `k`；在指针 tick 处把音符/clip 一分为二 |
+| 复制并移动 | duplicate & move | `Shift+d`；复制选区后立即 arm Grab |
+
 ## 符号白名单（egui 默认字体，硬约束）
 
 egui 0.36 默认字体（Ubuntu-Light + NotoEmoji + emoji-icon-font）**没有的字形一律渲染成方块**。窗口内出现的文案（按钮/标签/状态栏/浮窗）只允许以下符号：
