@@ -1,0 +1,277 @@
+//! Timeline keyboard-focus regression coverage (M4b follow-up).
+//!
+//! The lane rows are the keyboard focus carriers, and focus must SURVIVE
+//! layout changes around them. M4b initially drew the focus chip (and the
+//! knife / modal hints and the status message) directly in the parent ui:
+//! the chip appears exactly when focus is lost and disappears the frame
+//! after a click grants it. That toggling shifted the auto ids of every
+//! row below (egui auto ids are positional), so the focused lane's id
+//! stopped existing and egui's dead-man switch cleared focus — the chip
+//! came back, the ids shifted back, and no click could ever hold focus.
+//!
+//! The rows are now pinned with `push_id` (parent id + row identity),
+//! immune to sibling-count changes; these tests pin that property by
+//! letting the layout settle for several frames after each interaction.
+
+use eframe::egui;
+use resoz_model::{MidiClip, MidiTrack, TICKS_PER_BAR};
+use resoz_ui::timeline::{self, TimelineParams, TimelineState};
+
+const SCREEN: egui::Vec2 = egui::vec2(800.0, 600.0);
+/// Probe x: past the row header (108 px) and inside the lanes, away from
+/// the toolbar buttons (which sit at the far left of the toolbar row).
+const LANE_X: f32 = 500.0;
+
+struct Fixture {
+    ctx: egui::Context,
+    state: TimelineState,
+    tracks: Vec<MidiTrack>,
+    /// View-tab selection (the app's MainView; only Timeline matters
+    /// here, but the tab row must exist to mirror its layout).
+    view: bool,
+    /// Tempo DragValue target (the real transport panel has one — a
+    /// focus-interested interactive widget).
+    tempo: f64,
+    /// A widget above the timeline whose presence varies per frame — the
+    /// shape of whatever the app really does to churn the layout.
+    churn: bool,
+    time: f64,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let clip = MidiClip {
+            start_ticks: 0,
+            span_ticks: 2 * TICKS_PER_BAR,
+            ..MidiClip::default()
+        };
+        let mut tracks = vec![MidiTrack::default(), MidiTrack::default()];
+        tracks[0].clips.push(clip);
+        Self {
+            ctx: egui::Context::default(),
+            state: TimelineState::default(),
+            tracks,
+            view: true,
+            tempo: 120.0,
+            churn: false,
+            time: 0.0,
+        }
+    }
+
+    fn raw(&self, events: Vec<egui::Event>) -> egui::RawInput {
+        let mut viewports = egui::ViewportIdMap::default();
+        viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                inner_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+                ..Default::default()
+            },
+        );
+        egui::RawInput {
+            events,
+            time: Some(self.time),
+            // Without an explicit screen rect egui lays out into a huge
+            // default area and pointer interaction stops matching.
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+            viewports,
+            ..Default::default()
+        }
+    }
+
+    /// Runs one frame, mirroring the app's layout exactly: transport and
+    /// status panels, the view tab bar, then the timeline inside a
+    /// CentralPanel — the focus bug only reproduces in this nesting, not
+    /// with the timeline alone in the central area. 0.1s per frame — same
+    /// pinning as the roll harness: a whole click (4 steps = 0.4s) stays
+    /// under egui's 0.8s click ceiling and exceeds its 0.3s double-click
+    /// window.
+    fn frame(&mut self, events: Vec<egui::Event>) {
+        self.time += 0.1;
+        let raw = self.raw(events);
+        let Self {
+            ctx,
+            state,
+            tracks,
+            view,
+            tempo,
+            churn,
+            ..
+        } = self;
+        let muted: [bool; 0] = [];
+        let mut out = ctx.run_ui(raw, |root| {
+            egui::Panel::top("resoz_transport").show(root, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("▶ Play").clicked() {}
+                    if ui.button("■ Stop").clicked() {}
+                    ui.separator();
+                    ui.label("Tempo");
+                    let _ = ui.add(
+                        egui::DragValue::new(tempo)
+                            .range(40.0..=300.0)
+                            .suffix(" BPM"),
+                    );
+                    ui.separator();
+                    if ui.button("📂 Open").clicked() {}
+                    if ui.button("💾 Save").clicked() {}
+                });
+            });
+            egui::Panel::bottom("resoz_status").show(root, |ui| {
+                ui.label("status");
+            });
+            egui::Panel::top("resoz_views").show(root, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(view, true, "Timeline");
+                    ui.selectable_value(view, false, "Edit");
+                });
+            });
+            egui::CentralPanel::default().show(root, |ui| {
+                if *churn {
+                    ui.weak("churn");
+                }
+                let _ = timeline::show(
+                    ui,
+                    state,
+                    &*tracks,
+                    &[],
+                    TimelineParams {
+                        muted: &muted,
+                        selected_track: 0,
+                        selected_auto: 0,
+                        playhead_ticks: 0.0,
+                        playing: false,
+                        edit_target: None,
+                    },
+                );
+            });
+        });
+        out.textures_delta.clear();
+    }
+
+    /// A click (press + release, no movement). Four frames, matching what
+    /// a real platform delivers: hover, press, hold, release.
+    fn click(&mut self, pos: egui::Pos2) {
+        self.frame(vec![hover(pos)]);
+        self.frame(vec![hover(pos), press(pos, true)]);
+        self.frame(vec![hover(pos)]);
+        self.frame(vec![hover(pos), press(pos, false)]);
+    }
+
+    fn owns_focus(&self) -> bool {
+        self.state.owns_keyboard_focus(&self.ctx)
+    }
+
+    /// Clicks down the probe line until a click lands in a lane whose
+    /// focus survives the settling frames afterwards (the frame after the
+    /// click hides the "no keyboard focus" chip — a parent-ui widget
+    /// disappearing). Returns the lane y.
+    fn click_into_a_lane(&mut self) -> f32 {
+        let mut y = 60.0;
+        while y < 560.0 {
+            self.click(egui::pos2(LANE_X, y));
+            if self.owns_focus() {
+                let mut held = true;
+                for _ in 0..4 {
+                    self.frame(vec![]);
+                    held &= self.owns_focus();
+                }
+                if held {
+                    return y;
+                }
+            }
+            y += 4.0;
+        }
+        panic!("no timeline lane held keyboard focus after a click");
+    }
+}
+
+/// A click into a lane grants focus, and focus must survive the layout
+/// settling afterwards. If the row ids were positional auto ids, the chip
+/// disappearing the next frame shifted them and egui's dead-man switch
+/// cleared focus — the "always yellow, clicks do nothing" bug.
+#[test]
+fn a_click_holds_focus_across_the_following_frames() {
+    let mut f = Fixture::new();
+    let _ = f.click_into_a_lane();
+}
+
+/// Status messages and hints appear as parent-ui widgets while a lane
+/// holds focus (e.g. G on an empty selection queues a status message that
+/// renders next frame and vanishes the frame after). Focus must survive
+/// both the appearing and the disappearing.
+#[test]
+fn appearing_status_and_hints_do_not_steal_the_keyboard() {
+    let mut f = Fixture::new();
+    let y = f.click_into_a_lane();
+    // G on an empty selection is a no-op that queues a status message
+    // ("nothing selected — G / Shift+D / T need a selection").
+    f.frame(vec![hover(egui::pos2(LANE_X, y)), key(egui::Key::G)]);
+    for _ in 0..3 {
+        f.frame(vec![]);
+        assert!(
+            f.owns_focus(),
+            "focus died while the status/hint widgets were appearing"
+        );
+    }
+}
+
+/// The timeline's own variable hints (knife, modal, status messages) come
+/// and go while a lane holds focus. Before this was pinned they were
+/// drawn directly in the parent ui, so a hint appearing shifted every
+/// row's positional auto id: focus stayed parked on a phantom id, every
+/// focus-gated key went dead, and the "no keyboard focus" chip came back
+/// no matter how often you clicked. K tapped every frame toggles its hint
+/// and exercises exactly that churn — it is also consumed by the focused
+/// row, so the test covers keys reaching the timeline at all.
+#[test]
+fn focus_survives_the_rows_own_hints_coming_and_going() {
+    let mut f = Fixture::new();
+    let y = f.click_into_a_lane();
+    for _ in 0..4 {
+        f.frame(vec![hover(egui::pos2(LANE_X, y)), key(egui::Key::K)]);
+        assert!(
+            f.owns_focus(),
+            "focus died while the timeline's own hints were coming and going"
+        );
+    }
+}
+
+/// Anything appearing or disappearing ABOVE the timeline must not re-id
+/// the rows: egui keeps focus on the id, so a moved row leaves focus
+/// parked on a phantom — no row reports focus, the keys stop working and
+/// the "no keyboard focus" chip comes back after every click.
+#[test]
+fn focus_survives_layout_churn_above_the_timeline() {
+    let mut f = Fixture::new();
+    let _ = f.click_into_a_lane();
+    for i in 0..4 {
+        f.churn = i % 2 == 0;
+        f.frame(vec![]);
+        assert!(
+            f.owns_focus(),
+            "focus died when the layout above the timeline changed"
+        );
+    }
+}
+
+fn hover(pos: egui::Pos2) -> egui::Event {
+    egui::Event::PointerMoved(pos)
+}
+
+fn press(pos: egui::Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    }
+}
+
+fn key(k: egui::Key) -> egui::Event {
+    egui::Event::Key {
+        key: k,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::default(),
+    }
+}

@@ -197,9 +197,19 @@ impl Default for TimelineState {
 impl TimelineState {
     /// Whether a lane row owns keyboard focus *right now*, per egui (no
     /// frame lag, no staleness once the timeline stops being laid out).
+    ///
+    /// Both parts matter. egui keeps focus ON ITS ID even after the row
+    /// that claimed it moved to another id (positional auto ids — see
+    /// `lane_row`), so a focus-id-only check would report "focused" while
+    /// every row's `has_focus` is false: the focus is parked on a phantom,
+    /// all focus-gated keys are dead, and the toolbar chip — which reads
+    /// the rows, not this — disagrees with what this says. Requiring a row
+    /// to have reported focus keeps the three views consistent.
     pub fn owns_keyboard_focus(&self, ctx: &egui::Context) -> bool {
-        self.focus_id
-            .is_some_and(|id| ctx.memory(|m| m.has_focus(id)))
+        self.had_focus
+            && self
+                .focus_id
+                .is_some_and(|id| ctx.memory(|m| m.has_focus(id)))
     }
 }
 
@@ -612,7 +622,16 @@ pub fn show(
     let content_ticks = max_end.max(MIN_CONTENT_BARS * TICKS_PER_BAR);
     let content_px = content_ticks as f32 * px_per_tick + state.px_per_bar;
 
-    egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+    // The scroll area carries an explicit id: all rows below live off its
+    // content ui's positional auto ids, so if anything above it comes or
+    // goes every row silently re-id's — and since egui keeps focus ON THE
+    // ID, the focused lane turns into a phantom (no row reports focus
+    // again, every focus-gated key dies, and the "no keyboard focus" chip
+    // stays lit no matter how often you click).
+    egui::ScrollArea::both()
+        .auto_shrink(false)
+        .id_salt("resoz_timeline_scroll")
+        .show(ui, |ui| {
         // Toolbar: zoom + track add/remove + hints.
         ui.horizontal(|ui| {
             ui.strong("Arrangement");
@@ -629,70 +648,90 @@ pub fn show(
             if ui.button("- Track").clicked() {
                 actions.push(TimelineAction::RemoveLastMidiTrack);
             }
-            ui.weak("Drag move · edge resize · dbl-click insert/edit · right-click delete · marquee: select · Del: delete · K: knife");
-        });
-        // The focus chip mirrors the roll's: keyboard shortcuts are
-        // focus-gated, and the gate must be visible to be diagnosable.
-        if !state.had_focus {
-            ui.weak(egui::RichText::new("no keyboard focus — click the timeline").color(Color32::YELLOW));
-        }
-        if state.knife_armed {
-            ui.weak(
-                egui::RichText::new("Knife: click a clip to cut (bar-snapped) · Esc / right-click to stop")
-                    .color(Color32::from_rgb(240, 190, 80)),
+            ui.separator();
+            // Every variable hint must live INSIDE this child ui. Drawn in
+            // the toolbar's parent instead, appearing and disappearing
+            // would shift the rows' positional auto ids (see lane_row) and
+            // make every row jump down and back whenever a hint or status
+            // message comes and goes.
+            if !state.had_focus {
+                // Keyboard shortcuts are focus-gated; make the invisible
+                // gate visible so a dead key is diagnosable at a glance.
+                ui.weak(
+                    egui::RichText::new("no keyboard focus — click the timeline")
+                        .color(Color32::YELLOW),
+                );
+            }
+            if state.knife_armed {
+                ui.weak(
+                    egui::RichText::new("Knife: click a clip to cut (bar-snapped) · Esc / right-click to stop")
+                        .color(Color32::from_rgb(240, 190, 80)),
+                );
+            }
+            match &state.modal {
+                Some(Modal {
+                    kind: ModalKind::Grab { time_locked },
+                    ..
+                }) => {
+                    ui.weak(
+                        egui::RichText::new(format!(
+                            "Move: LMB drop · RMB / Esc cancel{}",
+                            if *time_locked {
+                                " · X: time lock ON (vertical disabled)"
+                            } else {
+                                " · X: lock time"
+                            }
+                        ))
+                        .color(Color32::from_rgb(140, 200, 250)),
+                    );
+                }
+                Some(Modal {
+                    kind: ModalKind::Duplicate { time_locked },
+                    ..
+                }) => {
+                    ui.weak(
+                        egui::RichText::new(format!(
+                            "Duplicate: LMB drop the copies · RMB / Esc cancel{}",
+                            if *time_locked {
+                                " · X: time lock ON (vertical disabled)"
+                            } else {
+                                " · X: lock time"
+                            }
+                        ))
+                        .color(Color32::from_rgb(140, 200, 250)),
+                    );
+                }
+                Some(Modal {
+                    kind: ModalKind::Stretch { start_edge },
+                    ..
+                }) => {
+                    ui.weak(
+                        egui::RichText::new(if *start_edge {
+                            "Stretch start: LMB drop · RMB / Esc cancel · T: other edge"
+                        } else {
+                            "Stretch end: LMB drop · RMB / Esc cancel · Shift+T: pull start"
+                        })
+                        .color(Color32::from_rgb(140, 200, 250)),
+                    );
+                }
+                None => {}
+            }
+            if let Some(msg) = state.status.take() {
+                ui.weak(egui::RichText::new(msg).color(Color32::YELLOW));
+            }
+            // The static hint goes last and truncates: an overflowing child
+            // expands the ui's available rect, and the rows below would be
+            // laid out wider than the panel itself.
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "Drag move · edge resize · dbl-click insert/edit · right-click delete · marquee: select · Del: delete · K: knife",
+                    )
+                    .weak(),
+                )
+                .truncate(),
             );
-        }
-        match &state.modal {
-            Some(Modal {
-                kind: ModalKind::Grab { time_locked },
-                ..
-            }) => {
-                ui.weak(
-                    egui::RichText::new(format!(
-                        "Move: LMB drop · RMB / Esc cancel{}",
-                        if *time_locked {
-                            " · X: time lock ON (vertical disabled)"
-                        } else {
-                            " · X: lock time"
-                        }
-                    ))
-                    .color(Color32::from_rgb(140, 200, 250)),
-                );
-            }
-            Some(Modal {
-                kind: ModalKind::Duplicate { time_locked },
-                ..
-            }) => {
-                ui.weak(
-                    egui::RichText::new(format!(
-                        "Duplicate: LMB drop the copies · RMB / Esc cancel{}",
-                        if *time_locked {
-                            " · X: time lock ON (vertical disabled)"
-                        } else {
-                            " · X: lock time"
-                        }
-                    ))
-                    .color(Color32::from_rgb(140, 200, 250)),
-                );
-            }
-            Some(Modal {
-                kind: ModalKind::Stretch { start_edge },
-                ..
-            }) => {
-                ui.weak(
-                    egui::RichText::new(if *start_edge {
-                        "Stretch start: LMB drop · RMB / Esc cancel · T: other edge"
-                    } else {
-                        "Stretch end: LMB drop · RMB / Esc cancel · Shift+T: pull start"
-                    })
-                    .color(Color32::from_rgb(140, 200, 250)),
-                );
-            }
-            None => {}
-        }
-        if let Some(msg) = state.status.take() {
-            ui.weak(egui::RichText::new(msg).color(Color32::YELLOW));
-        }
+        });
 
         // Ruler: bar numbers over the content width.
         ui.horizontal(|ui| {
@@ -1009,494 +1048,514 @@ fn lane_row<T: Placement>(
     highlight: Option<usize>,
     clip_label: &dyn Fn(&T) -> String,
 ) {
-    ui.horizontal(|ui| {
-        // Header cell.
-        match header {
-            HeaderKind::Midi {
-                index,
-                name,
-                muted,
-                selected,
-            } => {
-                let mut btn = egui::Button::new(egui::RichText::new(name).size(11.0));
-                if selected {
-                    btn = btn.fill(Color32::from_rgb(60, 90, 140));
-                }
-                if ui
-                    .add_sized([HEADER_WIDTH - 44.0, ROW_HEIGHT - 4.0], btn)
-                    .clicked()
-                {
-                    actions.push(TimelineAction::SelectTrack(index));
-                }
-                let mut mute_btn = egui::Button::new(if muted { "M" } else { "On" });
-                if muted {
-                    mute_btn = mute_btn.fill(Color32::from_rgb(140, 60, 50));
-                }
-                if ui
-                    .add_sized([40.0, ROW_HEIGHT - 4.0], mute_btn)
-                    .on_hover_text("Toggle mute")
-                    .clicked()
-                {
-                    actions.push(TimelineAction::ToggleMute(index, !muted));
-                }
+    // The row's widget ids must be STABLE. The lane is the keyboard focus
+    // carrier, and egui auto ids are positional: anything above the rows
+    // appearing or disappearing (the focus chip, the knife / modal hints,
+    // the status message — all drawn after the rows were show()'d this
+    // way) shifts every row's id, so the focused lane "disappears" and the
+    // focus stays parked on a phantom id forever (egui's dead-man switch
+    // grants one frame of grace, which only hides the problem for a frame:
+    // `has_focus` reports false, so every focus-gated key is dead and the
+    // "no keyboard focus" chip comes back no matter how often you click).
+    // `push_id` cannot help (it salts the parent id but still mixes in the
+    // positional counter); `UiBuilder::id` gives the row an id that is
+    // independent of everything drawn above it.
+    let mut row_ui = ui.new_child(
+        egui::UiBuilder::new()
+            // Same layout as `ui.horizontal`, but with an explicit id.
+            .layout(egui::Layout::left_to_right(egui::Align::Center))
+            .id(egui::Id::new("resoz_timeline_row").with(row.key())),
+    );
+    let ui = &mut row_ui;
+    // Header cell.
+    match header {
+        HeaderKind::Midi {
+            index,
+            name,
+            muted,
+            selected,
+        } => {
+            let mut btn = egui::Button::new(egui::RichText::new(name).size(11.0));
+            if selected {
+                btn = btn.fill(Color32::from_rgb(60, 90, 140));
             }
-            HeaderKind::Control { index, selected } => {
-                let mut btn = egui::Button::new(
-                    egui::RichText::new(format!("Curve {}", index + 1)).size(11.0),
-                );
-                if selected {
-                    btn = btn.fill(Color32::from_rgb(120, 90, 40));
-                }
-                if ui
-                    .add_sized([HEADER_WIDTH, ROW_HEIGHT - 4.0], btn)
-                    .clicked()
-                {
-                    actions.push(TimelineAction::SelectControlTrack(index));
-                }
+            if ui
+                .add_sized([HEADER_WIDTH - 44.0, ROW_HEIGHT - 4.0], btn)
+                .clicked()
+            {
+                actions.push(TimelineAction::SelectTrack(index));
+            }
+            let mut mute_btn = egui::Button::new(if muted { "M" } else { "On" });
+            if muted {
+                mute_btn = mute_btn.fill(Color32::from_rgb(140, 60, 50));
+            }
+            if ui
+                .add_sized([40.0, ROW_HEIGHT - 4.0], mute_btn)
+                .on_hover_text("Toggle mute")
+                .clicked()
+            {
+                actions.push(TimelineAction::ToggleMute(index, !muted));
             }
         }
-
-        // Lane surface.
-        let (lane, response) =
-            ui.allocate_exact_size(Vec2::new(content_px, ROW_HEIGHT), Sense::click_and_drag());
-        // The row owns keyboard focus while in use (command keys land in
-        // M4b.2+; the plumbing is here from the start). Any press counts.
-        if response.clicked() || response.is_pointer_button_down_on() {
-            response.request_focus();
-        }
-        if response.has_focus() {
-            state.had_focus = true;
-            state.focus_id = Some(response.id);
-        }
-        let painter = ui.painter_at(lane);
-        painter.rect_filled(lane, 0.0, colors.lane_bg);
-        geom.push((row, lane));
-
-        // Bar grid.
-        let bars = (content_px / px_per_tick / TICKS_PER_BAR as f32).ceil() as u32;
-        for bar in 0..=bars {
-            let x = lane.left() + bar as f32 * px_per_tick * TICKS_PER_BAR as f32;
-            if x > lane.right() {
-                break;
+        HeaderKind::Control { index, selected } => {
+            let mut btn =
+                egui::Button::new(egui::RichText::new(format!("Curve {}", index + 1)).size(11.0));
+            if selected {
+                btn = btn.fill(Color32::from_rgb(120, 90, 40));
             }
-            painter.line_segment(
-                [pos2(x, lane.top()), pos2(x, lane.bottom())],
-                Stroke::new(1.0, colors.grid),
-            );
-        }
-
-        let tick_at = |x: f32| ((x - lane.left()) / px_per_tick).max(0.0);
-
-        let (is_control, track) = row.key();
-
-        // Clip blocks.
-        for (index, clip) in clips.iter().enumerate() {
-            let x0 = lane.left() + clip.start() as f32 * px_per_tick;
-            let x1 = lane.left() + (clip.start() + clip.span()) as f32 * px_per_tick;
-            let rect = Rect::from_min_max(
-                pos2(x0 + 1.0, lane.top() + 2.0),
-                pos2(x1 - 1.0, lane.bottom() - 2.0),
-            );
-            if rect.right() < lane.left() || rect.left() > lane.right() || rect.width() < 2.0 {
-                continue;
+            if ui
+                .add_sized([HEADER_WIDTH, ROW_HEIGHT - 4.0], btn)
+                .clicked()
+            {
+                actions.push(TimelineAction::SelectControlTrack(index));
             }
-            // Modal convention (M4a.5): originals dim while the ghost is
-            // live, so the preview stays visible where they overlap.
-            let selected = state.selection.contains(&ClipSel {
-                is_control,
-                track,
-                clip: index,
-            });
-            let fill = if selected && state.modal.is_some() {
-                Color32::from_rgba_unmultiplied(
-                    colors.clip_fill.r(),
-                    colors.clip_fill.g(),
-                    colors.clip_fill.b(),
-                    60,
-                )
-            } else {
-                colors.clip_fill
-            };
-            painter.rect_filled(rect, 3.0, fill);
+        }
+    }
+
+    // Lane surface.
+    let (lane, response) =
+        ui.allocate_exact_size(Vec2::new(content_px, ROW_HEIGHT), Sense::click_and_drag());
+    // The row owns keyboard focus while in use (command keys land in
+    // M4b.2+; the plumbing is here from the start). Any press counts.
+    if response.clicked() || response.is_pointer_button_down_on() {
+        response.request_focus();
+    }
+    if response.has_focus() {
+        state.had_focus = true;
+        state.focus_id = Some(response.id);
+    }
+    let painter = ui.painter_at(lane);
+    painter.rect_filled(lane, 0.0, colors.lane_bg);
+    geom.push((row, lane));
+
+    // Bar grid.
+    let bars = (content_px / px_per_tick / TICKS_PER_BAR as f32).ceil() as u32;
+    for bar in 0..=bars {
+        let x = lane.left() + bar as f32 * px_per_tick * TICKS_PER_BAR as f32;
+        if x > lane.right() {
+            break;
+        }
+        painter.line_segment(
+            [pos2(x, lane.top()), pos2(x, lane.bottom())],
+            Stroke::new(1.0, colors.grid),
+        );
+    }
+
+    let tick_at = |x: f32| ((x - lane.left()) / px_per_tick).max(0.0);
+
+    let (is_control, track) = row.key();
+
+    // Clip blocks.
+    for (index, clip) in clips.iter().enumerate() {
+        let x0 = lane.left() + clip.start() as f32 * px_per_tick;
+        let x1 = lane.left() + (clip.start() + clip.span()) as f32 * px_per_tick;
+        let rect = Rect::from_min_max(
+            pos2(x0 + 1.0, lane.top() + 2.0),
+            pos2(x1 - 1.0, lane.bottom() - 2.0),
+        );
+        if rect.right() < lane.left() || rect.left() > lane.right() || rect.width() < 2.0 {
+            continue;
+        }
+        // Modal convention (M4a.5): originals dim while the ghost is
+        // live, so the preview stays visible where they overlap.
+        let selected = state.selection.contains(&ClipSel {
+            is_control,
+            track,
+            clip: index,
+        });
+        let fill = if selected && state.modal.is_some() {
+            Color32::from_rgba_unmultiplied(
+                colors.clip_fill.r(),
+                colors.clip_fill.g(),
+                colors.clip_fill.b(),
+                60,
+            )
+        } else {
+            colors.clip_fill
+        };
+        painter.rect_filled(rect, 3.0, fill);
+        painter.rect_stroke(
+            rect,
+            3.0,
+            Stroke::new(1.0, colors.clip_stroke),
+            StrokeKind::Inside,
+        );
+        if state.selection.contains(&ClipSel {
+            is_control,
+            track,
+            clip: index,
+        }) {
+            painter.rect_stroke(rect, 3.0, Stroke::new(2.0, SELECTED), StrokeKind::Inside);
+        }
+        if highlight == Some(index) {
             painter.rect_stroke(
                 rect,
                 3.0,
-                Stroke::new(1.0, colors.clip_stroke),
+                Stroke::new(2.0, colors.edit_highlight),
                 StrokeKind::Inside,
             );
-            if state.selection.contains(&ClipSel {
-                is_control,
-                track,
-                clip: index,
-            }) {
-                painter.rect_stroke(rect, 3.0, Stroke::new(2.0, SELECTED), StrokeKind::Inside);
-            }
-            if highlight == Some(index) {
-                painter.rect_stroke(
-                    rect,
-                    3.0,
-                    Stroke::new(2.0, colors.edit_highlight),
-                    StrokeKind::Inside,
-                );
-            }
-            painter.text(
-                pos2(rect.left() + 4.0, rect.center().y),
-                Align2::LEFT_CENTER,
-                clip_label(clip),
-                FontId::proportional(10.0),
-                colors.clip_text,
-            );
         }
+        painter.text(
+            pos2(rect.left() + 4.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            clip_label(clip),
+            FontId::proportional(10.0),
+            colors.clip_text,
+        );
+    }
 
-        // Playhead.
-        let playhead_x = lane.left() + playhead_ticks * px_per_tick;
-        if lane.left() <= playhead_x && playhead_x <= lane.right() {
-            painter.line_segment(
-                [
-                    pos2(playhead_x, lane.top()),
-                    pos2(playhead_x, lane.bottom()),
-                ],
-                Stroke::new(1.5, Color32::from_rgb(235, 90, 90)),
-            );
-        }
+    // Playhead.
+    let playhead_x = lane.left() + playhead_ticks * px_per_tick;
+    if lane.left() <= playhead_x && playhead_x <= lane.right() {
+        painter.line_segment(
+            [
+                pos2(playhead_x, lane.top()),
+                pos2(playhead_x, lane.bottom()),
+            ],
+            Stroke::new(1.5, Color32::from_rgb(235, 90, 90)),
+        );
+    }
 
-        // Interactions (all edits are emitted as actions; nothing mutates the
-        // document here).
+    // Interactions (all edits are emitted as actions; nothing mutates the
+    // document here).
 
-        // Knife (K armed): an LMB click cuts the clip under the pointer at
-        // the bar-snapped position; the knife stays armed for more cuts.
-        if state.knife_armed && state.modal.is_none() && response.clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                if clips.len() >= MAX_CLIPS_PER_TRACK {
-                    state.status = Some("this track is full — cannot split".to_string());
-                } else {
-                    match knife_target(clips, tick_at(pos.x)) {
-                        Some((index, at)) => {
-                            actions.push(TimelineAction::SplitClip {
-                                is_control,
-                                track,
-                                clip: index,
-                                at_ticks: at,
-                            });
-                            state.selection.retain(|s| {
-                                s.is_control != is_control || s.track != track || s.clip != index
-                            });
-                        }
-                        None if hit_clip(clips, tick_at(pos.x)).is_some() => {
-                            state.status =
-                                Some("a cut needs at least one bar on both sides".to_string());
-                        }
-                        None => {}
-                    }
-                }
-            }
-        }
-
-        // Knife preview: while armed, mark where the cut would land (the
-        // snapped bar line through the hovered lane).
-        if state.knife_armed && response.hovered() {
-            if let Some(pos) = response.hover_pos() {
-                let at = snap_bar(tick_at(pos.x));
-                let x = lane.left() + at as f32 * px_per_tick;
-                painter.line_segment(
-                    [pos2(x, lane.top()), pos2(x, lane.bottom())],
-                    Stroke::new(1.5, Color32::from_rgb(240, 190, 80)),
-                );
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-            }
-        }
-
-        // Double-click: open the clip's editor, or insert a new clip on empty
-        // space. Not while a modal owns the pointer.
-        if response.double_clicked() && state.modal.is_none() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let tick = tick_at(pos.x);
-                if let Some(index) = hit_clip(clips, tick) {
-                    match row {
-                        RowKind::Midi(t) => actions.push(TimelineAction::OpenMidiEditor {
-                            track: t,
-                            clip: index,
-                        }),
-                        RowKind::Control(t) => actions.push(TimelineAction::OpenControlEditor {
-                            track: t,
-                            clip: index,
-                        }),
-                    }
-                } else if clips.len() < MAX_CLIPS_PER_TRACK {
-                    let bound = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - TICKS_PER_BAR;
-                    let (is_control, track) = match row {
-                        RowKind::Midi(t) => (false, t),
-                        RowKind::Control(t) => (true, t),
-                    };
-                    actions.push(TimelineAction::AddClip {
-                        is_control,
-                        track,
-                        start_ticks: snap_bar(tick).min(bound),
-                    });
-                }
-            }
-        }
-
-        // Drag start: on a clip, pick move vs resize by the grab zone at
-        // the right edge (and select it if it was not); on empty space,
-        // start a rubber band (M4b selection). While the knife is armed or
-        // a modal is live the pointer belongs to them: no drags, no bands.
-        if response.drag_started() && !state.knife_armed && state.modal.is_none() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let tick = tick_at(pos.x);
-                if let Some(index) = hit_clip(clips, tick) {
-                    let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
-                    let sel = ClipSel {
-                        is_control,
-                        track,
-                        clip: index,
-                    };
-                    if additive {
-                        if let Some(at) = state.selection.iter().position(|s| *s == sel) {
-                            state.selection.remove(at);
-                        } else {
-                            state.selection.push(sel);
-                        }
-                    } else if !state.selection.contains(&sel) {
-                        state.selection = vec![sel];
-                    }
-                    let edge_x = lane.left()
-                        + (clips[index].start() + clips[index].span()) as f32 * px_per_tick;
-                    if (pos.x - edge_x).abs() <= EDGE_GRAB {
-                        state.drag = Some(Drag::Resize { row, clip: index });
-                    } else {
-                        let grab = tick - clips[index].start() as f32;
-                        state.drag = Some(Drag::Move {
-                            row,
-                            clip: index,
-                            grab_ticks: grab,
-                        });
-                    }
-                } else {
-                    let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
-                    state.marquee = Some(Marquee {
-                        origin: pos,
-                        current: pos,
-                        additive,
-                    });
-                }
-            }
-        }
-
-        if response.dragged() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                if let Some(m) = state.marquee.as_mut() {
-                    m.current = pos;
-                } else {
-                    match state.drag {
-                        Some(Drag::Move {
-                            clip, grab_ticks, ..
-                        }) if clip < clips.len() => {
-                            let span = clips[clip].span();
-                            let limit = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - span;
-                            let start = snap_bar(tick_at(pos.x) - grab_ticks).min(limit);
-                            if clips[clip].start() != start {
-                                let (is_control, track) = match row {
-                                    RowKind::Midi(t) => (false, t),
-                                    RowKind::Control(t) => (true, t),
-                                };
-                                actions.push(TimelineAction::MoveResizeClip {
-                                    is_control,
-                                    track,
-                                    clip,
-                                    start_ticks: start,
-                                    span_ticks: span,
-                                });
-                            }
-                        }
-                        Some(Drag::Resize { clip, .. }) if clip < clips.len() => {
-                            let start = clips[clip].start();
-                            let limit = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - start;
-                            let span = snap_bar(tick_at(pos.x) - start as f32)
-                                .clamp(TICKS_PER_BAR, limit.max(TICKS_PER_BAR));
-                            if clips[clip].span() != span {
-                                let (is_control, track) = match row {
-                                    RowKind::Midi(t) => (false, t),
-                                    RowKind::Control(t) => (true, t),
-                                };
-                                actions.push(TimelineAction::MoveResizeClip {
-                                    is_control,
-                                    track,
-                                    clip,
-                                    start_ticks: start,
-                                    span_ticks: span,
-                                });
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        if response.drag_stopped() {
-            state.drag = None;
-            if state.marquee.is_some() {
-                state.marquee_ending = true;
-            }
-        }
-
-        // Marquee hit reporting: every row contributes the clips its lane
-        // segment of the band covers, every frame the band is live.
-        if let Some(m) = &state.marquee {
-            let band = Rect::from_two_pos(m.origin, m.current);
-            let hits = clips
-                .iter()
-                .enumerate()
-                .filter(|(_, clip)| {
-                    let x0 = lane.left() + clip.start() as f32 * px_per_tick;
-                    let x1 = lane.left() + (clip.start() + clip.span()) as f32 * px_per_tick;
-                    Rect::from_min_max(pos2(x0, lane.top()), pos2(x1, lane.bottom()))
-                        .intersects(band)
-                })
-                .map(|(index, _)| index)
-                .collect();
-            marquee_hits.push((row, hits));
-        }
-
-        // The band itself, clipped to this row's lane segment.
-        if let Some(m) = &state.marquee {
-            let band = Rect::from_two_pos(m.origin, m.current);
-            let segment = band.intersect(lane);
-            if segment.is_positive() {
-                painter.rect_filled(
-                    segment,
-                    0.0,
-                    Color32::from_rgba_unmultiplied(80, 140, 220, 40),
-                );
-                painter.rect_stroke(
-                    segment,
-                    0.0,
-                    Stroke::new(1.0, Color32::from_rgb(80, 140, 220)),
-                    StrokeKind::Inside,
-                );
-            }
-        }
-
-        // Modal pointer handling: LMB click confirms, RMB cancels (and
-        // suppresses delete while the modal is live).
-        if state.modal.is_some() {
-            if response.clicked() {
-                state.modal_confirm = true;
-            }
-            if response.secondary_clicked() {
-                state.modal_cancel = true;
-            }
-        }
-
-        // Right-click: cancel a live band, disarm the knife, otherwise
-        // delete the clip under the pointer.
-        if response.secondary_clicked() && state.modal.is_none() {
-            if state.knife_armed {
-                state.knife_armed = false;
-            } else if let Some(pos) = response.interact_pointer_pos() {
-                if state.marquee.take().is_none() {
-                    if let Some(index) = hit_clip(clips, tick_at(pos.x)) {
-                        actions.push(TimelineAction::RemoveClip {
+    // Knife (K armed): an LMB click cuts the clip under the pointer at
+    // the bar-snapped position; the knife stays armed for more cuts.
+    if state.knife_armed && state.modal.is_none() && response.clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            if clips.len() >= MAX_CLIPS_PER_TRACK {
+                state.status = Some("this track is full — cannot split".to_string());
+            } else {
+                match knife_target(clips, tick_at(pos.x)) {
+                    Some((index, at)) => {
+                        actions.push(TimelineAction::SplitClip {
                             is_control,
                             track,
                             clip: index,
+                            at_ticks: at,
                         });
-                        state.drag = None;
+                        state.selection.retain(|s| {
+                            s.is_control != is_control || s.track != track || s.clip != index
+                        });
                     }
+                    None if hit_clip(clips, tick_at(pos.x)).is_some() => {
+                        state.status =
+                            Some("a cut needs at least one bar on both sides".to_string());
+                    }
+                    None => {}
                 }
             }
         }
+    }
 
-        // Keyboard: focus-gated, roll-style. M4b.1 wires Escape (clear the
-        // selection / cancel the band) and Delete (remove the selection as
-        // one undo step); the command family lands in M4b.2+.
-        if response.has_focus() {
-            ui.memory_mut(|m| {
-                m.set_focus_lock_filter(
-                    response.id,
-                    EventFilter {
-                        escape: true,
-                        ..Default::default()
-                    },
-                )
-            });
-            let escape = ui
-                .ctx()
-                .input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
-            let delete = ui
-                .ctx()
-                .input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete));
-            let knife = ui
-                .ctx()
-                .input_mut(|i| i.consume_key(Modifiers::NONE, Key::K));
-            // Shift+T must be consumed before plain T (consume_key ignores
-            // the shift qualifier when matching).
-            let shift_t = ui
-                .ctx()
-                .input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::T));
-            let t = ui
-                .ctx()
-                .input_mut(|i| i.consume_key(Modifiers::NONE, Key::T));
-            let g = ui
-                .ctx()
-                .input_mut(|i| i.consume_key(Modifiers::NONE, Key::G));
-            // Shift+D must be consumed before plain D would ever match
-            // (consume_key ignores the shift qualifier when matching).
-            let shift_d = ui
-                .ctx()
-                .input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::D));
-            let x = ui
-                .ctx()
-                .input_mut(|i| i.consume_key(Modifiers::NONE, Key::X));
-            if knife {
-                state.knife_armed = !state.knife_armed;
-                state.modal = None;
-            }
-            // X toggles the time lock while a Grab / Duplicate modal is live.
-            if x {
-                if let Some(modal) = &mut state.modal {
-                    match &mut modal.kind {
-                        ModalKind::Grab { time_locked } | ModalKind::Duplicate { time_locked } => {
-                            *time_locked = !*time_locked;
-                        }
-                        ModalKind::Stretch { .. } => {}
-                    }
+    // Knife preview: while armed, mark where the cut would land (the
+    // snapped bar line through the hovered lane).
+    if state.knife_armed && response.hovered() {
+        if let Some(pos) = response.hover_pos() {
+            let at = snap_bar(tick_at(pos.x));
+            let x = lane.left() + at as f32 * px_per_tick;
+            painter.line_segment(
+                [pos2(x, lane.top()), pos2(x, lane.bottom())],
+                Stroke::new(1.5, Color32::from_rgb(240, 190, 80)),
+            );
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+    }
+
+    // Double-click: open the clip's editor, or insert a new clip on empty
+    // space. Not while a modal owns the pointer.
+    if response.double_clicked() && state.modal.is_none() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let tick = tick_at(pos.x);
+            if let Some(index) = hit_clip(clips, tick) {
+                match row {
+                    RowKind::Midi(t) => actions.push(TimelineAction::OpenMidiEditor {
+                        track: t,
+                        clip: index,
+                    }),
+                    RowKind::Control(t) => actions.push(TimelineAction::OpenControlEditor {
+                        track: t,
+                        clip: index,
+                    }),
                 }
-            }
-            // Arm G / Shift+D / T (Blender-style modal; arming one tool
-            // clears the other).
-            if (g || shift_d || t || shift_t) && state.modal.is_none() {
-                state.knife_armed = false;
-                let arm = if g {
-                    Arm::Grab
-                } else if shift_d {
-                    Arm::Duplicate
-                } else {
-                    Arm::Stretch {
-                        start_edge: shift_t,
-                    }
+            } else if clips.len() < MAX_CLIPS_PER_TRACK {
+                let bound = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - TICKS_PER_BAR;
+                let (is_control, track) = match row {
+                    RowKind::Midi(t) => (false, t),
+                    RowKind::Control(t) => (true, t),
                 };
-                arm_modal(state, ui.ctx(), arm);
-            }
-            if escape {
-                if state.modal.is_some() {
-                    state.modal = None;
-                } else {
-                    state.selection.clear();
-                    state.marquee = None;
-                    state.marquee_ending = false;
-                    state.knife_armed = false;
-                }
-            }
-            if delete && state.modal.is_none() && !state.selection.is_empty() {
-                actions.push(TimelineAction::RemoveClipsBatch {
-                    clips: state.selection.clone(),
+                actions.push(TimelineAction::AddClip {
+                    is_control,
+                    track,
+                    start_ticks: snap_bar(tick).min(bound),
                 });
-                state.selection.clear();
             }
         }
-    });
+    }
+
+    // Drag start: on a clip, pick move vs resize by the grab zone at
+    // the right edge (and select it if it was not); on empty space,
+    // start a rubber band (M4b selection). While the knife is armed or
+    // a modal is live the pointer belongs to them: no drags, no bands.
+    if response.drag_started() && !state.knife_armed && state.modal.is_none() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let tick = tick_at(pos.x);
+            if let Some(index) = hit_clip(clips, tick) {
+                let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                let sel = ClipSel {
+                    is_control,
+                    track,
+                    clip: index,
+                };
+                if additive {
+                    if let Some(at) = state.selection.iter().position(|s| *s == sel) {
+                        state.selection.remove(at);
+                    } else {
+                        state.selection.push(sel);
+                    }
+                } else if !state.selection.contains(&sel) {
+                    state.selection = vec![sel];
+                }
+                let edge_x =
+                    lane.left() + (clips[index].start() + clips[index].span()) as f32 * px_per_tick;
+                if (pos.x - edge_x).abs() <= EDGE_GRAB {
+                    state.drag = Some(Drag::Resize { row, clip: index });
+                } else {
+                    let grab = tick - clips[index].start() as f32;
+                    state.drag = Some(Drag::Move {
+                        row,
+                        clip: index,
+                        grab_ticks: grab,
+                    });
+                }
+            } else {
+                let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                state.marquee = Some(Marquee {
+                    origin: pos,
+                    current: pos,
+                    additive,
+                });
+            }
+        }
+    }
+
+    if response.dragged() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            if let Some(m) = state.marquee.as_mut() {
+                m.current = pos;
+            } else {
+                match state.drag {
+                    Some(Drag::Move {
+                        clip, grab_ticks, ..
+                    }) if clip < clips.len() => {
+                        let span = clips[clip].span();
+                        let limit = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - span;
+                        let start = snap_bar(tick_at(pos.x) - grab_ticks).min(limit);
+                        if clips[clip].start() != start {
+                            let (is_control, track) = match row {
+                                RowKind::Midi(t) => (false, t),
+                                RowKind::Control(t) => (true, t),
+                            };
+                            actions.push(TimelineAction::MoveResizeClip {
+                                is_control,
+                                track,
+                                clip,
+                                start_ticks: start,
+                                span_ticks: span,
+                            });
+                        }
+                    }
+                    Some(Drag::Resize { clip, .. }) if clip < clips.len() => {
+                        let start = clips[clip].start();
+                        let limit = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - start;
+                        let span = snap_bar(tick_at(pos.x) - start as f32)
+                            .clamp(TICKS_PER_BAR, limit.max(TICKS_PER_BAR));
+                        if clips[clip].span() != span {
+                            let (is_control, track) = match row {
+                                RowKind::Midi(t) => (false, t),
+                                RowKind::Control(t) => (true, t),
+                            };
+                            actions.push(TimelineAction::MoveResizeClip {
+                                is_control,
+                                track,
+                                clip,
+                                start_ticks: start,
+                                span_ticks: span,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if response.drag_stopped() {
+        state.drag = None;
+        if state.marquee.is_some() {
+            state.marquee_ending = true;
+        }
+    }
+
+    // Marquee hit reporting: every row contributes the clips its lane
+    // segment of the band covers, every frame the band is live.
+    if let Some(m) = &state.marquee {
+        let band = Rect::from_two_pos(m.origin, m.current);
+        let hits = clips
+            .iter()
+            .enumerate()
+            .filter(|(_, clip)| {
+                let x0 = lane.left() + clip.start() as f32 * px_per_tick;
+                let x1 = lane.left() + (clip.start() + clip.span()) as f32 * px_per_tick;
+                Rect::from_min_max(pos2(x0, lane.top()), pos2(x1, lane.bottom())).intersects(band)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        marquee_hits.push((row, hits));
+    }
+
+    // The band itself, clipped to this row's lane segment.
+    if let Some(m) = &state.marquee {
+        let band = Rect::from_two_pos(m.origin, m.current);
+        let segment = band.intersect(lane);
+        if segment.is_positive() {
+            painter.rect_filled(
+                segment,
+                0.0,
+                Color32::from_rgba_unmultiplied(80, 140, 220, 40),
+            );
+            painter.rect_stroke(
+                segment,
+                0.0,
+                Stroke::new(1.0, Color32::from_rgb(80, 140, 220)),
+                StrokeKind::Inside,
+            );
+        }
+    }
+
+    // Modal pointer handling: LMB click confirms, RMB cancels (and
+    // suppresses delete while the modal is live).
+    if state.modal.is_some() {
+        if response.clicked() {
+            state.modal_confirm = true;
+        }
+        if response.secondary_clicked() {
+            state.modal_cancel = true;
+        }
+    }
+
+    // Right-click: cancel a live band, disarm the knife, otherwise
+    // delete the clip under the pointer.
+    if response.secondary_clicked() && state.modal.is_none() {
+        if state.knife_armed {
+            state.knife_armed = false;
+        } else if let Some(pos) = response.interact_pointer_pos() {
+            if state.marquee.take().is_none() {
+                if let Some(index) = hit_clip(clips, tick_at(pos.x)) {
+                    actions.push(TimelineAction::RemoveClip {
+                        is_control,
+                        track,
+                        clip: index,
+                    });
+                    state.drag = None;
+                }
+            }
+        }
+    }
+
+    // Keyboard: focus-gated, roll-style. M4b.1 wires Escape (clear the
+    // selection / cancel the band) and Delete (remove the selection as
+    // one undo step); the command family lands in M4b.2+.
+    if response.has_focus() {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                response.id,
+                EventFilter {
+                    escape: true,
+                    // egui's arrow-key focus navigation is the same trap
+                    // the roll hit in M4a.4: unclaimed directional keys
+                    // hand focus to whatever widget points that way.
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    ..Default::default()
+                },
+            )
+        });
+        let escape = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+        let delete = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete));
+        let knife = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::NONE, Key::K));
+        // Shift+T must be consumed before plain T (consume_key ignores
+        // the shift qualifier when matching).
+        let shift_t = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::T));
+        let t = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::NONE, Key::T));
+        let g = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::NONE, Key::G));
+        // Shift+D must be consumed before plain D would ever match
+        // (consume_key ignores the shift qualifier when matching).
+        let shift_d = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::D));
+        let x = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::NONE, Key::X));
+        if knife {
+            state.knife_armed = !state.knife_armed;
+            state.modal = None;
+        }
+        // X toggles the time lock while a Grab / Duplicate modal is live.
+        if x {
+            if let Some(modal) = &mut state.modal {
+                match &mut modal.kind {
+                    ModalKind::Grab { time_locked } | ModalKind::Duplicate { time_locked } => {
+                        *time_locked = !*time_locked;
+                    }
+                    ModalKind::Stretch { .. } => {}
+                }
+            }
+        }
+        // Arm G / Shift+D / T (Blender-style modal; arming one tool
+        // clears the other).
+        if (g || shift_d || t || shift_t) && state.modal.is_none() {
+            state.knife_armed = false;
+            let arm = if g {
+                Arm::Grab
+            } else if shift_d {
+                Arm::Duplicate
+            } else {
+                Arm::Stretch {
+                    start_edge: shift_t,
+                }
+            };
+            arm_modal(state, ui.ctx(), arm);
+        }
+        if escape {
+            if state.modal.is_some() {
+                state.modal = None;
+            } else {
+                state.selection.clear();
+                state.marquee = None;
+                state.marquee_ending = false;
+                state.knife_armed = false;
+            }
+        }
+        if delete && state.modal.is_none() && !state.selection.is_empty() {
+            actions.push(TimelineAction::RemoveClipsBatch {
+                clips: state.selection.clone(),
+            });
+            state.selection.clear();
+        }
+    }
 }
 
 /// Which modal G / Shift+D / T arms (M4b.3/4).
