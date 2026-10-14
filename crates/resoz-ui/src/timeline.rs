@@ -162,9 +162,10 @@ pub struct TimelineState {
     /// the pointer at the bar-snapped position. Stays armed for multiple
     /// cuts; Esc / RMB disarms.
     knife_armed: bool,
-    /// One-frame status message (invalid cut explanation); the toolbar
-    /// drains it the same frame it is set.
-    status: Option<String>,
+    /// Transient status message (why an action was refused) with an
+    /// expiry time. The old one-frame version was unreadable in practice —
+    /// the message flashed by faster than the eye could catch it.
+    status: Option<(String, std::time::Instant)>,
     /// Live modal transform (G/T), if any.
     modal: Option<Modal>,
     /// Set when a lane row sees the modal-confirming LMB click; show()
@@ -216,6 +217,15 @@ impl TimelineState {
     /// state through public accessors — same observability as the roll.
     pub fn modal_active(&self) -> bool {
         self.modal.is_some()
+    }
+
+    /// Shows a transient status message in the toolbar for a few seconds
+    /// (or until another status replaces it).
+    fn set_status(&mut self, msg: impl Into<String>) {
+        self.status = Some((
+            msg.into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        ));
     }
 }
 
@@ -722,7 +732,25 @@ pub fn show(
                 }
                 None => {}
             }
-            if let Some(msg) = state.status.take() {
+            // Selection feedback: a persistent count so "did my click
+            // select anything?" is answerable at a glance (the selected
+            // clips also get an accent stroke in the lanes).
+            if !state.selection.is_empty() {
+                ui.weak(
+                    egui::RichText::new(format!("{} selected", state.selection.len()))
+                        .color(Color32::from_rgb(120, 220, 160)),
+                );
+            }
+            // Status messages stick for a few seconds — the old one-frame
+            // drain flashed by faster than anyone could read it.
+            if state
+                .status
+                .as_ref()
+                .is_some_and(|(_, until)| std::time::Instant::now() >= *until)
+            {
+                state.status = None;
+            }
+            if let Some((msg, _)) = &state.status {
                 ui.weak(egui::RichText::new(msg).color(Color32::YELLOW));
             }
             // The static hint goes last and truncates: an overflowing child
@@ -878,6 +906,9 @@ pub fn show(
         // Modal transform (M4b.3): finalize on the confirming click, cancel
         // on RMB, otherwise draw the ghosts (they may land on any row of
         // the same kind, so they go through the geometry registry).
+        // Refusal reasons are collected into a message and flushed after
+        // the block — `state.modal` is still borrowed inside it.
+        let mut refused_msg: Option<String> = None;
         if state.modal.is_some() {
             let ptr = ui.ctx().pointer_hover_pos();
             let px_per_bar = state.px_per_bar;
@@ -908,7 +939,7 @@ pub fn show(
                                         targets, midi_tracks, control_tracks,
                                     );
                                     if refused > 0 {
-                                        state.status = Some(format!(
+                                        refused_msg = Some(format!(
                                             "{refused} clip(s) held: target fully covers an existing clip"
                                         ));
                                     }
@@ -959,7 +990,7 @@ pub fn show(
                                         targets, midi_tracks, control_tracks,
                                     );
                                     if refused > 0 {
-                                        state.status = Some(format!(
+                                        refused_msg = Some(format!(
                                             "{refused} clip(s) held: target fully covers an existing clip"
                                         ));
                                     }
@@ -1031,6 +1062,9 @@ pub fn show(
                     }
                 }
             }
+        }
+        if let Some(msg) = refused_msg {
+            state.set_status(msg);
         }
     });
     actions
@@ -1241,7 +1275,7 @@ fn lane_row<T: Placement>(
     if state.knife_armed && state.modal.is_none() && response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if clips.len() >= MAX_CLIPS_PER_TRACK {
-                state.status = Some("this track is full — cannot split".to_string());
+                state.set_status("this track is full — cannot split");
             } else {
                 match knife_target(clips, tick_at(pos.x)) {
                     Some((index, at)) => {
@@ -1256,8 +1290,7 @@ fn lane_row<T: Placement>(
                         });
                     }
                     None if hit_clip(clips, tick_at(pos.x)).is_some() => {
-                        state.status =
-                            Some("a cut needs at least one bar on both sides".to_string());
+                        state.set_status("a cut needs at least one bar on both sides");
                     }
                     None => {}
                 }
@@ -1625,8 +1658,7 @@ enum Arm {
 /// non-empty selection and a pointer position to grab from.
 fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
     if state.selection.is_empty() {
-        state.status =
-            Some("nothing selected \u{2014} G / Shift+D / T need a selection".to_string());
+        state.set_status("nothing selected \u{2014} G / Shift+D / T need a selection");
         return;
     }
     let Some(ptr) = ctx.pointer_hover_pos() else {
@@ -1636,8 +1668,7 @@ fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
         Arm::Grab => {
             let first = state.selection[0].is_control;
             if state.selection.iter().any(|s| s.is_control != first) {
-                state.status =
-                    Some("mixed selection: G moves one track kind at a time".to_string());
+                state.set_status("mixed selection: G moves one track kind at a time");
                 return;
             }
             ModalKind::Grab { time_locked: false }
@@ -1645,8 +1676,7 @@ fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
         Arm::Duplicate => {
             let first = state.selection[0].is_control;
             if state.selection.iter().any(|s| s.is_control != first) {
-                state.status =
-                    Some("mixed selection: Shift+D copies one track kind at a time".to_string());
+                state.set_status("mixed selection: Shift+D copies one track kind at a time");
                 return;
             }
             ModalKind::Duplicate { time_locked: false }
