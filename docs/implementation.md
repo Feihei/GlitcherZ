@@ -184,3 +184,13 @@
 **② `drag_started` 只在指针移动后才触发 → 纯点击选不中 clip**。egui 0.36 对 `Sense::click_and_drag` 做点击/拖动消歧：*"If the widget also senses clicks, this will only become true if the pointer has moved a bit"*（超过 `max_click_dist`）。M4b.1 把 clip 选中放在 `drag_started` 分支里，于是"点一下 clip"永远不进选区，G/T/S/Shift+D 全部闪一句 "nothing selected"。钢琴窗早在自己的一轮里踩过同一个坑（`piano_roll.rs` clicked 分支注释）。修复：镜像 roll，加 `response.clicked()` 处理——命中 clip 则选中（Shift/Ctrl 追加/移除），空白处取消选择（带修饰键的空白点击不动选区）；拖动路径原样保留（真拖动时 `drag_started` 照常触发，二者互斥）。规范本就写明"点击=选中、空白单击=取消"（editing-model.md 交互表），是实现没对齐规范。守护测试 `clicking_a_clip_then_g_arms_the_move_modal` 直接钉住用户报障的操作流（点击 clip → G → 模态亮起）；`TimelineState` 补 `modal_active()` 观测访问器（与 roll 的测试访问器对齐）。
 
 **③ 状态消息一帧即逝 = 拒绝原因完全不可读（2026-10-14）**。用户复测"按 G 只见黄字一闪"——那条黄字是 `state.status` 拒绝消息，toolbar 用 `take()` 当帧抽走，人眼根本看不清内容。G 路径下只可能是 "nothing selected" 或 "mixed selection"，闪现本身证明按键已到达 timeline（焦点门是通的）、只是按 G 时选区为空。修复：状态消息改为**粘性 5 秒**（`status: Option<(String, Instant)>` + `set_status` helper，新消息顶替旧消息，过期自动清除）；同时在 toolbar 加持久的 **"N selected"** 选区计数 chip——"我的点击到底选没选中"从此一眼可判。拒绝消息若在模态 finalize 期间产生（`&state.modal` 还被借用），先存入局部 `refused_msg` 再在借用结束后 flush。
+
+#### 命令族对齐 roll（2026-10-14，用户复测反馈）
+
+用户复测通过 G/Shift+D 后提出三处与 roll 不一致，全部统一：
+
+- **X/Y 轴锁**：`ModalKind::Grab/Duplicate` 的 `time_locked: bool` 改为 `locked: Option<Axis>`（`Axis::{Time, Row}`），镜像 roll 的 `Move { axis: Option<Axis> }`。Blender 约定（roll `Axis` doc 注释定音）：**X = 仅时间轴移动**（行冻结，即原 `time_locked` 的行为——原字段名"锁时间"实为"锁定到时间轴"，改名消除歧义）、**Y = 仅行轴移动**（时间冻结，新增）。同键再按解锁、另一轴接管（`apply_axis` 同款三态）。
+- **T+S 拉伸**：Shift+T 退役；bare `T` 武装尾缘拉伸，模态存活时 `S` 翻转为首缘（模态存活时键盘只答限定键——镜像 roll 的 "A modal transform owns the keyboard" 规则）。
+- **单次刀**：K 从开关切换改为只武装；一次 LMB 点击消费武装（成功切割 / 拒绝提示 / 空白均可——roll 的 stroke 完成即收刀同理）；Esc / 右键取消不消费。
+
+单测 `grab_moves_by_bars_and_rows_within_kind` 更新字段并补 Row 锁断言（时间冻结、行仍动）。

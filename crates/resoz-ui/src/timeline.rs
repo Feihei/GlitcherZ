@@ -73,19 +73,28 @@ pub struct ClipSpanEdit {
     pub span_ticks: u32,
 }
 
+/// Which axis a Grab / Duplicate is constrained to (Blender convention,
+/// unified with the roll: X = time only, Y = rows only). Pressing the
+/// same key again releases the lock; the other axis takes over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    Time,
+    Row,
+}
+
 /// Modal transform kind (Blender-style, M4b.3): armed by G/T, the ghost
 /// follows the pointer, LMB finalizes, RMB/Esc cancels with zero cost
 /// (the document is not touched until the finalize).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModalKind {
     /// G: free move — bar delta in time + row delta (same kind only).
-    /// X toggles the time lock (row delta forced to 0).
-    Grab { time_locked: bool },
+    /// X / Y lock an axis mid-modal (unified with the roll).
+    Grab { locked: Option<Axis> },
     /// Shift+D: duplicate the selection — the clones enter a grab-style
     /// modal; the originals stay untouched until the drop.
-    Duplicate { time_locked: bool },
-    /// T: stretch the end edge of every selected clip (Shift+T: the start
-    /// edge). Bar delta only.
+    Duplicate { locked: Option<Axis> },
+    /// T: stretch the end edge of every selected clip; S mid-modal flips
+    /// to the start edge (unified with the roll's t+s). Bar delta only.
     Stretch { start_edge: bool },
 }
 
@@ -450,18 +459,21 @@ fn grab_targets(
     midi_tracks: &[MidiTrack],
     control_tracks: &[ControlTrack],
 ) -> Option<Vec<ClipMove>> {
-    let (ModalKind::Grab { time_locked } | ModalKind::Duplicate { time_locked }) = modal.kind
-    else {
+    let (ModalKind::Grab { locked } | ModalKind::Duplicate { locked }) = modal.kind else {
         return None;
     };
     let ptr = ptr?;
-    let bar_delta = ((ptr.x - modal.grab.x) / px_per_bar).round() as i64;
+    let mut bar_delta = ((ptr.x - modal.grab.x) / px_per_bar).round() as i64;
     let mut row_delta = ((ptr.y - modal.grab.y) / ROW_HEIGHT).round() as i32;
     let is_control = modal.origin.first().map(|s| s.is_control).unwrap_or(false);
     let rows = if is_control { rows_control } else { rows_midi };
     row_delta = clamp_row_delta(row_delta, &modal.origin, rows);
-    if time_locked {
-        row_delta = 0;
+    // An axis lock zeroes the OTHER axis' delta (Blender convention: the
+    // named axis is the one that still moves).
+    match locked {
+        Some(Axis::Time) => row_delta = 0,
+        Some(Axis::Row) => bar_delta = 0,
+        None => {}
     }
     Some(
         modal
@@ -680,39 +692,31 @@ pub fn show(
             }
             if state.knife_armed {
                 ui.weak(
-                    egui::RichText::new("Knife: click a clip to cut (bar-snapped) · Esc / right-click to stop")
+                    egui::RichText::new("Knife: one click cuts (bar-snapped) · Esc / right-click cancels")
                         .color(Color32::from_rgb(240, 190, 80)),
                 );
             }
             match &state.modal {
                 Some(Modal {
-                    kind: ModalKind::Grab { time_locked },
+                    kind: ModalKind::Grab { locked },
                     ..
                 }) => {
                     ui.weak(
                         egui::RichText::new(format!(
                             "Move: LMB drop · RMB / Esc cancel{}",
-                            if *time_locked {
-                                " · X: time lock ON (vertical disabled)"
-                            } else {
-                                " · X: lock time"
-                            }
+                            axis_hint(*locked)
                         ))
                         .color(Color32::from_rgb(140, 200, 250)),
                     );
                 }
                 Some(Modal {
-                    kind: ModalKind::Duplicate { time_locked },
+                    kind: ModalKind::Duplicate { locked },
                     ..
                 }) => {
                     ui.weak(
                         egui::RichText::new(format!(
                             "Duplicate: LMB drop the copies · RMB / Esc cancel{}",
-                            if *time_locked {
-                                " · X: time lock ON (vertical disabled)"
-                            } else {
-                                " · X: lock time"
-                            }
+                            axis_hint(*locked)
                         ))
                         .color(Color32::from_rgb(140, 200, 250)),
                     );
@@ -723,9 +727,9 @@ pub fn show(
                 }) => {
                     ui.weak(
                         egui::RichText::new(if *start_edge {
-                            "Stretch start: LMB drop · RMB / Esc cancel · T: other edge"
+                            "Stretch start: LMB drop · RMB / Esc cancel"
                         } else {
-                            "Stretch end: LMB drop · RMB / Esc cancel · Shift+T: pull start"
+                            "Stretch end: LMB drop · RMB / Esc cancel · S: pull start instead"
                         })
                         .color(Color32::from_rgb(140, 200, 250)),
                     );
@@ -1271,8 +1275,11 @@ fn lane_row<T: Placement>(
     // document here).
 
     // Knife (K armed): an LMB click cuts the clip under the pointer at
-    // the bar-snapped position; the knife stays armed for more cuts.
+    // the bar-snapped position. Single-shot, unified with the roll: the
+    // arming is consumed by one click either way (cut, refused cut, or
+    // empty lane); Esc / right-click cancel without consuming.
     if state.knife_armed && state.modal.is_none() && response.clicked() {
+        state.knife_armed = false;
         if let Some(pos) = response.interact_pointer_pos() {
             if clips.len() >= MAX_CLIPS_PER_TRACK {
                 state.set_status("this track is full — cannot split");
@@ -1573,14 +1580,14 @@ fn lane_row<T: Placement>(
         let knife = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::NONE, Key::K));
-        // Shift+T must be consumed before plain T (consume_key ignores
-        // the shift qualifier when matching).
-        let shift_t = ui
-            .ctx()
-            .input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::T));
         let t = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::NONE, Key::T));
+        // S is a mid-modal qualifier (flips a Stretch to its start edge,
+        // unified with the roll's t+s) — never an arming key here.
+        let s = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::NONE, Key::S));
         let g = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::NONE, Key::G));
@@ -1592,33 +1599,50 @@ fn lane_row<T: Placement>(
         let x = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::NONE, Key::X));
+        let y = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::NONE, Key::Y));
         if knife {
-            state.knife_armed = !state.knife_armed;
+            // Single-shot, unified with the roll: K arms, one click
+            // consumes; Esc / right-click cancel. Not a toggle.
+            state.knife_armed = true;
             state.modal = None;
         }
-        // X toggles the time lock while a Grab / Duplicate modal is live.
-        if x {
+        // X / Y lock an axis mid-modal (Blender convention, unified with
+        // the roll): X = time only, Y = rows only. The same key again
+        // releases the lock; the other axis takes over.
+        if x || y {
             if let Some(modal) = &mut state.modal {
+                let axis = if x { Axis::Time } else { Axis::Row };
                 match &mut modal.kind {
-                    ModalKind::Grab { time_locked } | ModalKind::Duplicate { time_locked } => {
-                        *time_locked = !*time_locked;
+                    ModalKind::Grab { locked } | ModalKind::Duplicate { locked } => {
+                        *locked = if *locked == Some(axis) {
+                            None
+                        } else {
+                            Some(axis)
+                        };
                     }
                     ModalKind::Stretch { .. } => {}
                 }
             }
         }
+        // A live modal owns the keyboard: only the qualifiers answer —
+        // S flips a Stretch to its start edge (the roll's t+s).
+        if let Some(modal) = &mut state.modal {
+            if s && matches!(modal.kind, ModalKind::Stretch { .. }) {
+                modal.kind = ModalKind::Stretch { start_edge: true };
+            }
+        }
         // Arm G / Shift+D / T (Blender-style modal; arming one tool
         // clears the other).
-        if (g || shift_d || t || shift_t) && state.modal.is_none() {
+        if (g || shift_d || t) && state.modal.is_none() {
             state.knife_armed = false;
             let arm = if g {
                 Arm::Grab
             } else if shift_d {
                 Arm::Duplicate
             } else {
-                Arm::Stretch {
-                    start_edge: shift_t,
-                }
+                Arm::Stretch
             };
             arm_modal(state, ui.ctx(), arm);
         }
@@ -1650,7 +1674,16 @@ fn lane_row<T: Placement>(
 enum Arm {
     Grab,
     Duplicate,
-    Stretch { start_edge: bool },
+    Stretch,
+}
+
+/// The X/Y axis-lock suffix for the Move / Duplicate hints.
+fn axis_hint(locked: Option<Axis>) -> &'static str {
+    match locked {
+        Some(Axis::Time) => " · X: time only (X again releases)",
+        Some(Axis::Row) => " · Y: rows only (Y again releases)",
+        None => " · X: time only · Y: rows only",
+    }
 }
 
 /// Arms a modal from the current selection. G and Shift+D require a
@@ -1671,7 +1704,7 @@ fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
                 state.set_status("mixed selection: G moves one track kind at a time");
                 return;
             }
-            ModalKind::Grab { time_locked: false }
+            ModalKind::Grab { locked: None }
         }
         Arm::Duplicate => {
             let first = state.selection[0].is_control;
@@ -1679,9 +1712,9 @@ fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
                 state.set_status("mixed selection: Shift+D copies one track kind at a time");
                 return;
             }
-            ModalKind::Duplicate { time_locked: false }
+            ModalKind::Duplicate { locked: None }
         }
-        Arm::Stretch { start_edge } => ModalKind::Stretch { start_edge },
+        Arm::Stretch => ModalKind::Stretch { start_edge: false },
     };
     state.modal = Some(Modal {
         kind,
@@ -1863,7 +1896,7 @@ mod tests {
             ..MidiTrack::default()
         }];
         let modal = Modal {
-            kind: ModalKind::Grab { time_locked: false },
+            kind: ModalKind::Grab { locked: None },
             origin: vec![ClipSel {
                 is_control: false,
                 track: 0,
@@ -1878,14 +1911,26 @@ mod tests {
         assert_eq!(targets[0].to_track, 1);
         // 1.6 bars → rounds to 2 bars.
         assert_eq!(targets[0].start_ticks, 4 * TICKS_PER_BAR);
-        // Time lock kills the vertical delta only.
+        // X locks the movement to the time axis: the row delta dies.
         let locked = Modal {
-            kind: ModalKind::Grab { time_locked: true },
+            kind: ModalKind::Grab {
+                locked: Some(Axis::Time),
+            },
             ..modal.clone()
         };
         let targets = grab_targets(&locked, Some(ptr), 56.0, 2, 1, &midi, &[]).unwrap();
         assert_eq!(targets[0].to_track, 0);
         assert_eq!(targets[0].start_ticks, 4 * TICKS_PER_BAR);
+        // Y locks the movement to the rows: the bar delta dies.
+        let row_locked = Modal {
+            kind: ModalKind::Grab {
+                locked: Some(Axis::Row),
+            },
+            ..modal.clone()
+        };
+        let targets = grab_targets(&row_locked, Some(ptr), 56.0, 2, 1, &midi, &[]).unwrap();
+        assert_eq!(targets[0].to_track, 1);
+        assert_eq!(targets[0].start_ticks, 2 * TICKS_PER_BAR);
     }
 
     #[test]
