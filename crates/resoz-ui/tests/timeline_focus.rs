@@ -282,6 +282,34 @@ fn rows_stack_vertically_instead_of_overlapping() {
     );
 }
 
+/// The user flow that reported "commands don't work": click a clip to
+/// select it (which also focuses the lane), then press G — the move
+/// modal must arm rather than flash "nothing selected".
+#[test]
+fn clicking_a_clip_then_g_arms_the_move_modal() {
+    let mut f = Fixture::new();
+    f.frame(vec![]);
+    f.frame(vec![]);
+    let row = f
+        .ctx
+        .read_response(egui::Id::new("resoz_timeline_row").with((false, 0usize)))
+        .expect("row 0 is missing from the widget stack")
+        .rect;
+    // The fixture clip covers bars 0-2 from the lane start; the lane
+    // begins right of the ~108 px header, so a probe a little past that
+    // lands inside the clip.
+    let pos = egui::pos2(row.left() + 130.0, row.center().y);
+    f.click(pos);
+    f.frame(vec![hover(pos)]);
+    f.frame(vec![hover(pos), key(egui::Key::G)]);
+    assert!(
+        f.state.modal_active(),
+        "G on a selected clip must arm the move modal"
+    );
+    // And focus must still be held for the modal keys (X / Esc / click).
+    assert!(f.owns_focus());
+}
+
 fn hover(pos: egui::Pos2) -> egui::Event {
     egui::Event::PointerMoved(pos)
 }

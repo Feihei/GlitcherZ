@@ -211,6 +211,12 @@ impl TimelineState {
                 .focus_id
                 .is_some_and(|id| ctx.memory(|m| m.has_focus(id)))
     }
+    /// Whether a modal transform (G / T / Shift+D) is live right now.
+    /// The integration tests drive real egui frames and can only reach
+    /// state through public accessors — same observability as the roll.
+    pub fn modal_active(&self) -> bool {
+        self.modal.is_some()
+    }
 }
 
 /// One action for the caller (engine pushes / cross-panel state changes).
@@ -1441,6 +1447,39 @@ fn lane_row<T: Placement>(
                 Stroke::new(1.0, Color32::from_rgb(80, 140, 220)),
                 StrokeKind::Inside,
             );
+        }
+    }
+
+    // A plain click (press + release without moving past the click
+    // threshold) picks the clip under the pointer. egui only reports
+    // `drag_started` once the pointer MOVED, so without this a click
+    // selects nothing and every command key (G / T / Shift+D) just
+    // flashes "nothing selected" — the roll hit the same trap. Clicking
+    // empty space deselects; a modifier click on empty space leaves the
+    // selection alone.
+    if response.clicked() && !state.knife_armed && state.modal.is_none() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
+            match hit_clip(clips, tick_at(pos.x)) {
+                Some(index) => {
+                    let sel = ClipSel {
+                        is_control,
+                        track,
+                        clip: index,
+                    };
+                    if additive {
+                        if let Some(at) = state.selection.iter().position(|s| *s == sel) {
+                            state.selection.remove(at);
+                        } else {
+                            state.selection.push(sel);
+                        }
+                    } else if !state.selection.contains(&sel) {
+                        state.selection = vec![sel];
+                    }
+                }
+                None if additive => {}
+                None => state.selection.clear(),
+            }
         }
     }
 
