@@ -152,3 +152,25 @@
 - clack 0.2：`clack-extensions` 宿主侧 trait 需 `clack-host` feature；`Pckn::new` 需显式 u16/u32 字面量；`start_processing` 返回 `&mut Started`；`PluginInstance::new` 收 `&CStr`；
 - RON/serde：定长数组（`[Track; 4]`/`[Step; 16]`）在 RON 里是**圆括号**（serde tuple 路径），方括号只用于 `Vec`；
 - VST3 参数为归一化 0..1（CLAP 为原始值），跨格式展示需换算。
+
+### egui 0.36 焦点契约（M4b 时间轴“永远 no focus”根因）
+
+症状：时间轴工具栏黄色 “no keyboard focus” 常亮，点击也救不回来；所有 G/T/S/K/Delete 全死；钢琴窗同套机制却正常。
+
+根因是 **widget id 的位置相关性**：
+
+- `Ui::next_auto_id()` 是**纯计数器**（`Id::new(next_auto_id_salt)`），不掺 ui 自己的 id；
+- `ui.horizontal` / `Ui::new_child` 默认走 `IdSource::Child`：子 Ui 的 `unique_id = parent.id.with(salt).with(父计数器)`，且内部自增种子取自该值——所以**父 Ui 里任意 widget 增减，都会整体平移下面所有子 Ui 及其后代的 id**；
+- `ui.push_id` **救不了**：它只给盐值，`unique_id` 仍含计数器；
+- 解法是 `UiBuilder::new().id(explicit_id)`（`IdSource::Explicit`）：子 Ui 的 id 与上方一切无关。
+
+故障链条：焦点 chip / knife·modal 提示 / 状态消息本来直接画在行的父 Ui 里，它们的**出现与消失**把每行 `horizontal` 的 id 整体挪了一位；egui 的焦点是**绑 id**的，`Focus::end_pass` 的死人开关还给刚获焦的 id 一帧宽限（`recently_gained_focus`），于是焦点永久停在一个没有任何 widget 认领的**幽灵 id**上——每行 `has_focus()` 恒假，键全死，chip 重新点亮；而 chip 点亮本身又会把 id 挪回去，形成闪烁。**点击永远救不回来**，因为救活的那一帧正是 chip 消失、id 再次漂移的那一帧。
+
+修复（`timeline.rs`）：
+
+- 每行改用 `ui.new_child(UiBuilder::new().layout(Layout::left_to_right(Align::Center)).id(Id::new("resoz_timeline_row").with(row.key())))`，行内 widget 拿到稳定的 id；
+- 所有可变提示搬进 toolbar 的 `ui.horizontal` **子 Ui**（与 roll 一致）：子 Ui 只占父层一个槽，内容多少不影响下游顺带——顺带修掉“状态消息一来整排行往下跳一行”的视觉 bug；
+- `owns_keyboard_focus` 增加“本帧有行真的报告了焦点”：只看 egui 的 focus id 时，幽灵 id 会让它谎报 true（从而把虚拟钢琴静音、而按键其实到不了任何东西）；
+- 焦点锁 filter 认领 `horizontal_arrows`/`vertical_arrows`（roll 自 M4a.4 起如此）：未认领的方向键会把焦点“导航”给别的 widget。
+
+守护测试 `crates/resoz-ui/tests/timeline_focus.rs`：用真实 egui 帧复刻 app 的面板结构（transport 含 DragValue、status bar、view tabs、CentralPanel），断言焦点能扛住①点击后的若干帧 ②自身提示的来去 ③行上方任意 widget 的增删（该用例在修复前失败）。
