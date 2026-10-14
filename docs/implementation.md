@@ -174,3 +174,9 @@
 - 焦点锁 filter 认领 `horizontal_arrows`/`vertical_arrows`（roll 自 M4a.4 起如此）：未认领的方向键会把焦点“导航”给别的 widget。
 
 守护测试 `crates/resoz-ui/tests/timeline_focus.rs`：用真实 egui 帧复刻 app 的面板结构（transport 含 DragValue、status bar、view tabs、CentralPanel），断言焦点能扛住①点击后的若干帧 ②自身提示的来去 ③行上方任意 widget 的增删（该用例在修复前失败）。
+
+#### 实测追加的两课（2026-10-14，用户复测暴露）
+
+上一节修复后真实跑 app 暴露两个独立问题，根源都是"单元测试覆盖不到的 egui 行为"：
+
+**① `new_child` 不推进父光标 → 整个时间轴只剩最后一行**。`Ui::new_child` 的文档明说它"不在父 Ui 里分配空间"，需要调用方自己 `advance_cursor_after_rect(child.min_rect())`——`ui.horizontal` 内部（`scope_dyn`）就是这么做的。但只补 advance 还不够：`Layout::left_to_right(Align::Center)` 的**frame 会撑满可用高度**（`Layout::next_frame_ignore_wrap`：水平布局 + `vertical_align()==Center` → `frame_size.y = available_rect.height()`），`expand_to_include_rect(frame_rect)` 又把这个 frame 计入 min_rect——`ui.horizontal` 之所以没这个问题，是它先用 `allocate_ui_with_layout` 把子 Ui 高度钳到 `interact_size.y`。所以行的正确写法是：`new_child(UiBuilder::new().layout(...).id(...).max_rect(可用矩形钳到 ROW_HEIGHT))` + 行画完后 `advance_cursor_after_rect(row_ui.min_rect())`。症状：所有行叠在同一位置，只有最后画的行可见，"时间轴只剩 track4，上面全是灰的"；焦点 fixture 测试全绿——它只断言 id/焦点，从不断言行位置。守护测试 `rows_stack_vertically_instead_of_overlapping`：从 egui widget stack 读回行容器矩形，断言纵向堆叠不重叠。

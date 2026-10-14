@@ -1033,7 +1033,7 @@ pub fn show(
 /// One row: header cell + clip lane (grid, clips, playhead, interactions).
 #[allow(clippy::too_many_arguments)]
 fn lane_row<T: Placement>(
-    ui: &mut egui::Ui,
+    parent: &mut egui::Ui,
     state: &mut TimelineState,
     actions: &mut Vec<TimelineAction>,
     marquee_hits: &mut Vec<(RowKind, Vec<usize>)>,
@@ -1060,11 +1060,22 @@ fn lane_row<T: Placement>(
     // `push_id` cannot help (it salts the parent id but still mixes in the
     // positional counter); `UiBuilder::id` gives the row an id that is
     // independent of everything drawn above it.
-    let mut row_ui = ui.new_child(
+    //
+    // The max_rect must be clamped to ONE row. A raw `new_child` (unlike
+    // `ui.horizontal`, which pre-allocates only `interact_size.y`) hands
+    // the child the FULL remaining rect, and a Center-aligned horizontal
+    // frame then fills its whole available height (`Layout::
+    // next_frame_ignore_wrap`): the first row would swallow the entire
+    // scroll area and every later row would land below the fold — the
+    // "only the last track remains" bug.
+    let mut row_rect = parent.available_rect_before_wrap();
+    row_rect.max.y = row_rect.min.y + ROW_HEIGHT;
+    let mut row_ui = parent.new_child(
         egui::UiBuilder::new()
             // Same layout as `ui.horizontal`, but with an explicit id.
             .layout(egui::Layout::left_to_right(egui::Align::Center))
-            .id(egui::Id::new("resoz_timeline_row").with(row.key())),
+            .id(egui::Id::new("resoz_timeline_row").with(row.key()))
+            .max_rect(row_rect),
     );
     let ui = &mut row_ui;
     // Header cell.
@@ -1556,6 +1567,11 @@ fn lane_row<T: Placement>(
             state.selection.clear();
         }
     }
+    // `new_child` does not allocate any space in the parent (egui 0.36
+    // docs) — `ui.horizontal` reserves its child's min_rect via
+    // `scope_dyn`; a raw `new_child` must hand the parent its extent
+    // explicitly or every row lays out at the parent's unmoved cursor.
+    parent.advance_cursor_after_rect(row_ui.min_rect());
 }
 
 /// Which modal G / Shift+D / T arms (M4b.3/4).

@@ -9,9 +9,13 @@
 //! stopped existing and egui's dead-man switch cleared focus — the chip
 //! came back, the ids shifted back, and no click could ever hold focus.
 //!
-//! The rows are now pinned with `push_id` (parent id + row identity),
-//! immune to sibling-count changes; these tests pin that property by
-//! letting the layout settle for several frames after each interaction.
+//! The rows are now pinned with `UiBuilder::id` (an explicit id, immune
+//! to sibling-count changes); these tests pin that property by letting
+//! the layout settle for several frames after each interaction. They also
+//! pin the row STACKING: the rows are laid out with a raw `new_child`,
+//! which (unlike `ui.horizontal`) does not advance the parent cursor —
+//! without the explicit `advance_cursor_after_rect` every row paints on
+//! top of the previous one and only the last-drawn row is visible.
 
 use eframe::egui;
 use resoz_model::{MidiClip, MidiTrack, TICKS_PER_BAR};
@@ -251,6 +255,31 @@ fn focus_survives_layout_churn_above_the_timeline() {
             "focus died when the layout above the timeline changed"
         );
     }
+}
+
+/// The rows must stack vertically, each on its own line. The rows are
+/// laid out with a raw `new_child`, which does not advance the parent
+/// cursor; without the explicit `advance_cursor_after_rect` every row
+/// laid out at the same spot, painted over the previous one, and only
+/// the last-drawn row was visible (the "only track 4 remains" bug).
+/// Reads each row container's rect back out of egui's widget stack.
+#[test]
+fn rows_stack_vertically_instead_of_overlapping() {
+    let mut f = Fixture::new();
+    f.frame(vec![]);
+    f.frame(vec![]);
+    let rect = |track: usize| {
+        f.ctx
+            .read_response(egui::Id::new("resoz_timeline_row").with((false, track)))
+            .unwrap_or_else(|| panic!("row {track} is missing from the widget stack"))
+            .rect
+    };
+    let first = rect(0);
+    let second = rect(1);
+    assert!(
+        second.top() >= first.bottom() - 0.5,
+        "rows overlap: {first:?} vs {second:?}"
+    );
 }
 
 fn hover(pos: egui::Pos2) -> egui::Event {
