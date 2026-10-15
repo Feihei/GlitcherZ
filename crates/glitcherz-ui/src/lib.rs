@@ -545,7 +545,11 @@ impl GlitcherZApp {
             match node {
                 NodeDoc::Instrument { voice, .. } => match voice {
                     VoiceSpec::Builtin => (Box::new(SynthProcessor::new(sr)), None, String::new()),
-                    VoiceSpec::Clap { path, plugin_id } => {
+                    VoiceSpec::Clap {
+                        path,
+                        plugin_id,
+                        state,
+                    } => {
                         match ClapInstance::spawn_rt(
                             std::path::Path::new(path),
                             plugin_id,
@@ -554,12 +558,24 @@ impl GlitcherZApp {
                                 max_frames: 128,
                             },
                         ) {
-                            Ok(instance) => {
+                            Ok(mut instance) => {
+                                // Restore the persisted state blob (project
+                                // reload / undo), then refresh the slider
+                                // cache from the plugin's live values.
+                                if !state.is_empty() {
+                                    if let Err(err) = instance.guard.load_state(state) {
+                                        log::warn!(
+                                            "Failed to restore CLAP state for {plugin_id}: {err}"
+                                        );
+                                    }
+                                }
+                                let values = instance.read_param_values();
                                 // Parameter enumeration must happen before the instance is
                                 // destructured (the guard holds the plugin instance).
                                 let params = instance.list_params();
                                 let ClapInstance { guard, node } = instance;
                                 self.clap_voice_params.insert(track, params);
+                                self.clap_voice_values.insert(track, values);
                                 (
                                     Box::new(node),
                                     Some(PluginGuard::Clap(guard)),
@@ -574,7 +590,7 @@ impl GlitcherZApp {
                             }
                         }
                     }
-                    VoiceSpec::Vst3 { path, class_id } => {
+                    VoiceSpec::Vst3 { path, class_id, .. } => {
                         match glitcherz_vst3_host::Vst3Instance::spawn_rt(
                             std::path::Path::new(path),
                             class_id,
@@ -603,7 +619,11 @@ impl GlitcherZApp {
                 },
                 NodeDoc::Effect { voice, .. } => match voice {
                     VoiceSpec::Builtin => (Box::new(DelayProcessor::new(sr)), None, String::new()),
-                    VoiceSpec::Clap { path, plugin_id } => {
+                    VoiceSpec::Clap {
+                        path,
+                        plugin_id,
+                        state,
+                    } => {
                         match ClapInstance::spawn_rt(
                             std::path::Path::new(path),
                             plugin_id,
@@ -612,7 +632,14 @@ impl GlitcherZApp {
                                 max_frames: 128,
                             },
                         ) {
-                            Ok(instance) => {
+                            Ok(mut instance) => {
+                                if !state.is_empty() {
+                                    if let Err(err) = instance.guard.load_state(state) {
+                                        log::warn!(
+                                            "Failed to restore CLAP effect state for {plugin_id}: {err}"
+                                        );
+                                    }
+                                }
                                 let ClapInstance { guard, node } = instance;
                                 (
                                     Box::new(node),
@@ -626,7 +653,7 @@ impl GlitcherZApp {
                             }
                         }
                     }
-                    VoiceSpec::Vst3 { path, class_id } => {
+                    VoiceSpec::Vst3 { path, class_id, .. } => {
                         match glitcherz_vst3_host::Vst3Instance::spawn_rt(
                             std::path::Path::new(path),
                             class_id,
@@ -1589,11 +1616,63 @@ impl GlitcherZApp {
         self.do_open(path);
     }
 
+    /// Captures live plugin state blobs into the document before saving
+    /// (save-time only, not an undoable edit — same class as the patch
+    /// layout, spec/plugin-state.md D3). Individual failures are logged and
+    /// skipped: a broken plugin must not block the whole save (D7).
+    fn capture_plugin_states(&mut self) {
+        let doc_by_engine: std::collections::HashMap<u64, u64> = self
+            .node_map
+            .iter()
+            .map(|(doc_id, engine_id)| (*engine_id, *doc_id))
+            .collect();
+        // Two passes: the guard loop borrows `voice_guards` mutably, the doc
+        // write needs `project_mut` — collect blobs first, apply afterwards.
+        let mut blobs: Vec<(u64, Vec<u8>)> = Vec::new();
+        for entry in &mut self.voice_guards {
+            let Some(doc_id) = doc_by_engine.get(&entry.node_id).copied() else {
+                continue;
+            };
+            let blob = match &mut entry._guard {
+                PluginGuard::Clap(guard) => match guard.save_state() {
+                    Ok(blob) => Some(blob),
+                    Err(glitcherz_clap_host::HostError::NoState) => None,
+                    Err(err) => {
+                        log::warn!("State capture skipped for {}: {err}", entry.plugin_id);
+                        None
+                    }
+                },
+                // VST3 FState capture: phase 2 (spec S5).
+                PluginGuard::Vst3(_) => None,
+            };
+            if let Some(blob) = blob {
+                blobs.push((doc_id, blob));
+            }
+        }
+        for (doc_id, blob) in blobs {
+            let Some(node) = self.project_mut().graph.node_by_id_mut(doc_id) else {
+                continue;
+            };
+            match node {
+                NodeDoc::Instrument {
+                    voice: VoiceSpec::Clap { state, .. },
+                    ..
+                }
+                | NodeDoc::Effect {
+                    voice: VoiceSpec::Clap { state, .. },
+                    ..
+                } => *state = blob,
+                _ => {}
+            }
+        }
+    }
+
     /// Write to disk and update recent files / title / status message.
     fn do_save(&mut self, path: PathBuf) {
         // Persist the patch canvas layout (view data) with the project.
         let layout = self.patch_state.export_layout(&self.project().graph);
         self.project_mut().graph.layout = layout;
+        self.capture_plugin_states();
         match glitcherz_model::save_project(self.project(), &path) {
             Ok(()) => {
                 self.session.mark_clean();
@@ -1926,6 +2005,7 @@ impl GlitcherZApp {
                     VoiceSpec::Clap {
                         path: path.to_string(),
                         plugin_id: plugin_id.to_string(),
+                        state: Vec::new(),
                     },
                     plugin_id.to_string(),
                     Box::new(node),
@@ -1957,6 +2037,7 @@ impl GlitcherZApp {
                     VoiceSpec::Vst3 {
                         path: path.to_string(),
                         class_id: class_id.to_string(),
+                        state: Vec::new(),
                     },
                     class_id.to_string(),
                     Box::new(node),
@@ -2963,6 +3044,7 @@ impl GlitcherZApp {
                         *voice = VoiceSpec::Clap {
                             path: path.clone(),
                             plugin_id: plugin_id.clone(),
+                            state: Vec::new(),
                         };
                     }
                     self.load_clap_voice(sel, &path, &plugin_id);
@@ -2991,6 +3073,7 @@ impl GlitcherZApp {
                         *voice = VoiceSpec::Vst3 {
                             path: path.clone(),
                             class_id: class_id.clone(),
+                            state: Vec::new(),
                         };
 
                     }

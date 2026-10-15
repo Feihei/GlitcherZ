@@ -671,6 +671,11 @@ pub enum VoiceSpec {
         path: String,
         #[serde(default)]
         plugin_id: String,
+        /// Full plugin state blob (state extension), captured at save time;
+        /// empty = plugin defaults. Plugin-private format (CLAP spec), the
+        /// plugin itself owns any versioning inside it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        state: Vec<u8>,
     },
     /// VST3 plugin: .vst3 file/bundle path + class CID (16-byte hex).
     Vst3 {
@@ -678,6 +683,10 @@ pub enum VoiceSpec {
         path: String,
         #[serde(default)]
         class_id: String,
+        /// Full plugin state blob (FState stream), captured at save time;
+        /// empty = plugin defaults. Plugin-private format.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        state: Vec<u8>,
     },
 }
 
@@ -2156,16 +2165,49 @@ mod tests {
             VoiceSpec::Clap {
                 path: "a.clap".to_string(),
                 plugin_id: "x".to_string(),
+                state: Vec::new(),
+            },
+            VoiceSpec::Clap {
+                path: "a.clap".to_string(),
+                plugin_id: "x".to_string(),
+                state: vec![1, 2, 3],
             },
             VoiceSpec::Vst3 {
                 path: "b.vst3".to_string(),
                 class_id: "cid".to_string(),
+                state: Vec::new(),
+            },
+            VoiceSpec::Vst3 {
+                path: "b.vst3".to_string(),
+                class_id: "cid".to_string(),
+                state: vec![9, 8],
             },
         ] {
             let text = ron::to_string(&voice).expect("serialization failed");
             let back: VoiceSpec = ron::from_str(&text).expect("deserialization failed");
             assert_eq!(voice, back);
         }
+    }
+
+    /// Empty state must not appear in the file; old files without the field
+    /// load as empty (serde default, D2).
+    #[test]
+    fn voice_spec_state_serde_compatibility() {
+        let clap = VoiceSpec::Clap {
+            path: "a.clap".to_string(),
+            plugin_id: "x".to_string(),
+            state: Vec::new(),
+        };
+        let text = ron::to_string(&clap).expect("serialization failed");
+        assert!(
+            !text.contains("state"),
+            "empty state must be skipped: {text}"
+        );
+        // Legacy form (pre-state files; internally tagged, snake_case tag).
+        let legacy =
+            ron::from_str::<VoiceSpec>("(type: \"clap\", path: \"a.clap\", plugin_id: \"x\")")
+                .expect("legacy form must deserialize");
+        assert_eq!(legacy, clap);
     }
 
     #[test]
