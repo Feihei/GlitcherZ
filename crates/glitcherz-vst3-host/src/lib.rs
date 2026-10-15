@@ -64,7 +64,8 @@ use glitcherz_engine::realtime::context::ProcessContext;
 use glitcherz_engine::realtime::processor::Processor;
 
 use crate::host_impl::{
-    HostEventList, HostParamChanges, HostParamValueQueue, NoopComponentHandler, QueueSlot,
+    HostEventList, HostMemoryStream, HostParamChanges, HostParamValueQueue, NoopComponentHandler,
+    QueueSlot,
 };
 
 /// Maximum number of bridged events queued per `process` call (notes +
@@ -96,6 +97,10 @@ pub enum HostError {
     SampleSizeUnsupported,
     #[error("Invalid plugin CID: {0}")]
     BadCid(String),
+    #[error("Plugin failed to save state (tresult = {0:#x})")]
+    StateSave(Steinberg::tresult),
+    #[error("Plugin failed to load state (tresult = {0:#x})")]
+    StateLoad(Steinberg::tresult),
 }
 
 /// Whether a tresult indicates success (kResultOk / kResultTrue).
@@ -371,6 +376,85 @@ impl Vst3InstanceGuard {
                 });
             }
             out
+        }
+    }
+
+    /// Saves the plugin's full state blob (the component's `getState`
+    /// stream, control-side call; the plugin may remain active — the
+    /// simple-host posture, same class as the CLAP mirror). The blob format
+    /// is plugin-private per the VST3 spec.
+    ///
+    /// Returns [`HostError::StateSave`] when the plugin refuses
+    /// (`kNotImplemented` = the plugin implements no state persistence).
+    pub fn save_state(&self) -> Result<Vec<u8>, HostError> {
+        let stream = ComWrapper::new(HostMemoryStream::new());
+        // SAFETY: the component is alive (held by the guard); the stream
+        // object outlives the call (same scope).
+        let result = unsafe {
+            let ibstream = stream
+                .as_com_ref::<Steinberg::IBStream>()
+                .expect("HostMemoryStream always implements IBStream");
+            self.component.getState(ibstream.as_ptr())
+        };
+        if !tresult_ok(result) {
+            return Err(HostError::StateSave(result));
+        }
+        Ok(stream.take_bytes())
+    }
+
+    /// Restores the plugin state from a previously saved blob (control-side
+    /// call, after instantiation): component `setState` first (the
+    /// authoritative state), then the spec-mandated controller
+    /// `setComponentState` sync so the controller's parameter read-back
+    /// matches. Each consumer gets a fresh stream over the same blob (the
+    /// stream is consumed sequentially; no rewind needed). A refusing
+    /// controller is logged and tolerated (the VST3 spec allows state-less
+    /// controllers); a refusing component fails the call with
+    /// [`HostError::StateLoad`].
+    pub fn load_state(&self, data: &[u8]) -> Result<(), HostError> {
+        // Component pass: the authoritative state.
+        let component_stream = ComWrapper::new(HostMemoryStream::from_bytes(data.to_vec()));
+        // SAFETY: the component is alive (held by the guard); the stream
+        // outlives the call (same scope).
+        let result = unsafe {
+            let ibstream = component_stream
+                .as_com_ref::<Steinberg::IBStream>()
+                .expect("HostMemoryStream always implements IBStream");
+            self.component.setState(ibstream.as_ptr())
+        };
+        if !tresult_ok(result) {
+            return Err(HostError::StateLoad(result));
+        }
+        // Controller pass: a fresh stream over the same blob.
+        let controller_stream = ComWrapper::new(HostMemoryStream::from_bytes(data.to_vec()));
+        // SAFETY: the controller is alive (held by the guard); the stream
+        // outlives the call (same scope).
+        let controller_result = unsafe {
+            let ibstream = controller_stream
+                .as_com_ref::<Steinberg::IBStream>()
+                .expect("HostMemoryStream always implements IBStream");
+            self.controller.setComponentState(ibstream.as_ptr())
+        };
+        if !tresult_ok(controller_result) {
+            log::warn!(
+                "VST3 controller rejected setComponentState (0x{controller_result:08x}); parameter read-back may be stale"
+            );
+        }
+        Ok(())
+    }
+
+    /// Reads the current normalized value (0..1) of every parameter the
+    /// controller exposes (control side, `getParamNormalized`). Used after
+    /// a state load to refresh UI-side caches (the CLAP D6 mirror; the
+    /// VST3 parameter panel lands with the normalization work).
+    pub fn read_param_values(&self) -> std::collections::HashMap<u32, f64> {
+        // SAFETY: the controller is alive (held by the guard); control-side
+        // call, not RT-safe.
+        unsafe {
+            self.parameters()
+                .into_iter()
+                .map(|info| (info.id, self.controller.getParamNormalized(info.id)))
+                .collect()
         }
     }
 }
@@ -1027,6 +1111,54 @@ mod tests {
         assert_eq!(gain.title, "Gain");
         assert!((gain.default_normalized - 0.5).abs() < 1e-9);
         assert!(gain.can_automate, "Gain should be marked as automatable");
+    }
+
+    #[test]
+    fn state_roundtrip_restores_gain() {
+        let Some((mut instance, ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        let mut buffer = AudioBuffer::new(2, 128);
+        buffer.set_len(128);
+        buffer.clear();
+
+        // Move the gain away from its default via the param bridge (one
+        // block flushes the stashed event into the plugin's parameter
+        // queue).
+        assert!(instance.node.set_param(ParamId::PluginParam(1), 0.25));
+        instance.node.process(&ctx, &mut buffer);
+
+        let blob = instance.guard.save_state().expect("state save should work");
+        assert_eq!(blob.len(), 8, "the test plugin saves 8 bytes (f64 LE bits)");
+
+        // Fresh instance (per-instance factory): the component must report
+        // the console default.
+        let Some((fresh, _)) = spawn_test_plugin() else {
+            return;
+        };
+        let default_blob = fresh.guard.save_state().expect("save on a fresh instance");
+        assert_ne!(
+            default_blob, blob,
+            "fresh instance must carry the default state"
+        );
+
+        // Restore, then verify both channels: the component state blob
+        // matches the saved one, and the controller's parameter read-back
+        // is in sync (the setComponentState mirror).
+        fresh
+            .guard
+            .load_state(&blob)
+            .expect("state load should work");
+        let restored_blob = fresh.guard.save_state().expect("save after load");
+        assert_eq!(
+            restored_blob, blob,
+            "loaded state must equal the saved blob"
+        );
+        assert_eq!(
+            fresh.guard.read_param_values().get(&1),
+            Some(&0.25),
+            "controller read-back should reflect the loaded state"
+        );
     }
 
     #[test]

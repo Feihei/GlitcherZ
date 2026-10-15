@@ -590,7 +590,12 @@ impl GlitcherZApp {
                             }
                         }
                     }
-                    VoiceSpec::Vst3 { path, class_id, .. } => {
+                    VoiceSpec::Vst3 {
+                        path,
+                        class_id,
+                        state,
+                        ..
+                    } => {
                         match glitcherz_vst3_host::Vst3Instance::spawn_rt(
                             std::path::Path::new(path),
                             class_id,
@@ -600,6 +605,15 @@ impl GlitcherZApp {
                             },
                         ) {
                             Ok(instance) => {
+                                // Restore the persisted state blob (project
+                                // reload / undo; the CLAP D4 mirror).
+                                if !state.is_empty() {
+                                    if let Err(err) = instance.guard.load_state(state) {
+                                        log::warn!(
+                                            "Failed to restore VST3 state for {class_id}: {err}"
+                                        );
+                                    }
+                                }
                                 let glitcherz_vst3_host::Vst3Instance { guard, node } = instance;
                                 let params = guard.parameters();
                                 self.voice_params.insert(track, params);
@@ -653,7 +667,12 @@ impl GlitcherZApp {
                             }
                         }
                     }
-                    VoiceSpec::Vst3 { path, class_id, .. } => {
+                    VoiceSpec::Vst3 {
+                        path,
+                        class_id,
+                        state,
+                        ..
+                    } => {
                         match glitcherz_vst3_host::Vst3Instance::spawn_rt(
                             std::path::Path::new(path),
                             class_id,
@@ -663,6 +682,15 @@ impl GlitcherZApp {
                             },
                         ) {
                             Ok(instance) => {
+                                // Restore the persisted state blob (project
+                                // reload / undo; the CLAP D4 mirror).
+                                if !state.is_empty() {
+                                    if let Err(err) = instance.guard.load_state(state) {
+                                        log::warn!(
+                                            "Failed to restore VST3 effect state for {class_id}: {err}"
+                                        );
+                                    }
+                                }
                                 let glitcherz_vst3_host::Vst3Instance { guard, node } = instance;
                                 (
                                     Box::new(node),
@@ -1642,8 +1670,13 @@ impl GlitcherZApp {
                         None
                     }
                 },
-                // VST3 FState capture: phase 2 (spec S5).
-                PluginGuard::Vst3(_) => None,
+                PluginGuard::Vst3(guard) => match guard.save_state() {
+                    Ok(blob) => Some(blob),
+                    Err(err) => {
+                        log::warn!("State capture skipped for {}: {err}", entry.plugin_id);
+                        None
+                    }
+                },
             };
             if let Some(blob) = blob {
                 blobs.push((doc_id, blob));
@@ -1660,6 +1693,14 @@ impl GlitcherZApp {
                 }
                 | NodeDoc::Effect {
                     voice: VoiceSpec::Clap { state, .. },
+                    ..
+                }
+                | NodeDoc::Instrument {
+                    voice: VoiceSpec::Vst3 { state, .. },
+                    ..
+                }
+                | NodeDoc::Effect {
+                    voice: VoiceSpec::Vst3 { state, .. },
                     ..
                 } => *state = blob,
                 _ => {}

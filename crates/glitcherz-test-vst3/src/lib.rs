@@ -8,7 +8,10 @@
 //!   effect class;
 //! - `SineComponent`: IPluginBase + IComponent + IAudioProcessor +
 //!   IConnectionPoint — an A4 sine instrument, triggered by NoteOn and
-//!   stopped by NoteOff;
+//!   stopped by NoteOff. Persists its Gain parameter (id 1, normalized
+//!   f64) through `IComponent::getState`/`setState` as an 8-byte
+//!   little-endian blob, consumed from the host's `IParameterChanges`
+//!   queue during processing (state roundtrip fixture, spec S5);
 //! - `SineController`: IPluginBase + IEditController + IConnectionPoint
 //!   — a single Gain parameter (id 1, default 0.5);
 //! - `GainEffectComponent`: stereo passthrough gain effect
@@ -32,13 +35,13 @@
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use vst3::Steinberg::Vst::{
     self, IAudioProcessorTrait, IComponentTrait, IConnectionPointTrait, IEditControllerTrait,
-    IEventListTrait,
+    IEventListTrait, IParamValueQueueTrait, IParameterChangesTrait,
 };
-use vst3::Steinberg::{self, IPluginBaseTrait, TUID};
+use vst3::Steinberg::{self, IBStreamTrait, IPluginBaseTrait, TUID};
 use vst3::{Class, ComRef, ComWrapper};
 
 // ---------------------------------------------------------------------------
@@ -179,8 +182,10 @@ impl Steinberg::IPluginFactoryTrait for SineFactory {
                     .all(|(a, b)| (*a as i8) == *b)
             };
             if matches(&COMPONENT_CID) {
-                static COMPONENT: OnceLock<ComWrapper<SineComponent>> = OnceLock::new();
-                let wrapper = COMPONENT.get_or_init(|| ComWrapper::new(SineComponent::new()));
+                // Per kManyInstances, every createInstance call yields a
+                // fresh instance (host-owned via the +1 refcounted pointer)
+                // — fresh-instance state tests rely on this.
+                let wrapper = ComWrapper::new(SineComponent::new());
                 if let Some(ptr) = wrapper.to_com_ptr::<Vst::IComponent>() {
                     *obj = ptr.into_raw() as *mut c_void;
                     return Steinberg::kResultOk;
@@ -188,8 +193,7 @@ impl Steinberg::IPluginFactoryTrait for SineFactory {
                 return Steinberg::kResultFalse;
             }
             if matches(&CONTROLLER_CID) {
-                static CONTROLLER: OnceLock<ComWrapper<SineController>> = OnceLock::new();
-                let wrapper = CONTROLLER.get_or_init(|| ComWrapper::new(SineController));
+                let wrapper = ComWrapper::new(SineController::new());
                 if let Some(ptr) = wrapper.to_com_ptr::<Vst::IEditController>() {
                     *obj = ptr.into_raw() as *mut c_void;
                     return Steinberg::kResultOk;
@@ -197,8 +201,7 @@ impl Steinberg::IPluginFactoryTrait for SineFactory {
                 return Steinberg::kResultFalse;
             }
             if matches(&EFFECT_COMPONENT_CID) {
-                static EFFECT: OnceLock<ComWrapper<GainEffectComponent>> = OnceLock::new();
-                let wrapper = EFFECT.get_or_init(|| ComWrapper::new(GainEffectComponent));
+                let wrapper = ComWrapper::new(GainEffectComponent);
                 if let Some(ptr) = wrapper.to_com_ptr::<Vst::IComponent>() {
                     *obj = ptr.into_raw() as *mut c_void;
                     return Steinberg::kResultOk;
@@ -258,12 +261,20 @@ impl Steinberg::IPluginFactory3Trait for SineFactory {
 // ---------------------------------------------------------------------------
 
 /// A4 sine instrument component: triggered by NoteOn, silenced by NoteOff;
-/// single voice, stereo output.
+/// single voice, stereo output. Carries the Gain parameter (id 1,
+/// normalized 0..1, default 0.5) as persisted state: consumed from the
+/// host's `IParameterChanges` queue during processing, output amplitude =
+/// velocity × gain, saved/restored through `getState`/`setState` as an
+/// 8-byte little-endian f64 blob.
 struct SineComponent {
     note_on: AtomicBool,
     velocity_bits: AtomicU32,
     phase_bits: AtomicU32,
+    gain_bits: AtomicU64,
 }
+
+/// Bit pattern of the default normalized gain (0.5).
+const DEFAULT_GAIN_BITS: u64 = 0.5_f64.to_bits();
 
 impl SineComponent {
     fn new() -> Self {
@@ -271,6 +282,7 @@ impl SineComponent {
             note_on: AtomicBool::new(false),
             velocity_bits: AtomicU32::new(0.0_f32.to_bits()),
             phase_bits: AtomicU32::new(0.0_f32.to_bits()),
+            gain_bits: AtomicU64::new(DEFAULT_GAIN_BITS),
         }
     }
 }
@@ -371,12 +383,43 @@ impl IComponentTrait for SineComponent {
         Steinberg::kResultOk
     }
 
-    unsafe fn setState(&self, _state: *mut Steinberg::IBStream) -> Steinberg::tresult {
-        Steinberg::kNotImplemented
+    unsafe fn setState(&self, state: *mut Steinberg::IBStream) -> Steinberg::tresult {
+        // State blob: 8-byte little-endian f64 (normalized gain bits).
+        // SAFETY: the stream pointer is provided by the host per spec and
+        // stays valid for the duration of the call.
+        let Some(stream) = (unsafe { ComRef::<Steinberg::IBStream>::from_raw(state) }) else {
+            return Steinberg::kInvalidArgument;
+        };
+        let mut bits = [0u8; 8];
+        let mut read = 0i32;
+        // SAFETY: the stream is provided by the host per spec; the byte
+        // buffer is writable for 8 elements.
+        let result = unsafe { stream.read(bits.as_mut_ptr().cast(), 8, &mut read) };
+        if result == Steinberg::kResultOk && read == 8 {
+            self.gain_bits
+                .store(u64::from_le_bytes(bits), Ordering::Relaxed);
+            Steinberg::kResultOk
+        } else {
+            Steinberg::kResultFalse
+        }
     }
 
-    unsafe fn getState(&self, _state: *mut Steinberg::IBStream) -> Steinberg::tresult {
-        Steinberg::kNotImplemented
+    unsafe fn getState(&self, state: *mut Steinberg::IBStream) -> Steinberg::tresult {
+        // SAFETY: the stream pointer is provided by the host per spec and
+        // stays valid for the duration of the call.
+        let Some(stream) = (unsafe { ComRef::<Steinberg::IBStream>::from_raw(state) }) else {
+            return Steinberg::kInvalidArgument;
+        };
+        let bits = self.gain_bits.load(Ordering::Relaxed).to_le_bytes();
+        let mut written = 0i32;
+        // SAFETY: the stream is provided by the host per spec; writing 8
+        // bytes through the vtable.
+        let result = unsafe { stream.write(bits.as_ptr().cast_mut().cast(), 8, &mut written) };
+        if result == Steinberg::kResultOk && written == 8 {
+            Steinberg::kResultOk
+        } else {
+            Steinberg::kResultFalse
+        }
     }
 }
 
@@ -477,6 +520,37 @@ impl IAudioProcessorTrait for SineComponent {
                 }
             }
 
+            // Consume host parameter changes (id 1 = normalized gain; the
+            // last point in the queue wins).
+            if !data.inputParameterChanges.is_null() {
+                if let Some(changes) =
+                    ComRef::<Vst::IParameterChanges>::from_raw(data.inputParameterChanges)
+                {
+                    let queues = changes.getParameterCount();
+                    for queue_index in 0..queues {
+                        let Some(queue) = ComRef::<Vst::IParamValueQueue>::from_raw(
+                            changes.getParameterData(queue_index),
+                        ) else {
+                            continue;
+                        };
+                        if queue.getParameterId() != 1 {
+                            continue;
+                        }
+                        let points = queue.getPointCount();
+                        if points <= 0 {
+                            continue;
+                        }
+                        let mut offset = 0i32;
+                        let mut value = 0f64;
+                        if queue.getPoint(points - 1, &mut offset, &mut value)
+                            == Steinberg::kResultOk
+                        {
+                            self.gain_bits.store(value.to_bits(), Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+
             if !self.note_on.load(Ordering::Relaxed) || channels == 0 {
                 for channel in 0..channels {
                     let base = *bus.__field0.channelBuffers32.add(channel);
@@ -488,10 +562,11 @@ impl IAudioProcessorTrait for SineComponent {
             }
 
             let velocity = f32_bits_cell(&self.velocity_bits);
+            let gain = f64::from_bits(self.gain_bits.load(Ordering::Relaxed)) as f32;
             let step = std::f32::consts::TAU * SINE_FREQ_HZ / SAMPLE_RATE;
             let mut phase = f32_bits_cell(&self.phase_bits);
             for sample in 0..frames {
-                let value = phase.sin() * velocity;
+                let value = phase.sin() * velocity * gain;
                 phase += step;
                 if phase >= std::f32::consts::TAU {
                     phase -= std::f32::consts::TAU;
@@ -752,8 +827,21 @@ impl IConnectionPointTrait for GainEffectComponent {
 // Controller (IEditController, dumb implementation)
 // ---------------------------------------------------------------------------
 
-/// Zero-parameter dumb controller.
-struct SineController;
+/// Dumb controller mirroring the component's Gain parameter (id 1): keeps a
+/// normalized value cell updated through `setComponentState` (the state
+/// load sync) and `setParamNormalized`, read back by the host via
+/// `getParamNormalized` (the D6 slider-refresh vehicle, spec S5).
+struct SineController {
+    gain_bits: AtomicU64,
+}
+
+impl SineController {
+    fn new() -> Self {
+        Self {
+            gain_bits: AtomicU64::new(DEFAULT_GAIN_BITS),
+        }
+    }
+}
 
 impl Class for SineController {
     type Interfaces = (
@@ -774,8 +862,25 @@ impl IPluginBaseTrait for SineController {
 }
 
 impl IEditControllerTrait for SineController {
-    unsafe fn setComponentState(&self, _state: *mut Steinberg::IBStream) -> Steinberg::tresult {
-        Steinberg::kResultOk
+    unsafe fn setComponentState(&self, state: *mut Steinberg::IBStream) -> Steinberg::tresult {
+        // Mirrors the component state blob (8-byte LE f64 normalized gain).
+        // SAFETY: the stream pointer is provided by the host per spec and
+        // stays valid for the duration of the call.
+        let Some(stream) = (unsafe { ComRef::<Steinberg::IBStream>::from_raw(state) }) else {
+            return Steinberg::kInvalidArgument;
+        };
+        let mut bits = [0u8; 8];
+        let mut read = 0i32;
+        // SAFETY: the stream is provided by the host per spec; the byte
+        // buffer is writable for 8 elements.
+        let result = unsafe { stream.read(bits.as_mut_ptr().cast(), 8, &mut read) };
+        if result == Steinberg::kResultOk && read == 8 {
+            self.gain_bits
+                .store(u64::from_le_bytes(bits), Ordering::Relaxed);
+            Steinberg::kResultOk
+        } else {
+            Steinberg::kResultFalse
+        }
     }
 
     unsafe fn setState(&self, _state: *mut Steinberg::IBStream) -> Steinberg::tresult {
@@ -849,16 +954,24 @@ impl IEditControllerTrait for SineController {
         plainValue
     }
 
-    unsafe fn getParamNormalized(&self, _id: Vst::ParamID) -> Vst::ParamValue {
-        0.0
+    unsafe fn getParamNormalized(&self, id: Vst::ParamID) -> Vst::ParamValue {
+        if id == 1 {
+            f64::from_bits(self.gain_bits.load(Ordering::Relaxed))
+        } else {
+            0.0
+        }
     }
 
     unsafe fn setParamNormalized(
         &self,
-        _id: Vst::ParamID,
-        _value: Vst::ParamValue,
+        id: Vst::ParamID,
+        value: Vst::ParamValue,
     ) -> Steinberg::tresult {
-        Steinberg::kResultOk
+        if id == 1 {
+            self.gain_bits.store(value.to_bits(), Ordering::Relaxed);
+            return Steinberg::kResultTrue;
+        }
+        Steinberg::kInvalidArgument
     }
 
     unsafe fn setComponentHandler(

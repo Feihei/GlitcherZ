@@ -372,6 +372,151 @@ impl Vst::IParameterChangesTrait for HostParamChanges {
 }
 
 // ---------------------------------------------------------------------------
+// Memory stream (plugin-state carrier)
+// ---------------------------------------------------------------------------
+
+/// Internal data of the host-side memory stream.
+struct MemoryStreamData {
+    bytes: Vec<u8>,
+    pos: usize,
+}
+
+/// Host-side `IBStream` memory-stream implementation: the carrier for
+/// `getState`/`setState` (the plugin writes into / reads from it through the
+/// COM vtable; the host pre-fills it for loads and reads it out after saves
+/// via direct Rust access).
+///
+/// Unlike the audio-path objects above, this stream is **control-thread
+/// only** (state capture/restore are non-realtime paths); `UnsafeCell`
+/// interior mutability follows the COM `&self` convention, with all access
+/// serialized on the control thread.
+pub(crate) struct HostMemoryStream {
+    data: std::cell::UnsafeCell<MemoryStreamData>,
+}
+
+// SAFETY: Same serial-access contract as the objects above, but scoped to
+// the control thread: construction, COM calls (getState/setState), and
+// direct fills/reads never overlap.
+unsafe impl Send for HostMemoryStream {}
+unsafe impl Sync for HostMemoryStream {}
+
+impl HostMemoryStream {
+    /// Empty writable stream (the save-path carrier: the plugin writes its
+    /// state in via `IBStream::write`).
+    pub(crate) fn new() -> Self {
+        Self {
+            data: std::cell::UnsafeCell::new(MemoryStreamData {
+                bytes: Vec::new(),
+                pos: 0,
+            }),
+        }
+    }
+
+    /// Read-only stream preloaded with a state blob (the load-path carrier:
+    /// the plugin reads the state out via `IBStream::read`).
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self {
+            data: std::cell::UnsafeCell::new(MemoryStreamData { bytes, pos: 0 }),
+        }
+    }
+
+    /// Takes the bytes written by the plugin (save path; control thread).
+    pub(crate) fn take_bytes(&self) -> Vec<u8> {
+        // SAFETY: control-thread serial access.
+        unsafe { std::mem::take(&mut (*self.data.get()).bytes) }
+    }
+}
+
+impl Class for HostMemoryStream {
+    type Interfaces = (Steinberg::IBStream,);
+}
+
+impl Steinberg::IBStreamTrait for HostMemoryStream {
+    unsafe fn read(
+        &self,
+        buffer: *mut std::ffi::c_void,
+        num_bytes: i32,
+        num_bytes_read: *mut i32,
+    ) -> Steinberg::tresult {
+        if buffer.is_null() || num_bytes_read.is_null() || num_bytes < 0 {
+            return Steinberg::kInvalidArgument;
+        }
+        // SAFETY: control-thread serial access; `buffer` is provided by the
+        // plugin per spec (writable for num_bytes).
+        unsafe {
+            let data = &mut *self.data.get();
+            let pos = data.pos.min(data.bytes.len());
+            let count = (num_bytes as usize).min(data.bytes.len() - pos);
+            if count > 0 {
+                ptr::copy_nonoverlapping(data.bytes.as_ptr().add(pos), buffer.cast::<u8>(), count);
+            }
+            data.pos = pos + count;
+            *num_bytes_read = count as i32;
+        }
+        Steinberg::kResultOk
+    }
+
+    unsafe fn write(
+        &self,
+        buffer: *mut std::ffi::c_void,
+        num_bytes: i32,
+        num_bytes_written: *mut i32,
+    ) -> Steinberg::tresult {
+        if buffer.is_null() || num_bytes_written.is_null() || num_bytes < 0 {
+            return Steinberg::kInvalidArgument;
+        }
+        // SAFETY: control-thread serial access; `buffer` is provided by the
+        // plugin per spec (readable for num_bytes).
+        unsafe {
+            let data = &mut *self.data.get();
+            let pos = data.pos.min(data.bytes.len());
+            let count = num_bytes as usize;
+            // Overwrite in place within the existing length; append (and
+            // zero-fill a hypothetical seek gap) beyond it.
+            if data.bytes.len() < pos + count {
+                data.bytes.resize(pos + count, 0);
+            }
+            ptr::copy_nonoverlapping(buffer.cast::<u8>(), data.bytes.as_mut_ptr().add(pos), count);
+            data.pos = pos + count;
+            *num_bytes_written = num_bytes;
+        }
+        Steinberg::kResultOk
+    }
+
+    unsafe fn seek(&self, pos: i64, mode: i32, result: *mut i64) -> Steinberg::tresult {
+        // SAFETY: control-thread serial access; `result` is host-provided
+        // (may be null per spec).
+        unsafe {
+            let data = &mut *self.data.get();
+            let len = data.bytes.len() as i64;
+            let target = match mode {
+                Steinberg::IBStream_::IStreamSeekMode_::kIBSeekSet => pos,
+                Steinberg::IBStream_::IStreamSeekMode_::kIBSeekCur => data.pos as i64 + pos,
+                Steinberg::IBStream_::IStreamSeekMode_::kIBSeekEnd => len + pos,
+                _ => return Steinberg::kInvalidArgument,
+            };
+            data.pos = target.clamp(0, len) as usize;
+            if !result.is_null() {
+                *result = data.pos as i64;
+            }
+        }
+        Steinberg::kResultOk
+    }
+
+    unsafe fn tell(&self, pos: *mut i64) -> Steinberg::tresult {
+        if pos.is_null() {
+            return Steinberg::kInvalidArgument;
+        }
+        // SAFETY: control-thread serial access; output pointer provided by
+        // the plugin per spec.
+        unsafe {
+            *pos = (*self.data.get()).pos as i64;
+        }
+        Steinberg::kResultOk
+    }
+}
+
+// ---------------------------------------------------------------------------
 // No-op component handler
 // ---------------------------------------------------------------------------
 
