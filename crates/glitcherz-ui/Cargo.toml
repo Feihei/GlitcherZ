@@ -1,0 +1,24 @@
+[package]
+name = "glitcherz-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GlitcherZ egui UI: transport, sequencer, piano roll, mixer"
+
+[dependencies]
+# On Windows, wgpu/Vulkan initialization can hang on a stale injection layer
+# (e.g. RenderDoc); glow (OpenGL) is lighter and starts faster, so it is the
+# default render backend.
+# (eframe in the workspace is default-features = false + default_fonts.)
+# persistence: eframe built-in storage (RON), used to persist the recent-files list
+eframe = { workspace = true, features = ["glow", "persistence"] }
+log = { workspace = true }
+rfd = { workspace = true }
+glitcherz-clap-host = { workspace = true }
+glitcherz-vst3-host = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+glitcherz-engine = { workspace = true }
+glitcherz-model = { workspace = true }
+glitcherz-command = { workspace = true }

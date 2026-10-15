@@ -1,4 +1,4 @@
-# 架构约定 — ResoZ
+# 架构约定 — GlitcherZ
 
 > 从 AGENTS.md 拆出（2026-10-07）。本文件记录稳定的架构层约定；实现细节见 `implementation.md`，计划见 `plan.md`。
 
@@ -11,7 +11,7 @@ UI 线程 (egui)                音频线程 (cpal callback)
      │ ◄──◄─── state snapshot (原子/队列) ───┤
 ```
 
-- **UI 线程**：每秒 60 帧，负责绘制、用户交互、项目编辑。持有 `resoz-model` 的可变状态。
+- **UI 线程**：每秒 60 帧，负责绘制、用户交互、项目编辑。持有 `glitcherz-model` 的可变状态。
 - **音频线程**：`cpal` 回调，只从预分配的处理图读取，消费控制消息队列。
 - **参数更新**：所有影响音频的参数（增益、音符、效果器开关）通过**无锁命令队列**传递，音频线程在块边界（block boundary）消费。
 - **状态回传**：音频电平表、播放位置等用 `AtomicF32` / `AtomicU64` 回传给 UI。
@@ -26,6 +26,6 @@ UI 线程 (egui)                音频线程 (cpal callback)
 
 ## 数据模型
 
-- `resoz-model` 中的所有类型必须 `Serialize + Deserialize`（RON 格式），保证项目文件向前兼容（新增字段用 `#[serde(default)]`）。
+- `glitcherz-model` 中的所有类型必须 `Serialize + Deserialize`（RON 格式），保证项目文件向前兼容（新增字段用 `#[serde(default)]`）。
 - 模型与实时引擎解耦：模型是"文档"，引擎是"播放器"，编译期互不依赖对方的内部类型。
 - 引擎侧实时镜像类型必须 `Copy` + 定容（超容截断），经命令整块下发。

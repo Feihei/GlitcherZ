@@ -1,0 +1,16 @@
+[package]
+name = "glitcherz-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GlitcherZ DAW application entry point"
+
+[[bin]]
+name = "glitcherz"
+path = "src/main.rs"
+
+[dependencies]
+glitcherz-engine = { workspace = true }
+glitcherz-ui = { workspace = true }
+env_logger = { workspace = true }

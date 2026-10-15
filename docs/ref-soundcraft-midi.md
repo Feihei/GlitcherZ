@@ -343,9 +343,9 @@ let k = 0.45 + 0.55 * f32::from(n.velocity) / 127.0;   // 亮度 = 力度
 2. `Note.velocity`: `f32` → `u8`；`start/length`: `u32` → `i64`；加 `channel`
 3. `Sequence { notes, ctrls }` 替代裸 `Vec<Note>`
 4. `sort()` 不变量 + `remove_duplicates()`
-5. `crates/resoz-command` 新 crate：命令注册表 + `execute`（panic 捕获 + 回滚）+ `execute_merged`
+5. `crates/glitcherz-command` 新 crate：命令注册表 + `execute`（panic 捕获 + 回滚）+ `execute_merged`
 
-> ⚠️ 这一步动的是 `resoz-model` 和 `resoz-engine`，`sequencer.rs`（898 行）和 `piano_roll.rs` 都要跟着改。建议单独一个 commit，标注 breaking change。
+> ⚠️ 这一步动的是 `glitcherz-model` 和 `glitcherz-engine`，`sequencer.rs`（898 行）和 `piano_roll.rs` 都要跟着改。建议单独一个 commit，标注 breaking change。
 
 ### 第二步：编辑能力
 

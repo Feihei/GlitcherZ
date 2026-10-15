@@ -1,15 +1,15 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/resoz-model",
-    "crates/resoz-command",
-    "crates/resoz-engine",
-    "crates/resoz-ui",
-    "crates/resoz-app",
-    "crates/resoz-test-plugin",
-    "crates/resoz-test-vst3",
-    "crates/resoz-clap-host",
-    "crates/resoz-vst3-host",
+    "crates/glitcherz-model",
+    "crates/glitcherz-command",
+    "crates/glitcherz-engine",
+    "crates/glitcherz-ui",
+    "crates/glitcherz-app",
+    "crates/glitcherz-test-plugin",
+    "crates/glitcherz-test-vst3",
+    "crates/glitcherz-clap-host",
+    "crates/glitcherz-vst3-host",
 ]
 
 [workspace.package]
@@ -23,7 +23,7 @@ license = "MIT OR Apache-2.0"
 cpal = "0.18"
 # 原生文件对话框（保存/打开项目）
 rfd = "0.17"
-# GUI（egui 框架）。默认关闭全部 feature；渲染后端由 resoz-ui 选择 glow。
+# GUI（egui 框架）。默认关闭全部 feature；渲染后端由 glitcherz-ui 选择 glow。
 eframe = { version = "0.36", default-features = false, features = ["default_fonts"] }
 # 实时无锁队列（UI → 音频线程）
 rtrb = "0.4"
@@ -52,12 +52,12 @@ libloading = "0.8"
 vst3 = "0.3"
 
 clack-plugin = "0.2"
-resoz-model = { path = "crates/resoz-model" }
-resoz-command = { path = "crates/resoz-command" }
-resoz-clap-host = { path = "crates/resoz-clap-host" }
-resoz-vst3-host = { path = "crates/resoz-vst3-host" }
-resoz-engine = { path = "crates/resoz-engine" }
-resoz-ui = { path = "crates/resoz-ui" }
+glitcherz-model = { path = "crates/glitcherz-model" }
+glitcherz-command = { path = "crates/glitcherz-command" }
+glitcherz-clap-host = { path = "crates/glitcherz-clap-host" }
+glitcherz-vst3-host = { path = "crates/glitcherz-vst3-host" }
+glitcherz-engine = { path = "crates/glitcherz-engine" }
+glitcherz-ui = { path = "crates/glitcherz-ui" }
 
 [profile.release]
 lto = "thin"

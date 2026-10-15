@@ -1,0 +1,14 @@
+[package]
+name = "glitcherz-vst3-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GlitcherZ VST3 plugin host adapter: scanning, instantiation, and realtime node bridging"
+
+[dependencies]
+vst3 = { workspace = true }
+libloading = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+glitcherz-engine = { workspace = true }

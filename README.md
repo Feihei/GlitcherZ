@@ -1,8 +1,8 @@
-# ResoZ
+# GlitcherZ
 
 [中文说明见下方](#中文)
 
-**ResoZ** is a free, open-source digital audio workstation (DAW) for Windows, macOS and Linux, inspired by the workflow of LMMS.
+**GlitcherZ** is a free, open-source digital audio workstation (DAW) for Windows, macOS and Linux, inspired by the workflow of LMMS.
 
 Make music entirely on your computer: compose melodies, arrange beats, mix tracks, and shape your sound — all in one app.
 
@@ -20,9 +20,9 @@ Make music entirely on your computer: compose melodies, arrange beats, mix track
 
 ## 中文
 
-[English version above](#resoz)
+[English version above](#glitcherz)
 
-**ResoZ** 是一款免费、开源的数字音频工作站（DAW），支持 Windows / macOS / Linux，工作流参考 LMMS。
+**GlitcherZ** 是一款免费、开源的数字音频工作站（DAW），支持 Windows / macOS / Linux，工作流参考 LMMS。
 
 无需任何外部设备，在你的电脑上就能完成编曲、配器、混音全流程。
 

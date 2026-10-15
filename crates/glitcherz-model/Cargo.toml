@@ -1,0 +1,12 @@
+[package]
+name = "glitcherz-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GlitcherZ data model: tracks, clips, automation, and the project file"
+
+[dependencies]
+ron = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "glitcherz-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GlitcherZ audio engine: processing graph, scheduling, synthesizer and effects"
+
+[dependencies]
+cpal = { workspace = true }
+rtrb = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }

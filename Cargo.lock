@@ -984,6 +984,101 @@ dependencies = [
 ]
 
 [[package]]
+name = "glitcherz-app"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "glitcherz-engine",
+ "glitcherz-ui",
+]
+
+[[package]]
+name = "glitcherz-clap-host"
+version = "0.1.0"
+dependencies = [
+ "clack-common",
+ "clack-extensions",
+ "clack-host",
+ "clap-sys",
+ "glitcherz-engine",
+ "log",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "glitcherz-command"
+version = "0.1.0"
+dependencies = [
+ "glitcherz-model",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "glitcherz-engine"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "log",
+ "rtrb",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "glitcherz-model"
+version = "0.1.0"
+dependencies = [
+ "ron",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "glitcherz-test-plugin"
+version = "0.1.0"
+dependencies = [
+ "clack-common",
+ "clack-extensions",
+ "clack-plugin",
+]
+
+[[package]]
+name = "glitcherz-test-vst3"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "vst3",
+]
+
+[[package]]
+name = "glitcherz-ui"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "glitcherz-clap-host",
+ "glitcherz-command",
+ "glitcherz-engine",
+ "glitcherz-model",
+ "glitcherz-vst3-host",
+ "log",
+ "rfd",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "glitcherz-vst3-host"
+version = "0.1.0"
+dependencies = [
+ "glitcherz-engine",
+ "libloading",
+ "log",
+ "thiserror 2.0.21",
+ "vst3",
+]
+
+[[package]]
 name = "glow"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2098,101 +2193,6 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
-
-[[package]]
-name = "resoz-app"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "resoz-engine",
- "resoz-ui",
-]
-
-[[package]]
-name = "resoz-clap-host"
-version = "0.1.0"
-dependencies = [
- "clack-common",
- "clack-extensions",
- "clack-host",
- "clap-sys",
- "log",
- "resoz-engine",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "resoz-command"
-version = "0.1.0"
-dependencies = [
- "resoz-model",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "resoz-engine"
-version = "0.1.0"
-dependencies = [
- "cpal",
- "log",
- "rtrb",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "resoz-model"
-version = "0.1.0"
-dependencies = [
- "ron",
- "serde",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "resoz-test-plugin"
-version = "0.1.0"
-dependencies = [
- "clack-common",
- "clack-extensions",
- "clack-plugin",
-]
-
-[[package]]
-name = "resoz-test-vst3"
-version = "0.1.0"
-dependencies = [
- "log",
- "vst3",
-]
-
-[[package]]
-name = "resoz-ui"
-version = "0.1.0"
-dependencies = [
- "eframe",
- "log",
- "resoz-clap-host",
- "resoz-command",
- "resoz-engine",
- "resoz-model",
- "resoz-vst3-host",
- "rfd",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "resoz-vst3-host"
-version = "0.1.0"
-dependencies = [
- "libloading",
- "log",
- "resoz-engine",
- "thiserror 2.0.21",
- "vst3",
-]
 
 [[package]]
 name = "rfd"

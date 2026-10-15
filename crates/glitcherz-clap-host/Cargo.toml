@@ -1,0 +1,16 @@
+[package]
+name = "glitcherz-clap-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GlitcherZ CLAP plugin host adaptation layer: scanning, instantiation and real-time node bridging"
+
+[dependencies]
+clack-host = { workspace = true }
+clack-common = { workspace = true }
+clack-extensions = { workspace = true }
+clap-sys = "0.5"
+log = { workspace = true }
+thiserror = { workspace = true }
+glitcherz-engine = { workspace = true }

@@ -1,6 +1,6 @@
 ---
 title: "模块节点图架构"
-summary: "ResoZ 引擎演进：可自由布线的处理图 + 时间轴信号源（Cardinal/PureData 式布线，乐队现场隐喻）"
+summary: "GlitcherZ 引擎演进：可自由布线的处理图 + 时间轴信号源（Cardinal/PureData 式布线，乐队现场隐喻）"
 status: 已评审定稿（2026-10-07 拷问式 Q&A 两轮）；v2 修订（2026-10-09 D14–D21 单输入 + Mixer 语义）评审通过
 related: [../plan.md, ../architecture.md]
 ---
@@ -56,7 +56,7 @@ related: [../plan.md, ../architecture.md]
 
 约束（D14/D15/D17）：非 mixer 节点 ≤1 条音频入边、mixer ≤32 且 `in_port` 唯一，compile 期校验拒绝；节点总出边不设限（一条输出可拉多根线，读同一缓冲）。定容调整：`MAX_IN_EDGES` 8→32（仅 mixer 用得到）、`MAX_CABLES` 128→256（一个 32 通道 mixer 即占 32 条线）。最大并发音频缓冲不变（64 × 2ch × 128 × 4B = 64 KB）。混合开销：32 通道 mixer 每块 32 × 128 × 2 ≈ 8K 次 FMA ≈ 8µs，48kHz 下 <0.5% 单核，可忽略。
 
-## 4. 引擎侧数据结构（`resoz-engine::realtime::graph`，新模块）
+## 4. 引擎侧数据结构（`glitcherz-engine::realtime::graph`，新模块）
 
 ```rust
 pub const MAX_NODES: usize = 64;
@@ -123,7 +123,7 @@ pub struct RtGraph {
 - 自动化轨道自带 `loop_ticks`（默认一小节，384 tick），与 MIDI 轨道的循环解耦（现 `Track.automations` 随源循环的语义废止）；
 - Sequencer 内核（纯窗口扫描、采样时钟、BPM 语义）**零改动**，只把投递目标从 `track: usize` 换成查 MIDI 连线表。
 
-## 7. Model v2（`resoz-model`，D8）
+## 7. Model v2（`glitcherz-model`，D8）
 
 ```rust
 pub struct Project {                       // v2，PROJECT_VERSION = 2
@@ -184,10 +184,10 @@ pub struct CableDoc {
 - [x] **P1+P2 图核心 + 替换 Mixer**：`graph` 模块（NodeSlot/ExecPlan/RtGraph/求和遍历/事件槽）+ `SetGraph` 结构协议 + 差异回收 + ChannelStrip/主输出真节点；**一步替换 `[TrackStrip; 4]`**。验收：现 Mixer 全部数学测试以"默认图（复刻旧拓扑）"形式通过；新增图专项测试（多入边求和、悬空执行、播放中换图、回收计数、有环拒绝）。✅ 2026-10-08
 - [x] **P3 时间轴入图**：时间轴节点 + MIDI 连线表投递 + 自动化轨道（无目标曲线）+ Automation 连线投递。验收：现有音序/自动化端到端测试经连线路径通过。✅ 2026-10-08 —— 落地为 `ExecPlan::midi_targets`（每 MIDI 轨扇出 ≤4）+ `ExecPlan::auto_routes`（终点 = (槽位, 参数)，编译期经 `route_slot` 由 `(track, param)` 解析）；`RtAutomation` 退化为纯锚点，新增 `RtAutoTrack{loop_ticks=384, curve}` 独立实体；`GraphCompiler::connect_midi/disconnect_midi/set_auto_route/clear_auto_route`；结构队列扩容 8→64（项目加载一次性下发全部连线）。
 - [x] **P4 model v2**：`Project` v2 + 保存/加载 + `node_id` 稳定性（编辑会话内单调，不跨文件持久复用）。验收：往返保存加载图结构无损。✅ 2026-10-08 —— **过渡形态落地**（完整 §7 形态随 P5 `node_id` 端口重构展开）：`PROJECT_VERSION = 2`，不做 v1 读路径（Q5；serde 字段级默认值自然容忍缺失字段）；`Project.graph: GraphDoc` 只序列化当下不可推导的图状态（`midi_links` 跨轨扇出，上限 16，加载期校验越界/自连/超容**报错不截断**）；自动化连线终点 `(track, param)` 可由曲线推导，不重复存储；`Automation::loop_ticks` 显式携带（默认一小节），泳道显示口径同步回写文档。`node_id` 已是会话内单调、不持久化，无需改动。
-- [x] **P5a CLAP 参数枚举**（自动化线的参数端前置项）：`ClapInstance::list_params()` 经 clack 0.2 `raw_instance()` vtable 直调实现（`PluginParams` 包装无读取方法，`resoz-clap-host/src/raw.rs` 为唯一 unsafe 边界）；UI 自动化选择器合并 CLAP/VST3 参数列表；测试插件补 `Amplitude` 参数端到端验证。✅ 2026-10-08
+- [x] **P5a CLAP 参数枚举**（自动化线的参数端前置项）：`ClapInstance::list_params()` 经 clack 0.2 `raw_instance()` vtable 直调实现（`PluginParams` 包装无读取方法，`glitcherz-clap-host/src/raw.rs` 为唯一 unsafe 边界）；UI 自动化选择器合并 CLAP/VST3 参数列表；测试插件补 `Amplitude` 参数端到端验证。✅ 2026-10-08
 - [x] **P5b 引擎寻址层（node_id 端口 + 轨道定容 16）**：① `ExecPlan` 增 slot→node_id 表与 id→slot 解析，`RtGraph`/引擎公开 API 从轨道坐标升为 node_id 寻址；② 自动化连线终点与 MIDI 扇出目标显式 node_id 化（取代 `route_slot` 按参数种类猜终点的过渡语义）；③ 编译器出边单值 `out_edge` → 定容 cable 列表（§3"出边不设限"落地：一个输出口拉多根线；快照回滚的全 Copy 约束保持）；④ `NUM_TRACKS = 4` → `MAX_MIDI_TRACKS = 16` 定容 + 活跃轨数控制侧下发（D12：音序器 patterns/clips/pending_offs、路由表、电平表全跟进）。UI 仅最小跟进（现有面板继续工作，内部改走 node_id）。验收：默认拓扑下现有测试全绿；新增 node_id 寻址、多出边扇出、动态轨数专项测试。✅ 2026-10-08 —— `set_node_param` / `set_auto_route(auto_index, node_id, param)` / `connect_midi_node`；cable 列表上限 128（去重、多出边扇出）；`add_midi_track`/`remove_midi_track` 运行期增拆轨；修复 `insert_effect` 漏 occupied 标记与 `clear_effects` 悬空入边导致的 Kahn 误报 Cycle。
 - [x] **P5c 模型完整形态（GraphDoc v2 终态）**：`GraphDoc{nodes: Vec<NodeDoc>, cables: Vec<CableDoc>}`（`NodeDoc::{Instrument, Effect, ChannelStrip}` 携带 node_id 与参数，D11 持久化；`CableDoc{kind, from: PortRef, to: PortRef}`，Timeline/Master 以保留身份寻址）；`Track` 拆 `MidiTrack`（音符面）+ 节点文档（voice → Instrument、gain/pan/mute → ChannelStrip、delay → Effect）；`automation_tracks: Vec<AutomationTrack>` 顶层化（D12）；加载器**纯按文档重建**引擎图（D13 全显式，`default_graph` 退役为新建项目初始文档生成器）；UI 面板改 Vec 遍历与节点寻址。验收：往返无损；默认项目文档可完整重建默认图（逐步建图 API：add_node/connect 粒度）。✅ 2026-10-08 —— `PROJECT_VERSION = 3`；`PortRef::{Node, Master, MidiTrack, AutoTrack}`，`MASTER_NODE_ID = 1`（文档节点从 2 起）；引擎新增 `empty_graph`（仅主输出）+ 文档建图 API `add_node`/`register_track_chain`/`connect_nodes`/`replace_node`（保 id 原位换装）/`insert_node_between`/`remove_node`（**旁路语义**：入边源×出边目标重新直连，效果器移除即旁通）；结构队列 64→256（最坏 64 节点 + 128 连线）。**双身份约定**（P5d 画布须知）：文档 node_id 是持久化身份，引擎侧身份为会话内单调 `fresh_node_id`，UI 持 doc→engine 映射（`node_map`）——会话内不复用已回收 id，插件守卫配对无歧义（被换下守卫入退役区，回收回执到达后释放）。UI 重构：`Track` 拆分后全部面板改走 `midi_tracks` Vec + 图节点字段（synth/delay/mixer 三类数据源），自动化区改自动化轨道列表（新增/删除/选终点），`lane::show` 增 `param` 参数（轴映射来自连线终点）。
-- [x] **P5d UI 节点画布**：egui 自绘（平移/缩放/拉线/类型着色/删除联动），现有混音器面板逐步让位。前置依赖：P5b 寻址层 + P5a 参数枚举（均就绪后画布只需面对 node_id + cables 数据模型）。✅ 2026-10-08 —— `resoz-ui/src/canvas.rs`：画布只做视图 + 交互意图（`CanvasAction` 枚举返回，`ResoZApp::apply_canvas_actions` 统一落文档 + 引擎，画布不触碰引擎/守卫）；平移（拖背景）+ 缩放（Ctrl+滚轮/按钮，指针锚定）；类型着色（乐器/效果器/通道条/主输出/MIDI 源/自动化源）；连线贝塞尔分色绘制 + 自动化线标注终点参数；拉线经端口类型规则校验（音频→效果器/通道条/主输出、MIDI→乐器、自动化→乐器/通道条），自动化拉线弹参数菜单（复用 CLAP/VST3 参数枚举）；Delete 删除连线与效果器节点（引擎旁路语义，文档镜像直连对）；点节点联动主编辑轨道。节点位置会话内存（轨道链自动布点 + 拖拽），不持久化。
+- [x] **P5d UI 节点画布**：egui 自绘（平移/缩放/拉线/类型着色/删除联动），现有混音器面板逐步让位。前置依赖：P5b 寻址层 + P5a 参数枚举（均就绪后画布只需面对 node_id + cables 数据模型）。✅ 2026-10-08 —— `glitcherz-ui/src/canvas.rs`：画布只做视图 + 交互意图（`CanvasAction` 枚举返回，`GlitcherZApp::apply_canvas_actions` 统一落文档 + 引擎，画布不触碰引擎/守卫）；平移（拖背景）+ 缩放（Ctrl+滚轮/按钮，指针锚定）；类型着色（乐器/效果器/通道条/主输出/MIDI 源/自动化源）；连线贝塞尔分色绘制 + 自动化线标注终点参数；拉线经端口类型规则校验（音频→效果器/通道条/主输出、MIDI→乐器、自动化→乐器/通道条），自动化拉线弹参数菜单（复用 CLAP/VST3 参数枚举）；Delete 删除连线与效果器节点（引擎旁路语义，文档镜像直连对）；点节点联动主编辑轨道。节点位置会话内存（轨道链自动布点 + 拖拽），不持久化。
 - [ ] **P5f 单输入语义 + Mixer 节点（D14–D21，2026-10-09 spec v2 修订，评审已定）**：
   - ① 引擎：`MixerProcessor`（通道状态表 [MixerChannel; 32] + 输出 pan/mute；覆写 `input_weights()` 返回按通道状态算出的 L/R 权重表，求和循环逐边乘权，D20）+ `Processor` trait 增默认实现方法（插件零改动）+ compile 按节点类型校验入边（非 mixer ≤1、mixer ≤32 且 in_port 唯一）+ 常量扩容（`MAX_IN_EDGES` 32 / `MAX_CABLES` 256）+ 旁路语义修订（D19：≤1 入边才旁路，mixer/master 删除即弃线）+ `ParamId::{MixerGain(u8), MixerPan(u8), MixerMute(u8), MixerSolo(u8), MixerOutPan, MixerOutMute}`（手动控制先行，自动化后续）；
   - ② model v4：`NodeDoc::Mixer { channels: Vec<MixerChannel{gain,pan,muted,solo}>, pan, muted }` 替代 ChannelStrip、`CableDoc.in_port`、`default_graph_doc` 改全局 mixer 拓扑（D18：每轨 `声源→延迟→mixer.in[i]`，mixer→master）、加载校验（§7）+ v3 自动迁移（Q-B 决议）；

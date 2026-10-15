@@ -1,0 +1,16 @@
+[package]
+name = "glitcherz-test-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GlitcherZ test CLAP sine instrument plugin"
+
+[lib]
+# CLAP plugins = cdylib dynamic libraries
+crate-type = ["cdylib"]
+
+[dependencies]
+clack-plugin = { workspace = true }
+clack-common = { workspace = true }
+clack-extensions = { workspace = true, features = ["clack-plugin"] }

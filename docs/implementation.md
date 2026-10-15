@@ -1,4 +1,4 @@
-# 实现细节 — ResoZ
+# 实现细节 — GlitcherZ
 
 > 记录已落地模块的实现要点、协议细节与版本 gotchas。新增模块落地后在此追加条目。
 
@@ -13,7 +13,7 @@
 - **结构队列扩容 8 → 64**：项目加载一次性下发最多 16 条自动化连线 + 每轨声源恢复，原容量会静默丢连线。
 - Sequencer 内核零改动（`advance` 回调签名不变）；现有音序/自动化端到端测试全部经连线路径通过。
 
-### CLAP 宿主（`resoz-clap-host`）
+### CLAP 宿主（`glitcherz-clap-host`）
 
 - **参数枚举**：`ClapInstance::list_params()` → `raw::enumerate_params`——直接经 `clap_plugin.get_extension` 取 `clap_plugin_params` vtable 指针直调（clack 0.2 的 `PluginParams` 包装无读取方法，raw 模块为唯一 unsafe 边界）；返回 `ClapParamInfo{id, name, module, min/max/default}`。测试插件实现一个可自动化 Amplitude 参数（ID 1，0..1，默认 0.5，f64 位模式原子共享），参数事件驱动渲染振幅。
 - **UI 接入**：`clap_voice_params`（轨道 → 参数快照）在装填 CLAP 声源时填入；参数面板 CollapsingHeader 内滑块直接调参（2026-10-15：当前值存 `clap_voice_values`（UI 会话内，track → param id → f64），变更经 `send_track_param(ParamId::PluginParam)` 下发，块粒度下一 process 生效；重载插件/切回内置/文档重应用时重置为插件默认值；不持久化——待 state 扩展）；自动化目标选择器合并 CLAP（曲线值 = 插件值域原始值）与 VST3（曲线值 = 归一化 0..1）两份列表。
@@ -29,7 +29,7 @@
 - **行为变化**：`set_builtin_voice` 现在回收外部插件节点（旧实现驻留），切回插件需重新实例化（状态不保留）；UI 守卫经回收 `node_id` 正常配对释放。
 - `mixer.rs` 已删除；`MixerLevels` → `GraphLevels`；`VoiceUpdate` → `GraphUpdate`。
 
-### 引擎核心（`resoz-engine::realtime`）
+### 引擎核心（`glitcherz-engine::realtime`）
 
 - `AudioBuffer`、`Processor`（`set_param` + `note_event`）、`ProcessorChain`、`BlockRunner`（固定 128 块拆分 + 块边界命令消费 + `Feedback` 原子回传：主电平/位置/步进/走带/**每轨电平**）；
 - **`Mixer`**：4 条 `TrackStrip`（`SynthProcessor → DelayProcessor`）并行处理 + 线性声像/增益/静音求和 → 主链（`MasterGain`）；`MixerLevels` 每块回传各轨 post-fader 峰值；
@@ -46,33 +46,33 @@
 
 ### 自动化（路线图第 8 步）
 
-- `resoz-model` 的 `Automation`（`AutoParam` = 音量/声像/截止 + `AutoPoint{tick,value}` 有序列表，线性插值、两端保持端值）挂 `Track.automations`；
+- `glitcherz-model` 的 `Automation`（`AutoParam` = 音量/声像/截止 + `AutoPoint{tick,value}` 有序列表，线性插值、两端保持端值）挂 `Track.automations`；
 - 引擎侧 `RtAutomation`（定容 64 锚点 Copy）经 `SetAutomation` 命令 upsert（同参替换 / 空槽插入 / 空曲线=删除，每轨 ≤4 条）；
 - 求值器在 `BlockRunner` 每块**仅播放中**按"循环后的音乐位置"（步进源 = 一小节、卷帘源 = 片段 loop_ticks 取模）采样并经混音器内部路径直写参数（不走命令队列）；UI 在走带停止沿重推手动参数实现"停止后回到手动值"；
 - 插件参数桥接端到端（引擎集成测试锁定）：自动化曲线 → `AutoParam::PluginParam{param_id}` → `ParamId::PluginParam` → 求值器 → `TrackStrip`（`PluginParam` 只路由外部声源）→ `ClapNode` → `ParamValueEvent` → 插件生效。
 
-### CLAP 宿主（`resoz-clap-host`，路线图第 9 步）
+### CLAP 宿主（`glitcherz-clap-host`，路线图第 9 步）
 
-- `resoz-test-plugin`（cdylib）：clack-plugin 单音正弦乐器 fixture（`org.resoz.sine`，instrument+stereo 特性），供宿主端到端测试；
-- 宿主 crate（唯一允许 unsafe 的边界 = `raw::load_entry`，模块级 SAFETY 文档 + 无效文件测试）：`clap_search_paths` / `scan_clap_files`（标准目录 + `RESOZ_CLAP_PATH`）/ `list_clap_plugins`（描述枚举 + instrument 特性识别）；`ClapInstance::spawn_rt(path, id, config)` 控制线程加载 → 实例化 → 激活，产出守卫 `ClapInstanceGuard`（持有动态库 + 实例，必须与节点同寿命）+ `ClapNode`；
-- `ClapNode` 实现 `resoz-engine::realtime::Processor`：音符/参数经定容事件槽（`MAX_PENDING_EVENTS=32`）暂存，每块以 `NoteOn/OffEvent` / `ParamValueEvent` 发出（块粒度）；`ParamId::PluginParam(u32)` 已加入参数空间（自动化桥接的落点）；音频经构造期预分配的 `AudioPorts` + 立体声临时缓冲渲染回 `AudioBuffer`；首块自动 `start_processing`，任何失败输出静音（无 panic）；处理用统一 `PluginAudioProcessor`（`as_started_mut`/`start_processing` 运行时切换）；
+- `glitcherz-test-plugin`（cdylib）：clack-plugin 单音正弦乐器 fixture（`org.glitcherz.sine`，instrument+stereo 特性），供宿主端到端测试；
+- 宿主 crate（唯一允许 unsafe 的边界 = `raw::load_entry`，模块级 SAFETY 文档 + 无效文件测试）：`clap_search_paths` / `scan_clap_files`（标准目录 + `GLITCHERZ_CLAP_PATH`）/ `list_clap_plugins`（描述枚举 + instrument 特性识别）；`ClapInstance::spawn_rt(path, id, config)` 控制线程加载 → 实例化 → 激活，产出守卫 `ClapInstanceGuard`（持有动态库 + 实例，必须与节点同寿命）+ `ClapNode`；
+- `ClapNode` 实现 `glitcherz-engine::realtime::Processor`：音符/参数经定容事件槽（`MAX_PENDING_EVENTS=32`）暂存，每块以 `NoteOn/OffEvent` / `ParamValueEvent` 发出（块粒度）；`ParamId::PluginParam(u32)` 已加入参数空间（自动化桥接的落点）；音频经构造期预分配的 `AudioPorts` + 立体声临时缓冲渲染回 `AudioBuffer`；首块自动 `start_processing`，任何失败输出静音（无 panic）；处理用统一 `PluginAudioProcessor`（`as_started_mut`/`start_processing` 运行时切换）；
 - 分层决定：**engine 保持零 CLAP 依赖**——clap-host 依赖 engine（实现其 Processor trait）。
 
-### VST3 宿主（`resoz-vst3-host`）
+### VST3 宿主（`glitcherz-vst3-host`）
 
-- 架构镜像 `resoz-clap-host`：扫描（单文件 / bundle 目录，标准目录 + `RESOZ_VST3_PATH`）→ 非实时线程实例化（IComponent + IEditController + IConnectionPoint 互连 + 总线激活）→ `Vst3Node`；
+- 架构镜像 `glitcherz-clap-host`：扫描（单文件 / bundle 目录，标准目录 + `GLITCHERZ_VST3_PATH`）→ 非实时线程实例化（IComponent + IEditController + IConnectionPoint 互连 + 总线激活）→ `Vst3Node`；
 - **参数语义差异**：VST3 参数以**归一化 0..1** 经 `IParameterChanges` 传递（CLAP 是原始值）——自动化求值器天然桥接，但 UI 层展示插件参数时须经控制器做归一化换算；
 - 乐器渲染到节点内预分配立体声缓冲；效果器自动接通输入通路（引擎缓冲 → 独立输入缓冲 → 插件 → 独立输出缓冲 → 拷回引擎缓冲），kSample32 单精度；
 - 生命周期：`Vst3InstanceGuard` 持有动态库与全部 COM 对象，**必须与 `Vst3Node` 同寿命且晚于其释放**；Node 释放时 `setProcessing(false)`；Guard 释放时 `setActive(false)` + `terminate()` + 断开连接，最后才卸载动态库；
 - 已集成：`VoiceSpec::Vst3{path, class_id}` 进 model 与项目序列化；UI 守卫注册表 + 乐器/效果器懒扫描缓存 + 每轨参数列表。
 
-### 项目文件与模型（`resoz-model`）
+### 项目文件与模型（`glitcherz-model`）
 
 - `Project`（metadata + gate + master_gain + 4×`Track`）；`Track` = 名称 + `Pattern` + `Clip`（`Note{start,length,note,velocity}` 列表 + loop_ticks，tick 基准：`TICKS_PER_QUARTER=96`/步=24/小节=384）+ 音源枚举（`VoiceSpec`: `Builtin | Clap | Vst3`）+ 混音（增益/声像/静音）+ `SynthParams` + `DelayParams`，全部 serde/RON + 字段级 `#[serde(default)]`；引擎侧镜像 `RtClip`（定容 128 音符 `Copy`，超容截断）经 `SetClip` 命令整块下发；
 - `ProjectFile{version: u32, project}`（当前 `PROJECT_VERSION = 1`），`save_project`（RON pretty）/ `load_project` / `parse_project`；解析前用 `ron::Value` 探测顶层结构（含 `project`/`version` 键 → 包装格式，否则回退裸 `Project` 开发期格式——serde 会把裸格式的字段当未知字段"成功"忽略，必须先探测）；
 - 程序化 `Default` 全部手写（派生 Default 会绕过 serde 字段默认值，曾导致 gate/tempo 为 0 的真 bug）。
 
-### UI（`resoz-ui`，eframe 0.36 glow）
+### UI（`glitcherz-ui`，eframe 0.36 glow）
 
 - 📂 打开 / 💾 保存（无路径时转另存为）/ 最近文件菜单（eframe `persistence` feature 存 RON，容量 8）；窗口标题随当前文件更新；状态栏消息（8 秒自动消失）；`Ctrl+S` / `Ctrl+O` 快捷键（优先于演奏键盘映射）；`--open <文件>` 启动加载；
 - 走带 + BPM、**自动化泳道**（`lane` 自绘组件：参数三选 + 启用开关 + 锚点点按/拖拽/右键删除，播放头走线，截止频率对数轴）、**混音器面板**（轨道选择/静音/post-fader 电平条/竖直推子/声像）、16 步网格（播放位置黄色描边）、**钢琴卷帘编辑器**（`piano_roll` 自绘组件：点空白绘制、拖拽移动、右键删除、滚轮滚动音高、播放头走线；fit-to-width 时间轴、1/64 吸附）、画笔音符/音长、滤波器/ADSR/延迟面板（作用于选中轨道）、虚拟键盘（屏幕 + 电脑键盘）、主输出电平表；
@@ -169,12 +169,12 @@
 
 修复（`timeline.rs`）：
 
-- 每行改用 `ui.new_child(UiBuilder::new().layout(Layout::left_to_right(Align::Center)).id(Id::new("resoz_timeline_row").with(row.key())))`，行内 widget 拿到稳定的 id；
+- 每行改用 `ui.new_child(UiBuilder::new().layout(Layout::left_to_right(Align::Center)).id(Id::new("glitcherz_timeline_row").with(row.key())))`，行内 widget 拿到稳定的 id；
 - 所有可变提示搬进 toolbar 的 `ui.horizontal` **子 Ui**（与 roll 一致）：子 Ui 只占父层一个槽，内容多少不影响下游顺带——顺带修掉“状态消息一来整排行往下跳一行”的视觉 bug；
 - `owns_keyboard_focus` 增加“本帧有行真的报告了焦点”：只看 egui 的 focus id 时，幽灵 id 会让它谎报 true（从而把虚拟钢琴静音、而按键其实到不了任何东西）；
 - 焦点锁 filter 认领 `horizontal_arrows`/`vertical_arrows`（roll 自 M4a.4 起如此）：未认领的方向键会把焦点“导航”给别的 widget。
 
-守护测试 `crates/resoz-ui/tests/timeline_focus.rs`：用真实 egui 帧复刻 app 的面板结构（transport 含 DragValue、status bar、view tabs、CentralPanel），断言焦点能扛住①点击后的若干帧 ②自身提示的来去 ③行上方任意 widget 的增删（该用例在修复前失败）。
+守护测试 `crates/glitcherz-ui/tests/timeline_focus.rs`：用真实 egui 帧复刻 app 的面板结构（transport 含 DragValue、status bar、view tabs、CentralPanel），断言焦点能扛住①点击后的若干帧 ②自身提示的来去 ③行上方任意 widget 的增删（该用例在修复前失败）。
 
 #### 实测追加的两课（2026-10-14，用户复测暴露）
 

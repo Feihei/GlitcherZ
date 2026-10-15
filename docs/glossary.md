@@ -1,4 +1,4 @@
-# 术语表 — ResoZ
+# 术语表 — GlitcherZ
 
 > 代码注释、doc comment、日志、UI 文案、错误消息一律使用英文，且**术语必须与本表一致**。
 > 新概念出现时先在这里登记再使用，避免同义漂移（如 delay/effect/FX 混用）。
@@ -80,7 +80,7 @@
 
 | 中文 | 英文 | 约定 |
 | :--- | :--- | :--- |
-| 项目文件 | project file | `.rez`（RON 格式） |
+| 项目文件 | project file | `.glz`（RON 格式） |
 | 持久化 | persisted | eframe storage / 文档序列化语境 |
 | 冒烟测试 | smoke test | `--seconds` 自动关窗跑通 |
 | 节点画布 | node patch | P5d 的 patch 图视图编辑器（Pure Data 语境，连线图叫 patch） |
