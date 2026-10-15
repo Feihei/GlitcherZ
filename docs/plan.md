@@ -23,8 +23,9 @@
 
 - [x] CLAP 插件参数**枚举**（2026-10-08 完成：`ClapInstance::list_params` 经 params 扩展 vtable 直调（`raw::enumerate_params`，clack 0.2 包装无读取方法）；测试插件实现 Amplitude 参数；UI 参数面板 + 自动化目标选择器接入 `clap_voice_params`）
 - [x] CLAP 乐器参数**滑块面板**（2026-10-15：`clap_voice_values` 会话内当前值 map（track → param id → f64 原始值域），滑块变更经 `send_track_param(ParamId::PluginParam)` 直达 `ClapNode`；重载插件/切回内置声源/文档重应用时重置为插件默认值。当前值不持久化——待 state 扩展接入。VST3 滑块仍待归一化换算；Dexed 兼容性复现测试见 `glitcherz-clap-host` 的 `dexed_instrument_note_on_produces_audio`）
-- [ ] CLAP / VST3 效果器节点参数桥接（需处理图节点 ID 引入，区分声源/效果器参数空间）
-- [ ] 插件状态保存/加载（进行中，spec 见 `spec/plugin-state.md`：CLAP state extension 先行，VST3 FState 镜像跟进；`VoiceSpec` 加 `state: Vec<u8>`，保存时采集、实例化时恢复）
+- [x] 插件状态保存/加载 **CLAP 部分**（2026-10-15，spec `spec/plugin-state.md` D1–D7 + S1–S4：`VoiceSpec` 加 `state: Vec<u8>`（serde default，PROJECT_VERSION 不动）；clack state 扩展宿主捕获 + `ClapInstanceGuard::{save_state, load_state}` + raw `get_value` 滑块回填；do_save 采集 / install_node 恢复；测试插件 amplitude 往返测试。VST3 FState 镜像 = S5，见下条）
+- [ ] CLAP / VST3 效果器节点参数桥接（需处理图节点 ID 引用，区分声源/效果器参数空间）
+- [ ] 插件状态保存/加载 **VST3 部分**（S5：FState → 同一 `state` 字段，镜像 clap-host）
 - [ ] VST3 参数归一化换算的 UI 层处理（宿主用归一化 0..1，CLAP 用原始值；见 `implementation.md`）
 
 ## 新方向：模块节点图架构（spec 已定稿）
