@@ -312,6 +312,10 @@ pub struct ResoZApp {
     /// Per-track CLAP instrument parameter lists (read at instantiation, keyed by track number).
     /// Data source for automation cable targets; curve value semantics = raw plugin-range values.
     clap_voice_params: HashMap<usize, Vec<resoz_clap_host::ClapParamInfo>>,
+    /// Per-track current CLAP parameter values (raw plugin range, keyed by track → param id).
+    /// UI-session only (plugin state persistence is a pending item); a fresh
+    /// plugin load resets them to the plugin defaults.
+    clap_voice_values: HashMap<usize, HashMap<u32, f64>>,
     /// Diagnostic flag: whether `ui()` has been entered (logging only).
     first_frame_logged: bool,
     /// Diagnostic flag: whether the close command has been sent (logging only).
@@ -417,6 +421,7 @@ impl ResoZApp {
             vst3_effects: None,
             voice_params: HashMap::new(),
             clap_voice_params: HashMap::new(),
+            clap_voice_values: HashMap::new(),
             first_frame_logged: false,
             close_sent: false,
         };
@@ -448,6 +453,7 @@ impl ResoZApp {
         self.node_map.clear();
         self.voice_params.clear();
         self.clap_voice_params.clear();
+        self.clap_voice_values.clear();
 
         // 2) Install document nodes (external plugin failure → fall back to built-in, keeping the
         //    chain intact).
@@ -563,6 +569,7 @@ impl ResoZApp {
                             Err(err) => {
                                 log::error!("Failed to instantiate CLAP plugin {plugin_id}: {err}");
                                 self.clap_voice_params.remove(&track);
+                                self.clap_voice_values.remove(&track);
                                 (Box::new(SynthProcessor::new(sr)), None, String::new())
                             }
                         }
@@ -1655,6 +1662,7 @@ impl ResoZApp {
         }
         self.voice_params.remove(&track);
         self.clap_voice_params.remove(&track);
+        self.clap_voice_values.remove(&track);
         let Some(doc_id) = self
             .project()
             .graph
@@ -1720,6 +1728,7 @@ impl ResoZApp {
                         plugin_id: plugin_id.to_string(),
                         _guard: PluginGuard::Clap(guard),
                     });
+                    self.clap_voice_values.remove(&track); // fresh load resets sliders to plugin defaults
                     self.clap_voice_params.insert(track, params);
                     log::info!("Track {} loaded CLAP voice: {plugin_id}", track + 1);
                 } else {
@@ -3072,8 +3081,11 @@ impl ResoZApp {
                 }
             }
 
-            // CLAP plugin parameter list (enumerated via the params extension at instantiation).
-            if let Some(params) = self.clap_voice_params.get(&sel) {
+            // CLAP plugin parameter panel: enumerated via the params extension at instantiation.
+            // Sliders send raw plugin-range values through the `PluginParam` bridge (applied at
+            // the next `process`, block granularity). Current values live in the UI session
+            // only; a fresh plugin load resets them to the plugin defaults.
+            if let Some(params) = self.clap_voice_params.get(&sel).cloned() {
                 if !params.is_empty() {
                     egui::CollapsingHeader::new(format!("Plugin Params CLAP ({})", params.len()))
                         .default_open(false)
@@ -3084,10 +3096,33 @@ impl ResoZApp {
                                 .show(ui, |ui| {
                                     for param in params {
                                         ui.label(&param.name);
-                                        ui.weak(format!("id {}", param.id));
+                                        let mut value = self
+                                            .clap_voice_values
+                                            .get(&sel)
+                                            .and_then(|by_id| by_id.get(&param.id))
+                                            .copied()
+                                            .unwrap_or(param.default_value);
+                                        let slider = ui.add(
+                                            egui::Slider::new(
+                                                &mut value,
+                                                param.min_value..=param.max_value,
+                                            )
+                                            .text(format!("id {}", param.id)),
+                                        );
+                                        if slider.changed() {
+                                            self.clap_voice_values
+                                                .entry(sel)
+                                                .or_default()
+                                                .insert(param.id, value);
+                                            self.send_track_param(
+                                                sel,
+                                                ParamId::PluginParam(param.id),
+                                                value as f32,
+                                            );
+                                        }
                                         ui.weak(format!(
-                                            "Default {:.3} [{:.3}..{:.3}]",
-                                            param.default_value, param.min_value, param.max_value
+                                            "[{:.3}..{:.3}] default {:.3}",
+                                            param.min_value, param.max_value, param.default_value
                                         ));
                                         ui.end_row();
                                     }
