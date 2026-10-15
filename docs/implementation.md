@@ -27,7 +27,19 @@
 - **结构更新协议（D5）**：控制侧 `GraphCompiler`（全 `Copy`，队列满可快照回滚）编译计划并产出 `GraphUpdate::SetTopology { plan, deployments, removed }`；音频线程块边界整体换计划 + 指针级装卸，零分配；被移除节点连同输出缓冲经 `RecycledNode`（已扩展携带 `output: AudioBuffer`）回执队列送回控制线程释放。
 - **`ChannelStripProcessor`**：增益/声像（线性律）/静音升级为真节点（原 `TrackStrip` 求和段逻辑）；默认拓扑复刻旧 Mixer（`声源 → 延迟 → 通道条 → 主输出`），旧 mixer 全部数学测试以默认图形式通过。
 - **行为变化**：`set_builtin_voice` 现在回收外部插件节点（旧实现驻留），切回插件需重新实例化（状态不保留）；UI 守卫经回收 `node_id` 正常配对释放。
-- `mixer.rs` 已删除；`MixerLevels` → `GraphLevels`；`VoiceUpdate` → `GraphUpdate`。
+- P1+P2 时 `mixer.rs` 曾随固定 Mixer 一起删除（`MixerLevels` → `GraphLevels`；`VoiceUpdate` → `GraphUpdate`）；P5f 重建 `mixer.rs` 承载 `MixerProcessor`（见下节）。
+
+### Mixer 节点与单输入语义（P5f，D14–D21，2026-10-09）
+
+- **单输入纪律（D14/D16）**：compile 期按 `NodeKind`（`Plain` / `Mixer` / `Master`）校验入边——Plain 与 Master ≤1、Mixer ≤32 且 `in_port` 唯一，超限整个计划拒绝（`FanInOverflow`）。隐式加合废止：新连线落到已占用 `(to, in_port)` 槽位时**顶掉旧线**（`add_cable` 严格替换语义，精确重复幂等）。
+- **`MixerProcessor`（D15/D20）**：语义分两段——**per-channel 权重**（gain × pan 声像系数 × mute × solo）在图求和循环逐边乘（求和后通道分离不复存在，权重必须在求和时生效），经 `Processor::input_weights()` 暴露——带默认实现返回 `None` = 单位权重，全部内置与 CLAP/VST3 节点零改动，仅 Mixer 覆写；权重在 `set_param` 时重算缓存。**输出段**（pan/mute）原地处理，与旧通道条同数学。solo 作用域 = 单台 mixer（任一通道 solo → 未 solo 通道权重清零），级联 mixer 各自独立。
+- **参数路径（D5/D20）**：`ParamId::{MixerGain(u8), MixerPan(u8), MixerMute(u8), MixerSolo(u8), MixerOutPan, MixerOutMute}`——推子/pan/mute/solo 全走节点参数路径（块边界生效），**永不触发拓扑重建**。
+- **默认图（D18）**：每轨 `声源→延迟→mixer.ch[i]` + 单个全局 Mixer（通道数 = max(轨数, 2)）→ master；`allocate_track_chain` 缩为 voice+delay 两节点，轨电平点（`track_channel`）= 轨道链末端 delay（pre-mixer，mute 不影响其读数）。
+- **旁路修订（D19）**：`remove_node` 旁路重连仅适用于 ≤1 入边节点（效果器照旧旁通，直连保留目标 `in_port`）；mixer/master 多入边无处重连——删除即弃线。
+- **model（Q-B 决议）**：`NodeDoc::Mixer{node_id, track, inputs: u8(2..=32), channels: Vec<MixerChannel>, out_pan, out_muted}` 替代 ChannelStrip（旧变体保留仅作加载读路径，新文档不再产出）；加载期自动迁移——strip → 2 通道 mixer（原 gain/pan/mute 进通道 0）、master 入边 >1 时插入合成 mixer 承接。文档校验（load/save 双端）：非 mixer ≤1 音频入边、mixer `in_port` 唯一且 < `inputs`、通道数 2..=32。
+- **UI**：mixer 节点画 N 个输入口（节点盒随通道数伸缩）+ 按口命中落线（精确口命中优先、否则自动落第一个空通道——任意空口可落，D21）+ 调音台风格面板（每通道 solo/mute/竖直推子/pan + 输出段 pan/mute + 通道增删按钮 2..=32，占用口不可删）；ChannelStrip 面板退役。
+- **轨寻址（P5f ④）**：UI `track_channel_target(track)` 沿轨链连线走到首个 mixer 节点得 `(mixer_doc_id, in_port)`；轨推子/mute 读写对应 mixer 通道（文档与引擎参数路径同步），未接入 mixer 的轨回落默认值。`register_track_chain` 的 channel 槽位退化为电平点（传 delay）。
+- **容量**：`MAX_IN_EDGES` 8→32（仅 mixer 可达）、`MAX_CABLES` 128→256（32 口 mixer 单节点即占 32 线）；32 通道求和 ≈8K FMA/块 ≈ 8µs，48kHz 下 <0.5% 单核。
 
 ### 引擎核心（`glitcherz-engine::realtime`）
 

@@ -15,9 +15,9 @@
 9. ✅ CLAP 插件宿主（先于 VST3，API 更简洁）
 10. ✅ VST3 插件宿主（乐器/效果器已集成进 model/UI；遗留项见下）
 
-## 当前状态（2026-10-07）
+## 当前状态（2026-10-15）
 
-路线图 1–10 全部落地。乐器插件（CLAP / VST3）为一等声源，效果器节点已接入，自动化桥接到插件参数。剩余为插件生态收尾项与新架构方向。
+路线图 1–10 全部落地。乐器插件（CLAP / VST3）为一等声源，效果器节点已接入，自动化桥接到插件参数。节点图 P1–P5e.2 与 MIDI 编辑 M1–M4（M4a 钢琴窗、M4b 时间轴）全部交付；CLAP 乐器参数滑块已接通（2026-10-15）。下一步：P5f 单输入语义 + Mixer 节点。
 
 ## 遗留任务
 
@@ -43,7 +43,7 @@
 - [x] P5e Patch 自由加删节点（2026-10-09：① 右键 context menu 添加 Instrument / Effect (Delay) / Channel Strip（`AddNodeKind` + `PatchAction::AddNode{kind, at}`；新节点悬空出生 D6、归属当前选中轨、位置落在点击处——文档 push → 引擎 `install_node` → `PatchState::place_node`，引擎安装失败回滚文档，节点表满 64 拒绝）；② `DeleteNode` 放宽到全部文档节点（master/timeline 固定不可删）：引擎 bypass 语义不变，MIDI/自动化触及连线直接移除，删除后刷新所属轨寻址表；③ 抽取 `register_track_chain(track)` 助手（apply_document 与加/删节点共用）。回归测试：place_node 位置不被 ensure_positions 覆盖。遗留：面板仍是"轨→first-match 节点"驱动，多乐器/多 strip 轨的面板寻址与 `track` 字段弱化待后续）
 - [x] P5e.1 节点位置持久化（2026-10-09：`GraphDoc.layout: LayoutDoc{nodes: BTreeMap<u64, [f32; 2]>, timeline, master}`——`#[serde(default)]` 旧文件无感兼容，BTreeMap 保证序列化稳定，model 不依赖 egui；`PatchState::export_layout`（保存前导出，剔除文档中已不存在的 id）/ `import_layout`（加载后导入，缺项回落自动布点）；`do_save` / `do_open` 接线。demo_project 携带 layout 进入 roundtrip 覆盖；patch.rs 增 export 过滤 stale id + 往返回归测试。168 测试绿）
 - [x] P5e.2 连线交互打磨（2026-10-09：① **端口抓取热区** `PORT_HIT_RADIUS` 12→18，拉线起点更好抓；② **Ctrl+右键拖拽切线**（Blender 式 knife）：记录指针轨迹，采样点距轨迹 < 10px 的连线红色高亮，松开批量 `DeleteCable`（索引降序防漂移）、Escape 取消；Ctrl+右键单击不再弹加节点菜单；③ **连线中间控制点**：每条连线贝塞尔中点画控制圆点（hover 放大），点击弹菜单——音频线可 Insert Effect / Insert Channel Strip（`PatchAction::InsertNode{cable, kind, at}`：A→B 替换为 A→新→B，新节点落位点击处，复用 `create_patch_node`/`connect_audio`），Delete Cable 全类型可用；几何命中统一收敛到 `cable_controls` 助手 + `dist_point_seg`。170 测试绿）
-- [ ] P5f 单输入语义 + Mixer 节点（D14–D21）：spec v2 评审通过（docs/spec/node-graph.md）。决议：master 也单输入；strip 退役并入 mixer——per-channel gain/pan/mute/solo（舞台调音台方式）+ 输出级 pan/mute；通道数按钮手动增减 2..32（拔线不丢设置，连线可落任意空通道）；v3→v4 加载期自动迁移；默认图改全局 mixer 拓扑；推子自动化后续版本。实现拆分见 spec §9 P5f（引擎 → model v4 → UI → 轨寻址/metering）
+- [x] P5f 单输入语义 + Mixer 节点（2026-10-09 完成，commit `b34d0cc`，spec §9 ①–④ 一次交付）：① 引擎 `MixerProcessor`（2..32 通道 gain/pan/mute/solo + 输出级 pan/mute；`input_weights()` 权重表参与图求和循环，默认实现 `None` = 单位权重、插件零改动）+ `NodeKind`（Plain/Mixer/Master）compile 期入边纪律 + 容量扩容（`MAX_IN_EDGES` 32 / `MAX_CABLES` 256）+ D19 旁路修订（≤1 入边才旁通）；② model `NodeDoc::Mixer{inputs, channels, out_pan, out_muted}` 替代 ChannelStrip（旧变体仅作加载路径）+ `CableDoc.in_port`（D17 连线↔输入口绑定持久化）+ 旧版文档加载期自动迁移（strip → 2 通道 mixer、master 多入边 → 合成 mixer）；③ UI 调音台面板（每通道 solo/mute/推子/pan + 输出段 + 通道增删 2..=32、占用口保护）+ mixer 节点按口落线（精确口命中优先、否则第一个空通道）；④ 轨寻址：`track_channel_target` 沿连线推导轨 → (mixer, channel)，轨推子/mute 走 `ParamId::Mixer*` 参数路径（永不触发重建），电平点 = 轨道链末端 delay。验收（spec §9）：默认图端到端 / 32 通道加权求和数学 / 参数路径不重建 / 迁移往返 / P5e.x 画布回归——全绿
 - [ ] P6 音频反馈环路（可选，1 块延迟节点）
 
 ## 新方向：MIDI 编辑能力对标 SoundCraft（M1–M3）
@@ -133,7 +133,7 @@
 2026-10-13 经三轮拷问式 Q&A 定稿，spec 见 `spec/editing-model.md`。核心决策：语义决策源从"指针落点 × 修饰键"（全手势）移到**离散状态**——常驻态只有 Select；D（Draw）为粘性命令（d 进入 / Esc 退出，输入爆发场景）；G/S/T/K/Shift+D 为一次性命令族（按键唤起、一次操作、Esc 取消、不改变常驻态）。关键设计：命令在 draw 态下同样生效（画完自动选中 → 直接 g/t 调整，1 次按键而非模式往返），消解 Ableton 式双态切换税。G 带 X/Y 轴锁定（X=只改时间 / Y=只改音高，mid-drag 可切）；T 默认拉终点、`t+s` 拉起点（统一规则：bare=最常见变体，限定键=次常见变体；`t+e` 与裸 T 重合已删）；S pivot=选区中心且不吸附；Shift+D=复制并移动（arm Grab）。时间轴砍掉 S（clip 是容器无音乐语义）与 D（clip 摆放低频，双击创建+拖缘调长已覆盖）。M3.8"空白拖动永远=画"边界规则废除，空拖回归框选。undo 合并全沿用 execute_merged + gesture id 基建，新增仅 Scale/Split 两族命令 + 状态机 + 视觉反馈。
 
 - [x] **M4a 钢琴窗**：状态机（Select/Draw）+ G/S/T/Shift+D/K + 视觉反馈 + 映射矩阵测试（2026-10-13：命令层 `a02612e`；状态机+接线 `feat(roll)`。测试 75 项 glitcherz-ui 全绿，含 22 项映射矩阵集成测试）
-- [ ] **M4b 时间轴**：Select/T/K + clip 多选 + G（无 D、无 S；跨轨移动语义、批量 undo key 单独决策）
+- [x] **M4b 时间轴**（2026-10-13 交付，2026-10-14 对齐 roll：X/Y 轴锁、t+s 翻转、单次刀）：clip 跨轨多选（`ClipSel` + 框选合并 + Delete 批删一步 undo）+ G/T 模态（ghost 跨行预览、X 轴锁时间、落定 `filter_covered` 重叠策略）+ K 切刀（bar 吸附）+ Shift+D 复制模态（副本落定选区转移）。四段交付细节见 `implementation.md` M4b 段与 `spec/editing-model.md`
 - [ ] **未来命令族扩展**：quantize / legato / glue / transpose = 同族零侵入
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
