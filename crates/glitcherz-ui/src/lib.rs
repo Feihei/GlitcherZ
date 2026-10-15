@@ -316,6 +316,20 @@ pub struct GlitcherZApp {
     /// UI-session only (plugin state persistence is a pending item); a fresh
     /// plugin load resets them to the plugin defaults.
     clap_voice_values: HashMap<usize, HashMap<u32, f64>>,
+    /// Per-track current VST3 instrument parameter values (normalized 0..1,
+    /// keyed by track → param id) — the slider cache; seeded from the
+    /// controller read-back (`read_param_values`) at load time.
+    vst3_voice_values: HashMap<usize, HashMap<u32, f64>>,
+    /// External effect parameter lists, keyed by **document node_id** (the
+    /// stable identity across engine rebuilds; delivery resolves the engine
+    /// id via `node_map`). CLAP = raw plugin range, VST3 = normalized 0..1.
+    clap_effect_params: HashMap<u64, Vec<glitcherz_clap_host::ClapParamInfo>>,
+    /// CLAP effect current raw values (doc node_id → param id), UI session only.
+    clap_effect_values: HashMap<u64, HashMap<u32, f64>>,
+    /// VST3 external effect parameter lists (doc node_id-keyed, normalized).
+    vst3_effect_params: HashMap<u64, Vec<glitcherz_vst3_host::Vst3ParamInfo>>,
+    /// VST3 effect current normalized values (doc node_id → param id), UI session only.
+    vst3_effect_values: HashMap<u64, HashMap<u32, f64>>,
     /// Diagnostic flag: whether `ui()` has been entered (logging only).
     first_frame_logged: bool,
     /// Diagnostic flag: whether the close command has been sent (logging only).
@@ -422,6 +436,11 @@ impl GlitcherZApp {
             voice_params: HashMap::new(),
             clap_voice_params: HashMap::new(),
             clap_voice_values: HashMap::new(),
+            vst3_voice_values: HashMap::new(),
+            clap_effect_params: HashMap::new(),
+            clap_effect_values: HashMap::new(),
+            vst3_effect_params: HashMap::new(),
+            vst3_effect_values: HashMap::new(),
             first_frame_logged: false,
             close_sent: false,
         };
@@ -454,6 +473,11 @@ impl GlitcherZApp {
         self.voice_params.clear();
         self.clap_voice_params.clear();
         self.clap_voice_values.clear();
+        self.vst3_voice_values.clear();
+        self.clap_effect_params.clear();
+        self.clap_effect_values.clear();
+        self.vst3_effect_params.clear();
+        self.vst3_effect_values.clear();
 
         // 2) Install document nodes (external plugin failure → fall back to built-in, keeping the
         //    chain intact).
@@ -614,9 +638,13 @@ impl GlitcherZApp {
                                         );
                                     }
                                 }
+                                // Slider cache seeded from the controller
+                                // read-back (normalized 0..1).
+                                let values = instance.guard.read_param_values();
                                 let glitcherz_vst3_host::Vst3Instance { guard, node } = instance;
                                 let params = guard.parameters();
                                 self.voice_params.insert(track, params);
+                                self.vst3_voice_values.insert(track, values);
                                 (
                                     Box::new(node),
                                     Some(PluginGuard::Vst3(guard)),
@@ -654,6 +682,14 @@ impl GlitcherZApp {
                                         );
                                     }
                                 }
+                                // Effect param caches keyed by the document
+                                // node_id (panel data source; delivery goes
+                                // through node addressing).
+                                let fx_doc = node.node_id();
+                                let params = instance.list_params();
+                                let values = instance.read_param_values();
+                                self.clap_effect_params.insert(fx_doc, params);
+                                self.clap_effect_values.insert(fx_doc, values);
                                 let ClapInstance { guard, node } = instance;
                                 (
                                     Box::new(node),
@@ -691,6 +727,13 @@ impl GlitcherZApp {
                                         );
                                     }
                                 }
+                                // Effect param caches keyed by the document
+                                // node_id (normalized 0..1 domain).
+                                let fx_doc = node.node_id();
+                                let params = instance.guard.parameters();
+                                let values = instance.guard.read_param_values();
+                                self.vst3_effect_params.insert(fx_doc, params);
+                                self.vst3_effect_values.insert(fx_doc, values);
                                 let glitcherz_vst3_host::Vst3Instance { guard, node } = instance;
                                 (
                                     Box::new(node),
@@ -1531,6 +1574,12 @@ impl GlitcherZApp {
         }
         self.node_map.remove(&doc_id);
         self.retire_guard(engine_id);
+        // Effect param caches are doc-keyed; dropping them for a deleted
+        // node is always safe (instrument caches are track-keyed).
+        self.clap_effect_params.remove(&doc_id);
+        self.clap_effect_values.remove(&doc_id);
+        self.vst3_effect_params.remove(&doc_id);
+        self.vst3_effect_values.remove(&doc_id);
         self.commit_edit("Delete Node", before);
         // The deleted node may have filled a role (voice / delay / channel) in the track
         // addressing table — refresh it from the remaining document nodes.
@@ -1783,6 +1832,7 @@ impl GlitcherZApp {
         self.voice_params.remove(&track);
         self.clap_voice_params.remove(&track);
         self.clap_voice_values.remove(&track);
+        self.vst3_voice_values.remove(&track);
         let Some(doc_id) = self
             .project()
             .graph
@@ -1886,16 +1936,19 @@ impl GlitcherZApp {
             },
         ) {
             Ok(instance) => {
+                // Slider cache seeded from the controller read-back
+                // (normalized 0..1); enumerated before the guard moves into
+                // the registry.
+                let params = instance.guard.parameters();
+                let values = instance.guard.read_param_values();
                 let glitcherz_vst3_host::Vst3Instance { guard, node } = instance;
-                // Enumerate the parameter list on the control side (read before the guard moves
-                // into the registry).
-                let params = guard.parameters();
                 if self
                     .engine
                     .replace_node(engine_id, Box::new(node))
                     .is_some()
                 {
                     self.voice_params.insert(track, params);
+                    self.vst3_voice_values.insert(track, values);
                     self.voice_guards.push(PluginGuardEntry {
                         node_id: engine_id,
                         track,
@@ -1924,7 +1977,7 @@ impl GlitcherZApp {
         plugin_label: String,
         node: Box<dyn Processor>,
         guard: PluginGuard,
-    ) {
+    ) -> Option<u64> {
         let Some(delay_doc) = self
             .project()
             .graph
@@ -1935,7 +1988,7 @@ impl GlitcherZApp {
                 "Track {} has no built-in delay node; effect insertion failed",
                 track + 1
             );
-            return;
+            return None;
         };
         // Walk the audio chain from the delay to its LAST node (P5f: the chain
         // ends at the mixer channel / master landing, not a channel strip).
@@ -1953,7 +2006,7 @@ impl GlitcherZApp {
                     "Track {} chain is dangling after node {last_doc}; effect insertion failed",
                     track + 1
                 );
-                return;
+                return None;
             };
             match &cable.to {
                 PortRef::Node(next_id)
@@ -1970,14 +2023,10 @@ impl GlitcherZApp {
         };
         let PortRef::Node(downstream_doc) = downstream.to else {
             log::error!("Track {} chain landing is not a node", track + 1);
-            return;
+            return None;
         };
-        let Some(last_engine) = self.engine_id(last_doc) else {
-            return;
-        };
-        let Some(downstream_engine) = self.engine_id(downstream_doc) else {
-            return;
-        };
+        let last_engine = self.engine_id(last_doc)?;
+        let downstream_engine = self.engine_id(downstream_doc)?;
         let new_doc_id = self.project().graph.next_node_id();
         let new_engine_id = self.engine.fresh_node_id();
         if !self
@@ -1988,7 +2037,7 @@ impl GlitcherZApp {
                 "Structure queue full: failed to insert effect on track {}",
                 track + 1
             );
-            return;
+            return None;
         }
         // Document sync: node + splice rewiring (the downstream cable keeps its
         // in_port — the mixer channel binding, D17).
@@ -2026,6 +2075,7 @@ impl GlitcherZApp {
         });
         self.commit_edit("Insert Effect", before);
         log::info!("Track {} inserted external effect", track + 1);
+        Some(new_doc_id)
     }
 
     /// Insert a CLAP effect node into the track (non-real-time instantiation → engine insertion →
@@ -2040,8 +2090,12 @@ impl GlitcherZApp {
             },
         ) {
             Ok(instance) => {
+                // Effect param caches are keyed by the document node_id —
+                // enumerate before the instance is destructured.
+                let params = instance.list_params();
+                let values = instance.read_param_values();
                 let ClapInstance { guard, node } = instance;
-                self.insert_effect_common(
+                if let Some(fx_doc) = self.insert_effect_common(
                     track,
                     VoiceSpec::Clap {
                         path: path.to_string(),
@@ -2051,7 +2105,10 @@ impl GlitcherZApp {
                     plugin_id.to_string(),
                     Box::new(node),
                     PluginGuard::Clap(guard),
-                );
+                ) {
+                    self.clap_effect_params.insert(fx_doc, params);
+                    self.clap_effect_values.insert(fx_doc, values);
+                }
             }
             Err(err) => {
                 log::error!("Failed to instantiate CLAP effect {plugin_id}: {err}");
@@ -2072,8 +2129,12 @@ impl GlitcherZApp {
             },
         ) {
             Ok(instance) => {
+                // Effect param caches are keyed by the document node_id
+                // (normalized 0..1 domain); enumerate before destructuring.
+                let params = instance.guard.parameters();
+                let values = instance.guard.read_param_values();
                 let glitcherz_vst3_host::Vst3Instance { guard, node } = instance;
-                self.insert_effect_common(
+                if let Some(fx_doc) = self.insert_effect_common(
                     track,
                     VoiceSpec::Vst3 {
                         path: path.to_string(),
@@ -2083,7 +2144,10 @@ impl GlitcherZApp {
                     class_id.to_string(),
                     Box::new(node),
                     PluginGuard::Vst3(guard),
-                );
+                ) {
+                    self.vst3_effect_params.insert(fx_doc, params);
+                    self.vst3_effect_values.insert(fx_doc, values);
+                }
             }
             Err(err) => {
                 log::error!("Failed to instantiate VST3 effect {class_id}: {err}");
@@ -2148,8 +2212,39 @@ impl GlitcherZApp {
                 .push(glitcherz_model::CableDoc::audio(in_from, out_to));
             self.node_map.remove(&effect_doc);
             self.retire_guard(effect_engine);
+            self.clap_effect_params.remove(&effect_doc);
+            self.clap_effect_values.remove(&effect_doc);
+            self.vst3_effect_params.remove(&effect_doc);
+            self.vst3_effect_values.remove(&effect_doc);
         }
         self.commit_edit("Clear External Effects", before);
+    }
+
+    /// The track's external effect nodes as `(doc_id, display label, is_clap)`
+    /// — the shared data source for the effect param panels and the
+    /// automation target selector.
+    fn track_external_fx(&self, track: usize) -> Vec<(u64, String, bool)> {
+        self.project()
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.track() == track)
+            .filter_map(|n| match n {
+                NodeDoc::Effect { node_id, voice, .. } => match voice {
+                    VoiceSpec::Clap { plugin_id, .. } => Some((*node_id, plugin_id.clone(), true)),
+                    VoiceSpec::Vst3 { path, .. } => Some((
+                        *node_id,
+                        std::path::Path::new(path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "VST3".to_string()),
+                        false,
+                    )),
+                    VoiceSpec::Builtin => None,
+                },
+                _ => None,
+            })
+            .collect()
     }
 
     /// Scanned CLAP instruments (lazy).
@@ -3175,9 +3270,121 @@ impl GlitcherZApp {
                 }
             });
 
-            // VST3 plugin parameter list (read on the control side at instantiation; displays
-            // default normalized values).
-            if let Some(params) = self.voice_params.get(&sel) {
+            // External effect parameter panels: sliders per effect node,
+            // delivered through node addressing (`set_node_param` — the
+            // effect node's own `PluginParam` bridge). CLAP sliders show raw
+            // plugin-range values, VST3 sliders normalized 0..1 (the same
+            // domain split as the instruments). Current values live in the
+            // UI session only (no undo, same class as the instrument sliders).
+            for (fx_doc, fx_label, is_clap) in self.track_external_fx(sel) {
+                let Some(&fx_engine) = self.node_map.get(&fx_doc) else {
+                    continue;
+                };
+                if is_clap {
+                    let Some(params) = self.clap_effect_params.get(&fx_doc).cloned() else {
+                        continue;
+                    };
+                    if params.is_empty() {
+                        continue;
+                    }
+                    egui::CollapsingHeader::new(format!("FX CLAP {fx_label} ({})", params.len()))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::Grid::new(format!("clap_fx_{fx_doc}"))
+                                .num_columns(3)
+                                .spacing([16.0, 4.0])
+                                .show(ui, |ui| {
+                                    for param in params {
+                                        ui.label(&param.name);
+                                        let mut value = self
+                                            .clap_effect_values
+                                            .get(&fx_doc)
+                                            .and_then(|by_id| by_id.get(&param.id))
+                                            .copied()
+                                            .unwrap_or(param.default_value);
+                                        let slider = ui.add(
+                                            egui::Slider::new(
+                                                &mut value,
+                                                param.min_value..=param.max_value,
+                                            )
+                                            .text(format!("id {}", param.id)),
+                                        );
+                                        if slider.changed() {
+                                            self.clap_effect_values
+                                                .entry(fx_doc)
+                                                .or_default()
+                                                .insert(param.id, value);
+                                            self.engine.set_node_param(
+                                                fx_engine,
+                                                ParamId::PluginParam(param.id),
+                                                value as f32,
+                                            );
+                                        }
+                                        ui.weak(format!(
+                                            "[{:.3}..{:.3}] default {:.3}",
+                                            param.min_value, param.max_value, param.default_value
+                                        ));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                } else {
+                    let Some(params) = self.vst3_effect_params.get(&fx_doc).cloned() else {
+                        continue;
+                    };
+                    if params.is_empty() {
+                        continue;
+                    }
+                    egui::CollapsingHeader::new(format!("FX VST3 {fx_label} ({})", params.len()))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::Grid::new(format!("vst3_fx_{fx_doc}"))
+                                .num_columns(3)
+                                .spacing([16.0, 4.0])
+                                .show(ui, |ui| {
+                                    for param in params {
+                                        ui.label(&param.title);
+                                        let mut value = self
+                                            .vst3_effect_values
+                                            .get(&fx_doc)
+                                            .and_then(|by_id| by_id.get(&param.id))
+                                            .copied()
+                                            .unwrap_or(param.default_normalized);
+                                        let slider = ui.add(
+                                            egui::Slider::new(&mut value, 0.0..=1.0)
+                                                .text(format!("id {}", param.id)),
+                                        );
+                                        if slider.changed() {
+                                            self.vst3_effect_values
+                                                .entry(fx_doc)
+                                                .or_default()
+                                                .insert(param.id, value);
+                                            self.engine.set_node_param(
+                                                fx_engine,
+                                                ParamId::PluginParam(param.id),
+                                                value as f32,
+                                            );
+                                        }
+                                        ui.weak(format!(
+                                            "normalized{}",
+                                            if param.can_automate {
+                                                ""
+                                            } else {
+                                                " (not automatable)"
+                                            }
+                                        ));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+            }
+
+            // VST3 plugin parameter panel (normalized 0..1 sliders; the
+            // bridge passes the normalized value through as-is). Current
+            // values are seeded from the controller read-back at load time
+            // and live in the UI session only.
+            if let Some(params) = self.voice_params.get(&sel).cloned() {
                 if !params.is_empty() {
                     egui::CollapsingHeader::new(format!("Plugin Params ({})", params.len()))
                         .default_open(false)
@@ -3188,14 +3395,33 @@ impl GlitcherZApp {
                                 .show(ui, |ui| {
                                     for param in params {
                                         ui.label(&param.title);
-                                        ui.weak(format!("id {}", param.id));
+                                        let mut value = self
+                                            .vst3_voice_values
+                                            .get(&sel)
+                                            .and_then(|by_id| by_id.get(&param.id))
+                                            .copied()
+                                            .unwrap_or(param.default_normalized);
+                                        let slider = ui.add(
+                                            egui::Slider::new(&mut value, 0.0..=1.0)
+                                                .text(format!("id {}", param.id)),
+                                        );
+                                        if slider.changed() {
+                                            self.vst3_voice_values
+                                                .entry(sel)
+                                                .or_default()
+                                                .insert(param.id, value);
+                                            self.send_track_param(
+                                                sel,
+                                                ParamId::PluginParam(param.id),
+                                                value as f32,
+                                            );
+                                        }
                                         ui.weak(format!(
-                                            "Default {:.3}{}",
-                                            param.default_normalized,
+                                            "normalized{}",
                                             if param.can_automate {
                                                 ""
                                             } else {
-                                                "(not automatable)"
+                                                " (not automatable)"
                                             }
                                         ));
                                         ui.end_row();
@@ -4392,6 +4618,47 @@ impl GlitcherZApp {
                     options.push((
                         format!("VST3 {label}"),
                         voice_doc,
+                        AutoParam::PluginParam {
+                            param_id: param.id,
+                            name: label,
+                        },
+                    ));
+                }
+            }
+        }
+
+        // External effect parameters (node-addressed endpoints land on the
+        // effect node itself; the same CLAP raw / VST3 normalized domain
+        // split as the instruments).
+        for (fx_doc, fx_label, is_clap) in self.track_external_fx(sel) {
+            if is_clap {
+                if let Some(params) = self.clap_effect_params.get(&fx_doc) {
+                    for param in params {
+                        let label = if param.name.is_empty() {
+                            format!("Param {}", param.id)
+                        } else {
+                            param.name.clone()
+                        };
+                        options.push((
+                            format!("FX CLAP {fx_label} · {label}"),
+                            fx_doc,
+                            AutoParam::PluginParam {
+                                param_id: param.id,
+                                name: label,
+                            },
+                        ));
+                    }
+                }
+            } else if let Some(params) = self.vst3_effect_params.get(&fx_doc) {
+                for param in params {
+                    let label = if param.title.is_empty() {
+                        format!("Param {}", param.id)
+                    } else {
+                        param.title.clone()
+                    };
+                    options.push((
+                        format!("FX VST3 {fx_label} · {label}"),
+                        fx_doc,
                         AutoParam::PluginParam {
                             param_id: param.id,
                             name: label,
