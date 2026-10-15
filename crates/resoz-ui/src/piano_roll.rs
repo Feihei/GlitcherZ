@@ -764,6 +764,7 @@ pub fn show(
     state: &mut RollState,
     playhead_ticks: f32,
     playing: bool,
+    router: &mut crate::focus::FocusRouter,
 ) -> Option<RollIntent> {
     let loop_ticks = i64::from(clip.loop_ticks.max(TICKS_PER_STEP)).max(1);
     let grid_ticks = state
@@ -850,7 +851,7 @@ pub fn show(
             // visible so "the keys do nothing" is diagnosable at a glance.
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new("no keyboard focus — click the roll")
+                    egui::RichText::new("no keyboard focus — hover the roll")
                         .color(egui::Color32::YELLOW),
                 ),
             );
@@ -871,12 +872,14 @@ pub fn show(
         egui::vec2(width, ROLL_HEIGHT),
         egui::Sense::click_and_drag(),
     );
-    // The roll owns keyboard focus while in use (arrow-key nudging); the
-    // click itself is handled in the interaction section below (it needs
-    // the pointer→tick/pitch helpers defined there). Any press counts —
-    // a slow press-and-hold is neither a click (too long) nor yet a drag
-    // (no movement), and focus must not depend on gesture classification.
-    if response.clicked() || response.is_pointer_button_down_on() {
+    // The roll owns keyboard focus while hovered (the app-level FocusRouter
+    // assigns it before layout); the click itself is handled in the
+    // interaction section below (it needs the pointer→tick/pitch helpers
+    // defined there). Registration is enough for hover-follow focus; the
+    // explicit click is a fallback that also pulls focus out of an inline
+    // DragValue edit, which the router is frozen on.
+    router.register_keyboard(response.id, response.rect);
+    if response.clicked() {
         response.request_focus();
     }
     state.had_focus = response.has_focus();
@@ -1399,8 +1402,8 @@ pub fn show(
     }
 
     if response.drag_started() {
-        // Keyboard commands must work right after the first drag, even if
-        // the roll never saw a plain click.
+        // Belt-and-suspenders: hover-follow focus (the router) already covers
+        // this, but a drag on the roll must never run without focus.
         response.request_focus();
         // Classify the grab by where the press *landed*, never by where the
         // pointer is on this frame. egui only reports `drag_started` once

@@ -631,6 +631,7 @@ pub fn show(
     midi_tracks: &[MidiTrack],
     control_tracks: &[ControlTrack],
     p: TimelineParams<'_>,
+    router: &mut crate::focus::FocusRouter,
 ) -> Vec<TimelineAction> {
     let mut actions = Vec::new();
     let px_per_tick = state.px_per_bar / TICKS_PER_BAR as f32;
@@ -686,7 +687,7 @@ pub fn show(
                 // Keyboard shortcuts are focus-gated; make the invisible
                 // gate visible so a dead key is diagnosable at a glance.
                 ui.weak(
-                    egui::RichText::new("no keyboard focus — click the timeline")
+                    egui::RichText::new("no keyboard focus — hover the timeline")
                         .color(Color32::YELLOW),
                 );
             }
@@ -826,6 +827,7 @@ pub fn show(
             lane_row(
                 ui,
                 state,
+                router,
                 &mut actions,
                 &mut marquee_hits,
                 &mut geom,
@@ -856,6 +858,7 @@ pub fn show(
                 lane_row(
                     ui,
                     state,
+                    router,
                     &mut actions,
                     &mut marquee_hits,
                     &mut geom,
@@ -1079,6 +1082,7 @@ pub fn show(
 fn lane_row<T: Placement>(
     parent: &mut egui::Ui,
     state: &mut TimelineState,
+    router: &mut crate::focus::FocusRouter,
     actions: &mut Vec<TimelineAction>,
     marquee_hits: &mut Vec<(RowKind, Vec<usize>)>,
     geom: &mut Vec<(RowKind, Rect)>,
@@ -1170,9 +1174,12 @@ fn lane_row<T: Placement>(
     // Lane surface.
     let (lane, response) =
         ui.allocate_exact_size(Vec2::new(content_px, ROW_HEIGHT), Sense::click_and_drag());
-    // The row owns keyboard focus while in use (command keys land in
-    // M4b.2+; the plumbing is here from the start). Any press counts.
-    if response.clicked() || response.is_pointer_button_down_on() {
+    // The lane is a keyboard surface of the app-level FocusRouter: hovering
+    // it grants focus, hovering another surface or chrome releases it. The
+    // explicit click is a fallback that also pulls focus out of an inline
+    // DragValue edit, which the router is frozen on.
+    router.register_keyboard(response.id, lane);
+    if response.clicked() {
         response.request_focus();
     }
     if response.has_focus() {
@@ -1751,7 +1758,6 @@ fn snap_bar(ticks: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use resoz_model::Sequence;
 
     fn clip(start: u32, span: u32) -> MidiClip {
         MidiClip {

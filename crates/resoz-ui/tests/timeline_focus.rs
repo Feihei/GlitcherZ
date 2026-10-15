@@ -29,6 +29,8 @@ const LANE_X: f32 = 500.0;
 struct Fixture {
     ctx: egui::Context,
     state: TimelineState,
+    /// Hover-follow focus arbiter, mirroring the app's per-frame flow.
+    router: resoz_ui::focus::FocusRouter,
     tracks: Vec<MidiTrack>,
     /// View-tab selection (the app's MainView; only Timeline matters
     /// here, but the tab row must exist to mirror its layout).
@@ -54,6 +56,7 @@ impl Fixture {
         Self {
             ctx: egui::Context::default(),
             state: TimelineState::default(),
+            router: resoz_ui::focus::FocusRouter::new(),
             tracks,
             view: true,
             tempo: 120.0,
@@ -95,6 +98,7 @@ impl Fixture {
         let Self {
             ctx,
             state,
+            router,
             tracks,
             view,
             tempo,
@@ -103,10 +107,13 @@ impl Fixture {
         } = self;
         let muted: [bool; 0] = [];
         let mut out = ctx.run_ui(raw, |root| {
-            egui::Panel::top("resoz_transport").show(root, |ui| {
+            // Same order as the app: the router resolves hover focus before
+            // the panels run; the transport + tab bar are neutral chrome.
+            router.begin_frame(root.ctx());
+            let transport = egui::Panel::top("resoz_transport").show(root, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("▶ Play").clicked() {}
-                    if ui.button("■ Stop").clicked() {}
+                    let _ = ui.button("▶ Play").clicked();
+                    let _ = ui.button("■ Stop").clicked();
                     ui.separator();
                     ui.label("Tempo");
                     let _ = ui.add(
@@ -115,8 +122,8 @@ impl Fixture {
                             .suffix(" BPM"),
                     );
                     ui.separator();
-                    if ui.button("📂 Open").clicked() {}
-                    if ui.button("💾 Save").clicked() {}
+                    let _ = ui.button("📂 Open").clicked();
+                    let _ = ui.button("💾 Save").clicked();
                 });
             });
             egui::Panel::bottom("resoz_status").show(root, |ui| {
@@ -145,8 +152,11 @@ impl Fixture {
                         playing: false,
                         edit_target: None,
                     },
+                    router,
                 );
             });
+            // Chrome registration, mirroring the app (transport + tabs).
+            router.register_neutral(transport.response.rect);
         });
         out.textures_delta.clear();
     }
@@ -308,6 +318,64 @@ fn clicking_a_clip_then_g_arms_the_move_modal() {
     );
     // And focus must still be held for the modal keys (X / Esc / click).
     assert!(f.owns_focus());
+}
+
+/// Hover-follow focus (Blender-style context): merely hovering a lane
+/// grants it the keyboard — no click needed.
+#[test]
+fn hovering_a_lane_grants_focus_without_a_click() {
+    let mut f = Fixture::new();
+    f.frame(vec![]);
+    f.frame(vec![]);
+    // Read row 0's real rect out of the widget stack instead of guessing a
+    // y — the toolbar / ruler heights are egui's business.
+    let row = f
+        .ctx
+        .read_response(egui::Id::new("resoz_timeline_row").with((false, 0usize)))
+        .expect("row 0 is missing from the widget stack")
+        .rect;
+    f.frame(vec![hover(egui::pos2(LANE_X, row.center().y))]);
+    assert!(f.owns_focus(), "hovering a lane must grant it the keyboard");
+
+    // Remote-desktop sessions deliver the pointer like a touch: after every
+    // gesture egui-winit pushes `PointerGone` (CursorLeft / touch end), which
+    // clears `latest_pos`. The router must fall back to the retained last
+    // position, or hover-follow would be permanently dead in those sessions.
+    f.frame(vec![egui::Event::PointerGone]);
+    assert!(
+        f.owns_focus(),
+        "pointer-gone (remote session) must not drop the hover-follow focus"
+    );
+}
+
+/// Hovering the neutral chrome (transport) releases the lane's focus; the
+/// pointer is free (no button down), so the hover decision applies.
+#[test]
+fn hovering_the_transport_releases_the_lane() {
+    let mut f = Fixture::new();
+    let y = f.click_into_a_lane();
+    assert!(f.owns_focus());
+    f.frame(vec![hover(egui::pos2(60.0, 12.0))]); // inside the transport panel
+    assert!(
+        !f.owns_focus(),
+        "moving to the transport must release the lane focused at y={y}"
+    );
+}
+
+/// Hovering nothing registered is sticky: the last owner keeps the
+/// keyboard. The row header (left of the lane surface) is not a registered
+/// keyboard surface, so hovering it must not hand focus around — and must
+/// not release it either.
+#[test]
+fn focus_is_sticky_over_unregistered_space() {
+    let mut f = Fixture::new();
+    let y = f.click_into_a_lane();
+    // Over the row's header buttons, NOT over the registered lane surface.
+    f.frame(vec![hover(egui::pos2(30.0, y))]);
+    assert!(
+        f.owns_focus(),
+        "focus from the lane at y={y} must survive idle hover over unregistered ui"
+    );
 }
 
 fn hover(pos: egui::Pos2) -> egui::Event {

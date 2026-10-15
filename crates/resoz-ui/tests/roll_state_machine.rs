@@ -30,6 +30,8 @@ struct Fixture {
     ctx: egui::Context,
     clip: MidiClip,
     state: RollState,
+    /// Hover-follow focus arbiter, mirroring the app's per-frame flow.
+    router: resoz_ui::focus::FocusRouter,
     /// Roll rect left edge (the roll spans the panel's full width).
     left: f32,
     ticks_to_x: f32,
@@ -65,6 +67,7 @@ impl Fixture {
             ctx: egui::Context::default(),
             clip,
             state: RollState::new(),
+            router: resoz_ui::focus::FocusRouter::new(),
             left: 0.0,
             ticks_to_x: 0.0,
             y60: 0.0,
@@ -144,12 +147,19 @@ impl Fixture {
         self.time += 0.1;
         let raw = self.raw(events);
         let Self {
-            ctx, clip, state, ..
+            ctx,
+            clip,
+            state,
+            router,
+            ..
         } = self;
         let mut intent = None;
         let mut out = ctx.run_ui(raw, |ctx| {
+            // Same order as the app: the router resolves hover focus before
+            // the widgets run.
+            router.begin_frame(ctx.ctx());
             egui::CentralPanel::default().show(ctx, |ui| {
-                intent = resoz_ui::piano_roll::show(ui, clip, state, 0.0, false);
+                intent = resoz_ui::piano_roll::show(ui, clip, state, 0.0, false, router);
             });
         });
         out.textures_delta.clear();
@@ -866,8 +876,10 @@ fn keyboard_ownership_tracks_egui_focus_exactly() {
     if let Some(id) = f.state.focus_id() {
         f.ctx.memory_mut(|m| m.surrender_focus(id));
     }
-    // egui settles focus at end of pass; run one frame so memory catches up.
-    f.frame(vec![]);
+    // Park the pointer off the roll (over the toolbar — not a registered
+    // keyboard surface) BEFORE settling: with hover-follow focus, a pointer
+    // still over the roll re-acquires focus the very next frame by design.
+    f.frame(vec![hover(egui::pos2(10.0, 20.0))]);
     assert!(
         !f.state.owns_keyboard_focus(&f.ctx),
         "a roll without focus does not own the keyboard"

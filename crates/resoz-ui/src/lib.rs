@@ -42,6 +42,7 @@ use resoz_model::{
 };
 
 pub mod event_list;
+pub mod focus;
 pub mod grid;
 pub mod lane;
 pub mod patch;
@@ -253,6 +254,10 @@ pub struct ResoZApp {
     edit_clip: Option<EditTarget>,
     /// Piano roll cross-frame state (scroll/drag).
     roll_state: piano_roll::RollState,
+    /// Hover-follow keyboard focus arbiter (Blender-style context; see
+    /// `focus.rs`). Keyboards surfaces register each frame; the decision is
+    /// applied at the start of the next frame.
+    focus_router: focus::FocusRouter,
     /// Automation lane cross-frame state (drag).
     lane_state: lane::LaneState,
     /// Node patch cross-frame state (pan/zoom/selection/drag).
@@ -387,6 +392,7 @@ impl ResoZApp {
             timeline_state: timeline::TimelineState::default(),
             edit_clip: None,
             roll_state: piano_roll::RollState::new(),
+            focus_router: focus::FocusRouter::new(),
             lane_state: lane::LaneState::default(),
             patch_state: patch::PatchState::default(),
             view: MainView::default(),
@@ -2170,7 +2176,7 @@ impl ResoZApp {
 
     fn transport_panel(&mut self, ui: &mut egui::Ui) {
         let playing = self.engine.is_playing();
-        egui::Panel::top("resoz_transport").show(ui, |ui| {
+        let response = egui::Panel::top("resoz_transport").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let mut play_btn = egui::Button::new("▶ Play");
                 if playing {
@@ -2227,13 +2233,15 @@ impl ResoZApp {
                 ui.weak("ResoZ — Rust DAW");
             });
         });
+        // Chrome: hovering the transport releases any editor's focus.
+        self.focus_router.register_neutral(response.response.rect);
     }
 
     /// Arrangement timeline panel (timeline spec T3): rows = tracks, clip
     /// blocks with move/resize/insert/delete, double-click opens the editor.
     /// Main view tab bar (stacks under the transport panel).
     fn view_tabs(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("resoz_views").show(ui, |ui| {
+        let response = egui::Panel::top("resoz_views").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.view, MainView::Timeline, "Timeline");
                 ui.selectable_value(&mut self.view, MainView::Edit, "Edit");
@@ -2241,6 +2249,8 @@ impl ResoZApp {
                 ui.selectable_value(&mut self.view, MainView::Synth, "Synth / Mixer");
             });
         });
+        // Chrome: switching tabs releases the previous view's focus.
+        self.focus_router.register_neutral(response.response.rect);
     }
 
     fn timeline_panel(&mut self, ui: &mut egui::Ui) {
@@ -2270,6 +2280,7 @@ impl ResoZApp {
             let Self {
                 session,
                 timeline_state: state,
+                focus_router: router,
                 ..
             } = self;
             // Read-only: the timeline is a view now; its edit actions come
@@ -2289,6 +2300,7 @@ impl ResoZApp {
                     playing,
                     edit_target,
                 },
+                router,
             )
         };
         for action in actions {
@@ -2834,7 +2846,7 @@ impl ResoZApp {
             .status_message
             .take_if(|(_, at)| at.elapsed() < STATUS_MESSAGE_TTL);
 
-        egui::Panel::bottom("resoz_status").show(ui, |ui| {
+        let response = egui::Panel::bottom("resoz_status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("Device: {}", info.device_name));
                 ui.separator();
@@ -2857,12 +2869,26 @@ impl ResoZApp {
                 ui.label(format!("Pos {}.{}", bar as u32 + 1, beat));
                 ui.separator();
                 ui.label(format!("Uptime {:.1} s", position));
+                if std::env::var_os("RESOZ_FOCUS_DEBUG").is_some() {
+                    ui.separator();
+                    let ctx = ui.ctx().clone();
+                    let (pos, down) =
+                        ctx.input(|i| (i.pointer.latest_pos(), i.pointer.any_down()));
+                    let focused = ctx.memory(|m| m.focused());
+                    let (kb, nz) = self.focus_router.registry_size();
+                    let retained = self.focus_router.last_known_pos();
+                    ui.monospace(format!(
+                        "focus: live={pos:?} retained={retained:?} down={down} owner={focused:?} kb={kb} nz={nz}"
+                    ));
+                }
                 if let Some((text, _)) = message {
                     ui.separator();
                     ui.colored_label(egui::Color32::LIGHT_BLUE, text);
                 }
             });
         });
+        // Chrome: hovering the status bar releases any editor's focus.
+        self.focus_router.register_neutral(response.response.rect);
     }
 
     fn synth_panel(&mut self, ui: &mut egui::Ui) {
@@ -3841,10 +3867,11 @@ impl ResoZApp {
             let Self {
                 session,
                 roll_state,
+                focus_router: router,
                 ..
             } = self;
             let clip = &session.project().midi_tracks[sel].clips[clip_index];
-            piano_roll::show(ui, clip, roll_state, playhead, playing)
+            piano_roll::show(ui, clip, roll_state, playhead, playing, router)
         };
         // Intents run as commands, so every roll edit is undoable. A drag
         // emits one intent per frame under the same gesture key: one drag,
@@ -4464,6 +4491,11 @@ impl eframe::App for ResoZApp {
             self.first_frame_logged = true;
             log::info!("UI first frame rendered");
         }
+
+        // Hover-follow focus resolves first, using the rects registered
+        // last frame, so every `has_focus()` check below (including the
+        // keyboard handling) sees the hover decision this very frame.
+        self.focus_router.begin_frame(ui.ctx());
 
         self.handle_keyboard_input(ui.ctx());
 
