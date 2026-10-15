@@ -26,7 +26,7 @@
 - **数据落点（D1/D2）**：`VoiceSpec::Clap/Vst3` 各加 `state: Vec<u8>`（`#[serde(default, skip_serializing_if = "Vec::is_empty")]`）——旧文件无感，`PROJECT_VERSION` 不动。**注意**：VoiceSpec 是内部 tag 枚举（`type: "clap"` snake_case），RON legacy 形态测试别写成 `(Clap: ...)`。
 - **数据流（D3/D4）**：保存 = `do_save` → `capture_plugin_states()`（engine_id 经 `node_map` 反查 doc_id，两段式：guard 循环采集 blobs → `project_mut()` 写文档；单实例失败 log + 跳过，D7）→ 序列化；恢复 = `install_node` spawn 成功后 `state` 非空即 `load_state` + `read_param_values` 回填 `clap_voice_values`。面板换声源（`load_clap_voice`/构造点）产 `state: Vec::new()`；切内置声源状态随 `VoiceSpec::Builtin` 替换自然丢弃。undo/redo 经 `apply_document → install_node` 走同一恢复路径（但状态 blob 本身不进 undo 图，D5——保存前 undo 回退到旧快照时 state 为旧值）。
 - **测试**：clap-host `state_roundtrip_restores_amplitude`（设参 0.25 → save（8 字节）→ 新实例 load → get_value 读回 0.25，新实例先验证默认 0.5）；model `voice_spec_state_serde_compatibility`（空 state 不序列化 + legacy 无 state 字段可加载）。
-- **VST3**：`state` 字段已预留，FState 采集/恢复 = spec S5（镜像 clap-host，单独 commit）。
+- **VST3**（S5，2026-10-15）：`HostMemoryStream`（`IBStream` 内存流 COM 对象，控制线程专用；读/写/seek/tell 全实现）+ `Vst3InstanceGuard::{save_state, load_state, read_param_values}`——save = 组件 `getState` 写入内存流后整块取出；load = 组件 `setState` + 控制器 `setComponentState` 同步（**两个消费者各一条独立流**：ComRef 不走 SmartPtr 毯子实现，无 vtable 透传 seek，直接免掉 rewind）；save 时插件保持活跃（与 CLAP 镜像一致的简化宿主姿态，Dexed 实测兼容；规范最稳妥顺序是先于 setActive，留待生命周期重构收紧）；测试插件工厂改**逐实例创建**（原 OnceLock 单例与 kManyInstances 相悖且测不了"新实例回落默认值"），SineComponent 以 8 字节 LE f64 经 `getState/setState` 持久化 Gain（`IParameterChanges` 逐队列消费、末点胜出、作用于振幅），控制器镜像读回 = D6 滑块刷新载体（归一化滑块 UI 待接入，`read_param_values` 已预留）。
 
 ### 节点图（`realtime::graph`，P1+P2，spec 见 `docs/spec/node-graph.md`）
 

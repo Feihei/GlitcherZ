@@ -36,18 +36,26 @@ CLAP/VST3 声源与效果器为图节点后，插件的内部状态（音色补�
 
 ## 4. 实现拆分
 
-- [ ] **S1** 文档（本 spec + plan.md）
-- [ ] **S2** clap-host：workspace features 加 `"state"`；`GlitcherZHostShared` 在
+- [x] **S1** 文档（本 spec + plan.md）✅ 2026-10-15
+- [x] **S2** clap-host：workspace features 加 `"state"`；`GlitcherZHostShared` 在
   `initializing()` 经 `InitializingPluginHandle::get_extension` 捕获 `PluginState`
   （OnceLock）；`GlitcherZHostMainThread` 实现 `HostStateImpl`（mark_dirty → log）；
   `ClapInstanceGuard::{save_state, load_state}`；`raw.rs` 增 params `get_value`
   裸调（复用 enumerate_params 的 vtable 模式）；测试插件实现 `PluginStateImpl`
   （amplitude 8 字节 LE 往返）+ 端到端测试（设参 → save → 新实例 load → 读回）
-- [ ] **S3** model：`VoiceSpec` 两变体加 `state` 字段 + RON 往返测试
-- [ ] **S4** UI：`do_save` 采集（engine_id → doc_id 反查）；`install_node` /
+  ✅ 2026-10-15（commit `f71de79`）
+- [x] **S3** model：`VoiceSpec` 两变体加 `state` 字段 + RON 往返测试 ✅ 2026-10-15（commit `a94af04`）
+- [x] **S4** UI：`do_save` 采集（engine_id → doc_id 反查）；`install_node` /
   `load_clap_voice` 恢复 + 滑块回填；换内置声源路径确认状态随 `VoiceSpec::Builtin`
-  替换自然丢弃
-- [ ] **S5** VST3 FState 镜像（第二阶段，单独 commit）
+  替换自然丢弃 ✅ 2026-10-15（commit `a94af04`）
+- [x] **S5** VST3 FState 镜像 ✅ 2026-10-15：`HostMemoryStream`（`IBStream` 内存流
+  COM 对象，host_impl；控制线程专用）+ `Vst3InstanceGuard::{save_state, load_state,
+  read_param_values}`——save 走组件 `getState`；load = 组件 `setState` + 控制器
+  `setComponentState` 同步（两个消费者各一条独立流，免 seek）；测试插件工厂改逐实例
+  创建（原 OnceLock 单例无法测"新实例回落默认值"），SineComponent 以 8 字节 LE f64
+  持久化 Gain（`IParameterChanges` 消费 + 作用于振幅）、控制器 `setComponentState`/
+  `setParamNormalized` 镜像读回（D6 载体）；UI install_node 乐器/效果器两处恢复 +
+  capture 采集 + 文档写回；端到端 `state_roundtrip_restores_gain`
 
 ## 5. 边界与明确不做
 

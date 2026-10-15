@@ -25,7 +25,7 @@
 - [x] CLAP 乐器参数**滑块面板**（2026-10-15：`clap_voice_values` 会话内当前值 map（track → param id → f64 原始值域），滑块变更经 `send_track_param(ParamId::PluginParam)` 直达 `ClapNode`；重载插件/切回内置声源/文档重应用时重置为插件默认值。当前值不持久化——待 state 扩展接入。VST3 滑块仍待归一化换算；Dexed 兼容性复现测试见 `glitcherz-clap-host` 的 `dexed_instrument_note_on_produces_audio`）
 - [x] 插件状态保存/加载 **CLAP 部分**（2026-10-15，spec `spec/plugin-state.md` D1–D7 + S1–S4：`VoiceSpec` 加 `state: Vec<u8>`（serde default，PROJECT_VERSION 不动）；clack state 扩展宿主捕获 + `ClapInstanceGuard::{save_state, load_state}` + raw `get_value` 滑块回填；do_save 采集 / install_node 恢复；测试插件 amplitude 往返测试。VST3 FState 镜像 = S5，见下条）
 - [ ] CLAP / VST3 效果器节点参数桥接（需处理图节点 ID 引用，区分声源/效果器参数空间）
-- [ ] 插件状态保存/加载 **VST3 部分**（S5：FState → 同一 `state` 字段，镜像 clap-host）
+- [x] 插件状态保存/加载 **VST3 部分**（2026-10-15，S5 镜像 clap-host：`HostMemoryStream`（`IBStream` 内存流 COM 对象，host_impl）+ `Vst3InstanceGuard::{save_state, load_state, read_param_values}`——save 走组件 `getState`，load = 组件 `setState` + 控制器 `setComponentState` 同步（各给一条独立流）；测试插件工厂改**逐实例创建**（原 OnceLock 单例与 kManyInstances 相悖且无法测"新实例回落默认值"），SineComponent 以 8 字节 LE f64 持久化 Gain（经 `IParameterChanges` 消费、作用于振幅）、控制器镜像读回；UI install_node 两处恢复 + capture 采集 + 文档写回；端到端 `state_roundtrip_restores_gain`。`read_param_values` 为归一化滑块（下一条）预留）
 - [ ] VST3 参数归一化换算的 UI 层处理（宿主用归一化 0..1，CLAP 用原始值；见 `implementation.md`）
 
 ## 新方向：模块节点图架构（spec 已定稿）
