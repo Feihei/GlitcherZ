@@ -1,22 +1,25 @@
 //! GlitcherZ test CLAP plugin: monophonic sine instrument (with one
-//! automatable parameter).
+//! automatable parameter and a state extension).
 //!
 //! Purpose: end-to-end verification of GlitcherZ's CLAP host — plugin discovery,
-//! instantiation, note event bridging and parameter enumeration. The
-//! implementation is deliberately minimal: a single voice (the last NoteOn
-//! wins), exposing one Amplitude parameter (ID 1, 0..1, default 0.5) for
-//! parameter enumeration and automation bridge verification.
+//! instantiation, note event bridging, parameter enumeration and state
+//! save/load round-trip. The implementation is deliberately minimal: a single
+//! voice (the last NoteOn wins), exposing one Amplitude parameter (ID 1, 0..1,
+//! default 0.5); the state extension persists the amplitude as 8 LE bytes.
 
 use std::ffi::CStr;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use clack_common::events::Match;
 use clack_common::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
+use clack_common::stream::{InputStream, OutputStream};
 use clack_common::utils::Cookie;
 use clack_extensions::params::{
     ParamDisplayWriter, ParamInfo, ParamInfoFlags, ParamInfoWriter, PluginAudioProcessorParams,
     PluginMainThreadParams, PluginParams,
 };
+use clack_extensions::state::{PluginState, PluginStateImpl};
 use clack_plugin::clack_export_entry;
 use clack_plugin::extensions::PluginExtensions;
 use clack_plugin::plugin::features::{INSTRUMENT, STEREO};
@@ -221,6 +224,24 @@ impl PluginMainThreadParams for SineMainThread<'_> {
     }
 }
 
+impl PluginStateImpl for SineMainThread<'_> {
+    /// Persists the amplitude as 8 little-endian bytes (f64 bit pattern).
+    fn save(&self, output: &mut OutputStream) -> Result<(), PluginError> {
+        output
+            .write_all(&self.shared.amplitude().to_bits().to_le_bytes())
+            .map_err(PluginError::from)
+    }
+
+    /// Restores the amplitude from the 8-byte blob.
+    fn load(&self, input: &mut InputStream) -> Result<(), PluginError> {
+        let mut bits = [0u8; 8];
+        input.read_exact(&mut bits).map_err(PluginError::from)?;
+        self.shared
+            .set_amplitude(f64::from_bits(u64::from_le_bytes(bits)));
+        Ok(())
+    }
+}
+
 pub struct SinePlugin;
 
 impl Plugin for SinePlugin {
@@ -233,6 +254,7 @@ impl Plugin for SinePlugin {
         _shared: Option<&Self::Shared<'_>>,
     ) {
         builder.register::<PluginParams>();
+        builder.register::<PluginState>();
     }
 }
 

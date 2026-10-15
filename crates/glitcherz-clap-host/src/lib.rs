@@ -13,7 +13,10 @@
 //!   rules apply to its `process` path);
 //! - Enumerates the parameter list of a plugin instance
 //!   ([`ClapInstance::list_params`], direct calls via the params extension,
-//!   see the `raw` module).
+//!   see the `raw` module);
+//! - Saves/restores the full plugin state blob via the state extension
+//!   ([`ClapInstanceGuard::save_state`] / [`ClapInstanceGuard::load_state`])
+//!   for project persistence.
 //!
 //! Bridging model:
 //! - **Notes**: [`Processor::note_event`] stashes `NoteOn/Off` into a
@@ -37,12 +40,14 @@
 pub mod raw;
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use clack_common::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
 use clack_extensions::log::{HostLog, HostLogImpl};
 use clack_extensions::params::{
     HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamRescanFlags,
 };
+use clack_extensions::state::{HostState, HostStateImpl, PluginState, StateError};
 use clack_host::entry::PluginEntryError;
 use clack_host::prelude::*;
 use clack_host::process::audio_buffers::InputChannel;
@@ -84,6 +89,12 @@ pub enum HostError {
     NoPlugin,
     #[error("plugin does not implement the params extension")]
     NoParams,
+    #[error("plugin does not implement the state extension")]
+    NoState,
+    #[error("failed to save plugin state: {0}")]
+    StateSave(#[source] StateError),
+    #[error("failed to load plugin state: {0}")]
+    StateLoad(#[source] StateError),
 }
 
 // ---------------------------------------------------------------------------
@@ -225,12 +236,20 @@ pub fn list_clap_plugins() -> Vec<ClapPluginInfo> {
 // Host callback implementations
 // ---------------------------------------------------------------------------
 
-struct GlitcherZHostShared;
+struct GlitcherZHostShared {
+    /// Captured during plugin initialization: the plugin's state extension,
+    /// when implemented (read back after instantiation for save/load).
+    state_ext: OnceLock<Option<PluginState>>,
+}
 
 impl SharedHandler<'_> for GlitcherZHostShared {
     fn request_restart(&self) {}
     fn request_process(&self) {}
     fn request_callback(&self) {}
+
+    fn initializing(&self, instance: InitializingPluginHandle<'_>) {
+        let _ = self.state_ext.set(instance.get_extension::<PluginState>());
+    }
 }
 
 impl HostLogImpl for GlitcherZHostShared {
@@ -255,6 +274,13 @@ impl HostParamsImplMainThread for GlitcherZHostMainThread {
     fn clear(&self, _param_id: ClapId, _flags: ParamClearFlags) {}
 }
 
+impl HostStateImpl for GlitcherZHostMainThread {
+    fn mark_dirty(&self) {
+        // No dirty tracking: state is captured wholesale at save time
+        // (see docs/spec/plugin-state.md, D3/D5).
+    }
+}
+
 struct GlitcherZHostHandlers;
 
 impl HostHandlers for GlitcherZHostHandlers {
@@ -265,6 +291,7 @@ impl HostHandlers for GlitcherZHostHandlers {
     fn declare_extensions(builder: &mut HostExtensions<Self>, _shared: &Self::Shared<'_>) {
         builder.register::<HostLog>();
         builder.register::<HostParams>();
+        builder.register::<HostState>();
     }
 }
 
@@ -309,7 +336,40 @@ pub struct ClapNode {
 /// library, leaving the node's processing pointers dangling.
 pub struct ClapInstanceGuard {
     _entry: PluginEntry,
-    _instance: PluginInstance<GlitcherZHostHandlers>,
+    instance: PluginInstance<GlitcherZHostHandlers>,
+    /// The plugin's state extension, when implemented (captured at
+    /// initialization; `None` when the plugin has none).
+    state_ext: Option<PluginState>,
+}
+
+impl ClapInstanceGuard {
+    /// Saves the plugin's full state blob (main thread only; the plugin may
+    /// remain active). The blob format is plugin-private per the CLAP spec.
+    ///
+    /// Returns [`HostError::NoState`] when the plugin does not implement the
+    /// state extension.
+    pub fn save_state(&mut self) -> Result<Vec<u8>, HostError> {
+        let state = self.state_ext.ok_or(HostError::NoState)?;
+        let mut out = Vec::new();
+        state
+            .save(&self.instance.plugin_handle(), &mut out)
+            .map_err(HostError::StateSave)?;
+        Ok(out)
+    }
+
+    /// Restores the plugin state from a previously saved blob (main thread
+    /// only). Call right after instantiation, before the node starts
+    /// processing.
+    ///
+    /// Returns [`HostError::NoState`] when the plugin does not implement the
+    /// state extension.
+    pub fn load_state(&mut self, data: &[u8]) -> Result<(), HostError> {
+        let state = self.state_ext.ok_or(HostError::NoState)?;
+        let mut reader = std::io::Cursor::new(data);
+        state
+            .load(&self.instance.plugin_handle(), &mut reader)
+            .map_err(HostError::StateLoad)
+    }
 }
 
 /// One-shot instantiation result: control-side guard + real-time node.
@@ -349,13 +409,21 @@ impl ClapInstance {
         )
         .map_err(|_| HostError::HostInfo)?;
         let mut instance = PluginInstance::<GlitcherZHostHandlers>::new(
-            |_| GlitcherZHostShared,
+            |_| GlitcherZHostShared {
+                state_ext: OnceLock::new(),
+            },
             |_| GlitcherZHostMainThread,
             &entry,
             &plugin_id,
             &host_info,
         )
         .map_err(HostError::Instance)?;
+
+        // The extension is captured in `initializing` (already run by `new`);
+        // read it back here so save/load do not depend on handler lifetimes.
+        let state_ext = instance
+            .access_shared_handler(|shared| shared.state_ext.get().copied())
+            .flatten();
 
         let stopped = instance
             .activate(
@@ -375,7 +443,8 @@ impl ClapInstance {
         Ok(Self {
             guard: ClapInstanceGuard {
                 _entry: entry,
-                _instance: instance,
+                instance,
+                state_ext,
             },
             node: ClapNode::new(processor, config),
         })
@@ -390,7 +459,19 @@ impl ClapInstance {
     /// RT-safety is irrelevant — this method does not touch the real-time
     /// node.
     pub fn list_params(&self) -> Vec<ClapParamInfo> {
-        raw::enumerate_params(self.guard._instance.raw_instance())
+        raw::enumerate_params(self.guard.instance.raw_instance())
+    }
+
+    /// Reads the current value of every parameter the plugin exposes (main
+    /// thread; params extension `get_value`). Missing ids mean the plugin
+    /// refused the read.
+    ///
+    /// Used after a state load to refresh the UI's cached slider values.
+    pub fn read_param_values(&self) -> std::collections::HashMap<u32, f64> {
+        let ids: Vec<u32> = self.list_params().iter().map(|p| p.id).collect();
+        raw::read_param_values(self.guard.instance.raw_instance(), &ids)
+            .into_iter()
+            .collect()
     }
 }
 
@@ -746,6 +827,41 @@ mod tests {
         assert!(
             (peak - 0.25).abs() < 0.02,
             "output peak should be close to the parameter value 0.25, got {peak}"
+        );
+    }
+
+    #[test]
+    fn state_roundtrip_restores_amplitude() {
+        let Some((mut instance, ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        let mut buffer = AudioBuffer::new(2, 128);
+        buffer.set_len(128);
+        buffer.clear();
+
+        // Move the amplitude away from its default via the param bridge
+        // (needs one process block for the stashed event to flush).
+        assert!(instance.node.set_param(ParamId::PluginParam(1), 0.25));
+        instance.node.process(&ctx, &mut buffer);
+
+        let blob = instance.guard.save_state().expect("state save should work");
+        assert_eq!(blob.len(), 8, "the test plugin saves 8 bytes (f64 bits)");
+
+        // Fresh instance: default amplitude (0.5), then restore the blob.
+        let Some((mut restored, _)) = spawn_test_plugin() else {
+            return;
+        };
+        let before = restored.read_param_values();
+        assert_eq!(before.get(&1), Some(&0.5), "fresh instance has the default");
+        restored
+            .guard
+            .load_state(&blob)
+            .expect("state load should work");
+        let after = restored.read_param_values();
+        assert_eq!(
+            after.get(&1),
+            Some(&0.25),
+            "loaded state should restore the amplitude"
         );
     }
 

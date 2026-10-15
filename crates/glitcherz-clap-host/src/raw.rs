@@ -136,6 +136,44 @@ impl RawPluginParams<'_> {
     }
 }
 
+/// Reads the current value of each given parameter id via the params
+/// extension `get_value` callback; ids the plugin refuses are omitted.
+/// Returns an empty list when the params extension is not implemented.
+///
+/// # Safety (preconditions guaranteed by the caller)
+///
+/// `plugin` must point to a live plugin instance (while held by
+/// [`ClapInstanceGuard`]).
+pub(crate) fn read_param_values(plugin: &clap_plugin, ids: &[u32]) -> Vec<(u32, f64)> {
+    let Some(get_extension) = plugin.get_extension else {
+        return Vec::new();
+    };
+    // SAFETY: the plugin pointer is alive (see preconditions); the callback
+    // returns, per the CLAP spec, a pointer to the extension structure
+    // declared by the plugin (valid for the instance's lifetime).
+    let ext_ptr = unsafe { get_extension(plugin as *const clap_plugin, CLAP_EXT_PARAMS.as_ptr()) };
+    let Some(ext_ptr) = NonNull::new(ext_ptr as *mut clap_plugin_params) else {
+        return Vec::new();
+    };
+    let ext = RawPluginParams {
+        ext_ptr,
+        plugin_ptr: plugin,
+    };
+    let Some(get_value) = ext.vtable().get_value else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(ids.len());
+    for &id in ids {
+        let mut value = 0.0f64;
+        // SAFETY: the extension pointer and the plugin instance are alive;
+        // `value` is a stack slot filled by the plugin callback per the spec.
+        if unsafe { get_value(ext.plugin_ptr as *const clap_plugin, id, &mut value) } {
+            out.push((id, value));
+        }
+    }
+    out
+}
+
 /// Fixed-capacity `c_char` array → String (truncated at the first NUL;
 /// invalid UTF-8 leniently replaced).
 fn c_char_array_to_string(buffer: &[c_char]) -> String {

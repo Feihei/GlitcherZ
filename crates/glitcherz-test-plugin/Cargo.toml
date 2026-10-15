@@ -13,4 +13,4 @@ crate-type = ["cdylib"]
 [dependencies]
 clack-plugin = { workspace = true }
 clack-common = { workspace = true }
-clack-extensions = { workspace = true, features = ["clack-plugin"] }
+clack-extensions = { workspace = true, features = ["clack-plugin", "state"] }
