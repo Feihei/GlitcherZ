@@ -547,6 +547,7 @@ impl Processor for ClapNode {
 mod tests {
     use super::{
         ClapInstance, ClapInstanceConfig, ClapPluginInfo, HostError, list_clap_plugins_in,
+        scan_clap_files,
     };
     use resoz_engine::realtime::NoteEvent;
     use resoz_engine::realtime::buffer::AudioBuffer;
@@ -765,5 +766,75 @@ mod tests {
             result,
             Err(HostError::Load(_) | HostError::NoPlugin)
         ));
+    }
+
+    /// Real-world repro (diagnostic): if a Dexed CLAP build is installed in
+    /// the standard scan directories, instantiate it, trigger a note, and
+    /// assert the output is not silent. Isolates "host bridging broken" from
+    /// "mixer chain broken" and "plugin state/patch empty" (ResoZ hosts
+    /// neither the gui nor the state extension, so Dexed runs on its internal
+    /// default patch). Skipped when no `dexed*.clap` is found.
+    #[test]
+    fn dexed_instrument_note_on_produces_audio() {
+        let Some(path) = scan_clap_files().into_iter().find(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().to_lowercase().contains("dexed"))
+                .unwrap_or(false)
+        }) else {
+            eprintln!("skipped: no dexed*.clap in the CLAP scan directories");
+            return;
+        };
+        let infos = list_clap_plugins_in(&path);
+        let Some(info) = infos.iter().find(|info| info.is_instrument) else {
+            panic!(
+                "{} exposes no instrument plugin (found: {infos:?})",
+                path.display()
+            );
+        };
+
+        let mut instance = ClapInstance::spawn_rt(
+            &path,
+            &info.id,
+            ClapInstanceConfig {
+                sample_rate: 48_000,
+                max_frames: 128,
+            },
+        )
+        .expect("Dexed should instantiate and activate");
+        let param_count = instance.list_params().len();
+        eprintln!("dexed: id={}, params={param_count}", info.id);
+
+        let ctx = ProcessContext {
+            sample_rate: 48_000.0,
+            frames: 128,
+            playback_sample_pos: 0,
+        };
+        let mut buffer = AudioBuffer::new(2, 128);
+        buffer.set_len(128);
+        buffer.clear();
+
+        // Warm-up block (also performs the lazy start_processing), then
+        // enough post-NoteOn blocks to cover a slow attack (~27 ms here).
+        instance.node.process(&ctx, &mut buffer);
+        assert!(instance.node.note_event(NoteEvent::On {
+            note: 69,
+            velocity: 1.0
+        }));
+        let mut peak = 0.0f32;
+        for _ in 0..16 {
+            instance.node.process(&ctx, &mut buffer);
+            let block_peak = buffer
+                .channel(0)
+                .unwrap()
+                .iter()
+                .fold(0.0f32, |acc, s| acc.max(s.abs()));
+            peak = peak.max(block_peak);
+        }
+        assert!(
+            peak > 1e-4,
+            "Dexed stayed silent after NoteOn (peak {peak}, params {param_count}) — \
+             suspect an empty default patch (no state extension hosted) or a \
+             bridging gap; check the clap_plugin log lines"
+        );
     }
 }
