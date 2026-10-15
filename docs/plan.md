@@ -22,6 +22,7 @@
 ## 遗留任务
 
 - [x] CLAP 插件参数**枚举**（2026-10-08 完成：`ClapInstance::list_params` 经 params 扩展 vtable 直调（`raw::enumerate_params`，clack 0.2 包装无读取方法）；测试插件实现 Amplitude 参数；UI 参数面板 + 自动化目标选择器接入 `clap_voice_params`）
+- [x] CLAP 乐器参数**滑块面板**（2026-10-15：`clap_voice_values` 会话内当前值 map（track → param id → f64 原始值域），滑块变更经 `send_track_param(ParamId::PluginParam)` 直达 `ClapNode`；重载插件/切回内置声源/文档重应用时重置为插件默认值。当前值不持久化——待 state 扩展接入。VST3 滑块仍待归一化换算；Dexed 兼容性复现测试见 `resoz-clap-host` 的 `dexed_instrument_note_on_produces_audio`）
 - [ ] CLAP / VST3 效果器节点参数桥接（需处理图节点 ID 引入，区分声源/效果器参数空间）
 - [ ] 插件状态保存/加载（CLAP state extension / VST3 FState → ProjectFile）
 - [ ] VST3 参数归一化换算的 UI 层处理（宿主用归一化 0..1，CLAP 用原始值；见 `implementation.md`）

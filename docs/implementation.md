@@ -16,7 +16,8 @@
 ### CLAP 宿主（`resoz-clap-host`）
 
 - **参数枚举**：`ClapInstance::list_params()` → `raw::enumerate_params`——直接经 `clap_plugin.get_extension` 取 `clap_plugin_params` vtable 指针直调（clack 0.2 的 `PluginParams` 包装无读取方法，raw 模块为唯一 unsafe 边界）；返回 `ClapParamInfo{id, name, module, min/max/default}`。测试插件实现一个可自动化 Amplitude 参数（ID 1，0..1，默认 0.5，f64 位模式原子共享），参数事件驱动渲染振幅。
-- **UI 接入**：`clap_voice_params`（轨道 → 参数快照）在装填 CLAP 声源时填入；参数面板 CollapsingHeader 展示；自动化目标选择器合并 CLAP（曲线值 = 插件值域原始值）与 VST3（曲线值 = 归一化 0..1）两份列表。
+- **UI 接入**：`clap_voice_params`（轨道 → 参数快照）在装填 CLAP 声源时填入；参数面板 CollapsingHeader 内滑块直接调参（2026-10-15：当前值存 `clap_voice_values`（UI 会话内，track → param id → f64），变更经 `send_track_param(ParamId::PluginParam)` 下发，块粒度下一 process 生效；重载插件/切回内置/文档重应用时重置为插件默认值；不持久化——待 state 扩展）；自动化目标选择器合并 CLAP（曲线值 = 插件值域原始值）与 VST3（曲线值 = 归一化 0..1）两份列表。
+- **真实插件兼容性复现**：`dexed_instrument_note_on_produces_audio`（clap-host 测试）——标准扫描目录发现 `dexed*.clap` 时实例化 + NoteOn + 16 块内断言非零输出，找不到则跳过；用于把"宿主桥接问题"与"插件状态/默认补丁问题"（宿主无 gui/state 扩展，Dexed 跑在内部默认补丁上）分开定位。
 
 ### 节点图（`realtime::graph`，P1+P2，spec 见 `docs/spec/node-graph.md`）
 
