@@ -19,7 +19,7 @@
 - **UI 接入**：`clap_voice_params`（轨道 → 参数快照）在装填 CLAP 声源时填入；参数面板 CollapsingHeader 内滑块直接调参（当前值存 `clap_voice_values`（UI 会话内，track → param id → f64），变更经 `send_track_param(ParamId::PluginParam)` 下发，块粒度下一 process 生效；重载插件/切回内置/文档重应用时重置为插件默认值；state 持久化落地后，重载路径经 `load_state` + `read_param_values` 重播种滑块缓存）；自动化目标选择器合并 CLAP（曲线值 = 插件值域原始值）与 VST3（曲线值 = 归一化 0..1）两份列表，并含外挂效果器参数（端点 = 效果器节点）。
 - **真实插件兼容性复现**：`dexed_instrument_note_on_produces_audio`（clap-host 测试）——标准扫描目录发现 `dexed*.clap` 时实例化 + NoteOn + 16 块内断言非零输出，找不到则跳过；用于把"宿主桥接问题"与"插件状态/默认补丁问题"（宿主无 gui/state 扩展，Dexed 跑在内部默认补丁上）分开定位。
 
-### 插件状态持久化（CLAP state extension，2026-10-15，spec 见 `docs/spec/plugin-state.md`）
+### 插件状态持久化（CLAP state extension，2026-10-15，spec 见 `.agents/spec/plugin-state.md`）
 
 - **宿主侧**：workspace `clack-extensions` features 加 `"state"`（clack 0.2 的 `PluginState` 包装**有**完整 save/load 方法，与 params 不同、无需裸调 vtable）。`GlitcherZHostShared.state_ext: OnceLock<Option<PluginState>>` 在 `initializing()` 经 `InitializingPluginHandle::get_extension` 捕获，spawn 后 `access_shared_handler` 读出存进 `ClapInstanceGuard`；`GlitcherZHostMainThread` 实现 `HostStateImpl`（mark_dirty → no-op，采集时机见 D3）。
 - **API**：`ClapInstanceGuard::{save_state() -> Vec<u8>, load_state(&[u8])}`（main thread，错误变体 `NoState/StateSave/StateLoad`）；`ClapInstance::read_param_values()` → `HashMap<u32, f64>`——raw vtable `get_value`（复用 enumerate 的扩展抓取模式），供状态加载后刷新滑块缓存。
@@ -28,7 +28,7 @@
 - **测试**：clap-host `state_roundtrip_restores_amplitude`（设参 0.25 → save（8 字节）→ 新实例 load → get_value 读回 0.25，新实例先验证默认 0.5）；model `voice_spec_state_serde_compatibility`（空 state 不序列化 + legacy 无 state 字段可加载）。
 - **VST3**（S5，2026-10-15）：`HostMemoryStream`（`IBStream` 内存流 COM 对象，控制线程专用；读/写/seek/tell 全实现）+ `Vst3InstanceGuard::{save_state, load_state, read_param_values}`——save = 组件 `getState` 写入内存流后整块取出；load = 组件 `setState` + 控制器 `setComponentState` 同步（**两个消费者各一条独立流**：ComRef 不走 SmartPtr 毯子实现，无 vtable 透传 seek，直接免掉 rewind）；save 时插件保持活跃（与 CLAP 镜像一致的简化宿主姿态，Dexed 实测兼容；规范最稳妥顺序是先于 setActive，留待生命周期重构收紧）；测试插件工厂改**逐实例创建**（原 OnceLock 单例与 kManyInstances 相悖且测不了"新实例回落默认值"），SineComponent 以 8 字节 LE f64 经 `getState/setState` 持久化 Gain（`IParameterChanges` 逐队列消费、末点胜出、作用于振幅），控制器镜像读回 = D6 滑块刷新载体（归一化滑块 UI 待接入，`read_param_values` 已预留）。
 
-### 节点图（`realtime::graph`，P1+P2，spec 见 `docs/spec/node-graph.md`）
+### 节点图（`realtime::graph`，P1+P2，spec 见 `.agents/spec/node-graph.md`）
 
 - **项目文件 v2（P4）**：`PROJECT_VERSION = 2`，无 v1 读路径（serde 字段级默认值容忍缺失）。新增 `Project.graph: GraphDoc`（过渡形态，spec §7 完整 nodes+cables 随 P5 落地）——`midi_links`（MIDI 跨轨扇出，上限 16；加载期校验越界/自连/超容报 `ModelError::InvalidGraph`）；`Automation::loop_ticks` 显式携带（默认 384），泳道显示口径同步回写。引擎侧配套 `AudioEngine::connect_midi_track/disconnect_midi_track`（快照回滚），UI `push_all_params` 加载时重放连线。
 - **`RtGraph`**：定容 64 槽位，每节点一个专属立体声 128 帧输出缓冲；处理按预编译拓扑序遍历——清零 → 多入边自动求和（≤8）→ 原地 `Processor::process`；主输出槽缓冲即 cpal 写出源。

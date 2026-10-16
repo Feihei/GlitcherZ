@@ -23,7 +23,7 @@
 //!   not depend on `glitcherz-engine`, and the engine does not depend on this
 //!   crate either -- `glitcherz-app` / `glitcherz-ui` do the conversion glue.
 //!
-//! v4 (spec `docs/spec/timeline.md` §4, D14-D15):
+//! v4 (spec `.agents/spec/timeline.md` §4, D14-D15):
 //! - `MidiTrack { name, clips: Vec<MidiClip> }` — a track holds up to
 //!   [`MAX_CLIPS_PER_TRACK`] clips placed on the arrangement timeline
 //!   (absolute `start_ticks`, `span_ticks`, content loops every
@@ -34,7 +34,7 @@
 //!   per-track single `Clip` / project `gate` are gone);
 //! - validation rejects over-capacity documents (report, never truncate).
 //!
-//! v3 (spec `docs/spec/node-graph.md` §7, D11-D13, unchanged in v4):
+//! v3 (spec `.agents/spec/node-graph.md` §7, D11-D13, unchanged in v4):
 //! - `GraphDoc{nodes, cables}` fully explicit: the default topology is also
 //!   written into the document, and the loader rebuilds the engine graph
 //!   purely from the document (D13);

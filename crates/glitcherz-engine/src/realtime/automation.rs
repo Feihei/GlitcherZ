@@ -1,6 +1,6 @@
 //! Automation curves and control clips (evaluated on the audio thread side).
 //!
-//! D7/D17 (spec `docs/spec/node-graph.md`, `docs/spec/timeline.md`): control
+//! D7/D17 (spec `.agents/spec/node-graph.md`, `.agents/spec/timeline.md`): control
 //! tracks are independent timeline entities parallel to MIDI tracks — a curve
 //! is just a pure anchor list with no target parameter; the delivery target is
 //! entirely determined by the node graph's automation routing table

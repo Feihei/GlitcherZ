@@ -1,6 +1,6 @@
 # AGENTS.md — GlitcherZ
 
-> 本文件是**索引与硬规范**。架构约定、实现细节、计划分别见 `docs/` 下文档；动代码前先读对应文档。
+> 本文件是**索引与硬规范**。架构约定、实现细节、计划分别见 `.agents/` 下文档；动代码前先读对应文档。
 
 ## 项目简介
 
@@ -39,7 +39,8 @@ glitcherz/
 │   ├── glitcherz-test-plugin/  # CLAP 测试插件 fixture（cdylib）
 │   ├── glitcherz-test-vst3/    # VST3 测试插件 fixture
 │   └── glitcherz-app/          # 可执行入口，粘合 engine/model/ui
-└── docs/                   # 详细文档（见下方「文档索引」）
+├── .agents/               # agent 开发文档（见下方「文档索引」）
+└── docs/                  # 用户文档与 assets 素材
 ```
 
 ## 实时音频铁律（最高优先级）
@@ -54,7 +55,7 @@ glitcherz/
 
 ## 编码规范
 
-- **语言约定**：代码注释、doc comment、日志、UI 文案、错误消息一律**英文**（用户要求：egui 默认字体无 CJK 字形）；术语以 `docs/glossary.md` 为准，新概念先登记再使用。`docs/` 与本文件等项目文档可用中文。
+- **语言约定**：代码注释、doc comment、日志、UI 文案、错误消息一律**英文**（用户要求：egui 默认字体无 CJK 字形）；术语以 `.agents/glossary.md` 为准，新概念先登记再使用。`.agents/` 与本文件等项目文档可用中文。
 - `cargo clippy -- -D warnings` 必须零警告。
 - `cargo fmt` 格式化所有代码。
 - 禁止 `unsafe`，除非：模块顶部有 `// SAFETY:` 注释 + 理由 + 测试。当前允许的边界仅 `glitcherz-clap-host` / `glitcherz-vst3-host` 的插件绑定层。
@@ -97,12 +98,14 @@ cargo build --release -p glitcherz-app
 
 | 文档 | 内容 | 何时读 |
 | :--- | :--- | :--- |
-| `docs/architecture.md` | 架构约定：线程模型、处理图、数据模型 | 动引擎/模型代码前 |
-| `docs/glossary.md` | 术语表：中英对照 + 文案风格约定 | 写注释/日志/UI 文案、引入新概念前 |
-| `docs/implementation.md` | 已落地模块的实现要点、协议细节、版本 gotchas | 改现有功能、排查问题时 |
-| `docs/plan.md` | 路线图、当前状态、遗留任务、进行中的方向 | 规划下一步、同步进度时 |
-| `docs/spec/` | 特性 spec（节点图架构 spec 进行中） | 实施对应特性前 |
+| `.agents/architecture.md` | 架构约定：线程模型、处理图、数据模型 | 动引擎/模型代码前 |
+| `.agents/glossary.md` | 术语表：中英对照 + 文案风格约定 | 写注释/日志/UI 文案、引入新概念前 |
+| `.agents/implementation.md` | 已落地模块的实现要点、协议细节、版本 gotchas | 改现有功能、排查问题时 |
+| `.agents/plan.md` | 路线图、当前状态、遗留任务、进行中的方向 | 规划下一步、同步进度时 |
+| `.agents/spec/` | 特性 spec（节点图架构 spec 进行中） | 实施对应特性前 |
+
+目录约定：`.agents/` 只放 agent / 开发向文档；`docs/` 只放面向用户的文档与 assets 素材（图片、示例工程等），二者不要混放。
 
 ## 给 AI 助手的特别说明
 
-修改音频回调路径代码时，先完整阅读 `glitcherz-engine/src/realtime/` 下的现有代码并遵守上述实时铁律；对架构有疑问时优先阅读 `glitcherz-engine` 的模块文档注释与 `docs/architecture.md`，而非自行假设。计划类变更先更新 `docs/plan.md`，重大设计决策先写 `docs/spec/` 再实现。
+修改音频回调路径代码时，先完整阅读 `glitcherz-engine/src/realtime/` 下的现有代码并遵守上述实时铁律；对架构有疑问时优先阅读 `glitcherz-engine` 的模块文档注释与 `.agents/architecture.md`，而非自行假设。计划类变更先更新 `.agents/plan.md`，重大设计决策先写 `.agents/spec/` 再实现。

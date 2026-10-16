@@ -5,7 +5,7 @@
 //! GlitcherZ's egui UI: transport controls, arrangement timeline, piano roll,
 //! mixer, patch board, and automation lanes.
 //!
-//! P5c (spec `docs/spec/node-graph.md` D13): the engine graph is
+//! P5c (spec `.agents/spec/node-graph.md` D13): the engine graph is
 //! **rebuilt purely from the project document** — `GlitcherZApp` owns the
 //! `Project` document; on load/new, `apply_document` builds the graph
 //! step by step at `add_node` / `connect_nodes` granularity. Document

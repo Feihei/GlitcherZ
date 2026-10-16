@@ -277,7 +277,7 @@ impl HostParamsImplMainThread for GlitcherZHostMainThread {
 impl HostStateImpl for GlitcherZHostMainThread {
     fn mark_dirty(&self) {
         // No dirty tracking: state is captured wholesale at save time
-        // (see docs/spec/plugin-state.md, D3/D5).
+        // (see .agents/spec/plugin-state.md, D3/D5).
     }
 }
 

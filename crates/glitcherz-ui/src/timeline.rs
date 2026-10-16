@@ -1,4 +1,4 @@
-//! Arrangement timeline view (timeline spec T3, `docs/spec/timeline.md`).
+//! Arrangement timeline view (timeline spec T3, `.agents/spec/timeline.md`).
 //!
 //! Rows = tracks (MIDI + control); each row shows its clip blocks on an
 //! absolute-tick ruler (bars). Interactions:

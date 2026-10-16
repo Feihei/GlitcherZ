@@ -1,6 +1,6 @@
 //! Piano roll editor component (egui self-drawn).
 //!
-//! Interaction model (M4, see `docs/spec/editing-model.md`): the semantic
+//! Interaction model (M4, see `.agents/spec/editing-model.md`): the semantic
 //! decision source is **discrete state**, not the pointer position.
 //!
 //! - **Persistent state** — [`RollMode::Select`] (a left-drag tweaks: moves

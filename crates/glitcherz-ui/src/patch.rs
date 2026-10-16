@@ -23,7 +23,7 @@ use glitcherz_model::{
 /// Patch entity identity: document nodes + fixed entities (master output /
 /// the arrangement timeline).
 ///
-/// T4 (spec `docs/spec/timeline.md`): the per-track source boxes merged into
+/// T4 (spec `.agents/spec/timeline.md`): the per-track source boxes merged into
 /// **one explicit Timeline node** — no inputs, `n` outputs (n = MIDI tracks +
 /// control tracks), undeletable. `PortRef::MidiTrack/AutoTrack` semantics are
 /// unchanged; this is a pure presentation-layer merge.

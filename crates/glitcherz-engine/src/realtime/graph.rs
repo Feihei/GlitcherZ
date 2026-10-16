@@ -1,7 +1,7 @@
 //! Node graph (P1–P3): wireable processing graph core, default track
 //! topology, timeline routing tables, and the structural update protocol.
 //!
-//! Replaces the old fixed-topology `Mixer` (spec: `docs/spec/node-graph.md`):
+//! Replaces the old fixed-topology `Mixer` (spec: `.agents/spec/node-graph.md`):
 //!
 //! - **One preallocated stereo output buffer per node**; multiple incoming
 //!   edges are summed automatically at node inputs (D4); the in-place
