@@ -110,6 +110,14 @@
 - **守卫定位**：`instrument_engine_guard(track)` 经乐器 doc 节点反查 engine id 再扫 `voice_guards`——不能直接按 track 匹配（效果器守卫同轨注册）。
 - **后续**：效果器预设（机制可平移，缓存键换 doc id）；预设重命名/导入导出按需再加。
 
+### Dexed .syx 预设导入（dev 工具，2026-10-15）
+
+- **state 格式逆向结论**：Dexed 的 CLAP state = `VC2!` 魔数 + u32 LE XML 长度 + XML + `\0`。XML 根 `dexedState`（cutoff/gain/opSwitch/mpe… 属性 + `currentProgram`），子元素 `dexedBlob` 带**两个** JUCE 专有 base64 属性：`base64:sysex`（整盘 4104 字节 DX7 bank）与 `base64:program`（161 字节 `data[]`）。**加载时 `memcpy(data, program, 161)` 覆盖引擎数据——换音色必须替换 program，只换 sysex 无效**（cart 只是库存储）。
+- **编码**：`MemoryBlock::toBase64Encoding` 是 JUCE 专有变体（非 RFC 4648）：字母表 = `.` + `A-Z` + `a-z` + `0-9` + `+`（`.`=0，无 `/` 无 `=` 填充，尾组零填充），格式 = `"SIZE." + 编码流`，位序 MSB-first 6-bit 组。
+- **`data[161]` 布局**：`[0..155]` = 解包音色（6 op × 21：EG rate/level×8、BP、scale depth×2（+11/12 曲线位包、+13 rate scaling、+14 AMS、+15 KVS、+16 output、+17 mode、+18 coarse、+19 fine、**+20 detune**）→ pitch EG 8（126..134）→ algorithm@134 → feedback@135 → osc sync@136 → LFO speed/delay/pmd/lamd（137..141）→ lfo keysync/wave/pmsens 位包（141..144）→ transpose@144 → 名字 10 字节（145..155））；`[155]` = opSwitch 位包（运行时由 XML opSwitch 属性同步）；`[156..161]` = 控制器杂项。`Cartridge::unpackProgram` 已 1:1 移植为 `unpack_voice`（含 `normparm` 越界归一化）。
+- **导入器**：`dexed_import_ym2612_banks`（`#[ignore]`，`DEXED_IMPORT_BANK_DIR` 指定 bank 目录）：校验 bank 头/校验和 → 模板 XML 双属性替换（sysex = 整盘 bank、program = 逐音色解包 + 模板尾部继承）→ `load_state` → `save_state` 回读解码逐字节校验 program → bank 首音色 NoteOn 出声断言 → 写 `presets/<键>/<bank>-NN-<音色名>.glzpreset`。`dexed_dump_param_table` 可导出插件参数表（id/名字/域）供排查。
+- 已入库：YM2612-Dexed-Presets 四个 bank × 32 = **128 个音色**（BASS_BRASS / KEYS_BELLS / MORPH / SYNTH），预设文件为本地用户数据（.gitignore 已排除）。
+
 ### 项目文件与模型（`glitcherz-model`）
 
 - `Project`（metadata + gate + master_gain + 4×`Track`）；`Track` = 名称 + `Pattern` + `Clip`（`Note{start,length,note,velocity}` 列表 + loop_ticks，tick 基准：`TICKS_PER_QUARTER=96`/步=24/小节=384）+ 音源枚举（`VoiceSpec`: `Builtin | Clap | Vst3`）+ 混音（增益/声像/静音）+ `SynthParams` + `DelayParams`，全部 serde/RON + 字段级 `#[serde(default)]`；引擎侧镜像 `RtClip`（定容 128 音符 `Copy`，超容截断）经 `SetClip` 命令整块下发；
