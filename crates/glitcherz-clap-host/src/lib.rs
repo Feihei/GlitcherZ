@@ -969,4 +969,441 @@ mod tests {
              bridging gap; check the clap_plugin log lines"
         );
     }
+
+    /// Dev tool (diagnostic dump): enumerates every Dexed parameter
+    /// (id | module | name | min | max | default) into a workspace text file
+    /// for building the DX7 sysex → Dexed param mapping. Run with:
+    /// `cargo test -p glitcherz-clap-host dexed_dump_param_table -- --ignored --nocapture`
+    #[test]
+    #[ignore = "dev tool: writes dexed_params.txt into the workspace root"]
+    fn dexed_dump_param_table() {
+        let Some(path) = scan_clap_files().into_iter().find(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().to_lowercase().contains("dexed"))
+                .unwrap_or(false)
+        }) else {
+            panic!("no dexed*.clap found in the CLAP scan directories");
+        };
+        let infos = list_clap_plugins_in(&path);
+        let info = infos
+            .iter()
+            .find(|info| info.is_instrument)
+            .expect("Dexed exposes no instrument class");
+        let instance = ClapInstance::spawn_rt(
+            &path,
+            &info.id,
+            ClapInstanceConfig {
+                sample_rate: 48_000,
+                max_frames: 128,
+            },
+        )
+        .expect("Dexed should instantiate");
+        let params = instance.list_params();
+        let mut out = String::new();
+        out.push_str(&format!("# Dexed param dump from {}\n", path.display()));
+        out.push_str(&format!("# total {}\n", params.len()));
+        out.push_str("id | module | name | min | max | default\n");
+        for p in &params {
+            out.push_str(&format!(
+                "{} | {} | {} | {:.3} | {:.3} | {:.3}\n",
+                p.id, p.module, p.name, p.min_value, p.max_value, p.default_value
+            ));
+        }
+        let dest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dexed_params.txt");
+        std::fs::write(&dest, out).expect("write dump");
+        eprintln!("wrote {}", dest.canonicalize().unwrap().display());
+    }
+
+    // -----------------------------------------------------------------------
+    // DX7 bank (.syx) → Dexed preset import (dev tool)
+    // -----------------------------------------------------------------------
+    //
+    // Dexed's state blob is `VC2!` + u32 LE xml_len + XML + '\0', where the
+    // XML carries the **whole 4104-byte DX7 cartridge** as a JUCE base64
+    // attribute (`base64:sysex="4104.<b64>"`) plus `currentProgram="N"`.
+    // Importing a bank therefore needs no parameter mapping: splice the bank
+    // bytes into the template XML, set the program index per voice, and load.
+
+    /// JUCE's **proprietary** base64 (MemoryBlock::toBase64Encoding):
+    /// alphabet `.` + A-Z + a-z + 0-9 + `+` (no '/' and no '=' padding),
+    /// "SIZE." prefix is written by the caller. Dexed stores its blob
+    /// attributes with this encoding, not RFC 4648.
+    fn b64_encode(data: &[u8]) -> String {
+        const T: &[u8; 64] = b".ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+";
+        let num_chars = (data.len() * 8 + 5) / 6;
+        let mut out = String::with_capacity(num_chars);
+        for i in 0..num_chars {
+            let bit_pos = i * 6;
+            let byte_i = bit_pos / 8;
+            let shift = bit_pos % 8;
+            let next = data.get(byte_i + 1).copied().unwrap_or(0) as u32;
+            let v = ((((data[byte_i] as u32) << 8) | next) >> (10 - shift)) & 0x3f;
+            out.push(T[v as usize] as char);
+        }
+        out
+    }
+
+    /// Inverse of [`b64_encode`] (JUCE `fromBase64Encoding`, minus the size
+    /// prefix) — used to verify roundtrips byte-for-byte.
+    fn b64_decode(encoded: &str, out_len: usize) -> Vec<u8> {
+        fn value(c: u8) -> Option<u32> {
+            Some(match c {
+                b'.' => 0,
+                b'A'..=b'Z' => (c - b'A') as u32 + 1,
+                b'a'..=b'z' => (c - b'a') as u32 + 27,
+                b'0'..=b'9' => (c - b'0') as u32 + 53,
+                b'+' => 63,
+                _ => return None,
+            })
+        }
+        let mut out = vec![0u8; out_len];
+        for (k, ch) in encoded.chars().enumerate() {
+            let Some(v) = value(ch as u8) else { continue };
+            let bit_pos = k * 6;
+            let byte_i = bit_pos / 8;
+            let shift = bit_pos % 8;
+            if byte_i >= out_len {
+                break;
+            }
+            // The 6 bits v land at stream positions [shift, shift+6) within
+            // the MSB-first byte stream; split across bytes when needed.
+            match shift {
+                0 => out[byte_i] |= (v << 2) as u8,
+                2 => out[byte_i] |= v as u8,
+                4 => {
+                    out[byte_i] |= (v >> 2) as u8;
+                    if byte_i + 1 < out_len {
+                        out[byte_i + 1] |= ((v & 3) << 6) as u8;
+                    }
+                }
+                6 => {
+                    out[byte_i] |= (v >> 4) as u8;
+                    if byte_i + 1 < out_len {
+                        out[byte_i + 1] |= ((v & 0xf) << 4) as u8;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// `Cartridge::unpackProgram` (Dexed old PluginData.cpp, ported 1:1):
+    /// one 128-byte packed bank voice → the 155-byte engine layout
+    /// (`data[0..155]`).
+    fn unpack_voice(packed: &[u8]) -> [u8; 155] {
+        let bulk = |i: usize| packed[i] & 0x7f;
+        let mut up = [0u8; 155];
+        let norm = |value: u8, max: u8| {
+            if value <= max {
+                value
+            } else {
+                ((value as f32) / 255.0 * max as f32) as u8
+            }
+        };
+        for op in 0..6usize {
+            for i in 0..11 {
+                up[op * 21 + i] = norm(bulk(op * 17 + i), 99);
+            }
+            let curves = bulk(op * 17 + 11) & 0xf;
+            up[op * 21 + 11] = curves & 3;
+            up[op * 21 + 12] = (curves >> 2) & 3;
+            let detune_rs = bulk(op * 17 + 12);
+            up[op * 21 + 13] = detune_rs & 7;
+            let kvs_ams = bulk(op * 17 + 13) & 0x1f;
+            up[op * 21 + 14] = kvs_ams & 3;
+            up[op * 21 + 15] = (kvs_ams >> 2) & 7;
+            up[op * 21 + 16] = bulk(op * 17 + 14);
+            let fcoarse_mode = bulk(op * 17 + 15) & 0x3f;
+            up[op * 21 + 17] = fcoarse_mode & 1;
+            up[op * 21 + 18] = (fcoarse_mode >> 1) & 0x1f;
+            up[op * 21 + 19] = bulk(op * 17 + 16);
+            up[op * 21 + 20] = (detune_rs >> 3) & 0x7f;
+        }
+        for i in 0..8 {
+            up[126 + i] = norm(bulk(102 + i), 99);
+        }
+        up[134] = norm(bulk(110) & 0x1f, 31);
+        let oks_fb = bulk(111) & 0xf;
+        up[135] = oks_fb & 7;
+        up[136] = oks_fb >> 3;
+        up[137] = bulk(112);
+        up[138] = bulk(113);
+        up[139] = bulk(114);
+        up[140] = bulk(115);
+        let lpms_lfw_lks = bulk(116);
+        up[141] = lpms_lfw_lks & 1;
+        up[142] = (lpms_lfw_lks >> 1) & 7;
+        up[143] = lpms_lfw_lks >> 4;
+        up[144] = bulk(117);
+        for i in 0..10 {
+            up[145 + i] = bulk(118 + i);
+        }
+        up
+    }
+
+    /// Replaces `prefix"old"` with `prefix"new"` (attribute-value surgery on
+    /// the flat Dexed XML).
+    fn xml_attr_replace(xml: &str, attr_prefix: &str, new_value: &str) -> Option<String> {
+        let start = xml.find(attr_prefix)? + attr_prefix.len();
+        let end = start + xml[start..].find('"')?;
+        Some(format!("{}{}{}", &xml[..start], new_value, &xml[end..]))
+    }
+
+    /// Filesystem-safe fragment (mirrors the UI's `sanitize_filename_fragment`).
+    fn sanitize_fragment(text: &str, max_chars: usize) -> String {
+        let cleaned: String = text
+            .chars()
+            .take(max_chars)
+            .map(|c| match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | ' ' => c,
+                _ => '_',
+            })
+            .collect();
+        let trimmed = cleaned.trim();
+        if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+            "plugin".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    /// The preset-library key (mirrors the UI's `preset_plugin_key`).
+    fn preset_key_for(path_str: &str, id: &str) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path_str.hash(&mut hasher);
+        format!(
+            "clap-{:08x}-{}",
+            hasher.finish() as u32,
+            sanitize_fragment(id, 24)
+        )
+    }
+
+    /// DX7 bank checksum (two's complement of the data sum, 7-bit).
+    fn dx7_checksum(data: &[u8]) -> u8 {
+        let sum: u32 = data.iter().map(|b| *b as u32).sum();
+        ((0x80 - (sum & 0x7f)) & 0x7f) as u8
+    }
+
+    /// Imports the YM2612 bank .syx files (each 32 DX7 voices) into the
+    /// preset library as Dexed presets — one `.glzpreset` per voice,
+    /// verified by a load→save roundtrip and (bank voice #0) a render check.
+    #[test]
+    #[ignore = "dev tool: imports .syx banks into presets/ (needs Dexed installed)"]
+    fn dexed_import_ym2612_banks() {
+        let Some(path) = scan_clap_files().into_iter().find(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().to_lowercase().contains("dexed"))
+                .unwrap_or(false)
+        }) else {
+            panic!("no dexed*.clap found in the CLAP scan directories");
+        };
+        let infos = list_clap_plugins_in(&path);
+        let info = infos
+            .iter()
+            .find(|info| info.is_instrument)
+            .expect("Dexed exposes no instrument class");
+        let mut instance = ClapInstance::spawn_rt(
+            &path,
+            &info.id,
+            ClapInstanceConfig {
+                sample_rate: 48_000,
+                max_frames: 128,
+            },
+        )
+        .expect("Dexed should instantiate");
+
+        // Template state: fresh XML with the stock cartridge + program.
+        let fresh = instance
+            .guard
+            .save_state()
+            .expect("Dexed implements the state extension");
+        assert_eq!(&fresh[0..4], b"VC2!", "unexpected Dexed state magic");
+        let xml_len = u32::from_le_bytes([fresh[4], fresh[5], fresh[6], fresh[7]]) as usize;
+        let template_xml =
+            String::from_utf8(fresh[8..8 + xml_len].to_vec()).expect("Dexed state XML is UTF-8");
+        assert!(
+            template_xml.contains("base64:sysex=\"4104."),
+            "template XML does not carry a 4104-byte cartridge"
+        );
+        // The `program` blob (Dexed's data[161]) is what actually drives the
+        // engine on load (`memcpy(data, program, 161)`) — its tail
+        // (data[155..161], op-switch byte + controller extras) is donated by
+        // the template.
+        let template_program_start = template_xml
+            .find("base64:program=\"")
+            .expect("program attr")
+            + 17;
+        let template_program_end =
+            template_program_start + template_xml[template_program_start..].find('"').unwrap();
+        let template_program_all = &template_xml[template_program_start..template_program_end];
+        let (_prefix, template_program_b64) =
+            template_program_all.split_once('.').expect("size prefix");
+        let template_program = b64_decode(template_program_b64, 161);
+
+        let ctx = ProcessContext {
+            sample_rate: 48_000.0,
+            frames: 128,
+            playback_sample_pos: 0,
+        };
+        let mut buffer = AudioBuffer::new(2, 128);
+        buffer.set_len(128);
+        buffer.clear();
+
+        // Workspace layout: this crate lives at <workspace>/crates/
+        // glitcherz-clap-host. Bank directory overridable via
+        // `DEXED_IMPORT_BANK_DIR` (a folder of 4104-byte DX7 bank .syx
+        // files); defaults to the YM2612 scratch extraction.
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest.join("../..").canonicalize().unwrap();
+        let bank_dir = std::env::var("DEXED_IMPORT_BANK_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                workspace.join(".tmp-dexed-presets/YM2612-Dexed-Presets-main/YM2612_CART")
+            });
+        let preset_root = workspace.join("presets");
+        let key = preset_key_for(&path.display().to_string(), &info.id);
+
+        let mut imported = 0usize;
+        let mut checked_audio = 0usize;
+        let bank_paths: Vec<_> = std::fs::read_dir(&bank_dir)
+            .expect("bank dir")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "syx").unwrap_or(false))
+            .collect();
+        assert!(
+            !bank_paths.is_empty(),
+            "no .syx banks found in {bank_dir:?}"
+        );
+
+        for bank_path in &bank_paths {
+            let cart = std::fs::read(bank_path).expect("read bank");
+            assert_eq!(cart.len(), 4104, "bank size must be 4104");
+            assert_eq!(
+                &cart[0..6],
+                &[0xF0, 0x43, 0x00, 0x09, 0x20, 0x00],
+                "unexpected DX7 bank header"
+            );
+            let data = &cart[6..6 + 4096];
+            assert_eq!(cart[4102], dx7_checksum(data), "bank checksum mismatch");
+            assert_eq!(cart[4103], 0xF7, "missing sysex end byte");
+            let bank_label = sanitize_fragment(
+                bank_path
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .strip_prefix("YM2612_")
+                    .unwrap_or("BANK"),
+                24,
+            );
+            let cart_b64 = b64_encode(&cart);
+
+            for voice in 0..32u32 {
+                let packed = &data[voice as usize * 128..(voice as usize + 1) * 128];
+                let name: String = packed[118..128]
+                    .iter()
+                    .map(|b| {
+                        if (32..127).contains(b) {
+                            *b as char
+                        } else {
+                            ' '
+                        }
+                    })
+                    .collect();
+                let name = name.trim().trim_end_matches('_').replace(' ', "_");
+                let name = sanitize_fragment(&name, 24);
+
+                // Engine data: unpacked voice + the template's tail.
+                let unpacked = unpack_voice(packed);
+                let mut program = [0u8; 161];
+                program[..155].copy_from_slice(&unpacked);
+                program[155..161].copy_from_slice(&template_program[155..161]);
+
+                // Splice cartridge + program + program index into the XML.
+                let xml = xml_attr_replace(&template_xml, "base64:sysex=\"", &cart_b64)
+                    .expect("sysex attribute");
+                let xml = xml_attr_replace(
+                    &xml,
+                    "base64:program=\"",
+                    &format!("161.{}", b64_encode(&program)),
+                )
+                .expect("program attribute");
+                let xml = xml_attr_replace(&xml, "currentProgram=\"", &voice.to_string())
+                    .expect("currentProgram attribute");
+                let mut blob = Vec::with_capacity(8 + xml.len() + 1);
+                blob.extend_from_slice(b"VC2!");
+                blob.extend_from_slice(&(xml.len() as u32).to_le_bytes());
+                blob.extend_from_slice(xml.as_bytes());
+                blob.push(0);
+
+                instance
+                    .guard
+                    .load_state(&blob)
+                    .expect("Dexed rejected the constructed state");
+
+                // Roundtrip check: the saved state must carry the same
+                // program bytes (the sound-critical part) and index.
+                let saved = instance.guard.save_state().expect("save after load");
+                let saved_xml_len =
+                    u32::from_le_bytes([saved[4], saved[5], saved[6], saved[7]]) as usize;
+                let saved_xml = String::from_utf8(saved[8..8 + saved_xml_len].to_vec()).unwrap();
+                assert!(
+                    saved_xml.contains(&format!("currentProgram=\"{voice}\"")),
+                    "program index did not stick (voice {voice})"
+                );
+                {
+                    let start = saved_xml.find("base64:program=\"").expect("program attr") + 17;
+                    let end = start + saved_xml[start..].find('"').unwrap();
+                    let (_p, b64) = saved_xml[start..end].split_once('.').expect("size prefix");
+                    let saved_program = b64_decode(b64, 161);
+                    assert_eq!(
+                        &saved_program[..155],
+                        &unpacked[..],
+                        "engine program bytes did not survive the roundtrip (voice {voice})"
+                    );
+                }
+
+                // Render check: bank voice #0 must produce sound.
+                if voice == 0 {
+                    instance.node.process(&ctx, &mut buffer);
+                    assert!(instance.node.note_event(NoteEvent::On {
+                        note: 69,
+                        velocity: 1.0
+                    }));
+                    let mut peak = 0.0f32;
+                    for _ in 0..16 {
+                        instance.node.process(&ctx, &mut buffer);
+                        peak = peak.max(
+                            buffer
+                                .channel(0)
+                                .unwrap()
+                                .iter()
+                                .fold(0.0f32, |acc, s| acc.max(s.abs())),
+                        );
+                    }
+                    instance.node.note_event(NoteEvent::Off { note: 69 });
+                    assert!(
+                        peak > 1e-4,
+                        "bank {bank_label} voice 0 stayed silent (peak {peak})"
+                    );
+                    checked_audio += 1;
+                    instance.node.process(&ctx, &mut buffer);
+                }
+
+                // Persist: raw state bytes under the bank-prefixed name.
+                let preset_name = format!("{bank_label}-{voice:02}-{name}");
+                let dir = preset_root.join(&key);
+                std::fs::create_dir_all(&dir).expect("preset dir");
+                std::fs::write(dir.join(format!("{preset_name}.glzpreset")), &blob)
+                    .expect("write preset");
+                imported += 1;
+            }
+            eprintln!("bank {bank_label}: 32 voices imported");
+        }
+
+        eprintln!("imported {imported} presets into presets/{key} (audio-checked {checked_audio})");
+        assert!(imported > 0);
+    }
 }

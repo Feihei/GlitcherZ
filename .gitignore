@@ -17,3 +17,6 @@ working_files/
 
 # 参考
 .ref/
+
+# 插件预设库（用户本地数据，不入库）/ Plugin preset library (local user data)
+presets/
