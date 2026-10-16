@@ -133,7 +133,10 @@ impl Steinberg::IPluginFactoryTrait for SineFactory {
     }
 
     unsafe fn countClasses(&self) -> Steinberg::int32 {
-        2
+        // The edit controller is enumerated too (spec-conformant factories
+        // list it under the "Component Controller Class" category) — the
+        // host-side scanner filter regression test relies on it.
+        3
     }
 
     unsafe fn getClassInfo(
@@ -155,6 +158,12 @@ impl Steinberg::IPluginFactoryTrait for SineFactory {
                     cardinality: Steinberg::PClassInfo_::ClassCardinality_::kManyInstances,
                     category: c_field::<32>("Audio Module Class"),
                     name: c_field::<64>(EFFECT_NAME),
+                },
+                2 => Steinberg::PClassInfo {
+                    cid: CONTROLLER_CID,
+                    cardinality: Steinberg::PClassInfo_::ClassCardinality_::kManyInstances,
+                    category: c_field::<32>("Component Controller Class"),
+                    name: c_field::<64>("GlitcherZ Sine VST3 Controller"),
                 },
                 _ => return Steinberg::kInvalidArgument,
             };
@@ -219,9 +228,25 @@ impl Steinberg::IPluginFactory2Trait for SineFactory {
         index: Steinberg::int32,
         info: *mut Steinberg::PClassInfo2,
     ) -> Steinberg::tresult {
-        let (cid, name, sub_categories) = match index {
-            0 => (COMPONENT_CID, PLUGIN_NAME, "Instrument|Synth|Stereo"),
-            1 => (EFFECT_COMPONENT_CID, EFFECT_NAME, "Fx|Stereo"),
+        let (cid, name, sub_categories, category) = match index {
+            0 => (
+                COMPONENT_CID,
+                PLUGIN_NAME,
+                "Instrument|Synth|Stereo",
+                "Audio Module Class",
+            ),
+            1 => (
+                EFFECT_COMPONENT_CID,
+                EFFECT_NAME,
+                "Fx|Stereo",
+                "Audio Module Class",
+            ),
+            2 => (
+                CONTROLLER_CID,
+                "GlitcherZ Sine VST3 Controller",
+                "",
+                "Component Controller Class",
+            ),
             _ => return Steinberg::kInvalidArgument,
         };
         // SAFETY: The host provides a writable PClassInfo2 per spec.
@@ -229,7 +254,7 @@ impl Steinberg::IPluginFactory2Trait for SineFactory {
             *info = Steinberg::PClassInfo2 {
                 cid,
                 cardinality: Steinberg::PClassInfo_::ClassCardinality_::kManyInstances,
-                category: c_field::<32>("Audio Module Class"),
+                category: c_field::<32>(category),
                 name: c_field::<64>(name),
                 classFlags: 0,
                 subCategories: c_field::<128>(sub_categories),

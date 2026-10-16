@@ -213,36 +213,49 @@ fn c_field_text(field: &[Steinberg::char8]) -> String {
         .into_owned()
 }
 
-/// Fallback when PClassInfo3 is unavailable: PClassInfo2 → PClassInfo.
+/// Reads one factory class entry (PClassInfo2 → PClassInfo fallback).
+///
+/// Returns `None` for classes that are **not audio components**: per the
+/// VST3 spec the component's category is `Audio Module Class`, while the
+/// edit controller registers as `Component Controller Class` (frequently
+/// under the same display name as the component — without this filter every
+/// plugin appears twice in the scan list). Controllers are located via
+/// `getControllerClassId`, not by enumeration.
 fn fallback_class_info(
     factory: &ComPtr<Steinberg::IPluginFactory>,
     factory2: Option<&ComPtr<Steinberg::IPluginFactory2>>,
     index: i32,
-) -> (String, String, bool) {
+) -> Option<(String, String, bool)> {
     if let Some(f2) = factory2 {
         let mut info2: Steinberg::PClassInfo2 = unsafe { std::mem::zeroed() };
         if tresult_ok(unsafe { f2.getClassInfo2(index, &mut info2) }) {
-            return (
+            if c_field_text(&info2.category) != "Audio Module Class" {
+                return None;
+            }
+            return Some((
                 format_cid(&info2.cid),
                 c_field_text(&info2.name),
                 c_field_text(&info2.subCategories).contains("Instrument"),
-            );
+            ));
         }
     }
     // SAFETY: factory reference is valid; info is filled in by the SDK.
     unsafe {
         let mut info: Steinberg::PClassInfo = std::mem::zeroed();
         if tresult_ok(factory.getClassInfo(index, &mut info)) {
+            if c_field_text(&info.category) != "Audio Module Class" {
+                return None;
+            }
             // v1 class info carries no sub-category information; guess from
             // the category name.
-            return (
+            return Some((
                 format_cid(&info.cid),
                 c_field_text(&info.name),
                 c_field_text(&info.category).contains("Instrument"),
-            );
+            ));
         }
     }
-    (String::new(), String::new(), false)
+    None
 }
 
 /// Enumerates all plugin classes within the given VST3 module. Modules that
@@ -263,7 +276,11 @@ pub fn list_vst3_plugins_in(path: &Path) -> Vec<Vst3PluginInfo> {
     let factory2 = factory.cast::<Steinberg::IPluginFactory2>();
     let mut infos = Vec::new();
     for index in 0..count {
-        let (cid, name, is_instrument) = fallback_class_info(factory, factory2.as_ref(), index);
+        let Some((cid, name, is_instrument)) =
+            fallback_class_info(factory, factory2.as_ref(), index)
+        else {
+            continue;
+        };
         if cid.chars().all(|c| c == '0') {
             continue;
         }
@@ -1238,6 +1255,33 @@ mod tests {
             "sine plugin should be marked as instrument"
         );
         assert_eq!(sine.name, "GlitcherZ Sine VST3");
+    }
+
+    #[test]
+    fn scanner_filters_out_controller_classes() {
+        // The fixture factory enumerates the edit controller under the
+        // "Component Controller Class" category (as real plugins do) — the
+        // scan list must keep audio components only, or every plugin would
+        // show up twice (component + same-named controller).
+        let Some(path) = test_plugin_path() else {
+            eprintln!("skipped: VST3 test plugin cdylib not built");
+            return;
+        };
+        let temp = std::env::temp_dir().join("glitcherz_test_vst3_scan_ctrl.vst3");
+        std::fs::copy(&path, &temp).expect("copy failed");
+        let infos: Vec<Vst3PluginInfo> = list_vst3_plugins_in(&temp);
+        let _ = std::fs::remove_file(&temp);
+        assert_eq!(
+            infos.len(),
+            2,
+            "only the two Audio Module Classes should be listed, got {infos:?}"
+        );
+        assert!(
+            infos
+                .iter()
+                .all(|info| info.cid != "5245534f5a53494e4500000000000002"),
+            "the controller CID must not leak into the scan list"
+        );
     }
 
     #[test]
