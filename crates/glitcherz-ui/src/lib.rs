@@ -330,6 +330,12 @@ pub struct GlitcherZApp {
     vst3_effect_params: HashMap<u64, Vec<glitcherz_vst3_host::Vst3ParamInfo>>,
     /// VST3 effect current normalized values (doc node_id → param id), UI session only.
     vst3_effect_values: HashMap<u64, HashMap<u32, f64>>,
+    /// Instrument param panel filter (CLAP; matched against module + name).
+    clap_param_filter: String,
+    /// Instrument param panel filter (VST3; matched against title).
+    vst3_param_filter: String,
+    /// Automation target picker filter (matched against the option label).
+    auto_param_filter: String,
     /// Diagnostic flag: whether `ui()` has been entered (logging only).
     first_frame_logged: bool,
     /// Diagnostic flag: whether the close command has been sent (logging only).
@@ -441,6 +447,9 @@ impl GlitcherZApp {
             clap_effect_values: HashMap::new(),
             vst3_effect_params: HashMap::new(),
             vst3_effect_values: HashMap::new(),
+            clap_param_filter: String::new(),
+            vst3_param_filter: String::new(),
+            auto_param_filter: String::new(),
             first_frame_logged: false,
             close_sent: false,
         };
@@ -1899,6 +1908,10 @@ impl GlitcherZApp {
                         _guard: PluginGuard::Clap(guard),
                     });
                     self.clap_voice_values.remove(&track); // fresh load resets sliders to plugin defaults
+                    // Switching formats: drop the other format's panel
+                    // caches so its sliders don't linger on the track panel.
+                    self.voice_params.remove(&track);
+                    self.vst3_voice_values.remove(&track);
                     self.clap_voice_params.insert(track, params);
                     log::info!("Track {} loaded CLAP voice: {plugin_id}", track + 1);
                 } else {
@@ -1949,6 +1962,9 @@ impl GlitcherZApp {
                 {
                     self.voice_params.insert(track, params);
                     self.vst3_voice_values.insert(track, values);
+                    // Switching formats: drop the other format's caches.
+                    self.clap_voice_params.remove(&track);
+                    self.clap_voice_values.remove(&track);
                     self.voice_guards.push(PluginGuardEntry {
                         node_id: engine_id,
                         track,
@@ -3290,42 +3306,52 @@ impl GlitcherZApp {
                     egui::CollapsingHeader::new(format!("FX CLAP {fx_label} ({})", params.len()))
                         .default_open(false)
                         .show(ui, |ui| {
-                            egui::Grid::new(format!("clap_fx_{fx_doc}"))
-                                .num_columns(3)
-                                .spacing([16.0, 4.0])
+                            egui::ScrollArea::vertical()
+                                .max_height(280.0)
                                 .show(ui, |ui| {
-                                    for param in params {
-                                        ui.label(&param.name);
-                                        let mut value = self
-                                            .clap_effect_values
-                                            .get(&fx_doc)
-                                            .and_then(|by_id| by_id.get(&param.id))
-                                            .copied()
-                                            .unwrap_or(param.default_value);
-                                        let slider = ui.add(
-                                            egui::Slider::new(
-                                                &mut value,
-                                                param.min_value..=param.max_value,
-                                            )
-                                            .text(format!("id {}", param.id)),
-                                        );
-                                        if slider.changed() {
-                                            self.clap_effect_values
-                                                .entry(fx_doc)
-                                                .or_default()
-                                                .insert(param.id, value);
-                                            self.engine.set_node_param(
-                                                fx_engine,
-                                                ParamId::PluginParam(param.id),
-                                                value as f32,
-                                            );
-                                        }
-                                        ui.weak(format!(
-                                            "[{:.3}..{:.3}] default {:.3}",
-                                            param.min_value, param.max_value, param.default_value
-                                        ));
-                                        ui.end_row();
-                                    }
+                                    egui::Grid::new(format!("clap_fx_{fx_doc}"))
+                                        .num_columns(3)
+                                        .spacing([16.0, 4.0])
+                                        .show(ui, |ui| {
+                                            for param in params {
+                                                let label = if param.module.is_empty() {
+                                                    param.name.clone()
+                                                } else {
+                                                    format!("{} / {}", param.module, param.name)
+                                                };
+                                                ui.label(label);
+                                                let mut value = self
+                                                    .clap_effect_values
+                                                    .get(&fx_doc)
+                                                    .and_then(|by_id| by_id.get(&param.id))
+                                                    .copied()
+                                                    .unwrap_or(param.default_value);
+                                                let slider = ui.add(
+                                                    egui::Slider::new(
+                                                        &mut value,
+                                                        param.min_value..=param.max_value,
+                                                    )
+                                                    .text(format!("id {}", param.id)),
+                                                );
+                                                if slider.changed() {
+                                                    self.clap_effect_values
+                                                        .entry(fx_doc)
+                                                        .or_default()
+                                                        .insert(param.id, value);
+                                                    self.engine.set_node_param(
+                                                        fx_engine,
+                                                        ParamId::PluginParam(param.id),
+                                                        value as f32,
+                                                    );
+                                                }
+                                                ui.weak(format!(
+                                                    "[{:.3}..{:.3}] default {:.3}",
+                                                    param.min_value, param.max_value,
+                                                    param.default_value
+                                                ));
+                                                ui.end_row();
+                                            }
+                                        });
                                 });
                         });
                 } else {
@@ -3338,148 +3364,215 @@ impl GlitcherZApp {
                     egui::CollapsingHeader::new(format!("FX VST3 {fx_label} ({})", params.len()))
                         .default_open(false)
                         .show(ui, |ui| {
-                            egui::Grid::new(format!("vst3_fx_{fx_doc}"))
-                                .num_columns(3)
-                                .spacing([16.0, 4.0])
+                            egui::ScrollArea::vertical()
+                                .max_height(280.0)
                                 .show(ui, |ui| {
-                                    for param in params {
-                                        ui.label(&param.title);
-                                        let mut value = self
-                                            .vst3_effect_values
-                                            .get(&fx_doc)
-                                            .and_then(|by_id| by_id.get(&param.id))
-                                            .copied()
-                                            .unwrap_or(param.default_normalized);
-                                        let slider = ui.add(
-                                            egui::Slider::new(&mut value, 0.0..=1.0)
-                                                .text(format!("id {}", param.id)),
-                                        );
-                                        if slider.changed() {
-                                            self.vst3_effect_values
-                                                .entry(fx_doc)
-                                                .or_default()
-                                                .insert(param.id, value);
-                                            self.engine.set_node_param(
-                                                fx_engine,
-                                                ParamId::PluginParam(param.id),
-                                                value as f32,
-                                            );
-                                        }
-                                        ui.weak(format!(
-                                            "normalized{}",
-                                            if param.can_automate {
-                                                ""
-                                            } else {
-                                                " (not automatable)"
+                                    egui::Grid::new(format!("vst3_fx_{fx_doc}"))
+                                        .num_columns(3)
+                                        .spacing([16.0, 4.0])
+                                        .show(ui, |ui| {
+                                            for param in params {
+                                                ui.label(&param.title);
+                                                let mut value = self
+                                                    .vst3_effect_values
+                                                    .get(&fx_doc)
+                                                    .and_then(|by_id| by_id.get(&param.id))
+                                                    .copied()
+                                                    .unwrap_or(param.default_normalized);
+                                                let slider = ui.add(
+                                                    egui::Slider::new(&mut value, 0.0..=1.0)
+                                                        .text(format!("id {}", param.id)),
+                                                );
+                                                if slider.changed() {
+                                                    self.vst3_effect_values
+                                                        .entry(fx_doc)
+                                                        .or_default()
+                                                        .insert(param.id, value);
+                                                    self.engine.set_node_param(
+                                                        fx_engine,
+                                                        ParamId::PluginParam(param.id),
+                                                        value as f32,
+                                                    );
+                                                }
+                                                ui.weak(format!(
+                                                    "normalized{}",
+                                                    if param.can_automate {
+                                                        ""
+                                                    } else {
+                                                        " (not automatable)"
+                                                    }
+                                                ));
+                                                ui.end_row();
                                             }
-                                        ));
-                                        ui.end_row();
-                                    }
+                                        });
                                 });
                         });
                 }
             }
 
             // VST3 plugin parameter panel (normalized 0..1 sliders; the
-            // bridge passes the normalized value through as-is). Current
-            // values are seeded from the controller read-back at load time
-            // and live in the UI session only.
-            if let Some(params) = self.voice_params.get(&sel).cloned() {
-                if !params.is_empty() {
-                    egui::CollapsingHeader::new(format!("Plugin Params ({})", params.len()))
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            egui::Grid::new("vst3_params")
-                                .num_columns(3)
-                                .spacing([16.0, 4.0])
-                                .show(ui, |ui| {
-                                    for param in params {
-                                        ui.label(&param.title);
-                                        let mut value = self
-                                            .vst3_voice_values
-                                            .get(&sel)
-                                            .and_then(|by_id| by_id.get(&param.id))
-                                            .copied()
-                                            .unwrap_or(param.default_normalized);
-                                        let slider = ui.add(
-                                            egui::Slider::new(&mut value, 0.0..=1.0)
-                                                .text(format!("id {}", param.id)),
-                                        );
-                                        if slider.changed() {
-                                            self.vst3_voice_values
-                                                .entry(sel)
-                                                .or_default()
-                                                .insert(param.id, value);
-                                            self.send_track_param(
-                                                sel,
-                                                ParamId::PluginParam(param.id),
-                                                value as f32,
-                                            );
-                                        }
-                                        ui.weak(format!(
-                                            "normalized{}",
-                                            if param.can_automate {
-                                                ""
-                                            } else {
-                                                " (not automatable)"
-                                            }
-                                        ));
-                                        ui.end_row();
+            // bridge passes the normalized value through as-is). Rows are
+            // **virtualized** (`ScrollArea::show_rows` — only visible
+            // sliders are laid out, so 2000+ parameter plugins stay
+            // responsive) and a filter narrows the list. Current values are
+            // seeded from the controller read-back at load time, UI session
+            // only.
+            egui::CollapsingHeader::new(format!(
+                "Plugin Params ({})",
+                self.voice_params.get(&sel).map(Vec::len).unwrap_or(0)
+            ))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.vst3_param_filter)
+                        .hint_text("Filter params…"),
+                );
+                let needle = self.vst3_param_filter.to_lowercase();
+                let mut changed: Vec<(u32, f64)> = Vec::new();
+                if let Some(params) = self.voice_params.get(&sel) {
+                    let visible: Vec<usize> = params
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| {
+                            needle.is_empty() || p.title.to_lowercase().contains(&needle)
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                    if visible.is_empty() {
+                        ui.weak("(no match)");
+                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show_rows(ui, row_h, visible.len(), |ui, range| {
+                            for row in range {
+                                let param = &params[visible[row]];
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [200.0, row_h],
+                                        egui::Label::new(&param.title).truncate(),
+                                    );
+                                    let mut value = self
+                                        .vst3_voice_values
+                                        .get(&sel)
+                                        .and_then(|by_id| by_id.get(&param.id))
+                                        .copied()
+                                        .unwrap_or(param.default_normalized);
+                                    let slider = ui.add_sized(
+                                        [240.0, row_h],
+                                        egui::Slider::new(&mut value, 0.0..=1.0)
+                                            .text(format!("id {}", param.id)),
+                                    );
+                                    if slider.changed() {
+                                        changed.push((param.id, value));
                                     }
+                                    ui.weak(format!(
+                                        "normalized{}",
+                                        if param.can_automate {
+                                            ""
+                                        } else {
+                                            " (not automatable)"
+                                        }
+                                    ));
                                 });
+                            }
                         });
                 }
-            }
+                // Mutations applied after the params borrow ends (NLL).
+                for (id, value) in changed {
+                    self.vst3_voice_values
+                        .entry(sel)
+                        .or_default()
+                        .insert(id, value);
+                    self.send_track_param(sel, ParamId::PluginParam(id), value as f32);
+                }
+            });
 
             // CLAP plugin parameter panel: enumerated via the params extension at instantiation.
             // Sliders send raw plugin-range values through the `PluginParam` bridge (applied at
-            // the next `process`, block granularity). Current values live in the UI session
-            // only; a fresh plugin load resets them to the plugin defaults.
-            if let Some(params) = self.clap_voice_params.get(&sel).cloned() {
-                if !params.is_empty() {
-                    egui::CollapsingHeader::new(format!("Plugin Params CLAP ({})", params.len()))
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            egui::Grid::new("clap_params")
-                                .num_columns(3)
-                                .spacing([16.0, 4.0])
-                                .show(ui, |ui| {
-                                    for param in params {
-                                        ui.label(&param.name);
-                                        let mut value = self
-                                            .clap_voice_values
-                                            .get(&sel)
-                                            .and_then(|by_id| by_id.get(&param.id))
-                                            .copied()
-                                            .unwrap_or(param.default_value);
-                                        let slider = ui.add(
-                                            egui::Slider::new(
-                                                &mut value,
-                                                param.min_value..=param.max_value,
-                                            )
-                                            .text(format!("id {}", param.id)),
-                                        );
-                                        if slider.changed() {
-                                            self.clap_voice_values
-                                                .entry(sel)
-                                                .or_default()
-                                                .insert(param.id, value);
-                                            self.send_track_param(
-                                                sel,
-                                                ParamId::PluginParam(param.id),
-                                                value as f32,
-                                            );
-                                        }
-                                        ui.weak(format!(
-                                            "[{:.3}..{:.3}] default {:.3}",
-                                            param.min_value, param.max_value, param.default_value
-                                        ));
-                                        ui.end_row();
+            // the next `process`, block granularity). Rows are virtualized (`show_rows`) and
+            // grouped by the CLAP `module` path (Dexed's OP1/OP2/… sections) — the label shows
+            // `module / name` and an empty-filter view sorts by module. Current values live in
+            // the UI session only; a fresh plugin load resets them to the plugin defaults.
+            egui::CollapsingHeader::new(format!(
+                "Plugin Params CLAP ({})",
+                self.clap_voice_params.get(&sel).map(Vec::len).unwrap_or(0)
+            ))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.clap_param_filter)
+                        .hint_text("Filter params (module / name)…"),
+                );
+                let needle = self.clap_param_filter.to_lowercase();
+                let mut changed: Vec<(u32, f64)> = Vec::new();
+                if let Some(params) = self.clap_voice_params.get(&sel) {
+                    let mut visible: Vec<usize> = (0..params.len())
+                        .filter(|&i| {
+                            needle.is_empty() || {
+                                let p = &params[i];
+                                format!("{} {}", p.module, p.name).to_lowercase().contains(&needle)
+                            }
+                        })
+                        .collect();
+                    if needle.is_empty() {
+                        // Stable sort by module: sections keep their
+                        // original enumeration order within the group.
+                        visible.sort_by(|&a, &b| params[a].module.cmp(&params[b].module));
+                    }
+                    let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                    if visible.is_empty() {
+                        ui.weak("(no match)");
+                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show_rows(ui, row_h, visible.len(), |ui, range| {
+                            for row in range {
+                                let param = &params[visible[row]];
+                                let label = if param.module.is_empty() {
+                                    param.name.clone()
+                                } else {
+                                    format!("{} / {}", param.module, param.name)
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [220.0, row_h],
+                                        egui::Label::new(label).truncate(),
+                                    );
+                                    let mut value = self
+                                        .clap_voice_values
+                                        .get(&sel)
+                                        .and_then(|by_id| by_id.get(&param.id))
+                                        .copied()
+                                        .unwrap_or(param.default_value);
+                                    let slider = ui.add_sized(
+                                        [240.0, row_h],
+                                        egui::Slider::new(
+                                            &mut value,
+                                            param.min_value..=param.max_value,
+                                        )
+                                        .text(format!("id {}", param.id)),
+                                    );
+                                    if slider.changed() {
+                                        changed.push((param.id, value));
                                     }
+                                    ui.weak(format!(
+                                        "[{:.2}..{:.2}]",
+                                        param.min_value, param.max_value
+                                    ));
                                 });
+                            }
                         });
                 }
-            }
+                // Mutations applied after the params borrow ends (NLL).
+                for (id, value) in changed {
+                    self.clap_voice_values
+                        .entry(sel)
+                        .or_default()
+                        .insert(id, value);
+                    self.send_track_param(sel, ParamId::PluginParam(id), value as f32);
+                }
+            });
             ui.weak("Node graph: instrument -> delay -> mixer channels -> master (doc-driven, changes go live)");
             ui.add_space(8.0);
 
@@ -4672,12 +4765,39 @@ impl GlitcherZApp {
         ui.horizontal(|ui| {
             ui.label("Target");
             ui.menu_button("Pick Parameter…", |ui| {
-                for (label, doc_id, param) in &options {
-                    if ui.button(label).clicked() {
-                        picked = Some((*doc_id, param.clone()));
-                        ui.close();
-                    }
+                // 2000+ parameter plugins make an unfiltered menu unusable:
+                // a filter box + virtualized rows keep it responsive.
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.auto_param_filter)
+                        .hint_text("Filter parameters…"),
+                );
+                let needle = self.auto_param_filter.to_lowercase();
+                let visible: Vec<usize> = options
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (label, _, _))| {
+                        needle.is_empty() || label.to_lowercase().contains(&needle)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                if visible.is_empty() {
+                    ui.weak("(no match)");
                 }
+                egui::ScrollArea::vertical().max_height(320.0).show_rows(
+                    ui,
+                    row_h,
+                    visible.len(),
+                    |ui, range| {
+                        for row in range {
+                            let (label, doc_id, param) = &options[visible[row]];
+                            if ui.button(label).clicked() {
+                                picked = Some((*doc_id, param.clone()));
+                                ui.close();
+                            }
+                        }
+                    },
+                );
             });
             if let Some((doc_id, param)) = picked {
                 self.set_auto_endpoint(index, doc_id, param);
