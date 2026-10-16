@@ -94,6 +94,13 @@
 - **域约定**：CLAP 滑块与自动化曲线 = 插件原始值域（min/max 来自参数枚举）；VST3 滑块与自动化曲线 = 归一化 0..1（`ParameterInfo` 不携带 plain 值域，plain↔normalized 换算需逐参调控制器，v1 明确不做——归一化滑块诚实且跨插件一致）。VST3 当前值经 S5 的 `read_param_values`（控制器 `getParamNormalized` 读回）播种会话缓存 `vst3_voice_values`（乐器）/ `vst3_effect_values`（效果器）。
 - **自动化目标**：`track_external_fx(track)` 辅助统一产出效果器清单（doc_id + 显示标签 + 格式），轨道面板与自动化选择器共用；效果器参数作为自动化端点落在效果器节点上（`AutoParam::PluginParam` 域随格式）。
 
+### 实测反馈修订（大参数量插件：Dexed CLAP 156 / VST3 2238 参数，2026-10-15）
+
+- **扫描列表重复**：每个插件出现两次（Dexed / xstudio bridge / plugdata）——根因是扫描器枚举了工厂里全部类而**未按 category 过滤**：组件的 category 是 `Audio Module Class`，编辑控制器是 `Component Controller Class` 且常与组件同名。修复：`fallback_class_info` 只放行 `Audio Module Class`（控制器本就该经 `getControllerClassId` 定位，不靠枚举发现）；测试插件工厂补枚举控制器类（category 用规范值）钉住回归（`scanner_filters_out_controller_classes`）。
+- **面板卡顿**：每帧渲染全部滑块（2238 个）+ 每帧克隆全部参数结构体。修复：乐器参数面板改**虚拟化行**（`ScrollArea::show_rows`，只布局可见行）+ 过滤框（`clap_param_filter` / `vst3_param_filter`）；取值用**下标索引 + 延迟提交**模式——闭包内只读参数表、把变更收集进局部 `Vec`，出闭包后再写缓存/发参数（既避免每帧 clone 参数 Vec，又绕开「闭包内读参数表 + 写缓存」的借用冲突）。CLAP 面板按 `module` 路径稳定排序并显示 `module / name`（Dexed 的 OP1/OP2 分组可读）；FX 面板包 ScrollArea；自动化目标菜单同样过滤 + 虚拟化（`auto_param_filter`）。
+- **跨格式残留**：VST3 → CLAP 切换后 VST3 面板残留——`load_clap_voice` / `load_vst3_voice` 互删对方格式的面板缓存（`voice_params` + `vst3_voice_values` ↔ `clap_voice_params` + `clap_voice_values`）。
+- **GUI 缺口确认**：宿主无 CLAP gui 扩展 / VST3 `IPlugView`（无头运行），已入 plan.md 遗留项（需独立 spec）。
+
 ### 项目文件与模型（`glitcherz-model`）
 
 - `Project`（metadata + gate + master_gain + 4×`Track`）；`Track` = 名称 + `Pattern` + `Clip`（`Note{start,length,note,velocity}` 列表 + loop_ticks，tick 基准：`TICKS_PER_QUARTER=96`/步=24/小节=384）+ 音源枚举（`VoiceSpec`: `Builtin | Clap | Vst3`）+ 混音（增益/声像/静音）+ `SynthParams` + `DelayParams`，全部 serde/RON + 字段级 `#[serde(default)]`；引擎侧镜像 `RtClip`（定容 128 音符 `Copy`，超容截断）经 `SetClip` 命令整块下发；
