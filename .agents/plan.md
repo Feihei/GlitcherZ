@@ -28,6 +28,7 @@
 - [x] VST3 参数归一化换算的 UI 层处理（2026-10-15：v1 决策——滑块直接工作在归一化 0..1 域，不做 plain↔normalized 换算（VST3 ParameterInfo 不携带 plain 值域，换算需逐参调控制器；归一化滑块诚实且够用）；当前值经 `read_param_values`（S5 落地的 `getParamNormalized` 读回）播种会话缓存，CLAP `clap_voice_values` 的镜像 `vst3_voice_values`；自动化曲线值沿用归一化域）
 - [x] 插件状态保存/加载 **VST3 部分**（2026-10-15，S5 镜像 clap-host：`HostMemoryStream`（`IBStream` 内存流 COM 对象，host_impl）+ `Vst3InstanceGuard::{save_state, load_state, read_param_values}`——save 走组件 `getState`，load = 组件 `setState` + 控制器 `setComponentState` 同步（各给一条独立流）；测试插件工厂改**逐实例创建**（原 OnceLock 单例与 kManyInstances 相悖且无法测"新实例回落默认值"），SineComponent 以 8 字节 LE f64 持久化 Gain（经 `IParameterChanges` 消费、作用于振幅）、控制器镜像读回；UI install_node 两处恢复 + capture 采集 + 文档写回；端到端 `state_roundtrip_restores_gain`。`read_param_values` 为归一化滑块（下一条）预留）
 - [ ] 插件 GUI 宿主（2026-10-15 实测确认缺口：宿主目前**无头**运行插件——CLAP gui 扩展 / VST3 `IPlugView` 均未实现，Dexed 等只能靠参数滑块 + state 持久化操作补丁；GUI 需宿主侧嵌入插件自绘窗口（平台原生窗口句柄 + 独立事件循环），体量不小，先立独立 spec 再动工）
+- [x] 乐器预设系统 v1（2026-10-15，实测"只能拖滑块太痛苦"的直接回应：宿主侧预设库 `presets/<插件键>/<名字>.glzpreset`（原始状态字节，插件键 = 格式 + 路径 hash8 + id，同名插件不同安装互不串库）；UI 一行 Preset 工具条（下拉加载 / Reset / 名称框 + Save As / Delete），乐器 CLAP 与 VST3 通用。加载/重置 = 先活体 `load_state`（插件拒收则文档不动）→ 滑块缓存回填（CLAP 守卫补 `read_param_values`）→ `VoiceSpec.state` 写入为**一步可撤销编辑**；Reset 用 spawn 时抓的出厂默认快照（`voice_default_state`，文档 state 清空 = 重载即出厂默认）；Save As 是文件操作不进 undo。效果器预设为后续项——机制（守卫 + doc 键缓存）可平移）
 
 ## 新方向：模块节点图架构（spec 已定稿）
 

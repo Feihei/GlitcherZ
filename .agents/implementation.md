@@ -101,6 +101,15 @@
 - **跨格式残留**：VST3 → CLAP 切换后 VST3 面板残留——`load_clap_voice` / `load_vst3_voice` 互删对方格式的面板缓存（`voice_params` + `vst3_voice_values` ↔ `clap_voice_params` + `clap_voice_values`）。
 - **GUI 缺口确认**：宿主无 CLAP gui 扩展 / VST3 `IPlugView`（无头运行），已入 plan.md 遗留项（需独立 spec）。
 
+### 乐器预设系统 v1（2026-10-15）
+
+- **存储**：`presets/<插件键>/<名字>.glzpreset`，文件内容 = **原始状态字节**（不包 host 信封——blob 格式本就插件私有，文件名即预设名）。插件键 `preset_plugin_key(format, path, id)` = `<format>-<路径 hash8>-<id 片段>`：路径 hash 让不同安装的同名插件互不串库，id 片段经 `sanitize_filename_fragment`（64/24 字符上限，非法字符 → `_`）。库根 = 工作目录下 `presets/`（dev 运行即仓库根）。
+- **加载/重置 = 可撤销文档编辑**：顺序是先活体 `guard.load_state(&blob)`（插件拒收 → 报错返回，文档不动）→ `refresh_voice_slider_cache`（CLAP 守卫新增 `read_param_values`——原方法在 `ClapInstance` 上，守卫注册后 UI 够不着）→ `begin_edit` 写 `VoiceSpec.state` → `commit_edit("Load Preset")`。undo/redo 走 apply_document 重装即自然回滚。
+- **出厂默认快照**：`voice_default_state`（track → blob）在 spawn 时抓取——**必须先于文档 state 恢复**（四条路径：install_node 乐器两分支 + `load_clap_voice`/`load_vst3_voice`）。Reset = 活体加载快照 + 滑块回填 + 文档 state 置空（空 state = 重载即出厂默认，与 D4 语义一致）。
+- **Save As = 文件操作**（同 project save 类，不进 undo）；Delete 仅对当前选中预设可用。内置声源隐藏预设行。
+- **守卫定位**：`instrument_engine_guard(track)` 经乐器 doc 节点反查 engine id 再扫 `voice_guards`——不能直接按 track 匹配（效果器守卫同轨注册）。
+- **后续**：效果器预设（机制可平移，缓存键换 doc id）；预设重命名/导入导出按需再加。
+
 ### 项目文件与模型（`glitcherz-model`）
 
 - `Project`（metadata + gate + master_gain + 4×`Track`）；`Track` = 名称 + `Pattern` + `Clip`（`Note{start,length,note,velocity}` 列表 + loop_ticks，tick 基准：`TICKS_PER_QUARTER=96`/步=24/小节=384）+ 音源枚举（`VoiceSpec`: `Builtin | Clap | Vst3`）+ 混音（增益/声像/静音）+ `SynthParams` + `DelayParams`，全部 serde/RON + 字段级 `#[serde(default)]`；引擎侧镜像 `RtClip`（定容 128 音符 `Copy`，超容截断）经 `SetClip` 命令整块下发；
