@@ -370,6 +370,22 @@ impl ClapInstanceGuard {
             .load(&self.instance.plugin_handle(), &mut reader)
             .map_err(HostError::StateLoad)
     }
+
+    /// Reads the current value of every parameter the plugin exposes (main
+    /// thread; params extension `get_value`). Missing ids mean the plugin
+    /// refused the read.
+    ///
+    /// Used after a state/preset load to refresh the UI's cached slider
+    /// values once the instance is held in the guard registry.
+    pub fn read_param_values(&self) -> std::collections::HashMap<u32, f64> {
+        let ids: Vec<u32> = raw::enumerate_params(self.instance.raw_instance())
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        raw::read_param_values(self.instance.raw_instance(), &ids)
+            .into_iter()
+            .collect()
+    }
 }
 
 /// One-shot instantiation result: control-side guard + real-time node.

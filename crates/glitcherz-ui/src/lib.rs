@@ -133,6 +133,127 @@ fn param_id_of(param: &AutoParam) -> ParamId {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Host-side preset library
+// ---------------------------------------------------------------------------
+//
+// A preset is a plugin's full state blob (`VoiceSpec.state`, spec S5)
+// stored under a name: `presets/<plugin-key>/<name>.glzpreset`, the file
+// content being the **raw state bytes** (plugin-private format, no host
+// wrapping). The plugin key distinguishes plugin identity (format + path
+// hash + id) so presets never leak across plugins.
+
+/// Preset file extension.
+const PRESET_EXT: &str = "glzpreset";
+
+/// Root directory of the preset library (relative to the working directory;
+/// matches the dev-run layout, `cargo run -p glitcherz-app`).
+fn preset_library_root() -> PathBuf {
+    PathBuf::from("presets")
+}
+
+/// Maps arbitrary text onto a filesystem-safe fragment (length-capped,
+/// separator-stripped).
+fn sanitize_filename_fragment(text: &str, max_chars: usize) -> String {
+    let cleaned: String = text
+        .chars()
+        .take(max_chars)
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | ' ' => c,
+            _ => '_',
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "plugin".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Preset names are filenames: trimmed, non-empty, no bare dot fragments
+/// (remaining separators are mapped to `_` by the fragment sanitizer).
+fn sanitize_preset_name(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return None;
+    }
+    Some(sanitize_filename_fragment(trimmed, 64))
+}
+
+/// The preset-library key of a plugin identity: `<format>-<path hash8>-<id>`.
+/// The path hash keeps same-named plugins from different installs separate.
+fn preset_plugin_key(format_label: &str, path: &str, id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    format!(
+        "{format_label}-{:08x}-{}",
+        hasher.finish() as u32,
+        sanitize_filename_fragment(id, 24)
+    )
+}
+
+/// Directory holding one plugin's presets.
+fn preset_dir(root: &std::path::Path, plugin_key: &str) -> PathBuf {
+    root.join(plugin_key)
+}
+
+/// Preset file path (`<name>.glzpreset`).
+fn preset_file(root: &std::path::Path, plugin_key: &str, name: &str) -> PathBuf {
+    preset_dir(root, plugin_key).join(format!("{name}.{PRESET_EXT}"))
+}
+
+/// Lists a plugin's preset names (sorted; unreadable entries skipped).
+fn list_voice_presets_in(root: &std::path::Path, plugin_key: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(preset_dir(root, plugin_key)) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|x| x == PRESET_EXT)
+                .unwrap_or(false)
+        })
+        .filter_map(|e| {
+            e.path()
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Writes one preset (raw state bytes). The preset name becomes the file name.
+fn save_voice_preset_in(
+    root: &std::path::Path,
+    plugin_key: &str,
+    name: &str,
+    blob: &[u8],
+) -> std::io::Result<PathBuf> {
+    let path = preset_file(root, plugin_key, name);
+    std::fs::create_dir_all(preset_dir(root, plugin_key))?;
+    std::fs::write(&path, blob)?;
+    Ok(path)
+}
+
+/// Reads one preset's raw state blob.
+fn read_voice_preset_in(root: &std::path::Path, plugin_key: &str, name: &str) -> Option<Vec<u8>> {
+    std::fs::read(preset_file(root, plugin_key, name)).ok()
+}
+
+/// Deletes one preset file.
+fn delete_voice_preset_in(
+    root: &std::path::Path,
+    plugin_key: &str,
+    name: &str,
+) -> std::io::Result<()> {
+    std::fs::remove_file(preset_file(root, plugin_key, name))
+}
+
 /// UI startup parameters.
 #[derive(Debug, Clone, Default)]
 pub struct UiConfig {
@@ -336,6 +457,13 @@ pub struct GlitcherZApp {
     vst3_param_filter: String,
     /// Automation target picker filter (matched against the option label).
     auto_param_filter: String,
+    /// Captured factory-default state blobs (track → blob), taken at spawn
+    /// time before any document state restore — the preset "Reset" target.
+    voice_default_state: HashMap<usize, Vec<u8>>,
+    /// Per-track selected preset name (the ComboBox display + Delete target).
+    voice_preset_selected: HashMap<usize, String>,
+    /// "Save preset" name input.
+    preset_name_input: String,
     /// Diagnostic flag: whether `ui()` has been entered (logging only).
     first_frame_logged: bool,
     /// Diagnostic flag: whether the close command has been sent (logging only).
@@ -450,6 +578,9 @@ impl GlitcherZApp {
             clap_param_filter: String::new(),
             vst3_param_filter: String::new(),
             auto_param_filter: String::new(),
+            voice_default_state: HashMap::new(),
+            voice_preset_selected: HashMap::new(),
+            preset_name_input: String::new(),
             first_frame_logged: false,
             close_sent: false,
         };
@@ -487,6 +618,8 @@ impl GlitcherZApp {
         self.clap_effect_values.clear();
         self.vst3_effect_params.clear();
         self.vst3_effect_values.clear();
+        self.voice_default_state.clear();
+        self.voice_preset_selected.clear();
 
         // 2) Install document nodes (external plugin failure → fall back to built-in, keeping the
         //    chain intact).
@@ -592,6 +725,12 @@ impl GlitcherZApp {
                             },
                         ) {
                             Ok(mut instance) => {
+                                // Factory-default snapshot for the preset
+                                // "Reset" target — must precede the document
+                                // state restore.
+                                if let Ok(default_blob) = instance.guard.save_state() {
+                                    self.voice_default_state.insert(track, default_blob);
+                                }
                                 // Restore the persisted state blob (project
                                 // reload / undo), then refresh the slider
                                 // cache from the plugin's live values.
@@ -638,6 +777,12 @@ impl GlitcherZApp {
                             },
                         ) {
                             Ok(instance) => {
+                                // Factory-default snapshot for the preset
+                                // "Reset" target — must precede the document
+                                // state restore.
+                                if let Ok(default_blob) = instance.guard.save_state() {
+                                    self.voice_default_state.insert(track, default_blob);
+                                }
                                 // Restore the persisted state blob (project
                                 // reload / undo; the CLAP D4 mirror).
                                 if !state.is_empty() {
@@ -1842,6 +1987,8 @@ impl GlitcherZApp {
         self.clap_voice_params.remove(&track);
         self.clap_voice_values.remove(&track);
         self.vst3_voice_values.remove(&track);
+        self.voice_default_state.remove(&track);
+        self.voice_preset_selected.remove(&track);
         let Some(doc_id) = self
             .project()
             .graph
@@ -1891,7 +2038,11 @@ impl GlitcherZApp {
                 max_frames: 128,
             },
         ) {
-            Ok(instance) => {
+            Ok(mut instance) => {
+                // Factory-default snapshot for the preset "Reset" target.
+                if let Ok(default_blob) = instance.guard.save_state() {
+                    self.voice_default_state.insert(track, default_blob);
+                }
                 // Parameter enumeration must happen before the instance is destructured (the
                 // guard holds the plugin instance).
                 let params = instance.list_params();
@@ -1949,6 +2100,10 @@ impl GlitcherZApp {
             },
         ) {
             Ok(instance) => {
+                // Factory-default snapshot for the preset "Reset" target.
+                if let Ok(default_blob) = instance.guard.save_state() {
+                    self.voice_default_state.insert(track, default_blob);
+                }
                 // Slider cache seeded from the controller read-back
                 // (normalized 0..1); enumerated before the guard moves into
                 // the registry.
@@ -1981,6 +2136,157 @@ impl GlitcherZApp {
                 self.set_message(format!("VST3 plugin load failed: {err}"));
             }
         }
+    }
+
+    // ---- Instrument presets (host-side library over the state blob) ----
+
+    /// The current instrument's preset-library key (`None` for the built-in
+    /// synth, which has no presets yet).
+    fn voice_plugin_key(&self, track: usize) -> Option<String> {
+        match self.project().graph.instrument_of_track(track)? {
+            NodeDoc::Instrument { voice, .. } => match voice {
+                VoiceSpec::Clap {
+                    path, plugin_id, ..
+                } => Some(preset_plugin_key("clap", path, plugin_id)),
+                VoiceSpec::Vst3 { path, class_id, .. } => {
+                    Some(preset_plugin_key("vst3", path, class_id))
+                }
+                VoiceSpec::Builtin => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The live guard of the track's instrument (its own engine id; effect
+    /// guards share the track number, so matching goes through the doc).
+    fn instrument_engine_guard(&mut self, track: usize) -> Option<&mut PluginGuard> {
+        let doc_id = self
+            .project()
+            .graph
+            .instrument_of_track(track)
+            .map(NodeDoc::node_id)?;
+        let engine_id = *self.node_map.get(&doc_id)?;
+        self.voice_guards
+            .iter_mut()
+            .find(|e| e.node_id == engine_id)
+            .map(|e| &mut e._guard)
+    }
+
+    /// Re-seeds the track's slider cache from the plugin's live values
+    /// (after a state/preset load).
+    fn refresh_voice_slider_cache(&mut self, track: usize) {
+        match self.instrument_engine_guard(track) {
+            Some(PluginGuard::Clap(g)) => {
+                let values = g.read_param_values();
+                self.clap_voice_values.insert(track, values);
+            }
+            Some(PluginGuard::Vst3(g)) => {
+                let values = g.read_param_values();
+                self.vst3_voice_values.insert(track, values);
+            }
+            _ => {}
+        }
+    }
+
+    /// Loads a preset into the track's instrument: live `load_state` first
+    /// (a refusing plugin must not touch the document), slider cache
+    /// re-seed, then the blob into `VoiceSpec.state` as one undoable edit.
+    fn load_voice_preset(&mut self, track: usize, name: &str) {
+        let Some(key) = self.voice_plugin_key(track) else {
+            return;
+        };
+        let Some(blob) = read_voice_preset_in(&preset_library_root(), &key, name) else {
+            self.set_message(format!("Preset unreadable: {name}"));
+            return;
+        };
+        let loaded = match self.instrument_engine_guard(track) {
+            Some(PluginGuard::Clap(g)) => g.load_state(&blob).is_ok(),
+            Some(PluginGuard::Vst3(g)) => g.load_state(&blob).is_ok(),
+            _ => false,
+        };
+        if !loaded {
+            self.set_message("Preset load failed: plugin rejected the state".to_string());
+            return;
+        }
+        self.refresh_voice_slider_cache(track);
+        let before = self.begin_edit();
+        if let Some(NodeDoc::Instrument { voice, .. }) =
+            self.project_mut().graph.instrument_of_track_mut(track)
+        {
+            match voice {
+                VoiceSpec::Clap { state, .. } | VoiceSpec::Vst3 { state, .. } => *state = blob,
+                VoiceSpec::Builtin => {}
+            }
+        }
+        self.commit_edit("Load Preset", before);
+        self.voice_preset_selected.insert(track, name.to_string());
+        self.set_message(format!("Loaded preset {name}"));
+    }
+
+    /// Saves the instrument's current state blob as a named preset file
+    /// (file operation — not an undoable edit, same class as project save).
+    fn save_voice_preset_as(&mut self, track: usize) {
+        let Some(key) = self.voice_plugin_key(track) else {
+            return;
+        };
+        let Some(name) = sanitize_preset_name(&self.preset_name_input) else {
+            self.set_message("Preset name is empty".to_string());
+            return;
+        };
+        let blob = match self.instrument_engine_guard(track) {
+            Some(PluginGuard::Clap(g)) => g.save_state().ok(),
+            Some(PluginGuard::Vst3(g)) => g.save_state().ok(),
+            _ => None,
+        };
+        let Some(blob) = blob else {
+            self.set_message("Save preset failed: plugin state unavailable".to_string());
+            return;
+        };
+        match save_voice_preset_in(&preset_library_root(), &key, &name, &blob) {
+            Ok(_) => {
+                self.voice_preset_selected.insert(track, name.clone());
+                self.set_message(format!("Preset saved: {name}"));
+                log::info!("Preset saved: {key}/{name}");
+            }
+            Err(err) => {
+                self.set_message(format!("Preset save failed: {err}"));
+                log::error!("Preset save failed: {err}");
+            }
+        }
+    }
+
+    /// Resets the instrument to the factory-default state captured at spawn
+    /// time: live reload + slider cache re-seed + an undoable edit that
+    /// clears the persisted blob (empty state = factory default on reload).
+    fn reset_voice_preset(&mut self, track: usize) {
+        let Some(default_blob) = self.voice_default_state.get(&track).cloned() else {
+            self.set_message("Factory default unavailable this session".to_string());
+            return;
+        };
+        let loaded = match self.instrument_engine_guard(track) {
+            Some(PluginGuard::Clap(g)) => g.load_state(&default_blob).is_ok(),
+            Some(PluginGuard::Vst3(g)) => g.load_state(&default_blob).is_ok(),
+            _ => false,
+        };
+        if !loaded {
+            self.set_message("Reset failed: plugin rejected the state".to_string());
+            return;
+        }
+        self.refresh_voice_slider_cache(track);
+        let before = self.begin_edit();
+        if let Some(NodeDoc::Instrument { voice, .. }) =
+            self.project_mut().graph.instrument_of_track_mut(track)
+        {
+            match voice {
+                VoiceSpec::Clap { state, .. } | VoiceSpec::Vst3 { state, .. } => {
+                    *state = Vec::new()
+                }
+                VoiceSpec::Builtin => {}
+            }
+        }
+        self.commit_edit("Reset Preset", before);
+        self.voice_preset_selected.remove(&track);
+        self.set_message("Reset to factory default".to_string());
     }
 
     /// Insert an external effect node at the end of the track chain (before the
@@ -3408,6 +3714,68 @@ impl GlitcherZApp {
                                 });
                         });
                 }
+            }
+
+            // Preset row: host-side preset library over the plugin state
+            // blob (`presets/<plugin-key>/<name>.glzpreset`, raw state
+            // bytes). Load/Reset ride the S5 state plumbing and are undoable
+            // document edits; Save As is a file operation. Hidden for the
+            // built-in synth (no presets yet).
+            if self.voice_plugin_key(sel).is_some() {
+                ui.horizontal(|ui| {
+                    ui.label("Preset");
+                    let presets = self
+                        .voice_plugin_key(sel)
+                        .map(|key| list_voice_presets_in(&preset_library_root(), &key))
+                        .unwrap_or_default();
+                    let selected = self.voice_preset_selected.get(&sel).cloned();
+                    egui::ComboBox::from_id_salt(format!("voice_preset_{sel}"))
+                        .selected_text(selected.unwrap_or_else(|| "(factory default)".to_string()))
+                        .show_ui(ui, |ui| {
+                            for name in &presets {
+                                let is_selected = self
+                                    .voice_preset_selected
+                                    .get(&sel)
+                                    .is_some_and(|s| s == name);
+                                if ui.selectable_label(is_selected, name).clicked() {
+                                    let name = name.clone();
+                                    self.load_voice_preset(sel, &name);
+                                }
+                            }
+                        });
+                    if ui.button("Reset").clicked() {
+                        self.reset_voice_preset(sel);
+                    }
+                    ui.separator();
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.preset_name_input)
+                            .hint_text("preset name")
+                            .desired_width(120.0),
+                    );
+                    if ui.button("Save As").clicked() {
+                        self.save_voice_preset_as(sel);
+                    }
+                    let can_delete = self.voice_preset_selected.contains_key(&sel);
+                    if ui
+                        .add_enabled(can_delete, egui::Button::new("Delete"))
+                        .clicked()
+                    {
+                        if let Some(name) = self.voice_preset_selected.get(&sel).cloned() {
+                            if let Some(key) = self.voice_plugin_key(sel) {
+                                match delete_voice_preset_in(&preset_library_root(), &key, &name)
+                                {
+                                    Ok(()) => {
+                                        self.voice_preset_selected.remove(&sel);
+                                        self.set_message(format!("Preset deleted: {name}"));
+                                    }
+                                    Err(err) => {
+                                        self.set_message(format!("Preset delete failed: {err}"))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
             }
 
             // VST3 plugin parameter panel (normalized 0..1 sliders; the
@@ -5124,4 +5492,65 @@ pub fn run(engine: AudioEngine, config: UiConfig) -> eframe::Result<()> {
         native_options,
         Box::new(move |cc| Ok(Box::new(GlitcherZApp::new(cc, engine, config)))),
     )
+}
+
+#[cfg(test)]
+mod preset_store_tests {
+    use super::*;
+
+    /// A unique throwaway preset-library root for one test run.
+    fn temp_root(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("glitcherz_preset_test_{tag}_{nanos}"))
+    }
+
+    #[test]
+    fn preset_names_are_filesystem_safe() {
+        assert_eq!(
+            sanitize_preset_name("  My Lead  "),
+            Some("My Lead".to_string())
+        );
+        assert_eq!(sanitize_preset_name(""), None);
+        assert_eq!(sanitize_preset_name("   "), None);
+        assert_eq!(sanitize_preset_name("."), None);
+        assert_eq!(sanitize_preset_name(".."), None);
+        // Path separators and reserved characters are mapped away.
+        assert_eq!(
+            sanitize_preset_name("a/b\\c:d"),
+            Some("a_b_c_d".to_string())
+        );
+    }
+
+    #[test]
+    fn preset_plugin_key_separates_paths() {
+        let a = preset_plugin_key("clap", "C:/plugins/dexed.clap", "Dexed");
+        let b = preset_plugin_key("clap", "C:/elsewhere/dexed.clap", "Dexed");
+        assert_ne!(a, b, "same-named plugins from different paths differ");
+        let c = preset_plugin_key("vst3", "C:/plugins/dexed.vst3", "same cid");
+        assert_ne!(a, c, "formats are namespaced");
+        assert!(a.starts_with("clap-"));
+    }
+
+    #[test]
+    fn preset_store_roundtrip_and_list() {
+        let root = temp_root("roundtrip");
+        let key = "clap-00000001-Dexed";
+        let blob = vec![1u8, 2, 3, 250];
+        save_voice_preset_in(&root, key, "Init", &blob).expect("save");
+        save_voice_preset_in(&root, key, "Bass", &blob).expect("save");
+
+        assert_eq!(
+            list_voice_presets_in(&root, key),
+            vec!["Bass".to_string(), "Init".to_string()]
+        );
+        assert_eq!(read_voice_preset_in(&root, key, "Init"), Some(blob));
+        assert_eq!(read_voice_preset_in(&root, key, "missing"), None);
+
+        delete_voice_preset_in(&root, key, "Init").expect("delete");
+        assert_eq!(list_voice_presets_in(&root, key), vec!["Bass".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
