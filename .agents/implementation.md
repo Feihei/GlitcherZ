@@ -4,6 +4,12 @@
 
 ## 已落地
 
+### SF2 音色库加载器 S1–S2（2026-10-19，spec 见 `.agents/spec/sf2-loader.md`）
+
+- **S1 RT 审计**（结论细节在 spec §7）：`rustysynth-ext = "=1.4.0"` 热路径零堆分配实证（计数 `#[global_allocator]`，测试 `tests/sf2_rt_audit.rs`），`VoiceCollection` 即预分配池，voice 池 fork 预案（D4）解除；唯一 panic 点 = `render` 等长契约（调用侧保证）。**审计 harness 的坑**：断言 label 的 `format!` 在计数窗口内求值会被计入分配（首跑真实库的假阳性），label 构建须在 scope 之外；计数器全局，测试须 `Mutex` 串行。
+- **共享测试 fixture**：`tests/common/mod.rs` 手建最小合法 SF2 字节流（单 preset 正弦 + loop + exclusive class，bank/program 可参数化 `minimal_sf2_bytes_at(bank, program)`）——纯 `cargo test` 无外部文件可跑全部路径；真实库测试统一走 `#[ignore]` + `GLITCHERZ_SF2_PATH` 环境变量（本地数据不入库，D9）。**手写 RIFF 的坑**：ibag terminator 的 generator index 必须指向 igen 全部记录之后（差一条 → zone 丢 `sampleID` → 被当 global zone → 0 region → 静音且不报错）。
+- **S2 非实时模块 `engine::sf2`**：`Sf2Library::load(path)`（控制线程：BufReader + `SoundFont::new`，产物 `Arc<SoundFont>` 交 RT 侧不再解析）+ 加载期一次性 `presets(): &[Sf2Preset{bank: u8, program: u8, name}]` 枚举（D7 轨级 u8:u8 寻址；**bank/program 超出 u8 的 preset 跳过 + log::warn**，全部不可寻址 → `Sf2Error::NoPresets`）+ `find_preset(bank, program)`（UI 下拉与 S4 VoiceSpec 寻址共用）；`Sf2Error{Io, Parse, NoPresets}` thiserror。rustysynth-ext 自 S2 起为 engine 正式依赖。测试 `tests/sf2_load.rs` 8 场景（含截断/垃圾字节/越界 bank），真实库（MuseScore_General/FatBoy）load + 枚举 + **preset 地址唯一性**验证通过。
+
 ### 时间轴入图（P3，2026-10-08）
 
 - **MIDI 连线表**：`ExecPlan::midi_targets`（每 MIDI 轨扇出 ≤ `MAX_MIDI_FANOUT`=4）——音序器与键盘演奏的音符事件经 `RtGraph::track_note` 扇出到全部连线目标（`note_off_all` 同样遍历连线表）；默认图每轨连本轨声源（复刻旧语义）。编译器侧 `connect_midi/disconnect_midi`（重复连线幂等、空槽/越界拒绝、扇出超限报 `MidiFanOutOverflow`）。

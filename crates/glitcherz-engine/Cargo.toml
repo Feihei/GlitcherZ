@@ -11,7 +11,6 @@ cpal = { workspace = true }
 rtrb = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
-[dev-dependencies]
-# S1 RT-safety audit spike: allocation-counting harness for rustysynth-ext.
-# Promoted to a regular dependency in S3 once the audit verdict lands.
+# SF2 sound font synthesis (S2+): loading/parsing is control-thread only
+# (sf2 module); RT hot paths audited allocation-free in S1 (spec section 7).
 rustysynth-ext = { workspace = true }
