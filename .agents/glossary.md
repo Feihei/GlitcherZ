@@ -48,6 +48,9 @@
 | 效果器 | effect | 插入轨道链的处理节点；不用 FX / plug-in effect |
 | 旁路 | bypass | remove_node 的直连语义 |
 | 延迟 | delay | 时间线效果器；回声语义用 echo（测试中） |
+| 音色库 | soundfont | SF2/SF3 音色文件；`VoiceSpec::SoundFont` 变体；不用"音源库"作代码术语 |
+| 音色预设 | preset | SoundFont 内的 bank:program 声源；区别于插件预设（plugin preset） |
+| 采样 | sample | SoundFont 内嵌 PCM 采样数据；不进文档 |
 | 湿声 / 干声 | wet / dry | 只作形容词或独立名词 |
 | 包络 | envelope | ADSR 音量包络 |
 | 截止频率 | cutoff frequency | 字段/参数名 `cutoff` |

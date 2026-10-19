@@ -30,6 +30,11 @@
 - [ ] 插件 GUI 宿主（2026-10-15 实测确认缺口：宿主目前**无头**运行插件——CLAP gui 扩展 / VST3 `IPlugView` 均未实现，Dexed 等只能靠参数滑块 + state 持久化操作补丁；GUI 需宿主侧嵌入插件自绘窗口（平台原生窗口句柄 + 独立事件循环），体量不小，先立独立 spec 再动工）
 - [x] 乐器预设系统 v1（2026-10-15，实测"只能拖滑块太痛苦"的直接回应：宿主侧预设库 `presets/<插件键>/<名字>.glzpreset`（原始状态字节，插件键 = 格式 + 路径 hash8 + id，同名插件不同安装互不串库）；UI 一行 Preset 工具条（下拉加载 / Reset / 名称框 + Save As / Delete），乐器 CLAP 与 VST3 通用。加载/重置 = 先活体 `load_state`（插件拒收则文档不动）→ 滑块缓存回填（CLAP 守卫补 `read_param_values`）→ `VoiceSpec.state` 写入为**一步可撤销编辑**；Reset 用 spawn 时抓的出厂默认快照（`voice_default_state`，文档 state 清空 = 重载即出厂默认）；Save As 是文件操作不进 undo。效果器预设为后续项——机制（守卫 + doc 键缓存）可平移）
 - [x] Dexed .syx 预设导入工具（2026-10-15，clap-host dev harness `dexed_import_ym2612_banks`，`#[ignore]` + `DEXED_IMPORT_BANK_DIR` 环境变量指定 bank 目录）：DX7 bank（4104 字节，32 音色）→ Dexed state 构造。逆向出的格式要点：state = `VC2!` + u32 LE xml_len + XML + `\0`；XML 的 dexedBlob 元素带 `base64:sysex`（整盘 4104 bank）与 **`base64:program`（161 字节 data[]，加载时 `memcpy` 覆盖引擎数据——真正决定声音的是它**）双属性；编码是 **JUCE 专有 base64**（`MemoryBlock::toBase64Encoding`：字母表 `.` + A-Z + a-z + 0-9 + `+`，无 `/` 无填充，"SIZE." 前缀）。导入 = `Cartridge::unpackProgram` 移植（128 位包 → 155 引擎字节）+ 模板尾部 5 字节继承 + 双属性替换 + `currentProgram`。YM2612-Dexed-Presets 四个 bank 128 个音色已入库（逐个 program 往返校验 + 每行首音色出声验证），预设文件为本地数据不入库
+- [x] Dexed 播放缺陷修复（2026-10-16，实测"preset 只有 click / Stop 停不了 / 循环杂音"三个症状，诊断 harness 三个见 implementation.md）：导入数据无问题。根因与修复——
+  - [x] **Stop/Play 按 pitch 释放**：`note_off_all` 原来只发 `Off{note:0}`，pitch 匹配的插件（Dexed `keyup` 按 `midi_note` 查找）永远收不到 → 挂死音。修复：`Sequencer::take_pending_offs`（清槽并带出真实音符号）+ `BlockRunner::release_pending_notes`（Play/Stop 先按音符号逐轨 Off，再兜底群发）；回归测试 `stop_drains_pending_offs_by_pitch`
+  - [x] **循环长音符合并 retrigger guard**：`pending_offs` 每轨单槽被新 occurrence 覆盖 → 前一 occurrence 的 off 丢失 → 挂死堆积（"永远重复的杂音"）。修复：`schedule_track_clips` 同音符重触发时先发 Off 再发 On（槽清空 + 干净重触发）；回归测试 `long_note_in_looping_clip_retriggers_with_releases`
+  - [x] **`StateGate` 主线程调用与音频线程串行化（正确性加固，CLAP + VST3 镜像）**：guard 的 save/load/read_param_values 与音频线程 `process` 并发违反 clack 主线程契约；`glitcherz_engine::host_gate::StateGate`（Arc 共享原子门：音频侧 `audio_should_park` 停靠应答 + 控制侧有界等待握手），guard 三方法包裹，spawn 时（节点未处理）不等待。验证：竞态 A（绕门）/B（走门）/C（干净对照）三组渲染逐字节一致——**实测竞态未污染 Dexed state（此前"竞态复现"是 morph 音色自身 pluck 包络的假阳性），gate 为契约加固而非实测缺陷修复**
+  - 遗留：preset 音色在 App 实测仍 click 的根因尚未完全钉死（引擎级单音符/长音符路径已验证正常；优先怀疑挂死音修复后消失，待用户复测确认）
 
 ## 新方向：模块节点图架构（spec 已定稿）
 
@@ -139,6 +144,23 @@
 - [x] **M4a 钢琴窗**：状态机（Select/Draw）+ G/S/T/Shift+D/K + 视觉反馈 + 映射矩阵测试（2026-10-13：命令层 `a02612e`；状态机+接线 `feat(roll)`。测试 75 项 glitcherz-ui 全绿，含 22 项映射矩阵集成测试）
 - [x] **M4b 时间轴**（2026-10-13 交付，2026-10-14 对齐 roll：X/Y 轴锁、t+s 翻转、单次刀）：clip 跨轨多选（`ClipSel` + 框选合并 + Delete 批删一步 undo）+ G/T 模态（ghost 跨行预览、X 轴锁时间、落定 `filter_covered` 重叠策略）+ K 切刀（bar 吸附）+ Shift+D 复制模态（副本落定选区转移）。四段交付细节见 `implementation.md` M4b 段与 `spec/editing-model.md`
 - [ ] **未来命令族扩展**：quantize / legato / glue / transpose = 同族零侵入
+
+## 新方向：内置 SF2 音色库加载器（spec 已定稿）
+
+2026-10-19 调研 crates.io 并定稿方案 A，spec 见 `spec/sf2-loader.md`。选型
+`rustysynth-ext` 锁版本 `=1.4.0`（纯 Rust、零 unsafe、SF2+SF3、MIT；oxisynth
+0.0.x 与 xsynth 生态不选，C 绑定类排除）。核心决策：加载/解析只在控制线程，
+`Arc<SoundFont>` 交引擎；`VoiceSpec::SoundFont{path, bank, program}` 加法变体
+（PROJECT_VERSION 不动）；**RT 安全先审计后接入**——rustysynth render 内部有
+voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预分配 voice 池，
+不允许带分配裸进音频回调。
+
+- [ ] S1 RT 安全审计 spike（分配计数 allocator + 源码审计，结论回写 spec）
+- [ ] S2 engine `sf2` 非实时模块（load / preset 枚举 / thiserror 错误）
+- [ ] S3 engine `realtime/sf2.rs` `Sf2VoiceProcessor`（`Processor` 实现，逐行铁律评审）
+- [ ] S4 model `VoiceSpec::SoundFont` 变体 + RON 往返测试
+- [ ] S5 UI 音色库面板（加载 / preset 下拉 / 轨声源绑定，走守卫与命令约定）
+- [ ] S6 SF3 feature 开启 + 端到端验收
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
