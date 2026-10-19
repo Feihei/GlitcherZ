@@ -68,6 +68,18 @@ pub enum ParamId {
     /// happen to be normalized models), and each node maps them to the
     /// plugin's actual parameter range itself.
     PluginParam(u32),
+    /// SF2 voice: bank select (MIDI CC #0). Value carries the **literal bank
+    /// number** (rounded; D7 track-level `bank:program` addressing). Takes
+    /// effect together with the next `Sf2ProgramChange`, mirroring MIDI
+    /// semantics.
+    Sf2BankSelect,
+    /// SF2 voice: program change. Value carries the **literal program
+    /// number** (rounded); applies the currently latched bank.
+    Sf2ProgramChange,
+    /// SF2 voice: synthesizer master volume (linear, clamped 0..1;
+    /// non-finite values are ignored). The synth starts at its own default
+    /// of 0.5.
+    Sf2MasterVolume,
 }
 
 /// Note event (MIDI semantics). `note` is the MIDI note number (69 = A4),

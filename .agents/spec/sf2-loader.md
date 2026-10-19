@@ -58,9 +58,11 @@ C 构建链依赖的 SF2 加载与合成路径。
 - [x] **S1** RT 安全审计 spike：分配计数 allocator 包 `Synthesizer::note_on`/`render`
   单音符与和弦场景，产出审计结论写入本节；决定是否需要 voice 池 fork
   ✅ 2026-10-19 完成，结论见 §7——**零分配实证通过，无需 fork**
-- [ ] **S2** engine `sf2` 模块（非实时）：load / preset 枚举 / 错误类型（thiserror）
-- [ ] **S3** engine `realtime/sf2.rs`：`Sf2VoiceProcessor` 实现 `Processor`，预分配缓冲；
-  逐行审查进回调路径（铁律评审）
+- [x] **S2** engine `sf2` 模块（非实时）：load / preset 枚举 / 错误类型（thiserror）
+  ✅ 2026-10-19 完成（`engine::sf2`，详见 `implementation.md`）
+- [x] **S3** engine `realtime/sf2.rs`：`Sf2VoiceProcessor` 实现 `Processor`，预分配缓冲；
+  逐行审查进回调路径（铁律评审）✅ 2026-10-19 完成，接入要点（§7 的 ①②③）全部
+  落实；毯式 `Off { note: 0 }` 以 held 位图区分「全部释放」与「pitch-matched 释放」
 - [ ] **S4** model：`VoiceSpec::SoundFont` 变体 + RON 往返测试
 - [ ] **S5** UI：音色库面板（加载 SF2/SF3、preset 下拉、轨声源绑定）+ undo/redo 路径
   走现有守卫/命令约定

@@ -29,6 +29,8 @@ pub enum Sf2Error {
     Parse(#[from] rustysynth_ext::SoundFontError),
     #[error("sound font contains no presets addressable by bank/program (u8)")]
     NoPresets,
+    #[error("failed to create the sf2 synthesizer: {0}")]
+    Synth(#[from] rustysynth_ext::SynthesizerError),
 }
 
 /// One preset of a loaded SoundFont, addressed as `bank:program` (D7).

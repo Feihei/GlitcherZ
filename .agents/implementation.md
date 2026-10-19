@@ -4,11 +4,12 @@
 
 ## 已落地
 
-### SF2 音色库加载器 S1–S2（2026-10-19，spec 见 `.agents/spec/sf2-loader.md`）
+### SF2 音色库加载器 S1–S3（2026-10-19，spec 见 `.agents/spec/sf2-loader.md`）
 
 - **S1 RT 审计**（结论细节在 spec §7）：`rustysynth-ext = "=1.4.0"` 热路径零堆分配实证（计数 `#[global_allocator]`，测试 `tests/sf2_rt_audit.rs`），`VoiceCollection` 即预分配池，voice 池 fork 预案（D4）解除；唯一 panic 点 = `render` 等长契约（调用侧保证）。**审计 harness 的坑**：断言 label 的 `format!` 在计数窗口内求值会被计入分配（首跑真实库的假阳性），label 构建须在 scope 之外；计数器全局，测试须 `Mutex` 串行。
 - **共享测试 fixture**：`tests/common/mod.rs` 手建最小合法 SF2 字节流（单 preset 正弦 + loop + exclusive class，bank/program 可参数化 `minimal_sf2_bytes_at(bank, program)`）——纯 `cargo test` 无外部文件可跑全部路径；真实库测试统一走 `#[ignore]` + `GLITCHERZ_SF2_PATH` 环境变量（本地数据不入库，D9）。**手写 RIFF 的坑**：ibag terminator 的 generator index 必须指向 igen 全部记录之后（差一条 → zone 丢 `sampleID` → 被当 global zone → 0 region → 静音且不报错）。
 - **S2 非实时模块 `engine::sf2`**：`Sf2Library::load(path)`（控制线程：BufReader + `SoundFont::new`，产物 `Arc<SoundFont>` 交 RT 侧不再解析）+ 加载期一次性 `presets(): &[Sf2Preset{bank: u8, program: u8, name}]` 枚举（D7 轨级 u8:u8 寻址；**bank/program 超出 u8 的 preset 跳过 + log::warn**，全部不可寻址 → `Sf2Error::NoPresets`）+ `find_preset(bank, program)`（UI 下拉与 S4 VoiceSpec 寻址共用）；`Sf2Error{Io, Parse, NoPresets}` thiserror。rustysynth-ext 自 S2 起为 engine 正式依赖。测试 `tests/sf2_load.rs` 8 场景（含截断/垃圾字节/越界 bank），真实库（MuseScore_General/FatBoy）load + 枚举 + **preset 地址唯一性**验证通过。
+- **S3 实时渲染 `realtime/sf2.rs` `Sf2VoiceProcessor`**：实现 `Processor`，spec §7 接入要点全部落实——① `SynthesizerSettings.block_size = 128`（对齐 `FIXED_BLOCK_SIZE`）；② stereo render 缓冲构造期预分配，`process` 内经 `render(&mut l, &mut r)` 等长切片填入（排除库唯一 panic 点）后 `copy_channel` 进图缓冲（目标帧数小于 render 帧数时截断，mono 缓冲只写 ch0）；③ 轨级 bank:program 经 `process_midi_message(0xB0/0xC0)` 下发（零分配，S1 已实证），`set_master_volume` 纯写入挂 `ParamId`。**参数面**：`ParamId::{Sf2BankSelect, Sf2ProgramChange, Sf2MasterVolume}`（bank/program 为字面整数参数：`f32.round() as i32`，NaN 饱和转换为 0；负值不钳制——库侧 `set_bank/set_patch` 纯字段写、仅作 preset_lookup HashMap 键，未命中走 GM/默认 preset 回落，已核实安全；master volume 非有限值忽略）；`Sf2Error::Synth` 变体承接 `SynthesizerSettings` 越界（采样率 16000..=192000 / block 8..=1024 / 复音 8..=256）。**复音** `SF2_POLYPHONY = 64`。**毯式 note-off 语义**：引擎 transport stop 发 `Off { note: 0 }`，pitch-matched 接收端会忽略 → 挂音；以 `held: u128` 位图跟踪按下键，`Off { note: 0 }` 且 key 0 未按住 = `note_off_all()` 全释放，key 0 按住 = 正常 pitch-matched 释放（`held_note_zero_release_stays_pitch_matched` 测试锁定）。**边界**：velocity f32→MIDI 七位（NaN/Inf 钳制）；越界 note（≥128）照常转发 synth（内部静默忽略）但 `1u128 << note` 前有 `<128` 守卫（否则 panic）。测试 `tests/sf2_voice.rs` 13 场景 + 真实库 smoke（`#[ignore]` + `GLITCHERZ_SF2_PATH`）。**测试坑**：GM 默认 CC#91 reverb send=40，被拒绝的音符仍带 ~0.003 尾音残余——绝对阈值断言（`< 0.001`）会假失败，须先渲染 baseline 再相对比较；fixture `two_preset_sf2_bytes` 的 preset keyRange 以 pgen generator `lo | hi << 8` 编码（`20..=40`）。
 
 ### 时间轴入图（P3，2026-10-08）
 

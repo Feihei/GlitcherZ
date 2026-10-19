@@ -24,6 +24,8 @@
 //!   structure update protocol, and control-side compiler);
 //! - [`sine`] / [`gain`]: sine oscillator source and gain effect (`Processor` reference implementations);
 //! - [`envelope`] / [`svf`] / [`synth`]: ADSR envelope, SVF filter, and full synthesizer;
+//! - [`sf2`]: SoundFont voice ([`Sf2VoiceProcessor`](sf2::Sf2VoiceProcessor)) — RT rendering
+//!   around the audited `rustysynth-ext` synthesizer (loading stays in [`crate::sf2`]);
 //! - [`commands`]: `rtrb` command queue and [`EngineCommand`] / [`NoteEvent`] / [`ParamId`];
 //! - [`atomic`]: [`AtomicF32`] (audio thread → UI scalar feedback);
 //! - [`block`]: [`BlockRunner`] — splits the host's (cpal) arbitrarily long interleaved
@@ -42,6 +44,7 @@ pub mod graph;
 pub mod mixer;
 pub mod processor;
 pub mod sequencer;
+pub mod sf2;
 pub mod sine;
 pub mod svf;
 pub mod synth;
@@ -81,6 +84,7 @@ pub use sequencer::{
     MAX_CLIP_NOTES, MAX_TRACK_CLIPS, MIN_VELOCITY, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR,
     TICKS_PER_QUARTER, TICKS_PER_STEP,
 };
+pub use sf2::{SF2_POLYPHONY, Sf2VoiceProcessor};
 pub use sine::SineProcessor;
 pub use svf::{FilterMode, SvfProcessor};
 pub use synth::{SynthProcessor, note_to_frequency};
