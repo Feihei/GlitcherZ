@@ -117,6 +117,11 @@
 - **`data[161]` 布局**：`[0..155]` = 解包音色（6 op × 21：EG rate/level×8、BP、scale depth×2（+11/12 曲线位包、+13 rate scaling、+14 AMS、+15 KVS、+16 output、+17 mode、+18 coarse、+19 fine、**+20 detune**）→ pitch EG 8（126..134）→ algorithm@134 → feedback@135 → osc sync@136 → LFO speed/delay/pmd/lamd（137..141）→ lfo keysync/wave/pmsens 位包（141..144）→ transpose@144 → 名字 10 字节（145..155））；`[155]` = opSwitch 位包（运行时由 XML opSwitch 属性同步）；`[156..161]` = 控制器杂项。`Cartridge::unpackProgram` 已 1:1 移植为 `unpack_voice`（含 `normparm` 越界归一化）。
 - **导入器**：`dexed_import_ym2612_banks`（`#[ignore]`，`DEXED_IMPORT_BANK_DIR` 指定 bank 目录）：校验 bank 头/校验和 → 模板 XML 双属性替换（sysex = 整盘 bank、program = 逐音色解包 + 模板尾部继承）→ `load_state` → `save_state` 回读解码逐字节校验 program → bank 首音色 NoteOn 出声断言 → 写 `presets/<键>/<bank>-NN-<音色名>.glzpreset`。`dexed_dump_param_table` 可导出插件参数表（id/名字/域）供排查。
 - 已入库：YM2612-Dexed-Presets 四个 bank × 32 = **128 个音色**（BASS_BRASS / KEYS_BELLS / MORPH / SYNTH），预设文件为本地用户数据（.gitignore 已排除）。
+- **Dexed 声音问题定位与修复（2026-10-16，诊断 harness `dexed_preset_render_profile` / `dexed_engine_playback_repro` / `dexed_live_load_race`，均 `#[ignore]`）**：导入数据无问题（`unpack_voice` 与上游 `unpackProgram` 逐字段一致、program 字节独立解码复核；引擎级单音符 velocity 127 / 长音符 4s 全程持续、note-off 正常）。修复三处——
+  ① **Stop/Play 按 pitch 释放**：`Sequencer::take_pending_offs`（`std::mem::replace` 清槽带出 `(time, note)`）+ `BlockRunner::release_pending_notes`（Play/Stop 先逐轨按音符号 Off，再 `note_off_all` 兜底群发——内置 synth 的 env 忽略音符号，pitch 匹配插件（Dexed `keyup` 按 `midi_note` 查找）靠逐轨 Off；原 `Off{note:0}` 永远不匹配 → 挂死音 = "Stop 停不了"）。
+  ② **循环长音符 retrigger guard**：`schedule_track_clips` 同音符重触发前先清槽发 Off（否则单槽 pending off 被覆盖丢失，Dexed 挂死复音堆积成循环杂音）；回归测试 `stop_drains_pending_offs_by_pitch` / `long_note_in_looping_clip_retriggers_with_releases`。
+  ③ **`StateGate`（`glitcherz_engine::host_gate`，CLAP + VST3 镜像）**：guard 的 `save_state`/`load_state`/`read_param_values` 包裹 `begin_host_call`/`end_host_call`；`ClapNode::process`/`Vst3Node::process` 开头 `audio_should_park()`——宿主调用在飞时停靠应答、输出置零（仅原子操作）；spawn 时节点未处理不等待。**注意**：实测证明竞态并未污染 Dexed state（竞态 A（绕门）/B（走门）/C（干净对照）三组渲染逐字节一致，此前的"竞态复现"是 morph 音色自身快衰减 pluck 的假阳性——race harness 的 race 循环必须以与对照相同的 blob 结尾，否则最后加载的音色包络会被误读为"损坏"），gate 是 clack 主线程契约的加固而非实测缺陷修复。
+  遗留：preset 音色在 App 实测仍 click 的最终根因待复测确认（引擎级路径已验证正常；优先怀疑挂死音修复后消失）。诊断命令：`cargo test -p glitcherz-clap-host <harness名> -- --ignored --nocapture`。
 
 ### 项目文件与模型（`glitcherz-model`）
 
