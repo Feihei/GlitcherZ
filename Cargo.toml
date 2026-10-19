@@ -53,6 +53,8 @@ libloading = "0.8"
 vst3 = "0.3"
 
 clack-plugin = "0.2"
+# SF2 音色库合成（纯 Rust、零 unsafe；S1 RT 审计期先作 dev-dependency，S3 接入后转正式依赖）
+rustysynth-ext = "=1.4.0"
 glitcherz-model = { path = "crates/glitcherz-model" }
 glitcherz-command = { path = "crates/glitcherz-command" }
 glitcherz-clap-host = { path = "crates/glitcherz-clap-host" }

@@ -1022,6 +1022,7 @@ dependencies = [
  "cpal",
  "log",
  "rtrb",
+ "rustysynth-ext",
  "thiserror 2.0.21",
 ]
 
@@ -2281,6 +2282,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rustysynth-ext"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54edca64bf7626d89283046b71cb2a14c90668b5e28a527a150aee92ed530667"
 
 [[package]]
 name = "same-file"

@@ -55,8 +55,9 @@ C 构建链依赖的 SF2 加载与合成路径。
 
 ## 5. 实现拆分
 
-- [ ] **S1** RT 安全审计 spike：分配计数 allocator 包 `Synthesizer::note_on`/`render`
+- [x] **S1** RT 安全审计 spike：分配计数 allocator 包 `Synthesizer::note_on`/`render`
   单音符与和弦场景，产出审计结论写入本节；决定是否需要 voice 池 fork
+  ✅ 2026-10-19 完成，结论见 §7——**零分配实证通过，无需 fork**
 - [ ] **S2** engine `sf2` 模块（非实时）：load / preset 枚举 / 错误类型（thiserror）
 - [ ] **S3** engine `realtime/sf2.rs`：`Sf2VoiceProcessor` 实现 `Processor`，预分配缓冲；
   逐行审查进回调路径（铁律评审）
@@ -71,3 +72,36 @@ C 构建链依赖的 SF2 加载与合成路径。
 - **不做** SF2 编辑器、采样提取/导出、用户采样导入。
 - **不做** drum bank（bank 128）特判与 GM 重映射（v1 直通 bank:program，实测后定）。
 - **不做** 多 SoundFont 同时加载（v1 单库全局共享，多库留待实测需求）。
+## 7. S1 RT 安全审计结论（2026-10-19）
+
+> 审计对象：`rustysynth-ext = "=1.4.0"`。产出：
+> `crates/glitcherz-engine/tests/sf2_rt_audit.rs`（计数 allocator + 9 场景，常规
+> `cargo test` 即跑；真实库审计 `#[ignore]` + `GLITCHERZ_SF2_PATH`）。
+
+**结论：`Synthesizer` 热路径零堆分配，D4 的 voice 池 fork 预案解除。**
+
+- **源码审计**：全 crate 85 处分配调用逐一定位——`SoundFont::new`（RIFF 解析、
+  sample 解码）与 `Synthesizer::new`（preset_lookup HashMap、Channel 表、
+  `VoiceCollection`、block/effects 缓冲）之外**无任何分配点**。关键结构
+  `VoiceCollection`（voice_collection.rs）是 `Vec::with_capacity(polyphony)` 的
+  **预分配池**：`request_new` 池内取用 / exclusive class 复用 / 优先级抢占，voice
+  结束走 `swap` 回收，全程零分配。`Voice` 的 envelope/LFO/oscillator/filter/block
+  缓冲全部在 `Voice::new` 构造期建好，`start()` 纯字段写入。这正是选 ext fork 而非
+  上游 rustysynth 的决定性验证（上游 `Vec::remove` 式管理非池化）。
+- **实证验证**（计数 `#[global_allocator]`，测试内 `Mutex` 串行防并发污染）：
+  静音 render / 单音符完整生命周期（含 release 后 voice 回收）/ 10 音和弦打满
+  8 复音 / 20 音连续触发 voice stealing / exclusive class 复用 / bank+program+
+  CC+pitch bend 控制面 / `note_off_all` / `reset`——全部 **0 分配**。
+- **真实库加固**：MuseScore_General.sf2（256 preset，多 keyRange 分区）与
+  FatBoy-v0.790.sf2 全 preset 逐个 bank/program 切换 + 5 音和弦 + render，
+  每 preset 独立计数窗口，全部 0 分配。
+- **已知 panic 点（非 fork 理由）**：`render` 在 `left.len() != right.len()` 时
+  `panic!`（调用方契约违约）；`process_midi_message` 对 channel 越界有显式
+  保护。S3 的 `Sf2VoiceProcessor` 保证传入等长切片即可静态排除。
+- **S3 接入要点**：① `SynthesizerSettings.block_size = 128`（对齐
+  `FIXED_BLOCK_SIZE`，审计已按此配置）；② stereo render 缓冲在 Processor
+  构造期预分配，`render(&mut l, &mut r)` 逐块填入后进图求和；③ 轨级
+  bank:program（D7）经 `process_midi_message(0xB0/0xC0)` 下发，零分配已验证；
+  `set_master_volume` 纯写入可挂 `ParamId` 参数路径。
+- **测试自身坑（已注释在案）**：断言 label 的 `format!` 若在计数窗口内求值会被
+  计入——真实库审计首跑的"1 次分配"即此假阳性，label 构建须移到 scope 之外。

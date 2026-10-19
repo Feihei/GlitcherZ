@@ -11,3 +11,7 @@ cpal = { workspace = true }
 rtrb = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
+[dev-dependencies]
+# S1 RT-safety audit spike: allocation-counting harness for rustysynth-ext.
+# Promoted to a regular dependency in S3 once the audit verdict lands.
+rustysynth-ext = { workspace = true }

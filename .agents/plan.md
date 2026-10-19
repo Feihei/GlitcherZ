@@ -15,9 +15,9 @@
 9. ✅ CLAP 插件宿主（先于 VST3，API 更简洁）
 10. ✅ VST3 插件宿主（乐器/效果器已集成进 model/UI；遗留项见下）
 
-## 当前状态（2026-10-15）
+## 当前状态（2026-10-19）
 
-路线图 1–10 全部落地。乐器插件（CLAP / VST3）为一等声源，效果器节点已接入，自动化桥接到插件参数。节点图 P1–P5e.2 与 MIDI 编辑 M1–M4（M4a 钢琴窗、M4b 时间轴）全部交付；CLAP 乐器参数滑块已接通（2026-10-15）。下一步：P5f 单输入语义 + Mixer 节点。
+路线图 1–10 全部落地。乐器插件（CLAP / VST3）为一等声源，效果器节点已接入，自动化桥接到插件参数。节点图 P1–P5f 与 MIDI 编辑 M1–M4 全部交付；SF2 音色库方向 S1 RT 审计完成（零分配、无需 fork）。下一步：S2 engine `sf2` 非实时模块。
 
 ## 遗留任务
 
@@ -155,7 +155,7 @@
 voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预分配 voice 池，
 不允许带分配裸进音频回调。
 
-- [ ] S1 RT 安全审计 spike（分配计数 allocator + 源码审计，结论回写 spec）
+- [x] S1 RT 安全审计 spike（分配计数 allocator + 源码审计，结论回写 spec）✅ 2026-10-19：`rustysynth-ext` 1.4.0 热路径（note_on/off、render、process_midi_message、reset、voice stealing、exclusive class）**零堆分配实证通过**——`VoiceCollection` 即预分配池（ext fork 相对上游的关键改进），**无需 fork**（D4 预案解除）。审计 harness `glitcherz-engine/tests/sf2_rt_audit.rs`：手建最小 SF2 字节流 fixture（无外部文件、常规 CI 可跑）9 场景 + 真实库 `#[ignore]` 审计（MuseScore_General 256 preset / FatBoy 全量逐 preset 计数，全 0 分配）。唯一 panic 点 = render 等长契约（调用侧保证）。结论与 S3 接入要点见 spec §7
 - [ ] S2 engine `sf2` 非实时模块（load / preset 枚举 / thiserror 错误）
 - [ ] S3 engine `realtime/sf2.rs` `Sf2VoiceProcessor`（`Processor` 实现，逐行铁律评审）
 - [ ] S4 model `VoiceSpec::SoundFont` 变体 + RON 往返测试
