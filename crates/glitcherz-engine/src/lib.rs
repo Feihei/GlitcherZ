@@ -16,6 +16,9 @@
 //!   level, playback position).
 //! - [`convert`]: the central point for f32 (audio path) / f64 (UI, time)
 //!   conversions.
+//! - [`host_gate`]: plugin-host infrastructure — the atomic handoff gate
+//!   shared by the CLAP/VST3 hosts to serialize main-thread plugin calls
+//!   (state load/save/param read) against the audio thread's `process`.
 //!
 //! Thread model overview (see AGENTS.md for details):
 //!
@@ -29,6 +32,7 @@
 
 pub mod convert;
 pub mod engine;
+pub mod host_gate;
 pub mod realtime;
 
 #[cfg(test)]

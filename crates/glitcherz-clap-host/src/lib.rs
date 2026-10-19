@@ -40,7 +40,7 @@
 pub mod raw;
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use clack_common::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
 use clack_extensions::log::{HostLog, HostLogImpl};
@@ -329,6 +329,8 @@ pub struct ClapNode {
     out_r: Box<[f32]>,
     pending: [PendingClapEvent; MAX_PENDING_EVENTS],
     pending_count: usize,
+    /// Handoff gate shared with the control-side guard (see [`StateGate`]).
+    state_gate: Arc<StateGate>,
 }
 
 /// Guard holding the plugin dynamic library and instance. **Must live as
@@ -340,15 +342,29 @@ pub struct ClapInstanceGuard {
     /// The plugin's state extension, when implemented (captured at
     /// initialization; `None` when the plugin has none).
     state_ext: Option<PluginState>,
+    /// Handoff gate shared with the real-time node (see
+    /// `glitcherz_engine::host_gate::StateGate`).
+    state_gate: Arc<StateGate>,
 }
+
+use glitcherz_engine::host_gate::StateGate;
 
 impl ClapInstanceGuard {
     /// Saves the plugin's full state blob (main thread only; the plugin may
     /// remain active). The blob format is plugin-private per the CLAP spec.
     ///
-    /// Returns [`HostError::NoState`] when the plugin does not implement the
-    /// state extension.
+    /// The call is serialized against the audio thread via the state gate
+    /// (a racing save would tear the plugin's engine state the same way a
+    /// load does). Returns [`HostError::NoState`] when the plugin does not
+    /// implement the state extension.
     pub fn save_state(&mut self) -> Result<Vec<u8>, HostError> {
+        self.state_gate.begin_host_call();
+        let result = self.save_state_impl();
+        self.state_gate.end_host_call();
+        result
+    }
+
+    fn save_state_impl(&mut self) -> Result<Vec<u8>, HostError> {
         let state = self.state_ext.ok_or(HostError::NoState)?;
         let mut out = Vec::new();
         state
@@ -359,11 +375,20 @@ impl ClapInstanceGuard {
 
     /// Restores the plugin state from a previously saved blob (main thread
     /// only). Call right after instantiation, before the node starts
-    /// processing.
+    /// processing — or rely on the state gate: a live load (while the audio
+    /// thread processes) is serialized against `process` so the plugin's
+    /// engine state never tears.
     ///
     /// Returns [`HostError::NoState`] when the plugin does not implement the
     /// state extension.
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), HostError> {
+        self.state_gate.begin_host_call();
+        let result = self.load_state_impl(data);
+        self.state_gate.end_host_call();
+        result
+    }
+
+    fn load_state_impl(&mut self, data: &[u8]) -> Result<(), HostError> {
         let state = self.state_ext.ok_or(HostError::NoState)?;
         let mut reader = std::io::Cursor::new(data);
         state
@@ -376,15 +401,19 @@ impl ClapInstanceGuard {
     /// refused the read.
     ///
     /// Used after a state/preset load to refresh the UI's cached slider
-    /// values once the instance is held in the guard registry.
+    /// values once the instance is held in the guard registry. Serialized
+    /// against the audio thread via the state gate (same tear risk).
     pub fn read_param_values(&self) -> std::collections::HashMap<u32, f64> {
+        self.state_gate.begin_host_call();
         let ids: Vec<u32> = raw::enumerate_params(self.instance.raw_instance())
             .iter()
             .map(|p| p.id)
             .collect();
-        raw::read_param_values(self.instance.raw_instance(), &ids)
+        let values = raw::read_param_values(self.instance.raw_instance(), &ids)
             .into_iter()
-            .collect()
+            .collect();
+        self.state_gate.end_host_call();
+        values
     }
 }
 
@@ -456,13 +485,15 @@ impl ClapInstance {
         // processing must be started via as_started_mut before process.
         let processor: PluginAudioProcessor<GlitcherZHostHandlers> = stopped.into();
 
+        let state_gate = Arc::new(StateGate::default());
         Ok(Self {
             guard: ClapInstanceGuard {
                 _entry: entry,
                 instance,
                 state_ext,
+                state_gate: Arc::clone(&state_gate),
             },
-            node: ClapNode::new(processor, config),
+            node: ClapNode::new(processor, config, state_gate),
         })
     }
 
@@ -495,6 +526,7 @@ impl ClapNode {
     fn new(
         processor: impl Into<PluginAudioProcessor<GlitcherZHostHandlers>>,
         config: ClapInstanceConfig,
+        state_gate: Arc<StateGate>,
     ) -> Self {
         let frames = config.max_frames.max(FIXED_BLOCK_SIZE as u32) as usize;
         Self {
@@ -507,6 +539,7 @@ impl ClapNode {
             out_r: vec![0.0; frames].into_boxed_slice(),
             pending: [PendingClapEvent::NoteOff { note: 0 }; MAX_PENDING_EVENTS],
             pending_count: 0,
+            state_gate,
         }
     }
 
@@ -522,6 +555,26 @@ impl ClapNode {
 
 impl Processor for ClapNode {
     fn process(&mut self, ctx: &ProcessContext, buffer: &mut AudioBuffer) {
+        // 0. State-gate handoff: while the control thread runs a main-thread
+        //    plugin call (state load/save/param read), park — acknowledge and
+        //    keep the output zeroed (atomics only, no locks).
+        if self.state_gate.audio_should_park() {
+            let frames = ctx.frames.min(self.out_l.len()).min(buffer.capacity());
+            for channel in [&mut self.out_l[..frames], &mut self.out_r[..frames]] {
+                channel.fill(0.0);
+            }
+            for (channel_index, source) in [&self.out_l[..frames], &self.out_r[..frames]]
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(destination) = buffer.channel_mut(channel_index) {
+                    for (index, sample) in destination.iter_mut().enumerate() {
+                        *sample = source.get(index).copied().unwrap_or(0.0);
+                    }
+                }
+            }
+            return;
+        }
         let frames = ctx.frames.min(self.out_l.len()).min(buffer.capacity());
 
         // 1. Stashed events → CLAP input events (block granularity).
@@ -1405,5 +1458,654 @@ mod tests {
 
         eprintln!("imported {imported} presets into presets/{key} (audio-checked {checked_audio})");
         assert!(imported > 0);
+    }
+
+    /// Dev tool (diagnostic): loads one imported `.glzpreset` (plus the
+    /// factory-template state as a control) and renders a long NoteOn,
+    /// printing a per-block peak profile so "click at note start, then
+    /// silence" reproduces headlessly. Run with:
+    /// `cargo test -p glitcherz-clap-host dexed_preset_render_profile -- --ignored --nocapture`
+    #[test]
+    #[ignore = "dev tool: needs Dexed installed + imported presets/"]
+    fn dexed_preset_render_profile() {
+        let Some(path) = scan_clap_files().into_iter().find(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().to_lowercase().contains("dexed"))
+                .unwrap_or(false)
+        }) else {
+            panic!("no dexed*.clap found in the CLAP scan directories");
+        };
+        let infos = list_clap_plugins_in(&path);
+        let info = infos
+            .iter()
+            .find(|info| info.is_instrument)
+            .expect("Dexed exposes no instrument class");
+        let mut instance = ClapInstance::spawn_rt(
+            &path,
+            &info.id,
+            ClapInstanceConfig {
+                sample_rate: 48_000,
+                max_frames: 128,
+            },
+        )
+        .expect("Dexed should instantiate");
+
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let preset_dir = workspace
+            .join("presets")
+            .join(preset_key_for(&path.display().to_string(), &info.id));
+        let template = instance
+            .guard
+            .save_state()
+            .expect("Dexed implements the state extension");
+
+        // State XML summary: the global attrs that shape the render.
+        let xml_of = |blob: &[u8]| -> String {
+            let len = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
+            String::from_utf8(blob[8..8 + len].to_vec()).unwrap()
+        };
+        let attr_of = |xml: &str, prefix: &str| -> String {
+            let start = match xml.find(prefix) {
+                Some(s) => s + prefix.len(),
+                None => return "<absent>".into(),
+            };
+            let end = start + xml[start..].find('"').unwrap();
+            xml[start..end].to_string()
+        };
+
+        // Unpacked-voice summary from a blob's `program` attr: per-op EG
+        // rates/levels + output level, and the global algorithm/feedback.
+        let program_of = |xml: &str| -> Vec<u8> {
+            let start = xml.find("base64:program=\"").expect("program attr") + 17;
+            let end = start + xml[start..].find('"').unwrap();
+            let (_p, b64) = xml[start..end].split_once('.').expect("size prefix");
+            b64_decode(b64, 161)
+        };
+        let dump_template_raw = |xml: &str| {
+            let start = xml.find("base64:program=\"").expect("program attr") + 17;
+            let end = start + xml[start..].find('"').unwrap();
+            let raw_attr = &xml[start..end];
+            let (prefix, b64) = raw_attr.split_once('.').expect("size prefix");
+            eprintln!(
+                "    template program attr: size-prefix={prefix} b64_len={} b64_head={}",
+                b64.len(),
+                &b64[..b64.len().min(24)]
+            );
+            let at = xml.find("base64:program=\"").expect("program attr");
+            eprintln!(
+                "    xml around attr: {:?}",
+                &xml[at.saturating_sub(60)..at + 80]
+            );
+            let program = b64_decode(b64, 161);
+            eprintln!("    template program bytes[0..40]: {:?}", &program[..40]);
+            eprintln!(
+                "    template program bytes[155..161]: {:?}",
+                &program[155..161]
+            );
+        };
+        let dump_program = |xml: &str| {
+            let program = program_of(xml);
+            let name: String = program[145..155]
+                .iter()
+                .map(|b| {
+                    if (32..127).contains(b) {
+                        *b as char
+                    } else {
+                        ' '
+                    }
+                })
+                .collect();
+            eprintln!("    voice name: {:?}", name.trim());
+            eprintln!(
+                "    algorithm {} feedback {} osc-sync {}",
+                program[134], program[135], program[136]
+            );
+            for op in 0..6usize {
+                let o = op * 21;
+                eprintln!(
+                    "    op{}: rates={:?} levels={:?} out={} coarse={} fine={} mode={} kvs={} ams={}",
+                    6 - op,
+                    &program[o..o + 4],
+                    &program[o + 4..o + 8],
+                    program[o + 16],
+                    program[o + 18],
+                    program[o + 19],
+                    program[o + 17],
+                    program[o + 15],
+                    program[o + 14],
+                );
+            }
+        };
+
+        let ctx = ProcessContext {
+            sample_rate: 48_000.0,
+            frames: 128,
+            playback_sample_pos: 0,
+        };
+        let mut buffer = AudioBuffer::new(2, 128);
+        buffer.set_len(128);
+        buffer.clear();
+
+        let mut render = |label: &str, blob: &[u8], blocks: usize| {
+            eprintln!("== {label}");
+            let xml = xml_of(blob);
+            eprintln!(
+                "    attrs: currentProgram={} opSwitch={} gain={} engineType={}",
+                attr_of(&xml, "currentProgram=\""),
+                attr_of(&xml, "opSwitch=\""),
+                attr_of(&xml, "gain=\""),
+                attr_of(&xml, "engineType=\""),
+            );
+            dump_program(&xml);
+
+            instance.guard.load_state(blob).expect("state load failed");
+            instance.node.process(&ctx, &mut buffer); // warm-up / lazy start
+            assert!(instance.node.note_event(NoteEvent::On {
+                note: 69,
+                velocity: 1.0
+            }));
+
+            let mut peaks = Vec::with_capacity(blocks);
+            for _ in 0..blocks {
+                instance.node.process(&ctx, &mut buffer);
+                let peak = buffer
+                    .channel(0)
+                    .unwrap()
+                    .iter()
+                    .fold(0.0f32, |acc, s| acc.max(s.abs()));
+                peaks.push(peak);
+            }
+            instance.node.note_event(NoteEvent::Off { note: 69 });
+            instance.node.process(&ctx, &mut buffer);
+
+            let max_peak = peaks.iter().copied().fold(0.0f32, f32::max);
+            let nonzero = peaks.iter().filter(|p| **p > 1e-4).count();
+            eprintln!("    max peak {max_peak:.6}, blocks > 1e-4: {nonzero}/{blocks}");
+            // Compact profile: every 4th block peak over the first ~2 s.
+            let shown: Vec<String> = peaks
+                .iter()
+                .take(blocks.min(200))
+                .step_by(4)
+                .map(|p| format!("{p:.4}"))
+                .collect();
+            eprintln!("    profile: {}", shown.join(" "));
+        };
+
+        render("control: fresh template state", &template, 100);
+        dump_template_raw(&xml_of(&template));
+        for (label, file) in [
+            (
+                "preset: BASS_BRASS-07 Bass 08",
+                "ROM1_BASS_BRASS-07-Bass_08.glzpreset",
+            ),
+            (
+                "preset: MORPH-00 Morph 01",
+                "ROM3_MORPH-00-Morph_01.glzpreset",
+            ),
+        ] {
+            let blob = std::fs::read(preset_dir.join(file))
+                .unwrap_or_else(|err| panic!("read {file}: {err}"));
+            render(label, &blob, 100);
+        }
+
+        // App-like scenario: repeated press/release cycles on the Bass 08
+        // preset at a lower velocity, across two sample rates, plus live
+        // state switches while the plugin is already running.
+        let bass_blob = std::fs::read(preset_dir.join("ROM1_BASS_BRASS-07-Bass_08.glzpreset"))
+            .expect("read bass preset");
+        for sr in [48_000u32, 44_100] {
+            let mut inst = ClapInstance::spawn_rt(
+                &path,
+                &info.id,
+                ClapInstanceConfig {
+                    sample_rate: sr,
+                    max_frames: 128,
+                },
+            )
+            .expect("spawn for cycling test");
+            let ctx = ProcessContext {
+                sample_rate: sr as f32,
+                frames: 128,
+                playback_sample_pos: 0,
+            };
+            let mut buf = AudioBuffer::new(2, 128);
+            buf.set_len(128);
+            buf.clear();
+            inst.node.process(&ctx, &mut buf); // warm-up / lazy start
+
+            let held_peaks = |inst: &mut ClapInstance,
+                              ctx: &ProcessContext,
+                              buf: &mut AudioBuffer,
+                              note: u8,
+                              velocity: f32,
+                              blocks: usize|
+             -> Vec<f32> {
+                let _ = inst.node.note_event(NoteEvent::On { note, velocity });
+                let mut peaks = Vec::with_capacity(blocks);
+                for _ in 0..blocks {
+                    inst.node.process(ctx, buf);
+                    let peak = buf
+                        .channel(0)
+                        .unwrap()
+                        .iter()
+                        .fold(0.0f32, |acc, s| acc.max(s.abs()));
+                    peaks.push(peak);
+                }
+                let _ = inst.node.note_event(NoteEvent::Off { note });
+                for _ in 0..8 {
+                    inst.node.process(ctx, buf);
+                }
+                peaks
+            };
+
+            inst.guard.load_state(&bass_blob).expect("load bass");
+            inst.node.process(&ctx, &mut buf);
+            eprintln!("== cycling @ {sr} Hz, velocity 0.8, Bass 08");
+            for cycle in 0..5u8 {
+                let note = 45 + cycle * 3;
+                let peaks = held_peaks(&mut inst, &ctx, &mut buf, note, 0.8, 16);
+                eprintln!("    cycle {cycle} (note {note}): held peaks {peaks:?}");
+            }
+
+            eprintln!("    -- note x velocity grid (16-block held peak every 2 blocks)");
+            for note in [36u8, 48, 60, 69, 81] {
+                for velocity in [0.5f32, 1.0] {
+                    let peaks = held_peaks(&mut inst, &ctx, &mut buf, note, velocity, 16);
+                    let sampled: Vec<f32> = peaks.iter().step_by(2).copied().collect();
+                    eprintln!("    note {note} vel {velocity}: {sampled:?}");
+                }
+            }
+
+            eprintln!("    -- velocity sweep @ note 60 (bass preset then template)");
+            for velocity in [1.0f32, 0.95, 0.9, 0.8, 0.7, 0.6, 0.5] {
+                let peaks = held_peaks(&mut inst, &ctx, &mut buf, 60, velocity, 16);
+                let tail: Vec<f32> = peaks.iter().step_by(4).copied().collect();
+                eprintln!("    bass08 vel {velocity}: {tail:?}");
+            }
+            inst.guard.load_state(&template).expect("reload template");
+            inst.node.process(&ctx, &mut buf);
+            for velocity in [1.0f32, 0.8, 0.5] {
+                let peaks = held_peaks(&mut inst, &ctx, &mut buf, 60, velocity, 16);
+                let tail: Vec<f32> = peaks.iter().step_by(4).copied().collect();
+                eprintln!("    template vel {velocity}: {tail:?}");
+            }
+
+            // KVS attribution: patch the bass preset's program bytes so every
+            // operator's key-velocity sensitivity is 0/1/3, re-encode the
+            // state, and render at velocity 0.5. If the collapse tracks KVS,
+            // Dexed's ScaleVelocity path is live; if identical, velocity
+            // enters elsewhere.
+            eprintln!("    -- KVS sweep @ note 60 vel 0.5");
+            for kvs in [0u8, 1, 3] {
+                let mut patched = bass_blob.clone();
+                let xml_start = 8usize;
+                let xml_len =
+                    u32::from_le_bytes([patched[4], patched[5], patched[6], patched[7]]) as usize;
+                let mut xml = String::from_utf8(patched[xml_start..xml_start + xml_len].to_vec())
+                    .expect("xml");
+                let start = xml.find("base64:program=\"").expect("program attr") + 16;
+                let end = start + xml[start..].find('"').unwrap();
+                let raw_attr = &xml[start..end];
+                let (prefix, b64) = raw_attr.split_once('.').expect("size prefix");
+                let mut program = b64_decode(b64, usize::from_str_radix(prefix, 10).unwrap());
+                for op in 0..6usize {
+                    program[op * 21 + 15] = kvs;
+                }
+                let new_attr = format!("{}.{}", prefix, b64_encode(&program));
+                xml.replace_range(start..end, &new_attr);
+                let mut blob = Vec::with_capacity(8 + xml.len() + 1);
+                blob.extend_from_slice(b"VC2!");
+                blob.extend_from_slice(&(xml.len() as u32).to_le_bytes());
+                blob.extend_from_slice(xml.as_bytes());
+                blob.push(0);
+                patched = blob;
+
+                inst.guard.load_state(&patched).expect("load patched");
+                inst.node.process(&ctx, &mut buf);
+                let peaks = held_peaks(&mut inst, &ctx, &mut buf, 60, 0.5, 16);
+                let tail: Vec<f32> = peaks.iter().step_by(4).copied().collect();
+                eprintln!("    kvs={kvs} vel 0.5: {tail:?}");
+            }
+
+            // Byte-exact threshold hunt: velocity = byte/127.
+            eprintln!("    -- byte threshold hunt (kvs=0 blob, note 60)");
+            for byte in [100u32, 103, 105, 106, 107, 108, 109, 110, 111, 113] {
+                inst.guard.load_state(&bass_blob).expect("reload bass");
+                inst.node.process(&ctx, &mut buf);
+                let velocity = byte as f32 / 127.0;
+                let peaks = held_peaks(&mut inst, &ctx, &mut buf, 60, velocity, 16);
+                let tail: Vec<f32> = peaks.iter().step_by(4).copied().collect();
+                eprintln!("    byte {byte}: {tail:?}");
+            }
+        }
+    }
+
+    /// Dev tool (diagnostic): full engine-path repro — Dexed as the track
+    /// instrument inside the node graph, notes delivered by the sequencer
+    /// (timeline playback), observing sustain, the per-note off, and the
+    /// transport Stop behavior. Run with:
+    /// `cargo test -p glitcherz-clap-host dexed_engine_playback_repro -- --ignored --nocapture`
+    #[test]
+    #[ignore = "dev tool: needs Dexed installed + imported presets/"]
+    fn dexed_engine_playback_repro() {
+        use glitcherz_engine::realtime::Feedback;
+        use glitcherz_engine::realtime::block::BlockRunner;
+        use glitcherz_engine::realtime::commands::{
+            EngineCommand, SequencerCommand, command_channel,
+        };
+        use glitcherz_engine::realtime::graph::GraphCompiler;
+        use glitcherz_engine::realtime::sequencer::{RtMidiClip, RtNote, Sequencer};
+        use glitcherz_engine::realtime::voice::{recycle_channel, structure_channel};
+
+        let sr = 48_000.0f32;
+        let fixed_block = 128usize;
+
+        let Some(path) = scan_clap_files().into_iter().find(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().to_lowercase().contains("dexed"))
+                .unwrap_or(false)
+        }) else {
+            panic!("no dexed*.clap found");
+        };
+        let infos = list_clap_plugins_in(&path);
+        let info = infos
+            .iter()
+            .find(|info| info.is_instrument)
+            .expect("no instrument class");
+        let mut instance = ClapInstance::spawn_rt(
+            &path,
+            &info.id,
+            ClapInstanceConfig {
+                sample_rate: 48_000,
+                max_frames: 128,
+            },
+        )
+        .expect("spawn");
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let preset = workspace
+            .join("presets")
+            .join(preset_key_for(&path.display().to_string(), &info.id))
+            .join("ROM1_BASS_BRASS-07-Bass_08.glzpreset");
+        let blob = std::fs::read(&preset).expect("read preset");
+        instance.guard.load_state(&blob).expect("load preset");
+
+        // Engine harness (mirrors the block.rs tests).
+        let (mut tx, rx) = command_channel(64);
+        let (graph_tx, graph_rx) = structure_channel();
+        let (recycle_tx, _recycle_rx) = recycle_channel();
+        let (mut compiler, graph) = GraphCompiler::default_graph(sr, fixed_block);
+        let feedback = Feedback::new();
+        let sequencer = Sequencer::new(sr);
+        let mut runner = BlockRunner::new(
+            fixed_block,
+            2,
+            sr,
+            graph,
+            sequencer,
+            rx,
+            graph_rx,
+            recycle_tx,
+            feedback.clone(),
+        );
+
+        // Install the Dexed node as track 0's instrument (mirrors the app's
+        // engine set_voice path) and keep the default chain → mixer wiring.
+        let mut graph_tx = graph_tx;
+        let (update, _node_id) = match compiler.set_voice(0, Box::new(instance.node)) {
+            Ok(result) => result,
+            Err(_handed_back) => panic!("set voice failed"),
+        };
+        graph_tx.push(update).expect("structure queue");
+
+        // One bar-long note, sequencer velocity 127 (0..1 = 1.0).
+        let mut clips = [RtMidiClip::default(); 8];
+        clips[0].start_ticks = 0;
+        clips[0].span_ticks = 384;
+        clips[0].loop_ticks = 384;
+        clips[0].push(RtNote::new(0, 384, 60, 0, 127));
+        tx.push(EngineCommand::Sequencer(SequencerCommand::SetTrackClips {
+            track: 0,
+            clips,
+        }))
+        .expect("queue");
+
+        tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
+            .expect("queue");
+
+        // Render 2 s while playing: per-block peak for the first 30 blocks,
+        // then per-100 ms for the rest.
+        let block = fixed_block;
+        let mut rendered = 0usize;
+        let mut profile = Vec::new();
+        let mut peak_100ms = 0.0f32;
+        while rendered < (sr as usize) * 2 {
+            let mut out = vec![0.0f32; block * 2];
+            runner.render_interleaved(&mut out);
+            for s in out.iter().step_by(2) {
+                peak_100ms = peak_100ms.max(s.abs());
+            }
+            if rendered < block * 30 {
+                profile.push((peak_100ms * 1e4).round() / 1e4);
+                peak_100ms = 0.0;
+            } else if rendered % ((sr as usize) / 10) == 0 {
+                profile.push((peak_100ms * 1e3).round() / 1e3);
+                peak_100ms = 0.0;
+            }
+            rendered += block;
+        }
+        eprintln!(
+            "== playing 2 s (note 60, vel 127, one bar): peaks (first 30 per-block, then per-100ms)"
+        );
+        eprintln!("   {profile:?}");
+
+        // Transport Stop: the sequencer's note_off_all sends Off{note:0} —
+        // anything still sounding on another pitch must NOT hang.
+        tx.push(EngineCommand::Sequencer(SequencerCommand::Stop))
+            .expect("queue");
+        let mut rendered = 0usize;
+        let mut profile = Vec::new();
+        let mut peak_100ms = 0.0f32;
+        while rendered < (sr as usize) {
+            let mut out = vec![0.0f32; block * 2];
+            runner.render_interleaved(&mut out);
+            for s in out.iter().step_by(2) {
+                peak_100ms = peak_100ms.max(s.abs());
+            }
+            if rendered % ((sr as usize) / 10) == 0 {
+                profile.push((peak_100ms * 1e3).round() / 1e3);
+                peak_100ms = 0.0;
+            }
+            rendered += block;
+        }
+        eprintln!("== after Stop, 1 s: per-100ms peaks (hanging note check)");
+        eprintln!("   {profile:?}");
+
+        // Hanging-note check done properly: play 1 s (note still sounding),
+        // then Stop mid-note (the Stop path's note_off_all only sends
+        // Off{note:0} — a sounding note 60 must NOT survive it).
+        tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
+            .expect("queue");
+        let mut rendered = 0usize;
+        let mut block_peaks = Vec::new();
+        while rendered < fixed_block * 20 {
+            let mut out = vec![0.0f32; fixed_block * 2];
+            runner.render_interleaved(&mut out);
+            let peak = out.iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
+            block_peaks.push((peak * 1e4).round() / 1e4);
+            rendered += fixed_block;
+        }
+        eprintln!("== mid-note Stop section: playing peaks (20 blocks)");
+        eprintln!("   {block_peaks:?}");
+        for _ in 0..((sr as usize) / fixed_block - 20) {
+            let mut out = vec![0.0f32; fixed_block * 2];
+            runner.render_interleaved(&mut out);
+        }
+        tx.push(EngineCommand::Sequencer(SequencerCommand::Stop))
+            .expect("queue");
+        let mut rendered = 0usize;
+        let mut block_peaks = Vec::new();
+        while rendered < fixed_block * 40 {
+            let mut out = vec![0.0f32; fixed_block * 2];
+            runner.render_interleaved(&mut out);
+            let peak = out.iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
+            block_peaks.push((peak * 1e4).round() / 1e4);
+            rendered += fixed_block;
+        }
+        eprintln!("== stop mid-note: per-block peaks after Stop (40 blocks, hanging check)");
+        eprintln!("   {block_peaks:?}");
+    }
+
+    /// Dev tool (diagnostic): the app's live preset load calls
+    /// `ClapInstanceGuard::load_state` on the **UI thread while the audio
+    /// thread keeps processing the node**. Three sections: (A) non-gated
+    /// loads during processing (race reproduction), (B) gated loads (the
+    /// `StateGate` fix), (C) clean control. Every race ends on the bass blob
+    /// so any divergence from the control is race damage, not patch
+    /// character. Run with:
+    /// `cargo test -p glitcherz-clap-host dexed_live_load_race -- --ignored --nocapture`
+    #[test]
+    #[ignore = "dev tool: needs Dexed installed + imported presets/"]
+    fn dexed_live_load_race() {
+        let Some(path) = scan_clap_files().into_iter().find(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().to_lowercase().contains("dexed"))
+                .unwrap_or(false)
+        }) else {
+            panic!("no dexed*.clap found");
+        };
+        let infos = list_clap_plugins_in(&path);
+        let info = infos
+            .iter()
+            .find(|info| info.is_instrument)
+            .expect("no instrument class");
+        let mut instance = ClapInstance::spawn_rt(
+            &path,
+            &info.id,
+            ClapInstanceConfig {
+                sample_rate: 48_000,
+                max_frames: 128,
+            },
+        )
+        .expect("spawn");
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let preset_dir = workspace
+            .join("presets")
+            .join(preset_key_for(&path.display().to_string(), &info.id));
+        let bass_blob = std::fs::read(preset_dir.join("ROM1_BASS_BRASS-07-Bass_08.glzpreset"))
+            .expect("read preset");
+        let morph_blob =
+            std::fs::read(preset_dir.join("ROM3_MORPH-00-Morph_01.glzpreset")).expect("read");
+
+        let ctx = ProcessContext {
+            sample_rate: 48_000.0,
+            frames: 128,
+            playback_sample_pos: 0,
+        };
+        let mut buf = AudioBuffer::new(2, 128);
+        buf.set_len(128);
+        buf.clear();
+
+        // Clean state first: load at spawn (before any processing), verify
+        // the note sustains.
+        instance.guard.load_state(&bass_blob).expect("load bass");
+        instance.node.process(&ctx, &mut buf); // warm-up
+        let sustain = |instance: &mut ClapInstance, ctx: &ProcessContext, buf: &mut AudioBuffer| {
+            let _ = instance.node.note_event(NoteEvent::On {
+                note: 60,
+                velocity: 1.0,
+            });
+            let mut peaks = Vec::with_capacity(16);
+            for _ in 0..16 {
+                instance.node.process(ctx, buf);
+                let peak = buf
+                    .channel(0)
+                    .unwrap()
+                    .iter()
+                    .fold(0.0f32, |acc, s| acc.max(s.abs()));
+                peaks.push((peak * 1e4).round() / 1e4);
+            }
+            let _ = instance.node.note_event(NoteEvent::Off { note: 60 });
+            for _ in 0..8 {
+                instance.node.process(ctx, buf);
+            }
+            peaks
+        };
+        eprintln!(
+            "== clean load (before processing): {:#?}",
+            sustain(&mut instance, &ctx, &mut buf)
+        );
+
+        // Race sections: audio thread processes while the "UI thread" switches
+        // presets live (exactly the app's load_voice_preset path). Every race
+        // ends on the BASS blob so the final state is the same as the clean
+        // control — any divergence is race damage, not patch character.
+        fn race_loads(
+            instance: &mut ClapInstance,
+            ctx: &ProcessContext,
+            buf: &mut AudioBuffer,
+            gated: bool,
+            morph: &[u8],
+            bass: &[u8],
+        ) {
+            use std::thread::scope;
+            let ClapInstance { guard, node } = instance;
+            scope(|s| {
+                let audio = s.spawn(|| {
+                    for _ in 0..(48_000 / 128) {
+                        node.process(ctx, buf);
+                    }
+                });
+                for _ in 0..10 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    let _ = if gated {
+                        guard.load_state(morph)
+                    } else {
+                        guard.load_state_impl(morph)
+                    };
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    let _ = if gated {
+                        guard.load_state(bass)
+                    } else {
+                        guard.load_state_impl(bass)
+                    };
+                }
+                let _ = audio.join();
+            });
+        }
+
+        // A. NON-gated loads (guard's raw impl, bypassing the state gate):
+        //    if the state corrupts here, the race is real.
+        race_loads(
+            &mut instance,
+            &ctx,
+            &mut buf,
+            false,
+            &morph_blob,
+            &bass_blob,
+        );
+        instance.node.process(&ctx, &mut buf); // warm-up
+        eprintln!("== A: 10x NON-gated loads during processing (ends on bass):");
+        eprintln!("   {:#?}", sustain(&mut instance, &ctx, &mut buf));
+
+        // B. Gated loads (the fixed path): must match the clean control.
+        race_loads(&mut instance, &ctx, &mut buf, true, &morph_blob, &bass_blob);
+        instance.node.process(&ctx, &mut buf); // warm-up
+        eprintln!("== B: 10x GATED loads during processing (ends on bass):");
+        eprintln!("   {:#?}", sustain(&mut instance, &ctx, &mut buf));
+
+        // C. Control: clean reload, no audio thread.
+        instance.guard.load_state(&bass_blob).expect("reload");
+        instance.node.process(&ctx, &mut buf); // warm-up
+        eprintln!("== C: clean reload (no audio thread):");
+        eprintln!("   {:#?}", sustain(&mut instance, &ctx, &mut buf));
     }
 }

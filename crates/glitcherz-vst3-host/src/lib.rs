@@ -57,6 +57,9 @@ use vst3::Steinberg::Vst::{
 use vst3::Steinberg::{self, IPluginBaseTrait, IPluginFactory2Trait, IPluginFactoryTrait, Vst};
 use vst3::{ComPtr, ComWrapper, Interface};
 
+use std::sync::Arc;
+
+use glitcherz_engine::host_gate::StateGate;
 use glitcherz_engine::realtime::FIXED_BLOCK_SIZE;
 use glitcherz_engine::realtime::buffer::AudioBuffer;
 use glitcherz_engine::realtime::commands::ParamId;
@@ -329,6 +332,9 @@ pub struct Vst3InstanceGuard {
     controller_connection: Option<ComPtr<Steinberg::Vst::IConnectionPoint>>,
     controller: ComPtr<Steinberg::Vst::IEditController>,
     component: ComPtr<Steinberg::Vst::IComponent>,
+    /// Handoff gate shared with the realtime node (the CLAP mirror; see
+    /// `glitcherz_engine::host_gate::StateGate`).
+    state_gate: Arc<StateGate>,
     /// Host-side handler held by the plugin (the controller keeps this
     /// pointer long-term per spec; it must share the lifetime).
     // Field exists only to extend the lifetime (the pointer was handed to
@@ -401,9 +407,19 @@ impl Vst3InstanceGuard {
     /// simple-host posture, same class as the CLAP mirror). The blob format
     /// is plugin-private per the VST3 spec.
     ///
-    /// Returns [`HostError::StateSave`] when the plugin refuses
-    /// (`kNotImplemented` = the plugin implements no state persistence).
+    /// Serialized against the audio thread via the state gate (the CLAP
+    /// mirror: a racing save would tear the plugin's engine state the same
+    /// way a load does). Returns [`HostError::StateSave`] when the plugin
+    /// refuses (`kNotImplemented` = the plugin implements no state
+    /// persistence).
     pub fn save_state(&self) -> Result<Vec<u8>, HostError> {
+        self.state_gate.begin_host_call();
+        let result = self.save_state_impl();
+        self.state_gate.end_host_call();
+        result
+    }
+
+    fn save_state_impl(&self) -> Result<Vec<u8>, HostError> {
         let stream = ComWrapper::new(HostMemoryStream::new());
         // SAFETY: the component is alive (held by the guard); the stream
         // object outlives the call (same scope).
@@ -429,6 +445,13 @@ impl Vst3InstanceGuard {
     /// controllers); a refusing component fails the call with
     /// [`HostError::StateLoad`].
     pub fn load_state(&self, data: &[u8]) -> Result<(), HostError> {
+        self.state_gate.begin_host_call();
+        let result = self.load_state_impl(data);
+        self.state_gate.end_host_call();
+        result
+    }
+
+    fn load_state_impl(&self, data: &[u8]) -> Result<(), HostError> {
         // Component pass: the authoritative state.
         let component_stream = ComWrapper::new(HostMemoryStream::from_bytes(data.to_vec()));
         // SAFETY: the component is alive (held by the guard); the stream
@@ -463,16 +486,20 @@ impl Vst3InstanceGuard {
     /// Reads the current normalized value (0..1) of every parameter the
     /// controller exposes (control side, `getParamNormalized`). Used after
     /// a state load to refresh UI-side caches (the CLAP D6 mirror; the
-    /// VST3 parameter panel lands with the normalization work).
+    /// VST3 parameter panel lands with the normalization work). Serialized
+    /// against the audio thread via the state gate (same tear risk).
     pub fn read_param_values(&self) -> std::collections::HashMap<u32, f64> {
+        self.state_gate.begin_host_call();
         // SAFETY: the controller is alive (held by the guard); control-side
         // call, not RT-safe.
-        unsafe {
+        let values = unsafe {
             self.parameters()
                 .into_iter()
                 .map(|info| (info.id, self.controller.getParamNormalized(info.id)))
                 .collect()
-        }
+        };
+        self.state_gate.end_host_call();
+        values
     }
 }
 
@@ -551,6 +578,9 @@ pub struct Vst3Node {
     out_r: Box<[f32]>,
     pending: [PendingVst3Event; MAX_PENDING_EVENTS],
     pending_count: usize,
+    /// Handoff gate shared with the control-side guard (the CLAP mirror; see
+    /// `glitcherz_engine::host_gate::StateGate`).
+    state_gate: Arc<StateGate>,
 }
 
 // SAFETY: The node is moved wholesale between threads (constructed on the
@@ -669,6 +699,7 @@ impl Vst3Instance {
         }
 
         // 5. Construct the realtime node (all preallocation happens here).
+        let state_gate = Arc::new(StateGate::default());
         // Whether an audio input bus exists (true for effects; false for
         // instruments) — the query must complete before component is moved
         // into the guard.
@@ -718,6 +749,7 @@ impl Vst3Instance {
             out_r: vec![0.0; frames].into_boxed_slice(),
             pending: [PendingVst3Event::NoteOff { note: 0 }; MAX_PENDING_EVENTS],
             pending_count: 0,
+            state_gate: Arc::clone(&state_gate),
         };
 
         // Instantiation success path: objects are handed to the guard; the
@@ -733,6 +765,7 @@ impl Vst3Instance {
                 handler_ptr,
                 _handler: handler,
                 module,
+                state_gate,
             },
         })
     }
@@ -841,6 +874,27 @@ fn note_off_event(note: u8) -> Vst::Event {
 
 impl Processor for Vst3Node {
     fn process(&mut self, ctx: &ProcessContext, buffer: &mut AudioBuffer) {
+        // 0. State-gate handoff (the CLAP mirror): while the control thread
+        //    runs a main-thread plugin call, park — acknowledge and keep the
+        //    output zeroed (atomics only, no locks).
+        if self.state_gate.audio_should_park() {
+            let frames = ctx.frames.min(self.out_l.len()).min(buffer.capacity());
+            let out_l = &mut self.out_l[..frames];
+            let out_r = &mut self.out_r[..frames];
+            out_l.fill(0.0);
+            out_r.fill(0.0);
+            for (channel_index, source) in [&self.out_l[..frames], &self.out_r[..frames]]
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(destination) = buffer.channel_mut(channel_index) {
+                    for (index, sample) in destination.iter_mut().enumerate() {
+                        *sample = source.get(index).copied().unwrap_or(0.0);
+                    }
+                }
+            }
+            return;
+        }
         let frames = ctx.frames.min(self.out_l.len()).min(buffer.capacity());
 
         // 1. Stashed events → host COM objects (block granularity).
