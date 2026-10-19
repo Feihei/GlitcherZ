@@ -28,12 +28,13 @@ use eframe::egui;
 
 use glitcherz_clap_host::{ClapInstance, ClapInstanceConfig};
 use glitcherz_engine::AudioEngine;
+use glitcherz_engine::Sf2Library;
 use glitcherz_engine::convert;
 use glitcherz_engine::realtime::{
     ChannelStripProcessor, DelayProcessor, EngineCommand, MAX_AUTO_POINTS, MAX_CLIP_NOTES,
     MAX_TRACK_CLIPS, MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent,
     ParamId, Processor, RtAutoPoint, RtAutomation, RtControlClip, RtMidiClip, RtNote,
-    SequencerCommand, SynthProcessor,
+    SequencerCommand, Sf2VoiceProcessor, SynthProcessor,
 };
 use glitcherz_model::{
     AutoParam, CableKind, ControlClip, ControlTrack, DelayParams, MAX_AUTO_TRACKS,
@@ -711,6 +712,30 @@ impl GlitcherZApp {
             match node {
                 NodeDoc::Instrument { voice, .. } => match voice {
                     VoiceSpec::Builtin => (Box::new(SynthProcessor::new(sr)), None, String::new()),
+                    VoiceSpec::SoundFont {
+                        path,
+                        bank,
+                        program,
+                    } => {
+                        // Document voice restore (D8): load on the
+                        // non-real-time thread and address the preset
+                        // before installation; a missing or broken file
+                        // falls back to the built-in synth (document
+                        // fields kept for a later retry).
+                        match Sf2Library::load(std::path::Path::new(path))
+                            .and_then(|library| Sf2VoiceProcessor::new(library.font(), sr))
+                        {
+                            Ok(mut processor) => {
+                                processor.set_param(ParamId::Sf2BankSelect, f32::from(*bank));
+                                processor.set_param(ParamId::Sf2ProgramChange, f32::from(*program));
+                                (Box::new(processor), None, String::new())
+                            }
+                            Err(err) => {
+                                log::error!("Failed to load SoundFont {path}: {err}");
+                                (Box::new(SynthProcessor::new(sr)), None, String::new())
+                            }
+                        }
+                    }
                     VoiceSpec::Clap {
                         path,
                         plugin_id,
@@ -814,7 +839,9 @@ impl GlitcherZApp {
                     }
                 },
                 NodeDoc::Effect { voice, .. } => match voice {
-                    VoiceSpec::Builtin => (Box::new(DelayProcessor::new(sr)), None, String::new()),
+                    VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } => {
+                        (Box::new(DelayProcessor::new(sr)), None, String::new())
+                    }
                     VoiceSpec::Clap {
                         path,
                         plugin_id,
@@ -2151,7 +2178,7 @@ impl GlitcherZApp {
                 VoiceSpec::Vst3 { path, class_id, .. } => {
                     Some(preset_plugin_key("vst3", path, class_id))
                 }
-                VoiceSpec::Builtin => None,
+                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } => None,
             },
             _ => None,
         }
@@ -2215,7 +2242,7 @@ impl GlitcherZApp {
         {
             match voice {
                 VoiceSpec::Clap { state, .. } | VoiceSpec::Vst3 { state, .. } => *state = blob,
-                VoiceSpec::Builtin => {}
+                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } => {}
             }
         }
         self.commit_edit("Load Preset", before);
@@ -2281,7 +2308,7 @@ impl GlitcherZApp {
                 VoiceSpec::Clap { state, .. } | VoiceSpec::Vst3 { state, .. } => {
                     *state = Vec::new()
                 }
-                VoiceSpec::Builtin => {}
+                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } => {}
             }
         }
         self.commit_edit("Reset Preset", before);
@@ -2562,7 +2589,7 @@ impl GlitcherZApp {
                             .unwrap_or_else(|| "VST3".to_string()),
                         false,
                     )),
-                    VoiceSpec::Builtin => None,
+                    VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } => None,
                 },
                 _ => None,
             })

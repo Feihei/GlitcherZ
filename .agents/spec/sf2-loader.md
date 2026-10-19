@@ -63,7 +63,9 @@ C 构建链依赖的 SF2 加载与合成路径。
 - [x] **S3** engine `realtime/sf2.rs`：`Sf2VoiceProcessor` 实现 `Processor`，预分配缓冲；
   逐行审查进回调路径（铁律评审）✅ 2026-10-19 完成，接入要点（§7 的 ①②③）全部
   落实；毯式 `Off { note: 0 }` 以 held 位图区分「全部释放」与「pitch-matched 释放」
-- [ ] **S4** model：`VoiceSpec::SoundFont` 变体 + RON 往返测试
+- [x] **S4** model：`VoiceSpec::SoundFont` 变体 + RON 往返测试
+  ✅ 2026-10-19 完成（serde default 加法字段，PROJECT_VERSION 不动；UI 非穷尽
+  match 补齐，install_node 文档恢复路径含 D8 文件丢失回落）
 - [ ] **S5** UI：音色库面板（加载 SF2/SF3、preset 下拉、轨声源绑定）+ undo/redo 路径
   走现有守卫/命令约定
 - [ ] **S6** SF3 feature 开启 + 端到端验收（含 S1 审计复跑）

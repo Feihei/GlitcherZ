@@ -299,13 +299,18 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
         PatchId::Node(node_id) => match doc.node_by_id(node_id) {
             Some(NodeDoc::Instrument { voice, track, .. }) => match voice {
                 VoiceSpec::Builtin => format!("Synth · Track {}", track + 1),
+                VoiceSpec::SoundFont { bank, program, .. } => {
+                    format!("SF2 {bank}:{program} · Track {}", track + 1)
+                }
                 VoiceSpec::Clap { plugin_id, .. } => {
                     format!("♪ {}", truncate(plugin_id, 16))
                 }
                 VoiceSpec::Vst3 { class_id, .. } => format!("♪ {}", truncate(class_id, 16)),
             },
             Some(NodeDoc::Effect { voice, track, .. }) => match voice {
-                VoiceSpec::Builtin => format!("Delay · Track {}", track + 1),
+                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } => {
+                    format!("Delay · Track {}", track + 1)
+                }
                 VoiceSpec::Clap { plugin_id, .. } => {
                     format!("Fx {}", truncate(plugin_id, 14))
                 }

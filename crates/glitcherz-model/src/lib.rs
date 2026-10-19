@@ -664,6 +664,21 @@ pub enum VoiceSpec {
     /// Built-in (default, forward compatible with old project files).
     #[default]
     Builtin,
+    /// SoundFont file (.sf2/.sf3): file path + `bank:program` preset
+    /// address (spec `sf2-loader.md` D7). Sample data stays out of the
+    /// document; a missing file falls back to the built-in voice with the
+    /// fields kept (D8).
+    SoundFont {
+        /// Path to the .sf2/.sf3 file.
+        #[serde(default)]
+        path: String,
+        /// Preset bank number (0..=255).
+        #[serde(default)]
+        bank: u8,
+        /// Preset program number (0..=255).
+        #[serde(default)]
+        program: u8,
+    },
     /// CLAP plugin: dynamic library path + plugin ID (instantiated on the
     /// non-real-time thread).
     Clap {
@@ -2162,6 +2177,11 @@ mod tests {
     fn voice_spec_ron_roundtrip() {
         for voice in [
             VoiceSpec::Builtin,
+            VoiceSpec::SoundFont {
+                path: "General.sf2".to_string(),
+                bank: 0,
+                program: 40,
+            },
             VoiceSpec::Clap {
                 path: "a.clap".to_string(),
                 plugin_id: "x".to_string(),
@@ -2208,6 +2228,35 @@ mod tests {
             ron::from_str::<VoiceSpec>("(type: \"clap\", path: \"a.clap\", plugin_id: \"x\")")
                 .expect("legacy form must deserialize");
         assert_eq!(legacy, clap);
+    }
+
+    /// SoundFont voice (spec `sf2-loader.md` D5/D6): internally tagged as
+    /// `sound_font`; files without bank/program load as 0:0 (serde default,
+    /// additive field -- PROJECT_VERSION untouched).
+    #[test]
+    fn voice_spec_soundfont_serde_compatibility() {
+        let soundfont = VoiceSpec::SoundFont {
+            path: "General.sf2".to_string(),
+            bank: 0,
+            program: 40,
+        };
+        let text = ron::to_string(&soundfont).expect("serialization failed");
+        assert!(
+            text.contains("type:\"sound_font\""),
+            "tag must be snake_case sound_font: {text}"
+        );
+        // Older files (or hand-written projects) without bank/program: both
+        // default to 0 = preset 0:0.
+        let partial: VoiceSpec = ron::from_str("(type: \"sound_font\", path: \"General.sf2\")")
+            .expect("fields must default");
+        assert_eq!(
+            partial,
+            VoiceSpec::SoundFont {
+                path: "General.sf2".to_string(),
+                bank: 0,
+                program: 0
+            }
+        );
     }
 
     #[test]
