@@ -263,8 +263,8 @@ impl BlockRunner {
     /// Releases the sequencer's taken pending notes **by note number**
     /// (pitch-matched release; see [`Sequencer::take_pending_offs`]). RT-safe.
     fn release_pending_notes(&mut self) {
-        for (track, pending) in self.sequencer.take_pending_offs().into_iter().enumerate() {
-            if let Some((_, note)) = pending {
+        for (track, slots) in self.sequencer.take_pending_offs().into_iter().enumerate() {
+            for (_, note) in slots.into_iter().flatten() {
                 self.graph.track_note(track, NoteEvent::Off { note });
             }
         }

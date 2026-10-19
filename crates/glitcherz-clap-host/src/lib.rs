@@ -1083,7 +1083,7 @@ mod tests {
     /// attributes with this encoding, not RFC 4648.
     fn b64_encode(data: &[u8]) -> String {
         const T: &[u8; 64] = b".ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+";
-        let num_chars = (data.len() * 8 + 5) / 6;
+        let num_chars = (data.len() * 8).div_ceil(6);
         let mut out = String::with_capacity(num_chars);
         for i in 0..num_chars {
             let bit_pos = i * 6;
@@ -1375,8 +1375,12 @@ mod tests {
                 program[155..161].copy_from_slice(&template_program[155..161]);
 
                 // Splice cartridge + program + program index into the XML.
-                let xml = xml_attr_replace(&template_xml, "base64:sysex=\"", &cart_b64)
-                    .expect("sysex attribute");
+                let xml = xml_attr_replace(
+                    &template_xml,
+                    "base64:sysex=\"",
+                    &format!("4104.{}", cart_b64),
+                )
+                .expect("sysex attribute");
                 let xml = xml_attr_replace(
                     &xml,
                     "base64:program=\"",
@@ -1750,7 +1754,7 @@ mod tests {
                 let end = start + xml[start..].find('"').unwrap();
                 let raw_attr = &xml[start..end];
                 let (prefix, b64) = raw_attr.split_once('.').expect("size prefix");
-                let mut program = b64_decode(b64, usize::from_str_radix(prefix, 10).unwrap());
+                let mut program = b64_decode(b64, prefix.parse::<usize>().unwrap());
                 for op in 0..6usize {
                     program[op * 21 + 15] = kvs;
                 }
@@ -1959,6 +1963,53 @@ mod tests {
         }
         eprintln!("== stop mid-note: per-block peaks after Stop (40 blocks, hanging check)");
         eprintln!("   {block_peaks:?}");
+
+        // Chord regression: two simultaneous long notes on one track must both
+        // release. A single per-track pending-off slot used to orphan the first
+        // note, leaving Dexed's voice sounding forever — heard as a stuck /
+        // arpeggiated drone that a blanket `Off { note: 0 }` cannot clear.
+        let mut chords = [RtMidiClip::default(); 8];
+        chords[0].start_ticks = 0;
+        chords[0].span_ticks = 384;
+        chords[0].loop_ticks = 384;
+        chords[0].push(RtNote::new(0, 384, 58, 0, 100)); // Bb3
+        chords[0].push(RtNote::new(0, 384, 53, 0, 100)); // F3
+        tx.push(EngineCommand::Sequencer(SequencerCommand::SetTrackClips {
+            track: 0,
+            clips: chords,
+        }))
+        .expect("queue");
+        tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
+            .expect("queue");
+        let mut held_peak = 0.0f32;
+        for _ in 0..((sr as usize) / (fixed_block * 2)) {
+            let mut out = vec![0.0f32; fixed_block * 2];
+            runner.render_interleaved(&mut out);
+            for s in out.iter().step_by(2) {
+                held_peak = held_peak.max(s.abs());
+            }
+        }
+        tx.push(EngineCommand::Sequencer(SequencerCommand::Stop))
+            .expect("queue");
+        let mut tail_peak = 0.0f32;
+        for _ in 0..((sr as usize) / fixed_block) {
+            let mut out = vec![0.0f32; fixed_block * 2];
+            runner.render_interleaved(&mut out);
+            for s in out.iter().step_by(2) {
+                tail_peak = tail_peak.max(s.abs());
+            }
+        }
+        eprintln!(
+            "== chord (Bb3+F3) held peak {held_peak:.4}, after-Stop tail peak {tail_peak:.4}"
+        );
+        assert!(
+            held_peak > 1e-3,
+            "chord produced no sound (peak {held_peak})"
+        );
+        assert!(
+            tail_peak < 1e-3,
+            "a chord voice hung after Stop (tail peak {tail_peak})"
+        );
     }
 
     /// Dev tool (diagnostic): the app's live preset load calls

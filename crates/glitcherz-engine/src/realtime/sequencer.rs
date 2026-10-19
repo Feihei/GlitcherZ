@@ -148,6 +148,10 @@ impl RtMidiClip {
 ///
 /// All methods RT-safe: no allocation, no locks, no panics (`advance` events
 /// are sent through a callback, never collected or heap-allocated).
+/// Max simultaneously-gated note-offs tracked per MIDI track (a chord): each
+/// sounding note keeps its own slot so no pending off overwrites another.
+pub const MAX_PENDING_OFFS_PER_TRACK: usize = 16;
+
 pub struct Sequencer {
     sample_rate: f32,
     playing: bool,
@@ -165,9 +169,10 @@ pub struct Sequencer {
     /// Arrangement end in ticks (D16: the latest clip end rounded up to a
     /// bar); `0` = unbounded (empty arrangement, free run).
     arrangement_end_ticks: u32,
-    /// Per-track pending NoteOffs (absolute sample position where the
-    /// length ends + note).
-    pending_offs: [Option<(u64, u8)>; MAX_MIDI_TRACKS],
+    /// Per-track pending NoteOffs (absolute sample position where the length
+    /// ends + note), several slots per track so a chord's notes each keep
+    /// their own off (a single slot orphans all but the last note).
+    pending_offs: [[Option<(u64, u8)>; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS],
 }
 
 impl Sequencer {
@@ -186,7 +191,7 @@ impl Sequencer {
             clips: [[RtMidiClip::default(); MAX_TRACK_CLIPS]; MAX_MIDI_TRACKS],
             control_clips: [[RtControlClip::default(); MAX_TRACK_CLIPS]; MAX_AUTO_TRACKS],
             arrangement_end_ticks: 0,
-            pending_offs: [None; MAX_MIDI_TRACKS],
+            pending_offs: [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS],
         }
     }
 
@@ -222,14 +227,14 @@ impl Sequencer {
     pub fn play(&mut self) {
         self.playing = true;
         self.position_ticks = 0.0;
-        self.pending_offs = [None; MAX_MIDI_TRACKS];
+        self.pending_offs = [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS];
     }
 
     /// Stops scheduling and clears all gate tails.
     /// The caller should send `NoteOff` to all tracks to release envelopes. RT-safe.
     pub fn stop(&mut self) {
         self.playing = false;
-        self.pending_offs = [None; MAX_MIDI_TRACKS];
+        self.pending_offs = [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS];
     }
 
     /// Takes the pending note offs (clearing them). The caller must release
@@ -237,8 +242,13 @@ impl Sequencer {
     /// (Dexed's `keyup` looks up `midi_note == pitch`), so a blanket
     /// `Off { note: 0 }` never reaches them and leaves the voice hanging.
     /// RT-safe.
-    pub fn take_pending_offs(&mut self) -> [Option<(u64, u8)>; MAX_MIDI_TRACKS] {
-        std::mem::replace(&mut self.pending_offs, [None; MAX_MIDI_TRACKS])
+    pub fn take_pending_offs(
+        &mut self,
+    ) -> [[Option<(u64, u8)>; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS] {
+        std::mem::replace(
+            &mut self.pending_offs,
+            [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS],
+        )
     }
 
     /// Sets the active MIDI track count (clamped to [`MAX_MIDI_TRACKS`]; when
@@ -246,8 +256,8 @@ impl Sequencer {
     pub fn set_track_count(&mut self, count: usize) {
         self.track_count = count.min(MAX_MIDI_TRACKS);
         if self.pending_offs.len() > self.track_count {
-            for pending in self.pending_offs[self.track_count..].iter_mut() {
-                *pending = None;
+            for slots in self.pending_offs[self.track_count..].iter_mut() {
+                *slots = [None; MAX_PENDING_OFFS_PER_TRACK];
             }
         }
     }
@@ -331,11 +341,13 @@ impl Sequencer {
         // 1. Due note offs — always processed, even after an auto-stop, so
         //    the arrangement's final notes still release (offs before ons,
         //    keeping each track's handoff clean).
-        for (track, pending) in self.pending_offs.iter_mut().enumerate() {
-            if let Some((time, note)) = *pending {
-                if time < block_start + ctx.frames as u64 {
-                    emit(track, NoteEvent::Off { note });
-                    *pending = None;
+        for (track, slots) in self.pending_offs.iter_mut().enumerate() {
+            for pending in slots.iter_mut() {
+                if let Some((time, note)) = *pending {
+                    if time < block_start + ctx.frames as u64 {
+                        emit(track, NoteEvent::Off { note });
+                        *pending = None;
+                    }
                 }
             }
         }
@@ -415,10 +427,12 @@ impl Sequencer {
                         // would overwrite the single pending-off slot,
                         // leaving the old voice hanging forever on
                         // pitch-matching plugins. Release it first instead.
-                        if let Some((_, pending_note)) = self.pending_offs[track] {
-                            if pending_note == note.note {
-                                self.pending_offs[track] = None;
-                                emit(track, NoteEvent::Off { note: note.note });
+                        for slot in self.pending_offs[track].iter_mut() {
+                            if let Some((_, pending_note)) = *slot {
+                                if pending_note == note.note {
+                                    *slot = None;
+                                    emit(track, NoteEvent::Off { note: note.note });
+                                }
                             }
                         }
                         emit(
@@ -457,7 +471,22 @@ impl Sequencer {
         note: u8,
     ) {
         let offset_samples = ((off_tick - t0) * samples_per_tick).max(1.0);
-        self.pending_offs[track] = Some((block_start + offset_samples as u64, note));
+        let at = block_start + offset_samples as u64;
+        let slots = &mut self.pending_offs[track];
+        // Reuse the slot already holding this pitch, else take the first free
+        // one; if every slot is busy, fall back to slot 0.
+        let mut target = None;
+        for (i, slot) in slots.iter().enumerate() {
+            match slot {
+                Some((_, held)) if *held == note => {
+                    target = Some(i);
+                    break;
+                }
+                None if target.is_none() => target = Some(i),
+                _ => {}
+            }
+        }
+        slots[target.unwrap_or(0)] = Some((at, note));
     }
 }
 
@@ -595,18 +624,18 @@ mod tests {
 
         // take_pending_offs yields the real note number and clears the slot.
         let drained = seq.take_pending_offs();
-        assert_eq!(
-            drained[0].map(|(_, note)| note),
-            Some(60),
-            "pending off must carry note 60"
+        let notes: Vec<u8> = drained[0].iter().flatten().map(|(_, note)| *note).collect();
+        assert_eq!(notes, vec![60], "pending off must carry note 60");
+        assert!(
+            seq.take_pending_offs()[0].iter().all(|slot| slot.is_none()),
+            "slots must be cleared"
         );
-        assert_eq!(seq.take_pending_offs()[0], None, "slot must be cleared");
 
         // stop() also clears, and play() resets pending offs.
         seq.take_pending_offs();
         seq.play();
         seq.stop();
-        assert_eq!(seq.take_pending_offs()[0], None);
+        assert!(seq.take_pending_offs()[0].iter().all(|slot| slot.is_none()));
     }
 
     #[test]
@@ -1049,5 +1078,39 @@ mod tests {
         // Clamped to the capacity limit.
         seq.set_track_count(MAX_MIDI_TRACKS + 10);
         assert_eq!(seq.track_count(), MAX_MIDI_TRACKS);
+    }
+
+    #[test]
+    fn simultaneous_notes_on_one_track_both_release() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        // Two notes starting together on the same track (a chord): each must
+        // get its own note off. A single per-track pending-off slot loses the
+        // first one, hanging it forever on pitch-matching plugins.
+        place(
+            &mut seq,
+            0,
+            0,
+            256 * TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[
+                clip_note(0, TICKS_PER_STEP, 60),
+                clip_note(0, TICKS_PER_STEP, 64),
+            ],
+        );
+        seq.play();
+        let events = run(&mut seq, 200);
+        let ons = ons(&events);
+        let offs: Vec<u8> = events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                NoteEvent::Off { note } => Some(*note),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            offs.contains(&60) && offs.contains(&64),
+            "both simultaneous notes must receive an off; ons={ons:?} offs={offs:?}"
+        );
     }
 }
