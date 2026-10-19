@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use rtrb::Consumer;
 
 use crate::realtime::atomic::AtomicF32;
-use crate::realtime::commands::{EngineCommand, SequencerCommand};
+use crate::realtime::commands::{EngineCommand, NoteEvent, SequencerCommand};
 use crate::realtime::context::ProcessContext;
 use crate::realtime::graph::{GraphLevels, GraphUpdate, RtGraph};
 use crate::realtime::sequencer::Sequencer;
@@ -260,16 +260,33 @@ impl BlockRunner {
         }
     }
 
+    /// Releases the sequencer's taken pending notes **by note number**
+    /// (pitch-matched release; see [`Sequencer::take_pending_offs`]). RT-safe.
+    fn release_pending_notes(&mut self) {
+        for (track, pending) in self.sequencer.take_pending_offs().into_iter().enumerate() {
+            if let Some((_, note)) = pending {
+                self.graph.track_note(track, NoteEvent::Off { note });
+            }
+        }
+    }
+
     fn apply_sequencer_command(&mut self, cmd: SequencerCommand) {
         match cmd {
             SequencerCommand::Play => {
                 self.sequencer.play();
-                // Clear any manual notes that may still be held, avoiding
-                // overlap with sequencer voices.
+                // Release the previous play's still-pending notes **by pitch**
+                // (see `take_pending_offs`), then a blanket off for the
+                // built-in chain — clearing manual notes that may still be
+                // held, avoiding overlap with sequencer voices.
+                self.release_pending_notes();
                 self.graph.note_off_all();
             }
             SequencerCommand::Stop => {
                 self.sequencer.stop();
+                // Same pitch-matched release: a blanket `Off { note: 0 }`
+                // alone never reaches a pitch-matching plugin (Dexed), whose
+                // sounding notes then hang forever.
+                self.release_pending_notes();
                 self.graph.note_off_all();
             }
             SequencerCommand::SetBpm(bpm) => self.sequencer.set_bpm(bpm),

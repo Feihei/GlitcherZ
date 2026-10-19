@@ -232,6 +232,15 @@ impl Sequencer {
         self.pending_offs = [None; MAX_MIDI_TRACKS];
     }
 
+    /// Takes the pending note offs (clearing them). The caller must release
+    /// these **by note number**: external plugins match note-offs by pitch
+    /// (Dexed's `keyup` looks up `midi_note == pitch`), so a blanket
+    /// `Off { note: 0 }` never reaches them and leaves the voice hanging.
+    /// RT-safe.
+    pub fn take_pending_offs(&mut self) -> [Option<(u64, u8)>; MAX_MIDI_TRACKS] {
+        std::mem::replace(&mut self.pending_offs, [None; MAX_MIDI_TRACKS])
+    }
+
     /// Sets the active MIDI track count (clamped to [`MAX_MIDI_TRACKS`]; when
     /// shrinking, gate tails of higher-numbered tracks are cleared too). RT-safe.
     pub fn set_track_count(&mut self, count: usize) {
@@ -400,6 +409,18 @@ impl Sequencer {
                     }
                     if on_tick >= t0 {
                         let velocity = note.velocity_f32();
+                        // Retrigger guard: a previous occurrence of this note
+                        // may still be sounding (its off was scheduled past
+                        // the clip end by the loop) — the new occurrence
+                        // would overwrite the single pending-off slot,
+                        // leaving the old voice hanging forever on
+                        // pitch-matching plugins. Release it first instead.
+                        if let Some((_, pending_note)) = self.pending_offs[track] {
+                            if pending_note == note.note {
+                                self.pending_offs[track] = None;
+                                emit(track, NoteEvent::Off { note: note.note });
+                            }
+                        }
                         emit(
                             track,
                             NoteEvent::On {
@@ -525,6 +546,67 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Transport stop drains pending offs as **pitch-matched** note offs:
+    /// the drained note is the clip note's number (a pitch-matching plugin
+    /// such as Dexed releases by `midi_note`), and the slot clears.
+    /// A long note in a looping clip retriggers cleanly: the retrigger guard
+    /// releases the still-sounding occurrence **before** the next On instead
+    /// of overwriting its pending off (which would leave the voice hanging
+    /// forever on pitch-matching plugins).
+    #[test]
+    fn long_note_in_looping_clip_retriggers_with_releases() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        // Two-bar span, one-bar loop, one 768-tick note.
+        place(&mut seq, 0, 0, 768, 384, &[clip_note(0, 768, 60)]);
+        seq.play();
+
+        let events = run(&mut seq, 2100); // covers ticks 0..~1600 at 120 BPM
+        let notes = events
+            .iter()
+            .filter_map(|(t, e)| match (t, e) {
+                (0, NoteEvent::On { note, .. }) => Some(('o', *note)),
+                (0, NoteEvent::Off { note }) => Some(('f', *note)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // Occurrences at 0 and 384; occurrence 1's off must come BEFORE
+        // occurrence 2's on (clean retrigger), and the last pending off
+        // drains afterwards — no voice left hanging.
+        assert_eq!(
+            notes,
+            vec![('o', 60), ('f', 60), ('o', 60), ('f', 60)],
+            "retrigger must be guarded by a release: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn stop_drains_pending_offs_by_pitch() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        place(&mut seq, 0, 0, 384, 384, &[clip_note(0, 384, 60)]);
+        seq.play();
+
+        // Advance past the note-on; the off is still pending.
+        let events = run(&mut seq, 2);
+        assert_eq!(ons(&events), vec![(0, 60)]);
+
+        // take_pending_offs yields the real note number and clears the slot.
+        let drained = seq.take_pending_offs();
+        assert_eq!(
+            drained[0].map(|(_, note)| note),
+            Some(60),
+            "pending off must carry note 60"
+        );
+        assert_eq!(seq.take_pending_offs()[0], None, "slot must be cleared");
+
+        // stop() also clears, and play() resets pending offs.
+        seq.take_pending_offs();
+        seq.play();
+        seq.stop();
+        assert_eq!(seq.take_pending_offs()[0], None);
     }
 
     #[test]
