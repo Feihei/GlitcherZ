@@ -21,8 +21,8 @@ use egui::{
     StrokeKind, Vec2, pos2,
 };
 use glitcherz_model::{
-    ControlClip, ControlTrack, MAX_ARRANGEMENT_BARS, MAX_CLIPS_PER_TRACK, MidiClip, MidiTrack,
-    TICKS_PER_BAR,
+    AutoPoint, ControlClip, ControlTrack, CtrlEvent, MAX_ARRANGEMENT_BARS, MAX_CLIPS_PER_TRACK,
+    MidiClip, MidiTrack, Note, TICKS_PER_BAR,
 };
 
 /// Fixed width of the row-header column.
@@ -341,6 +341,11 @@ pub(crate) trait Placement {
     fn span(&self) -> u32;
     fn set_start(&mut self, v: u32);
     fn set_span(&mut self, v: u32);
+    fn set_loop(&mut self, v: u32);
+    /// Keeps only the content at/after `offset` (tick, relative to the clip
+    /// start) and shifts it to the clip origin — the right half of a split.
+    /// Notes crossing the offset continue at the cut with their tail.
+    fn retain_from(&mut self, offset: u32);
 }
 
 impl Placement for MidiClip {
@@ -355,6 +360,44 @@ impl Placement for MidiClip {
     }
     fn set_span(&mut self, v: u32) {
         self.span_ticks = v;
+    }
+    fn set_loop(&mut self, v: u32) {
+        self.loop_ticks = v;
+    }
+    fn retain_from(&mut self, offset: u32) {
+        let o = i64::from(offset);
+        self.sequence.notes = self
+            .sequence
+            .notes
+            .iter()
+            .filter_map(|n| {
+                if n.start >= o {
+                    Some(Note {
+                        start: n.start - o,
+                        ..*n
+                    })
+                } else if n.end() > o {
+                    Some(Note {
+                        start: 0,
+                        length: n.end() - o,
+                        ..*n
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        self.sequence.ctrls = self
+            .sequence
+            .ctrls
+            .iter()
+            .filter(|&c| c.tick >= o)
+            .map(|c| CtrlEvent {
+                tick: c.tick - o,
+                ..*c
+            })
+            .collect();
+        self.sort();
     }
 }
 
@@ -371,13 +414,29 @@ impl Placement for ControlClip {
     fn set_span(&mut self, v: u32) {
         self.span_ticks = v;
     }
+    fn set_loop(&mut self, v: u32) {
+        self.loop_ticks = v;
+    }
+    fn retain_from(&mut self, offset: u32) {
+        self.curve = self
+            .curve
+            .iter()
+            .filter(|&p| p.tick >= offset)
+            .map(|p| AutoPoint {
+                tick: p.tick - offset,
+                ..*p
+            })
+            .collect();
+    }
 }
 
 /// Splits `clips[index]` at `at` in place (M4b.2): the left half keeps the
 /// start with a shortened span, the right half is inserted at `index + 1`
-/// with cloned content (loop-based clips both play the same loop). Returns
-/// false untouched when the index is out of bounds, the track is full, or
-/// `at` is not strictly inside the clip.
+/// with the content from the cut onward shifted to its origin (notes
+/// crossing the cut continue in both halves). Both halves are single-period
+/// clips (`loop == span`, D14), so neither half tiles. Returns false
+/// untouched when the index is out of bounds, the track is full, or `at` is
+/// not strictly inside the clip.
 pub(crate) fn split_clip_in<T: Placement + Clone>(
     clips: &mut Vec<T>,
     at: u32,
@@ -390,10 +449,14 @@ pub(crate) fn split_clip_in<T: Placement + Clone>(
     if at <= start || at >= end || clips.len() >= MAX_CLIPS_PER_TRACK {
         return false;
     }
+    let left_span = at - start;
     let mut right = clips[index].clone();
     right.set_start(at);
     right.set_span(end - at);
-    clips[index].set_span(at - start);
+    right.set_loop(end - at);
+    right.retain_from(left_span);
+    clips[index].set_span(left_span);
+    clips[index].set_loop(left_span);
     clips.insert(index + 1, right);
     true
 }
@@ -1809,23 +1872,102 @@ mod tests {
 
     #[test]
     fn split_halves_keep_start_end_and_content() {
-        let mut clips = vec![MidiClip {
-            start_ticks: 2 * TICKS_PER_BAR,
-            span_ticks: 4 * TICKS_PER_BAR,
-            ..MidiClip::new(2 * TICKS_PER_BAR)
-        }];
-        let original = clips[0].clone();
+        let mut clip = MidiClip::new(2 * TICKS_PER_BAR);
+        clip.span_ticks = 4 * TICKS_PER_BAR;
+        clip.loop_ticks = 4 * TICKS_PER_BAR;
+        clip.sequence.notes = vec![
+            Note {
+                start: 0,
+                length: 240,
+                note: 60,
+                ..Note::default()
+            },
+            // Crosses the cut at 2 bars: continues in both halves.
+            Note {
+                start: 3 * i64::from(TICKS_PER_BAR) / 2,
+                length: i64::from(TICKS_PER_BAR),
+                note: 62,
+                ..Note::default()
+            },
+            Note {
+                start: 5 * i64::from(TICKS_PER_BAR) / 2,
+                length: 240,
+                note: 64,
+                ..Note::default()
+            },
+        ];
+        let mut clips = vec![clip];
         let at = 4 * TICKS_PER_BAR;
         assert!(split_clip_in(&mut clips, at, 0));
         assert_eq!(clips.len(), 2);
-        // Left: same start, span ends at the cut.
+        // Left: same start, ends at the cut, single-period.
         assert_eq!(clips[0].start_ticks, 2 * TICKS_PER_BAR);
         assert_eq!(clips[0].span_ticks, 2 * TICKS_PER_BAR);
-        // Right: starts at the cut, runs to the old end, same loop/content.
+        assert_eq!(clips[0].loop_ticks, 2 * TICKS_PER_BAR);
+        // Left keeps every note in the data (the past-span one included: it
+        // stays hidden until the clip grows back over it).
+        let left = clips[0].notes();
+        assert_eq!(left.len(), 3);
+        assert_eq!(left[1].note, 62);
+        assert_eq!(left[1].length, i64::from(TICKS_PER_BAR));
+        // Right: starts at the cut, runs to the old end, single-period.
         assert_eq!(clips[1].start_ticks, at);
         assert_eq!(clips[1].span_ticks, 2 * TICKS_PER_BAR);
-        assert_eq!(clips[1].loop_ticks, original.loop_ticks);
-        assert_eq!(clips[1].sequence, original.sequence);
+        assert_eq!(clips[1].loop_ticks, 2 * TICKS_PER_BAR);
+        let right = clips[1].notes();
+        assert_eq!(right.len(), 2);
+        // The crossing note's tail continues at the cut...
+        assert_eq!(right[0].note, 62);
+        assert_eq!(right[0].start, 0);
+        assert_eq!(right[0].length, i64::from(TICKS_PER_BAR) / 2);
+        // ...and the shifted note keeps its offset from the cut.
+        assert_eq!(right[1].note, 64);
+        assert_eq!(right[1].start, i64::from(TICKS_PER_BAR) / 2);
+    }
+
+    #[test]
+    fn split_shifts_control_curve_anchors() {
+        let mut clip = ControlClip::new(TICKS_PER_BAR);
+        clip.span_ticks = 2 * TICKS_PER_BAR;
+        clip.loop_ticks = 2 * TICKS_PER_BAR;
+        clip.curve = vec![
+            AutoPoint {
+                tick: 0,
+                value: 0.0,
+            },
+            AutoPoint {
+                tick: TICKS_PER_BAR,
+                value: 0.5,
+            },
+            AutoPoint {
+                tick: 3 * TICKS_PER_BAR / 2,
+                value: 1.0,
+            },
+        ];
+        let mut clips = vec![clip];
+        let at = 2 * TICKS_PER_BAR;
+        assert!(split_clip_in(&mut clips, at, 0));
+        // Left keeps its anchors untouched (data survives a shorten).
+        assert_eq!(clips[0].span_ticks, TICKS_PER_BAR);
+        assert_eq!(clips[0].loop_ticks, TICKS_PER_BAR);
+        assert_eq!(clips[0].curve.len(), 3);
+        // Right carries the anchors from the cut onward, shifted.
+        assert_eq!(clips[1].start_ticks, at);
+        assert_eq!(clips[1].span_ticks, TICKS_PER_BAR);
+        assert_eq!(clips[1].loop_ticks, TICKS_PER_BAR);
+        assert_eq!(
+            clips[1].curve,
+            vec![
+                AutoPoint {
+                    tick: 0,
+                    value: 0.5
+                },
+                AutoPoint {
+                    tick: TICKS_PER_BAR / 2,
+                    value: 1.0
+                },
+            ]
+        );
     }
 
     #[test]

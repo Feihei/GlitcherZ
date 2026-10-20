@@ -659,7 +659,7 @@ fn real_soundfont_velocity_sweep() {
                     "  preset zone key {pks}..{pke} vel {pvs}..{pve} explicit=[{}]",
                     explicit.join(", ")
                 );
-                let inst = &font.get_instruments()[region.get_instrument_id() as usize];
+                let inst = &font.get_instruments()[region.get_instrument_id()];
                 for inst_region in inst.get_regions() {
                     let ks = inst_region.get_key_range_start();
                     let ke = inst_region.get_key_range_end();

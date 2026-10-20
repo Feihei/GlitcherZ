@@ -982,6 +982,10 @@ pub fn show(
     // origin dimmed, transform preview solid).
     let modal_active = modal_frame.as_ref().is_some_and(|f| !f.is_identity());
     for (index, note) in clip.notes().iter().enumerate() {
+        // Notes past a shortened span stay in the data but are never drawn.
+        if note.start >= loop_ticks {
+            continue;
+        }
         let note_i = i32::from(note.note);
         if !(min_note..=top_note).contains(&note_i) {
             continue;

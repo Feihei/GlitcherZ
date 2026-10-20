@@ -3133,9 +3133,14 @@ impl GlitcherZApp {
                 .get_mut(track)
                 .and_then(|t| t.clips.get_mut(clip))
                 .map(|c| {
-                    let changed = c.start_ticks != start_ticks || c.span_ticks != span_ticks;
+                    let changed = c.start_ticks != start_ticks
+                        || c.span_ticks != span_ticks
+                        || c.loop_ticks != span_ticks;
                     c.start_ticks = start_ticks;
+                    // Single-period clips (D14): the loop follows the span, so
+                    // resizing exposes fresh empty bars instead of tiling.
                     c.span_ticks = span_ticks;
+                    c.loop_ticks = span_ticks;
                     changed
                 })
                 .unwrap_or(false)
@@ -3145,9 +3150,12 @@ impl GlitcherZApp {
                 .get_mut(track)
                 .and_then(|t| t.clips.get_mut(clip))
                 .map(|c| {
-                    let changed = c.start_ticks != start_ticks || c.span_ticks != span_ticks;
+                    let changed = c.start_ticks != start_ticks
+                        || c.span_ticks != span_ticks
+                        || c.loop_ticks != span_ticks;
                     c.start_ticks = start_ticks;
                     c.span_ticks = span_ticks;
+                    c.loop_ticks = span_ticks;
                     changed
                 })
                 .unwrap_or(false)
@@ -3363,7 +3371,9 @@ impl GlitcherZApp {
                         .and_then(|t| t.clips.get_mut(e.sel.clip))
                         .map(|c| {
                             c.start_ticks = e.start_ticks;
+                            // Single-period clips (D14): the loop follows the span.
                             c.span_ticks = e.span_ticks;
+                            c.loop_ticks = e.span_ticks;
                         })
                         .is_some()
                 } else {
@@ -3374,6 +3384,7 @@ impl GlitcherZApp {
                         .map(|c| {
                             c.start_ticks = e.start_ticks;
                             c.span_ticks = e.span_ticks;
+                            c.loop_ticks = e.span_ticks;
                         })
                         .is_some()
                 };

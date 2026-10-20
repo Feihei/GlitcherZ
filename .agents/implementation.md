@@ -205,7 +205,7 @@
 四段交付，全部复用 M4a 的模态机制与 M4b.1 的焦点管线；决策项（spec §4）用户拍板：**G=自由移动+X 锁时间；重叠=部分允许、完全拒绝；K 吸附整 bar；Shift+D 复制纳入时间轴**。
 
 - **M4b.1 选区模型**：`ClipSel{is_control, track, clip}` 跨轨选区；跨行框选由各行上报自己段内命中、`show()` 帧末统一合并——**带必须在看到 `drag_stopped` 的行之后延迟一帧清除**（`marquee_ending`），否则同帧行序靠后的行会丢末帧命中。焦点管线对齐 roll（任意按下即获焦 + Escape filter + 焦点 chip + 虚拟钢琴门控扩展）。Delete 批删 `RemoveClipsBatch`（每轨索引降序应用防位移，一步 undo）。
-- **M4b.2 切刀**：K 唤起（切换式，可连续切），点击在 `snap_bar` 处切开；两侧各 ≥1 bar 否则一帧状态提示拒绝。`split_clip_in` 纯函数：左半保留 start 缩短 span，右半克隆内容（loop 语义两半同 loop）插在 index+1。armed 期间指针归切刀（无拖动无框选）。
+- **M4b.2 切刀**：K 唤起（单次消费），点击在 `snap_bar` 处切开；两侧各 ≥1 bar 否则一帧状态提示拒绝。`split_clip_in` 纯函数：左半保留 start 缩短 span，右半携带切口之后的内容（平移到新原点，跨界音符在两半延续）插在 index+1；两半各自单周期（`loop = span`，见文末"单周期不变量"）。armed 期间指针归切刀（无拖动无框选）。
 - **M4b.3 模态 G/T**：G = 时间 bar delta + 同类轨 row delta 的**刚性移动**（行 delta 全局钳制不逐 clip，组内相对关系不动）；X 切时间锁。T 默认拉终点、Shift+T 拉起点（bar 对齐、≥1 bar、不出编排边界）。ghost 经**行几何注册表**跨行绘制（目标可落同类任意行，行先注册 `lane` rect，ghost 帧行末统一画）；原位变暗 alpha 60（M4a.5 惯例）。落定校验 `filter_covered`：目标**完全覆盖**既有（非移动）clip 时该 clip 留原位+提示，批次其余照常落下（部分重叠允许）。`relocate_in`：每源轨降序 remove + 目的轨 append——**append 不位移任何剩余索引**，跨轨移动因此不需要索引重映射。
 - **M4b.4 Shift+D**：克隆选区进入 grab 式模态（`ModalKind::Duplicate` 与 Grab 共享 `grab_targets` 数学与 X 锁），LMB 落定 `DuplicateClipsBatch`（内容克隆 append 到目标轨、选区转移到副本），RMB/Esc 副本不落盘。
 
@@ -264,3 +264,16 @@
 - **单次刀**：K 从开关切换改为只武装；一次 LMB 点击消费武装（成功切割 / 拒绝提示 / 空白均可——roll 的 stroke 完成即收刀同理）；Esc / 右键取消不消费。
 
 单测 `grab_moves_by_bars_and_rows_within_kind` 更新字段并补 Row 锁断言（时间冻结、行仍动）。
+#### clip 单周期不变量：resize 拖长自动平铺 bug（2026-10-20）
+
+症状：clip 第一小节输入音符后拖长尾部，播放时音符在新增小节**自动重复**（pattern 平铺效果），预期应是空白小节。
+
+根因是 **UI 打破了 D14 的单周期前提**：引擎调度器按 `loop_ticks` 周期在 `[start, start+span)` 内平铺音符（spec 预埋的未来特性，`sequencer.rs` 的 `m·loop` 循环），而 UI resize/stretch 只写 `span_ticks` 不动 `loop_ticks`（恒为默认 1 bar）——`span > loop` 后平铺自动生效。同一裂口还让 split 产生 `span < loop` 的**非法文档**（模型校验 `span ≥ loop`，保存即报错）。
+
+修复 = UI 层所有改 `span_ticks` 的路径维持 `loop_ticks == span_ticks` 不变量（引擎平铺语义原样保留，`span == loop` 时天然无重复）：
+
+- `timeline_move_resize_clip` / `timeline_stretch_clips_batch`（`lib.rs`）：写 span 同时写 loop；
+- `split_clip_in`（`timeline.rs`）：两半各自 `loop = span`；`Placement` trait 新增 `set_loop` + `retain_from(offset)`——右半内容取切口之后部分并平移到新原点（**跨界音符两半延续**：右半以剩余尾巴从 0 开始；`sequence.ctrls` 与 `curve` 锚点按 `tick ≥ offset` 平移过滤），左半内容**原样保留**（超出新 span 的音符/锚点只是隐藏，拖回长度即恢复——数据永不丢）；
+- piano roll / lane 绘制过滤 `start ≥ loop_ticks` 的遗留内容（防溢出画布右侧；交互早已按位置匹配 + `min(loop_ticks - 1)` clamp，超界项点不到）。
+
+新增小节从此**空白可输入**（piano roll 宽度 = `loop_ticks` = span，拖长即扩宽编辑区）。测试：`split_halves_keep_start_end_and_content` 重写（含跨界音符断言）、新增 `split_shifts_control_curve_anchors`。引擎平铺测试 `clip_tiles_within_span_and_stops_at_span_end` 不变（未来特性仍被锁定）。

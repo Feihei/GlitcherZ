@@ -13,7 +13,7 @@
 
 use eframe::egui;
 
-use glitcherz_model::{AutoParam, ControlClip, TICKS_PER_STEP};
+use glitcherz_model::{AutoParam, AutoPoint, ControlClip, TICKS_PER_STEP};
 
 /// Lane height (pixels).
 pub const LANE_HEIGHT: f32 = 96.0;
@@ -129,19 +129,26 @@ pub fn show(
         egui::Stroke::new(1.0, egui::Color32::from_gray(45)),
     );
 
-    // Curve segments (lines between adjacent anchors).
+    // Curve segments (lines between adjacent anchors). Anchors past a
+    // shortened span stay in the data but are never drawn.
     let curve_color = egui::Color32::from_rgb(90, 160, 220);
-    if clip.curve.len() >= 2 {
-        for window in clip.curve.windows(2) {
+    let visible: Vec<(usize, &AutoPoint)> = clip
+        .curve
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.tick < loop_ticks)
+        .collect();
+    if visible.len() >= 2 {
+        for window in visible.windows(2) {
             painter.line_segment(
                 [
                     egui::pos2(
-                        rect.left() + window[0].tick as f32 * ticks_to_x,
-                        value_y(window[0].value),
+                        rect.left() + window[0].1.tick as f32 * ticks_to_x,
+                        value_y(window[0].1.value),
                     ),
                     egui::pos2(
-                        rect.left() + window[1].tick as f32 * ticks_to_x,
-                        value_y(window[1].value),
+                        rect.left() + window[1].1.tick as f32 * ticks_to_x,
+                        value_y(window[1].1.value),
                     ),
                 ],
                 egui::Stroke::new(1.5, curve_color),
@@ -151,6 +158,9 @@ pub fn show(
 
     // Anchors.
     for (index, point) in clip.curve.iter().enumerate() {
+        if point.tick >= loop_ticks {
+            continue;
+        }
         let x = rect.left() + point.tick as f32 * ticks_to_x;
         let y = value_y(point.value);
         let color = if state.drag == Some(index) {
