@@ -17,7 +17,7 @@
 
 ## 当前状态（2026-10-19）
 
-路线图 1–10 全部落地。乐器插件（CLAP / VST3）为一等声源，效果器节点已接入，自动化桥接到插件参数。节点图 P1–P5f 与 MIDI 编辑 M1–M4 全部交付；SF2 音色库方向 S1 RT 审计（零分配、无需 fork）、S2 非实时加载模块（`engine::sf2`）、S3 实时渲染（`realtime/sf2.rs` `Sf2VoiceProcessor`）与 S4 model `VoiceSpec::SoundFont` 变体（含 UI 非穷尽 match 补齐与文档恢复路径）完成。下一步：S5 UI 音色库面板。
+路线图 1–10 全部落地。乐器插件（CLAP / VST3）为一等声源，效果器节点已接入，自动化桥接到插件参数。节点图 P1–P5f 与 MIDI 编辑 M1–M4 全部交付；SF2 音色库方向 S1 RT 审计（零分配、无需 fork）、S2 非实时加载模块（`engine::sf2`）、S3 实时渲染（`realtime/sf2.rs` `Sf2VoiceProcessor`）、S4 model `VoiceSpec::SoundFont` 变体（含 UI 非穷尽 match 补齐与文档恢复路径）与 S5 UI 音色库面板（加载 / preset 下拉 / 声源绑定）完成。下一步：S6 SF3 feature 开启 + 端到端验收。
 
 ## 遗留任务
 
@@ -159,7 +159,7 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 - [x] S2 engine `sf2` 非实时模块（load / preset 枚举 / thiserror 错误）✅ 2026-10-19：`engine::sf2`（`Sf2Library::load` → `Arc<SoundFont>` + 加载期 preset 枚举 `Sf2Preset{bank: u8, program: u8, name}` + `find_preset`；`Sf2Error{Io, Parse, NoPresets}`；bank/program 超出 u8 的 preset 跳过 + warn）。rustysynth-ext 转正式依赖；S1 fixture 提取 `tests/common`（bank/program 参数化），`tests/sf2_load.rs` 8 场景 + 真实库（MuseScore_General/FatBoy，含 preset 地址唯一性）通过
 - [x] S3 engine `realtime/sf2.rs` `Sf2VoiceProcessor`（`Processor` 实现，逐行铁律评审）✅ 2026-10-19：stereo render 缓冲构造期预分配（`SynthesizerSettings.block_size=128` 对齐）；`ParamId::{Sf2BankSelect, Sf2ProgramChange, Sf2MasterVolume}`（bank/program 经 `process_midi_message(0xB0/0xC0)` 零分配下发，master volume 纯写入）；`held: u128` 位图解决毯式 `Off { note: 0 }` 歧义（key 0 未按 = 全释放，按住 = pitch-matched）；velocity→MIDI 七位映射 + 越界 note 守卫（`1u128 << note` 需 <128）；`Sf2Error::Synth` 变体承接设置越界。`tests/sf2_voice.rs` 13 场景（构造、静音/NaN 铁律对、奇形缓冲、生命周期、velocity-0、毯式释放×2、参数路由、音量、bank/program 寻址、真实库 smoke）——**坑**：GM 默认 CC#91 reverb send=40 使被拒音符仍带 ~0.003 尾音，绝对阈值断言须改 baseline 比较
 - [x] S4 model `VoiceSpec::SoundFont` 变体 + RON 往返测试 ✅ 2026-10-19：`SoundFont { path, bank: u8, program: u8 }`（serde default 加法字段，PROJECT_VERSION 不动；partial 加载 = 0:0）；`voice_spec_ron_roundtrip` 覆盖 + `voice_spec_soundfont_serde_compatibility`（tag `"sound_font"` + 无 bank/program 可加载）。**坑**：RON 紧凑输出无空格（`type:"sound_font"`，`contains("type: \"sound_font\"")` 会假失败）；serde default 是 `u8::default()` 而非实例值。UI 侧 8 处非穷尽 match 补分支：install_node Instrument+SoundFont 走完整加载（`Sf2Library::load` → `Sf2VoiceProcessor::new` → `set_param` 下发 bank/program，文件丢失/解析失败回落 SynthProcessor + log，D8）；Effect+SoundFont 回落 Delay（防御性，UI 不产生该组合）；`voice_plugin_key`/`track_external_fx` → None；preset load/reset 的 `&mut` match → `{}`（无 state blob）
-- [ ] S5 UI 音色库面板（加载 / preset 下拉 / 轨声源绑定，走守卫与命令约定）
+- [x] S5 UI 音色库面板（加载 / preset 下拉 / 轨声源绑定，走守卫与命令约定）✅ 2026-10-19：Synth 面板 `SoundFont…` 按钮（rfd 对话框 filter sf2/sf3）→ 文档改 `VoiceSpec::SoundFont`（begin_edit/commit_edit，undoable）→ `load_soundfont_voice`（engine 替换 + preset 下发）；App 持有 `sf2_library: Option<Arc<Sf2Library>>` 会话单库（spec §6），`obtain_sf2_voice` path 匹配复用 / 未命中加载并缓存（install_node 重装同样复用，避免反复读大文件）；preset 下拉（ComboBox）从共享库枚举，列表快照释放借用后走 `set_soundfont_preset`（undoable 文档编辑 + `set_node_param` 即时下发）；当前声源为 SoundFont 时 `Built-in Synth` 不再高亮
 - [ ] S6 SF3 feature 开启 + 端到端验收
 
 ## 附：VST3 调研结论（2026-10-07，已实施）

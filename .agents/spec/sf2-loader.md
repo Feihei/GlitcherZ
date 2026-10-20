@@ -66,8 +66,9 @@ C 构建链依赖的 SF2 加载与合成路径。
 - [x] **S4** model：`VoiceSpec::SoundFont` 变体 + RON 往返测试
   ✅ 2026-10-19 完成（serde default 加法字段，PROJECT_VERSION 不动；UI 非穷尽
   match 补齐，install_node 文档恢复路径含 D8 文件丢失回落）
-- [ ] **S5** UI：音色库面板（加载 SF2/SF3、preset 下拉、轨声源绑定）+ undo/redo 路径
-  走现有守卫/命令约定
+- [x] **S5** UI：音色库面板（加载 SF2/SF3、preset 下拉、轨声源绑定）+ undo/redo 路径
+  走现有守卫/命令约定 ✅ 2026-10-19 完成（会话单库 `sf2_library` + `obtain_sf2_voice`
+  path 匹配复用；preset 下拉 undoable + set_node_param 即时下发）
 - [ ] **S6** SF3 feature 开启 + 端到端验收（含 S1 审计复跑）
 
 ## 6. 边界与明确不做

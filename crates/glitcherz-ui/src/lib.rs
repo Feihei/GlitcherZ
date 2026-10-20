@@ -22,12 +22,14 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
 use glitcherz_clap_host::{ClapInstance, ClapInstanceConfig};
 use glitcherz_engine::AudioEngine;
+use glitcherz_engine::Sf2Error;
 use glitcherz_engine::Sf2Library;
 use glitcherz_engine::convert;
 use glitcherz_engine::realtime::{
@@ -465,6 +467,10 @@ pub struct GlitcherZApp {
     voice_preset_selected: HashMap<usize, String>,
     /// "Save preset" name input.
     preset_name_input: String,
+    /// Shared session SoundFont (v1: one library per session, spec
+    /// `sf2-loader.md` §6). Loaded via the library panel; document restores
+    /// reuse it when the path matches to avoid re-reading a large file.
+    sf2_library: Option<Arc<Sf2Library>>,
     /// Diagnostic flag: whether `ui()` has been entered (logging only).
     first_frame_logged: bool,
     /// Diagnostic flag: whether the close command has been sent (logging only).
@@ -582,6 +588,7 @@ impl GlitcherZApp {
             voice_default_state: HashMap::new(),
             voice_preset_selected: HashMap::new(),
             preset_name_input: String::new(),
+            sf2_library: None,
             first_frame_logged: false,
             close_sent: false,
         };
@@ -717,14 +724,12 @@ impl GlitcherZApp {
                         bank,
                         program,
                     } => {
-                        // Document voice restore (D8): load on the
-                        // non-real-time thread and address the preset
-                        // before installation; a missing or broken file
-                        // falls back to the built-in synth (document
-                        // fields kept for a later retry).
-                        match Sf2Library::load(std::path::Path::new(path))
-                            .and_then(|library| Sf2VoiceProcessor::new(library.font(), sr))
-                        {
+                        // Document voice restore (D8): prefer the shared
+                        // session library (avoids re-reading a large .sf2
+                        // on every reinstall), otherwise load here; a
+                        // missing or broken file falls back to the built-in
+                        // synth (document fields kept for a later retry).
+                        match self.obtain_sf2_voice(path, sr) {
                             Ok(mut processor) => {
                                 processor.set_param(ParamId::Sf2BankSelect, f32::from(*bank));
                                 processor.set_param(ParamId::Sf2ProgramChange, f32::from(*program));
@@ -2039,6 +2044,114 @@ impl GlitcherZApp {
             );
         }
         self.commit_edit("Set Instrument Voice", before);
+    }
+
+    /// Build a SoundFont voice processor from the shared session library
+    /// (v1: one library per session, spec §6): reuse the cached font when
+    /// the path matches, otherwise load (and replace the cache). Control
+    /// thread only (D3).
+    fn obtain_sf2_voice(
+        &mut self,
+        path: &str,
+        sample_rate: f32,
+    ) -> Result<Sf2VoiceProcessor, Sf2Error> {
+        if let Some(lib) = self.sf2_library.as_ref() {
+            if lib.path() == std::path::Path::new(path) {
+                return Sf2VoiceProcessor::new(lib.font(), sample_rate);
+            }
+        }
+        let library = Sf2Library::load(std::path::Path::new(path))?;
+        self.sf2_library = Some(Arc::new(library));
+        Sf2VoiceProcessor::new(
+            self.sf2_library.as_ref().expect("just set").font(),
+            sample_rate,
+        )
+    }
+
+    /// Load a SoundFont voice into the track: reuse/load the shared library
+    /// (control thread, D3) → in-place engine replacement → preset
+    /// addressed before installation (D7). The document edit happens at the
+    /// call site (same split as `load_clap_voice`).
+    fn load_soundfont_voice(&mut self, track: usize, path: &str, bank: u8, program: u8) {
+        let Some(doc_id) = self
+            .project()
+            .graph
+            .instrument_of_track(track)
+            .map(NodeDoc::node_id)
+        else {
+            return;
+        };
+        let Some(engine_id) = self.engine_id(doc_id) else {
+            return;
+        };
+        self.retire_guard(engine_id);
+        let sample_rate = convert::sample_rate_to_f32(self.engine.info().sample_rate);
+        match self.obtain_sf2_voice(path, sample_rate) {
+            Ok(mut processor) => {
+                processor.set_param(ParamId::Sf2BankSelect, f32::from(bank));
+                processor.set_param(ParamId::Sf2ProgramChange, f32::from(program));
+                if self
+                    .engine
+                    .replace_node(engine_id, Box::new(processor))
+                    .is_some()
+                {
+                    // Switching formats: drop the other formats' panel
+                    // caches (no plugin presets / sliders for a sound font).
+                    self.voice_params.remove(&track);
+                    self.clap_voice_params.remove(&track);
+                    self.clap_voice_values.remove(&track);
+                    self.vst3_voice_values.remove(&track);
+                    self.voice_default_state.remove(&track);
+                    self.voice_preset_selected.remove(&track);
+                    log::info!("Track {} loaded SoundFont voice: {path}", track + 1);
+                } else {
+                    log::error!("Voice queue full: failed to load track {}", track + 1);
+                }
+            }
+            Err(err) => {
+                log::error!("Failed to load SoundFont {path}: {err}");
+                self.set_message(format!("SoundFont load failed: {err}"));
+            }
+        }
+    }
+
+    /// Switch the track's SoundFont preset: document bank/program as one
+    /// undoable edit + live node-param delivery (block-granularity, D7).
+    fn set_soundfont_preset(&mut self, track: usize, bank: u8, program: u8) {
+        let before = self.begin_edit();
+        if let Some(NodeDoc::Instrument {
+            voice:
+                VoiceSpec::SoundFont {
+                    bank: b,
+                    program: p,
+                    ..
+                },
+            ..
+        }) = self.project_mut().graph.instrument_of_track_mut(track)
+        {
+            *b = bank;
+            *p = program;
+        }
+        if let Some(doc_id) = self
+            .project()
+            .graph
+            .instrument_of_track(track)
+            .map(NodeDoc::node_id)
+        {
+            if let Some(engine_id) = self.engine_id(doc_id) {
+                self.engine
+                    .set_node_param(engine_id, ParamId::Sf2BankSelect, f32::from(bank));
+                self.engine.set_node_param(
+                    engine_id,
+                    ParamId::Sf2ProgramChange,
+                    f32::from(program),
+                );
+                self.commit_edit("Select SF2 Preset", before);
+                return;
+            }
+        }
+        self.commit_edit("Select SF2 Preset", before);
+        self.set_message("Preset switch failed: voice not installed".to_string());
     }
 
     /// Load a CLAP instrument voice into the track: non-real-time instantiation → in-place engine
@@ -3501,7 +3614,21 @@ impl GlitcherZApp {
                         _ => None,
                     })
                     .unwrap_or(false);
-                if ui.selectable_label(!is_external, "Built-in Synth").clicked() {
+                let is_sf2 = self
+                    .project()
+                    .graph
+                    .instrument_of_track(sel)
+                    .and_then(|n| match n {
+                        NodeDoc::Instrument { voice, .. } => {
+                            Some(matches!(voice, VoiceSpec::SoundFont { .. }))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+                if ui
+                    .selectable_label(!is_external && !is_sf2, "Built-in Synth")
+                    .clicked()
+                {
                     self.set_builtin_instrument(sel);
                 }
                 // Collect the choice first; load after the menu closure ends (avoids borrow
@@ -3564,6 +3691,92 @@ impl GlitcherZApp {
                     }
                     self.load_vst3_voice(sel, &path, &class_id);
                     self.commit_edit("Load VST3 Instrument", before);
+                }
+                // SoundFont voice (v1: one shared session library, spec §6).
+                let mut sf2_picked: Option<String> = None;
+                if ui.button("SoundFont…").clicked() {
+                    sf2_picked = rfd::FileDialog::new()
+                        .add_filter("SoundFont", &["sf2", "sf3"])
+                        .pick_file()
+                        .map(|p| p.display().to_string());
+                }
+                if let Some(path) = sf2_picked {
+                    let before = self.begin_edit();
+                    if let Some(NodeDoc::Instrument { voice, .. }) =
+                        self.project_mut().graph.instrument_of_track_mut(sel)
+                    {
+                        *voice = VoiceSpec::SoundFont {
+                            path: path.clone(),
+                            bank: 0,
+                            program: 0,
+                        };
+                    }
+                    self.load_soundfont_voice(sel, &path, 0, 0);
+                    self.commit_edit("Load SoundFont Instrument", before);
+                }
+                // SoundFont preset picker (visible while the track voice is
+                // SoundFont): presets enumerated from the shared session
+                // library; the selection is one undoable edit + live
+                // node-param delivery (D7).
+                let sf2_state = self
+                    .project()
+                    .graph
+                    .instrument_of_track(sel)
+                    .and_then(|n| match n {
+                        NodeDoc::Instrument {
+                            voice:
+                                VoiceSpec::SoundFont {
+                                    path,
+                                    bank,
+                                    program,
+                                },
+                            ..
+                        } => Some((path.clone(), *bank, *program)),
+                        _ => None,
+                    });
+                if let Some((sf2_path, sf2_bank, sf2_program)) = sf2_state {
+                    // Snapshot the preset list (releases the library borrow
+                    // before the picker's undoable edit runs).
+                    let presets: Option<Vec<(u8, u8, String)>> = self
+                        .sf2_library
+                        .as_ref()
+                        .filter(|lib| lib.path() == std::path::Path::new(&sf2_path))
+                        .map(|lib| {
+                            lib.presets()
+                                .iter()
+                                .map(|p| (p.bank, p.program, p.name.clone()))
+                                .collect()
+                        });
+                    match presets {
+                        Some(presets) => {
+                            let current = presets
+                                .iter()
+                                .find(|(b, p, _)| *b == sf2_bank && *p == sf2_program)
+                                .map(|(_, _, name)| name.clone())
+                                .unwrap_or_else(|| format!("{sf2_bank}:{sf2_program}"));
+                            ui.horizontal(|ui| {
+                                ui.label("Preset");
+                                let mut preset_picked: Option<(u8, u8)> = None;
+                                egui::ComboBox::from_id_salt(format!("sf2_preset_{sel}"))
+                                    .selected_text(current)
+                                    .show_ui(ui, |ui| {
+                                        for (bank, program, name) in &presets {
+                                            let is_selected =
+                                                *bank == sf2_bank && *program == sf2_program;
+                                            if ui.selectable_label(is_selected, name).clicked() {
+                                                preset_picked = Some((*bank, *program));
+                                            }
+                                        }
+                                    });
+                                if let Some((bank, program)) = preset_picked {
+                                    self.set_soundfont_preset(sel, bank, program);
+                                }
+                            });
+                        }
+                        None => {
+                            ui.weak("(soundfont file not loaded this session — reopen it)");
+                        }
+                    }
                 }
                 if is_external {
                     ui.weak("(external instrument plugin)");
