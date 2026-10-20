@@ -87,6 +87,10 @@ pub enum PatchAction {
     },
     /// Set a node's owning track as the current editing track.
     SelectTrack(usize),
+    /// Double-clicked a document node: jump to the Synth panel with that
+    /// node as the editing target (spec `plugin-gui.md` §6 — the patch
+    /// analogue of double-clicking a timeline clip to open the Edit view).
+    OpenNode(u64),
 }
 
 /// Snapshot of external data the patch depends on (immutable borrows to avoid borrow conflicts).
@@ -345,6 +349,20 @@ fn truncate(s: &str, max_chars: usize) -> String {
 }
 
 impl PatchState {
+    /// Document node ids currently selected (fixed entities — timeline /
+    /// master — excluded). Read by the app to resolve the Synth panel's
+    /// editing target (spec `plugin-gui.md` §6).
+    pub fn selected_doc_nodes(&self) -> Vec<u64> {
+        self.selection
+            .nodes
+            .iter()
+            .filter_map(|id| match id {
+                PatchId::Node(doc) => Some(*doc),
+                PatchId::Timeline | PatchId::Master => None,
+            })
+            .collect()
+    }
+
     /// Graph space → screen space.
     fn to_screen(&self, rect_min: Pos2, p: Pos2) -> Pos2 {
         Pos2::new(
@@ -957,6 +975,16 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         if !shift && let Some(track) = track_of_node(picked, doc) {
             actions.push(PatchAction::SelectTrack(track));
         }
+    }
+
+    // ---- Double-click a document node: jump to the Synth panel editing it ----
+    // (Fixed entities — timeline / master — have no panel of their own.)
+    if response.double_clicked()
+        && let Some(sp) = pointer
+        && let Some(PatchId::Node(doc_id)) =
+            state.hit_node(rect.min, sp, midi_count, auto_count, doc)
+    {
+        actions.push(PatchAction::OpenNode(doc_id));
     }
 
     // ---- Right-click: add-node context menu (any position; the new node appears where
