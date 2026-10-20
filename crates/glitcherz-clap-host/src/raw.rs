@@ -24,6 +24,13 @@
 //!   is destroyed); the host upholds it by closing all editors before
 //!   releasing the owning window or guard (see
 //!   `.agents/spec/plugin-gui.md` §4.3).
+//! - [`flush_params`]: invokes the params extension's `flush` callback
+//!   directly (empty in queue, stack-local out queue) because the clack
+//!   wrappers require handles this host's architecture cannot provide (see
+//!   the function's docs). Same lifetime guarantees as
+//!   [`enumerate_params`]: the plugin instance is held by the caller's
+//!   [`ClapInstanceGuard`], the vtable pointers stay valid for the
+//!   instance's lifetime.
 //!
 //! Behavioral verification is in the crate's `tests` (invalid files must
 //! return errors, not UB).
@@ -33,6 +40,8 @@ use std::ffi::{c_char, c_void};
 use std::path::Path;
 use std::ptr::NonNull;
 
+use clack_common::events::event_types::ParamValueEvent;
+use clack_common::events::io::EventBuffer;
 use clack_extensions::gui::{GuiError, PluginGui};
 use clack_host::entry::{PluginEntry, PluginEntryError};
 use clack_host::plugin::PluginMainThreadHandle;
@@ -198,6 +207,80 @@ pub(crate) fn read_param_values(plugin: &clap_plugin, ids: &[u32]) -> Vec<(u32, 
     }
     out
 }
+
+/// Calls the params extension's `flush` with an empty input queue and
+/// returns the parameter changes the plugin wrote into the output queue
+/// (pairs of `(param_id, plain_value)`).
+///
+/// This is the host's standard response to the plugin's
+/// `host_params::request_flush` (a GUI edit): the plugin reports the values
+/// it changed on its main thread via the out queue. The clack 0.2 wrappers
+/// cannot be used here — `PluginParams::flush` (clack-extensions) demands
+/// an `InactivePluginMainThreadHandle` and `flush_active` demands a handle
+/// to the audio processor, which lives on the audio thread in this host —
+/// hence this vtable direct call, following [`enumerate_params`].
+///
+/// Returns an empty list when the params extension (or its flush callback)
+/// is not implemented.
+///
+/// # Safety (preconditions guaranteed by the caller)
+///
+/// `plugin` must point to a live plugin instance (while held by
+/// [`ClapInstanceGuard`]).
+pub(crate) fn flush_params(plugin: &clap_plugin) -> Vec<(u32, f64)> {
+    let Some(get_extension) = plugin.get_extension else {
+        return Vec::new();
+    };
+    // SAFETY: the plugin pointer is alive (see preconditions); the callback
+    // returns, per the CLAP spec, a pointer to the extension structure
+    // declared by the plugin (valid for the instance's lifetime).
+    let ext_ptr = unsafe { get_extension(plugin as *const clap_plugin, CLAP_EXT_PARAMS.as_ptr()) };
+    let Some(ext_ptr) = NonNull::new(ext_ptr as *mut clap_plugin_params) else {
+        return Vec::new();
+    };
+    // SAFETY: the extension pointer comes from get_extension and points to
+    // the clap_plugin_params structure declared by the plugin, valid for
+    // the instance's lifetime.
+    let flush = unsafe { ext_ptr.as_ref() }.flush;
+    let Some(flush) = flush else {
+        return Vec::new();
+    };
+
+    // Empty input queue (nothing to push into the plugin), pre-sized
+    // output queue; both are stack-local CLAP event lists.
+    let input = EventBuffer::new();
+    let mut output = EventBuffer::with_capacity(MAX_PARAM_CHANGES);
+    {
+        let input_raw = input.as_input();
+        let mut output_raw = output.as_output();
+        // SAFETY: the plugin pointer, the extension callback and both event
+        // queues are alive for the duration of the call; the buffers are
+        // filled by the plugin callback per the spec (fixed-capacity
+        // try_push on the out queue).
+        unsafe {
+            flush(
+                plugin as *const clap_plugin,
+                input_raw.as_raw(),
+                output_raw.as_raw_mut(),
+            );
+        }
+    }
+
+    let mut changes = Vec::new();
+    for event in &output {
+        if let Some(param) = event.as_event::<ParamValueEvent>() {
+            let Some(id) = param.param_id() else {
+                continue;
+            };
+            changes.push((id.get(), param.value()));
+        }
+    }
+    changes
+}
+
+/// Capacity of the stack-local output event queue of [`flush_params`]
+/// (parameters a plugin GUI may report changed in one flush).
+const MAX_PARAM_CHANGES: usize = 64;
 
 /// Fixed-capacity `c_char` array → String (truncated at the first NUL;
 /// invalid UTF-8 leniently replaced).

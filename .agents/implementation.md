@@ -135,6 +135,17 @@
   ④ **每轨多音符 pending-off 槽位（2026-10-19，本次 click 根因）**：`Sequencer.pending_offs` 原为 `[Option<(u64,u8)>; MAX_MIDI_TRACKS]`——**每轨仅 1 槽**。同轨第二个同时发声音符（用户实测场景：一个 clip 里的两个长音 B flat + F）的 On 会直接**覆盖**第一个音符的 pending-off，第一个音符永不 note-off；Dexed 按音高匹配释放、`Off{note:0}` 也清不掉 → 挂死 voice 堆积，听感即"琶音般的很多个正弦波 / 换 preset 后短促 click 或无声"（内置 synth 的 env 忽略音符号，故听不出该症状）。改为每轨定长多槽 `[[Option<(u64,u8)>; MAX_PENDING_OFFS_PER_TRACK=16]; MAX_MIDI_TRACKS]`：`set_pending_off` 先复用同音高槽、否则取首个空槽；retrigger guard 扫描全部槽；`take_pending_offs` 返回嵌套数组、`release_pending_notes` 逐槽释放（全程 RT-safe 固定数组）。回归测试 `simultaneous_notes_on_one_track_both_release`；端到端 `dexed_engine_playback_repro` 增补"和弦 Bb3+F3 持续发声 + Stop 后 tail peak=0"断言。
   **结论：根因在宿主的音序器 note-off 追踪，与 Dexed 插件及预设数据无关**（`unpack_voice` 与官方 `unpackProgram` 对 4 bank×32 音色 0 差异、program 字节正确、单音符引擎路径与 live-load 竞态路径均正常）。诊断命令：`cargo test -p glitcherz-clap-host <harness名> -- --ignored --nocapture`。
 
+### 插件 GUI 宿主（plugin-gui spec，G1–G3，2026-10-20）
+
+G1（gui 扩展宿主）/ G2（Win32 嵌入容器）/ G3（参数回接）已落地，Dexed 实测通过；决策 D1–D10 与阶段明细见 `spec/plugin-gui.md` 与 plan.md。跨版本 gotchas：
+
+- **CLAP gui 契约**：`destroy` 即 `closed(was_destroyed=true)` 的**宿主确认**（宿主主动关闭后插件才回调 closed；spec 初稿方向写反已修）。gui/flush 调用**不过 StateGate**（[main-thread] 调用与 process 的并发安全由插件契约保证，D7 同款裁决）；GUI 编辑**不进 undo**（preset save 捕获 state 覆盖持久化，D8）；tab 切走 = hide、切轨/retire = destroy（D9）。
+- **test-plugin 观察通道**：cdylib 的 static 宿主进程读不到——插件内观察状态（gui 调用序列位图 GuiCallMask、destroy 计数）经**只读参数**暴露，宿主侧 `read_param_values` 读回断言。改 test-plugin 后须显式 `cargo build -p glitcherz-test-plugin`——**dll 不随 clap-host 测试自动重建**（测试仍链旧 dll，症状是"改了没生效"）。
+- **Win32 容器（`glitcherz-ui::plugin_window`，G2）**：宿主自建 STATIC 子容器、插件真窗口为孙窗口（宿主永不直接操作插件 HWND）。三个实测坑：① 容器**不能带 `WS_DISABLED`**——禁用父窗口阻断整个子树的鼠标命中与键盘焦点；② reposition **去抖**——同 rect 不再 `SetWindowPos`，否则周期性 `WM_WINDOWPOSCHANGED` 干扰插件内部拖拽（hide 后强制重放一次）；③ 嵌入区**必须在 ScrollArea 外**——原生子窗口不受 egui 裁剪，放滚动区内会留残影。
+- **G3 flush 必须 raw vtable 直调**：clack 的 `PluginParams::flush` 包装要 `InactivePluginMainThreadHandle`（实例已激活拿不到）、`flush_active` 要 processor 独占 handle（processor 已移交音频线程的 ClapNode）——两条包装路都走不通；`raw::flush_params` 直调 `clap_plugin_params::flush`（与 `enumerate_params` 同模式）：空 in EventBuffer + 栈上 out EventBuffer（容量 64），解析 `ParamValueEvent` 回 `(id, value)`。
+- **clack wrapper 的 flush 分派规则**：对**活跃**实例，宿主调 flush 时 wrapper 分派给 `PluginAudioProcessorParams::flush`（audio 侧实现），inactive 才走 main-thread 版本——**插件侧两个 flush 实现都要写 out queue**（只实现 main-thread 版本时活跃实例回读永远为空，且测试链的是旧 dll 时更难定位）。
+- **UI 轮询时序（G3）**：`ui()` 尾部、编辑器 open 且非 `gui_closed` 时轮询 `poll_param_flush`（原子标志 take 语义），回读值同步 `clap_voice_values` 滑块缓存 + `send_track_param(ParamId::PluginParam)` 下发引擎；缓存写入与下发在 guard 借用结束之后做（借用冲突）。轮询放 `gui_closed` 的 else 分支，避开插件自毁边角。
+
 ### 项目文件与模型（`glitcherz-model`）
 
 - `Project`（metadata + gate + master_gain + 4×`Track`）；`Track` = 名称 + `Pattern` + `Clip`（`Note{start,length,note,velocity}` 列表 + loop_ticks，tick 基准：`TICKS_PER_QUARTER=96`/步=24/小节=384）+ 音源枚举（`VoiceSpec`: `Builtin | Clap | Vst3`）+ 混音（增益/声像/静音）+ `SynthParams` + `DelayParams`，全部 serde/RON + 字段级 `#[serde(default)]`；引擎侧镜像 `RtClip`（定容 128 音符 `Copy`，超容截断）经 `SetClip` 命令整块下发；
@@ -219,7 +230,7 @@
 
 - cpal 0.18；
 - egui 0.36：`App::ui(&mut Ui)`、`egui::Panel`、`Response` 无 `pressed/released`（用 `is_pointer_button_down_on`）、`DragValue::range(RangeInclusive)`、`Painter::rect_stroke(rect, radius, stroke, StrokeKind)`；
-- clack 0.2：`clack-extensions` 宿主侧 trait 需 `clack-host` feature；`Pckn::new` 需显式 u16/u32 字面量；`start_processing` 返回 `&mut Started`；`PluginInstance::new` 收 `&CStr`；
+- clack 0.2：`clack-extensions` 宿主侧 trait 需 `clack-host` feature；`Pckn::new` 需显式 u16/u32 字面量；`start_processing` 返回 `&mut Started`；`PluginInstance::new` 收 `&CStr`；`Pckn` 类型导出路径是 `clack_common::events::Pckn`（`events::pckn` 模块私有）；`ParamValueEvent::new(time, param_id, pckn, value)`；`EventBuffer` 经 `as_input()/as_output()` 包装后 `as_raw()/as_raw_mut()` 取 raw 指针（G3 flush 直调用到）；
 - RON/serde：定长数组（`[Track; 4]`/`[Step; 16]`）在 RON 里是**圆括号**（serde tuple 路径），方括号只用于 `Vec`；
 - VST3 参数为归一化 0..1（CLAP 为原始值），跨格式展示需换算。
 

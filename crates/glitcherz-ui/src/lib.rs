@@ -5992,6 +5992,12 @@ impl eframe::App for GlitcherZApp {
             }
         }
         let mut destroy_editor = false;
+        // Parameter flush read-back (spec `plugin-gui.md` §5): parameter
+        // changes the plugin made inside its GUI, read via the guard's
+        // poll; applied after the guard borrow ends (engine delivery +
+        // slider cache). `None` while the editor is closed (no polling,
+        // no engine traffic).
+        let mut flush_changes: Option<(usize, Vec<(u32, f64)>)> = None;
         if let Some(editor) = self.plugin_editor.as_mut() {
             if editor.track != sel {
                 destroy_editor = true;
@@ -6012,11 +6018,27 @@ impl eframe::App for GlitcherZApp {
                     // session down.
                     g.close_editor();
                     destroy_editor = true;
+                } else {
+                    let changes = g.poll_param_flush();
+                    if !changes.is_empty() {
+                        flush_changes = Some((editor.track, changes));
+                    }
                 }
             }
         }
         if destroy_editor {
             self.close_plugin_editor();
+        }
+        if let Some((track, changes)) = flush_changes {
+            // GUI edits do not enter undo history (spec D8); persistence is
+            // covered by the preset system's save-time state capture.
+            for (id, value) in changes {
+                self.clap_voice_values
+                    .entry(track)
+                    .or_default()
+                    .insert(id, value);
+                self.send_track_param(track, ParamId::PluginParam(id), value as f32);
+            }
         }
         if let Some(editor) = self.plugin_editor.as_ref() {
             if self.view != MainView::Synth {

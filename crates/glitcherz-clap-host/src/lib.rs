@@ -268,6 +268,16 @@ pub struct GuiHostState {
     closed: AtomicBool,
 }
 
+/// Host-side params-extension callback facts. `request_flush` is called by
+/// the plugin from its main thread (typically from inside its GUI after a
+/// user edit); the flag is polled and taken by the UI frame loop via
+/// [`ClapInstanceGuard::poll_param_flush`] (single-word atomics only; the
+/// audio thread is never involved).
+#[derive(Debug, Default)]
+pub struct ParamsHostState {
+    flush_requested: AtomicBool,
+}
+
 /// One-shot gui events polled from the UI frame loop (take semantics: a
 /// flag is reported once per plugin request).
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -292,6 +302,9 @@ struct GlitcherZHostShared {
     /// Gui callback facts shared with the guard (polled via
     /// [`ClapInstanceGuard::editor_events`]).
     gui: Arc<GuiHostState>,
+    /// Params callback facts shared with the guard (polled via
+    /// [`ClapInstanceGuard::poll_param_flush`]).
+    params: Arc<ParamsHostState>,
 }
 
 impl SharedHandler<'_> for GlitcherZHostShared {
@@ -313,8 +326,10 @@ impl HostLogImpl for GlitcherZHostShared {
 
 impl HostParamsImplShared for GlitcherZHostShared {
     fn request_flush(&self) {
-        // Simplified host: when the plugin requests a flush, the next process
-        // carries all stashed events.
+        // The plugin changed parameters on its main thread (typically from
+        // its GUI); the UI frame loop picks the flag up via
+        // ClapInstanceGuard::poll_param_flush and reads the changes back.
+        self.params.flush_requested.store(true, Ordering::Relaxed);
     }
 }
 
@@ -437,6 +452,9 @@ pub struct ClapInstanceGuard {
     /// Gui callback facts shared with the host handlers (see
     /// [`Self::editor_events`]).
     gui: Arc<GuiHostState>,
+    /// Params callback facts shared with the host handlers (see
+    /// [`Self::poll_param_flush`]).
+    params: Arc<ParamsHostState>,
     /// Whether the host-side GUI lifecycle is open (created, not yet
     /// destroyed).
     gui_open: bool,
@@ -634,6 +652,25 @@ impl ClapInstanceGuard {
         self.gui.closed.load(Ordering::Relaxed)
     }
 
+    /// Reads back parameter changes the plugin made on its main thread
+    /// (spec `plugin-gui.md` §5, the `request_flush` response): takes the
+    /// pending flag and, when set, calls the params extension's `flush`
+    /// with an empty input queue, returning the `(param_id, plain_value)`
+    /// pairs the plugin reported. Call from the UI frame loop while the
+    /// plugin's editor is open (an idle poll is one atomic load).
+    ///
+    /// Not serialized against the audio thread (spec D7 rationale): the
+    /// flush call is a main-thread plugin call and the standard host
+    /// response to `request_flush` — the plugin guarantees
+    /// main-thread-call safety while `process` executes, exactly like the
+    /// gui calls the host already issues per frame.
+    pub fn poll_param_flush(&mut self) -> Vec<(u32, f64)> {
+        if !self.params.flush_requested.swap(false, Ordering::Relaxed) {
+            return Vec::new();
+        }
+        raw::flush_params(self.instance.raw_instance())
+    }
+
     fn with_open_gui(
         &mut self,
         op: &str,
@@ -691,11 +728,14 @@ impl ClapInstance {
         .map_err(|_| HostError::HostInfo)?;
         let gui_state = Arc::new(GuiHostState::default());
         let shared_gui_state = Arc::clone(&gui_state);
+        let params_state = Arc::new(ParamsHostState::default());
+        let shared_params_state = Arc::clone(&params_state);
         let mut instance = PluginInstance::<GlitcherZHostHandlers>::new(
             move |_| GlitcherZHostShared {
                 state_ext: OnceLock::new(),
                 gui_ext: OnceLock::new(),
                 gui: Arc::clone(&shared_gui_state),
+                params: Arc::clone(&shared_params_state),
             },
             |_| GlitcherZHostMainThread,
             &entry,
@@ -739,6 +779,7 @@ impl ClapInstance {
                 state_gate: Arc::clone(&state_gate),
                 gui_ext,
                 gui: gui_state,
+                params: params_state,
                 gui_open: false,
             },
             node: ClapNode::new(processor, config, state_gate),
@@ -1436,6 +1477,94 @@ mod tests {
             instance.guard.show_editor(),
             Err(super::HostError::GuiNotOpen)
         ));
+    }
+
+    // ---- Parameter flush read-back (spec plugin-gui.md §5) ----
+    //
+    // The test plugin's hide() doubles as the "in-GUI edit" hook: it
+    // changes the amplitude on the plugin's main thread and calls
+    // host_params::request_flush; the host's poll_param_flush then reads
+    // the change back through the params extension's flush callback.
+
+    /// Amplitude the test plugin's GUI edit hook sets (mirrors
+    /// glitcherz-test-plugin's GUI_EDIT_AMPLITUDE).
+    const GUI_EDIT_AMPLITUDE: f64 = 0.75;
+
+    #[test]
+    fn param_flush_reads_back_gui_changes() {
+        let Some((mut instance, _ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        instance
+            .guard
+            .open_editor(FAKE_HWND, 1.0)
+            .expect("open should succeed");
+
+        // No request yet: the poll is empty and does not call flush.
+        assert!(
+            instance.guard.poll_param_flush().is_empty(),
+            "no flush requested yet"
+        );
+
+        // The in-GUI edit hook: hide changes the amplitude and requests a
+        // flush.
+        instance
+            .guard
+            .hide_editor()
+            .expect("hide should succeed on an open editor");
+        let changes = instance.guard.poll_param_flush();
+        assert_eq!(
+            changes,
+            vec![(1, GUI_EDIT_AMPLITUDE)],
+            "the flush read-back should report the GUI edit"
+        );
+
+        // Take semantics: a second poll reports nothing new.
+        assert!(
+            instance.guard.poll_param_flush().is_empty(),
+            "flush requests are one-shot"
+        );
+    }
+
+    #[test]
+    fn param_flush_value_feeds_engine_bridge() {
+        let Some((mut instance, ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        let node = &mut instance.node;
+        let mut buffer = AudioBuffer::new(2, 128);
+        buffer.set_len(128);
+        buffer.clear();
+
+        // GUI edit read-back (protocol as above), then the read-back value
+        // takes the existing PluginParam bridge into the engine.
+        instance
+            .guard
+            .open_editor(FAKE_HWND, 1.0)
+            .expect("open should succeed");
+        instance
+            .guard
+            .hide_editor()
+            .expect("hide should succeed on an open editor");
+        for (id, value) in instance.guard.poll_param_flush() {
+            assert!(node.set_param(ParamId::PluginParam(id), value as f32));
+        }
+
+        assert!(node.note_event(NoteEvent::On {
+            note: 69,
+            velocity: 1.0
+        }));
+        node.process(&ctx, &mut buffer);
+        let peak = buffer
+            .channel(0)
+            .unwrap()
+            .iter()
+            .fold(0.0f32, |acc, s| acc.max(s.abs()));
+        assert!(
+            (peak - GUI_EDIT_AMPLITUDE as f32).abs() < 0.02,
+            "the read-back value should shape the output through the param \
+             bridge, expected ~{GUI_EDIT_AMPLITUDE}, got {peak}"
+        );
     }
 
     #[test]

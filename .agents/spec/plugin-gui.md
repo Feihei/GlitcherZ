@@ -103,10 +103,12 @@ pub struct PluginWindowHandle(platform_impl::NativeChild); // Windows: HWND 子�
 
 ## 5 G3 — 参数回接（CLAP）
 
-- `HostParamsImplShared::request_flush`（当前空实现）→ 置原子标志 `flush_requested`。
-- UI 帧驱动（`GlitcherZApp::ui` 尾部，50ms repaint 已保证节拍）：标志置位时调 `PluginParams::flush(None, out_queue)`（clack `params/host.rs:204` 已有包装，无需 raw）→ 解析 out 参数 → `set_node_param(node_id, ParamId::PluginParam(id))` 引擎下发 + `clap_voice_values` 滑块缓存同步（编辑器打开时才轮询，避免空转）。
-- 通道归属：flush 回读发生在 guard（有 `PluginInstance`），下发需要 node_id——`PluginGuardEntry` 已有，编辑器 open 时缓存 entry 的 `(node_id, track)` 到 GUI 状态。
-- 测试：test-plugin 假 gui 提供"内部改参数"测试钩子（调 host `request_flush`）→ 宿主轮询后断言引擎收到 `PluginParam` 事件 + 滑块缓存更新。
+- `HostParamsImplShared::request_flush`（原空实现）→ 置原子标志 `flush_requested`（`ParamsHostState`，与 `GuiHostState` 同模式）。
+- UI 帧驱动（`GlitcherZApp::ui` 尾部，50ms repaint 已保证节拍）：标志置位时调 params 扩展的 `flush`（空 in queue / 栈上 out queue）→ 解析 out 参数 → `set_node_param`/`send_track_param` 引擎下发 + `clap_voice_values` 滑块缓存同步（编辑器打开时才轮询，避免空转）。
+- **实施修正（2026-10-20）**：clack 的 `PluginParams::flush` 包装需 `InactivePluginMainThreadHandle`（实例已激活，拿不到）、`flush_active` 需 processor 的独占 handle（processor 已移交音频线程的 `ClapNode`）——两条包装路径在本宿主架构下都不可用，实际落地为 `raw::flush_params` vtable 直调（与 `enumerate_params` 同模式）。另有插件侧分发细节：clack wrapper 对**活跃**实例把 flush 回调分派给 audio-processor 实现（`PluginAudioProcessorParams::flush`），inactive 时才走 main-thread 版本——插件两侧实现都要写 out queue。
+- 通道归属：flush 回读发生在 guard（有 `PluginInstance`），下发需要 node_id——`PluginGuardEntry` 已有，编辑器 open 时缓存 entry 的 `(node_id, track)` 到 GUI 状态（G2 的 `PluginEditor` 已携带）。
+- 并发：flush 不过 StateGate（D7 同款裁决：[main-thread] 插件调用，`request_flush` 的标准宿主响应，插件的 GUI 与 process 并发安全保证同样覆盖 flush；过闸反而每帧打断音频）。
+- 测试：test-plugin 假 gui 的 `hide` 提供"内部改参数"测试钩子（改 amplitude + 置 dirty + 调 host `request_flush`）→ 宿主轮询后断言回读 `(1, 0.75)` + take 语义；回读值经 `ParamId::PluginParam` 桥下发后影响引擎输出。
 - 宿主滑块 → 插件 GUI：无额外协议（D10，CLAP 契约内建）。
 
 ## 6 G4 — Synth/Mixer 面板按选中节点重构（P5e 收口）

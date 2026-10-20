@@ -11,16 +11,19 @@
 //! The fake GUI never opens a real window: every gui extension call sets a
 //! bit in a call bitmask and (for destroy) a call counter, both readable by
 //! the host through read-only parameters (IDs 2/3) so protocol tests can
-//! assert exact call sequences from the host process. Two host-callback
+//! assert exact call sequences from the host process. Three host-callback
 //! paths are exercised: `set_parent` requests a resize, `show` requests a
-//! show, and a negative `set_scale` simulates the plugin losing its GUI
-//! (`closed(destroyed=true)` + failing call).
+//! show, and `hide` simulates an in-GUI parameter edit (the plugin changes
+//! its amplitude and calls `request_flush`, so the host's flush read-back
+//! can be verified). A negative `set_scale` simulates the plugin losing its
+//! GUI (`closed(destroyed=true)` + failing call).
 
 use std::ffi::CStr;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use clack_common::events::Match;
+use clack_common::events::Pckn;
 use clack_common::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
 use clack_common::stream::{InputStream, OutputStream};
 use clack_common::utils::Cookie;
@@ -28,8 +31,8 @@ use clack_extensions::gui::{
     GuiApiType, GuiConfiguration, GuiSize, HostGui, PluginGui, PluginGuiImpl, Window,
 };
 use clack_extensions::params::{
-    ParamDisplayWriter, ParamInfo, ParamInfoFlags, ParamInfoWriter, PluginAudioProcessorParams,
-    PluginMainThreadParams, PluginParams,
+    HostParams, ParamDisplayWriter, ParamInfo, ParamInfoFlags, ParamInfoWriter,
+    PluginAudioProcessorParams, PluginMainThreadParams, PluginParams,
 };
 use clack_extensions::state::{PluginState, PluginStateImpl};
 use clack_plugin::clack_export_entry;
@@ -71,15 +74,23 @@ pub const GUI_FAKE_REQUESTED_SIZE: GuiSize = GuiSize {
     width: 240,
     height: 160,
 };
+/// Amplitude the fake GUI "edit hook" sets (see `hide`): exercises the
+/// host's `request_flush` → `flush` read-back path.
+pub const GUI_EDIT_AMPLITUDE: f64 = 0.75;
 
 /// Plugin shared state (main thread + audio thread): amplitude, stored
-/// atomically as an f64 bit pattern, plus the gui call observation state.
+/// atomically as an f64 bit pattern, plus the gui call observation state
+/// and the pending-GUI-edit flag the flush read-back consumes.
 pub struct SineShared {
     amplitude_bits: AtomicU64,
     /// Bitmask of gui extension calls observed so far.
     gui_calls: AtomicU32,
     /// Number of gui destroy calls (idempotency checks).
     gui_destroy_count: AtomicU32,
+    /// Whether the GUI changed the amplitude since the last flush reported
+    /// it (the flush callback writes the pending edit into its out queue
+    /// and takes this flag).
+    gui_param_dirty: AtomicBool,
 }
 
 impl PluginShared<'_> for SineShared {}
@@ -93,6 +104,32 @@ impl SineShared {
         let clamped = value.clamp(0.0, 1.0);
         self.amplitude_bits
             .store(clamped.to_bits(), Ordering::Relaxed);
+    }
+
+    /// A GUI-side edit: moves the value and marks it pending for the next
+    /// flush (the host's `request_flush` → `flush` read-back path).
+    fn set_amplitude_from_gui(&self, value: f64) {
+        self.set_amplitude(value);
+        self.gui_param_dirty.store(true, Ordering::Relaxed);
+    }
+
+    fn take_gui_param_dirty(&self) -> bool {
+        self.gui_param_dirty.swap(false, Ordering::Relaxed)
+    }
+
+    /// Reports a pending GUI edit through a flush out queue (shared by the
+    /// main-thread and audio-processor flush implementations — the clack
+    /// wrapper dispatches to the audio one while the plugin is active).
+    fn report_pending_gui_edit(&self, out: &mut OutputEvents) {
+        if self.take_gui_param_dirty() {
+            out.try_push(ParamValueEvent::new(
+                0,
+                ClapId::new(AMPLITUDE_PARAM_ID),
+                Pckn::new(0u16, 0u16, 0u16, 0u32),
+                self.amplitude(),
+            ))
+            .ok();
+        }
     }
 
     fn mark_gui(&self, bit: u32) {
@@ -123,6 +160,12 @@ impl SineShared {
     fn report_host_closed(&self, host: &HostMainThreadHandle<'_>) {
         if let Some(gui) = host.shared().get_extension::<HostGui>() {
             gui.closed(&host.shared(), true);
+        }
+    }
+
+    fn request_host_flush(&self, host: &HostMainThreadHandle<'_>) {
+        if let Some(params) = host.shared().get_extension::<HostParams>() {
+            params.request_flush(&host.shared());
         }
     }
 }
@@ -223,11 +266,12 @@ impl<'a> PluginAudioProcessor<'a, SineShared, SineMainThread<'a>> for SineAudio<
 }
 
 impl PluginAudioProcessorParams for SineAudio<'_> {
-    /// Parameter sync while inactive: writes input events into shared state.
+    /// Parameter sync while inactive: writes input events into shared
+    /// state, and reports pending GUI edits through the out queue.
     fn flush(
         &mut self,
         input_parameter_changes: &InputEvents,
-        _output_parameter_changes: &mut OutputEvents,
+        output_parameter_changes: &mut OutputEvents,
     ) {
         for event in input_parameter_changes.iter() {
             if let Some(param) = event.as_event::<ParamValueEvent>() {
@@ -236,6 +280,8 @@ impl PluginAudioProcessorParams for SineAudio<'_> {
                 }
             }
         }
+        self.shared
+            .report_pending_gui_edit(output_parameter_changes);
     }
 }
 
@@ -315,7 +361,7 @@ impl PluginMainThreadParams for SineMainThread<'_> {
     fn flush(
         &self,
         input_parameter_changes: &InputEvents,
-        _output_parameter_changes: &mut OutputEvents,
+        output_parameter_changes: &mut OutputEvents,
     ) {
         for event in input_parameter_changes.iter() {
             if let Some(param) = event.as_event::<ParamValueEvent>() {
@@ -324,6 +370,11 @@ impl PluginMainThreadParams for SineMainThread<'_> {
                 }
             }
         }
+        // Report pending GUI edits: the host called flush in response to
+        // our request_flush, so hand the changed value back through the out
+        // queue (the read-back path real GUIs use).
+        self.shared
+            .report_pending_gui_edit(output_parameter_changes);
     }
 }
 
@@ -422,6 +473,12 @@ impl PluginGuiImpl for SineMainThread<'_> {
 
     fn hide(&self) -> Result<(), PluginError> {
         self.shared.mark_gui(GUI_CALL_HIDE);
+        // Test hook: simulates the user editing a parameter inside the GUI —
+        // the plugin changes the value on its main thread and asks the host
+        // to flush (the host then reads the change back via the params
+        // extension's flush callback).
+        self.shared.set_amplitude_from_gui(GUI_EDIT_AMPLITUDE);
+        self.shared.request_host_flush(&self.host);
         Ok(())
     }
 }
@@ -455,6 +512,7 @@ impl DefaultPluginFactory for SinePlugin {
             amplitude_bits: AtomicU64::new(AMPLITUDE_DEFAULT.to_bits()),
             gui_calls: AtomicU32::new(0),
             gui_destroy_count: AtomicU32::new(0),
+            gui_param_dirty: AtomicBool::new(false),
         })
     }
 
