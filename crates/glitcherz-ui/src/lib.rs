@@ -86,6 +86,17 @@ pub const TRACK_GAIN_RANGE: RangeInclusive<f32> = 0.0..=1.5;
 /// Track pan slider range.
 pub const PAN_RANGE: RangeInclusive<f32> = -1.0..=1.0;
 
+/// Short row label for one plugin inline control (G5): the node-body label
+/// column is narrow, so the display name is truncated to its first few
+/// characters; an empty name falls back to the parameter id.
+fn inline_plugin_label(name: &str, id: u32) -> String {
+    if name.is_empty() {
+        format!("p{id}")
+    } else {
+        name.chars().take(6).collect()
+    }
+}
+
 /// BPM adjustable range (f64 in the document: time computation convention).
 pub const BPM_RANGE: RangeInclusive<f64> = 20.0..=300.0;
 
@@ -137,6 +148,20 @@ fn param_id_of(param: &AutoParam) -> ParamId {
         AutoParam::TrackPan => ParamId::TrackPan,
         AutoParam::FilterCutoff => ParamId::FilterCutoff,
         AutoParam::PluginParam { param_id, .. } => ParamId::PluginParam(*param_id),
+    }
+}
+
+/// Built-in inline registry entry → engine parameter ID (G5 spec §7: the
+/// inline sliders address the same `set_node_param` entries as the panel
+/// sliders, so both edit paths stay interchangeable).
+fn inline_param_id(p: patch::InlineParam) -> ParamId {
+    match p {
+        patch::InlineParam::Cutoff => ParamId::FilterCutoff,
+        patch::InlineParam::Resonance => ParamId::FilterResonance,
+        patch::InlineParam::DelayTime => ParamId::DelayTime,
+        patch::InlineParam::DelayFeedback => ParamId::DelayFeedback,
+        patch::InlineParam::DelayMix => ParamId::DelayMix,
+        patch::InlineParam::MixerOutPan => ParamId::MixerOutPan,
     }
 }
 
@@ -1555,9 +1580,17 @@ impl GlitcherZApp {
                 patch_state,
                 clap_voice_params: clap,
                 voice_params: vst3,
+                clap_voice_values: clap_values,
+                vst3_voice_values: vst3_values,
                 ..
             } = self;
+            // Immutable reborrow aliases: two closures (auto_options /
+            // plugin_inline) capture the same tables simultaneously.
             let doc = &session.project().graph;
+            let clap = &*clap;
+            let vst3 = &*vst3;
+            let clap_values = &*clap_values;
+            let vst3_values = &*vst3_values;
             let options = move |node_id: u64| -> Vec<(String, AutoParam)> {
                 let mut v = Vec::new();
                 let Some(node) = doc.node_by_id(node_id) else {
@@ -1600,6 +1633,58 @@ impl GlitcherZApp {
                 }
                 v
             };
+            // Plugin-node inline controls (G5 spec §7): the first two
+            // enumerated parameters of the node's plugin voice. CLAP rows
+            // carry the raw plugin range, VST3 rows the normalized 0..1
+            // domain — the same split as the panel sliders, so inline edits
+            // stay interchangeable with panel edits.
+            let plugin_inline = move |node_id: u64| -> Vec<patch::InlinePluginControl> {
+                let voice = match doc.node_by_id(node_id) {
+                    Some(NodeDoc::Instrument { voice, .. } | NodeDoc::Effect { voice, .. }) => {
+                        Some(voice)
+                    }
+                    _ => None,
+                };
+                let mut v = Vec::new();
+                match voice {
+                    Some(VoiceSpec::Clap { .. }) => {
+                        if let Some(params) = clap.get(&node_id) {
+                            for p in params.iter().take(2) {
+                                v.push(patch::InlinePluginControl {
+                                    param_id: p.id,
+                                    label: inline_plugin_label(&p.name, p.id),
+                                    value: clap_values
+                                        .get(&node_id)
+                                        .and_then(|m| m.get(&p.id))
+                                        .copied()
+                                        .unwrap_or(p.default_value),
+                                    min: p.min_value,
+                                    max: p.max_value,
+                                });
+                            }
+                        }
+                    }
+                    Some(VoiceSpec::Vst3 { .. }) => {
+                        if let Some(params) = vst3.get(&node_id) {
+                            for p in params.iter().take(2) {
+                                v.push(patch::InlinePluginControl {
+                                    param_id: p.id,
+                                    label: inline_plugin_label(&p.title, p.id),
+                                    value: vst3_values
+                                        .get(&node_id)
+                                        .and_then(|m| m.get(&p.id))
+                                        .copied()
+                                        .unwrap_or(p.default_normalized),
+                                    min: 0.0,
+                                    max: 1.0,
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                v
+            };
             patch::show(
                 ui,
                 patch_state,
@@ -1608,6 +1693,7 @@ impl GlitcherZApp {
                     track_count,
                     auto_count,
                     auto_options: &options,
+                    plugin_inline: &plugin_inline,
                 },
             )
         };
@@ -1679,6 +1765,9 @@ impl GlitcherZApp {
                     if self.project().graph.node_by_id(doc_id).is_some() {
                         self.view = MainView::Synth;
                     }
+                }
+                patch::PatchAction::SetInlineParam { node, param, value } => {
+                    self.apply_inline_param(node, param, value);
                 }
             }
         }
@@ -4715,6 +4804,85 @@ impl GlitcherZApp {
         }
     }
 
+    /// Apply one inline parameter change from a node-body slider (G5 spec
+    /// §7): document write (undo-merged under the same gesture key as the
+    /// matching panel slider) + the non-rebuilding `set_node_param` path.
+    /// Plugin rows additionally update the session value cache so the panel
+    /// sliders and inline sliders read the same current value.
+    fn apply_inline_param(&mut self, node: u64, param: patch::InlineParamId, value: f32) {
+        match param {
+            patch::InlineParamId::BuiltIn(p) => match p {
+                patch::InlineParam::Cutoff => {
+                    let before = self.begin_param_edit();
+                    if let Some(s) = self.synth_mut_node(node) {
+                        s.cutoff_hz = value;
+                    }
+                    self.commit_param_edit("Filter Cutoff", before, "synth-cutoff");
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::Resonance => {
+                    let before = self.begin_param_edit();
+                    if let Some(s) = self.synth_mut_node(node) {
+                        s.resonance = value;
+                    }
+                    self.commit_param_edit("Filter Resonance", before, "synth-res");
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::DelayTime
+                | patch::InlineParam::DelayFeedback
+                | patch::InlineParam::DelayMix => {
+                    let before = self.begin_param_edit();
+                    if let Some(d) = self.delay_mut_node(node) {
+                        match p {
+                            patch::InlineParam::DelayTime => d.time_s = value,
+                            patch::InlineParam::DelayFeedback => d.feedback = value,
+                            patch::InlineParam::DelayMix => d.mix = value,
+                            _ => {}
+                        }
+                    }
+                    self.commit_param_edit("Delay Params", before, "delay-params");
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::MixerOutPan => {
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Mixer { out_pan, .. }) =
+                        self.project_mut().graph.node_by_id_mut(node)
+                    {
+                        *out_pan = value;
+                    }
+                    self.commit_param_edit("Mixer Out Pan", before, "mixer-out-pan");
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+            },
+            patch::InlineParamId::Plugin(id) => {
+                let is_clap = matches!(
+                    self.project().graph.node_by_id(node),
+                    Some(
+                        NodeDoc::Instrument {
+                            voice: VoiceSpec::Clap { .. },
+                            ..
+                        } | NodeDoc::Effect {
+                            voice: VoiceSpec::Clap { .. },
+                            ..
+                        },
+                    )
+                );
+                if is_clap {
+                    self.clap_voice_values
+                        .entry(node)
+                        .or_default()
+                        .insert(id, value as f64);
+                } else {
+                    self.vst3_voice_values
+                        .entry(node)
+                        .or_default()
+                        .insert(id, value as f64);
+                }
+                self.send_node_param(node, ParamId::PluginParam(id), value);
+            }
+        }
+    }
+
     /// Mixer console (P5f D15/D21, stage-console metaphor): one column per
     /// mixer channel — solo / mute / level meter / fader / pan — plus channel
     /// add/remove buttons (2..=32, D21) and the output pan/mute stage. The
@@ -6310,5 +6478,49 @@ mod panel_target_tests {
         // Selection order is irrelevant: document order decides.
         assert_eq!(resolve_panel_target(doc, &[delay1, t0], 0), Some(t0));
         assert_eq!(resolve_panel_target(doc, &[t0, delay1], 0), Some(t0));
+    }
+}
+#[cfg(test)]
+mod inline_param_tests {
+    use super::*;
+
+    /// G5: every registry entry maps to the engine parameter the matching
+    /// panel slider uses (inline and panel edits address the same
+    /// `set_node_param` entry, so both paths stay interchangeable).
+    #[test]
+    fn inline_params_map_to_panel_param_ids() {
+        assert_eq!(
+            inline_param_id(patch::InlineParam::Cutoff),
+            ParamId::FilterCutoff
+        );
+        assert_eq!(
+            inline_param_id(patch::InlineParam::Resonance),
+            ParamId::FilterResonance
+        );
+        assert_eq!(
+            inline_param_id(patch::InlineParam::DelayTime),
+            ParamId::DelayTime
+        );
+        assert_eq!(
+            inline_param_id(patch::InlineParam::DelayFeedback),
+            ParamId::DelayFeedback
+        );
+        assert_eq!(
+            inline_param_id(patch::InlineParam::DelayMix),
+            ParamId::DelayMix
+        );
+        assert_eq!(
+            inline_param_id(patch::InlineParam::MixerOutPan),
+            ParamId::MixerOutPan
+        );
+        // Plugin rows bridge through the same PluginParam entry as the panel
+        // and automation paths.
+        assert_eq!(
+            param_id_of(&AutoParam::PluginParam {
+                param_id: 7,
+                name: String::new()
+            }),
+            ParamId::PluginParam(7)
+        );
     }
 }

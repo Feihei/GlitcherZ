@@ -20,6 +20,149 @@ use glitcherz_model::{
     AutoParam, CableDoc, CableKind, GraphDoc, LayoutDoc, NodeDoc, PortRef, VoiceSpec,
 };
 
+/// Inline parameter identity for built-in node kinds (G5, spec
+/// `plugin-gui.md` §7): one small slider row under the node body. The
+/// `ParamId` translation lives in the app glue (the patch stays
+/// engine-agnostic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineParam {
+    /// Built-in synth filter cutoff (Hz).
+    Cutoff,
+    /// Built-in synth filter resonance.
+    Resonance,
+    /// Built-in delay time (seconds).
+    DelayTime,
+    /// Built-in delay feedback.
+    DelayFeedback,
+    /// Built-in delay wet mix.
+    DelayMix,
+    /// Mixer output-stage pan.
+    MixerOutPan,
+}
+
+/// Inline parameter addressing: built-in registry entry or an external
+/// plugin parameter id.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InlineParamId {
+    BuiltIn(InlineParam),
+    Plugin(u32),
+}
+
+/// Static registry entry: label + document read/write accessor key.
+#[derive(Debug, Clone, Copy)]
+struct InlineParamSpec {
+    param: InlineParam,
+    label: &'static str,
+}
+
+/// Built-in synth inline rows (cutoff / resonance).
+const SYNTH_INLINE: [InlineParamSpec; 2] = [
+    InlineParamSpec {
+        param: InlineParam::Cutoff,
+        label: "cut",
+    },
+    InlineParamSpec {
+        param: InlineParam::Resonance,
+        label: "res",
+    },
+];
+
+/// Built-in delay inline rows (time / feedback / mix).
+const DELAY_INLINE: [InlineParamSpec; 3] = [
+    InlineParamSpec {
+        param: InlineParam::DelayTime,
+        label: "time",
+    },
+    InlineParamSpec {
+        param: InlineParam::DelayFeedback,
+        label: "fdbk",
+    },
+    InlineParamSpec {
+        param: InlineParam::DelayMix,
+        label: "mix",
+    },
+];
+
+/// Mixer inline row (output-stage pan; channel parameters stay on the
+/// mixer console — spec §7).
+const MIXER_INLINE: [InlineParamSpec; 1] = [InlineParamSpec {
+    param: InlineParam::MixerOutPan,
+    label: "pan",
+}];
+
+/// Static inline-parameter registry for one node (G5 spec §7). SoundFont
+/// instruments expose none (the preset picker is the primary operation);
+/// plugin nodes take their rows from the session enumeration instead
+/// (first 2 parameters — see [`PatchDeps::plugin_inline`]).
+fn inline_params_of(node: &NodeDoc) -> &'static [InlineParamSpec] {
+    match node {
+        NodeDoc::Instrument {
+            voice: VoiceSpec::Builtin,
+            ..
+        } => &SYNTH_INLINE,
+        NodeDoc::Effect {
+            voice: VoiceSpec::Builtin | VoiceSpec::SoundFont { .. },
+            ..
+        } => &DELAY_INLINE,
+        NodeDoc::Mixer { .. } => &MIXER_INLINE,
+        _ => &[],
+    }
+}
+
+/// One external plugin inline control (G5): the first enumerated
+/// parameters of a plugin node, with the session's current value and
+/// range. CLAP carries raw plugin ranges; VST3 normalized 0..1 (the same
+/// domain split as the panel sliders).
+#[derive(Debug, Clone)]
+pub struct InlinePluginControl {
+    /// Plugin-side parameter id.
+    pub param_id: u32,
+    /// Short row label.
+    pub label: String,
+    /// Current value (session cache or plugin default).
+    pub value: f64,
+    /// Slider range minimum.
+    pub min: f64,
+    /// Slider range maximum.
+    pub max: f64,
+}
+
+/// Current document value + slider range of one built-in inline
+/// parameter (G5): reads the node's own fields (the ranges mirror the
+/// panel sliders — one source of slider geometry per parameter).
+fn inline_doc_value(node: &NodeDoc, param: InlineParam) -> (f64, f64, f64) {
+    use crate::{CUTOFF_RANGE, DELAY_FB_RANGE, DELAY_MIX_RANGE, DELAY_TIME_RANGE, RES_RANGE};
+    match (node, param) {
+        (NodeDoc::Instrument { synth, .. }, InlineParam::Cutoff) => (
+            synth.cutoff_hz as f64,
+            *CUTOFF_RANGE.start() as f64,
+            *CUTOFF_RANGE.end() as f64,
+        ),
+        (NodeDoc::Instrument { synth, .. }, InlineParam::Resonance) => (
+            synth.resonance as f64,
+            *RES_RANGE.start() as f64,
+            *RES_RANGE.end() as f64,
+        ),
+        (NodeDoc::Effect { delay, .. }, InlineParam::DelayTime) => (
+            delay.time_s as f64,
+            *DELAY_TIME_RANGE.start() as f64,
+            *DELAY_TIME_RANGE.end() as f64,
+        ),
+        (NodeDoc::Effect { delay, .. }, InlineParam::DelayFeedback) => (
+            delay.feedback as f64,
+            *DELAY_FB_RANGE.start() as f64,
+            *DELAY_FB_RANGE.end() as f64,
+        ),
+        (NodeDoc::Effect { delay, .. }, InlineParam::DelayMix) => (
+            delay.mix as f64,
+            *DELAY_MIX_RANGE.start() as f64,
+            *DELAY_MIX_RANGE.end() as f64,
+        ),
+        (NodeDoc::Mixer { out_pan, .. }, InlineParam::MixerOutPan) => (*out_pan as f64, -1.0, 1.0),
+        _ => (0.0, 0.0, 1.0),
+    }
+}
+
 /// Patch entity identity: document nodes + fixed entities (master output /
 /// the arrangement timeline).
 ///
@@ -91,6 +234,14 @@ pub enum PatchAction {
     /// node as the editing target (spec `plugin-gui.md` §6 — the patch
     /// analogue of double-clicking a timeline clip to open the Edit view).
     OpenNode(u64),
+    /// Inline parameter slider changed on a node body (G5 spec §7): the
+    /// value is delivered through the non-rebuilding `set_node_param`
+    /// path by the glue.
+    SetInlineParam {
+        node: u64,
+        param: InlineParamId,
+        value: f32,
+    },
 }
 
 /// Snapshot of external data the patch depends on (immutable borrows to avoid borrow conflicts).
@@ -103,6 +254,10 @@ pub struct PatchDeps<'a> {
     pub auto_count: usize,
     /// Given a document node id, return automatable parameter options `(label, parameter)`.
     pub auto_options: &'a dyn Fn(u64) -> Vec<(String, AutoParam)>,
+    /// Given a document node id, return its external-plugin inline
+    /// controls (first enumerated parameters, G5 spec §7). Empty for
+    /// built-in nodes — their rows come from the static registry.
+    pub plugin_inline: &'a dyn Fn(u64) -> Vec<InlinePluginControl>,
 }
 
 /// Cable being dragged (source = the entity + output port owning the drag).
@@ -206,6 +361,13 @@ const NODE_SIZE: Vec2 = Vec2::new(150.0, 64.0);
 const NODE_HEIGHT_MIN: f32 = 64.0;
 /// Vertical spacing between mixer input ports (P5f: one port per channel).
 const PORT_SPACING: f32 = 30.0;
+/// Inline parameter row height (graph space; G5 — the node body grows
+/// downward by `rows * INLINE_ROW_HEIGHT`).
+const INLINE_ROW_HEIGHT: f32 = 16.0;
+/// Left/right inset of the inline slider rows inside the node box.
+const INLINE_INSET: f32 = 8.0;
+/// Width reserved for the inline row label (graph space).
+const INLINE_LABEL_WIDTH: f32 = 34.0;
 /// Timeline box size per output port row (width fixed, height scales).
 const TIMELINE_WIDTH: f32 = 150.0;
 const TIMELINE_ROW_HEIGHT: f32 = 26.0;
@@ -279,12 +441,36 @@ fn cable_color(kind: CableKind) -> Color32 {
     }
 }
 
+/// Inline row count of one entity (G5): static registry length for
+/// built-in nodes, the session plugin enumeration length for plugin
+/// nodes, 0 for fixed entities.
+fn inline_row_count(id: PatchId, deps: &PatchDeps) -> usize {
+    let PatchId::Node(node_id) = id else {
+        return 0;
+    };
+    let Some(node) = deps.doc.node_by_id(node_id) else {
+        return 0;
+    };
+    match node {
+        NodeDoc::Instrument {
+            voice: VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. },
+            ..
+        }
+        | NodeDoc::Effect {
+            voice: VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. },
+            ..
+        } => (deps.plugin_inline)(node_id).len(),
+        _ => inline_params_of(node).len(),
+    }
+}
+
 /// Entity box size. Mixer boxes scale with the channel (input port) count so
-/// every channel gets its own input port dot on the left edge.
-fn size_of(id: PatchId, midi_count: usize, auto_count: usize, doc: &GraphDoc) -> Vec2 {
-    match id {
-        PatchId::Timeline => timeline_size(midi_count, auto_count),
-        PatchId::Node(node_id) => match doc.node_by_id(node_id) {
+/// every channel gets its own input port dot on the left edge; every node
+/// grows downward by its inline parameter rows (G5).
+fn size_of(id: PatchId, deps: &PatchDeps) -> Vec2 {
+    let base = match id {
+        PatchId::Timeline => timeline_size(deps.track_count, deps.auto_count),
+        PatchId::Node(node_id) => match deps.doc.node_by_id(node_id) {
             Some(NodeDoc::Mixer { inputs, .. }) => Vec2::new(
                 NODE_SIZE.x,
                 (NODE_HEIGHT_MIN).max(*inputs as f32 * PORT_SPACING + 20.0),
@@ -292,7 +478,11 @@ fn size_of(id: PatchId, midi_count: usize, auto_count: usize, doc: &GraphDoc) ->
             _ => NODE_SIZE,
         },
         _ => NODE_SIZE,
-    }
+    };
+    Vec2::new(
+        base.x,
+        base.y + inline_row_count(id, deps) as f32 * INLINE_ROW_HEIGHT,
+    )
 }
 
 /// Entity label.
@@ -373,20 +563,13 @@ impl PatchState {
 
     /// Entity screen rect (returns `None` when no position exists).
     ///
-    /// Single source of truth for entity geometry: box size is scaled by the
-    /// zoom factor here so drawing, ports and ALL hit tests stay in sync.
-    fn screen_rect(
-        &self,
-        rect_min: Pos2,
-        id: PatchId,
-        midi_count: usize,
-        auto_count: usize,
-        doc: &GraphDoc,
-    ) -> Option<Rect> {
+    /// Single source of truth for entity geometry: box size is scaled by
+    /// the zoom factor here so drawing, ports and ALL hit tests stay in sync.
+    fn screen_rect(&self, rect_min: Pos2, id: PatchId, deps: &PatchDeps) -> Option<Rect> {
         let p = *self.positions.get(&id)?;
         Some(Rect::from_min_size(
             self.to_screen(rect_min, p),
-            size_of(id, midi_count, auto_count, doc) * self.zoom,
+            size_of(id, deps) * self.zoom,
         ))
     }
 
@@ -397,17 +580,15 @@ impl PatchState {
         &self,
         rect_min: Pos2,
         id: PatchId,
-        midi_count: usize,
-        auto_count: usize,
-        doc: &GraphDoc,
+        deps: &PatchDeps,
     ) -> Vec<(usize, Pos2)> {
-        let Some(r) = self.screen_rect(rect_min, id, midi_count, auto_count, doc) else {
+        let Some(r) = self.screen_rect(rect_min, id, deps) else {
             return Vec::new();
         };
         match id {
             PatchId::Master => Vec::new(),
             PatchId::Timeline => {
-                let n = timeline_port_count(midi_count, auto_count);
+                let n = timeline_port_count(deps.track_count, deps.auto_count);
                 (0..n)
                     .map(|i| {
                         let y = r.top() + (i as f32 + 0.5) * (r.height() / n.max(1) as f32);
@@ -423,21 +604,14 @@ impl PatchState {
     /// (P5f D17: a mixer exposes one port per channel spread along its left
     /// edge; other nodes/master have the single port 0; the timeline has none
     /// — it is a pure source, D14/T4).
-    fn in_ports_screen(
-        &self,
-        rect_min: Pos2,
-        id: PatchId,
-        midi_count: usize,
-        auto_count: usize,
-        doc: &GraphDoc,
-    ) -> Vec<(u8, Pos2)> {
-        let Some(r) = self.screen_rect(rect_min, id, midi_count, auto_count, doc) else {
+    fn in_ports_screen(&self, rect_min: Pos2, id: PatchId, deps: &PatchDeps) -> Vec<(u8, Pos2)> {
+        let Some(r) = self.screen_rect(rect_min, id, deps) else {
             return Vec::new();
         };
         let n = match id {
             PatchId::Timeline => return Vec::new(),
             PatchId::Master => 1,
-            PatchId::Node(node_id) => match doc.node_by_id(node_id) {
+            PatchId::Node(node_id) => match deps.doc.node_by_id(node_id) {
                 Some(node) if node.is_mixer() => {
                     if let NodeDoc::Mixer { inputs, .. } = node {
                         *inputs as usize
@@ -548,16 +722,9 @@ impl PatchState {
     }
 
     /// Hit-test an output port (screen distance) → `(entity, port index)`.
-    fn hit_out_port(
-        &self,
-        rect_min: Pos2,
-        sp: Pos2,
-        midi_count: usize,
-        auto_count: usize,
-        doc: &GraphDoc,
-    ) -> Option<(PatchId, usize)> {
+    fn hit_out_port(&self, rect_min: Pos2, sp: Pos2, deps: &PatchDeps) -> Option<(PatchId, usize)> {
         for &id in self.positions.keys() {
-            for (port, p) in self.out_ports_screen(rect_min, id, midi_count, auto_count, doc) {
+            for (port, p) in self.out_ports_screen(rect_min, id, deps) {
                 if p.distance(sp) <= PORT_HIT_RADIUS {
                     return Some((id, port));
                 }
@@ -568,16 +735,9 @@ impl PatchState {
 
     /// Hit-test an input port (screen distance) → `(entity, channel index)`.
     /// Used for mixer-channel-targeted cable drops (D17).
-    fn hit_in_port(
-        &self,
-        rect_min: Pos2,
-        sp: Pos2,
-        midi_count: usize,
-        auto_count: usize,
-        doc: &GraphDoc,
-    ) -> Option<(PatchId, u8)> {
+    fn hit_in_port(&self, rect_min: Pos2, sp: Pos2, deps: &PatchDeps) -> Option<(PatchId, u8)> {
         for &id in self.positions.keys() {
-            for (port, p) in self.in_ports_screen(rect_min, id, midi_count, auto_count, doc) {
+            for (port, p) in self.in_ports_screen(rect_min, id, deps) {
                 if p.distance(sp) <= PORT_HIT_RADIUS {
                     return Some((id, port));
                 }
@@ -587,16 +747,9 @@ impl PatchState {
     }
 
     /// Hit-test an entity box.
-    fn hit_node(
-        &self,
-        rect_min: Pos2,
-        sp: Pos2,
-        midi_count: usize,
-        auto_count: usize,
-        doc: &GraphDoc,
-    ) -> Option<PatchId> {
+    fn hit_node(&self, rect_min: Pos2, sp: Pos2, deps: &PatchDeps) -> Option<PatchId> {
         for &id in self.positions.keys() {
-            if let Some(r) = self.screen_rect(rect_min, id, midi_count, auto_count, doc) {
+            if let Some(r) = self.screen_rect(rect_min, id, deps) {
                 if r.contains(sp) {
                     return Some(id);
                 }
@@ -606,19 +759,12 @@ impl PatchState {
     }
 
     /// All entities whose screen rect intersects the marquee (box selection).
-    fn nodes_in_rect(
-        &self,
-        rect_min: Pos2,
-        marquee: Rect,
-        midi_count: usize,
-        auto_count: usize,
-        doc: &GraphDoc,
-    ) -> Vec<PatchId> {
+    fn nodes_in_rect(&self, rect_min: Pos2, marquee: Rect, deps: &PatchDeps) -> Vec<PatchId> {
         self.positions
             .keys()
             .copied()
             .filter(|&id| {
-                self.screen_rect(rect_min, id, midi_count, auto_count, doc)
+                self.screen_rect(rect_min, id, deps)
                     .is_some_and(|r| r.intersects(marquee))
             })
             .collect()
@@ -632,19 +778,17 @@ impl PatchState {
         &self,
         rect_min: Pos2,
         cable: &CableDoc,
-        midi_count: usize,
-        auto_count: usize,
-        doc: &GraphDoc,
+        deps: &PatchDeps,
     ) -> Option<[Pos2; 4]> {
-        let (from, from_port) = patch_port_from(&cable.from, midi_count)?;
+        let (from, from_port) = patch_port_from(&cable.from, deps.track_count)?;
         let to = patch_port_to(&cable.to)?;
         let p0 = self
-            .out_ports_screen(rect_min, from, midi_count, auto_count, doc)
+            .out_ports_screen(rect_min, from, deps)
             .into_iter()
             .find(|(k, _)| *k == from_port)?
             .1;
         let p3 = self
-            .in_ports_screen(rect_min, to, midi_count, auto_count, doc)
+            .in_ports_screen(rect_min, to, deps)
             .into_iter()
             .find(|(k, _)| *k == cable.in_port)?
             .1;
@@ -652,16 +796,9 @@ impl PatchState {
     }
 
     /// Hit-test a cable (returns the index into the document cable table).
-    fn hit_cable(
-        &self,
-        rect_min: Pos2,
-        sp: Pos2,
-        doc: &GraphDoc,
-        midi_count: usize,
-        auto_count: usize,
-    ) -> Option<usize> {
-        for (i, cable) in doc.cables.iter().enumerate() {
-            let Some(c) = self.cable_controls(rect_min, cable, midi_count, auto_count, doc) else {
+    fn hit_cable(&self, rect_min: Pos2, sp: Pos2, deps: &PatchDeps) -> Option<usize> {
+        for (i, cable) in deps.doc.cables.iter().enumerate() {
+            let Some(c) = self.cable_controls(rect_min, cable, deps) else {
                 continue;
             };
             for pt in bezier_points(c, 24) {
@@ -674,16 +811,9 @@ impl PatchState {
     }
 
     /// Hit-test a cable midpoint control dot (returns the cable index).
-    fn hit_cable_midpoint(
-        &self,
-        rect_min: Pos2,
-        sp: Pos2,
-        doc: &GraphDoc,
-        midi_count: usize,
-        auto_count: usize,
-    ) -> Option<usize> {
-        for (i, cable) in doc.cables.iter().enumerate() {
-            let Some(c) = self.cable_controls(rect_min, cable, midi_count, auto_count, doc) else {
+    fn hit_cable_midpoint(&self, rect_min: Pos2, sp: Pos2, deps: &PatchDeps) -> Option<usize> {
+        for (i, cable) in deps.doc.cables.iter().enumerate() {
+            let Some(c) = self.cable_controls(rect_min, cable, deps) else {
                 continue;
             };
             if bezier_points(c, 24)[12].distance(sp) <= MIDPOINT_HIT_RADIUS {
@@ -695,20 +825,13 @@ impl PatchState {
 
     /// All cables whose sampled curve passes within [`CUT_HIT_DIST`] of the
     /// screen-space pointer path (Blender-style knife hit test).
-    fn cables_crossing_path(
-        &self,
-        rect_min: Pos2,
-        path: &[Pos2],
-        doc: &GraphDoc,
-        midi_count: usize,
-        auto_count: usize,
-    ) -> Vec<usize> {
+    fn cables_crossing_path(&self, rect_min: Pos2, path: &[Pos2], deps: &PatchDeps) -> Vec<usize> {
         let mut hits = Vec::new();
         if path.len() < 2 {
             return hits;
         }
-        for (i, cable) in doc.cables.iter().enumerate() {
-            let Some(c) = self.cable_controls(rect_min, cable, midi_count, auto_count, doc) else {
+        for (i, cable) in deps.doc.cables.iter().enumerate() {
+            let Some(c) = self.cable_controls(rect_min, cable, deps) else {
                 continue;
             };
             'cable: for pt in bezier_points(c, 32) {
@@ -733,12 +856,10 @@ impl PatchState {
         &mut self,
         rect_min: Pos2,
         sp: Pos2,
-        doc: &GraphDoc,
-        midi_count: usize,
-        auto_count: usize,
+        deps: &PatchDeps,
         shift: bool,
     ) -> Option<PatchId> {
-        if let Some(id) = self.hit_node(rect_min, sp, midi_count, auto_count, doc) {
+        if let Some(id) = self.hit_node(rect_min, sp, deps) {
             if shift {
                 self.selection.toggle_node(id);
             } else if !self.selection.contains_node(id) {
@@ -748,7 +869,7 @@ impl PatchState {
                 };
             }
             Some(id)
-        } else if let Some(i) = self.hit_cable_midpoint(rect_min, sp, doc, midi_count, auto_count) {
+        } else if let Some(i) = self.hit_cable_midpoint(rect_min, sp, deps) {
             // Click on a cable's midpoint control dot: open the insert/delete menu.
             let graph_at = Pos2::new(
                 self.pan.x + (sp.x - rect_min.x) / self.zoom,
@@ -756,7 +877,7 @@ impl PatchState {
             );
             self.pending_cable_menu = Some((i, sp + Vec2::new(4.0, 4.0), graph_at, u64::MAX));
             None
-        } else if let Some(i) = self.hit_cable(rect_min, sp, doc, midi_count, auto_count) {
+        } else if let Some(i) = self.hit_cable(rect_min, sp, deps) {
             if shift {
                 self.selection.toggle_cable(i);
             } else {
@@ -936,19 +1057,18 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     let ctrl = ui.ctx().input(|i| i.modifiers.ctrl);
 
     // Shorthands for the port geometry (the timeline box grows with tracks).
-    let (midi_count, auto_count) = (deps.track_count, deps.auto_count);
+    let midi_count = deps.track_count;
 
     // ---- Press: hit-test and enter the matching drag ----
     // egui 0.36 (click+drag sense) only starts a drag after the pointer moves
     // decisively; in-place presses are handled by the `clicked` path below.
     if drag_started {
         let sp = pointer.unwrap_or(rect.min);
-        if let Some((source, port)) = state.hit_out_port(rect.min, sp, midi_count, auto_count, doc)
-        {
+        if let Some((source, port)) = state.hit_out_port(rect.min, sp, &deps) {
             state.selection = Selection::default();
             state.drag = Some(DragKind::Cable(CableDrag { from: source, port }));
-        } else if let Some(id) = state.hit_node(rect.min, sp, midi_count, auto_count, doc) {
-            let picked = state.point_select(rect.min, sp, doc, midi_count, auto_count, shift);
+        } else if let Some(id) = state.hit_node(rect.min, sp, &deps) {
+            let picked = state.point_select(rect.min, sp, &deps, shift);
             if !shift && let Some(track) = track_of_node(picked, doc) {
                 actions.push(PatchAction::SelectTrack(track));
             }
@@ -971,7 +1091,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     if response.clicked()
         && let Some(sp) = pointer
     {
-        let picked = state.point_select(rect.min, sp, doc, midi_count, auto_count, shift);
+        let picked = state.point_select(rect.min, sp, &deps, shift);
         if !shift && let Some(track) = track_of_node(picked, doc) {
             actions.push(PatchAction::SelectTrack(track));
         }
@@ -981,8 +1101,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     // (Fixed entities — timeline / master — have no panel of their own.)
     if response.double_clicked()
         && let Some(sp) = pointer
-        && let Some(PatchId::Node(doc_id)) =
-            state.hit_node(rect.min, sp, midi_count, auto_count, doc)
+        && let Some(PatchId::Node(doc_id)) = state.hit_node(rect.min, sp, &deps)
     {
         actions.push(PatchAction::OpenNode(doc_id));
     }
@@ -1044,7 +1163,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         if let Some(path) = state.cut_path.take()
             && path.len() >= 2
         {
-            let mut cuts = state.cables_crossing_path(rect.min, &path, doc, midi_count, auto_count);
+            let mut cuts = state.cables_crossing_path(rect.min, &path, &deps);
             cuts.sort_unstable();
             cuts.dedup();
             // Descending index order: each removal shifts later document indices.
@@ -1083,7 +1202,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         match state.drag.take() {
             Some(DragKind::Cable(drag)) => {
                 if let Some(sp) = pointer
-                    && let Some(target) = state.hit_node(rect.min, sp, midi_count, auto_count, doc)
+                    && let Some(target) = state.hit_node(rect.min, sp, &deps)
                 {
                     match drag.from {
                         // Timeline port: MIDI tracks first, then control tracks
@@ -1128,9 +1247,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                                     PatchId::Node(to_doc)
                                         if doc.node_by_id(to_doc).is_some_and(|n| n.is_mixer()) =>
                                     {
-                                        match state
-                                            .hit_in_port(rect.min, sp, midi_count, auto_count, doc)
-                                        {
+                                        match state.hit_in_port(rect.min, sp, &deps) {
                                             Some((PatchId::Node(_), port)) => Some(port),
                                             _ => doc.first_free_channel(to_doc),
                                         }
@@ -1153,7 +1270,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             Some(DragKind::BoxSelect { start, add }) => {
                 if let Some(sp) = pointer {
                     let marquee = Rect::from_two_pos(start, sp);
-                    let hits = state.nodes_in_rect(rect.min, marquee, midi_count, auto_count, doc);
+                    let hits = state.nodes_in_rect(rect.min, marquee, &deps);
                     if add {
                         for id in hits {
                             if !state.selection.contains_node(id) {
@@ -1174,7 +1291,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
 
     // ---- Draw cables (beneath nodes) ----
     for (i, cable) in doc.cables.iter().enumerate() {
-        let Some(bez) = state.cable_controls(rect.min, cable, midi_count, auto_count, doc) else {
+        let Some(bez) = state.cable_controls(rect.min, cable, &deps) else {
             continue;
         };
         let selected = state.selection.cables.contains(&i);
@@ -1218,10 +1335,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     if let Some(path) = &state.cut_path
         && path.len() >= 2
     {
-        for i in state.cables_crossing_path(rect.min, path, doc, midi_count, auto_count) {
-            if let Some(bez) =
-                state.cable_controls(rect.min, &doc.cables[i], midi_count, auto_count, doc)
-            {
+        for i in state.cables_crossing_path(rect.min, path, &deps) {
+            if let Some(bez) = state.cable_controls(rect.min, &doc.cables[i], &deps) {
                 painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
                     bez,
                     false,
@@ -1251,7 +1366,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         };
         if let Some(sp) = pointer {
             let p0 = state
-                .out_ports_screen(rect.min, drag.from, midi_count, auto_count, doc)
+                .out_ports_screen(rect.min, drag.from, &deps)
                 .into_iter()
                 .find(|(k, _)| *k == drag.port)
                 .map(|(_, p)| p);
@@ -1263,11 +1378,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     egui::Stroke::new(2.0, cable_color(kind).gamma_multiply(0.7)),
                 ));
                 // Highlight the hovered target.
-                if let Some(target) = state.hit_node(rect.min, sp, midi_count, auto_count, doc) {
+                if let Some(target) = state.hit_node(rect.min, sp, &deps) {
                     if accepts(kind, target, doc) && drag.from != target {
-                        if let Some(r) =
-                            state.screen_rect(rect.min, target, midi_count, auto_count, doc)
-                        {
+                        if let Some(r) = state.screen_rect(rect.min, target, &deps) {
                             painter.rect_stroke(
                                 r,
                                 4.0,
@@ -1283,7 +1396,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
 
     // ---- Draw nodes ----
     for &id in state.positions.keys() {
-        let Some(r) = state.screen_rect(rect.min, id, midi_count, auto_count, doc) else {
+        let Some(r) = state.screen_rect(rect.min, id, &deps) else {
             continue;
         };
         if !r.intersects(rect) {
@@ -1313,7 +1426,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         );
 
         // Output ports (the timeline draws one per track with a small label).
-        for (port, p) in state.out_ports_screen(rect.min, id, midi_count, auto_count, doc) {
+        for (port, p) in state.out_ports_screen(rect.min, id, &deps) {
             let port_color = match id {
                 PatchId::Timeline if port < midi_count => cable_color(CableKind::Midi),
                 PatchId::Timeline => cable_color(CableKind::Automation),
@@ -1338,9 +1451,95 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         }
         // Input ports: mixers draw one per channel (P5f D17), other nodes /
         // master the single port 0.
-        for (_, p) in state.in_ports_screen(rect.min, id, midi_count, auto_count, doc) {
+        for (_, p) in state.in_ports_screen(rect.min, id, &deps) {
             painter.circle_filled(p, PORT_RADIUS, Color32::from_gray(90));
             painter.circle_stroke(p, PORT_RADIUS, egui::Stroke::new(1.0, Color32::BLACK));
+        }
+    }
+
+    // ---- Inline parameter sliders (G5 spec §7) ----
+    // Real widgets placed over the bottom row strip of each node box (the
+    // height formula in `size_of` reserves it). Being later in the layer,
+    // they sit above the painted nodes and win the pointer from the patch
+    // backdrop — dragging a slider adjusts the parameter instead of moving
+    // the node. Values are read-only snapshots; edits leave as actions.
+    for &id in state.positions.keys() {
+        let PatchId::Node(doc_id) = id else {
+            continue;
+        };
+        let Some(node) = doc.node_by_id(doc_id) else {
+            continue;
+        };
+        let rows: Vec<(String, InlineParamId, f64, f64, f64)> = match node {
+            NodeDoc::Instrument {
+                voice: VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. },
+                ..
+            }
+            | NodeDoc::Effect {
+                voice: VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. },
+                ..
+            } => (deps.plugin_inline)(doc_id)
+                .into_iter()
+                .map(|c| {
+                    (
+                        c.label,
+                        InlineParamId::Plugin(c.param_id),
+                        c.value,
+                        c.min,
+                        c.max,
+                    )
+                })
+                .collect(),
+            _ => inline_params_of(node)
+                .iter()
+                .map(|spec| {
+                    let (value, min, max) = inline_doc_value(node, spec.param);
+                    (
+                        spec.label.to_string(),
+                        InlineParamId::BuiltIn(spec.param),
+                        value,
+                        min,
+                        max,
+                    )
+                })
+                .collect(),
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        let Some(r) = state.screen_rect(rect.min, id, &deps) else {
+            continue;
+        };
+        if !r.intersects(rect) {
+            continue;
+        }
+        let row_h = INLINE_ROW_HEIGHT * state.zoom;
+        let n = rows.len();
+        for (i, (label, param, mut value, min, max)) in rows.into_iter().enumerate() {
+            let top = r.bottom() - (n - i) as f32 * row_h;
+            painter.text(
+                Pos2::new(r.left() + INLINE_INSET * state.zoom, top + row_h * 0.5),
+                egui::Align2::LEFT_CENTER,
+                &label,
+                FontId::proportional((9.0 * state.zoom).max(5.0)),
+                Color32::from_gray(190),
+            );
+            let slider_rect = Rect::from_min_max(
+                Pos2::new(
+                    r.left() + (INLINE_INSET + INLINE_LABEL_WIDTH) * state.zoom,
+                    top + 1.0,
+                ),
+                Pos2::new(r.right() - INLINE_INSET * state.zoom, top + row_h - 2.0),
+            );
+            let slider = egui::Slider::new(&mut value, min..=max).show_value(true);
+            let resp = ui.put(slider_rect, slider);
+            if resp.changed() {
+                actions.push(PatchAction::SetInlineParam {
+                    node: doc_id,
+                    param,
+                    value: value as f32,
+                });
+            }
         }
     }
 
@@ -1594,25 +1793,254 @@ mod tests {
             .push(CableDoc::audio(mixer, PortRef::Master));
         let idx = project.graph.cables.len() - 1;
         let doc = &project.graph;
-        let (midi, auto) = (project.midi_tracks.len(), project.control_tracks.len());
+        let deps = PatchDeps {
+            doc,
+            track_count: project.midi_tracks.len(),
+            auto_count: project.control_tracks.len(),
+            auto_options: &|_| Vec::new(),
+            plugin_inline: &|_| Vec::new(),
+        };
         let mut state = PatchState::default();
-        state.ensure_positions(doc, midi, auto);
+        state.ensure_positions(doc, deps.track_count, deps.auto_count);
 
         let rect_min = Pos2::ZERO; // pan = 0, zoom = 1 → screen == graph space
         let bez = state
-            .cable_controls(rect_min, &doc.cables[idx], midi, auto, doc)
+            .cable_controls(rect_min, &doc.cables[idx], &deps)
             .expect("cable endpoints resolve");
         let path = bezier_points(bez, 8);
-        let hits = state.cables_crossing_path(rect_min, &path, doc, midi, auto);
+        let hits = state.cables_crossing_path(rect_min, &path, &deps);
         assert!(hits.contains(&idx), "path along the cable must hit it");
 
         let far = [Pos2::new(-3000.0, -3000.0), Pos2::new(-2500.0, -2500.0)];
         assert!(
-            state
-                .cables_crossing_path(rect_min, &far, doc, midi, auto)
-                .is_empty(),
+            state.cables_crossing_path(rect_min, &far, &deps).is_empty(),
             "a path far from all cables must hit nothing"
         );
+    }
+
+    /// G5: the static inline registry covers every built-in node variant
+    /// (and stays silent for SoundFont / plugin / legacy nodes).
+    #[test]
+    fn inline_registry_covers_builtin_variants() {
+        let synth = NodeDoc::Instrument {
+            node_id: 2,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            synth: glitcherz_model::SynthParams::default(),
+        };
+        let params: Vec<InlineParam> = inline_params_of(&synth).iter().map(|s| s.param).collect();
+        assert_eq!(params, vec![InlineParam::Cutoff, InlineParam::Resonance]);
+
+        let sf2 = NodeDoc::Instrument {
+            node_id: 3,
+            track: 0,
+            voice: VoiceSpec::SoundFont {
+                path: String::new(),
+                bank: 0,
+                program: 0,
+            },
+            synth: glitcherz_model::SynthParams::default(),
+        };
+        assert!(
+            inline_params_of(&sf2).is_empty(),
+            "SoundFont instruments expose no inline rows"
+        );
+
+        let clap = NodeDoc::Instrument {
+            node_id: 4,
+            track: 0,
+            voice: VoiceSpec::Clap {
+                path: String::new(),
+                plugin_id: "p".to_string(),
+                state: Vec::new(),
+            },
+            synth: glitcherz_model::SynthParams::default(),
+        };
+        assert!(
+            inline_params_of(&clap).is_empty(),
+            "plugin nodes take their rows from the session enumeration"
+        );
+
+        let delay = NodeDoc::Effect {
+            node_id: 5,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            delay: glitcherz_model::DelayParams::default(),
+        };
+        let params: Vec<InlineParam> = inline_params_of(&delay).iter().map(|s| s.param).collect();
+        assert_eq!(
+            params,
+            vec![
+                InlineParam::DelayTime,
+                InlineParam::DelayFeedback,
+                InlineParam::DelayMix,
+            ]
+        );
+
+        let mixer = NodeDoc::Mixer {
+            node_id: 6,
+            track: 0,
+            inputs: 2,
+            channels: vec![Default::default(); 2],
+            out_pan: 0.0,
+            out_muted: false,
+        };
+        let params: Vec<InlineParam> = inline_params_of(&mixer).iter().map(|s| s.param).collect();
+        assert_eq!(params, vec![InlineParam::MixerOutPan]);
+    }
+
+    /// G5: the node box height grows downward by `rows * INLINE_ROW_HEIGHT`
+    /// on top of the existing (port-adaptive) base size; fixed entities are
+    /// unaffected.
+    #[test]
+    fn node_size_grows_with_inline_rows() {
+        let mut project = Project::default();
+        let plugin_node = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::Instrument {
+            node_id: plugin_node,
+            track: 0,
+            voice: VoiceSpec::Clap {
+                path: String::new(),
+                plugin_id: "p".to_string(),
+                state: Vec::new(),
+            },
+            synth: glitcherz_model::SynthParams::default(),
+        });
+        let doc = &project.graph;
+        let deps = PatchDeps {
+            doc,
+            track_count: project.midi_tracks.len(),
+            auto_count: project.control_tracks.len(),
+            auto_options: &|_| Vec::new(),
+            plugin_inline: &|node| {
+                if node == plugin_node {
+                    vec![
+                        InlinePluginControl {
+                            param_id: 1,
+                            label: "a".to_string(),
+                            value: 0.0,
+                            min: 0.0,
+                            max: 1.0,
+                        },
+                        InlinePluginControl {
+                            param_id: 2,
+                            label: "b".to_string(),
+                            value: 0.0,
+                            min: 0.0,
+                            max: 1.0,
+                        },
+                    ]
+                } else {
+                    Vec::new()
+                }
+            },
+        };
+
+        let instr = doc.instrument_of_track(0).unwrap().node_id();
+        let delay = doc.builtin_delay_of_track(0).unwrap().node_id();
+        let mixer = doc.first_mixer().unwrap().node_id();
+        let NodeDoc::Mixer { inputs, .. } = doc.node_by_id(mixer).unwrap() else {
+            unreachable!()
+        };
+        let mixer_base = (NODE_HEIGHT_MIN).max(*inputs as f32 * PORT_SPACING + 20.0);
+
+        // Built-in synth: 2 registry rows.
+        assert_eq!(
+            size_of(PatchId::Node(instr), &deps),
+            Vec2::new(NODE_SIZE.x, NODE_SIZE.y + 2.0 * INLINE_ROW_HEIGHT)
+        );
+        // Built-in delay: 3 registry rows.
+        assert_eq!(
+            size_of(PatchId::Node(delay), &deps),
+            Vec2::new(NODE_SIZE.x, NODE_SIZE.y + 3.0 * INLINE_ROW_HEIGHT)
+        );
+        // Mixer: channel-scaled base + 1 registry row.
+        assert_eq!(
+            size_of(PatchId::Node(mixer), &deps),
+            Vec2::new(NODE_SIZE.x, mixer_base + INLINE_ROW_HEIGHT)
+        );
+        // Plugin node: 2 session-enumerated rows.
+        assert_eq!(
+            size_of(PatchId::Node(plugin_node), &deps),
+            Vec2::new(NODE_SIZE.x, NODE_SIZE.y + 2.0 * INLINE_ROW_HEIGHT)
+        );
+        // Fixed entities: no inline rows.
+        assert_eq!(
+            size_of(PatchId::Timeline, &deps),
+            timeline_size(deps.track_count, deps.auto_count)
+        );
+        assert_eq!(size_of(PatchId::Master, &deps), NODE_SIZE);
+    }
+
+    /// G5: `inline_doc_value` reads the node's own document fields and
+    /// mirrors the panel slider ranges (one slider-geometry source per
+    /// parameter — inline and panel sliders are interchangeable).
+    #[test]
+    fn inline_doc_value_reads_document_fields() {
+        let synth = glitcherz_model::SynthParams {
+            cutoff_hz: 440.0,
+            resonance: 0.5,
+            ..Default::default()
+        };
+        let instr = NodeDoc::Instrument {
+            node_id: 2,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            synth,
+        };
+        let (v, min, max) = inline_doc_value(&instr, InlineParam::Cutoff);
+        assert_eq!(v, 440.0);
+        assert_eq!(
+            (min, max),
+            (
+                *crate::CUTOFF_RANGE.start() as f64,
+                *crate::CUTOFF_RANGE.end() as f64
+            )
+        );
+        let (v, min, max) = inline_doc_value(&instr, InlineParam::Resonance);
+        assert_eq!(v, 0.5);
+        assert_eq!(
+            (min, max),
+            (
+                *crate::RES_RANGE.start() as f64,
+                *crate::RES_RANGE.end() as f64
+            )
+        );
+
+        let delay = glitcherz_model::DelayParams {
+            time_s: 0.25,
+            feedback: 0.4,
+            mix: 0.3,
+        };
+        let fx = NodeDoc::Effect {
+            node_id: 3,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            delay,
+        };
+        assert_eq!(inline_doc_value(&fx, InlineParam::DelayTime).0, 0.25);
+        assert!((inline_doc_value(&fx, InlineParam::DelayFeedback).0 - 0.4).abs() < 1e-6);
+        assert!((inline_doc_value(&fx, InlineParam::DelayMix).0 - 0.3).abs() < 1e-6);
+        let (_, min, max) = inline_doc_value(&fx, InlineParam::DelayTime);
+        assert_eq!(
+            (min, max),
+            (
+                *crate::DELAY_TIME_RANGE.start() as f64,
+                *crate::DELAY_TIME_RANGE.end() as f64
+            )
+        );
+
+        let mixer = NodeDoc::Mixer {
+            node_id: 4,
+            track: 0,
+            inputs: 2,
+            channels: vec![Default::default(); 2],
+            out_pan: -0.5,
+            out_muted: false,
+        };
+        let (v, min, max) = inline_doc_value(&mixer, InlineParam::MixerOutPan);
+        assert_eq!(v, -0.5);
+        assert_eq!((min, max), (-1.0, 1.0));
     }
 
     #[test]
