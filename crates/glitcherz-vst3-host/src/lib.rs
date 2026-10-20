@@ -45,16 +45,21 @@
 // comment; behavioral verification lives in tests (invalid files must
 // return errors rather than UB).
 
+pub mod gui;
 pub mod host_impl;
 pub mod raw;
 
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, c_char, c_void};
 use std::path::{Path, PathBuf};
 
 use vst3::Steinberg::Vst::{
-    IAudioProcessorTrait, IComponentTrait, IConnectionPointTrait, IEditControllerTrait,
+    IAudioProcessorTrait, IComponentTrait, IConnectionPointTrait, IEditControllerHostEditingTrait,
+    IEditControllerTrait,
 };
-use vst3::Steinberg::{self, IPluginBaseTrait, IPluginFactory2Trait, IPluginFactoryTrait, Vst};
+use vst3::Steinberg::{
+    self, IPlugViewContentScaleSupportTrait, IPlugViewTrait, IPluginBaseTrait,
+    IPluginFactory2Trait, IPluginFactoryTrait, Vst,
+};
 use vst3::{ComPtr, ComWrapper, Interface};
 
 use std::sync::Arc;
@@ -66,9 +71,9 @@ use glitcherz_engine::realtime::commands::ParamId;
 use glitcherz_engine::realtime::context::ProcessContext;
 use glitcherz_engine::realtime::processor::Processor;
 
+use crate::gui::{EditQueue, GuiHostState, HostComponentHandler, HostPlugFrame};
 use crate::host_impl::{
-    HostEventList, HostMemoryStream, HostParamChanges, HostParamValueQueue, NoopComponentHandler,
-    QueueSlot,
+    HostEventList, HostMemoryStream, HostParamChanges, HostParamValueQueue, QueueSlot,
 };
 
 /// Maximum number of bridged events queued per `process` call (notes +
@@ -104,6 +109,23 @@ pub enum HostError {
     StateSave(Steinberg::tresult),
     #[error("Plugin failed to load state (tresult = {0:#x})")]
     StateLoad(Steinberg::tresult),
+    #[error("Plugin provides no editor view (createView returned null)")]
+    NoEditorView,
+    #[error("Plugin editor does not support HWND embedding (tresult = {0:#x})")]
+    EditorPlatformUnsupported(Steinberg::tresult),
+    #[error("Plugin editor attach failed (tresult = {0:#x})")]
+    EditorAttach(Steinberg::tresult),
+    #[error("Plugin editor reported no usable size")]
+    EditorSize,
+}
+
+/// Pixel size of an editor view (VST3 `ViewRect` extents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewSize {
+    /// View width in physical pixels.
+    pub width: i32,
+    /// View height in physical pixels.
+    pub height: i32,
 }
 
 /// Whether a tresult indicates success (kResultOk / kResultTrue).
@@ -328,10 +350,30 @@ pub struct Vst3InstanceConfig {
 /// object references are released first, then the dynamic library is
 /// unloaded.
 pub struct Vst3InstanceGuard {
+    /// Open editor view (spec `plugin-gui.md` §9). `Some` between
+    /// [`Vst3InstanceGuard::open_editor`] and
+    /// [`Vst3InstanceGuard::close_editor`]. Declared first so the view is
+    /// released before the plug frame and the controller it calls back
+    /// into.
+    view: Option<ComPtr<Steinberg::IPlugView>>,
     component_connection: Option<ComPtr<Steinberg::Vst::IConnectionPoint>>,
     controller_connection: Option<ComPtr<Steinberg::Vst::IConnectionPoint>>,
     controller: ComPtr<Steinberg::Vst::IEditController>,
+    /// Optional `IEditControllerHostEditing` (host-driven edit
+    /// notifications: `beginEditFromHost`/`endEditFromHost` around
+    /// `setParamNormalized`, so the plugin's GUI follows host slider
+    /// moves).
+    editing: Option<ComPtr<Steinberg::Vst::IEditControllerHostEditing>>,
     component: ComPtr<Steinberg::Vst::IComponent>,
+    /// Gui facts shared with the plug frame (`resizeView` requests).
+    gui: Arc<GuiHostState>,
+    /// Parameter edits the plugin performed in its own GUI (drained by the
+    /// UI frame loop; the CLAP `request_flush` mirror).
+    edits: Arc<EditQueue>,
+    /// Plug frame handed to the view (`setFrame`); **lifetime must cover
+    /// the view**.
+    plug_frame_ptr: ComPtr<Steinberg::IPlugFrame>,
+    _plug_frame: ComWrapper<HostPlugFrame>,
     /// Handoff gate shared with the realtime node (the CLAP mirror; see
     /// `glitcherz_engine::host_gate::StateGate`).
     state_gate: Arc<StateGate>,
@@ -341,7 +383,7 @@ pub struct Vst3InstanceGuard {
     // the controller at spawn time).
     #[allow(dead_code)]
     handler_ptr: ComPtr<Steinberg::Vst::IComponentHandler>,
-    _handler: ComWrapper<NoopComponentHandler>,
+    _handler: ComWrapper<HostComponentHandler>,
     /// Module (dynamic library + factory). **Last field**: dropped last —
     /// all plugin COM object references are released first, then the
     /// dynamic library is unloaded.
@@ -352,9 +394,13 @@ pub struct Vst3InstanceGuard {
 }
 
 impl Vst3InstanceGuard {
-    /// Canonical teardown: disconnect → setActive(false) → terminate().
+    /// Canonical teardown: close the editor view → disconnect →
+    /// setActive(false) → terminate().
     /// Reused by both the normal Drop path and instantiation failure paths.
     fn tear_down(&mut self) {
+        // The view goes down first: it calls back into the controller and
+        // (through the plug frame) into this guard.
+        self.close_editor();
         // SAFETY: The component/controller objects are all alive (the
         // dynamic library is unloaded last; see field order); the calls
         // follow the VST3 teardown order, and failures are simply ignored.
@@ -501,6 +547,198 @@ impl Vst3InstanceGuard {
         self.state_gate.end_host_call();
         values
     }
+
+    // -----------------------------------------------------------------------
+    // Editor (spec `plugin-gui.md` §9 — the CLAP G1/G3 mirror)
+    // -----------------------------------------------------------------------
+
+    /// Opens the plugin's editor view attached to `parent_hwnd` (main
+    /// thread only; the parent is the host's container window, see
+    /// `glitcherz_ui::plugin_window`).
+    ///
+    /// Sequence (VST3 spec): `createView("editor")` → `setFrame(plug
+    /// frame)` → optional content scale → `isPlatformTypeSupported(HWND)`
+    /// → `attached` → `getSize`. Every failure after a successful create
+    /// undoes the attach, so no half-open view is left behind. Reopening
+    /// without an intervening close closes first (idempotent).
+    ///
+    /// Not serialized against the audio thread: gui calls are main-thread
+    /// plugin calls (spec D7 rationale), safe to run while `process`
+    /// executes.
+    ///
+    /// # Safety contract (not enforced by the type system)
+    /// `parent_hwnd` must be a live platform window handle owned by the
+    /// caller for the whole attached lifetime — the plugin stores it and
+    /// creates its child window under it.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // handle is forwarded to the plugin, never dereferenced here
+    pub fn open_editor(
+        &mut self,
+        parent_hwnd: *mut c_void,
+        scale: f64,
+    ) -> Result<ViewSize, HostError> {
+        if self.view.is_some() {
+            self.close_editor();
+        }
+        // SAFETY: the controller is alive (held by the guard); createView
+        // returns a +1 reference owned by the ComPtr below.
+        let view = unsafe {
+            ComPtr::<Steinberg::IPlugView>::from_raw(
+                self.controller.createView(Vst::ViewType::kEditor),
+            )
+        }
+        .ok_or(HostError::NoEditorView)?;
+
+        // The view keeps the frame pointer for its whole attached life (it
+        // reports size requests through it).
+        // SAFETY: both objects are alive; the frame outlives the view (see
+        // the field order on the guard).
+        unsafe {
+            let _ = view.setFrame(self.plug_frame_ptr.as_ptr());
+        }
+        // DPI: the optional content-scale extension (VST3 3.6.5+). Plugins
+        // without it draw at 100% and the container scales nothing.
+        if let Some(scale_support) = view.cast::<Steinberg::IPlugViewContentScaleSupport>() {
+            // SAFETY: the extension interface is alive for the same
+            // lifetime as the view.
+            unsafe {
+                let _ = scale_support.setContentScaleFactor(scale as f32);
+            }
+        }
+        // SAFETY: platform check is a read-only call on a live view.
+        let platform_supported =
+            unsafe { view.isPlatformTypeSupported(Steinberg::kPlatformTypeHWND) };
+        if !tresult_ok(platform_supported) {
+            // SAFETY: detach the frame before releasing the view.
+            unsafe {
+                let _ = view.setFrame(std::ptr::null_mut());
+            }
+            return Err(HostError::EditorPlatformUnsupported(platform_supported));
+        }
+        // SAFETY: the parent handle is the caller's container window
+        // (borrowed for the call; the plugin attaches its child window
+        // synchronously).
+        let attached = unsafe { view.attached(parent_hwnd, Steinberg::kPlatformTypeHWND) };
+        if !tresult_ok(attached) {
+            // SAFETY: as above.
+            unsafe {
+                let _ = view.setFrame(std::ptr::null_mut());
+            }
+            return Err(HostError::EditorAttach(attached));
+        }
+        let mut rect = Steinberg::ViewRect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        // SAFETY: rect is a writable stack out-parameter.
+        let sized = unsafe { view.getSize(&mut rect) };
+        if !tresult_ok(sized) || rect.right <= rect.left || rect.bottom <= rect.top {
+            // SAFETY: undoing the attach on the failure path.
+            unsafe {
+                let _ = view.removed();
+                let _ = view.setFrame(std::ptr::null_mut());
+            }
+            return Err(HostError::EditorSize);
+        }
+        let size = ViewSize {
+            width: rect.right - rect.left,
+            height: rect.bottom - rect.top,
+        };
+        self.view = Some(view);
+        log::info!(
+            "VST3 editor opened: {}x{} px (scale {scale})",
+            size.width,
+            size.height
+        );
+        Ok(size)
+    }
+
+    /// Detaches and releases the editor view (main thread only).
+    /// Idempotent: `removed` runs exactly once per successful
+    /// [`Self::open_editor`]. Call this **before** dropping the host's
+    /// container window (spec §4.3 order).
+    pub fn close_editor(&mut self) {
+        let Some(view) = self.view.take() else {
+            self.gui.clear_resize();
+            return;
+        };
+        // SAFETY: the view is alive (we just took ownership); `removed` is
+        // the spec-mandated detach and must precede the release.
+        unsafe {
+            let _ = view.removed();
+            let _ = view.setFrame(std::ptr::null_mut());
+        }
+        // ComPtr drop releases the view (the plugin frees its window).
+        self.gui.clear_resize();
+    }
+
+    /// Whether an editor view is currently open.
+    pub fn editor_open(&self) -> bool {
+        self.view.is_some()
+    }
+
+    /// Takes the plugin's latest `resizeView` request (take semantics; in
+    /// physical pixels). The UI resizes the container and then confirms
+    /// with [`Self::ack_editor_size`].
+    pub fn editor_resize_request(&self) -> Option<ViewSize> {
+        self.gui
+            .take_resize()
+            .map(|(width, height)| ViewSize { width, height })
+    }
+
+    /// Acknowledges an applied editor size to the view (`IPlugView::onSize`,
+    /// the host half of the resize handshake).
+    pub fn ack_editor_size(&self, size: ViewSize) {
+        let Some(view) = &self.view else {
+            return;
+        };
+        let mut rect = Steinberg::ViewRect {
+            left: 0,
+            top: 0,
+            right: size.width,
+            bottom: size.height,
+        };
+        // SAFETY: the view is alive; rect is a stack out-parameter per spec.
+        unsafe {
+            let _ = view.onSize(&mut rect);
+        }
+    }
+
+    /// Drains parameter edits the plugin performed in its own GUI
+    /// (`IComponentHandler::performEdit`): `(param_id, value_normalized)`
+    /// pairs, normalized domain (the VST3 mirror of the CLAP
+    /// `poll_param_flush`). Called from the UI frame loop while the editor
+    /// is open; an idle poll drains an empty queue.
+    pub fn take_param_edits(&self) -> Vec<(u32, f64)> {
+        self.edits.drain()
+    }
+
+    /// Host-side parameter change notification (spec §9): keeps the
+    /// plugin's edit controller in sync with a host slider move so its GUI
+    /// follows.
+    ///
+    /// VST3 defines this as `IEditControllerHostEditing::
+    /// beginEditFromHost`/`endEditFromHost` around
+    /// `setParamNormalized` (the spec's "beginEdit/performEdit/endEdit"
+    /// wording describes the plugin→host direction; the host→plugin
+    /// counterpart is the HostEditing interface). Controllers without the
+    /// extension still get `setParamNormalized`, which is what a host
+    /// outside an edit gesture would call.
+    pub fn set_param_from_host(&self, id: u32, value_normalized: f64) {
+        let value = value_normalized.clamp(0.0, 1.0);
+        // SAFETY: controller and extension interface are alive (held by the
+        // guard); main-thread plugin calls.
+        unsafe {
+            if let Some(editing) = &self.editing {
+                let _ = editing.beginEditFromHost(id);
+            }
+            let _ = self.controller.setParamNormalized(id, value);
+            if let Some(editing) = &self.editing {
+                let _ = editing.endEditFromHost(id);
+            }
+        }
+    }
 }
 
 /// Plugin parameter description (control-side enumeration; see
@@ -641,12 +879,20 @@ impl Vst3Instance {
             create_instance::<Steinberg::Vst::IEditController>(factory, &controller_cid)
                 .map_err(HostError::CreateController)?;
 
-        // 2. Host handler (empty implementation) + connection point
-        //    interconnect.
-        let handler = ComWrapper::new(NoopComponentHandler);
+        // 2. Host handler (parameter edits from the plugin's GUI land in
+        //    the edit queue) + connection point interconnect.
+        let edits = Arc::new(EditQueue::new());
+        let handler = ComWrapper::new(HostComponentHandler::new(Arc::clone(&edits)));
         let handler_ptr = handler
             .to_com_ptr::<Steinberg::Vst::IComponentHandler>()
-            .expect("NoopComponentHandler always implements IComponentHandler");
+            .expect("HostComponentHandler always implements IComponentHandler");
+        // Plug frame: the channel a view uses to request a resize. Created
+        // here so the guard can hand it to every view it opens.
+        let gui = Arc::new(GuiHostState::default());
+        let plug_frame = ComWrapper::new(HostPlugFrame::new(Arc::clone(&gui)));
+        let plug_frame_ptr = plug_frame
+            .to_com_ptr::<Steinberg::IPlugFrame>()
+            .expect("HostPlugFrame always implements IPlugFrame");
         let component_connection = component.cast::<Steinberg::Vst::IConnectionPoint>();
         let controller_connection = controller.cast::<Steinberg::Vst::IConnectionPoint>();
         if let (Some(component_cp), Some(controller_cp)) =
@@ -755,13 +1001,21 @@ impl Vst3Instance {
         // Instantiation success path: objects are handed to the guard; the
         // failure path is covered by tear_down.
         // (All steps here can no longer fail; assemble directly.)
+        // Optional host-editing extension (host slider → plugin GUI sync).
+        let editing = controller.cast::<Steinberg::Vst::IEditControllerHostEditing>();
         Ok(Self {
             node,
             guard: Vst3InstanceGuard {
+                view: None,
                 component_connection,
                 controller_connection,
                 controller,
+                editing,
                 component,
+                gui,
+                edits,
+                plug_frame_ptr,
+                _plug_frame: plug_frame,
                 handler_ptr,
                 _handler: handler,
                 module,
@@ -1176,12 +1430,15 @@ mod tests {
             return;
         };
         let params = instance.guard.parameters();
-        assert_eq!(params.len(), 1, "test plugin should expose 1 parameter");
+        // Gain + the read-only GuiCalls probe (the G7 view fixture).
+        assert_eq!(params.len(), 2, "test plugin should expose 2 parameters");
         let gain = &params[0];
         assert_eq!(gain.id, 1);
         assert_eq!(gain.title, "Gain");
         assert!((gain.default_normalized - 0.5).abs() < 1e-9);
         assert!(gain.can_automate, "Gain should be marked as automatable");
+        assert_eq!(params[1].id, 2);
+        assert!(!params[1].can_automate);
     }
 
     #[test]
@@ -1352,5 +1609,146 @@ mod tests {
         );
         let _ = std::fs::remove_file(&bogus);
         assert!(matches!(result, Err(super::HostError::Load(_))));
+    }
+
+    // -----------------------------------------------------------------------
+    // G7 editor view (spec `plugin-gui.md` §9)
+    // -----------------------------------------------------------------------
+
+    /// Fixture contract (mirrors the bit constants in
+    /// `glitcherz-test-vst3`): read-only parameter id 2 carries `mask / 1024`.
+    const GUI_ATTACHED: u64 = 1 << 0;
+    const GUI_REMOVED: u64 = 1 << 1;
+    const GUI_GET_SIZE: u64 = 1 << 2;
+    const GUI_ON_SIZE: u64 = 1 << 3;
+    const GUI_SET_FRAME: u64 = 1 << 4;
+    const GUI_RESIZE_REQUESTED: u64 = 1 << 6;
+    const GUI_PERFORM_EDIT: u64 = 1 << 7;
+    const GUI_BEGIN_HOST_EDIT: u64 = 1 << 8;
+    const GUI_END_HOST_EDIT: u64 = 1 << 9;
+    const GUI_PROBE_PARAM: u32 = 2;
+    const GUI_MASK_SCALE: f64 = 1024.0;
+
+    /// Reads the fixture's GUI call mask through the read-only probe
+    /// parameter (the host cannot see cdylib statics; observation travels
+    /// through the COM surface).
+    fn gui_mask(guard: &super::Vst3InstanceGuard) -> u64 {
+        let values = guard.read_param_values();
+        let normalized = values
+            .get(&GUI_PROBE_PARAM)
+            .copied()
+            .expect("fixture should expose the GuiCalls probe");
+        (normalized * GUI_MASK_SCALE).round() as u64
+    }
+
+    #[test]
+    fn editor_view_round_trip() {
+        let Some((mut instance, _ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        let guard = &mut instance.guard;
+        assert!(!guard.editor_open(), "no editor before open");
+
+        // Headless parent: the fixture view records but never dereferences
+        // the handle (the platform container is exercised separately by
+        // `glitcherz_ui::plugin_window`).
+        let fake_parent = std::ptr::dangling_mut::<std::ffi::c_void>();
+        let size = guard.open_editor(fake_parent, 1.0).expect("editor opens");
+        assert_eq!(
+            size,
+            super::ViewSize {
+                width: 320,
+                height: 240
+            }
+        );
+        assert!(guard.editor_open());
+
+        let mask = gui_mask(guard);
+        assert!(mask & GUI_ATTACHED != 0, "attached not called");
+        assert!(mask & GUI_GET_SIZE != 0, "getSize not called");
+        assert!(mask & GUI_SET_FRAME != 0, "setFrame not called");
+
+        // view → host: the fixture asks for a size at attach time.
+        let request = guard
+            .editor_resize_request()
+            .expect("resizeView request should be pending");
+        assert_eq!(request.width, 320);
+        assert_eq!(request.height, 240);
+        assert!(
+            gui_mask(guard) & GUI_RESIZE_REQUESTED != 0,
+            "resizeView did not reach the host frame"
+        );
+        // Take semantics: reported once.
+        assert_eq!(guard.editor_resize_request(), None);
+
+        // host → view: the onSize acknowledgement closes the handshake.
+        guard.ack_editor_size(size);
+        assert!(
+            gui_mask(guard) & GUI_ON_SIZE != 0,
+            "ack_editor_size should call IPlugView::onSize"
+        );
+
+        // Close: removed exactly once; a second close is a no-op.
+        guard.close_editor();
+        assert!(!guard.editor_open());
+        assert!(
+            gui_mask(guard) & GUI_REMOVED != 0,
+            "removed not called on close"
+        );
+        guard.close_editor();
+        assert!(!guard.editor_open());
+
+        // Reopen after close (the panel's target-switch path).
+        let reopened = guard.open_editor(fake_parent, 1.0).expect("editor reopens");
+        assert_eq!(reopened.width, 320);
+        guard.close_editor();
+    }
+
+    #[test]
+    fn perform_edit_reaches_the_host_queue() {
+        let Some((mut instance, _ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        let guard = &mut instance.guard;
+        assert!(guard.take_param_edits().is_empty(), "idle poll is empty");
+        let fake_parent = std::ptr::dangling_mut::<std::ffi::c_void>();
+        guard.open_editor(fake_parent, 1.0).expect("editor opens");
+
+        // The fixture's view reported Gain = 0.75 through performEdit
+        // during attach (the CLAP `request_flush` stand-in).
+        assert!(
+            gui_mask(guard) & GUI_PERFORM_EDIT != 0,
+            "performEdit did not reach the host handler"
+        );
+        assert_eq!(
+            guard.take_param_edits(),
+            vec![(1, 0.75)],
+            "GUI edit should surface as (param, normalized) on the drain"
+        );
+        // Take semantics.
+        assert!(guard.take_param_edits().is_empty());
+        guard.close_editor();
+    }
+
+    #[test]
+    fn host_param_change_reaches_the_controller() {
+        let Some((instance, _ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        let guard = &instance.guard;
+        guard.set_param_from_host(1, 0.25);
+        let values = guard.read_param_values();
+        assert!(
+            (values[&1] - 0.25).abs() < 1e-9,
+            "controller should hold the host-driven value, got {:?}",
+            values[&1]
+        );
+        // The HostEditing gesture wrapped the change (the fixture's
+        // controller implements the extension).
+        let mask = gui_mask(guard);
+        assert!(
+            mask & GUI_BEGIN_HOST_EDIT != 0 && mask & GUI_END_HOST_EDIT != 0,
+            "set_param_from_host should run beginEditFromHost/endEditFromHost"
+        );
     }
 }

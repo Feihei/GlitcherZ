@@ -6,10 +6,11 @@
 //! - [`HostParamValueQueue`]: `IParamValueQueue` — normalized value change
 //!   points of a single parameter;
 //! - [`HostParamChanges`]: `IParameterChanges` — container of parameter
-//!   queues;
-//! - [`NoopComponentHandler`]: empty `IComponentHandler` implementation
-//!   (the receiver when the plugin reports parameter edits/restart requests
-//!   to the host; the simple host ignores all of them).
+//!   queues.
+//!
+//! The gui-side host objects (`IPlugFrame`, `IComponentHandler`) live in
+//! [`crate::gui`] instead: they are called from plugin threads other than
+//! the audio thread and must not share this module's audio-only contract.
 //!
 //! # Real-time constraints
 //!
@@ -512,40 +513,6 @@ impl Steinberg::IBStreamTrait for HostMemoryStream {
         unsafe {
             *pos = (*self.data.get()).pos as i64;
         }
-        Steinberg::kResultOk
-    }
-}
-
-// ---------------------------------------------------------------------------
-// No-op component handler
-// ---------------------------------------------------------------------------
-
-/// Empty `IComponentHandler`: ignores parameter edit/restart requests
-/// reported by the plugin.
-pub(crate) struct NoopComponentHandler;
-
-impl Class for NoopComponentHandler {
-    type Interfaces = (Vst::IComponentHandler,);
-}
-
-impl Vst::IComponentHandlerTrait for NoopComponentHandler {
-    unsafe fn beginEdit(&self, _id: Vst::ParamID) -> Steinberg::tresult {
-        Steinberg::kResultOk
-    }
-
-    unsafe fn performEdit(
-        &self,
-        _id: Vst::ParamID,
-        _value_normalized: Vst::ParamValue,
-    ) -> Steinberg::tresult {
-        Steinberg::kResultOk
-    }
-
-    unsafe fn endEdit(&self, _id: Vst::ParamID) -> Steinberg::tresult {
-        Steinberg::kResultOk
-    }
-
-    unsafe fn restartComponent(&self, _flags: Steinberg::int32) -> Steinberg::tresult {
         Steinberg::kResultOk
     }
 }

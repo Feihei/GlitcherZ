@@ -358,6 +358,24 @@ struct PluginEditor {
     /// Native container window (dropped = destroyed; only after the plugin
     /// editor itself is closed).
     container: plugin_window::PluginWindowContainer,
+    /// VST3 only: a `resizeView` request the UI has accepted but not yet
+    /// confirmed with `IPlugView::onSize`; cleared once the container has
+    /// actually been repositioned to the new size (the host half of the
+    /// resize handshake, spec `plugin-gui.md` §9).
+    pending_ack: Option<glitcherz_vst3_host::ViewSize>,
+}
+
+/// Parameter values a plugin reported from inside its own editor, waiting
+/// to be applied once the guard borrow ends (spec `plugin-gui.md` §5 for
+/// CLAP, §9 for VST3).
+struct GuiParamBatch {
+    /// Document node whose instrument produced the values.
+    doc_node: u64,
+    /// CLAP raw-value domain (true) vs VST3 normalized domain (false) —
+    /// selects the session slider cache the read-back seeds.
+    is_clap: bool,
+    /// `(param id, value)` pairs in the plugin's own domain.
+    changes: Vec<(u32, f64)>,
 }
 
 /// Resolves the Synth panel's editing target (spec `plugin-gui.md` §6):
@@ -1137,23 +1155,26 @@ impl GlitcherZApp {
             .map(|e| &mut e._guard)
     }
 
-    /// Closes the embedded plugin editor: the plugin's `gui.destroy` first,
-    /// then the native container window (spec `plugin-gui.md` §4.3 order —
-    /// the plugin never sees its parent vanish). No-op when closed.
+    /// Closes the embedded plugin editor: the plugin's editor comes down
+    /// first (`gui.destroy` / `IPlugView::removed` + release), then the
+    /// native container window (spec `plugin-gui.md` §4.3 order — the
+    /// plugin never sees its parent vanish). No-op when closed.
     fn close_plugin_editor(&mut self) {
         let Some(editor) = self.plugin_editor.take() else {
             return;
         };
-        if let Some(PluginGuard::Clap(g)) = self.guard_by_engine_id(editor.node_id) {
-            g.close_editor();
+        match self.guard_by_engine_id(editor.node_id) {
+            Some(PluginGuard::Clap(g)) => g.close_editor(),
+            Some(PluginGuard::Vst3(g)) => g.close_editor(),
+            None => {}
         }
         drop(editor); // container destroyed after the plugin editor closed
     }
 
-    /// Opens a CLAP instrument editor embedded under the main window for the
-    /// given **document node** (spec `plugin-gui.md` §4/§6). Needs the
-    /// eframe frame (main HWND + scale) — therefore runs in the `ui()` tail,
-    /// not in the panel.
+    /// Opens a plugin editor embedded under the main window for the given
+    /// **document node** (spec `plugin-gui.md` §4/§6), CLAP or VST3 (G7).
+    /// Needs the eframe frame (main HWND + scale) — therefore runs in the
+    /// `ui()` tail, not in the panel.
     fn open_plugin_editor(&mut self, frame: &eframe::Frame, doc_node: u64) {
         if self.plugin_editor.is_some() {
             return;
@@ -1177,22 +1198,22 @@ impl GlitcherZApp {
             .winit_window()
             .map(|w| w.scale_factor())
             .unwrap_or(1.0) as f32;
-        // CLAP reports GUI sizes in pixels; the egui layout works in points.
-        let to_points =
-            |s: glitcherz_clap_host::GuiSize| (s.width as f32 / ppp, s.height as f32 / ppp);
-        let mut opened: Option<Result<(f32, f32), glitcherz_clap_host::HostError>> = None;
-        match self.guard_by_engine_id(engine_id) {
-            Some(PluginGuard::Clap(g)) => {
-                opened = Some(
-                    g.open_editor(container.raw_handle(), ppp as f64)
-                        .map(to_points),
-                );
-            }
-            Some(PluginGuard::Vst3(_)) => {}
-            None => {}
-        }
+        // Plugin GUIs report sizes in pixels; the egui layout works in
+        // points.
+        let to_points = |width: i32, height: i32| (width as f32 / ppp, height as f32 / ppp);
+        let opened: Result<(f32, f32), String> = match self.guard_by_engine_id(engine_id) {
+            Some(PluginGuard::Clap(g)) => g
+                .open_editor(container.raw_handle(), ppp as f64)
+                .map(|s| to_points(s.width as i32, s.height as i32))
+                .map_err(|e| e.to_string()),
+            Some(PluginGuard::Vst3(g)) => g
+                .open_editor(container.raw_handle(), ppp as f64)
+                .map(|s| to_points(s.width, s.height))
+                .map_err(|e| e.to_string()),
+            None => Err("This node has no plugin editor (built-in voice)".to_string()),
+        };
         match opened {
-            Some(Ok(size)) => {
+            Ok(size) => {
                 log::info!(
                     "Embedded editor open: node {doc_node} engine {engine_id} size {size:?}pt"
                 );
@@ -1202,15 +1223,13 @@ impl GlitcherZApp {
                     size,
                     rect: None,
                     container,
+                    pending_ack: None,
                 });
             }
-            Some(Err(err)) => {
+            Err(err) => {
                 log::info!("Plugin editor open failed: {err}");
                 self.set_message(format!("Plugin editor unavailable: {err}"));
                 // Container dropped here — the plugin never attached to it.
-            }
-            None => {
-                self.set_message("Only CLAP instruments have embedded editors (v1)".to_string());
             }
         }
     }
@@ -2632,15 +2651,20 @@ impl GlitcherZApp {
             .map(|e| &mut e._guard)
     }
 
-    /// Whether a document node's live guard is a CLAP instance (read-only;
-    /// usable where `node_guard`'s `&mut` borrow would conflict).
-    fn node_guard_is_clap(&self, doc_id: u64) -> bool {
+    /// Whether a document node's live guard is an external plugin that can
+    /// embed an editor (CLAP or VST3; read-only — usable where
+    /// `node_guard`'s `&mut` borrow would conflict). Whether the specific
+    /// plugin actually exposes a view is only known once `open_editor`
+    /// runs; this is the "show the button / reopen on target change"
+    /// predicate.
+    fn node_guard_has_editor(&self, doc_id: u64) -> bool {
         let Some(&engine_id) = self.node_map.get(&doc_id) else {
             return false;
         };
-        self.voice_guards
-            .iter()
-            .any(|e| e.node_id == engine_id && matches!(e._guard, PluginGuard::Clap(_)))
+        self.voice_guards.iter().any(|e| {
+            e.node_id == engine_id
+                && matches!(e._guard, PluginGuard::Clap(_) | PluginGuard::Vst3(_))
+        })
     }
 
     /// Re-seeds a node's slider cache from the plugin's live values
@@ -4002,8 +4026,8 @@ impl GlitcherZApp {
                     .as_ref()
                     .map(|e| Some(e.doc_node) == target)
                     .unwrap_or(false);
-                let is_clap = target.is_some_and(|t| self.node_guard_is_clap(t));
-                if is_clap {
+                let has_editor = target.is_some_and(|t| self.node_guard_has_editor(t));
+                if has_editor {
                     let label = if editor_here {
                         "Close Editor"
                     } else {
@@ -4455,6 +4479,9 @@ impl GlitcherZApp {
                                                         ParamId::PluginParam(param.id),
                                                         value as f32,
                                                     );
+                                                    self.sync_vst3_host_param(
+                                                        fx_doc, param.id, value,
+                                                    );
                                                 }
                                                 ui.weak(format!(
                                                     "normalized{}",
@@ -4613,6 +4640,7 @@ impl GlitcherZApp {
                         .or_default()
                         .insert(id, value);
                     self.send_node_param(instr_id, ParamId::PluginParam(id), value as f32);
+                    self.sync_vst3_host_param(instr_id, id, value);
                 }
             });
 
@@ -4905,6 +4933,19 @@ impl GlitcherZApp {
         }
     }
 
+    /// Tell a VST3 plugin's edit controller about a host-driven parameter
+    /// change so the plugin's own GUI follows (spec `plugin-gui.md` §9 —
+    /// the `IEditControllerHostEditing` gesture). CLAP needs no equivalent
+    /// (D10: the CLAP contract syncs on `set_value`). `value` is the VST3
+    /// normalized value. No-op for non-VST3 nodes.
+    fn sync_vst3_host_param(&mut self, doc_id: u64, id: u32, value: f64) {
+        if let Some(guard) = self.node_guard(doc_id)
+            && let PluginGuard::Vst3(g) = guard
+        {
+            g.set_param_from_host(id, value);
+        }
+    }
+
     /// Apply one inline parameter change from a node-body slider (G5 spec
     /// §7): document write (undo-merged under the same gesture key as the
     /// matching panel slider) + the non-rebuilding `set_node_param` path.
@@ -4978,6 +5019,8 @@ impl GlitcherZApp {
                         .entry(node)
                         .or_default()
                         .insert(id, value as f64);
+                    // Host slider → plugin GUI (G7 three-phase edit).
+                    self.sync_vst3_host_param(node, id, value as f64);
                 }
                 self.send_node_param(node, ParamId::PluginParam(id), value);
             }
@@ -6377,37 +6420,64 @@ impl eframe::App for GlitcherZApp {
             }
         }
         let mut destroy_editor = false;
-        // Parameter flush read-back (spec `plugin-gui.md` §5): parameter
-        // changes the plugin made inside its GUI, read via the guard's
-        // poll; applied after the guard borrow ends (engine delivery +
-        // slider cache). `None` while the editor is closed (no polling,
-        // no engine traffic).
-        let mut flush_changes: Option<(u64, Vec<(u32, f64)>)> = None;
+        // Parameter read-back (spec `plugin-gui.md` §5/§9): parameter
+        // changes the plugin made inside its own GUI. CLAP pulls them via
+        // `request_flush` (the plugin sets a flag), VST3 pushes them
+        // through `IComponentHandler::performEdit` into a lock-free queue;
+        // both land here. Applied after the guard borrow ends (engine
+        // delivery + slider cache). `None` while the editor is closed (no
+        // polling, no engine traffic).
+        let mut flush_changes: Option<GuiParamBatch> = None;
         if let Some(editor) = self.plugin_editor.as_mut() {
             if Some(editor.doc_node) != target {
                 destroy_editor = true;
-            } else if let Some(PluginGuard::Clap(g)) = self
+            } else if let Some(guard) = self
                 .voice_guards
                 .iter_mut()
                 .find(|e| e.node_id == editor.node_id)
                 .map(|e| &mut e._guard)
             {
-                let events = g.editor_events();
-                if let Some(size) = events.resize {
-                    let ppp = ui.ctx().pixels_per_point();
-                    editor.size = (size.width as f32 / ppp, size.height as f32 / ppp);
-                }
-                if g.gui_closed() {
-                    // The plugin destroyed its GUI: the host acknowledges
-                    // by calling destroy exactly once, then tears the
-                    // session down.
-                    g.close_editor();
-                    self.editor_user_open = false;
-                    destroy_editor = true;
-                } else {
-                    let changes = g.poll_param_flush();
-                    if !changes.is_empty() {
-                        flush_changes = Some((editor.doc_node, changes));
+                let ppp = ui.ctx().pixels_per_point();
+                match guard {
+                    PluginGuard::Clap(g) => {
+                        let events = g.editor_events();
+                        if let Some(size) = events.resize {
+                            editor.size = (size.width as f32 / ppp, size.height as f32 / ppp);
+                        }
+                        if g.gui_closed() {
+                            // The plugin destroyed its GUI: the host
+                            // acknowledges by calling destroy exactly once,
+                            // then tears the session down.
+                            g.close_editor();
+                            self.editor_user_open = false;
+                            destroy_editor = true;
+                        } else {
+                            let changes = g.poll_param_flush();
+                            if !changes.is_empty() {
+                                flush_changes = Some(GuiParamBatch {
+                                    doc_node: editor.doc_node,
+                                    is_clap: true,
+                                    changes,
+                                });
+                            }
+                        }
+                    }
+                    PluginGuard::Vst3(g) => {
+                        // The view asked for a new size: accept it, then
+                        // confirm once the container is actually resized
+                        // (ack below).
+                        if let Some(size) = g.editor_resize_request() {
+                            editor.size = (size.width as f32 / ppp, size.height as f32 / ppp);
+                            editor.pending_ack = Some(size);
+                        }
+                        let changes = g.take_param_edits();
+                        if !changes.is_empty() {
+                            flush_changes = Some(GuiParamBatch {
+                                doc_node: editor.doc_node,
+                                is_clap: false,
+                                changes,
+                            });
+                        }
                     }
                 }
             }
@@ -6419,22 +6489,40 @@ impl eframe::App for GlitcherZApp {
         // node while the user toggle is still on (spec `plugin-gui.md` §6).
         if self.editor_user_open
             && self.plugin_editor.is_none()
-            && let Some(t) = target.filter(|t| self.node_guard_is_clap(*t))
+            && let Some(t) = target.filter(|t| self.node_guard_has_editor(*t))
         {
             self.open_plugin_editor(frame, t);
         }
-        if let Some((doc_node, changes)) = flush_changes {
+        if let Some(GuiParamBatch {
+            doc_node,
+            is_clap,
+            changes,
+        }) = flush_changes
+        {
             // GUI edits do not enter undo history (spec D8); persistence is
             // covered by the preset system's save-time state capture.
             for (id, value) in changes {
-                self.clap_voice_values
-                    .entry(doc_node)
-                    .or_default()
-                    .insert(id, value);
+                if is_clap {
+                    self.clap_voice_values
+                        .entry(doc_node)
+                        .or_default()
+                        .insert(id, value);
+                } else {
+                    // VST3 parameter values are normalized 0..1, which is
+                    // also the engine bridge domain.
+                    self.vst3_voice_values
+                        .entry(doc_node)
+                        .or_default()
+                        .insert(id, value);
+                }
                 self.send_node_param(doc_node, ParamId::PluginParam(id), value as f32);
             }
         }
-        if let Some(editor) = self.plugin_editor.as_ref() {
+        // The view's size request is only acknowledged after the container
+        // has been moved to it (the host half of the VST3 resize
+        // handshake).
+        let mut ack_resize: Option<(u64, glitcherz_vst3_host::ViewSize)> = None;
+        if let Some(editor) = self.plugin_editor.as_mut() {
             if self.view != MainView::Synth {
                 // D9: tab-away only hides; returning to the synth tab
                 // shows the container again via reposition's
@@ -6444,7 +6532,15 @@ impl eframe::App for GlitcherZApp {
                 editor
                     .container
                     .reposition_screen_rect(frame, rect, ui.ctx().pixels_per_point());
+                if let Some(size) = editor.pending_ack.take() {
+                    ack_resize = Some((editor.node_id, size));
+                }
             }
+        }
+        if let Some((node_id, size)) = ack_resize
+            && let Some(PluginGuard::Vst3(g)) = self.guard_by_engine_id(node_id)
+        {
+            g.ack_editor_size(size);
         }
 
         // Audio-driven displays (level meter, playback position, envelope) need periodic

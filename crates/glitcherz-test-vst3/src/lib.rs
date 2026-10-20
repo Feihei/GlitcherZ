@@ -12,8 +12,12 @@
 //!   f64) through `IComponent::getState`/`setState` as an 8-byte
 //!   little-endian blob, consumed from the host's `IParameterChanges`
 //!   queue during processing (state roundtrip fixture, spec S5);
-//! - `SineController`: IPluginBase + IEditController + IConnectionPoint
-//!   — a single Gain parameter (id 1, default 0.5);
+//! - `SineController`: IPluginBase + IEditController + IConnectionPoint +
+//!   IEditControllerHostEditing — a Gain parameter (id 1, default 0.5)
+//!   plus a read-only `GuiCalls` probe (id 2) and an editor-view factory;
+//! - `SinePlugView`: headless `IPlugView` fixture for the G7 protocol tests
+//!   (attach/remove/size bookkeeping, a `resizeView` request at attach time
+//!   and a simulated GUI parameter edit through the host handler);
 //! - `GainEffectComponent`: stereo passthrough gain effect
 //!   (output = input × 0.5, no event input bus); the controller reuses
 //!   `SineController`.
@@ -34,15 +38,38 @@
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use vst3::Steinberg::Vst::{
-    self, IAudioProcessorTrait, IComponentTrait, IConnectionPointTrait, IEditControllerTrait,
-    IEventListTrait, IParamValueQueueTrait, IParameterChangesTrait,
+    self, IAudioProcessorTrait, IComponentHandlerTrait, IComponentTrait, IConnectionPointTrait,
+    IEditControllerHostEditingTrait, IEditControllerTrait, IEventListTrait, IParamValueQueueTrait,
+    IParameterChangesTrait,
 };
-use vst3::Steinberg::{self, IBStreamTrait, IPluginBaseTrait, TUID};
+use vst3::Steinberg::{
+    self, IBStreamTrait, IPlugFrameTrait, IPlugViewTrait, IPluginBaseTrait, TUID,
+};
 use vst3::{Class, ComRef, ComWrapper};
+
+/// GUI protocol probe bits (read-only parameter id 2, normalized as
+/// `mask / 1024` — ≤ 10 bits, an exact binary fraction).
+const GUI_ATTACHED: u64 = 1 << 0;
+const GUI_REMOVED: u64 = 1 << 1;
+const GUI_GET_SIZE: u64 = 1 << 2;
+const GUI_ON_SIZE: u64 = 1 << 3;
+const GUI_SET_FRAME: u64 = 1 << 4;
+const GUI_CAN_RESIZE: u64 = 1 << 5;
+const GUI_RESIZE_REQUESTED: u64 = 1 << 6;
+const GUI_PERFORM_EDIT: u64 = 1 << 7;
+const GUI_BEGIN_HOST_EDIT: u64 = 1 << 8;
+const GUI_END_HOST_EDIT: u64 = 1 << 9;
+
+/// Normalized scaling of the probe mask.
+const GUI_MASK_SCALE: f64 = 1024.0;
+
+/// Fake editor view size (pixels).
+const VIEW_WIDTH: i32 = 320;
+const VIEW_HEIGHT: i32 = 240;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -856,14 +883,28 @@ impl IConnectionPointTrait for GainEffectComponent {
 /// normalized value cell updated through `setComponentState` (the state
 /// load sync) and `setParamNormalized`, read back by the host via
 /// `getParamNormalized` (the D6 slider-refresh vehicle, spec S5).
+///
+/// GUI fixture (spec `plugin-gui.md` §9): exposes the host handler pointer
+/// to the views it creates, and a read-only parameter (id 2) carrying the
+/// GUI call mask, so the host test can assert the exact
+/// createView/attached/getSize/removed transaction (cdylib statics are not
+/// reachable from the host process — the observation must travel through
+/// the COM surface).
 struct SineController {
     gain_bits: AtomicU64,
+    /// Host component handler (set by `setComponentHandler`), handed to
+    /// every view so it can report a simulated GUI edit.
+    handler: AtomicPtr<Vst::IComponentHandler>,
+    /// GUI protocol probe bits (`GUI_*`).
+    gui_calls: Arc<AtomicU64>,
 }
 
 impl SineController {
     fn new() -> Self {
         Self {
             gain_bits: AtomicU64::new(DEFAULT_GAIN_BITS),
+            handler: AtomicPtr::new(std::ptr::null_mut()),
+            gui_calls: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -872,6 +913,7 @@ impl Class for SineController {
     type Interfaces = (
         Steinberg::IPluginBase,
         Vst::IEditController,
+        Vst::IEditControllerHostEditing,
         Vst::IConnectionPoint,
     );
 }
@@ -917,7 +959,8 @@ impl IEditControllerTrait for SineController {
     }
 
     unsafe fn getParameterCount(&self) -> Steinberg::int32 {
-        1
+        // Gain + the GUI protocol probe (read-only).
+        2
     }
 
     unsafe fn getParameterInfo(
@@ -925,21 +968,31 @@ impl IEditControllerTrait for SineController {
         paramIndex: Steinberg::int32,
         info: *mut Vst::ParameterInfo,
     ) -> Steinberg::tresult {
-        if paramIndex != 0 {
-            return Steinberg::kInvalidArgument;
-        }
+        let (id, title, default) = match paramIndex {
+            0 => (1, "Gain", 0.5),
+            1 => (
+                2,
+                "GuiCalls",
+                self.gui_calls.load(Ordering::Relaxed) as f64 / GUI_MASK_SCALE,
+            ),
+            _ => return Steinberg::kInvalidArgument,
+        };
         // SAFETY: The host guarantees info points to a writable
         // ParameterInfo.
         unsafe {
             (*info) = Vst::ParameterInfo {
-                id: 1,
-                title: utf16_field::<128>("Gain"),
-                shortTitle: utf16_field::<128>("Gain"),
+                id,
+                title: utf16_field::<128>(title),
+                shortTitle: utf16_field::<128>(title),
                 units: utf16_field::<128>(""),
                 stepCount: 0,
-                defaultNormalizedValue: 0.5,
+                defaultNormalizedValue: default,
                 unitId: 0,
-                flags: Vst::ParameterInfo_::ParameterFlags_::kCanAutomate,
+                flags: if id == 1 {
+                    Vst::ParameterInfo_::ParameterFlags_::kCanAutomate
+                } else {
+                    Vst::ParameterInfo_::ParameterFlags_::kIsReadOnly
+                },
             };
         }
         Steinberg::kResultOk
@@ -980,10 +1033,12 @@ impl IEditControllerTrait for SineController {
     }
 
     unsafe fn getParamNormalized(&self, id: Vst::ParamID) -> Vst::ParamValue {
-        if id == 1 {
-            f64::from_bits(self.gain_bits.load(Ordering::Relaxed))
-        } else {
-            0.0
+        match id {
+            1 => f64::from_bits(self.gain_bits.load(Ordering::Relaxed)),
+            // Read-only probe: the GUI call mask as an exact binary
+            // fraction (all bits < 8, so mask / 256 is lossless).
+            2 => self.gui_calls.load(Ordering::Relaxed) as f64 / GUI_MASK_SCALE,
+            _ => 0.0,
         }
     }
 
@@ -1001,13 +1056,57 @@ impl IEditControllerTrait for SineController {
 
     unsafe fn setComponentHandler(
         &self,
-        _handler: *mut Vst::IComponentHandler,
+        handler: *mut Vst::IComponentHandler,
     ) -> Steinberg::tresult {
+        self.handler.store(handler, Ordering::Relaxed);
         Steinberg::kResultOk
     }
 
-    unsafe fn createView(&self, _name: Steinberg::FIDString) -> *mut Steinberg::IPlugView {
-        std::ptr::null_mut()
+    unsafe fn createView(&self, name: Steinberg::FIDString) -> *mut Steinberg::IPlugView {
+        if name.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: `name` comes from the host per spec and is a
+        // NUL-terminated FIDString; `ViewType::kEditor` is a static
+        // NUL-terminated literal.
+        let matches_editor = unsafe {
+            let requested = std::ffi::CStr::from_ptr(name);
+            let editor = std::ffi::CStr::from_ptr(Vst::ViewType::kEditor);
+            requested == editor
+        };
+        if !matches_editor {
+            return std::ptr::null_mut();
+        }
+        let view = ComWrapper::new(SinePlugView {
+            self_ptr: AtomicPtr::new(std::ptr::null_mut()),
+            frame: AtomicPtr::new(std::ptr::null_mut()),
+            handler: self.handler.load(Ordering::Relaxed),
+            calls: Arc::clone(&self.gui_calls),
+        });
+        // The +1 reference handed to the host (the ComWrapper's Rust data
+        // stays owned by the COM object itself — the factory pattern).
+        let Some(ptr) = view.to_com_ptr::<Steinberg::IPlugView>() else {
+            return std::ptr::null_mut();
+        };
+        // The view needs its own COM pointer to call back into the host
+        // frame (`resizeView(view, rect)`); storing through an atomic needs
+        // no unsafe and is visible to every later call.
+        view.self_ptr.store(ptr.as_ptr(), Ordering::Release);
+        ptr.into_raw()
+    }
+}
+
+impl IEditControllerHostEditingTrait for SineController {
+    unsafe fn beginEditFromHost(&self, _paramID: Vst::ParamID) -> Steinberg::tresult {
+        self.gui_calls
+            .fetch_or(GUI_BEGIN_HOST_EDIT, Ordering::Relaxed);
+        Steinberg::kResultOk
+    }
+
+    unsafe fn endEditFromHost(&self, _paramID: Vst::ParamID) -> Steinberg::tresult {
+        self.gui_calls
+            .fetch_or(GUI_END_HOST_EDIT, Ordering::Relaxed);
+        Steinberg::kResultOk
     }
 }
 
@@ -1022,6 +1121,167 @@ impl IConnectionPointTrait for SineController {
 
     unsafe fn notify(&self, _message: *mut Steinberg::Vst::IMessage) -> Steinberg::tresult {
         Steinberg::kResultOk
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fake editor view (IPlugView) — headless protocol fixture
+// ---------------------------------------------------------------------------
+
+/// Minimal `IPlugView`: no real window, records the call sequence in the
+/// GUI probe mask and exercises both host directions:
+///
+/// - **host → view**: `setFrame`, `attached`, `getSize`, `onSize`,
+///   `removed`;
+/// - **view → host**: `IPlugFrame::resizeView` (a 320×240 request at
+///   attach time) and `IComponentHandler::performEdit` (a simulated GUI
+///   edit of Gain to 0.75 — the `request_flush` stand-in).
+struct SinePlugView {
+    /// The view's own COM interface pointer (needed for `resizeView`).
+    self_ptr: AtomicPtr<Steinberg::IPlugView>,
+    /// Plug frame set by the host through `setFrame`.
+    frame: AtomicPtr<Steinberg::IPlugFrame>,
+    /// Host component handler (borrowed; the host owns it).
+    handler: *mut Vst::IComponentHandler,
+    /// Probe bits shared with the controller.
+    calls: Arc<AtomicU64>,
+}
+
+impl SinePlugView {
+    fn mark(&self, bit: u64) {
+        self.calls.fetch_or(bit, Ordering::Relaxed);
+    }
+}
+
+impl Class for SinePlugView {
+    type Interfaces = (Steinberg::IPlugView,);
+}
+
+impl IPlugViewTrait for SinePlugView {
+    unsafe fn isPlatformTypeSupported(&self, r#type: Steinberg::FIDString) -> Steinberg::tresult {
+        if r#type.is_null() {
+            return Steinberg::kInvalidArgument;
+        }
+        // SAFETY: host-provided NUL-terminated FIDString.
+        let requested = unsafe { std::ffi::CStr::from_ptr(r#type) };
+        if requested == unsafe { std::ffi::CStr::from_ptr(Steinberg::kPlatformTypeHWND) } {
+            Steinberg::kResultTrue
+        } else {
+            Steinberg::kResultFalse
+        }
+    }
+
+    unsafe fn attached(
+        &self,
+        parent: *mut c_void,
+        r#type: Steinberg::FIDString,
+    ) -> Steinberg::tresult {
+        if parent.is_null() || r#type.is_null() {
+            return Steinberg::kInvalidArgument;
+        }
+        self.mark(GUI_ATTACHED);
+        // Ask the host for a size (view → host direction).
+        // SAFETY: the frame pointer was set by the host and is alive for
+        // the attached lifetime; the rect is a stack out-parameter.
+        unsafe {
+            let frame = self.frame.load(Ordering::Acquire);
+            if !frame.is_null()
+                && let Some(frame) = ComRef::<Steinberg::IPlugFrame>::from_raw(frame)
+            {
+                let mut rect = Steinberg::ViewRect {
+                    left: 0,
+                    top: 0,
+                    right: VIEW_WIDTH,
+                    bottom: VIEW_HEIGHT,
+                };
+                if frame.resizeView(self.self_ptr.load(Ordering::Acquire), &mut rect)
+                    == Steinberg::kResultOk
+                {
+                    self.mark(GUI_RESIZE_REQUESTED);
+                }
+            }
+            // Simulate a user edit inside the GUI (the CLAP `hide` hook
+            // mirror): report Gain = 0.75 through the host handler.
+            let handler = self.handler;
+            if !handler.is_null()
+                && let Some(handler) = ComRef::<Vst::IComponentHandler>::from_raw(handler)
+                && handler.performEdit(1, 0.75) == Steinberg::kResultOk
+            {
+                self.mark(GUI_PERFORM_EDIT);
+            }
+        }
+        Steinberg::kResultOk
+    }
+
+    unsafe fn removed(&self) -> Steinberg::tresult {
+        self.mark(GUI_REMOVED);
+        Steinberg::kResultOk
+    }
+
+    unsafe fn onWheel(&self, _distance: f32) -> Steinberg::tresult {
+        Steinberg::kNotImplemented
+    }
+
+    unsafe fn onKeyDown(
+        &self,
+        _key: Steinberg::char16,
+        _key_code: Steinberg::int16,
+        _modifiers: Steinberg::int16,
+    ) -> Steinberg::tresult {
+        Steinberg::kNotImplemented
+    }
+
+    unsafe fn onKeyUp(
+        &self,
+        _key: Steinberg::char16,
+        _key_code: Steinberg::int16,
+        _modifiers: Steinberg::int16,
+    ) -> Steinberg::tresult {
+        Steinberg::kNotImplemented
+    }
+
+    unsafe fn getSize(&self, size: *mut Steinberg::ViewRect) -> Steinberg::tresult {
+        if size.is_null() {
+            return Steinberg::kInvalidArgument;
+        }
+        self.mark(GUI_GET_SIZE);
+        // SAFETY: writable out-parameter provided by the host.
+        unsafe {
+            *size = Steinberg::ViewRect {
+                left: 0,
+                top: 0,
+                right: VIEW_WIDTH,
+                bottom: VIEW_HEIGHT,
+            };
+        }
+        Steinberg::kResultOk
+    }
+
+    unsafe fn onSize(&self, new_size: *mut Steinberg::ViewRect) -> Steinberg::tresult {
+        if new_size.is_null() {
+            return Steinberg::kInvalidArgument;
+        }
+        self.mark(GUI_ON_SIZE);
+        Steinberg::kResultOk
+    }
+
+    unsafe fn onFocus(&self, _state: Steinberg::TBool) -> Steinberg::tresult {
+        Steinberg::kNotImplemented
+    }
+
+    unsafe fn setFrame(&self, frame: *mut Steinberg::IPlugFrame) -> Steinberg::tresult {
+        self.frame.store(frame, Ordering::Release);
+        self.mark(GUI_SET_FRAME);
+        Steinberg::kResultOk
+    }
+
+    unsafe fn canResize(&self) -> Steinberg::tresult {
+        self.mark(GUI_CAN_RESIZE);
+        Steinberg::kResultTrue
+    }
+
+    unsafe fn checkSizeConstraint(&self, _rect: *mut Steinberg::ViewRect) -> Steinberg::tresult {
+        Steinberg::kNotImplemented
     }
 }
 
