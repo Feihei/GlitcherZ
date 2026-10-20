@@ -20,3 +20,10 @@ working_files/
 
 # 插件预设库（用户本地数据，不入库）/ Plugin preset library (local user data)
 presets/
+# Agent 工具产物（不入库）/ Agent tooling artifacts
+.arts/
+.box-agent/
+.box-agent-scratch/
+
+# Dev tool 输出（dexed_dump_param_table 测试写入）/ Dev tool output
+dexed_params.txt

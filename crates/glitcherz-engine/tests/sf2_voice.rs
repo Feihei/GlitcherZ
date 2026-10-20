@@ -371,3 +371,319 @@ fn real_soundfont_smoke() {
         "at least one of the first presets must be audible"
     );
 }
+/// Diagnostic against a real font: walks every preset, prints its render
+/// peak, and asserts the GM piano (bank 0 / program 0) is audible. Enable
+/// with `GLITCHERZ_SF2_PATH`.
+#[test]
+#[ignore = "set GLITCHERZ_SF2_PATH to a real .sf2 file to run this diagnostic"]
+fn real_soundfont_preset_audibility() {
+    let Ok(path) = std::env::var("GLITCHERZ_SF2_PATH") else {
+        eprintln!("GLITCHERZ_SF2_PATH not set; skipping real-soundfont audibility diagnostic");
+        return;
+    };
+    let library =
+        Sf2Library::load(std::path::Path::new(&path)).expect("sound font must load and parse");
+    let mut proc = Sf2VoiceProcessor::new(library.font(), SR).expect("processor must build");
+
+    let mut silent: Vec<String> = Vec::new();
+    for preset in library.presets() {
+        proc.set_param(ParamId::Sf2BankSelect, preset.bank as f32);
+        proc.set_param(ParamId::Sf2ProgramChange, preset.program as f32);
+        proc.note_event(note_on(60));
+        let (_buffer, peak) = render_blocks(&mut proc, 4);
+        eprintln!(
+            "{:3}:{:<3} peak={:.4} {}",
+            preset.bank, preset.program, peak, preset.name
+        );
+        if peak <= 0.001 {
+            silent.push(format!(
+                "{}:{} {}",
+                preset.bank, preset.program, preset.name
+            ));
+        }
+        proc.note_event(NoteEvent::Off { note: 60 });
+        render_blocks(&mut proc, RELEASE_BLOCKS);
+    }
+    eprintln!(
+        "silent presets ({} of {}):",
+        silent.len(),
+        library.presets().len()
+    );
+    for entry in &silent {
+        eprintln!("  {entry}");
+    }
+
+    library
+        .find_preset(0, 0)
+        .expect("bank 0 / program 0 must exist");
+    assert!(
+        !silent.iter().any(|s| s.starts_with("0:0 ")),
+        "the GM piano (0:0) must be audible, but it rendered silence"
+    );
+}
+/// Full RT-graph replay of the UI's SoundFont load and preset-switch paths
+/// against a real font: structure-queue node replacement (load), then
+/// command-queue preset switching (the preset picker). Both paths must end
+/// audible for the GM piano (0:0). Enable with `GLITCHERZ_SF2_PATH`.
+#[test]
+#[ignore = "set GLITCHERZ_SF2_PATH to a real .sf2 file to run this diagnostic"]
+fn real_soundfont_full_graph_paths() {
+    use glitcherz_engine::realtime::BlockRunner;
+    use glitcherz_engine::realtime::commands::{EngineCommand, command_channel};
+    use glitcherz_engine::realtime::graph::GraphCompiler;
+    use glitcherz_engine::realtime::sequencer::Sequencer;
+    use glitcherz_engine::realtime::voice::{recycle_channel, structure_channel};
+
+    let Ok(path) = std::env::var("GLITCHERZ_SF2_PATH") else {
+        eprintln!("GLITCHERZ_SF2_PATH not set; skipping real-soundfont full-graph diagnostic");
+        return;
+    };
+    let library =
+        Sf2Library::load(std::path::Path::new(&path)).expect("sound font must load and parse");
+
+    let (cmd_tx, cmd_rx) = command_channel(64);
+    let (mut structure_tx, structure_rx) = structure_channel();
+    let (recycle_tx, _recycle_rx) = recycle_channel();
+    let (mut compiler, graph) = GraphCompiler::default_graph(SR, BLOCK);
+    let feedback = glitcherz_engine::realtime::Feedback::new();
+    let runner = BlockRunner::new(
+        BLOCK,
+        2,
+        SR,
+        graph,
+        Sequencer::new(SR),
+        cmd_rx,
+        structure_rx,
+        recycle_tx,
+        feedback,
+    );
+    let mut runner = runner;
+    let mut cmd_tx = cmd_tx;
+
+    // Path 1 — UI load: preset addressed on the control thread, node swapped
+    // in via the structure queue (mirrors `load_soundfont_voice`).
+    let voice_id = compiler
+        .track_voice_node_id(0)
+        .expect("track 0 voice node must exist");
+    let mut processor = Sf2VoiceProcessor::new(library.font(), SR).expect("processor must build");
+    processor.set_param(ParamId::Sf2BankSelect, 0.0);
+    processor.set_param(ParamId::Sf2ProgramChange, 0.0);
+    let (update, _kept) = compiler
+        .replace_node(voice_id, Box::new(processor))
+        .map_err(|_| ())
+        .expect("node replacement must be accepted");
+    structure_tx.push(update).expect("structure queue not full");
+
+    let mut out = vec![0.0f32; 48_000 * 2];
+    runner.render_interleaved(&mut out[..1024 * 2]); // let the swap land
+    cmd_tx
+        .push(EngineCommand::Note {
+            track: 0,
+            event: NoteEvent::On {
+                note: 60,
+                velocity: 0.9,
+            },
+        })
+        .expect("queue not full");
+    runner.render_interleaved(&mut out);
+    let load_peak = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+    eprintln!("after load path (0:0), render peak = {load_peak:.4}");
+    assert!(
+        load_peak > 0.001,
+        "the freshly loaded GM piano (0:0) must be audible through the graph"
+    );
+
+    // Path 2 — preset picker: command-queue switch to another preset, then
+    // back to 0:0 (mirrors `set_soundfont_preset`).
+    cmd_tx
+        .push(EngineCommand::SetNodeParam {
+            node_id: voice_id,
+            id: ParamId::Sf2BankSelect,
+            value: 0.0,
+        })
+        .expect("queue not full");
+    cmd_tx
+        .push(EngineCommand::SetNodeParam {
+            node_id: voice_id,
+            id: ParamId::Sf2ProgramChange,
+            value: 1.0,
+        })
+        .expect("queue not full");
+    out.fill(0.0);
+    runner.render_interleaved(&mut out[..1024 * 2]);
+    runner.render_interleaved(&mut out);
+    let switch_peak = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+    eprintln!("after preset switch (0:1), render peak = {switch_peak:.4}");
+    assert!(switch_peak > 0.001, "preset 0:1 must be audible");
+
+    cmd_tx
+        .push(EngineCommand::SetNodeParam {
+            node_id: voice_id,
+            id: ParamId::Sf2ProgramChange,
+            value: 0.0,
+        })
+        .expect("queue not full");
+    cmd_tx
+        .push(EngineCommand::Note {
+            track: 0,
+            event: NoteEvent::On {
+                note: 64,
+                velocity: 0.9,
+            },
+        })
+        .expect("queue not full");
+    out.fill(0.0);
+    runner.render_interleaved(&mut out);
+    let back_peak = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+    eprintln!("after switching back (0:0), render peak = {back_peak:.4}");
+    assert!(
+        back_peak > 0.001,
+        "switching back to 0:0 must be audible (note: previous note may still ring)"
+    );
+}
+/// Generator index -> SF2 2.04 short name, for dump readability.
+fn generator_name(index: usize) -> &'static str {
+    match index {
+        0 => "startAddrsOfs",
+        1 => "endAddrsOfs",
+        2 => "startLoopAddrsOfs",
+        3 => "endLoopAddrsOfs",
+        4 => "startAddrsCoarseOfs",
+        5 => "modLfoToPitch",
+        6 => "vibLfoToPitch",
+        7 => "modEnvToPitch",
+        8 => "initialFilterFc",
+        9 => "initialFilterQ",
+        10 => "modLfoToFilterFc",
+        11 => "modEnvToFilterFc",
+        12 => "endAddrsCoarseOfs",
+        13 => "modLfoToVolume",
+        15 => "chorusSend",
+        16 => "reverbSend",
+        17 => "pan",
+        21 => "delayModLfo",
+        22 => "freqModLfo",
+        23 => "delayVibLfo",
+        24 => "freqVibLfo",
+        25 => "delayModEnv",
+        26 => "attackModEnv",
+        27 => "holdModEnv",
+        28 => "decayModEnv",
+        29 => "sustainModEnv",
+        30 => "releaseModEnv",
+        31 => "keynumToModEnvHold",
+        32 => "keynumToModEnvDecay",
+        33 => "delayVolEnv",
+        34 => "attackVolEnv",
+        35 => "holdVolEnv",
+        36 => "decayVolEnv",
+        37 => "sustainVolEnv",
+        38 => "releaseVolEnv",
+        39 => "keynumToVolEnvHold",
+        40 => "keynumToVolEnvDecay",
+        41 => "instrument",
+        43 => "keyRange",
+        44 => "velRange",
+        45 => "startLoopAddrsCoarseOfs",
+        46 => "keynum",
+        47 => "velocity",
+        48 => "initialAttenuation",
+        50 => "endLoopAddrsCoarseOfs",
+        51 => "coarseTune",
+        52 => "fineTune",
+        53 => "sampleID",
+        54 => "sampleModes",
+        56 => "scaleTuning",
+        57 => "exclusiveClass",
+        58 => "overridingRootKey",
+        _ => "?",
+    }
+}
+
+/// Velocity sweep against a real font: the piano roll delivers the document
+/// default velocity 100 (~0.787) while the virtual keyboard sends ~0.9..1.0;
+/// reports the render peak per velocity so a velrange gap in the font is
+/// visible. Enable with `GLITCHERZ_SF2_PATH`.
+#[test]
+#[ignore = "set GLITCHERZ_SF2_PATH to a real .sf2 file to run this diagnostic"]
+fn real_soundfont_velocity_sweep() {
+    let Ok(path) = std::env::var("GLITCHERZ_SF2_PATH") else {
+        eprintln!("GLITCHERZ_SF2_PATH not set; skipping real-soundfont velocity sweep");
+        return;
+    };
+    let library =
+        Sf2Library::load(std::path::Path::new(&path)).expect("sound font must load and parse");
+
+    for (bank, program, label) in [
+        (0u8, 0u8, "Grand Piano"),
+        (0, 1, "Bright Grand"),
+        (0, 3, "Honky-Tonk"),
+    ] {
+        for velocity in [1.0f32, 0.9, 100.0 / 127.0, 0.5, 0.25, 0.1] {
+            let mut proc =
+                Sf2VoiceProcessor::new(library.font(), SR).expect("processor must build");
+            proc.set_param(ParamId::Sf2BankSelect, f32::from(bank));
+            proc.set_param(ParamId::Sf2ProgramChange, f32::from(program));
+            proc.note_event(NoteEvent::On { note: 60, velocity });
+            // Full-envelope peak: every block's peak (not just the last),
+            // so a slow piano attack is not mistaken for silence.
+            let mut full_peak = 0.0f32;
+            for _ in 0..64 {
+                let (_buffer, peak) = render_blocks(&mut proc, 1);
+                full_peak = full_peak.max(peak);
+            }
+            eprintln!("{label:<14} velocity {velocity:.4} -> full peak {full_peak:.4}");
+        }
+    }
+
+    // Dump the piano's velocity-layer structure: every instrument region
+    // covering key 60 with its vel range, so the dip at MIDI velocity 100
+    // can be attributed to a font layer or a matching bug.
+    let font = library.font();
+    for preset in font.get_presets() {
+        if preset.get_bank_number() == 0 && preset.get_patch_number() == 0 {
+            eprintln!("--- preset '{}' regions ---", preset.get_name());
+            for region in preset.get_regions() {
+                let pvs = region.get_velocity_range_start();
+                let pve = region.get_velocity_range_end();
+                let pks = region.get_key_range_start();
+                let pke = region.get_key_range_end();
+                let explicit: Vec<String> = (0..61usize)
+                    .filter_map(|i| {
+                        region
+                            .get_generator(i)
+                            .map(|v| format!("{}={v}", generator_name(i)))
+                    })
+                    .collect();
+                eprintln!(
+                    "  preset zone key {pks}..{pke} vel {pvs}..{pve} explicit=[{}]",
+                    explicit.join(", ")
+                );
+                let inst = &font.get_instruments()[region.get_instrument_id() as usize];
+                for inst_region in inst.get_regions() {
+                    let ks = inst_region.get_key_range_start();
+                    let ke = inst_region.get_key_range_end();
+                    if ks <= 60 && 60 <= ke {
+                        eprintln!(
+                            "    -> inst '{}' vel {}..{} attn={:.1}dB cutoff={:.0}Hz Q={:.0} modEnvToFc={} attackModEnv={:.3}s sustainModEnv={:.1}dB decayModEnv={:.3}s attack={:.4}s sustain={:.1}dB decay={:.3}s release={:.3}s",
+                            inst.get_name(),
+                            inst_region.get_velocity_range_start(),
+                            inst_region.get_velocity_range_end(),
+                            inst_region.get_initial_attenuation(),
+                            inst_region.get_initial_filter_cutoff_frequency(),
+                            inst_region.get_initial_filter_q(),
+                            inst_region.get_modulation_envelope_to_filter_cutoff_frequency(),
+                            inst_region.get_attack_modulation_envelope(),
+                            inst_region.get_sustain_modulation_envelope(),
+                            inst_region.get_decay_modulation_envelope(),
+                            inst_region.get_attack_volume_envelope(),
+                            inst_region.get_sustain_volume_envelope(),
+                            inst_region.get_decay_volume_envelope(),
+                            inst_region.get_release_volume_envelope(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
