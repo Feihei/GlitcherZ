@@ -145,6 +145,15 @@ pub enum EngineCommand {
     },
     /// Send a note event to the given track's sound source (keyboard playing, etc.).
     Note { track: usize, event: NoteEvent },
+    /// Send a note event to **one instrument node** addressed by `node_id`
+    /// (G6, spec `.agents/spec/plugin-gui.md` §8: the virtual-keyboard route).
+    ///
+    /// Unlike [`EngineCommand::Note`] — which fans out through the timeline
+    /// MIDI routing table — this reaches exactly the addressed node and
+    /// ignores the track table entirely (the vk node itself never enters the
+    /// graph; only its document cable decides the target). Unknown ids are
+    /// silently dropped (RT-safe, no panic).
+    NoteAtNode { node_id: u64, event: NoteEvent },
     /// Sequencer transport / configuration.
     Sequencer(SequencerCommand),
     /// Set a node parameter addressed by node_id (P5b: node-addressed path;
@@ -184,6 +193,7 @@ mod tests {
             EngineCommand::SetTrackParam { value, .. } => value,
             EngineCommand::SetNodeParam { value, .. } => value,
             EngineCommand::Note { .. } => f32::NAN,
+            EngineCommand::NoteAtNode { .. } => f32::NAN,
             EngineCommand::Sequencer(_) => f32::NAN,
         }
     }

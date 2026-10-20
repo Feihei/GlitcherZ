@@ -463,6 +463,12 @@ pub struct GlitcherZApp {
     view: MainView,
     /// Octave base (MIDI number of C, default 60 = C4).
     octave_base: u8,
+    /// Live virtual-keyboard route (G6, spec `plugin-gui.md` §8): the
+    /// document instrument node a **selected** keyboard node's MIDI cable
+    /// points at. `None` = the computer / on-screen keyboard plays the
+    /// selected track (pre-G6 behavior — additive routing, no regression).
+    /// Recomputed once per frame from the patch selection.
+    vk_target: Option<u64>,
     /// Currently held notes (shared by on-screen keys and computer keys, for highlighting and
     /// de-duplication).
     held_notes: HashSet<u8>,
@@ -646,6 +652,7 @@ impl GlitcherZApp {
             patch_state: patch::PatchState::default(),
             view: MainView::default(),
             octave_base: 60,
+            vk_target: None,
             held_notes: HashSet::new(),
             mouse_down_notes: HashSet::new(),
             current_note: None,
@@ -766,6 +773,9 @@ impl GlitcherZApp {
                     }
                 }
                 CableKind::Midi => {
+                    // G6: vk → instrument cables are document-only routing
+                    // (the keyboard has no engine node; the app resolves the
+                    // route and addresses the instrument directly).
                     let PortRef::MidiTrack(track) = &cable.from else {
                         continue;
                     };
@@ -805,6 +815,11 @@ impl GlitcherZApp {
     /// Install a document node: build the processor (external plugins instantiated
     /// non-real-time) → engine `add_node` (new engine-side id) → register the mapping and guard.
     fn install_node(&mut self, node: &NodeDoc, sample_rate: u32) {
+        // G6: the virtual keyboard is document-only (UI routing node) — it
+        // never enters the engine graph, so it has no entry in `node_map`.
+        if node.is_keyboard() {
+            return;
+        }
         let sr = convert::sample_rate_to_f32(sample_rate);
         let doc_id = node.node_id();
         let track = node.track();
@@ -1051,6 +1066,11 @@ impl GlitcherZApp {
                 }
                 NodeDoc::ChannelStrip { .. } => {
                     (Box::new(ChannelStripProcessor::new()), None, String::new())
+                }
+                // G6: unreachable — virtual keyboards return before the match
+                // (document-only node, no engine processor).
+                NodeDoc::Keyboard { .. } => {
+                    (Box::new(SynthProcessor::new(sr)), None, String::new())
                 }
             };
         let engine_id = self.engine.fresh_node_id();
@@ -1740,6 +1760,9 @@ impl GlitcherZApp {
                         }
                     }
                 }
+                patch::PatchAction::ConnectKeyboardMidi { from_doc, to_doc } => {
+                    self.connect_keyboard_midi(from_doc, to_doc);
+                }
                 patch::PatchAction::ConnectAuto {
                     index,
                     to_doc,
@@ -1814,7 +1837,17 @@ impl GlitcherZApp {
                 out_pan: 0.0,
                 out_muted: false,
             },
+            // G6: document-only routing node — no engine processor, so the
+            // usual "installed into the engine?" check does not apply.
+            patch::AddNodeKind::VirtualKeyboard => NodeDoc::Keyboard { node_id, track },
         };
+        if node.is_keyboard() {
+            let before = self.begin_edit();
+            self.project_mut().graph.nodes.push(node);
+            self.commit_edit("Add Virtual Keyboard", before);
+            self.patch_state.place_node(node_id, at);
+            return Some(node_id);
+        }
         let sample_rate = self.engine.info().sample_rate;
         let before = self.begin_edit();
         self.project_mut().graph.nodes.push(node.clone());
@@ -1913,6 +1946,35 @@ impl GlitcherZApp {
         self.commit_edit("Connect Audio", before);
     }
 
+    /// Connect a virtual-keyboard MIDI cable (G6, spec `plugin-gui.md` §8):
+    /// **document-only** — the keyboard has no engine node, so there is no
+    /// engine edge to dispatch; the live route is resolved from the document
+    /// on selection (`GraphDoc::keyboard_route`).
+    ///
+    /// One keyboard drives one instrument: an existing vk out cable is
+    /// replaced (single-source discipline, mirroring the audio single-input
+    /// rule).
+    fn connect_keyboard_midi(&mut self, from_doc: u64, to_doc: u64) {
+        let is_vk = self
+            .project()
+            .graph
+            .node_by_id(from_doc)
+            .is_some_and(NodeDoc::is_keyboard);
+        if !is_vk {
+            self.set_message("Connect failed: source is not a virtual keyboard".to_string());
+            return;
+        }
+        let before = self.begin_edit();
+        let graph = &mut self.project_mut().graph;
+        graph
+            .cables
+            .retain(|c| !(c.kind == CableKind::Midi && c.from == PortRef::Node(from_doc)));
+        graph
+            .cables
+            .push(glitcherz_model::CableDoc::keyboard_midi(from_doc, to_doc));
+        self.commit_edit("Connect Keyboard", before);
+    }
+
     /// Delete a cable (document index i; document and engine stay in sync).
     fn delete_cable(&mut self, i: usize) {
         let Some(cable) = self.project().graph.cables.get(i).cloned() else {
@@ -1966,6 +2028,8 @@ impl GlitcherZApp {
             return;
         };
         let track = node.track();
+        // G6: the vk node is document-only (no engine counterpart).
+        let is_keyboard = node.is_keyboard();
         let audio_in_count = self
             .project()
             .graph
@@ -2004,13 +2068,20 @@ impl GlitcherZApp {
             .find(|c| c.kind == CableKind::Audio && c.from == PortRef::Node(doc_id))
             .map(|c| c.in_port)
             .unwrap_or(0);
-        let Some(&engine_id) = self.node_map.get(&doc_id) else {
-            return;
+        // G6: the vk node has no engine counterpart — only the document
+        // loses it (its MIDI cables go with it, no bypass rewiring).
+        let engine_id = if is_keyboard {
+            None
+        } else {
+            let Some(&engine_id) = self.node_map.get(&doc_id) else {
+                return;
+            };
+            if !self.engine.remove_node(engine_id) {
+                self.set_message("Node removal failed (queue full)".to_string());
+                return;
+            }
+            Some(engine_id)
         };
-        if !self.engine.remove_node(engine_id) {
-            self.set_message("Node removal failed (queue full)".to_string());
-            return;
-        }
         let before = self.begin_edit();
         self.project_mut()
             .graph
@@ -2050,7 +2121,9 @@ impl GlitcherZApp {
             }
         }
         self.node_map.remove(&doc_id);
-        self.retire_guard(engine_id);
+        if let Some(engine_id) = engine_id {
+            self.retire_guard(engine_id);
+        }
         // Param caches are node-keyed (G4): dropping them for a deleted
         // node is always safe.
         self.clap_effect_params.remove(&doc_id);
@@ -3025,22 +3098,50 @@ impl GlitcherZApp {
     }
 
     fn send_note_on(&mut self, note: u8, velocity: f32) {
-        let track = self.selected_track;
-        self.engine.send(EngineCommand::Note {
-            track,
-            event: NoteEvent::On { note, velocity },
-        });
+        let target = self.vk_target;
+        self.send_note_event_at(target, NoteEvent::On { note, velocity });
         self.held_notes.insert(note);
         self.current_note = Some(note);
     }
 
     fn send_note_off(&mut self, note: u8) {
-        let track = self.selected_track;
-        self.engine.send(EngineCommand::Note {
-            track,
-            event: NoteEvent::Off { note },
-        });
+        let target = self.vk_target;
+        self.send_note_event_at(target, NoteEvent::Off { note });
         self.held_notes.remove(&note);
+    }
+
+    /// Delivers one live note event to the current keyboard destination: the
+    /// vk-routed instrument node (G6 — node-addressed, skips the track table)
+    /// or the selected track's fan-out (the pre-G6 path). A stale route (the
+    /// instrument node vanished from the engine) falls back to the track.
+    fn send_note_event_at(&mut self, target: Option<u64>, event: NoteEvent) {
+        let command = match target.and_then(|doc| self.node_map.get(&doc).copied()) {
+            Some(node_id) => EngineCommand::NoteAtNode { node_id, event },
+            None => EngineCommand::Note {
+                track: self.selected_track,
+                event,
+            },
+        };
+        self.engine.send(command);
+    }
+
+    /// Recompute the virtual-keyboard route from the patch selection (G6,
+    /// spec `plugin-gui.md` §8). A route switch releases every held note at
+    /// the **old** destination first, so switching never leaves a hanging
+    /// voice behind (the later key-up simply targets a note nobody holds).
+    fn refresh_vk_target(&mut self) {
+        let target = {
+            let selected = self.patch_state.selected_doc_nodes();
+            self.project().graph.keyboard_route(&selected)
+        };
+        if target == self.vk_target {
+            return;
+        }
+        let old = self.vk_target;
+        for note in self.held_notes.iter().copied().collect::<Vec<u8>>() {
+            self.send_note_event_at(old, NoteEvent::Off { note });
+        }
+        self.vk_target = target;
     }
 
     /// Handle computer keyboard playing (FL Studio-style layout; Z/X shift octaves).
@@ -6115,8 +6216,16 @@ impl GlitcherZApp {
         ui.separator();
         ui.add_space(4.0);
         let sel = self.selected_track;
+        // G6: a selected vk node overrides the track destination.
+        let header = match self.vk_target {
+            Some(doc) => match self.project().graph.node_by_id(doc).map(NodeDoc::track) {
+                Some(track) => format!("Keyboard — vk → Track {}", track + 1),
+                None => "Keyboard — vk".to_string(),
+            },
+            None => format!("Keyboard — Track {}", sel + 1),
+        };
         ui.horizontal(|ui| {
-            ui.label(format!("Keyboard — Track {}", sel + 1));
+            ui.label(header);
             if ui.button("− Octave").clicked() {
                 self.octave_base = (self.octave_base.saturating_sub(12)).max(24);
             }
@@ -6189,6 +6298,10 @@ impl eframe::App for GlitcherZApp {
         // last frame, so every `has_focus()` check below (including the
         // keyboard handling) sees the hover decision this very frame.
         self.focus_router.begin_frame(ui.ctx());
+
+        // G6: the vk route decides where live notes go — recomputed before
+        // the keyboard handling below reads it.
+        self.refresh_vk_target();
 
         self.handle_keyboard_input(ui.ctx());
 

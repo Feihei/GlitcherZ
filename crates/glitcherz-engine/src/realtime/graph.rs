@@ -434,6 +434,22 @@ impl RtGraph {
             .is_some_and(|n| n.processor.note_event(event))
     }
 
+    /// Targeted note delivery by node_id (G6: the virtual-keyboard route —
+    /// one instrument, no track fan-out). Unknown / empty slots are silently
+    /// ignored. RT-safe (linear slot scan, no allocation).
+    pub fn node_note(&mut self, node_id: u64, event: NoteEvent) -> bool {
+        let Some(index) = self
+            .slots
+            .iter()
+            .position(|s| s.as_ref().is_some_and(|n| n.node_id == node_id))
+        else {
+            return false;
+        };
+        // `index` comes from the slice itself, so the cast cannot truncate
+        // (slot capacity 64 < u16::MAX).
+        self.slot_note(index as u16, event)
+    }
+
     /// Automation track delivery: looks up the routing table and writes the
     /// curve value to `(target node, target param)` (the destination is fixed
     /// at compile time, see [`AutoRoute`]). Silent when unconnected / out of
@@ -1836,6 +1852,27 @@ mod tests {
         for level in levels.tracks[DEFAULT_MIDI_TRACKS..].iter() {
             assert!(level.abs() < 1e-12, "unconfigured track levels should be 0");
         }
+    }
+
+    /// G6 (spec `plugin-gui.md` §8): node-addressed note delivery — exactly
+    /// the addressed instrument sounds, the track table stays untouched.
+    #[test]
+    fn node_note_reaches_only_the_addressed_slot() {
+        let (compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let node = compiler
+            .track_voice_node_id(1)
+            .expect("track 1 should carry an instrument node");
+        assert!(graph.node_note(node, note_on(69)));
+        let levels = graph.process_block(&ctx());
+        assert!(levels.tracks[1] > 0.05, "the addressed instrument sounds");
+        assert!(
+            levels.tracks[0].abs() < 1e-9,
+            "the track fan-out table must not be involved"
+        );
+        assert!(
+            !graph.node_note(u64::MAX, note_on(69)),
+            "unknown node ids are dropped"
+        );
     }
 
     #[test]

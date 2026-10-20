@@ -42,7 +42,7 @@
 //!   id 1 = master output reserved ([`MASTER_NODE_ID`]), document nodes
 //!   start from 2.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub mod file;
 pub mod ops;
@@ -870,6 +870,22 @@ pub enum NodeDoc {
         #[serde(default)]
         out_muted: bool,
     },
+    /// Virtual keyboard node (G6, spec `plugin-gui.md` §8): a **UI-only
+    /// routing node**. It has no real-time processor and never enters the
+    /// engine graph (the document node_id simply has no engine counterpart);
+    /// its MIDI out cable points at an instrument so that selecting the node
+    /// routes the computer / on-screen keyboard to that instrument.
+    ///
+    /// The node still carries `node_id` (cable endpoints address it) and
+    /// `track` (patch auto-placement grouping only).
+    Keyboard {
+        /// Persisted node ID.
+        #[serde(default)]
+        node_id: u64,
+        /// Owning track (auto-placement grouping only).
+        #[serde(default)]
+        track: usize,
+    },
     /// Legacy v4 channel strip — load-only (the v4→v5 migration converts it
     /// into a 2-channel [`NodeDoc::Mixer`]); new documents never emit it.
     ChannelStrip {
@@ -906,6 +922,7 @@ impl NodeDoc {
             NodeDoc::Instrument { node_id, .. }
             | NodeDoc::Effect { node_id, .. }
             | NodeDoc::Mixer { node_id, .. }
+            | NodeDoc::Keyboard { node_id, .. }
             | NodeDoc::ChannelStrip { node_id, .. } => *node_id,
         }
     }
@@ -916,6 +933,7 @@ impl NodeDoc {
             NodeDoc::Instrument { track, .. }
             | NodeDoc::Effect { track, .. }
             | NodeDoc::Mixer { track, .. }
+            | NodeDoc::Keyboard { track, .. }
             | NodeDoc::ChannelStrip { track, .. } => *track,
         }
     }
@@ -923,6 +941,12 @@ impl NodeDoc {
     /// Whether this node is a mixer (the only multi-input node, D14/D15).
     pub fn is_mixer(&self) -> bool {
         matches!(self, NodeDoc::Mixer { .. })
+    }
+
+    /// Whether this node is a virtual keyboard (G6: document-only routing
+    /// node — no engine processor, no audio ports).
+    pub fn is_keyboard(&self) -> bool {
+        matches!(self, NodeDoc::Keyboard { .. })
     }
 }
 
@@ -1006,6 +1030,18 @@ impl CableDoc {
         Self {
             kind: CableKind::Midi,
             from: PortRef::MidiTrack(from_track),
+            to: PortRef::Node(to_node),
+            param: AutoParam::default(),
+            in_port: 0,
+        }
+    }
+
+    /// Convenience constructor for a virtual-keyboard MIDI cable (G6: vk
+    /// node → instrument node; the only node→node MIDI edge).
+    pub fn keyboard_midi(from_node: u64, to_node: u64) -> Self {
+        Self {
+            kind: CableKind::Midi,
+            from: PortRef::Node(from_node),
             to: PortRef::Node(to_node),
             param: AutoParam::default(),
             in_port: 0,
@@ -1114,6 +1150,48 @@ impl GraphDoc {
                 }
             ) && n.track() == track
         })
+    }
+
+    /// G6 (spec `plugin-gui.md` §8): resolves the **virtual keyboard route**.
+    ///
+    /// Seeds are the selected [`NodeDoc::Keyboard`] nodes; their MIDI out
+    /// cables (`Keyboard → node`, G6 cable rule) are walked breadth-first and
+    /// the first **instrument** reached wins, picked in document order so
+    /// several keyboards / several instruments resolve deterministically.
+    /// Non-instrument endpoints (an effect fed by a MIDI cable, which the UI
+    /// never creates) are traversed but never returned — no MIDI pass-through.
+    ///
+    /// `None` = the selection carries no keyboard, or no route reaches an
+    /// instrument; the caller then keeps the track-driven behavior (G6: the
+    /// vk route is *additive*, unselected vk nodes change nothing).
+    pub fn keyboard_route(&self, selection: &[u64]) -> Option<u64> {
+        let seeds: Vec<u64> = self
+            .nodes
+            .iter()
+            .filter(|n| n.is_keyboard() && selection.contains(&n.node_id()))
+            .map(NodeDoc::node_id)
+            .collect();
+        if seeds.is_empty() {
+            return None;
+        }
+        let mut reached: BTreeSet<u64> = seeds.iter().copied().collect();
+        let mut queue: VecDeque<u64> = seeds.into_iter().collect();
+        while let Some(id) = queue.pop_front() {
+            for cable in &self.cables {
+                if cable.kind != CableKind::Midi || cable.from != PortRef::Node(id) {
+                    continue;
+                }
+                if let PortRef::Node(to) = cable.to
+                    && reached.insert(to)
+                {
+                    queue.push_back(to);
+                }
+            }
+        }
+        self.nodes
+            .iter()
+            .find(|n| matches!(n, NodeDoc::Instrument { .. }) && reached.contains(&n.node_id()))
+            .map(NodeDoc::node_id)
     }
 
     /// The first effect node of a track.
@@ -1269,6 +1347,14 @@ impl GraphDoc {
                     if !matches!(cable.from, PortRef::Node(_)) {
                         return Err("audio cable source port must be a node".to_string());
                     }
+                    // G6: a virtual keyboard has no audio ports at all.
+                    if let PortRef::Node(id) = cable.from
+                        && self.node_by_id(id).is_some_and(NodeDoc::is_keyboard)
+                    {
+                        return Err(format!(
+                            "virtual keyboard node {id} has no audio output (MIDI only)"
+                        ));
+                    }
                     let dest_key = match &cable.to {
                         PortRef::Node(id) => *id,
                         PortRef::Master => MASTER_NODE_ID,
@@ -1279,6 +1365,11 @@ impl GraphDoc {
                             );
                         }
                     };
+                    if self.node_by_id(dest_key).is_some_and(NodeDoc::is_keyboard) {
+                        return Err(format!(
+                            "virtual keyboard node {dest_key} has no audio input (MIDI only)"
+                        ));
+                    }
                     if dest_key == MASTER_NODE_ID {
                         // Master (D16): single input; in_port must be 0.
                         if cable.in_port != 0 {
@@ -1324,10 +1415,24 @@ impl GraphDoc {
                     }
                 }
                 CableKind::Midi => {
-                    if !matches!(cable.from, PortRef::MidiTrack(_)) {
-                        return Err(
-                            "MIDI cable source port must be a timeline MIDI track".to_string()
-                        );
+                    // D3 + G6: MIDI sources are the timeline MIDI track
+                    // outlets and virtual keyboard nodes (the only node kind
+                    // with a MIDI out port).
+                    match cable.from {
+                        PortRef::MidiTrack(_) => {}
+                        PortRef::Node(id) => {
+                            if !self.node_by_id(id).is_some_and(NodeDoc::is_keyboard) {
+                                return Err(format!(
+                                    "MIDI cable source node {id} is not a virtual keyboard (D3: track outlets and vk nodes only)"
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(
+                                "MIDI cable source port must be a timeline MIDI track or a virtual keyboard node"
+                                    .to_string(),
+                            );
+                        }
                     }
                     match cable.to {
                         PortRef::Node(id) => {
@@ -2444,5 +2549,138 @@ mod tests {
         let track = MidiTrack::default();
         assert!(track.clips.is_empty());
         let _ = SynthParams::default();
+    }
+
+    // ---- G6: virtual keyboard node (spec `plugin-gui.md` §8) ----
+
+    /// A document with two instrument nodes (ids 2 / 4) and no cables.
+    fn vk_doc() -> GraphDoc {
+        GraphDoc {
+            nodes: vec![
+                NodeDoc::Instrument {
+                    node_id: 2,
+                    track: 0,
+                    voice: VoiceSpec::Builtin,
+                    synth: SynthParams::default(),
+                },
+                NodeDoc::Instrument {
+                    node_id: 4,
+                    track: 1,
+                    voice: VoiceSpec::Builtin,
+                    synth: SynthParams::default(),
+                },
+                NodeDoc::Keyboard {
+                    node_id: 6,
+                    track: 0,
+                },
+            ],
+            cables: Vec::new(),
+            layout: Default::default(),
+        }
+    }
+
+    #[test]
+    fn keyboard_node_is_document_only_and_keeps_identity() {
+        let doc = vk_doc();
+        let kb = doc.node_by_id(6).expect("keyboard node present");
+        assert!(kb.is_keyboard());
+        assert_eq!(kb.track(), 0);
+        assert!(!doc.node_by_id(2).expect("instrument").is_keyboard());
+
+        // serde: additive tagged variant, no extra payload required.
+        let text = ron::to_string(&NodeDoc::Keyboard {
+            node_id: 6,
+            track: 2,
+        })
+        .expect("serialization failed");
+        assert!(text.contains("keyboard"), "tag missing: {text}");
+        let back: NodeDoc = ron::from_str(&text).expect("deserialization failed");
+        assert_eq!(
+            back,
+            NodeDoc::Keyboard {
+                node_id: 6,
+                track: 2
+            }
+        );
+    }
+
+    #[test]
+    fn keyboard_route_requires_a_selected_keyboard() {
+        let mut doc = vk_doc();
+        doc.cables.push(CableDoc::keyboard_midi(6, 4));
+        assert_eq!(
+            doc.keyboard_route(&[]),
+            None,
+            "empty selection routes nowhere"
+        );
+        assert_eq!(
+            doc.keyboard_route(&[2]),
+            None,
+            "a selected instrument is not a vk route"
+        );
+    }
+
+    #[test]
+    fn keyboard_route_without_cables_is_none() {
+        let doc = vk_doc();
+        assert_eq!(doc.keyboard_route(&[6]), None);
+    }
+
+    #[test]
+    fn keyboard_route_follows_the_midi_cable_to_the_instrument() {
+        let mut doc = vk_doc();
+        doc.cables.push(CableDoc::keyboard_midi(6, 4));
+        assert_eq!(doc.keyboard_route(&[6]), Some(4));
+    }
+
+    #[test]
+    fn keyboard_route_picks_the_first_instrument_in_document_order() {
+        let mut doc = vk_doc();
+        // Cables added in "reverse" document order: the instrument listed
+        // first (id 2) still wins.
+        doc.cables.push(CableDoc::keyboard_midi(6, 4));
+        doc.cables.push(CableDoc::keyboard_midi(6, 2));
+        assert_eq!(doc.keyboard_route(&[6]), Some(2));
+    }
+
+    #[test]
+    fn keyboard_route_ignores_non_instrument_endpoints() {
+        let mut doc = vk_doc();
+        doc.nodes.push(NodeDoc::Effect {
+            node_id: 8,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            delay: Default::default(),
+        });
+        doc.cables.push(CableDoc::keyboard_midi(6, 8));
+        assert_eq!(
+            doc.keyboard_route(&[6]),
+            None,
+            "MIDI never passes through an effect to an instrument"
+        );
+    }
+
+    #[test]
+    fn validate_allows_keyboard_midi_cable_only() {
+        let mut doc = vk_doc();
+        doc.cables.push(CableDoc::keyboard_midi(6, 2));
+        assert!(doc.validate(2, 0).is_ok(), "vk → instrument MIDI is legal");
+
+        // Audio cables touching a virtual keyboard are rejected both ways.
+        let mut doc = vk_doc();
+        doc.cables.push(CableDoc::audio(6, 2));
+        assert!(doc.validate(2, 0).is_err(), "vk has no audio output");
+
+        let mut doc = vk_doc();
+        doc.cables.push(CableDoc::audio(2, 6));
+        assert!(doc.validate(2, 0).is_err(), "vk has no audio input");
+
+        // A MIDI cable sourced from a non-keyboard node stays illegal.
+        let mut doc = vk_doc();
+        doc.cables.push(CableDoc::keyboard_midi(2, 4));
+        assert!(
+            doc.validate(2, 0).is_err(),
+            "only vk nodes have a MIDI out port"
+        );
     }
 }

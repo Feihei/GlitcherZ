@@ -190,6 +190,10 @@ pub enum AddNodeKind {
     /// Mixer node (P5f D15/D21): the explicit multi-channel summing point;
     /// absorbs the old ChannelStrip.
     Mixer,
+    /// Virtual keyboard node (G6, spec `plugin-gui.md` §8): document-only
+    /// routing node — selecting it plays the instrument at the end of its
+    /// MIDI cable.
+    VirtualKeyboard,
 }
 
 /// Interaction intents produced within one patch frame (applied by the caller; the patch has
@@ -209,6 +213,9 @@ pub enum PatchAction {
     },
     /// MIDI cable drag: timeline track → instrument document node.
     ConnectMidi { track: usize, to_doc: u64 },
+    /// MIDI cable drag out of a virtual keyboard node (G6): keyboard node →
+    /// instrument document node (the only node→node MIDI edge).
+    ConnectKeyboardMidi { from_doc: u64, to_doc: u64 },
     /// Automation cable drag (parameter already picked by the user from the popup menu).
     ConnectAuto {
         index: usize,
@@ -357,6 +364,8 @@ enum DragKind {
 
 /// Audio node box size.
 const NODE_SIZE: Vec2 = Vec2::new(150.0, 64.0);
+/// Virtual keyboard box (G6): a compact box with a mini key strip.
+const KEYBOARD_SIZE: Vec2 = Vec2::new(150.0, 56.0);
 /// Mixer box minimum height (scales with channel/input port count).
 const NODE_HEIGHT_MIN: f32 = 64.0;
 /// Vertical spacing between mixer input ports (P5f: one port per channel).
@@ -420,6 +429,7 @@ fn node_color(id: PatchId, doc: &GraphDoc) -> (Color32, Color32) {
             Some(NodeDoc::Instrument { .. }) => Color32::from_rgb(90, 160, 220),
             Some(NodeDoc::Effect { .. }) => Color32::from_rgb(220, 150, 70),
             Some(NodeDoc::Mixer { .. }) => Color32::from_rgb(110, 190, 120),
+            Some(NodeDoc::Keyboard { .. }) => Color32::from_rgb(95, 205, 190),
             Some(NodeDoc::ChannelStrip { .. }) => Color32::from_gray(140),
             None => Color32::from_gray(120),
         },
@@ -475,6 +485,7 @@ fn size_of(id: PatchId, deps: &PatchDeps) -> Vec2 {
                 NODE_SIZE.x,
                 (NODE_HEIGHT_MIN).max(*inputs as f32 * PORT_SPACING + 20.0),
             ),
+            Some(NodeDoc::Keyboard { .. }) => KEYBOARD_SIZE,
             _ => NODE_SIZE,
         },
         _ => NODE_SIZE,
@@ -511,6 +522,7 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 VoiceSpec::Vst3 { class_id, .. } => format!("Fx {}", truncate(class_id, 14)),
             },
             Some(NodeDoc::Mixer { inputs, .. }) => format!("Mixer · {} ch", inputs),
+            Some(NodeDoc::Keyboard { track, .. }) => format!("Keyboard · Track {}", track + 1),
             Some(NodeDoc::ChannelStrip { track, .. }) => {
                 format!("Strip (legacy) · Track {}", track + 1)
             }
@@ -619,6 +631,8 @@ impl PatchState {
                         1
                     }
                 }
+                // G6: the virtual keyboard has no audio input.
+                Some(node) if node.is_keyboard() => 0,
                 _ => 1,
             },
         };
@@ -655,6 +669,10 @@ impl PatchState {
                     )
                 }
                 NodeDoc::Mixer { .. } => (PatchId::Node(node.node_id()), Pos2::new(700.0, y)),
+                // G6: vk nodes sit in their own column, left of the
+                // instrument column (only a fallback — the menu places them
+                // at the click position).
+                NodeDoc::Keyboard { .. } => (PatchId::Node(node.node_id()), Pos2::new(200.0, y)),
                 NodeDoc::ChannelStrip { .. } => {
                     (PatchId::Node(node.node_id()), Pos2::new(700.0, y))
                 }
@@ -945,6 +963,38 @@ fn accepts(kind: CableKind, target: PatchId, doc: &GraphDoc) -> bool {
     }
 }
 
+/// Virtual-keyboard glyph (G6): a mini white/black key strip inside the node
+/// box, drawn beneath the label.
+fn paint_key_strip(painter: &egui::Painter, node: Rect) {
+    let strip = Rect::from_min_max(
+        Pos2::new(node.left() + 10.0, node.top() + 30.0),
+        Pos2::new(node.right() - 10.0, node.bottom() - 8.0),
+    );
+    if strip.width() <= 8.0 || strip.height() <= 4.0 {
+        return;
+    }
+    let white_keys = 7;
+    let key_w = strip.width() / white_keys as f32;
+    for i in 0..white_keys {
+        let key = Rect::from_min_size(
+            Pos2::new(strip.left() + i as f32 * key_w, strip.top()),
+            Vec2::new((key_w - 1.0).max(1.0), strip.height()),
+        );
+        painter.rect_filled(key, 1.0, Color32::from_rgb(232, 234, 236));
+    }
+    // Black keys on the C-D-E / F-G-A boundaries of the one-octave strip.
+    for i in [0, 1, 3, 4, 5] {
+        let x = strip.left() + (i as f32 + 1.0) * key_w;
+        let key = Rect::from_min_size(
+            Pos2::new(x - key_w * 0.28, strip.top()),
+            Vec2::new(key_w * 0.56, strip.height() * 0.6),
+        );
+        if key.right() <= strip.right() {
+            painter.rect_filled(key, 1.0, Color32::from_rgb(30, 32, 36));
+        }
+    }
+}
+
 /// Cubic bezier control points: horizontal extension scales with distance.
 fn bezier_controls(p0: Pos2, p3: Pos2) -> [Pos2; 4] {
     let dx = ((p3.x - p0.x).abs() * 0.5).clamp(40.0, 140.0);
@@ -1135,6 +1185,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             if ui.button("Mixer").clicked() {
                 picked_kind = Some(AddNodeKind::Mixer);
             }
+            if ui.button("Virtual Keyboard").clicked() {
+                picked_kind = Some(AddNodeKind::VirtualKeyboard);
+            }
         });
     }
     if let Some(kind) = picked_kind
@@ -1230,7 +1283,20 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                             }
                         }
                         PatchId::Node(from_doc) => {
-                            if accepts(CableKind::Audio, target, doc) && drag.from != target {
+                            // G6: a virtual keyboard's out port is a MIDI
+                            // port; every other node out port is audio.
+                            if doc.node_by_id(from_doc).is_some_and(NodeDoc::is_keyboard) {
+                                if accepts(CableKind::Midi, target, doc)
+                                    && drag.from != target
+                                    && let PatchId::Node(to_doc) = target
+                                {
+                                    actions.push(PatchAction::ConnectKeyboardMidi {
+                                        from_doc,
+                                        to_doc,
+                                    });
+                                }
+                            } else if accepts(CableKind::Audio, target, doc) && drag.from != target
+                            {
                                 let to = match target {
                                     PatchId::Node(id) => PortRef::Node(id),
                                     PatchId::Master => PortRef::Master,
@@ -1361,7 +1427,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     CableKind::Automation
                 }
             }
-            PatchId::Node(_) => CableKind::Audio,
+            PatchId::Node(node_id) => {
+                // G6: the vk node's out port carries MIDI, not audio.
+                if doc.node_by_id(node_id).is_some_and(NodeDoc::is_keyboard) {
+                    CableKind::Midi
+                } else {
+                    CableKind::Audio
+                }
+            }
             PatchId::Master => CableKind::Audio,
         };
         if let Some(sp) = pointer {
@@ -1425,11 +1498,23 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             Color32::from_rgb(225, 225, 228),
         );
 
+        // G6: mini key strip — the virtual keyboard's visual signature.
+        if let PatchId::Node(node_id) = id
+            && doc.node_by_id(node_id).is_some_and(NodeDoc::is_keyboard)
+        {
+            paint_key_strip(&painter, r);
+        }
+
         // Output ports (the timeline draws one per track with a small label).
         for (port, p) in state.out_ports_screen(rect.min, id, &deps) {
             let port_color = match id {
                 PatchId::Timeline if port < midi_count => cable_color(CableKind::Midi),
                 PatchId::Timeline => cable_color(CableKind::Automation),
+                PatchId::Node(node_id)
+                    if doc.node_by_id(node_id).is_some_and(NodeDoc::is_keyboard) =>
+                {
+                    cable_color(CableKind::Midi)
+                }
                 _ => cable_color(CableKind::Audio),
             };
             painter.circle_filled(p, PORT_RADIUS, port_color);
@@ -2111,5 +2196,42 @@ mod tests {
             doc
         ));
         assert!(!accepts(CableKind::Automation, PatchId::Master, doc));
+    }
+
+    /// G6 (spec `plugin-gui.md` §8): the vk node is a MIDI-only source with
+    /// no audio ports and its own compact box.
+    #[test]
+    fn virtual_keyboard_node_geometry_and_port_rules() {
+        let mut doc = Project::default().graph;
+        let instrument = doc.instrument_of_track(0).unwrap().node_id();
+        doc.nodes.push(NodeDoc::Keyboard {
+            node_id: 99,
+            track: 0,
+        });
+        let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
+        let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let deps = PatchDeps {
+            doc: &doc,
+            track_count: 1,
+            auto_count: 0,
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+        };
+        let vk = PatchId::Node(99);
+
+        // MIDI reaches instruments only; the vk node itself is no target.
+        assert!(accepts(CableKind::Midi, PatchId::Node(instrument), &doc));
+        assert!(!accepts(CableKind::Midi, vk, &doc));
+        assert!(!accepts(CableKind::Audio, vk, &doc));
+
+        // Geometry: compact box, exactly one (MIDI) out port, no in ports.
+        assert_eq!(size_of(vk, &deps), KEYBOARD_SIZE);
+        assert_eq!(inline_row_count(vk, &deps), 0);
+        let mut state = PatchState::default();
+        state.place_node(99, Pos2::ZERO);
+        let min = Pos2::ZERO;
+        assert_eq!(state.out_ports_screen(min, vk, &deps).len(), 1);
+        assert!(state.in_ports_screen(min, vk, &deps).is_empty());
+        assert_eq!(label_of(vk, &doc), "Keyboard · Track 1");
     }
 }

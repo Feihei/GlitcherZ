@@ -256,6 +256,10 @@ impl BlockRunner {
             EngineCommand::Note { track, event } => {
                 self.graph.track_note(track, event);
             }
+            EngineCommand::NoteAtNode { node_id, event } => {
+                // G6: virtual-keyboard route — the addressed instrument only.
+                let _ = self.graph.node_note(node_id, event);
+            }
             EngineCommand::Sequencer(cmd) => self.apply_sequencer_command(cmd),
         }
     }
@@ -513,6 +517,52 @@ mod tests {
             feedback.level.load() < 1e-9,
             "should be silent when no note is triggered"
         );
+    }
+
+    /// G6 (spec `plugin-gui.md` §8): `NoteAtNode` reaches exactly the
+    /// addressed instrument — not the track's MIDI fan-out targets.
+    #[test]
+    fn note_at_node_reaches_only_the_addressed_instrument() {
+        let (mut runner, mut tx, _voice_tx, feedback, compiler) = make_runner(128, 2);
+        let node = compiler
+            .track_voice_node_id(1)
+            .expect("track 1 should carry an instrument node");
+        tx.push(EngineCommand::NoteAtNode {
+            node_id: node,
+            event: NoteEvent::On {
+                note: 69,
+                velocity: 1.0,
+            },
+        })
+        .expect("queue not full");
+        let mut out = vec![0.0f32; 512 * 2];
+        runner.render_interleaved(&mut out);
+
+        assert!(
+            feedback.track_levels[1].load() > 0.0,
+            "the addressed instrument (track 1) should sound"
+        );
+        assert!(
+            feedback.track_levels[0].load() < 1e-9,
+            "the track table must not be involved"
+        );
+    }
+
+    /// G6: an unknown node id is silently dropped (no panic, no audio).
+    #[test]
+    fn note_at_unknown_node_is_a_dropped_no_op() {
+        let (mut runner, mut tx, _voice_tx, feedback, _compiler) = make_runner(128, 2);
+        tx.push(EngineCommand::NoteAtNode {
+            node_id: 9999,
+            event: NoteEvent::On {
+                note: 69,
+                velocity: 1.0,
+            },
+        })
+        .expect("queue not full");
+        let mut out = vec![0.0f32; 512 * 2];
+        runner.render_interleaved(&mut out);
+        assert!(feedback.level.load() < 1e-9, "no node should sound");
     }
 
     /// Sequencer end-to-end: command queue sends pattern and transport →
