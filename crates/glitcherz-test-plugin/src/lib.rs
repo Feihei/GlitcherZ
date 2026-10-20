@@ -1,20 +1,32 @@
 //! GlitcherZ test CLAP plugin: monophonic sine instrument (with one
-//! automatable parameter and a state extension).
+//! automatable parameter, a state extension, and a fake GUI extension).
 //!
 //! Purpose: end-to-end verification of GlitcherZ's CLAP host — plugin discovery,
-//! instantiation, note event bridging, parameter enumeration and state
-//! save/load round-trip. The implementation is deliberately minimal: a single
-//! voice (the last NoteOn wins), exposing one Amplitude parameter (ID 1, 0..1,
-//! default 0.5); the state extension persists the amplitude as 8 LE bytes.
+//! instantiation, note event bridging, parameter enumeration, state
+//! save/load round-trip, and the GUI open/close protocol. The
+//! implementation is deliberately minimal: a single voice (the last NoteOn
+//! wins), exposing one Amplitude parameter (ID 1, 0..1, default 0.5); the
+//! state extension persists the amplitude as 8 LE bytes.
+//!
+//! The fake GUI never opens a real window: every gui extension call sets a
+//! bit in a call bitmask and (for destroy) a call counter, both readable by
+//! the host through read-only parameters (IDs 2/3) so protocol tests can
+//! assert exact call sequences from the host process. Two host-callback
+//! paths are exercised: `set_parent` requests a resize, `show` requests a
+//! show, and a negative `set_scale` simulates the plugin losing its GUI
+//! (`closed(destroyed=true)` + failing call).
 
 use std::ffi::CStr;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use clack_common::events::Match;
 use clack_common::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
 use clack_common::stream::{InputStream, OutputStream};
 use clack_common::utils::Cookie;
+use clack_extensions::gui::{
+    GuiApiType, GuiConfiguration, GuiSize, HostGui, PluginGui, PluginGuiImpl, Window,
+};
 use clack_extensions::params::{
     ParamDisplayWriter, ParamInfo, ParamInfoFlags, ParamInfoWriter, PluginAudioProcessorParams,
     PluginMainThreadParams, PluginParams,
@@ -29,11 +41,45 @@ use clack_plugin::prelude::*;
 const AMPLITUDE_PARAM_ID: u32 = 1;
 /// Default value of the Amplitude parameter.
 const AMPLITUDE_DEFAULT: f64 = 0.5;
+/// Fixed ID of the read-only GuiCallMask parameter (bitmask of the gui
+/// extension calls observed so far; see the `GUI_CALL_*` bits).
+const GUI_MASK_PARAM_ID: u32 = 2;
+/// Fixed ID of the read-only GuiDestroyCount parameter (how many times the
+/// gui destroy call ran — lets host tests verify close idempotency).
+const GUI_DESTROY_COUNT_PARAM_ID: u32 = 3;
+
+/// GUI call observation bits (mirrored in `glitcherz-clap-host` tests as
+/// `GUI_CALL_*`).
+pub const GUI_CALL_CREATE: u32 = 1 << 0;
+pub const GUI_CALL_DESTROY: u32 = 1 << 1;
+pub const GUI_CALL_SET_SCALE: u32 = 1 << 2;
+pub const GUI_CALL_GET_SIZE: u32 = 1 << 3;
+pub const GUI_CALL_SET_PARENT: u32 = 1 << 4;
+pub const GUI_CALL_SHOW: u32 = 1 << 5;
+pub const GUI_CALL_HIDE: u32 = 1 << 6;
+pub const GUI_CALL_SET_SIZE: u32 = 1 << 7;
+pub const GUI_CALL_ADJUST_SIZE: u32 = 1 << 8;
+
+/// Size reported by the fake GUI.
+pub const GUI_FAKE_SIZE: GuiSize = GuiSize {
+    width: 320,
+    height: 200,
+};
+/// Size the fake GUI requests from the host during `set_parent` (exercises
+/// the host's `request_resize` callback).
+pub const GUI_FAKE_REQUESTED_SIZE: GuiSize = GuiSize {
+    width: 240,
+    height: 160,
+};
 
 /// Plugin shared state (main thread + audio thread): amplitude, stored
-/// atomically as an f64 bit pattern.
+/// atomically as an f64 bit pattern, plus the gui call observation state.
 pub struct SineShared {
     amplitude_bits: AtomicU64,
+    /// Bitmask of gui extension calls observed so far.
+    gui_calls: AtomicU32,
+    /// Number of gui destroy calls (idempotency checks).
+    gui_destroy_count: AtomicU32,
 }
 
 impl PluginShared<'_> for SineShared {}
@@ -47,6 +93,37 @@ impl SineShared {
         let clamped = value.clamp(0.0, 1.0);
         self.amplitude_bits
             .store(clamped.to_bits(), Ordering::Relaxed);
+    }
+
+    fn mark_gui(&self, bit: u32) {
+        self.gui_calls.fetch_or(bit, Ordering::Relaxed);
+    }
+
+    fn gui_mask(&self) -> u32 {
+        self.gui_calls.load(Ordering::Relaxed)
+    }
+
+    fn gui_destroy_count(&self) -> u32 {
+        self.gui_destroy_count.load(Ordering::Relaxed)
+    }
+
+    fn request_host_resize(&self, host: &HostMainThreadHandle<'_>, size: GuiSize) {
+        if let Some(gui) = host.shared().get_extension::<HostGui>() {
+            gui.request_resize(&host.shared(), size.width, size.height)
+                .ok();
+        }
+    }
+
+    fn request_host_show(&self, host: &HostMainThreadHandle<'_>) {
+        if let Some(gui) = host.shared().get_extension::<HostGui>() {
+            gui.request_show(&host.shared()).ok();
+        }
+    }
+
+    fn report_host_closed(&self, host: &HostMainThreadHandle<'_>) {
+        if let Some(gui) = host.shared().get_extension::<HostGui>() {
+            gui.closed(&host.shared(), true);
+        }
     }
 }
 
@@ -162,37 +239,63 @@ impl PluginAudioProcessorParams for SineAudio<'_> {
     }
 }
 
-/// Main-thread side: parameter metadata and value queries (CLAP params
-/// extension implementation).
+/// Main-thread side: parameter metadata, value queries, state persistence
+/// and the fake GUI (CLAP params/state/gui extension implementations).
 pub struct SineMainThread<'a> {
     shared: &'a SineShared,
+    host: HostMainThreadHandle<'a>,
 }
 
 impl<'a> PluginMainThread<'a, SineShared> for SineMainThread<'a> {}
 
 impl PluginMainThreadParams for SineMainThread<'_> {
     fn count(&self) -> u32 {
-        1
+        3
     }
 
     fn get_info(&self, param_index: u32, info: &mut ParamInfoWriter) {
-        if param_index != 0 {
-            return;
+        match param_index {
+            0 => info.set(&ParamInfo {
+                id: ClapId::new(AMPLITUDE_PARAM_ID),
+                flags: ParamInfoFlags::IS_AUTOMATABLE,
+                cookie: Cookie::empty(),
+                name: b"Amplitude",
+                module: b"",
+                min_value: 0.0,
+                max_value: 1.0,
+                default_value: AMPLITUDE_DEFAULT,
+            }),
+            1 => info.set(&ParamInfo {
+                id: ClapId::new(GUI_MASK_PARAM_ID),
+                flags: ParamInfoFlags::IS_READONLY | ParamInfoFlags::IS_STEPPED,
+                cookie: Cookie::empty(),
+                name: b"GuiCallMask",
+                module: b"",
+                min_value: 0.0,
+                max_value: 1023.0,
+                default_value: 0.0,
+            }),
+            2 => info.set(&ParamInfo {
+                id: ClapId::new(GUI_DESTROY_COUNT_PARAM_ID),
+                flags: ParamInfoFlags::IS_READONLY | ParamInfoFlags::IS_STEPPED,
+                cookie: Cookie::empty(),
+                name: b"GuiDestroyCount",
+                module: b"",
+                min_value: 0.0,
+                max_value: 1000.0,
+                default_value: 0.0,
+            }),
+            _ => {}
         }
-        info.set(&ParamInfo {
-            id: ClapId::new(AMPLITUDE_PARAM_ID),
-            flags: ParamInfoFlags::IS_AUTOMATABLE,
-            cookie: Cookie::empty(),
-            name: b"Amplitude",
-            module: b"",
-            min_value: 0.0,
-            max_value: 1.0,
-            default_value: AMPLITUDE_DEFAULT,
-        });
     }
 
     fn get_value(&self, param_id: ClapId) -> Option<f64> {
-        (param_id.get() == AMPLITUDE_PARAM_ID).then(|| self.shared.amplitude())
+        match param_id.get() {
+            AMPLITUDE_PARAM_ID => Some(self.shared.amplitude()),
+            GUI_MASK_PARAM_ID => Some(f64::from(self.shared.gui_mask())),
+            GUI_DESTROY_COUNT_PARAM_ID => Some(f64::from(self.shared.gui_destroy_count())),
+            _ => None,
+        }
     }
 
     fn value_to_text(
@@ -242,6 +345,87 @@ impl PluginStateImpl for SineMainThread<'_> {
     }
 }
 
+impl PluginGuiImpl for SineMainThread<'_> {
+    /// Only Win32 embedding is supported (the fake GUI never opens a
+    /// window, but the negotiation answers like a Windows plugin).
+    fn is_api_supported(&self, configuration: GuiConfiguration) -> bool {
+        configuration.api_type == GuiApiType::WIN32 && !configuration.is_floating
+    }
+
+    fn get_preferred_api(&self) -> Option<GuiConfiguration<'_>> {
+        Some(GuiConfiguration {
+            api_type: GuiApiType::WIN32,
+            is_floating: false,
+        })
+    }
+
+    fn create(&self, _configuration: GuiConfiguration) -> Result<(), PluginError> {
+        self.shared.mark_gui(GUI_CALL_CREATE);
+        Ok(())
+    }
+
+    fn destroy(&self) {
+        self.shared.mark_gui(GUI_CALL_DESTROY);
+        self.shared
+            .gui_destroy_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn set_scale(&self, scale: f64) -> Result<(), PluginError> {
+        self.shared.mark_gui(GUI_CALL_SET_SCALE);
+        if scale < 0.0 {
+            // Test hook: a negative scale simulates the plugin losing its
+            // GUI — it reports closed(destroyed) and fails the call.
+            self.shared.report_host_closed(&self.host);
+            return Err(PluginError::Message("simulated GUI loss"));
+        }
+        Ok(())
+    }
+
+    fn get_size(&self) -> Option<GuiSize> {
+        self.shared.mark_gui(GUI_CALL_GET_SIZE);
+        Some(GUI_FAKE_SIZE)
+    }
+
+    fn can_resize(&self) -> bool {
+        true
+    }
+
+    fn adjust_size(&self, size: GuiSize) -> Option<GuiSize> {
+        self.shared.mark_gui(GUI_CALL_ADJUST_SIZE);
+        Some(size)
+    }
+
+    fn set_size(&self, _size: GuiSize) -> Result<(), PluginError> {
+        self.shared.mark_gui(GUI_CALL_SET_SIZE);
+        Ok(())
+    }
+
+    fn set_parent(&self, _window: Window) -> Result<(), PluginError> {
+        self.shared.mark_gui(GUI_CALL_SET_PARENT);
+        // Exercise the host's request_resize callback path.
+        self.shared
+            .request_host_resize(&self.host, GUI_FAKE_REQUESTED_SIZE);
+        Ok(())
+    }
+
+    fn set_transient(&self, _window: Window) -> Result<(), PluginError> {
+        Err(PluginError::Message("floating windows are not supported"))
+    }
+
+    fn show(&self) -> Result<(), PluginError> {
+        self.shared.mark_gui(GUI_CALL_SHOW);
+        // Exercise the host's request_show callback path.
+        self.shared.request_host_show(&self.host);
+        Ok(())
+    }
+
+    fn hide(&self) -> Result<(), PluginError> {
+        self.shared.mark_gui(GUI_CALL_HIDE);
+        Ok(())
+    }
+}
+
 pub struct SinePlugin;
 
 impl Plugin for SinePlugin {
@@ -255,6 +439,7 @@ impl Plugin for SinePlugin {
     ) {
         builder.register::<PluginParams>();
         builder.register::<PluginState>();
+        builder.register::<PluginGui>();
     }
 }
 
@@ -268,14 +453,16 @@ impl DefaultPluginFactory for SinePlugin {
     fn new_shared(_host: HostSharedHandle<'_>) -> Result<Self::Shared<'_>, PluginError> {
         Ok(SineShared {
             amplitude_bits: AtomicU64::new(AMPLITUDE_DEFAULT.to_bits()),
+            gui_calls: AtomicU32::new(0),
+            gui_destroy_count: AtomicU32::new(0),
         })
     }
 
     fn new_main_thread<'a>(
-        _host: HostMainThreadHandle<'a>,
+        host: HostMainThreadHandle<'a>,
         shared: &'a Self::Shared<'a>,
     ) -> Result<Self::MainThread<'a>, PluginError> {
-        Ok(SineMainThread { shared })
+        Ok(SineMainThread { shared, host })
     }
 }
 

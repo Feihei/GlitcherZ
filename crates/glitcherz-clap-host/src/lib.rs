@@ -39,10 +39,15 @@
 
 pub mod raw;
 
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use clack_common::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
+use clack_extensions::gui::{
+    GuiApiType, GuiConfiguration, GuiError, GuiSize, HostGui, HostGuiImpl, PluginGui,
+};
 use clack_extensions::log::{HostLog, HostLogImpl};
 use clack_extensions::params::{
     HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamRescanFlags,
@@ -95,6 +100,16 @@ pub enum HostError {
     StateSave(#[source] StateError),
     #[error("failed to load plugin state: {0}")]
     StateLoad(#[source] StateError),
+    #[error("plugin does not implement the gui extension")]
+    NoGui,
+    #[error("plugin GUI does not support win32 embedding")]
+    GuiUnsupportedApi,
+    #[error("plugin GUI reported no size")]
+    GuiNoSize,
+    #[error("plugin GUI is not open")]
+    GuiNotOpen,
+    #[error("plugin GUI operation failed: {0}")]
+    Gui(#[source] GuiError),
 }
 
 // ---------------------------------------------------------------------------
@@ -236,10 +251,46 @@ pub fn list_clap_plugins() -> Vec<ClapPluginInfo> {
 // Host callback implementations
 // ---------------------------------------------------------------------------
 
+/// Host-side facts surfaced by gui extension callbacks. Written from plugin
+/// main-thread calls, polled by the UI frame loop (single-word atomics
+/// only; the audio thread is never involved).
+#[derive(Debug, Default)]
+pub struct GuiHostState {
+    /// Packed [`GuiSize`] of the latest `request_resize` (0 = none pending).
+    resize_request: AtomicU64,
+    show_request: AtomicBool,
+    hide_request: AtomicBool,
+    resize_hints_changed: AtomicBool,
+    /// Sticky: set by `closed(was_destroyed = true)`; cleared when the
+    /// guard acknowledges the destruction (see
+    /// [`ClapInstanceGuard::close_editor`]).
+    closed: AtomicBool,
+}
+
+/// One-shot gui events polled from the UI frame loop (take semantics: a
+/// flag is reported once per plugin request).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct EditorEvents {
+    /// Latest plugin-requested GUI size.
+    pub resize: Option<GuiSize>,
+    /// The plugin requested its GUI to be shown.
+    pub show: bool,
+    /// The plugin requested its GUI to be hidden.
+    pub hide: bool,
+    /// The plugin's resize hints changed (re-query `get_resize_hints`).
+    pub resize_hints_changed: bool,
+}
+
 struct GlitcherZHostShared {
     /// Captured during plugin initialization: the plugin's state extension,
     /// when implemented (read back after instantiation for save/load).
     state_ext: OnceLock<Option<PluginState>>,
+    /// Captured during plugin initialization: the plugin's gui extension,
+    /// when implemented (read back after instantiation for open/close).
+    gui_ext: OnceLock<Option<PluginGui>>,
+    /// Gui callback facts shared with the guard (polled via
+    /// [`ClapInstanceGuard::editor_events`]).
+    gui: Arc<GuiHostState>,
 }
 
 impl SharedHandler<'_> for GlitcherZHostShared {
@@ -249,6 +300,7 @@ impl SharedHandler<'_> for GlitcherZHostShared {
 
     fn initializing(&self, instance: InitializingPluginHandle<'_>) {
         let _ = self.state_ext.set(instance.get_extension::<PluginState>());
+        let _ = self.gui_ext.set(instance.get_extension::<PluginGui>());
     }
 }
 
@@ -262,6 +314,38 @@ impl HostParamsImplShared for GlitcherZHostShared {
     fn request_flush(&self) {
         // Simplified host: when the plugin requests a flush, the next process
         // carries all stashed events.
+    }
+}
+
+impl HostGuiImpl for GlitcherZHostShared {
+    fn resize_hints_changed(&self) {
+        self.gui.resize_hints_changed.store(true, Ordering::Relaxed);
+    }
+
+    fn request_resize(&self, new_size: GuiSize) -> Result<(), clack_host::host::HostError> {
+        self.gui
+            .resize_request
+            .store(new_size.pack_to_u64(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn request_show(&self) -> Result<(), clack_host::host::HostError> {
+        self.gui.show_request.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn request_hide(&self) -> Result<(), clack_host::host::HostError> {
+        self.gui.hide_request.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn closed(&self, was_destroyed: bool) {
+        // Per the CLAP contract, `was_destroyed == true` means the plugin
+        // already destroyed its GUI; the host acknowledges by calling
+        // destroy (see ClapInstanceGuard::close_editor).
+        if was_destroyed {
+            self.gui.closed.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -292,6 +376,7 @@ impl HostHandlers for GlitcherZHostHandlers {
         builder.register::<HostLog>();
         builder.register::<HostParams>();
         builder.register::<HostState>();
+        builder.register::<HostGui>();
     }
 }
 
@@ -345,6 +430,15 @@ pub struct ClapInstanceGuard {
     /// Handoff gate shared with the real-time node (see
     /// `glitcherz_engine::host_gate::StateGate`).
     state_gate: Arc<StateGate>,
+    /// The plugin's gui extension, when implemented (captured at
+    /// initialization; `None` when the plugin has none).
+    gui_ext: Option<PluginGui>,
+    /// Gui callback facts shared with the host handlers (see
+    /// [`Self::editor_events`]).
+    gui: Arc<GuiHostState>,
+    /// Whether the host-side GUI lifecycle is open (created, not yet
+    /// destroyed).
+    gui_open: bool,
 }
 
 use glitcherz_engine::host_gate::StateGate;
@@ -415,6 +509,147 @@ impl ClapInstanceGuard {
         self.state_gate.end_host_call();
         values
     }
+
+    /// Opens the plugin's embedded GUI (main thread only). `parent_hwnd`
+    /// is the platform parent window handle (Windows: HWND; borrowed for
+    /// the call — the plugin attaches its child window synchronously).
+    ///
+    /// Follows the CLAP embedded-GUI sequence: create → set_scale →
+    /// get_size → set_parent → show. On failure after a successful create
+    /// the GUI is destroyed again (no half-open state). Reopening without
+    /// an intervening close is allowed and closes first.
+    ///
+    /// Not serialized against the audio thread: gui calls are main-thread
+    /// plugin calls under the CLAP threading contract, safe to run while
+    /// `process` executes (unlike state save/load, see
+    /// `.agents/spec/plugin-gui.md` D7).
+    pub fn open_editor(
+        &mut self,
+        parent_hwnd: *mut c_void,
+        scale: f64,
+    ) -> Result<GuiSize, HostError> {
+        if self.gui_open {
+            self.close_editor();
+        }
+        let Some(gui) = self.gui_ext else {
+            return Err(HostError::NoGui);
+        };
+        let handle = self.instance.plugin_handle();
+        let config = GuiConfiguration {
+            api_type: GuiApiType::WIN32,
+            is_floating: false,
+        };
+        if !gui.is_api_supported(&handle, config) {
+            return Err(HostError::GuiUnsupportedApi);
+        }
+
+        let mut created = false;
+        let result = (|| {
+            gui.create(&handle, config).map_err(HostError::Gui)?;
+            created = true;
+            gui.set_scale(&handle, scale).map_err(HostError::Gui)?;
+            let size = gui.get_size(&handle).ok_or(HostError::GuiNoSize)?;
+            raw::gui_set_parent(&gui, &handle, parent_hwnd).map_err(HostError::Gui)?;
+            gui.show(&handle).map_err(HostError::Gui)?;
+            Ok(size)
+        })();
+
+        match result {
+            Ok(size) => {
+                self.gui_open = true;
+                Ok(size)
+            }
+            Err(err) => {
+                if created {
+                    gui.destroy(&handle);
+                    self.gui.closed.store(false, Ordering::Relaxed);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Closes and destroys the plugin GUI (main thread only). Idempotent.
+    /// This is also the host acknowledgement required after the plugin
+    /// reported `closed(was_destroyed = true)`: destroy is issued exactly
+    /// once either way.
+    pub fn close_editor(&mut self) {
+        if !self.gui_open {
+            return;
+        }
+        self.gui_open = false;
+        self.gui.closed.store(false, Ordering::Relaxed);
+        if let Some(gui) = self.gui_ext {
+            gui.destroy(&self.instance.plugin_handle());
+        }
+    }
+
+    /// Shows a previously opened (but hidden) editor (main thread only).
+    pub fn show_editor(&mut self) -> Result<(), HostError> {
+        self.with_open_gui("show", |gui, handle| gui.show(handle))
+    }
+
+    /// Hides the editor without destroying it (main thread only; tab-away
+    /// semantics, see `.agents/spec/plugin-gui.md` D9).
+    pub fn hide_editor(&mut self) -> Result<(), HostError> {
+        self.with_open_gui("hide", |gui, handle| gui.hide(handle))
+    }
+
+    /// Resizes the open embedded GUI (host-initiated; main thread only).
+    /// Negotiates via `adjust_size` when the plugin can resize, then
+    /// applies `set_size`.
+    pub fn resize_editor(&mut self, size: GuiSize) -> Result<(), HostError> {
+        if !self.gui_open {
+            return Err(HostError::GuiNotOpen);
+        }
+        let Some(gui) = self.gui_ext else {
+            return Err(HostError::NoGui);
+        };
+        let handle = self.instance.plugin_handle();
+        let working = if gui.can_resize(&handle) {
+            gui.adjust_size(&handle, size).unwrap_or(size)
+        } else {
+            size
+        };
+        gui.set_size(&handle, working).map_err(HostError::Gui)
+    }
+
+    /// Polls one-shot gui extension events (show/hide/resize requests from
+    /// the plugin) accumulated since the last call (main thread only).
+    pub fn editor_events(&self) -> EditorEvents {
+        let packed = self.gui.resize_request.swap(0, Ordering::Relaxed);
+        EditorEvents {
+            resize: (packed != 0).then(|| GuiSize::unpack_from_u64(packed)),
+            show: self.gui.show_request.swap(false, Ordering::Relaxed),
+            hide: self.gui.hide_request.swap(false, Ordering::Relaxed),
+            resize_hints_changed: self.gui.resize_hints_changed.swap(false, Ordering::Relaxed),
+        }
+    }
+
+    /// Whether the plugin reported its GUI as destroyed
+    /// (`closed(was_destroyed = true)`); sticky until
+    /// [`Self::close_editor`] acknowledges it.
+    pub fn gui_closed(&self) -> bool {
+        self.gui.closed.load(Ordering::Relaxed)
+    }
+
+    fn with_open_gui(
+        &mut self,
+        op: &str,
+        f: impl FnOnce(&PluginGui, &PluginMainThreadHandle) -> Result<(), GuiError>,
+    ) -> Result<(), HostError> {
+        if !self.gui_open {
+            return Err(HostError::GuiNotOpen);
+        }
+        let Some(gui) = self.gui_ext else {
+            return Err(HostError::NoGui);
+        };
+        let handle = self.instance.plugin_handle();
+        f(&gui, &handle).map_err(|err| {
+            log::warn!("plugin gui {op} failed: {err}");
+            HostError::Gui(err)
+        })
+    }
 }
 
 /// One-shot instantiation result: control-side guard + real-time node.
@@ -453,9 +688,13 @@ impl ClapInstance {
             env!("CARGO_PKG_VERSION"),
         )
         .map_err(|_| HostError::HostInfo)?;
+        let gui_state = Arc::new(GuiHostState::default());
+        let shared_gui_state = Arc::clone(&gui_state);
         let mut instance = PluginInstance::<GlitcherZHostHandlers>::new(
-            |_| GlitcherZHostShared {
+            move |_| GlitcherZHostShared {
                 state_ext: OnceLock::new(),
+                gui_ext: OnceLock::new(),
+                gui: Arc::clone(&shared_gui_state),
             },
             |_| GlitcherZHostMainThread,
             &entry,
@@ -464,10 +703,14 @@ impl ClapInstance {
         )
         .map_err(HostError::Instance)?;
 
-        // The extension is captured in `initializing` (already run by `new`);
-        // read it back here so save/load do not depend on handler lifetimes.
+        // The extensions are captured in `initializing` (already run by
+        // `new`); read them back here so save/load and gui open/close do
+        // not depend on handler lifetimes.
         let state_ext = instance
             .access_shared_handler(|shared| shared.state_ext.get().copied())
+            .flatten();
+        let gui_ext = instance
+            .access_shared_handler(|shared| shared.gui_ext.get().copied())
             .flatten();
 
         let stopped = instance
@@ -486,12 +729,16 @@ impl ClapInstance {
         let processor: PluginAudioProcessor<GlitcherZHostHandlers> = stopped.into();
 
         let state_gate = Arc::new(StateGate::default());
+
         Ok(Self {
             guard: ClapInstanceGuard {
                 _entry: entry,
                 instance,
                 state_ext,
                 state_gate: Arc::clone(&state_gate),
+                gui_ext,
+                gui: gui_state,
+                gui_open: false,
             },
             node: ClapNode::new(processor, config, state_gate),
         })
@@ -859,8 +1106,8 @@ mod tests {
         let params = instance.list_params();
         assert_eq!(
             params.len(),
-            1,
-            "the test plugin should expose one parameter"
+            3,
+            "the test plugin should expose three parameters"
         );
         let param = &params[0];
         assert_eq!(param.id, 1);
@@ -932,6 +1179,262 @@ mod tests {
             Some(&0.25),
             "loaded state should restore the amplitude"
         );
+    }
+
+    // ---- GUI extension protocol tests ----
+    //
+    // The test plugin's fake GUI records every call into a bitmask
+    // (parameter 2) and a destroy counter (parameter 3); the bits below
+    // mirror glitcherz-test-plugin's GUI_CALL_* constants. The fake GUI
+    // also exercises the host callbacks: set_parent requests a resize to
+    // 240x160 and show requests a show.
+
+    use std::ffi::c_void;
+
+    use super::{ClapInstanceGuard, GuiSize};
+
+    const GUI_CALL_CREATE: u32 = 1 << 0;
+    const GUI_CALL_DESTROY: u32 = 1 << 1;
+    const GUI_CALL_SET_SCALE: u32 = 1 << 2;
+    const GUI_CALL_GET_SIZE: u32 = 1 << 3;
+    const GUI_CALL_SET_PARENT: u32 = 1 << 4;
+    const GUI_CALL_SHOW: u32 = 1 << 5;
+    const GUI_CALL_HIDE: u32 = 1 << 6;
+    const GUI_CALL_SET_SIZE: u32 = 1 << 7;
+    const GUI_CALL_ADJUST_SIZE: u32 = 1 << 8;
+
+    const GUI_MASK_PARAM_ID: u32 = 2;
+    const GUI_DESTROY_COUNT_PARAM_ID: u32 = 3;
+
+    /// Fake parent window handle (the fake GUI never dereferences it).
+    const FAKE_HWND: *mut c_void = 0x1234_5678usize as *mut c_void;
+
+    fn gui_mask(guard: &ClapInstanceGuard) -> u32 {
+        guard
+            .read_param_values()
+            .get(&GUI_MASK_PARAM_ID)
+            .copied()
+            .map(|value| value as u32)
+            .unwrap_or(0)
+    }
+
+    fn gui_destroy_count(guard: &ClapInstanceGuard) -> u32 {
+        guard
+            .read_param_values()
+            .get(&GUI_DESTROY_COUNT_PARAM_ID)
+            .copied()
+            .map(|value| value as u32)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn gui_open_runs_embedded_sequence() {
+        let Some((mut instance, _ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        let size = instance
+            .guard
+            .open_editor(FAKE_HWND, 1.0)
+            .expect("open_editor should succeed");
+        assert_eq!(
+            size,
+            GuiSize {
+                width: 320,
+                height: 200
+            },
+            "open_editor should report the plugin's size"
+        );
+
+        // The full embedded sequence ran, exactly once each.
+        let mask = gui_mask(&instance.guard);
+        let expected = GUI_CALL_CREATE
+            | GUI_CALL_SET_SCALE
+            | GUI_CALL_GET_SIZE
+            | GUI_CALL_SET_PARENT
+            | GUI_CALL_SHOW;
+        assert_eq!(
+            mask, expected,
+            "open should run create→set_scale→get_size→set_parent→show and nothing else"
+        );
+
+        // The plugin's callbacks reached the host state (set_parent
+        // requests a resize, show requests a show).
+        let events = instance.guard.editor_events();
+        assert_eq!(
+            events.resize,
+            Some(GuiSize {
+                width: 240,
+                height: 160
+            }),
+            "set_parent should have requested a 240x160 resize"
+        );
+        assert!(events.show, "show should have requested a show");
+        assert!(!events.hide);
+
+        // Take semantics: a second poll reports nothing new.
+        let drained = instance.guard.editor_events();
+        assert_eq!(
+            drained,
+            super::EditorEvents::default(),
+            "editor events should be one-shot"
+        );
+    }
+
+    #[test]
+    fn gui_close_is_idempotent_and_reopenable() {
+        let Some((mut instance, _ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        instance
+            .guard
+            .open_editor(FAKE_HWND, 1.0)
+            .expect("open should succeed");
+        instance.guard.close_editor();
+        assert_eq!(
+            gui_destroy_count(&instance.guard),
+            1,
+            "first close should destroy exactly once"
+        );
+
+        // Idempotent: a second close must not call destroy again.
+        instance.guard.close_editor();
+        assert_eq!(
+            gui_destroy_count(&instance.guard),
+            1,
+            "second close must not destroy again"
+        );
+
+        // Reopenable after close.
+        instance
+            .guard
+            .open_editor(FAKE_HWND, 1.0)
+            .expect("reopen should succeed");
+        instance.guard.close_editor();
+        assert_eq!(
+            gui_destroy_count(&instance.guard),
+            2,
+            "second lifecycle should destroy once more"
+        );
+        assert!(
+            gui_mask(&instance.guard) & GUI_CALL_DESTROY != 0,
+            "destroy bit should be set"
+        );
+    }
+
+    #[test]
+    fn gui_open_failure_cleans_up_and_reopens() {
+        let Some((mut instance, _ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        // Negative scale: the test plugin reports closed(destroyed=true)
+        // and fails set_scale.
+        let result = instance.guard.open_editor(FAKE_HWND, -1.0);
+        assert!(
+            matches!(
+                result,
+                Err(super::HostError::Gui(
+                    clack_extensions::gui::GuiError::SetScaleError
+                ))
+            ),
+            "negative scale should fail at set_scale, got {result:?}"
+        );
+        assert_eq!(
+            gui_destroy_count(&instance.guard),
+            1,
+            "the failed open should clean up via destroy"
+        );
+        assert!(
+            !instance.guard.gui_closed(),
+            "the cleanup destroy acknowledges the closed report"
+        );
+
+        // The guard is reusable after the failure.
+        instance
+            .guard
+            .open_editor(FAKE_HWND, 1.0)
+            .expect("reopen after failure should succeed");
+        instance.guard.close_editor();
+        assert_eq!(
+            gui_destroy_count(&instance.guard),
+            2,
+            "the successful lifecycle after the failed one should destroy once"
+        );
+    }
+
+    #[test]
+    fn gui_resize_negotiates_via_adjust_size() {
+        let Some((mut instance, _ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        instance
+            .guard
+            .open_editor(FAKE_HWND, 1.0)
+            .expect("open should succeed");
+        instance
+            .guard
+            .resize_editor(GuiSize {
+                width: 640,
+                height: 480,
+            })
+            .expect("resize should succeed");
+        let mask = gui_mask(&instance.guard);
+        assert!(
+            mask & GUI_CALL_ADJUST_SIZE != 0 && mask & GUI_CALL_SET_SIZE != 0,
+            "resize should go through adjust_size and set_size, mask {mask:#x}"
+        );
+    }
+
+    #[test]
+    fn gui_hide_and_show_without_destroy() {
+        let Some((mut instance, _ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        instance
+            .guard
+            .open_editor(FAKE_HWND, 1.0)
+            .expect("open should succeed");
+        instance
+            .guard
+            .hide_editor()
+            .expect("hide should succeed on an open editor");
+        let mask = gui_mask(&instance.guard);
+        assert!(mask & GUI_CALL_HIDE != 0, "hide should reach the plugin");
+        assert_eq!(
+            gui_destroy_count(&instance.guard),
+            0,
+            "hide must not destroy"
+        );
+        instance
+            .guard
+            .show_editor()
+            .expect("show should succeed on a hidden editor");
+        assert_eq!(
+            gui_destroy_count(&instance.guard),
+            0,
+            "show must not destroy"
+        );
+    }
+
+    #[test]
+    fn gui_ops_on_closed_editor_error() {
+        let Some((mut instance, _ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        assert!(matches!(
+            instance.guard.resize_editor(GuiSize {
+                width: 1,
+                height: 1
+            }),
+            Err(super::HostError::GuiNotOpen)
+        ));
+        assert!(matches!(
+            instance.guard.hide_editor(),
+            Err(super::HostError::GuiNotOpen)
+        ));
+        assert!(matches!(
+            instance.guard.show_editor(),
+            Err(super::HostError::GuiNotOpen)
+        ));
     }
 
     #[test]

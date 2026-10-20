@@ -48,6 +48,7 @@ clack-extensions = { version = "0.2", features = [
     "log",
     "tail",
     "state",
+    "gui",
     "clack-host",
 ] }
 # 动态库加载（CLAP/VST3 插件扫描）

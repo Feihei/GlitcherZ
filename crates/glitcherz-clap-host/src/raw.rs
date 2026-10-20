@@ -18,21 +18,46 @@
 //!   caller's [`ClapInstanceGuard`]); the soundness of the plugin callbacks
 //!   themselves is the plugin author's responsibility (as with all DAW
 //!   hosts).
+//! - [`gui_set_parent`]: wraps the unsafe `Window::from_win32_hwnd` +
+//!   `PluginGui::set_parent` pair. The window-handle validity contract is
+//!   the caller's (the parent window must stay alive until the plugin GUI
+//!   is destroyed); the host upholds it by closing all editors before
+//!   releasing the owning window or guard (see
+//!   `.agents/spec/plugin-gui.md` §4.3).
 //!
 //! Behavioral verification is in the crate's `tests` (invalid files must
 //! return errors, not UB).
 #![allow(unsafe_code)]
 
-use std::ffi::c_char;
+use std::ffi::{c_char, c_void};
 use std::path::Path;
 use std::ptr::NonNull;
 
+use clack_extensions::gui::{GuiError, PluginGui};
 use clack_host::entry::{PluginEntry, PluginEntryError};
+use clack_host::plugin::PluginMainThreadHandle;
 use clap_sys::ext::params::{CLAP_EXT_PARAMS, clap_param_info, clap_plugin_params};
 use clap_sys::plugin::clap_plugin;
 use clap_sys::string_sizes::{CLAP_NAME_SIZE, CLAP_PATH_SIZE};
 
 use crate::ClapParamInfo;
+
+/// Attaches the plugin GUI to a Win32 parent window (the gui extension's
+/// `set_parent` call).
+///
+/// # Safety (preconditions guaranteed by the caller)
+///
+/// `hwnd` must be a valid, alive window handle. Per the clack contract the
+/// window must remain valid until the plugin GUI is destroyed.
+pub(crate) fn gui_set_parent(
+    gui: &PluginGui,
+    plugin: &PluginMainThreadHandle,
+    hwnd: *mut c_void,
+) -> Result<(), GuiError> {
+    // SAFETY: window validity is the caller's contract (see above); the
+    // plugin handle is alive while the guard holds the instance.
+    unsafe { gui.set_parent(plugin, clack_extensions::gui::Window::from_win32_hwnd(hwnd)) }
+}
 
 /// Enumerates all parameter metadata from a raw plugin instance; returns an
 /// empty list when the params extension is not implemented.
