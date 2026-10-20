@@ -22,3 +22,13 @@ serde_json = "1"
 glitcherz-engine = { workspace = true }
 glitcherz-model = { workspace = true }
 glitcherz-command = { workspace = true }
+
+raw-window-handle = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }

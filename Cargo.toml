@@ -57,6 +57,10 @@ libloading = "0.8"
 vst3 = "0.3"
 
 clack-plugin = "0.2"
+# Win32 子窗口容器（插件 GUI 嵌入，仅 Windows 构建）
+windows-sys = "0.60"
+# 原生窗口句柄提取（eframe 主窗口 HWND；与 eframe 0.36 的传递依赖同版本）
+raw-window-handle = "0.6"
 # SF2/SF3 音色库合成（纯 Rust、零 unsafe；S6 起 sf3 feature 常开——Vorbis 解码
 # 只发生在加载期控制线程，RT 热路径仍零分配）。
 # Vendored fork：修复 preset zone 合并语义（覆盖 + 仅 initialAttenuation 相加，

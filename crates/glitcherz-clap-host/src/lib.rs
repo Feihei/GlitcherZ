@@ -45,8 +45,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use clack_common::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
+pub use clack_extensions::gui::GuiSize;
 use clack_extensions::gui::{
-    GuiApiType, GuiConfiguration, GuiError, GuiSize, HostGui, HostGuiImpl, PluginGui,
+    GuiApiType, GuiConfiguration, GuiError, HostGui, HostGuiImpl, PluginGui,
 };
 use clack_extensions::log::{HostLog, HostLogImpl};
 use clack_extensions::params::{

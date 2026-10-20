@@ -1,4 +1,7 @@
-#![forbid(unsafe_code)]
+// `deny` instead of `forbid`: the one sanctioned unsafe boundary is
+// `plugin_window` (Win32 container plumbing, rationale + tests in that
+// module; see also AGENTS.md "禁止 unsafe" exceptions).
+#![deny(unsafe_code)]
 
 //! # glitcherz-ui
 //!
@@ -50,6 +53,7 @@ pub mod grid;
 pub mod lane;
 pub mod patch;
 pub mod piano_roll;
+pub mod plugin_window;
 pub mod timeline;
 
 /// Filter cutoff frequency slider range (logarithmic scale).
@@ -309,6 +313,27 @@ struct PluginGuardEntry {
     _guard: PluginGuard,
 }
 
+/// Embedded plugin editor session state (spec `plugin-gui.md` §4). The
+/// native container is the window the plugin attaches to; its on-screen
+/// geometry is refreshed each frame from the egui layout.
+struct PluginEditor {
+    /// Track whose instrument's editor is open.
+    track: usize,
+    /// Engine node id of the instrument (guard identity; retirement closes
+    /// the editor when this node goes away).
+    node_id: u64,
+    /// Desired editor size in egui points (initial = plugin-reported size;
+    /// updated by the plugin's request_resize).
+    size: (f32, f32),
+    /// Last frame's editor rect (egui points, screen coordinates) — where
+    /// the container window must be placed. `None` until the synth panel
+    /// lays the editor area out (or when the view is away).
+    rect: Option<egui::Rect>,
+    /// Native container window (dropped = destroyed; only after the plugin
+    /// editor itself is closed).
+    container: plugin_window::PluginWindowContainer,
+}
+
 /// Peak level meter: the peak holds for 600 ms before falling back, which is easier to read visually.
 #[derive(Debug)]
 struct PeakMeter {
@@ -471,6 +496,13 @@ pub struct GlitcherZApp {
     /// `sf2-loader.md` §6). Loaded via the library panel; document restores
     /// reuse it when the path matches to avoid re-reading a large file.
     sf2_library: Option<Arc<Sf2Library>>,
+    /// Embedded plugin editor state (spec `plugin-gui.md` §4): `Some` while
+    /// a CLAP instrument editor is open for `track`. Closed when the guard
+    /// retires, the track's voice changes, or the user toggles it off.
+    plugin_editor: Option<PluginEditor>,
+    /// Frame-queued request from the synth panel (it has no eframe frame to
+    /// create the container with); processed at the end of `ui()`.
+    plugin_editor_wants_open: bool,
     /// Diagnostic flag: whether `ui()` has been entered (logging only).
     first_frame_logged: bool,
     /// Diagnostic flag: whether the close command has been sent (logging only).
@@ -589,6 +621,8 @@ impl GlitcherZApp {
             voice_preset_selected: HashMap::new(),
             preset_name_input: String::new(),
             sf2_library: None,
+            plugin_editor: None,
+            plugin_editor_wants_open: false,
             first_frame_logged: false,
             close_sent: false,
         };
@@ -1015,9 +1049,111 @@ impl GlitcherZApp {
         }
     }
 
+    /// The live guard owning `engine_id` (active zone only; retiring
+    /// guards are on their way out and are never reopened).
+    fn guard_by_engine_id(&mut self, engine_id: u64) -> Option<&mut PluginGuard> {
+        self.voice_guards
+            .iter_mut()
+            .find(|e| e.node_id == engine_id)
+            .map(|e| &mut e._guard)
+    }
+
+    /// Closes the embedded plugin editor: the plugin's `gui.destroy` first,
+    /// then the native container window (spec `plugin-gui.md` §4.3 order —
+    /// the plugin never sees its parent vanish). No-op when closed.
+    fn close_plugin_editor(&mut self) {
+        let Some(editor) = self.plugin_editor.take() else {
+            return;
+        };
+        if let Some(PluginGuard::Clap(g)) = self.guard_by_engine_id(editor.node_id) {
+            g.close_editor();
+        }
+        drop(editor); // container destroyed after the plugin editor closed
+    }
+
+    /// Opens the selected track's CLAP instrument editor embedded under the
+    /// main window (spec `plugin-gui.md` §4). Needs the eframe frame (main
+    /// HWND + scale) — therefore runs in the `ui()` tail, not in the panel.
+    fn open_plugin_editor(&mut self, frame: &eframe::Frame, track: usize) {
+        if self.plugin_editor.is_some() {
+            return;
+        }
+        let Some(doc_id) = self
+            .project()
+            .graph
+            .instrument_of_track(track)
+            .map(NodeDoc::node_id)
+        else {
+            return;
+        };
+        let Some(&engine_id) = self.node_map.get(&doc_id) else {
+            return;
+        };
+        let Some(hwnd) = plugin_window::main_window_handle(frame) else {
+            self.set_message("Embedded editors need a native parent window".to_string());
+            return;
+        };
+        let container = match plugin_window::PluginWindowContainer::new(hwnd) {
+            Ok(c) => c,
+            Err(err) => {
+                log::warn!("Plugin editor container creation failed: {err}");
+                self.set_message(format!("Editor window failed: {err}"));
+                return;
+            }
+        };
+        let ppp = frame
+            .winit_window()
+            .map(|w| w.scale_factor())
+            .unwrap_or(1.0) as f32;
+        // CLAP reports GUI sizes in pixels; the egui layout works in points.
+        let to_points =
+            |s: glitcherz_clap_host::GuiSize| (s.width as f32 / ppp, s.height as f32 / ppp);
+        let mut opened: Option<Result<(f32, f32), glitcherz_clap_host::HostError>> = None;
+        match self.guard_by_engine_id(engine_id) {
+            Some(PluginGuard::Clap(g)) => {
+                opened = Some(
+                    g.open_editor(container.raw_handle(), ppp as f64)
+                        .map(to_points),
+                );
+            }
+            Some(PluginGuard::Vst3(_)) => {}
+            None => {}
+        }
+        match opened {
+            Some(Ok(size)) => {
+                log::info!("Embedded editor open: track {track} node {engine_id} size {size:?}pt");
+                self.plugin_editor = Some(PluginEditor {
+                    track,
+                    node_id: engine_id,
+                    size,
+                    rect: None,
+                    container,
+                });
+            }
+            Some(Err(err)) => {
+                log::info!("Plugin editor open failed: {err}");
+                self.set_message(format!("Plugin editor unavailable: {err}"));
+                // Container dropped here — the plugin never attached to it.
+            }
+            None => {
+                self.set_message("Only CLAP instruments have embedded editors (v1)".to_string());
+            }
+        }
+    }
+
     /// Move a node's active guard into the retiring zone (called when a node is swapped out or
     /// removed; retiring guards are released once recycling receipts arrive).
     fn retire_guard(&mut self, engine_id: u64) {
+        // An embedded editor attached to this node closes first (spec
+        // `plugin-gui.md` §4.3): plugin editor down before the guard moves
+        // on — an editor over a retired node would draw into a stale graph.
+        if self
+            .plugin_editor
+            .as_ref()
+            .is_some_and(|e| e.node_id == engine_id)
+        {
+            self.close_plugin_editor();
+        }
         let mut i = 0;
         while i < self.voice_guards.len() {
             if self.voice_guards[i].node_id == engine_id {
@@ -3601,8 +3737,6 @@ impl GlitcherZApp {
                 ui.weak("(no MIDI tracks in project)");
                 return;
             }
-            // Long parameter stack: without a scroll area the content clips with no scrollbar.
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             let sel = self.selected_track.min(self.project().midi_tracks.len() - 1);
             self.selected_track = sel;
             let track_title = if self.project().midi_tracks[sel].name.is_empty() {
@@ -3611,6 +3745,54 @@ impl GlitcherZApp {
                 self.project().midi_tracks[sel].name.clone()
             };
             ui.heading(format!("Synth — {track_title}"));
+            // Embedded plugin editor (spec `plugin-gui.md` §4): CLAP
+            // instruments only (v1). The toggle requests/destroys the
+            // session; the framed area below reserves layout space whose
+            // rect drives the native container window position (the real
+            // plugin GUI draws on top of it as a native child window).
+            // Deliberately **outside** the ScrollArea: a native child
+            // window cannot be clipped by egui, so a scrolling editor
+            // would smear over neighbouring UI (ghosting) — the editor
+            // stays pinned at the top and only the parameter stack below
+            // scrolls.
+            {
+                let editor_here = self
+                    .plugin_editor
+                    .as_ref()
+                    .map(|e| e.track == sel)
+                    .unwrap_or(false);
+                let is_clap = matches!(
+                    self.instrument_engine_guard(sel),
+                    Some(PluginGuard::Clap(_))
+                );
+                if is_clap {
+                    let label = if editor_here {
+                        "Close Editor"
+                    } else {
+                        "Show Editor"
+                    };
+                    if ui.button(label).clicked() {
+                        if editor_here {
+                            self.close_plugin_editor();
+                        } else {
+                            self.plugin_editor_wants_open = true;
+                        }
+                    }
+                }
+                if let Some(editor) = self.plugin_editor.as_mut() {
+                    if editor.track == sel {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(editor.size.0.max(1.0), editor.size.1.max(1.0)),
+                                egui::Sense::hover(),
+                            );
+                            editor.rect = Some(rect);
+                        });
+                    }
+                }
+            }
+            // Long parameter stack: without a scroll area the content clips with no scrollbar.
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Instrument");
                 let is_external = self
@@ -5719,7 +5901,7 @@ impl eframe::App for GlitcherZApp {
     // eframe 0.36: the App trait entry point changed from update(ctx) to ui(&mut Ui);
     // top/bottom panels act directly on the root Ui, and the remaining space is the central
     // region.
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         if !self.first_frame_logged {
             self.first_frame_logged = true;
             log::info!("UI first frame rendered");
@@ -5791,9 +5973,77 @@ impl eframe::App for GlitcherZApp {
             MainView::Synth => self.synth_panel(ui),
         }
 
+        // Embedded plugin editor lifecycle + window sync (spec
+        // `plugin-gui.md` §4). Open requests come from the synth panel
+        // (which has no eframe frame to parent a container with); plugin
+        // gui events are polled each frame; the native container follows
+        // the rect the panel laid out. Tab-away hides the container;
+        // switching the selected track destroys the editor (D9).
+        let track_count = self.project().midi_tracks.len();
+        let sel = if track_count == 0 {
+            usize::MAX
+        } else {
+            self.selected_track.min(track_count - 1)
+        };
+        if self.plugin_editor_wants_open {
+            self.plugin_editor_wants_open = false;
+            if sel != usize::MAX {
+                self.open_plugin_editor(frame, sel);
+            }
+        }
+        let mut destroy_editor = false;
+        if let Some(editor) = self.plugin_editor.as_mut() {
+            if editor.track != sel {
+                destroy_editor = true;
+            } else if let Some(PluginGuard::Clap(g)) = self
+                .voice_guards
+                .iter_mut()
+                .find(|e| e.node_id == editor.node_id)
+                .map(|e| &mut e._guard)
+            {
+                let events = g.editor_events();
+                if let Some(size) = events.resize {
+                    let ppp = ui.ctx().pixels_per_point();
+                    editor.size = (size.width as f32 / ppp, size.height as f32 / ppp);
+                }
+                if g.gui_closed() {
+                    // The plugin destroyed its GUI: the host acknowledges
+                    // by calling destroy exactly once, then tears the
+                    // session down.
+                    g.close_editor();
+                    destroy_editor = true;
+                }
+            }
+        }
+        if destroy_editor {
+            self.close_plugin_editor();
+        }
+        if let Some(editor) = self.plugin_editor.as_ref() {
+            if self.view != MainView::Synth {
+                // D9: tab-away only hides; returning to the synth tab
+                // shows the container again via reposition's
+                // SWP_SHOWWINDOW.
+                editor.container.hide();
+            } else if let Some(rect) = editor.rect {
+                editor
+                    .container
+                    .reposition_screen_rect(frame, rect, ui.ctx().pixels_per_point());
+            }
+        }
+
         // Audio-driven displays (level meter, playback position, envelope) need periodic
         // repaints; without this, egui sleeps when idle and auto-close (smoke test) never fires.
         ui.ctx().request_repaint_after(Duration::from_millis(50));
+    }
+}
+
+impl Drop for GlitcherZApp {
+    fn drop(&mut self) {
+        // Struct fields drop in declaration order and `voice_guards` is
+        // declared before `plugin_editor` — without this explicit close
+        // the plugin library would unload while its editor window is
+        // still attached (spec `plugin-gui.md` §4.3).
+        self.close_plugin_editor();
     }
 }
 

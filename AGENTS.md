@@ -58,7 +58,7 @@ glitcherz/
 - **语言约定**：代码注释、doc comment、日志、UI 文案、错误消息一律**英文**（用户要求：egui 默认字体无 CJK 字形）；术语以 `.agents/glossary.md` 为准，新概念先登记再使用。`.agents/` 与本文件等项目文档可用中文。
 - `cargo clippy -- -D warnings` 必须零警告。
 - `cargo fmt` 格式化所有代码。
-- 禁止 `unsafe`，除非：模块顶部有 `// SAFETY:` 注释 + 理由 + 测试。当前允许的边界仅 `glitcherz-clap-host` / `glitcherz-vst3-host` 的插件绑定层。
+- 禁止 `unsafe`，除非：模块顶部有 `// SAFETY:` 注释 + 理由 + 测试。当前允许的边界：`glitcherz-clap-host` / `glitcherz-vst3-host` 的插件绑定层，以及 `glitcherz-ui` 的 `plugin_window` 模块（Win32 容器窗口，spec `plugin-gui.md` §4）。
 - 浮点数统一使用 `f32`（音频路径）/ `f64`（UI 与时间计算），转换点集中在 `glitcherz-engine::convert`。
 - 错误处理：应用层用 `thiserror` 定义错误枚举，不使用 `anyhow` 跨 crate 边界。
 - **UI 层不得直接修改 model**：两种等价路径，都记录 undo——
