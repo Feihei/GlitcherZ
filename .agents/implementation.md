@@ -171,6 +171,19 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 - **测试**：`gui` 3 项（队列往返 / 溢出丢新 / 尺寸请求 take 一次）；`vst3-host` 3 项（`editor_view_round_trip` = attached→getSize→resize 请求→onSize 确认→removed，含重复 close 与重开；`perform_edit_reaches_the_host_queue`；`host_param_change_reaches_the_controller` 含 begin/end 位）。`parameter_enumeration_reports_gain` 期望值改 2 个参数。
 - **踩坑**：`cargo test --workspace` **不会**重建 cdylib fixture（G7 首次跑测试时链到 10-16 的旧 dll，症状 = `NoEditorView` + 只有 1 个参数）。改过 `glitcherz-test-vst3` 后先 `cargo build -p glitcherz-test-vst3` 再跑测试；`test_plugin_path()` 只检查文件存在，旧 dll 不会报警。
 
+### 反馈环路（P6，spec `node-graph.md` D10 修订，2026-10-21）
+
+显式 **Feedback 节点**：环路必须经过它才合法，不含它的环照旧 `TopologyError::Cycle`。
+
+- **1 块延迟 = 排序反转，不是缓冲**（本轮最省事的一刀）：编译期把「入 Feedback 的连线」视为**抽头**（tap）——该边不计入 Feedback 节点自身的入度（它构造上就是根），反而给**源**方的入度 +1，于是 Feedback 先跑、抽头源后跑，运行时抽头源缓冲里还留着上一块的输出。无额外延迟缓冲、无跨块状态、`ExecPlan` 依旧全 `Copy`。延迟 = `BLOCK` 样本（128 @ 48k ≈ 2.67 ms），写进 spec 供用户预期。
+- **为何反转安全**：`F → … → X` 叠加 `X → F` 本来就是环，反转只是把这条既有的环约束换成"先 F 后 X"，不会凭空造出新环。释放抽头源的时机在**处理到 Feedback 节点时**（`checked_sub` 一次）；`checked_sub` 失败即自环（纯延迟没有源），报 `Cycle`。
+- **`FeedbackProcessor` 只做 gain**：默认 0.5（裸环 unity 会持续或发散），`set_param(FeedbackGain)` clamp 0..1，unity 走 early-return fast path。文档侧 `NodeDoc::Feedback{node_id, track, gain}`（`#[serde(default)]` 默认 0.5）。
+- **无环的 Feedback 同样延迟一块**：不特判"这节点其实没成环"，语义统一（否则图上"有没有环"会静默改变一处延迟，用户没法推理）。
+- **删除不走旁路**：既有 D19 旁路要求 `in_count <= 1`，`bypassable` 额外排除 `NodeKind::Feedback`——旁路会把环重连成直连（多半直接变非法环），所以它的连线直接丢弃（mixer 同款）。
+- **UI 接入**：patch 右键 "Feedback Tap"（`AddNodeKind::Feedback`，粉紫配色、默认落 x=600）、`inline_param_id`/`apply_inline_param` 支持 `FeedbackGain`（undo 键 `feedback-gain`）、`install_node` 装 `FeedbackProcessor` + `set_param`、`kind` 推导 `match node { Mixer→Mixer, Feedback→Feedback, _→Plain }`。
+- **测试 5 项**（`graph.rs`）：`feedback_tap_is_exempt_from_cycle_rejection`（编译通过 + 断言 Feedback 排在 mixer 之前）、`feedback_tap_delays_one_block_and_applies_gain`（`y[n]=1+0.5y[n-1]` → 1 / 1.5 / 1.75 / 1.875，逐块钉住递推）、`feedback_tap_without_a_cycle_still_delays`、`feedback_self_loop_is_rejected`、`removing_a_feedback_node_drops_its_cables`。
+- **踩坑**：`FeedbackProcessor` 忘了补进 `realtime/mod.rs` 的 `pub use graph::{…}`，UI 侧 `unresolved import`——新 `Processor` 类型照例要过一遍 re-export。
+
 ### 项目文件与模型（`glitcherz-model`）
 
 - `Project`（metadata + gate + master_gain + 4×`Track`）；`Track` = 名称 + `Pattern` + `Clip`（`Note{start,length,note,velocity}` 列表 + loop_ticks，tick 基准：`TICKS_PER_QUARTER=96`/步=24/小节=384）+ 音源枚举（`VoiceSpec`: `Builtin | Clap | Vst3`）+ 混音（增益/声像/静音）+ `SynthParams` + `DelayParams`，全部 serde/RON + 字段级 `#[serde(default)]`；引擎侧镜像 `RtClip`（定容 128 音符 `Copy`，超容截断）经 `SetClip` 命令整块下发；

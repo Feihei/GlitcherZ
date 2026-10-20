@@ -31,7 +31,7 @@ related: [../plan.md, ../architecture.md]
 | D7 | 时间轴节点 | 固定存在（与主输出同级）：**MIDI 轨道**与**自动化轨道**是两类独立实体，各出一种端口；自动化曲线不再内嵌目标参数（现 `AutoParam` 职责），**目标 = 连线终点 (node_id, param)** |
 | D8 | 兼容性 | 不做 v1 迁移；`Project` v2 按节点图重新设计 |
 | D9 | 实施策略 | **P1+P2 连做**，不留两套引擎并存中间态 |
-| D10 | 环路 | 初期禁止：拓扑排序失败（有环）→ UI 拒绝该连线；P6 再议显式反馈节点 |
+| D10 | 环路 | 拓扑排序失败（有环）→ 拒绝该连线；**P6 修订（2026-10-21）**：环必须经过一个显式 **Feedback 节点**才合法——该节点的入边是"抽头"，编译器把它排在抽头源**之前**（读上一块缓冲），因此环不再参与排序约束；不含 Feedback 节点的环仍然拒绝 |
 | D11 | node_id 持久化 | `node_id` 随项目文件持久化（完整形态里 cables 跨会话引用节点的前提，补全 P4 过渡期"会话内单调不持久化"的临时口径）；加载后引擎编译器从文档 `max(node_id) + 1` 继续单调分配 |
 | D12 | 轨道动态化 | MIDI 轨 `Vec<MidiTrack>`（引擎侧定容 `MAX_MIDI_TRACKS = 16` + 活跃轨数控制侧下发；`midi_targets`/路由表/音序器全部扩容）；自动化轨道顶层 `Vec<AutomationTrack>`（引擎已定容 16） |
 | D13 | 默认图全显式 | 默认拓扑（每轨 `声源→延迟→通道条→主输出` + MIDI 自连）全部以 `nodes + cables` 写入项目文档；加载器**纯按文档重建**引擎图，`GraphCompiler::default_graph` 退役为"新建项目生成初始文档"的参考实现；文档与引擎一张皮 |
@@ -194,7 +194,7 @@ pub struct CableDoc {
   - ③ UI：mixer 节点绘制 N 个输入口（节点盒随通道数伸缩）+ 按口命中与连线落口（**自动选第一个空通道，任意空口可落**，D21）+ mixer 面板（每通道推子/pan/mute/solo + 输出 pan/mute 主控段 + 通道添加/删除按钮，2/32 上下限禁用）；
   - ④ 轨寻址与 metering 跟进：`register_track_chain` 的 channel 槽位语义退役，手动 TrackGain/TrackPan/TrackMute 改寻 mixer 通道参数（轨 → (mixer, in_port) 映射由文档连线推导）；每轨电平表点改为轨道末端节点（delay/voice），mixer 自身电平按节点回传；
   - 验收：单输入规则引擎级拒绝测试（含 master）；32 通道 mixer 加权求和数学测试（含 pan 声像系数、mute/solo 逻辑）；推子/pan/mute/solo 拖动不触发重建（参数路径断言）；v3 文件迁移往返；默认图端到端；P5e/P5e.1/P5e.2 画布交互回归。
-- [ ] **P6 反馈环路（可选）**：显式 1 块延迟反馈节点（128 样本 ≈ 2.7 ms），拓扑排序对其豁免。
+- [x] **P6 反馈环路**（2026-10-21 落地）：显式 Feedback 节点（`NodeKind::Feedback` + `FeedbackProcessor` + `NodeDoc::Feedback{gain}`）。实现要点——编译期把「入 Feedback 的连线」的排序约束**反转**（Feedback 先于抽头源运行，运行时读到的就是上一块的输出，1 块 ≈ 128 样本 ≈ 2.67 ms，**不需要额外延迟缓冲**）；节点自身只做 `gain` 缩放（0..1，默认 0.5，防止裸环发散）。无环的 Feedback 节点同样延迟一块（语义统一）。自环 / 不含 Feedback 的环仍报 `Cycle`；删除 Feedback 节点不走旁路（否则会把环重连成非法直连），其连线直接丢弃。
 
 ## 10. 开放问题
 
