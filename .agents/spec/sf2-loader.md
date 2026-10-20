@@ -1,6 +1,6 @@
 # Spec: 内置 SF2 音色库加载器（SoundFont Loader）
 
-> 状态：已定稿（2026-10-19）。对应 `plan.md`「新方向：内置 SF2 音色库加载器」。
+> 状态：已收官（2026-10-19，S1–S6 全部落地）。对应 `plan.md`「新方向：内置 SF2 音色库加载器」。
 > 范围：纯 Rust 方案；SF2 为主体，SF3（Vorbis 压缩采样）为第二阶段可选 feature。
 > 前置调研：crates.io 检索（2026-10-19），结论见 §2。
 
@@ -69,7 +69,10 @@ C 构建链依赖的 SF2 加载与合成路径。
 - [x] **S5** UI：音色库面板（加载 SF2/SF3、preset 下拉、轨声源绑定）+ undo/redo 路径
   走现有守卫/命令约定 ✅ 2026-10-19 完成（会话单库 `sf2_library` + `obtain_sf2_voice`
   path 匹配复用；preset 下拉 undoable + set_node_param 即时下发）
-- [ ] **S6** SF3 feature 开启 + 端到端验收（含 S1 审计复跑）
+- [x] **S6** SF3 feature 开启 + 端到端验收（含 S1 审计复跑）✅ 2026-10-19 完成：
+  workspace 常开 `sf3`（lewton 0.10；Vorbis 解码仅在加载期控制线程）；S1 审计
+  复跑（fixture 9 场景 + MuseScore_General 全 preset）sf3 开启后仍零分配；
+  真实库端到端验收全绿。**S1–S6 全部完成，spec 收官**
 
 ## 6. 边界与明确不做
 

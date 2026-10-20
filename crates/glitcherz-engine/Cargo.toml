@@ -11,6 +11,7 @@ cpal = { workspace = true }
 rtrb = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
-# SF2 sound font synthesis (S2+): loading/parsing is control-thread only
-# (sf2 module); RT hot paths audited allocation-free in S1 (spec section 7).
+# SF2/SF3 sound font synthesis (S2+): loading/parsing (including Vorbis
+# sample decode for SF3, via the sf3 feature) is control-thread only (sf2
+# module); RT hot paths audited allocation-free in S1 (spec section 7).
 rustysynth-ext = { workspace = true }
