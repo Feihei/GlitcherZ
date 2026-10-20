@@ -92,13 +92,19 @@ pub enum NodeKind {
     Mixer,
     /// Master output: exactly ≤ 1 audio in-edge (D16).
     Master,
+    /// Feedback tap (P6): sums up to [`MAX_IN_EDGES`] in-edges **read from
+    /// the previous block**, which is what exempts it from cycle rejection.
+    /// Ordering edges into this node are reversed (it runs *before* its
+    /// sources), so the tap sources still hold last block's output when the
+    /// sum happens — the explicit one-block delay, no extra buffer needed.
+    Feedback,
 }
 
 impl NodeKind {
     /// Compile-time in-edge limit for this node kind.
     pub fn max_in(self) -> usize {
         match self {
-            NodeKind::Mixer => MAX_IN_EDGES,
+            NodeKind::Mixer | NodeKind::Feedback => MAX_IN_EDGES,
             NodeKind::Plain | NodeKind::Master => 1,
         }
     }
@@ -642,6 +648,57 @@ impl Processor for ChannelStripProcessor {
     }
 }
 
+/// Feedback tap node (P6): the explicit loop breaker.
+///
+/// Its in-edges are summed from the **previous block's** buffers (the
+/// compiler orders it before its tap sources, see [`NodeKind::Feedback`]),
+/// so the processor itself only has to scale the sum — the one-block delay
+/// lives in the scheduling, not in a buffer. `gain` keeps a bare loop from
+/// diverging (default 0.5, clamped to 0..1).
+pub struct FeedbackProcessor {
+    gain: f32,
+}
+
+impl FeedbackProcessor {
+    /// Default gain 0.5 (a loop at unity would sustain or blow up).
+    pub fn new() -> Self {
+        Self { gain: 0.5 }
+    }
+}
+
+impl Default for FeedbackProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Processor for FeedbackProcessor {
+    fn process(&mut self, _ctx: &ProcessContext, buffer: &mut AudioBuffer) {
+        if (self.gain - 1.0).abs() < f32::EPSILON {
+            return; // Unity gain: the summed tap is the output
+        }
+        for ch in 0..buffer.channels() {
+            if let Some(channel) = buffer.channel_mut(ch) {
+                for sample in channel.iter_mut() {
+                    *sample *= self.gain;
+                }
+            }
+        }
+    }
+
+    fn set_param(&mut self, id: ParamId, value: f32) -> bool {
+        match id {
+            ParamId::FeedbackGain => {
+                if value.is_finite() {
+                    self.gain = value.clamp(0.0, 1.0);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Topology compilation/validation errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopologyError {
@@ -1076,7 +1133,28 @@ impl GraphCompiler {
             in_counts[d] += 1;
         }
 
-        let mut degree = in_counts;
+        // Ordering degrees (P6): a normal cable constrains `to` after
+        // `from`; a cable *into* a feedback node is a tap, so the
+        // constraint is reversed (the feedback node runs first and reads
+        // the tap source's previous-block buffer). Reversal never creates a
+        // new cycle: `F → … → X` on top of `X → F` was already a cycle.
+        let mut degree = [0u16; MAX_NODES];
+        for (slot, count) in in_counts.iter().enumerate() {
+            // A feedback node's in-edges are taps: they never gate the node
+            // itself (it is a root by construction).
+            if self.kinds[slot] == NodeKind::Feedback {
+                continue;
+            }
+            degree[slot] = u16::from(*count);
+        }
+        for cable in &self.cables[..self.cable_count] {
+            if !self.occupied[cable.from as usize] || !self.occupied[cable.to as usize] {
+                continue;
+            }
+            if self.kinds[cable.to as usize] == NodeKind::Feedback {
+                degree[cable.from as usize] += 1;
+            }
+        }
         let mut work = [0u16; MAX_NODES];
         let mut work_len = 0usize;
         let mut head = 0usize;
@@ -1092,16 +1170,47 @@ impl GraphCompiler {
             plan.order[plan.order_len] = s as u16;
             plan.order_len += 1;
             // Traverse all out-edges of this slot (multi-out fan-out: each
-            // downstream in-degree decrements by one).
+            // downstream in-degree decrements by one). Edges into a
+            // feedback node do not constrain their destination (see above).
             for cable in &self.cables[..self.cable_count] {
-                if cable.from as usize == s
-                    && self.occupied[cable.from as usize]
-                    && self.occupied[cable.to as usize]
+                if cable.from as usize != s
+                    || !self.occupied[cable.from as usize]
+                    || !self.occupied[cable.to as usize]
                 {
-                    let d = cable.to as usize;
+                    continue;
+                }
+                if self.kinds[cable.to as usize] == NodeKind::Feedback {
+                    continue;
+                }
+                let d = cable.to as usize;
+                if degree[d] > 0 {
                     degree[d] -= 1;
-                    if degree[d] == 0 {
-                        work[work_len] = cable.to;
+                }
+                if degree[d] == 0 {
+                    work[work_len] = cable.to;
+                    work_len += 1;
+                }
+            }
+            // This node's tap edges (only meaningful on a feedback node):
+            // releasing their sources is what lets the rest of the graph
+            // run after it.
+            if self.kinds[s] == NodeKind::Feedback {
+                for cable in &self.cables[..self.cable_count] {
+                    if cable.to as usize != s
+                        || !self.occupied[cable.from as usize]
+                        || !self.occupied[cable.to as usize]
+                    {
+                        continue;
+                    }
+                    let src = cable.from as usize;
+                    let Some(next) = degree[src].checked_sub(1) else {
+                        // Self-loop on a feedback node: its own tap can
+                        // never be satisfied (a pure delay has no source).
+                        return Err(TopologyError::Cycle);
+                    };
+                    degree[src] = next;
+                    if next == 0 {
+                        work[work_len] = cable.from;
                         work_len += 1;
                     }
                 }
@@ -1678,7 +1787,11 @@ impl GraphCompiler {
             in_port: 0,
         }; MAX_NODES];
         let mut bypass_count = 0usize;
-        if in_count <= 1 {
+        // P6: a feedback node's cables are taps — bypassing it would turn
+        // the loop into a direct edge and, usually, into a rejected cycle;
+        // its cables are dropped instead (mixer-like).
+        let bypassable = in_count <= 1 && self.kinds[slot as usize] != NodeKind::Feedback;
+        if bypassable {
             for cable in &self.cables[..self.cable_count] {
                 if cable.to == slot {
                     for out in &self.cables[..self.cable_count] {
@@ -2159,6 +2272,148 @@ mod tests {
             .add_cable(compiler.master_slot, compiler.track_voice[0], 0)
             .expect("should be able to add a cable within capacity");
         assert!(matches!(compiler.compile(), Err(TopologyError::Cycle)));
+    }
+
+    // ---- P6 feedback tap ----
+
+    /// Builds `DC → mixer[0]`, `feedback → mixer[1]`, `mixer → feedback`
+    /// (the tap) and `mixer → master`; returns the compiler and a running
+    /// graph. The mixer output therefore satisfies `y[n] = 1 + gain·y[n-1]`.
+    fn feedback_rig(gain: f32) -> (GraphCompiler, RtGraph) {
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let mut feedback = super::FeedbackProcessor::new();
+        assert!(feedback.set_param(ParamId::FeedbackGain, gain));
+        for update in [
+            compiler
+                .add_node(10, NodeKind::Plain, Box::new(DcSource { value: 1.0 }))
+                .expect("source node"),
+            compiler
+                .add_node(
+                    11,
+                    NodeKind::Mixer,
+                    Box::new(MixerProcessor::with_channels(
+                        &[
+                            crate::realtime::mixer::MixerChannel {
+                                gain: 1.0,
+                                ..Default::default()
+                            },
+                            crate::realtime::mixer::MixerChannel {
+                                gain: 1.0,
+                                ..Default::default()
+                            },
+                        ],
+                        0.0,
+                        false,
+                    )),
+                )
+                .expect("mixer node"),
+            compiler
+                .add_node(12, NodeKind::Feedback, Box::new(feedback))
+                .expect("feedback node"),
+            compiler.connect_nodes(10, 11, 0).expect("source → mixer"),
+            compiler.connect_nodes(12, 11, 1).expect("feedback → mixer"),
+            // The tap: mixer output feeds the feedback node one block late.
+            compiler.connect_nodes(11, 12, 0).expect("mixer → feedback"),
+            compiler
+                .connect_nodes(11, super::MASTER_NODE_ID, 0)
+                .expect("mixer → master"),
+        ] {
+            graph.apply_update(update, &mut recycle_tx);
+        }
+        (compiler, graph)
+    }
+
+    #[test]
+    fn feedback_tap_is_exempt_from_cycle_rejection() {
+        let (compiler, _graph) = feedback_rig(0.5);
+        let plan = compiler.compile().expect("feedback loop must compile");
+        assert_eq!(plan.order_len, 4, "all four nodes must be ordered");
+        // The feedback node is ordered before its tap source (the mixer),
+        // which is what keeps the read one block stale.
+        let feedback_slot = compiler.node_slot(12).expect("feedback slot");
+        let mixer_slot = compiler.node_slot(11).expect("mixer slot");
+        let pos = |slot: u16| plan.order[..plan.order_len].iter().position(|&s| s == slot);
+        assert!(pos(feedback_slot) < pos(mixer_slot));
+    }
+
+    #[test]
+    fn feedback_tap_delays_one_block_and_applies_gain() {
+        let (_compiler, mut graph) = feedback_rig(0.5);
+        // y[n] = 1 + 0.5·y[n-1], y[-1] = 0.
+        let expected = [1.0f32, 1.5, 1.75, 1.875];
+        for (block, want) in expected.iter().enumerate() {
+            let levels = graph.process_block(&ctx());
+            assert!(
+                (levels.master - want).abs() < 1e-6,
+                "block {block}: expected {want}, got {}",
+                levels.master
+            );
+        }
+    }
+
+    #[test]
+    fn feedback_tap_without_a_cycle_still_delays() {
+        // X → F with no return path: the node still reads X one block late
+        // (the ordering reversal is unconditional), and F drives master.
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let mut feedback = super::FeedbackProcessor::new();
+        assert!(feedback.set_param(ParamId::FeedbackGain, 1.0));
+        for update in [
+            compiler
+                .add_node(10, NodeKind::Plain, Box::new(DcSource { value: 1.0 }))
+                .expect("source node"),
+            compiler
+                .add_node(11, NodeKind::Feedback, Box::new(feedback))
+                .expect("feedback node"),
+            compiler
+                .connect_nodes(10, 11, 0)
+                .expect("source → feedback"),
+            compiler
+                .connect_nodes(11, super::MASTER_NODE_ID, 0)
+                .expect("feedback → master"),
+        ] {
+            graph.apply_update(update, &mut recycle_tx);
+        }
+        assert_eq!(
+            graph.process_block(&ctx()).master,
+            0.0,
+            "first block is stale"
+        );
+        assert!((graph.process_block(&ctx()).master - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn feedback_self_loop_is_rejected() {
+        let (mut compiler, _graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        compiler
+            .add_node(
+                10,
+                NodeKind::Feedback,
+                Box::new(super::FeedbackProcessor::new()),
+            )
+            .expect("feedback node");
+        let slot = compiler.node_slot(10).expect("slot");
+        compiler.add_cable(slot, slot, 0).expect("self cable");
+        assert!(matches!(compiler.compile(), Err(TopologyError::Cycle)));
+    }
+
+    #[test]
+    fn removing_a_feedback_node_drops_its_cables() {
+        let (mut compiler, _graph) = feedback_rig(0.5);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let update = compiler.remove_node(12).expect("feedback node removal");
+        // No bypass rewiring: both cables touching the node are gone and the
+        // loop is broken (a bypass would have recreated the cycle).
+        assert!(
+            compiler.cables[..compiler.cable_count]
+                .iter()
+                .all(|c| c.to != 12 || c.from != 12)
+        );
+        assert!(compiler.compile().is_ok());
+        let _ = update;
+        let _ = &mut recycle_tx;
     }
 
     #[test]

@@ -38,6 +38,8 @@ pub enum InlineParam {
     DelayMix,
     /// Mixer output-stage pan.
     MixerOutPan,
+    /// Feedback tap gain (P6).
+    FeedbackGain,
 }
 
 /// Inline parameter addressing: built-in registry entry or an external
@@ -90,6 +92,12 @@ const MIXER_INLINE: [InlineParamSpec; 1] = [InlineParamSpec {
     label: "pan",
 }];
 
+/// Feedback tap inline row (P6): the loop amount.
+const FEEDBACK_INLINE: [InlineParamSpec; 1] = [InlineParamSpec {
+    param: InlineParam::FeedbackGain,
+    label: "fb",
+}];
+
 /// Static inline-parameter registry for one node (G5 spec §7). SoundFont
 /// instruments expose none (the preset picker is the primary operation);
 /// plugin nodes take their rows from the session enumeration instead
@@ -105,6 +113,7 @@ fn inline_params_of(node: &NodeDoc) -> &'static [InlineParamSpec] {
             ..
         } => &DELAY_INLINE,
         NodeDoc::Mixer { .. } => &MIXER_INLINE,
+        NodeDoc::Feedback { .. } => &FEEDBACK_INLINE,
         _ => &[],
     }
 }
@@ -159,6 +168,7 @@ fn inline_doc_value(node: &NodeDoc, param: InlineParam) -> (f64, f64, f64) {
             *DELAY_MIX_RANGE.end() as f64,
         ),
         (NodeDoc::Mixer { out_pan, .. }, InlineParam::MixerOutPan) => (*out_pan as f64, -1.0, 1.0),
+        (NodeDoc::Feedback { gain, .. }, InlineParam::FeedbackGain) => (*gain as f64, 0.0, 1.0),
         _ => (0.0, 0.0, 1.0),
     }
 }
@@ -194,6 +204,9 @@ pub enum AddNodeKind {
     /// routing node — selecting it plays the instrument at the end of its
     /// MIDI cable.
     VirtualKeyboard,
+    /// Feedback tap node (P6, spec `node-graph.md` D10): sums its inputs one
+    /// block late, which is what makes a loop legal.
+    Feedback,
 }
 
 /// Interaction intents produced within one patch frame (applied by the caller; the patch has
@@ -430,6 +443,7 @@ fn node_color(id: PatchId, doc: &GraphDoc) -> (Color32, Color32) {
             Some(NodeDoc::Effect { .. }) => Color32::from_rgb(220, 150, 70),
             Some(NodeDoc::Mixer { .. }) => Color32::from_rgb(110, 190, 120),
             Some(NodeDoc::Keyboard { .. }) => Color32::from_rgb(95, 205, 190),
+            Some(NodeDoc::Feedback { .. }) => Color32::from_rgb(215, 105, 160),
             Some(NodeDoc::ChannelStrip { .. }) => Color32::from_gray(140),
             None => Color32::from_gray(120),
         },
@@ -523,6 +537,7 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
             },
             Some(NodeDoc::Mixer { inputs, .. }) => format!("Mixer · {} ch", inputs),
             Some(NodeDoc::Keyboard { track, .. }) => format!("Keyboard · Track {}", track + 1),
+            Some(NodeDoc::Feedback { gain, .. }) => format!("Feedback {:.0}%", gain * 100.0),
             Some(NodeDoc::ChannelStrip { track, .. }) => {
                 format!("Strip (legacy) · Track {}", track + 1)
             }
@@ -669,6 +684,8 @@ impl PatchState {
                     )
                 }
                 NodeDoc::Mixer { .. } => (PatchId::Node(node.node_id()), Pos2::new(700.0, y)),
+                // P6: feedback taps sit just left of the mixer column.
+                NodeDoc::Feedback { .. } => (PatchId::Node(node.node_id()), Pos2::new(600.0, y)),
                 // G6: vk nodes sit in their own column, left of the
                 // instrument column (only a fallback — the menu places them
                 // at the click position).
@@ -952,7 +969,10 @@ fn accepts(kind: CableKind, target: PatchId, doc: &GraphDoc) -> bool {
         };
         match kind {
             CableKind::Audio => {
-                matches!(node, NodeDoc::Effect { .. } | NodeDoc::Mixer { .. })
+                matches!(
+                    node,
+                    NodeDoc::Effect { .. } | NodeDoc::Mixer { .. } | NodeDoc::Feedback { .. }
+                )
             }
             CableKind::Midi => matches!(node, NodeDoc::Instrument { .. }),
             // Mixer-fader automation is deferred (P5f decision): instruments only.
@@ -1187,6 +1207,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             }
             if ui.button("Virtual Keyboard").clicked() {
                 picked_kind = Some(AddNodeKind::VirtualKeyboard);
+            }
+            if ui.button("Feedback Tap").clicked() {
+                picked_kind = Some(AddNodeKind::Feedback);
             }
         });
     }

@@ -49,6 +49,9 @@ pub enum ParamId {
     DelayFeedback,
     /// Delay wet mix ratio (0..1).
     DelayMix,
+    /// Feedback tap gain (P6; 0..1). Applied to the one-block-delayed sum
+    /// of the feedback node's in-edges.
+    FeedbackGain,
     /// Mixer channel gain (payload = channel index 0..32, linear 0..1.5; D15).
     MixerGain(u8),
     /// Mixer channel pan (payload = channel index; -1..1, linear law).

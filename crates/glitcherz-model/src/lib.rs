@@ -886,6 +886,23 @@ pub enum NodeDoc {
         #[serde(default)]
         track: usize,
     },
+    /// Feedback tap node (P6, spec `node-graph.md` D10): the explicit,
+    /// self-documenting loop breaker. Its in-edges are summed **one block
+    /// late** (the engine orders it before its tap sources), which is what
+    /// exempts it from the cycle rejection — so it has N inputs (taps) and
+    /// one output. `gain` (0..1) scales the delayed sum, which keeps a bare
+    /// loop from diverging.
+    Feedback {
+        /// Persisted node ID.
+        #[serde(default)]
+        node_id: u64,
+        /// Owning track (grouping only).
+        #[serde(default)]
+        track: usize,
+        /// Feedback amount applied to the delayed sum (0..1).
+        #[serde(default = "default_feedback_gain")]
+        gain: f32,
+    },
     /// Legacy v4 channel strip — load-only (the v4→v5 migration converts it
     /// into a 2-channel [`NodeDoc::Mixer`]); new documents never emit it.
     ChannelStrip {
@@ -915,6 +932,10 @@ fn default_track_gain() -> f32 {
     0.8
 }
 
+fn default_feedback_gain() -> f32 {
+    0.5
+}
+
 impl NodeDoc {
     /// Node ID.
     pub fn node_id(&self) -> u64 {
@@ -922,6 +943,7 @@ impl NodeDoc {
             NodeDoc::Instrument { node_id, .. }
             | NodeDoc::Effect { node_id, .. }
             | NodeDoc::Mixer { node_id, .. }
+            | NodeDoc::Feedback { node_id, .. }
             | NodeDoc::Keyboard { node_id, .. }
             | NodeDoc::ChannelStrip { node_id, .. } => *node_id,
         }
@@ -933,6 +955,7 @@ impl NodeDoc {
             NodeDoc::Instrument { track, .. }
             | NodeDoc::Effect { track, .. }
             | NodeDoc::Mixer { track, .. }
+            | NodeDoc::Feedback { track, .. }
             | NodeDoc::Keyboard { track, .. }
             | NodeDoc::ChannelStrip { track, .. } => *track,
         }

@@ -36,9 +36,9 @@ use glitcherz_engine::Sf2Error;
 use glitcherz_engine::Sf2Library;
 use glitcherz_engine::convert;
 use glitcherz_engine::realtime::{
-    ChannelStripProcessor, DelayProcessor, EngineCommand, MAX_AUTO_POINTS, MAX_CLIP_NOTES,
-    MAX_TRACK_CLIPS, MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent,
-    ParamId, Processor, RtAutoPoint, RtAutomation, RtControlClip, RtMidiClip, RtNote,
+    ChannelStripProcessor, DelayProcessor, EngineCommand, FeedbackProcessor, MAX_AUTO_POINTS,
+    MAX_CLIP_NOTES, MAX_TRACK_CLIPS, MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind,
+    NoteEvent, ParamId, Processor, RtAutoPoint, RtAutomation, RtControlClip, RtMidiClip, RtNote,
     SequencerCommand, Sf2VoiceProcessor, SynthProcessor,
 };
 use glitcherz_model::{
@@ -162,6 +162,7 @@ fn inline_param_id(p: patch::InlineParam) -> ParamId {
         patch::InlineParam::DelayFeedback => ParamId::DelayFeedback,
         patch::InlineParam::DelayMix => ParamId::DelayMix,
         patch::InlineParam::MixerOutPan => ParamId::MixerOutPan,
+        patch::InlineParam::FeedbackGain => ParamId::FeedbackGain,
     }
 }
 
@@ -1082,6 +1083,13 @@ impl GlitcherZApp {
                         String::new(),
                     )
                 }
+                NodeDoc::Feedback { gain, .. } => {
+                    // P6: the tap gain; the one-block delay is the
+                    // compiler's ordering, not a buffer.
+                    let mut processor = FeedbackProcessor::new();
+                    processor.set_param(ParamId::FeedbackGain, *gain);
+                    (Box::new(processor), None, String::new())
+                }
                 NodeDoc::ChannelStrip { .. } => {
                     (Box::new(ChannelStripProcessor::new()), None, String::new())
                 }
@@ -1093,11 +1101,13 @@ impl GlitcherZApp {
             };
         let engine_id = self.engine.fresh_node_id();
         // D15: the mixer is the only multi-input node; the engine compiler
-        // uses the kind for fan-in validation + cable→channel binding.
-        let kind = if node.is_mixer() {
-            NodeKind::Mixer
-        } else {
-            NodeKind::Plain
+        // uses the kind for fan-in validation + cable→channel binding. P6
+        // adds the feedback tap kind, which the compiler orders before its
+        // own input sources (the one-block delay).
+        let kind = match node {
+            NodeDoc::Mixer { .. } => NodeKind::Mixer,
+            NodeDoc::Feedback { .. } => NodeKind::Feedback,
+            _ => NodeKind::Plain,
         };
         if self.engine.add_node(engine_id, kind, processor) {
             self.node_map.insert(doc_id, engine_id);
@@ -1859,6 +1869,11 @@ impl GlitcherZApp {
             // G6: document-only routing node — no engine processor, so the
             // usual "installed into the engine?" check does not apply.
             patch::AddNodeKind::VirtualKeyboard => NodeDoc::Keyboard { node_id, track },
+            patch::AddNodeKind::Feedback => NodeDoc::Feedback {
+                node_id,
+                track,
+                gain: 0.5,
+            },
         };
         if node.is_keyboard() {
             let before = self.begin_edit();
@@ -4993,6 +5008,16 @@ impl GlitcherZApp {
                         *out_pan = value;
                     }
                     self.commit_param_edit("Mixer Out Pan", before, "mixer-out-pan");
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::FeedbackGain => {
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Feedback { gain, .. }) =
+                        self.project_mut().graph.node_by_id_mut(node)
+                    {
+                        *gain = value;
+                    }
+                    self.commit_param_edit("Feedback Gain", before, "feedback-gain");
                     self.send_node_param(node, inline_param_id(p), value);
                 }
             },
