@@ -146,6 +146,16 @@ G1（gui 扩展宿主）/ G2（Win32 嵌入容器）/ G3（参数回接）已落
 - **clack wrapper 的 flush 分派规则**：对**活跃**实例，宿主调 flush 时 wrapper 分派给 `PluginAudioProcessorParams::flush`（audio 侧实现），inactive 才走 main-thread 版本——**插件侧两个 flush 实现都要写 out queue**（只实现 main-thread 版本时活跃实例回读永远为空，且测试链的是旧 dll 时更难定位）。
 - **UI 轮询时序（G3）**：`ui()` 尾部、编辑器 open 且非 `gui_closed` 时轮询 `poll_param_flush`（原子标志 take 语义），回读值同步 `clap_voice_values` 滑块缓存 + `send_track_param(ParamId::PluginParam)` 下发引擎；缓存写入与下发在 guard 借用结束之后做（借用冲突）。轮询放 `gui_closed` 的 else 分支，避开插件自毁边角。
 
+### 虚拟键盘节点（G6，spec `plugin-gui.md` §8，2026-10-20）
+
+`NodeDoc::Keyboard{node_id, track}` 是文档里**唯一没有引擎对应物的节点变体**：不进引擎图、不建 processor、不占 slot（`install_node` 首行早退，`node_map` 里查不到它）。它的语义全靠文档连线 + UI 路由：
+
+- **连线规则（model `validate`）**：MIDI 源从「只能是 `MidiTrack(_)`」放宽为「`MidiTrack(_)` 或 Keyboard 节点」，目标仍是 instrument；audio 连线两端都禁止 vk（它没有任何音频口）。UI 侧 `accepts()` 不变（Midi 只接受 instrument），vk 出端口的**拖拽类型**由 `patch.rs` 按文档节点种类判定——vk 出边发 `PatchAction::ConnectKeyboardMidi`（不是 `ConnectAudio`）。
+- **路由纯函数**：`GraphDoc::keyboard_route(selection) -> Option<u64>`。种子 = 选中集里的 vk 节点，沿 `kind == Midi && from == Node(id)` 做 BFS，最后**按文档序遍历 nodes 取首个 Instrument**（不是 BFS 出队顺序——多键盘/多目标时结果确定）。非 instrument 终点会被遍历但永不返回（MIDI 不穿透效果器）。
+- **音符号直达**：引擎新增 `EngineCommand::NoteAtNode { node_id, event }` → `RtGraph::node_note`（slot 线性扫描找 `node_id`，无分配；未知 id 返回 false 静默丢弃）。这条路径**绕开轨道扇出表**，因此 vk 能弹一个没接时间轴 MIDI 线的悬空 instrument。
+- **UI 状态机**：`GlitcherZApp::vk_target: Option<u64>`（文档 instrument id），每帧 `ui()` 开头由 `patch_state.selected_doc_nodes()` 重算。**路由切换必须先按旧目标发 Off 再更新**（否则旧 instrument 的挂音永远收不到 note-off——与 Dexed "Stop 停不了" 同一类坑）；`send_note_event_at(target, event)` 是唯一出口，target 解析不到引擎 id（节点刚被删）时回落轨道路径。
+- **无引擎节点路径的守卫**：`create_patch_node` 对 vk 跳过"引擎安装是否成功"的判定（否则会被判失败回滚），`delete_graph_node` / `remove_last_midi_track` 对 `node_map` 缺失的节点不做 `remove_node`/`retire_guard`。
+
 ### 项目文件与模型（`glitcherz-model`）
 
 - `Project`（metadata + gate + master_gain + 4×`Track`）；`Track` = 名称 + `Pattern` + `Clip`（`Note{start,length,note,velocity}` 列表 + loop_ticks，tick 基准：`TICKS_PER_QUARTER=96`/步=24/小节=384）+ 音源枚举（`VoiceSpec`: `Builtin | Clap | Vst3`）+ 混音（增益/声像/静音）+ `SynthParams` + `DelayParams`，全部 serde/RON + 字段级 `#[serde(default)]`；引擎侧镜像 `RtClip`（定容 128 音符 `Copy`，超容截断）经 `SetClip` 命令整块下发；
