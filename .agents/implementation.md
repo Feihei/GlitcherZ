@@ -156,6 +156,21 @@ G1（gui 扩展宿主）/ G2（Win32 嵌入容器）/ G3（参数回接）已落
 - **UI 状态机**：`GlitcherZApp::vk_target: Option<u64>`（文档 instrument id），每帧 `ui()` 开头由 `patch_state.selected_doc_nodes()` 重算。**路由切换必须先按旧目标发 Off 再更新**（否则旧 instrument 的挂音永远收不到 note-off——与 Dexed "Stop 停不了" 同一类坑）；`send_note_event_at(target, event)` 是唯一出口，target 解析不到引擎 id（节点刚被删）时回落轨道路径。
 - **无引擎节点路径的守卫**：`create_patch_node` 对 vk 跳过"引擎安装是否成功"的判定（否则会被判失败回滚），`delete_graph_node` / `remove_last_midi_track` 对 `node_map` 缺失的节点不做 `remove_node`/`retire_guard`。
 
+### VST3 编辑器镜像（G7，spec `plugin-gui.md` §9，2026-10-21）
+
+CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占位区 / reposition / 销毁时序）**原样复用**，格式分派全在 guard 层——`PluginGuard::{Clap,Vst3}` 的两个 `open_editor`/`close_editor` 同签名。
+
+- **新模块 `vst3-host/gui.rs`**（与 `host_impl.rs` 的音频线程契约分开）：`HostPlugFrame`（`IPlugFrame::resizeView` → 原子打包 w/h；**回调里不调 `onSize`**，宿主这时还没改窗口尺寸）、`HostComponentHandler`（`IComponentHandler` + `IComponentHandler2`；`performEdit` 入队，`beginEdit/endEdit/restartComponent/setDirty/startGroupEdit/finishGroupEdit` 只应答）、`EditQueue`（128 槽原子环形队列：`performEdit` 可能来自插件 GUI 线程**或**音频线程，所以只能原子操作；CAS 抢写指针，抢输时宁可丢一条也不能写坏；UI 每帧 `drain`）。
+- **`NoopComponentHandler` 删除**：它的 `performEdit` 空实现正是 G7 要补的缺口；handler 现在持有 `Arc<EditQueue>`，guard 持有同一 Arc 供轮询。
+- **guard 新增字段**：`view`（`Option<ComPtr<IPlugView>>`，声明在最前 → 先于 plug frame/controller 释放）、`editing`（`Option<ComPtr<IEditControllerHostEditing>>`，spawn 时 `cast` 一次）、`gui`/`edits`/`plug_frame_ptr`/`_plug_frame`。`tear_down()` 第一步改成 `close_editor()`（视图会回调 controller 与 plug frame，必须死在 terminate 之前）。
+- **`open_editor` 序列**：`createView("editor")` → `setFrame(plug frame)` → 可选 `IPlugViewContentScaleSupport::setContentScaleFactor(ppp)` → `isPlatformTypeSupported(kPlatformTypeHWND)` → `attached(hwnd, kPlatformTypeHWND)` → `getSize`。**每一处失败都撤销 attach 并 `setFrame(null)`**，不留半开视图（E2 失败清理的 CLAP 同款）。返回 `ViewSize{width,height}`（物理像素，UI 除 ppp 转 points）。
+- **尺寸握手（与 spec 原文相反）**：插件 `resizeView` 只落进 `GuiHostState`；UI 帧尾 `editor_resize_request()` 取走后更新 `editor.size` 并记 `PluginEditor.pending_ack`，**等容器真的 `reposition_screen_rect` 之后**才 `ack_editor_size()` → `IPlugView::onSize(rect)`。先 ack 后改窗口会让等 `onSize` 的插件按旧几何重排。
+- **参数回接（插件 → 宿主）**：VST3 没有 CLAP `request_flush` 那种"宿主拉"的通道，只有 `performEdit` 的"推"。UI 帧尾 `take_param_edits()` 把 `(id, normalized)` 交给 `GuiParamBatch{is_clap:false}`，写 `vst3_voice_values` 缓存 + `send_node_param(PluginParam)` 下发引擎（归一化域与引擎桥同域，无需换算）。
+- **宿主滑块 → 插件 GUI（spec 方向修正）**：正确接口是 `IEditControllerHostEditing::beginEditFromHost(id)` → `setParamNormalized(id,v)` → `endEditFromHost(id)`；`beginEdit/performEdit/endEdit` 是插件→宿主方向（`IComponentHandler`），spec 原文写反。控制器不实现该扩展时退化为单独 `setParamNormalized`。UI 出口 `sync_vst3_host_param(doc_id,id,value)`，接在三处：VST3 乐器参数面板、VST3 效果参数面板、节点内联插件参数（面板/内联互换时 GUI 与缓存一起动）。
+- **测试插件**：`SineController` 加只读探针参数 **id 2 `GuiCalls`**（值 = 掩码/1024，10 位以内是精确二进制小数），掩码由 `SinePlugView` 写：attached/removed/getSize/onSize/setFrame/canResize/resizeView 达成/performEdit 达成/beginEditFromHost/endEditFromHost。`SinePlugView` 是**无窗口假视图**：`attached` 时调 `IPlugFrame::resizeView(320×240)` 并调 `IComponentHandler::performEdit(1, 0.75)`（CLAP 假 GUI `hide` 钩子的镜像）；`createView` 只认 `"editor"`，返回 `ComWrapper::to_com_ptr().into_raw()`（+1 引用交给宿主，factory 同款），并把自身 COM 指针存进 `AtomicPtr` 供回调使用（`&` 下改原子不需要 unsafe）。
+- **测试**：`gui` 3 项（队列往返 / 溢出丢新 / 尺寸请求 take 一次）；`vst3-host` 3 项（`editor_view_round_trip` = attached→getSize→resize 请求→onSize 确认→removed，含重复 close 与重开；`perform_edit_reaches_the_host_queue`；`host_param_change_reaches_the_controller` 含 begin/end 位）。`parameter_enumeration_reports_gain` 期望值改 2 个参数。
+- **踩坑**：`cargo test --workspace` **不会**重建 cdylib fixture（G7 首次跑测试时链到 10-16 的旧 dll，症状 = `NoEditorView` + 只有 1 个参数）。改过 `glitcherz-test-vst3` 后先 `cargo build -p glitcherz-test-vst3` 再跑测试；`test_plugin_path()` 只检查文件存在，旧 dll 不会报警。
+
 ### 项目文件与模型（`glitcherz-model`）
 
 - `Project`（metadata + gate + master_gain + 4×`Track`）；`Track` = 名称 + `Pattern` + `Clip`（`Note{start,length,note,velocity}` 列表 + loop_ticks，tick 基准：`TICKS_PER_QUARTER=96`/步=24/小节=384）+ 音源枚举（`VoiceSpec`: `Builtin | Clap | Vst3`）+ 混音（增益/声像/静音）+ `SynthParams` + `DelayParams`，全部 serde/RON + 字段级 `#[serde(default)]`；引擎侧镜像 `RtClip`（定容 128 音符 `Copy`，超容截断）经 `SetClip` 命令整块下发；

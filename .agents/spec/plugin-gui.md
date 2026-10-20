@@ -143,12 +143,13 @@ pub struct PluginWindowHandle(platform_impl::NativeChild); // Windows: HWND 子�
 
 ## 9 G7 — VST3 IPlugView 镜像（后补，只记差异）
 
-- `vst3 0.3.0` bindings 已含 `IPlugView` / `IPlugFrame` / `ViewRect` / `kPlatformTypeHWND`（bindings.rs:1775/1672/4184/4237）——无需自写 COM 绑定。
-- 宿主侧新增 `HostPlugFrame`（`Class` + `IPlugFrameTrait::onSize`，照 `NoopComponentHandler` 模式，host_impl.rs）。
-- guard：`create_view()`（`IEditController::createView("editor")`）→ `attached(hwnd, kPlatformTypeHWND)` → `getSize`；关闭 = `removed` + `release`。
-- 参数回接：`NoopComponentHandler` 替换为实现 `ComponentHandler2` 的 `performEdit(paramID, valueNormalized)` → `set_node_param` + `vst3_voice_values` 同步（归一化域，沿用 lib.rs:22-25 注释约定）。
-- 宿主滑块 → 插件 GUI：滑块变更补 `beginEdit/performEdit/endEdit` 三段（控制器才会刷自己的 GUI）——CLAP 无此协议，VST3 专有。
-- UI 层（plugin_window / 面板 / reposition / 销毁时序）全复用，格式分派在 guard 层。
+- `vst3 0.3.0` bindings 已含 `IPlugView` / `IPlugFrame` / `ViewRect` / `kPlatformTypeHWND` / `IPlugViewContentScaleSupport` / `IEditControllerHostEditing`——无需自写 COM 绑定。
+- 宿主侧新增 `HostPlugFrame`（`Class` + `IPlugFrameTrait::resizeView`，`gui.rs`）：只记录请求（原子打包 w/h），**不**在回调里调 `onSize`（宿主此时还没改窗口尺寸）。
+- guard：`open_editor()`（`createView("editor")` → `setFrame(plug frame)` → 可选 `setContentScaleFactor` → `isPlatformTypeSupported` → `attached(hwnd, kPlatformTypeHWND)` → `getSize`）；关闭 = `removed` + `setFrame(null)` + release。任何中途失败都要撤销 attach（不留半开视图）。
+- 尺寸握手（**实施修正 2026-10-21**）：`resizeView` 只落到 UI 的 `pending_ack`，UI 真正 reposition 容器之后才调 `IPlugView::onSize(rect)` 确认——spec 原先把 `onSize` 写在 plug frame 侧，顺序反了（插件等的是"窗口已改尺寸"的确认）。
+- 参数回接：`NoopComponentHandler` 替换为实现 `IComponentHandler` + `IComponentHandler2` 的 `HostComponentHandler`：`performEdit(paramID, valueNormalized)` → 无锁 `EditQueue`（原子槽，GUI/音频线程都可能写）→ UI 每帧 drain → `set_node_param` + `vst3_voice_values` 同步（归一化域，沿用 lib.rs 注释约定）。VST3 没有 CLAP `request_flush` 那种"宿主拉"的通道，只有插件"推"的 `performEdit`。
+- 宿主滑块 → 插件 GUI（**实施修正 2026-10-21**）：VST3 的正确接口是 `IEditControllerHostEditing::beginEditFromHost(id)` → `setParamNormalized(id, v)` → `endEditFromHost(id)`（`beginEdit/performEdit/endEdit` 是**插件→宿主**方向的 IComponentHandler 回调，方向写反了）。控制器没实现该扩展时退化为单独 `setParamNormalized`。
+- UI 层（plugin_window / 面板 / reposition / 销毁时序）全复用，格式分派在 guard 层；`PluginEditor.pending_ack` 只服务 VST3 的 onSize 确认。
 
 ## 10 分阶段实施与验收
 
