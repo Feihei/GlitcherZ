@@ -3749,25 +3749,93 @@ impl GlitcherZApp {
                         });
                     match presets {
                         Some(presets) => {
-                            let current = presets
-                                .iter()
-                                .find(|(b, p, _)| *b == sf2_bank && *p == sf2_program)
-                                .map(|(_, _, name)| name.clone())
-                                .unwrap_or_else(|| format!("{sf2_bank}:{sf2_program}"));
+                            // Bank-grouped picker (LMMS-style): the bank
+                            // selector narrows the patch list; patches are
+                            // ordered by program (GM order) inside a bank.
+                            let mut banks: std::collections::BTreeMap<u8, Vec<(u8, String)>> =
+                                std::collections::BTreeMap::new();
+                            for (bank, program, name) in &presets {
+                                banks.entry(*bank).or_default().push((*program, name.clone()));
+                            }
+                            for patches in banks.values_mut() {
+                                patches.sort_unstable_by_key(|(program, _)| *program);
+                            }
+                            let bank_list: Vec<(u8, Vec<(u8, String)>)> = banks.into_iter().collect();
+                            let current_name = |bank: u8, program: u8| -> Option<String> {
+                                bank_list
+                                    .iter()
+                                    .find(|(b, _)| *b == bank)
+                                    .and_then(|(_, patches)| {
+                                        patches
+                                            .iter()
+                                            .find(|(p, _)| *p == program)
+                                            .map(|(_, name)| name.clone())
+                                    })
+                            };
                             ui.horizontal(|ui| {
                                 ui.label("Preset");
+                                let mut bank_picked: Option<u8> = None;
                                 let mut preset_picked: Option<(u8, u8)> = None;
-                                egui::ComboBox::from_id_salt(format!("sf2_preset_{sel}"))
-                                    .selected_text(current)
+                                egui::ComboBox::from_id_salt(format!("sf2_bank_{sel}"))
+                                    .selected_text(format!("Bank {sf2_bank}"))
                                     .show_ui(ui, |ui| {
-                                        for (bank, program, name) in &presets {
-                                            let is_selected =
-                                                *bank == sf2_bank && *program == sf2_program;
-                                            if ui.selectable_label(is_selected, name).clicked() {
-                                                preset_picked = Some((*bank, *program));
+                                        for (bank, _) in &bank_list {
+                                            if ui
+                                                .selectable_label(
+                                                    *bank == sf2_bank,
+                                                    format!("Bank {bank}"),
+                                                )
+                                                .clicked()
+                                            {
+                                                bank_picked = Some(*bank);
                                             }
                                         }
                                     });
+                                let patch_label = match current_name(sf2_bank, sf2_program) {
+                                    Some(name) => format!("{sf2_program}. {name}"),
+                                    None => format!("{sf2_bank}:{sf2_program}"),
+                                };
+                                egui::ComboBox::from_id_salt(format!("sf2_preset_{sel}"))
+                                    .selected_text(patch_label)
+                                    .show_ui(ui, |ui| {
+                                        if let Some((_, patches)) =
+                                            bank_list.iter().find(|(b, _)| *b == sf2_bank)
+                                        {
+                                            for (program, name) in patches {
+                                                if ui
+                                                    .selectable_label(
+                                                        *program == sf2_program,
+                                                        format!("{program}. {name}"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    preset_picked = Some((sf2_bank, *program));
+                                                }
+                                            }
+                                        }
+                                    });
+                                if let Some(bank) = bank_picked {
+                                    if bank != sf2_bank {
+                                        // Keep the program number when the new
+                                        // bank has it; otherwise fall back to
+                                        // the bank's first patch.
+                                        let target = bank_list
+                                            .iter()
+                                            .find(|(b, _)| *b == bank)
+                                            .and_then(|(_, patches)| {
+                                                patches
+                                                    .iter()
+                                                    .find(|(p, _)| *p == sf2_program)
+                                                    .map(|_| sf2_program)
+                                                    .or_else(|| {
+                                                        patches.first().map(|(p, _)| *p)
+                                                    })
+                                            });
+                                        if let Some(program) = target {
+                                            preset_picked = Some((bank, program));
+                                        }
+                                    }
+                                }
                                 if let Some((bank, program)) = preset_picked {
                                     self.set_soundfont_preset(sel, bank, program);
                                 }
