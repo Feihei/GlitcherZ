@@ -3441,6 +3441,9 @@ impl GlitcherZApp {
             }
             timeline::TimelineAction::AddMidiTrack => self.add_midi_track(),
             timeline::TimelineAction::RemoveLastMidiTrack => self.remove_last_midi_track(),
+            timeline::TimelineAction::ReorderMidiTrack { from, to } => {
+                self.reorder_midi_track(from, to)
+            }
             timeline::TimelineAction::AddClip {
                 is_control,
                 track,
@@ -5576,6 +5579,72 @@ impl GlitcherZApp {
             self.edit_clip = None;
         }
         self.commit_edit("Remove MIDI Track", before);
+    }
+
+    /// Reorders the MIDI tracks (the track at `from` is re-inserted so it
+    /// ends up just before original index `to`): the track table, the
+    /// per-track node `track` fields and the `MidiTrack` cable indices all
+    /// move together as one undo step, then the engine is rebuilt from the
+    /// document — the same path undo/redo already takes. Mixer / Keyboard /
+    /// Feedback `track` fields are patch-layout grouping only and stay put
+    /// (the same exclusion `remove_last_midi_track` applies).
+    fn reorder_midi_track(&mut self, from: usize, to: usize) {
+        let len = self.project().midi_tracks.len();
+        if from >= len || to > len || to == from || to == from + 1 {
+            return; // identity drop (the view already filters these)
+        }
+        let perm = crate::timeline::track_permutation(len, from, to);
+        let before = self.begin_edit();
+        {
+            let project = self.project_mut();
+            // 1) Track table: new[perm[old]] = tracks[old].
+            let old_tracks = std::mem::take(&mut project.midi_tracks);
+            let mut new_tracks = vec![glitcherz_model::MidiTrack::default(); len];
+            for (old, track) in old_tracks.into_iter().enumerate() {
+                new_tracks[perm[old]] = track;
+            }
+            project.midi_tracks = new_tracks;
+            // 2) Per-track node `track` fields (Instrument / Effect / the
+            // legacy ChannelStrip are track members; the fixed entities
+            // above are not).
+            for node in &mut project.graph.nodes {
+                match node {
+                    NodeDoc::Instrument { track, .. }
+                    | NodeDoc::Effect { track, .. }
+                    | NodeDoc::ChannelStrip { track, .. }
+                        if *track < len =>
+                    {
+                        *track = perm[*track];
+                    }
+                    _ => {}
+                }
+            }
+            // 3) `MidiTrack` cable outlets follow the table.
+            for cable in &mut project.graph.cables {
+                if let PortRef::MidiTrack(t) = &mut cable.from
+                    && *t < len
+                {
+                    *t = perm[*t];
+                }
+            }
+        }
+        // App-side track indices follow the permutation: the selected
+        // track, the editor target and the timeline's clip selection.
+        if self.selected_track < len {
+            self.selected_track = perm[self.selected_track];
+        }
+        if let Some(EditTarget::Midi { track, .. }) = &mut self.edit_clip
+            && *track < len
+        {
+            *track = perm[*track];
+        }
+        for sel in &mut self.timeline_state.selection {
+            if !sel.is_control && sel.track < len {
+                sel.track = perm[sel.track];
+            }
+        }
+        self.apply_document();
+        self.commit_edit("Reorder Tracks", before);
     }
 
     /// Piano roll hint (the editor itself lives in the Edit tab; double-click

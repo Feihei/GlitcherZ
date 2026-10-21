@@ -51,8 +51,14 @@ pub const ROLL_HEIGHT: f32 = ROW_HEIGHT * 32.0;
 /// Velocity lane height (pixels), below the roll.
 pub const LANE_HEIGHT: f32 = 48.0;
 
-/// Number of visible rows.
-const VISIBLE_ROWS: i32 = (ROLL_HEIGHT / ROW_HEIGHT) as i32;
+/// Horizontal zoom bounds (multiplier over the fit-to-width scale; 1.0 shows
+/// the whole loop).
+const ZOOM_X_MIN: f32 = 0.2;
+const ZOOM_X_MAX: f32 = 64.0;
+
+/// Vertical zoom bounds (multiplier over [`ROW_HEIGHT`]; 1.0 = 9 px rows).
+const ZOOM_Y_MIN: f32 = 0.4;
+const ZOOM_Y_MAX: f32 = 6.0;
 
 /// Default duration of a new note (tick) — a 16th note.
 const DEFAULT_NOTE_LENGTH: i64 = TICKS_PER_STEP as i64;
@@ -170,6 +176,13 @@ pub enum RollIntent {
 pub struct RollState {
     /// Top visible MIDI note number (f32 for smooth scrolling).
     pub top_note: f32,
+    /// Horizontal zoom (multiplier over the fit-to-width scale; 1.0 = the
+    /// whole clip loop fits the roll width).
+    pub zoom_x: f32,
+    /// Vertical zoom (multiplier over [`ROW_HEIGHT`]; 1.0 = 9 px rows).
+    pub zoom_y: f32,
+    /// Horizontal scroll offset: the tick at the roll's left edge.
+    pub scroll_x: f32,
     /// Snap granularity / grid density.
     pub grid: GridValue,
     /// Indices into `clip.notes()` of the selected notes.
@@ -603,6 +616,9 @@ impl RollState {
     pub fn new() -> Self {
         Self {
             top_note: 84.0,
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            scroll_x: 0.0,
             grid: GridValue::Note(NoteValue {
                 division: 16,
                 dotted: false,
@@ -773,6 +789,13 @@ pub fn show(
         .unwrap_or(i64::from(TICKS_PER_STEP))
         .max(1);
 
+    // While a modal transform (G/S/T/Shift+D) or the armed knife owns the
+    // pointer, the keyboard stays with the roll — the pointer may travel
+    // outside the roll without the focus-follow handing the keys to someone
+    // else. Same guarantee a real drag gets from the router's any-down
+    // freeze; set every frame so it clears itself when the modal ends.
+    router.set_focus_hold(state.modal.is_some() || state.knife_armed);
+
     // Toolbar: grid menu, mode / armed-command chips, hints.
     let mut intent = None;
 
@@ -859,7 +882,7 @@ pub fn show(
         ui.add(
             egui::Label::new(
                 egui::RichText::new(
-                    "click: select · drag: tweak · dbl-click: insert · edges: trim · Ctrl+drag: copy · d: draw · G move · S scale · T stretch (LMB ok · RMB/Esc cancel) · K knife · Del del · RMB: delete · arrows: nudge",
+                    "click: select · drag: tweak · dbl-click: insert · edges: trim · Ctrl+drag: copy · d: draw · G move · S scale · T stretch (LMB ok · RMB/Esc cancel) · K knife · Del del · RMB: delete · arrows: nudge · wheel: pitch · Shift+wheel: time · Ctrl+wheel: zoom time · Ctrl+Alt+wheel: zoom pitch · middle-drag: pan",
                 )
                 .weak(),
             )
@@ -885,30 +908,98 @@ pub fn show(
     state.had_focus = response.has_focus();
     state.focus_id = Some(response.id);
 
-    // Wheel: scroll the pitch view vertically.
+    // ---- View navigation: Ctrl+wheel zooms the time axis, Ctrl+Alt+wheel
+    // zooms the pitch axis (egui's vertical-only zoom), Shift+wheel scrolls
+    // the time axis, the plain wheel scrolls pitch, middle-drag pans both
+    // axes. Zoom is anchored on the pointer so the note under it stays put.
+    let fit_ticks_to_x = width / loop_ticks as f32;
+    let (zoom2, wheel, nav_mods) = ui
+        .ctx()
+        .input(|i| (i.zoom_delta_2d(), i.smooth_scroll_delta, i.modifiers));
     if response.hovered() {
-        let scroll = ui.ctx().input(|i| i.smooth_scroll_delta().y);
-        if scroll != 0.0 {
-            state.top_note =
-                (state.top_note + scroll / ROW_HEIGHT).clamp(VISIBLE_ROWS as f32 - 1.0, 127.0);
+        let ctrl = nav_mods.ctrl || nav_mods.command;
+        if ctrl {
+            if let Some(sp) = response.hover_pos() {
+                let (zx, zy) = (zoom2.x, zoom2.y);
+                // Pure Ctrl gives a uniform factor; Ctrl+Alt gives a
+                // vertical-only factor. Treat the time axis as the default
+                // (a uniform zoom only ever moves time), and the pitch axis
+                // only when the factor is vertical-only.
+                let uniform = (zx - zy).abs() < 1e-4;
+                if zx != 1.0 {
+                    let new_zoom = (state.zoom_x * zx).clamp(ZOOM_X_MIN, ZOOM_X_MAX);
+                    let scroll = zoom_scroll_anchor(
+                        state.zoom_x,
+                        state.scroll_x,
+                        new_zoom,
+                        fit_ticks_to_x,
+                        rect.left(),
+                        sp.x,
+                    );
+                    state.zoom_x = new_zoom;
+                    let t_x = fit_ticks_to_x * new_zoom;
+                    state.scroll_x = scroll.clamp(0.0, (loop_ticks as f32 - width / t_x).max(0.0));
+                }
+                if zy != 1.0 && !uniform {
+                    let new_zoom = (state.zoom_y * zy).clamp(ZOOM_Y_MIN, ZOOM_Y_MAX);
+                    let top = zoom_top_note_anchor(
+                        state.zoom_y,
+                        state.top_note,
+                        new_zoom,
+                        rect.top(),
+                        sp.y,
+                    );
+                    state.zoom_y = new_zoom;
+                    let rows = (ROLL_HEIGHT / (ROW_HEIGHT * new_zoom)).max(1.0);
+                    state.top_note = top.clamp(rows - 1.0, 127.0);
+                }
+                ui.ctx().request_repaint();
+            }
+        } else if wheel.x != 0.0 {
+            let t_x = fit_ticks_to_x * state.zoom_x;
+            state.scroll_x = (state.scroll_x - wheel.x / t_x)
+                .clamp(0.0, (loop_ticks as f32 - width / t_x).max(0.0));
+            ui.ctx().request_repaint();
+        } else if wheel.y != 0.0 {
+            let row_h = ROW_HEIGHT * state.zoom_y;
+            let rows = (ROLL_HEIGHT / row_h).max(1.0);
+            state.top_note = (state.top_note + wheel.y / row_h).clamp(rows - 1.0, 127.0);
             ui.ctx().request_repaint();
         }
     }
 
-    let ticks_to_x = width / loop_ticks as f32;
+    // Middle-drag pans both axes (grab-and-drag scrolling).
+    if response.dragged_by(egui::PointerButton::Middle) {
+        let d = ui.ctx().input(|i| i.pointer.delta());
+        let t_x = fit_ticks_to_x * state.zoom_x;
+        let row_h = ROW_HEIGHT * state.zoom_y;
+        state.scroll_x =
+            (state.scroll_x - d.x / t_x).clamp(0.0, (loop_ticks as f32 - width / t_x).max(0.0));
+        let rows = (ROLL_HEIGHT / row_h).max(1.0);
+        state.top_note = (state.top_note + d.y / row_h).clamp(rows - 1.0, 127.0);
+        ui.ctx().request_repaint();
+    }
+
+    let ticks_to_x = fit_ticks_to_x * state.zoom_x;
+    let row_h = ROW_HEIGHT * state.zoom_y;
+    let visible_rows = (ROLL_HEIGHT / row_h).ceil().max(1.0) as i32;
+    // Tick 0's screen x (scroll + zoom applied). Every note / grid draw and
+    // every hit test derives from this, so painting and hit-testing can never
+    // drift apart.
+    let t0_x = rect.left() - state.scroll_x * ticks_to_x;
     let painter = ui.painter_at(rect);
     let top_note = state.top_note.round() as i32;
-    let min_note = top_note - VISIBLE_ROWS + 1;
+    let min_note = top_note - visible_rows + 1;
 
     // ---- Pointer → tick/pitch helpers (the keyboard section needs them
     // for the modal grab point; the interaction sections below reuse them).
-    let pointer_tick = |pos: egui::Pos2| ((pos.x - rect.left()) / ticks_to_x).max(0.0);
+    let pointer_tick = |pos: egui::Pos2| ((pos.x - t0_x) / ticks_to_x).max(0.0);
     let pointer_note = |pos: egui::Pos2| {
-        (top_note as f32 - (pos.y - rect.top()) / ROW_HEIGHT)
+        (top_note as f32 - (pos.y - rect.top()) / row_h)
             .round()
             .clamp(0.0, 127.0) as u8
     };
-    let hit_note = |pos: egui::Pos2| note_at(clip, pos, rect, ticks_to_x, top_note);
+    let hit_note = |pos: egui::Pos2| note_at(clip, pos, rect, t0_x, ticks_to_x, top_note, row_h);
     let snap = |ticks: f32| -> i64 { snap_ticks(ticks, grid_ticks) };
     let modifiers = ui.ctx().input(|i| i.modifiers);
     let additive = modifiers.shift || modifiers.ctrl;
@@ -936,14 +1027,14 @@ pub fn show(
         if !(0..=127).contains(&note) {
             continue;
         }
-        let y = rect.top() + (top_note - note) as f32 * ROW_HEIGHT;
+        let y = rect.top() + (top_note - note) as f32 * row_h;
         let color = if is_black_key(note) {
             egui::Color32::from_gray(26)
         } else {
             egui::Color32::from_gray(40)
         };
         painter.rect_filled(
-            egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(width, ROW_HEIGHT)),
+            egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(width, row_h)),
             0.0,
             color,
         );
@@ -959,7 +1050,7 @@ pub fn show(
         let mut tick = bar_start;
         while tick < bar_end {
             let is_bar_line = tick % i64::from(TICKS_PER_BAR) == 0;
-            let x = rect.left() + tick as f32 * ticks_to_x;
+            let x = t0_x + tick as f32 * ticks_to_x;
             let stroke = egui::Stroke::new(
                 if is_bar_line { 1.5 } else { 1.0 },
                 if is_bar_line {
@@ -990,7 +1081,7 @@ pub fn show(
         if !(min_note..=top_note).contains(&note_i) {
             continue;
         }
-        let y = rect.top() + (top_note as f32 - note.note as f32) * ROW_HEIGHT;
+        let y = rect.top() + (top_note as f32 - note.note as f32) * row_h;
         let selected = state.selection.contains(&index);
         let dragging = state.drag.is_some() && selected;
         let base = if dragging {
@@ -1011,7 +1102,7 @@ pub fn show(
         } else {
             fill
         };
-        painter.rect_filled(note_rect(rect, note, ticks_to_x, y), 2.0, fill);
+        painter.rect_filled(note_rect(t0_x, note, ticks_to_x, y, row_h), 2.0, fill);
     }
 
     // 3b. Modal ghosts: the selection at its transformed geometry. Preview
@@ -1025,9 +1116,9 @@ pub fn show(
                 continue;
             };
             let ghost = modal_ghost(note, frame);
-            let y = rect.top() + (top_note as f32 - f32::from(ghost.note)) * ROW_HEIGHT;
+            let y = rect.top() + (top_note as f32 - f32::from(ghost.note)) * row_h;
             painter.rect_filled(
-                note_rect(rect, &ghost, ticks_to_x, y),
+                note_rect(t0_x, &ghost, ticks_to_x, y, row_h),
                 2.0,
                 egui::Color32::from_rgba_unmultiplied(240, 190, 80, 170),
             );
@@ -1063,7 +1154,7 @@ pub fn show(
     // 5. Playhead (musical position modulo loop length).
     if playing {
         let pos = playhead_ticks.rem_euclid(loop_ticks as f32);
-        let x = rect.left() + pos * ticks_to_x;
+        let x = t0_x + pos * ticks_to_x;
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
             egui::Stroke::new(2.0, egui::Color32::YELLOW),
@@ -1073,10 +1164,11 @@ pub fn show(
     // ---- Velocity lane (M2.4): bars under the roll, drag to set. ----
     let (lane_rect, lane_response) =
         ui.allocate_exact_size(egui::vec2(width, LANE_HEIGHT), egui::Sense::drag());
+    let lane_t0_x = lane_rect.left() - state.scroll_x * ticks_to_x;
     let lane_painter = ui.painter_at(lane_rect);
     lane_painter.rect_filled(lane_rect, 0.0, egui::Color32::from_gray(20));
     for (index, note) in clip.notes().iter().enumerate() {
-        let x = lane_rect.left() + note.start as f32 * ticks_to_x;
+        let x = lane_t0_x + note.start as f32 * ticks_to_x;
         let w = (note.length as f32 * ticks_to_x).clamp(3.0, 8.0);
         let h = (LANE_HEIGHT - 4.0) * f32::from(note.velocity) / 127.0;
         let selected = state.selection.contains(&index);
@@ -1096,7 +1188,7 @@ pub fn show(
     }
     if playing {
         let pos = playhead_ticks.rem_euclid(loop_ticks as f32);
-        let x = lane_rect.left() + pos * ticks_to_x;
+        let x = lane_t0_x + pos * ticks_to_x;
         lane_painter.line_segment(
             [
                 egui::pos2(x, lane_rect.top()),
@@ -1395,7 +1487,7 @@ pub fn show(
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             } else if let Some(index) = hit_note(pos) {
                 let note = &clip.notes()[index];
-                let (x0, x1) = note_edges(rect, note, ticks_to_x);
+                let (x0, x1) = note_edges(t0_x, note, ticks_to_x);
                 if edge_zone(pos.x, x0, x1).is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
@@ -1405,7 +1497,10 @@ pub fn show(
         }
     }
 
-    if response.drag_started() {
+    // Left-button gestures only: the middle button owns panning, and egui's
+    // unfiltered `drag_started`/`dragged`/`drag_stopped` fire for ANY button
+    // (the patch hit the same trap and filters by button everywhere).
+    if response.drag_started_by(egui::PointerButton::Primary) {
         // Belt-and-suspenders: hover-follow focus (the router) already covers
         // this, but a drag on the roll must never run without focus.
         response.request_focus();
@@ -1439,7 +1534,7 @@ pub fn show(
                 // note's start/end the grab trims that edge instead of moving.
                 let edge = hit_note(pos).and_then(|index| {
                     let note = &clip.notes()[index];
-                    let (x0, x1) = note_edges(rect, note, ticks_to_x);
+                    let (x0, x1) = note_edges(t0_x, note, ticks_to_x);
                     edge_zone(pos.x, x0, x1)
                 });
                 match hit_note(pos) {
@@ -1555,7 +1650,9 @@ pub fn show(
     // plain move. The increment lands on the next frame instead (a real
     // drag has many; the grab-relative delta is computed from the press
     // point, so nothing is lost).
-    if response.dragged() && !(response.drag_started() && intent.is_some()) {
+    if response.dragged_by(egui::PointerButton::Primary)
+        && !(response.drag_started_by(egui::PointerButton::Primary) && intent.is_some())
+    {
         if let Some(pos) = response.interact_pointer_pos() {
             if let Some(knife) = &mut state.knife {
                 // Knife stroke: the frame's segment cuts every note it
@@ -1568,7 +1665,8 @@ pub fn show(
                     if knife.cuts.iter().any(|(cut, _)| *cut == index) {
                         continue; // one cut per note per stroke
                     }
-                    if let Some(tick) = knife_crossing(from, pos, rect, note, ticks_to_x, top_note)
+                    if let Some(tick) =
+                        knife_crossing(from, pos, rect, note, t0_x, ticks_to_x, top_note, row_h)
                     {
                         knife.cuts.push((index, tick));
                     }
@@ -1664,7 +1762,7 @@ pub fn show(
         }
     }
 
-    if response.drag_stopped() {
+    if response.drag_stopped_by(egui::PointerButton::Primary) {
         // A finished marquee selects what it covers.
         if let Some(marquee) = state.marquee.take() {
             let band = egui::Rect::from_two_pos(marquee.origin, marquee.current);
@@ -1673,8 +1771,8 @@ pub fn show(
                 .iter()
                 .enumerate()
                 .filter(|(_, n)| {
-                    let y0 = rect.top() + (top_note as f32 - n.note as f32) * ROW_HEIGHT;
-                    band.intersects(note_rect(rect, n, ticks_to_x, y0))
+                    let y0 = rect.top() + (top_note as f32 - n.note as f32) * row_h;
+                    band.intersects(note_rect(t0_x, n, ticks_to_x, y0, row_h))
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -1727,13 +1825,15 @@ pub fn show(
     // Velocity lane: drag sets absolute velocities. With a selection, every
     // selected note follows the pointer; without one, the notes under the
     // pointer do (a sweep across the lane "paints" velocities).
-    if lane_response.dragged() || lane_response.drag_started() {
+    if lane_response.dragged_by(egui::PointerButton::Primary)
+        || lane_response.drag_started_by(egui::PointerButton::Primary)
+    {
         if let Some(pos) = lane_response.interact_pointer_pos() {
             let velocity = ((lane_rect.bottom() - pos.y) / (LANE_HEIGHT - 4.0) * 127.0)
                 .round()
                 .clamp(1.0, 127.0) as u8;
             let updates: Vec<(usize, u8)> = if state.selection.is_empty() {
-                let tick = ((pos.x - lane_rect.left()) / ticks_to_x).max(0.0) as i64;
+                let tick = ((pos.x - lane_t0_x) / ticks_to_x).max(0.0) as i64;
                 clip.notes()
                     .iter()
                     .enumerate()
@@ -1749,12 +1849,79 @@ pub fn show(
         }
     }
 
+    // A live modal also confirms / cancels on clicks that land OUTSIDE the
+    // roll (Blender semantics: the modal owns the whole input while it runs
+    // — by the time the user clicks, the pointer has often travelled past
+    // the roll, e.g. chasing the ghost far right of the content). Clicks
+    // inside the roll were already consumed by the paths above (which take
+    // the modal, so this only fires for the outside case). The confirming
+    // frame uses the live pointer position — the same one the ghosts
+    // preview, so what you see is exactly what lands.
+    if state.modal.is_some() {
+        let (lmb, rmb) = ui.ctx().input(|i| {
+            (
+                i.pointer.button_clicked(egui::PointerButton::Primary),
+                i.pointer.button_clicked(egui::PointerButton::Secondary),
+            )
+        });
+        if lmb && let Some(modal) = state.modal.take() {
+            let pos = ui
+                .ctx()
+                .input(|i| i.pointer.latest_pos())
+                .unwrap_or_else(|| rect.center());
+            let frame = modal.frame(
+                clip,
+                &state.selection,
+                pointer_tick(pos),
+                pointer_note(pos),
+                grid_ticks,
+                loop_ticks,
+            );
+            intent = modal.finalize(clip, &state.selection, frame, loop_ticks);
+        }
+        if rmb {
+            state.modal = None;
+        }
+    }
+
     intent
 }
 
 /// Snap a tick position to the grid (nearest line, never negative).
 fn snap_ticks(ticks: f32, grid_ticks: i64) -> i64 {
     ((ticks / grid_ticks as f32).round() as i64).max(0) * grid_ticks
+}
+
+/// Time-axis zoom anchored at the pointer: the tick under `anchor_x` stays
+/// under it after the zoom (unclamped new scroll; the caller clamps).
+fn zoom_scroll_anchor(
+    old_zoom: f32,
+    old_scroll: f32,
+    new_zoom: f32,
+    fit: f32,
+    rect_left: f32,
+    anchor_x: f32,
+) -> f32 {
+    let old_px = fit * old_zoom;
+    let t0 = rect_left - old_scroll * old_px;
+    let tick = ((anchor_x - t0) / old_px).max(0.0);
+    let new_px = fit * new_zoom;
+    (rect_left - (anchor_x - tick * new_px)) / new_px
+}
+
+/// Pitch-axis zoom anchored at the pointer: the note under `anchor_y`
+/// stays under it (unclamped new top note; the caller clamps).
+fn zoom_top_note_anchor(
+    old_zoom: f32,
+    old_top: f32,
+    new_zoom: f32,
+    rect_top: f32,
+    anchor_y: f32,
+) -> f32 {
+    let old_h = ROW_HEIGHT * old_zoom;
+    let note = old_top - (anchor_y - rect_top) / old_h;
+    let new_h = ROW_HEIGHT * new_zoom;
+    note + (anchor_y - rect_top) / new_h
 }
 
 /// End tick of a note being drawn: the pointer snapped to the grid, at least
@@ -1801,20 +1968,23 @@ fn edge_zone(x: f32, left: f32, right: f32) -> Option<DragKind> {
 /// a precision operation, not a grid one. `None` when the segment never
 /// enters the note (including when it merely touches the note's boundary,
 /// which would cut off a zero-length half).
+#[allow(clippy::too_many_arguments)]
 fn knife_crossing(
     from: egui::Pos2,
     to: egui::Pos2,
     rect: egui::Rect,
     note: &Note,
+    t0_x: f32,
     ticks_to_x: f32,
     top: i32,
+    row_h: f32,
 ) -> Option<i64> {
-    let row_top = rect.top() + (top as f32 - f32::from(note.note)) * ROW_HEIGHT;
-    let centre = row_top + ROW_HEIGHT / 2.0;
-    let x_left = rect.left() + note.start as f32 * ticks_to_x;
+    let row_top = rect.top() + (top as f32 - f32::from(note.note)) * row_h;
+    let centre = row_top + row_h / 2.0;
+    let x_left = t0_x + note.start as f32 * ticks_to_x;
     let x_right = x_left + (note.length as f32 * ticks_to_x).max(3.0);
     let cut_at = |x: f32| -> Option<i64> {
-        let tick = ((x - rect.left()) / ticks_to_x).round() as i64;
+        let tick = ((x - t0_x) / ticks_to_x).round() as i64;
         (tick > note.start && tick < note.end()).then_some(tick)
     };
 
@@ -1827,7 +1997,7 @@ fn knife_crossing(
     }
     // Sweeping along the note's own row: cut in the middle of the span the
     // segment covered.
-    let band = row_top..=(row_top + ROW_HEIGHT);
+    let band = row_top..=(row_top + row_h);
     if band.contains(&ya) && band.contains(&yb) {
         let lo = from.x.min(to.x).max(x_left);
         let hi = from.x.max(to.x).min(x_right);
@@ -1909,38 +2079,37 @@ fn note_at(
     clip: &MidiClip,
     pos: egui::Pos2,
     rect: egui::Rect,
+    t0_x: f32,
     ticks_to_x: f32,
     top: i32,
+    row_h: f32,
 ) -> Option<usize> {
     clip.notes().iter().position(|n| {
-        let y = rect.top() + (top as f32 - f32::from(n.note)) * ROW_HEIGHT;
-        note_hit_rect(rect, n, ticks_to_x, y).contains(pos)
+        let y = rect.top() + (top as f32 - f32::from(n.note)) * row_h;
+        note_hit_rect(t0_x, n, ticks_to_x, y, row_h).contains(pos)
     })
 }
 
 /// The on-screen rectangle a note is painted into. The single source of
 /// truth for both painting and hit-testing, so the two can never drift.
-fn note_rect(rect: egui::Rect, note: &Note, ticks_to_x: f32, y: f32) -> egui::Rect {
-    let x = rect.left() + note.start as f32 * ticks_to_x;
+fn note_rect(t0_x: f32, note: &Note, ticks_to_x: f32, y: f32, row_h: f32) -> egui::Rect {
+    let x = t0_x + note.start as f32 * ticks_to_x;
     let w = (note.length as f32 * ticks_to_x).max(3.0);
-    egui::Rect::from_min_max(
-        egui::pos2(x, y + 1.0),
-        egui::pos2(x + w, y + ROW_HEIGHT - 1.0),
-    )
+    egui::Rect::from_min_max(egui::pos2(x, y + 1.0), egui::pos2(x + w, y + row_h - 1.0))
 }
 
 /// Left / right pixel edges of a note's drawn rectangle. Edge trims are
 /// measured against these — the *visual* edges, without slop.
-fn note_edges(rect: egui::Rect, note: &Note, ticks_to_x: f32) -> (f32, f32) {
-    let x = rect.left() + note.start as f32 * ticks_to_x;
+fn note_edges(t0_x: f32, note: &Note, ticks_to_x: f32) -> (f32, f32) {
+    let x = t0_x + note.start as f32 * ticks_to_x;
     (x, x + (note.length as f32 * ticks_to_x).max(3.0))
 }
 
 /// The hit-testing rectangle: the drawn one plus [`HIT_SLOP`]. Kept
 /// separate from [`note_rect`] so painting and the edge zones stay exact
 /// — only *landing on* a note is forgiving.
-fn note_hit_rect(rect: egui::Rect, note: &Note, ticks_to_x: f32, y: f32) -> egui::Rect {
-    note_rect(rect, note, ticks_to_x, y).expand2(HIT_SLOP)
+fn note_hit_rect(t0_x: f32, note: &Note, ticks_to_x: f32, y: f32, row_h: f32) -> egui::Rect {
+    note_rect(t0_x, note, ticks_to_x, y, row_h).expand2(HIT_SLOP)
 }
 
 /// A uniform move clamped on the UI side so no note crosses the engine's
@@ -2020,7 +2189,8 @@ mod tests {
         AwaitCreate, Axis, DragKind, DragSelection, EDGE_PX, HIT_SLOP, Modal, ModalFrame,
         ModalKind, ROLL_HEIGHT, ROW_HEIGHT, RollIntent, RollMode, RollState, StretchEdge,
         clamped_move, draw_end, edge_zone, is_black_key, knife_crossing, modal_ghost, note_at,
-        note_rect, scale_max_k, selection_bbox, snap_ticks, trim_start,
+        note_rect, scale_max_k, selection_bbox, snap_ticks, trim_start, zoom_scroll_anchor,
+        zoom_top_note_anchor,
     };
     use crate::grid::{GridValue, NoteValue};
     use eframe::egui;
@@ -2063,6 +2233,68 @@ mod tests {
                 dotted: false,
                 triplet: false
             })
+        );
+        // View navigation starts at the identity: fit-to-width time axis,
+        // base row height, no scroll. (A derived `Default` would give 0.0
+        // zoom and collapse the roll — the patch hit the same trap.)
+        assert_eq!(state.zoom_x, 1.0);
+        assert_eq!(state.zoom_y, 1.0);
+        assert_eq!(state.scroll_x, 0.0);
+    }
+
+    /// The zoom anchor: the tick under the pointer stays under the pointer.
+    #[test]
+    fn time_zoom_keeps_the_pointer_tick_in_place() {
+        // 400 px roll, 960-tick loop → fit scale 400/960 px per tick.
+        let fit = 400.0 / 960.0;
+        let rect_left = 100.0;
+        // Zoomed 4× and scrolled half the loop across: tick 0 sits at
+        // 100 - 480*fit*4 < 0 (scrolled past), the visible window starts
+        // around tick 240.
+        let (zoom, scroll) = (4.0f32, 240.0f32);
+        let anchor_x = 300.0; // mid-roll
+        let old_tick = {
+            let px = fit * zoom;
+            let t0 = rect_left - scroll * px;
+            (anchor_x - t0) / px
+        };
+        let new_zoom = zoom * 2.0;
+        let new_scroll = zoom_scroll_anchor(zoom, scroll, new_zoom, fit, rect_left, anchor_x);
+        let new_px = fit * new_zoom;
+        let new_t0 = rect_left - new_scroll * new_px;
+        let new_tick = (anchor_x - new_t0) / new_px;
+        assert!(
+            (new_tick - old_tick).abs() < 1e-3,
+            "anchor tick {old_tick} drifted to {new_tick}"
+        );
+    }
+
+    /// Zooming out past fit clamps to scroll 0 — the view shows the whole
+    /// loop instead of scrolling into blank space on the left.
+    #[test]
+    fn time_zoom_out_past_fit_pins_scroll_to_zero() {
+        let fit = 400.0 / 960.0;
+        let rect_left = 100.0;
+        // Anchor at the right edge, zoom from 4× down to 0.5× (past fit).
+        let scroll = zoom_scroll_anchor(4.0, 0.0, 0.5, fit, rect_left, 500.0);
+        assert!(scroll <= 0.0, "scroll must clamp to 0, got {scroll}");
+    }
+
+    /// The pitch zoom anchor: the note under the pointer stays under it.
+    #[test]
+    fn pitch_zoom_keeps_the_pointer_note_in_place() {
+        let rect_top = 50.0;
+        let anchor_y = 150.0; // 100 px below the top
+        let (zoom, top) = (2.0f32, 84.0f32);
+        let old_h = ROW_HEIGHT * zoom;
+        let note = top - (anchor_y - rect_top) / old_h;
+        let new_zoom = 4.0;
+        let new_top = zoom_top_note_anchor(zoom, top, new_zoom, rect_top, anchor_y);
+        let new_h = ROW_HEIGHT * new_zoom;
+        let new_note = new_top - (anchor_y - rect_top) / new_h;
+        assert!(
+            (new_note - note).abs() < 1e-3,
+            "anchor note {note} drifted to {new_note}"
         );
     }
 
@@ -2357,7 +2589,7 @@ mod tests {
         let top = 60i32;
         let y = rect.top();
 
-        let drawn = note_rect(rect, &clip.notes()[0], ticks_to_x, y);
+        let drawn = note_rect(rect.left(), &clip.notes()[0], ticks_to_x, y, ROW_HEIGHT);
         assert_eq!(drawn.left(), 100.0);
         assert_eq!(drawn.right(), 340.0);
 
@@ -2365,7 +2597,7 @@ mod tests {
         for x in [drawn.left(), drawn.center().x, drawn.right() - 0.5] {
             let pos = egui::pos2(x, drawn.center().y);
             assert_eq!(
-                note_at(&clip, pos, rect, ticks_to_x, top),
+                note_at(&clip, pos, rect, rect.left(), ticks_to_x, top, ROW_HEIGHT),
                 Some(0),
                 "x={x} is inside the drawn rect and must hit"
             );
@@ -2377,8 +2609,10 @@ mod tests {
                 &clip,
                 egui::pos2(drawn.right() + 1.0, drawn.center().y),
                 rect,
+                rect.left(),
                 ticks_to_x,
-                top
+                top,
+                ROW_HEIGHT
             ),
             Some(0),
             "a press a pixel past the tail still hits (aim error is not empty space)"
@@ -2389,8 +2623,10 @@ mod tests {
                 &clip,
                 egui::pos2(drawn.right() + HIT_SLOP.x + 0.5, drawn.center().y),
                 rect,
+                rect.left(),
                 ticks_to_x,
-                top
+                top,
+                ROW_HEIGHT
             ),
             None
         );
@@ -2401,8 +2637,10 @@ mod tests {
                 &clip,
                 egui::pos2(drawn.center().x, drawn.center().y + ROW_HEIGHT),
                 rect,
+                rect.left(),
                 ticks_to_x,
-                top
+                top,
+                ROW_HEIGHT
             ),
             None
         );
@@ -2418,11 +2656,19 @@ mod tests {
         // ticks_to_x = 0.1 → one tick is 0.1 px, floored to the 3 px minimum.
         let ticks_to_x = 0.1f32;
         let y = rect.top();
-        let drawn = note_rect(rect, &clip.notes()[0], ticks_to_x, y);
+        let drawn = note_rect(rect.left(), &clip.notes()[0], ticks_to_x, y, ROW_HEIGHT);
         assert_eq!(drawn.width(), 3.0, "the minimum width is what gets drawn");
         for x in [drawn.left() + 0.5, drawn.right() - 0.5] {
             assert_eq!(
-                note_at(&clip, egui::pos2(x, drawn.center().y), rect, ticks_to_x, 60),
+                note_at(
+                    &clip,
+                    egui::pos2(x, drawn.center().y),
+                    rect,
+                    rect.left(),
+                    ticks_to_x,
+                    60,
+                    ROW_HEIGHT
+                ),
                 Some(0),
                 "x={x} within the drawn 3 px must hit the note"
             );
@@ -2787,34 +3033,37 @@ mod tests {
         let n = &clip.notes()[0];
         let row_top = rect.top();
         let centre = row_top + ROW_HEIGHT / 2.0;
+        let k = |from: egui::Pos2, to: egui::Pos2| {
+            knife_crossing(from, to, rect, n, rect.left(), ttx, top, ROW_HEIGHT)
+        };
 
         // A vertical slash at tick 120 crosses the row centreline inside.
         let to = egui::pos2(12.0, centre + 20.0);
         let from = egui::pos2(12.0, centre - 20.0);
-        assert_eq!(knife_crossing(from, to, rect, n, ttx, top), Some(120));
+        assert_eq!(k(from, to), Some(120));
 
         // Crossing the row outside the note's span cuts nothing (the
         // centreline meet is at x = 35 px → tick 350, past the note).
         let from = egui::pos2(40.0, centre - 20.0);
         let to_outside = egui::pos2(30.0, centre + 20.0);
-        assert_eq!(knife_crossing(from, to_outside, rect, n, ttx, top), None);
+        assert_eq!(k(from, to_outside), None);
 
         // Touching the note's boundary would cut off a zero-length half
         // (the centreline meet is at tick 0 exactly).
         let from = egui::pos2(-12.0, centre - 20.0);
         let to_edge = egui::pos2(12.0, centre + 20.0);
-        assert_eq!(knife_crossing(from, to_edge, rect, n, ttx, top), None);
+        assert_eq!(k(from, to_edge), None);
 
         // A sweep along the note's own row cuts in the middle of the
         // covered span: overlap [2..20] px → tick 110.
         let from = egui::pos2(2.0, centre);
         let to = egui::pos2(20.0, centre);
-        assert_eq!(knife_crossing(from, to, rect, n, ttx, top), Some(110));
+        assert_eq!(k(from, to), Some(110));
 
         // A segment nowhere near the row.
         let from = egui::pos2(2.0, centre + 5.0 * ROW_HEIGHT);
         let to = egui::pos2(20.0, centre + 5.0 * ROW_HEIGHT);
-        assert_eq!(knife_crossing(from, to, rect, n, ttx, top), None);
+        assert_eq!(k(from, to), None);
     }
 
     #[test]

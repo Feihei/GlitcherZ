@@ -27,8 +27,15 @@ use glitcherz_model::{
 
 /// Fixed width of the row-header column.
 pub const HEADER_WIDTH: f32 = 108.0;
-/// Height of one track row.
+/// Height of one track row at `row_zoom` = 1.
 pub const ROW_HEIGHT: f32 = 28.0;
+/// Row-height zoom bounds (multiplier over [`ROW_HEIGHT`]).
+const ROW_ZOOM_MIN: f32 = 0.5;
+const ROW_ZOOM_MAX: f32 = 3.0;
+/// Horizontal zoom bounds (pixels per bar; the toolbar +/- buttons share
+/// them).
+pub const PX_PER_BAR_MIN: f32 = 14.0;
+pub const PX_PER_BAR_MAX: f32 = 280.0;
 /// Height of the bar-number ruler.
 const RULER_HEIGHT: f32 = 20.0;
 /// Half-width of the grab zone at a clip's right edge (resize handle).
@@ -152,6 +159,8 @@ struct Marquee {
 pub struct TimelineState {
     /// Horizontal zoom: pixels per bar.
     pub px_per_bar: f32,
+    /// Row-height zoom (multiplier over [`ROW_HEIGHT`]).
+    pub row_zoom: f32,
     drag: Option<Drag>,
     /// Selected clips across tracks (M4b).
     pub selection: Vec<ClipSel>,
@@ -183,12 +192,24 @@ pub struct TimelineState {
     /// Set when a lane row sees a modal-cancelling RMB; show() clears the
     /// modal after all rows have run.
     modal_cancel: bool,
+    /// Last frame's row area in screen coordinates (header column through
+    /// the last lane) — the wheel/pan navigation reads it to decide when
+    /// the pointer is over the rows, so zoom can be applied *before* the
+    /// ScrollArea lays out (zoom + offset compensation in one frame).
+    rows_rect: Option<Rect>,
+    /// Last frame's scroll viewport origin (screen coordinates) — the
+    /// anchor math for pointer-anchored horizontal zoom.
+    rows_viewport_min: Pos2,
+    /// Track-reorder drag (header grab handle): the MIDI track index the
+    /// grab started on.
+    reorder: Option<usize>,
 }
 
 impl Default for TimelineState {
     fn default() -> Self {
         Self {
             px_per_bar: 56.0,
+            row_zoom: 1.0,
             drag: None,
             selection: Vec::new(),
             marquee: None,
@@ -200,6 +221,9 @@ impl Default for TimelineState {
             modal: None,
             modal_confirm: false,
             modal_cancel: false,
+            rows_rect: None,
+            rows_viewport_min: Pos2::ZERO,
+            reorder: None,
         }
     }
 }
@@ -301,6 +325,16 @@ pub enum TimelineAction {
     SelectTrack(usize),
     SelectControlTrack(usize),
     ToggleMute(usize, bool),
+    /// Reorder the MIDI tracks: the track at `from` is re-inserted so it
+    /// ends up just before original index `to` (an insertion index,
+    /// 0..=len; `to == from` / `to == from + 1` are identity drops the
+    /// caller skips). One undo step — the document track table, the
+    /// per-track node `track` fields and the `MidiTrack` cable indices all
+    /// move together.
+    ReorderMidiTrack {
+        from: usize,
+        to: usize,
+    },
     OpenMidiEditor {
         track: usize,
         clip: usize,
@@ -513,10 +547,12 @@ fn track_spans<T: Placement>(clips: &[T], skip: &[usize]) -> Vec<(u32, u32)> {
 /// The G / Shift+D modal's per-clip targets (moves and clones share the
 /// grab math). `None` when the pointer is unavailable (no ghost this
 /// frame) or the modal is a Stretch.
+#[allow(clippy::too_many_arguments)]
 fn grab_targets(
     modal: &Modal,
     ptr: Option<Pos2>,
     px_per_bar: f32,
+    row_h: f32,
     rows_midi: usize,
     rows_control: usize,
     midi_tracks: &[MidiTrack],
@@ -527,7 +563,7 @@ fn grab_targets(
     };
     let ptr = ptr?;
     let mut bar_delta = ((ptr.x - modal.grab.x) / px_per_bar).round() as i64;
-    let mut row_delta = ((ptr.y - modal.grab.y) / ROW_HEIGHT).round() as i32;
+    let mut row_delta = ((ptr.y - modal.grab.y) / row_h).round() as i32;
     let is_control = modal.origin.first().map(|s| s.is_control).unwrap_or(false);
     let rows = if is_control { rows_control } else { rows_midi };
     row_delta = clamp_row_delta(row_delta, &modal.origin, rows);
@@ -697,7 +733,15 @@ pub fn show(
     router: &mut crate::focus::FocusRouter,
 ) -> Vec<TimelineAction> {
     let mut actions = Vec::new();
+    // While a modal transform (G/T/Shift+D) or the armed knife owns the
+    // pointer, the keyboard stays with the lane that armed it — the pointer
+    // may travel across neutral chrome (or past the content edge) without
+    // the focus-follow handing the keys to someone else. Same guarantee a
+    // real drag gets from the router's any-down freeze; set every frame so
+    // it clears itself when the modal ends.
+    router.set_focus_hold(state.modal.is_some() || state.knife_armed);
     let px_per_tick = state.px_per_bar / TICKS_PER_BAR as f32;
+    let row_h = ROW_HEIGHT * state.row_zoom;
     let midi_end = midi_tracks
         .iter()
         .flat_map(|t| t.clips.iter())
@@ -714,6 +758,71 @@ pub fn show(
     let content_ticks = max_end.max(MIN_CONTENT_BARS * TICKS_PER_BAR);
     let content_px = content_ticks as f32 * px_per_tick + state.px_per_bar;
 
+    // ---- View navigation (read before the ScrollArea lays out, using last
+    // frame's row geometry, so zoom and its offset compensation land in the
+    // same frame). Ctrl+wheel zooms the time axis anchored on the pointer,
+    // Ctrl+Alt+wheel zooms the row height, middle-drag pans both axes. Plain
+    // / Shift wheel stay with the ScrollArea (vertical / horizontal
+    // scrolling).
+    let scroll_id = ui.make_persistent_id("glitcherz_timeline_scroll");
+    {
+        let (zoom2, mods) = ui.ctx().input(|i| (i.zoom_delta_2d(), i.modifiers));
+        let ctrl = mods.ctrl || mods.command;
+        let ptr = ui.ctx().pointer_hover_pos();
+        let in_rows = state
+            .rows_rect
+            .is_some_and(|r| ptr.is_some_and(|p| r.contains(p)));
+        if in_rows && ctrl {
+            let Some(ptr) = ptr else {
+                unreachable!("in_rows implies ptr")
+            };
+            let vmin = state.rows_viewport_min;
+            let mut scroll_state = egui::containers::scroll_area::State::load(ui.ctx(), scroll_id);
+            let offset = scroll_state.as_ref().map_or(Vec2::ZERO, |s| s.offset);
+            // Time axis: uniform zoom (pure Ctrl) or horizontal-only (the
+            // touch pinch case). Anchor the tick under the pointer.
+            if zoom2.x != 1.0 {
+                let old = state.px_per_bar;
+                let new = (old * zoom2.x).clamp(PX_PER_BAR_MIN, PX_PER_BAR_MAX);
+                if new != old {
+                    let old_ppt = old / TICKS_PER_BAR as f32;
+                    let tick = ((offset.x + ptr.x - vmin.x) / old_ppt).max(0.0);
+                    let new_ppt = new / TICKS_PER_BAR as f32;
+                    let anchored = (tick * new_ppt - (ptr.x - vmin.x)).max(0.0);
+                    state.px_per_bar = new;
+                    if let Some(s) = scroll_state.as_mut() {
+                        s.offset.x = anchored;
+                    }
+                }
+            }
+            // Row height: only a vertical-only factor (Ctrl+Alt) resizes
+            // the rows — a uniform zoom belongs to the time axis above.
+            if zoom2.y != 1.0 && (zoom2.x - zoom2.y).abs() > 1e-4 {
+                state.row_zoom = (state.row_zoom * zoom2.y).clamp(ROW_ZOOM_MIN, ROW_ZOOM_MAX);
+            }
+            if let Some(s) = scroll_state {
+                s.store(ui.ctx(), scroll_id);
+            }
+            ui.ctx().request_repaint();
+        }
+        // Middle-drag pans the viewport (the ScrollArea's drag-to-scroll is
+        // touch-only by default).
+        if in_rows
+            && ui
+                .ctx()
+                .input(|i| i.pointer.button_down(egui::PointerButton::Middle))
+        {
+            let d = ui.ctx().input(|i| i.pointer.delta());
+            if d != Vec2::ZERO
+                && let Some(mut s) = egui::containers::scroll_area::State::load(ui.ctx(), scroll_id)
+            {
+                s.offset.x = (s.offset.x - d.x).max(0.0);
+                s.offset.y = (s.offset.y - d.y).max(0.0);
+                s.store(ui.ctx(), scroll_id);
+            }
+        }
+    }
+
     // The scroll area carries an explicit id: all rows below live off its
     // content ui's positional auto ids, so if anything above it comes or
     // goes every row silently re-id's — and since egui keeps focus ON THE
@@ -728,10 +837,10 @@ pub fn show(
         ui.horizontal(|ui| {
             ui.strong("Arrangement");
             if ui.button("-").on_hover_text("Zoom out").clicked() {
-                state.px_per_bar = (state.px_per_bar / 1.3).max(14.0);
+                state.px_per_bar = (state.px_per_bar / 1.3).max(PX_PER_BAR_MIN);
             }
             if ui.button("+").on_hover_text("Zoom in").clicked() {
-                state.px_per_bar = (state.px_per_bar * 1.3).min(280.0);
+                state.px_per_bar = (state.px_per_bar * 1.3).min(PX_PER_BAR_MAX);
             }
             ui.separator();
             if ui.button("+ Track").clicked() {
@@ -827,7 +936,7 @@ pub fn show(
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(
-                        "Drag move · edge resize · dbl-click insert/edit · right-click delete · marquee: select · Del: delete · K: knife",
+                        "Drag move · edge resize · dbl-click insert/edit · right-click delete · marquee: select · Del: delete · K: knife · header dots: reorder track · Ctrl+wheel: zoom time · Ctrl+Alt+wheel: row height · middle-drag: pan",
                     )
                     .weak(),
                 )
@@ -870,6 +979,7 @@ pub fn show(
         // row of the same kind, so they are drawn after all rows have run).
         let mut geom: Vec<(RowKind, Rect)> = Vec::new();
         state.had_focus = false;
+        let rows_top = ui.cursor().min.y;
 
         // MIDI rows.
         for (i, track) in midi_tracks.iter().enumerate() {
@@ -898,6 +1008,7 @@ pub fn show(
                 RowKind::Midi(i),
                 &track.clips,
                 px_per_tick,
+                row_h,
                 content_px,
                 p.playhead_ticks,
                 RowColors::midi(p.selected_track == i),
@@ -929,6 +1040,7 @@ pub fn show(
                     RowKind::Control(i),
                     &track.clips,
                     px_per_tick,
+                    row_h,
                     content_px,
                     p.playhead_ticks,
                     RowColors::control(p.selected_auto == i),
@@ -941,6 +1053,57 @@ pub fn show(
                         }
                     },
                 );
+            }
+        }
+
+        // Record this frame's row area for the next frame's navigation
+        // input (see the wheel/pan block before the ScrollArea): the union
+        // of the header column and every lane, plus the scroll viewport
+        // origin for the zoom-anchor math.
+        let rows_frame = geom.first().map(|(_, first)| {
+            let left = first.left() - HEADER_WIDTH;
+            let right = geom
+                .iter()
+                .map(|(_, r)| r.right())
+                .fold(first.right(), f32::max);
+            Rect::from_min_max(pos2(left, rows_top), pos2(right, ui.cursor().min.y))
+        });
+        state.rows_rect = rows_frame;
+        if rows_frame.is_some() {
+            state.rows_viewport_min = ui.clip_rect().min;
+        }
+
+        // ---- Track reorder (header grab handle). The target is the
+        // insertion row the pointer hovers among the MIDI rows; the drop
+        // (primary release anywhere — the drag follows the pointer across
+        // rows) lands as one action. The insert indicator is drawn over
+        // the rows so the target is visible while dragging. ----
+        if let Some(from) = state.reorder
+            && let Some(frame) = rows_frame
+        {
+            let midi_rows: Vec<Rect> = geom
+                .iter()
+                .filter_map(|(r, rect)| matches!(r, RowKind::Midi(_)).then_some(*rect))
+                .collect();
+            let ptr = ui.ctx().pointer_hover_pos();
+            let mut drop: Option<usize> = None;
+            if let Some(ptr) = ptr
+                && let Some((to, y)) = reorder_target(ptr.y, &midi_rows)
+            {
+                drop = Some(to);
+                ui.painter().line_segment(
+                    [pos2(frame.left(), y), pos2(frame.right(), y)],
+                    Stroke::new(2.0, SELECTED),
+                );
+            }
+            if ui.ctx().input(|i| i.pointer.primary_released()) {
+                state.reorder = None;
+                if let Some(to) = drop
+                    && to != from
+                    && to != from + 1
+                {
+                    actions.push(TimelineAction::ReorderMidiTrack { from, to });
+                }
             }
         }
 
@@ -980,6 +1143,23 @@ pub fn show(
         // the block — `state.modal` is still borrowed inside it.
         let mut refused_msg: Option<String> = None;
         if state.modal.is_some() {
+            // The modal owns the whole input while it runs: the confirming
+            // / cancelling click lands ANYWHERE (Blender semantics — the
+            // pointer has usually travelled past the lane, e.g. past the
+            // content edge, by the time the user clicks). This is the
+            // global click, not a lane response.
+            let (lmb, rmb) = ui.ctx().input(|i| {
+                (
+                    i.pointer.button_clicked(egui::PointerButton::Primary),
+                    i.pointer.button_clicked(egui::PointerButton::Secondary),
+                )
+            });
+            if lmb {
+                state.modal_confirm = true;
+            }
+            if rmb {
+                state.modal_cancel = true;
+            }
             let ptr = ui.ctx().pointer_hover_pos();
             let px_per_bar = state.px_per_bar;
             if state.modal_cancel || state.modal_confirm {
@@ -988,7 +1168,7 @@ pub fn show(
                         match m.kind {
                             ModalKind::Grab { .. } | ModalKind::Duplicate { .. } => {
                                 if let Some(moves) = grab_targets(
-                                    m, ptr, px_per_bar, midi_tracks.len(),
+                                    m, ptr, px_per_bar, row_h, midi_tracks.len(),
                                     control_tracks.len(), midi_tracks, control_tracks,
                                 ) {
                                     let targets: Vec<_> = moves
@@ -1087,7 +1267,7 @@ pub fn show(
                 // over dimmed originals (the rows already drew them dim).
                 let targets = match m.kind {
                     ModalKind::Grab { .. } | ModalKind::Duplicate { .. } => grab_targets(
-                        m, ptr, px_per_bar, midi_tracks.len(), control_tracks.len(),
+                        m, ptr, px_per_bar, row_h, midi_tracks.len(), control_tracks.len(),
                         midi_tracks, control_tracks,
                     )
                     .map(|ms| {
@@ -1153,6 +1333,7 @@ fn lane_row<T: Placement>(
     row: RowKind,
     clips: &[T],
     px_per_tick: f32,
+    row_h: f32,
     content_px: f32,
     playhead_ticks: f32,
     colors: RowColors,
@@ -1180,7 +1361,7 @@ fn lane_row<T: Placement>(
     // scroll area and every later row would land below the fold — the
     // "only the last track remains" bug.
     let mut row_rect = parent.available_rect_before_wrap();
-    row_rect.max.y = row_rect.min.y + ROW_HEIGHT;
+    row_rect.max.y = row_rect.min.y + row_h;
     let mut row_ui = parent.new_child(
         egui::UiBuilder::new()
             // Same layout as `ui.horizontal`, but with an explicit id.
@@ -1197,12 +1378,39 @@ fn lane_row<T: Placement>(
             muted,
             selected,
         } => {
+            // Reorder grab handle (MIDI rows only): a drag on the dots
+            // moves the track. Sense::drag only — a plain click on it does
+            // nothing (selecting stays with the name button).
+            let (grip_rect, grip_response) =
+                ui.allocate_exact_size(Vec2::new(12.0, row_h - 4.0), Sense::drag());
+            let grip_color = if state.reorder == Some(index) {
+                SELECTED
+            } else {
+                Color32::from_gray(110)
+            };
+            let grip_painter = ui.painter_at(grip_rect);
+            let mid = grip_rect.center().y;
+            for dy in [-3.0, 0.0, 3.0] {
+                for dx in [-3.0, 0.0] {
+                    grip_painter.circle_filled(
+                        pos2(grip_rect.center().x + dx, mid + dy),
+                        1.2,
+                        grip_color,
+                    );
+                }
+            }
+            if grip_response.drag_started_by(egui::PointerButton::Primary) {
+                state.reorder = Some(index);
+            }
+            if grip_response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
             let mut btn = egui::Button::new(egui::RichText::new(name).size(11.0));
             if selected {
                 btn = btn.fill(Color32::from_rgb(60, 90, 140));
             }
             if ui
-                .add_sized([HEADER_WIDTH - 44.0, ROW_HEIGHT - 4.0], btn)
+                .add_sized([HEADER_WIDTH - 56.0, row_h - 4.0], btn)
                 .clicked()
             {
                 actions.push(TimelineAction::SelectTrack(index));
@@ -1212,7 +1420,7 @@ fn lane_row<T: Placement>(
                 mute_btn = mute_btn.fill(Color32::from_rgb(140, 60, 50));
             }
             if ui
-                .add_sized([40.0, ROW_HEIGHT - 4.0], mute_btn)
+                .add_sized([40.0, row_h - 4.0], mute_btn)
                 .on_hover_text("Toggle mute")
                 .clicked()
             {
@@ -1225,10 +1433,7 @@ fn lane_row<T: Placement>(
             if selected {
                 btn = btn.fill(Color32::from_rgb(120, 90, 40));
             }
-            if ui
-                .add_sized([HEADER_WIDTH, ROW_HEIGHT - 4.0], btn)
-                .clicked()
-            {
+            if ui.add_sized([HEADER_WIDTH, row_h - 4.0], btn).clicked() {
                 actions.push(TimelineAction::SelectControlTrack(index));
             }
         }
@@ -1236,7 +1441,7 @@ fn lane_row<T: Placement>(
 
     // Lane surface.
     let (lane, response) =
-        ui.allocate_exact_size(Vec2::new(content_px, ROW_HEIGHT), Sense::click_and_drag());
+        ui.allocate_exact_size(Vec2::new(content_px, row_h), Sense::click_and_drag());
     // The lane is a keyboard surface of the app-level FocusRouter: hovering
     // it grants focus, hovering another surface or chrome releases it. The
     // explicit click is a fallback that also pulls focus out of an inline
@@ -1424,7 +1629,13 @@ fn lane_row<T: Placement>(
     // the right edge (and select it if it was not); on empty space,
     // start a rubber band (M4b selection). While the knife is armed or
     // a modal is live the pointer belongs to them: no drags, no bands.
-    if response.drag_started() && !state.knife_armed && state.modal.is_none() {
+    // Left button only: the middle button owns panning, and egui's
+    // unfiltered `drag_started`/`dragged`/`drag_stopped` fire for ANY
+    // button (the patch filters by button everywhere for this reason).
+    if response.drag_started_by(egui::PointerButton::Primary)
+        && !state.knife_armed
+        && state.modal.is_none()
+    {
         if let Some(pos) = response.interact_pointer_pos() {
             let tick = tick_at(pos.x);
             if let Some(index) = hit_clip(clips, tick) {
@@ -1466,7 +1677,7 @@ fn lane_row<T: Placement>(
         }
     }
 
-    if response.dragged() {
+    if response.dragged_by(egui::PointerButton::Primary) {
         if let Some(pos) = response.interact_pointer_pos() {
             if let Some(m) = state.marquee.as_mut() {
                 m.current = pos;
@@ -1517,7 +1728,7 @@ fn lane_row<T: Placement>(
         }
     }
 
-    if response.drag_stopped() {
+    if response.drag_stopped_by(egui::PointerButton::Primary) {
         state.drag = None;
         if state.marquee.is_some() {
             state.marquee_ending = true;
@@ -1590,17 +1801,6 @@ fn lane_row<T: Placement>(
                 None if additive => {}
                 None => state.selection.clear(),
             }
-        }
-    }
-
-    // Modal pointer handling: LMB click confirms, RMB cancels (and
-    // suppresses delete while the modal is live).
-    if state.modal.is_some() {
-        if response.clicked() {
-            state.modal_confirm = true;
-        }
-        if response.secondary_clicked() {
-            state.modal_cancel = true;
         }
     }
 
@@ -1816,6 +2016,51 @@ fn knife_target<T: Placement>(clips: &[T], tick: f32) -> Option<(usize, u32)> {
 fn snap_bar(ticks: f32) -> u32 {
     let bar = TICKS_PER_BAR as f32;
     ((ticks / bar).round().max(0.0) as u32) * TICKS_PER_BAR
+}
+
+/// The insertion row a track-reorder drag points at, plus the screen y the
+/// insert indicator should draw at. `rows` are the MIDI lane rects in
+/// track order; `to` is the insertion index in ORIGINAL track coordinates
+/// (0..=rows.len() — above row 0, between rows, or below the last row);
+/// `to == from` / `to == from + 1` are identity drops the caller skips.
+/// `None` when there are no rows.
+fn reorder_target(ptr_y: f32, rows: &[Rect]) -> Option<(usize, f32)> {
+    let first = rows.first()?;
+    if ptr_y <= first.top() {
+        return Some((0, first.top()));
+    }
+    for (i, rect) in rows.iter().enumerate() {
+        if ptr_y <= rect.bottom() {
+            let (to, y) = if ptr_y < rect.center().y {
+                (i, rect.top())
+            } else {
+                (i + 1, rect.bottom())
+            };
+            return Some((to, y));
+        }
+    }
+    let last = rows.last().expect("rows is non-empty (checked above)");
+    Some((rows.len(), last.bottom()))
+}
+
+/// The old→new index permutation a MIDI-track reorder produces: the track
+/// at `from` is removed and re-inserted so it ends up just before original
+/// index `to` (the geometry's insertion semantics). Reordering is applied
+/// atomically at the document level (track table, per-track node `track`
+/// fields, `MidiTrack` cable indices all move together); this permutation
+/// is the shared math the app applies and the tests verify.
+pub(crate) fn track_permutation(len: usize, from: usize, to: usize) -> Vec<usize> {
+    let insert_at = if to > from { to - 1 } else { to };
+    (0..len)
+        .map(|old| {
+            if old == from {
+                insert_at
+            } else {
+                let r = if old > from { old - 1 } else { old };
+                if r >= insert_at { r + 1 } else { r }
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2054,7 +2299,7 @@ mod tests {
         };
         // Pointer 1.6 bars right, one row down.
         let ptr = pos2(100.0 + 1.6 * 56.0, 100.0 + ROW_HEIGHT);
-        let targets = grab_targets(&modal, Some(ptr), 56.0, 2, 1, &midi, &[]).unwrap();
+        let targets = grab_targets(&modal, Some(ptr), 56.0, ROW_HEIGHT, 2, 1, &midi, &[]).unwrap();
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].to_track, 1);
         // 1.6 bars → rounds to 2 bars.
@@ -2066,7 +2311,7 @@ mod tests {
             },
             ..modal.clone()
         };
-        let targets = grab_targets(&locked, Some(ptr), 56.0, 2, 1, &midi, &[]).unwrap();
+        let targets = grab_targets(&locked, Some(ptr), 56.0, ROW_HEIGHT, 2, 1, &midi, &[]).unwrap();
         assert_eq!(targets[0].to_track, 0);
         assert_eq!(targets[0].start_ticks, 4 * TICKS_PER_BAR);
         // Y locks the movement to the rows: the bar delta dies.
@@ -2076,9 +2321,71 @@ mod tests {
             },
             ..modal.clone()
         };
-        let targets = grab_targets(&row_locked, Some(ptr), 56.0, 2, 1, &midi, &[]).unwrap();
+        let targets =
+            grab_targets(&row_locked, Some(ptr), 56.0, ROW_HEIGHT, 2, 1, &midi, &[]).unwrap();
         assert_eq!(targets[0].to_track, 1);
         assert_eq!(targets[0].start_ticks, 2 * TICKS_PER_BAR);
+    }
+
+    #[test]
+    fn timeline_state_defaults() {
+        let state = TimelineState::default();
+        assert_eq!(state.px_per_bar, 56.0);
+        // View navigation starts at the identity (base row height, no
+        // pending reorder, no recorded row geometry yet).
+        assert_eq!(state.row_zoom, 1.0);
+        assert_eq!(state.reorder, None);
+        assert_eq!(state.rows_rect, None);
+    }
+
+    /// The reorder permutation: applying `perm[old] = new` to a track list
+    /// must equal remove(from) + insert at the original-index target.
+    #[test]
+    fn track_permutation_matches_remove_insert() {
+        // Track 0 dropped below track 2 ([A,B,C] → [B,A,C]).
+        assert_eq!(track_permutation(3, 0, 2), vec![1, 0, 2]);
+        // Track 2 lifted to the top ([A,B,C] → [C,A,B]).
+        assert_eq!(track_permutation(3, 2, 0), vec![1, 2, 0]);
+        // Track 1 pushed to the end ([A,B,C] → [A,C,B]).
+        assert_eq!(track_permutation(3, 1, 3), vec![0, 2, 1]);
+        // Identity neighbours: dropping onto yourself or just below is a
+        // no-op the caller filters, and the permutation reflects that.
+        assert_eq!(track_permutation(3, 1, 1), vec![0, 1, 2]);
+        assert_eq!(track_permutation(3, 1, 2), vec![0, 1, 2]);
+        // The permutation is a bijection for every from/to pair.
+        for len in 1..=6usize {
+            for from in 0..len {
+                for to in 0..=len {
+                    let perm = track_permutation(len, from, to);
+                    let mut seen = vec![false; len];
+                    for &new in &perm {
+                        assert!(!seen[new], "duplicate target index in {perm:?}");
+                        seen[new] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The reorder drop target: pointer position → insertion row +
+    /// indicator y, in original track coordinates.
+    #[test]
+    fn reorder_target_picks_the_insertion_row() {
+        let rows = vec![
+            Rect::from_min_size(pos2(100.0, 0.0), Vec2::new(500.0, 28.0)),
+            Rect::from_min_size(pos2(100.0, 28.0), Vec2::new(500.0, 28.0)),
+            Rect::from_min_size(pos2(100.0, 56.0), Vec2::new(500.0, 28.0)),
+        ];
+        // Above everything: insert at the top.
+        assert_eq!(reorder_target(-10.0, &rows), Some((0, 0.0)));
+        // Upper half of row 1: insert before it.
+        assert_eq!(reorder_target(30.0, &rows), Some((1, 28.0)));
+        // Lower half of row 1: insert after it.
+        assert_eq!(reorder_target(48.0, &rows), Some((2, 56.0)));
+        // Below everything: insert at the end.
+        assert_eq!(reorder_target(500.0, &rows), Some((3, 84.0)));
+        // No rows: nothing to target.
+        assert_eq!(reorder_target(10.0, &[]), None);
     }
 
     #[test]
