@@ -40,8 +40,7 @@ pub const PX_PER_BAR_MAX: f32 = 280.0;
 const RULER_HEIGHT: f32 = 20.0;
 /// Half-width of the grab zone at a clip's right edge (resize handle).
 const EDGE_GRAB: f32 = 6.0;
-/// Minimum timeline content width (bars), even for an empty arrangement.
-const MIN_CONTENT_BARS: u32 = 16;
+
 /// Accent color for selected clips (matches the roll's selection family).
 const SELECTED: Color32 = Color32::from_rgb(240, 190, 80);
 
@@ -742,21 +741,14 @@ pub fn show(
     router.set_focus_hold(state.modal.is_some() || state.knife_armed);
     let px_per_tick = state.px_per_bar / TICKS_PER_BAR as f32;
     let row_h = ROW_HEIGHT * state.row_zoom;
-    let midi_end = midi_tracks
-        .iter()
-        .flat_map(|t| t.clips.iter())
-        .map(|c| c.start() + c.span())
-        .max()
-        .unwrap_or(0);
-    let control_end = control_tracks
-        .iter()
-        .flat_map(|t| t.clips.iter())
-        .map(|c| c.start() + c.span())
-        .max()
-        .unwrap_or(0);
-    let max_end = midi_end.max(control_end);
-    let content_ticks = max_end.max(MIN_CONTENT_BARS * TICKS_PER_BAR);
-    let content_px = content_ticks as f32 * px_per_tick + state.px_per_bar;
+    // The lanes span the FULL arrangement (MAX_ARRANGEMENT_BARS), not just
+    // past the last clip: the bar grid keeps drawing behind the content, so
+    // a G-modal ghost (or any insert / drop target) always has visible bar
+    // lines to land on, and the scroll range matches the bound every
+    // interaction already clamps to. The grid/ruler drawing is
+    // viewport-culled, so the 256-bar span costs nothing per frame.
+    let content_bars = MAX_ARRANGEMENT_BARS;
+    let content_px = content_bars as f32 * state.px_per_bar;
 
     // ---- View navigation (read before the ScrollArea lays out, using last
     // frame's row geometry, so zoom and its offset compensation land in the
@@ -944,7 +936,9 @@ pub fn show(
             );
         });
 
-        // Ruler: bar numbers over the content width.
+        // Ruler: bar numbers over the content width (viewport-culled — the
+        // ruler spans the whole arrangement, only the bars in view get
+        // lines and numbers).
         ui.horizontal(|ui| {
             ui.allocate_exact_size(Vec2::new(HEADER_WIDTH, RULER_HEIGHT), Sense::hover());
             let (rect, _) =
@@ -952,9 +946,14 @@ pub fn show(
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, Color32::from_gray(24));
             let step = if state.px_per_bar < 28.0 { 4 } else { 1 };
-            let bars = content_ticks / TICKS_PER_BAR;
-            let mut bar = 0;
-            while bar <= bars {
+            let clip = ui.clip_rect();
+            let first = (((clip.left() - rect.left()) / state.px_per_bar).ceil().max(0.0) as u32)
+                .div_ceil(step)
+                * step;
+            let last = (((clip.right() - rect.left()) / state.px_per_bar).floor().max(0.0) as u32)
+                .min(content_bars);
+            let mut bar = first;
+            while bar <= last {
                 let x = rect.left() + bar as f32 * state.px_per_bar;
                 painter.line_segment(
                     [pos2(x, rect.top() + 4.0), pos2(x, rect.bottom())],
@@ -1458,13 +1457,16 @@ fn lane_row<T: Placement>(
     painter.rect_filled(lane, 0.0, colors.lane_bg);
     geom.push((row, lane));
 
-    // Bar grid.
-    let bars = (content_px / px_per_tick / TICKS_PER_BAR as f32).ceil() as u32;
-    for bar in 0..=bars {
-        let x = lane.left() + bar as f32 * px_per_tick * TICKS_PER_BAR as f32;
-        if x > lane.right() {
-            break;
-        }
+    // Bar grid (viewport-culled: the lane spans the whole arrangement, so
+    // iterating from bar 0 would walk hundreds of off-screen bars every
+    // frame).
+    let bar_px = px_per_tick * TICKS_PER_BAR as f32;
+    let bars = (content_px / bar_px).floor() as u32;
+    let clip_x = ui.clip_rect();
+    let first = (((clip_x.left() - lane.left()) / bar_px).ceil().max(0.0) as u32).min(bars);
+    let last = (((clip_x.right() - lane.left()) / bar_px).floor().max(0.0) as u32).min(bars);
+    for bar in first..=last {
+        let x = lane.left() + bar as f32 * bar_px;
         painter.line_segment(
             [pos2(x, lane.top()), pos2(x, lane.bottom())],
             Stroke::new(1.0, colors.grid),
