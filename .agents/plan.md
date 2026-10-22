@@ -197,9 +197,21 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 - [ ] **U5 采样播放器 instrument**（spec 先行，RT 审计同 S1 流程）：wav 解码（hound，控制线程）+ 会话 SampleLibrary 缓存（`Arc` 共享 f32 立体声缓冲）；`VoiceSpec::Sample { path, root_note, … }` + `SampleVoiceProcessor`（RT 预分配 voice 池、零分配审计）；note-on 触发样本播放 + root note 音高映射
 - [ ] **U6 audio track**（依赖 U5，spec 先行）：`AudioTrack` 文档轨 + `AudioClip { path, span, offset, gain }`；`RtAudioClip` 从预加载缓冲按时间轴播放入图混音；timeline 波形渲染；无 pitch/音符语义（区别于 U5 乐器化采样）
 - [ ] **U7 Export Audio + 电平表升级**：离线渲染 wav（控制线程 block 循环驱动引擎图，绕开 cpal 实时流，hound 写文件）；master 电平表立体声双条 + dB 刻度（-60..0，替换单条峰值）
-- [ ] **U8 Synth/Mixer tab → Inspector 重构**：改名 Inspector（G4 按选中节点分派已就位，此步收口堆叠杂项）：automation lane 挪 timeline（U4 交付）、master 电平表挪位、clip_section 死文案清除；Instrument 面板收敛为"源选择 + preset + 参数 + 插件编辑器区"
+- [ ] **U8 Synth/Mixer tab → Inspector 重构**：改名 Inspector（G4 按选中节点分派已就位，此步收口堆叠杂项）：automation lane 挪 timeline（U4 交付）、master 电平表挪位、clip_section 死文案清除；Instrument 面板收敛为 preset + 参数 + 插件编辑器区（**源选择已迁出**，见下方 U9 / `spec/plugin-browser.md`）
 
 实施顺序 U1 → U2 → U3 → U4 → U5 → U6 → U7 → U8（U4 无重依赖可前插；U5/U6 音频链条工作量大；U7 在音频能力齐后覆盖全轨渲染；U8 收口）。
+
+## 新方向：插件浏览器与添加节点菜单（U9，2026-10-22 立项，spec 已定稿）
+
+痛点实证（用户 2026-10-22 提出"过多插件右键菜单太长很影响体验，Blender/ComfyUI 都是多级菜单 + 搜索过滤框"）。spec 见 `spec/plugin-browser.md`。核心决策：**类型前置**（Add 第一层选 Instrument/Effect，节点带最终声源出生，只 install 一次、一步 undo）；**多级菜单 + 过滤框**（Blender `Add` 菜单 / ComfyUI 搜索语义，叶子层不是裸 submenu）；**启动时一次扫描 + 缓存 + 进度条，前台分片推进**（每帧末尾扫一个模块；主线程扫描免 COM 初始化，键 `(path, mtime, size)`，一趟扫描四视图分流，消灭现在 4 次重复全量）；**职责切分**（结构操作归 patch、参数编辑归 Inspector，**不提供换源动作**——换声源 = 删了重建，参数不迁移）。不动引擎、不动文档版本。
+
+- [x] **E1 目录与缓存内核** ✅ 2026-10-22：`glitcherz-ui/src/plugin_catalog.rs`（`PluginFormat`/`PluginEntry`/`PluginCache`/`CandidateFile::stat`/`collect_from_disk`/`plan_refresh`/`merge`+`sort_entries`/`view`/`encode`+`decode`），纯函数 8 项单测；ui crate 增 `ron` 依赖。全仓 482 测试绿
+- [ ] **E2 扫描接线**：`PluginCatalog` 状态机 + 帧末单模块推进 + 进度条/状态栏文案 + `Rescan Plugins`
+- [ ] **E3 picker 与菜单**：`plugin_picker.rs` 浮层（过滤 + 键盘 + Recent）+ `Add` 三级结构 + 全局 `Search plugins…`
+- [ ] **E4 创建路径重构**：`NodeCategory` / `NodeSource` 拆分、一次 install、连线中点 `Insert` 复用 picker
+- [ ] **E5 Inspector 收口**：删源选择行与 effects 快捷加载、`Clear All Effects` 挪位
+
+与 U 系列的关系：E1–E5 建议**先于 U8** 落地（U8 的"源选择"项由本 spec 接管，E5 与 U8 剩余项可合并收口）。
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
