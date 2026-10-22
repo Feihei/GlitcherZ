@@ -16,7 +16,13 @@
 //! Arrangement end (D16): the latest clip end rounded up to a bar; playback
 //! stops automatically when the transport reaches it (pending note offs keep
 //! draining so the last notes release naturally). An empty arrangement
-//! (no clips at all) is unbounded and free-runs.
+//! (no clips at all) is unbounded and free-runs. An active song loop (U1)
+//! suppresses the auto-stop: the transport wraps from the loop end back to
+//! the loop start forever, and a block that straddles the wrap point
+//! schedules both segments of itself.
+//!
+//! Transport semantics (U1): `play` resumes from the current position,
+//! `stop` rewinds to zero, `pause` keeps the position, `seek` moves it.
 
 use crate::realtime::MAX_MIDI_TRACKS;
 use crate::realtime::automation::{MAX_AUTO_TRACKS, RtControlClip};
@@ -169,6 +175,10 @@ pub struct Sequencer {
     /// Arrangement end in ticks (D16: the latest clip end rounded up to a
     /// bar); `0` = unbounded (empty arrangement, free run).
     arrangement_end_ticks: u32,
+    /// Song loop range (U1). Invariant: `loop_end == 0 || loop_end >
+    /// loop_start` — anything else means looping is disabled.
+    loop_start_ticks: u32,
+    loop_end_ticks: u32,
     /// Per-track pending NoteOffs (absolute sample position where the length
     /// ends + note), several slots per track so a chord's notes each keep
     /// their own off (a single slot orphans all but the last note).
@@ -191,6 +201,8 @@ impl Sequencer {
             clips: [[RtMidiClip::default(); MAX_TRACK_CLIPS]; MAX_MIDI_TRACKS],
             control_clips: [[RtControlClip::default(); MAX_TRACK_CLIPS]; MAX_AUTO_TRACKS],
             arrangement_end_ticks: 0,
+            loop_start_ticks: 0,
+            loop_end_ticks: 0,
             pending_offs: [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS],
         }
     }
@@ -223,18 +235,59 @@ impl Sequencer {
         f64::from(bpm) / 60.0 * f64::from(TICKS_PER_QUARTER) / f64::from(self.sample_rate)
     }
 
-    /// Play from position 0 (musical position reset to zero). RT-safe.
+    /// Play from the **current** transport position (resume semantics, U1).
+    /// Fresh-from-zero playback is `Stop` followed by `Play` (or `Seek(0)`).
+    /// Pending offs from the previous run are cleared: the block runner
+    /// releases them by pitch before this takes effect. RT-safe.
     pub fn play(&mut self) {
         self.playing = true;
+        self.pending_offs = [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS];
+    }
+
+    /// Stops scheduling and rewinds to zero. The caller should send
+    /// `NoteOff` to all tracks to release envelopes. RT-safe.
+    pub fn stop(&mut self) {
+        self.playing = false;
         self.position_ticks = 0.0;
         self.pending_offs = [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS];
     }
 
-    /// Stops scheduling and clears all gate tails.
-    /// The caller should send `NoteOff` to all tracks to release envelopes. RT-safe.
-    pub fn stop(&mut self) {
+    /// Pauses: stops scheduling but **keeps the transport position** (U1);
+    /// resume with [`Sequencer::play`]. Pending offs are cleared — the block
+    /// runner releases them by pitch (sounding notes fall silent).
+    /// RT-safe.
+    pub fn pause(&mut self) {
         self.playing = false;
         self.pending_offs = [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS];
+    }
+
+    /// Moves the transport to `ticks` (clamped to ≥ 0; non-finite values
+    /// are ignored). Pending offs are cleared: nothing scheduled relative to
+    /// the old position may fire at the new one. RT-safe.
+    pub fn seek(&mut self, ticks: f64) {
+        if ticks.is_finite() {
+            self.position_ticks = ticks.max(0.0);
+            self.pending_offs = [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS];
+        }
+    }
+
+    /// Sets the song loop range (U1). While playing, the transport wraps
+    /// from `end` back to `start`; `end == 0` or `end <= start` disables
+    /// looping (a stale position beyond the new range keeps playing — the
+    /// wrap only triggers once the transport re-enters it). RT-safe.
+    pub fn set_loop_range(&mut self, start_ticks: u32, end_ticks: u32) {
+        if end_ticks == 0 || end_ticks <= start_ticks {
+            self.loop_start_ticks = 0;
+            self.loop_end_ticks = 0;
+        } else {
+            self.loop_start_ticks = start_ticks;
+            self.loop_end_ticks = end_ticks;
+        }
+    }
+
+    /// Whether the song loop is active. RT-safe.
+    fn loop_active(&self) -> bool {
+        self.loop_end_ticks > 0
     }
 
     /// Takes the pending note offs (clearing them). The caller must release
@@ -356,27 +409,75 @@ impl Sequencer {
             return;
         }
 
-        // 2. This block's window, clamped at the arrangement end (D16).
+        // 2. This block's window, split into segments at the song loop wrap
+        //    (U1). A block that crosses the loop end schedules both the tail
+        //    `[t0, loop_end)` and the wrapped head `[loop_start, ...)`. The
+        //    window is clamped at the arrangement end (D16) — but only when
+        //    the song loop is inactive: an active loop never auto-stops.
         let dt_ticks = ctx.frames as f64 * tps;
-        let t0 = self.position_ticks;
-        let mut t1 = t0 + dt_ticks;
+        let mut budget = dt_ticks;
+        let mut t = self.position_ticks;
         let mut stop_at_end = false;
-        if self.arrangement_end_ticks > 0 {
-            let end = f64::from(self.arrangement_end_ticks);
-            if t1 >= end {
-                t1 = end;
-                stop_at_end = true;
+        while budget > 0.0 {
+            if self.loop_active() {
+                let ls = f64::from(self.loop_start_ticks);
+                let le = f64::from(self.loop_end_ticks);
+                if t >= le {
+                    t = ls;
+                }
+                let seg_end = (t + budget).min(le);
+                // Float-progress guard: at extreme positions `t + budget`
+                // can round back to `t`; without this the loop would spin.
+                if seg_end <= t {
+                    break;
+                }
+                for track in 0..self.track_count {
+                    self.schedule_track_clips(
+                        track,
+                        t,
+                        seg_end,
+                        block_start,
+                        samples_per_tick,
+                        emit,
+                    );
+                }
+                budget -= (seg_end - t).min(budget);
+                t = if seg_end >= le { ls } else { seg_end };
+            } else {
+                let mut seg_end = t + budget;
+                if self.arrangement_end_ticks > 0 {
+                    let end = f64::from(self.arrangement_end_ticks);
+                    if t >= end {
+                        stop_at_end = true;
+                        break;
+                    }
+                    if seg_end >= end {
+                        seg_end = end;
+                        stop_at_end = true;
+                    }
+                }
+                if seg_end <= t {
+                    break;
+                }
+                for track in 0..self.track_count {
+                    self.schedule_track_clips(
+                        track,
+                        t,
+                        seg_end,
+                        block_start,
+                        samples_per_tick,
+                        emit,
+                    );
+                }
+                budget -= (seg_end - t).min(budget);
+                t = seg_end;
+                if stop_at_end {
+                    break;
+                }
             }
         }
 
-        // 3. Schedule note ons within the window per track (scan active tracks only, D12).
-        if t1 > t0 {
-            for track in 0..self.track_count {
-                self.schedule_track_clips(track, t0, t1, block_start, samples_per_tick, emit);
-            }
-        }
-
-        self.position_ticks = t1;
+        self.position_ticks = t;
         if stop_at_end {
             // Keep the pending offs: they drain in the following blocks and
             // release the arrangement's last notes.
@@ -459,7 +560,10 @@ impl Sequencer {
 
     /// Records a note off: converted to an absolute sample position, landing
     /// at least in the next block (guaranteeing the off comes after the on
-    /// already emitted in the same block). RT-safe.
+    /// already emitted in the same block). The sample clock is continuous
+    /// across a song-loop wrap, so an off whose tick lands beyond the loop
+    /// end still fires at `on + length` — no wrap mapping needed (U1).
+    /// RT-safe.
     #[allow(clippy::too_many_arguments)]
     fn set_pending_off(
         &mut self,
@@ -930,6 +1034,7 @@ mod tests {
         seq.play();
         let slow = count_ons(&run(&mut seq, 1_500));
         seq.set_bpm(240.0);
+        seq.seek(0.0); // play resumes; rewind explicitly for the second pass
         seq.play();
         let fast = count_ons(&run(&mut seq, 1_500));
         assert_eq!(slow, 32);
@@ -1073,7 +1178,8 @@ mod tests {
             "tracks beyond the active count should not schedule"
         );
         seq.set_track_count(8);
-        seq.play(); // reset the transport so position 0 falls back into the scheduling window
+        seq.seek(0.0); // play resumes; rewind explicitly for the retry
+        seq.play();
         assert_eq!(ons(&run(&mut seq, 30)), vec![(5, 60)]);
         // Clamped to the capacity limit.
         seq.set_track_count(MAX_MIDI_TRACKS + 10);
@@ -1112,5 +1218,197 @@ mod tests {
             offs.contains(&60) && offs.contains(&64),
             "both simultaneous notes must receive an off; ons={ons:?} offs={offs:?}"
         );
+    }
+
+    #[test]
+    fn play_resumes_and_pause_keeps_position() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        place(
+            &mut seq,
+            0,
+            0,
+            256 * TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, TICKS_PER_STEP, 60)],
+        );
+        seq.play();
+        run(&mut seq, 750); // half a bar
+        let mid = seq.position_ticks();
+        assert!(mid > 0.0, "the transport should have advanced");
+
+        seq.pause();
+        assert!(!seq.is_playing());
+        assert_eq!(seq.position_ticks(), mid, "pause keeps the position");
+        assert!(
+            run(&mut seq, 100).is_empty(),
+            "a paused transport schedules nothing"
+        );
+
+        // Play resumes from the paused position (U1), not from zero.
+        seq.play();
+        assert!(
+            seq.position_ticks() >= mid,
+            "resume must continue from the paused position"
+        );
+
+        // Stop rewinds to zero.
+        seq.stop();
+        assert_eq!(seq.position_ticks(), 0.0);
+    }
+
+    #[test]
+    fn seek_repositions_the_scheduling_window() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        // A single note at the start of bar 2.
+        place(
+            &mut seq,
+            0,
+            TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, TICKS_PER_STEP, 72)],
+        );
+        // Seek into bar 1 (before the clip) and play: the note fires.
+        seq.seek(f64::from(TICKS_PER_QUARTER));
+        seq.play();
+        let events = run(&mut seq, 1_600); // ~1.3 bars
+        assert_eq!(ons(&events), vec![(0, 72)]);
+
+        // Seek past the arrangement end and play: the transport is already
+        // beyond the end, so it auto-stops (D16) without scheduling.
+        seq.seek(4.0 * f64::from(TICKS_PER_BAR));
+        seq.play();
+        assert!(ons(&run(&mut seq, 100)).is_empty());
+        assert!(!seq.is_playing(), "a position past the end auto-stops");
+    }
+
+    #[test]
+    fn seek_clears_pending_offs_from_the_old_position() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        place(
+            &mut seq,
+            0,
+            0,
+            256 * TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, TICKS_PER_STEP, 60)],
+        );
+        seq.play();
+        run(&mut seq, 2); // the on fired; the off is still pending
+        seq.seek(4.0 * f64::from(TICKS_PER_BAR));
+        // The transport keeps playing into fresh content: the clip's note
+        // re-fires at its occurrence in the new window (on) and gets its own
+        // off there. The OLD pre-seek pending off must be gone — exactly one
+        // on and one off means nothing leaked from the old position.
+        let events = run_from(&mut seq, 2 * BLOCK as u64, 100);
+        let on_count = events
+            .iter()
+            .filter(|(_, e)| matches!(e, NoteEvent::On { .. }))
+            .count();
+        let off_count = events
+            .iter()
+            .filter(|(_, e)| matches!(e, NoteEvent::Off { .. }))
+            .count();
+        assert_eq!(
+            (on_count, off_count),
+            (1, 1),
+            "only the new position's on/off pair; the pre-seek pending off must not survive: {events:?}"
+        );
+    }
+
+    #[test]
+    fn song_loop_wraps_and_keeps_playing() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        // One-bar clip (arrangement end = 1 bar) with a note at tick 0;
+        // looping the whole bar must repeat the note every pass forever.
+        place(
+            &mut seq,
+            0,
+            0,
+            TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, TICKS_PER_STEP, 60)],
+        );
+        seq.set_loop_range(0, TICKS_PER_BAR);
+        seq.play();
+        // SR 48 kHz / 128-block: one bar = 750 blocks; 3 bars = 2_250.
+        let fired = ons(&run(&mut seq, 2_250)); // three passes
+        assert_eq!(fired.len(), 3, "one on per loop pass: {fired:?}");
+        assert!(
+            seq.is_playing(),
+            "an active song loop suppresses the arrangement auto-stop"
+        );
+        assert!(
+            seq.position_ticks() < f64::from(TICKS_PER_BAR) + 1.0,
+            "the position stays inside the loop after wrapping"
+        );
+    }
+
+    #[test]
+    fn long_note_keeps_full_duration_across_loop_wrap() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        // A note starting one 16th before the loop end whose off lands
+        // beyond it: the off wraps to (start + length) - (end - start) of
+        // the next pass instead of being lost.
+        place(
+            &mut seq,
+            0,
+            0,
+            TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(
+                TICKS_PER_BAR - TICKS_PER_STEP,
+                2 * TICKS_PER_STEP,
+                60,
+            )],
+        );
+        seq.set_loop_range(0, TICKS_PER_BAR);
+        seq.play();
+        let events = run(&mut seq, 1_600); // two passes + tail (bar = 750 blocks)
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|(_, e)| match e {
+                NoteEvent::On { .. } => "on",
+                NoteEvent::Off { .. } => "off",
+            })
+            .collect();
+        // Each pass: an on near the loop end, its off `length` ticks later
+        // (the sample clock is continuous across the wrap, so the long note
+        // keeps its full duration instead of hanging or being clipped).
+        assert_eq!(
+            kinds,
+            vec!["on", "off", "on", "off"],
+            "each pass's long note must release at its natural length: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn degenerate_loop_range_is_disabled() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        place(
+            &mut seq,
+            0,
+            0,
+            TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, TICKS_PER_STEP, 60)],
+        );
+        // end == 0 and end <= start both mean "no loop".
+        seq.set_loop_range(0, 0);
+        seq.play();
+        run(&mut seq, 2_255); // past the 1-bar arrangement end
+        assert!(!seq.is_playing(), "no loop: the auto-stop applies");
+
+        seq.seek(0.0);
+        seq.set_loop_range(TICKS_PER_BAR, TICKS_PER_BAR); // equal: disabled
+        seq.play();
+        run(&mut seq, 2_255);
+        assert!(!seq.is_playing(), "an equal range is a disabled loop");
     }
 }

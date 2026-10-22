@@ -106,6 +106,7 @@ impl Fixture {
             ..
         } = self;
         let muted: [bool; 0] = [];
+        let loop_range = glitcherz_model::SongLoop::default();
         let mut out = ctx.run_ui(raw, |root| {
             // Same order as the app: the router resolves hover focus before
             // the panels run; the transport + tab bar are neutral chrome.
@@ -151,6 +152,8 @@ impl Fixture {
                         playhead_ticks: 0.0,
                         playing: false,
                         edit_target: None,
+                        loop_range: &loop_range,
+                        markers: &[],
                     },
                     router,
                 );

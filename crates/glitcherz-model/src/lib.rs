@@ -1784,6 +1784,29 @@ impl Project {
                 check_clip_placement(ti, ci, clip.start_ticks, clip.span_ticks, clip.loop_ticks)?;
             }
         }
+        if u64::from(self.metadata.loop_range.end_ticks) > MAX_ARRANGEMENT_TICKS {
+            return Err(format!(
+                "song loop end {} exceeds the {MAX_ARRANGEMENT_BARS}-bar arrangement bound",
+                self.metadata.loop_range.end_ticks
+            ));
+        }
+        if self.metadata.markers.len() > MAX_MARKERS {
+            return Err(format!(
+                "marker count {} exceeds the limit {MAX_MARKERS}",
+                self.metadata.markers.len()
+            ));
+        }
+        for (i, marker) in self.metadata.markers.iter().enumerate() {
+            if marker.name.is_empty() {
+                return Err(format!("marker #{i} has an empty name"));
+            }
+            if u64::from(marker.tick) > MAX_ARRANGEMENT_TICKS {
+                return Err(format!(
+                    "marker #{i} ({}) lies beyond the {MAX_ARRANGEMENT_BARS}-bar arrangement bound",
+                    marker.name
+                ));
+            }
+        }
         self.graph
             .validate(self.midi_tracks.len(), self.control_tracks.len())
     }
@@ -1824,6 +1847,46 @@ pub struct ProjectMetadata {
     /// Tempo (BPM). The UI and time calculations uniformly use f64.
     #[serde(default = "default_tempo")]
     pub tempo_bpm: f64,
+    /// Song loop range (U1): the transport wraps from `end_ticks` back to
+    /// `start_ticks` while playing. Disabled by default and whenever
+    /// `end_ticks <= start_ticks`.
+    #[serde(default)]
+    pub loop_range: SongLoop,
+    /// Timeline markers (U1): named jump targets on the arrangement ruler,
+    /// kept sorted by tick. Additive field — old files load with none.
+    #[serde(default)]
+    pub markers: Vec<Marker>,
+}
+
+/// Song loop range (U1). See [`ProjectMetadata::loop_range`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SongLoop {
+    /// Whether the range is active (the range can be kept while toggled off).
+    pub enabled: bool,
+    /// Loop start (ticks; inclusive).
+    pub start_ticks: u32,
+    /// Loop end (ticks; exclusive).
+    pub end_ticks: u32,
+}
+
+impl SongLoop {
+    /// Whether the range describes an actual loop (`end > start` while
+    /// enabled). Mirrors the engine's degenerate-range rule.
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.end_ticks > self.start_ticks
+    }
+}
+
+/// Maximum number of timeline markers (U1).
+pub const MAX_MARKERS: usize = 32;
+
+/// One timeline marker (U1): a named jump target on the arrangement ruler.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Marker {
+    /// Absolute position (ticks).
+    pub tick: u32,
+    /// Display name (non-empty; `Marker 1` style when created via the UI).
+    pub name: String,
 }
 
 fn default_tempo() -> f64 {
@@ -1835,6 +1898,8 @@ impl Default for ProjectMetadata {
         Self {
             name: String::new(),
             tempo_bpm: default_tempo(),
+            loop_range: SongLoop::default(),
+            markers: Vec::new(),
         }
     }
 }

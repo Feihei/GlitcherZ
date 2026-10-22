@@ -184,6 +184,55 @@ mod tests {
         );
     }
 
+    // U1: the song loop range and markers live on the metadata and survive
+    // the roundtrip.
+    #[test]
+    fn metadata_loop_and_markers_roundtrip() {
+        let mut project = demo_project();
+        project.metadata.loop_range = crate::SongLoop {
+            enabled: true,
+            start_ticks: crate::TICKS_PER_BAR,
+            end_ticks: 4 * crate::TICKS_PER_BAR,
+        };
+        project.metadata.markers = vec![
+            crate::Marker {
+                tick: 0,
+                name: "Intro".to_string(),
+            },
+            crate::Marker {
+                tick: 4 * crate::TICKS_PER_BAR,
+                name: "Drop".to_string(),
+            },
+        ];
+        let path = std::env::temp_dir().join(format!("glitcherz_meta_{}.glz", std::process::id()));
+
+        save_project(&project, &path).expect("save failed");
+        let loaded = load_project(&path).expect("load failed");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.metadata.loop_range, project.metadata.loop_range);
+        assert_eq!(loaded.metadata.markers, project.metadata.markers);
+        assert!(loaded.metadata.loop_range.is_active());
+    }
+
+    // U1: old documents without the new metadata fields load with defaults
+    // (additive fields, PROJECT_VERSION unchanged).
+    #[test]
+    fn metadata_defaults_load_old_document() {
+        let text = r#"(
+    version: 6,
+    project: (
+        metadata: (name: "old", tempo_bpm: 100.0),
+    ),
+)"#;
+        let loaded = parse_project(text).expect("old metadata should load");
+        assert_eq!(loaded.metadata.name, "old");
+        assert!((loaded.metadata.tempo_bpm - 100.0).abs() < 1e-9);
+        assert_eq!(loaded.metadata.loop_range, crate::SongLoop::default());
+        assert!(!loaded.metadata.loop_range.is_active());
+        assert!(loaded.metadata.markers.is_empty());
+    }
+
     #[test]
     fn saved_file_carries_version() {
         let path =

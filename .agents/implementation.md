@@ -192,9 +192,18 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 
 ### UI（`glitcherz-ui`，eframe 0.36 glow）
 
-- 📂 打开 / 💾 保存（无路径时转另存为）/ 最近文件菜单（eframe `persistence` feature 存 RON，容量 8）；窗口标题随当前文件更新；状态栏消息（8 秒自动消失）；`Ctrl+S` / `Ctrl+O` 快捷键（优先于演奏键盘映射）；`--open <文件>` 启动加载；
+- **File 菜单**（U2 收口）：New / Open… / Open Recent ▸ / Save / Save As… / Import MIDI… / Export MIDI…，快捷键 `Ctrl+N` / `Ctrl+O` / `Ctrl+S` / `Ctrl+Shift+S`（优先于演奏键盘映射）；最近文件经 eframe `persistence` 存 RON，容量 8；窗口标题每帧按「文件名 + 未保存 `*`」重算；状态栏消息（8 秒自动消失）；`--open <文件>` 启动加载；
 - 走带 + BPM、**自动化泳道**（`lane` 自绘组件：参数三选 + 启用开关 + 锚点点按/拖拽/右键删除，播放头走线，截止频率对数轴）、**混音器面板**（轨道选择/静音/post-fader 电平条/竖直推子/声像）、16 步网格（播放位置黄色描边）、**钢琴卷帘编辑器**（`piano_roll` 自绘组件：点空白绘制、拖拽移动、右键删除、滚轮滚动音高、播放头走线；fit-to-width 时间轴、1/64 吸附）、画笔音符/音长、滤波器/ADSR/延迟面板（作用于选中轨道）、虚拟键盘（屏幕 + 电脑键盘）、主输出电平表；
 - 音序器音乐位置经 `Feedback.position_ticks`（AtomicF32）回传驱动播放头。
+
+#### 文件管理（U2，2026-10-22）
+
+- **`project_files` 模块**：只放纯函数与文件 IO（标题格式化、导出默认名、空轨判定、导入落位计划、SMF 读写包装），app 壳负责对话框 / undo / 引擎推送，因此不必起 egui 上下文即可测试。
+- **导入落位**（`plan_import`）：先复用**空轨**（无音符且无 CC 任意 clip）再追加新轨，容量按 `MAX_MIDI_TRACKS`，超出部分丢弃并报数。`Project::default()` 有 4 条空轨，所以「新建 → 导入」不会留下占位空轨。
+- **整次导入 = 一步 undo**：外层 `begin_edit` + `suspend_history`，内层 `add_midi_track()` 自身的 `commit_edit` 在挂起期间被丢弃；收尾 `resume_history` 后一次性 commit。轨道内容写入后逐轨 `send_track_clips`（不走 `apply_document` 全量重建，节点已由 `add_midi_track` 装好）。
+- **`Session::is_dirty` 的可信度是前提**（此前形同虚设）：任何每帧执行的 `project_mut()` 都会置脏，于是保存后标题立刻变 `*`。三个元凶全部改为「读局部值 → `changed()` 才写」或「读取走 `project()`」——走带条的 tempo `DragValue`、Synth 面板的 master gain `Slider`、`control_editor_body` 的 `auto_endpoint` 读取。**新增每帧代码时不要直接 `DragValue::new(&mut self.project_mut()...)`**。
+- **未保存确认**：`FileAction{New, Open(PathBuf), Exit}` 统一走 `request_file_action`；dirty 时挂进 `pending_file_action` 并弹 `egui::Modal`（Save / Discard changes / Cancel）。**Save 失败或用户取消保存时对话框保持打开、动作不执行**（`do_save` 因此返回 `bool`）。关窗拦截 = `viewport().close_requested()` → `CancelClose` → 答复后 `allow_close` 回放；auto-close 冒烟路径直接置 `allow_close` 绕过。modal 打开期间跳过 `handle_keyboard_input`（否则 Space 会边弹窗边播放）。
+- **已知取舍**：undo 退回到已保存状态仍显示 `*`（要清必须比内容 hash，成本不值）；SMF 导入不搬文件里的 tempo（`import_smf` 只回轨道），沿用当前工程 BPM。
 
 #### 钢琴卷帘拖动协议（`piano_roll::DragSelection`）
 

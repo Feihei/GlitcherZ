@@ -390,6 +390,26 @@ impl AudioEngine {
         ))
     }
 
+    /// Pauses the transport: scheduling stops, the musical position stays
+    /// (resume with `SequencerCommand::Play`). U1.
+    pub fn pause(&mut self) -> bool {
+        self.send(EngineCommand::Sequencer(SequencerCommand::Pause))
+    }
+
+    /// Moves the transport to `ticks` (musical position, ≥ 0). U1.
+    pub fn seek_ticks(&mut self, ticks: f64) -> bool {
+        self.send(EngineCommand::Sequencer(SequencerCommand::Seek(ticks)))
+    }
+
+    /// Sets the song loop range (U1); `end == 0` or `end <= start` disables
+    /// looping.
+    pub fn set_loop_range(&mut self, start_ticks: u32, end_ticks: u32) -> bool {
+        self.send(EngineCommand::Sequencer(SequencerCommand::SetLoopRange {
+            start_ticks,
+            end_ticks,
+        }))
+    }
+
     // ---- Document-driven graph building API (P5c, D13: the loader rebuilds
     // the engine graph from the document) ----
 

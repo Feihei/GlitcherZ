@@ -43,8 +43,9 @@ use glitcherz_engine::realtime::{
 };
 use glitcherz_model::{
     AutoParam, CableKind, ControlClip, ControlTrack, DelayParams, GraphDoc, MAX_AUTO_TRACKS,
-    MAX_CLIPS_PER_TRACK, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS,
-    MidiClip, NodeDoc, PortRef, Project, SynthParams, VoiceSpec,
+    MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES,
+    MIN_MIXER_CHANNELS, Marker, MidiClip, MidiTrack, NodeDoc, PortRef, Project, SongLoop,
+    SynthParams, VoiceSpec,
 };
 
 pub mod event_list;
@@ -54,6 +55,7 @@ pub mod lane;
 pub mod patch;
 pub mod piano_roll;
 pub mod plugin_window;
+pub mod project_files;
 pub mod timeline;
 
 /// Filter cutoff frequency slider range (logarithmic scale).
@@ -448,6 +450,36 @@ enum MainView {
     Synth,
 }
 
+/// A destructive file action that must ask about unsaved changes first (U2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileAction {
+    /// Replace the document with a fresh default project.
+    New,
+    /// Load this project file.
+    Open(PathBuf),
+    /// Quit the application.
+    Exit,
+}
+
+impl FileAction {
+    /// Verb used in the unsaved-changes prompt.
+    fn verb(&self) -> &'static str {
+        match self {
+            Self::New => "start a new project",
+            Self::Open(_) => "open another project",
+            Self::Exit => "quit",
+        }
+    }
+}
+
+/// Answer to the unsaved-changes modal (U2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
 /// Main window app. Owns the [`AudioEngine`]: closing the window drops the engine and stops the
 /// audio stream.
 pub struct GlitcherZApp {
@@ -508,6 +540,12 @@ pub struct GlitcherZApp {
     window_title: String,
     /// Title already sent to the windowing system (avoids resending the command every frame).
     title_sent: String,
+    /// Destructive file action parked behind the unsaved-changes modal (U2).
+    /// `None` = no dialog.
+    pending_file_action: Option<FileAction>,
+    /// The window close has been approved: let the viewport request through
+    /// instead of prompting again (U2).
+    allow_close: bool,
     /// Transport state of the previous frame (to detect the stop edge → restore manual
     /// parameters).
     was_playing: bool,
@@ -683,6 +721,8 @@ impl GlitcherZApp {
             status_message: None,
             window_title: "GlitcherZ".to_string(),
             title_sent: String::new(),
+            pending_file_action: None,
+            allow_close: false,
             was_playing: false,
             voice_guards: Vec::new(),
             retiring_guards: Vec::new(),
@@ -829,6 +869,10 @@ impl GlitcherZApp {
         // 5) Active MIDI track count (D12).
         self.engine
             .set_midi_track_count(self.project().midi_tracks.len());
+
+        // 6) Song loop range (U1): metadata lives outside the graph, so the
+        //    full rebuild is also the undo/redo/open refresh path for it.
+        self.push_loop_range();
     }
 
     /// Install a document node: build the processor (external plugins instantiated
@@ -2252,7 +2296,9 @@ impl GlitcherZApp {
     }
 
     /// Save to the current path; if never saved, pop up the "Save As" dialog.
-    fn save_project(&mut self) {
+    /// Returns whether the document reached the disk — the unsaved-changes
+    /// modal (U2) only proceeds when it did.
+    fn save_project(&mut self) -> bool {
         match self.project_path.clone() {
             Some(path) => self.do_save(path),
             None => self.save_project_as(),
@@ -2260,19 +2306,19 @@ impl GlitcherZApp {
     }
 
     /// "Save As": pop up the save dialog.
-    fn save_project_as(&mut self) {
+    fn save_project_as(&mut self) -> bool {
         let Some(mut path) = rfd::FileDialog::new()
             .add_filter("GlitcherZ Project", &["glz"])
             .set_file_name("Untitled.glz")
             .save_file()
         else {
-            return;
+            return false;
         };
         path.set_extension("glz");
-        self.do_save(path);
+        self.do_save(path)
     }
 
-    /// "Open": pop up the file picker dialog.
+    /// "Open": pop up the file picker dialog (unsaved changes ask first).
     fn open_project_dialog(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("GlitcherZ Project", &["glz"])
@@ -2280,7 +2326,197 @@ impl GlitcherZApp {
         else {
             return;
         };
-        self.do_open(path);
+        self.request_file_action(FileAction::Open(path));
+    }
+
+    /// A destructive file action (new / open / quit) requested by the menu or
+    /// a shortcut: run it while the document is clean, otherwise park it
+    /// behind the unsaved-changes modal (U2).
+    fn request_file_action(&mut self, action: FileAction) {
+        if self.pending_file_action.is_some() {
+            return;
+        }
+        if self.session.is_dirty() {
+            self.pending_file_action = Some(action);
+        } else {
+            self.perform_file_action(action);
+        }
+    }
+
+    /// Runs a file action the user has already approved.
+    fn perform_file_action(&mut self, action: FileAction) {
+        match action {
+            FileAction::New => self.do_new(),
+            FileAction::Open(path) => self.do_open(path),
+            // `ui()` sends the viewport close once `allow_close` is up, so
+            // this needs no egui context.
+            FileAction::Exit => self.allow_close = true,
+        }
+    }
+
+    /// New project (U2): a fresh default document replaces the current one and
+    /// the engine graph is rebuilt from it. Never called directly — go through
+    /// [`Self::request_file_action`] so unsaved work is protected.
+    fn do_new(&mut self) {
+        self.close_plugin_editor();
+        self.editor_user_open = false;
+        self.send_sequencer(SequencerCommand::Stop);
+        self.session.replace(Project::default());
+        self.project_path = None;
+        self.selected_track = 0;
+        self.selected_auto = 0;
+        self.edit_clip = None;
+        self.roll_state = piano_roll::RollState::new();
+        self.timeline_state = timeline::TimelineState::default();
+        self.lane_state = lane::LaneState::default();
+        self.patch_state = patch::PatchState::default();
+        self.held_notes.clear();
+        self.push_all_params();
+        // U1: the fresh document's (default) loop range reaches the engine.
+        self.push_loop_range();
+        self.set_message("New project".to_string());
+        log::info!("New project");
+    }
+
+    /// Unsaved-changes modal for a parked file action (U2). The backdrop and
+    /// Escape cancel; the three buttons are drawn here.
+    fn unsaved_changes_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.pending_file_action.clone() else {
+            return;
+        };
+        let mut choice = None;
+        let modal = egui::Modal::new(egui::Id::new("glitcherz_unsaved_changes")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Unsaved changes");
+            ui.label(format!(
+                "The project has unsaved changes. Save them before you {}?",
+                action.verb()
+            ));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    choice = Some(ConfirmChoice::Save);
+                }
+                if ui.button("Discard changes").clicked() {
+                    choice = Some(ConfirmChoice::Discard);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(ConfirmChoice::Cancel);
+                }
+            });
+        });
+        if modal.should_close() {
+            choice = Some(ConfirmChoice::Cancel);
+        }
+        match choice {
+            Some(ConfirmChoice::Save) => {
+                // A failed or cancelled save keeps the dialog (and the action)
+                // pending: nothing is discarded behind the user's back.
+                if self.save_project() {
+                    self.pending_file_action = None;
+                    self.perform_file_action(action);
+                }
+            }
+            Some(ConfirmChoice::Discard) => {
+                self.pending_file_action = None;
+                self.perform_file_action(action);
+            }
+            Some(ConfirmChoice::Cancel) => self.pending_file_action = None,
+            None => {}
+        }
+    }
+
+    /// "Import MIDI": pick a file and append its tracks to the project (U2).
+    fn import_midi_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("MIDI File", &["mid", "midi", "smf"])
+            .pick_file()
+        else {
+            return;
+        };
+        match project_files::read_midi(&path) {
+            Ok(tracks) => self.import_midi_tracks(tracks, &path),
+            Err(err) => {
+                self.set_message(format!("MIDI import failed: {err}"));
+                log::error!("MIDI import failed: {err}");
+            }
+        }
+    }
+
+    /// Appends imported tracks: empty tracks on screen are filled first, the
+    /// rest get a fresh MIDI track (nodes + cables). The whole import is one
+    /// undo step — the per-track steps must not split the history.
+    fn import_midi_tracks(&mut self, imported: Vec<MidiTrack>, source: &std::path::Path) {
+        let imported_len = imported.len();
+        if imported_len == 0 {
+            self.set_message(format!("No notes found in {}", display_name(source)));
+            return;
+        }
+        let plan = project_files::plan_import(&self.project().midi_tracks, imported_len);
+        let before = self.begin_edit();
+        self.session.suspend_history();
+        let mut queue = imported.into_iter();
+        let mut first_target = None;
+        let mut placed = 0usize;
+        for index in &plan.reuse {
+            let Some(track) = queue.next() else { break };
+            self.project_mut().midi_tracks[*index] = track;
+            self.send_track_clips(*index);
+            first_target.get_or_insert(*index);
+            placed += 1;
+        }
+        for _ in 0..plan.append {
+            let Some(track) = queue.next() else { break };
+            let before_len = self.project().midi_tracks.len();
+            self.add_midi_track();
+            if self.project().midi_tracks.len() <= before_len {
+                break; // engine slots or the command queue are full
+            }
+            self.project_mut().midi_tracks[before_len] = track;
+            self.send_track_clips(before_len);
+            first_target.get_or_insert(before_len);
+            placed += 1;
+        }
+        self.session.resume_history();
+        self.commit_edit("Import MIDI", before);
+        if let Some(index) = first_target {
+            self.selected_track = index;
+        }
+        let skipped = imported_len.saturating_sub(placed);
+        let mut message = format!("Imported {placed} track(s) from {}", display_name(source));
+        if skipped > 0 {
+            message.push_str(&format!(
+                " — {skipped} skipped (track limit {MAX_MIDI_TRACKS})"
+            ));
+        }
+        self.set_message(message);
+        log::info!("MIDI imported: {}", source.display());
+    }
+
+    /// "Export MIDI": write the arrangement as a format-1 SMF (U2). Not an
+    /// edit — the file on disk changes, the document does not.
+    fn export_midi_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("MIDI File", &["mid"])
+            .set_file_name(project_files::midi_export_name(
+                self.project_path.as_deref(),
+            ))
+            .save_file()
+        else {
+            return;
+        };
+        let mut path = path;
+        path.set_extension("mid");
+        match project_files::write_midi(&path, self.project()) {
+            Ok(bytes) => {
+                self.set_message(format!("Exported {} ({bytes} bytes)", display_name(&path)));
+                log::info!("MIDI exported: {}", path.display());
+            }
+            Err(err) => {
+                self.set_message(format!("MIDI export failed: {err}"));
+                log::error!("MIDI export failed: {err}");
+            }
+        }
     }
 
     /// Captures live plugin state blobs into the document before saving
@@ -2347,8 +2583,10 @@ impl GlitcherZApp {
         }
     }
 
-    /// Write to disk and update recent files / title / status message.
-    fn do_save(&mut self, path: PathBuf) {
+    /// Write to disk and update recent files / status message. Returns
+    /// whether the write succeeded (U2: the title's dirty marker and the
+    /// unsaved-changes modal depend on it).
+    fn do_save(&mut self, path: PathBuf) -> bool {
         // Persist the patch canvas layout (view data) with the project.
         let layout = self.patch_state.export_layout(&self.project().graph);
         self.project_mut().graph.layout = layout;
@@ -2358,13 +2596,14 @@ impl GlitcherZApp {
                 self.session.mark_clean();
                 self.project_path = Some(path.clone());
                 self.push_recent(path.clone());
-                self.window_title = format!("GlitcherZ — {}", display_name(&path));
                 self.set_message(format!("Saved {}", path.display()));
                 log::info!("Project saved: {}", path.display());
+                true
             }
             Err(err) => {
                 self.set_message(format!("Save failed: {err}"));
                 log::error!("Failed to save project: {err}");
+                false
             }
         }
     }
@@ -2387,7 +2626,8 @@ impl GlitcherZApp {
                 self.edit_clip = None;
                 self.roll_state = piano_roll::RollState::new();
                 self.push_all_params();
-                self.window_title = format!("GlitcherZ — {}", display_name(&path));
+                // U1: the opened document's song loop reaches the engine.
+                self.push_loop_range();
                 self.set_message(format!("Opened {}", path.display()));
                 log::info!("Project opened: {}", path.display());
             }
@@ -3212,8 +3452,16 @@ impl GlitcherZApp {
             // Ctrl+Z undo).
             if modifiers.ctrl && pressed {
                 match key {
+                    egui::Key::S if modifiers.shift => {
+                        self.save_project_as();
+                        continue;
+                    }
                     egui::Key::S => {
                         self.save_project();
+                        continue;
+                    }
+                    egui::Key::N => {
+                        self.request_file_action(FileAction::New);
                         continue;
                     }
                     egui::Key::O => {
@@ -3231,6 +3479,32 @@ impl GlitcherZApp {
                     _ => {
                         continue; // other Ctrl combos do not trigger notes
                     }
+                }
+            }
+            // Global play/pause (U1): works regardless of which editor owns
+            // focus, but not while a text field is being edited (it would
+            // steal the space that ends the edit).
+            if key == egui::Key::Space && pressed && !ctx.egui_wants_keyboard_input() {
+                if self.engine.is_playing() {
+                    self.engine.pause();
+                } else {
+                    self.send_sequencer(SequencerCommand::Play);
+                }
+                continue;
+            }
+            // Home / End: transport jump (U1) — same text-edit guard.
+            if pressed && !ctx.egui_wants_keyboard_input() {
+                match key {
+                    egui::Key::Home => {
+                        self.engine.seek_ticks(0.0);
+                        continue;
+                    }
+                    egui::Key::End => {
+                        let end = f64::from(self.arrangement_end_ticks());
+                        self.engine.seek_ticks(end);
+                        continue;
+                    }
+                    _ => {}
                 }
             }
             match (key, pressed) {
@@ -3265,63 +3539,198 @@ impl GlitcherZApp {
         let playing = self.engine.is_playing();
         let response = egui::Panel::top("glitcherz_transport").show(ui, |ui| {
             ui.horizontal(|ui| {
-                let mut play_btn = egui::Button::new("▶ Play");
+                // U2: the file menu is the single entry point for project
+                // work (the old inline Open / Save / Recent buttons live
+                // here now).
+                ui.menu_button("File", |ui| {
+                    if ui
+                        .add(egui::Button::new("New").shortcut_text("Ctrl+N"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.request_file_action(FileAction::New);
+                    }
+                    if ui
+                        .add(egui::Button::new("Open…").shortcut_text("Ctrl+O"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.open_project_dialog();
+                    }
+                    ui.menu_button("Open Recent", |ui| {
+                        if self.recent.is_empty() {
+                            ui.weak("(empty)");
+                        }
+                        let recent = self.recent.clone();
+                        for path in recent {
+                            if ui.button(display_name(&path)).clicked() {
+                                ui.close();
+                                self.request_file_action(FileAction::Open(path));
+                            }
+                        }
+                    });
+                    ui.separator();
+                    if ui
+                        .add(egui::Button::new("Save").shortcut_text("Ctrl+S"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.save_project();
+                    }
+                    if ui
+                        .add(egui::Button::new("Save As…").shortcut_text("Ctrl+Shift+S"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.save_project_as();
+                    }
+                    ui.separator();
+                    if ui.button("Import MIDI…").clicked() {
+                        ui.close();
+                        self.import_midi_dialog();
+                    }
+                    if ui.button("Export MIDI…").clicked() {
+                        ui.close();
+                        self.export_midi_dialog();
+                    }
+                });
+                ui.separator();
+                // Transport group (U1): rewind / play-pause / stop /
+                // skip-to-end, then the song-loop toggle and marker jumps.
+                if ui
+                    .button("⏮")
+                    .on_hover_text("Return to start (Home)")
+                    .clicked()
+                {
+                    self.engine.seek_ticks(0.0);
+                }
+                let play_label = if playing { "⏸ Pause" } else { "▶ Play" };
+                let mut play_btn = egui::Button::new(play_label);
                 if playing {
                     play_btn = play_btn.fill(egui::Color32::DARK_GREEN);
                 }
-                if ui.add(play_btn).clicked() {
-                    self.send_sequencer(SequencerCommand::Play);
+                if ui.add(play_btn).on_hover_text("Space").clicked() {
+                    if playing {
+                        self.engine.pause();
+                    } else {
+                        self.send_sequencer(SequencerCommand::Play);
+                    }
                 }
-                if ui.button("■ Stop").clicked() {
+                if ui
+                    .button("■ Stop")
+                    .on_hover_text("Stop and rewind")
+                    .clicked()
+                {
                     self.send_sequencer(SequencerCommand::Stop);
+                }
+                if ui.button("⏭").on_hover_text("Skip to end (End)").clicked() {
+                    self.engine
+                        .seek_ticks(f64::from(self.arrangement_end_ticks()));
+                }
+                let loop_on = self.project().metadata.loop_range.is_active();
+                let loop_btn = egui::Button::new("Loop").selected(loop_on);
+                if ui
+                    .add(loop_btn)
+                    .on_hover_text("Song loop (drag it out on the ruler with Ctrl)")
+                    .clicked()
+                {
+                    let enable = !loop_on;
+                    self.timeline_toggle_loop(enable);
+                }
+                if ui.button("‹").on_hover_text("Previous marker").clicked() {
+                    self.seek_to_previous_marker();
+                }
+                if ui.button("›").on_hover_text("Next marker").clicked() {
+                    self.seek_to_next_marker();
                 }
                 ui.separator();
                 ui.label("Tempo");
+                // U2: the value is read into a local first — writing the
+                // document every frame would keep `Session::is_dirty` (and
+                // the title's `*`) permanently true.
                 let before = self.begin_param_edit();
+                let mut tempo = self.project().metadata.tempo_bpm;
                 let bpm = ui.add(
-                    egui::DragValue::new(&mut self.project_mut().metadata.tempo_bpm)
+                    egui::DragValue::new(&mut tempo)
                         .range(*BPM_RANGE.start()..=*BPM_RANGE.end())
                         .speed(0.5)
                         .suffix(" BPM"),
                 );
                 if bpm.changed() {
+                    self.project_mut().metadata.tempo_bpm = tempo;
                     // One drag = one undo step; keyboard nudges are separate steps.
                     if bpm.dragged() {
                         self.commit_param_edit("Tempo", before, "tempo");
                     } else {
                         self.commit_edit("Tempo", before);
                     }
-                    self.send_sequencer(SequencerCommand::SetBpm(convert::to_f32(
-                        self.project().metadata.tempo_bpm,
-                    )));
+                    self.send_sequencer(SequencerCommand::SetBpm(convert::to_f32(tempo)));
                 }
                 if bpm.drag_stopped() {
                     self.end_param_edit();
                 }
-                ui.separator();
-                if ui.button("📂 Open").clicked() {
-                    self.open_project_dialog();
-                }
-                if ui.button("💾 Save").clicked() {
-                    self.save_project();
-                }
-                ui.menu_button("Recent Files", |ui| {
-                    if self.recent.is_empty() {
-                        ui.weak("(empty)");
-                    }
-                    let recent = self.recent.clone();
-                    for path in recent {
-                        if ui.button(display_name(&path)).clicked() {
-                            self.do_open(path);
-                        }
-                    }
-                });
                 ui.separator();
                 ui.weak("GlitcherZ — Rust DAW");
             });
         });
         // Chrome: hovering the transport releases any editor's focus.
         self.focus_router.register_neutral(response.response.rect);
+    }
+
+    /// Arrangement end in ticks (U1: the skip-to-end target) — the latest
+    /// clip end across all tracks, rounded up to a bar (mirrors the
+    /// engine's D16 rule); `0` when the arrangement is empty.
+    fn arrangement_end_ticks(&self) -> u32 {
+        let bar = u64::from(glitcherz_model::TICKS_PER_BAR);
+        let mut latest = 0u64;
+        for track in &self.project().midi_tracks {
+            for clip in &track.clips {
+                latest = latest.max(u64::from(clip.start_ticks) + u64::from(clip.span_ticks));
+            }
+        }
+        for track in &self.project().control_tracks {
+            for clip in &track.clips {
+                latest = latest.max(u64::from(clip.start_ticks) + u64::from(clip.span_ticks));
+            }
+        }
+        let end = if latest == 0 {
+            0
+        } else {
+            latest.div_ceil(bar) * bar
+        };
+        end.min(u64::from(u32::MAX)) as u32
+    }
+
+    /// Seeks to the nearest marker strictly before the playhead (U1);
+    /// without one, back to the arrangement start.
+    fn seek_to_previous_marker(&mut self) {
+        let pos = f64::from(self.engine.musical_ticks());
+        let target = self
+            .project()
+            .metadata
+            .markers
+            .iter()
+            .rev()
+            .find(|m| f64::from(m.tick) < pos - 1e-6)
+            .map_or(0.0, |m| f64::from(m.tick));
+        self.engine.seek_ticks(target);
+    }
+
+    /// Seeks to the nearest marker strictly after the playhead (U1);
+    /// without one, to the arrangement end.
+    fn seek_to_next_marker(&mut self) {
+        let pos = f64::from(self.engine.musical_ticks());
+        let target = self
+            .project()
+            .metadata
+            .markers
+            .iter()
+            .find(|m| f64::from(m.tick) > pos + 1e-6)
+            .map_or_else(
+                || f64::from(self.arrangement_end_ticks()),
+                |m| f64::from(m.tick),
+            );
+        self.engine.seek_ticks(target);
     }
 
     /// Arrangement timeline panel (timeline spec T3): rows = tracks, clip
@@ -3386,6 +3795,8 @@ impl GlitcherZApp {
                     playhead_ticks: playhead,
                     playing,
                     edit_target,
+                    loop_range: &project.metadata.loop_range,
+                    markers: &project.metadata.markers,
                 },
                 router,
             )
@@ -3479,7 +3890,80 @@ impl GlitcherZApp {
             timeline::TimelineAction::DuplicateClipsBatch { dups } => {
                 self.timeline_duplicate_clips_batch(dups)
             }
+            timeline::TimelineAction::Seek { ticks } => {
+                // Not a document edit: straight to the engine.
+                self.engine.seek_ticks(ticks);
+            }
+            timeline::TimelineAction::SetLoop {
+                start_ticks,
+                end_ticks,
+            } => self.timeline_set_loop(start_ticks, end_ticks),
+            timeline::TimelineAction::ToggleLoop(enabled) => self.timeline_toggle_loop(enabled),
+            timeline::TimelineAction::AddMarker { tick } => self.timeline_add_marker(tick),
+            timeline::TimelineAction::RemoveMarker { index } => self.timeline_remove_marker(index),
         }
+    }
+
+    /// Sets the song loop range (U1): one undoable document edit, then the
+    /// engine push (a disabled/degenerate range disables looping).
+    fn timeline_set_loop(&mut self, start_ticks: u32, end_ticks: u32) {
+        let before = self.begin_edit();
+        self.project_mut().metadata.loop_range = SongLoop {
+            enabled: true,
+            start_ticks,
+            end_ticks,
+        };
+        self.commit_edit("Set Song Loop", before);
+        self.push_loop_range();
+    }
+
+    /// Toggles the song loop on/off (U1); the range itself is kept.
+    fn timeline_toggle_loop(&mut self, enabled: bool) {
+        let before = self.begin_edit();
+        self.project_mut().metadata.loop_range.enabled = enabled;
+        self.commit_edit("Toggle Song Loop", before);
+        self.push_loop_range();
+    }
+
+    /// Adds a timeline marker (U1): auto-named "M<n>", inserted in tick
+    /// order. One undo step; the marker cap refuses with a status message.
+    fn timeline_add_marker(&mut self, tick: u32) {
+        if self.project().metadata.markers.len() >= MAX_MARKERS {
+            self.set_message("Marker limit reached (32)".to_string());
+            return;
+        }
+        let before = self.begin_edit();
+        let markers = &mut self.project_mut().metadata.markers;
+        let name = format!("M{}", markers.len() + 1);
+        let index = markers
+            .iter()
+            .position(|m| m.tick > tick)
+            .unwrap_or(markers.len());
+        markers.insert(index, Marker { tick, name });
+        self.commit_edit("Add Marker", before);
+    }
+
+    /// Removes the marker at `index` (U1). One undo step.
+    fn timeline_remove_marker(&mut self, index: usize) {
+        let before = self.begin_edit();
+        let markers = &mut self.project_mut().metadata.markers;
+        if index >= markers.len() {
+            return;
+        }
+        markers.remove(index);
+        self.commit_edit("Remove Marker", before);
+    }
+
+    /// Forwards the document's loop range to the engine (disabled or
+    /// degenerate ranges disable looping there; U1).
+    fn push_loop_range(&mut self) {
+        let range = self.project().metadata.loop_range;
+        let (start, end) = if range.is_active() {
+            (range.start_ticks, range.end_ticks)
+        } else {
+            (0, 0)
+        };
+        self.engine.set_loop_range(start, end);
     }
 
     /// Timeline clip edits: the view sends data, these apply it undoably.
@@ -4837,15 +5321,18 @@ impl GlitcherZApp {
                     }
 
                     ui.label("Master Gain");
+                    // U2: same rule as the tempo field — no document write
+                    // unless the slider actually moved, or the title would
+                    // claim unsaved changes forever.
                     let before = self.begin_param_edit();
-                    let r = ui.add(
-                        egui::Slider::new(&mut self.project_mut().master_gain, 0.0..=1.5).text("Linear"),
-                    );
+                    let mut master_gain = self.project().master_gain;
+                    let r = ui.add(egui::Slider::new(&mut master_gain, 0.0..=1.5).text("Linear"));
                     if r.changed() {
+                        self.project_mut().master_gain = master_gain;
                         self.commit_param_edit("Master Gain", before, "master-gain");
                         self.engine.send(EngineCommand::SetParam {
                             id: ParamId::MasterGain,
-                            value: self.project().master_gain,
+                            value: master_gain,
                         });
                     }
                     if r.drag_stopped() {
@@ -6277,7 +6764,7 @@ impl GlitcherZApp {
             }
         });
         let axis_param = self
-            .project_mut()
+            .project()
             .graph
             .auto_endpoint(index)
             .unwrap_or_default();
@@ -6440,18 +6927,40 @@ impl eframe::App for GlitcherZApp {
         // the keyboard handling below reads it.
         self.refresh_vk_target();
 
-        self.handle_keyboard_input(ui.ctx());
+        // U2: an open unsaved-changes modal owns the keyboard (its Escape
+        // cancels); the transport / note shortcuts stay out of the way.
+        if self.pending_file_action.is_none() {
+            self.handle_keyboard_input(ui.ctx());
+        }
 
-        // For smoke tests: request exit once the auto-close deadline is reached.
+        // U2: unsaved-changes guard on window close. The request is refused
+        // once and replayed after the modal is answered.
+        if ui.ctx().input(|i| i.viewport().close_requested())
+            && !self.allow_close
+            && self.session.is_dirty()
+            && self.pending_file_action.is_none()
+        {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending_file_action = Some(FileAction::Exit);
+        }
+
+        // For smoke tests: request exit once the auto-close deadline is reached
+        // (the guard above must not block it).
         if let Some(after) = self.auto_close_after {
             if !self.close_sent && self.opened_at.elapsed() >= after {
                 self.close_sent = true;
+                self.allow_close = true;
                 log::info!("Auto-close deadline reached; requesting exit");
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
 
-        // Window title is resent only when changed (updated on open/save).
+        // Window title: file name + unsaved marker (U2). Recomputed every
+        // frame so edits and undos retitle immediately; the viewport command
+        // only fires when the text actually changed.
+        self.window_title =
+            project_files::window_title(self.project_path.as_deref(), self.session.is_dirty());
         if self.window_title != self.title_sent {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Title(self.window_title.clone()));
@@ -6635,6 +7144,14 @@ impl eframe::App for GlitcherZApp {
             && let Some(PluginGuard::Vst3(g)) = self.guard_by_engine_id(node_id)
         {
             g.ack_editor_size(size);
+        }
+
+        // U2: the unsaved-changes modal draws on top of every panel, and an
+        // approved close is replayed here (the guard above let it through).
+        self.unsaved_changes_dialog(ui.ctx());
+        if self.allow_close && !self.close_sent {
+            self.close_sent = true;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
         // Audio-driven displays (level meter, playback position, envelope) need periodic

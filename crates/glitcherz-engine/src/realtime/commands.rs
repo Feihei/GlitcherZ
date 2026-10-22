@@ -107,10 +107,22 @@ pub enum NoteEvent {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy)]
 pub enum SequencerCommand {
-    /// Play from position 0 (the stream position at receive time is the clock origin).
+    /// Play (from the current transport position — resume semantics; the
+    /// position only returns to zero via `Stop` or `Seek(0.0)`).
     Play,
-    /// Stop and release all tracks' current notes.
+    /// Stop, rewind to zero and release all tracks' current notes.
     Stop,
+    /// Pause: stop scheduling but keep the transport position (resume with
+    /// `Play`). Sounding notes are released by the block runner.
+    Pause,
+    /// Move the transport to `ticks` (musical position; negative values are
+    /// clamped to zero). Pending note offs are cleared — nothing from the
+    /// old position may fire at the new one.
+    Seek(f64),
+    /// Song loop range (U1): while playing, the transport wraps from
+    /// `end_ticks` back to `start_ticks`. `end_ticks == 0` (or `end <=
+    /// start`) disables looping.
+    SetLoopRange { start_ticks: u32, end_ticks: u32 },
     /// Set BPM (20..300).
     SetBpm(f32),
     /// Replace one MIDI track's clip table in one block (D15 batch Copy;

@@ -8,7 +8,10 @@
 //! - double-click an empty lane spot → insert a one-bar clip;
 //! - double-click a clip → jump to the Edit tab (piano roll / curve lane);
 //! - right-click a clip → delete;
-//! - header: click to select the track, toggle mute (MIDI rows only).
+//! - header: click to select the track, toggle mute (MIDI rows only);
+//! - ruler (U1): click/drag → seek; Ctrl+drag → set the song loop range;
+//!   drag a loop edge → reshape it; right-click → add a marker (on a
+//!   marker's flag → remove it).
 //!
 //! Pure view + intent: position/span edits are applied directly to the passed
 //! track slices (pure document data), while everything that needs the engine
@@ -22,7 +25,7 @@ use egui::{
 };
 use glitcherz_model::{
     AutoPoint, ControlClip, ControlTrack, CtrlEvent, MAX_ARRANGEMENT_BARS, MAX_CLIPS_PER_TRACK,
-    MidiClip, MidiTrack, Note, TICKS_PER_BAR,
+    Marker, MidiClip, MidiTrack, Note, SongLoop, TICKS_PER_BAR,
 };
 
 /// Fixed width of the row-header column.
@@ -38,6 +41,10 @@ pub const PX_PER_BAR_MIN: f32 = 14.0;
 pub const PX_PER_BAR_MAX: f32 = 280.0;
 /// Height of the bar-number ruler.
 const RULER_HEIGHT: f32 = 20.0;
+/// Half-width of the grab zone at a loop brace's edges (U1).
+const LOOP_EDGE_GRAB: f32 = 5.0;
+/// Half-width of the hit zone around a marker's flag line (U1).
+const MARKER_GRAB: f32 = 6.0;
 /// Half-width of the grab zone at a clip's right edge (resize handle).
 const EDGE_GRAB: f32 = 6.0;
 
@@ -153,6 +160,20 @@ struct Marquee {
     additive: bool,
 }
 
+/// A song-loop drag on the ruler (U1): what the drag is doing plus the
+/// anchor/context it needs. The final range is committed once, on
+/// `drag_stopped` — one drag = one undo step.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LoopDrag {
+    /// Ctrl+drag dragging out a brand-new range; the anchor is the press
+    /// tick.
+    New { anchor: f64 },
+    /// Dragging the loop's start edge (the end edge stays put).
+    StartEdge,
+    /// Dragging the loop's end edge (the start edge stays put).
+    EndEdge,
+}
+
 /// Cross-frame interaction state.
 #[derive(Debug)]
 pub struct TimelineState {
@@ -202,6 +223,9 @@ pub struct TimelineState {
     /// Track-reorder drag (header grab handle): the MIDI track index the
     /// grab started on.
     reorder: Option<usize>,
+    /// Song-loop drag on the ruler (U1): `None` means an in-progress ruler
+    /// drag is a plain seek scrub instead.
+    loop_drag: Option<LoopDrag>,
 }
 
 impl Default for TimelineState {
@@ -223,6 +247,7 @@ impl Default for TimelineState {
             rows_rect: None,
             rows_viewport_min: Pos2::ZERO,
             reorder: None,
+            loop_drag: None,
         }
     }
 }
@@ -266,7 +291,7 @@ impl TimelineState {
 /// Clip edits carry their data (`is_control` picks the track table): the
 /// timeline is a view and must not mutate the document — the caller turns
 /// these into undoable edits (M1.4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TimelineAction {
     /// A MIDI track's clips changed; re-push to the engine.
     MidiEdited(usize),
@@ -324,6 +349,28 @@ pub enum TimelineAction {
     SelectTrack(usize),
     SelectControlTrack(usize),
     ToggleMute(usize, bool),
+    /// Transport seek (U1): a ruler click/drag moves the playhead. Not a
+    /// document edit — the caller forwards it to the engine directly.
+    Seek {
+        ticks: f64,
+    },
+    /// Set the song loop range (U1; bar-snapped by the view). One undo step;
+    /// also enables the loop.
+    SetLoop {
+        start_ticks: u32,
+        end_ticks: u32,
+    },
+    /// Toggle the song loop on/off (U1); the range itself is kept.
+    ToggleLoop(bool),
+    /// Add a marker at `tick` (U1; bar-snapped by the view, name
+    /// auto-assigned "M<n>"). One undo step.
+    AddMarker {
+        tick: u32,
+    },
+    /// Remove the marker at `index` (U1). One undo step.
+    RemoveMarker {
+        index: usize,
+    },
     /// Reorder the MIDI tracks: the track at `from` is re-inserted so it
     /// ends up just before original index `to` (an insertion index,
     /// 0..=len; `to == from` / `to == from + 1` are identity drops the
@@ -366,6 +413,10 @@ pub struct TimelineParams<'a> {
     pub playing: bool,
     /// Clip to outline as "being edited" (from the floating editor window).
     pub edit_target: Option<EditHighlight>,
+    /// Song loop range for the ruler brace (U1).
+    pub loop_range: &'a SongLoop,
+    /// Timeline markers for the ruler (U1).
+    pub markers: &'a [Marker],
 }
 
 /// Placement semantics shared by MIDI and control clips.
@@ -928,7 +979,7 @@ pub fn show(
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(
-                        "Drag move · edge resize · dbl-click insert/edit · right-click delete · marquee: select · Del: delete · K: knife · header dots: reorder track · Ctrl+wheel: zoom time · Ctrl+Alt+wheel: row height · middle-drag: pan",
+                        "Drag move · edge resize · dbl-click insert/edit · right-click delete · marquee: select · Del: delete · K: knife · header dots: reorder track · ruler: click seek / Ctrl+drag loop / RMB marker · Ctrl+wheel: zoom time · Ctrl+Alt+wheel: row height · middle-drag: pan",
                     )
                     .weak(),
                 )
@@ -936,13 +987,18 @@ pub fn show(
             );
         });
 
-        // Ruler: bar numbers over the content width (viewport-culled — the
-        // ruler spans the whole arrangement, only the bars in view get
-        // lines and numbers).
+        // Ruler: bar numbers, markers, the song loop brace and the playhead
+        // over the content width (viewport-culled — the ruler spans the
+        // whole arrangement, only the bars in view get lines and numbers).
+        // U1 interactions: bare click/drag = seek scrub; Ctrl+drag = drag
+        // out a song loop range; dragging a loop edge reshapes it; RMB adds
+        // a marker (RMB on a marker's flag removes it).
         ui.horizontal(|ui| {
             ui.allocate_exact_size(Vec2::new(HEADER_WIDTH, RULER_HEIGHT), Sense::hover());
-            let (rect, _) =
-                ui.allocate_exact_size(Vec2::new(content_px, RULER_HEIGHT), Sense::hover());
+            let (rect, response) = ui.allocate_exact_size(
+                Vec2::new(content_px, RULER_HEIGHT),
+                Sense::click_and_drag(),
+            );
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, Color32::from_gray(24));
             let step = if state.px_per_bar < 28.0 { 4 } else { 1 };
@@ -968,6 +1024,162 @@ pub fn show(
                 );
                 bar += step;
             }
+
+            // ---- U1 geometry helpers ----
+            let bar_ticks = f64::from(TICKS_PER_BAR);
+            let max_tick = f64::from(content_bars * TICKS_PER_BAR);
+            let tick_at = |x: f32| {
+                (((x - rect.left()) / px_per_tick).max(0.0) as f64).min(max_tick)
+            };
+            let snap_bar = |tick: f64| ((tick / bar_ticks).round() * bar_ticks).max(0.0);
+            let loop_has_range = p.loop_range.end_ticks > p.loop_range.start_ticks;
+            let brace_y = (rect.bottom() - 5.0, rect.bottom() - 1.0);
+            let start_x = rect.left() + p.loop_range.start_ticks as f32 * px_per_tick;
+            let end_x = rect.left() + p.loop_range.end_ticks as f32 * px_per_tick;
+
+            // ---- Markers: flag line + short name under the bar numbers. ----
+            for marker in p.markers {
+                let x = rect.left() + marker.tick as f32 * px_per_tick;
+                if x < clip.left() - 8.0 || x > clip.right() {
+                    continue;
+                }
+                painter.line_segment(
+                    [pos2(x, rect.top() + 2.0), pos2(x, brace_y.0)],
+                    Stroke::new(1.0, Color32::from_rgb(150, 175, 210)),
+                );
+                painter.text(
+                    pos2(x + 2.0, rect.top() + 9.0),
+                    Align2::LEFT_TOP,
+                    &marker.name,
+                    FontId::proportional(9.0),
+                    Color32::from_rgb(170, 190, 220),
+                );
+            }
+
+            // ---- Song loop brace: the bottom strip of the ruler. Enabled =
+            // solid amber; kept-but-disabled = faint outline. ----
+            if loop_has_range {
+                let brace =
+                    Rect::from_min_max(pos2(start_x, brace_y.0), pos2(end_x, brace_y.1));
+                if p.loop_range.enabled {
+                    painter.rect_filled(brace, 2.0, Color32::from_rgb(240, 200, 70));
+                } else {
+                    painter.rect_stroke(
+                        brace,
+                        2.0,
+                        Stroke::new(1.0, Color32::from_rgb(150, 125, 50)),
+                        StrokeKind::Inside,
+                    );
+                }
+            }
+
+            // ---- Interaction: drag intent locks in at drag start. ----
+            let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let hit_start = loop_has_range && (pos.x - start_x).abs() <= LOOP_EDGE_GRAB;
+                    let hit_end = loop_has_range && (pos.x - end_x).abs() <= LOOP_EDGE_GRAB;
+                    if hit_start {
+                        state.loop_drag = Some(LoopDrag::StartEdge);
+                    } else if hit_end {
+                        state.loop_drag = Some(LoopDrag::EndEdge);
+                    } else if ctrl {
+                        state.loop_drag =
+                            Some(LoopDrag::New { anchor: snap_bar(tick_at(pos.x)) });
+                    } else {
+                        state.loop_drag = None;
+                        actions.push(TimelineAction::Seek {
+                            ticks: tick_at(pos.x),
+                        });
+                    }
+                }
+            }
+            if response.dragged_by(egui::PointerButton::Primary)
+                && state.loop_drag.is_none()
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                // Plain scrub: every frame of the drag seeks.
+                actions.push(TimelineAction::Seek {
+                    ticks: tick_at(pos.x),
+                });
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                if let (Some(drag), Some(pos)) =
+                    (state.loop_drag, response.interact_pointer_pos())
+                {
+                    let cur = snap_bar(tick_at(pos.x));
+                    let lr = p.loop_range;
+                    let committed: Option<(u32, u32)> = match drag {
+                        LoopDrag::New { anchor } => {
+                            let (a, b) = if anchor <= cur { (anchor, cur) } else { (cur, anchor) };
+                            (b - a >= bar_ticks).then_some((a as u32, b as u32))
+                        }
+                        LoopDrag::StartEdge => {
+                            let end = f64::from(lr.end_ticks);
+                            (cur < end).then_some((cur as u32, lr.end_ticks))
+                        }
+                        LoopDrag::EndEdge => {
+                            let start = f64::from(lr.start_ticks);
+                            (cur > start).then_some((lr.start_ticks, cur as u32))
+                        }
+                    };
+                    match committed {
+                        Some((s, e)) => actions.push(TimelineAction::SetLoop {
+                            start_ticks: s,
+                            end_ticks: e,
+                        }),
+                        None => state.set_status("loop: needs at least one bar"),
+                    }
+                }
+                state.loop_drag = None;
+            }
+            // RMB: add a marker at the click (bar-snapped); RMB right on a
+            // marker's flag line removes it instead.
+            if response.secondary_clicked()
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let hit = p.markers.iter().enumerate().find(|(_, m)| {
+                    (rect.left() + m.tick as f32 * px_per_tick - pos.x).abs() <= MARKER_GRAB
+                });
+                match hit {
+                    Some((index, _)) => actions.push(TimelineAction::RemoveMarker { index }),
+                    None => actions.push(TimelineAction::AddMarker {
+                        tick: snap_bar(tick_at(pos.x)) as u32,
+                    }),
+                }
+            }
+
+            // ---- Ghost preview of the loop drag in progress. ----
+            if let Some(drag) = state.loop_drag
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let cur = snap_bar(tick_at(pos.x));
+                let (a, b) = match drag {
+                    LoopDrag::New { anchor } => {
+                        if anchor <= cur { (anchor, cur) } else { (cur, anchor) }
+                    }
+                    LoopDrag::StartEdge => (cur, f64::from(p.loop_range.end_ticks)),
+                    LoopDrag::EndEdge => (f64::from(p.loop_range.start_ticks), cur),
+                };
+                let ax = rect.left() + a as f32 * px_per_tick;
+                let bx = rect.left() + b as f32 * px_per_tick;
+                painter.rect_filled(
+                    Rect::from_min_max(pos2(ax, brace_y.0), pos2(bx, brace_y.1)),
+                    2.0,
+                    Color32::from_rgba_premultiplied(240, 200, 70, 90),
+                );
+            }
+
+            // ---- Playhead through the ruler. ----
+            let ph_x = rect.left() + p.playhead_ticks * px_per_tick;
+            painter.line_segment(
+                [pos2(ph_x, rect.top()), pos2(ph_x, rect.bottom())],
+                Stroke::new(1.5, Color32::from_rgb(250, 220, 90)),
+            );
+
+            let _ = response.on_hover_text(
+                "Click/drag: seek · Ctrl+drag: set song loop · drag loop edges: reshape · right-click: add marker (on a marker: remove)",
+            );
         });
 
         // Marquee selection: every row reports the clips its lane segment

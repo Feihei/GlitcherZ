@@ -278,7 +278,7 @@ impl BlockRunner {
         match cmd {
             SequencerCommand::Play => {
                 self.sequencer.play();
-                // Release the previous play's still-pending notes **by pitch**
+                // Release the previous run's still-pending notes **by pitch**
                 // (see `take_pending_offs`), then a blanket off for the
                 // built-in chain — clearing manual notes that may still be
                 // held, avoiding overlap with sequencer voices.
@@ -292,6 +292,27 @@ impl BlockRunner {
                 // sounding notes then hang forever.
                 self.release_pending_notes();
                 self.graph.note_off_all();
+            }
+            SequencerCommand::Pause => {
+                // U1: the position stays (resume via Play); sounding notes
+                // still fall silent — same release semantics as Stop.
+                self.sequencer.pause();
+                self.release_pending_notes();
+                self.graph.note_off_all();
+            }
+            SequencerCommand::Seek(ticks) => {
+                // U1: nothing scheduled relative to the old position may
+                // fire at the new one (the sequencer clears its pending
+                // offs); sounding notes release like a transport jump.
+                self.sequencer.seek(ticks);
+                self.release_pending_notes();
+                self.graph.note_off_all();
+            }
+            SequencerCommand::SetLoopRange {
+                start_ticks,
+                end_ticks,
+            } => {
+                self.sequencer.set_loop_range(start_ticks, end_ticks);
             }
             SequencerCommand::SetBpm(bpm) => self.sequencer.set_bpm(bpm),
             SequencerCommand::SetTrackClips { track, clips } => {
