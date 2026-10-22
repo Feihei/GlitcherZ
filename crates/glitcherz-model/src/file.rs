@@ -184,6 +184,33 @@ mod tests {
         );
     }
 
+    /// U3b: a tempo cable (control track → the fixed Timeline In terminal)
+    /// survives the file layer, and the layout slot travels with it. The
+    /// project version stays 6 — the port and the parameter are additive
+    /// serde tags.
+    #[test]
+    fn tempo_cable_roundtrips_through_the_file() {
+        let mut project = demo_project();
+        project.graph.remove_auto_cable(0);
+        project.graph.cables.push(CableDoc::tempo(0));
+        project.graph.layout.timeline_in = Some([930.0, 320.0]);
+        project
+            .validate()
+            .expect("a tempo cable is a legal document");
+        let path = std::env::temp_dir().join(format!("glitcherz_tempo_{}.glz", std::process::id()));
+
+        save_project(&project, &path).expect("save failed");
+        let loaded = load_project(&path).expect("load failed");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            loaded.graph.auto_target(0),
+            Some((crate::PortRef::TimelineIn, AutoParam::Tempo))
+        );
+        assert_eq!(loaded.graph.layout.timeline_in, Some([930.0, 320.0]));
+        assert_eq!(loaded, project, "the whole document must roundtrip");
+    }
+
     // U1: the song loop range and markers live on the metadata and survive
     // the roundtrip.
     #[test]

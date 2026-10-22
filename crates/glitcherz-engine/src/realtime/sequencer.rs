@@ -49,6 +49,13 @@ pub const TICKS_PER_BAR: u32 = TICKS_PER_STEP * 16;
 /// Largest beats-per-bar the engine accepts (`TimeSignature`'s mirror).
 pub const MAX_TIME_SIGNATURE_NUMERATOR: u8 = 16;
 
+/// Lowest transport BPM (mirrors the UI's `BPM_RANGE`; U3b keeps the tempo
+/// curve inside the same bounds so a curve can never demand a rate the
+/// transport itself would reject).
+pub const MIN_BPM: f32 = 20.0;
+/// Highest transport BPM.
+pub const MAX_BPM: f32 = 300.0;
+
 /// Bar length in ticks for a meter: `TICKS_PER_QUARTER × 4 / denominator ×
 /// numerator`.
 ///
@@ -180,7 +187,14 @@ pub const MAX_PENDING_OFFS_PER_TRACK: usize = 16;
 pub struct Sequencer {
     sample_rate: f32,
     playing: bool,
-    bpm: f32,
+    /// The BPM the user set (transport field). U3b splits this from
+    /// [`Sequencer::bpm_override`] so a tempo curve can override it per block
+    /// and cleanly fall back outside the curve (D3).
+    base_bpm: f32,
+    /// Per-block tempo override sampled from a Timeline In curve (U3b). `None`
+    /// = no curve covers the current position, use `base_bpm`. Rebuilt every
+    /// block by the block runner before `advance` (D4).
+    bpm_override: Option<f32>,
     /// Ticks per bar for the document's meter (U3a). Everything that measures
     /// in bars — arrangement-end rounding, loop snapping on the control side —
     /// reads this instead of the 4/4 [`TICKS_PER_BAR`] constant. Set by
@@ -219,7 +233,8 @@ impl Sequencer {
                 48_000.0
             },
             playing: false,
-            bpm: 120.0,
+            base_bpm: 120.0,
+            bpm_override: None,
             bar_ticks: TICKS_PER_BAR,
             position_ticks: 0.0,
             track_count: crate::realtime::DEFAULT_MIDI_TRACKS,
@@ -251,13 +266,40 @@ impl Sequencer {
 
     /// Ticks per sample (f64 intermediate computation).
     fn ticks_per_sample(&self) -> f64 {
-        let bpm = if self.bpm.is_finite() {
-            self.bpm.clamp(20.0, 300.0)
+        // ticks/second = BPM/60 × TPQN; divide by the sample rate to get ticks/sample.
+        f64::from(self.effective_bpm()) / 60.0 * f64::from(TICKS_PER_QUARTER)
+            / f64::from(self.sample_rate)
+    }
+
+    /// The BPM actually in force this block (U3b D3): the curve override when
+    /// one was sampled, otherwise the user's base value. Clamped to
+    /// [`MIN_BPM`]..=[`MAX_BPM`]; non-finite values fall back to 120.
+    /// RT-safe.
+    pub fn effective_bpm(&self) -> f32 {
+        let bpm = self.bpm_override.unwrap_or(self.base_bpm);
+        if bpm.is_finite() {
+            bpm.clamp(MIN_BPM, MAX_BPM)
         } else {
             120.0
-        };
-        // ticks/second = BPM/60 × TPQN; divide by the sample rate to get ticks/sample.
-        f64::from(bpm) / 60.0 * f64::from(TICKS_PER_QUARTER) / f64::from(self.sample_rate)
+        }
+    }
+
+    /// Sets the curve override for the current block (U3b). Values outside
+    /// [`MIN_BPM`]..=[`MAX_BPM`] are clamped, non-finite values ignored.
+    /// RT-safe.
+    pub fn set_bpm_override(&mut self, bpm: f32) {
+        if bpm.is_finite() {
+            self.bpm_override = Some(bpm.clamp(MIN_BPM, MAX_BPM));
+        }
+    }
+
+    /// Drops the curve override: the transport returns to the user's base BPM
+    /// (U3b D3 — outside every tempo clip, and while stopped). The block
+    /// runner calls this once per block before re-sampling, so a curve that
+    /// stops covering the playhead cannot leave the tempo stuck at its last
+    /// value. RT-safe.
+    pub fn clear_bpm_override(&mut self) {
+        self.bpm_override = None;
     }
 
     /// Play from the **current** transport position (resume semantics, U1).
@@ -266,23 +308,30 @@ impl Sequencer {
     /// releases them by pitch before this takes effect. RT-safe.
     pub fn play(&mut self) {
         self.playing = true;
+        self.bpm_override = None;
         self.pending_offs = [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS];
     }
 
     /// Stops scheduling and rewinds to zero. The caller should send
-    /// `NoteOff` to all tracks to release envelopes. RT-safe.
+    /// `NoteOff` to all tracks to release envelopes. A tempo override is
+    /// dropped so the stopped transport reads the user's base BPM (U3b).
+    /// RT-safe.
     pub fn stop(&mut self) {
         self.playing = false;
+        self.bpm_override = None;
         self.position_ticks = 0.0;
         self.pending_offs = [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS];
     }
 
     /// Pauses: stops scheduling but **keeps the transport position** (U1);
     /// resume with [`Sequencer::play`]. Pending offs are cleared — the block
-    /// runner releases them by pitch (sounding notes fall silent).
+    /// runner releases them by pitch (sounding notes fall silent). The tempo
+    /// override is cleared too: automation is only evaluated while playing
+    /// (U3b D3).
     /// RT-safe.
     pub fn pause(&mut self) {
         self.playing = false;
+        self.bpm_override = None;
         self.pending_offs = [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS];
     }
 
@@ -345,13 +394,20 @@ impl Sequencer {
         self.track_count
     }
 
-    /// Sets BPM (20..300, non-finite values ignored). The musical position is
-    /// counted in ticks, so tempo changes do not affect already-played content,
-    /// only the subsequent rate. RT-safe.
+    /// Sets the user's base BPM (20..300, non-finite values ignored). The
+    /// musical position is counted in ticks, so tempo changes do not affect
+    /// already-played content, only the subsequent rate. A curve override
+    /// (U3b) still wins until the next block clears it. RT-safe.
     pub fn set_bpm(&mut self, bpm: f32) {
         if bpm.is_finite() {
-            self.bpm = bpm.clamp(20.0, 300.0);
+            self.base_bpm = bpm.clamp(MIN_BPM, MAX_BPM);
         }
+    }
+
+    /// The user's base BPM (what the transport field shows; unaffected by a
+    /// tempo curve, U3b). RT-safe.
+    pub fn base_bpm(&self) -> f32 {
+        self.base_bpm
     }
 
     /// Sets the document's meter (U3a): only the bar length changes, and the
@@ -643,7 +699,7 @@ impl Sequencer {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CLIP_NOTES, MAX_TRACK_CLIPS, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR,
+        MAX_BPM, MAX_CLIP_NOTES, MAX_TRACK_CLIPS, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR,
         TICKS_PER_QUARTER, TICKS_PER_STEP,
     };
     use crate::realtime::MAX_MIDI_TRACKS;
@@ -1489,5 +1545,69 @@ mod tests {
         seq.play();
         run(&mut seq, 2_255);
         assert!(!seq.is_playing(), "an equal range is a disabled loop");
+    }
+
+    /// U3b D3: the curve override wins while set, and clearing it falls back
+    /// to the user's base value — never to "the last curve value".
+    #[test]
+    fn tempo_override_overrides_base_until_cleared() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        assert!((seq.base_bpm() - 120.0).abs() < 1e-6);
+        assert!((seq.effective_bpm() - 120.0).abs() < 1e-6);
+
+        seq.set_bpm_override(240.0);
+        assert!(
+            (seq.effective_bpm() - 240.0).abs() < 1e-6,
+            "the curve wins over the transport field"
+        );
+        assert!(
+            (seq.base_bpm() - 120.0).abs() < 1e-6,
+            "the base value is untouched"
+        );
+
+        seq.clear_bpm_override();
+        assert!(
+            (seq.effective_bpm() - 120.0).abs() < 1e-6,
+            "outside every tempo clip the transport returns to base"
+        );
+
+        // Curve values are clamped to the transport's own range; non-finite
+        // values are ignored (the previous override or base stays).
+        seq.set_bpm_override(10_000.0);
+        assert!((seq.effective_bpm() - MAX_BPM).abs() < 1e-6);
+        seq.set_bpm_override(f32::NAN);
+        assert!(
+            (seq.effective_bpm() - MAX_BPM).abs() < 1e-6,
+            "a non-finite curve value must not poison the clock"
+        );
+    }
+
+    /// U3b: the override only lives while the transport is running (automation
+    /// is evaluated only while playing); a pause/stop drops it so the field
+    /// reads the base tempo again. `seek` keeps it — the next block re-samples
+    /// at the target position (D4).
+    #[test]
+    fn transport_edges_drop_the_tempo_override() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+
+        seq.play();
+        seq.set_bpm_override(180.0);
+        seq.pause();
+        assert!((seq.effective_bpm() - 120.0).abs() < 1e-6, "pause: base");
+
+        seq.play();
+        seq.set_bpm_override(180.0);
+        seq.stop();
+        assert!((seq.effective_bpm() - 120.0).abs() < 1e-6, "stop: base");
+
+        seq.play();
+        seq.set_bpm_override(180.0);
+        seq.seek(2.0 * f64::from(TICKS_PER_BAR));
+        assert!(
+            (seq.effective_bpm() - 180.0).abs() < 1e-6,
+            "seek keeps the sampled override until the next block re-samples"
+        );
     }
 }

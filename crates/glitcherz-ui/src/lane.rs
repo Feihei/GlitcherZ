@@ -63,6 +63,9 @@ fn axis(param: &AutoParam) -> (f32, f32, bool) {
         AutoParam::TrackGain => (0.0, 1.5, false),
         AutoParam::TrackPan => (-1.0, 1.0, false),
         AutoParam::FilterCutoff => (20.0, 18_000.0, true),
+        // U3b: song tempo shares the transport's own range; log axis so slow
+        // ramps get as much room as fast ones.
+        AutoParam::Tempo => (20.0, 300.0, true),
         // Plugin parameter range unknown: display normalized 0..1 (interpreted by the plugin).
         AutoParam::PluginParam { .. } => (0.0, 1.0, false),
     }

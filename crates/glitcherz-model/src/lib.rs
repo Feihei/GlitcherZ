@@ -837,6 +837,20 @@ pub enum AutoParam {
         #[serde(default)]
         name: String,
     },
+    /// Song tempo in BPM (U3b, spec `.agents/spec/tempo-meter.md`).
+    ///
+    /// Only valid on a cable targeting [`PortRef::TimelineIn`] — tempo is a
+    /// clock, not a node parameter, so it must never land on a node's
+    /// `set_param` path (D1/D7). The curve value **overrides** the transport
+    /// BPM rather than adding to it (D3).
+    Tempo,
+}
+
+impl AutoParam {
+    /// Whether this parameter is only legal on the Timeline In endpoint.
+    pub fn is_timeline_in_only(&self) -> bool {
+        matches!(self, AutoParam::Tempo)
+    }
 }
 
 /// Automation anchor: tick position + real parameter value.
@@ -1065,9 +1079,9 @@ impl NodeDoc {
 
 /// Cable port reference (spec §7 `PortRef`).
 ///
-/// `Master` / `MidiTrack` / `AutoTrack` are reserved identities of fixed
-/// entities (not listed in the node table; the loader/engine fills them in
-/// implicitly); `Node` references a document node.
+/// `Master` / `TimelineIn` / `MidiTrack` / `AutoTrack` are reserved identities
+/// of fixed entities (not listed in the node table; the loader/engine fills
+/// them in implicitly); `Node` references a document node.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PortRef {
@@ -1080,6 +1094,12 @@ pub enum PortRef {
     MidiTrack(usize),
     /// Timeline automation track outlet (track index).
     AutoTrack(usize),
+    /// Timeline input terminal (U3b, spec `tempo-meter.md` D1): the fixed
+    /// **pure sink** mirroring the `Timeline` source. It has no node_id, no
+    /// engine processor and no user-creatable instance — identity alone makes
+    /// it a singleton (D2), so `validate` only constrains the cables, not the
+    /// entity. v1 has a single port ([`AutoParam::Tempo`]).
+    TimelineIn,
 }
 
 /// Cable type (D3): bound to the port type; type mismatches are rejected at
@@ -1171,6 +1191,18 @@ impl CableDoc {
             in_port: 0,
         }
     }
+
+    /// Convenience constructor for a tempo cable (U3b): control track →
+    /// the fixed Timeline In endpoint's `Tempo` port.
+    pub fn tempo(from_track: usize) -> Self {
+        Self {
+            kind: CableKind::Automation,
+            from: PortRef::AutoTrack(from_track),
+            to: PortRef::TimelineIn,
+            param: AutoParam::Tempo,
+            in_port: 0,
+        }
+    }
 }
 
 impl From<u64> for PortRef {
@@ -1219,6 +1251,9 @@ pub struct LayoutDoc {
     /// Master output box position.
     #[serde(default)]
     pub master: Option<[f32; 2]>,
+    /// Timeline In box position (U3b).
+    #[serde(default)]
+    pub timeline_in: Option<[f32; 2]>,
 }
 
 impl GraphDoc {
@@ -1385,6 +1420,25 @@ impl GraphDoc {
                 None
             }
         })
+    }
+
+    /// Full endpoint of the cable for automation track `index`: the
+    /// destination port (a document node, or the fixed [`PortRef::TimelineIn`])
+    /// plus the parameter (U3b). `None` when not cabled.
+    pub fn auto_target(&self, index: usize) -> Option<(PortRef, AutoParam)> {
+        self.cables.iter().find_map(|c| {
+            if c.kind == CableKind::Automation && c.from == PortRef::AutoTrack(index) {
+                Some((c.to.clone(), c.param.clone()))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Whether automation track `index` is cabled to the Timeline In endpoint
+    /// (U3b: song tempo).
+    pub fn auto_targets_timeline_in(&self, index: usize) -> bool {
+        matches!(self.auto_target(index), Some((PortRef::TimelineIn, _)))
     }
 
     /// Removes the cable for automation track `index` (call before changing
@@ -1571,9 +1625,32 @@ impl GraphDoc {
                                 .to_string(),
                         );
                     }
-                    if !matches!(cable.to, PortRef::Node(_)) {
-                        return Err("automation cable target port must be a node parameter port"
-                            .to_string());
+                    // U3b D1/D7: the only valid automation destination is a
+                    // node parameter port, or the fixed Timeline In endpoint
+                    // whose sole v1 port is `Tempo`. Tempo is a clock, so it
+                    // must not reach a node's `set_param` path, and every
+                    // other parameter must not reach the clock.
+                    match cable.to {
+                        PortRef::Node(_) => {
+                            if cable.param.is_timeline_in_only() {
+                                return Err(format!(
+                                    "{:?} is only valid on the timeline input (it is a clock, not a node parameter)",
+                                    cable.param
+                                ));
+                            }
+                        }
+                        PortRef::TimelineIn => {
+                            if !matches!(cable.param, AutoParam::Tempo) {
+                                return Err("the timeline input only accepts the tempo port (v1)"
+                                    .to_string());
+                            }
+                        }
+                        _ => {
+                            return Err(
+                                "automation cable target port must be a node parameter port or the timeline input"
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
             }
@@ -1609,6 +1686,8 @@ impl GraphDoc {
                 }
             }
             PortRef::Master => {}
+            // Fixed sink with no identity to resolve (U3b D2).
+            PortRef::TimelineIn => {}
         }
         Ok(())
     }
@@ -2016,7 +2095,7 @@ impl Default for ProjectMetadata {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoParam, AutoPoint, CableDoc, DEFAULT_MIDI_TRACKS, GraphDoc, MASTER_NODE_ID,
+        AutoParam, AutoPoint, CableDoc, CableKind, DEFAULT_MIDI_TRACKS, GraphDoc, MASTER_NODE_ID,
         MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK,
         MAX_NODES, MidiClip, MidiTrack, NodeDoc, PortRef, Project, SynthParams, TICKS_PER_BAR,
         TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec, default_graph_doc,
@@ -2945,5 +3024,87 @@ mod tests {
             doc.validate(2, 0).is_err(),
             "only vk nodes have a MIDI out port"
         );
+    }
+
+    /// U3b (spec `tempo-meter.md` D1/D2/D7): the Timeline In terminal accepts
+    /// exactly one thing — an automation cable carrying `Tempo`. Everything
+    /// else is rejected by `validate`, and no extra singleton rule is needed
+    /// (the identity is not instantiable).
+    #[test]
+    fn timeline_in_accepts_only_tempo_automation() {
+        let mut doc = default_graph_doc(2);
+        doc.cables.push(CableDoc::tempo(0));
+        assert!(
+            doc.validate(2, 1).is_ok(),
+            "tempo → Timeline In is a legal automation cable"
+        );
+        assert_eq!(
+            doc.auto_target(0),
+            Some((PortRef::TimelineIn, AutoParam::Tempo))
+        );
+        assert!(doc.auto_targets_timeline_in(0));
+        assert!(!doc.auto_targets_timeline_in(1), "track 1 is not cabled");
+
+        // Audio cables have no port there (the terminal is a pure sink).
+        let mut doc = default_graph_doc(2);
+        doc.cables.push(CableDoc::audio(2, PortRef::TimelineIn));
+        assert!(
+            doc.validate(2, 0).is_err(),
+            "audio cannot enter the terminal"
+        );
+
+        // Neither do MIDI cables.
+        let mut doc = default_graph_doc(2);
+        doc.cables.push(CableDoc {
+            kind: CableKind::Midi,
+            from: PortRef::MidiTrack(0),
+            to: PortRef::TimelineIn,
+            param: AutoParam::default(),
+            in_port: 0,
+        });
+        assert!(
+            doc.validate(2, 0).is_err(),
+            "MIDI cannot enter the terminal"
+        );
+
+        // Tempo is a clock, not a node parameter: it must not reach a node.
+        let mut doc = default_graph_doc(2);
+        let voice = doc
+            .instrument_of_track(0)
+            .expect("track 0 has an instrument")
+            .node_id();
+        doc.cables
+            .push(CableDoc::automation(0, voice, AutoParam::Tempo));
+        assert!(
+            doc.validate(2, 1).is_err(),
+            "Tempo only exists on the Timeline In endpoint"
+        );
+
+        // v1 has a single port: other parameters cannot enter through it.
+        let mut doc = default_graph_doc(2);
+        doc.cables.push(CableDoc {
+            kind: CableKind::Automation,
+            from: PortRef::AutoTrack(0),
+            to: PortRef::TimelineIn,
+            param: AutoParam::TrackGain,
+            in_port: 0,
+        });
+        assert!(
+            doc.validate(2, 1).is_err(),
+            "the terminal's only v1 port is Tempo"
+        );
+    }
+
+    /// U3b: the new port/parameter tags are part of the saved format, so a
+    /// document written now must read back identically (no version bump —
+    /// both additions are behind a serde tag).
+    #[test]
+    fn tempo_cable_roundtrips_through_ron() {
+        let cable = CableDoc::tempo(3);
+        let text = ron::to_string(&cable).expect("serialize");
+        assert!(text.contains("timeline_in"), "port tag: {text}");
+        assert!(text.contains("Tempo"), "parameter tag: {text}");
+        let back: CableDoc = ron::from_str(&text).expect("deserialize");
+        assert_eq!(back, cable);
     }
 }

@@ -52,6 +52,12 @@ pub const MAX_CABLES: usize = 256;
 pub const MAX_IN_EDGES: usize = 32;
 /// Sentinel value for "no edge" (empty slot marker in `out_edge` / cable tables).
 pub const NO_EDGE: u16 = u16::MAX;
+/// Sentinel slot of the Timeline In endpoint (U3b, spec
+/// `.agents/spec/tempo-meter.md` §6): an [`AutoRoute`] whose `slot` is this
+/// value delivers its curve to the **transport clock** instead of a node
+/// parameter. Distinct from [`NO_EDGE`] so "cabled to the conductor" and
+/// "not cabled" stay distinguishable. It never indexes `slots`.
+pub const TIMELINE_IN: u16 = u16::MAX - 1;
 /// Number of external effect slots per track (following the old `TrackStrip` semantics).
 pub const EFFECT_SLOTS: usize = 4;
 /// Maximum nodes installed in a single structural update (≥ the per-track trio of 3).
@@ -113,7 +119,10 @@ impl NodeKind {
 /// Destination of one automation cable (D7): target node slot + target parameter.
 ///
 /// The curve carries no destination; `slot == NO_EDGE` means this automation
-/// track is not connected (silent).
+/// track is not connected (silent). `slot == TIMELINE_IN` (U3b) means the
+/// curve drives the transport clock; `param` is then unused — v1 has exactly
+/// one conductor port (`Tempo`), so the sentinel alone identifies it (a
+/// second port such as `Swing` would add a `port` field, see spec §4.2).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AutoRoute {
     /// Target node slot.
@@ -467,7 +476,19 @@ impl RtGraph {
         if route.slot == NO_EDGE {
             return;
         }
+        // U3b: the conductor endpoint is not a node — the block runner reads
+        // the routing table itself and steers the transport clock instead.
+        if route.slot == TIMELINE_IN {
+            return;
+        }
         let _ = self.slot_set_param(route.slot, route.param, value);
+    }
+
+    /// Routing entry of one automation track (U3b): the block runner needs to
+    /// tell a node target from the Timeline In sentinel **before** delivering
+    /// the sampled value. RT-safe.
+    pub fn auto_route(&self, auto_index: usize) -> Option<AutoRoute> {
+        self.plan.auto_routes.get(auto_index).copied()
     }
 
     /// Targeted parameter delivery by node_id (P5b: the public node-addressed
@@ -1551,6 +1572,26 @@ impl GraphCompiler {
         }
         let slot = self.node_slot(node_id).ok_or(TopologyError::InvalidSlot)?;
         self.auto_routes[auto_index] = AutoRoute { slot, param };
+        Ok(self.build_update(self.compile()?, Vec::new(), &[]))
+    }
+
+    /// Timeline wiring: connects automation track `auto_index` to the
+    /// **Timeline In** endpoint (U3b): the sampled curve overrides the
+    /// transport BPM for the next block instead of setting a node parameter.
+    /// No node lookup happens here — the sentinel never enters `slots`.
+    pub fn set_timeline_in_route(
+        &mut self,
+        auto_index: usize,
+    ) -> Result<GraphUpdate, TopologyError> {
+        if auto_index >= MAX_AUTO_TRACKS {
+            return Err(TopologyError::InvalidIndex);
+        }
+        // `param` is unused for the conductor route (v1 has one port); keep
+        // the default so the table stays `Copy` and comparable.
+        self.auto_routes[auto_index] = AutoRoute {
+            slot: TIMELINE_IN,
+            param: ParamId::MasterGain,
+        };
         Ok(self.build_update(self.compile()?, Vec::new(), &[]))
     }
 

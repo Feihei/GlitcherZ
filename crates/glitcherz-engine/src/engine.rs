@@ -166,6 +166,13 @@ impl AudioEngine {
         self.feedback.playing.load(Ordering::Relaxed)
     }
 
+    /// Effective BPM of the most recent block (U3b): a tempo curve overrides
+    /// the transport field, so this can differ from the document's
+    /// `metadata.tempo_bpm` while automation is driving the clock.
+    pub fn live_bpm(&self) -> f32 {
+        self.feedback.bpm.load()
+    }
+
     /// Swaps the instrument of the given track to an external node (e.g. a
     /// CLAP instrument).
     /// The node is constructed by the caller on a **non-real-time thread**;
@@ -298,6 +305,13 @@ impl AudioEngine {
     /// re-routes.
     pub fn set_auto_route(&mut self, auto_index: usize, node_id: u64, param: ParamId) -> bool {
         self.apply_plan_update(|compiler| compiler.set_auto_route(auto_index, node_id, param))
+    }
+
+    /// Timeline wiring: connects automation track `auto_index` to the
+    /// **Timeline In** endpoint (U3b): the curve overrides the transport BPM
+    /// per block instead of driving a node parameter.
+    pub fn set_timeline_in_route(&mut self, auto_index: usize) -> bool {
+        self.apply_plan_update(|compiler| compiler.set_timeline_in_route(auto_index))
     }
 
     /// Timeline wiring: disconnects automation track `auto_index`.

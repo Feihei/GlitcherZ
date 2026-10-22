@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use rtrb::Consumer;
 
 use crate::realtime::atomic::AtomicF32;
+use crate::realtime::automation::MAX_AUTO_TRACKS;
 use crate::realtime::commands::{EngineCommand, NoteEvent, SequencerCommand};
 use crate::realtime::context::ProcessContext;
-use crate::realtime::graph::{GraphLevels, GraphUpdate, RtGraph};
+use crate::realtime::graph::{GraphLevels, GraphUpdate, NO_EDGE, RtGraph, TIMELINE_IN};
 use crate::realtime::sequencer::Sequencer;
 use crate::realtime::voice::RecycledNode;
 
@@ -28,6 +29,10 @@ pub struct Feedback {
     pub playing: Arc<AtomicBool>,
     /// Sequencer musical position (ticks, accumulated from the play start).
     pub position_ticks: Arc<AtomicF32>,
+    /// Effective transport BPM of the most recent block (U3b: reflects a
+    /// tempo-curve override, so the UI can show that automation is driving
+    /// the clock). Equals the base BPM when no curve covers the playhead.
+    pub bpm: Arc<AtomicF32>,
     /// Per-track post-fader peak levels (fixed capacity
     /// [`crate::realtime::MAX_MIDI_TRACKS`], unconfigured tracks always 0).
     pub track_levels: [Arc<AtomicF32>; crate::realtime::MAX_MIDI_TRACKS],
@@ -42,6 +47,7 @@ impl Feedback {
             step: Arc::new(AtomicU32::new(0)),
             playing: Arc::new(AtomicBool::new(false)),
             position_ticks: Arc::new(AtomicF32::new(0.0)),
+            bpm: Arc::new(AtomicF32::new(120.0)),
             track_levels: std::array::from_fn(|_| Arc::new(AtomicF32::new(0.0))),
         }
     }
@@ -64,14 +70,15 @@ impl Default for Feedback {
 ///    immediately if the queue is empty);
 /// 2. Apply structure updates (swap plans / attach-detach nodes, recycling via
 ///    the receipt queue);
-/// 3. The sequencer schedules on the sample clock; due note events fan out
+/// 3. Automation tracks are evaluated (only while playing) at the block's
+///    start position — before scheduling, so a tempo curve governs the block
+///    it was sampled for and node parameters are current when the block runs;
+/// 4. The sequencer schedules on the sample clock; due note events fan out
 ///    along the graph's MIDI routing table;
-/// 4. Automation tracks are evaluated (only while playing), delivering target
-///    parameters via the automation routing table;
 /// 5. The node graph processes one block in precompiled topological order
 ///    (sum inputs → process in place);
-/// 6. Report peak level, playback position, sequencer step, and transport
-///    state (atomics).
+/// 6. Report peak level, playback position, sequencer step, transport state
+///    and the effective BPM (atomics).
 pub struct BlockRunner {
     fixed_block: usize,
     out_channels: usize,
@@ -177,27 +184,27 @@ impl BlockRunner {
             playback_sample_pos: self.played_samples,
         };
 
-        // 3. Sequencer scheduling: due note events fan out along the graph's
+        // 3. Automation evaluation (only while playing) **before** the
+        //    sequencer advances (U3b D4): a tempo curve must be sampled at the
+        //    block's *start* position so the block it governs actually runs at
+        //    the sampled rate — evaluating afterwards would always spend one
+        //    block at the stale tempo. Note events are scheduled with the
+        //    effective BPM in the same step.
+        let position_before = self.sequencer.position_ticks();
+        if self.sequencer.is_playing() {
+            self.evaluate_automation(position_before);
+        }
+
+        // 4. Sequencer scheduling: due note events fan out along the graph's
         //    MIDI routing table to the target instrument nodes (block-boundary
         //    precision). Split field borrows so sequencer and graph can be
-        //    mutable at the same time. Automation uses the block's start
-        //    position (audio within the block approximated by the start).
-        let position_before = self.sequencer.position_ticks();
+        //    mutable at the same time.
         let Self {
             sequencer, graph, ..
         } = self;
         sequencer.advance(&ctx, &mut |track, event| {
             graph.track_note(track, event);
         });
-
-        // 4. Automation track evaluation (only while playing): each track
-        //    samples its curve modulo its own loop length, delivered via the
-        //    node graph's automation routing table (curves carry no target, D7);
-        //    when stopped, the last manual value stays in effect (the UI
-        //    re-pushes manual parameters on the transport stop edge).
-        if self.sequencer.is_playing() {
-            self.evaluate_automation(position_before);
-        }
 
         // 5. The node graph processes one block (topological order: sum inputs → process in place → master output).
         let levels: GraphLevels = self.graph.process_block(&ctx);
@@ -219,24 +226,52 @@ impl BlockRunner {
         self.feedback
             .position_ticks
             .store(self.sequencer.position_ticks() as f32);
+        self.feedback.bpm.store(self.sequencer.effective_bpm());
 
         self.played_samples += frames as u64;
         self.scratch_pos = 0;
     }
 
-    /// Samples and applies all control tracks' clips: the first clip covering
-    /// the transport position delivers its curve value (D17: nothing is
-    /// delivered outside any clip span — the target keeps its last value);
-    /// the delivery endpoint is determined by the graph's routing table.
+    /// Samples and applies all control tracks' clips at `position_ticks`: the
+    /// first clip covering the transport position delivers its curve value
+    /// (D17: nothing is delivered outside any clip span); the delivery
+    /// endpoint is determined by the graph's routing table.
+    ///
+    /// U3b: a route into the Timeline In sentinel steers the **transport
+    /// clock** (tempo override) instead of a node parameter; the override is
+    /// cleared first, so a gap between tempo clips drops back to the base BPM
+    /// rather than freezing at the last value (D3). Everything is collected
+    /// into fixed-size buffers before delivery to keep the sequencer and
+    /// graph borrows apart — no allocation (RT rule 1).
     /// RT-safe.
     fn evaluate_automation(&mut self, position_ticks: f64) {
-        for (index, clips) in self.sequencer.control_clips().iter().enumerate() {
+        let Self {
+            sequencer, graph, ..
+        } = self;
+        sequencer.clear_bpm_override();
+        let mut tempo: Option<f32> = None;
+        let mut node_values = [(0usize, 0.0f32); MAX_AUTO_TRACKS];
+        let mut node_count = 0usize;
+        for (index, clips) in sequencer.control_clips().iter().enumerate() {
             for clip in clips {
                 if let Some(value) = clip.value_at_absolute(position_ticks) {
-                    self.graph.auto_set_param(index, value);
+                    match graph.auto_route(index) {
+                        Some(route) if route.slot == TIMELINE_IN => tempo = Some(value),
+                        Some(route) if route.slot != NO_EDGE => {
+                            node_values[node_count] = (index, value);
+                            node_count += 1;
+                        }
+                        _ => {}
+                    }
                     break;
                 }
             }
+        }
+        for &(index, value) in &node_values[..node_count] {
+            graph.auto_set_param(index, value);
+        }
+        if let Some(bpm) = tempo {
+            sequencer.set_bpm_override(bpm);
         }
     }
 
@@ -901,6 +936,156 @@ mod tests {
         assert!(
             feedback.track_levels[2].load() < 1e-9 && feedback.track_levels[3].load() < 1e-9,
             "unused tracks must be silent"
+        );
+    }
+
+    /// Builds a flat tempo curve control clip for U3b tests.
+    fn tempo_clip(start: u32, span: u32, bpm: f32) -> RtControlClip {
+        let mut curve = RtAutomation {
+            enabled: true,
+            ..RtAutomation::default()
+        };
+        curve.push(RtAutoPoint {
+            tick: 0,
+            value: bpm,
+        });
+        curve.push(RtAutoPoint {
+            tick: span,
+            value: bpm,
+        });
+        RtControlClip {
+            start_ticks: start,
+            span_ticks: span,
+            loop_ticks: span,
+            curve,
+        }
+    }
+
+    /// U3b D4: a tempo curve sampled at the block start governs that same
+    /// block — at 240 BPM the transport covers twice the ticks per block, and
+    /// the UI-side `feedback.bpm` reports the effective value.
+    #[test]
+    fn tempo_curve_overrides_the_transport_clock() {
+        let (mut runner, mut tx, mut structure_tx, feedback, mut compiler) = make_runner(128, 2);
+        let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
+        clips[0] = tempo_clip(0, TICKS_PER_BAR, 240.0);
+        tx.push(EngineCommand::Sequencer(
+            SequencerCommand::SetControlClips { index: 0, clips },
+        ))
+        .expect("queue not full");
+        let update = compiler
+            .set_timeline_in_route(0)
+            .expect("tempo routing should succeed");
+        structure_tx.push(update).expect("structure queue not full");
+        tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
+            .expect("queue not full");
+
+        // 100 blocks × 128 frames. At the base 120 BPM that is half the ticks
+        // the 240 BPM curve produces; derive both from the tick maths so the
+        // assertion does not depend on the harness sample rate.
+        let mut out = vec![0.0f32; 128 * 100 * 2];
+        runner.render_interleaved(&mut out);
+
+        let bpm = feedback.bpm.load();
+        assert!(
+            (bpm - 240.0).abs() < 0.5,
+            "effective BPM should be the curve value, got {bpm}"
+        );
+        let ticks_per_frame = |bpm: f32| bpm / 60.0 * TICKS_PER_QUARTER as f32 / SR;
+        let expected = 100.0 * 128.0 * ticks_per_frame(240.0);
+        let pos = feedback.position_ticks.load();
+        assert!(
+            (pos - expected).abs() <= 12.0,
+            "transport should advance at the curve rate: expected {expected}, position = {pos}"
+        );
+        assert!(
+            pos > 1.8 * 100.0 * 128.0 * ticks_per_frame(120.0),
+            "the curve must roughly double the base advance, position = {pos}"
+        );
+    }
+
+    /// U3b D3: the override is rebuilt every block, so a gap between tempo
+    /// clips drops the transport back to the base BPM instead of freezing at
+    /// the last curve value.
+    #[test]
+    fn tempo_curve_gap_falls_back_to_base() {
+        let (mut runner, mut tx, mut structure_tx, feedback, mut compiler) = make_runner(128, 2);
+        // Bar 1 at 240 BPM, silence (no clip) during bar 2, bar 3 at 240 again.
+        let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
+        clips[0] = tempo_clip(0, TICKS_PER_BAR, 240.0);
+        clips[1] = tempo_clip(2 * TICKS_PER_BAR, TICKS_PER_BAR, 240.0);
+        tx.push(EngineCommand::Sequencer(
+            SequencerCommand::SetControlClips { index: 0, clips },
+        ))
+        .expect("queue not full");
+        let update = compiler
+            .set_timeline_in_route(0)
+            .expect("tempo routing should succeed");
+        structure_tx.push(update).expect("structure queue not full");
+        tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
+            .expect("queue not full");
+
+        // 450 blocks: bar 1 at 240 BPM takes ~375 blocks, the remaining ~75
+        // blocks land in the gap at 120 BPM.
+        let mut out = vec![0.0f32; 128 * 450 * 2];
+        runner.render_interleaved(&mut out);
+
+        let pos = feedback.position_ticks.load();
+        assert!(
+            pos > TICKS_PER_BAR as f32 && pos < (2 * TICKS_PER_BAR) as f32,
+            "the playhead should sit in the gap, position = {pos}"
+        );
+        let bpm = feedback.bpm.load();
+        assert!(
+            (bpm - 120.0).abs() < 0.5,
+            "a tempo gap must fall back to the base BPM, got {bpm}"
+        );
+    }
+
+    /// U3b: with no tempo cable the transport behaves exactly as before (pure
+    /// addition, zero regression) — and dropping the route restores the base.
+    #[test]
+    fn no_tempo_route_keeps_the_base_bpm() {
+        let (mut runner, mut tx, mut structure_tx, feedback, mut compiler) = make_runner(128, 2);
+        let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
+        clips[0] = tempo_clip(0, TICKS_PER_BAR, 240.0);
+        tx.push(EngineCommand::Sequencer(
+            SequencerCommand::SetControlClips { index: 0, clips },
+        ))
+        .expect("queue not full");
+        tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
+            .expect("queue not full");
+
+        let mut out = vec![0.0f32; 128 * 50 * 2];
+        runner.render_interleaved(&mut out);
+        let bpm = feedback.bpm.load();
+        assert!(
+            (bpm - 120.0).abs() < 0.5,
+            "an unrouted curve must not touch the clock, got {bpm}"
+        );
+
+        // Cable the track to the conductor, then cut it: the override applies
+        // while cabled and disappears on disconnect.
+        let update = compiler
+            .set_timeline_in_route(0)
+            .expect("tempo routing should succeed");
+        structure_tx.push(update).expect("structure queue not full");
+        runner.render_interleaved(&mut out);
+        let cabled = feedback.bpm.load();
+        assert!(
+            (cabled - 240.0).abs() < 0.5,
+            "cabled curve should drive the clock, got {cabled}"
+        );
+
+        let update = compiler
+            .clear_auto_route(0)
+            .expect("clearing the route should succeed");
+        structure_tx.push(update).expect("structure queue not full");
+        runner.render_interleaved(&mut out);
+        let cut = feedback.bpm.load();
+        assert!(
+            (cut - 120.0).abs() < 0.5,
+            "cutting the cable restores the base BPM, got {cut}"
         );
     }
 }

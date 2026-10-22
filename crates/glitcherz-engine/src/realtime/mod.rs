@@ -77,7 +77,7 @@ pub use gain::GainProcessor;
 pub use graph::{
     AutoRoute, Cable, ChannelStripProcessor, ExecPlan, FeedbackProcessor, GraphCompiler,
     GraphLevels, GraphUpdate, MASTER_NODE_ID, MAX_CABLES, MAX_MIDI_FANOUT, NodeKind, RtGraph,
-    TopologyError,
+    TIMELINE_IN, TopologyError,
 };
 pub use mixer::{MixerChannel, MixerProcessor};
 pub use processor::{ChannelWeights, MAX_WEIGHT_CHANNELS, Processor, ProcessorChain};

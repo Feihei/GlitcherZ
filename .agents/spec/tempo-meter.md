@@ -1,6 +1,6 @@
 # 拍号与 tempo 控制（U3）Spec
 
-> 状态：草案（2026-10-22，待评审）。拍号（U3a）与 tempo 曲线（U3b）互相独立，可分两批落地。
+> 状态：**已实现**（U3a 拍号 2026-10-22 / U3b tempo 曲线 2026-10-22）。实现要点与踩坑见 `.agents/implementation.md` 的「拍号（U3a）」「tempo 曲线（U3b）」两节。
 > 上游：`timeline.md` D17（control clip 投递窗口）、`node-graph.md` D7（`auto_routes`）、U1（seek / loop 基建）、U2（文件与 dirty）。
 
 ## 1. 背景与问题
@@ -121,11 +121,13 @@ impl TimeSignature {
 - 校验：指向 `TimelineIn` 的线必须是 `Automation`；`AutoParam::Tempo` 只允许出现在 `TimelineIn` 上（`AutoParam` 其它变体不允许指向它）。
 - **端口表**（v1）：`enum TimelineInPort { Tempo }`，patch 与引擎各一份，两者由 `glitcherz-ui/tests/tick_base_consistency.rs` 同类测试锁同步；未来加 `Swing` 等只需扩这个枚举（见 §4.2）。
 
+> **实现注记（2026-10-22 落地后）**：v1 只有一个端口，所以没有真的引入 `TimelineInPort` 枚举——文档侧用 `AutoParam::Tempo`（`is_timeline_in_only()`），引擎侧用 `AutoRoute.slot == TIMELINE_IN` 哨兵，patch 侧端口数直接写 1 并在 `patch.rs` 单测里锁住（`timeline_in_ports_and_cable_rules`）。加第二个端口（如 `Swing`）时再把这个枚举补上，`AutoRoute` 也需多一个 `port` 字段——届时 `TIMELINE_IN` 哨兵的含义从"唯一端口"变成"端口表索引"。
+
 ## 6. 引擎实现
 
 ```text
-UI ──cable→ engine.set_timeline_in_route(auto_index, TimelineInPort::Tempo)
-                └─ 不进 GraphCompiler 的 node_slot 查找 → AutoRoute{slot: TIMELINE_IN, param: Tempo}
+UI ──cable→ engine.set_timeline_in_route(auto_index)      // 单端口，无需 port 参数
+                └─ 不进 GraphCompiler 的 node_slot 查找 → AutoRoute{slot: TIMELINE_IN, param: 占位}
                                                      (TIMELINE_IN = u16::MAX - 1，与 NO_EDGE 区分)
 
 每个 block:

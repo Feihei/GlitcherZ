@@ -214,6 +214,19 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 - **改拍号后的既有对象停在原 tick**：loop 端点、marker、clip 不吸附也不换算（可能不再落在大节线上）；下一次手动拖动才按新网格吸附。这是"拍号是记谱不是变换"的直接结论，别在 UI 里加"自动重排"。
 - **SMF**：导出写真实 `FF 58`（`dd = log2(denominator)`，`cc=24` / `bb=8` 不变）；`import_smf` 返回 `SmfImport{tracks, time_signature}`，首个 `FF 58` 胜出。**导入策略**：`project_files::is_unwritten`（所有 MIDI 轨无音符无 CC 且无控制 clip）时继承文件拍号（此时"导入"等价于"打开"），否则保留工程拍号并在状态栏说明差异——一次导入不应偷偷重划已有内容的网格。
 
+#### tempo 曲线（U3b，2026-10-22）
+
+- **`Timeline In` 不是节点，是身份**：`PortRef::TimelineIn` 与 `PortRef::Master` 同级——无 node_id、不进 `graph.nodes`、无 engine processor、没有 `AddNodeKind`。单例由"不可实例化"保证，所以 `validate` 里**没有**任何"只能有一个"的规则，只有连线规则三条：指向它的线必须是 `Automation`；`AutoParam::Tempo` 只能指向它；它自己的端口表 v1 只有 `Tempo`（`AutoParam` 落成节点参数一律拒绝）。patch 里它就是一个固定 box（`PatchId::TimelineIn`，1 个入端口、0 个出端口），`LayoutDoc.timeline_in` 记住它的位置。
+- **引擎用哨兵路由，不走 `slot`**：`AutoRoute.slot == TIMELINE_IN`（`u16::MAX - 1`，与 `NO_EDGE = u16::MAX` 区分）表示"这条曲线驱动时钟"。`GraphCompiler::set_timeline_in_route()` 直接写这个哨兵，不做 `node_slot` 查找；`RtGraph::auto_set_param` 见到哨兵立即返回（它永远不能落进 `slots`）；block runner 反过来需要一个**只读**的 `RtGraph::auto_route(index)` 来分辨"节点目标 / 时钟目标"。
+- **顺序是功能的一半（D4）**：`evaluate_automation` 从 `advance()` **之后**移到**之前**，用块起始位置采样。放在之后会让每一块都用上一块的 tempo 跑 10 ms——曲线永远慢一拍，长 ramp 上能听出来。改这一处时同时改 `run_next_block` 的步骤注释，否则下一个人会"顺手"挪回去。
+- **每块先清 override**：`evaluate_automation` 开头 `clear_bpm_override()`，再按"首个覆盖当前位置的 clip"设置。空隙里自动回落 `base_bpm`，这与普通参数"clip 外保持最后值"是**有意相反**的：时钟必须有一个确定的基值，否则一段 tempo 曲线结束后速度会永远停在最后一点（D3）。
+- **borrow 拆分的写法**：在 `evaluate_automation` 里同时要 `&sequencer.control_clips()` 与 `&mut graph`，还要随后 `&mut sequencer`。用 `let Self { sequencer, graph, .. } = self;` 拿到两个字段，再把命中结果收进**固定容量栈数组**（`[(usize, f32); MAX_AUTO_TRACKS]` + 计数），最后统一投递——不要为了图省事 `Vec`，那是 RT 违规。
+- **`Sequencer` 两层 tempo**：`base_bpm`（用户拧的）+ `bpm_override: Option<f32>`（每块重算），`effective_bpm()` 统一钳制 20..300（`MIN_BPM`/`MAX_BPM`，非有限值回落 120）。`play` / `stop` / `pause` 清 override；`seek` **不清**——seek 后下一块立刻按目标 tick 重采样，这正是 D4 想要的（覆盖值只活一块）。
+- **UI**：patch 里从控制轨出口拖到 `Timeline In` 的 box 上直接成线（`PatchAction::ConnectTempoIn`，跳过参数弹窗——单端口没有可选项）；Synth 面板的 `Pick Parameter…` 顶部固定一条 `Song Tempo (BPM)`（`AutoTarget::TimelineIn`）。走带 BPM 字段永远显示**用户基值**，播放中若曲线接管，旁边追加 `→ 143.2 auto`（读 `Feedback.bpm` 原子）。曲线纵轴 20..300 对数轴（`lane::axis`）。
+- **`param_id_of` 改返回 `Option<ParamId>`**：`Tempo` 没有也不该有 `ParamId`（它不进 `set_param`）。返回 `Some(default)` 之类的占位值会在将来某次重构里悄悄把 tempo 送进节点通路，宁可让类型系统顶住。调用点只有两处（`apply_document` 的自动化分支、`set_auto_endpoint`）。
+- **测试**：model `timeline_in_accepts_only_tempo_automation`（3 条非法连线逐一拒绝）+ RON 往返（tag `timeline_in` / `Tempo`）；engine `tempo_override_overrides_base_until_cleared` / `transport_edges_drop_the_tempo_override` / `tempo_curve_overrides_the_transport_clock`（位置按 `bpm/60×TPQ/sr` 公式算，**别按 48 kHz 硬编码**——block 测试的 harness 是 44.1 kHz）/ `tempo_curve_gap_falls_back_to_base` / `no_tempo_route_keeps_the_base_bpm`（含"接线 → 生效 → 剪线 → 回落"）；patch `timeline_in_ports_and_cable_rules`。
+- **已知取舍**：`Project::default()` 仍是 0 条控制轨，所以新工程要按 Synth 面板的 `+ Add` 才有一条可拖的 A1 出口。默认轨的取舍留给 U4（控制轨一等化进 timeline 时一并决定），U3 不动默认工程。
+
 #### 钢琴卷帘拖动协议（`piano_roll::DragSelection`）
 
 拖动手势**不持有音符索引**，改为「冻结锚点 + 增量发射」，两条不变量：

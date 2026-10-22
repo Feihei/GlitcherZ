@@ -147,13 +147,28 @@ fn display_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Automation cable endpoint in the UI's terms: a document node parameter, or
+/// the fixed Timeline In terminal (U3b — song tempo, which is a clock rather
+/// than a node parameter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoTarget {
+    /// Document node id (mapped to the engine id when dispatching).
+    Node(u64),
+    /// The fixed conductor terminal (`PortRef::TimelineIn`).
+    TimelineIn,
+}
+
 /// Document automation parameter → engine parameter ID.
-fn param_id_of(param: &AutoParam) -> ParamId {
+///
+/// `None` for [`AutoParam::Tempo`]: tempo never reaches a node's `set_param`
+/// path — the engine route uses the Timeline In sentinel instead (U3b D1/D7).
+fn param_id_of(param: &AutoParam) -> Option<ParamId> {
     match param {
-        AutoParam::TrackGain => ParamId::TrackGain,
-        AutoParam::TrackPan => ParamId::TrackPan,
-        AutoParam::FilterCutoff => ParamId::FilterCutoff,
-        AutoParam::PluginParam { param_id, .. } => ParamId::PluginParam(*param_id),
+        AutoParam::TrackGain => Some(ParamId::TrackGain),
+        AutoParam::TrackPan => Some(ParamId::TrackPan),
+        AutoParam::FilterCutoff => Some(ParamId::FilterCutoff),
+        AutoParam::PluginParam { param_id, .. } => Some(ParamId::PluginParam(*param_id)),
+        AutoParam::Tempo => None,
     }
 }
 
@@ -856,14 +871,23 @@ impl GlitcherZApp {
                     let PortRef::AutoTrack(index) = &cable.from else {
                         continue;
                     };
+                    // U3b: the conductor terminal has no engine node — the
+                    // route is a sentinel slot, not a node lookup.
+                    if cable.to == PortRef::TimelineIn {
+                        if !self.engine.set_timeline_in_route(*index) {
+                            log::warn!("Tempo cable (track {index} → Timeline In) dispatch failed");
+                        }
+                        continue;
+                    }
                     let Some(to) = to_node else {
                         log::warn!("Automation cable target node missing, skipping: {cable:?}");
                         continue;
                     };
-                    if !self
-                        .engine
-                        .set_auto_route(*index, to, param_id_of(&cable.param))
-                    {
+                    let Some(id) = param_id_of(&cable.param) else {
+                        log::warn!("Automation cable carries a non-node parameter: {cable:?}");
+                        continue;
+                    };
+                    if !self.engine.set_auto_route(*index, to, id) {
                         log::warn!("Automation cable (track {index} → {to}) dispatch failed");
                     }
                 }
@@ -1642,21 +1666,27 @@ impl GlitcherZApp {
 
     /// Redirect an automation track's cable endpoint (the document cable stores the **document**
     /// node_id; engine routing maps to the engine-side id via node_map).
-    fn set_auto_endpoint(&mut self, index: usize, doc_id: u64, param: AutoParam) {
+    fn set_auto_endpoint(&mut self, index: usize, target: AutoTarget, param: AutoParam) {
         let before = self.begin_edit();
         self.project_mut().graph.remove_auto_cable(index);
-        self.project_mut()
-            .graph
-            .cables
-            .push(glitcherz_model::CableDoc::automation(
-                index,
-                doc_id,
-                param.clone(),
-            ));
+        let cable = match target {
+            AutoTarget::Node(doc_id) => {
+                glitcherz_model::CableDoc::automation(index, doc_id, param.clone())
+            }
+            // U3b: the terminal's single port fixes the parameter to Tempo.
+            AutoTarget::TimelineIn => glitcherz_model::CableDoc::tempo(index),
+        };
+        self.project_mut().graph.cables.push(cable);
         self.commit_edit("Route Automation", before);
-        if let Some(engine_id) = self.engine_id(doc_id) {
-            self.engine
-                .set_auto_route(index, engine_id, param_id_of(&param));
+        match target {
+            AutoTarget::TimelineIn => {
+                self.engine.set_timeline_in_route(index);
+            }
+            AutoTarget::Node(doc_id) => {
+                if let (Some(engine_id), Some(id)) = (self.engine_id(doc_id), param_id_of(&param)) {
+                    self.engine.set_auto_route(index, engine_id, id);
+                }
+            }
         }
     }
 
@@ -1846,7 +1876,10 @@ impl GlitcherZApp {
                     to_doc,
                     param,
                 } => {
-                    self.set_auto_endpoint(index, to_doc, param);
+                    self.set_auto_endpoint(index, AutoTarget::Node(to_doc), param);
+                }
+                patch::PatchAction::ConnectTempoIn { index } => {
+                    self.set_auto_endpoint(index, AutoTarget::TimelineIn, AutoParam::Tempo);
                 }
                 patch::PatchAction::DeleteCable(i) => {
                     self.delete_cable(i);
@@ -3700,6 +3733,18 @@ impl GlitcherZApp {
                 }
                 if bpm.drag_stopped() {
                     self.end_param_edit();
+                }
+                // U3b: a tempo curve overrides the transport, so show the
+                // effective value it is actually running at (read-only — the
+                // field above stays the user's base tempo).
+                let live_bpm = self.engine.live_bpm();
+                if self.engine.is_playing() && (live_bpm - convert::to_f32(tempo)).abs() > 0.05 {
+                    ui.label(
+                        egui::RichText::new(format!("→ {live_bpm:.1} auto"))
+                            .small()
+                            .color(egui::Color32::from_rgb(230, 190, 70)),
+                    )
+                    .on_hover_text("Tempo curve (Timeline In) is driving the clock");
                 }
                 ui.separator();
                 // U3a: meter. Same read-local-then-write rule as tempo — the
@@ -6641,17 +6686,28 @@ impl GlitcherZApp {
         let sel = self.selected_track;
 
         // Endpoint selection: this track's instrument (cutoff / plugin
-        // parameters). Mixer-fader automation is deferred (P5f decision).
-        // Options carry the **document** node_id (the cable's persisted identity), mapped when
-        // dispatching.
-        let mut options: Vec<(String, u64, AutoParam)> = Vec::new();
+        // parameters) plus the global song tempo. Mixer-fader automation is
+        // deferred (P5f decision). Options carry the **document** node_id (the
+        // cable's persisted identity), mapped when dispatching.
+        let mut options: Vec<(String, AutoTarget, AutoParam)> = Vec::new();
+        // U3b: song tempo is always offered — the conductor terminal is a
+        // fixed entity, so it needs no ownership check.
+        options.push((
+            "Song Tempo (BPM)".to_string(),
+            AutoTarget::TimelineIn,
+            AutoParam::Tempo,
+        ));
         if let Some(voice_doc) = self
             .project()
             .graph
             .instrument_of_track(sel)
             .map(NodeDoc::node_id)
         {
-            options.push(("Cutoff".to_string(), voice_doc, AutoParam::FilterCutoff));
+            options.push((
+                "Cutoff".to_string(),
+                AutoTarget::Node(voice_doc),
+                AutoParam::FilterCutoff,
+            ));
             if let Some(params) = self.clap_voice_params.get(&voice_doc) {
                 for param in params {
                     let label = if param.name.is_empty() {
@@ -6661,7 +6717,7 @@ impl GlitcherZApp {
                     };
                     options.push((
                         format!("CLAP {label}"),
-                        voice_doc,
+                        AutoTarget::Node(voice_doc),
                         AutoParam::PluginParam {
                             param_id: param.id,
                             name: label,
@@ -6678,7 +6734,7 @@ impl GlitcherZApp {
                     };
                     options.push((
                         format!("VST3 {label}"),
-                        voice_doc,
+                        AutoTarget::Node(voice_doc),
                         AutoParam::PluginParam {
                             param_id: param.id,
                             name: label,
@@ -6702,7 +6758,7 @@ impl GlitcherZApp {
                         };
                         options.push((
                             format!("FX CLAP {fx_label} · {label}"),
-                            fx_doc,
+                            AutoTarget::Node(fx_doc),
                             AutoParam::PluginParam {
                                 param_id: param.id,
                                 name: label,
@@ -6719,7 +6775,7 @@ impl GlitcherZApp {
                     };
                     options.push((
                         format!("FX VST3 {fx_label} · {label}"),
-                        fx_doc,
+                        AutoTarget::Node(fx_doc),
                         AutoParam::PluginParam {
                             param_id: param.id,
                             name: label,
@@ -6729,7 +6785,7 @@ impl GlitcherZApp {
             }
         }
 
-        let mut picked: Option<(u64, AutoParam)> = None;
+        let mut picked: Option<(AutoTarget, AutoParam)> = None;
         ui.horizontal(|ui| {
             ui.label("Target");
             ui.menu_button("Pick Parameter…", |ui| {
@@ -6758,28 +6814,30 @@ impl GlitcherZApp {
                     visible.len(),
                     |ui, range| {
                         for row in range {
-                            let (label, doc_id, param) = &options[visible[row]];
+                            let (label, target, param) = &options[visible[row]];
                             if ui.button(label).clicked() {
-                                picked = Some((*doc_id, param.clone()));
+                                picked = Some((*target, param.clone()));
                                 ui.close();
                             }
                         }
                     },
                 );
             });
-            if let Some((doc_id, param)) = picked {
-                self.set_auto_endpoint(index, doc_id, param);
+            if let Some((target, param)) = picked {
+                self.set_auto_endpoint(index, target, param);
             }
             // Current endpoint display.
             let current = self
                 .project()
                 .graph
-                .auto_endpoint(index)
-                .map(|param| match &param {
-                    AutoParam::TrackGain => "Volume".to_string(),
-                    AutoParam::TrackPan => "Pan".to_string(),
-                    AutoParam::FilterCutoff => "Cutoff".to_string(),
-                    AutoParam::PluginParam { name, .. } => name.clone(),
+                .auto_target(index)
+                .map(|(port, param)| match (port, param) {
+                    (PortRef::TimelineIn, _) => "Song Tempo".to_string(),
+                    (_, AutoParam::TrackGain) => "Volume".to_string(),
+                    (_, AutoParam::TrackPan) => "Pan".to_string(),
+                    (_, AutoParam::FilterCutoff) => "Cutoff".to_string(),
+                    (_, AutoParam::PluginParam { name, .. }) => name.clone(),
+                    (_, AutoParam::Tempo) => "Song Tempo".to_string(),
                 })
                 .unwrap_or_else(|| "Not connected".to_string());
             ui.weak(format!("-> {current}"));
@@ -7436,7 +7494,9 @@ mod inline_param_tests {
                 param_id: 7,
                 name: String::new()
             }),
-            ParamId::PluginParam(7)
+            Some(ParamId::PluginParam(7))
         );
+        // U3b: tempo has no ParamId — it never reaches a node's set_param.
+        assert_eq!(param_id_of(&AutoParam::Tempo), None);
     }
 }

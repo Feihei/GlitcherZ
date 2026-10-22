@@ -188,6 +188,12 @@ pub enum PatchId {
     Master,
     /// The arrangement timeline (one box; one output port per track).
     Timeline,
+    /// The timeline **input terminal** (U3b, spec `tempo-meter.md` D1): a
+    /// fixed pure sink mirroring [`PatchId::Timeline`]. No outputs, one input
+    /// port (`Tempo`), always present, never deletable or duplicable — the
+    /// identity is the singleton guarantee, so no validation or guard code is
+    /// needed (D2).
+    TimelineIn,
 }
 
 /// Kind of node the user wants to add via the patch context menu.
@@ -235,6 +241,10 @@ pub enum PatchAction {
         to_doc: u64,
         param: AutoParam,
     },
+    /// Automation cable drag onto the fixed Timeline In terminal (U3b): the
+    /// single `Tempo` port needs no parameter popup (D7), so the cable is
+    /// committed directly.
+    ConnectTempoIn { index: usize },
     /// Delete a cable (index into the document cable table).
     DeleteCable(usize),
     /// Delete a node (document node_id; any instrument / effect / channel strip is
@@ -394,6 +404,9 @@ const INLINE_LABEL_WIDTH: f32 = 34.0;
 const TIMELINE_WIDTH: f32 = 150.0;
 const TIMELINE_ROW_HEIGHT: f32 = 26.0;
 const TIMELINE_MIN_HEIGHT: f32 = 40.0;
+/// Timeline In terminal size (U3b): one port row, same width as the timeline
+/// box it mirrors.
+const TIMELINE_IN_SIZE: Vec2 = Vec2::new(TIMELINE_WIDTH, 52.0);
 /// Fixed patch height.
 const CANVAS_HEIGHT: f32 = 300.0;
 /// Output port circle radius / hit radius (generous so port drags are easy to start).
@@ -438,6 +451,8 @@ fn node_color(id: PatchId, doc: &GraphDoc) -> (Color32, Color32) {
     let stroke = match id {
         PatchId::Master => Color32::from_rgb(230, 110, 90),
         PatchId::Timeline => Color32::from_rgb(170, 120, 225),
+        // The sink shares the timeline's identity colour (same subsystem).
+        PatchId::TimelineIn => Color32::from_rgb(150, 105, 205),
         PatchId::Node(id) => match doc.node_by_id(id) {
             Some(NodeDoc::Instrument { .. }) => Color32::from_rgb(90, 160, 220),
             Some(NodeDoc::Effect { .. }) => Color32::from_rgb(220, 150, 70),
@@ -451,6 +466,7 @@ fn node_color(id: PatchId, doc: &GraphDoc) -> (Color32, Color32) {
     let fill = match id {
         PatchId::Master => Color32::from_rgb(52, 32, 30),
         PatchId::Timeline => Color32::from_rgb(38, 30, 50),
+        PatchId::TimelineIn => Color32::from_rgb(33, 26, 44),
         PatchId::Node(_) => Color32::from_rgb(34, 38, 46),
     };
     (stroke, fill)
@@ -494,6 +510,7 @@ fn inline_row_count(id: PatchId, deps: &PatchDeps) -> usize {
 fn size_of(id: PatchId, deps: &PatchDeps) -> Vec2 {
     let base = match id {
         PatchId::Timeline => timeline_size(deps.track_count, deps.auto_count),
+        PatchId::TimelineIn => TIMELINE_IN_SIZE,
         PatchId::Node(node_id) => match deps.doc.node_by_id(node_id) {
             Some(NodeDoc::Mixer { inputs, .. }) => Vec2::new(
                 NODE_SIZE.x,
@@ -515,6 +532,7 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
     match id {
         PatchId::Master => "Master Out".to_string(),
         PatchId::Timeline => "Timeline".to_string(),
+        PatchId::TimelineIn => "Timeline In".to_string(),
         PatchId::Node(node_id) => match doc.node_by_id(node_id) {
             Some(NodeDoc::Instrument { voice, track, .. }) => match voice {
                 VoiceSpec::Builtin => format!("Synth · Track {}", track + 1),
@@ -553,6 +571,7 @@ fn auto_param_label(param: &AutoParam) -> String {
         AutoParam::TrackPan => "Pan".to_string(),
         AutoParam::FilterCutoff => "Cutoff".to_string(),
         AutoParam::PluginParam { name, .. } => name.clone(),
+        AutoParam::Tempo => "Tempo".to_string(),
     }
 }
 
@@ -575,7 +594,7 @@ impl PatchState {
             .iter()
             .filter_map(|id| match id {
                 PatchId::Node(doc) => Some(*doc),
-                PatchId::Timeline | PatchId::Master => None,
+                PatchId::Timeline | PatchId::Master | PatchId::TimelineIn => None,
             })
             .collect()
     }
@@ -614,6 +633,8 @@ impl PatchState {
         };
         match id {
             PatchId::Master => Vec::new(),
+            // The timeline input is a pure sink: no outputs (U3b).
+            PatchId::TimelineIn => Vec::new(),
             PatchId::Timeline => {
                 let n = timeline_port_count(deps.track_count, deps.auto_count);
                 (0..n)
@@ -637,6 +658,8 @@ impl PatchState {
         };
         let n = match id {
             PatchId::Timeline => return Vec::new(),
+            // v1 port table: `Tempo` only (spec §4.2 lists future slots).
+            PatchId::TimelineIn => 1,
             PatchId::Master => 1,
             PatchId::Node(node_id) => match deps.doc.node_by_id(node_id) {
                 Some(node) if node.is_mixer() => {
@@ -710,6 +733,13 @@ impl PatchState {
             .entry(PatchId::Master)
             .or_insert(Pos2::new(930.0, y_center));
 
+        // The fixed Timeline In sink (U3b) sits below the master output —
+        // same right-hand column, i.e. where signals terminate.
+        wanted.push(PatchId::TimelineIn);
+        self.positions
+            .entry(PatchId::TimelineIn)
+            .or_insert(Pos2::new(930.0, y_center + 96.0));
+
         // Prune positions of deleted entities to prevent unbounded hashmap growth.
         self.positions.retain(|id, _| wanted.contains(id));
     }
@@ -734,6 +764,7 @@ impl PatchState {
                 }
                 PatchId::Timeline => layout.timeline = Some([p.x, p.y]),
                 PatchId::Master => layout.master = Some([p.x, p.y]),
+                PatchId::TimelineIn => layout.timeline_in = Some([p.x, p.y]),
             }
         }
         layout
@@ -753,6 +784,9 @@ impl PatchState {
         }
         if let Some([x, y]) = layout.master {
             self.positions.insert(PatchId::Master, Pos2::new(x, y));
+        }
+        if let Some([x, y]) = layout.timeline_in {
+            self.positions.insert(PatchId::TimelineIn, Pos2::new(x, y));
         }
     }
 
@@ -949,6 +983,7 @@ fn patch_port_from(port: &PortRef, midi_count: usize) -> Option<(PatchId, usize)
         PortRef::MidiTrack(t) => Some((PatchId::Timeline, *t)),
         PortRef::AutoTrack(i) => Some((PatchId::Timeline, midi_count + i)),
         PortRef::Master => None, // The master output is not a valid audio source.
+        PortRef::TimelineIn => None, // Pure sink: no output ports.
     }
 }
 
@@ -957,6 +992,7 @@ fn patch_port_to(port: &PortRef) -> Option<PatchId> {
     match port {
         PortRef::Node(id) => Some(PatchId::Node(*id)),
         PortRef::Master => Some(PatchId::Master),
+        PortRef::TimelineIn => Some(PatchId::TimelineIn),
         _ => None,
     }
 }
@@ -979,7 +1015,16 @@ fn accepts(kind: CableKind, target: PatchId, doc: &GraphDoc) -> bool {
             CableKind::Automation => matches!(node, NodeDoc::Instrument { .. }),
         }
     } else {
-        matches!(target, PatchId::Master) && kind == CableKind::Audio
+        match target {
+            PatchId::Master => kind == CableKind::Audio,
+            // U3b D7: the conductor terminal only takes automation (its sole
+            // port is `Tempo`); audio / MIDI cables are rejected like any
+            // other port-type mismatch.
+            PatchId::TimelineIn => kind == CableKind::Automation,
+            PatchId::Timeline => false,
+            // Handled by the `if let` above (unreachable here).
+            PatchId::Node(_) => false,
+        }
     }
 }
 
@@ -1292,16 +1337,26 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                                         actions.push(PatchAction::ConnectMidi { track, to_doc });
                                     }
                                 }
-                                PortRef::AutoTrack(index) => {
-                                    if accepts(CableKind::Automation, target, doc)
-                                        && let PatchId::Node(to_doc) = target
-                                    {
-                                        // The cable is committed after the parameter is
-                                        // picked in the popup menu.
-                                        state.pending_auto =
-                                            Some((index, to_doc, sp + Vec2::new(4.0, 4.0)));
+                                PortRef::AutoTrack(index)
+                                    if accepts(CableKind::Automation, target, doc) =>
+                                {
+                                    match target {
+                                        // The conductor terminal has a single
+                                        // port, so the cable commits straight
+                                        // away — no parameter popup (U3b D7).
+                                        PatchId::TimelineIn => {
+                                            actions.push(PatchAction::ConnectTempoIn { index });
+                                        }
+                                        PatchId::Node(to_doc) => {
+                                            // The cable is committed after the
+                                            // parameter is picked in the popup menu.
+                                            state.pending_auto =
+                                                Some((index, to_doc, sp + Vec2::new(4.0, 4.0)));
+                                        }
+                                        _ => {}
                                     }
                                 }
+                                PortRef::AutoTrack(_) => {}
                                 _ => {}
                             }
                         }
@@ -1353,6 +1408,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                             }
                         }
                         PatchId::Master => {}
+                        // A pure sink has no output port, so no drag can start
+                        // here (U3b).
+                        PatchId::TimelineIn => {}
                     }
                 }
             }
@@ -1459,6 +1517,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 }
             }
             PatchId::Master => CableKind::Audio,
+            // Unreachable (no output ports); automation keeps the type
+            // consistent with the terminal's port table.
+            PatchId::TimelineIn => CableKind::Automation,
         };
         if let Some(sp) = pointer {
             let p0 = state
@@ -1511,6 +1572,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         let text = label_of(id, doc);
         let text_pos = match id {
             PatchId::Timeline => Pos2::new(r.center().x, r.top() + 12.0),
+            PatchId::TimelineIn => Pos2::new(r.center().x, r.top() + 12.0),
             _ => Pos2::new(r.center().x, r.top() + 18.0),
         };
         painter.text(
@@ -1558,10 +1620,25 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             }
         }
         // Input ports: mixers draw one per channel (P5f D17), other nodes /
-        // master the single port 0.
-        for (_, p) in state.in_ports_screen(rect.min, id, &deps) {
-            painter.circle_filled(p, PORT_RADIUS, Color32::from_gray(90));
+        // master the single port 0. The Timeline In terminal names its port
+        // (U3b: v1 has the `Tempo` port only).
+        for (port, p) in state.in_ports_screen(rect.min, id, &deps) {
+            let inbound = if matches!(id, PatchId::TimelineIn) {
+                cable_color(CableKind::Automation)
+            } else {
+                Color32::from_gray(90)
+            };
+            painter.circle_filled(p, PORT_RADIUS, inbound);
             painter.circle_stroke(p, PORT_RADIUS, egui::Stroke::new(1.0, Color32::BLACK));
+            if matches!(id, PatchId::TimelineIn) && port == 0 {
+                painter.text(
+                    Pos2::new(p.x + 10.0, p.y),
+                    egui::Align2::LEFT_CENTER,
+                    "Tempo",
+                    FontId::proportional(10.0),
+                    Color32::from_gray(170),
+                );
+            }
         }
     }
 
@@ -1815,6 +1892,11 @@ mod tests {
         assert!(state.positions.contains_key(&PatchId::Master));
         // T4: one explicit Timeline entity instead of per-track source boxes.
         assert!(state.positions.contains_key(&PatchId::Timeline));
+        // U3b: the Timeline In sink is a fixed entity too — always present.
+        assert!(
+            state.positions.contains_key(&PatchId::TimelineIn),
+            "the conductor terminal must always exist in the patch"
+        );
         assert_eq!(
             state
                 .positions
@@ -1823,6 +1905,56 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// U3b D1/D7: the conductor terminal is a pure sink with a single
+    /// automation input port — no outputs, and it rejects audio / MIDI cables
+    /// exactly like any other port-type mismatch.
+    #[test]
+    fn timeline_in_ports_and_cable_rules() {
+        let project = Project::default();
+        let doc = &project.graph;
+        let deps = PatchDeps {
+            doc,
+            track_count: project.midi_tracks.len(),
+            auto_count: project.control_tracks.len(),
+            auto_options: &|_| Vec::new(),
+            plugin_inline: &|_| Vec::new(),
+        };
+        let mut state = PatchState::default();
+        state.ensure_positions(doc, deps.track_count, deps.auto_count);
+
+        let min = Pos2::ZERO;
+        assert!(
+            state
+                .out_ports_screen(min, PatchId::TimelineIn, &deps)
+                .is_empty(),
+            "a pure sink has no output ports"
+        );
+        assert_eq!(
+            state.in_ports_screen(min, PatchId::TimelineIn, &deps).len(),
+            1,
+            "v1 exposes exactly the Tempo port"
+        );
+
+        assert!(accepts(CableKind::Automation, PatchId::TimelineIn, doc));
+        assert!(!accepts(CableKind::Audio, PatchId::TimelineIn, doc));
+        assert!(!accepts(CableKind::Midi, PatchId::TimelineIn, doc));
+
+        // Cable endpoint resolution: the sink is a valid target, never a
+        // source; the timeline itself accepts nothing.
+        assert_eq!(
+            patch_port_to(&PortRef::TimelineIn),
+            Some(PatchId::TimelineIn)
+        );
+        assert_eq!(
+            patch_port_from(&PortRef::TimelineIn, deps.track_count),
+            None
+        );
+        assert!(!accepts(CableKind::Automation, PatchId::Timeline, doc));
+
+        // The layout round-trips the sink's position like master / timeline.
+        assert!(state.export_layout(doc).timeline_in.is_some());
     }
 
     /// A freshly added node's placed position must survive `ensure_positions`
