@@ -222,6 +222,10 @@ pub enum PatchAction {
     /// Add a new node of `kind` at graph-space position `at` (right-click menu). The new
     /// node is born dangling (no cables; D6 dangling semantics) — the user wires it up.
     AddNode { kind: AddNodeKind, at: Pos2 },
+    /// Re-scan every plugin module, ignoring the cached stats (U9 E2, spec
+    /// `plugin-browser.md` §5.4). The catalog queues the work; the caller only
+    /// restarts the scan.
+    RescanPlugins,
     /// Audio cable drag: source document node → target (node or master output).
     /// `in_port` binds the cable to the target's input port — the mixer channel
     /// (D17; 0 for single-input nodes / master).
@@ -1254,6 +1258,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     // closure runs only while the menu is open. egui 0.36's `context_menu` closure
     // returns `()`, so the pick is collected through a captured outer variable.
     let mut picked_kind: Option<AddNodeKind> = None;
+    let mut rescan_plugins = false;
     if !(response.secondary_clicked() && ctrl) {
         response.context_menu(|ui| {
             ui.set_min_width(120.0);
@@ -1273,7 +1278,17 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             if ui.button("Feedback Tap").clicked() {
                 picked_kind = Some(AddNodeKind::Feedback);
             }
+            ui.separator();
+            // U9 E2: full plugin re-scan on demand (the startup scan is
+            // cached, so this is the escape hatch after installing or
+            // removing plugins while the app is closed).
+            if ui.button("Rescan Plug-ins").clicked() {
+                rescan_plugins = true;
+            }
         });
+    }
+    if rescan_plugins {
+        actions.push(PatchAction::RescanPlugins);
     }
     if let Some(kind) = picked_kind
         && let Some(at) = state.add_menu_at.take()

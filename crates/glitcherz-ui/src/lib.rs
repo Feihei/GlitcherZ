@@ -332,6 +332,10 @@ const RECENT_FILES_MAX: usize = 8;
 /// Key for [`UiState`] in eframe storage.
 const UI_STATE_KEY: &str = "glitcherz_ui_state";
 
+/// Key for the encoded plugin catalog in eframe storage (spec
+/// `plugin-browser.md` D11).
+const PLUGIN_CACHE_KEY: &str = "plugin_cache";
+
 /// Status bar message display duration.
 const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(8);
 
@@ -576,14 +580,10 @@ pub struct GlitcherZApp {
     /// receipt arrives (the dynamic library must stay alive until the old node truly leaves the
     /// processing graph).
     retiring_guards: Vec<PluginGuardEntry>,
-    /// Scanned CLAP instrument list (lazy scan cache).
-    clap_plugins: Option<Vec<glitcherz_clap_host::ClapPluginInfo>>,
-    /// Scanned CLAP effect list (lazy scan cache).
-    clap_effects: Option<Vec<glitcherz_clap_host::ClapPluginInfo>>,
-    /// Scanned VST3 instrument list (lazy scan cache).
-    vst3_plugins: Option<Vec<glitcherz_vst3_host::Vst3PluginInfo>>,
-    /// Scanned VST3 effect list (lazy scan cache).
-    vst3_effects: Option<Vec<glitcherz_vst3_host::Vst3PluginInfo>>,
+    /// Plugin catalog: startup scan state plus the entry table both plugin
+    /// pickers read (spec `.agents/spec/plugin-browser.md`, U9 E2). Replaces
+    /// the four lazy per-format scan caches.
+    plugin_catalog: plugin_catalog::PluginCatalog,
     /// Instrument VST3 parameter lists (read at instantiation), keyed by
     /// **document node_id** (G4: node-addressed like the effect caches, so
     /// multi-instrument tracks keep independent panels). For
@@ -711,6 +711,11 @@ impl GlitcherZApp {
             .storage
             .and_then(|storage| eframe::get_value(storage, UI_STATE_KEY))
             .unwrap_or_default();
+        // U9 E2: the plugin catalog restores from storage and plans the
+        // startup scan (a warm cache usually leaves nothing to do).
+        let cached_plugins = cc
+            .storage
+            .and_then(|storage| storage.get_string(PLUGIN_CACHE_KEY));
         let mut app = Self {
             engine,
             session: glitcherz_command::Session::new(Project {
@@ -744,10 +749,7 @@ impl GlitcherZApp {
             was_playing: false,
             voice_guards: Vec::new(),
             retiring_guards: Vec::new(),
-            clap_plugins: None,
-            clap_effects: None,
-            vst3_plugins: None,
-            vst3_effects: None,
+            plugin_catalog: plugin_catalog::PluginCatalog::load(cached_plugins.as_deref()),
             voice_params: HashMap::new(),
             clap_voice_params: HashMap::new(),
             clap_voice_values: HashMap::new(),
@@ -1843,6 +1845,10 @@ impl GlitcherZApp {
             match action {
                 patch::PatchAction::AddNode { kind, at } => {
                     self.add_patch_node(kind, at);
+                }
+                patch::PatchAction::RescanPlugins => {
+                    self.plugin_catalog.rescan();
+                    self.set_message("Rescanning plug-ins…".to_string());
                 }
                 patch::PatchAction::InsertNode { cable, kind, at } => {
                     self.insert_node_in_cable(cable, kind, at);
@@ -3507,56 +3513,33 @@ impl GlitcherZApp {
             .collect()
     }
 
-    /// Scanned CLAP instruments (lazy).
-    fn scanned_instruments(&mut self) -> &[glitcherz_clap_host::ClapPluginInfo] {
-        if self.clap_plugins.is_none() {
-            self.clap_plugins = Some(
-                glitcherz_clap_host::list_clap_plugins()
-                    .into_iter()
-                    .filter(|info| info.is_instrument)
-                    .collect(),
-            );
-        }
-        self.clap_plugins.as_deref().unwrap_or(&[])
+    /// Plugin entries for one picker view (spec `plugin-browser.md` D8:
+    /// instruments and effects are partitioned at query time from the single
+    /// catalog, never scanned twice). Entries scanned so far are usable while
+    /// the startup scan is still running.
+    fn plugin_entries(
+        &self,
+        format: plugin_catalog::PluginFormat,
+        want_instrument: bool,
+    ) -> Vec<&plugin_catalog::PluginEntry> {
+        plugin_catalog::view(self.plugin_catalog.entries(), format, want_instrument).collect()
     }
 
-    /// Scanned CLAP effects (lazy).
-    fn scanned_effects(&mut self) -> &[glitcherz_clap_host::ClapPluginInfo] {
-        if self.clap_effects.is_none() {
-            self.clap_effects = Some(
-                glitcherz_clap_host::list_clap_plugins()
-                    .into_iter()
-                    .filter(|info| !info.is_instrument)
-                    .collect(),
-            );
+    /// Empty-list placeholder for a plugin menu: during the startup scan the
+    /// list is legitimately empty, so say so instead of "no plugins found".
+    fn plugin_empty_hint(&self, format: plugin_catalog::PluginFormat) -> &'static str {
+        if self.plugin_catalog.is_scanning() {
+            "(scanning plug-ins…)"
+        } else {
+            match format {
+                plugin_catalog::PluginFormat::Clap => {
+                    "(no plugins found; set GLITCHERZ_CLAP_PATH to add dirs)"
+                }
+                plugin_catalog::PluginFormat::Vst3 => {
+                    "(no plugins found; set GLITCHERZ_VST3_PATH to add dirs)"
+                }
+            }
         }
-        self.clap_effects.as_deref().unwrap_or(&[])
-    }
-
-    /// Scanned VST3 instruments (lazy).
-    fn scanned_vst3_instruments(&mut self) -> &[glitcherz_vst3_host::Vst3PluginInfo] {
-        if self.vst3_plugins.is_none() {
-            self.vst3_plugins = Some(
-                glitcherz_vst3_host::list_vst3_plugins()
-                    .into_iter()
-                    .filter(|info| info.is_instrument)
-                    .collect(),
-            );
-        }
-        self.vst3_plugins.as_deref().unwrap_or(&[])
-    }
-
-    /// Scanned VST3 effects (lazy).
-    fn scanned_vst3_effects(&mut self) -> &[glitcherz_vst3_host::Vst3PluginInfo] {
-        if self.vst3_effects.is_none() {
-            self.vst3_effects = Some(
-                glitcherz_vst3_host::list_vst3_plugins()
-                    .into_iter()
-                    .filter(|info| !info.is_instrument)
-                    .collect(),
-            );
-        }
-        self.vst3_effects.as_deref().unwrap_or(&[])
     }
 
     fn send_sequencer(&mut self, cmd: SequencerCommand) {
@@ -4697,6 +4680,46 @@ impl GlitcherZApp {
         });
     }
 
+    /// U9 E2: thin banner shown while the startup plugin scan still has
+    /// modules queued.
+    ///
+    /// It names the module the frame will block on at its end (spec D14), so
+    /// a plugin that hangs inside its metadata read leaves its own name on
+    /// screen — the only diagnostic in-process scanning can offer.
+    fn plugin_scan_banner(&self, ui: &mut egui::Ui) {
+        let Some(upcoming) = self.plugin_catalog.upcoming() else {
+            return;
+        };
+        let (done, total) = self.plugin_catalog.progress();
+        let name = upcoming
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| upcoming.path.display().to_string());
+        egui::Panel::top("glitcherz_plugin_scan").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                        .desired_width(140.0)
+                        .text(format!("{done}/{total}")),
+                );
+                ui.weak(format!("Scanning plug-ins — {name}"));
+            });
+        });
+    }
+
+    /// U9 E2: scans exactly one module at the **end** of the frame (spec D14).
+    ///
+    /// A module that fails to load yields nothing; progress advances either
+    /// way so the queue always drains.
+    fn plugin_scan_step(&mut self) {
+        let Some(candidate) = self.plugin_catalog.take_next() else {
+            return;
+        };
+        let entries = plugin_catalog::scan_module(&candidate);
+        self.plugin_catalog.accept(entries);
+    }
+
     fn status_panel(&mut self, ui: &mut egui::Ui) {
         let info = self.engine.info().clone();
         let position = self.engine.position_seconds();
@@ -4904,15 +4927,13 @@ impl GlitcherZApp {
                 // conflicts).
                 let mut picked: Option<(String, String)> = None;
                 ui.menu_button("CLAP Instruments…", |ui| {
-                    let empty: Vec<glitcherz_clap_host::ClapPluginInfo> = Vec::new();
-                    let plugins = self.scanned_instruments();
-                    let list = if plugins.is_empty() { &empty } else { plugins };
+                    let list = self.plugin_entries(plugin_catalog::PluginFormat::Clap, true);
                     if list.is_empty() {
-                        ui.weak("(no instrument plugins found; set GLITCHERZ_CLAP_PATH to add dirs)");
+                        ui.weak(self.plugin_empty_hint(plugin_catalog::PluginFormat::Clap));
                     }
-                    for info in list {
+                    for info in &list {
                         if ui.button(&info.name).clicked() {
-                            picked = Some((info.path.display().to_string(), info.id.clone()));
+                            picked = Some((info.path.clone(), info.id.clone()));
                             ui.close();
                         }
                     }
@@ -4933,15 +4954,13 @@ impl GlitcherZApp {
                 }
                 let mut vst3_picked: Option<(String, String)> = None;
                 ui.menu_button("VST3 Instruments…", |ui| {
-                    let empty: Vec<glitcherz_vst3_host::Vst3PluginInfo> = Vec::new();
-                    let plugins = self.scanned_vst3_instruments();
-                    let list = if plugins.is_empty() { &empty } else { plugins };
+                    let list = self.plugin_entries(plugin_catalog::PluginFormat::Vst3, true);
                     if list.is_empty() {
-                        ui.weak("(no VST3 plugins found; set GLITCHERZ_VST3_PATH to add dirs)");
+                        ui.weak(self.plugin_empty_hint(plugin_catalog::PluginFormat::Vst3));
                     }
-                    for info in list {
+                    for info in &list {
                         if ui.button(&info.name).clicked() {
-                            vst3_picked = Some((info.path.display().to_string(), info.cid.clone()));
+                            vst3_picked = Some((info.path.clone(), info.id.clone()));
                             ui.close();
                         }
                     }
@@ -5128,16 +5147,13 @@ impl GlitcherZApp {
                         clear_effects = true;
                         ui.close();
                     }
-                    let empty: Vec<glitcherz_clap_host::ClapPluginInfo> = Vec::new();
-                    let plugins = self.scanned_effects();
-                    let list = if plugins.is_empty() { &empty } else { plugins };
+                    let list = self.plugin_entries(plugin_catalog::PluginFormat::Clap, false);
                     if list.is_empty() {
-                        ui.weak("(no effect plugins found)");
+                        ui.weak(self.plugin_empty_hint(plugin_catalog::PluginFormat::Clap));
                     }
-                    for info in list {
+                    for info in &list {
                         if ui.button(&info.name).clicked() {
-                            effect_picked =
-                                Some((info.path.display().to_string(), info.id.clone()));
+                            effect_picked = Some((info.path.clone(), info.id.clone()));
                             ui.close();
                         }
                     }
@@ -5150,16 +5166,13 @@ impl GlitcherZApp {
                 }
                 let mut vst3_effect_picked: Option<(String, String)> = None;
                 ui.menu_button("VST3 Effects…", |ui| {
-                    let empty: Vec<glitcherz_vst3_host::Vst3PluginInfo> = Vec::new();
-                    let plugins = self.scanned_vst3_effects();
-                    let list = if plugins.is_empty() { &empty } else { plugins };
+                    let list = self.plugin_entries(plugin_catalog::PluginFormat::Vst3, false);
                     if list.is_empty() {
-                        ui.weak("(no VST3 effect plugins found)");
+                        ui.weak(self.plugin_empty_hint(plugin_catalog::PluginFormat::Vst3));
                     }
-                    for info in list {
+                    for info in &list {
                         if ui.button(&info.name).clicked() {
-                            vst3_effect_picked =
-                                Some((info.path.display().to_string(), info.cid.clone()));
+                            vst3_effect_picked = Some((info.path.clone(), info.id.clone()));
                             ui.close();
                         }
                     }
@@ -7178,6 +7191,12 @@ impl eframe::App for GlitcherZApp {
                 recent_files: self.recent.clone(),
             },
         );
+        // U9 E2: the plugin catalog (spec `plugin-browser.md` D11). A partial
+        // catalog is still a valid cache — the next launch keeps the scanned
+        // modules and replans the rest.
+        if let Some(text) = plugin_catalog::encode(&self.plugin_catalog.to_cache()) {
+            storage.set_string(PLUGIN_CACHE_KEY, text);
+        }
     }
 
     // eframe 0.36: the App trait entry point changed from update(ctx) to ui(&mut Ui);
@@ -7259,6 +7278,10 @@ impl eframe::App for GlitcherZApp {
         }
         self.was_playing = playing;
 
+        // U9 E2: the plugin-scan banner sits above the transport while the
+        // startup scan has modules left (it names the module the frame's tail
+        // will block on, spec D14).
+        self.plugin_scan_banner(ui);
         self.transport_panel(ui);
         self.status_panel(ui);
         self.view_tabs(ui);
@@ -7423,6 +7446,15 @@ impl eframe::App for GlitcherZApp {
         if self.allow_close && !self.close_sent {
             self.close_sent = true;
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // U9 E2: the startup plugin scan runs at the very end of the frame —
+        // one module per frame, after every panel has been drawn (spec D14).
+        // While modules remain, ask for the next frame immediately so the
+        // queue drains faster than the 50 ms display tick below.
+        self.plugin_scan_step();
+        if self.plugin_catalog.is_scanning() {
+            ui.ctx().request_repaint();
         }
 
         // Audio-driven displays (level meter, playback position, envelope) need periodic

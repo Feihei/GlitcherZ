@@ -17,7 +17,7 @@
 //! classes), which is why cache validity is tracked **per module path**, not
 //! per entry.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -337,6 +337,138 @@ pub fn decode(text: &str) -> Option<PluginCache> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Runtime scan state
+// ---------------------------------------------------------------------------
+
+/// Runtime scan state (spec §5.4).
+///
+/// The frame loop drives it: read [`PluginCatalog::upcoming`] while drawing
+/// the progress banner, call [`PluginCatalog::next`] at the **end** of the
+/// frame, then feed the result back through [`PluginCatalog::accept`]
+/// (spec D14 — the frame only ever blocks on a module it has already
+/// announced on screen).
+pub struct PluginCatalog {
+    /// Search directories this catalog was built from (cache key, spec D7).
+    dirs: Vec<String>,
+    /// Usable entries, sorted for the picker.
+    entries: Vec<PluginEntry>,
+    /// Modules still waiting for a scan, in discovery order.
+    pending: VecDeque<CandidateFile>,
+    /// Modules scanned in this pass.
+    scanned: usize,
+    /// Modules this pass started with.
+    total: usize,
+}
+
+impl PluginCatalog {
+    /// Builds the catalog from the persisted blob (spec D11).
+    ///
+    /// A missing or malformed blob simply means "cold start"; a warm cache
+    /// with no changed module yields an idle catalog with no scan to run.
+    pub fn load(cache_text: Option<&str>) -> Self {
+        let cache = cache_text.and_then(decode).unwrap_or_default();
+        Self::with_snapshot(&cache, collect_from_disk())
+    }
+
+    /// Testable constructor: plan a refresh against an explicit snapshot.
+    pub fn with_snapshot(cache: &PluginCache, snapshot: DiskScanInput) -> Self {
+        let plan = plan_refresh(cache, &snapshot.dirs, &snapshot.candidates);
+        if !plan.removed.is_empty() {
+            log::info!(
+                "{} plugin module(s) referenced by the cache are gone",
+                plan.removed.len()
+            );
+        }
+        let mut entries = plan.keep;
+        sort_entries(&mut entries);
+        Self {
+            dirs: snapshot.dirs,
+            entries,
+            total: plan.rescan.len(),
+            pending: plan.rescan.into(),
+            scanned: 0,
+        }
+    }
+
+    /// Usable entries (cache hits plus everything scanned so far).
+    pub fn entries(&self) -> &[PluginEntry] {
+        &self.entries
+    }
+
+    /// Module the next [`PluginCatalog::next`] will read — the name shown in
+    /// the progress banner before the frame blocks on it (spec D14).
+    pub fn upcoming(&self) -> Option<&CandidateFile> {
+        self.pending.front()
+    }
+
+    /// Takes the next module to scan. The caller scans it and calls
+    /// [`PluginCatalog::accept`] whatever the outcome (progress must advance
+    /// even when a module yields nothing).
+    pub fn take_next(&mut self) -> Option<CandidateFile> {
+        self.pending.pop_front()
+    }
+
+    /// Folds one module's scan result into the table.
+    pub fn accept(&mut self, scanned: Vec<PluginEntry>) {
+        self.scanned += 1;
+        self.entries = merge(std::mem::take(&mut self.entries), scanned);
+    }
+
+    /// `true` while modules remain to be scanned.
+    pub fn is_scanning(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// `(scanned, total)` for this pass.
+    pub fn progress(&self) -> (usize, usize) {
+        (self.scanned, self.total)
+    }
+
+    /// Forces a full re-scan, ignoring every cached stat (`Rescan Plugins`).
+    pub fn rescan(&mut self) {
+        // An empty cache with no directories never matches, so every
+        // candidate ends up in the rescan list (spec §5.4).
+        *self = Self::with_snapshot(&PluginCache::default(), collect_from_disk());
+    }
+
+    /// Snapshot for persistence.
+    pub fn to_cache(&self) -> PluginCache {
+        PluginCache {
+            version: CACHE_VERSION,
+            dirs: self.dirs.clone(),
+            entries: self.entries.clone(),
+        }
+    }
+}
+
+/// Scans one module into entries (blocking; UI thread only, spec D6).
+///
+/// A module that fails to load yields an empty list — the existing
+/// `list_*_plugins_in` helpers already log the reason.
+pub fn scan_module(candidate: &CandidateFile) -> Vec<PluginEntry> {
+    let path = candidate.path.to_string_lossy().into_owned();
+    let entry = |id: String, name: String, is_instrument: bool| PluginEntry {
+        format: candidate.format,
+        path: path.clone(),
+        id,
+        name,
+        is_instrument,
+        mtime_ms: candidate.mtime_ms,
+        size: candidate.size,
+    };
+    match candidate.format {
+        PluginFormat::Clap => glitcherz_clap_host::list_clap_plugins_in(&candidate.path)
+            .into_iter()
+            .map(|info| entry(info.id, info.name, info.is_instrument))
+            .collect(),
+        PluginFormat::Vst3 => glitcherz_vst3_host::list_vst3_plugins_in(&candidate.path)
+            .into_iter()
+            .map(|info| entry(info.cid, info.name, info.is_instrument))
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,5 +747,76 @@ mod tests {
             .map(|entry| entry.id.as_str())
             .collect();
         assert!(vst3_effects.is_empty());
+    }
+
+    #[test]
+    fn catalog_scans_pending_modules_and_reports_progress() {
+        let snapshot = DiskScanInput {
+            dirs: vec!["clap:C:/clap".to_string()],
+            candidates: vec![
+                candidate(PluginFormat::Clap, "C:/clap/a.clap", 1, 2),
+                candidate(PluginFormat::Clap, "C:/clap/b.clap", 3, 4),
+            ],
+        };
+        let mut catalog = PluginCatalog::with_snapshot(&PluginCache::default(), snapshot);
+        assert!(catalog.is_scanning());
+        assert_eq!(catalog.progress(), (0, 2));
+        // The banner announces the module the frame is about to block on.
+        assert_eq!(
+            catalog.upcoming().map(|next| next.path.clone()),
+            Some(PathBuf::from("C:/clap/a.clap"))
+        );
+
+        let first = catalog.take_next().expect("first module");
+        assert_eq!(
+            catalog.upcoming().map(|next| next.path.clone()),
+            Some(PathBuf::from("C:/clap/b.clap"))
+        );
+        catalog.accept(vec![entry(
+            PluginFormat::Clap,
+            &first.path.to_string_lossy(),
+            "a",
+            "Alpha",
+            true,
+            1,
+            2,
+        )]);
+        assert_eq!(catalog.progress(), (1, 2));
+        assert_eq!(catalog.entries().len(), 1);
+
+        let _second = catalog.take_next().expect("second module");
+        // A module that yields nothing (failed load) still advances progress.
+        catalog.accept(Vec::new());
+        assert!(!catalog.is_scanning());
+        assert_eq!(catalog.progress(), (2, 2));
+        assert!(catalog.take_next().is_none());
+        assert_eq!(catalog.entries().len(), 1);
+        assert_eq!(catalog.to_cache().entries.len(), 1);
+        assert_eq!(catalog.to_cache().dirs, vec!["clap:C:/clap".to_string()]);
+    }
+
+    #[test]
+    fn catalog_from_warm_cache_is_idle() {
+        let cache = cache_with(
+            &["clap:C:/clap"],
+            vec![entry(
+                PluginFormat::Clap,
+                "C:/clap/x.clap",
+                "x",
+                "X",
+                true,
+                100,
+                10,
+            )],
+        );
+        let snapshot = DiskScanInput {
+            dirs: cache.dirs.clone(),
+            candidates: vec![candidate(PluginFormat::Clap, "C:/clap/x.clap", 100, 10)],
+        };
+        let catalog = PluginCatalog::with_snapshot(&cache, snapshot);
+        assert!(!catalog.is_scanning());
+        assert_eq!(catalog.progress(), (0, 0));
+        assert_eq!(catalog.entries().len(), 1);
+        assert!(catalog.upcoming().is_none());
     }
 }
