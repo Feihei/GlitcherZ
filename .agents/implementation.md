@@ -375,3 +375,22 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 **坑（模态变换失焦 + 落定无效）**：G/T/Shift+D 模态不是真实拖动——router 的 `any_down` 冻结只保护按住按钮的手势，hover-follow 照常运转（指针越过内容边缘到达 neutral chrome 即 surrender，Esc/轴限定键全灭）；且确认点击是 `response.clicked()`（组件矩形内），指针已在组件外时点击落不进任何 lane。修复两层：① `FocusRouter::set_focus_hold(bool)`——模态/armed knife 期间由组件每帧置位，`begin_frame` 跳过整个 hover-follow（与 any_down 同级的冻结；每帧设置所以模态结束自动解）；② 确认/取消改读**全局** `i.pointer.button_clicked(Primary/Secondary)`（timeline 在 finalize 段、roll 在 show() 尾部兜底——lane 内点击先被原有路径消费掉 modal，两路天然互斥；确认 frame 用 `latest_pos()` 与 ghost 预览同源）。守护测试：`focus_hold_pins_the_owner_through_neutral_hover`（focus.rs）+ `a_click_outside_any_widget_is_globally_visible`（egui_event_semantics.rs，锁定"死区点击全局可见、Response 沉默"契约）。**注意**：focus 单测里被聚焦的 id 必须有真实 widget（`ui.interact`）——egui 的 focus dead-man switch 会清掉无人认领的 id。
 
 **坑**：PowerShell 5.1 `Get-Content -Raw` 默认按 ANSI(GBK) 解码 UTF-8 文件 + `Set-Content -Encoding UTF8` 会加 BOM——非 ASCII（→/—/·）全部乱码且不可逆（部分字符吞换行合并行）。**改源文件一律用 edit 工具或 Python（显式 `encoding='utf-8'`）**；已损坏时 `git checkout -- <file>` 恢复后重放编辑。
+
+### 插件目录与启动扫描（U9 E1/E2，spec `plugin-browser.md`，2026-10-22）
+
+**模块切分**：`glitcherz-ui/src/plugin_catalog.rs` 完全不依赖 egui —— 数据模型（`PluginEntry` / `PluginCache`）、缓存 diff（`plan_refresh`）、合并排序（`merge` / `sort_entries` / `view`）、编码（RON）、扫描状态机（`PluginCatalog`）与 `scan_module` 都在这里，帧循环只做三件事：画进度条、取一个模块、喂回结果。八个纯函数单测 + 两个状态机单测不碰磁盘、不碰插件二进制。
+
+**缓存有效性**（易踩点）：
+- 有效性按**模块路径**判定，不是按条目 —— 一个 VST3 bundle 可能注册多个 class，它们的 `mtime/size` 相同，必须同生共死（`plan_keeps_unchanged_module_and_all_of_its_classes` 锁定）。
+- 目录集比较用**打标签的扁平字符串** `"clap:<path>"` / `"vst3:<path>"`，任一格式的搜索目录变化都触发全量重扫，但缓存字段只有一个 `Vec<String>`。
+- 版本不符或目录集变化时，老的条目路径全部进 `removed`（仅用于日志），`keep` 清空。
+
+**接线**：四个惰性 `Option<Vec<...>>`（`clap_plugins` / `clap_effects` / `vst3_plugins` / `vst3_effects`）全部删除，换成单个 `plugin_catalog`。原先 `scanned_*()` 里"首次展开菜单时全盘扫描"的整段逻辑消失——这正是原来 UI 卡数秒的根因，且 CLAP 乐器/效果各扫一遍、VST3 同理（最多 4 次全量）。现在菜单只剩查询期过滤：`plugin_entries(format, want_instrument)`（薄包一层 `view`）；空列表提示由 `plugin_empty_hint` 区分"扫描中"与"真的没有"。
+
+**帧序契约（D14）**：扫描发生在 `ui()` 的**最后**——`self.plugin_scan_step()` 取 `pending` 队首扫一个模块，紧跟 `request_repaint()` 让队列以帧率推进（否则只有 50 ms 的显示刷新节奏，冷启动 200 个模块要十几秒）。进度条在 `ui()` 开头以 `TopBottomPanel` 画出，文案取 `upcoming()` = **队首**（下一帧才扫的那个），因此插件挂死时屏幕上已经写着它的文件名 —— 这是 in-process 扫描唯一能给的可观测性。
+
+**持久化**：`save()` 里 `storage.set_string("plugin_cache", ron)`；部分扫完的目录也是合法缓存（下次启动 keep 已扫的、只补剩余）。eframe 退出/周期写盘，崩溃丢缓存只损失一次冷扫。
+
+**Rescan**：patch 右键菜单底部的 `Rescan Plug-ins` → `PatchAction::RescanPlugins` → `PluginCatalog::rescan()`（塞一个空缓存，`dirs` 不匹配 ⇒ 全量）。E3 重写添加菜单时该项随之搬走。
+
+**实测**：冷启动扫描期间日志里能看到 Cardinal 的 CLAP 描述符枚举会拉起整套 Rack 上下文（`Creating module widget ...`，约 140 ms）——正是"启动时一次性付清"优于"点开菜单才付"的实例。热启动（缓存命中）**零 dylib 加载**：第二次运行 `RUST_LOG=info` 输出中 Cardinal/Rack 日志条数为 0。

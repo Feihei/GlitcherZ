@@ -206,7 +206,7 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 痛点实证（用户 2026-10-22 提出"过多插件右键菜单太长很影响体验，Blender/ComfyUI 都是多级菜单 + 搜索过滤框"）。spec 见 `spec/plugin-browser.md`。核心决策：**类型前置**（Add 第一层选 Instrument/Effect，节点带最终声源出生，只 install 一次、一步 undo）；**多级菜单 + 过滤框**（Blender `Add` 菜单 / ComfyUI 搜索语义，叶子层不是裸 submenu）；**启动时一次扫描 + 缓存 + 进度条，前台分片推进**（每帧末尾扫一个模块；主线程扫描免 COM 初始化，键 `(path, mtime, size)`，一趟扫描四视图分流，消灭现在 4 次重复全量）；**职责切分**（结构操作归 patch、参数编辑归 Inspector，**不提供换源动作**——换声源 = 删了重建，参数不迁移）。不动引擎、不动文档版本。
 
 - [x] **E1 目录与缓存内核** ✅ 2026-10-22：`glitcherz-ui/src/plugin_catalog.rs`（`PluginFormat`/`PluginEntry`/`PluginCache`/`CandidateFile::stat`/`collect_from_disk`/`plan_refresh`/`merge`+`sort_entries`/`view`/`encode`+`decode`），纯函数 8 项单测；ui crate 增 `ron` 依赖。全仓 482 测试绿
-- [ ] **E2 扫描接线**：`PluginCatalog` 状态机 + 帧末单模块推进 + 进度条/状态栏文案 + `Rescan Plugins`
+- [x] **E2 扫描接线** ✅ 2026-10-22：`PluginCatalog` 状态机 + 帧尾单模块推进（`upcoming` 文案 = 队首，挂住时可定位）+ 顶部进度条 + `storage.set_string("plugin_cache")` 持久化 + patch 右键 `Rescan Plug-ins`；四个惰性扫描缓存删除。全仓 484 测试绿，热启动零 dylib 加载实测通过
 - [ ] **E3 picker 与菜单**：`plugin_picker.rs` 浮层（过滤 + 键盘 + Recent）+ `Add` 三级结构 + 全局 `Search plugins…`
 - [ ] **E4 创建路径重构**：`NodeCategory` / `NodeSource` 拆分、一次 install、连线中点 `Insert` 复用 picker
 - [ ] **E5 Inspector 收口**：删源选择行与 effects 快捷加载、`Clear All Effects` 挪位
