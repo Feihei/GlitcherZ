@@ -146,15 +146,20 @@ G1（gui 扩展宿主）/ G2（Win32 嵌入容器）/ G3（参数回接）已落
 - **clack wrapper 的 flush 分派规则**：对**活跃**实例，宿主调 flush 时 wrapper 分派给 `PluginAudioProcessorParams::flush`（audio 侧实现），inactive 才走 main-thread 版本——**插件侧两个 flush 实现都要写 out queue**（只实现 main-thread 版本时活跃实例回读永远为空，且测试链的是旧 dll 时更难定位）。
 - **UI 轮询时序（G3）**：`ui()` 尾部、编辑器 open 且非 `gui_closed` 时轮询 `poll_param_flush`（原子标志 take 语义），回读值同步 `clap_voice_values` 滑块缓存 + `send_track_param(ParamId::PluginParam)` 下发引擎；缓存写入与下发在 guard 借用结束之后做（借用冲突）。轮询放 `gui_closed` 的 else 分支，避开插件自毁边角。
 
-### 虚拟键盘节点（G6，spec `plugin-gui.md` §8，2026-10-20）
+### 键盘输入节点（G6，spec `plugin-gui.md` §8，2026-10-20；2026-10-22 改版为输入端口）
 
-`NodeDoc::Keyboard{node_id, track}` 是文档里**唯一没有引擎对应物的节点变体**：不进引擎图、不建 processor、不占 slot（`install_node` 首行早退，`node_map` 里查不到它）。它的语义全靠文档连线 + UI 路由：
+`NodeDoc::Keyboard{node_id, track, source}` 是文档里**唯一没有引擎对应物的节点变体**：不进引擎图、不建 processor、不占 slot（`install_node` 首行早退，`node_map` 里查不到它）。它的语义全靠文档的**绑定 + 连线**（"A 设计"，2026-10-22 定）：
 
-- **连线规则（model `validate`）**：MIDI 源从「只能是 `MidiTrack(_)`」放宽为「`MidiTrack(_)` 或 Keyboard 节点」，目标仍是 instrument；audio 连线两端都禁止 vk（它没有任何音频口）。UI 侧 `accepts()` 不变（Midi 只接受 instrument），vk 出端口的**拖拽类型**由 `patch.rs` 按文档节点种类判定——vk 出边发 `PatchAction::ConnectKeyboardMidi`（不是 `ConnectAudio`）。
-- **路由纯函数**：`GraphDoc::keyboard_route(selection) -> Option<u64>`。种子 = 选中集里的 vk 节点，沿 `kind == Midi && from == Node(id)` 做 BFS，最后**按文档序遍历 nodes 取首个 Instrument**（不是 BFS 出队顺序——多键盘/多目标时结果确定）。非 instrument 终点会被遍历但永不返回（MIDI 不穿透效果器）。
-- **音符号直达**：引擎新增 `EngineCommand::NoteAtNode { node_id, event }` → `RtGraph::node_note`（slot 线性扫描找 `node_id`，无分配；未知 id 返回 false 静默丢弃）。这条路径**绕开轨道扇出表**，因此 vk 能弹一个没接时间轴 MIDI 线的悬空 instrument。
-- **UI 状态机**：`GlitcherZApp::vk_target: Option<u64>`（文档 instrument id），每帧 `ui()` 开头由 `patch_state.selected_doc_nodes()` 重算。**路由切换必须先按旧目标发 Off 再更新**（否则旧 instrument 的挂音永远收不到 note-off——与 Dexed "Stop 停不了" 同一类坑）；`send_note_event_at(target, event)` 是唯一出口，target 解析不到引擎 id（节点刚被删）时回落轨道路径。
-- **无引擎节点路径的守卫**：`create_patch_node` 对 vk 跳过"引擎安装是否成功"的判定（否则会被判失败回滚），`delete_graph_node` / `remove_last_midi_track` 对 `node_map` 缺失的节点不做 `remove_node`/`retire_guard`。
+- **绑定（A 设计）**：`source: MidiSource = Computer | Device(name)`，`#[serde(default)] = Computer`。**一源一节点**由 `validate` 强制（`validate_rejects_two_nodes_bound_to_the_same_source`）；`create_patch_node` 在已有 Computer 节点时拒绝再加一个（否则写出自己 validate 会拒的文档）。`track` 只作 patch 摆放分组，**不再是路由依据**。
+- **无 fallback**：`send_to_vk_targets` 在 `vk_targets` 为空时只发一次状态提示（"cable the input node to an instrument (Ctrl+L)"）然后静音——旧的 `EngineCommand::Note { track }` 回落分支已删除。`send_note_event_at(doc, event)` 只做 `node_map` 查表，查不到就丢（节点刚删）。`--auto-play-note` 例外：它直发 `EngineCommand::Note { track }`，因为那是音频链诊断，不是路由。
+- **路由纯函数**：`GraphDoc::computer_keyboard() -> Option<node_id>` + `keyboard_routes_from(vk) -> Vec<u64>`。沿 `kind == Midi && from == Node(id)` 做 BFS，最后**按文档序遍历 nodes 收集全部 Instrument**（不是 BFS 出队顺序——多目标时结果确定）。非 instrument 终点会被遍历但永不返回（MIDI 不穿透效果器）。
+- **默认工程**：`default_graph_doc` 末尾追加一个 `Computer` 节点（id = 现有最大 id + 1）并 `keyboard_midi(vk, track0 voice)`——新工程开箱能弹，但那条线是可见可删的真实连线。默认图节点数/连线数断言已相应 +1/+1。
+- **多出线（2026-10-22）**：一个输出口可拉多条 Midi 连线（多出 / 单入，与 track outlet 同规则），一次按键送到全部目标 → 无混音器即可叠音。`connect_keyboard_midi` 是「追加 + 去重 + 上限 `MAX_MIDI_FANOUT`(4)」——旧的 `retain` 同源连线把它锁成单目标，正是"只能拉一条线"的根因。上限只在 dispatch 层拦（文档 `validate` 放行，加载别人多连线的工程不会整份失败）。
+- **音符号直达**：引擎 `EngineCommand::NoteAtNode { node_id, event }` → `RtGraph::node_note`（slot 线性扫描找 `node_id`，无分配；未知 id 返回 false 静默丢弃）。这条路径**绕开轨道扇出表**，因此能弹一个没接时间轴 MIDI 线的悬空 instrument。
+- **UI 状态机**：`GlitcherZApp::vk_targets: Vec<u64>`（文档 instrument id，文档序），每帧 `ui()` 开头由 `computer_keyboard()` 重算；`send_to_vk_targets` 按索引循环逐个投递。**只在"掉出路由"的目标上补 Off**：新增目标不切断正在响的音，删节点/连线时旧目标全部掉出 → 全部释放（否则挂音永远收不到 note-off——与 Dexed "Stop 停不了" 同一类坑）。
+- **`Ctrl+L` 快速试听**：`toggle_audition_route` 把选中的 instrument 接到 / 断开电脑键盘节点；全连 → 只删这几条，未全连 → 补缺的那几条并检查 `MAX_MIDI_FANOUT`。不重写手搭的其他连线。快捷键在全局 handler 的 Ctrl 分支里，不与演奏映射冲突。
+- **屏幕键盘退役（2026-10-22）**：`keyboard_section`（on-screen 键盘 + `Keyboard — Track N` 头部 + `mouse_down_notes`/`BLACK_SEMIS`）整段删除；状态栏新增 `Keys → N synth(s) T1 T3`（空则 `none`）。副作用：键位提示不再常显（如需再补，放输入节点 tooltip）。
+- **无引擎节点路径的守卫**：`create_patch_node` 对键盘节点跳过"引擎安装是否成功"的判定（否则会被判失败回滚），`delete_graph_node` / `remove_last_midi_track` 对 `node_map` 缺失的节点不做 `remove_node`/`retire_guard`。
 
 ### VST3 编辑器镜像（G7，spec `plugin-gui.md` §9，2026-10-21）
 

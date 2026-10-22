@@ -908,6 +908,24 @@ impl Default for MixerChannel {
     }
 }
 
+/// Input source bound to a [`NodeDoc::Keyboard`] (spec `plugin-gui.md` §8).
+///
+/// The binding is **one-to-one**: a node owns exactly one source, and a source
+/// is owned by at most one node ([`GraphDoc::validate`]). That is what makes a
+/// key press have exactly one entry point into the graph — no "which node
+/// wins" and no silent second route to another instrument.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MidiSource {
+    /// The computer / on-screen keyboard (the only source wired in v1).
+    #[default]
+    Computer,
+    /// A hardware MIDI input port, identified by the backend's port name.
+    /// Hardware input is not wired yet; the document shape is fixed now so
+    /// landing it does not need another node-layout change.
+    Device(String),
+}
+
 /// Document node (spec §7 `NodeDoc`): node identity in the engine graph +
 /// parameter persistence.
 ///
@@ -974,14 +992,16 @@ pub enum NodeDoc {
         #[serde(default)]
         out_muted: bool,
     },
-    /// Virtual keyboard node (G6, spec `plugin-gui.md` §8): a **UI-only
-    /// routing node**. It has no real-time processor and never enters the
-    /// engine graph (the document node_id simply has no engine counterpart);
-    /// its MIDI out cable points at an instrument so that selecting the node
-    /// routes the computer / on-screen keyboard to that instrument.
+    /// Keyboard input node (G6, spec `plugin-gui.md` §8): a **UI-only
+    /// routing node** that owns exactly one input source. It has no real-time
+    /// processor and never enters the engine graph (the document node_id has
+    /// no engine counterpart); its MIDI out cables point at instruments, so
+    /// whatever the bound device plays enters the graph through **this** node
+    /// and nowhere else.
     ///
-    /// The node still carries `node_id` (cable endpoints address it) and
-    /// `track` (patch auto-placement grouping only).
+    /// The node carries `node_id` (cable endpoints address it), `track`
+    /// (patch auto-placement grouping only — it is *not* a routing input) and
+    /// `source` (the bound device; [`MidiSource::Computer`] in v1).
     Keyboard {
         /// Persisted node ID.
         #[serde(default)]
@@ -989,6 +1009,10 @@ pub enum NodeDoc {
         /// Owning track (auto-placement grouping only).
         #[serde(default)]
         track: usize,
+        /// The input source this node listens to. [`GraphDoc::validate`]
+        /// rejects two nodes bound to the same source.
+        #[serde(default)]
+        source: MidiSource,
     },
     /// Feedback tap node (P6, spec `node-graph.md` D10): the explicit,
     /// self-documenting loop breaker. Its in-edges are summed **one block
@@ -1300,30 +1324,46 @@ impl GraphDoc {
         })
     }
 
-    /// G6 (spec `plugin-gui.md` §8): resolves the **virtual keyboard route**.
+    /// The node bound to the computer keyboard, if the document has one
+    /// (spec `plugin-gui.md` §8). Identity, not selection: the keyboard is
+    /// live whenever its node exists, exactly like a hardware port.
+    pub fn computer_keyboard(&self) -> Option<u64> {
+        self.nodes
+            .iter()
+            .find(|n| {
+                matches!(
+                    n,
+                    NodeDoc::Keyboard {
+                        source: MidiSource::Computer,
+                        ..
+                    }
+                )
+            })
+            .map(NodeDoc::node_id)
+    }
+
+    /// All instruments cabled from one keyboard node, in document order
+    /// (spec `plugin-gui.md` §8).
     ///
-    /// Seeds are the selected [`NodeDoc::Keyboard`] nodes; their MIDI out
-    /// cables (`Keyboard → node`, G6 cable rule) are walked breadth-first and
-    /// the first **instrument** reached wins, picked in document order so
-    /// several keyboards / several instruments resolve deterministically.
+    /// The node's MIDI out cables (`Keyboard → node`, G6 cable rule) are
+    /// walked breadth-first and **every** instrument reached is returned, so
+    /// one source drives all of its cabled instruments at once: a MIDI source
+    /// is one out jack that any number of cables may leave (multi-out /
+    /// single-in, the same rule the timeline's track outlets follow), which
+    /// makes synth layering need no mixer gymnastics. The fan-out cap lives at
+    /// the dispatch edge (`MAX_MIDI_FANOUT`), not in the document — a loaded
+    /// file with extra cables still resolves.
+    ///
     /// Non-instrument endpoints (an effect fed by a MIDI cable, which the UI
     /// never creates) are traversed but never returned — no MIDI pass-through.
-    ///
-    /// `None` = the selection carries no keyboard, or no route reaches an
-    /// instrument; the caller then keeps the track-driven behavior (G6: the
-    /// vk route is *additive*, unselected vk nodes change nothing).
-    pub fn keyboard_route(&self, selection: &[u64]) -> Option<u64> {
-        let seeds: Vec<u64> = self
-            .nodes
-            .iter()
-            .filter(|n| n.is_keyboard() && selection.contains(&n.node_id()))
-            .map(NodeDoc::node_id)
-            .collect();
-        if seeds.is_empty() {
-            return None;
+    /// Empty = nothing is cabled (the source is silent: there is **no**
+    /// track fallback).
+    pub fn keyboard_routes_from(&self, keyboard: u64) -> Vec<u64> {
+        if !self.node_by_id(keyboard).is_some_and(NodeDoc::is_keyboard) {
+            return Vec::new();
         }
-        let mut reached: BTreeSet<u64> = seeds.iter().copied().collect();
-        let mut queue: VecDeque<u64> = seeds.into_iter().collect();
+        let mut reached: BTreeSet<u64> = BTreeSet::from([keyboard]);
+        let mut queue: VecDeque<u64> = VecDeque::from([keyboard]);
         while let Some(id) = queue.pop_front() {
             for cable in &self.cables {
                 if cable.kind != CableKind::Midi || cable.from != PortRef::Node(id) {
@@ -1338,8 +1378,9 @@ impl GraphDoc {
         }
         self.nodes
             .iter()
-            .find(|n| matches!(n, NodeDoc::Instrument { .. }) && reached.contains(&n.node_id()))
+            .filter(|n| matches!(n, NodeDoc::Instrument { .. }) && reached.contains(&n.node_id()))
             .map(NodeDoc::node_id)
+            .collect()
     }
 
     /// The first effect node of a track.
@@ -1499,6 +1540,22 @@ impl GraphDoc {
                         inputs
                     ));
                 }
+            }
+        }
+        // Input-source ownership (spec `plugin-gui.md` §8): one source, one
+        // keyboard node. Two nodes listening to the same device would route
+        // the same key press into two unrelated fan-outs — unpredictable and
+        // unauditable, so the binding is rejected instead.
+        let mut sources: std::collections::HashSet<&MidiSource> = Default::default();
+        for node in &self.nodes {
+            if let NodeDoc::Keyboard {
+                node_id, source, ..
+            } = node
+                && !sources.insert(source)
+            {
+                return Err(format!(
+                    "keyboard node {node_id} binds an input source that another node already owns ({source:?})"
+                ));
             }
         }
         // Single-input discipline (P5f D14/D16): audio cables into one
@@ -1702,11 +1759,13 @@ pub fn default_graph_doc(track_count: usize) -> GraphDoc {
     let mut nodes = Vec::new();
     let mut cables = Vec::new();
     let mut next_id = MASTER_NODE_ID + 1;
+    let mut voice_ids = Vec::new();
     let mut delay_ids = Vec::new();
     for track in 0..track_count {
         let voice_id = next_id;
         let delay_id = next_id + 1;
         next_id += 2;
+        voice_ids.push(voice_id);
         nodes.push(NodeDoc::Instrument {
             node_id: voice_id,
             track,
@@ -1738,6 +1797,20 @@ pub fn default_graph_doc(track_count: usize) -> GraphDoc {
         cables.push(CableDoc::audio_to_channel(*delay_id, mixer_id, ch as u8));
     }
     cables.push(CableDoc::audio(mixer_id, PortRef::Master));
+    // One computer-keyboard input node, cabled to the first track's
+    // instrument (spec `plugin-gui.md` §8): a fresh project plays from the
+    // computer keyboard, but through an explicit, visible, deletable route
+    // instead of the old implicit track fallback.
+    next_id += 1;
+    let keyboard_id = next_id;
+    nodes.push(NodeDoc::Keyboard {
+        node_id: keyboard_id,
+        track: 0,
+        source: MidiSource::Computer,
+    });
+    if let Some(voice_id) = voice_ids.first() {
+        cables.push(CableDoc::keyboard_midi(keyboard_id, *voice_id));
+    }
     GraphDoc {
         nodes,
         cables,
@@ -2097,8 +2170,8 @@ mod tests {
     use super::{
         AutoParam, AutoPoint, CableDoc, CableKind, DEFAULT_MIDI_TRACKS, GraphDoc, MASTER_NODE_ID,
         MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK,
-        MAX_NODES, MidiClip, MidiTrack, NodeDoc, PortRef, Project, SynthParams, TICKS_PER_BAR,
-        TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec, default_graph_doc,
+        MAX_NODES, MidiClip, MidiSource, MidiTrack, NodeDoc, PortRef, Project, SynthParams,
+        TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec, default_graph_doc,
     };
 
     #[test]
@@ -2431,18 +2504,19 @@ mod tests {
     #[test]
     fn default_project_graph_is_fully_explicit() {
         // D13/D18: the default document fully describes the default topology
-        // (per-track voice → delay + one global mixer → master).
+        // (per-track voice → delay + one global mixer → master + the
+        // computer-keyboard input node).
         let project = Project::default();
         assert_eq!(project.midi_tracks.len(), DEFAULT_MIDI_TRACKS);
         let graph = &project.graph;
         assert_eq!(
             graph.nodes.len(),
-            DEFAULT_MIDI_TRACKS * 2 + 1,
-            "two nodes per track + the global mixer"
+            DEFAULT_MIDI_TRACKS * 2 + 2,
+            "two nodes per track + the global mixer + the keyboard input node"
         );
         // Cables: voice→delay + midi self-connection per track, then
-        // delay→mixer.ch per track + mixer→master.
-        assert_eq!(graph.cables.len(), DEFAULT_MIDI_TRACKS * 3 + 1);
+        // delay→mixer.ch per track + mixer→master + keyboard→track 0 voice.
+        assert_eq!(graph.cables.len(), DEFAULT_MIDI_TRACKS * 3 + 2);
         for t in 0..DEFAULT_MIDI_TRACKS {
             let voice = graph.instrument_of_track(t).expect("voice should exist");
             let delay = graph.builtin_delay_of_track(t).expect("delay should exist");
@@ -2610,14 +2684,33 @@ mod tests {
     #[test]
     fn next_node_id_and_track_lookups() {
         let graph = default_graph_doc(2);
-        // ids: track0 voice=2 delay=3, track1 voice=4 delay=5, mixer=6.
-        assert_eq!(graph.next_node_id(), 7);
+        // ids: track0 voice=2 delay=3, track1 voice=4 delay=5, mixer=6,
+        // computer keyboard=7.
+        assert_eq!(graph.next_node_id(), 8);
         assert_eq!(
             graph.instrument_of_track(1).map(NodeDoc::node_id),
             Some(MASTER_NODE_ID + 3)
         );
         assert!(graph.instrument_of_track(2).is_none());
         assert_eq!(graph.auto_endpoint(0), None);
+    }
+
+    /// Spec `plugin-gui.md` §8: a fresh project owns one computer-keyboard
+    /// node already cabled to the first track's instrument — the computer
+    /// keyboard plays out of the box, but through a visible route instead of
+    /// an implicit track fallback.
+    #[test]
+    fn default_project_ships_one_routed_computer_keyboard() {
+        let graph = default_graph_doc(DEFAULT_MIDI_TRACKS);
+        let vk = graph.computer_keyboard().expect("default keyboard node");
+        let first_voice = graph.instrument_of_track(0).expect("track 0 voice");
+        assert_eq!(graph.keyboard_routes_from(vk), vec![first_voice.node_id()]);
+        assert!(graph.validate(DEFAULT_MIDI_TRACKS, 0).is_ok());
+        assert_eq!(
+            graph.nodes.iter().filter(|n| n.is_keyboard()).count(),
+            1,
+            "exactly one input node by default"
+        );
     }
 
     #[test]
@@ -2914,6 +3007,7 @@ mod tests {
                 NodeDoc::Keyboard {
                     node_id: 6,
                     track: 0,
+                    source: MidiSource::Computer,
                 },
             ],
             cables: Vec::new(),
@@ -2927,66 +3021,101 @@ mod tests {
         let kb = doc.node_by_id(6).expect("keyboard node present");
         assert!(kb.is_keyboard());
         assert_eq!(kb.track(), 0);
+        assert_eq!(doc.computer_keyboard(), Some(6));
         assert!(!doc.node_by_id(2).expect("instrument").is_keyboard());
 
-        // serde: additive tagged variant, no extra payload required.
+        // serde: the bound source is part of the saved shape.
         let text = ron::to_string(&NodeDoc::Keyboard {
             node_id: 6,
             track: 2,
+            source: MidiSource::Computer,
         })
         .expect("serialization failed");
         assert!(text.contains("keyboard"), "tag missing: {text}");
+        assert!(text.contains("computer"), "source tag missing: {text}");
         let back: NodeDoc = ron::from_str(&text).expect("deserialization failed");
         assert_eq!(
             back,
             NodeDoc::Keyboard {
                 node_id: 6,
-                track: 2
+                track: 2,
+                source: MidiSource::Computer,
             }
         );
     }
 
     #[test]
-    fn keyboard_route_requires_a_selected_keyboard() {
+    fn only_the_computer_source_answers_the_live_keyboard() {
         let mut doc = vk_doc();
-        doc.cables.push(CableDoc::keyboard_midi(6, 4));
-        assert_eq!(
-            doc.keyboard_route(&[]),
-            None,
-            "empty selection routes nowhere"
-        );
-        assert_eq!(
-            doc.keyboard_route(&[2]),
-            None,
-            "a selected instrument is not a vk route"
-        );
+        assert_eq!(doc.computer_keyboard(), Some(6));
+        // A hardware-bound node is not the computer keyboard's owner.
+        doc.nodes.push(NodeDoc::Keyboard {
+            node_id: 8,
+            track: 1,
+            source: MidiSource::Device("KeyStep".to_string()),
+        });
+        assert_eq!(doc.computer_keyboard(), Some(6));
+
+        let mut doc = vk_doc();
+        doc.nodes.retain(|n| !n.is_keyboard());
+        assert_eq!(doc.computer_keyboard(), None, "no node, no input");
     }
 
     #[test]
-    fn keyboard_route_without_cables_is_none() {
+    fn keyboard_routes_without_cables_is_empty() {
         let doc = vk_doc();
-        assert_eq!(doc.keyboard_route(&[6]), None);
+        assert!(
+            doc.keyboard_routes_from(6).is_empty(),
+            "an unconnected source is silent (no track fallback)"
+        );
+        assert!(doc.keyboard_routes_from(2).is_empty(), "not a keyboard");
     }
 
     #[test]
-    fn keyboard_route_follows_the_midi_cable_to_the_instrument() {
+    fn keyboard_routes_follow_the_midi_cable_to_the_instrument() {
         let mut doc = vk_doc();
         doc.cables.push(CableDoc::keyboard_midi(6, 4));
-        assert_eq!(doc.keyboard_route(&[6]), Some(4));
+        assert_eq!(doc.keyboard_routes_from(6), vec![4]);
     }
 
     #[test]
-    fn keyboard_route_picks_the_first_instrument_in_document_order() {
+    fn one_keyboard_feeds_every_cabled_instrument_in_document_order() {
         let mut doc = vk_doc();
-        // Cables added in "reverse" document order: the instrument listed
-        // first (id 2) still wins.
+        // Cables added in "reverse" document order: the result still follows
+        // document order (id 2 before id 4), so layering is deterministic.
         doc.cables.push(CableDoc::keyboard_midi(6, 4));
         doc.cables.push(CableDoc::keyboard_midi(6, 2));
-        assert_eq!(doc.keyboard_route(&[6]), Some(2));
+        assert_eq!(doc.keyboard_routes_from(6), vec![2, 4]);
+    }
+
+    /// Spec `plugin-gui.md` §8: one source, one node. Two nodes listening to
+    /// the same device would double-trigger every key into two unrelated
+    /// fan-outs, so the binding is a document-level error.
+    #[test]
+    fn validate_rejects_two_nodes_bound_to_the_same_source() {
+        let mut doc = vk_doc();
+        doc.nodes.push(NodeDoc::Keyboard {
+            node_id: 8,
+            track: 1,
+            source: MidiSource::Computer,
+        });
+        let err = doc
+            .validate(2, 0)
+            .expect_err("two computer keyboard nodes must be rejected");
+        assert!(err.contains("already owns"), "unexpected error: {err}");
+
+        // Distinct sources are fine (hardware ports exist side by side).
+        let mut doc = vk_doc();
+        doc.nodes.push(NodeDoc::Keyboard {
+            node_id: 8,
+            track: 1,
+            source: MidiSource::Device("KeyStep".to_string()),
+        });
+        assert!(doc.validate(2, 0).is_ok());
     }
 
     #[test]
-    fn keyboard_route_ignores_non_instrument_endpoints() {
+    fn keyboard_routes_ignore_non_instrument_endpoints() {
         let mut doc = vk_doc();
         doc.nodes.push(NodeDoc::Effect {
             node_id: 8,
@@ -2995,9 +3124,8 @@ mod tests {
             delay: Default::default(),
         });
         doc.cables.push(CableDoc::keyboard_midi(6, 8));
-        assert_eq!(
-            doc.keyboard_route(&[6]),
-            None,
+        assert!(
+            doc.keyboard_routes_from(6).is_empty(),
             "MIDI never passes through an effect to an instrument"
         );
     }
@@ -3007,6 +3135,16 @@ mod tests {
         let mut doc = vk_doc();
         doc.cables.push(CableDoc::keyboard_midi(6, 2));
         assert!(doc.validate(2, 0).is_ok(), "vk → instrument MIDI is legal");
+
+        // One vk out jack feeds several instruments: fan-out is a document
+        // fact (the cap is enforced at dispatch, like the timeline's).
+        let mut doc = vk_doc();
+        doc.cables.push(CableDoc::keyboard_midi(6, 2));
+        doc.cables.push(CableDoc::keyboard_midi(6, 4));
+        assert!(
+            doc.validate(2, 0).is_ok(),
+            "one keyboard may cable several instruments (layering)"
+        );
 
         // Audio cables touching a virtual keyboard are rejected both ways.
         let mut doc = vk_doc();

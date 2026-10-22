@@ -31,7 +31,7 @@
 | D3 | 平台 | Windows-first，`plugin_window` 平台抽象层 | 开发/实测环境 Windows；NSView/X11 后续补 |
 | D4 | 实施顺序 | GUI 先行（G1–G3）→ 面板节点化（G4）→ 内联参数（G5）→ vk 节点（G6） | 痛点优先；面板重构后编辑器挂到新面板自然过渡 |
 | D5 | 内联参数形态 | 节点常显核心参数（每节点类型注册表定义），高度自适应 | plugdata 式；选中展开抽屉增加往返 |
-| D6 | vk 节点 | 纯 UI 路由：文档记录节点+连线，选中时键盘事件沿连线解析目标 instrument，引擎零改动 | 引擎节点是为未来硬件 MIDI-in 铺路，v1 用不上 |
+| D6 | 输入节点 | 纯 UI 端口：一源一节点（源唯一），事件只沿连线走、无轨道 fallback，可多条出线叠音源；默认工程带 Computer 节点，引擎零改动 | 引擎节点是为未来硬件 MIDI-in 铺路，v1 用不上 |
 | D7 | GUI 调用与 StateGate | **gui 扩展调用不过闸** | CLAP 线程契约：[main-thread] gui 调用与 audio `process()` 并发安全由插件保证；state 扩展才要求停靠。停靠反而卡 GUI |
 | D8 | GUI 编辑参数不进 undo | 同非目标 4 | preset save 捕获 state 已覆盖持久化 |
 | D9 | tab 切走 = hide，切轨/换声源 = destroy | 编辑器生命周期最小化销毁，保留 GUI 状态跨 tab | hide 后 rect 消失只需 ShowWindow；跨轨插件实例都可能换 |
@@ -133,13 +133,22 @@ pub struct PluginWindowHandle(platform_impl::NativeChild); // Windows: HWND 子�
 - 值写入：**全部走 `set_node_param` 非重建路径**（ParamId 已有对应变体；插件参数 = `ParamId::PluginParam`）。内联滑条与面板滑条共享合并手势键（一次拖动 = 一步 undo——参数虽非文档态，与现有面板滑条行为对齐）。
 - 测试：注册表覆盖每个内建节点变体；高度公式；控件值 ↔ ParamId 换算往返。
 
-## 8 G6 — Virtual keyboard 节点（UI 路由）
+## 8 G6 — Keyboard input 节点（MIDI 输入端口）
 
-- 文档：`NodeDoc::Keyboard`（新变体，serde default 加法——无字段的 unit 变体，旧文件无感）；patch 右键菜单 `AddNodeKind::VirtualKeyboard`。
-- 引擎：**跳过**——`install_node` 遇 `Keyboard` 不建 processor、不占引擎节点槽（文档 node_id 与引擎 fresh_node_id 映射表记"无 RT 对应"）；`CableDoc` 允许 `Keyboard → Instrument` 的 Midi 连线（连线类型校验表加一行）；引擎 `ExecPlan` 解析时忽略 Keyboard 出边（它不参与时间轴扇出）。
-- 路由：patch 选中集含 Keyboard 节点且其 MIDI 出边可达 instrument → `handle_keyboard_input` / `keyboard_section`（电脑键盘 + 屏幕键盘）目标从 selected_track 切换为该 instrument 节点（node_id 直达 live note 通道；现有 per-track live 路径不动，vk 是**附加**路由，未选 vk 时行为完全兼容）。
-- 可达性解析为纯函数 `keyboard_route(doc, selection) -> Option<node_id>`（BFS 沿 Midi 连线，遇第一个 instrument 终点停），单测覆盖：无 vk 选中 / vk 无连线 / vk 连效果器（穿 MIDI 直通？——不穿，只认 instrument 终点）/ 多 instrument 取文档序首个。
-- `octave_base` 全局保留；vk 节点绘制 = 小钢琴图标 + 名称节点。
+> **2026-10-22 改版（A 设计）**：vk 从"按选中生效的软路由"变成**输入端口**。旧语义（选中 vk 才接管电脑键盘、未选中回落到选中轨）已废弃。
+
+- 文档：`NodeDoc::Keyboard { node_id, track, source }`，`source: MidiSource = Computer | Device(name)`（`track` 仅作 patch 摆放分组，**不参与路由**；patch 右键菜单 `Keyboard In (computer)`）。
+- **一源一节点**：一个节点只绑一个源，一个源只属于一个节点。`validate` 拒绝重复绑定（两个节点听同一个设备会把同一次按键送进两套互不相关的扇出）。结构即约束：连线和绑定就是唯一事实，看 patch 就知道信号去哪。
+- **无 fallback**：键盘事件只沿该节点的出线走。没有输入节点、或节点没接线 → 静音（状态栏 `Keys → none` + 首次按键给出提示），不再悄悄播选中轨。
+- 默认工程带一个 `Computer` 节点并连到 Track 1 的 instrument：新工程开箱能弹，但那条线是**可见、可删**的一条真实连线，而不是隐式行为。
+- 引擎：**跳过**——不建 processor、不占引擎节点槽；`ExecPlan` 解析时忽略 Keyboard 出边；`CableDoc` 允许 `Keyboard → Instrument` 的 Midi 连线。
+- 路由纯函数：`GraphDoc::computer_keyboard() -> Option<node_id>`（谁绑了电脑键盘）+ `keyboard_routes_from(vk) -> Vec<node_id>`（BFS 沿 Midi 连线收集全部 instrument，按文档序返回）。单测：无连线 / 连效果器（不穿透）/ 多目标全部返回且文档序 / 非键盘节点 / 源唯一性。
+- **多出线**：一个输出口可拉多条 Midi 连线（MIDI 源是"多输出 / 单输入"的一端，与时间轴 track outlet 同规则），一次按键送到全部目标 → 无需混音器即可叠音。每次连线是**新增**（旧实现 `retain` 掉同源连线，把 vk 锁死单目标）；重复连线忽略；上限 `MAX_MIDI_FANOUT`（4）在 dispatch 层拦，文档层不拒（加载别人多连线的工程不会整份失败）。
+- 手持音符只在**掉出路由**的目标上补 `NoteOff`：新加目标不切断正在响的音；删除输入节点/连线时全部释放。
+- **`Ctrl+L` 快速试听**：把选中的 instrument 接到 / 断开电脑键盘节点（只动这几条线，不重写手搭的其他连线；同样受 `MAX_MIDI_FANOUT` 限制）。
+- **屏幕键盘退役**：synth/mixer tab 底部的 on-screen 键盘与 `Keyboard — Track N` 头部一并删除（输入只有一个入口，键盘区不再有"当前轨"概念）；状态栏改为 `Keys → N synth(s) T1 T3`。
+- 硬件 MIDI 输入**未接线**：`Device(name)` 只是占位。落地时的约定：掉线保留绑定并显示缺失，**不自动重绑**（自动挑"下一个可用设备"会静默把键盘送到别的音源）。设备枚举需要新依赖（如 `midir`），单独一步。
+- `--auto-play-note`（冒烟/诊断）直接 `EngineCommand::Note { track }`：它验证的是音频链，不是路由。
 
 ## 9 G7 — VST3 IPlugView 镜像（后补，只记差异）
 

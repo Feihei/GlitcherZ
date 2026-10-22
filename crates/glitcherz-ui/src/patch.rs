@@ -17,7 +17,7 @@ use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Sense, Vec2};
 
 use glitcherz_model::{
-    AutoParam, CableDoc, CableKind, GraphDoc, LayoutDoc, NodeDoc, PortRef, VoiceSpec,
+    AutoParam, CableDoc, CableKind, GraphDoc, LayoutDoc, MidiSource, NodeDoc, PortRef, VoiceSpec,
 };
 
 /// Inline parameter identity for built-in node kinds (G5, spec
@@ -554,7 +554,12 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 VoiceSpec::Vst3 { class_id, .. } => format!("Fx {}", truncate(class_id, 14)),
             },
             Some(NodeDoc::Mixer { inputs, .. }) => format!("Mixer · {} ch", inputs),
-            Some(NodeDoc::Keyboard { track, .. }) => format!("Keyboard · Track {}", track + 1),
+            // G6 (A design): the node *is* its input source — the track is
+            // only a placement hint now, so it stays out of the label.
+            Some(NodeDoc::Keyboard { source, .. }) => match source {
+                MidiSource::Computer => "Keyboard · Computer".to_string(),
+                MidiSource::Device(name) => format!("Keyboard · {name}"),
+            },
             Some(NodeDoc::Feedback { gain, .. }) => format!("Feedback {:.0}%", gain * 100.0),
             Some(NodeDoc::ChannelStrip { track, .. }) => {
                 format!("Strip (legacy) · Track {}", track + 1)
@@ -684,11 +689,16 @@ impl PatchState {
 
     /// Fill in default placements for missing entities (never overwrites existing positions;
     /// prunes stale entries).
-    fn ensure_positions(&mut self, doc: &GraphDoc, track_count: usize, _auto_count: usize) {
+    fn ensure_positions(&mut self, doc: &GraphDoc, track_count: usize, auto_count: usize) {
         let mut wanted: Vec<PatchId> = Vec::new();
 
         // One column per track: instrument → effect stack → mixer.
         let mut effect_slot = vec![0usize; track_count];
+        // Input nodes share the timeline's left column, stacked underneath its
+        // box (the gap between the timeline and the instrument column is too
+        // narrow for a 150 px box).
+        let mut keyboard_slot = 0usize;
+        let keyboard_top = 32.0 + timeline_size(track_count, auto_count).y + 16.0;
         for node in &doc.nodes {
             let track = node.track().min(track_count.saturating_sub(1));
             let y = 32.0 + track as f32 * 132.0;
@@ -709,10 +719,17 @@ impl PatchState {
                 NodeDoc::Mixer { .. } => (PatchId::Node(node.node_id()), Pos2::new(700.0, y)),
                 // P6: feedback taps sit just left of the mixer column.
                 NodeDoc::Feedback { .. } => (PatchId::Node(node.node_id()), Pos2::new(600.0, y)),
-                // G6: vk nodes sit in their own column, left of the
-                // instrument column (only a fallback — the menu places them
-                // at the click position).
-                NodeDoc::Keyboard { .. } => (PatchId::Node(node.node_id()), Pos2::new(200.0, y)),
+                // G6: input nodes stack in the left column below the
+                // timeline box (only a fallback — the menu places them at the
+                // click position).
+                NodeDoc::Keyboard { .. } => {
+                    let k = keyboard_slot;
+                    keyboard_slot += 1;
+                    (
+                        PatchId::Node(node.node_id()),
+                        Pos2::new(16.0, keyboard_top + k as f32 * 68.0),
+                    )
+                }
                 NodeDoc::ChannelStrip { .. } => {
                     (PatchId::Node(node.node_id()), Pos2::new(700.0, y))
                 }
@@ -1250,7 +1267,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             if ui.button("Mixer").clicked() {
                 picked_kind = Some(AddNodeKind::Mixer);
             }
-            if ui.button("Virtual Keyboard").clicked() {
+            if ui.button("Keyboard In (computer)").clicked() {
                 picked_kind = Some(AddNodeKind::VirtualKeyboard);
             }
             if ui.button("Feedback Tap").clicked() {
@@ -2353,8 +2370,9 @@ mod tests {
         assert!(!accepts(CableKind::Automation, PatchId::Master, doc));
     }
 
-    /// G6 (spec `plugin-gui.md` §8): the vk node is a MIDI-only source with
-    /// no audio ports and its own compact box.
+    /// G6 (spec `plugin-gui.md` §8): an input node is a MIDI-only source with
+    /// no audio ports, its own compact box, and a label naming its **source**
+    /// (the track is only a placement hint).
     #[test]
     fn virtual_keyboard_node_geometry_and_port_rules() {
         let mut doc = Project::default().graph;
@@ -2362,6 +2380,7 @@ mod tests {
         doc.nodes.push(NodeDoc::Keyboard {
             node_id: 99,
             track: 0,
+            source: MidiSource::Device("KeyStep".to_string()),
         });
         let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
         let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
@@ -2387,6 +2406,8 @@ mod tests {
         let min = Pos2::ZERO;
         assert_eq!(state.out_ports_screen(min, vk, &deps).len(), 1);
         assert!(state.in_ports_screen(min, vk, &deps).is_empty());
-        assert_eq!(label_of(vk, &doc), "Keyboard · Track 1");
+        assert_eq!(label_of(vk, &doc), "Keyboard · KeyStep");
+        // The default project ships a computer-keyboard node instead.
+        assert_eq!(label_of(PatchId::Node(11), &doc), "Keyboard · Computer");
     }
 }
