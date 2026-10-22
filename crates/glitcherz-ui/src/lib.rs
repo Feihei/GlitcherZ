@@ -54,6 +54,7 @@ pub mod grid;
 pub mod lane;
 pub mod patch;
 pub mod piano_roll;
+pub mod plugin_catalog;
 pub mod plugin_window;
 pub mod project_files;
 pub mod timeline;

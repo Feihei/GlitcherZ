@@ -19,6 +19,9 @@ glitcherz-clap-host = { workspace = true }
 glitcherz-vst3-host = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"
+# Plugin-cache storage (eframe storage holds the encoded blob; spec
+# `.agents/spec/plugin-browser.md` D11) — same text format as project files.
+ron = { workspace = true }
 glitcherz-engine = { workspace = true }
 glitcherz-model = { workspace = true }
 glitcherz-command = { workspace = true }
