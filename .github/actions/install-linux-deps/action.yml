@@ -1,0 +1,23 @@
+name: Install Linux build dependencies
+description: >-
+  System packages needed to compile GlitcherZ on Linux: ALSA (cpal),
+  X11 / Wayland / xkbcommon (winit, rfd), OpenGL (egui glow backend).
+
+runs:
+  using: composite
+  steps:
+    - name: apt-get install
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          pkg-config \
+          libasound2-dev \
+          libxkbcommon-dev \
+          libxkbcommon-x11-dev \
+          libwayland-dev \
+          libx11-dev \
+          libxcursor-dev \
+          libxrandr-dev \
+          libxi-dev \
+          libgl1-mesa-dev

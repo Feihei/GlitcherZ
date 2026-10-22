@@ -1,0 +1,85 @@
+name: CI
+
+# Continuous integration: format, lint and test.
+#
+# Triggers:
+#   - push to any branch (documentation-only pushes are skipped)
+#   - pull requests targeting main (always run, so required checks stay honest)
+#   - manual dispatch
+#
+# Tag pushes are handled by release.yml, which runs its own preflight gate
+# before publishing anything.
+
+on:
+  push:
+    branches: ['**']
+    paths-ignore:
+      - '**.md'
+      - '.agents/**'
+      - 'docs/**'
+      - 'presets/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the same ref supersedes the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # 1) Formatting -- cheapest check, fail fast.
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # 2) Clippy, warnings are errors (AGENTS.md: zero-warning policy).
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/install-linux-deps
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # 3) Tests on all three desktop targets. The CLAP / VST3 host tests dlopen
+  #    the fixture cdylibs from target/debug, so the whole workspace (fixture
+  #    crates included) has to be built before testing -- `cargo test` alone
+  #    does not guarantee the cdylib artifacts exist.
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/install-linux-deps
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}
+      - name: Build workspace (fixture plugins included)
+        run: cargo build --workspace --locked
+      - name: Run tests
+        run: cargo test --workspace --locked

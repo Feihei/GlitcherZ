@@ -90,9 +90,20 @@ cargo build --release -p glitcherz-app
 ```
 
 平台依赖：
-- **Linux**：需要 ALSA 开发包（`libasound2-dev`）；GUI 依赖系统 GTK/wayland 库。
+- **Linux**：ALSA 开发包（`libasound2-dev`）+ X11 / Wayland / xkbcommon / OpenGL 开发包（winit、rfd、egui glow 后端；不需要 GTK）。完整清单见 `.github/actions/install-linux-deps/action.yml`。
 - **Windows**：建议安装 ASIO SDK 后启用 `cpal` 的 asio feature（可选）。
 - **macOS**：无需额外依赖。
+
+## 持续集成
+
+| Workflow | 触发 | 做什么 |
+| :--- | :--- | :--- |
+| `.github/workflows/ci.yml` | push 任意分支（纯文档提交跳过）、PR 到 `main`、手动 | `fmt` → `clippy -D warnings` → 三平台（Linux/macOS/Windows）`cargo build --workspace` + `cargo test --workspace` |
+| `.github/workflows/release.yml` | push `v*` tag | preflight（tag 与 `[workspace.package] version` 一致性 + fmt/clippy/test）→ 构建 Windows x86_64 / macOS universal / Linux x86_64 → 单点发布 Release（归档 + `sha256sums.txt`） |
+
+- 发布前**先改 `Cargo.toml` 的 workspace 版本并提交，再打 tag**（`v0.1.0` ↔ `0.1.0`），不一致 preflight 直接失败。
+- Linux 二进制在 `ubuntu-22.04` 上构建（glibc 2.35），以兼容更多发行版。
+- 测试 job 先 `cargo build --workspace`：CLAP / VST3 host 单测会从 `target/debug` dlopen fixture cdylib，只跑 `cargo test` 不保证该产物存在。
 
 ## 文档索引
 
