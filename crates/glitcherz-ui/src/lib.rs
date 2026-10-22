@@ -102,6 +102,10 @@ fn inline_plugin_label(name: &str, id: u32) -> String {
 /// BPM adjustable range (f64 in the document: time computation convention).
 pub const BPM_RANGE: RangeInclusive<f64> = 20.0..=300.0;
 
+/// Meters offered by the transport dropdown (U3a). The document stores any
+/// valid numerator/denominator pair; this is just the pick list.
+pub const METER_PRESETS: [(u8, u8); 6] = [(4, 4), (3, 4), (2, 4), (5, 4), (6, 8), (7, 8)];
+
 /// Computer keyboard → semitone offset (relative to the octave base, FL Studio-style layout).
 const KEYMAP: &[(egui::Key, u8)] = &[
     (egui::Key::A, 0),
@@ -1344,6 +1348,7 @@ impl GlitcherZApp {
         self.send_sequencer(SequencerCommand::SetBpm(convert::to_f32(
             self.project().metadata.tempo_bpm,
         )));
+        self.push_time_signature();
         for track in 0..self.project().midi_tracks.len() {
             self.send_track_clips(track);
         }
@@ -2435,7 +2440,9 @@ impl GlitcherZApp {
             return;
         };
         match project_files::read_midi(&path) {
-            Ok(tracks) => self.import_midi_tracks(tracks, &path),
+            Ok(imported) => {
+                self.import_midi_tracks(imported.tracks, imported.time_signature, &path);
+            }
             Err(err) => {
                 self.set_message(format!("MIDI import failed: {err}"));
                 log::error!("MIDI import failed: {err}");
@@ -2446,12 +2453,23 @@ impl GlitcherZApp {
     /// Appends imported tracks: empty tracks on screen are filled first, the
     /// rest get a fresh MIDI track (nodes + cables). The whole import is one
     /// undo step — the per-track steps must not split the history.
-    fn import_midi_tracks(&mut self, imported: Vec<MidiTrack>, source: &std::path::Path) {
+    ///
+    /// U3a: the file's meter is adopted only when the project has no content
+    /// yet (that import is really "open"); otherwise the project keeps its own
+    /// meter and the status line says so — re-measuring the grid under existing
+    /// clips is not something an import may do silently.
+    fn import_midi_tracks(
+        &mut self,
+        imported: Vec<MidiTrack>,
+        file_meter: Option<glitcherz_model::TimeSignature>,
+        source: &std::path::Path,
+    ) {
         let imported_len = imported.len();
         if imported_len == 0 {
             self.set_message(format!("No notes found in {}", display_name(source)));
             return;
         }
+        let unwritten = project_files::is_unwritten(self.project());
         let plan = project_files::plan_import(&self.project().midi_tracks, imported_len);
         let before = self.begin_edit();
         self.session.suspend_history();
@@ -2488,6 +2506,20 @@ impl GlitcherZApp {
             message.push_str(&format!(
                 " — {skipped} skipped (track limit {MAX_MIDI_TRACKS})"
             ));
+        }
+        // Meter (U3a): same undo step as the tracks, so one Ctrl+Z undoes the
+        // import as a whole.
+        if let Some(meter) = file_meter {
+            let current = self.project().metadata.time_signature;
+            if meter != current {
+                if unwritten {
+                    self.project_mut().metadata.time_signature = meter;
+                    self.push_time_signature();
+                    message.push_str(&format!(" — meter set to {meter}"));
+                } else {
+                    message.push_str(&format!(" — file is {meter}, project stays {current}"));
+                }
+            }
         }
         self.set_message(message);
         log::info!("MIDI imported: {}", source.display());
@@ -3670,6 +3702,25 @@ impl GlitcherZApp {
                     self.end_param_edit();
                 }
                 ui.separator();
+                // U3a: meter. Same read-local-then-write rule as tempo — the
+                // dropdown must not touch the document every frame.
+                ui.label("Meter");
+                let meter = self.project().metadata.time_signature;
+                let mut chosen = meter;
+                egui::ComboBox::from_id_salt("glitcherz_meter")
+                    .selected_text(meter.to_string())
+                    .width(52.0)
+                    .show_ui(ui, |ui| {
+                        for (numerator, denominator) in METER_PRESETS {
+                            let candidate =
+                                glitcherz_model::TimeSignature::new(numerator, denominator);
+                            ui.selectable_value(&mut chosen, candidate, candidate.to_string());
+                        }
+                    });
+                if chosen != meter {
+                    self.set_meter(chosen);
+                }
+                ui.separator();
                 ui.weak("GlitcherZ — Rust DAW");
             });
         });
@@ -3681,7 +3732,7 @@ impl GlitcherZApp {
     /// clip end across all tracks, rounded up to a bar (mirrors the
     /// engine's D16 rule); `0` when the arrangement is empty.
     fn arrangement_end_ticks(&self) -> u32 {
-        let bar = u64::from(glitcherz_model::TICKS_PER_BAR);
+        let bar = u64::from(self.project().ticks_per_bar());
         let mut latest = 0u64;
         for track in &self.project().midi_tracks {
             for clip in &track.clips {
@@ -3797,6 +3848,8 @@ impl GlitcherZApp {
                     edit_target,
                     loop_range: &project.metadata.loop_range,
                     markers: &project.metadata.markers,
+                    // U3a: the document's bar length, not the 4/4 constant.
+                    bar_ticks: project.ticks_per_bar(),
                 },
                 router,
             )
@@ -3966,18 +4019,50 @@ impl GlitcherZApp {
         self.engine.set_loop_range(start, end);
     }
 
+    /// Pushes the document meter to the engine (U3a): the engine derives its
+    /// bar length from it (arrangement-end rounding).
+    fn push_time_signature(&mut self) {
+        let meter = self.project().metadata.time_signature;
+        self.send_sequencer(SequencerCommand::SetTimeSignature {
+            numerator: meter.numerator,
+            denominator: meter.denominator,
+        });
+    }
+
+    /// Meter change from the transport (U3a): one undo step, and **no event
+    /// moves** — only the bar-derived measures (grid, loop snapping,
+    /// arrangement end, the ruler's bar numbers) change. Existing clips,
+    /// markers and the loop range keep their ticks, so a loop may stop sitting
+    /// on a bar line; the next manual drag snaps to the new grid.
+    fn set_meter(&mut self, meter: glitcherz_model::TimeSignature) {
+        if meter == self.project().metadata.time_signature {
+            return;
+        }
+        let before = self.begin_edit();
+        self.project_mut().metadata.time_signature = meter;
+        self.commit_edit("Meter", before);
+        self.push_time_signature();
+        self.set_message(format!("Meter {meter}"));
+    }
+
     /// Timeline clip edits: the view sends data, these apply it undoably.
     /// A drag frame goes through `commit_param_edit` with the gesture key, so
     /// one drag is one undo step.
     fn timeline_add_clip(&mut self, is_control: bool, track: usize, start_ticks: u32) {
         let before = self.begin_edit();
+        // A new clip is one bar long — of the document's meter (U3a), not the
+        // 4/4 constant the model default carries.
+        let bar = self.project().ticks_per_bar();
         let added = if is_control {
             self.project_mut()
                 .control_tracks
                 .get_mut(track)
                 .map(|t| {
                     if t.clips.len() < MAX_CLIPS_PER_TRACK {
-                        t.clips.push(ControlClip::new(start_ticks));
+                        let mut clip = ControlClip::new(start_ticks);
+                        clip.span_ticks = bar;
+                        clip.loop_ticks = bar;
+                        t.clips.push(clip);
                         true
                     } else {
                         false
@@ -3990,7 +4075,10 @@ impl GlitcherZApp {
                 .get_mut(track)
                 .map(|t| {
                     if t.clips.len() < MAX_CLIPS_PER_TRACK {
-                        t.clips.push(MidiClip::new(start_ticks));
+                        let mut clip = MidiClip::new(start_ticks);
+                        clip.span_ticks = bar;
+                        clip.loop_ticks = bar;
+                        t.clips.push(clip);
                         true
                     } else {
                         false
@@ -4448,9 +4536,12 @@ impl GlitcherZApp {
                 // frozen while stopped). The raw seconds counter is engine uptime (audio
                 // callback keeps rendering silent blocks), kept as a secondary diagnostic.
                 let ticks = self.engine.musical_ticks();
-                let tpb = glitcherz_model::TICKS_PER_BAR as f32;
+                // U3a: bar length and beat unit both come from the document's
+                // meter, so 6/8 counts six beats while 3/4 counts three.
+                let meter = self.project().metadata.time_signature;
+                let tpb = meter.ticks_per_bar() as f32;
                 let bar = (ticks / tpb).floor().max(0.0);
-                let beat = (ticks - bar * tpb) / (tpb / 4.0) + 1.0;
+                let beat = (ticks - bar * tpb) / meter.ticks_per_beat() as f32 + 1.0;
                 ui.label(format!("Pos {}.{}", bar as u32 + 1, beat));
                 ui.separator();
                 ui.label(format!("Uptime {:.1} s", position));
@@ -6163,9 +6254,11 @@ impl GlitcherZApp {
         let sel = track.min(self.project().midi_tracks.len() - 1);
         if self.project().midi_tracks[sel].clips.is_empty() {
             let before = self.begin_edit();
-            self.project_mut().midi_tracks[sel]
-                .clips
-                .push(MidiClip::new(0));
+            let bar = self.project().ticks_per_bar();
+            let mut clip = MidiClip::new(0);
+            clip.span_ticks = bar;
+            clip.loop_ticks = bar;
+            self.project_mut().midi_tracks[sel].clips.push(clip);
             self.commit_edit("New Clip", before);
             self.send_track_clips(sel);
         }
@@ -6211,6 +6304,9 @@ impl GlitcherZApp {
         });
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
+        // U3a: the roll's bar lines follow the document meter; read it before
+        // the destructuring below (which borrows `self` field by field).
+        let bar_ticks = self.project().ticks_per_bar();
         let intent = {
             // Destructured: `project()` borrows all of `self`, which would
             // collide with the `&mut self.roll_state` below.
@@ -6221,7 +6317,7 @@ impl GlitcherZApp {
                 ..
             } = self;
             let clip = &session.project().midi_tracks[sel].clips[clip_index];
-            piano_roll::show(ui, clip, roll_state, playhead, playing, router)
+            piano_roll::show(ui, clip, roll_state, playhead, playing, bar_ticks, router)
         };
         // Intents run as commands, so every roll edit is undoable. A drag
         // emits one intent per frame under the same gesture key: one drag,

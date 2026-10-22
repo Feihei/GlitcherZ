@@ -203,7 +203,16 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 - **整次导入 = 一步 undo**：外层 `begin_edit` + `suspend_history`，内层 `add_midi_track()` 自身的 `commit_edit` 在挂起期间被丢弃；收尾 `resume_history` 后一次性 commit。轨道内容写入后逐轨 `send_track_clips`（不走 `apply_document` 全量重建，节点已由 `add_midi_track` 装好）。
 - **`Session::is_dirty` 的可信度是前提**（此前形同虚设）：任何每帧执行的 `project_mut()` 都会置脏，于是保存后标题立刻变 `*`。三个元凶全部改为「读局部值 → `changed()` 才写」或「读取走 `project()`」——走带条的 tempo `DragValue`、Synth 面板的 master gain `Slider`、`control_editor_body` 的 `auto_endpoint` 读取。**新增每帧代码时不要直接 `DragValue::new(&mut self.project_mut()...)`**。
 - **未保存确认**：`FileAction{New, Open(PathBuf), Exit}` 统一走 `request_file_action`；dirty 时挂进 `pending_file_action` 并弹 `egui::Modal`（Save / Discard changes / Cancel）。**Save 失败或用户取消保存时对话框保持打开、动作不执行**（`do_save` 因此返回 `bool`）。关窗拦截 = `viewport().close_requested()` → `CancelClose` → 答复后 `allow_close` 回放；auto-close 冒烟路径直接置 `allow_close` 绕过。modal 打开期间跳过 `handle_keyboard_input`（否则 Space 会边弹窗边播放）。
-- **已知取舍**：undo 退回到已保存状态仍显示 `*`（要清必须比内容 hash，成本不值）；SMF 导入不搬文件里的 tempo（`import_smf` 只回轨道），沿用当前工程 BPM。
+- **已知取舍**：undo 退回到已保存状态仍显示 `*`（要清必须比内容 hash，成本不值）；SMF 导入不搬文件里的 tempo（`import_smf` 只回轨道与拍号），沿用当前工程 BPM。
+
+#### 拍号（U3a，2026-10-22）
+
+- **模型**：`TimeSignature{numerator, denominator}`（`serde(default)` → 旧文档读出 4/4，**PROJECT_VERSION 仍 6**）；`new()` 钳制（分子 1..=16、分母向上取到 2 的幂 ≤32），`is_valid()` 才是 `Project::validate` 的严格检查。派生 `ticks_per_bar()` = `TPQ × 4 / den × num`、`ticks_per_beat()`（= 分母的音符时值，用于 `Pos bar.beat` 读数）。`TICKS_PER_BAR` 常量保留为 4/4 默认（新建 clip 的兜底），不再是唯一真源。
+- **引擎镜像**：`glitcherz-engine` 不依赖 model，`ticks_per_bar_of()` 是第二份公式，由 `tests/tick_base_consistency.rs` 对锁（4/4 3/4 2/4 5/4 6/8 7/8 9/8 全比对）。`Sequencer::bar_ticks` 只在 `SetTimeSignature` 时变，改拍号**不碰 transport 位置**，只触发 `refresh_arrangement_end`（排列末尾按新小节取整）。
+- **UI 侧**：`TimelineParams.bar_ticks` / `piano_roll::show(..., bar_ticks, ...)` 把文档拍号传进两个自绘视图；`snap_bar` / `knife_target` / `grab_targets` / `stretch_targets` 全部显式接收 bar 长度（原来都闭包捕获 `TICKS_PER_BAR`）。走带拍号下拉一步 undo，且**只改网格不改事件**。
+- **排列上限是 tick 而不是小节**：`MAX_ARRANGEMENT_TICKS` 保持原值（4/4 下 256 小节），视图宽度按 `ceil(limit / bar_ticks)` 铺满——7/8 下能放 292 小节、3/4 下 341 小节，内容上限始终是同一段时间。
+- **改拍号后的既有对象停在原 tick**：loop 端点、marker、clip 不吸附也不换算（可能不再落在大节线上）；下一次手动拖动才按新网格吸附。这是"拍号是记谱不是变换"的直接结论，别在 UI 里加"自动重排"。
+- **SMF**：导出写真实 `FF 58`（`dd = log2(denominator)`，`cc=24` / `bb=8` 不变）；`import_smf` 返回 `SmfImport{tracks, time_signature}`，首个 `FF 58` 胜出。**导入策略**：`project_files::is_unwritten`（所有 MIDI 轨无音符无 CC 且无控制 clip）时继承文件拍号（此时"导入"等价于"打开"），否则保留工程拍号并在状态栏说明差异——一次导入不应偷偷重划已有内容的网格。
 
 #### 钢琴卷帘拖动协议（`piano_roll::DragSelection`）
 

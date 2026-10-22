@@ -38,7 +38,7 @@
 use eframe::egui;
 
 use crate::grid::GridValue;
-use glitcherz_model::{MidiClip, Note, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP};
+use glitcherz_model::{MidiClip, Note, TICKS_PER_QUARTER, TICKS_PER_STEP};
 
 pub use crate::grid::NoteValue;
 
@@ -780,6 +780,7 @@ pub fn show(
     state: &mut RollState,
     playhead_ticks: f32,
     playing: bool,
+    bar_ticks: u32,
     router: &mut crate::focus::FocusRouter,
 ) -> Option<RollIntent> {
     let loop_ticks = i64::from(clip.loop_ticks.max(TICKS_PER_STEP)).max(1);
@@ -1042,14 +1043,16 @@ pub fn show(
 
     // 2. Vertical grid, re-anchored on every bar line (M2.1): lines are
     //    counted from each bar start, so they stay aligned with the bars
-    //    whatever the meter does to a bar's length.
-    let bars = (loop_ticks + i64::from(TICKS_PER_BAR) - 1) / i64::from(TICKS_PER_BAR);
+    //    whatever the meter does to a bar's length. `bar_ticks` is the
+    //    document's meter (U3a), not the 4/4 constant.
+    let bar_ticks = i64::from(bar_ticks.max(1));
+    let bars = (loop_ticks + bar_ticks - 1) / bar_ticks;
     for bar in 0..bars {
-        let bar_start = bar * i64::from(TICKS_PER_BAR);
-        let bar_end = (bar_start + i64::from(TICKS_PER_BAR)).min(loop_ticks);
+        let bar_start = bar * bar_ticks;
+        let bar_end = (bar_start + bar_ticks).min(loop_ticks);
         let mut tick = bar_start;
         while tick < bar_end {
-            let is_bar_line = tick % i64::from(TICKS_PER_BAR) == 0;
+            let is_bar_line = tick % bar_ticks == 0;
             let x = t0_x + tick as f32 * ticks_to_x;
             let stroke = egui::Stroke::new(
                 if is_bar_line { 1.5 } else { 1.0 },

@@ -212,7 +212,97 @@ pub const TICKS_PER_QUARTER: u32 = 960;
 pub const TICKS_PER_STEP: u32 = TICKS_PER_QUARTER / 4;
 
 /// Ticks per bar (4/4) = 16 steps × 240.
+///
+/// The 4/4 default, kept as the span of a freshly created clip. Reading the
+/// **document's** meter goes through [`TimeSignature::ticks_per_bar`] (U3a) —
+/// this constant is no longer the only source of a bar length.
 pub const TICKS_PER_BAR: u32 = TICKS_PER_STEP * 16;
+
+/// Largest number of beats per bar a [`TimeSignature`] can express.
+pub const MAX_TIME_SIGNATURE_NUMERATOR: u8 = 16;
+
+/// Musical meter (U3a): how the timeline is grouped into bars.
+///
+/// A meter is **notation plus a bar length**, never a data transform: changing
+/// it moves no note, clip, marker or loop endpoint. Only the derived
+/// [`TimeSignature::ticks_per_bar`] changes, and with it everything that
+/// measures in bars — grid lines, loop snapping, arrangement rounding, the
+/// ruler's bar numbers and the SMF `FF 58` meta event.
+///
+/// Two meters can share a bar length yet group differently (3/4 and 6/8 are
+/// both 2880 ticks here): the grouping is notation, the tick count is what
+/// other code reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TimeSignature {
+    /// Beats per bar (`1..=`[`MAX_TIME_SIGNATURE_NUMERATOR`]).
+    #[serde(default = "default_meter_numerator")]
+    pub numerator: u8,
+    /// The note value that counts as one beat: a power of two (1, 2, 4, 8, 16
+    /// or 32 — the range the SMF `FF 58` denominator exponent can express).
+    #[serde(default = "default_meter_denominator")]
+    pub denominator: u8,
+}
+
+fn default_meter_numerator() -> u8 {
+    4
+}
+
+fn default_meter_denominator() -> u8 {
+    4
+}
+
+impl TimeSignature {
+    /// 4/4 — the project default and what old (meter-less) documents load with.
+    pub const COMMON: Self = Self {
+        numerator: 4,
+        denominator: 4,
+    };
+
+    /// Builds a meter, clamping both fields into range. The file layer and the
+    /// UI both funnel through here, so a malformed value can never produce a
+    /// zero-length bar; [`TimeSignature::is_valid`] is the strict check
+    /// `Project::validate` runs on load.
+    pub fn new(numerator: u8, denominator: u8) -> Self {
+        Self {
+            numerator: numerator.clamp(1, MAX_TIME_SIGNATURE_NUMERATOR),
+            denominator: denominator.clamp(1, 32).next_power_of_two().min(32),
+        }
+    }
+
+    /// Whether both fields are in range (no clamping performed).
+    pub fn is_valid(&self) -> bool {
+        (1..=MAX_TIME_SIGNATURE_NUMERATOR).contains(&self.numerator)
+            && self.denominator.is_power_of_two()
+            && (1..=32).contains(&self.denominator)
+    }
+
+    /// Ticks per bar: `TICKS_PER_QUARTER × 4 / denominator × numerator`.
+    ///
+    /// 4/4 = 3840, 3/4 = 2880, 6/8 = 2880 (the same span, grouped in three),
+    /// 7/8 = 3360. Always `>= 1` (the fields are clamped on construction).
+    pub fn ticks_per_bar(&self) -> u32 {
+        TICKS_PER_QUARTER * 4 / u32::from(self.denominator.max(1))
+            * u32::from(self.numerator.max(1))
+    }
+
+    /// Ticks in one beat (the denominator's note value) — the bar.beat readout
+    /// steps by this, so 6/8 counts six beats while 3/4 counts three.
+    pub fn ticks_per_beat(&self) -> u32 {
+        TICKS_PER_QUARTER * 4 / u32::from(self.denominator.max(1))
+    }
+}
+
+impl Default for TimeSignature {
+    fn default() -> Self {
+        Self::COMMON
+    }
+}
+
+impl std::fmt::Display for TimeSignature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.numerator, self.denominator)
+    }
+}
 
 /// A note block in the piano roll.
 ///
@@ -1734,10 +1824,23 @@ impl Project {
         }
     }
 
+    /// The document's bar length in ticks (U3a): every bar-based measure
+    /// (grid, loop snapping, arrangement rounding, ruler) reads this instead
+    /// of the 4/4 [`TICKS_PER_BAR`] constant.
+    pub fn ticks_per_bar(&self) -> u32 {
+        self.metadata.time_signature.ticks_per_bar()
+    }
+
     /// Project-level validation: track counts, clip capacities/placement and
     /// graph structure (the file layer is the last line of defense; report
     /// errors instead of truncating).
     pub fn validate(&self) -> Result<(), String> {
+        if !self.metadata.time_signature.is_valid() {
+            return Err(format!(
+                "invalid time signature {} (numerator 1..={MAX_TIME_SIGNATURE_NUMERATOR}, denominator a power of two up to 32)",
+                self.metadata.time_signature
+            ));
+        }
         if self.midi_tracks.len() > MAX_MIDI_TRACKS {
             return Err(format!(
                 "MIDI track count {} exceeds the limit {MAX_MIDI_TRACKS}",
@@ -1856,6 +1959,11 @@ pub struct ProjectMetadata {
     /// kept sorted by tick. Additive field — old files load with none.
     #[serde(default)]
     pub markers: Vec<Marker>,
+    /// Musical meter (U3a). Additive field: documents written before it
+    /// existed load as 4/4, byte-identical to the old behavior — which is why
+    /// `PROJECT_VERSION` stays at 6.
+    #[serde(default)]
+    pub time_signature: TimeSignature,
 }
 
 /// Song loop range (U1). See [`ProjectMetadata::loop_range`].
@@ -1900,6 +2008,7 @@ impl Default for ProjectMetadata {
             tempo_bpm: default_tempo(),
             loop_range: SongLoop::default(),
             markers: Vec::new(),
+            time_signature: TimeSignature::COMMON,
         }
     }
 }
@@ -2145,6 +2254,72 @@ mod tests {
         assert_eq!(TICKS_PER_STEP * 3 / 2, 360);
         // Triplet 1/8 = quarter / 3.
         assert_eq!(TICKS_PER_QUARTER / 3, 320);
+    }
+
+    #[test]
+    fn meter_derives_the_bar_length_from_its_own_fields() {
+        use super::TimeSignature;
+        // 4/4 keeps the historical constant.
+        assert_eq!(TimeSignature::COMMON.ticks_per_bar(), TICKS_PER_BAR);
+        assert_eq!(TimeSignature::new(3, 4).ticks_per_bar(), 2880);
+        // 6/8 and 3/4 span the SAME ticks but group differently: the only
+        // difference a meter makes to arithmetic is the bar length.
+        assert_eq!(TimeSignature::new(6, 8).ticks_per_bar(), 2880);
+        assert_eq!(TimeSignature::new(7, 8).ticks_per_bar(), 3360);
+        assert_eq!(TimeSignature::new(5, 4).ticks_per_bar(), 4800);
+        // Beat length is the denominator's note value.
+        assert_eq!(TimeSignature::new(3, 4).ticks_per_beat(), TICKS_PER_QUARTER);
+        assert_eq!(TimeSignature::new(6, 8).ticks_per_beat(), 480);
+    }
+
+    #[test]
+    fn meter_clamps_and_validates() {
+        use super::TimeSignature;
+        // Out-of-range input snaps instead of producing a zero-length bar.
+        let clamped = TimeSignature::new(0, 0);
+        assert_eq!(clamped.numerator, 1);
+        assert_eq!(clamped.denominator, 1);
+        assert!(clamped.ticks_per_bar() >= 1);
+        // Non-power-of-two denominators round up to the next power of two.
+        assert_eq!(TimeSignature::new(4, 3).denominator, 4);
+        assert_eq!(TimeSignature::new(9, 64).denominator, 32);
+        assert_eq!(TimeSignature::new(20, 4).numerator, 16);
+        // Validation is strict: the parsed document must already be in range.
+        assert!(TimeSignature::COMMON.is_valid());
+        assert!(
+            !TimeSignature {
+                numerator: 0,
+                denominator: 4
+            }
+            .is_valid()
+        );
+        assert!(
+            !TimeSignature {
+                numerator: 4,
+                denominator: 3
+            }
+            .is_valid()
+        );
+        assert!(
+            !TimeSignature {
+                numerator: 4,
+                denominator: 64
+            }
+            .is_valid()
+        );
+    }
+
+    #[test]
+    fn meter_is_additive_for_old_documents() {
+        // A document written before U3a has no `time_signature` field: it must
+        // load as 4/4 (no version bump, no migration branch).
+        let metadata: super::ProjectMetadata =
+            ron::from_str(r#"(name: "old", tempo_bpm: 120.0)"#).expect("parse");
+        assert_eq!(metadata.time_signature, super::TimeSignature::COMMON);
+        assert_eq!(metadata.time_signature.ticks_per_bar(), TICKS_PER_BAR);
+        // A partial object (numerator only) still fills the denominator.
+        let partial: super::TimeSignature = ron::from_str("(numerator: 3)").expect("parse");
+        assert_eq!(partial, super::TimeSignature::new(3, 4));
     }
 
     #[test]

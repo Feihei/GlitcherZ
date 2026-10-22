@@ -10,7 +10,7 @@
 //! behavior, and structural violations return [`SmfError`] with the byte
 //! offset. Event and track counts are capped.
 
-use crate::{MidiClip, MidiTrack, Note, Sequence, TICKS_PER_QUARTER};
+use crate::{MidiClip, MidiTrack, Note, Sequence, TICKS_PER_QUARTER, TimeSignature};
 
 /// Parser safety limits.
 pub const MAX_TRACKS: usize = 4096;
@@ -37,7 +37,8 @@ fn error(offset: usize, message: impl Into<String>) -> SmfError {
 ///
 /// Clips are laid out at their absolute arrangement position; a clip's loop
 /// repeats across its span exactly as the scheduler plays it. The conductor
-/// track carries the project tempo.
+/// track carries the project tempo **and its meter** (U3a: `FF 58`, which used
+/// to be hardcoded to 4/4).
 pub fn export_smf(project: &crate::Project) -> Vec<u8> {
     let mut out = Vec::new();
     let track_count = project.midi_tracks.len() + 1; // + conductor
@@ -47,14 +48,25 @@ pub fn export_smf(project: &crate::Project) -> Vec<u8> {
     out.extend_from_slice(&(track_count as u16).to_be_bytes());
     out.extend_from_slice(&(TICKS_PER_QUARTER as u16).to_be_bytes());
 
-    // Conductor: tempo + 4/4 + end of track.
+    // Conductor: tempo + meter + end of track.
     let micros_per_quarter = (60.0 / project.metadata.tempo_bpm * 1_000_000.0).round() as u32;
+    let meter = project.metadata.time_signature;
     let mut conductor = Vec::new();
     conductor.extend_from_slice(&vlq(0));
     conductor.extend_from_slice(&[0xFF, 0x51, 0x03]);
     conductor.extend_from_slice(&micros_per_quarter.to_be_bytes()[1..4]);
     conductor.extend_from_slice(&vlq(0));
-    conductor.extend_from_slice(&[0xFF, 0x58, 0x04, 4, 2, 24, 8]); // 4/4
+    // FF 58 04 nn dd cc bb: nn beats per bar, dd = log2(denominator),
+    // cc = MIDI clocks per metronome click, bb = 32nd notes per quarter.
+    conductor.extend_from_slice(&[
+        0xFF,
+        0x58,
+        0x04,
+        meter.numerator,
+        meter.denominator.trailing_zeros() as u8,
+        24,
+        8,
+    ]);
     conductor.extend_from_slice(&vlq(0));
     conductor.extend_from_slice(&[0xFF, 0x2F, 0x00]);
     write_chunk(&mut out, b"MTrk", &conductor);
@@ -147,12 +159,27 @@ fn vlq(mut value: i64) -> Vec<u8> {
 
 // ---- Import -------------------------------------------------------------------------------
 
-/// Parses a format-0/1 SMF into MIDI tracks.
+/// What a format-1 file carries beyond its notes: the document-level header.
+///
+/// Tempo is still left out (importing it would silently re-time an existing
+/// project; the caller keeps its BPM — see `implementation.md`'s known
+/// trade-off). The meter **is** reported so the caller can decide: a meter is
+/// notation, and a file's meter is worth adopting when the project has no
+/// content of its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SmfImport {
+    /// The note-bearing tracks (the conductor track folds into this header).
+    pub tracks: Vec<MidiTrack>,
+    /// The first `FF 58` meter in the file, if any.
+    pub time_signature: Option<TimeSignature>,
+}
+
+/// Parses a format-0/1 SMF into MIDI tracks plus the file's meter.
 ///
 /// Notes become one clip per track spanning the track's musical extent, with
 /// note starts relative to the clip. Meta events other than the track name
-/// are ignored (tempo is a project-level setting here).
-pub fn import_smf(bytes: &[u8]) -> Result<Vec<MidiTrack>, SmfError> {
+/// (and, since U3a, the meter) are ignored.
+pub fn import_smf(bytes: &[u8]) -> Result<SmfImport, SmfError> {
     let mut cursor = Cursor { bytes, offset: 0 };
     cursor.expect_tag(b"MThd")?;
     let header_len = cursor.u32()? as usize;
@@ -181,6 +208,7 @@ pub fn import_smf(bytes: &[u8]) -> Result<Vec<MidiTrack>, SmfError> {
     cursor.skip(header_len - 6)?;
 
     let mut tracks = Vec::new();
+    let mut meter: Option<TimeSignature> = None;
     let mut parsed = 0usize;
     while parsed < declared_tracks.min(MAX_TRACKS) {
         parsed += 1;
@@ -193,7 +221,7 @@ pub fn import_smf(bytes: &[u8]) -> Result<Vec<MidiTrack>, SmfError> {
             ));
         }
         let payload = &bytes[cursor.offset..cursor.offset + length];
-        let track = parse_track(payload, ticks_per_quarter, tracks.len())?;
+        let track = parse_track(payload, ticks_per_quarter, tracks.len(), &mut meter)?;
         // A format-1 conductor track carries only meta events: it folds into
         // the project's global tempo/meter, so it becomes no track here.
         if !track.clips.iter().all(|c| c.sequence.notes.is_empty()) {
@@ -201,7 +229,10 @@ pub fn import_smf(bytes: &[u8]) -> Result<Vec<MidiTrack>, SmfError> {
         }
         cursor.skip(length)?;
     }
-    Ok(tracks)
+    Ok(SmfImport {
+        tracks,
+        time_signature: meter,
+    })
 }
 
 struct Cursor<'a> {
@@ -256,10 +287,15 @@ impl Cursor<'_> {
 }
 
 /// Parses one MTrk payload into note events.
+///
+/// The meter (`FF 58`) lands in `meter` — first occurrence wins, so a format-1
+/// conductor track's header is what the caller sees even when later tracks
+/// restate it.
 fn parse_track(
     payload: &[u8],
     ticks_per_quarter: i64,
     track_index: usize,
+    meter: &mut Option<TimeSignature>,
 ) -> Result<MidiTrack, SmfError> {
     let mut cursor = Cursor {
         bytes: payload,
@@ -331,6 +367,18 @@ fn parse_track(
                     name = String::from_utf8_lossy(text)
                         .trim_end_matches('\0')
                         .to_string();
+                }
+                // FF 58 04 nn dd cc bb — the first meter in the file wins.
+                if kind == 0x58 && length >= 2 && meter.is_none() {
+                    let data = payload
+                        .get(cursor.offset..cursor.offset + length)
+                        .unwrap_or(&[]);
+                    if let (Some(&numerator), Some(&exponent)) = (data.first(), data.get(1)) {
+                        // dd is log2(denominator); anything beyond 32 is
+                        // clamped by `TimeSignature::new`.
+                        let denominator = 1u8.checked_shl(u32::from(exponent)).unwrap_or(32);
+                        *meter = Some(TimeSignature::new(numerator, denominator));
+                    }
                 }
                 cursor.skip(length)?;
             }
@@ -414,7 +462,7 @@ fn entry(map: &mut OpenNotes, key: (u8, u8)) -> &mut Vec<(i64, u8)> {
 #[cfg(test)]
 mod tests {
     use super::{MAX_EVENTS, export_smf, import_smf, vlq};
-    use crate::{MidiClip, MidiTrack, Note, Project, TICKS_PER_QUARTER};
+    use crate::{MidiClip, MidiTrack, Note, Project, TICKS_PER_QUARTER, TimeSignature};
 
     fn project_with(tracks: Vec<MidiTrack>, bpm: f64) -> Project {
         let mut project = Project::default();
@@ -470,7 +518,7 @@ mod tests {
         );
 
         let bytes = export_smf(&project);
-        let mut imported = import_smf(&bytes).expect("parse");
+        let mut imported = import_smf(&bytes).expect("parse").tracks;
         assert_eq!(imported.len(), 1);
         let track = imported.pop().expect("one track");
         assert_eq!(track.name, "lead");
@@ -488,6 +536,43 @@ mod tests {
     }
 
     #[test]
+    fn meter_round_trips_through_the_conductor_track() {
+        let mut project = project_with(Vec::new(), 120.0);
+        project.metadata.time_signature = TimeSignature::new(7, 8);
+        let bytes = export_smf(&project);
+        // FF 58 04 nn dd cc bb with dd = log2(8) = 3.
+        assert!(
+            bytes
+                .windows(7)
+                .any(|w| w == [0xFF, 0x58, 0x04, 7, 3, 24, 8]),
+            "the conductor track carries the project meter"
+        );
+        let imported = import_smf(&bytes).expect("parse");
+        assert_eq!(imported.time_signature, Some(TimeSignature::new(7, 8)));
+        assert!(
+            imported.tracks.is_empty(),
+            "a conductor-only file holds no note tracks"
+        );
+    }
+
+    #[test]
+    fn files_without_a_meter_report_none() {
+        // A bare note file: no FF 58, so the caller keeps its own meter.
+        let mut bytes = header(1, 960);
+        let mut track = vec![0x00, 0x90, 60, 100];
+        track.extend_from_slice(&vlq(240));
+        track.extend_from_slice(&[0x80, 60, 0]);
+        track.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        bytes.extend_from_slice(b"MTrk");
+        bytes.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&track);
+
+        let imported = import_smf(&bytes).expect("parse");
+        assert_eq!(imported.time_signature, None);
+        assert_eq!(imported.tracks.len(), 1);
+    }
+
+    #[test]
     fn note_on_with_velocity_zero_is_a_note_off() {
         // One note-on (vel 100) then a note-on with velocity 0.
         let mut bytes = header(1, 960);
@@ -502,7 +587,7 @@ mod tests {
         bytes.extend_from_slice(&(track.len() as u32).to_be_bytes());
         bytes.extend_from_slice(&track);
 
-        let tracks = import_smf(&bytes).expect("parse");
+        let tracks = import_smf(&bytes).expect("parse").tracks;
         let notes = &tracks[0].clips[0].sequence.notes;
         assert_eq!(notes.len(), 1);
         assert_eq!((notes[0].start, notes[0].length), (0, 240));
@@ -518,7 +603,7 @@ mod tests {
         bytes.extend_from_slice(&(track.len() as u32).to_be_bytes());
         bytes.extend_from_slice(&track);
 
-        let tracks = import_smf(&bytes).expect("parse");
+        let tracks = import_smf(&bytes).expect("parse").tracks;
         let notes = &tracks[0].clips[0].sequence.notes;
         assert_eq!(notes.len(), 1, "the hanging note is closed, not dropped");
         assert_eq!(notes[0].length, 1000);
@@ -541,7 +626,7 @@ mod tests {
         bytes.extend_from_slice(&(track.len() as u32).to_be_bytes());
         bytes.extend_from_slice(&track);
 
-        let tracks = import_smf(&bytes).expect("parse");
+        let tracks = import_smf(&bytes).expect("parse").tracks;
         let mut notes = tracks[0].clips[0].sequence.notes.clone();
         notes.sort_by_key(|n| n.start);
         assert_eq!(notes.len(), 2);
@@ -565,7 +650,7 @@ mod tests {
         bytes.extend_from_slice(&(track.len() as u32).to_be_bytes());
         bytes.extend_from_slice(&track);
 
-        let tracks = import_smf(&bytes).expect("parse");
+        let tracks = import_smf(&bytes).expect("parse").tracks;
         let notes = &tracks[0].clips[0].sequence.notes;
         assert_eq!(notes.len(), 1);
         assert_eq!(

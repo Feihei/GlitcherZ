@@ -215,6 +215,24 @@ mod tests {
         assert!(loaded.metadata.loop_range.is_active());
     }
 
+    // U3a: the meter survives the roundtrip and drives the derived bar length.
+    #[test]
+    fn metadata_time_signature_roundtrip() {
+        let mut project = demo_project();
+        project.metadata.time_signature = crate::TimeSignature::new(7, 8);
+        let path = std::env::temp_dir().join(format!("glitcherz_meter_{}.glz", std::process::id()));
+
+        save_project(&project, &path).expect("save failed");
+        let loaded = load_project(&path).expect("load failed");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            loaded.metadata.time_signature,
+            crate::TimeSignature::new(7, 8)
+        );
+        assert_eq!(loaded.ticks_per_bar(), 3360);
+    }
+
     // U1: old documents without the new metadata fields load with defaults
     // (additive fields, PROJECT_VERSION unchanged).
     #[test]
@@ -231,6 +249,9 @@ mod tests {
         assert_eq!(loaded.metadata.loop_range, crate::SongLoop::default());
         assert!(!loaded.metadata.loop_range.is_active());
         assert!(loaded.metadata.markers.is_empty());
+        // U3a: meter-less documents read as 4/4, byte-identical to before.
+        assert_eq!(loaded.metadata.time_signature, crate::TimeSignature::COMMON);
+        assert_eq!(loaded.ticks_per_bar(), crate::TICKS_PER_BAR);
     }
 
     #[test]

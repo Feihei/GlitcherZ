@@ -25,6 +25,26 @@ fn engine_bar_length_is_derived_not_hardcoded() {
 }
 
 #[test]
+fn engine_meter_formula_matches_the_document() {
+    // U3a: the bar length is now meter-derived, and the engine keeps its own
+    // copy of the formula (it cannot depend on the model). Lock them together
+    // for every meter a user can pick.
+    for (numerator, denominator) in [(4, 4), (3, 4), (2, 4), (5, 4), (6, 8), (7, 8), (9, 8)] {
+        let document = glitcherz_model::TimeSignature::new(numerator, denominator);
+        assert_eq!(
+            document.ticks_per_bar(),
+            glitcherz_engine::realtime::ticks_per_bar_of(numerator, denominator),
+            "{numerator}/{denominator} bar length diverged"
+        );
+    }
+    // The 4/4 constant is still the default meter's bar length.
+    assert_eq!(
+        glitcherz_model::TimeSignature::default().ticks_per_bar(),
+        TICKS_PER_BAR
+    );
+}
+
+#[test]
 fn document_note_converts_into_an_rte_note_without_loss() {
     use glitcherz_engine::realtime::RtNote;
 

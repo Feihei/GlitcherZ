@@ -82,8 +82,8 @@ pub use graph::{
 pub use mixer::{MixerChannel, MixerProcessor};
 pub use processor::{ChannelWeights, MAX_WEIGHT_CHANNELS, Processor, ProcessorChain};
 pub use sequencer::{
-    MAX_CLIP_NOTES, MAX_TRACK_CLIPS, MIN_VELOCITY, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR,
-    TICKS_PER_QUARTER, TICKS_PER_STEP,
+    MAX_CLIP_NOTES, MAX_TIME_SIGNATURE_NUMERATOR, MAX_TRACK_CLIPS, MIN_VELOCITY, RtMidiClip,
+    RtNote, Sequencer, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, ticks_per_bar_of,
 };
 pub use sf2::{SF2_POLYPHONY, Sf2VoiceProcessor};
 pub use sine::SineProcessor;

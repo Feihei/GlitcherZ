@@ -315,6 +315,10 @@ impl BlockRunner {
                 self.sequencer.set_loop_range(start_ticks, end_ticks);
             }
             SequencerCommand::SetBpm(bpm) => self.sequencer.set_bpm(bpm),
+            SequencerCommand::SetTimeSignature {
+                numerator,
+                denominator,
+            } => self.sequencer.set_time_signature(numerator, denominator),
             SequencerCommand::SetTrackClips { track, clips } => {
                 self.sequencer.set_track_clips(track, clips);
             }

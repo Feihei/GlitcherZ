@@ -33,16 +33,35 @@ use crate::realtime::context::ProcessContext;
 ///
 /// The engine crate deliberately does **not** depend on `glitcherz-model` (the
 /// audio thread must stay independent of the document layer), so this mirrors
-/// `glitcherz_model::TICKS_PER_QUARTER`. `tests/tick_base.rs` locks the two in
-/// step — 960 PPQ is the Standard MIDI File convention and divides evenly for
-/// 1/64 triplets.
+/// `glitcherz_model::TICKS_PER_QUARTER`. The workspace test
+/// `glitcherz-ui/tests/tick_base_consistency.rs` locks the two in step — 960
+/// PPQ is the Standard MIDI File convention and divides evenly for 1/64
+/// triplets.
 pub const TICKS_PER_QUARTER: u32 = 960;
 
 /// Ticks per step (a sixteenth note).
 pub const TICKS_PER_STEP: u32 = TICKS_PER_QUARTER / 4;
 
-/// Ticks per bar (4/4) — default clip span/loop length.
+/// Ticks per bar in **4/4** — the default clip span/loop length and the
+/// fallback meter. The live bar length is [`Sequencer::bar_ticks`] (U3a).
 pub const TICKS_PER_BAR: u32 = TICKS_PER_STEP * 16;
+
+/// Largest beats-per-bar the engine accepts (`TimeSignature`'s mirror).
+pub const MAX_TIME_SIGNATURE_NUMERATOR: u8 = 16;
+
+/// Bar length in ticks for a meter: `TICKS_PER_QUARTER × 4 / denominator ×
+/// numerator`.
+///
+/// Mirrors `glitcherz_model::TimeSignature::ticks_per_bar` (the engine crate
+/// cannot depend on the model); `tick_base_consistency.rs` keeps the two
+/// formulas in step. Both fields are clamped: a malformed value must never
+/// yield a zero-length bar (that would make `div_ceil` panic-free but every
+/// arrangement end zero).
+pub fn ticks_per_bar_of(numerator: u8, denominator: u8) -> u32 {
+    let numerator = u32::from(numerator.clamp(1, MAX_TIME_SIGNATURE_NUMERATOR));
+    let denominator = u32::from(denominator.clamp(1, 32).next_power_of_two().min(32));
+    TICKS_PER_QUARTER * 4 / denominator * numerator
+}
 
 /// Lowest note-on velocity (a note-off; silence).
 pub const MIN_VELOCITY: u8 = 1;
@@ -162,6 +181,11 @@ pub struct Sequencer {
     sample_rate: f32,
     playing: bool,
     bpm: f32,
+    /// Ticks per bar for the document's meter (U3a). Everything that measures
+    /// in bars — arrangement-end rounding, loop snapping on the control side —
+    /// reads this instead of the 4/4 [`TICKS_PER_BAR`] constant. Set by
+    /// `SetTimeSignature`; changing it never moves the transport.
+    bar_ticks: u32,
     position_ticks: f64,
     /// Active MIDI track count (D12 dynamic tracks: sent from the control side
     /// via `SetMidiTrackCount`, scheduling only scans `0..track_count`;
@@ -196,6 +220,7 @@ impl Sequencer {
             },
             playing: false,
             bpm: 120.0,
+            bar_ticks: TICKS_PER_BAR,
             position_ticks: 0.0,
             track_count: crate::realtime::DEFAULT_MIDI_TRACKS,
             clips: [[RtMidiClip::default(); MAX_TRACK_CLIPS]; MAX_MIDI_TRACKS],
@@ -329,6 +354,25 @@ impl Sequencer {
         }
     }
 
+    /// Sets the document's meter (U3a): only the bar length changes, and the
+    /// arrangement end is re-rounded to whole bars of the new length. The
+    /// transport position is untouched — a meter is notation, not a data
+    /// transform (no event moves).
+    ///
+    /// RT-safe: arithmetic only, no allocation.
+    pub fn set_time_signature(&mut self, numerator: u8, denominator: u8) {
+        let bar_ticks = ticks_per_bar_of(numerator, denominator);
+        if bar_ticks != self.bar_ticks {
+            self.bar_ticks = bar_ticks;
+            self.refresh_arrangement_end();
+        }
+    }
+
+    /// The live bar length in ticks (U3a). RT-safe.
+    pub fn bar_ticks(&self) -> u32 {
+        self.bar_ticks
+    }
+
     /// Replaces one MIDI track's clip table in one block (D15 batch; out-of-range
     /// tracks ignored). Also refreshes the arrangement end. RT-safe.
     pub fn set_track_clips(&mut self, track: usize, clips: [RtMidiClip; MAX_TRACK_CLIPS]) {
@@ -359,7 +403,8 @@ impl Sequencer {
     }
 
     /// D16: arrangement end = the latest clip end (`start + span`) across all
-    /// MIDI and control clips, rounded up to a whole bar.
+    /// MIDI and control clips, rounded up to a whole bar of the **current**
+    /// meter (U3a).
     fn refresh_arrangement_end(&mut self) {
         let mut latest: u32 = 0;
         for track in &self.clips {
@@ -372,10 +417,11 @@ impl Sequencer {
                 latest = latest.max(clip.start_ticks.saturating_add(clip.span_ticks));
             }
         }
+        let bar = self.bar_ticks.max(1);
         self.arrangement_end_ticks = if latest == 0 {
             0
         } else {
-            latest.div_ceil(TICKS_PER_BAR) * TICKS_PER_BAR
+            latest.div_ceil(bar) * bar
         };
     }
 
@@ -884,6 +930,39 @@ mod tests {
         seq.set_track_clips(1, [RtMidiClip::default(); MAX_TRACK_CLIPS]);
         seq.set_control_clips(0, [RtControlClip::default(); MAX_TRACK_CLIPS]);
         assert_eq!(seq.arrangement_end_ticks(), 0);
+    }
+
+    #[test]
+    fn meter_changes_the_bar_rounding_and_moves_nothing() {
+        let mut seq = Sequencer::new(SR);
+        // 4800 ticks = 1.25 bars of 4/4, ceiled to 2 bars.
+        place(
+            &mut seq,
+            0,
+            0,
+            4800,
+            4800,
+            &[clip_note(0, TICKS_PER_STEP, 60)],
+        );
+        assert_eq!(seq.arrangement_end_ticks(), 2 * TICKS_PER_BAR);
+        // 3/4 (2880): the same content now spans two shorter bars.
+        seq.set_time_signature(3, 4);
+        assert_eq!(seq.bar_ticks(), 2880);
+        assert_eq!(seq.arrangement_end_ticks(), 5760);
+        // 6/8 has the same bar length as 3/4 — nothing moves.
+        seq.set_time_signature(6, 8);
+        assert_eq!(seq.arrangement_end_ticks(), 5760);
+        // 7/8 (3360) → 2 bars = 6720.
+        seq.set_time_signature(7, 8);
+        assert_eq!(seq.arrangement_end_ticks(), 6720);
+        // A meter change never touches the transport position.
+        seq.seek(1000.0);
+        seq.set_time_signature(4, 4);
+        assert!((seq.position_ticks() - 1000.0).abs() < 1e-9);
+        assert_eq!(seq.arrangement_end_ticks(), 2 * TICKS_PER_BAR);
+        // Garbage is clamped, never a zero-length bar.
+        seq.set_time_signature(0, 0);
+        assert!(seq.bar_ticks() >= 1);
     }
 
     #[test]

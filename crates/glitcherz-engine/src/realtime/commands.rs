@@ -125,6 +125,11 @@ pub enum SequencerCommand {
     SetLoopRange { start_ticks: u32, end_ticks: u32 },
     /// Set BPM (20..300).
     SetBpm(f32),
+    /// Set the document's meter (U3a). Only the bar length derived from it
+    /// changes (arrangement-end rounding); no event moves and the transport
+    /// position is kept — a meter is notation plus a bar length, not a data
+    /// transform. Invalid fields are clamped on the real-time side.
+    SetTimeSignature { numerator: u8, denominator: u8 },
     /// Replace one MIDI track's clip table in one block (D15 batch Copy;
     /// also refreshes the arrangement end, D16).
     SetTrackClips {

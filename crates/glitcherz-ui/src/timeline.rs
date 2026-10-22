@@ -24,9 +24,14 @@ use egui::{
     StrokeKind, Vec2, pos2,
 };
 use glitcherz_model::{
-    AutoPoint, ControlClip, ControlTrack, CtrlEvent, MAX_ARRANGEMENT_BARS, MAX_CLIPS_PER_TRACK,
-    Marker, MidiClip, MidiTrack, Note, SongLoop, TICKS_PER_BAR,
+    AutoPoint, ControlClip, ControlTrack, CtrlEvent, MAX_ARRANGEMENT_TICKS, MAX_CLIPS_PER_TRACK,
+    Marker, MidiClip, MidiTrack, Note, SongLoop,
 };
+
+/// Absolute arrangement ceiling in ticks (U3a). The bound is a **tick** count,
+/// not a bar count: 256 bars at 4/4, 292 at 7/8, 341 at 3/4 — placing content
+/// is limited by time, not by how the time is grouped.
+const ARRANGEMENT_LIMIT_TICKS: u32 = MAX_ARRANGEMENT_TICKS as u32;
 
 /// Fixed width of the row-header column.
 pub const HEADER_WIDTH: f32 = 108.0;
@@ -417,6 +422,10 @@ pub struct TimelineParams<'a> {
     pub loop_range: &'a SongLoop,
     /// Timeline markers for the ruler (U1).
     pub markers: &'a [Marker],
+    /// Bar length in ticks from the document's meter (U3a). Everything that
+    /// measures in bars — grid, snapping, knife edges, resize minimums — reads
+    /// this instead of the 4/4 [`TICKS_PER_BAR`] constant.
+    pub bar_ticks: u32,
 }
 
 /// Placement semantics shared by MIDI and control clips.
@@ -602,6 +611,7 @@ fn grab_targets(
     modal: &Modal,
     ptr: Option<Pos2>,
     px_per_bar: f32,
+    bar_ticks: u32,
     row_h: f32,
     rows_midi: usize,
     rows_control: usize,
@@ -631,7 +641,7 @@ fn grab_targets(
             .filter_map(|sel| {
                 let (start, _) = clip_geometry(midi_tracks, control_tracks, *sel)?;
                 let to_track = (sel.track as i32 + row_delta).max(0) as usize;
-                let new_start = (start as i64 + bar_delta * TICKS_PER_BAR as i64).max(0) as u32;
+                let new_start = (start as i64 + bar_delta * i64::from(bar_ticks)).max(0) as u32;
                 Some(ClipMove {
                     from: *sel,
                     to_track,
@@ -648,6 +658,7 @@ fn stretch_targets(
     modal: &Modal,
     ptr: Option<Pos2>,
     px_per_bar: f32,
+    bar_ticks: u32,
     midi_tracks: &[MidiTrack],
     control_tracks: &[ControlTrack],
 ) -> Option<Vec<ClipSpanEdit>> {
@@ -656,9 +667,9 @@ fn stretch_targets(
     };
     let ptr = ptr?;
     let bar_delta = ((ptr.x - modal.grab.x) / px_per_bar).round() as i64;
-    let tick_delta = bar_delta * TICKS_PER_BAR as i64;
-    let bar = TICKS_PER_BAR as i64;
-    let max_end = MAX_ARRANGEMENT_BARS as i64 * bar;
+    let bar = i64::from(bar_ticks);
+    let tick_delta = bar_delta * bar;
+    let max_end = i64::from(ARRANGEMENT_LIMIT_TICKS);
     Some(
         modal
             .origin
@@ -790,15 +801,19 @@ pub fn show(
     // real drag gets from the router's any-down freeze; set every frame so
     // it clears itself when the modal ends.
     router.set_focus_hold(state.modal.is_some() || state.knife_armed);
-    let px_per_tick = state.px_per_bar / TICKS_PER_BAR as f32;
+    // U3a: the bar length comes from the document's meter, so "pixels per bar"
+    // keeps its on-screen meaning while the tick↔pixel mapping follows the
+    // meter (a clip's tick position therefore moves when the meter changes).
+    let bar_ticks = p.bar_ticks.max(1);
+    let px_per_tick = state.px_per_bar / bar_ticks as f32;
     let row_h = ROW_HEIGHT * state.row_zoom;
-    // The lanes span the FULL arrangement (MAX_ARRANGEMENT_BARS), not just
-    // past the last clip: the bar grid keeps drawing behind the content, so
-    // a G-modal ghost (or any insert / drop target) always has visible bar
-    // lines to land on, and the scroll range matches the bound every
-    // interaction already clamps to. The grid/ruler drawing is
-    // viewport-culled, so the 256-bar span costs nothing per frame.
-    let content_bars = MAX_ARRANGEMENT_BARS;
+    // The lanes span the full arrangement bound, not just past the last clip:
+    // the bar grid keeps drawing behind the content, so a G-modal ghost (or
+    // any insert / drop target) always has visible bar lines to land on, and
+    // the scroll range matches the tick bound every interaction clamps to.
+    // The grid/ruler drawing is viewport-culled, so the span costs nothing per
+    // frame.
+    let content_bars = ARRANGEMENT_LIMIT_TICKS.div_ceil(bar_ticks);
     let content_px = content_bars as f32 * state.px_per_bar;
 
     // ---- View navigation (read before the ScrollArea lays out, using last
@@ -828,9 +843,9 @@ pub fn show(
                 let old = state.px_per_bar;
                 let new = (old * zoom2.x).clamp(PX_PER_BAR_MIN, PX_PER_BAR_MAX);
                 if new != old {
-                    let old_ppt = old / TICKS_PER_BAR as f32;
+                    let old_ppt = old / bar_ticks as f32;
                     let tick = ((offset.x + ptr.x - vmin.x) / old_ppt).max(0.0);
-                    let new_ppt = new / TICKS_PER_BAR as f32;
+                    let new_ppt = new / bar_ticks as f32;
                     let anchored = (tick * new_ppt - (ptr.x - vmin.x)).max(0.0);
                     state.px_per_bar = new;
                     if let Some(s) = scroll_state.as_mut() {
@@ -1026,12 +1041,12 @@ pub fn show(
             }
 
             // ---- U1 geometry helpers ----
-            let bar_ticks = f64::from(TICKS_PER_BAR);
-            let max_tick = f64::from(content_bars * TICKS_PER_BAR);
+            let bar_ticks_f = f64::from(bar_ticks);
+            let max_tick = f64::from(content_bars) * bar_ticks_f;
             let tick_at = |x: f32| {
                 (((x - rect.left()) / px_per_tick).max(0.0) as f64).min(max_tick)
             };
-            let snap_bar = |tick: f64| ((tick / bar_ticks).round() * bar_ticks).max(0.0);
+            let snap_bar = |tick: f64| ((tick / bar_ticks_f).round() * bar_ticks_f).max(0.0);
             let loop_has_range = p.loop_range.end_ticks > p.loop_range.start_ticks;
             let brace_y = (rect.bottom() - 5.0, rect.bottom() - 1.0);
             let start_x = rect.left() + p.loop_range.start_ticks as f32 * px_per_tick;
@@ -1112,7 +1127,7 @@ pub fn show(
                     let committed: Option<(u32, u32)> = match drag {
                         LoopDrag::New { anchor } => {
                             let (a, b) = if anchor <= cur { (anchor, cur) } else { (cur, anchor) };
-                            (b - a >= bar_ticks).then_some((a as u32, b as u32))
+                            (b - a >= bar_ticks_f).then_some((a as u32, b as u32))
                         }
                         LoopDrag::StartEdge => {
                             let end = f64::from(lr.end_ticks);
@@ -1219,6 +1234,7 @@ pub fn show(
                 RowKind::Midi(i),
                 &track.clips,
                 px_per_tick,
+                bar_ticks,
                 row_h,
                 content_px,
                 p.playhead_ticks,
@@ -1251,6 +1267,7 @@ pub fn show(
                     RowKind::Control(i),
                     &track.clips,
                     px_per_tick,
+                    bar_ticks,
                     row_h,
                     content_px,
                     p.playhead_ticks,
@@ -1379,8 +1396,15 @@ pub fn show(
                         match m.kind {
                             ModalKind::Grab { .. } | ModalKind::Duplicate { .. } => {
                                 if let Some(moves) = grab_targets(
-                                    m, ptr, px_per_bar, row_h, midi_tracks.len(),
-                                    control_tracks.len(), midi_tracks, control_tracks,
+                                    m,
+                                    ptr,
+                                    px_per_bar,
+                                    bar_ticks,
+                                    row_h,
+                                    midi_tracks.len(),
+                                    control_tracks.len(),
+                                    midi_tracks,
+                                    control_tracks,
                                 ) {
                                     let targets: Vec<_> = moves
                                         .into_iter()
@@ -1434,7 +1458,12 @@ pub fn show(
                             }
                             ModalKind::Stretch { .. } => {
                                 if let Some(spans) = stretch_targets(
-                                    m, ptr, px_per_bar, midi_tracks, control_tracks,
+                                    m,
+                                    ptr,
+                                    px_per_bar,
+                                    bar_ticks,
+                                    midi_tracks,
+                                    control_tracks,
                                 ) {
                                     let targets: Vec<_> = spans
                                         .iter()
@@ -1478,8 +1507,15 @@ pub fn show(
                 // over dimmed originals (the rows already drew them dim).
                 let targets = match m.kind {
                     ModalKind::Grab { .. } | ModalKind::Duplicate { .. } => grab_targets(
-                        m, ptr, px_per_bar, row_h, midi_tracks.len(), control_tracks.len(),
-                        midi_tracks, control_tracks,
+                        m,
+                        ptr,
+                        px_per_bar,
+                        bar_ticks,
+                        row_h,
+                        midi_tracks.len(),
+                        control_tracks.len(),
+                        midi_tracks,
+                        control_tracks,
                     )
                     .map(|ms| {
                         ms.into_iter()
@@ -1491,7 +1527,12 @@ pub fn show(
                             .collect::<Vec<_>>()
                     }),
                     ModalKind::Stretch { .. } => stretch_targets(
-                        m, ptr, px_per_bar, midi_tracks, control_tracks,
+                        m,
+                        ptr,
+                        px_per_bar,
+                        bar_ticks,
+                        midi_tracks,
+                        control_tracks,
                     )
                     .map(|es| {
                         es.into_iter()
@@ -1544,6 +1585,7 @@ fn lane_row<T: Placement>(
     row: RowKind,
     clips: &[T],
     px_per_tick: f32,
+    bar_ticks: u32,
     row_h: f32,
     content_px: f32,
     playhead_ticks: f32,
@@ -1672,7 +1714,7 @@ fn lane_row<T: Placement>(
     // Bar grid (viewport-culled: the lane spans the whole arrangement, so
     // iterating from bar 0 would walk hundreds of off-screen bars every
     // frame).
-    let bar_px = px_per_tick * TICKS_PER_BAR as f32;
+    let bar_px = px_per_tick * bar_ticks as f32;
     let bars = (content_px / bar_px).floor() as u32;
     let clip_x = ui.clip_rect();
     let first = (((clip_x.left() - lane.left()) / bar_px).ceil().max(0.0) as u32).min(bars);
@@ -1773,7 +1815,7 @@ fn lane_row<T: Placement>(
             if clips.len() >= MAX_CLIPS_PER_TRACK {
                 state.set_status("this track is full — cannot split");
             } else {
-                match knife_target(clips, tick_at(pos.x)) {
+                match knife_target(clips, tick_at(pos.x), bar_ticks) {
                     Some((index, at)) => {
                         actions.push(TimelineAction::SplitClip {
                             is_control,
@@ -1798,7 +1840,7 @@ fn lane_row<T: Placement>(
     // snapped bar line through the hovered lane).
     if state.knife_armed && response.hovered() {
         if let Some(pos) = response.hover_pos() {
-            let at = snap_bar(tick_at(pos.x));
+            let at = snap_bar(tick_at(pos.x), bar_ticks);
             let x = lane.left() + at as f32 * px_per_tick;
             painter.line_segment(
                 [pos2(x, lane.top()), pos2(x, lane.bottom())],
@@ -1825,7 +1867,7 @@ fn lane_row<T: Placement>(
                     }),
                 }
             } else if clips.len() < MAX_CLIPS_PER_TRACK {
-                let bound = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - TICKS_PER_BAR;
+                let bound = ARRANGEMENT_LIMIT_TICKS - bar_ticks;
                 let (is_control, track) = match row {
                     RowKind::Midi(t) => (false, t),
                     RowKind::Control(t) => (true, t),
@@ -1833,7 +1875,7 @@ fn lane_row<T: Placement>(
                 actions.push(TimelineAction::AddClip {
                     is_control,
                     track,
-                    start_ticks: snap_bar(tick).min(bound),
+                    start_ticks: snap_bar(tick, bar_ticks).min(bound),
                 });
             }
         }
@@ -1901,8 +1943,8 @@ fn lane_row<T: Placement>(
                         clip, grab_ticks, ..
                     }) if clip < clips.len() => {
                         let span = clips[clip].span();
-                        let limit = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - span;
-                        let start = snap_bar(tick_at(pos.x) - grab_ticks).min(limit);
+                        let limit = ARRANGEMENT_LIMIT_TICKS - span;
+                        let start = snap_bar(tick_at(pos.x) - grab_ticks, bar_ticks).min(limit);
                         if clips[clip].start() != start {
                             let (is_control, track) = match row {
                                 RowKind::Midi(t) => (false, t),
@@ -1919,9 +1961,9 @@ fn lane_row<T: Placement>(
                     }
                     Some(Drag::Resize { clip, .. }) if clip < clips.len() => {
                         let start = clips[clip].start();
-                        let limit = MAX_ARRANGEMENT_BARS * TICKS_PER_BAR - start;
-                        let span = snap_bar(tick_at(pos.x) - start as f32)
-                            .clamp(TICKS_PER_BAR, limit.max(TICKS_PER_BAR));
+                        let limit = ARRANGEMENT_LIMIT_TICKS - start;
+                        let span = snap_bar(tick_at(pos.x) - start as f32, bar_ticks)
+                            .clamp(bar_ticks, limit.max(bar_ticks));
                         if clips[clip].span() != span {
                             let (is_control, track) = match row {
                                 RowKind::Midi(t) => (false, t),
@@ -2217,19 +2259,20 @@ fn hit_clip<T: Placement>(clips: &[T], tick: f32) -> Option<usize> {
 /// and a bar-snapped cut position, requiring at least one bar of clip on
 /// both sides of the cut. `None` when the click misses every clip or the
 /// snapped position is too close to either edge.
-fn knife_target<T: Placement>(clips: &[T], tick: f32) -> Option<(usize, u32)> {
+fn knife_target<T: Placement>(clips: &[T], tick: f32, bar_ticks: u32) -> Option<(usize, u32)> {
     let index = hit_clip(clips, tick)?;
     let clip = &clips[index];
-    let at = snap_bar(tick);
-    let left_ok = at >= clip.start() + TICKS_PER_BAR;
-    let right_ok = at + TICKS_PER_BAR <= clip.start() + clip.span();
+    let at = snap_bar(tick, bar_ticks);
+    let left_ok = at >= clip.start() + bar_ticks;
+    let right_ok = at + bar_ticks <= clip.start() + clip.span();
     (left_ok && right_ok).then_some((index, at))
 }
 
-/// Snaps to the nearest whole bar (0 stays 0).
-fn snap_bar(ticks: f32) -> u32 {
-    let bar = TICKS_PER_BAR as f32;
-    ((ticks / bar).round().max(0.0) as u32) * TICKS_PER_BAR
+/// Snaps to the nearest whole bar (0 stays 0). `bar_ticks` is the document's
+/// bar length (U3a), so the snap follows the meter.
+fn snap_bar(ticks: f32, bar_ticks: u32) -> u32 {
+    let bar = bar_ticks.max(1) as f32;
+    ((ticks / bar).round().max(0.0) as u32) * bar_ticks.max(1)
 }
 
 /// The insertion row a track-reorder drag points at, plus the screen y the
@@ -2280,6 +2323,9 @@ pub(crate) fn track_permutation(len: usize, from: usize, to: usize) -> Vec<usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The tests lock the 4/4 behavior: bar_ticks is the document's meter in
+    // production, the constant is the 4/4 case they exercise.
+    use glitcherz_model::TICKS_PER_BAR;
 
     fn clip(start: u32, span: u32) -> MidiClip {
         MidiClip {
@@ -2295,7 +2341,7 @@ mod tests {
         // 2.6 bars in → snaps to bar 3.
         let tick = 2.6 * TICKS_PER_BAR as f32;
         assert_eq!(
-            knife_target(&clips, tick),
+            knife_target(&clips, tick, TICKS_PER_BAR),
             Some((0, 3 * TICKS_PER_BAR)),
             "the cut lands on the nearest bar line"
         );
@@ -2306,18 +2352,25 @@ mod tests {
         let clips = vec![clip(0, 2 * TICKS_PER_BAR)];
         // Middle of a 2-bar clip snaps to bar 1 — valid.
         assert_eq!(
-            knife_target(&clips, TICKS_PER_BAR as f32),
+            knife_target(&clips, TICKS_PER_BAR as f32, TICKS_PER_BAR),
             Some((0, TICKS_PER_BAR))
         );
         // Near the start edge: snap lands on bar 0 → zero-length left half.
-        assert_eq!(knife_target(&clips, 0.2 * TICKS_PER_BAR as f32), None);
+        assert_eq!(
+            knife_target(&clips, 0.2 * TICKS_PER_BAR as f32, TICKS_PER_BAR),
+            None
+        );
         // Near the end edge: snap lands on the clip's end → zero right half.
-        assert_eq!(knife_target(&clips, 1.8 * TICKS_PER_BAR as f32), None);
+        assert_eq!(
+            knife_target(&clips, 1.8 * TICKS_PER_BAR as f32, TICKS_PER_BAR),
+            None
+        );
         // One-bar clips can never be split.
         assert_eq!(
             knife_target(
                 &[clip(4 * TICKS_PER_BAR, TICKS_PER_BAR)],
-                4.4 * TICKS_PER_BAR as f32
+                4.4 * TICKS_PER_BAR as f32,
+                TICKS_PER_BAR
             ),
             None
         );
@@ -2326,7 +2379,31 @@ mod tests {
     #[test]
     fn knife_misses_empty_lane() {
         let clips = vec![clip(0, 4 * TICKS_PER_BAR)];
-        assert_eq!(knife_target(&clips, 6.0 * TICKS_PER_BAR as f32), None);
+        assert_eq!(
+            knife_target(&clips, 6.0 * TICKS_PER_BAR as f32, TICKS_PER_BAR),
+            None
+        );
+    }
+
+    #[test]
+    fn snapping_follows_the_document_meter() {
+        // 6/8 bars are 2880 ticks: a clip of four 4/4 bars spans 15360 ticks,
+        // i.e. 5.33 six-eight bars, so a pointer at 1.6 bars of 6/8 snaps to
+        // bar 2 = 5760 — not to a 4/4 line.
+        const SIX_EIGHT: u32 = 2880;
+        let clips = vec![clip(0, 4 * TICKS_PER_BAR)];
+        assert_eq!(
+            knife_target(&clips, 1.6 * SIX_EIGHT as f32, SIX_EIGHT),
+            Some((0, 2 * SIX_EIGHT))
+        );
+        assert_eq!(snap_bar(1.6 * SIX_EIGHT as f32, SIX_EIGHT), 2 * SIX_EIGHT);
+        // A 3/4 clip of exactly one bar still cannot be cut (one bar minimum
+        // on both sides), even though it is shorter than a 4/4 bar.
+        let short = vec![clip(0, SIX_EIGHT)];
+        assert_eq!(
+            knife_target(&short, 0.4 * SIX_EIGHT as f32, SIX_EIGHT),
+            None
+        );
     }
 
     #[test]
@@ -2513,7 +2590,18 @@ mod tests {
         };
         // Pointer 1.6 bars right, one row down.
         let ptr = pos2(100.0 + 1.6 * 56.0, 100.0 + ROW_HEIGHT);
-        let targets = grab_targets(&modal, Some(ptr), 56.0, ROW_HEIGHT, 2, 1, &midi, &[]).unwrap();
+        let targets = grab_targets(
+            &modal,
+            Some(ptr),
+            56.0,
+            TICKS_PER_BAR,
+            ROW_HEIGHT,
+            2,
+            1,
+            &midi,
+            &[],
+        )
+        .unwrap();
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].to_track, 1);
         // 1.6 bars → rounds to 2 bars.
@@ -2525,7 +2613,18 @@ mod tests {
             },
             ..modal.clone()
         };
-        let targets = grab_targets(&locked, Some(ptr), 56.0, ROW_HEIGHT, 2, 1, &midi, &[]).unwrap();
+        let targets = grab_targets(
+            &locked,
+            Some(ptr),
+            56.0,
+            TICKS_PER_BAR,
+            ROW_HEIGHT,
+            2,
+            1,
+            &midi,
+            &[],
+        )
+        .unwrap();
         assert_eq!(targets[0].to_track, 0);
         assert_eq!(targets[0].start_ticks, 4 * TICKS_PER_BAR);
         // Y locks the movement to the rows: the bar delta dies.
@@ -2535,8 +2634,18 @@ mod tests {
             },
             ..modal.clone()
         };
-        let targets =
-            grab_targets(&row_locked, Some(ptr), 56.0, ROW_HEIGHT, 2, 1, &midi, &[]).unwrap();
+        let targets = grab_targets(
+            &row_locked,
+            Some(ptr),
+            56.0,
+            TICKS_PER_BAR,
+            ROW_HEIGHT,
+            2,
+            1,
+            &midi,
+            &[],
+        )
+        .unwrap();
         assert_eq!(targets[0].to_track, 1);
         assert_eq!(targets[0].start_ticks, 2 * TICKS_PER_BAR);
     }
@@ -2620,8 +2729,15 @@ mod tests {
             }],
             grab,
         };
-        let targets =
-            stretch_targets(&end, Some(pos2(-3.0 * 56.0, 0.0)), 56.0, &midi, &[]).unwrap();
+        let targets = stretch_targets(
+            &end,
+            Some(pos2(-3.0 * 56.0, 0.0)),
+            56.0,
+            TICKS_PER_BAR,
+            &midi,
+            &[],
+        )
+        .unwrap();
         assert_eq!(targets[0].span_ticks, TICKS_PER_BAR);
         assert_eq!(targets[0].start_ticks, 2 * TICKS_PER_BAR);
         // Start edge, pointer 3 bars right: start would pass the end →
@@ -2635,8 +2751,15 @@ mod tests {
             }],
             grab,
         };
-        let targets =
-            stretch_targets(&start, Some(pos2(3.0 * 56.0, 0.0)), 56.0, &midi, &[]).unwrap();
+        let targets = stretch_targets(
+            &start,
+            Some(pos2(3.0 * 56.0, 0.0)),
+            56.0,
+            TICKS_PER_BAR,
+            &midi,
+            &[],
+        )
+        .unwrap();
         assert_eq!(targets[0].start_ticks, 3 * TICKS_PER_BAR);
         assert_eq!(targets[0].span_ticks, TICKS_PER_BAR);
     }

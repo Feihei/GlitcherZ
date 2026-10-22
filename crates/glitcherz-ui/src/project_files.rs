@@ -78,11 +78,28 @@ pub fn write_midi(path: &Path, project: &Project) -> std::io::Result<usize> {
     Ok(bytes.len())
 }
 
-/// Reads a MIDI file into tracks (the hostile-input parsing lives in
-/// `glitcherz_model::smf`; this adds the IO and a display-ready error).
-pub fn read_midi(path: &Path) -> Result<Vec<MidiTrack>, String> {
+/// Reads a MIDI file into tracks plus the file's document-level header (its
+/// meter, U3a). The hostile-input parsing lives in `glitcherz_model::smf`;
+/// this adds the IO and a display-ready error.
+pub fn read_midi(path: &Path) -> Result<smf::SmfImport, String> {
     let bytes = std::fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
     smf::import_smf(&bytes).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+/// Whether the project holds no musical content at all (every MIDI track and
+/// control track empty).
+///
+/// Importing into such a project is really "open this file", so the file's
+/// meter is adopted (U3a). Once there is content, an import is an *addition*:
+/// silently changing the meter would re-measure the grid under the user's
+/// existing clips, so the project keeps its own and the status line reports
+/// the difference.
+pub fn is_unwritten(project: &Project) -> bool {
+    project.midi_tracks.iter().all(is_empty_track)
+        && project
+            .control_tracks
+            .iter()
+            .all(|track| track.clips.is_empty())
 }
 
 #[cfg(test)]
@@ -226,11 +243,36 @@ mod tests {
         let bytes = write_midi(&path, &project).expect("write smf");
         assert!(bytes > 0);
         let tracks = read_midi(&path).expect("read smf");
-        assert_eq!(tracks.len(), 1);
-        assert_eq!(tracks[0].clips.len(), 1);
-        assert_eq!(tracks[0].clips[0].sequence.notes.len(), 3);
+        assert_eq!(tracks.tracks.len(), 1);
+        assert_eq!(tracks.tracks[0].clips.len(), 1);
+        assert_eq!(tracks.tracks[0].clips[0].sequence.notes.len(), 3);
         // The imported clip sits at the earliest note, which is the start.
-        assert_eq!(tracks[0].clips[0].start_ticks, 0);
+        assert_eq!(tracks.tracks[0].clips[0].start_ticks, 0);
+        // Our own export always carries a meter, so the roundtrip sees 4/4.
+        assert_eq!(
+            tracks.time_signature,
+            Some(glitcherz_model::TimeSignature::COMMON)
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unwritten_project_adopts_an_imported_meter() {
+        // A fresh project has no content: an import there is really "open".
+        assert!(is_unwritten(&Project::default()));
+        assert!(!is_unwritten(&project_with_notes(1)));
+
+        let mut project = Project::default();
+        project
+            .control_tracks
+            .push(glitcherz_model::ControlTrack::default());
+        assert!(
+            is_unwritten(&project),
+            "an empty control track is still no content"
+        );
+        project.control_tracks[0]
+            .clips
+            .push(glitcherz_model::ControlClip::new(0));
+        assert!(!is_unwritten(&project), "a control clip is content too");
     }
 }

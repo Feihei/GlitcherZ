@@ -159,7 +159,15 @@ impl Fixture {
             // the widgets run.
             router.begin_frame(ctx.ctx());
             egui::CentralPanel::default().show(ctx, |ui| {
-                intent = glitcherz_ui::piano_roll::show(ui, clip, state, 0.0, false, router);
+                intent = glitcherz_ui::piano_roll::show(
+                    ui,
+                    clip,
+                    state,
+                    0.0,
+                    false,
+                    glitcherz_model::TICKS_PER_BAR,
+                    router,
+                );
             });
         });
         out.textures_delta.clear();

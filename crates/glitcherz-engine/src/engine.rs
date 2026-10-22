@@ -410,6 +410,18 @@ impl AudioEngine {
         }))
     }
 
+    /// Sets the document's meter (U3a): the derived bar length feeds the
+    /// arrangement-end rounding. No event moves and the transport keeps its
+    /// position.
+    pub fn set_time_signature(&mut self, numerator: u8, denominator: u8) -> bool {
+        self.send(EngineCommand::Sequencer(
+            SequencerCommand::SetTimeSignature {
+                numerator,
+                denominator,
+            },
+        ))
+    }
+
     // ---- Document-driven graph building API (P5c, D13: the loader rebuilds
     // the engine graph from the document) ----
 
