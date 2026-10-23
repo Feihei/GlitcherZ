@@ -417,4 +417,19 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 
 **测试**：8 项单测。4 项用 `ctx.run_ui(RawInput)` 跑 headless 帧（键盘选取、Esc 取消、Recent 置顶、开帧点击不自关），不需要窗口/显示后端 —— 与 `tests/egui_event_semantics.rs` 同一套路，可回归"popup 在真实帧循环里能画出并返回结果"。
 
-**已知未做（E4）**：连线中点仍是 `Insert Effect (Delay) / Insert Mixer` 两项，`PickerMode::Insert` 随 E4 落地。
+**E4 已补齐**：连线中点菜单改为 `Insert ▸ Effect ▸ …` + `Insert ▸ Mixer`，picker 增 `PickerPlace::Insert`（见下一节）。
+
+### 连线中点插入复用 picker（U9 E4，spec `plugin-browser.md`，2026-10-23）
+
+**同一 popup 两个落点**：`PickerPlace`（`Add { at }` / `Insert { cable, at }`）挂在 `GlitcherZApp.picker_place` 上，`PickFilter`（类别 + 格式）仍是列表筛选。`PatchAction::OpenPluginPicker` 里 `at: Pos2` 换成 `place: PickerPlace`，菜单与 picker 因此不需要第二份浮层代码；`PickerPlace::at()` 给需要坐标的调用点留一个统一出口。
+
+**菜单**：`Cable ▸ Insert ▸ Effect ▸ {Built-in Delay, ──, CLAP…, VST3…}` + `Insert ▸ Mixer`，音频线才有 `Insert` 分支；MIDI / 自动化线只剩 `Delete Cable`。和 `Add` 菜单同一套"先类别后来源"的形状，两处出生节点的地方读起来一致。
+
+**三个必须守的约束**：
+1. **归属轨道**（修复既有缺陷）：`create_patch_node` 原先把 `selected_track` 写进节点的 `track` 字段，插进别的轨的链路时归属就错了。拆出 `create_patch_node_on(source, at, track)`，插入路径用 `graph.node_by_id(上游节点).track()` —— 处理器永远跟着被插的链路走，`register_track_chain` 也刷对那张表。
+2. **一步 undo**：建节点、断旧线、接两根线各自 `commit_edit`，不合起来就是 4 步。用 `session.suspend_history()` 包住这三段、末尾 `commit_edit("Insert Node", before)` 提交一个快照（与 `Import MIDI` 同一套路）。`create_patch_node_on` 失败时先 `resume_history()` 再返回，靠它自己的 `session.restore` 把文档退回原位，线一根没动。
+3. **槽位不变**：纯函数 `splice_endpoints(&CableDoc) -> Result<(上游 node, 下游 PortRef, in_port), &str>`，`A → B` 变 `A → new → B` 时下游的 `in_port` 必须原样搬过去（D17，mixer 推子与线缆的绑定）。非音频线、`from` 不是节点的线直接报错，比原先散在函数体里的三处 `if` 好测。
+
+**可插入源白名单**：`NodeSource::fits_audio_insert()` —— `BuiltinDelay` / `ClapEffect` / `Vst3Effect` / `Mixer`。乐器进音频线会没有 MIDI 输入、永久静音，所以不是"能跑就先允许"。picker 侧已经用 `NodeCategory::Effect` 筛选，这层是动作层的兜底。
+
+**测试**：`splice_tests` 5 项（槽位保留、master 目标、MIDI 拒收、无上游节点拒收、可插入源白名单）。App 级断言（`node_map` 只加 1 条、`retiring_guards` 不增长）无法在无窗口环境下做 —— `GlitcherZApp::new` 需要 `eframe::CreationContext`，仓库也没有 headless app harness，故以 `cargo run --seconds 5` 冒烟 + 代码结构（单次 `install_node` + 无回收分支）代替。
