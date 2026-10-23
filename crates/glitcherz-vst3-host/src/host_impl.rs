@@ -52,6 +52,8 @@ use std::ptr;
 use vst3::Class;
 use vst3::Steinberg::{self, Vst};
 
+use crate::compat;
+
 /// Maximum events queued per block (notes + others; bridging granularity
 /// is a block).
 pub(crate) const MAX_EVENTS: i32 = 32;
@@ -490,7 +492,9 @@ impl Steinberg::IBStreamTrait for HostMemoryStream {
         unsafe {
             let data = &mut *self.data.get();
             let len = data.bytes.len() as i64;
-            let target = match mode {
+            // The seek-mode constants are `c_uint` outside Windows while the
+            // interface hands us an `int32` (see `compat`).
+            let target = match compat::to_enum(mode) {
                 Steinberg::IBStream_::IStreamSeekMode_::kIBSeekSet => pos,
                 Steinberg::IBStream_::IStreamSeekMode_::kIBSeekCur => data.pos as i64 + pos,
                 Steinberg::IBStream_::IStreamSeekMode_::kIBSeekEnd => len + pos,

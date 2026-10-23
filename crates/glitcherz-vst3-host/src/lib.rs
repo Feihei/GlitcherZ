@@ -45,6 +45,7 @@
 // comment; behavioral verification lives in tests (invalid files must
 // return errors rather than UB).
 
+mod compat;
 pub mod gui;
 pub mod host_impl;
 pub mod raw;
@@ -928,8 +929,8 @@ impl Vst3Instance {
         // SAFETY: setup/setActive are called in spec order before activation.
         unsafe {
             let mut setup = Vst::ProcessSetup {
-                processMode: Vst::ProcessModes_::kRealtime,
-                symbolicSampleSize: Vst::SymbolicSampleSizes_::kSample32,
+                processMode: compat::to_int32(Vst::ProcessModes_::kRealtime),
+                symbolicSampleSize: compat::to_int32(Vst::SymbolicSampleSizes_::kSample32),
                 maxSamplesPerBlock: config.max_frames.max(FIXED_BLOCK_SIZE as u32) as i32,
                 sampleRate: f64::from(config.sample_rate),
             };
@@ -950,7 +951,10 @@ impl Vst3Instance {
         // instruments) — the query must complete before component is moved
         // into the guard.
         let has_audio_input = unsafe {
-            component.getBusCount(Vst::MediaTypes_::kAudio, Vst::BusDirections_::kInput) > 0
+            component.getBusCount(
+                compat::to_int32(Vst::MediaTypes_::kAudio),
+                compat::to_int32(Vst::BusDirections_::kInput),
+            ) > 0
         };
         let frames = config.max_frames.max(FIXED_BLOCK_SIZE as u32) as usize;
         let event_list = ComWrapper::new(HostEventList::new());
@@ -1051,38 +1055,26 @@ fn create_instance<I: Interface>(
 
 /// Activates all audio input/output and event input buses of the component.
 fn activate_buses(component: &ComPtr<Steinberg::Vst::IComponent>) {
+    // The generated enum constants are `c_uint` outside Windows while the
+    // interface takes `int32`, hence the normalization (see `compat`).
+    let audio = compat::to_int32(Vst::MediaTypes_::kAudio);
+    let event = compat::to_int32(Vst::MediaTypes_::kEvent);
+    let input = compat::to_int32(Vst::BusDirections_::kInput);
+    let output = compat::to_int32(Vst::BusDirections_::kOutput);
     // SAFETY: The component is already initialized; bus information is
     // enumerated per spec.
     unsafe {
-        let audio_inputs =
-            component.getBusCount(Vst::MediaTypes_::kAudio, Vst::BusDirections_::kInput);
+        let audio_inputs = component.getBusCount(audio, input);
         for index in 0..audio_inputs {
-            let _ = component.activateBus(
-                Vst::MediaTypes_::kAudio,
-                Vst::BusDirections_::kInput,
-                index,
-                1,
-            );
+            let _ = component.activateBus(audio, input, index, 1);
         }
-        let audio_outputs =
-            component.getBusCount(Vst::MediaTypes_::kAudio, Vst::BusDirections_::kOutput);
+        let audio_outputs = component.getBusCount(audio, output);
         for index in 0..audio_outputs {
-            let _ = component.activateBus(
-                Vst::MediaTypes_::kAudio,
-                Vst::BusDirections_::kOutput,
-                index,
-                1,
-            );
+            let _ = component.activateBus(audio, output, index, 1);
         }
-        let event_inputs =
-            component.getBusCount(Vst::MediaTypes_::kEvent, Vst::BusDirections_::kInput);
+        let event_inputs = component.getBusCount(event, input);
         for index in 0..event_inputs {
-            let _ = component.activateBus(
-                Vst::MediaTypes_::kEvent,
-                Vst::BusDirections_::kInput,
-                index,
-                1,
-            );
+            let _ = component.activateBus(event, input, index, 1);
         }
     }
 }
@@ -1236,8 +1228,8 @@ impl Processor for Vst3Node {
         // state = 0: declare no valid bits (the simple host provides no
         // transport info).
         let mut data = Vst::ProcessData {
-            processMode: Vst::ProcessModes_::kRealtime,
-            symbolicSampleSize: Vst::SymbolicSampleSizes_::kSample32,
+            processMode: compat::to_int32(Vst::ProcessModes_::kRealtime),
+            symbolicSampleSize: compat::to_int32(Vst::SymbolicSampleSizes_::kSample32),
             numSamples: frames as i32,
             numInputs: if has_audio_input { 1 } else { 0 },
             numOutputs: 1,

@@ -12,7 +12,15 @@ description = "GlitcherZ egui UI: transport, sequencer, piano roll, mixer"
 # default render backend.
 # (eframe in the workspace is default-features = false + default_fonts.)
 # persistence: eframe built-in storage (RON), used to persist the recent-files list
-eframe = { workspace = true, features = ["glow", "persistence"] }
+# x11 + wayland: dropped along with eframe's default features, but winit refuses
+# to build on Linux unless one of them is on ("The platform you're compiling
+# for is not supported by winit"). They are inert on Windows / macOS.
+eframe = { workspace = true, features = [
+    "glow",
+    "persistence",
+    "wayland",
+    "x11",
+] }
 log = { workspace = true }
 rfd = { workspace = true }
 glitcherz-clap-host = { workspace = true }

@@ -51,6 +51,47 @@ use vst3::Steinberg::{
 };
 use vst3::{Class, ComRef, ComWrapper};
 
+// ---------------------------------------------------------------------------
+// Enum type seam
+//
+// The generated bindings spell each enum twice: the constant containers
+// (`Vst::MediaTypes`, `Vst::BusDirections`, `Vst::SymbolicSampleSizes`,
+// `Vst::Event_::EventTypes`, `Steinberg::PClassInfo_::ClassCardinality`, ...)
+// are `vst3::support::DefaultEnumType` — `c_int` on Windows, `c_uint`
+// everywhere else — while the struct fields and interface parameters that
+// receive them are `int32`. On Windows both are `i32`; on macOS/Linux they
+// are distinct types, so the fixture converts at every hand-off.
+
+/// Generated enum constant → `int32` slot (fields, arguments, comparisons).
+/// Enum discriminants are small non-negative values, so this never fails.
+#[inline]
+fn to_int32<T>(value: T) -> Steinberg::int32
+where
+    T: TryInto<Steinberg::int32>,
+{
+    value.try_into().unwrap_or(0)
+}
+
+/// Generated enum constant → `uint32` slot (e.g. `BusInfo::flags`), for the
+/// unsigned fields (`as u32` would be a redundant cast off Windows).
+#[inline]
+fn to_uint32<T>(value: T) -> Steinberg::uint32
+where
+    T: TryInto<Steinberg::uint32>,
+{
+    value.try_into().unwrap_or(0)
+}
+
+/// `int32` interface value → generated enum type, so incoming parameters can
+/// be `match`ed against the enum constants (`T` is inferred from the arms).
+#[inline]
+fn to_enum<T>(value: Steinberg::int32) -> T
+where
+    T: TryFrom<Steinberg::int32> + Default,
+{
+    T::try_from(value).unwrap_or_default()
+}
+
 /// GUI protocol probe bits (read-only parameter id 2, normalized as
 /// `mask / 1024` — ≤ 10 bits, an exact binary fraction).
 const GUI_ATTACHED: u64 = 1 << 0;
@@ -176,19 +217,25 @@ impl Steinberg::IPluginFactoryTrait for SineFactory {
             *info = match index {
                 0 => Steinberg::PClassInfo {
                     cid: COMPONENT_CID,
-                    cardinality: Steinberg::PClassInfo_::ClassCardinality_::kManyInstances,
+                    cardinality: to_int32(
+                        Steinberg::PClassInfo_::ClassCardinality_::kManyInstances,
+                    ),
                     category: c_field::<32>("Audio Module Class"),
                     name: c_field::<64>(PLUGIN_NAME),
                 },
                 1 => Steinberg::PClassInfo {
                     cid: EFFECT_COMPONENT_CID,
-                    cardinality: Steinberg::PClassInfo_::ClassCardinality_::kManyInstances,
+                    cardinality: to_int32(
+                        Steinberg::PClassInfo_::ClassCardinality_::kManyInstances,
+                    ),
                     category: c_field::<32>("Audio Module Class"),
                     name: c_field::<64>(EFFECT_NAME),
                 },
                 2 => Steinberg::PClassInfo {
                     cid: CONTROLLER_CID,
-                    cardinality: Steinberg::PClassInfo_::ClassCardinality_::kManyInstances,
+                    cardinality: to_int32(
+                        Steinberg::PClassInfo_::ClassCardinality_::kManyInstances,
+                    ),
                     category: c_field::<32>("Component Controller Class"),
                     name: c_field::<64>("GlitcherZ Sine VST3 Controller"),
                 },
@@ -280,7 +327,7 @@ impl Steinberg::IPluginFactory2Trait for SineFactory {
         unsafe {
             *info = Steinberg::PClassInfo2 {
                 cid,
-                cardinality: Steinberg::PClassInfo_::ClassCardinality_::kManyInstances,
+                cardinality: to_int32(Steinberg::PClassInfo_::ClassCardinality_::kManyInstances),
                 category: c_field::<32>(category),
                 name: c_field::<64>(name),
                 classFlags: 0,
@@ -376,7 +423,7 @@ impl IComponentTrait for SineComponent {
         r#type: Vst::MediaType,
         dir: Vst::BusDirection,
     ) -> Steinberg::int32 {
-        match (r#type, dir) {
+        match (to_enum(r#type), to_enum(dir)) {
             (Vst::MediaTypes_::kAudio, Vst::BusDirections_::kOutput) => 1,
             (Vst::MediaTypes_::kEvent, Vst::BusDirections_::kInput) => 1,
             _ => 0,
@@ -398,16 +445,16 @@ impl IComponentTrait for SineComponent {
             *bus = Vst::BusInfo {
                 mediaType: r#type,
                 direction: dir,
-                channelCount: match r#type {
+                channelCount: match to_enum(r#type) {
                     Vst::MediaTypes_::kAudio => 2,
                     _ => 1,
                 },
-                name: match r#type {
+                name: match to_enum(r#type) {
                     Vst::MediaTypes_::kAudio => utf16_field::<128>("Stereo Out"),
                     _ => utf16_field::<128>("Note In"),
                 },
-                busType: Vst::BusTypes_::kMain,
-                flags: Vst::BusInfo_::BusFlags_::kDefaultActive as u32,
+                busType: to_int32(Vst::BusTypes_::kMain),
+                flags: to_uint32(Vst::BusInfo_::BusFlags_::kDefaultActive),
             };
         }
         Steinberg::kResultOk
@@ -508,7 +555,7 @@ impl IAudioProcessorTrait for SineComponent {
         &self,
         symbolicSampleSize: Steinberg::int32,
     ) -> Steinberg::tresult {
-        if symbolicSampleSize == Vst::SymbolicSampleSizes_::kSample32 {
+        if symbolicSampleSize == to_int32(Vst::SymbolicSampleSizes_::kSample32) {
             Steinberg::kResultTrue
         } else {
             Steinberg::kNotImplemented
@@ -537,7 +584,7 @@ impl IAudioProcessorTrait for SineComponent {
             let data = &mut *data;
             if data.numOutputs < 1
                 || data.outputs.is_null()
-                || data.symbolicSampleSize != Vst::SymbolicSampleSizes_::kSample32
+                || data.symbolicSampleSize != to_int32(Vst::SymbolicSampleSizes_::kSample32)
             {
                 return Steinberg::kNotImplemented;
             }
@@ -553,7 +600,7 @@ impl IAudioProcessorTrait for SineComponent {
                     for index in 0..count {
                         let mut event: Vst::Event = std::mem::zeroed();
                         if events.getEvent(index, &mut event) == Steinberg::kResultOk {
-                            match event.r#type as i32 {
+                            match to_enum(event.r#type as i32) {
                                 Vst::Event_::EventTypes_::kNoteOnEvent => {
                                     let note_on = &event.__field0.noteOn;
                                     self.note_on.store(true, Ordering::Relaxed);
@@ -698,7 +745,7 @@ impl IComponentTrait for GainEffectComponent {
         r#type: Vst::MediaType,
         dir: Vst::BusDirection,
     ) -> Steinberg::int32 {
-        match (r#type, dir) {
+        match (to_enum(r#type), to_enum(dir)) {
             (Vst::MediaTypes_::kAudio, Vst::BusDirections_::kInput) => 1,
             (Vst::MediaTypes_::kAudio, Vst::BusDirections_::kOutput) => 1,
             _ => 0,
@@ -712,7 +759,7 @@ impl IComponentTrait for GainEffectComponent {
         index: Steinberg::int32,
         bus: *mut Vst::BusInfo,
     ) -> Steinberg::tresult {
-        if index != 0 || r#type != Vst::MediaTypes_::kAudio {
+        if index != 0 || r#type != to_int32(Vst::MediaTypes_::kAudio) {
             return Steinberg::kInvalidArgument;
         }
         // SAFETY: The host provides a writable BusInfo.
@@ -721,12 +768,12 @@ impl IComponentTrait for GainEffectComponent {
                 mediaType: r#type,
                 direction: dir,
                 channelCount: 2,
-                name: match dir {
+                name: match to_enum(dir) {
                     Vst::BusDirections_::kInput => utf16_field::<128>("Stereo In"),
                     _ => utf16_field::<128>("Stereo Out"),
                 },
-                busType: Vst::BusTypes_::kMain,
-                flags: Vst::BusInfo_::BusFlags_::kDefaultActive as u32,
+                busType: to_int32(Vst::BusTypes_::kMain),
+                flags: to_uint32(Vst::BusInfo_::BusFlags_::kDefaultActive),
             };
         }
         Steinberg::kResultOk
@@ -798,7 +845,7 @@ impl IAudioProcessorTrait for GainEffectComponent {
         &self,
         symbolicSampleSize: Steinberg::int32,
     ) -> Steinberg::tresult {
-        if symbolicSampleSize == Vst::SymbolicSampleSizes_::kSample32 {
+        if symbolicSampleSize == to_int32(Vst::SymbolicSampleSizes_::kSample32) {
             Steinberg::kResultTrue
         } else {
             Steinberg::kNotImplemented
@@ -830,7 +877,7 @@ impl IAudioProcessorTrait for GainEffectComponent {
                 || data.outputs.is_null()
                 || data.numInputs < 1
                 || data.inputs.is_null()
-                || data.symbolicSampleSize != Vst::SymbolicSampleSizes_::kSample32
+                || data.symbolicSampleSize != to_int32(Vst::SymbolicSampleSizes_::kSample32)
             {
                 return Steinberg::kNotImplemented;
             }
