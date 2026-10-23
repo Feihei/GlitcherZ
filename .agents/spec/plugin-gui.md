@@ -1,15 +1,15 @@
 # Spec — 插件 GUI 宿主 + Patch 交互升级（plugin-gui）
 
 > 状态：定稿（2026-10-20，三轮 Q&A）。关联：`plugin-state.md`（StateGate 协议）、`node-graph.md`（图架构、P5e 遗留）。
-> 验收锚点：Dexed（CLAP）在 Synth 面板内嵌编辑器可操作、参数实时生效、保存/加载不丢。
+> 验收锚点：Dexed（CLAP）在 Inspector 面板内嵌编辑器可操作、参数实时生效、保存/加载不丢。
 
 ## 1 目标与非目标
 
 **目标**：
 
-1. CLAP 插件 GUI（embedded）嵌入主窗口——插件自绘编辑器窗口挂在 Synth/Mixer 面板。
+1. CLAP 插件 GUI（embedded）嵌入主窗口——插件自绘编辑器窗口挂在 Inspector 面板。
 2. GUI 内参数编辑实时回接引擎 + 宿主滑块缓存同步。
-3. Synth/Mixer 面板从"轨 → first-match 节点"重构为**选中节点驱动**（P5e 遗留收口）。
+3. Inspector 面板从"轨 → first-match 节点"重构为**选中节点驱动**（P5e 遗留收口）。
 4. Patch 节点常显核心参数控件（plugdata 式）。
 5. Virtual keyboard 节点入 patch（UI 路由，引擎零改动）。
 6. VST3 `IPlugView` 镜像（后补，本 spec 只定协议差异）。
@@ -27,7 +27,7 @@
 | # | 决策 | 结论 | 理由 |
 | :--- | :--- | :--- | :--- |
 | D1 | 格式范围 | CLAP 先行（G1–G3），VST3 镜像 G7 后补 | Dexed 是实测痛点；架构镜像成本低 |
-| D2 | 挂载形态 | 嵌入式（child HWND），Synth/Mixer 面板内 | VST3 只有嵌入；floating 覆盖不了 VST3 |
+| D2 | 挂载形态 | 嵌入式（child HWND），Inspector 面板内 | VST3 只有嵌入；floating 覆盖不了 VST3 |
 | D3 | 平台 | Windows-first，`plugin_window` 平台抽象层 | 开发/实测环境 Windows；NSView/X11 后续补 |
 | D4 | 实施顺序 | GUI 先行（G1–G3）→ 面板节点化（G4）→ 内联参数（G5）→ vk 节点（G6） | 痛点优先；面板重构后编辑器挂到新面板自然过渡 |
 | D5 | 内联参数形态 | 节点常显核心参数（每节点类型注册表定义），高度自适应 | plugdata 式；选中展开抽屉增加往返 |
@@ -87,9 +87,9 @@ pub struct PluginWindowHandle(platform_impl::NativeChild); // Windows: HWND 子�
 ### 4.2 reposition 循环
 
 - 句柄来源：`GlitcherZApp::ui` 的 `frame`（当前 `_frame` 未用）→ `frame.winit_window()` → `HasWindowHandle`（eframe 0.36 已实现，epi.rs:702）→ `Win32WindowHandle.hwnd`。`raw-window-handle 0.6` 已在树（eframe 传递），加直依赖。
-- Synth 面板（当前轨声源为 CLAP 插件时）画编辑器区：`ui.allocate_exact_size(desired_size, Sense::hover())` 占位 → `rect` × `pixels_per_point` → 物理像素 → `SetWindowPos`（SWP_NOACTIVATE，z-order 恰在 GL surface 上方由 child 窗口语义天然成立）。
+- Inspector 面板（目标节点带编辑器时）画编辑器区：折叠头 `CollapsingHeader("Editor")` 的**三角在占位矩形上方一行**（2026-10-23 起；此前是 `Show Editor` / `Close Editor` 按钮，展开后原生窗口会盖住按钮），展开后 `ui.allocate_exact_size(desired_size, Sense::hover())` 占位 → `rect` × `pixels_per_point` → 物理像素 → `SetWindowPos`（SWP_NOACTIVATE，z-order 恰在 GL surface 上方由 child 窗口语义天然成立）。
 - 尺寸状态机：`desired_size` 初值 = `open_editor` 返回值；插件 `request_resize` → 更新 desired_size + `ctx.request_repaint()`（搭现有 50ms repaint 班车即可，不强求即时）。
-- rect 滚出视口 / tab 切走（`MainView` 离开 Synth）→ `hide()`（D9）；回到 Synth → `show()` + 立即 reposition。
+- rect 滚出视口 / tab 切走（`MainView` 离开 Inspector）→ `hide()`（D9）；回到 Inspector → `show()` + 立即 reposition。
 - `pixels_per_point` 变化（zoom）→ reposition 用新换算（插件内容不缩放，仅位置/容器尺寸跟随）。
 
 ### 4.3 销毁时序（正确性关键）
@@ -111,13 +111,13 @@ pub struct PluginWindowHandle(platform_impl::NativeChild); // Windows: HWND 子�
 - 测试：test-plugin 假 gui 的 `hide` 提供"内部改参数"测试钩子（改 amplitude + 置 dirty + 调 host `request_flush`）→ 宿主轮询后断言回读 `(1, 0.75)` + take 语义；回读值经 `ParamId::PluginParam` 桥下发后影响引擎输出。
 - 宿主滑块 → 插件 GUI：无额外协议（D10，CLAP 契约内建）。
 
-## 6 G4 — Synth/Mixer 面板按选中节点重构（P5e 收口）
+## 6 G4 — Inspector 面板按选中节点重构（P5e 收口）
 
-- 语义：**patch 中选中的 instrument / effect / mixer 文档节点** = Synth/Mixer tab 的编辑目标（类比 Edit tab 之于 clip）。双击 patch 节点跳转 Synth tab（同双击 timeline clip 进 Edit）。
+- 语义：**patch 中选中的 instrument / effect / mixer 文档节点** = Inspector tab 的编辑目标（类比 Edit tab 之于 clip）。双击 patch 节点跳转 Inspector tab（同双击 timeline clip 进 Edit）。
 - 面板按 `NodeDoc` 变体分派：
-  - Instrument：现有声源三选一（内置 synth 参数 / SF2 面板 / 插件滑条 + preset 工具条）+ **编辑器嵌入区**（G2）。
+  - Instrument：preset 工具条 + 参数栈 + 插件滑条 + **编辑器折叠区**（G2）。源选择已于 U9 E5 迁出（加节点即带最终声源，spec `plugin-browser.md` D1/D3）。
   - Effect：效果器参数面板（现有 `set_node_param(ParamId::PluginParam)` 节点寻址路径）。
-  - Mixer：通道条面板（现有 mixer 面板按 node_id 直达）。
+  - Mixer：通道条控制台（`mixer_section(ui, mixer_doc)`）——**只有选中 mixer 节点时才出现**（2026-10-23）；轨道增删归 timeline 工具栏，自动化曲线归 timeline 底部 strip。
 - 寻址统一为 **node_id**：`clap_voice_values` / `vst3_voice_values` 从 `HashMap<track, …>` 迁移为 `HashMap<node_id, …>`（效果器参数缓存已是 node_id 键，乐器侧对齐）；`track_channel_target` 的轨推导保留为"无选中节点"回落（当前 selected_track 行为不变）。
 - 编辑器生命周期挂接：选中节点变化 → 旧编辑器 `close_editor` → 新节点是插件乐器且用户开了编辑器 → 重开。编辑器开关状态会话内存，不持久化。
 
@@ -165,7 +165,7 @@ pub struct PluginWindowHandle(platform_impl::NativeChild); // Windows: HWND 子�
 | 阶段 | 内容 | 验收 |
 | :--- | :--- | :--- |
 | G1 | clack gui feature + HostGuiImpl + guard open/resize/close + test-plugin 假 gui | 协议测试 CI 绿（无头） |
-| G2 | plugin_window 平台层 + Synth 面板嵌入 + reposition + 销毁时序 | **Dexed 实测**：打开/操作/切轨/退出无崩溃 |
+| G2 | plugin_window 平台层 + Inspector 面板嵌入 + reposition + 销毁时序 | **Dexed 实测**：打开/操作/切轨/退出无崩溃 |
 | G3 | request_flush → flush 回接 + 滑块缓存同步 | Dexed GUI 拨参数引擎即时生效；宿主滑块与 GUI 双向一致 |
 | G4 | 面板按选中节点重构 + 双击跳转 + 乐器参数缓存 node_id 化 | 多插件轨各自面板寻址正确；回归：单轨行为不变 |
 | G5 | 内联参数注册表 + 节点控件 | 拖内联滑条不触发图重建（现有测试锚点）；plugdata 手感 |

@@ -197,7 +197,7 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 - [ ] **U5 采样播放器 instrument**（spec 先行，RT 审计同 S1 流程）：wav 解码（hound，控制线程）+ 会话 SampleLibrary 缓存（`Arc` 共享 f32 立体声缓冲）；`VoiceSpec::Sample { path, root_note, … }` + `SampleVoiceProcessor`（RT 预分配 voice 池、零分配审计）；note-on 触发样本播放 + root note 音高映射
 - [ ] **U6 audio track**（依赖 U5，spec 先行）：`AudioTrack` 文档轨 + `AudioClip { path, span, offset, gain }`；`RtAudioClip` 从预加载缓冲按时间轴播放入图混音；timeline 波形渲染；无 pitch/音符语义（区别于 U5 乐器化采样）
 - [ ] **U7 Export Audio + 电平表升级**：离线渲染 wav（控制线程 block 循环驱动引擎图，绕开 cpal 实时流，hound 写文件）；master 电平表立体声双条 + dB 刻度（-60..0，替换单条峰值）
-- [ ] **U8 Synth/Mixer tab → Inspector 重构**：改名 Inspector（G4 按选中节点分派已就位，此步收口堆叠杂项）：automation lane 挪 timeline（U4 交付）、master 电平表挪位、clip_section 死文案清除；Instrument 面板收敛为 preset + 参数 + 插件编辑器区（**源选择已迁出**，见下方 U9 / `spec/plugin-browser.md`）
+- [x] **U8 Synth/Mixer tab → Inspector 重构** ✅ 2026-10-23（余一项）：① 改名 **Inspector**（`MainView::Synth` → `Inspector`，面板标题去掉 `Synth —` 前缀，只留节点身份 `Instrument #3 · Track 1` / `Effect #3` / `Mixer #2`）；② **mixer 控制台只在选中 mixer 节点时出现**（`mixer_section(ui, mixer_doc)`，不再是"永远画一遍全局 mixer"），轨道增删交给 timeline 工具栏（那里本来就有 `+ Track`/`- Track`）；③ **automation 归 timeline**：`automation_section` 拆成 `automation_strip`（timeline 底部 `Panel::bottom`）+ `add_control_track` / `remove_control_track` + `auto_target_row`，Inspector 不再出现曲线管理；④ `clip_section` 死文案删除；⑤ Instrument 面板收敛为 preset + 参数 + 插件编辑器区（**源选择已迁出**，见 U9 / `spec/plugin-browser.md`，E5 已删）。**剩余**：master 电平表挪位（U7 会升级成立体声 dB 表，挪到走带条时合并做）
 
 实施顺序 U1 → U2 → U3 → U4 → U5 → U6 → U7 → U8（U4 无重依赖可前插；U5/U6 音频链条工作量大；U7 在音频能力齐后覆盖全轨渲染；U8 收口）。
 

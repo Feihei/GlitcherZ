@@ -446,6 +446,21 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 
 **验证**：全仓 497 测试绿（删除全程没动测试），`cargo run -p glitcherz-app -- --seconds 5` 首帧正常、按时退出。Dexed（CLAP）与 200+ VST3 目录的手工验收仍按 spec §10 门槛留给人工过一遍。
 
+### Inspector 收口：改名、mixer 分派、编辑器折叠头（U8，2026-10-23）
+
+**改名**：`MainView::Synth` → `Inspector`，`synth_panel` → `inspector_panel`，tab 文案 `Synth / Mixer` → `Inspector`。面板标题不再带通道前缀（`Synth — Instrument #3` → `Instrument #3`），因为面板身份已由 tab 表明。
+
+**面板只剩"选中节点的参数"**：三处结构管理搬走——① mixer 控制台改 `mixer_section(ui, mixer_doc)`，只有 `target_doc` 是 `NodeDoc::Mixer` 时才画（原先无论选什么都会画一遍"first mixer"）；② 混音台头部的 `+ Track` / `- Track` 删除（timeline 工具栏本来就有同名按钮，且那是轨道管理不是混音参数）；③ `automation_section` 拆解：`automation_strip`（新增，timeline 底部 `egui::Panel::bottom("glitcherz_automation")`）+ `add_control_track` / `remove_control_track` + `auto_target_row`（端点选择器，原样搬过来，`index` 改成入参）+ 删除 `clip_section` 死文案。曲线管理是轨道级状态，跟轨道放一起。
+
+**`Panel::bottom` 的声明顺序**：必须写在 `timeline::show` **之前**（面板先占位，再让内容吃剩余高度）；`timeline::show` 内部的 ScrollArea 是 `auto_shrink(false)`，放后面会把 strip 挤出屏幕。
+
+**插件编辑器改折叠头**（原来 `Show Editor` / `Close Editor` 按钮，展开后原生子窗口会盖住按钮）：
+
+- 用 `CollapsingHeader::new("Editor").id_salt("plugin_editor_header")`，三角独占一行在占位矩形上方，原生窗口只能覆盖 body 的 rect，永远压不到开关。
+- **`.open(Some(self.editor_user_open))`**：让 app 的 `editor_user_open` 成为唯一真值。若交给 egui memory 自己记，插件自毁 GUI（`gui_closed()` → 清 flag）那条路径会把 header 留在展开态，下一帧"header 开着但 flag 是 false"就把它又拉起来——死循环。强制 open 后点击不再自动 toggle，改由 `header_response.clicked()` 手动翻转 flag（`close_plugin_editor()` / `plugin_editor_wants_open = true`）+ `request_repaint()`，下一帧 header 跟上。
+- body 只在展开时布局：会话可能比点击晚一帧（`plugin_editor_wants_open` 在本帧尾部才被消费），因此 body 里用 `if let Some(editor) = ... && Some(editor.doc_node) == target` 兜住 `None`，不画占位文字（避免一帧闪烁）。
+- 折叠后立刻 `close_plugin_editor()`，不存在"隐藏但仍然加载"的中间态；`editor.rect` 留旧值无害（会话已销毁）。
+
 ### 跨平台构建：VST3 枚举类型 + eframe 的 Linux 后端（2026-10-23）
 
 症状：Windows 通过，`ubuntu-latest` / `macos-latest` 各自报一类错（CI 从没绿过）。
