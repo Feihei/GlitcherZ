@@ -452,7 +452,7 @@ struct GuiParamBatch {
     changes: Vec<(u32, f64)>,
 }
 
-/// Resolves the Synth panel's editing target (spec `plugin-gui.md` §6):
+/// Resolves the Inspector's editing target (spec `plugin-gui.md` §6):
 /// the first **editable** document node (instrument / effect / mixer) in the
 /// patch selection, in document order; with nothing selected the panel falls
 /// back to the selected track's first-match instrument (the pre-G4
@@ -517,8 +517,9 @@ enum MainView {
     Edit,
     /// Node patch graph (full-height, dedicated view).
     Patch,
-    /// Synth params + mixer + clip/automation editors + keyboard.
-    Synth,
+    /// The selected node's parameters (plus its mixer console when the
+    /// selection is a mixer node).
+    Inspector,
 }
 
 /// A destructive file action that must ask about unsaved changes first (U2).
@@ -1415,7 +1416,7 @@ impl GlitcherZApp {
         self.node_map.get(&doc_id).copied()
     }
 
-    /// The Synth panel's editing target (spec `plugin-gui.md` §6): the
+    /// The Inspector's editing target (spec `plugin-gui.md` §6): the
     /// patch selection's first editable document node, falling back to the
     /// selected track's first-match instrument (pre-G4 behavior).
     fn panel_target_node(&self) -> Option<u64> {
@@ -1986,7 +1987,7 @@ impl GlitcherZApp {
                     // (and linked the owning track); the jump itself just
                     // switches the view (spec `plugin-gui.md` §6).
                     if self.project().graph.node_by_id(doc_id).is_some() {
-                        self.view = MainView::Synth;
+                        self.view = MainView::Inspector;
                     }
                 }
                 patch::PatchAction::SetInlineParam { node, param, value } => {
@@ -3838,7 +3839,7 @@ impl GlitcherZApp {
                 ui.selectable_value(&mut self.view, MainView::Timeline, "Timeline");
                 ui.selectable_value(&mut self.view, MainView::Edit, "Edit");
                 ui.selectable_value(&mut self.view, MainView::Patch, "Patch");
-                ui.selectable_value(&mut self.view, MainView::Synth, "Synth / Mixer");
+                ui.selectable_value(&mut self.view, MainView::Inspector, "Inspector");
             });
         });
         // Chrome: switching tabs releases the previous view's focus.
@@ -3849,6 +3850,13 @@ impl GlitcherZApp {
         if self.project().midi_tracks.is_empty() && self.project().control_tracks.is_empty() {
             return;
         }
+        // Automation strip (add / remove a curve + its target parameter).
+        // Track-level state belongs to the timeline, not to the inspector
+        // panel; a `Panel::bottom` keeps it pinned while the arrangement
+        // scrolls.
+        egui::Panel::bottom("glitcherz_automation").show(ui, |ui| {
+            self.automation_strip(ui);
+        });
         let muted: Vec<bool> = (0..self.project().midi_tracks.len())
             .map(|i| self.track_mixer_channel_state(i).0)
             .collect();
@@ -4674,14 +4682,19 @@ impl GlitcherZApp {
         self.focus_router.register_neutral(response.response.rect);
     }
 
-    fn synth_panel(&mut self, ui: &mut egui::Ui) {
+    /// Main view: the **Inspector** — the selected node's parameters and
+    /// nothing structural. Adding / deleting / wiring nodes belongs to the
+    /// patch (spec `plugin-browser.md` D2), the mixer console appears only
+    /// while a mixer node is selected, and automation curves belong to the
+    /// timeline.
+    fn inspector_panel(&mut self, ui: &mut egui::Ui) {
         self.meter.update(self.engine.peak_level());
         let peak = self.meter.held;
 
         // In eframe 0.36 the root Ui has no margins; wrap a CentralPanel to keep the default look.
         egui::CentralPanel::default().show(ui, |ui| {
             if self.project().midi_tracks.is_empty() {
-                ui.heading("Synth");
+                ui.heading("Inspector");
                 ui.weak("(no MIDI tracks in project)");
                 return;
             }
@@ -4694,65 +4707,71 @@ impl GlitcherZApp {
             let target_doc = target.and_then(|id| self.project().graph.node_by_id(id).cloned());
             let title = match (&target_doc, target) {
                 (Some(NodeDoc::Effect { .. }), Some(id)) => {
-                    format!("Synth — Effect #{id} · Track {}", sel + 1)
+                    format!("Effect #{id} · Track {}", sel + 1)
                 }
-                (Some(NodeDoc::Mixer { .. }), Some(id)) => format!("Synth — Mixer #{id}"),
+                (Some(NodeDoc::Mixer { .. }), Some(id)) => format!("Mixer #{id}"),
                 (Some(NodeDoc::Instrument { .. }), Some(id)) => {
-                    format!("Synth — Instrument #{id} · Track {}", sel + 1)
+                    format!("Instrument #{id} · Track {}", sel + 1)
                 }
                 _ => {
-                    let track_title = if self.project().midi_tracks[sel].name.is_empty() {
+                    if self.project().midi_tracks[sel].name.is_empty() {
                         format!("Track {}", sel + 1)
                     } else {
                         self.project().midi_tracks[sel].name.clone()
-                    };
-                    format!("Synth — {track_title}")
+                    }
                 }
             };
             ui.heading(title);
             // Embedded plugin editor (spec `plugin-gui.md` §4): CLAP
-            // instruments only (v1). The toggle requests/destroys the
-            // session; the framed area below reserves layout space whose
-            // rect drives the native container window position (the real
-            // plugin GUI draws on top of it as a native child window).
+            // instruments only (v1). A collapsing header owns the toggle —
+            // its triangle sits on a row of its own **above** the reserved
+            // GUI rect, so the native container window (which always paints
+            // on top of egui) can never cover the control that opened it.
+            // The framed area reserves layout space whose rect drives the
+            // native container window position.
             // Deliberately **outside** the ScrollArea: a native child
             // window cannot be clipped by egui, so a scrolling editor
             // would smear over neighbouring UI (ghosting) — the editor
             // stays pinned at the top and only the parameter stack below
             // scrolls.
-            {
-                let editor_here = self
-                    .plugin_editor
-                    .as_ref()
-                    .map(|e| Some(e.doc_node) == target)
-                    .unwrap_or(false);
-                let has_editor = target.is_some_and(|t| self.node_guard_has_editor(t));
-                if has_editor {
-                    let label = if editor_here {
-                        "Close Editor"
-                    } else {
-                        "Show Editor"
-                    };
-                    if ui.button(label).clicked() {
-                        if editor_here {
-                            self.editor_user_open = false;
-                            self.close_plugin_editor();
-                        } else {
-                            self.editor_user_open = true;
-                            self.plugin_editor_wants_open = true;
+            // `open(Some(..))` makes `editor_user_open` the single source of
+            // truth: egui would otherwise remember the open state itself and
+            // fight the "plugin closed its own GUI" path (which clears the
+            // flag outside this panel).
+            if target.is_some_and(|t| self.node_guard_has_editor(t)) {
+                let user_wants = self.editor_user_open;
+                let resp = egui::CollapsingHeader::new("Editor")
+                    .id_salt("plugin_editor_header")
+                    .open(Some(user_wants))
+                    .show(ui, |ui| {
+                        // The body only lays out while open; the session may
+                        // still be one frame behind the click, hence the
+                        // `None` arm.
+                        if let Some(editor) = self.plugin_editor.as_mut()
+                            && Some(editor.doc_node) == target
+                        {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(
+                                        editor.size.0.max(1.0),
+                                        editor.size.1.max(1.0),
+                                    ),
+                                    egui::Sense::hover(),
+                                );
+                                editor.rect = Some(rect);
+                            });
                         }
+                    });
+                if resp.header_response.clicked() {
+                    if user_wants {
+                        self.editor_user_open = false;
+                        self.close_plugin_editor();
+                    } else {
+                        self.editor_user_open = true;
+                        self.plugin_editor_wants_open = true;
                     }
-                }
-                if let Some(editor) = self.plugin_editor.as_mut() {
-                    if Some(editor.doc_node) == target {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(editor.size.0.max(1.0), editor.size.1.max(1.0)),
-                                egui::Sense::hover(),
-                            );
-                            editor.rect = Some(rect);
-                        });
-                    }
+                    // The forced `open` state only changes next frame.
+                    ui.ctx().request_repaint();
                 }
             }
             // Long parameter stack: without a scroll area the content clips with no scrollbar.
@@ -5406,11 +5425,13 @@ impl GlitcherZApp {
                     ui.end_row();
                 });
 
-            ui.separator();
-
-            self.mixer_section(ui);
-            self.clip_section(ui);
-            self.automation_section(ui);
+            // The console belongs to the mixer node alone: it shows when (and
+            // only when) the patch selection is a mixer. Track add / remove
+            // moved to the timeline toolbar, automation to the timeline
+            // strip — the Inspector does not manage tracks.
+            if let (Some(NodeDoc::Mixer { .. }), Some(mixer_doc)) = (&target_doc, target) {
+                self.mixer_section(ui, mixer_doc);
+            }
 
             ui.add_space(10.0);
             ui.label("Master Out Level");
@@ -5609,48 +5630,15 @@ impl GlitcherZApp {
     /// Mixer console (P5f D15/D21, stage-console metaphor): one column per
     /// mixer channel — solo / mute / level meter / fader / pan — plus channel
     /// add/remove buttons (2..=32, D21) and the output pan/mute stage. The
-    /// channel a track feeds is labeled with the track name; data source =
-    /// the first (global) mixer document node.
-    fn mixer_section(&mut self, ui: &mut egui::Ui) {
+    /// channel a track feeds is labeled with the track name.
+    ///
+    /// Only rendered while the selected patch node **is** a mixer: the
+    /// console edits that node's fields, so it must not appear next to an
+    /// instrument's parameters. Track add/remove lives in the timeline
+    /// toolbar (it is track management, not a mixer parameter).
+    fn mixer_section(&mut self, ui: &mut egui::Ui, mixer_doc: u64) {
         ui.separator();
         ui.add_space(4.0);
-        let can_add_track = self.project().midi_tracks.len() < MAX_MIDI_TRACKS;
-        let can_remove_track = !self.project().midi_tracks.is_empty();
-        let mut add_track_clicked = false;
-        let mut remove_track_clicked = false;
-        ui.horizontal(|ui| {
-            ui.label("Mixer");
-            if ui
-                .add_enabled(can_add_track, egui::Button::new("+ Track"))
-                .clicked()
-            {
-                add_track_clicked = true;
-            }
-            if ui
-                .add_enabled(can_remove_track, egui::Button::new("- Track"))
-                .clicked()
-            {
-                remove_track_clicked = true;
-            }
-        });
-        if add_track_clicked {
-            self.add_midi_track();
-        }
-        if remove_track_clicked {
-            self.remove_last_midi_track();
-        }
-
-        let Some(mixer_doc) = self
-            .project()
-            .graph
-            .nodes
-            .iter()
-            .find(|n| n.is_mixer())
-            .map(NodeDoc::node_id)
-        else {
-            ui.weak("(no mixer node — add one in the Patch view)");
-            return;
-        };
         let mixer_engine = self.engine_id(mixer_doc);
         let NodeDoc::Mixer {
             inputs,
@@ -6198,17 +6186,6 @@ impl GlitcherZApp {
         self.commit_edit("Reorder Tracks", before);
     }
 
-    /// Piano roll hint (the editor itself lives in the Edit tab; double-click
-    /// a MIDI clip on the arrangement timeline to jump there).
-    fn clip_section(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        ui.add_space(4.0);
-        ui.weak(
-            "Piano roll: double-click a MIDI clip in the Arrangement timeline \
-             (bottom panel) — it opens in the Edit tab.",
-        );
-    }
-
     /// Points the Edit tab at `target`, dropping any in-flight roll gesture:
     /// selection indices refer to the clip that was being edited.
     fn set_edit_target(&mut self, target: EditTarget) {
@@ -6564,59 +6541,84 @@ impl GlitcherZApp {
         }
     }
 
-    /// Automation track section (D12 top-level entities; each curve's delivery endpoint is
-    /// decided by node-graph cables).
-    fn automation_section(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        ui.add_space(4.0);
+    /// Automation strip under the arrangement (D12 top-level entities; each
+    /// curve's delivery endpoint is decided by node-graph cables).
+    ///
+    /// Lives in the **timeline**, not the Inspector: adding a curve creates a
+    /// track, and picking which parameter a curve drives is track-level state.
+    /// The curves themselves are edited in the Edit tab (double-click a
+    /// control clip).
+    fn automation_strip(&mut self, ui: &mut egui::Ui) {
         let auto_count = self.project().control_tracks.len();
         ui.horizontal(|ui| {
-            ui.label("Automation Tracks");
-            for i in 0..auto_count {
-                if ui
-                    .selectable_label(self.selected_auto == i, format!("{}", i + 1))
-                    .clicked()
-                {
-                    self.selected_auto = i;
-                }
+            ui.strong("Curve");
+            if ui
+                .add_enabled(auto_count < MAX_AUTO_TRACKS, egui::Button::new("+ Curve"))
+                .on_hover_text("Add an automation (control) track")
+                .clicked()
+            {
+                self.add_control_track();
             }
-            if ui.button("+ Add").clicked() && auto_count < MAX_AUTO_TRACKS {
-                let before = self.begin_edit();
-                self.project_mut()
-                    .control_tracks
-                    .push(ControlTrack::default());
-                self.commit_edit("Add Automation Track", before);
-                self.selected_auto = auto_count;
-                self.send_control_clips(self.selected_auto);
+            if ui
+                .add_enabled(auto_count > 0, egui::Button::new("- Curve"))
+                .on_hover_text("Remove the selected automation track")
+                .clicked()
+            {
+                self.remove_control_track();
             }
-            if ui.button("- Remove").clicked() && auto_count > 0 {
-                let index = self.selected_auto.min(auto_count - 1);
-                let before = self.begin_edit();
-                self.project_mut().control_tracks.remove(index);
-                self.commit_edit("Remove Automation Track", before);
-                let _ = self.engine.clear_auto_route(index);
-                // Engine side: clear that index to an empty clip table.
-                self.send_sequencer(SequencerCommand::SetControlClips {
-                    index,
-                    clips: [RtControlClip::default(); MAX_TRACK_CLIPS],
-                });
-                self.selected_auto =
-                    index.min(self.project().control_tracks.len().saturating_sub(1));
+            ui.separator();
+            if auto_count == 0 {
+                ui.weak("(no curve yet — '+ Curve' adds a control track)");
+                return;
             }
+            let index = self.selected_auto.min(auto_count - 1);
+            ui.weak(format!("Track {}", index + 1));
+            self.auto_target_row(ui, index);
             ui.weak("Click lane to add anchor · drag to move · right-click to delete");
         });
+    }
 
+    /// Append a control track and select it (one undo step).
+    fn add_control_track(&mut self) {
+        let auto_count = self.project().control_tracks.len();
+        if auto_count >= MAX_AUTO_TRACKS {
+            return;
+        }
+        let before = self.begin_edit();
+        self.project_mut()
+            .control_tracks
+            .push(ControlTrack::default());
+        self.commit_edit("Add Automation Track", before);
+        self.selected_auto = auto_count;
+        self.send_control_clips(self.selected_auto);
+    }
+
+    /// Remove the selected control track and clear its engine route
+    /// (one undo step).
+    fn remove_control_track(&mut self) {
+        let auto_count = self.project().control_tracks.len();
         if auto_count == 0 {
-            ui.weak("(no automation tracks; click '+ Add' to create one)");
             return;
         }
         let index = self.selected_auto.min(auto_count - 1);
-        let sel = self.selected_track;
+        let before = self.begin_edit();
+        self.project_mut().control_tracks.remove(index);
+        self.commit_edit("Remove Automation Track", before);
+        let _ = self.engine.clear_auto_route(index);
+        // Engine side: clear that index to an empty clip table.
+        self.send_sequencer(SequencerCommand::SetControlClips {
+            index,
+            clips: [RtControlClip::default(); MAX_TRACK_CLIPS],
+        });
+        self.selected_auto = index.min(self.project().control_tracks.len().saturating_sub(1));
+    }
 
-        // Endpoint selection: this track's instrument (cutoff / plugin
-        // parameters) plus the global song tempo. Mixer-fader automation is
-        // deferred (P5f decision). Options carry the **document** node_id (the
-        // cable's persisted identity), mapped when dispatching.
+    /// Endpoint picker for one control track: this track's instrument
+    /// (cutoff / plugin parameters) plus the global song tempo. Mixer-fader
+    /// automation is deferred (P5f decision). Options carry the **document**
+    /// node_id (the cable's persisted identity), mapped when dispatching.
+    fn auto_target_row(&mut self, ui: &mut egui::Ui, index: usize) {
+        let sel = self.selected_track;
         let mut options: Vec<(String, AutoTarget, AutoParam)> = Vec::new();
         // U3b: song tempo is always offered — the conductor terminal is a
         // fixed entity, so it needs no ownership check.
@@ -6770,14 +6772,6 @@ impl GlitcherZApp {
                 .unwrap_or_else(|| "Not connected".to_string());
             ui.weak(format!("-> {current}"));
         });
-
-        // The curve editor lives in the Edit tab (double-click a control clip
-        // on the arrangement timeline to jump there); the clip's own
-        // `loop_ticks` sets the editing width.
-        ui.weak(
-            "Curve editor: double-click a control clip in the Arrangement \
-             timeline (bottom panel) — it opens in the Edit tab.",
-        );
     }
 
     /// Body of the curve editor (Edit tab): edits the targeted control clip,
@@ -7038,7 +7032,7 @@ impl eframe::App for GlitcherZApp {
             MainView::Patch => {
                 egui::CentralPanel::default().show(ui, |ui| self.graph_patch(ui));
             }
-            MainView::Synth => self.synth_panel(ui),
+            MainView::Inspector => self.inspector_panel(ui),
         }
 
         // Embedded plugin editor lifecycle + window sync (spec
@@ -7159,7 +7153,7 @@ impl eframe::App for GlitcherZApp {
         // handshake).
         let mut ack_resize: Option<(u64, glitcherz_vst3_host::ViewSize)> = None;
         if let Some(editor) = self.plugin_editor.as_mut() {
-            if self.view != MainView::Synth {
+            if self.view != MainView::Inspector {
                 // D9: tab-away only hides; returning to the synth tab
                 // shows the container again via reposition's
                 // SWP_SHOWWINDOW.
