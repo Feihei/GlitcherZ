@@ -55,6 +55,7 @@ pub mod lane;
 pub mod patch;
 pub mod piano_roll;
 pub mod plugin_catalog;
+pub mod plugin_picker;
 pub mod plugin_window;
 pub mod project_files;
 pub mod timeline;
@@ -182,6 +183,33 @@ fn inline_param_id(p: patch::InlineParam) -> ParamId {
         patch::InlineParam::DelayMix => ParamId::DelayMix,
         patch::InlineParam::MixerOutPan => ParamId::MixerOutPan,
         patch::InlineParam::FeedbackGain => ParamId::FeedbackGain,
+    }
+}
+
+/// Final node source for a plugin picked in the popup (U9 E3).
+///
+/// The entry's own classification decides instrument vs effect (spec D9): a
+/// mixed-up plugin still becomes a node of the kind it actually is, even when
+/// the user reached it through the global `Search Plug-ins…` entry.
+fn pick_to_source(choice: plugin_picker::PickChoice) -> patch::NodeSource {
+    use plugin_catalog::PluginFormat;
+    match (choice.is_instrument, choice.format) {
+        (true, PluginFormat::Clap) => patch::NodeSource::ClapInstrument {
+            path: choice.path,
+            plugin_id: choice.id,
+        },
+        (true, PluginFormat::Vst3) => patch::NodeSource::Vst3Instrument {
+            path: choice.path,
+            class_id: choice.id,
+        },
+        (false, PluginFormat::Clap) => patch::NodeSource::ClapEffect {
+            path: choice.path,
+            plugin_id: choice.id,
+        },
+        (false, PluginFormat::Vst3) => patch::NodeSource::Vst3Effect {
+            path: choice.path,
+            class_id: choice.id,
+        },
     }
 }
 
@@ -324,6 +352,10 @@ pub struct UiConfig {
 struct UiState {
     /// Recently opened project files (newest first, at most [`RECENT_FILES_MAX`] entries).
     recent_files: Vec<PathBuf>,
+    /// Recently picked plugins (spec `plugin-browser.md` D10): per category,
+    /// newest first. Persisted so the picker's `Recent` group survives restarts.
+    #[serde(default)]
+    recent_plugins: Vec<plugin_picker::RecentPlugin>,
 }
 
 /// Capacity limit of the recent files list.
@@ -584,6 +616,13 @@ pub struct GlitcherZApp {
     /// pickers read (spec `.agents/spec/plugin-browser.md`, U9 E2). Replaces
     /// the four lazy per-format scan caches.
     plugin_catalog: plugin_catalog::PluginCatalog,
+    /// Filterable plugin popup behind `Add ▸ Instrument ▸ CLAP…` (U9 E3).
+    picker: plugin_picker::PluginPicker,
+    /// Graph-space position the picker's node will be created at (taken from
+    /// the right-click that opened the menu).
+    picker_at: Option<egui::Pos2>,
+    /// Recently picked plugins, newest first, persisted in [`UiState`].
+    recent_plugins: Vec<plugin_picker::RecentPlugin>,
     /// Instrument VST3 parameter lists (read at instantiation), keyed by
     /// **document node_id** (G4: node-addressed like the effect caches, so
     /// multi-instrument tracks keep independent panels). For
@@ -750,6 +789,9 @@ impl GlitcherZApp {
             voice_guards: Vec::new(),
             retiring_guards: Vec::new(),
             plugin_catalog: plugin_catalog::PluginCatalog::load(cached_plugins.as_deref()),
+            picker: plugin_picker::PluginPicker::default(),
+            picker_at: None,
+            recent_plugins: ui_state.recent_plugins,
             voice_params: HashMap::new(),
             clap_voice_params: HashMap::new(),
             clap_voice_values: HashMap::new(),
@@ -1843,15 +1885,35 @@ impl GlitcherZApp {
     fn apply_patch_actions(&mut self, actions: Vec<patch::PatchAction>) {
         for action in actions {
             match action {
-                patch::PatchAction::AddNode { kind, at } => {
-                    self.add_patch_node(kind, at);
+                patch::PatchAction::AddNode { source, at } => {
+                    self.add_patch_node(source, at);
+                }
+                patch::PatchAction::OpenPluginPicker {
+                    category,
+                    format,
+                    at,
+                } => {
+                    self.open_plugin_picker(category, format, at);
+                }
+                patch::PatchAction::PickSoundFont { at } => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("SoundFont", &["sf2", "sf3"])
+                        .pick_file()
+                    {
+                        self.create_patch_node(
+                            patch::NodeSource::SoundFont {
+                                path: path.display().to_string(),
+                            },
+                            at,
+                        );
+                    }
                 }
                 patch::PatchAction::RescanPlugins => {
                     self.plugin_catalog.rescan();
                     self.set_message("Rescanning plug-ins…".to_string());
                 }
-                patch::PatchAction::InsertNode { cable, kind, at } => {
-                    self.insert_node_in_cable(cable, kind, at);
+                patch::PatchAction::InsertNode { cable, source, at } => {
+                    self.insert_node_in_cable(cable, source, at);
                 }
                 patch::PatchAction::ConnectAudio {
                     from_doc,
@@ -1921,18 +1983,75 @@ impl GlitcherZApp {
         }
     }
 
+    /// Open the filterable plugin popup for a leaf of the `Add` menu (U9 E3,
+    /// spec `plugin-browser.md` §6). `category`/`format` narrow the list; both
+    /// `None` is the global `Search Plug-ins…` entry, whose pick decides the
+    /// node category from the entry's own classification (spec D5).
+    fn open_plugin_picker(
+        &mut self,
+        category: Option<patch::NodeCategory>,
+        format: Option<plugin_catalog::PluginFormat>,
+        at: egui::Pos2,
+    ) {
+        self.picker_at = Some(at);
+        self.picker.open(plugin_picker::PickFilter {
+            want_instrument: category.map(patch::NodeCategory::is_instrument),
+            format,
+        });
+    }
+
+    /// Draw the plugin popup and create the picked node (U9 E3).
+    ///
+    /// The popup is drawn above every panel (`Order::Foreground`); a pick is
+    /// turned into the node's **final** source here, so the creation path
+    /// installs the plugin exactly once (spec D1).
+    fn plugin_picker_frame(&mut self, ctx: &egui::Context) {
+        let scan_progress = self
+            .plugin_catalog
+            .is_scanning()
+            .then(|| self.plugin_catalog.progress());
+        let outcome = self.picker.show(
+            ctx,
+            self.plugin_catalog.entries(),
+            &self.recent_plugins,
+            scan_progress,
+        );
+        match outcome {
+            Some(plugin_picker::PickOutcome::Picked(choice)) => {
+                plugin_picker::remember(&mut self.recent_plugins, &choice);
+                let Some(at) = self.picker_at.take() else {
+                    return;
+                };
+                let source = pick_to_source(choice);
+                self.add_patch_node(source, at);
+                // The status bar text changed; repaint immediately instead of
+                // waiting for the 50 ms display tick.
+                ctx.request_repaint();
+            }
+            Some(plugin_picker::PickOutcome::Cancelled) => {
+                self.picker_at = None;
+            }
+            None => {}
+        }
+    }
+
     /// Add a new document node from the patch context menu: allocate the next document
     /// node_id, install the processor into the engine (born dangling — no cables; D6),
     /// place it on the patch at the click position, and refresh the owning track's
     /// addressing table. The new node's owning track is the currently selected track.
-    fn add_patch_node(&mut self, kind: patch::AddNodeKind, at: egui::Pos2) {
-        self.create_patch_node(kind, at);
+    fn add_patch_node(&mut self, source: patch::NodeSource, at: egui::Pos2) -> Option<u64> {
+        self.create_patch_node(source, at)
     }
 
     /// Create + install a patch node (returns the new document node_id; `None` when the
     /// node table is full or the engine install failed — the document is rolled back so
     /// doc and engine stay in sync).
-    fn create_patch_node(&mut self, kind: patch::AddNodeKind, at: egui::Pos2) -> Option<u64> {
+    ///
+    /// The node is born with its **final** source (spec `plugin-browser.md` D1): a
+    /// plugin source is instantiated by this single `install_node` call, so there is no
+    /// "create a built-in, then swap the voice" double install (and therefore one
+    /// install, one undo step).
+    fn create_patch_node(&mut self, source: patch::NodeSource, at: egui::Pos2) -> Option<u64> {
         if self.project().graph.nodes.len() >= MAX_NODES {
             self.set_message("Add node failed: node table full (64)".to_string());
             return None;
@@ -1941,7 +2060,7 @@ impl GlitcherZApp {
         // only wired source today is the computer keyboard — so a second
         // input node has nothing to listen to. Refuse instead of writing a
         // document `validate` would reject.
-        if matches!(kind, patch::AddNodeKind::VirtualKeyboard)
+        if matches!(source, patch::NodeSource::Keyboard)
             && self.project().graph.computer_keyboard().is_some()
         {
             self.set_message(
@@ -1953,20 +2072,70 @@ impl GlitcherZApp {
         let track = self
             .selected_track
             .min(self.project().midi_tracks.len().saturating_sub(1));
-        let node = match kind {
-            patch::AddNodeKind::Instrument => NodeDoc::Instrument {
+        let node = match source {
+            patch::NodeSource::BuiltinSynth => NodeDoc::Instrument {
                 node_id,
                 track,
                 voice: VoiceSpec::Builtin,
                 synth: SynthParams::default(),
             },
-            patch::AddNodeKind::Effect => NodeDoc::Effect {
+            patch::NodeSource::BuiltinDelay => NodeDoc::Effect {
                 node_id,
                 track,
                 voice: VoiceSpec::Builtin,
                 delay: DelayParams::default(),
             },
-            patch::AddNodeKind::Mixer => NodeDoc::Mixer {
+            patch::NodeSource::SoundFont { path } => NodeDoc::Instrument {
+                node_id,
+                track,
+                voice: VoiceSpec::SoundFont {
+                    path,
+                    bank: 0,
+                    program: 0,
+                },
+                synth: SynthParams::default(),
+            },
+            patch::NodeSource::ClapInstrument { path, plugin_id } => NodeDoc::Instrument {
+                node_id,
+                track,
+                voice: VoiceSpec::Clap {
+                    path,
+                    plugin_id,
+                    state: Vec::new(),
+                },
+                synth: SynthParams::default(),
+            },
+            patch::NodeSource::Vst3Instrument { path, class_id } => NodeDoc::Instrument {
+                node_id,
+                track,
+                voice: VoiceSpec::Vst3 {
+                    path,
+                    class_id,
+                    state: Vec::new(),
+                },
+                synth: SynthParams::default(),
+            },
+            patch::NodeSource::ClapEffect { path, plugin_id } => NodeDoc::Effect {
+                node_id,
+                track,
+                voice: VoiceSpec::Clap {
+                    path,
+                    plugin_id,
+                    state: Vec::new(),
+                },
+                delay: DelayParams::default(),
+            },
+            patch::NodeSource::Vst3Effect { path, class_id } => NodeDoc::Effect {
+                node_id,
+                track,
+                voice: VoiceSpec::Vst3 {
+                    path,
+                    class_id,
+                    state: Vec::new(),
+                },
+                delay: DelayParams::default(),
+            },
+            patch::NodeSource::Mixer => NodeDoc::Mixer {
                 node_id,
                 track,
                 inputs: MIN_MIXER_CHANNELS as u8,
@@ -1977,12 +2146,12 @@ impl GlitcherZApp {
             // G6: document-only input node — no engine processor, so the
             // usual "installed into the engine?" check does not apply. It
             // owns the computer keyboard (the only wired source in v1).
-            patch::AddNodeKind::VirtualKeyboard => NodeDoc::Keyboard {
+            patch::NodeSource::Keyboard => NodeDoc::Keyboard {
                 node_id,
                 track,
                 source: MidiSource::Computer,
             },
-            patch::AddNodeKind::Feedback => NodeDoc::Feedback {
+            patch::NodeSource::Feedback => NodeDoc::Feedback {
                 node_id,
                 track,
                 gain: 0.5,
@@ -1997,14 +2166,43 @@ impl GlitcherZApp {
             self.patch_state.place_node(node_id, at);
             return Some(node_id);
         }
+        // A plugin source must leave the engine with a real instance: the
+        // installer silently falls back to the built-in processor, which would
+        // leave a document claiming a plugin voice the engine does not run.
+        // Such a node must not exist at all (spec §7 step 2). SoundFonts are
+        // exempt: a missing file already falls back to the built-in voice by
+        // design (spec `sf2-loader.md` D8), and no guard is involved.
+        let expects_guard = matches!(
+            node,
+            NodeDoc::Instrument {
+                voice: VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. },
+                ..
+            } | NodeDoc::Effect {
+                voice: VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. },
+                ..
+            }
+        );
         let sample_rate = self.engine.info().sample_rate;
         let before = self.begin_edit();
         self.project_mut().graph.nodes.push(node.clone());
         self.install_node(&node, sample_rate);
-        if !self.node_map.contains_key(&node_id) {
-            // Engine slot/queue full: roll the document back so doc and engine stay one.
+        let engine_id = self.node_map.get(&node_id).copied();
+        let installed = engine_id.is_some_and(|engine_id| {
+            !expects_guard
+                || self
+                    .voice_guards
+                    .iter()
+                    .any(|entry| entry.node_id == engine_id)
+        });
+        if !installed {
+            // Engine slot/queue full, or the plugin failed to instantiate:
+            // roll the document back so doc and engine stay one.
             self.session.restore(before);
-            self.set_message("Add node failed (engine slots or queue full)".to_string());
+            self.set_message(if expects_guard {
+                "Add node failed: the plug-in could not be loaded".to_string()
+            } else {
+                "Add node failed (engine slots or queue full)".to_string()
+            });
             return None;
         }
         self.commit_edit("Add Node", before);
@@ -2018,7 +2216,7 @@ impl GlitcherZApp {
     fn insert_node_in_cable(
         &mut self,
         cable_index: usize,
-        kind: patch::AddNodeKind,
+        source: patch::NodeSource,
         at: egui::Pos2,
     ) {
         let Some(cable) = self.project().graph.cables.get(cable_index).cloned() else {
@@ -2028,7 +2226,10 @@ impl GlitcherZApp {
             self.set_message("Insert failed: only audio cables accept inserted nodes".to_string());
             return;
         }
-        if !matches!(kind, patch::AddNodeKind::Effect | patch::AddNodeKind::Mixer) {
+        if !matches!(
+            source,
+            patch::NodeSource::BuiltinDelay | patch::NodeSource::Mixer
+        ) {
             self.set_message("Insert failed: only effects / mixers can be inserted".to_string());
             return;
         }
@@ -2036,7 +2237,7 @@ impl GlitcherZApp {
             self.set_message("Insert failed: cable has no node source".to_string());
             return;
         };
-        let Some(new_id) = self.create_patch_node(kind, at) else {
+        let Some(new_id) = self.create_patch_node(source, at) else {
             return;
         };
         self.delete_cable(cable_index);
@@ -7189,6 +7390,7 @@ impl eframe::App for GlitcherZApp {
             UI_STATE_KEY,
             &UiState {
                 recent_files: self.recent.clone(),
+                recent_plugins: self.recent_plugins.clone(),
             },
         );
         // U9 E2: the plugin catalog (spec `plugin-browser.md` D11). A partial
@@ -7218,8 +7420,9 @@ impl eframe::App for GlitcherZApp {
         self.refresh_vk_targets();
 
         // U2: an open unsaved-changes modal owns the keyboard (its Escape
-        // cancels); the transport / note shortcuts stay out of the way.
-        if self.pending_file_action.is_none() {
+        // cancels); the transport / note shortcuts stay out of the way. The
+        // same holds for the plugin popup (U9 E3): it owns ↑↓/Enter/Esc.
+        if self.pending_file_action.is_none() && !self.picker.is_open() {
             self.handle_keyboard_input(ui.ctx());
         }
 
@@ -7439,6 +7642,10 @@ impl eframe::App for GlitcherZApp {
         {
             g.ack_editor_size(size);
         }
+
+        // U9 E3: the plugin popup draws above every panel and reports a pick
+        // (it creates the node with its final source, spec D1).
+        self.plugin_picker_frame(ui.ctx());
 
         // U2: the unsaved-changes modal draws on top of every panel, and an
         // approved close is replayed here (the guard above let it through).

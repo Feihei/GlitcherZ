@@ -20,6 +20,8 @@ use glitcherz_model::{
     AutoParam, CableDoc, CableKind, GraphDoc, LayoutDoc, MidiSource, NodeDoc, PortRef, VoiceSpec,
 };
 
+use crate::plugin_catalog::PluginFormat;
+
 /// Inline parameter identity for built-in node kinds (G5, spec
 /// `plugin-gui.md` §7): one small slider row under the node body. The
 /// `ParamId` translation lives in the app glue (the patch stays
@@ -196,32 +198,101 @@ pub enum PatchId {
     TimelineIn,
 }
 
-/// Kind of node the user wants to add via the patch context menu.
+/// Category of a node being added (spec `plugin-browser.md` D1): the add menu
+/// asks for the category first, then for the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AddNodeKind {
-    /// Instrument node (built-in synth voice, MIDI entry).
+pub enum NodeCategory {
+    /// MIDI entry (built-in synth, SoundFont, or an instrument plugin).
     Instrument,
-    /// Effect node (built-in delay).
+    /// Audio processor (built-in delay or an effect plugin).
     Effect,
-    /// Mixer node (P5f D15/D21): the explicit multi-channel summing point;
-    /// absorbs the old ChannelStrip.
+}
+
+impl NodeCategory {
+    /// Plugin-catalog classification flag for this category (spec D9).
+    pub fn is_instrument(self) -> bool {
+        matches!(self, NodeCategory::Instrument)
+    }
+}
+
+/// The source a node is born with (spec `plugin-browser.md` §7).
+///
+/// Unlike the old `AddNodeKind` (which mixed "category" and "concrete node"),
+/// this already carries the plugin identity, so [`crate::GlitcherZApp`]
+/// installs the node exactly once with its real voice — no "create a built-in,
+/// then swap it in the panel" double install (spec D1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeSource {
+    /// Built-in synth voice.
+    BuiltinSynth,
+    /// Built-in delay effect.
+    BuiltinDelay,
+    /// SoundFont file at its default preset (bank 0 / program 0).
+    SoundFont {
+        /// `.sf2` / `.sf3` path picked in the file dialog.
+        path: String,
+    },
+    /// CLAP instrument plugin.
+    ClapInstrument {
+        /// Module path.
+        path: String,
+        /// CLAP plugin id.
+        plugin_id: String,
+    },
+    /// VST3 instrument plugin.
+    Vst3Instrument {
+        /// Module path.
+        path: String,
+        /// VST3 component class id.
+        class_id: String,
+    },
+    /// CLAP effect plugin.
+    ClapEffect {
+        /// Module path.
+        path: String,
+        /// CLAP plugin id.
+        plugin_id: String,
+    },
+    /// VST3 effect plugin.
+    Vst3Effect {
+        /// Module path.
+        path: String,
+        /// VST3 component class id.
+        class_id: String,
+    },
+    /// Mixer node (P5f D15/D21): the explicit multi-channel summing point.
     Mixer,
-    /// Virtual keyboard node (G6, spec `plugin-gui.md` §8): document-only
-    /// routing node — selecting it plays the instrument at the end of its
-    /// MIDI cable.
-    VirtualKeyboard,
     /// Feedback tap node (P6, spec `node-graph.md` D10): sums its inputs one
     /// block late, which is what makes a loop legal.
     Feedback,
+    /// Virtual keyboard node (G6, spec `plugin-gui.md` §8): document-only
+    /// routing node.
+    Keyboard,
 }
 
 /// Interaction intents produced within one patch frame (applied by the caller; the patch has
 /// no side effects).
 #[derive(Debug, Clone)]
 pub enum PatchAction {
-    /// Add a new node of `kind` at graph-space position `at` (right-click menu). The new
-    /// node is born dangling (no cables; D6 dangling semantics) — the user wires it up.
-    AddNode { kind: AddNodeKind, at: Pos2 },
+    /// Add a new node with `source` at graph-space position `at` (right-click
+    /// menu). The new node is born dangling (no cables; D6 dangling semantics)
+    /// — the user wires it up.
+    AddNode { source: NodeSource, at: Pos2 },
+    /// Open the plugin picker for `category` / `format` (spec `plugin-browser.md`
+    /// D4/D5): `None` category = the global `Search Plug-ins…` entry, whose
+    /// pick decides the node category from the entry's own classification.
+    /// `at` is the graph-space position the node will be created at.
+    OpenPluginPicker {
+        /// Category the leaf menu asked for (`None` = both).
+        category: Option<NodeCategory>,
+        /// Binary format the leaf menu asked for (`None` = both).
+        format: Option<PluginFormat>,
+        /// Graph-space creation position.
+        at: Pos2,
+    },
+    /// Open the SoundFont file dialog and create an instrument from the pick
+    /// (the patch cannot run a modal dialog inside the menu closure).
+    PickSoundFont { at: Pos2 },
     /// Re-scan every plugin module, ignoring the cached stats (U9 E2, spec
     /// `plugin-browser.md` §5.4). The catalog queues the work; the caller only
     /// restarts the scan.
@@ -254,12 +325,13 @@ pub enum PatchAction {
     /// Delete a node (document node_id; any instrument / effect / channel strip is
     /// deletable — master / timeline are fixed and never selected as document nodes).
     DeleteNode(u64),
-    /// Insert a new node of `kind` into the audio cable at document index `cable`,
-    /// replacing `A → B` with `A → new → B` (cable-midpoint menu). `at` = graph-space
-    /// position where the user clicked (the new node is placed there).
+    /// Insert a new node with `source` into the audio cable at document index
+    /// `cable`, replacing `A → B` with `A → new → B` (cable-midpoint menu).
+    /// `at` = graph-space position where the user clicked (the new node is
+    /// placed there).
     InsertNode {
         cable: usize,
-        kind: AddNodeKind,
+        source: NodeSource,
         at: Pos2,
     },
     /// Set a node's owning track as the current editing track.
@@ -1256,27 +1328,64 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     }
     // egui manages the open/close lifecycle (Escape / click elsewhere close it); the
     // closure runs only while the menu is open. egui 0.36's `context_menu` closure
-    // returns `()`, so the pick is collected through a captured outer variable.
-    let mut picked_kind: Option<AddNodeKind> = None;
+    // returns `()`, so the pick is collected through captured outer variables.
+    //
+    // Structure (spec `plugin-browser.md` §6.1): category first, then source. The
+    // plugin leaves open the filterable picker instead of listing hundreds of
+    // entries in a submenu (D4/D5); the built-in leaves create directly.
+    let mut picked_source: Option<NodeSource> = None;
+    let mut picked_picker: Option<(Option<NodeCategory>, Option<PluginFormat>)> = None;
+    let mut picked_soundfont = false;
     let mut rescan_plugins = false;
     if !(response.secondary_clicked() && ctrl) {
         response.context_menu(|ui| {
-            ui.set_min_width(120.0);
+            ui.set_min_width(160.0);
             ui.strong("Add Node");
-            if ui.button("Instrument").clicked() {
-                picked_kind = Some(AddNodeKind::Instrument);
+            ui.separator();
+            // D5: cross-category jump — the entry's own classification decides
+            // whether an instrument or an effect node is created.
+            if ui.button("Search Plug-ins…").clicked() {
+                picked_picker = Some((None, None));
             }
-            if ui.button("Effect (Delay)").clicked() {
-                picked_kind = Some(AddNodeKind::Effect);
-            }
+            ui.menu_button("Instrument", |ui| {
+                if ui.button("Built-in Synth").clicked() {
+                    picked_source = Some(NodeSource::BuiltinSynth);
+                }
+                if ui.button("SoundFont…").clicked() {
+                    picked_soundfont = true;
+                }
+                ui.separator();
+                if ui.button("CLAP…").clicked() {
+                    picked_picker =
+                        Some((Some(NodeCategory::Instrument), Some(PluginFormat::Clap)));
+                }
+                if ui.button("VST3…").clicked() {
+                    picked_picker =
+                        Some((Some(NodeCategory::Instrument), Some(PluginFormat::Vst3)));
+                }
+            });
+            ui.menu_button("Effect", |ui| {
+                if ui.button("Built-in Delay").clicked() {
+                    picked_source = Some(NodeSource::BuiltinDelay);
+                }
+                ui.separator();
+                if ui.button("CLAP…").clicked() {
+                    picked_picker = Some((Some(NodeCategory::Effect), Some(PluginFormat::Clap)));
+                }
+                if ui.button("VST3…").clicked() {
+                    picked_picker = Some((Some(NodeCategory::Effect), Some(PluginFormat::Vst3)));
+                }
+            });
+            ui.separator();
+            // No source dimension: one level is enough (spec §6.1).
             if ui.button("Mixer").clicked() {
-                picked_kind = Some(AddNodeKind::Mixer);
+                picked_source = Some(NodeSource::Mixer);
             }
             if ui.button("Keyboard In (computer)").clicked() {
-                picked_kind = Some(AddNodeKind::VirtualKeyboard);
+                picked_source = Some(NodeSource::Keyboard);
             }
             if ui.button("Feedback Tap").clicked() {
-                picked_kind = Some(AddNodeKind::Feedback);
+                picked_source = Some(NodeSource::Feedback);
             }
             ui.separator();
             // U9 E2: full plugin re-scan on demand (the startup scan is
@@ -1290,10 +1399,21 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     if rescan_plugins {
         actions.push(PatchAction::RescanPlugins);
     }
-    if let Some(kind) = picked_kind
-        && let Some(at) = state.add_menu_at.take()
-    {
-        actions.push(PatchAction::AddNode { kind, at });
+    // The menu position is consumed by whichever action the user picked.
+    if picked_source.is_some() || picked_picker.is_some() || picked_soundfont {
+        if let Some(at) = state.add_menu_at.take() {
+            if let Some(source) = picked_source {
+                actions.push(PatchAction::AddNode { source, at });
+            } else if let Some((category, format)) = picked_picker {
+                actions.push(PatchAction::OpenPluginPicker {
+                    category,
+                    format,
+                    at,
+                });
+            } else {
+                actions.push(PatchAction::PickSoundFont { at });
+            }
+        }
     }
 
     // ---- Ctrl + right-drag: cut cables the pointer path crosses ----
@@ -1837,9 +1957,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         *frame = ui.ctx().cumulative_frame_nr();
     }
     if let Some((cable_i, menu_pos, at, opened)) = state.pending_cable_menu {
-        #[derive(Clone, Copy)]
+        #[derive(Clone)]
         enum CablePick {
-            Insert(AddNodeKind),
+            Insert(NodeSource),
             Delete,
         }
         let mut picked: Option<CablePick> = None;
@@ -1855,10 +1975,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                         .get(cable_i)
                         .is_some_and(|c| c.kind == CableKind::Audio);
                     if is_audio && ui.button("Insert Effect (Delay)").clicked() {
-                        picked = Some(CablePick::Insert(AddNodeKind::Effect));
+                        picked = Some(CablePick::Insert(NodeSource::BuiltinDelay));
                     }
                     if is_audio && ui.button("Insert Mixer").clicked() {
-                        picked = Some(CablePick::Insert(AddNodeKind::Mixer));
+                        picked = Some(CablePick::Insert(NodeSource::Mixer));
                     }
                     if ui.button("Delete Cable").clicked() {
                         picked = Some(CablePick::Delete);
@@ -1866,10 +1986,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 });
             });
         match picked {
-            Some(CablePick::Insert(kind)) => {
+            Some(CablePick::Insert(source)) => {
                 actions.push(PatchAction::InsertNode {
                     cable: cable_i,
-                    kind,
+                    source,
                     at,
                 });
                 state.pending_cable_menu = None;
