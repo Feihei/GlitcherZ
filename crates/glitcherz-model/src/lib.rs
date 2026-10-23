@@ -844,12 +844,49 @@ pub enum AutoParam {
     /// `set_param` path (D1/D7). The curve value **overrides** the transport
     /// BPM rather than adding to it (D3).
     Tempo,
+    /// MIDI control change injected into the target node's MIDI input (U4a,
+    /// spec `.agents/spec/control-tracks.md` D1).
+    ///
+    /// A CC is an **event stream**, not a parameter: the target plugin's
+    /// `Cutoff` parameter and CC74 are different channels with different
+    /// domains, so this must never take the `set_param` path (D2/D3). The
+    /// curve stores the real 0..127 value (D7); the engine quantizes and
+    /// de-duplicates per block (D4).
+    Cc {
+        /// Controller number 0..=127.
+        #[serde(default)]
+        controller: u8,
+        /// MIDI channel 0..=15 (the UI shows 1..=16).
+        #[serde(default)]
+        channel: u8,
+    },
 }
 
 impl AutoParam {
     /// Whether this parameter is only legal on the Timeline In endpoint.
     pub fn is_timeline_in_only(&self) -> bool {
         matches!(self, AutoParam::Tempo)
+    }
+
+    /// A control-change destination with both fields clamped into range
+    /// (`controller` 0..=127, `channel` 0..=15). Documents written by hand or
+    /// by an older version cannot produce an out-of-range MIDI byte.
+    pub fn cc(controller: u8, channel: u8) -> Self {
+        AutoParam::Cc {
+            controller: controller.min(127),
+            channel: channel.min(15),
+        }
+    }
+
+    /// `(controller, channel)` when this is a CC destination.
+    pub fn cc_of(&self) -> Option<(u8, u8)> {
+        match self {
+            AutoParam::Cc {
+                controller,
+                channel,
+            } => Some((*controller, *channel)),
+            _ => None,
+        }
     }
 }
 
@@ -3244,5 +3281,53 @@ mod tests {
         assert!(text.contains("Tempo"), "parameter tag: {text}");
         let back: CableDoc = ron::from_str(&text).expect("deserialize");
         assert_eq!(back, cable);
+    }
+
+    /// U4a: a CC destination is clamped into MIDI byte range on construction,
+    /// so a hand-written document cannot produce a status byte out of range.
+    #[test]
+    fn cc_parameter_clamps_controller_and_channel() {
+        let param = AutoParam::cc(200, 99);
+        assert_eq!(param.cc_of(), Some((127, 15)));
+        assert!(!param.is_timeline_in_only());
+        assert_eq!(AutoParam::cc(74, 0).cc_of(), Some((74, 0)));
+        assert_eq!(AutoParam::TrackGain.cc_of(), None);
+
+        // The destination survives the saved format unchanged.
+        let cable = CableDoc::automation(0, 2, AutoParam::cc(74, 3));
+        let text = ron::to_string(&cable).expect("serialize");
+        assert!(text.contains("Cc"), "parameter tag: {text}");
+        let back: CableDoc = ron::from_str(&text).expect("deserialize");
+        assert_eq!(back, cable);
+    }
+
+    /// U4a: CC is an event stream for a node's MIDI input — it cannot enter
+    /// the conductor terminal, and a node target accepts it.
+    #[test]
+    fn cc_cable_must_target_a_node() {
+        let mut doc = default_graph_doc(2);
+        let voice = doc
+            .instrument_of_track(0)
+            .expect("track 0 has an instrument")
+            .node_id();
+        doc.cables
+            .push(CableDoc::automation(0, voice, AutoParam::cc(74, 0)));
+        assert!(
+            doc.validate(2, 1).is_ok(),
+            "a CC cable into an instrument is legal"
+        );
+
+        let mut doc = default_graph_doc(2);
+        doc.cables.push(CableDoc {
+            kind: CableKind::Automation,
+            from: PortRef::AutoTrack(0),
+            to: PortRef::TimelineIn,
+            param: AutoParam::cc(74, 0),
+            in_port: 0,
+        });
+        assert!(
+            doc.validate(2, 1).is_err(),
+            "the terminal's only v1 port is Tempo"
+        );
     }
 }

@@ -166,15 +166,46 @@ enum AutoTarget {
 
 /// Document automation parameter → engine parameter ID.
 ///
-/// `None` for [`AutoParam::Tempo`]: tempo never reaches a node's `set_param`
-/// path — the engine route uses the Timeline In sentinel instead (U3b D1/D7).
+/// `None` for [`AutoParam::Tempo`] (the engine route uses the Timeline In
+/// sentinel instead, U3b D1/D7) and for [`AutoParam::Cc`]: a control change is
+/// an event in the node's MIDI input, not a parameter slot (U4a D2/D3), and
+/// must never reach `set_node_param`.
 fn param_id_of(param: &AutoParam) -> Option<ParamId> {
     match param {
         AutoParam::TrackGain => Some(ParamId::TrackGain),
         AutoParam::TrackPan => Some(ParamId::TrackPan),
         AutoParam::FilterCutoff => Some(ParamId::FilterCutoff),
         AutoParam::PluginParam { param_id, .. } => Some(ParamId::PluginParam(*param_id)),
-        AutoParam::Tempo => None,
+        AutoParam::Tempo | AutoParam::Cc { .. } => None,
+    }
+}
+
+/// Control-change destinations offered by the automation target menus (U4a).
+///
+/// A short preset list instead of all 128 controllers: these are the ones that
+/// carry meaning in practice, and the automation strip lets the picked CC be
+/// re-numbered afterwards (so an uncommon controller costs one drag, not a
+/// 128-row menu).
+const CC_PRESETS: [(u8, &str); 8] = [
+    (1, "Mod Wheel"),
+    (2, "Breath"),
+    (7, "Volume"),
+    (10, "Pan"),
+    (11, "Expression"),
+    (64, "Sustain"),
+    (71, "Resonance"),
+    (74, "Cutoff"),
+];
+
+/// Human-readable CC destination label (`CC 74 Cutoff · ch 1`).
+fn cc_label(controller: u8, channel: u8) -> String {
+    let name = CC_PRESETS
+        .iter()
+        .find(|(number, _)| *number == controller)
+        .map(|(_, name)| *name);
+    match name {
+        Some(name) => format!("CC {controller} {name} · ch {}", channel + 1),
+        None => format!("CC {controller} · ch {}", channel + 1),
     }
 }
 
@@ -1038,6 +1069,18 @@ impl GlitcherZApp {
                         log::warn!("Automation cable target node missing, skipping: {cable:?}");
                         continue;
                     };
+                    // U4a: a CC cable re-establishes an event route, not a
+                    // parameter route — undo / open must rebuild it the same
+                    // way the picker created it.
+                    if let Some((controller, channel)) = cable.param.cc_of() {
+                        if !self
+                            .engine
+                            .set_auto_cc_route(*index, to, channel, controller)
+                        {
+                            log::warn!("CC cable (track {index} → {to}) dispatch failed");
+                        }
+                        continue;
+                    }
                     let Some(id) = param_id_of(&cable.param) else {
                         log::warn!("Automation cable carries a non-node parameter: {cable:?}");
                         continue;
@@ -1818,8 +1861,20 @@ impl GlitcherZApp {
                 self.engine.set_timeline_in_route(index);
             }
             AutoTarget::Node(doc_id) => {
-                if let (Some(engine_id), Some(id)) = (self.engine_id(doc_id), param_id_of(&param)) {
-                    self.engine.set_auto_route(index, engine_id, id);
+                if let Some(engine_id) = self.engine_id(doc_id) {
+                    match param.cc_of() {
+                        // U4a: an event stream, not a parameter — the route
+                        // carries the controller/channel instead of a ParamId.
+                        Some((controller, channel)) => {
+                            self.engine
+                                .set_auto_cc_route(index, engine_id, channel, controller);
+                        }
+                        None => {
+                            if let Some(id) = param_id_of(&param) {
+                                self.engine.set_auto_route(index, engine_id, id);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1892,6 +1947,12 @@ impl GlitcherZApp {
                                 },
                             ));
                         }
+                    }
+                    // U4a: CC is a separate destination family for the same
+                    // instrument; the presets mirror the automation strip's
+                    // menu so both entry points offer the same list.
+                    for (number, name) in CC_PRESETS {
+                        v.push((format!("CC {number} {name}"), AutoParam::cc(number, 0)));
                     }
                 }
                 v
@@ -6725,12 +6786,12 @@ impl GlitcherZApp {
             AutoTarget::TimelineIn,
             AutoParam::Tempo,
         ));
-        if let Some(voice_doc) = self
+        let voice_doc = self
             .project()
             .graph
             .instrument_of_track(sel)
-            .map(NodeDoc::node_id)
-        {
+            .map(NodeDoc::node_id);
+        if let Some(voice_doc) = voice_doc {
             options.push((
                 "Cutoff".to_string(),
                 AutoTarget::Node(voice_doc),
@@ -6814,6 +6875,9 @@ impl GlitcherZApp {
         }
 
         let mut picked: Option<(AutoTarget, AutoParam)> = None;
+        // Read once: the strip below renumbers an existing CC destination, and
+        // the horizontal closure only displays it.
+        let endpoint = self.project().graph.auto_target(index);
         ui.horizontal(|ui| {
             ui.label("Target");
             ui.menu_button("Pick Parameter…", |ui| {
@@ -6851,14 +6915,28 @@ impl GlitcherZApp {
                     },
                 );
             });
+            // U4a: MIDI CC is a second destination family, not a plugin
+            // parameter — it gets its own menu instead of hiding among 2000
+            // parameter rows.
+            if let Some(doc) = voice_doc {
+                ui.menu_button("MIDI CC…", |ui| {
+                    ui.weak("Into the track instrument's MIDI input");
+                    for (number, name) in CC_PRESETS {
+                        if ui.button(format!("{number} · {name}")).clicked() {
+                            picked = Some((AutoTarget::Node(doc), AutoParam::cc(number, 0)));
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("CLAP / SoundFont. VST3 cannot receive host CC.");
+            }
             if let Some((target, param)) = picked {
                 self.set_auto_endpoint(index, target, param);
             }
             // Current endpoint display.
-            let current = self
-                .project()
-                .graph
-                .auto_target(index)
+            let current = endpoint
+                .as_ref()
                 .map(|(port, param)| match (port, param) {
                     (PortRef::TimelineIn, _) => "Song Tempo".to_string(),
                     (_, AutoParam::TrackGain) => "Volume".to_string(),
@@ -6866,10 +6944,46 @@ impl GlitcherZApp {
                     (_, AutoParam::FilterCutoff) => "Cutoff".to_string(),
                     (_, AutoParam::PluginParam { name, .. }) => name.clone(),
                     (_, AutoParam::Tempo) => "Song Tempo".to_string(),
+                    (
+                        _,
+                        AutoParam::Cc {
+                            controller,
+                            channel,
+                        },
+                    ) => cc_label(*controller, *channel),
                 })
                 .unwrap_or_else(|| "Not connected".to_string());
             ui.weak(format!("-> {current}"));
         });
+        // The preset list is a shortcut, not a limit: a picked CC can be
+        // renumbered (0..127) and re-channelled in place. Applied on release
+        // so a drag is one undo step, not one per frame.
+        if let Some((
+            PortRef::Node(doc),
+            AutoParam::Cc {
+                controller,
+                channel,
+            },
+        )) = endpoint
+        {
+            let (mut cc, mut ch) = (controller, channel);
+            let mut commit = false;
+            ui.horizontal(|ui| {
+                ui.label("CC");
+                let number = ui.add(egui::DragValue::new(&mut cc).range(0..=127));
+                ui.label("ch");
+                let mut shown = u16::from(ch) + 1;
+                let channel_response = ui.add(egui::DragValue::new(&mut shown).range(1..=16));
+                commit = number.drag_stopped()
+                    || number.lost_focus()
+                    || channel_response.drag_stopped()
+                    || channel_response.lost_focus();
+                ch = (shown.saturating_sub(1).min(15)) as u8;
+            });
+            if commit && (cc, ch) != (controller, channel) {
+                self.set_auto_endpoint(index, AutoTarget::Node(doc), AutoParam::cc(cc, ch));
+            }
+        }
     }
 
     /// Body of the curve editor (Edit tab): edits the targeted control clip,

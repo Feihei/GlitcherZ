@@ -116,26 +116,51 @@ impl NodeKind {
     }
 }
 
-/// Destination of one automation cable (D7): target node slot + target parameter.
+/// What one automation cable delivers (U4a, spec `control-tracks.md` D2).
+///
+/// A curve can drive a node **parameter** or emit a **MIDI CC** into the
+/// node's MIDI input. The two are different channels, not two spellings of the
+/// same thing (a plugin's `Cutoff` parameter and CC74 are unrelated), so the
+/// route carries the distinction instead of overloading `ParamId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoDest {
+    /// Node parameter value (`Processor::set_param`).
+    Param(ParamId),
+    /// MIDI control change (`Processor::midi_cc`), 7-bit value.
+    Cc {
+        /// Controller number 0..=127.
+        controller: u8,
+        /// MIDI channel 0..=15.
+        channel: u8,
+    },
+}
+
+impl Default for AutoDest {
+    fn default() -> Self {
+        AutoDest::Param(ParamId::MasterGain)
+    }
+}
+
+/// Destination of one automation cable (D7): target node slot + destination.
 ///
 /// The curve carries no destination; `slot == NO_EDGE` means this automation
 /// track is not connected (silent). `slot == TIMELINE_IN` (U3b) means the
-/// curve drives the transport clock; `param` is then unused — v1 has exactly
+/// curve drives the transport clock; `dest` is then unused — v1 has exactly
 /// one conductor port (`Tempo`), so the sentinel alone identifies it (a
 /// second port such as `Swing` would add a `port` field, see spec §4.2).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AutoRoute {
     /// Target node slot.
     pub slot: u16,
-    /// Target parameter.
-    pub param: ParamId,
+    /// What the sampled value is delivered as.
+    pub dest: AutoDest,
 }
 
 impl Default for AutoRoute {
     fn default() -> Self {
         Self {
             slot: NO_EDGE,
-            param: ParamId::MasterGain,
+            dest: AutoDest::default(),
         }
     }
 }
@@ -200,7 +225,7 @@ impl ExecPlan {
         midi_target_counts: [0; MAX_MIDI_TRACKS],
         auto_routes: [AutoRoute {
             slot: NO_EDGE,
-            param: ParamId::MasterGain,
+            dest: AutoDest::Param(ParamId::MasterGain),
         }; MAX_AUTO_TRACKS],
     };
 }
@@ -237,6 +262,10 @@ pub struct RtGraph {
     /// Panic sweep cursor (see [`RtGraph::panic`]): `Some(start)` = the next
     /// block must release pitches `start..` and advance; `None` = idle.
     panic_sweep: Option<u8>,
+    /// Last 7-bit value emitted per automation track (U4a D4): `-1` = none
+    /// yet. A control change is an **absolute** value, so resending an
+    /// unchanged one is pure overhead (375 blocks/s otherwise).
+    last_cc: [i16; MAX_AUTO_TRACKS],
 }
 
 /// Pitches released per block by a panic sweep. Kept below the plugin hosts'
@@ -293,6 +322,7 @@ impl RtGraph {
             plan: ExecPlan::EMPTY,
             block_size: block_size.max(1),
             panic_sweep: None,
+            last_cc: [-1; MAX_AUTO_TRACKS],
         }
     }
 
@@ -357,6 +387,10 @@ impl RtGraph {
             });
         }
         self.plan = plan;
+        // A new plan may point a curve at a different node: forget the last
+        // emitted value so the next sampled block always delivers one (the
+        // new target would otherwise wait for the curve to move).
+        self.last_cc = [-1; MAX_AUTO_TRACKS];
     }
 
     /// Processes one block: in topological order, sum in-edges → consume
@@ -535,11 +569,13 @@ impl RtGraph {
         self.slot_note(index as u16, event)
     }
 
-    /// Automation track delivery: looks up the routing table and writes the
-    /// curve value to `(target node, target param)` (the destination is fixed
-    /// at compile time, see [`AutoRoute`]). Silent when unconnected / out of
-    /// range. RT-safe.
-    pub fn auto_set_param(&mut self, auto_index: usize, value: f32) {
+    /// Automation track delivery: looks up the routing table and hands the
+    /// curve value to `(target node, destination)` (fixed at compile time, see
+    /// [`AutoRoute`]). Silent when unconnected / out of range. RT-safe.
+    ///
+    /// Parameter destinations write the value through; CC destinations
+    /// quantize to 7 bits and **only emit on change** (U4a D4).
+    pub fn auto_deliver(&mut self, auto_index: usize, value: f32) {
         let Some(&route) = self.plan.auto_routes.get(auto_index) else {
             return;
         };
@@ -551,7 +587,29 @@ impl RtGraph {
         if route.slot == TIMELINE_IN {
             return;
         }
-        let _ = self.slot_set_param(route.slot, route.param, value);
+        match route.dest {
+            AutoDest::Param(id) => {
+                let _ = self.slot_set_param(route.slot, id, value);
+            }
+            AutoDest::Cc {
+                controller,
+                channel,
+            } => {
+                if !value.is_finite() {
+                    return;
+                }
+                // MIDI CC is a 7-bit integer: round rather than truncate so a
+                // 0.5 anchor lands on 64, not 0.
+                let value = value.clamp(0.0, 127.0).round() as i16;
+                if self.last_cc.get(auto_index) == Some(&value) {
+                    return;
+                }
+                if let Some(slot) = self.last_cc.get_mut(auto_index) {
+                    *slot = value;
+                }
+                let _ = self.slot_midi_cc(route.slot, channel, controller, value as u8);
+            }
+        }
     }
 
     /// Routing entry of one automation track (U3b): the block runner needs to
@@ -603,6 +661,13 @@ impl RtGraph {
             .get_mut(slot as usize)
             .and_then(|s| s.as_mut())
             .is_some_and(|n| n.processor.set_param(id, value))
+    }
+
+    fn slot_midi_cc(&mut self, slot: u16, channel: u8, controller: u8, value: u8) -> bool {
+        self.slots
+            .get_mut(slot as usize)
+            .and_then(|s| s.as_mut())
+            .is_some_and(|n| n.processor.midi_cc(channel, controller, value))
     }
 
     /// Read-only access to the master output buffer (for `BlockRunner`
@@ -1641,7 +1706,35 @@ impl GraphCompiler {
             return Err(TopologyError::InvalidIndex);
         }
         let slot = self.node_slot(node_id).ok_or(TopologyError::InvalidSlot)?;
-        self.auto_routes[auto_index] = AutoRoute { slot, param };
+        self.auto_routes[auto_index] = AutoRoute {
+            slot,
+            dest: AutoDest::Param(param),
+        };
+        Ok(self.build_update(self.compile()?, Vec::new(), &[]))
+    }
+
+    /// Timeline wiring: routes automation track `auto_index` to a **MIDI CC**
+    /// on `node_id` (U4a). Same node-addressed path as [`Self::set_auto_route`];
+    /// the destination kind tells `RtGraph` to emit an event instead of
+    /// setting a parameter.
+    pub fn set_auto_cc_route(
+        &mut self,
+        auto_index: usize,
+        node_id: u64,
+        channel: u8,
+        controller: u8,
+    ) -> Result<GraphUpdate, TopologyError> {
+        if auto_index >= MAX_AUTO_TRACKS {
+            return Err(TopologyError::InvalidIndex);
+        }
+        let slot = self.node_slot(node_id).ok_or(TopologyError::InvalidSlot)?;
+        self.auto_routes[auto_index] = AutoRoute {
+            slot,
+            dest: AutoDest::Cc {
+                controller: controller.min(127),
+                channel: channel.min(15),
+            },
+        };
         Ok(self.build_update(self.compile()?, Vec::new(), &[]))
     }
 
@@ -1660,7 +1753,7 @@ impl GraphCompiler {
         // the default so the table stays `Copy` and comparable.
         self.auto_routes[auto_index] = AutoRoute {
             slot: TIMELINE_IN,
-            param: ParamId::MasterGain,
+            dest: AutoDest::Param(ParamId::MasterGain),
         };
         Ok(self.build_update(self.compile()?, Vec::new(), &[]))
     }
@@ -1983,8 +2076,8 @@ fn chain_processor(kind: usize, sample_rate: f32) -> Box<dyn Processor> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelStripProcessor, DEFAULT_MIDI_TRACKS, GraphCompiler, GraphUpdate, MAX_CABLES,
-        MAX_MIDI_FANOUT, MAX_MIDI_TRACKS, NO_EDGE, NodeKind, RtGraph, TopologyError,
+        ChannelStripProcessor, DEFAULT_MIDI_TRACKS, GraphCompiler, GraphUpdate, MAX_AUTO_TRACKS,
+        MAX_CABLES, MAX_MIDI_FANOUT, MAX_MIDI_TRACKS, NO_EDGE, NodeKind, RtGraph, TopologyError,
         chain_processor,
     };
     use crate::realtime::buffer::AudioBuffer;
@@ -2859,7 +2952,7 @@ mod tests {
         graph.apply_update(update, &mut recycle_tx);
 
         // Curve value 0.5 → channel strip gain 0.5 → master output = 0.25 × 0.5.
-        graph.auto_set_param(0, 0.5);
+        graph.auto_deliver(0, 0.5);
         let levels = graph.process_block(&ctx());
         assert!(
             (levels.master - 0.125).abs() < 1e-6,
@@ -2868,7 +2961,7 @@ mod tests {
         );
 
         // Unconnected automation tracks are silent.
-        graph.auto_set_param(1, 1.5);
+        graph.auto_deliver(1, 1.5);
         let levels = graph.process_block(&ctx());
         assert!((levels.master - 0.125).abs() < 1e-6);
 
@@ -2877,7 +2970,7 @@ mod tests {
             .clear_auto_route(0)
             .expect("disconnect should succeed");
         graph.apply_update(update, &mut recycle_tx);
-        graph.auto_set_param(0, 1.5);
+        graph.auto_deliver(0, 1.5);
         let levels = graph.process_block(&ctx());
         assert!(
             (levels.master - 0.125).abs() < 1e-6,
@@ -2888,6 +2981,78 @@ mod tests {
         assert!(matches!(
             compiler.set_auto_route(1, u64::MAX, ParamId::TrackGain),
             Err(TopologyError::InvalidSlot)
+        ));
+    }
+
+    /// U4a: records the control changes an automation route emits.
+    struct CcRecorder {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(u8, u8, u8)>>>,
+    }
+
+    impl Processor for CcRecorder {
+        fn process(&mut self, _ctx: &ProcessContext, _buffer: &mut AudioBuffer) {}
+        fn midi_cc(&mut self, channel: u8, controller: u8, value: u8) -> bool {
+            self.seen
+                .lock()
+                .expect("recorder lock")
+                .push((channel, controller, value));
+            true
+        }
+    }
+
+    #[test]
+    fn auto_cc_route_quantizes_and_dedupes() {
+        let (mut compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (update, _) = expect_swap(
+            compiler.set_voice(
+                0,
+                Box::new(CcRecorder {
+                    seen: std::sync::Arc::clone(&seen),
+                }),
+            ),
+            "swap in the CC recorder",
+        );
+        graph.apply_update(update, &mut recycle_tx);
+        let voice_id = compiler
+            .track_voice_node_id(0)
+            .expect("instrument should exist");
+        let update = compiler
+            .set_auto_cc_route(0, voice_id, 3, 74)
+            .expect("CC route should succeed");
+        graph.apply_update(update, &mut recycle_tx);
+
+        // The curve stores real CC units (spec D7): 50.8 rounds to 51 rather
+        // than truncating to 50.
+        graph.auto_deliver(0, 50.8);
+        // Same quantized value: a CC is absolute, so it must not be resent.
+        graph.auto_deliver(0, 50.9);
+        // Out-of-range curve values clamp into 7 bits, and the second one is
+        // still a duplicate of the clamped result.
+        graph.auto_deliver(0, 900.0);
+        graph.auto_deliver(0, 127.0);
+        // A real move gets through.
+        graph.auto_deliver(0, 12.0);
+
+        let events = seen.lock().expect("recorder lock").clone();
+        assert_eq!(
+            events,
+            vec![(3, 74, 51), (3, 74, 127), (3, 74, 12)],
+            "quantized, change-only, channel-carrying CC stream"
+        );
+    }
+
+    #[test]
+    fn auto_cc_route_requires_a_live_node() {
+        let (mut compiler, _graph) = GraphCompiler::default_graph(SR, BLOCK);
+        assert!(matches!(
+            compiler.set_auto_cc_route(0, u64::MAX, 0, 74),
+            Err(TopologyError::InvalidSlot)
+        ));
+        assert!(matches!(
+            compiler.set_auto_cc_route(MAX_AUTO_TRACKS, 1, 0, 74),
+            Err(TopologyError::InvalidIndex)
         ));
     }
 

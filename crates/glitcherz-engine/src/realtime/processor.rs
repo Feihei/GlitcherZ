@@ -53,6 +53,17 @@ pub trait Processor: Send {
         let _ = _event;
         false
     }
+
+    /// Delivers one MIDI control change into this node's MIDI input at a block
+    /// boundary (U4a, spec `.agents/spec/control-tracks.md` D3).
+    ///
+    /// A CC is an event, not a parameter — it must not be routed through
+    /// [`Processor::set_param`]. Returns `true` when the node consumed the
+    /// event. Implementations must not allocate or panic.
+    fn midi_cc(&mut self, _channel: u8, _controller: u8, _value: u8) -> bool {
+        let _ = (_channel, _controller, _value);
+        false
+    }
 }
 
 /// Pre-allocated serial processing chain (the seed of an effect chain).

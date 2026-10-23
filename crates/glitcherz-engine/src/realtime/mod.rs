@@ -75,7 +75,7 @@ pub use delay::DelayProcessor;
 pub use envelope::AdsrProcessor;
 pub use gain::GainProcessor;
 pub use graph::{
-    AutoRoute, Cable, ChannelStripProcessor, ExecPlan, FeedbackProcessor, GraphCompiler,
+    AutoDest, AutoRoute, Cable, ChannelStripProcessor, ExecPlan, FeedbackProcessor, GraphCompiler,
     GraphLevels, GraphUpdate, MASTER_NODE_ID, MAX_CABLES, MAX_MIDI_FANOUT, NodeKind, RtGraph,
     TIMELINE_IN, TopologyError,
 };

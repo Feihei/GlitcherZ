@@ -313,6 +313,21 @@ impl AudioEngine {
         self.apply_plan_update(|compiler| compiler.set_auto_route(auto_index, node_id, param))
     }
 
+    /// Timeline wiring: routes automation track `auto_index` to a **MIDI CC**
+    /// on `node_id` (U4a): the curve value is quantized to 7 bits and emitted
+    /// into the node's MIDI input instead of being written as a parameter.
+    pub fn set_auto_cc_route(
+        &mut self,
+        auto_index: usize,
+        node_id: u64,
+        channel: u8,
+        controller: u8,
+    ) -> bool {
+        self.apply_plan_update(|compiler| {
+            compiler.set_auto_cc_route(auto_index, node_id, channel, controller)
+        })
+    }
+
     /// Timeline wiring: connects automation track `auto_index` to the
     /// **Timeline In** endpoint (U3b): the curve overrides the transport BPM
     /// per block instead of driving a node parameter.

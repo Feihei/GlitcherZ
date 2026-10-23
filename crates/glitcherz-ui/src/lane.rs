@@ -68,6 +68,9 @@ fn axis(param: &AutoParam) -> (f32, f32, bool) {
         AutoParam::Tempo => (20.0, 300.0, true),
         // Plugin parameter range unknown: display normalized 0..1 (interpreted by the plugin).
         AutoParam::PluginParam { .. } => (0.0, 1.0, false),
+        // U4a: the curve stores the real 7-bit CC value (spec D7), so the
+        // axis is the MIDI range rather than a normalized 0..1.
+        AutoParam::Cc { .. } => (0.0, 127.0, false),
     }
 }
 

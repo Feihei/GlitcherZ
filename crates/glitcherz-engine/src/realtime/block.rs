@@ -278,7 +278,7 @@ impl BlockRunner {
             }
         }
         for &(index, value) in &node_values[..node_count] {
-            graph.auto_set_param(index, value);
+            graph.auto_deliver(index, value);
         }
         if let Some(bpm) = tempo {
             sequencer.set_bpm_override(bpm);

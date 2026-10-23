@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use clack_common::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
+use clack_common::events::event_types::{MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent};
 pub use clack_extensions::gui::GuiSize;
 use clack_extensions::gui::{
     GuiApiType, GuiConfiguration, GuiError, HostGui, HostGuiImpl, PluginGui,
@@ -409,6 +409,9 @@ pub enum PendingClapEvent {
     NoteOff { note: u8 },
     /// Plugin parameter value (`ParamId::PluginParam` bridge).
     Param { id: u32, value: f32 },
+    /// Raw MIDI 1.0 bytes (U4a: a control-track CC injected into the plugin's
+    /// MIDI input).
+    Midi { data: [u8; 3] },
 }
 
 /// A CLAP instrument node that can run in the audio callback.
@@ -890,6 +893,13 @@ impl Processor for ClapNode {
                         f64::from(value),
                     ))
                 }
+                // U4a: raw MIDI 1.0 at the block start. CLAP has no typed
+                // control-change event, so the three bytes go as-is; plugins
+                // that only understand CC (most legacy-style instruments) read
+                // this path, not the parameter list.
+                PendingClapEvent::Midi { data } => {
+                    self.input_events.push(&MidiEvent::new(0, 0, data))
+                }
             }
         }
         self.pending_count = 0;
@@ -979,6 +989,16 @@ impl Processor for ClapNode {
             }
         }
         true
+    }
+
+    /// U4a: a control-track curve drives CC `controller` on `channel`. The
+    /// bytes are assembled here (status = 0xB0 | channel) so the audio thread
+    /// never formats MIDI.
+    fn midi_cc(&mut self, channel: u8, controller: u8, value: u8) -> bool {
+        let status = 0xB0 | (channel & 0x0F);
+        self.stash(PendingClapEvent::Midi {
+            data: [status, controller & 0x7F, value & 0x7F],
+        })
     }
 }
 

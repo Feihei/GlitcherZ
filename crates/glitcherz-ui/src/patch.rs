@@ -910,6 +910,9 @@ fn auto_param_label(param: &AutoParam) -> String {
         AutoParam::FilterCutoff => "Cutoff".to_string(),
         AutoParam::PluginParam { name, .. } => name.clone(),
         AutoParam::Tempo => "Tempo".to_string(),
+        // U4a: cable labels sit in the patch, where the channel matters less
+        // than knowing the destination is a controller.
+        AutoParam::Cc { controller, .. } => format!("CC {controller}"),
     }
 }
 

@@ -133,6 +133,20 @@ impl Processor for Sf2VoiceProcessor {
         true
     }
 
+    /// U4a: a control-track curve drives a CC. The channel argument is
+    /// ignored on purpose — this node's notes all go to [`CHANNEL`], so a CC
+    /// must land there too (honouring a foreign channel would silently do
+    /// nothing for this synth). RT-safe: plain field writes.
+    fn midi_cc(&mut self, _channel: u8, controller: u8, value: u8) -> bool {
+        self.synth.process_midi_message(
+            CHANNEL,
+            0xB0,
+            i32::from(controller & 0x7F),
+            i32::from(value & 0x7F),
+        );
+        true
+    }
+
     /// Applies SF2 parameters. RT-safe: `process_midi_message` and
     /// `set_master_volume` are audited allocation-free plain field writes.
     fn set_param(&mut self, id: ParamId, value: f32) -> bool {
