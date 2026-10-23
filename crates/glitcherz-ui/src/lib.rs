@@ -2066,6 +2066,19 @@ impl GlitcherZApp {
                         self.view = MainView::Inspector;
                     }
                 }
+                patch::PatchAction::OpenTimeline => {
+                    self.view = MainView::Timeline;
+                }
+                patch::PatchAction::AddMidiTrack => self.add_midi_track(),
+                patch::PatchAction::RemoveLastMidiTrack => self.remove_last_midi_track(),
+                patch::PatchAction::AddControlTrack => self.add_control_track(),
+                patch::PatchAction::RemoveControlTrack => self.remove_control_track(),
+                patch::PatchAction::AddMixerSlot(mixer_doc) => {
+                    self.mixer_add_channel(mixer_doc);
+                }
+                patch::PatchAction::RemoveMixerSlot(mixer_doc) => {
+                    self.mixer_remove_channel(mixer_doc);
+                }
                 patch::PatchAction::SetInlineParam { node, param, value } => {
                     self.apply_inline_param(node, param, value);
                 }

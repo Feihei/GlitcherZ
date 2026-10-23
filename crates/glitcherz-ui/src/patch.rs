@@ -17,7 +17,8 @@ use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Sense, Vec2};
 
 use glitcherz_model::{
-    AutoParam, CableDoc, CableKind, GraphDoc, LayoutDoc, MidiSource, NodeDoc, PortRef, VoiceSpec,
+    AutoParam, CableDoc, CableKind, GraphDoc, LayoutDoc, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS,
+    MAX_MIXER_CHANNELS, MIN_MIXER_CHANNELS, MidiSource, NodeDoc, PortRef, VoiceSpec,
 };
 
 use crate::plugin_catalog::PluginFormat;
@@ -324,7 +325,10 @@ pub enum PatchAction {
     /// Add a new node with `source` at graph-space position `at` (right-click
     /// menu). The new node is born dangling (no cables; D6 dangling semantics)
     /// — the user wires it up.
-    AddNode { source: NodeSource, at: Pos2 },
+    AddNode {
+        source: NodeSource,
+        at: Pos2,
+    },
     /// Open the plugin picker for `category` / `format` (spec `plugin-browser.md`
     /// D4/D5): `None` category = the global `Search Plug-ins…` entry, whose
     /// pick decides the node category from the entry's own classification.
@@ -340,7 +344,9 @@ pub enum PatchAction {
     },
     /// Open the SoundFont file dialog and create an instrument from the pick
     /// (the patch cannot run a modal dialog inside the menu closure).
-    PickSoundFont { at: Pos2 },
+    PickSoundFont {
+        at: Pos2,
+    },
     /// Re-scan every plugin module, ignoring the cached stats (U9 E2, spec
     /// `plugin-browser.md` §5.4). The catalog queues the work; the caller only
     /// restarts the scan.
@@ -354,10 +360,16 @@ pub enum PatchAction {
         in_port: u8,
     },
     /// MIDI cable drag: timeline track → instrument document node.
-    ConnectMidi { track: usize, to_doc: u64 },
+    ConnectMidi {
+        track: usize,
+        to_doc: u64,
+    },
     /// MIDI cable drag out of a virtual keyboard node (G6): keyboard node →
     /// instrument document node (the only node→node MIDI edge).
-    ConnectKeyboardMidi { from_doc: u64, to_doc: u64 },
+    ConnectKeyboardMidi {
+        from_doc: u64,
+        to_doc: u64,
+    },
     /// Automation cable drag (parameter already picked by the user from the popup menu).
     ConnectAuto {
         index: usize,
@@ -367,7 +379,9 @@ pub enum PatchAction {
     /// Automation cable drag onto the fixed Timeline In terminal (U3b): the
     /// single `Tempo` port needs no parameter popup (D7), so the cable is
     /// committed directly.
-    ConnectTempoIn { index: usize },
+    ConnectTempoIn {
+        index: usize,
+    },
     /// Delete a cable (index into the document cable table).
     DeleteCable(usize),
     /// Delete a node (document node_id; any instrument / effect / channel strip is
@@ -388,6 +402,19 @@ pub enum PatchAction {
     /// node as the editing target (spec `plugin-gui.md` §6 — the patch
     /// analogue of double-clicking a timeline clip to open the Edit view).
     OpenNode(u64),
+    /// Double-clicked the fixed Timeline node: open the arrangement view
+    /// (the patch analogue of double-clicking a clip into the Edit tab).
+    OpenTimeline,
+    /// Timeline node body: append a MIDI track / drop the last one.
+    AddMidiTrack,
+    RemoveLastMidiTrack,
+    /// Timeline node body: append a control track / drop the selected one.
+    AddControlTrack,
+    RemoveControlTrack,
+    /// Mixer node body: append a channel / drop the last one (D21). The
+    /// document node id comes from the box the button was drawn on.
+    AddMixerSlot(u64),
+    RemoveMixerSlot(u64),
     /// Inline parameter slider changed on a node body (G5 spec §7): the
     /// value is delivered through the non-rebuilding `set_node_param`
     /// path by the glue.
@@ -396,6 +423,100 @@ pub enum PatchAction {
         param: InlineParamId,
         value: f32,
     },
+}
+
+/// Double-click gate: whether the Inspector has anything to show for a node.
+/// Instruments and effects carry parameters; the mixer carries the channel
+/// console. The virtual keyboard, the legacy strip and feedback taps do not,
+/// so double-clicking them stays inert instead of switching to a panel that
+/// would fall back to some unrelated track's instrument.
+fn opens_inspector(node: Option<&NodeDoc>) -> bool {
+    matches!(
+        node,
+        Some(NodeDoc::Instrument { .. } | NodeDoc::Effect { .. } | NodeDoc::Mixer { .. })
+    )
+}
+
+/// One in-node action button (the small track / slot controls drawn inside
+/// a node box).
+struct NodeAction {
+    /// Button caption.
+    label: &'static str,
+    /// Whether the action currently applies (limit reached / nothing to
+    /// remove → disabled, with `hover` saying why).
+    enabled: bool,
+    /// Tooltip; doubles as the reason when disabled.
+    hover: &'static str,
+    /// Intent emitted on click.
+    action: PatchAction,
+}
+
+/// Buttons of one in-node action row. The timeline owns track management
+/// (row 0: MIDI tracks, row 1: control tracks); the mixer owns its slot
+/// count. Any other entity returns no buttons.
+fn node_action_buttons(id: PatchId, row: usize, deps: &PatchDeps) -> Vec<NodeAction> {
+    match id {
+        PatchId::Timeline if row == 0 => vec![
+            NodeAction {
+                label: "+ MIDI",
+                enabled: deps.track_count < MAX_MIDI_TRACKS,
+                hover: "Add a MIDI track",
+                action: PatchAction::AddMidiTrack,
+            },
+            NodeAction {
+                label: "- MIDI",
+                enabled: deps.track_count > 0,
+                hover: "Remove the last MIDI track",
+                action: PatchAction::RemoveLastMidiTrack,
+            },
+        ],
+        PatchId::Timeline => vec![
+            NodeAction {
+                label: "+ Curve",
+                enabled: deps.auto_count < MAX_AUTO_TRACKS,
+                hover: "Add a control (curve) track",
+                action: PatchAction::AddControlTrack,
+            },
+            NodeAction {
+                label: "- Curve",
+                enabled: deps.auto_count > 0,
+                hover: "Remove the selected curve track",
+                action: PatchAction::RemoveControlTrack,
+            },
+        ],
+        PatchId::Node(doc_id) => {
+            let inputs = match deps.doc.node_by_id(doc_id) {
+                Some(NodeDoc::Mixer { inputs, .. }) => *inputs as usize,
+                _ => return Vec::new(),
+            };
+            // The last slot cannot be dropped while a cable still lands on it
+            // (mirrors `mixer_remove_channel`, so the button says so up front
+            // instead of failing silently).
+            let last = inputs.saturating_sub(1) as u8;
+            let occupied = deps.doc.cables.iter().any(|c| {
+                c.kind == CableKind::Audio && c.to == PortRef::Node(doc_id) && c.in_port == last
+            });
+            vec![
+                NodeAction {
+                    label: "+ Slot",
+                    enabled: inputs < MAX_MIXER_CHANNELS,
+                    hover: "Add a mixer channel (slot)",
+                    action: PatchAction::AddMixerSlot(doc_id),
+                },
+                NodeAction {
+                    label: "- Slot",
+                    enabled: inputs > MIN_MIXER_CHANNELS && !occupied,
+                    hover: if occupied {
+                        "Remove the last slot (disconnect its cable first)"
+                    } else {
+                        "Remove the last mixer channel (slot)"
+                    },
+                    action: PatchAction::RemoveMixerSlot(doc_id),
+                },
+            ]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Snapshot of external data the patch depends on (immutable borrows to avoid borrow conflicts).
@@ -513,10 +634,18 @@ enum DragKind {
 const NODE_SIZE: Vec2 = Vec2::new(150.0, 64.0);
 /// Virtual keyboard box (G6): a compact box with a mini key strip.
 const KEYBOARD_SIZE: Vec2 = Vec2::new(150.0, 56.0);
-/// Mixer box minimum height (scales with channel/input port count).
+/// Mixer port-area minimum height (scales with the channel/input count).
 const NODE_HEIGHT_MIN: f32 = 64.0;
 /// Vertical spacing between mixer input ports (P5f: one port per channel).
 const PORT_SPACING: f32 = 30.0;
+/// Title band at the top of a node box. Ports and inline rows are measured
+/// from below it, so a port dot never lands on the label.
+const NODE_TITLE_BAND: f32 = 24.0;
+/// Height of one in-node action row (the track / slot buttons).
+const ACTION_ROW_HEIGHT: f32 = 18.0;
+/// Below this zoom the in-node buttons are too small to hit; they are left
+/// out (box and ports still draw).
+const ACTION_MIN_ZOOM: f32 = 0.6;
 /// Inline parameter row height (graph space; G5 — the node body grows
 /// downward by `rows * INLINE_ROW_HEIGHT`).
 const INLINE_ROW_HEIGHT: f32 = 16.0;
@@ -527,7 +656,11 @@ const INLINE_LABEL_WIDTH: f32 = 34.0;
 /// Timeline box size per output port row (width fixed, height scales).
 const TIMELINE_WIDTH: f32 = 150.0;
 const TIMELINE_ROW_HEIGHT: f32 = 26.0;
-const TIMELINE_MIN_HEIGHT: f32 = 40.0;
+/// Action rows inside the timeline box: `+ MIDI` / `- MIDI` and
+/// `+ Curve` / `- Curve`.
+const TIMELINE_ACTION_ROWS: usize = 2;
+/// Timeline header height: title band + the two action rows.
+const TIMELINE_HEADER: f32 = NODE_TITLE_BAND + TIMELINE_ACTION_ROWS as f32 * ACTION_ROW_HEIGHT;
 /// Timeline In terminal size (U3b): one port row, same width as the timeline
 /// box it mirrors.
 const TIMELINE_IN_SIZE: Vec2 = Vec2::new(TIMELINE_WIDTH, 52.0);
@@ -565,9 +698,29 @@ fn timeline_port_ref(port: usize, midi_count: usize) -> PortRef {
 fn timeline_size(midi_count: usize, auto_count: usize) -> Vec2 {
     Vec2::new(
         TIMELINE_WIDTH,
-        (TIMELINE_ROW_HEIGHT * timeline_port_count(midi_count, auto_count) as f32 + 14.0)
-            .max(TIMELINE_MIN_HEIGHT),
+        TIMELINE_HEADER
+            + (TIMELINE_ROW_HEIGHT * timeline_port_count(midi_count, auto_count) as f32)
+                .max(TIMELINE_ROW_HEIGHT),
     )
+}
+
+/// In-node action rows: the timeline grows / shrinks tracks (two rows), the
+/// mixer grows / shrinks slots (one row). Everything else has none — the
+/// buttons only exist where the entity owns the thing they add.
+fn action_rows(id: PatchId, deps: &PatchDeps) -> usize {
+    match id {
+        PatchId::Timeline => TIMELINE_ACTION_ROWS,
+        PatchId::Node(node_id) => match deps.doc.node_by_id(node_id) {
+            Some(node) if node.is_mixer() => 1,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// Height of the band above the port area (title + action rows), graph space.
+fn header_band(id: PatchId, deps: &PatchDeps) -> f32 {
+    NODE_TITLE_BAND + action_rows(id, deps) as f32 * ACTION_ROW_HEIGHT
 }
 
 /// Type coloring (spec P5d): stroke varies by type, fill is a dark base.
@@ -636,9 +789,10 @@ fn size_of(id: PatchId, deps: &PatchDeps) -> Vec2 {
         PatchId::Timeline => timeline_size(deps.track_count, deps.auto_count),
         PatchId::TimelineIn => TIMELINE_IN_SIZE,
         PatchId::Node(node_id) => match deps.doc.node_by_id(node_id) {
+            // Title + slot action row, then one port per channel.
             Some(NodeDoc::Mixer { inputs, .. }) => Vec2::new(
                 NODE_SIZE.x,
-                (NODE_HEIGHT_MIN).max(*inputs as f32 * PORT_SPACING + 20.0),
+                header_band(id, deps) + (*inputs as f32 * PORT_SPACING).max(NODE_HEIGHT_MIN),
             ),
             Some(NodeDoc::Keyboard { .. }) => KEYBOARD_SIZE,
             _ => NODE_SIZE,
@@ -748,6 +902,14 @@ impl PatchState {
         ))
     }
 
+    /// Screen-space vertical extent of one box's port area: below the
+    /// title / action band, above the inline slider rows.
+    fn port_area(&self, r: Rect, id: PatchId, deps: &PatchDeps) -> (f32, f32) {
+        let top = r.top() + header_band(id, deps) * self.zoom;
+        let bottom = r.bottom() - inline_row_count(id, deps) as f32 * INLINE_ROW_HEIGHT * self.zoom;
+        (top, bottom.max(top + 1.0))
+    }
+
     /// Output ports of one entity: `(port index, screen position)` pairs. The
     /// timeline exposes one port per track spread along its right edge; audio
     /// nodes have a single port; the master output has none.
@@ -766,11 +928,10 @@ impl PatchState {
             PatchId::TimelineIn => Vec::new(),
             PatchId::Timeline => {
                 let n = timeline_port_count(deps.track_count, deps.auto_count);
+                let (top, bottom) = self.port_area(r, id, deps);
+                let step = (bottom - top) / n.max(1) as f32;
                 (0..n)
-                    .map(|i| {
-                        let y = r.top() + (i as f32 + 0.5) * (r.height() / n.max(1) as f32);
-                        (i, Pos2::new(r.right(), y))
-                    })
+                    .map(|i| (i, Pos2::new(r.right(), top + (i as f32 + 0.5) * step)))
                     .collect()
             }
             PatchId::Node(_) => vec![(0, Pos2::new(r.right(), r.center().y))],
@@ -803,11 +964,17 @@ impl PatchState {
                 _ => 1,
             },
         };
+        // A mixer spreads its channels over the port area (below the slot
+        // buttons, above the inline row); single-port boxes keep the centre.
+        if n > 1 {
+            let (top, bottom) = self.port_area(r, id, deps);
+            let step = (bottom - top) / n as f32;
+            return (0..n)
+                .map(|i| (i as u8, Pos2::new(r.left(), top + (i as f32 + 0.5) * step)))
+                .collect();
+        }
         (0..n)
-            .map(|i| {
-                let y = r.top() + (i as f32 + 0.5) * (r.height() / n.max(1) as f32);
-                (i as u8, Pos2::new(r.left(), y))
-            })
+            .map(|i| (i as u8, Pos2::new(r.left(), r.center().y)))
             .collect()
     }
 
@@ -1353,13 +1520,25 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         }
     }
 
-    // ---- Double-click a document node: jump to the Synth panel editing it ----
-    // (Fixed entities — timeline / master — have no panel of their own.)
+    // ---- Double-click: open the view that edits the entity ----
+    // The timeline box is the arrangement's own entity → its tab. A document
+    // node opens the Inspector, but only when the panel would actually show
+    // something: instrument / effect parameters, or the mixer console. The
+    // virtual keyboard owns no parameters and the master group already lives
+    // on the transport bar, so those stay inert.
     if response.double_clicked()
         && let Some(sp) = pointer
-        && let Some(PatchId::Node(doc_id)) = state.hit_node(rect.min, sp, &deps)
+        && let Some(target) = state.hit_node(rect.min, sp, &deps)
     {
-        actions.push(PatchAction::OpenNode(doc_id));
+        match target {
+            PatchId::Timeline => actions.push(PatchAction::OpenTimeline),
+            PatchId::Node(doc_id) => {
+                if opens_inspector(doc.node_by_id(doc_id)) {
+                    actions.push(PatchAction::OpenNode(doc_id));
+                }
+            }
+            PatchId::Master | PatchId::TimelineIn => {}
+        }
     }
 
     // ---- Right-click: add-node context menu (any position; the new node appears where
@@ -1928,6 +2107,58 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         }
     }
 
+    // ---- In-node action rows ----
+    // Track management belongs to the timeline and the slot count to the
+    // mixer, so those buttons sit on the boxes that own them instead of a
+    // side panel. Real widgets placed over the painted box, exactly like the
+    // inline sliders: a press here is a button press, never a node drag.
+    if state.zoom >= ACTION_MIN_ZOOM {
+        for &id in state.positions.keys() {
+            let rows = action_rows(id, &deps);
+            if rows == 0 {
+                continue;
+            }
+            let Some(r) = state.screen_rect(rect.min, id, &deps) else {
+                continue;
+            };
+            if !r.intersects(rect) {
+                continue;
+            }
+            let z = state.zoom;
+            let row_h = ACTION_ROW_HEIGHT * z;
+            let gap = 4.0 * z;
+            let btn_w = ((r.width() - 2.0 * INLINE_INSET * z - gap) * 0.5).max(1.0);
+            for row in 0..rows {
+                let buttons = node_action_buttons(id, row, &deps);
+                let top = r.top() + (NODE_TITLE_BAND + row as f32 * ACTION_ROW_HEIGHT) * z + 1.0;
+                for (k, b) in buttons.into_iter().enumerate() {
+                    let btn_rect = Rect::from_min_size(
+                        Pos2::new(r.left() + INLINE_INSET * z + k as f32 * (btn_w + gap), top),
+                        Vec2::new(btn_w, row_h - 2.0),
+                    );
+                    let mut clicked = false;
+                    ui.scope_builder(
+                        egui::UiBuilder::new().max_rect(btn_rect).layout(
+                            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                        ),
+                        |ui| {
+                            ui.spacing_mut().button_padding = Vec2::new(2.0, 0.0);
+                            let text = egui::RichText::new(b.label).size((11.0 * z).max(8.0));
+                            let resp = ui.add_enabled(b.enabled, egui::Button::new(text));
+                            if resp.clicked() {
+                                clicked = true;
+                            }
+                            resp.on_hover_text(b.hover);
+                        },
+                    );
+                    if clicked {
+                        actions.push(b.action);
+                    }
+                }
+            }
+        }
+    }
+
     // ---- Marquee (box selection in progress, drawn on top) ----
     if let Some(DragKind::BoxSelect { start, .. }) = state.drag
         && let Some(sp) = pointer
@@ -2410,7 +2641,9 @@ mod tests {
         let NodeDoc::Mixer { inputs, .. } = doc.node_by_id(mixer).unwrap() else {
             unreachable!()
         };
-        let mixer_base = (NODE_HEIGHT_MIN).max(*inputs as f32 * PORT_SPACING + 20.0);
+        // Mixer: title + slot action row, channel-scaled port area, 1 registry row.
+        let mixer_base = header_band(PatchId::Node(mixer), &deps)
+            + (*inputs as f32 * PORT_SPACING).max(NODE_HEIGHT_MIN);
 
         // Built-in synth: 2 registry rows.
         assert_eq!(
@@ -2620,5 +2853,125 @@ mod tests {
         assert_eq!(label_of(vk, &doc), "Keyboard · KeyStep");
         // The default project ships a computer-keyboard node instead.
         assert_eq!(label_of(PatchId::Node(11), &doc), "Keyboard · Computer");
+    }
+
+    /// U10: the timeline and mixer boxes reserve action rows for their own
+    /// add / remove buttons, and their ports stay in the port area below;
+    /// only those two entities carry buttons, and the virtual keyboard gates
+    /// the Inspector double-click off.
+    #[test]
+    fn action_rows_reserve_space_and_only_owner_nodes_have_them() {
+        let project = Project::default();
+        let doc = &project.graph;
+        let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
+        let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let track_count = project.midi_tracks.len();
+        let auto_count = 1;
+        let deps = PatchDeps {
+            doc,
+            track_count,
+            auto_count,
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+        };
+        let mut state = PatchState::default();
+        state.positions.insert(PatchId::Timeline, Pos2::ZERO);
+        let mixer = doc.first_mixer().unwrap().node_id();
+        state.place_node(mixer, Pos2::new(0.0, 400.0));
+
+        // Timeline: title + two action rows, then one row per port.
+        assert_eq!(action_rows(PatchId::Timeline, &deps), TIMELINE_ACTION_ROWS);
+        let r = state
+            .screen_rect(Pos2::ZERO, PatchId::Timeline, &deps)
+            .unwrap();
+        assert_eq!(
+            r.height(),
+            TIMELINE_HEADER + TIMELINE_ROW_HEIGHT * (track_count + auto_count) as f32
+        );
+        let ports = state.out_ports_screen(Pos2::ZERO, PatchId::Timeline, &deps);
+        assert_eq!(ports.len(), track_count + auto_count);
+        for (_, p) in &ports {
+            assert!(p.y >= r.top() + TIMELINE_HEADER, "port under the buttons");
+            assert!(p.y <= r.bottom());
+        }
+
+        // Mixer: title + slot row above the port area, inline row below it.
+        let mid = PatchId::Node(mixer);
+        let m = state.screen_rect(Pos2::ZERO, mid, &deps).unwrap();
+        let band = header_band(mid, &deps);
+        let inline_top = m.bottom() - INLINE_ROW_HEIGHT; // out-pan row
+        let in_ports = state.in_ports_screen(Pos2::ZERO, mid, &deps);
+        assert!(!in_ports.is_empty());
+        for (_, p) in &in_ports {
+            assert!(p.y >= m.top() + band, "port under the slot buttons");
+            assert!(p.y <= inline_top, "port above the inline slider row");
+        }
+        assert_eq!(action_rows(mid, &deps), 1);
+
+        // Only the two owner nodes carry buttons.
+        assert_eq!(action_rows(PatchId::Master, &deps), 0);
+        assert_eq!(action_rows(PatchId::TimelineIn, &deps), 0);
+        assert!(node_action_buttons(PatchId::Master, 0, &deps).is_empty());
+        let midi_row = node_action_buttons(PatchId::Timeline, 0, &deps);
+        assert_eq!((midi_row[0].label, midi_row[1].label), ("+ MIDI", "- MIDI"));
+        assert!(midi_row[0].enabled && midi_row[1].enabled);
+        let curve_row = node_action_buttons(PatchId::Timeline, 1, &deps);
+        assert_eq!(
+            (curve_row[0].label, curve_row[1].label),
+            ("+ Curve", "- Curve")
+        );
+        // Default project: every slot carries a track cable → remove refuses.
+        let slot_row = node_action_buttons(mid, 0, &deps);
+        assert!(slot_row[0].enabled);
+        assert!(!slot_row[1].enabled, "last slot carries a track cable");
+
+        // A free last slot can be dropped; a cable landing on it blocks it
+        // again (the button mirrors `mixer_remove_channel`).
+        let mut free = Project::default();
+        let fm = free.graph.first_mixer().map(NodeDoc::node_id).unwrap();
+        let NodeDoc::Mixer { inputs, .. } = free.graph.node_by_id(fm).unwrap().clone() else {
+            unreachable!()
+        };
+        if let Some(NodeDoc::Mixer {
+            inputs, channels, ..
+        }) = free.graph.node_by_id_mut(fm)
+        {
+            *inputs += 1;
+            channels.push(Default::default());
+        }
+        let fdeps = PatchDeps {
+            doc: &free.graph,
+            track_count,
+            auto_count,
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+        };
+        assert!(node_action_buttons(PatchId::Node(fm), 0, &fdeps)[1].enabled);
+        let from = free
+            .graph
+            .instrument_of_track(0)
+            .map(NodeDoc::node_id)
+            .unwrap();
+        free.graph
+            .cables
+            .push(CableDoc::audio_to_channel(from, fm, inputs));
+        let fdeps = PatchDeps {
+            doc: &free.graph,
+            track_count,
+            auto_count,
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+        };
+        assert!(!node_action_buttons(PatchId::Node(fm), 0, &fdeps)[1].enabled);
+
+        // Double-click gate: keyboard / feedback have no panel to show.
+        let keyboard = doc
+            .nodes
+            .iter()
+            .find(|n| n.is_keyboard())
+            .cloned()
+            .expect("default project has a keyboard node");
+        assert!(!opens_inspector(Some(&keyboard)));
+        assert!(opens_inspector(doc.node_by_id(mixer)));
     }
 }
