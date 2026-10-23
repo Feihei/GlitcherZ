@@ -71,6 +71,8 @@
 | 静音 | mute | 通道条按钮状态 |
 | 电平表 | level meter | 峰值表；峰值保持 peak hold |
 | 推子 | fader | 混音器音量滑块 |
+| 主控组 | master section | 走带条右侧的 master gain + 立体声电平表 + Panic；全局量，不属于任何节点 |
+| 全停 | panic | 释放所有发声音符（逐 pitch 扫 0..127），transport 与参数不动；区别于 Stop |
 | 冲洗反规范数 | flush denormals | 指注入 0.0 消除 denormal 的处理 |
 
 ## 时间轴与音序

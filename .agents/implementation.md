@@ -472,3 +472,13 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 **② eframe 关掉默认 features 会连 winit 的 Linux 后端一起关掉**：workspace 里 `eframe = { default-features = false, features = ["default_fonts"] }`（为了不拉 wgpu），`glitcherz-ui` 只补了 `glow`/`persistence`，于是 `x11`/`wayland` 两个 feature 也没了 —— winit 在 Linux 上 `compile_error!("The platform you're compiling for is not supported by winit")`。`glitcherz-ui` 现在显式带 `wayland` + `x11`（在 Windows/macOS 上是空操作），`Cargo.lock` 因此多出 X11/Wayland 栈（另有一批只进 lock、不进构建图的 `egui-wgpu`/`wgpu` 条目，无影响）。`winit/default` 附带的两项没跟着开：`wayland-dlopen`（免运行期 `libwayland` 硬依赖）与 `wayland-csd-adwaita`（GNOME Wayland 下自绘窗口边框）——CI 装了 `libwayland-dev`，链接期没问题；要在 GNOME 上跑得舒服再单独补 feature。
 
 **验证方式**：Windows 上无法直接编译 Linux/macOS，`cargo check` 交叉 target 又会卡在 `alsa-sys` 的 pkg-config。用 `[patch.crates-io]` 指一份把 `DefaultEnumType` 改成恒为 `c_uint` 的 `vst3` 副本，就能在 Windows 上跑出 macOS/Linux 的 `E0308`，改完即绿；feature 侧用 `cargo tree --target x86_64-unknown-linux-gnu -e features -i winit` 确认 `x11`/`wayland` 真的上来了。
+
+### Master 组上走带条：立体声表 + Panic（U8 收尾，2026-10-23）
+
+**为什么挪**：Inspector 的契约是"只显示选中节点的参数"，可它底部压着 `Master Gain` 与 `Master Out Level` —— 两个全局量。视觉上它们紧贴 `Cutoff Freq` / `Volume Envelope` 那组节点参数（同在一个 `Grid` 里），很容易被读成"master 的滤波/包络"。现在 master 组进 `transport_panel`（`master_section`），`Panel::top` 不管切到哪个 tab 都在，符合"走带条上的东西属于整首歌"。Inspector 侧只剩节点参数，并在 `Grid` 前加了一行 `Node Parameters — filter / envelope / delay of the node above, not the master bus`。
+
+**立体声峰值链路**：`GraphLevels.master_lr: [f32; 2]`（新增 `slot_peak_lr`，逐声道扫；`master` 仍保留为两者的 max，历史单值调用点与测试不动）→ `Feedback.{level_l, level_r}` → `AudioEngine::master_peak_lr()` → 两个 `PeakMeter`（各 600 ms hold）。UI 侧自绘两条竖条：`-60..0 dB` 映射，`-9 dB` 以下绿、以上琥珀、`-1 dB` 以上红（红=过载是音频表惯例，与股票红绿无关）。用 `ProgressBar` 做不到——它只有一条且是横向的。
+
+**Panic 为什么不发 `Off { note: 0 }`**：`note_off_all` 的毯式 off 到不了按 pitch 匹配的插件（Dexed 的挂音问题已记在 SF2/CLAP 两节）。真实释放要逐 pitch 走 0..127，但 **CLAP / VST3 两个宿主的 pending 队列都只有 32 条**（`MAX_PENDING_EVENTS`），一个 block 内塞 128 条会静默丢事件。所以 `RtGraph::panic()` 只设 `panic_sweep = Some(0)` 游标，`process_block` 开头每块发 `PANIC_SWEEP_BATCH = 24` 个 pitch 再推进（24 而非 32，给同 block 的常规事件留余量）：128/24 = 6 块，48 kHz / 128 frames 下约 16 ms。`EngineCommand::Panic` 额外先 `release_pending_notes()`（按 pitch 释放音序器已取走的待关音符）。**语义是静音不是停止**：transport 继续跑、参数一个不动，`--seconds` 冒烟与 `panic_sweeps_every_pitch_across_bounded_batches`（断言 128 个不同 pitch 全部到达）锁定。
+
+**验收坑**：master gain 的 `Slider` 用 `custom_formatter` 显示 dB（线性 0..1.5 → `-∞..+3.5 dB`）；拖动仍走 `begin_param_edit` / `commit_param_edit("master-gain")` / `drag_stopped` 三步，否则一次拖动会塞满 undo 栈，或者每帧写文档让标题永远带 `*`。
