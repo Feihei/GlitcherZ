@@ -186,6 +186,24 @@ fn inline_param_id(p: patch::InlineParam) -> ParamId {
     }
 }
 
+/// Validates a cable-midpoint splice and returns the endpoints the new node
+/// has to join: `(upstream node, downstream port, downstream channel)`.
+///
+/// A splice turns `A → B` into `A → new → B`, so the new node needs the
+/// cable's **upstream node** as its feed and must reproduce the original
+/// target — including its channel binding (D17: a mixer input keeps its
+/// fader). Kept separate from the app so the acceptance rule ("the splice
+/// never changes the downstream slot") is testable without a window.
+fn splice_endpoints(cable: &glitcherz_model::CableDoc) -> Result<(u64, PortRef, u8), &'static str> {
+    if cable.kind != CableKind::Audio {
+        return Err("only audio cables accept inserted nodes");
+    }
+    let PortRef::Node(from_doc) = cable.from else {
+        return Err("cable has no node source");
+    };
+    Ok((from_doc, cable.to.clone(), cable.in_port))
+}
+
 /// Final node source for a plugin picked in the popup (U9 E3).
 ///
 /// The entry's own classification decides instrument vs effect (spec D9): a
@@ -618,9 +636,9 @@ pub struct GlitcherZApp {
     plugin_catalog: plugin_catalog::PluginCatalog,
     /// Filterable plugin popup behind `Add ▸ Instrument ▸ CLAP…` (U9 E3).
     picker: plugin_picker::PluginPicker,
-    /// Graph-space position the picker's node will be created at (taken from
-    /// the right-click that opened the menu).
-    picker_at: Option<egui::Pos2>,
+    /// Where the picker's pick lands: a new dangling node, or spliced into an
+    /// existing audio cable (taken from the click that opened the menu).
+    picker_place: Option<patch::PickerPlace>,
     /// Recently picked plugins, newest first, persisted in [`UiState`].
     recent_plugins: Vec<plugin_picker::RecentPlugin>,
     /// Instrument VST3 parameter lists (read at instantiation), keyed by
@@ -790,7 +808,7 @@ impl GlitcherZApp {
             retiring_guards: Vec::new(),
             plugin_catalog: plugin_catalog::PluginCatalog::load(cached_plugins.as_deref()),
             picker: plugin_picker::PluginPicker::default(),
-            picker_at: None,
+            picker_place: None,
             recent_plugins: ui_state.recent_plugins,
             voice_params: HashMap::new(),
             clap_voice_params: HashMap::new(),
@@ -1891,9 +1909,9 @@ impl GlitcherZApp {
                 patch::PatchAction::OpenPluginPicker {
                     category,
                     format,
-                    at,
+                    place,
                 } => {
-                    self.open_plugin_picker(category, format, at);
+                    self.open_plugin_picker(category, format, place);
                 }
                 patch::PatchAction::PickSoundFont { at } => {
                     if let Some(path) = rfd::FileDialog::new()
@@ -1991,16 +2009,17 @@ impl GlitcherZApp {
         &mut self,
         category: Option<patch::NodeCategory>,
         format: Option<plugin_catalog::PluginFormat>,
-        at: egui::Pos2,
+        place: patch::PickerPlace,
     ) {
-        self.picker_at = Some(at);
+        self.picker_place = Some(place);
         self.picker.open(plugin_picker::PickFilter {
             want_instrument: category.map(patch::NodeCategory::is_instrument),
             format,
         });
     }
 
-    /// Draw the plugin popup and create the picked node (U9 E3).
+    /// Draw the plugin popup and create the picked node (U9 E3), or splice it
+    /// into a cable (U9 E4 — same popup, different receiver).
     ///
     /// The popup is drawn above every panel (`Order::Foreground`); a pick is
     /// turned into the node's **final** source here, so the creation path
@@ -2019,17 +2038,24 @@ impl GlitcherZApp {
         match outcome {
             Some(plugin_picker::PickOutcome::Picked(choice)) => {
                 plugin_picker::remember(&mut self.recent_plugins, &choice);
-                let Some(at) = self.picker_at.take() else {
+                let Some(place) = self.picker_place.take() else {
                     return;
                 };
                 let source = pick_to_source(choice);
-                self.add_patch_node(source, at);
+                match place {
+                    patch::PickerPlace::Add { at } => {
+                        self.add_patch_node(source, at);
+                    }
+                    patch::PickerPlace::Insert { cable, at } => {
+                        self.insert_node_in_cable(cable, source, at);
+                    }
+                }
                 // The status bar text changed; repaint immediately instead of
                 // waiting for the 50 ms display tick.
                 ctx.request_repaint();
             }
             Some(plugin_picker::PickOutcome::Cancelled) => {
-                self.picker_at = None;
+                self.picker_place = None;
             }
             None => {}
         }
@@ -2052,6 +2078,25 @@ impl GlitcherZApp {
     /// "create a built-in, then swap the voice" double install (and therefore one
     /// install, one undo step).
     fn create_patch_node(&mut self, source: patch::NodeSource, at: egui::Pos2) -> Option<u64> {
+        let track = self
+            .selected_track
+            .min(self.project().midi_tracks.len().saturating_sub(1));
+        self.create_patch_node_on(source, at, track)
+    }
+
+    /// [`GlitcherZApp::create_patch_node`] with an explicit owning track.
+    ///
+    /// Needed by the cable-midpoint insert: the new processor belongs to the
+    /// track that owns the cable it was spliced into, **not** to whichever
+    /// track happens to be selected (they differ when the user inserts into
+    /// another track's chain). The `track` field drives per-track addressing
+    /// (`register_track_chain`) and the mixer panel grouping.
+    fn create_patch_node_on(
+        &mut self,
+        source: patch::NodeSource,
+        at: egui::Pos2,
+        track: usize,
+    ) -> Option<u64> {
         if self.project().graph.nodes.len() >= MAX_NODES {
             self.set_message("Add node failed: node table full (64)".to_string());
             return None;
@@ -2069,9 +2114,7 @@ impl GlitcherZApp {
             return None;
         }
         let node_id = self.project().graph.next_node_id();
-        let track = self
-            .selected_track
-            .min(self.project().midi_tracks.len().saturating_sub(1));
+        let track = track.min(self.project().midi_tracks.len().saturating_sub(1));
         let node = match source {
             patch::NodeSource::BuiltinSynth => NodeDoc::Instrument {
                 node_id,
@@ -2213,6 +2256,11 @@ impl GlitcherZApp {
 
     /// Insert a new node into an existing audio cable: `A → B` becomes `A → new → B`
     /// (cable-midpoint menu). The new node is placed where the user clicked.
+    ///
+    /// One undo step for the whole splice (spec `plugin-browser.md` E4): the
+    /// three sub-operations (create, cut the old cable, two new cables) each
+    /// record their own step, so history is suspended for their duration and a
+    /// single outer snapshot is committed at the end.
     fn insert_node_in_cable(
         &mut self,
         cable_index: usize,
@@ -2222,29 +2270,40 @@ impl GlitcherZApp {
         let Some(cable) = self.project().graph.cables.get(cable_index).cloned() else {
             return;
         };
-        if cable.kind != CableKind::Audio {
-            self.set_message("Insert failed: only audio cables accept inserted nodes".to_string());
-            return;
-        }
-        if !matches!(
-            source,
-            patch::NodeSource::BuiltinDelay | patch::NodeSource::Mixer
-        ) {
+        let (from_doc, to, in_port) = match splice_endpoints(&cable) {
+            Ok(endpoints) => endpoints,
+            Err(reason) => {
+                self.set_message(format!("Insert failed: {reason}"));
+                return;
+            }
+        };
+        if !source.fits_audio_insert() {
+            // Unreachable from the menu (its leaves are effects / mixer only),
+            // but the picker could hand back anything if a filter is ever
+            // widened — an instrument here would be born without a MIDI feed.
             self.set_message("Insert failed: only effects / mixers can be inserted".to_string());
             return;
         }
-        let PortRef::Node(from_doc) = cable.from else {
-            self.set_message("Insert failed: cable has no node source".to_string());
-            return;
-        };
-        let Some(new_id) = self.create_patch_node(source, at) else {
+        // The processor joins the track that owns the cable, not the selected
+        // one (see `create_patch_node_on`).
+        let track = self
+            .project()
+            .graph
+            .node_by_id(from_doc)
+            .map_or(self.selected_track, |node| node.track());
+        let before = self.begin_edit();
+        self.session.suspend_history();
+        let Some(new_id) = self.create_patch_node_on(source, at, track) else {
+            self.session.resume_history();
             return;
         };
         self.delete_cable(cable_index);
         self.connect_audio(from_doc, PortRef::Node(new_id), 0);
         // Preserve the original channel binding when the downstream target is
-        // a mixer (D17).
-        self.connect_audio(new_id, cable.to.clone(), cable.in_port);
+        // a mixer (D17) — the new node takes over the exact same slot.
+        self.connect_audio(new_id, to, in_port);
+        self.session.resume_history();
+        self.commit_edit("Insert Node", before);
     }
 
     /// Connect an audio cable (document deduplication + engine edge; both stay in sync).
@@ -7854,5 +7913,89 @@ mod inline_param_tests {
         );
         // U3b: tempo has no ParamId — it never reaches a node's set_param.
         assert_eq!(param_id_of(&AutoParam::Tempo), None);
+    }
+}
+
+#[cfg(test)]
+mod splice_tests {
+    use super::*;
+    use glitcherz_model::CableDoc;
+
+    /// E4 acceptance: a splice reproduces the downstream slot exactly, so a
+    /// mixer input keeps the channel its fader is bound to (D17).
+    #[test]
+    fn splice_keeps_the_downstream_channel_binding() {
+        let cable = CableDoc::audio_to_channel(PortRef::Node(4), PortRef::Node(9), 2);
+        let (from, to, in_port) = splice_endpoints(&cable).expect("audio splice");
+        assert_eq!(from, 4);
+        assert_eq!(to, PortRef::Node(9));
+        assert_eq!(in_port, 2);
+    }
+
+    /// A splice into the master output keeps the target as-is.
+    #[test]
+    fn splice_accepts_a_master_target() {
+        let cable = CableDoc::audio(PortRef::Node(3), PortRef::Master);
+        let (from, to, in_port) = splice_endpoints(&cable).expect("audio splice");
+        assert_eq!(from, 3);
+        assert_eq!(to, PortRef::Master);
+        assert_eq!(in_port, 0);
+    }
+
+    #[test]
+    fn midi_and_automation_cables_take_no_processor() {
+        let midi = CableDoc::midi(0, 7);
+        assert_eq!(
+            splice_endpoints(&midi),
+            Err("only audio cables accept inserted nodes")
+        );
+    }
+
+    #[test]
+    fn a_cable_without_a_node_source_is_rejected() {
+        // Timeline / master outs have no upstream node to re-feed.
+        let cable = CableDoc::audio(PortRef::Master, PortRef::Node(5));
+        assert_eq!(splice_endpoints(&cable), Err("cable has no node source"));
+    }
+
+    /// Only processors fit an audio splice: an instrument would join the chain
+    /// with no MIDI feed and stay silent.
+    #[test]
+    fn only_effects_and_mixers_fit_an_audio_splice() {
+        use patch::NodeSource;
+        let insertable = [
+            NodeSource::BuiltinDelay,
+            NodeSource::ClapEffect {
+                path: "C:/p/fx.clap".to_string(),
+                plugin_id: "fx".to_string(),
+            },
+            NodeSource::Vst3Effect {
+                path: "C:/p/fx.vst3".to_string(),
+                class_id: "fx".to_string(),
+            },
+            NodeSource::Mixer,
+        ];
+        for source in &insertable {
+            assert!(source.fits_audio_insert(), "{source:?} should insert");
+        }
+        let rejected = [
+            NodeSource::BuiltinSynth,
+            NodeSource::SoundFont {
+                path: "C:/p/x.sf2".to_string(),
+            },
+            NodeSource::ClapInstrument {
+                path: "C:/p/i.clap".to_string(),
+                plugin_id: "i".to_string(),
+            },
+            NodeSource::Vst3Instrument {
+                path: "C:/p/i.vst3".to_string(),
+                class_id: "i".to_string(),
+            },
+            NodeSource::Keyboard,
+            NodeSource::Feedback,
+        ];
+        for source in &rejected {
+            assert!(!source.fits_audio_insert(), "{source:?} must not insert");
+        }
     }
 }

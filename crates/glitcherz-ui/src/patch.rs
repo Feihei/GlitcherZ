@@ -215,6 +215,36 @@ impl NodeCategory {
     }
 }
 
+/// Where a picker pick lands (spec `plugin-browser.md` §6.1 `PickerMode`).
+///
+/// The picker itself is identical in both cases; only the receiver differs, so
+/// the same popup serves the add menu and the cable-midpoint menu.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PickerPlace {
+    /// A new dangling node at `at` (D6: no cables until the user draws them).
+    Add {
+        /// Graph-space creation position.
+        at: Pos2,
+    },
+    /// Spliced into the audio cable at document index `cable`: `A → B` becomes
+    /// `A → new → B`. `at` is where the new node is placed.
+    Insert {
+        /// Index into [`GraphDoc::cables`].
+        cable: usize,
+        /// Graph-space creation position.
+        at: Pos2,
+    },
+}
+
+impl PickerPlace {
+    /// Graph-space position the pick will be created at.
+    pub fn at(self) -> Pos2 {
+        match self {
+            PickerPlace::Add { at } | PickerPlace::Insert { at, .. } => at,
+        }
+    }
+}
+
 /// The source a node is born with (spec `plugin-browser.md` §7).
 ///
 /// Unlike the old `AddNodeKind` (which mixed "category" and "concrete node"),
@@ -270,6 +300,23 @@ pub enum NodeSource {
     Keyboard,
 }
 
+impl NodeSource {
+    /// Whether this source can be spliced into an audio cable (`A → x → B`).
+    ///
+    /// Instruments are excluded: an instrument spliced into an audio cable has
+    /// no MIDI feed, so it would be born silent and the cable would carry
+    /// nothing. Mixers are single-input-agnostic and perfectly legal.
+    pub fn fits_audio_insert(&self) -> bool {
+        matches!(
+            self,
+            NodeSource::BuiltinDelay
+                | NodeSource::ClapEffect { .. }
+                | NodeSource::Vst3Effect { .. }
+                | NodeSource::Mixer
+        )
+    }
+}
+
 /// Interaction intents produced within one patch frame (applied by the caller; the patch has
 /// no side effects).
 #[derive(Debug, Clone)]
@@ -281,14 +328,15 @@ pub enum PatchAction {
     /// Open the plugin picker for `category` / `format` (spec `plugin-browser.md`
     /// D4/D5): `None` category = the global `Search Plug-ins…` entry, whose
     /// pick decides the node category from the entry's own classification.
-    /// `at` is the graph-space position the node will be created at.
+    /// `place` says whether the pick becomes a dangling node or is spliced into
+    /// a cable.
     OpenPluginPicker {
         /// Category the leaf menu asked for (`None` = both).
         category: Option<NodeCategory>,
         /// Binary format the leaf menu asked for (`None` = both).
         format: Option<PluginFormat>,
-        /// Graph-space creation position.
-        at: Pos2,
+        /// Where the pick lands.
+        place: PickerPlace,
     },
     /// Open the SoundFont file dialog and create an instrument from the pick
     /// (the patch cannot run a modal dialog inside the menu closure).
@@ -1408,7 +1456,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 actions.push(PatchAction::OpenPluginPicker {
                     category,
                     format,
-                    at,
+                    place: PickerPlace::Add { at },
                 });
             } else {
                 actions.push(PatchAction::PickSoundFont { at });
@@ -1960,6 +2008,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         #[derive(Clone)]
         enum CablePick {
             Insert(NodeSource),
+            OpenPicker(PluginFormat),
             Delete,
         }
         let mut picked: Option<CablePick> = None;
@@ -1970,15 +2019,32 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(140.0);
                     ui.strong("Cable");
+                    // Same type-first shape as the add menu (spec §6.1), so the
+                    // two places a node can be born read alike. MIDI / automation
+                    // cables accept no processors at all.
                     let is_audio = doc
                         .cables
                         .get(cable_i)
                         .is_some_and(|c| c.kind == CableKind::Audio);
-                    if is_audio && ui.button("Insert Effect (Delay)").clicked() {
-                        picked = Some(CablePick::Insert(NodeSource::BuiltinDelay));
-                    }
-                    if is_audio && ui.button("Insert Mixer").clicked() {
-                        picked = Some(CablePick::Insert(NodeSource::Mixer));
+                    if is_audio {
+                        ui.menu_button("Insert", |ui| {
+                            ui.menu_button("Effect", |ui| {
+                                if ui.button("Built-in Delay").clicked() {
+                                    picked = Some(CablePick::Insert(NodeSource::BuiltinDelay));
+                                }
+                                ui.separator();
+                                if ui.button("CLAP…").clicked() {
+                                    picked = Some(CablePick::OpenPicker(PluginFormat::Clap));
+                                }
+                                if ui.button("VST3…").clicked() {
+                                    picked = Some(CablePick::OpenPicker(PluginFormat::Vst3));
+                                }
+                            });
+                            // A mixer is not an "effect"; it gets its own leaf.
+                            if ui.button("Mixer").clicked() {
+                                picked = Some(CablePick::Insert(NodeSource::Mixer));
+                            }
+                        });
                     }
                     if ui.button("Delete Cable").clicked() {
                         picked = Some(CablePick::Delete);
@@ -1991,6 +2057,16 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     cable: cable_i,
                     source,
                     at,
+                });
+                state.pending_cable_menu = None;
+            }
+            Some(CablePick::OpenPicker(format)) => {
+                actions.push(PatchAction::OpenPluginPicker {
+                    // Only effects can be spliced into an audio cable: the
+                    // instrument leaves would produce a silent node.
+                    category: Some(NodeCategory::Effect),
+                    format: Some(format),
+                    place: PickerPlace::Insert { cable: cable_i, at },
                 });
                 state.pending_cable_menu = None;
             }
