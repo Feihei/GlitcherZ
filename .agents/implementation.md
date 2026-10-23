@@ -433,3 +433,15 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 **可插入源白名单**：`NodeSource::fits_audio_insert()` —— `BuiltinDelay` / `ClapEffect` / `Vst3Effect` / `Mixer`。乐器进音频线会没有 MIDI 输入、永久静音，所以不是"能跑就先允许"。picker 侧已经用 `NodeCategory::Effect` 筛选，这层是动作层的兜底。
 
 **测试**：`splice_tests` 5 项（槽位保留、master 目标、MIDI 拒收、无上游节点拒收、可插入源白名单）。App 级断言（`node_map` 只加 1 条、`retiring_guards` 不增长）无法在无窗口环境下做 —— `GlitcherZApp::new` 需要 `eframe::CreationContext`，仓库也没有 headless app harness，故以 `cargo run --seconds 5` 冒烟 + 代码结构（单次 `install_node` + 无回收分支）代替。
+
+### 跨平台构建：VST3 枚举类型 + eframe 的 Linux 后端（2026-10-23）
+
+症状：Windows 通过，`ubuntu-latest` / `macos-latest` 各自报一类错（CI 从没绿过）。
+
+**① `vst3` 0.3 的枚举类型按平台分叉**：生成的绑定把每个枚举写两遍 —— 常量容器（`Vst::MediaTypes`、`Vst::BusDirections`、`Vst::ProcessModes`、`Vst::SymbolicSampleSizes`、`Vst::Event_::EventTypes`、`Steinberg::IBStream_::IStreamSeekMode`、`PClassInfo_::ClassCardinality` …）的类型是 `vst3::support::DefaultEnumType` = `c_int`（Windows）/ `c_uint`（其他），而**接收这些值的字段与接口参数一律写成 `int32`**（`ProcessSetup::processMode`、`ProcessData::symbolicSampleSize`、`IComponent::getBusCount(type, dir)` 等）；也有少数常量的类型本身就是 `int32`（如 `ParameterFlags`），天然对齐、不用转换。Windows 上两者都是 `i32` 所以看不出问题，macOS/Linux 上是两种类型，`cargo build` 直接 `E0308`。
+
+接缝收在两个 `compat` 里（宿主 `src/compat.rs`、fixture 内同名小函数）：`to_int32`（常量 → `int32` 槽）/ `to_uint32`（`BusInfo::flags` 这类 `uint32` 槽）/ `to_enum`（`int32` 参数 → 枚举类型，好在 `match` 里直接对常量分支）。泛型走 `TryInto`/`TryFrom`，两个方向都能编译，不必写 `#[allow(unnecessary_cast)]`——`as` 在 Windows 上是多余的、在 Linux 上是必需的，正是 `clippy -D warnings` 会卡住的那种差别。判 `match` 的入参一律先 `to_enum(...)` 再对常量，避免 `m if m == ...` 这种守卫写法。
+
+**② eframe 关掉默认 features 会连 winit 的 Linux 后端一起关掉**：workspace 里 `eframe = { default-features = false, features = ["default_fonts"] }`（为了不拉 wgpu），`glitcherz-ui` 只补了 `glow`/`persistence`，于是 `x11`/`wayland` 两个 feature 也没了 —— winit 在 Linux 上 `compile_error!("The platform you're compiling for is not supported by winit")`。`glitcherz-ui` 现在显式带 `wayland` + `x11`（在 Windows/macOS 上是空操作），`Cargo.lock` 因此多出 X11/Wayland 栈（另有一批只进 lock、不进构建图的 `egui-wgpu`/`wgpu` 条目，无影响）。`winit/default` 附带的两项没跟着开：`wayland-dlopen`（免运行期 `libwayland` 硬依赖）与 `wayland-csd-adwaita`（GNOME Wayland 下自绘窗口边框）——CI 装了 `libwayland-dev`，链接期没问题；要在 GNOME 上跑得舒服再单独补 feature。
+
+**验证方式**：Windows 上无法直接编译 Linux/macOS，`cargo check` 交叉 target 又会卡在 `alsa-sys` 的 pkg-config。用 `[patch.crates-io]` 指一份把 `DefaultEnumType` 改成恒为 `c_uint` 的 `vst3` 副本，就能在 Windows 上跑出 macOS/Linux 的 `E0308`，改完即绿；feature 侧用 `cargo tree --target x86_64-unknown-linux-gnu -e features -i winit` 确认 `x11`/`wayland` 真的上来了。
