@@ -99,6 +99,18 @@
 - 求值器在 `BlockRunner` 每块**仅播放中**按"循环后的音乐位置"（步进源 = 一小节、卷帘源 = 片段 loop_ticks 取模）采样并经混音器内部路径直写参数（不走命令队列）；UI 在走带停止沿重推手动参数实现"停止后回到手动值"；
 - 插件参数桥接端到端（引擎集成测试锁定）：自动化曲线 → `AutoParam::PluginParam{param_id}` → `ParamId::PluginParam` → 求值器 → `TrackStrip`（`PluginParam` 只路由外部声源）→ `ClapNode` → `ParamValueEvent` → 插件生效。
 
+### 控制轨 CC 输出与 inline 曲线带（U4a/U4b，spec `control-tracks.md`，2026-10-23）
+
+- **CC 是电缆的"目标模式"，不是新的电缆类型**（D1）：端点仍走 `CableKind::Automation`（`AutoTrack → Node`），拖线、删除、单源约束、`validate` 全部零改动——节点目标已拒绝 timeline-only 参数、`TimelineIn` 只收 `Tempo`，所以 CC 自动落在正确位置，**结构本身保证合法性**。
+- **`AutoDest` 分派**（D2）：引擎侧 `AutoRoute{slot, param: ParamId}` 换成 `AutoRoute{slot, dest: AutoDest}`，`Param(ParamId) | Cc{controller, channel}`；`RtGraph::auto_set_param` 改名 `auto_deliver`，按 dest 分派到 `slot_set_param` 或 `slot_midi_cc`。`Processor::midi_cc(channel, controller, value) -> bool` 是**新开的一条显式通道**（D3），不复用 `NoteEvent` 变体——音符路径的消费方（SF2 voice 池、插件事件槽）与 CC 无关，混进来只会让两边的分支都变脏。
+- **值域与去重**（D4/D7）：曲线存**真实 7bit CC 值**（不是归一化的 0..1），纵轴 0..127；投递时 `clamp(0,127).round()`（round 而非 truncate，否则曲线停在 0.4 附近永远发 0），`last_cc: [i16; MAX_AUTO_TRACKS]` 记上次发送值（`-1` = 从未发）→ **变化才发**。`apply_update` 末尾把 `last_cc` 清成全 `-1`：重定向到新目标后必须立刻收到一次当前值，否则要等曲线动起来才生效。
+- **时间戳取块边界**（D5）：CLAP 走 `MidiEvent::new(0, 0, data)`（`time = 0`），SF2 走块首 `process_midi_message`；采样级 CC 需要每采样事件队列，收益不可辨，明确不做。
+- **格式差异**（D6）：CLAP 组装 `0xB0 | channel` 注入输入事件流；SF2 **忽略外来 channel**（该节点所有音符都发在固定 `CHANNEL`，尊重外来 channel 反而静默失效）；**VST3 明确不支持**——`vst3-0.3.0` 的 `DataEvent` 只有 `kMidiSysEx`，`kLegacyMIDICCOutEvent` 是插件**输出**语义，宿主用它属未定义行为，`Vst3Node::midi_cc` 返回 `false`。
+- **UI 接线**：终点行多一条 `MIDI CC…`（就地 `CC`/`ch` 两个 DragValue，release 才提交 = 一次 undo）、端点显示 `cc_label()`、拖线菜单对 instrument 追加 8 条预设（1/2/7/10/11/64/71/74）；`set_auto_endpoint` 按 `param.cc_of()` 在 `set_auto_cc_route` / `set_auto_route` 间分派，文档重推（undo/open）那条路径同样分流。
+- **inline 曲线带**（U4b D9/D10）：选中控制轨时，其行**下方**展开 84 px 高的带（`curve_band()`），横轴是**绝对 tick**、每个 clip 按 `loop_ticks` 重复铺开——与引擎播出完全一致；指针位置折回 **loop 相对 tick**（`loop_tick_at()`：`rel % loop_ticks` 再按 `SNAP_TICKS` 吸附并夹在循环内），所以**文档格式不变**、点第 5 个重复格改的就是第 1 格的锚点。`loop_space_curve()` 给曲线补平直头尾：`ControlClip::value_at` 两端 clamp，不补的话"首锚点在 beat 2"看起来像曲线从那里才开始。
+- **单一编辑入口**（D10）：`EditTarget::Control` / `control_editor_body` / `OpenControlEditor` 全部删除，`edit_clip` 收敛成 `Option<(track, clip)>`，双击控制 clip 只做 `ShowControlCurve`（选中该轨、展开带）；`lane.rs` 改名 `curve.rs`，只留轴映射（`axis`/`to_norm`/`from_norm`/`SNAP_TICKS`），`LaneIntent`/`LaneState`/`lane::show` 整段退休——两套拖拽状态是 U4b 要消灭的东西。
+- **手势与 undo**：点击加锚（`dragging: false` → 单步 `Add Anchor`）、拖拽移动（`curve:{track}:{clip}` 合并键，drag end 收合并）、右键删最近锚（半格容差）。单击已有锚点时**不移动它**——低缩放下 6 px 命中容差可能跨过整格吸附，顺手改掉才是 bug。
+
 ### CLAP 宿主（`glitcherz-clap-host`，路线图第 9 步）
 
 - `glitcherz-test-plugin`（cdylib）：clack-plugin 单音正弦乐器 fixture（`org.glitcherz.sine`，instrument+stereo 特性），供宿主端到端测试；

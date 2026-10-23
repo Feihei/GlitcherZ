@@ -65,7 +65,7 @@ glitcherz/
   ① 命令：`GlitcherZApp::execute(id, params)`（报错/panic 自动回滚）；连续手势用 `execute_merged(id, params, key)`；
   ② 编辑守卫：`let before = self.begin_edit(); ... project_mut() 修改 ...; self.commit_edit(label, before)`。参数拖动用 `begin_param_edit`/`commit_param_edit(label, before, key)` + 拖动结束 `end_param_edit()`。
   复合操作（内部会触发其他可撤销编辑）先 `session.suspend_history()`，收尾 `resume_history()` 再 commit——只记外层一步。
-  组件层（钢琴卷帘/timeline/automation lane）**只读文档 + 返回意图**（`RollIntent`/`TimelineAction`/`LaneIntent`），由 app 层翻译成命令或守卫编辑；组件不得持有 `&mut` 文档。
+  组件层（钢琴卷帘/timeline）**只读文档 + 返回意图**（`RollIntent`/`TimelineAction`），由 app 层翻译成命令或守卫编辑；组件不得持有 `&mut` 文档。U4b 之后曲线编辑并入 timeline 的 inline 带（`TimelineAction::CurvePoint` / `CurveRemove`），独立的 automation lane 组件（`lane::show` + `LaneIntent`）已退休，模块改名 `curve.rs`，只剩轴映射（`axis`/`to_norm`/`from_norm`/`SNAP_TICKS`）。
 - **MIDI ops 纯函数化**：签名一律 `fn(&mut [Note], Options)`，原地修改、**不改变 slice 长度**（故可作用于选区），不碰 clip/track/context；随机部分走 seeded XorShift 保可测可复现。
 
 ## 测试
