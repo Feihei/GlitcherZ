@@ -2622,33 +2622,26 @@ fn curve_band(
             .map(|point| point.tick)
     };
 
-    if response.drag_started_by(egui::PointerButton::Primary)
+    // egui reports `drag_started` and `dragged` on the SAME frame the gesture
+    // begins. Only the start arm may emit then: it is the one that moves the
+    // anchor off its previous tick (the drag arm would re-insert at the same
+    // tick, a second write for nothing).
+    let started = response.drag_started_by(egui::PointerButton::Primary);
+    if started
         && let Some(pos) = response.interact_pointer_pos()
         && let Some((clip_index, tick, value, rel)) = resolve(pos)
     {
-        match hit_anchor(pos, clip_index, rel) {
-            Some(from) => {
-                state.curve_drag = Some((clip_index, tick));
-                actions.push(TimelineAction::CurvePoint {
-                    track: track_index,
-                    clip: clip_index,
-                    from: Some(from),
-                    tick,
-                    value,
-                    dragging: true,
-                });
-            }
-            None => {
-                actions.push(TimelineAction::CurvePoint {
-                    track: track_index,
-                    clip: clip_index,
-                    from: None,
-                    tick,
-                    value,
-                    dragging: true,
-                });
-            }
-        }
+        // Either way the gesture continues from the tick under the pointer.
+        state.curve_drag = Some((clip_index, tick));
+        let from = hit_anchor(pos, clip_index, rel);
+        actions.push(TimelineAction::CurvePoint {
+            track: track_index,
+            clip: clip_index,
+            from,
+            tick,
+            value,
+            dragging: true,
+        });
     }
     // A plain click never crosses egui's drag threshold, so it arrives here
     // instead: land an anchor where the pointer is, unless it is already on
@@ -2668,7 +2661,8 @@ fn curve_band(
             dragging: false,
         });
     }
-    if response.dragged_by(egui::PointerButton::Primary)
+    if !started
+        && response.dragged_by(egui::PointerButton::Primary)
         && let Some(pos) = response.interact_pointer_pos()
         && let Some((clip_index, from)) = state.curve_drag
         && clip_index < track.clips.len()
