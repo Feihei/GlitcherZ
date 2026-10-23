@@ -113,7 +113,7 @@ pub struct PluginWindowHandle(platform_impl::NativeChild); // Windows: HWND 子�
 
 ## 6 G4 — Inspector 面板按选中节点重构（P5e 收口）
 
-- 语义：**patch 中选中的 instrument / effect / mixer 文档节点** = Inspector tab 的编辑目标（类比 Edit tab 之于 clip）。双击 patch 节点跳转 Inspector tab（同双击 timeline clip 进 Edit）。
+- 语义：**patch 中选中的 instrument / effect / mixer 文档节点** = Inspector tab 的编辑目标（类比 Edit tab 之于 clip）。双击 patch 节点跳转 Inspector tab（同双击 timeline clip 进 Edit）；**但当节点没有可显示参数时不跳**——VK / Feedback / legacy strip 双击无反应，否则面板会 fallback 到"当前轨的乐器"显示别人的参数（2026-10-23）。双击固定的 Timeline 节点跳 Timeline tab，Master / Timeline In 不响应。
 - 面板按 `NodeDoc` 变体分派：
   - Instrument：preset 工具条 + 参数栈 + 插件滑条 + **编辑器折叠区**（G2）。源选择已于 U9 E5 迁出（加节点即带最终声源，spec `plugin-browser.md` D1/D3）。
   - Effect：效果器参数面板（现有 `set_node_param(ParamId::PluginParam)` 节点寻址路径）。

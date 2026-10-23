@@ -120,6 +120,8 @@
 | 缘拉伸 | stretch | 命令 `t`；默认拉终点，`t+s` 拉起点（`t+e` 与裸 T 重合，已删） |
 | 切分 | cut / split | 命令 `k`；在指针 tick 处把音符/clip 一分为二 |
 | 复制并移动 | duplicate & move | `Shift+d`；复制选区后立即 arm Grab |
+| 操作行 | action row | 节点框内、标题之下的一行小按钮（Timeline 的 `+/- MIDI` / `+/- Curve`、Mixer 的 `+/- Slot`）；占头部带高度，端口从它下方开始铺 |
+| 双击路由 | double-click routing | patch 双击的目标分派：节点 → Inspector（仅当有参数可显示）、Timeline → Timeline tab、其余实体无动作 |
 
 ## 符号白名单（egui 默认字体，硬约束）
 

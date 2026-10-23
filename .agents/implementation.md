@@ -4,6 +4,14 @@
 
 ## 已落地
 
+### patch 节点内联操作行 + 双击路由（U10，2026-10-23）
+
+- **几何单一来源**：`size_of` 为 Timeline（2 行）与 Mixer（1 行）预留 `NODE_TITLE_BAND + action_rows * ACTION_ROW_HEIGHT` 的头部带；端口位置改由 `port_area()` 计算——上界在头部带之下、下界再减去内联滑块行（`inline_row_count * INLINE_ROW_HEIGHT * zoom`）。`out_ports_screen` / `in_ports_screen` 同时供**绘制与命中测试**使用，所以只改一处就保证"看到的位置"与"能拖到的位置"一致；漏掉下界会让 mixer 最后一条端口漂到 `Out Pan` 滑块上。
+- **按钮不能 `ui.put`**：`ui.put(rect, Button)` 无法表达禁用态（节点里 `- Slot` 在最后一槽有线时必须灰掉）。改用 `ui.scope_builder(UiBuilder::new().max_rect(btn_rect).layout(centered_and_justified))` + `add_enabled`，并按 zoom 缩 `button_padding`（2×0）与字号。按钮是"后画的真控件"，与内联滑块同一套指针优先级，按在按钮上不会触发节点拖拽。
+- **zoom 门槛**：`ACTION_MIN_ZOOM = 0.6` 以下不画按钮（缩略视图里按钮只有十几个像素，点了只会误触）。
+- **动作全转发既有实现**：`add_midi_track` / `remove_last_midi_track` / `add_control_track` / `remove_control_track` / `mixer_add_channel` / `mixer_remove_channel`，undo 粒度与引擎同步沿用原路径。`- Slot` 的禁用条件抄 `mixer_remove_channel` 的拒绝条件（最后一槽仍有音频线），把"点了没反应"提前说清。
+- **双击路由要门控**：`opens_inspector(node)` 只放行 Instrument / Effect / Mixer。Inspector 在没有编辑目标时会 fallback 到"当前轨的乐器"，所以让 VK / Feedback / ChannelStrip 也能跳过去 = 显示别人的参数，比不反应更糟。Timeline 跳 `MainView::Timeline`，Master（参数在走带条）与 Timeline In（纯汇）不响应。
+
 ### SF2 音色库加载器 S1–S6（2026-10-19 收官，spec 见 `.agents/spec/sf2-loader.md`）
 
 - **S1 RT 审计**（结论细节在 spec §7）：`rustysynth-ext = "=1.4.0"` 热路径零堆分配实证（计数 `#[global_allocator]`，测试 `tests/sf2_rt_audit.rs`），`VoiceCollection` 即预分配池，voice 池 fork 预案（D4）解除；唯一 panic 点 = `render` 等长契约（调用侧保证）。**审计 harness 的坑**：断言 label 的 `format!` 在计数窗口内求值会被计入分配（首跑真实库的假阳性），label 构建须在 scope 之外；计数器全局，测试须 `Mutex` 串行。

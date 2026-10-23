@@ -213,6 +213,16 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 
 与 U 系列的关系：E1–E5 建议**先于 U8** 落地（U8 的"源选择"项由本 spec 接管，E5 与 U8 剩余项可合并收口）。
 
+## patch 节点内联管理（U10，2026-10-23）
+
+用户提出：patch 里的 timeline 节点要有 MIDI 轨 / 控制轨的增删按钮，mixer 节点要能增删 slot；双击 timeline 节点应跳到 Timeline tab，双击 VK（虚拟键盘）节点不该有反应——除非该节点真有参数可显示。
+
+- [x] **U10 节点内联操作行 + 双击路由** ✅ 2026-10-23：
+  - **操作行**：`action_rows(id)` = Timeline 2 行（`+/- MIDI`、`+/- Curve`）、Mixer 1 行（`+/- Slot`），其它实体 0 行。`size_of` 为这些行预留 `NODE_TITLE_BAND + rows * ACTION_ROW_HEIGHT`；端口改由 `port_area`（标题/操作行之下、内联滑块之上）铺开，按钮与端口永不重叠；zoom < 0.6 不画按钮（太小点不中）。mixer 的端口铺开从"整框均分"改为"端口区均分"，第一条端口不再压住标题。
+  - **动作**：`PatchAction::{OpenTimeline, AddMidiTrack, RemoveLastMidiTrack, AddControlTrack, RemoveControlTrack, AddMixerSlot, RemoveMixerSlot}`，全部转发既有实现（`add_midi_track` / `remove_last_midi_track` / `add_control_track` / `remove_control_track` / `mixer_add_channel` / `mixer_remove_channel`），一步 undo 与引擎同步沿用原路径。`- Slot` 在最后一槽仍有音频线时禁用（与 `mixer_remove_channel` 的拒绝条件一致，理由提前写在 tooltip 里）。
+  - **双击路由**：`opens_inspector(node)` 只放行 Instrument / Effect / Mixer；Keyboard / Feedback / ChannelStrip 双击无反应（否则 Inspector 会 fallback 到某条轨的乐器，等于显示错东西）；Timeline → `MainView::Timeline`；Master / TimelineIn（master 组已在走带条、In 是纯汇）无动作。
+  - 测试：几何（timeline 高度 = 表头 + 每端口一行、端口全在表头之下；mixer 端口夹在操作行与内联行之间）+ 按钮启用规则（默认工程最后一槽被轨线占用 → `- Slot` 禁用，腾出后可用，再接一根线又禁用）+ `opens_inspector` 门控。全仓 500 测试绿。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：
