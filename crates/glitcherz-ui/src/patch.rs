@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use eframe::egui;
-use egui::{Color32, FontId, Pos2, Rect, Sense, Vec2};
+use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 use glitcherz_model::{
     AutoParam, CableDoc, CableKind, GraphDoc, LayoutDoc, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS,
@@ -137,6 +137,53 @@ pub struct InlinePluginControl {
     pub min: f64,
     /// Slider range maximum.
     pub max: f64,
+}
+
+/// Value-text precision of one inline row follows the parameter span: two
+/// decimals for -1..=1-style ranges, one for tens, none for hertz-wide spans
+/// (the egui-native slider picked this automatically; the drawn one needs it
+/// spelled out).
+fn fmt_inline_value(value: f64, min: f64, max: f64) -> String {
+    let span = (max - min).abs();
+    if span <= 2.0 {
+        format!("{value:.2}")
+    } else if span <= 20.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value:.0}")
+    }
+}
+
+/// Normalized position of `value` inside `min..=max` (0.5 for a degenerate
+/// range instead of a NaN that would drift the handle off the rail).
+fn inline_ratio(value: f64, min: f64, max: f64) -> f64 {
+    if (max - min).abs() < f64::EPSILON {
+        0.5
+    } else {
+        ((value - min) / (max - min)).clamp(0.0, 1.0)
+    }
+}
+
+/// Layout of one inline row (already screen space): label anchor, rail rect,
+/// value anchor and the interactive hit rect. Shared by drawing and tests so
+/// the row cannot spill past its own box or overlap its neighbours — the
+/// failure mode that motivated replacing the egui-native slider (whose font
+/// and rail ignore the row rect).
+fn inline_row_parts(row: Rect, z: f32) -> (Pos2, Rect, Pos2, Rect) {
+    let mid = row.center().y;
+    let label = Pos2::new(row.left() + INLINE_INSET * z, mid);
+    let rail_left = row.left() + (INLINE_INSET + INLINE_LABEL_WIDTH) * z;
+    let hit_right = row.right() - INLINE_INSET * z;
+    let rail = Rect::from_min_max(
+        Pos2::new(rail_left, mid - 1.5 * z),
+        Pos2::new(hit_right - INLINE_VALUE_WIDTH * z, mid + 1.5 * z),
+    );
+    let value = Pos2::new(hit_right, mid);
+    let hit = Rect::from_min_max(
+        Pos2::new(rail_left, row.top()),
+        Pos2::new(hit_right, row.bottom()),
+    );
+    (label, rail, value, hit)
 }
 
 /// Current document value + slider range of one built-in inline
@@ -653,6 +700,14 @@ const INLINE_ROW_HEIGHT: f32 = 16.0;
 const INLINE_INSET: f32 = 8.0;
 /// Width reserved for the inline row label (graph space).
 const INLINE_LABEL_WIDTH: f32 = 34.0;
+/// Width reserved for the inline row value text (graph space).
+const INLINE_VALUE_WIDTH: f32 = 30.0;
+/// Below this zoom the inline slider rows are not drawn: the egui-native
+/// slider cannot shrink with the row rect (its font and rail come from the
+/// fixed style), so half-size rows only overflow the box. Geometry still
+/// reserves the rows (stable box / port layout while zooming), mirroring the
+/// action-button threshold.
+const INLINE_MIN_ZOOM: f32 = ACTION_MIN_ZOOM;
 /// Timeline box size per output port row (width fixed, height scales).
 const TIMELINE_WIDTH: f32 = 150.0;
 const TIMELINE_ROW_HEIGHT: f32 = 26.0;
@@ -2077,33 +2132,78 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         if !r.intersects(rect) {
             continue;
         }
+        if state.zoom < INLINE_MIN_ZOOM {
+            // The drawn slider shrinks with the row; the egui-native one does
+            // not (fixed style font / rail → it overflowed the box at half
+            // zoom). Below the threshold the rows drop out entirely, like the
+            // action buttons.
+            continue;
+        }
         let row_h = INLINE_ROW_HEIGHT * state.zoom;
         let n = rows.len();
         for (i, (label, param, mut value, min, max)) in rows.into_iter().enumerate() {
             let top = r.bottom() - (n - i) as f32 * row_h;
+            let row =
+                Rect::from_min_max(Pos2::new(r.left(), top), Pos2::new(r.right(), top + row_h));
+            let (label_pos, rail, value_pos, hit) = inline_row_parts(row, state.zoom);
             painter.text(
-                Pos2::new(r.left() + INLINE_INSET * state.zoom, top + row_h * 0.5),
+                label_pos,
                 egui::Align2::LEFT_CENTER,
                 &label,
-                FontId::proportional((9.0 * state.zoom).max(5.0)),
+                FontId::proportional(9.0 * state.zoom),
                 Color32::from_gray(190),
             );
-            let slider_rect = Rect::from_min_max(
-                Pos2::new(
-                    r.left() + (INLINE_INSET + INLINE_LABEL_WIDTH) * state.zoom,
-                    top + 1.0,
-                ),
-                Pos2::new(r.right() - INLINE_INSET * state.zoom, top + row_h - 2.0),
+            // Rail with a filled run up to the handle, then the handle dot —
+            // every measure multiplied by the zoom so the row stays inside
+            // its rect at any scale.
+            let t = inline_ratio(value, min, max) as f32;
+            let handle_x = rail.left() + t * rail.width();
+            let mid_y = rail.center().y;
+            painter.line_segment(
+                [
+                    Pos2::new(rail.left(), mid_y),
+                    Pos2::new(rail.right(), mid_y),
+                ],
+                Stroke::new(2.0 * state.zoom, Color32::from_gray(80)),
             );
-            let slider = egui::Slider::new(&mut value, min..=max).show_value(true);
-            let resp = ui.put(slider_rect, slider);
-            if resp.changed() {
-                actions.push(PatchAction::SetInlineParam {
-                    node: doc_id,
-                    param,
-                    value: value as f32,
-                });
+            if t > 0.0 {
+                painter.line_segment(
+                    [Pos2::new(rail.left(), mid_y), Pos2::new(handle_x, mid_y)],
+                    Stroke::new(2.0 * state.zoom, Color32::from_gray(160)),
+                );
             }
+            painter.circle_filled(
+                Pos2::new(handle_x, mid_y),
+                (4.0 * state.zoom).max(1.5),
+                Color32::from_gray(215),
+            );
+            painter.text(
+                value_pos,
+                egui::Align2::RIGHT_CENTER,
+                fmt_inline_value(value, min, max),
+                FontId::proportional(9.0 * state.zoom),
+                Color32::from_gray(200),
+            );
+            // Real widget over the painted row (same pointer priority as the
+            // action buttons): press here drags the handle, never the node.
+            let mut resp = ui.allocate_rect(hit, Sense::click_and_drag());
+            if resp.dragged() || resp.clicked() {
+                if let Some(sp) = resp.interact_pointer_pos() {
+                    let width = rail.width();
+                    if width > 0.0 {
+                        let k = ((sp.x - rail.left()) / width).clamp(0.0, 1.0) as f64;
+                        value = min + k * (max - min);
+                        actions.push(PatchAction::SetInlineParam {
+                            node: doc_id,
+                            param,
+                            value: value as f32,
+                        });
+                    }
+                }
+            }
+            resp = resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+            let _ =
+                resp.on_hover_text(format!("{} = {}", label, fmt_inline_value(value, min, max)));
         }
     }
 
@@ -2742,6 +2842,47 @@ mod tests {
         let (v, min, max) = inline_doc_value(&mixer, InlineParam::MixerOutPan);
         assert_eq!(v, -0.5);
         assert_eq!((min, max), (-1.0, 1.0));
+    }
+
+    #[test]
+    fn inline_value_format_follows_span() {
+        // -1..=1-style spans get two decimals (pan / gain / mix rows).
+        assert_eq!(fmt_inline_value(0.25, -1.0, 1.0), "0.25");
+        // Tens-wide spans get one decimal.
+        assert_eq!(fmt_inline_value(1.234, 0.0, 10.0), "1.2");
+        // Hertz-wide spans stay integral (cutoff 20..=20000).
+        assert_eq!(fmt_inline_value(440.4, 20.0, 20000.0), "440");
+        // Degenerate range still yields a finite handle position.
+        assert_eq!(inline_ratio(7.0, 3.0, 3.0), 0.5);
+        assert_eq!(inline_ratio(-5.0, 0.0, 1.0), 0.0);
+        assert_eq!(inline_ratio(5.0, 0.0, 1.0), 1.0);
+    }
+
+    #[test]
+    fn inline_row_parts_stay_inside_the_row() {
+        // A zoom-1 row of one synth node box: label, rail and value must all
+        // fit, and the hit rect must not reach the label column or spill
+        // past the row. This is the drawn-slider contract the egui-native
+        // one broke (fixed style font / rail → overflow at low zoom).
+        for z in [1.0f32, ACTION_MIN_ZOOM, 1.75] {
+            let row = Rect::from_min_size(
+                Pos2::new(100.0, 200.0),
+                Vec2::new(150.0 * z, INLINE_ROW_HEIGHT * z),
+            );
+            let (label, rail, value, hit) = inline_row_parts(row, z);
+            assert!(label.x > row.left() && label.x < rail.left() + 1.0);
+            assert!(rail.left() >= row.left() && rail.right() <= row.right());
+            assert!(rail.top() >= row.top() && rail.bottom() <= row.bottom());
+            assert!(value.x <= row.right() + 0.5 && value.x > rail.right());
+            assert_eq!(hit.left(), rail.left(), "hit starts at the rail");
+            assert!(hit.right() <= row.right());
+            assert!(hit.top() >= row.top() && hit.bottom() <= row.bottom());
+            // The label column is not part of the hit rect: pressing it
+            // drags the node, not the parameter.
+            assert!(hit.left() >= row.left() + (INLINE_INSET + INLINE_LABEL_WIDTH) * z - 0.5);
+            // The rail keeps a positive width even at the smallest zoom.
+            assert!(rail.width() > 10.0, "rail too narrow at zoom {z}");
+        }
     }
 
     #[test]
