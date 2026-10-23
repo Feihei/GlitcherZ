@@ -903,7 +903,7 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
 }
 
 /// Short label for an automation cable endpoint parameter.
-fn auto_param_label(param: &AutoParam) -> String {
+pub(crate) fn auto_param_label(param: &AutoParam) -> String {
     match param {
         AutoParam::TrackGain => "Volume".to_string(),
         AutoParam::TrackPan => "Pan".to_string(),

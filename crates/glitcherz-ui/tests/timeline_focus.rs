@@ -153,6 +153,7 @@ impl Fixture {
                         loop_range: &loop_range,
                         markers: &[],
                         bar_ticks: glitcherz_model::TICKS_PER_BAR,
+                        curve_param: None,
                     },
                     router,
                 );

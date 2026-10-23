@@ -42,16 +42,16 @@ use glitcherz_engine::realtime::{
     RtControlClip, RtMidiClip, RtNote, SequencerCommand, Sf2VoiceProcessor, SynthProcessor,
 };
 use glitcherz_model::{
-    AutoParam, CableKind, ControlClip, ControlTrack, DelayParams, GraphDoc, MAX_AUTO_TRACKS,
-    MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES,
-    MIN_MIXER_CHANNELS, Marker, MidiClip, MidiSource, MidiTrack, NodeDoc, PortRef, Project,
-    SongLoop, SynthParams, VoiceSpec,
+    AutoParam, AutoPoint, CableKind, ControlClip, ControlTrack, DelayParams, GraphDoc,
+    MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS,
+    MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip, MidiSource, MidiTrack, NodeDoc, PortRef,
+    Project, SongLoop, SynthParams, VoiceSpec,
 };
 
+pub mod curve;
 pub mod event_list;
 pub mod focus;
 pub mod grid;
-pub mod lane;
 pub mod patch;
 pub mod piano_roll;
 pub mod plugin_catalog;
@@ -611,21 +611,15 @@ fn master_meter(ui: &mut egui::Ui, levels: [f32; 2]) {
     response.on_hover_text(format!("L {left} dB · R {right} dB"));
 }
 
-/// Which clip the floating editor window (piano roll / curve lane) targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EditTarget {
-    Midi { track: usize, clip: usize },
-    Control { track: usize, clip: usize },
-}
-
 /// Main view switch (tab bar under the transport panel).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum MainView {
     /// Arrangement timeline (default view: the DAW's home screen).
     #[default]
     Timeline,
-    /// Clip editor (piano roll / curve lane) for the targeted clip;
-    /// double-clicking a clip in the timeline jumps here.
+    /// Piano roll for the targeted MIDI clip; double-clicking a MIDI clip in
+    /// the timeline jumps here. Control curves have no view of their own —
+    /// they are edited in the timeline's inline band (U4b D10).
     Edit,
     /// Node patch graph (full-height, dedicated view).
     Patch,
@@ -682,16 +676,16 @@ pub struct GlitcherZApp {
     selected_auto: usize,
     /// Arrangement timeline cross-frame state (zoom/drag).
     timeline_state: timeline::TimelineState,
-    /// Which clip the floating editor window is targeting (`None` = closed).
-    edit_clip: Option<EditTarget>,
+    /// Which MIDI clip the Edit tab is targeting, as `(track, clip)`
+    /// (`None` = closed). Control clips have no editor view: their curve
+    /// lives in the timeline's inline band (U4b D10).
+    edit_clip: Option<(usize, usize)>,
     /// Piano roll cross-frame state (scroll/drag).
     roll_state: piano_roll::RollState,
     /// Hover-follow keyboard focus arbiter (Blender-style context; see
     /// `focus.rs`). Keyboards surfaces register each frame; the decision is
     /// applied at the start of the next frame.
     focus_router: focus::FocusRouter,
-    /// Automation lane cross-frame state (drag).
-    lane_state: lane::LaneState,
     /// Node patch cross-frame state (pan/zoom/selection/drag).
     patch_state: patch::PatchState,
     /// Active main view (tab bar).
@@ -901,7 +895,6 @@ impl GlitcherZApp {
             edit_clip: None,
             roll_state: piano_roll::RollState::new(),
             focus_router: focus::FocusRouter::new(),
-            lane_state: lane::LaneState::default(),
             patch_state: patch::PatchState::default(),
             view: MainView::default(),
             octave_base: 60,
@@ -2837,7 +2830,7 @@ impl GlitcherZApp {
     pub fn undo(&mut self) {
         // Undo/redo invalidates every held index: drag, selection, marquee.
         self.roll_state.clear_gesture();
-        self.lane_state.clear_drag();
+        self.timeline_state.set_curve_drag(None);
         if self.session.undo() {
             // Undo can restore any kind of edit (a deleted node, a rerouted
             // cable), so the engine gets the full rebuild, not just clip
@@ -2852,7 +2845,7 @@ impl GlitcherZApp {
     pub fn redo(&mut self) {
         // Undo/redo invalidates every held index: drag, selection, marquee.
         self.roll_state.clear_gesture();
-        self.lane_state.clear_drag();
+        self.timeline_state.set_curve_drag(None);
         if self.session.redo() {
             self.apply_document();
         } else {
@@ -2933,7 +2926,6 @@ impl GlitcherZApp {
         self.edit_clip = None;
         self.roll_state = piano_roll::RollState::new();
         self.timeline_state = timeline::TimelineState::default();
-        self.lane_state = lane::LaneState::default();
         self.patch_state = patch::PatchState::default();
         self.held_notes.clear();
         self.push_all_params();
@@ -4049,18 +4041,12 @@ impl GlitcherZApp {
         let playing = self.engine.is_playing();
         let selected_track = self.selected_track;
         let selected_auto = self.selected_auto;
-        let edit_target = self.edit_clip.map(|t| match t {
-            EditTarget::Midi { track, clip } => timeline::EditHighlight {
-                is_control: false,
-                track,
-                clip,
-            },
-            EditTarget::Control { track, clip } => timeline::EditHighlight {
-                is_control: true,
-                track,
-                clip,
-            },
-        });
+        let edit_target = self
+            .edit_clip
+            .map(|(track, clip)| timeline::EditHighlight { track, clip });
+        // U4b: the selected control track's endpoint parameter drives the
+        // inline band's vertical axis. Read before the destructuring below.
+        let curve_param = self.project().graph.auto_endpoint(selected_auto);
         let actions = {
             let Self {
                 session,
@@ -4087,6 +4073,7 @@ impl GlitcherZApp {
                     markers: &project.metadata.markers,
                     // U3a: the document's bar length, not the 4/4 constant.
                     bar_ticks: project.ticks_per_bar(),
+                    curve_param: curve_param.as_ref(),
                 },
                 router,
             )
@@ -4112,13 +4099,26 @@ impl GlitcherZApp {
             timeline::TimelineAction::OpenMidiEditor { track, clip } => {
                 self.selected_track = track;
                 // Double-click jumps straight to the editor.
-                self.set_edit_target(EditTarget::Midi { track, clip });
+                self.set_edit_target(track, clip);
                 self.view = MainView::Edit;
             }
-            timeline::TimelineAction::OpenControlEditor { track, clip } => {
+            // U4b D10: a control clip has no editor view. Double-clicking it
+            // opens the inline curve band under its own row instead.
+            timeline::TimelineAction::ShowControlCurve { track } => {
                 self.selected_auto = track;
-                self.set_edit_target(EditTarget::Control { track, clip });
-                self.view = MainView::Edit;
+                self.edit_clip = None;
+            }
+            timeline::TimelineAction::CurvePoint {
+                track,
+                clip,
+                from,
+                tick,
+                value,
+                dragging,
+            } => self.timeline_curve_point(track, clip, from, tick, value, dragging),
+            timeline::TimelineAction::CurveDragEnd => self.end_param_edit(),
+            timeline::TimelineAction::CurveRemove { track, clip, tick } => {
+                self.timeline_curve_remove(track, clip, tick)
             }
             timeline::TimelineAction::AddMidiTrack => self.add_midi_track(),
             timeline::TimelineAction::RemoveLastMidiTrack => self.remove_last_midi_track(),
@@ -4379,6 +4379,66 @@ impl GlitcherZApp {
         if removed {
             self.commit_edit("Delete Clip", before);
             self.sync_clip_row(is_control, track);
+        }
+    }
+
+    /// U4b inline curve band: insert an anchor, or move the one at `from` to
+    /// `tick` (one frame of a drag).
+    ///
+    /// `dragging` frames go through the merged undo gesture (one Ctrl+Z for a
+    /// whole drag); a click lands a single step.
+    fn timeline_curve_point(
+        &mut self,
+        track: usize,
+        clip: usize,
+        from: Option<u32>,
+        tick: u32,
+        value: f32,
+        dragging: bool,
+    ) {
+        let Some(loop_ticks) = self
+            .project()
+            .control_tracks
+            .get(track)
+            .and_then(|t| t.clips.get(clip))
+            .map(|c| c.loop_ticks.max(1))
+        else {
+            return;
+        };
+        // Anchors are stored in loop space: the band repeats them across the
+        // clip, so a tick past the loop would neither draw nor play.
+        let tick = tick.min(loop_ticks - 1);
+        let before = self.begin_edit();
+        let curve = &mut self.project_mut().control_tracks[track].clips[clip];
+        // A move drops the old anchor first; on the same tick the upsert
+        // below already overwrites it.
+        if let Some(from) = from
+            && from != tick
+        {
+            curve.remove_near(from, 0);
+        }
+        curve.upsert_point(AutoPoint { tick, value });
+        if dragging {
+            self.commit_param_edit("Edit Anchor", before, &format!("curve:{track}:{clip}"));
+        } else {
+            self.commit_edit("Add Anchor", before);
+        }
+        self.send_control_clips(track);
+    }
+
+    /// U4b inline curve band: right-click deletes the nearest anchor within
+    /// half a snap step of `tick` (clip-relative).
+    fn timeline_curve_remove(&mut self, track: usize, clip: usize, tick: u32) {
+        let before = self.begin_edit();
+        let removed = self
+            .project_mut()
+            .control_tracks
+            .get_mut(track)
+            .and_then(|t| t.clips.get_mut(clip))
+            .is_some_and(|c| c.remove_near(tick, crate::curve::SNAP_TICKS / 2));
+        if removed {
+            self.commit_edit("Delete Anchor", before);
+            self.send_control_clips(track);
         }
     }
 
@@ -4700,15 +4760,15 @@ impl GlitcherZApp {
                         self.project().midi_tracks[track].name.clone()
                     };
                     if ui.button(format!("Edit {name} · clip 1")).clicked() {
-                        self.set_edit_target(EditTarget::Midi { track, clip: 0 });
+                        self.set_edit_target(track, 0);
                     }
                 }
             });
             return;
         };
-        egui::ScrollArea::vertical().show(ui, |ui| match target {
-            EditTarget::Midi { track, clip } => self.midi_editor_body(ui, track, clip),
-            EditTarget::Control { track, clip } => self.control_editor_body(ui, track, clip),
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let (track, clip) = target;
+            self.midi_editor_body(ui, track, clip);
         });
     }
 
@@ -6271,7 +6331,7 @@ impl GlitcherZApp {
         self.project_mut().midi_tracks.pop();
         self.selected_track = self.selected_track.min(last.saturating_sub(1));
         // The editor may have targeted the removed track's clip.
-        if let Some(EditTarget::Midi { track, .. }) = self.edit_clip
+        if let Some((track, _)) = self.edit_clip
             && track == last
         {
             self.edit_clip = None;
@@ -6331,7 +6391,7 @@ impl GlitcherZApp {
         if self.selected_track < len {
             self.selected_track = perm[self.selected_track];
         }
-        if let Some(EditTarget::Midi { track, .. }) = &mut self.edit_clip
+        if let Some((track, _)) = &mut self.edit_clip
             && *track < len
         {
             *track = perm[*track];
@@ -6345,11 +6405,12 @@ impl GlitcherZApp {
         self.commit_edit("Reorder Tracks", before);
     }
 
-    /// Points the Edit tab at `target`, dropping any in-flight roll gesture:
-    /// selection indices refer to the clip that was being edited.
-    fn set_edit_target(&mut self, target: EditTarget) {
+    /// Points the Edit tab at the MIDI clip `(track, clip)`, dropping any
+    /// in-flight roll gesture: selection indices refer to the clip that was
+    /// being edited.
+    fn set_edit_target(&mut self, track: usize, clip: usize) {
         self.roll_state.clear_gesture();
-        self.edit_clip = Some(target);
+        self.edit_clip = Some((track, clip));
     }
 
     /// Body of the piano-roll editor (Edit tab): edits the targeted clip,
@@ -6392,20 +6453,14 @@ impl GlitcherZApp {
                 .on_hover_text("Previous clip")
                 .clicked()
             {
-                self.set_edit_target(EditTarget::Midi {
-                    track: sel,
-                    clip: clip_index - 1,
-                });
+                self.set_edit_target(sel, clip_index - 1);
             }
             if ui
                 .add_enabled(clip_index + 1 < clip_count, egui::Button::new("→"))
                 .on_hover_text("Next clip")
                 .clicked()
             {
-                self.set_edit_target(EditTarget::Midi {
-                    track: sel,
-                    clip: clip_index + 1,
-                });
+                self.set_edit_target(sel, clip_index + 1);
             }
             if ui.button("× Close").clicked() {
                 self.edit_clip = None;
@@ -6705,8 +6760,8 @@ impl GlitcherZApp {
     ///
     /// Lives in the **timeline**, not the Inspector: adding a curve creates a
     /// track, and picking which parameter a curve drives is track-level state.
-    /// The curves themselves are edited in the Edit tab (double-click a
-    /// control clip).
+    /// The curves themselves are edited in the timeline's inline band (U4b):
+    /// select a control track, or double-click one of its clips.
     fn automation_strip(&mut self, ui: &mut egui::Ui) {
         let auto_count = self.project().control_tracks.len();
         ui.horizontal(|ui| {
@@ -6733,7 +6788,9 @@ impl GlitcherZApp {
             let index = self.selected_auto.min(auto_count - 1);
             ui.weak(format!("Track {}", index + 1));
             self.auto_target_row(ui, index);
-            ui.weak("Click lane to add anchor · drag to move · right-click to delete");
+            ui.weak(
+                "Band under the row: click to add an anchor · drag to move · right-click to delete",
+            );
         });
     }
 
@@ -6984,143 +7041,6 @@ impl GlitcherZApp {
                 self.set_auto_endpoint(index, AutoTarget::Node(doc), AutoParam::cc(cc, ch));
             }
         }
-    }
-
-    /// Body of the curve editor (Edit tab): edits the targeted control clip,
-    /// pushes edits to the audio thread immediately.
-    fn control_editor_body(&mut self, ui: &mut egui::Ui, index: usize, clip_index: usize) {
-        if self.project().control_tracks.is_empty() {
-            // The target track was removed underneath the editor.
-            self.edit_clip = None;
-            return;
-        }
-        let playhead = self.engine.musical_ticks();
-        let playing = self.engine.is_playing();
-        // Header: track name + clip navigation + close.
-        let track_count = self.project().control_tracks.len();
-        let index = index.min(track_count.saturating_sub(1));
-        let track_name = self
-            .project()
-            .control_tracks
-            .get(index)
-            .map(|t| {
-                if t.name.is_empty() {
-                    format!("Control {}", index + 1)
-                } else {
-                    t.name.clone()
-                }
-            })
-            .unwrap_or_else(|| format!("Control {}", index + 1));
-        let clip_count = self
-            .project()
-            .control_tracks
-            .get(index)
-            .map(|t| t.clips.len())
-            .unwrap_or(0);
-        let clip_index = if clip_count == 0 {
-            0
-        } else {
-            clip_index.min(clip_count - 1)
-        };
-        ui.horizontal(|ui| {
-            ui.label(format!(
-                "{track_name} · clip {} (of {clip_count})",
-                clip_index + 1
-            ));
-            if ui
-                .add_enabled(clip_index > 0, egui::Button::new("←"))
-                .on_hover_text("Previous clip")
-                .clicked()
-            {
-                self.set_edit_target(EditTarget::Control {
-                    track: index,
-                    clip: clip_index - 1,
-                });
-            }
-            if ui
-                .add_enabled(clip_index + 1 < clip_count, egui::Button::new("→"))
-                .on_hover_text("Next clip")
-                .clicked()
-            {
-                self.set_edit_target(EditTarget::Control {
-                    track: index,
-                    clip: clip_index + 1,
-                });
-            }
-            if ui.button("× Close").clicked() {
-                self.edit_clip = None;
-            }
-        });
-        let axis_param = self
-            .project()
-            .graph
-            .auto_endpoint(index)
-            .unwrap_or_default();
-        if self
-            .project()
-            .control_tracks
-            .get(index)
-            .is_none_or(|t| t.clips.is_empty())
-        {
-            let before = self.begin_edit();
-            self.project_mut().control_tracks[index]
-                .clips
-                .push(glitcherz_model::ControlClip::new(0));
-            self.commit_edit("New Clip", before);
-            self.send_control_clips(index);
-            return;
-        }
-        let intent = {
-            // Destructured: `project()` borrows all of `self`, which would
-            // collide with the `&mut self.lane_state` below.
-            let Self {
-                session,
-                lane_state,
-                ..
-            } = self;
-            let clip = &session.project().control_tracks[index].clips[clip_index];
-            lane::show(
-                ui,
-                clip,
-                &axis_param,
-                clip.loop_ticks,
-                playhead,
-                playing,
-                lane_state,
-            )
-        };
-        let Some(intent) = intent else {
-            return;
-        };
-        // Apply the intent undoably. A drag frame merges into one undo step;
-        // the new anchor index is fed back so the drag keeps tracking it.
-        let before = self.begin_edit();
-        let new_drag = match intent {
-            lane::LaneIntent::UpsertPoint { tick, value } => {
-                let clip = &mut self.project_mut().control_tracks[index].clips[clip_index];
-                clip.upsert_point(glitcherz_model::AutoPoint { tick, value });
-                let at = clip.curve.iter().position(|p| p.tick == tick);
-                let dragging = self.lane_state.is_dragging();
-                if dragging {
-                    self.commit_param_edit(
-                        "Edit Anchor",
-                        before,
-                        &format!("lane:{index}:{clip_index}"),
-                    );
-                } else {
-                    self.commit_edit("Add Anchor", before);
-                }
-                at
-            }
-            lane::LaneIntent::RemoveNear { tick } => {
-                let clip = &mut self.project_mut().control_tracks[index].clips[clip_index];
-                clip.remove_near(tick, lane::SNAP_TICKS / 2);
-                self.commit_edit("Delete Anchor", before);
-                None
-            }
-        };
-        self.lane_state.set_drag(new_drag);
-        self.send_control_clips(index);
     }
 }
 
