@@ -36,13 +36,15 @@
 | 插件宿主 | plugin host | CLAP / VST3 适配层统称 |
 | 实例化 | instantiate | 非实时线程上创建插件实例 |
 | 扫描 | scan | 枚举磁盘上的插件描述 |
-| 插件目录 | plugin catalog | 扫描结果的内存表（`PluginEntry` 列表 + Recent）；spec `plugin-browser.md` |
+| 插件目录 | plugin catalog | 扫描结果的内存表（`PluginEntry` 列表）；Recent 另存 UI 状态；spec `plugin-browser.md` |
 | 插件条目 | plugin entry | catalog 的一条 `(format, path, id)`；一个模块可出多条（VST3 多 class） |
 | 插件浏览器 | plugin browser | 添加/换源用的层级菜单 + 可搜索选择器整体 |
-| 浏览选择器 | picker | 带过滤框的浮层列表（`PickerMode` 两态：Add / Insert） |
+| 浏览选择器 | picker | 带过滤框的浮层列表（`PickFilter` 收窄类别/格式；E3 只有 Add 一态，E4 增 Insert） |
 | 过滤框 | filter field | picker 顶部单行输入，分词 AND 匹配 name + path |
 | 添加菜单 | add menu | patch 右键的多级菜单（类别 → 格式 → 条目） |
 | 换声源 | swap source | 删节点 + 添加新节点，**不迁移参数**（无 Replace 动作，2026-10-22 定）；不写 replace source |
+| 最近使用 | recent | picker 空查询时置顶的每类 5 条历史选择，存 eframe storage |
+| 节点源 | node source | 节点出生时携带的最终声源（`NodeSource`，插件条目已含身份），取代旧的 `AddNodeKind`；不写 add node kind |
 
 ## 音频处理
 

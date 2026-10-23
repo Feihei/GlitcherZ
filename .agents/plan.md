@@ -207,8 +207,8 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 
 - [x] **E1 目录与缓存内核** ✅ 2026-10-22：`glitcherz-ui/src/plugin_catalog.rs`（`PluginFormat`/`PluginEntry`/`PluginCache`/`CandidateFile::stat`/`collect_from_disk`/`plan_refresh`/`merge`+`sort_entries`/`view`/`encode`+`decode`），纯函数 8 项单测；ui crate 增 `ron` 依赖。全仓 482 测试绿
 - [x] **E2 扫描接线** ✅ 2026-10-22：`PluginCatalog` 状态机 + 帧尾单模块推进（`upcoming` 文案 = 队首，挂住时可定位）+ 顶部进度条 + `storage.set_string("plugin_cache")` 持久化 + patch 右键 `Rescan Plug-ins`；四个惰性扫描缓存删除。全仓 484 测试绿，热启动零 dylib 加载实测通过
-- [ ] **E3 picker 与菜单**：`plugin_picker.rs` 浮层（过滤 + 键盘 + Recent）+ `Add` 三级结构 + 全局 `Search plugins…`
-- [ ] **E4 创建路径重构**：`NodeCategory` / `NodeSource` 拆分、一次 install、连线中点 `Insert` 复用 picker
+- [x] **E3 picker 与菜单** ✅ 2026-10-23：`plugin_picker.rs` 浮层（`PickFilter` + 过滤框 + ↑↓/Enter/Esc + Recent 分组 + `Show all plug-ins…`）+ `Add` 三级菜单 + 全局 `Search Plug-ins…`；同批落地 `NodeCategory` / `NodeSource`（取代 `AddNodeKind`）与 `create_patch_node(source)` 单次 install（插件装不起来即回滚，不留空壳）；Recent 存 `UiState` 跨会话。8 项单测（4 项 headless egui 帧驱动），全仓 492 测试绿
+- [ ] **E4 连线中点 Insert 复用 picker**：cable 中点菜单改 `Insert ▸ Effect ▸ Built-in Delay / CLAP… / VST3… / Mixer`，picker 增 `Insert` 态；验收一步 undo + §7 不变式
 - [ ] **E5 Inspector 收口**：删源选择行与 effects 快捷加载、`Clear All Effects` 挪位
 
 与 U 系列的关系：E1–E5 建议**先于 U8** 落地（U8 的"源选择"项由本 spec 接管，E5 与 U8 剩余项可合并收口）。

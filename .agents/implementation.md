@@ -394,3 +394,27 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 **Rescan**：patch 右键菜单底部的 `Rescan Plug-ins` → `PatchAction::RescanPlugins` → `PluginCatalog::rescan()`（塞一个空缓存，`dirs` 不匹配 ⇒ 全量）。E3 重写添加菜单时该项随之搬走。
 
 **实测**：冷启动扫描期间日志里能看到 Cardinal 的 CLAP 描述符枚举会拉起整套 Rack 上下文（`Creating module widget ...`，约 140 ms）——正是"启动时一次性付清"优于"点开菜单才付"的实例。热启动（缓存命中）**零 dylib 加载**：第二次运行 `RUST_LOG=info` 输出中 Cardinal/Rack 日志条数为 0。
+
+### 插件选择器与添加菜单（U9 E3，spec `plugin-browser.md`，2026-10-23）
+
+**模块切分**：`glitcherz-ui/src/plugin_picker.rs` 只有浮层与它的纯函数（`PickFilter` / `PickChoice` / `RecentPlugin` / `matches_query` / `visible` / `visible_recents` / `remember`），数据源仍是 `plugin_catalog` 的条目表 —— picker 不碰磁盘、不实例化插件。**菜单**在 `patch.rs`（`PatchAction::OpenPluginPicker` / `PickSoundFont`），**建节点**在 `lib.rs`（`create_patch_node(NodeSource, at)`）—— 三者只通过 action 通信，patch 依旧零副作用。
+
+**为什么是 `Area` 而不是 `menu_button`**：叶子层要放 `TextEdit` + 滚动区 + 键盘导航，egui 原生 submenu 对这三样都不友好（spec D4）。popup 用 `Order::Foreground`，`constrain_to(ctx.content_rect())` 保证不出屏。**注意 `ctx.screen_rect()` 在 egui 0.36 已改名 `content_rect()`**。
+
+**键盘归属**（易踩点）：
+- `TextEdit` 的 `event_filter` 默认包含 `vertical_arrows`，单行框也会吃掉 ↑↓；所以 picker **先** `input_mut(|i| i.consume_key(...))` 读走 ↑↓/Enter/Esc，**再**画输入框。`consume_key` 只标记 consumed（`filtered_events` 不过滤 consumed），因此真正让 Enter 不被输入框吞掉的是 `.return_key(None)` —— 单行框默认把 Enter 当"结束输入"（`transition: surrender_focus`）。
+- 输入框用固定 `Id`（`query_id()`）：egui 自动生成的 id 会随 popup 位置变化，导致开帧 `request_focus` 落空、下一帧丢焦点。
+- 打开帧的点击/`Esc` 必须忽略一次（`just_opened` 标志）：开菜单那一下的 pointer click 与新 popup 的"点击外部关闭"是同一帧同一事件，不设这道闸，popup 会自己关掉。
+- picker 打开时 `handle_keyboard_input` 整段跳过，否则空格（播放）/Delete 会穿透到走带与 patch。
+
+**行渲染**：22 px 的 `allocate_exact_size` + `Sense::click()` 自绘背景，`ui.new_child(max_rect)` 里左 `Label::truncate()`（宽度 = 总宽 − 格式标签宽）、右 `right_to_left` 布局放 `CLAP`/`VST3` 小字标签；`response.on_hover_text(path)` 给全路径。Recent 段与 All 段共用同一份行列表，键盘高亮索引因此天然连续（`rows` 每帧重建，选中索引 clamp）。
+
+**单次 install（D1）**：`NodeSource` 扁平枚举（`BuiltinSynth` / `BuiltinDelay` / `SoundFont` / `ClapInstrument` / `Vst3Instrument` / `ClapEffect` / `Vst3Effect` / `Mixer` / `Feedback` / `Keyboard`）直接给出 `VoiceSpec`，`create_patch_node` push 文档后**只调一次** `install_node`。旧路径"先建内置、再从面板换装"的两次 install + 一次回收消失。
+
+**失败即回滚**：`install_node` 对插件加载失败是**静默降级**（回落到 SynthProcessor / DelayProcessor），因此新节点若"声称是插件"却在 `voice_guards` 里找不到自己的 engine_id，就当失败处理：`session.restore(before)` + 状态栏报错，文档不留空壳。SoundFont 不在此列（缺文件回落到内置声源是既定语义，`sf2-loader.md` D8）。
+
+**Recent（D10）**：`UiState.recent_plugins`（`#[serde(default)]`，跨会话）。`remember()` 按 `(format, path, id)` 去重后插到队首，再按 `is_instrument` 各自截断 5 条。点 Recent 里的条目即使插件已被卸载也会尝试实例化 —— 失败走上面的回滚路径并报错，比藏起来更可诊断。
+
+**测试**：8 项单测。4 项用 `ctx.run_ui(RawInput)` 跑 headless 帧（键盘选取、Esc 取消、Recent 置顶、开帧点击不自关），不需要窗口/显示后端 —— 与 `tests/egui_event_semantics.rs` 同一套路，可回归"popup 在真实帧循环里能画出并返回结果"。
+
+**已知未做（E4）**：连线中点仍是 `Insert Effect (Delay) / Insert Mixer` 两项，`PickerMode::Insert` 随 E4 落地。

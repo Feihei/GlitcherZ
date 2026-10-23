@@ -196,27 +196,33 @@ Add ▸ 🔍 Search plugins…                 ← D5 全局，跨类别
 | 键盘 | `↑`/`↓` 移动高亮（初始第 0 行）、`Enter` 确认——输入框聚焦时仍拦截 |
 | 选中 | 关闭 → 建节点；状态栏 `Loading <name>…` + `ctx.request_repaint()`（实例化同步，D13） |
 
-两处复用（D3 取消换源后只剩两态）：
+两处复用（D3 取消换源后剩两态；E3 只落 `Add`，`Insert` 随 E4）：
 
 ```rust
 pub enum PickerMode {
     Add { category: NodeCategory, at: Pos2 },
-    Insert { cable: usize, at: Pos2 },   // 连线中点
+    Insert { cable: usize, at: Pos2 },   // 连线中点（E4）
 }
 ```
 
 ## 7 节点创建路径
 
-`AddNodeKind` 现在的语义是"类别 + 具体"混装（`Instrument` / `Effect` / `Mixer` / `VirtualKeyboard` / `Feedback`，`patch.rs:201-217`）。拆成两层：
+`AddNodeKind` 现在的语义是"类别 + 具体"混装（`Instrument` / `Effect` / `Mixer` / `VirtualKeyboard` / `Feedback`，`patch.rs:201-217`）。拆成类别（菜单第一层）与**节点源**（最终声源）：
 
 ```rust
-pub enum NodeCategory { Instrument, Effect, Utility }
+pub enum NodeCategory { Instrument, Effect }
 
+// E3 实际落地形态：插件源按"乐器/效果"分成显式变体 —— install_node 的
+// Instrument / Effect 分支需要的 VoiceSpec 形状不同，扁平枚举让
+// create_patch_node 的 match 一眼可读（无需再交叉查 category）。
 pub enum NodeSource {
-    Builtin(BuiltinId),                    // BuiltinId::Synth | BuiltinId::Delay
-    SoundFont { path: String, bank: u8, program: u8 },
-    Clap { path: String, plugin_id: String },
-    Vst3 { path: String, class_id: String },
+    BuiltinSynth,
+    BuiltinDelay,
+    SoundFont { path: String },                              // bank 0 / program 0
+    ClapInstrument { path: String, plugin_id: String },
+    Vst3Instrument { path: String, class_id: String },
+    ClapEffect { path: String, plugin_id: String },
+    Vst3Effect { path: String, class_id: String },
     Mixer,
     Feedback,
     Keyboard,
@@ -273,8 +279,8 @@ Q3 推荐理由：缓存是**派生数据**，不需要用户可见、不需要�
 
 - [x] **E1 目录与缓存内核**（不接 UI）✅ 2026-10-22：`crates/glitcherz-ui/src/plugin_catalog.rs` —— `PluginFormat` / `PluginEntry` / `PluginCache`（`version` + 打标签的 `dirs` `"<format>:<path>"`）/ `CandidateFile::stat`（`mtime_ms` + `size`）/ `collect_from_disk`（唯一读盘入口，`clap_search_paths`+`scan_clap_files` / `vst3_search_paths`+`scan_vst3_files`，目录与候选各自去重）/ `plan_refresh`（按模块路径分组：一个模块的多个 class 同生共死；mtime/size 命中即 keep；版本或目录集变化 → 全量 + 老路径进 `removed`）/ `merge` + `sort_entries`（`sort_by_cached_key`：name 小写 → format → path → id）/ `view`（格式 × 乐器查询期分流）/ `encode`/`decode`（RON）。8 项单测：多 class 保持、mtime/size 变更、新增+消失、版本与目录集失效、候选去重、排序（大小写与 format 次序）、RON 往返 + 垃圾输入、view 分区。`glitcherz-ui` 增 `ron` 依赖；全仓 fmt/clippy/test 绿（482 项）
 - [x] **E2 扫描接线** ✅ 2026-10-22：`PluginCatalog` 状态机（`load` / `with_snapshot` / `upcoming` / `take_next` / `accept` / `progress` / `is_scanning` / `rescan` / `to_cache`）+ `scan_module`（按格式调 `list_*_plugins_in`，失败得空、进度照走）；`ui()` 开头画 `TopBottomPanel` 进度条（文案 = **队首**模块名，D14 的可观测性保证），帧尾扫一个模块并 `request_repaint`；四个惰性 `Option` 删除，菜单改走 `plugin_entries` / `plugin_empty_hint`；`save()` 用 `storage.set_string("plugin_cache")` 持久化（部分缓存合法）；patch 右键底部加 `Rescan Plug-ins`（`PatchAction::RescanPlugins`，E3 搬家）。单测 +2（pending 推进/进度/失败仍推进、warm 缓存即空闲），全仓 484 项绿。实测：热启动零 dylib 加载（Cardinal/Rack 日志条数 0），冷启动可观察 Cardinal 描述符枚举拉起整套 Rack 上下文（~140 ms）
-- [ ] **E3 picker 与菜单**：`plugin_picker.rs`（浮层 + 过滤 + 键盘 + Recent）+ `Add` 菜单三级结构 + 全局 `Search plugins…`；验收：200+ 插件目录下三次以内点击或两三个字符直达
-- [ ] **E4 创建路径重构**：`NodeCategory` / `NodeSource` 拆分、`create_patch_node` 一次 install、连线中点 `Insert` 复用 picker；验收：一步 undo + §7 不变式
+- [x] **E3 picker 与菜单** ✅ 2026-10-23：`plugin_picker.rs`（`PickFilter` / `PickChoice` / `RecentPlugin` / `matches_query` / `visible` / `visible_recents` / `PluginPicker` 浮层：过滤框 + ↑↓/Enter/Esc + Recent 分组 + `Show all plug-ins…` 兜底）+ `patch.rs` 的 `Add` 三级菜单（`Search Plug-ins…` / Instrument{Built-in Synth, SoundFont…, CLAP…, VST3…} / Effect{Built-in Delay, CLAP…, VST3…} / Mixer / Keyboard / Feedback / Rescan）+ `NodeCategory` & `NodeSource`（取代 `AddNodeKind`）+ `create_patch_node(source)` 单次 install（插件实例化失败即回滚，不留空壳）+ Recent 存 `UiState`；8 项单测（含 4 项 headless egui 帧驱动：键盘选取、Esc 取消、Recent 置顶、开帧点击不自关）；全仓 492 项绿
+- [ ] **E4 连线中点 Insert 复用 picker**：cable 中点菜单改为 `Insert ▸ Effect ▸ Built-in Delay / CLAP… / VST3… / Mixer`，picker 增 `Insert` 态（`PickerMode` 回归两态）；验收：一步 undo + §7 不变式（`node_map` 只加 1 条、`retiring_guards` 不增长）。**注**：`NodeCategory` / `NodeSource` 拆分与单次 install 已在 E3 落地（创建路径必须先于 picker 可用）
 - [ ] **E5 Inspector 收口**：删源选择行与 effects 快捷加载、`Clear All Effects` 挪到效果节点列表头部；验收：面板只剩 preset / 参数 / 编辑器 / 内联参数，且删除源选择后无残留缓存字段（`clap_plugins` / `clap_effects` / `vst3_*` 四个 `Option` 应被 `PluginCatalog` 取代）
 
 门槛：`cargo fmt && cargo clippy --workspace -- -D warnings && cargo test --workspace` 全绿；手工验收 Dexed（CLAP）+ 本地 200+ VST3 目录。
