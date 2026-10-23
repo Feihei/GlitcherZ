@@ -212,8 +212,12 @@ impl ExecPlan {
 pub struct GraphLevels {
     /// Peak of each track's channel strip output (post-fader, 0 when muted).
     pub tracks: [f32; MAX_MIDI_TRACKS],
-    /// Master output peak.
+    /// Master output peak, both channels collapsed to their maximum (kept
+    /// for single-bar call sites; the transport meter reads `master_lr`).
     pub master: f32,
+    /// Master output peak per channel, `[L, R]` — the transport's stereo
+    /// meter. A mono output leaves `R` at zero rather than duplicating `L`.
+    pub master_lr: [f32; 2],
 }
 
 /// Runtime node slot: processor + dedicated stereo output buffer.
@@ -230,7 +234,15 @@ pub struct RtGraph {
     slots: [Option<NodeSlot>; MAX_NODES],
     plan: ExecPlan,
     block_size: usize,
+    /// Panic sweep cursor (see [`RtGraph::panic`]): `Some(start)` = the next
+    /// block must release pitches `start..` and advance; `None` = idle.
+    panic_sweep: Option<u8>,
 }
+
+/// Pitches released per block by a panic sweep. Kept below the plugin hosts'
+/// 32-event pending queue (`MAX_PENDING_EVENTS`) so a sweep never crowds out
+/// regular events queued in the same block.
+const PANIC_SWEEP_BATCH: u8 = 24;
 
 /// Structural update payload: one topology change = new execution plan +
 /// incremental installs + incremental removals.
@@ -280,6 +292,7 @@ impl RtGraph {
             slots: std::array::from_fn(|_| None),
             plan: ExecPlan::EMPTY,
             block_size: block_size.max(1),
+            panic_sweep: None,
         }
     }
 
@@ -350,6 +363,9 @@ impl RtGraph {
     /// events → process in place; returns levels.
     /// RT-safe.
     pub fn process_block(&mut self, ctx: &ProcessContext) -> GraphLevels {
+        // A panic started in a previous command boundary continues here
+        // (bounded batch per block, see `panic`).
+        self.drain_panic_sweep();
         let frames = self.block_size.min(ctx.frames);
         for i in 0..self.plan.order_len {
             let s = self.plan.order[i] as usize;
@@ -389,7 +405,8 @@ impl RtGraph {
         for (t, &slot) in self.plan.track_channel.iter().enumerate() {
             levels.tracks[t] = self.slot_peak(slot);
         }
-        levels.master = self.slot_peak(self.plan.master_slot);
+        levels.master_lr = self.slot_peak_lr(self.plan.master_slot);
+        levels.master = levels.master_lr[0].max(levels.master_lr[1]);
         levels
     }
 
@@ -410,6 +427,27 @@ impl RtGraph {
             }
         }
         peak
+    }
+
+    /// Peak of a slot's output per channel, `[L, R]` (0 for an empty slot;
+    /// a mono output reports `[peak, 0]`). RT-safe.
+    fn slot_peak_lr(&self, slot: u16) -> [f32; 2] {
+        let Some(node) = self.slots.get(slot as usize).and_then(|s| s.as_ref()) else {
+            return [0.0; 2];
+        };
+        let mut peaks = [0.0f32; 2];
+        for (ch, peak) in peaks.iter_mut().enumerate() {
+            let Some(channel) = node.output.channel(ch) else {
+                break;
+            };
+            for &sample in channel {
+                let abs = sample.abs();
+                if abs > *peak {
+                    *peak = abs;
+                }
+            }
+        }
+        peaks
     }
 
     /// Delivers a note event to a MIDI track: fans out via the routing table
@@ -440,6 +478,38 @@ impl RtGraph {
                 let _ = self.slot_note(slot, NoteEvent::Off { note: 0 });
             }
         }
+    }
+
+    /// Panic: release **every** sounding voice, transport untouched.
+    ///
+    /// A blanket `Off { note: 0 }` (what [`Self::note_off_all`] sends) never
+    /// reaches a pitch-matching plugin — Dexed keeps its voices forever. So a
+    /// panic walks all 128 pitches across every slot in batches of
+    /// [`PANIC_SWEEP_BATCH`] per block (≈15 ms at 44.1 kHz / 128 frames): the
+    /// plugin hosts' pending event queues hold 32 entries, and a single
+    /// 128-event burst would be dropped past the cap.
+    ///
+    /// RT-safe: fixed loops, no allocation.
+    pub fn panic(&mut self) {
+        self.panic_sweep = Some(0);
+    }
+
+    /// Sends one panic batch to every slot and advances the cursor
+    /// (no-op when no panic is in flight). RT-safe.
+    fn drain_panic_sweep(&mut self) {
+        let Some(start) = self.panic_sweep else {
+            return;
+        };
+        let end = (u16::from(start) + u16::from(PANIC_SWEEP_BATCH)).min(128) as u8;
+        for slot in 0..MAX_NODES {
+            if self.slots[slot].is_none() {
+                continue;
+            }
+            for note in start..end {
+                let _ = self.slot_note(slot as u16, NoteEvent::Off { note });
+            }
+        }
+        self.panic_sweep = (end < 128).then_some(end);
     }
 
     fn slot_note(&mut self, slot: u16, event: NoteEvent) -> bool {
@@ -2118,6 +2188,85 @@ mod tests {
         assert!(
             (ratio - 0.25).abs() < 0.1,
             "master gain 0.25 should reduce output to about 1/4, ratio = {ratio}"
+        );
+    }
+
+    /// Records every note-off pitch it receives (no audio) — a stand-in for
+    /// a pitch-matching plugin, where a blanket `Off { note: 0 }` is useless.
+    struct PitchRecorder {
+        offs: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl Processor for PitchRecorder {
+        fn process(&mut self, _ctx: &ProcessContext, _buffer: &mut AudioBuffer) {}
+        fn note_event(&mut self, event: NoteEvent) -> bool {
+            if let NoteEvent::Off { note } = event {
+                self.offs.lock().expect("recorder lock").push(note);
+            }
+            true
+        }
+    }
+
+    #[test]
+    fn panic_sweeps_every_pitch_across_bounded_batches() {
+        let (mut compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (update, _) = expect_swap(
+            compiler.set_voice(
+                0,
+                Box::new(PitchRecorder {
+                    offs: std::sync::Arc::clone(&seen),
+                }),
+            ),
+            "swap in the pitch recorder",
+        );
+        graph.apply_update(update, &mut recycle_tx);
+
+        graph.panic();
+        // 128 pitches / 24 per block = 6 blocks; one spare block to confirm
+        // the sweep stops instead of running forever.
+        for _ in 0..7 {
+            graph.process_block(&ctx());
+        }
+
+        let mut pitches = seen.lock().expect("recorder lock").clone();
+        pitches.sort_unstable();
+        pitches.dedup();
+        assert_eq!(
+            pitches.len(),
+            128,
+            "panic must release every pitch, got {} distinct",
+            pitches.len()
+        );
+        assert_eq!(pitches.first(), Some(&0));
+        assert_eq!(pitches.last(), Some(&127));
+    }
+
+    #[test]
+    fn master_meter_reports_both_channels() {
+        let (compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let mixer = default_mixer_id(&compiler);
+        // Track 0 panned hard left: the stereo meter must show L only.
+        graph.track_note(0, note_on(69));
+        assert!(graph.node_set_param(mixer, ParamId::MixerPan(0), -1.0));
+        for _ in 0..20 {
+            graph.process_block(&ctx());
+        }
+        let levels = graph.process_block(&ctx());
+        assert!(
+            levels.master_lr[0] > 0.01,
+            "left channel should carry the signal, got {:?}",
+            levels.master_lr
+        );
+        assert!(
+            levels.master_lr[1] < 1e-6,
+            "right channel should be silent at hard-left pan, got {:?}",
+            levels.master_lr
+        );
+        assert!(
+            (levels.master - levels.master_lr[0]).abs() < 1e-6,
+            "the collapsed peak must equal the loudest channel"
         );
     }
 

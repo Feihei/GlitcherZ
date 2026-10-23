@@ -19,8 +19,14 @@ use crate::realtime::voice::RecycledNode;
 /// holds a clone for the UI to read.
 #[derive(Clone)]
 pub struct Feedback {
-    /// Peak level of the master output in the most recent block.
+    /// Peak level of the master output in the most recent block, both
+    /// channels collapsed (kept for single-value readers; the transport
+    /// meter reads `level_l` / `level_r`).
     pub level: Arc<AtomicF32>,
+    /// Master output peak of the left channel in the most recent block.
+    pub level_l: Arc<AtomicF32>,
+    /// Master output peak of the right channel in the most recent block.
+    pub level_r: Arc<AtomicF32>,
     /// Playback position (samples since the stream started).
     pub position: Arc<AtomicU64>,
     /// Sequencer's current step index.
@@ -43,6 +49,8 @@ impl Feedback {
     pub fn new() -> Self {
         Self {
             level: Arc::new(AtomicF32::new(0.0)),
+            level_l: Arc::new(AtomicF32::new(0.0)),
+            level_r: Arc::new(AtomicF32::new(0.0)),
             position: Arc::new(AtomicU64::new(0)),
             step: Arc::new(AtomicU32::new(0)),
             playing: Arc::new(AtomicBool::new(false)),
@@ -211,6 +219,8 @@ impl BlockRunner {
 
         // 6. State feedback.
         self.feedback.level.store(levels.master);
+        self.feedback.level_l.store(levels.master_lr[0]);
+        self.feedback.level_r.store(levels.master_lr[1]);
         for (slot, value) in self.feedback.track_levels.iter().zip(levels.tracks) {
             slot.store(value);
         }
@@ -296,6 +306,13 @@ impl BlockRunner {
                 let _ = self.graph.node_note(node_id, event);
             }
             EngineCommand::Sequencer(cmd) => self.apply_sequencer_command(cmd),
+            EngineCommand::Panic => {
+                // Panic = silence, not stop: the transport keeps running and
+                // every parameter is left alone. Pending sequencer offs are
+                // released first (by pitch), then the graph sweeps the rest.
+                self.release_pending_notes();
+                self.graph.panic();
+            }
         }
     }
 

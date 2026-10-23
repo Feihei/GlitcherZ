@@ -187,6 +187,11 @@ pub enum EngineCommand {
         /// Parameter value.
         value: f32,
     },
+    /// Panic: release every sounding voice now (all 128 pitches, every
+    /// node), leaving the transport and all parameters untouched. The
+    /// sweep spans a few blocks — see `RtGraph::panic` — so the response
+    /// lands within roughly 15 ms.
+    Panic,
 }
 
 /// Creates a pair of command queue endpoints: the producer goes to the UI /
@@ -215,6 +220,7 @@ mod tests {
             EngineCommand::Note { .. } => f32::NAN,
             EngineCommand::NoteAtNode { .. } => f32::NAN,
             EngineCommand::Sequencer(_) => f32::NAN,
+            EngineCommand::Panic => f32::NAN,
         }
     }
 

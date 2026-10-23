@@ -149,6 +149,12 @@ impl AudioEngine {
         self.feedback.level.load()
     }
 
+    /// Peak level of the most recent audio block per channel, `[L, R]`
+    /// (roughly 0..1 each) — the transport's stereo meter.
+    pub fn master_peak_lr(&self) -> [f32; 2] {
+        [self.feedback.level_l.load(), self.feedback.level_r.load()]
+    }
+
     /// Current step index of the sequencer (0..16, stays at the last position
     /// when not playing).
     pub fn current_step(&self) -> u32 {

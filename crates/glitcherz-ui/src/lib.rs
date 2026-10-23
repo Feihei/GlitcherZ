@@ -90,6 +90,13 @@ pub const TRACK_GAIN_RANGE: RangeInclusive<f32> = 0.0..=1.5;
 /// Track pan slider range.
 pub const PAN_RANGE: RangeInclusive<f32> = -1.0..=1.0;
 
+/// Master output gain range (linear, 1.0 = unity). Same span as a track
+/// fader so the two feel identical.
+pub const MASTER_GAIN_RANGE: RangeInclusive<f32> = 0.0..=1.5;
+
+/// Meter scale floor in dB (the transport meter's bottom of travel).
+const METER_FLOOR_DB: f32 = -60.0;
+
 /// Short row label for one plugin inline control (G5): the node-body label
 /// column is narrow, so the display name is truncated to its first few
 /// characters; an empty name falls back to the parameter id.
@@ -499,6 +506,72 @@ impl PeakMeter {
     }
 }
 
+/// Master fader label: linear gain rendered in dB (`-∞` at silence).
+fn gain_db_text(gain: f32) -> String {
+    if gain <= 1e-4 {
+        "-∞ dB".to_string()
+    } else {
+        format!("{:+.1} dB", 20.0 * gain.log10())
+    }
+}
+
+/// One channel's level in dB (clamped by the callers' floor, not here).
+fn level_db(level: f32) -> f32 {
+    20.0 * level.max(1e-6).log10()
+}
+
+/// dB label for a meter read-out (`-∞` below the displayed floor).
+fn meter_db_label(db: f32) -> String {
+    if db <= METER_FLOOR_DB {
+        "-∞".to_string()
+    } else {
+        format!("{db:.1}")
+    }
+}
+
+/// Meter bar colour by level: green under -9 dB, amber approaching full
+/// scale, red at the top (overload territory).
+fn meter_color(db: f32) -> egui::Color32 {
+    if db >= -1.0 {
+        egui::Color32::from_rgb(220, 96, 84)
+    } else if db >= -9.0 {
+        egui::Color32::from_rgb(224, 184, 76)
+    } else {
+        egui::Color32::from_rgb(96, 186, 112)
+    }
+}
+
+/// Stereo peak meter for the transport bar: two vertical bars (L / R) on a
+/// [`METER_FLOOR_DB`]..0 dB scale, fed by the 600 ms peak hold. Drawn by
+/// hand because a `ProgressBar` is a single horizontal bar.
+fn master_meter(ui: &mut egui::Ui, levels: [f32; 2]) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, 18.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    for (index, level) in levels.into_iter().enumerate() {
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + index as f32 * 11.0, rect.top()),
+            egui::vec2(8.0, rect.height()),
+        );
+        painter.rect_filled(
+            bar,
+            egui::CornerRadius::same(1),
+            ui.visuals().extreme_bg_color,
+        );
+        let db = level_db(level);
+        let fill = ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0);
+        if fill > 0.0 {
+            let top = bar.bottom() - bar.height() * fill;
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(bar.left(), top), bar.max),
+                egui::CornerRadius::same(1),
+                meter_color(db),
+            );
+        }
+    }
+    let [left, right] = levels.map(|level| meter_db_label(level_db(level)));
+    response.on_hover_text(format!("L {left} dB · R {right} dB"));
+}
+
 /// Which clip the floating editor window (piano roll / curve lane) targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditTarget {
@@ -601,7 +674,9 @@ pub struct GlitcherZApp {
     held_notes: HashSet<u8>,
     /// Most recently triggered note (shown in the status bar).
     current_note: Option<u8>,
-    meter: PeakMeter,
+    /// Master meter peak-hold, one per channel (the transport meter).
+    meter_l: PeakMeter,
+    meter_r: PeakMeter,
     opened_at: Instant,
     auto_close_after: Option<Duration>,
     /// Current project file path (`None` = never saved; a dialog pops up on save).
@@ -794,7 +869,8 @@ impl GlitcherZApp {
             vk_targets: Vec::new(),
             held_notes: HashSet::new(),
             current_note: None,
-            meter: PeakMeter::new(),
+            meter_l: PeakMeter::new(),
+            meter_r: PeakMeter::new(),
             opened_at: Instant::now(),
             auto_close_after: config.auto_close_after,
             project_path: None,
@@ -3767,11 +3843,55 @@ impl GlitcherZApp {
                     self.set_meter(chosen);
                 }
                 ui.separator();
-                ui.weak("GlitcherZ — Rust DAW");
+                self.master_section(ui);
             });
         });
         // Chrome: hovering the transport releases any editor's focus.
         self.focus_router.register_neutral(response.response.rect);
+    }
+
+    /// Master group on the transport bar: output gain, stereo peak meter and
+    /// the panic button. It lives **outside** the view tabs because it
+    /// belongs to the song, not to the selected node — the Inspector only
+    /// edits node parameters.
+    fn master_section(&mut self, ui: &mut egui::Ui) {
+        let [left, right] = self.engine.master_peak_lr();
+        self.meter_l.update(left);
+        self.meter_r.update(right);
+
+        ui.label("Master");
+        // Same rule as the tempo field: no document write unless the slider
+        // actually moved, or the title claims unsaved changes forever.
+        let before = self.begin_param_edit();
+        let mut gain = self.project().master_gain;
+        let slider_width = ui.spacing().slider_width;
+        ui.spacing_mut().slider_width = 96.0;
+        let response = ui.add(
+            egui::Slider::new(&mut gain, MASTER_GAIN_RANGE)
+                .custom_formatter(|value, _| gain_db_text(value as f32)),
+        );
+        ui.spacing_mut().slider_width = slider_width;
+        if response.changed() {
+            self.project_mut().master_gain = gain;
+            self.commit_param_edit("Master Gain", before, "master-gain");
+            self.engine.send(EngineCommand::SetParam {
+                id: ParamId::MasterGain,
+                value: gain,
+            });
+        }
+        if response.drag_stopped() {
+            self.end_param_edit();
+        }
+
+        master_meter(ui, [self.meter_l.held, self.meter_r.held]);
+
+        if ui
+            .button("Panic")
+            .on_hover_text("Release every sounding note — the transport keeps running")
+            .clicked()
+        {
+            self.engine.send(EngineCommand::Panic);
+        }
     }
 
     /// Arrangement end in ticks (U1: the skip-to-end target) — the latest
@@ -4688,9 +4808,6 @@ impl GlitcherZApp {
     /// while a mixer node is selected, and automation curves belong to the
     /// timeline.
     fn inspector_panel(&mut self, ui: &mut egui::Ui) {
-        self.meter.update(self.engine.peak_level());
-        let peak = self.meter.held;
-
         // In eframe 0.36 the root Ui has no margins; wrap a CentralPanel to keep the default look.
         egui::CentralPanel::default().show(ui, |ui| {
             if self.project().midi_tracks.is_empty() {
@@ -5339,6 +5456,16 @@ impl GlitcherZApp {
                     .builtin_delay_of_track(sel)
                     .map(NodeDoc::node_id),
             };
+            // Everything below belongs to the panel's **node** — the
+            // instrument's filter / amp envelope, the effect's delay. Master
+            // gain and the output meter live on the transport bar (always
+            // visible), so they must not look like part of this node.
+            if instr_target.is_some() || delay_target.is_some() {
+                ui.horizontal(|ui| {
+                    ui.strong("Node Parameters");
+                    ui.weak("— filter / envelope / delay of the node above, not the master bus");
+                });
+            }
             egui::Grid::new("synth_params")
                 .num_columns(2)
                 .spacing([16.0, 8.0])
@@ -5403,26 +5530,6 @@ impl GlitcherZApp {
                         self.delay_sliders(ui, delay_id);
                         ui.end_row();
                     }
-
-                    ui.label("Master Gain");
-                    // U2: same rule as the tempo field — no document write
-                    // unless the slider actually moved, or the title would
-                    // claim unsaved changes forever.
-                    let before = self.begin_param_edit();
-                    let mut master_gain = self.project().master_gain;
-                    let r = ui.add(egui::Slider::new(&mut master_gain, 0.0..=1.5).text("Linear"));
-                    if r.changed() {
-                        self.project_mut().master_gain = master_gain;
-                        self.commit_param_edit("Master Gain", before, "master-gain");
-                        self.engine.send(EngineCommand::SetParam {
-                            id: ParamId::MasterGain,
-                            value: master_gain,
-                        });
-                    }
-                    if r.drag_stopped() {
-                        self.end_param_edit();
-                    }
-                    ui.end_row();
                 });
 
             // The console belongs to the mixer node alone: it shows when (and
@@ -5432,15 +5539,6 @@ impl GlitcherZApp {
             if let (Some(NodeDoc::Mixer { .. }), Some(mixer_doc)) = (&target_doc, target) {
                 self.mixer_section(ui, mixer_doc);
             }
-
-            ui.add_space(10.0);
-            ui.label("Master Out Level");
-            ui.add(
-                egui::ProgressBar::new(peak.clamp(0.0, 1.0))
-                    .desired_height(16.0)
-                    .show_percentage(),
-            );
-            ui.weak(format!("Peak {peak:.3} (AtomicF32 feedback, 600 ms hold)"));
             });
         });
     }
