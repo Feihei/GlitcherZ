@@ -88,6 +88,7 @@ pub struct PluginWindowHandle(platform_impl::NativeChild); // Windows: HWND 子�
 
 - 句柄来源：`GlitcherZApp::ui` 的 `frame`（当前 `_frame` 未用）→ `frame.winit_window()` → `HasWindowHandle`（eframe 0.36 已实现，epi.rs:702）→ `Win32WindowHandle.hwnd`。`raw-window-handle 0.6` 已在树（eframe 传递），加直依赖。
 - Inspector 面板（目标节点带编辑器时）画编辑器区：折叠头 `CollapsingHeader("Editor")` 的**三角在占位矩形上方一行**（2026-10-23 起；此前是 `Show Editor` / `Close Editor` 按钮，展开后原生窗口会盖住按钮），展开后 `ui.allocate_exact_size(desired_size, Sense::hover())` 占位 → `rect` × `pixels_per_point` → 物理像素 → `SetWindowPos`（SWP_NOACTIVATE，z-order 恰在 GL surface 上方由 child 窗口语义天然成立）。
+- **坐标语义（2026-10-23 修正）**：egui 的屏幕坐标是**主窗口 client 区相对坐标**（`egui_winit` 以 `Pos2::ZERO` 构造 `screen_rect`），Win32 child 窗口的 SetWindowPos 坐标同样是**父 client 区相对**——两者直接 `rect * ppp` 对上，**不要再减 `ClientToScreen(main_hwnd, {0,0})` 的 origin**。旧实现多减了 origin，容器被上移一个标题栏高度，盖住编辑器折叠头/按钮那一行（即"GUI 挡住按钮/标题"的根因）。
 - 尺寸状态机：`desired_size` 初值 = `open_editor` 返回值；插件 `request_resize` → 更新 desired_size + `ctx.request_repaint()`（搭现有 50ms repaint 班车即可，不强求即时）。
 - rect 滚出视口 / tab 切走（`MainView` 离开 Inspector）→ `hide()`（D9）；回到 Inspector → `show()` + 立即 reposition。
 - `pixels_per_point` 变化（zoom）→ reposition 用新换算（插件内容不缩放，仅位置/容器尺寸跟随）。

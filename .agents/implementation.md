@@ -4,6 +4,14 @@
 
 ## 已落地
 
+### 一批 UI 修正（2026-10-23：meter 横放 / timeline mute 移除 / 编辑器坐标 / 参数面板门控 / picker 点击）
+
+- **Master meter 横放**：`master_meter` 改两条水平条（上 L 下 R，各 7px 高），`allocate_exact_size(ui.available_width(), 18.0)` 吃掉走带行剩余宽度；调用顺序 = gain 推子 → `Panic` → meter（meter 在 Panic 右侧）。
+- **timeline 的 M 按钮删除**（mute 归 mixer 节点）：`TimelineAction::ToggleMute` / `TimelineParams::muted` / `HeaderKind::Midi::muted` / `track_mixer_channel_state` 全链删除；MIDI header 名字按钮宽度 `HEADER_WIDTH - 56` → `- 16`（只剩 grip 占位）。
+- **插件 GUI 坐标（重要根因修正）**：`reposition_rect_platform` 删除 `ClientToScreen` origin 减法。egui 坐标 = client 相对（egui_winit 以 `Pos2::ZERO` 构造 `screen_rect`），child 窗口坐标 = 父 client 相对，`rect * ppp` 直接对上。旧代码多减 origin = 容器上移一个标题栏高度——这就是从 G2 起一直存在的"GUI 盖住按钮 / Editor 标题"的根因。
+- **Instrument 参数面板按 voice 门控**：第二个 Inspector Instrument 块里先解析 `voice_is_vst3` / `voice_is_clap`，`Plugin Params` / `Plugin Params CLAP` 两个 CollapsingHeader 各自只在对应 voice 时渲染；built-in / SoundFont 乐器不再出现空面板（与 effect 面板"有参数数据才出现"的规则对齐）。
+- **picker 鼠标点击失效（egui hit-testing 坑，必记）**：egui 0.31+ 的点击命中停在指针下**最上层** widget，不穿透——picker 行内 `Label`（hover sense）注册在行 response **之后**，把点击吸掉了，所以只有 Enter（键盘不走 hit-test）能选。修法：`allocate_exact_size(Sense::hover())` 占位 → 画内容 → **最后** `ui.interact(rect, 显式id, Sense::click())` 注册（行成为自己标签的上层）。行 id 显式化还顺带解决了"Recent 分组条件渲染导致自动 id 漂移"的隐患；`mouse_click_picks_a_row` headless 测试锁住行为（`ctx.read_response` 取行 rect → 跨帧 press/release）。注意 read_response 要等 popup **settle 帧之后**（开帧是 sizing pass，行可能没画）。
+
 ### patch 节点内联操作行 + 双击路由（U10，2026-10-23）
 
 - **几何单一来源**：`size_of` 为 Timeline（2 行）与 Mixer（1 行）预留 `NODE_TITLE_BAND + action_rows * ACTION_ROW_HEIGHT` 的头部带；端口位置改由 `port_area()` 计算——上界在头部带之下、下界再减去内联滑块行（`inline_row_count * INLINE_ROW_HEIGHT * zoom`）。`out_ports_screen` / `in_ports_screen` 同时供**绘制与命中测试**使用，所以只改一处就保证"看到的位置"与"能拖到的位置"一致；漏掉下界会让 mixer 最后一条端口漂到 `Out Pan` 滑块上。
