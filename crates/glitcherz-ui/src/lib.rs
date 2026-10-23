@@ -1415,11 +1415,6 @@ impl GlitcherZApp {
         self.node_map.get(&doc_id).copied()
     }
 
-    /// Document node_id → owning track.
-    fn node_track(&self, doc_id: u64) -> Option<usize> {
-        self.project().graph.node_by_id(doc_id).map(NodeDoc::track)
-    }
-
     /// The Synth panel's editing target (spec `plugin-gui.md` §6): the
     /// patch selection's first editable document node, falling back to the
     /// selected track's first-match instrument (pre-G4 behavior).
@@ -3103,35 +3098,6 @@ impl GlitcherZApp {
         self.status_message = Some((text, Instant::now()));
     }
 
-    /// Restore an instrument node to the built-in synth (in-place
-    /// replacement, node identity unchanged).
-    fn set_builtin_instrument(&mut self, doc_id: u64) {
-        let before = self.begin_edit();
-        if let Some(NodeDoc::Instrument { voice, .. }) =
-            self.project_mut().graph.node_by_id_mut(doc_id)
-        {
-            *voice = VoiceSpec::Builtin;
-        }
-        self.voice_params.remove(&doc_id);
-        self.clap_voice_params.remove(&doc_id);
-        self.clap_voice_values.remove(&doc_id);
-        self.vst3_voice_values.remove(&doc_id);
-        self.voice_default_state.remove(&doc_id);
-        self.voice_preset_selected.remove(&doc_id);
-        let Some(engine_id) = self.engine_id(doc_id) else {
-            return;
-        };
-        let sample_rate = convert::sample_rate_to_f32(self.engine.info().sample_rate);
-        if self
-            .engine
-            .replace_node(engine_id, Box::new(SynthProcessor::new(sample_rate)))
-            .is_none()
-        {
-            log::error!("Failed to restore instrument node {doc_id} (missing node or queue full)");
-        }
-        self.commit_edit("Set Instrument Voice", before);
-    }
-
     /// Build a SoundFont voice processor from the shared session library
     /// (v1: one library per session, spec §6): reuse the cached font when
     /// the path matches, otherwise load (and replace the cache). Control
@@ -3152,45 +3118,6 @@ impl GlitcherZApp {
             self.sf2_library.as_ref().expect("just set").font(),
             sample_rate,
         )
-    }
-
-    /// Load a SoundFont voice into an instrument node: reuse/load the
-    /// shared library (control thread, D3) → in-place engine replacement →
-    /// preset addressed before installation (D7). The document edit happens
-    /// at the call site (same split as `load_clap_voice`).
-    fn load_soundfont_voice(&mut self, doc_id: u64, path: &str, bank: u8, program: u8) {
-        let Some(engine_id) = self.engine_id(doc_id) else {
-            return;
-        };
-        self.retire_guard(engine_id);
-        let sample_rate = convert::sample_rate_to_f32(self.engine.info().sample_rate);
-        match self.obtain_sf2_voice(path, sample_rate) {
-            Ok(mut processor) => {
-                processor.set_param(ParamId::Sf2BankSelect, f32::from(bank));
-                processor.set_param(ParamId::Sf2ProgramChange, f32::from(program));
-                if self
-                    .engine
-                    .replace_node(engine_id, Box::new(processor))
-                    .is_some()
-                {
-                    // Switching formats: drop the other formats' panel
-                    // caches (no plugin presets / sliders for a sound font).
-                    self.voice_params.remove(&doc_id);
-                    self.clap_voice_params.remove(&doc_id);
-                    self.clap_voice_values.remove(&doc_id);
-                    self.vst3_voice_values.remove(&doc_id);
-                    self.voice_default_state.remove(&doc_id);
-                    self.voice_preset_selected.remove(&doc_id);
-                    log::info!("Node {doc_id} loaded SoundFont voice: {path}");
-                } else {
-                    log::error!("Voice queue full: failed to load node {doc_id}");
-                }
-            }
-            Err(err) => {
-                log::error!("Failed to load SoundFont {path}: {err}");
-                self.set_message(format!("SoundFont load failed: {err}"));
-            }
-        }
     }
 
     /// Switch a SoundFont instrument node's preset: document bank/program as
@@ -3220,115 +3147,6 @@ impl GlitcherZApp {
         }
         self.commit_edit("Select SF2 Preset", before);
         self.set_message("Preset switch failed: voice not installed".to_string());
-    }
-
-    /// Load a CLAP instrument voice into a document node: non-real-time
-    /// instantiation → in-place engine replacement → guard registration. On
-    /// success, also enumerate plugin parameters (data source for automation
-    /// cable targets).
-    fn load_clap_voice(&mut self, doc_id: u64, path: &str, plugin_id: &str) {
-        let Some(engine_id) = self.engine_id(doc_id) else {
-            return;
-        };
-        self.retire_guard(engine_id);
-        match ClapInstance::spawn_rt(
-            std::path::Path::new(path),
-            plugin_id,
-            ClapInstanceConfig {
-                sample_rate: self.engine.info().sample_rate,
-                max_frames: 128,
-            },
-        ) {
-            Ok(mut instance) => {
-                // Factory-default snapshot for the preset "Reset" target.
-                if let Ok(default_blob) = instance.guard.save_state() {
-                    self.voice_default_state.insert(doc_id, default_blob);
-                }
-                // Parameter enumeration must happen before the instance is destructured (the
-                // guard holds the plugin instance).
-                let params = instance.list_params();
-                let ClapInstance { guard, node } = instance;
-                if self
-                    .engine
-                    .replace_node(engine_id, Box::new(node))
-                    .is_some()
-                {
-                    self.voice_guards.push(PluginGuardEntry {
-                        node_id: engine_id,
-                        track: self.node_track(doc_id).unwrap_or(0),
-                        plugin_id: plugin_id.to_string(),
-                        _guard: PluginGuard::Clap(guard),
-                    });
-                    self.clap_voice_values.remove(&doc_id); // fresh load resets sliders to plugin defaults
-                    // Switching formats: drop the other format's panel
-                    // caches so its sliders don't linger on the node panel.
-                    self.voice_params.remove(&doc_id);
-                    self.vst3_voice_values.remove(&doc_id);
-                    self.clap_voice_params.insert(doc_id, params);
-                    log::info!("Node {doc_id} loaded CLAP voice: {plugin_id}");
-                } else {
-                    log::error!("Voice queue full: failed to load node {doc_id}");
-                }
-            }
-            Err(err) => {
-                log::error!("Failed to instantiate CLAP plugin {plugin_id}: {err}");
-                self.set_message(format!("Plugin load failed: {err}"));
-            }
-        }
-    }
-
-    /// Load a VST3 instrument voice into a document node: non-real-time
-    /// instantiation → in-place engine replacement → guard registration.
-    fn load_vst3_voice(&mut self, doc_id: u64, path: &str, class_id: &str) {
-        let Some(engine_id) = self.engine_id(doc_id) else {
-            return;
-        };
-        self.retire_guard(engine_id);
-        match glitcherz_vst3_host::Vst3Instance::spawn_rt(
-            std::path::Path::new(path),
-            class_id,
-            glitcherz_vst3_host::Vst3InstanceConfig {
-                sample_rate: self.engine.info().sample_rate,
-                max_frames: 128,
-            },
-        ) {
-            Ok(instance) => {
-                // Factory-default snapshot for the preset "Reset" target.
-                if let Ok(default_blob) = instance.guard.save_state() {
-                    self.voice_default_state.insert(doc_id, default_blob);
-                }
-                // Slider cache seeded from the controller read-back
-                // (normalized 0..1); enumerated before the guard moves into
-                // the registry.
-                let params = instance.guard.parameters();
-                let values = instance.guard.read_param_values();
-                let glitcherz_vst3_host::Vst3Instance { guard, node } = instance;
-                if self
-                    .engine
-                    .replace_node(engine_id, Box::new(node))
-                    .is_some()
-                {
-                    self.voice_params.insert(doc_id, params);
-                    self.vst3_voice_values.insert(doc_id, values);
-                    // Switching formats: drop the other format's caches.
-                    self.clap_voice_params.remove(&doc_id);
-                    self.clap_voice_values.remove(&doc_id);
-                    self.voice_guards.push(PluginGuardEntry {
-                        node_id: engine_id,
-                        track: self.node_track(doc_id).unwrap_or(0),
-                        plugin_id: class_id.to_string(),
-                        _guard: PluginGuard::Vst3(guard),
-                    });
-                    log::info!("Node {doc_id} loaded VST3 voice: {class_id}");
-                } else {
-                    log::error!("Voice queue full: failed to load node {doc_id}");
-                }
-            }
-            Err(err) => {
-                log::error!("Failed to instantiate VST3 plugin {class_id}: {err}");
-                self.set_message(format!("VST3 plugin load failed: {err}"));
-            }
-        }
     }
 
     // ---- Instrument presets (host-side library over the state blob) ----
@@ -3493,195 +3311,6 @@ impl GlitcherZApp {
         self.set_message("Reset to factory default".to_string());
     }
 
-    /// Insert an external effect node at the end of the track chain (before the
-    /// mixer channel / master landing): engine `insert_node_between` + document
-    /// sync (node + splice rewiring preserving the downstream in_port, D17).
-    fn insert_effect_common(
-        &mut self,
-        track: usize,
-        voice: VoiceSpec,
-        plugin_label: String,
-        node: Box<dyn Processor>,
-        guard: PluginGuard,
-    ) -> Option<u64> {
-        let Some(delay_doc) = self
-            .project()
-            .graph
-            .builtin_delay_of_track(track)
-            .map(NodeDoc::node_id)
-        else {
-            log::error!(
-                "Track {} has no built-in delay node; effect insertion failed",
-                track + 1
-            );
-            return None;
-        };
-        // Walk the audio chain from the delay to its LAST node (P5f: the chain
-        // ends at the mixer channel / master landing, not a channel strip).
-        let mut last_doc = delay_doc;
-        let downstream = loop {
-            let Some(cable) = self
-                .project()
-                .graph
-                .cables
-                .iter()
-                .find(|c| c.kind == CableKind::Audio && c.from == PortRef::Node(last_doc))
-                .cloned()
-            else {
-                log::error!(
-                    "Track {} chain is dangling after node {last_doc}; effect insertion failed",
-                    track + 1
-                );
-                return None;
-            };
-            match &cable.to {
-                PortRef::Node(next_id)
-                    if !self
-                        .project()
-                        .graph
-                        .node_by_id(*next_id)
-                        .is_some_and(|n| n.is_mixer()) =>
-                {
-                    last_doc = *next_id;
-                }
-                _ => break cable, // mixer / master landing: splice here
-            }
-        };
-        let PortRef::Node(downstream_doc) = downstream.to else {
-            log::error!("Track {} chain landing is not a node", track + 1);
-            return None;
-        };
-        let last_engine = self.engine_id(last_doc)?;
-        let downstream_engine = self.engine_id(downstream_doc)?;
-        let new_doc_id = self.project().graph.next_node_id();
-        let new_engine_id = self.engine.fresh_node_id();
-        if !self
-            .engine
-            .insert_node_between(new_engine_id, last_engine, downstream_engine, node)
-        {
-            log::error!(
-                "Structure queue full: failed to insert effect on track {}",
-                track + 1
-            );
-            return None;
-        }
-        // Document sync: node + splice rewiring (the downstream cable keeps its
-        // in_port — the mixer channel binding, D17).
-        let before = self.begin_edit();
-        self.project_mut().graph.nodes.push(NodeDoc::Effect {
-            node_id: new_doc_id,
-            track,
-            voice,
-            delay: DelayParams::default(),
-        });
-        self.project_mut().graph.cables.retain(|c| {
-            !(c.kind == CableKind::Audio
-                && c.from == PortRef::Node(last_doc)
-                && c.to == PortRef::Node(downstream_doc)
-                && c.in_port == downstream.in_port)
-        });
-        self.project_mut()
-            .graph
-            .cables
-            .push(glitcherz_model::CableDoc::audio(last_doc, new_doc_id));
-        self.project_mut()
-            .graph
-            .cables
-            .push(glitcherz_model::CableDoc::audio_to_channel(
-                new_doc_id,
-                PortRef::Node(downstream_doc),
-                downstream.in_port,
-            ));
-        self.node_map.insert(new_doc_id, new_engine_id);
-        self.voice_guards.push(PluginGuardEntry {
-            node_id: new_engine_id,
-            track,
-            plugin_id: plugin_label,
-            _guard: guard,
-        });
-        self.commit_edit("Insert Effect", before);
-        log::info!("Track {} inserted external effect", track + 1);
-        Some(new_doc_id)
-    }
-
-    /// Insert a CLAP effect node into the track (non-real-time instantiation → engine insertion →
-    /// guard registration).
-    fn load_clap_effect(&mut self, track: usize, path: &str, plugin_id: &str) {
-        match ClapInstance::spawn_rt(
-            std::path::Path::new(path),
-            plugin_id,
-            ClapInstanceConfig {
-                sample_rate: self.engine.info().sample_rate,
-                max_frames: 128,
-            },
-        ) {
-            Ok(instance) => {
-                // Effect param caches are keyed by the document node_id —
-                // enumerate before the instance is destructured.
-                let params = instance.list_params();
-                let values = instance.read_param_values();
-                let ClapInstance { guard, node } = instance;
-                if let Some(fx_doc) = self.insert_effect_common(
-                    track,
-                    VoiceSpec::Clap {
-                        path: path.to_string(),
-                        plugin_id: plugin_id.to_string(),
-                        state: Vec::new(),
-                    },
-                    plugin_id.to_string(),
-                    Box::new(node),
-                    PluginGuard::Clap(guard),
-                ) {
-                    self.clap_effect_params.insert(fx_doc, params);
-                    self.clap_effect_values.insert(fx_doc, values);
-                }
-            }
-            Err(err) => {
-                log::error!("Failed to instantiate CLAP effect {plugin_id}: {err}");
-                self.set_message(format!("Plugin load failed: {err}"));
-            }
-        }
-    }
-
-    /// Insert a VST3 effect node into the track (non-real-time instantiation → engine insertion →
-    /// guard registration).
-    fn load_vst3_effect(&mut self, track: usize, path: &str, class_id: &str) {
-        match glitcherz_vst3_host::Vst3Instance::spawn_rt(
-            std::path::Path::new(path),
-            class_id,
-            glitcherz_vst3_host::Vst3InstanceConfig {
-                sample_rate: self.engine.info().sample_rate,
-                max_frames: 128,
-            },
-        ) {
-            Ok(instance) => {
-                // Effect param caches are keyed by the document node_id
-                // (normalized 0..1 domain); enumerate before destructuring.
-                let params = instance.guard.parameters();
-                let values = instance.guard.read_param_values();
-                let glitcherz_vst3_host::Vst3Instance { guard, node } = instance;
-                if let Some(fx_doc) = self.insert_effect_common(
-                    track,
-                    VoiceSpec::Vst3 {
-                        path: path.to_string(),
-                        class_id: class_id.to_string(),
-                        state: Vec::new(),
-                    },
-                    class_id.to_string(),
-                    Box::new(node),
-                    PluginGuard::Vst3(guard),
-                ) {
-                    self.vst3_effect_params.insert(fx_doc, params);
-                    self.vst3_effect_values.insert(fx_doc, values);
-                }
-            }
-            Err(err) => {
-                log::error!("Failed to instantiate VST3 effect {class_id}: {err}");
-                self.set_message(format!("VST3 plugin load failed: {err}"));
-            }
-        }
-    }
-
     /// Clear all external effects of a track (built-in delay kept): engine bypass removal +
     /// document sync.
     fn clear_external_effects(&mut self, track: usize) {
@@ -3771,35 +3400,6 @@ impl GlitcherZApp {
                 _ => None,
             })
             .collect()
-    }
-
-    /// Plugin entries for one picker view (spec `plugin-browser.md` D8:
-    /// instruments and effects are partitioned at query time from the single
-    /// catalog, never scanned twice). Entries scanned so far are usable while
-    /// the startup scan is still running.
-    fn plugin_entries(
-        &self,
-        format: plugin_catalog::PluginFormat,
-        want_instrument: bool,
-    ) -> Vec<&plugin_catalog::PluginEntry> {
-        plugin_catalog::view(self.plugin_catalog.entries(), format, want_instrument).collect()
-    }
-
-    /// Empty-list placeholder for a plugin menu: during the startup scan the
-    /// list is legitimately empty, so say so instead of "no plugins found".
-    fn plugin_empty_hint(&self, format: plugin_catalog::PluginFormat) -> &'static str {
-        if self.plugin_catalog.is_scanning() {
-            "(scanning plug-ins…)"
-        } else {
-            match format {
-                plugin_catalog::PluginFormat::Clap => {
-                    "(no plugins found; set GLITCHERZ_CLAP_PATH to add dirs)"
-                }
-                plugin_catalog::PluginFormat::Vst3 => {
-                    "(no plugins found; set GLITCHERZ_VST3_PATH to add dirs)"
-                }
-            }
-        }
     }
 
     fn send_sequencer(&mut self, cmd: SequencerCommand) {
@@ -5157,111 +4757,17 @@ impl GlitcherZApp {
             }
             // Long parameter stack: without a scroll area the content clips with no scrollbar.
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            // G4 dispatch (spec `plugin-gui.md` §6): the instrument-source
-            // row renders for instrument targets (patch selection or track
-            // fallback — the fallback IS the track's instrument node).
+            // G4 dispatch (spec `plugin-gui.md` §6): instrument targets (patch
+            // selection or the track fallback — the fallback IS the track's
+            // instrument node) get the preset / parameter / editor stack.
             if matches!(target_doc, Some(NodeDoc::Instrument { .. }))
                 && let Some(instr_id) = target
             {
-            ui.horizontal(|ui| {
-                ui.label("Instrument");
-                // Effect loads ride the owning track of the target
-                // instrument node (correct for cross-track patch targets).
-                let fx_track = self.node_track(instr_id).unwrap_or(sel);
-                let voice_kind = target_doc.as_ref().and_then(|n| match n {
-                    NodeDoc::Instrument { voice, .. } => Some(voice.clone()),
-                    _ => None,
-                });
-                let is_external = matches!(
-                    voice_kind.as_ref(),
-                    Some(VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. })
-                );
-                let is_sf2 = matches!(voice_kind.as_ref(), Some(VoiceSpec::SoundFont { .. }));
-                if ui
-                    .selectable_label(!is_external && !is_sf2, "Built-in Synth")
-                    .clicked()
-                {
-                    self.set_builtin_instrument(instr_id);
-                }
-                // Collect the choice first; load after the menu closure ends (avoids borrow
-                // conflicts).
-                let mut picked: Option<(String, String)> = None;
-                ui.menu_button("CLAP Instruments…", |ui| {
-                    let list = self.plugin_entries(plugin_catalog::PluginFormat::Clap, true);
-                    if list.is_empty() {
-                        ui.weak(self.plugin_empty_hint(plugin_catalog::PluginFormat::Clap));
-                    }
-                    for info in &list {
-                        if ui.button(&info.name).clicked() {
-                            picked = Some((info.path.clone(), info.id.clone()));
-                            ui.close();
-                        }
-                    }
-                });
-                if let Some((path, plugin_id)) = picked {
-                    let before = self.begin_edit();
-                    if let Some(NodeDoc::Instrument { voice, .. }) =
-                        self.project_mut().graph.node_by_id_mut(instr_id)
-                    {
-                        *voice = VoiceSpec::Clap {
-                            path: path.clone(),
-                            plugin_id: plugin_id.clone(),
-                            state: Vec::new(),
-                        };
-                    }
-                    self.load_clap_voice(instr_id, &path, &plugin_id);
-                    self.commit_edit("Load CLAP Instrument", before);
-                }
-                let mut vst3_picked: Option<(String, String)> = None;
-                ui.menu_button("VST3 Instruments…", |ui| {
-                    let list = self.plugin_entries(plugin_catalog::PluginFormat::Vst3, true);
-                    if list.is_empty() {
-                        ui.weak(self.plugin_empty_hint(plugin_catalog::PluginFormat::Vst3));
-                    }
-                    for info in &list {
-                        if ui.button(&info.name).clicked() {
-                            vst3_picked = Some((info.path.clone(), info.id.clone()));
-                            ui.close();
-                        }
-                    }
-                });
-                if let Some((path, class_id)) = vst3_picked {
-                    let before = self.begin_edit();
-                    if let Some(NodeDoc::Instrument { voice, .. }) =
-                        self.project_mut().graph.node_by_id_mut(instr_id)
-                    {
-                        *voice = VoiceSpec::Vst3 {
-                            path: path.clone(),
-                            class_id: class_id.clone(),
-                            state: Vec::new(),
-                        };
-
-                    }
-                    self.load_vst3_voice(instr_id, &path, &class_id);
-                    self.commit_edit("Load VST3 Instrument", before);
-                }
-                // SoundFont voice (v1: one shared session library, spec §6).
-                let mut sf2_picked: Option<String> = None;
-                if ui.button("SoundFont…").clicked() {
-                    sf2_picked = rfd::FileDialog::new()
-                        .add_filter("SoundFont", &["sf2", "sf3"])
-                        .pick_file()
-                        .map(|p| p.display().to_string());
-                }
-                if let Some(path) = sf2_picked {
-                    let before = self.begin_edit();
-                    if let Some(NodeDoc::Instrument { voice, .. }) =
-                        self.project_mut().graph.node_by_id_mut(instr_id)
-                    {
-                        *voice = VoiceSpec::SoundFont {
-                            path: path.clone(),
-                            bank: 0,
-                            program: 0,
-                        };
-                    }
-                    self.load_soundfont_voice(instr_id, &path, 0, 0);
-                    self.commit_edit("Load SoundFont Instrument", before);
-                }
+                // No source selector here (spec `plugin-browser.md` D1/D2/D3):
+                // an instrument is born with its final voice from the patch Add
+                // menu, and "switch source" means delete + add — parameters are
+                // never migrated. What stays is the **preset** picker, since a
+                // SoundFont bank/program is a preset, not a source.
                 // SoundFont preset picker (visible while the track voice is
                 // SoundFont): presets enumerated from the shared session
                 // library; the selection is one undoable edit + live
@@ -5394,53 +4900,9 @@ impl GlitcherZApp {
                         }
                     }
                 }
-                if is_external {
-                    ui.weak("(external instrument plugin)");
-                }
-                ui.separator();
-                ui.label("Effects");
-                // Collect the choice first; load after the menu closure ends.
-                let mut effect_picked: Option<(String, String)> = None;
-                let mut clear_effects = false;
-                ui.menu_button("CLAP Effects…", |ui| {
-                    if ui.button("Clear All Effects").clicked() {
-                        clear_effects = true;
-                        ui.close();
-                    }
-                    let list = self.plugin_entries(plugin_catalog::PluginFormat::Clap, false);
-                    if list.is_empty() {
-                        ui.weak(self.plugin_empty_hint(plugin_catalog::PluginFormat::Clap));
-                    }
-                    for info in &list {
-                        if ui.button(&info.name).clicked() {
-                            effect_picked = Some((info.path.clone(), info.id.clone()));
-                            ui.close();
-                        }
-                    }
-                });
-                if clear_effects {
-                    self.clear_external_effects(fx_track);
-                }
-                if let Some((path, plugin_id)) = effect_picked {
-                    self.load_clap_effect(fx_track, &path, &plugin_id);
-                }
-                let mut vst3_effect_picked: Option<(String, String)> = None;
-                ui.menu_button("VST3 Effects…", |ui| {
-                    let list = self.plugin_entries(plugin_catalog::PluginFormat::Vst3, false);
-                    if list.is_empty() {
-                        ui.weak(self.plugin_empty_hint(plugin_catalog::PluginFormat::Vst3));
-                    }
-                    for info in &list {
-                        if ui.button(&info.name).clicked() {
-                            vst3_effect_picked = Some((info.path.clone(), info.id.clone()));
-                            ui.close();
-                        }
-                    }
-                });
-                if let Some((path, class_id)) = vst3_effect_picked {
-                    self.load_vst3_effect(fx_track, &path, &class_id);
-                }
-            });
+                // Effects are added from the graph only (Add ▸ Effect, or the
+                // cable-midpoint insert — spec `plugin-browser.md` D12); the
+                // track-level "clear" shortcut sits above the effect list.
             }
 
             // External effect parameter panels: sliders per effect node,
@@ -5468,6 +4930,21 @@ impl GlitcherZApp {
                 },
                 _ => self.track_external_fx(sel),
             };
+            // Track-level "clear" shortcut at the head of the effect list
+            // (spec `plugin-browser.md` §8.1): the batch removal of a track's
+            // external effects. Adding effects stays a graph operation (D12),
+            // so this is the only structural action left in the Inspector.
+            // Hidden when the panel is narrowed to one effect node — there the
+            // header would read as "clear this one".
+            let fx_track_view = !matches!(&target_doc, Some(NodeDoc::Effect { .. }));
+            if fx_track_view && !fx_list.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label("Effects");
+                    if ui.button("Clear All Effects").clicked() {
+                        self.clear_external_effects(sel);
+                    }
+                });
+            }
             for (fx_doc, fx_label, is_clap) in fx_list {
                 let Some(&fx_engine) = self.node_map.get(&fx_doc) else {
                     continue;

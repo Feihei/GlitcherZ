@@ -461,7 +461,7 @@ fn real_soundfont_full_graph_paths() {
     let mut cmd_tx = cmd_tx;
 
     // Path 1 — UI load: preset addressed on the control thread, node swapped
-    // in via the structure queue (mirrors `load_soundfont_voice`).
+    // in via the structure queue (mirrors `install_node`'s SoundFont branch).
     let voice_id = compiler
         .track_voice_node_id(0)
         .expect("track 0 voice node must exist");
