@@ -8,7 +8,7 @@
 //! - double-click an empty lane spot → insert a one-bar clip;
 //! - double-click a clip → jump to the Edit tab (piano roll / curve lane);
 //! - right-click a clip → delete;
-//! - header: click to select the track, toggle mute (MIDI rows only);
+//! - header: click to select the track (mute lives on the mixer node);
 //! - ruler (U1): click/drag → seek; Ctrl+drag → set the song loop range;
 //!   drag a loop edge → reshape it; right-click → add a marker (on a
 //!   marker's flag → remove it).
@@ -353,7 +353,6 @@ pub enum TimelineAction {
     },
     SelectTrack(usize),
     SelectControlTrack(usize),
-    ToggleMute(usize, bool),
     /// Transport seek (U1): a ruler click/drag moves the playhead. Not a
     /// document edit — the caller forwards it to the engine directly.
     Seek {
@@ -410,8 +409,6 @@ pub struct EditHighlight {
 }
 
 pub struct TimelineParams<'a> {
-    /// Mute flags of the MIDI tracks (channel-strip node state).
-    pub muted: &'a [bool],
     pub selected_track: usize,
     pub selected_auto: usize,
     pub playhead_ticks: f32,
@@ -774,7 +771,6 @@ enum HeaderKind {
     Midi {
         index: usize,
         name: String,
-        muted: bool,
         selected: bool,
     },
     Control {
@@ -1217,7 +1213,6 @@ pub fn show(
             let header = HeaderKind::Midi {
                 index: i,
                 name,
-                muted: p.muted.get(i).copied().unwrap_or(false),
                 selected: p.selected_track == i,
             };
             let highlight = p
@@ -1628,7 +1623,6 @@ fn lane_row<T: Placement>(
         HeaderKind::Midi {
             index,
             name,
-            muted,
             selected,
         } => {
             // Reorder grab handle (MIDI rows only): a drag on the dots
@@ -1663,21 +1657,10 @@ fn lane_row<T: Placement>(
                 btn = btn.fill(Color32::from_rgb(60, 90, 140));
             }
             if ui
-                .add_sized([HEADER_WIDTH - 56.0, row_h - 4.0], btn)
+                .add_sized([HEADER_WIDTH - 16.0, row_h - 4.0], btn)
                 .clicked()
             {
                 actions.push(TimelineAction::SelectTrack(index));
-            }
-            let mut mute_btn = egui::Button::new(if muted { "M" } else { "On" });
-            if muted {
-                mute_btn = mute_btn.fill(Color32::from_rgb(140, 60, 50));
-            }
-            if ui
-                .add_sized([40.0, row_h - 4.0], mute_btn)
-                .on_hover_text("Toggle mute")
-                .clicked()
-            {
-                actions.push(TimelineAction::ToggleMute(index, !muted));
             }
         }
         HeaderKind::Control { index, selected } => {

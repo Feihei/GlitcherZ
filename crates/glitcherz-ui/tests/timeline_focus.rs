@@ -105,7 +105,6 @@ impl Fixture {
             churn,
             ..
         } = self;
-        let muted: [bool; 0] = [];
         let loop_range = glitcherz_model::SongLoop::default();
         let mut out = ctx.run_ui(raw, |root| {
             // Same order as the app: the router resolves hover focus before
@@ -146,7 +145,6 @@ impl Fixture {
                     &*tracks,
                     &[],
                     TimelineParams {
-                        muted: &muted,
                         selected_track: 0,
                         selected_auto: 0,
                         playhead_ticks: 0.0,

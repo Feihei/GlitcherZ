@@ -544,13 +544,19 @@ fn meter_color(db: f32) -> egui::Color32 {
 /// Stereo peak meter for the transport bar: two vertical bars (L / R) on a
 /// [`METER_FLOOR_DB`]..0 dB scale, fed by the 600 ms peak hold. Drawn by
 /// hand because a `ProgressBar` is a single horizontal bar.
+/// Master output meter: two thin **horizontal** bars, left channel on top,
+/// right below. Takes the rest of the transport row, so the meter gets a long
+/// run-out; total height matches one button row.
 fn master_meter(ui: &mut egui::Ui, levels: [f32; 2]) {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, 18.0), egui::Sense::hover());
+    let width = ui.available_width().max(60.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
+    let bar_h = 7.0;
+    let gap = 4.0;
     for (index, level) in levels.into_iter().enumerate() {
         let bar = egui::Rect::from_min_size(
-            egui::pos2(rect.left() + index as f32 * 11.0, rect.top()),
-            egui::vec2(8.0, rect.height()),
+            egui::pos2(rect.left(), rect.top() + index as f32 * (bar_h + gap)),
+            egui::vec2(rect.width(), bar_h),
         );
         painter.rect_filled(
             bar,
@@ -560,9 +566,11 @@ fn master_meter(ui: &mut egui::Ui, levels: [f32; 2]) {
         let db = level_db(level);
         let fill = ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0);
         if fill > 0.0 {
-            let top = bar.bottom() - bar.height() * fill;
             painter.rect_filled(
-                egui::Rect::from_min_max(egui::pos2(bar.left(), top), bar.max),
+                egui::Rect::from_min_max(
+                    bar.min,
+                    egui::pos2(bar.left() + bar.width() * fill, bar.bottom()),
+                ),
                 egui::CornerRadius::same(1),
                 meter_color(db),
             );
@@ -1760,21 +1768,6 @@ impl GlitcherZApp {
             cur = next;
         }
         None
-    }
-
-    /// State of the mixer channel a track feeds: `(muted, gain, pan)`;
-    /// defaults when the track is not routed into a mixer.
-    fn track_mixer_channel_state(&self, track: usize) -> (bool, f32, f32) {
-        match self.track_channel_target(track) {
-            Some((mixer_doc, ch)) => match self.project().graph.node_by_id(mixer_doc) {
-                Some(NodeDoc::Mixer { channels, .. }) => channels
-                    .get(ch as usize)
-                    .map(|c| (c.muted, c.gain, c.pan))
-                    .unwrap_or((false, 0.8, 0.0)),
-                _ => (false, 0.8, 0.0),
-            },
-            None => (false, 0.8, 0.0),
-        }
     }
 
     // ---- Automation track dispatch (D7/D12: curve and cable endpoint are separated) ----
@@ -3896,8 +3889,8 @@ impl GlitcherZApp {
             self.end_param_edit();
         }
 
-        master_meter(ui, [self.meter_l.held, self.meter_r.held]);
-
+        // Panic first, meter last: the meter stretches over the remaining
+        // row width (long run-out) to the right of the Panic button.
         if ui
             .button("Panic")
             .on_hover_text("Release every sounding note — the transport keeps running")
@@ -3905,6 +3898,7 @@ impl GlitcherZApp {
         {
             self.engine.send(EngineCommand::Panic);
         }
+        master_meter(ui, [self.meter_l.held, self.meter_r.held]);
     }
 
     /// Arrangement end in ticks (U1: the skip-to-end target) — the latest
@@ -3990,9 +3984,6 @@ impl GlitcherZApp {
         egui::Panel::bottom("glitcherz_automation").show(ui, |ui| {
             self.automation_strip(ui);
         });
-        let muted: Vec<bool> = (0..self.project().midi_tracks.len())
-            .map(|i| self.track_mixer_channel_state(i).0)
-            .collect();
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
         let selected_track = self.selected_track;
@@ -4026,7 +4017,6 @@ impl GlitcherZApp {
                 midi,
                 control,
                 timeline::TimelineParams {
-                    muted: &muted,
                     selected_track,
                     selected_auto,
                     playhead_ticks: playhead,
@@ -4057,26 +4047,6 @@ impl GlitcherZApp {
             timeline::TimelineAction::SelectControlTrack(index) => {
                 self.selected_auto = index;
                 self.edit_clip = None;
-            }
-            timeline::TimelineAction::ToggleMute(track, muted) => {
-                // P5f: mute lives on the track's mixer channel (D15), not a strip.
-                if let Some((mixer_doc, ch)) = self.track_channel_target(track) {
-                    let before = self.begin_edit();
-                    if let Some(NodeDoc::Mixer { channels, .. }) =
-                        self.project_mut().graph.node_by_id_mut(mixer_doc)
-                        && let Some(c) = channels.get_mut(ch as usize)
-                    {
-                        c.muted = muted;
-                    }
-                    self.commit_edit("Toggle Mute", before);
-                    if let Some(&engine_id) = self.node_map.get(&mixer_doc) {
-                        self.engine.send(EngineCommand::SetNodeParam {
-                            node_id: engine_id,
-                            id: ParamId::MixerMute(ch),
-                            value: if muted { 1.0 } else { 0.0 },
-                        });
-                    }
-                }
             }
             timeline::TimelineAction::OpenMidiEditor { track, clip } => {
                 self.selected_track = track;
@@ -5224,6 +5194,17 @@ impl GlitcherZApp {
             if matches!(target_doc, Some(NodeDoc::Instrument { .. }))
                 && let Some(instr_id) = target
             {
+            // The plugin parameter panels below are gated on the voice kind:
+            // the VST3 panel exists for VST3 instruments, the CLAP panel for
+            // CLAP ones, and built-in / SoundFont voices show neither (they
+            // have no plugin parameters — same rule as the effect panels,
+            // which appear only when parameter data exists).
+            let voice_is_vst3 = self.project().graph.node_by_id(instr_id).is_some_and(|n| {
+                matches!(n, NodeDoc::Instrument { voice: VoiceSpec::Vst3 { .. }, .. })
+            });
+            let voice_is_clap = self.project().graph.node_by_id(instr_id).is_some_and(|n| {
+                matches!(n, NodeDoc::Instrument { voice: VoiceSpec::Clap { .. }, .. })
+            });
             if self.voice_plugin_key(instr_id).is_some() {
                 ui.horizontal(|ui| {
                     ui.label("Preset");
@@ -5288,10 +5269,12 @@ impl GlitcherZApp {
             // responsive) and a filter narrows the list. Current values are
             // seeded from the controller read-back at load time, UI session
             // only. G4: keyed to the target instrument node.
-            egui::CollapsingHeader::new(format!(
-                "Plugin Params ({})",
-                self.voice_params.get(&instr_id).map(Vec::len).unwrap_or(0)
-            ))
+            // Only rendered when the target's voice **is** VST3.
+            if voice_is_vst3 {
+                egui::CollapsingHeader::new(format!(
+                    "Plugin Params ({})",
+                    self.voice_params.get(&instr_id).map(Vec::len).unwrap_or(0)
+                ))
             .default_open(false)
             .show(ui, |ui| {
                 ui.add(
@@ -5359,6 +5342,7 @@ impl GlitcherZApp {
                     self.sync_vst3_host_param(instr_id, id, value);
                 }
             });
+            }
 
             // CLAP plugin parameter panel: enumerated via the params extension at instantiation.
             // Sliders send raw plugin-range values through the `PluginParam` bridge (applied at
@@ -5366,6 +5350,8 @@ impl GlitcherZApp {
             // grouped by the CLAP `module` path (Dexed's OP1/OP2/… sections) — the label shows
             // `module / name` and an empty-filter view sorts by module. Current values live in
             // the UI session only; a fresh plugin load resets them to the plugin defaults.
+            // Only rendered when the target's voice **is** CLAP.
+            if voice_is_clap {
             egui::CollapsingHeader::new(format!(
                 "Plugin Params CLAP ({})",
                 self.clap_voice_params.get(&instr_id).map(Vec::len).unwrap_or(0)
@@ -5445,6 +5431,7 @@ impl GlitcherZApp {
                     self.send_node_param(instr_id, ParamId::PluginParam(id), value as f32);
                 }
             });
+            }
             }
             ui.weak("Node graph: instrument -> delay -> mixer channels -> master (doc-driven, changes go live)");
             ui.add_space(8.0);

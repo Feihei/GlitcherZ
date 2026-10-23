@@ -199,23 +199,22 @@ mod windows_impl {
             rect: eframe::egui::Rect,
             pixels_per_point: f32,
         ) {
-            use windows_sys::Win32::Foundation::*;
-            use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
-            let Some(main_hwnd) = super::main_window_handle(frame) else {
+            use windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE;
+            use windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOZORDER;
+            use windows_sys::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW;
+            use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos;
+            let Some(_main_hwnd) = super::main_window_handle(frame) else {
                 return;
             };
-            // Screen position of the main window's client-area origin
-            // (physical pixels) — the offset between egui screen coords
-            // and the container's parent-client coords.
-            // SAFETY: `main_hwnd` is the live main-window HWND obtained
-            // from eframe; POINT is an out-parameter on our stack.
-            let mut origin = POINT { x: 0, y: 0 };
-            if unsafe { ClientToScreen(main_hwnd, &mut origin) } == 0 {
-                return;
-            }
+            // egui screen coords are **client-area relative** (egui_winit
+            // builds `RawInput::screen_rect` from `Pos2::ZERO`), and a child
+            // window's position is relative to its parent's client area too —
+            // so `rect * ppp` maps 1:1 onto the child coordinates. Subtracting
+            // the client origin here was the old bug: it shifted the container
+            // up by one title bar, covering the UI row above the editor.
             let target = (
-                (rect.left() * pixels_per_point - origin.x as f32).round() as i32,
-                (rect.top() * pixels_per_point - origin.y as f32).round() as i32,
+                (rect.left() * pixels_per_point).round() as i32,
+                (rect.top() * pixels_per_point).round() as i32,
                 (rect.width() * pixels_per_point).round() as i32,
                 (rect.height() * pixels_per_point).round() as i32,
             );
@@ -226,7 +225,20 @@ mod windows_impl {
             if self.placed.get() == Some(target) {
                 return;
             }
-            self.reposition_platform(target.0, target.1, target.2, target.3);
+            // SAFETY: the handle was created by this module on this thread.
+            // SWP_SHOWWINDOW flips visibility on; NOZORDER/NOACTIVATE keep
+            // the egui main window's focus and stacking untouched.
+            unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    std::ptr::null_mut(),
+                    target.0,
+                    target.1,
+                    target.2.max(1),
+                    target.3.max(1),
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
             self.placed.set(Some(target));
         }
     }

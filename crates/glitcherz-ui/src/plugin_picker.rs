@@ -379,7 +379,13 @@ impl PluginPicker {
                                 if recent_count > 0 {
                                     ui.weak("Recent");
                                     for choice in rows.iter().take(recent_count) {
-                                        if row(ui, choice, index == self.selected, self.reveal) {
+                                        if row(
+                                            ui,
+                                            choice,
+                                            index == self.selected,
+                                            self.reveal,
+                                            index,
+                                        ) {
                                             clicked = Some(index);
                                         }
                                         index += 1;
@@ -389,7 +395,7 @@ impl PluginPicker {
                                 }
                             }
                             for choice in rows.iter().skip(index) {
-                                if row(ui, choice, index == self.selected, self.reveal) {
+                                if row(ui, choice, index == self.selected, self.reveal, index) {
                                     clicked = Some(index);
                                 }
                                 index += 1;
@@ -455,15 +461,20 @@ impl PluginPicker {
     }
 }
 
-/// Paints one 22 px row and reports a click.
-fn row(ui: &mut egui::Ui, choice: &PickChoice, selected: bool, reveal: bool) -> bool {
+/// Paints one 22 px row and reports a click. `index` feeds the row's explicit
+/// id — a stable id keeps the click assigned to the same widget across frames
+/// (and makes the row addressable from headless tests).
+fn row(ui: &mut egui::Ui, choice: &PickChoice, selected: bool, reveal: bool, index: usize) -> bool {
     let width = ui.available_width();
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
+    // Hover-only placeholder reserves the row; the click sense attaches to an
+    // explicitly identified `interact` registered **after** the content — see
+    // below for why the order matters.
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return false;
     }
-    if selected || response.hovered() {
+    let hovered = ui.rect_contains_pointer(rect);
+    if selected || hovered {
         ui.painter()
             .rect_filled(rect, 2.0, ui.visuals().selection.bg_fill);
     }
@@ -492,6 +503,16 @@ fn row(ui: &mut egui::Ui, choice: &PickChoice, selected: bool, reveal: bool) -> 
                 .color(ui.visuals().weak_text_color()),
         );
     });
+    // egui's hit-testing stops at the **topmost** widget under the pointer —
+    // a hover-sense Label painted over the row absorbs the click instead of
+    // passing it through. Registering the click widget last puts the row on
+    // top of its own labels, so a mouse click on the name reaches it (the
+    // Enter path always worked because keys bypass hit-testing).
+    let response = ui.interact(
+        rect,
+        egui::Id::new(("plugin_picker_row", index)),
+        egui::Sense::click(),
+    );
     response.on_hover_text(&choice.path).clicked()
 }
 
@@ -783,6 +804,68 @@ mod tests {
             0.1,
         );
         assert_eq!(outcome, Some(PickOutcome::Cancelled));
+        assert!(!picker.is_open());
+    }
+
+    #[test]
+    fn mouse_click_picks_a_row() {
+        fn hover(pos: egui::Pos2) -> egui::Event {
+            egui::Event::PointerMoved(pos)
+        }
+        fn press(pos: egui::Pos2, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let entries = sample_entries();
+        let mut picker = PluginPicker::default();
+        picker.open(PickFilter {
+            want_instrument: Some(true),
+            format: None,
+        });
+        // Opening frame: the menu's own click must not land on the list.
+        assert!(frame(&ctx, &mut picker, &entries, &[], vec![], 0.0).is_none());
+        // Settle frame (the opening frame is a sizing pass — rows may skip
+        // drawing while the popup size is still unknown).
+        assert!(frame(&ctx, &mut picker, &entries, &[], vec![], 0.05).is_none());
+
+        // Rows carry explicit ids, so the test can address the first one
+        // directly and click its centre — the same gesture as clicking the
+        // plugin name with the mouse.
+        let row_rect = ctx
+            .read_response(egui::Id::new(("plugin_picker_row", 0)))
+            .expect("row 0 drew once the popup settled")
+            .rect;
+        let pos = row_rect.center();
+        assert!(frame(&ctx, &mut picker, &entries, &[], vec![hover(pos)], 0.1).is_none());
+        assert!(
+            frame(
+                &ctx,
+                &mut picker,
+                &entries,
+                &[],
+                vec![hover(pos), press(pos, true)],
+                0.2
+            )
+            .is_none()
+        );
+        let outcome = frame(
+            &ctx,
+            &mut picker,
+            &entries,
+            &[],
+            vec![hover(pos), press(pos, false)],
+            0.3,
+        );
+        match outcome {
+            Some(PickOutcome::Picked(choice)) => assert_eq!(choice.name, "Alpha"),
+            other => panic!("expected a pick from a mouse click, got {other:?}"),
+        }
         assert!(!picker.is_open());
     }
 
