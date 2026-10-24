@@ -36,6 +36,9 @@ glitcherz-command = { workspace = true }
 
 raw-window-handle = { workspace = true }
 thiserror = { workspace = true }
+# Offline wav export (U7, spec `.agents/spec/export-audio.md`): writing the
+# 16-bit PCM render — same crate the engine's sample loader decodes with.
+hound = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

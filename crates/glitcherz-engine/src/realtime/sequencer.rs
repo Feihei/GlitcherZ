@@ -213,6 +213,12 @@ pub struct Sequencer {
     /// Arrangement end in ticks (D16: the latest clip end rounded up to a
     /// bar); `0` = unbounded (empty arrangement, free run).
     arrangement_end_ticks: u32,
+    /// Arrangement-end **floor** (U7: the offline export sets it to the
+    /// latest clip end across ALL track kinds — audio clips are not
+    /// sequencer content, so the auto-stop would otherwise cut audio that
+    /// ends past the MIDI/control arrangement end). The live engine never
+    /// sets it (`0` = no floor).
+    arrangement_floor_ticks: u32,
     /// Song loop range (U1). Invariant: `loop_end == 0 || loop_end >
     /// loop_start` — anything else means looping is disabled.
     loop_start_ticks: u32,
@@ -241,6 +247,7 @@ impl Sequencer {
             clips: [[RtMidiClip::default(); MAX_TRACK_CLIPS]; MAX_MIDI_TRACKS],
             control_clips: [[RtControlClip::default(); MAX_TRACK_CLIPS]; MAX_AUTO_TRACKS],
             arrangement_end_ticks: 0,
+            arrangement_floor_ticks: 0,
             loop_start_ticks: 0,
             loop_end_ticks: 0,
             pending_offs: [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS],
@@ -475,7 +482,9 @@ impl Sequencer {
 
     /// D16: arrangement end = the latest clip end (`start + span`) across all
     /// MIDI and control clips, rounded up to a whole bar of the **current**
-    /// meter (U3a).
+    /// meter (U3a). The export floor (U7) keeps the end at least as far out
+    /// as the caller demanded, so audio-track material ending past the
+    /// MIDI content is not cut by the auto-stop.
     fn refresh_arrangement_end(&mut self) {
         let mut latest: u32 = 0;
         for track in &self.clips {
@@ -488,12 +497,21 @@ impl Sequencer {
                 latest = latest.max(clip.start_ticks.saturating_add(clip.span_ticks));
             }
         }
+        latest = latest.max(self.arrangement_floor_ticks);
         let bar = self.bar_ticks.max(1);
         self.arrangement_end_ticks = if latest == 0 {
             0
         } else {
             latest.div_ceil(bar) * bar
         };
+    }
+
+    /// Sets the arrangement-end floor (U7): the auto-stop never fires
+    /// before this tick. `0` clears it (the live engine's state). RT-safe;
+    /// the end refreshes immediately.
+    pub fn set_arrangement_floor(&mut self, floor_ticks: u32) {
+        self.arrangement_floor_ticks = floor_ticks;
+        self.refresh_arrangement_end();
     }
 
     /// Advances one block: sends note offs and note ons falling due within the

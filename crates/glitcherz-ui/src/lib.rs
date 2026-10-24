@@ -53,6 +53,7 @@ use glitcherz_model::{
 
 pub mod curve;
 pub mod event_list;
+pub mod export_audio;
 pub mod focus;
 pub mod grid;
 pub mod patch;
@@ -434,7 +435,7 @@ const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(8);
 
 /// External plugin instance guard (CLAP / VST3).
 #[allow(dead_code)] // guard held only to extend lifetime; the field itself is never read
-enum PluginGuard {
+pub(crate) enum PluginGuard {
     Clap(glitcherz_clap_host::ClapInstanceGuard),
     Vst3(glitcherz_vst3_host::Vst3InstanceGuard),
 }
@@ -820,6 +821,14 @@ pub struct GlitcherZApp {
     /// (the editor reopens on the new node); cleared only by an explicit
     /// close. Not persisted.
     editor_user_open: bool,
+    /// Running offline export (U7, spec `export-audio.md`): pumped a few
+    /// blocks per frame at the end of `ui()`. Dropping it releases the
+    /// offline engine and its plugin guards.
+    export_job: Option<export_audio::ExportJob>,
+    /// The range-selection modal for a pending export (U7 D2).
+    export_dialog_open: bool,
+    /// Selected range inside the export dialog.
+    export_range_choice: export_audio::ExportRange,
     /// Diagnostic flag: whether `ui()` has been entered (logging only).
     first_frame_logged: bool,
     /// Diagnostic flag: whether the close command has been sent (logging only).
@@ -950,6 +959,9 @@ impl GlitcherZApp {
             plugin_editor: None,
             plugin_editor_wants_open: false,
             editor_user_open: false,
+            export_job: None,
+            export_dialog_open: false,
+            export_range_choice: export_audio::ExportRange::FullSong,
             first_frame_logged: false,
             close_sent: false,
         };
@@ -3422,6 +3434,502 @@ impl GlitcherZApp {
         }
     }
 
+    /// Builds one document node's **processor** for the offline export
+    /// engine (U7 D4): the sound path only — spawn + persisted state +
+    /// construction-time parameter replay. Unlike [`Self::install_node`]
+    /// this touches **no session caches and no guard list**: the guard
+    /// lands in the caller's collection and dies with the export job.
+    fn spawn_offline_node(
+        &mut self,
+        engine: &mut glitcherz_engine::AudioEngine,
+        node_map: &mut HashMap<u64, u64>,
+        guards: &mut Vec<PluginGuard>,
+        node: &NodeDoc,
+    ) {
+        if node.is_keyboard() {
+            return; // document-only routing node, no engine counterpart
+        }
+        let sr = convert::sample_rate_to_f32(self.engine.info().sample_rate);
+        let sample_rate = self.engine.info().sample_rate;
+        let (processor, guard): (Box<dyn Processor>, Option<PluginGuard>) = match node {
+            NodeDoc::Instrument { voice, .. } => match voice {
+                VoiceSpec::Builtin => (Box::new(SynthProcessor::new(sr)), None),
+                VoiceSpec::Sample {
+                    path,
+                    root_note,
+                    play_mode,
+                    gain,
+                } => match self.obtain_sample_voice(path, sr) {
+                    Ok(mut processor) => {
+                        processor.set_param(ParamId::SampleRootNote, f32::from(*root_note));
+                        processor.set_param(
+                            ParamId::SamplePlayMode,
+                            if matches!(play_mode, SamplePlayMode::OneShot) {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                        );
+                        processor.set_param(ParamId::SampleGain, *gain);
+                        (Box::new(processor), None)
+                    }
+                    Err(err) => {
+                        log::error!("Export: sample {path} failed to load: {err}");
+                        (Box::new(SynthProcessor::new(sr)), None)
+                    }
+                },
+                VoiceSpec::SoundFont {
+                    path,
+                    bank,
+                    program,
+                } => match self.obtain_sf2_voice(path, sr) {
+                    Ok(mut processor) => {
+                        processor.set_param(ParamId::Sf2BankSelect, f32::from(*bank));
+                        processor.set_param(ParamId::Sf2ProgramChange, f32::from(*program));
+                        (Box::new(processor), None)
+                    }
+                    Err(err) => {
+                        log::error!("Export: sound font {path} failed to load: {err}");
+                        (Box::new(SynthProcessor::new(sr)), None)
+                    }
+                },
+                VoiceSpec::Clap {
+                    path,
+                    plugin_id,
+                    state,
+                } => match ClapInstance::spawn_rt(
+                    std::path::Path::new(path),
+                    plugin_id,
+                    ClapInstanceConfig {
+                        sample_rate,
+                        max_frames: 128,
+                    },
+                ) {
+                    Ok(mut instance) => {
+                        if !state.is_empty()
+                            && let Err(err) = instance.guard.load_state(state)
+                        {
+                            log::warn!("Export: CLAP state restore failed for {plugin_id}: {err}");
+                        }
+                        let ClapInstance { guard, node } = instance;
+                        (Box::new(node), Some(PluginGuard::Clap(guard)))
+                    }
+                    Err(err) => {
+                        log::error!("Export: CLAP {plugin_id} failed to spawn: {err}");
+                        (Box::new(SynthProcessor::new(sr)), None)
+                    }
+                },
+                VoiceSpec::Vst3 {
+                    path,
+                    class_id,
+                    state,
+                    ..
+                } => match glitcherz_vst3_host::Vst3Instance::spawn_rt(
+                    std::path::Path::new(path),
+                    class_id,
+                    glitcherz_vst3_host::Vst3InstanceConfig {
+                        sample_rate,
+                        max_frames: 128,
+                    },
+                ) {
+                    Ok(instance) => {
+                        if !state.is_empty()
+                            && let Err(err) = instance.guard.load_state(state)
+                        {
+                            log::warn!("Export: VST3 state restore failed for {class_id}: {err}");
+                        }
+                        let glitcherz_vst3_host::Vst3Instance { guard, node } = instance;
+                        (Box::new(node), Some(PluginGuard::Vst3(guard)))
+                    }
+                    Err(err) => {
+                        log::error!("Export: VST3 {class_id} failed to spawn: {err}");
+                        (Box::new(SynthProcessor::new(sr)), None)
+                    }
+                },
+            },
+            NodeDoc::Effect { voice, .. } => match voice {
+                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {
+                    (Box::new(DelayProcessor::new(sr)), None)
+                }
+                VoiceSpec::Clap {
+                    path,
+                    plugin_id,
+                    state,
+                } => match ClapInstance::spawn_rt(
+                    std::path::Path::new(path),
+                    plugin_id,
+                    ClapInstanceConfig {
+                        sample_rate,
+                        max_frames: 128,
+                    },
+                ) {
+                    Ok(mut instance) => {
+                        if !state.is_empty()
+                            && let Err(err) = instance.guard.load_state(state)
+                        {
+                            log::warn!("Export: CLAP effect state restore failed: {err}");
+                        }
+                        let ClapInstance { guard, node } = instance;
+                        (Box::new(node), Some(PluginGuard::Clap(guard)))
+                    }
+                    Err(err) => {
+                        log::error!("Export: CLAP effect {plugin_id} failed to spawn: {err}");
+                        (Box::new(DelayProcessor::new(sr)), None)
+                    }
+                },
+                VoiceSpec::Vst3 {
+                    path,
+                    class_id,
+                    state,
+                    ..
+                } => match glitcherz_vst3_host::Vst3Instance::spawn_rt(
+                    std::path::Path::new(path),
+                    class_id,
+                    glitcherz_vst3_host::Vst3InstanceConfig {
+                        sample_rate,
+                        max_frames: 128,
+                    },
+                ) {
+                    Ok(instance) => {
+                        if !state.is_empty()
+                            && let Err(err) = instance.guard.load_state(state)
+                        {
+                            log::warn!("Export: VST3 effect state restore failed: {err}");
+                        }
+                        let glitcherz_vst3_host::Vst3Instance { guard, node } = instance;
+                        (Box::new(node), Some(PluginGuard::Vst3(guard)))
+                    }
+                    Err(err) => {
+                        log::error!("Export: VST3 effect {class_id} failed to spawn: {err}");
+                        (Box::new(DelayProcessor::new(sr)), None)
+                    }
+                },
+            },
+            NodeDoc::Mixer {
+                channels,
+                out_pan,
+                out_muted,
+                ..
+            } => {
+                let eng: Vec<EngineMixerChannel> = channels
+                    .iter()
+                    .map(|c| EngineMixerChannel {
+                        gain: c.gain,
+                        pan: c.pan,
+                        muted: c.muted,
+                        solo: c.solo,
+                    })
+                    .collect();
+                (
+                    Box::new(MixerProcessor::with_channels(&eng, *out_pan, *out_muted)),
+                    None,
+                )
+            }
+            NodeDoc::Feedback { gain, .. } => {
+                let mut processor = FeedbackProcessor::new();
+                processor.set_param(ParamId::FeedbackGain, *gain);
+                (Box::new(processor), None)
+            }
+            NodeDoc::ChannelStrip { .. } => (Box::new(ChannelStripProcessor::new()), None),
+            NodeDoc::AudioTrack { track, .. } => {
+                let table = self.build_audio_clip_table(*track);
+                (Box::new(AudioTrackProcessor::new(table)), None)
+            }
+            // Unreachable (returned above); kept for exhaustiveness.
+            NodeDoc::Keyboard { .. } => (Box::new(SynthProcessor::new(sr)), None),
+        };
+        let engine_id = engine.fresh_node_id();
+        let kind = match node {
+            NodeDoc::Mixer { .. } => NodeKind::Mixer,
+            NodeDoc::Feedback { .. } => NodeKind::Feedback,
+            _ => NodeKind::Plain,
+        };
+        if engine.add_node(engine_id, kind, processor) {
+            node_map.insert(node.node_id(), engine_id);
+            if let Some(guard) = guard {
+                guards.push(guard);
+            }
+        } else if let Some(guard) = guard {
+            drop(guard); // never entered the graph: release immediately
+        }
+    }
+
+    /// Assembles the offline export engine from the current document (U7
+    /// D4: the mirror of `apply_document` — nodes, track addressing,
+    /// cables, the three clip-table pushes, the arrangement floor — minus
+    /// every session-cache side effect) and returns the started job.
+    fn start_export(
+        &mut self,
+        path: &std::path::Path,
+        range: export_audio::ExportRange,
+    ) -> Option<export_audio::ExportJob> {
+        let Some(window) = range.window(self.project()) else {
+            self.set_message("No song loop set — draw one on the ruler first".to_string());
+            return None;
+        };
+        let sample_rate = self.engine.info().sample_rate;
+        let mut engine = glitcherz_engine::AudioEngine::start_offline(sample_rate)
+            .expect("the offline engine needs no audio device");
+        let mut node_map: HashMap<u64, u64> = HashMap::new();
+        let mut guards: Vec<PluginGuard> = Vec::new();
+        let nodes = self.project().graph.nodes.clone();
+        for node in &nodes {
+            self.spawn_offline_node(&mut engine, &mut node_map, &mut guards, node);
+        }
+        // Track addressing (the mirror of register_track_chain).
+        for track in 0..self.project().midi_tracks.len() {
+            let resolve = |doc_id: Option<u64>| -> Option<u64> {
+                doc_id.and_then(|id| node_map.get(&id).copied())
+            };
+            let voice = resolve(
+                self.project()
+                    .graph
+                    .instrument_of_track(track)
+                    .map(NodeDoc::node_id),
+            );
+            let delay = resolve(
+                self.project()
+                    .graph
+                    .builtin_delay_of_track(track)
+                    .map(NodeDoc::node_id),
+            );
+            let _ = engine.register_track_chain(track, voice, delay, delay);
+        }
+        // Cables (the mirror of apply_document's dispatch, minus vk
+        // document-only routing — the export never routes the keyboard).
+        let master = engine.master_node_id();
+        let cables = self.project().graph.cables.clone();
+        for cable in &cables {
+            let from = match &cable.from {
+                PortRef::Node(id) => node_map.get(id).copied(),
+                _ => None,
+            };
+            let to_node = match &cable.to {
+                PortRef::Node(id) => node_map.get(id).copied(),
+                PortRef::Master => Some(master),
+                _ => None,
+            };
+            match cable.kind {
+                CableKind::Audio => {
+                    if let (Some(from), Some(to)) = (from, to_node) {
+                        let _ = engine.connect_nodes(from, to, cable.in_port);
+                    }
+                }
+                CableKind::Midi => {
+                    if let (PortRef::MidiTrack(track), Some(to)) = (&cable.from, to_node) {
+                        let _ = engine.connect_midi_node(*track, to);
+                    }
+                }
+                CableKind::Automation => {
+                    let PortRef::AutoTrack(index) = &cable.from else {
+                        continue;
+                    };
+                    if cable.to == PortRef::TimelineIn {
+                        let _ = engine.set_timeline_in_route(*index);
+                        continue;
+                    }
+                    let Some(to) = to_node else {
+                        continue;
+                    };
+                    if let Some((controller, channel)) = cable.param.cc_of() {
+                        let _ = engine.set_auto_cc_route(*index, to, channel, controller);
+                        continue;
+                    }
+                    if let Some(id) = param_id_of(&cable.param) {
+                        let _ = engine.set_auto_route(*index, to, id);
+                    }
+                }
+            }
+        }
+        engine.set_midi_track_count(self.project().midi_tracks.len());
+        // The three clip-table pushes (control clips keep automation — and
+        // the tempo curve — live in the export; audio clips included).
+        for track in 0..self.project().midi_tracks.len() {
+            let _ = engine.send(EngineCommand::Sequencer(SequencerCommand::SetTrackClips {
+                track,
+                clips: self.rt_clips(track),
+            }));
+        }
+        for index in 0..self.project().control_tracks.len() {
+            let Some(control_track) = self.project().control_tracks.get(index) else {
+                continue;
+            };
+            let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
+            for (slot, clip) in clips.iter_mut().zip(control_track.clips.iter()) {
+                let mut curve = RtAutomation::default();
+                for point in clip.curve.iter().take(MAX_AUTO_POINTS) {
+                    curve.push(RtAutoPoint {
+                        tick: point.tick,
+                        value: point.value,
+                    });
+                }
+                *slot = RtControlClip {
+                    start_ticks: clip.start_ticks,
+                    span_ticks: clip.span_ticks,
+                    loop_ticks: clip.loop_ticks,
+                    curve,
+                };
+            }
+            let _ = engine.send(EngineCommand::Sequencer(
+                SequencerCommand::SetControlClips { index, clips },
+            ));
+        }
+        for track in 0..self.project().audio_tracks.len() {
+            let Some(&engine_id) = self
+                .project()
+                .graph
+                .nodes
+                .iter()
+                .find(|n| matches!(n, NodeDoc::AudioTrack { track: t, .. } if *t == track))
+                .map(NodeDoc::node_id)
+                .and_then(|doc_id| node_map.get(&doc_id))
+            else {
+                continue;
+            };
+            let table = self.build_audio_clip_table(track);
+            let _ = engine.send_audio_clips(engine_id, table);
+        }
+        // U7 D5: the auto-stop must not fire before the latest clip end
+        // across ALL track kinds (audio is not sequencer content).
+        let _ = engine.set_arrangement_floor(export_audio::export_end_ticks(self.project()));
+        // No loop range is pushed — the offline render never wraps.
+        engine.seek_ticks(window.0);
+        let _ = engine.send(EngineCommand::Sequencer(SequencerCommand::Play));
+        match export_audio::ExportJob::new(engine, guards, path, sample_rate, window) {
+            Ok(job) => Some(job),
+            Err(err) => {
+                self.set_message(format!("Export failed to create the wav: {err}"));
+                None
+            }
+        }
+    }
+
+    /// Pumps the running export at the end of the UI frame (U7 D1, the
+    /// plugin-scan slicing precedent) and finishes/cancels it.
+    fn pump_export(&mut self) {
+        let Some(mut job) = self.export_job.take() else {
+            return;
+        };
+        let done = job.pump(export_audio::BLOCKS_PER_FRAME);
+        if !done {
+            self.export_job = Some(job);
+            return;
+        }
+        let path_label = job.path().display().to_string();
+        if job.cancelled {
+            self.set_message("Export cancelled".to_string());
+        } else {
+            match job.finalize() {
+                Ok(path) => {
+                    self.set_message(format!("Exported to {}", path.display()));
+                    log::info!("Audio export written to {path_label}");
+                }
+                Err(err) => {
+                    self.set_message(format!("Export finalize failed: {err}"));
+                }
+            }
+        }
+    }
+
+    /// Export progress banner above the transport (U7 D1: same slot the
+    /// plugin-scan banner uses).
+    fn export_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(job) = self.export_job.as_mut() else {
+            return;
+        };
+        let progress = job.progress();
+        let mut cancel = false;
+        egui::Panel::top("glitcherz_export").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::ProgressBar::new(progress)
+                        .desired_width(160.0)
+                        .text(format!("{}%", (progress * 100.0) as u32)),
+                );
+                ui.weak(format!("Exporting — {}", job.path().display()));
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if cancel && let Some(job) = self.export_job.as_mut() {
+            job.cancelled = true;
+        }
+    }
+
+    /// Range-selection modal before an export starts (U7 D2).
+    fn export_dialog(&mut self, ctx: &egui::Context) {
+        if !self.export_dialog_open {
+            return;
+        }
+        let mut close = false;
+        let mut start = false;
+        let loop_valid = self.project().metadata.loop_range.enabled
+            && self.project().metadata.loop_range.end_ticks
+                > self.project().metadata.loop_range.start_ticks
+            && self.project().metadata.loop_range.end_ticks > 0;
+        let modal = egui::Modal::new(egui::Id::new("glitcherz_export_range")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.heading("Export Audio");
+            ui.label("Render the arrangement to a 16-bit stereo wav.");
+            ui.add_space(8.0);
+            ui.radio_value(
+                &mut self.export_range_choice,
+                export_audio::ExportRange::FullSong,
+                "Full song",
+            );
+            ui.radio_value(
+                &mut self.export_range_choice,
+                export_audio::ExportRange::SongLoop,
+                "Song loop",
+            )
+            .on_disabled_hover_text(if loop_valid {
+                ""
+            } else {
+                "No song loop set — Ctrl+drag on the ruler to draw one"
+            })
+            .on_hover_text("The enabled loop range on the ruler");
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+                let can_start =
+                    self.export_range_choice == export_audio::ExportRange::FullSong || loop_valid;
+                if ui
+                    .add_enabled(can_start, egui::Button::new("Choose File…"))
+                    .clicked()
+                {
+                    start = true;
+                }
+            });
+        });
+        if modal.should_close() {
+            close = true;
+        }
+        if close || start {
+            self.export_dialog_open = false;
+        }
+        if start {
+            let range = self.export_range_choice;
+            let stem = self
+                .project_path
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Untitled".to_string());
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name(format!("{stem}.wav"))
+                .add_filter("Wave", &["wav"])
+                .save_file()
+                && let Some(job) = self.start_export(&path, range)
+            {
+                self.export_job = Some(job);
+                log::info!("Audio export started: {}", path.display());
+            }
+        }
+    }
+
     /// Switch a sample instrument's play mode (U5, spec D1): document field
     /// as one undoable edit + node-param delivery.
     fn set_sample_play_mode(&mut self, doc_id: u64, one_shot: bool) {
@@ -3989,6 +4497,16 @@ impl GlitcherZApp {
                     if ui.button("Export MIDI…").clicked() {
                         ui.close();
                         self.export_midi_dialog();
+                    }
+                    if ui.button("Export Audio…").clicked() {
+                        ui.close();
+                        // U7: one export at a time — a running job keeps its
+                        // snapshot; the menu simply refuses while it runs.
+                        if self.export_job.is_none() {
+                            self.export_dialog_open = true;
+                        } else {
+                            self.set_message("An export is already running".to_string());
+                        }
                     }
                 });
                 ui.separator();
@@ -7771,8 +8289,9 @@ impl eframe::App for GlitcherZApp {
 
         // U9 E2: the plugin-scan banner sits above the transport while the
         // startup scan has modules left (it names the module the frame's tail
-        // will block on, spec D14).
+        // will block on, spec D14). The U7 export banner shares the slot.
         self.plugin_scan_banner(ui);
+        self.export_banner(ui);
         self.transport_panel(ui);
         self.status_panel(ui);
         self.view_tabs(ui);
@@ -7935,6 +8454,10 @@ impl eframe::App for GlitcherZApp {
         // (it creates the node with its final source, spec D1).
         self.plugin_picker_frame(ui.ctx());
 
+        // U7: the export range modal rides above every panel (the
+        // unsaved-changes precedent).
+        self.export_dialog(ui.ctx());
+
         // U2: the unsaved-changes modal draws on top of every panel, and an
         // approved close is replayed here (the guard above let it through).
         self.unsaved_changes_dialog(ui.ctx());
@@ -7949,6 +8472,13 @@ impl eframe::App for GlitcherZApp {
         // queue drains faster than the 50 ms display tick below.
         self.plugin_scan_step();
         if self.plugin_catalog.is_scanning() {
+            ui.ctx().request_repaint();
+        }
+
+        // U7: the offline export pumps here too (same end-of-frame slot),
+        // and wants repaints while it runs so the progress bar moves.
+        self.pump_export();
+        if self.export_job.is_some() {
             ui.ctx().request_repaint();
         }
 

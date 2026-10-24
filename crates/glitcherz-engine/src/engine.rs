@@ -43,7 +43,8 @@ pub enum EngineError {
 /// The audio engine. Dropping [`AudioEngine`] (and thus the internal
 /// `cpal::Stream`) stops the output.
 pub struct AudioEngine {
-    _stream: cpal::Stream,
+    /// Output stream (live engines only; offline engines have `None`).
+    _stream: Option<cpal::Stream>,
     commands: rtrb::Producer<EngineCommand>,
     /// Structure update queue: producer end for graph topology changes
     /// (plan swaps / installing or removing nodes).
@@ -60,6 +61,11 @@ pub struct AudioEngine {
     /// execution plan compiler. Entirely `Copy`, so the whole snapshot can be
     /// rolled back when a queue push fails.
     compiler: GraphCompiler,
+    /// Offline-mode block runner (U7, spec `export-audio.md` D3): the live
+    /// engine moves its runner into the cpal callback and leaves `None`
+    /// here; an offline engine keeps it on the field so the control thread
+    /// can drive blocks via [`AudioEngine::render_offline_block`].
+    offline_runner: Option<BlockRunner>,
     feedback: Feedback,
     info: AudioEngineInfo,
 }
@@ -128,12 +134,13 @@ impl AudioEngine {
         stream.play()?;
 
         Ok(Self {
-            _stream: stream,
+            _stream: Some(stream),
             commands,
             structure: structure_tx,
             recycle: recycle_rx,
             audio_trash: audio_trash_rx,
             compiler,
+            offline_runner: None,
             feedback,
             info: AudioEngineInfo {
                 device_name,
@@ -141,6 +148,74 @@ impl AudioEngine {
                 out_channels: stream_config.channels,
             },
         })
+    }
+
+    /// Builds an **offline** engine (U7, spec `export-audio.md` D3): the
+    /// same queue/compiler/runner/feedback assembly as [`AudioEngine::start`]
+    /// minus the cpal device and stream — no audio hardware is touched, so
+    /// this works on headless machines. The runner stays on the
+    /// `offline_runner` field; the caller drives blocks with
+    /// [`AudioEngine::render_offline_block`] and reads progress through the
+    /// usual feedback methods (`musical_ticks` / `is_playing`).
+    ///
+    /// Output is fixed stereo at `sample_rate`. **Must be called on a
+    /// non-real-time thread** (allocation during construction).
+    pub fn start_offline(sample_rate: u32) -> Result<Self, EngineError> {
+        let sample_rate_f32 = convert::sample_rate_to_f32(sample_rate);
+        let (commands, command_rx) = command_channel(COMMAND_QUEUE_CAPACITY);
+        let (compiler, graph) = GraphCompiler::empty_graph(sample_rate_f32, FIXED_BLOCK_SIZE);
+        let feedback = Feedback::new();
+        let sequencer = Sequencer::new(sample_rate_f32);
+        let (structure_tx, structure_rx) = structure_channel();
+        let (recycle_tx, recycle_rx) = recycle_channel();
+        let (audio_trash_tx, audio_trash_rx) =
+            crate::realtime::audio_track::audio_clip_trash_channel();
+        let runner = BlockRunner::new(
+            FIXED_BLOCK_SIZE,
+            2,
+            sample_rate_f32,
+            graph,
+            sequencer,
+            command_rx,
+            structure_rx,
+            recycle_tx,
+            audio_trash_tx,
+            feedback.clone(),
+        );
+        Ok(Self {
+            _stream: None,
+            commands,
+            structure: structure_tx,
+            recycle: recycle_rx,
+            audio_trash: audio_trash_rx,
+            compiler,
+            offline_runner: Some(runner),
+            feedback,
+            info: AudioEngineInfo {
+                device_name: "offline".to_string(),
+                sample_rate,
+                out_channels: 2,
+            },
+        })
+    }
+
+    /// Renders one block (or any chunk of frames — the runner splits into
+    /// fixed blocks internally) of the offline engine into `out`
+    /// (interleaved stereo, `len = frames * 2`). Returns `false` when this
+    /// is a live engine (no offline runner) and nothing was rendered.
+    ///
+    /// The same path the cpal callback takes: commands and structure
+    /// updates are consumed at block boundaries, the sequencer advances,
+    /// automation is evaluated, and the graph processes. **Control thread
+    /// only** (the offline runner is not shared with any callback).
+    pub fn render_offline_block(&mut self, out: &mut [f32]) -> bool {
+        match self.offline_runner.as_mut() {
+            Some(runner) => {
+                runner.render_interleaved(out);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Sends a control command to the audio thread (takes effect at the next
@@ -457,6 +532,16 @@ impl AudioEngine {
     pub fn set_midi_track_count(&mut self, count: usize) -> bool {
         self.send(EngineCommand::Sequencer(
             SequencerCommand::SetMidiTrackCount(count),
+        ))
+    }
+
+    /// Sets the arrangement-end floor (U7 export): the auto-stop never
+    /// fires before this tick. The offline export uses it to keep
+    /// audio-track material ending past the MIDI arrangement running; the
+    /// live engine never sets it.
+    pub fn set_arrangement_floor(&mut self, floor_ticks: u32) -> bool {
+        self.send(EngineCommand::Sequencer(
+            SequencerCommand::SetArrangementFloor(floor_ticks),
         ))
     }
 

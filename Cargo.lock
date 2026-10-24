@@ -1146,6 +1146,7 @@ dependencies = [
  "glitcherz-engine",
  "glitcherz-model",
  "glitcherz-vst3-host",
+ "hound",
  "log",
  "raw-window-handle",
  "rfd",

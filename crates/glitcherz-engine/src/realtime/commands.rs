@@ -158,6 +158,12 @@ pub enum SequencerCommand {
     /// Set the active MIDI track count (D12 dynamic tracks; values beyond
     /// capacity are clamped on the real-time side).
     SetMidiTrackCount(usize),
+    /// Set the arrangement-end floor (U7 export): the auto-stop never fires
+    /// before this tick. The offline export sets it to the latest clip end
+    /// across ALL track kinds (audio clips are not sequencer content, so
+    /// the D16 end alone would cut audio ending past the MIDI arrangement).
+    /// `0` clears it — the live engine never sets anything else.
+    SetArrangementFloor(u32),
 }
 
 /// Control commands from the UI / control thread to the audio thread.
@@ -215,7 +221,7 @@ pub fn command_channel(capacity: usize) -> (Producer<EngineCommand>, Consumer<En
 
 #[cfg(test)]
 mod tests {
-    use super::{EngineCommand, NoteEvent, ParamId, command_channel};
+    use super::{EngineCommand, NoteEvent, ParamId, SequencerCommand, command_channel};
 
     fn set_param(value: f32) -> EngineCommand {
         EngineCommand::SetParam {
@@ -231,6 +237,7 @@ mod tests {
             EngineCommand::SetNodeParam { value, .. } => value,
             EngineCommand::Note { .. } => f32::NAN,
             EngineCommand::NoteAtNode { .. } => f32::NAN,
+            EngineCommand::Sequencer(SequencerCommand::SetBpm(value)) => value,
             EngineCommand::Sequencer(_) => f32::NAN,
             EngineCommand::Panic => f32::NAN,
         }

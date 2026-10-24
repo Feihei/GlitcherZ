@@ -542,3 +542,16 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 **波形"所见即所听"**：`SampleData` 加载期算 peaks（256 帧/列 min/max，双声道折叠）；`draw_waveform` 列 j ↔ peaks 子区间 [j/n,(j+1)/n) 的合并极值——与 RT 读取同一比例映射。UI 帧内波形源 = `SampleLibrary::get`（**只读查找，帧内不解码**——`&dyn Fn(&str) -> Option<Arc>` 不能是 FnMut，load 的 `&mut self` 进不了闭包）。
 
 **建 clip 的 span 换算**：wav 秒 × bpm/60 × TICKS_PER_QUARTER → ticks（clamp ≥1 bar、≤ 排列边界 − start）。
+### Export Audio 离线渲染（U7，spec `export-audio.md`，2026-10-24）
+
+**离线引擎 = 同一装配减去 cpal**：`AudioEngine::start_offline(sample_rate)` 与 `start()` 唯一的差别是不建流——`_stream: Option<Stream>` + `runner: Option<BlockRunner>`（实时把 runner move 进闭包后字段留 `None`；离线留 `Some`，`render_offline_block` 转发 `render_interleaved`）。无设备依赖 → headless/CI 可跑。装配/命令/结构队列全部复用，离线引擎的高层 API（add_node/connect_nodes/set_auto_route/send_audio_clips…）与 live 完全同路径。
+
+**`SetArrangementFloor`（本 feature 新增的引擎命令）**：D16 自停的 `arrangement_end` 只统计 MIDI/control clip（`refresh_arrangement_end`），audio clip 终点更晚时自停先发生 → `transport_active=false` → AudioTrackProcessor 静音切断。floor 让 `arrangement_end = max(内容, floor)`。live 引擎永不推（零影响）；导出装配推 `export_end_ticks`（全 clip 终点 max）。**任何"sequencer 内容之外还有时间轴内容"的后续特性（录音？）都要重访这个坑**。
+
+**Play 的 `note_off_all` 吞同块 note**：`apply_command(Play)` 会群发 blanket off——FIFO 队列里 Play 之前发的手动 Note 在**同块**被消费：note 触发 envelope → 紧跟 note_off_all → release 从 level≈0 开始 = 瞬间静音。**导出无此坑**（音符全部来自 clip 调度，advance 在 Play 生效后的块里跑）；`offline_engine` 测试的时序注释锁定该认知。手动 note 测试必须：装配块 → Play → **再渲染一块** → Note。
+
+**离线装配 = `spawn_offline_node`（不是 install_node 的参数化）**：install_node 一半代码是 UI 缓存记账（clap_voice_params/voice_default_state/voice_guards——**离线 guard 混入主列表会被 engine_id 撞号误回收**）。独立 spawn 只走声音路径（构造/spawn+load_state/构造期 set_param），guard 收集到 job 本地的 `Vec`，随 job drop 统一释放。VST3 的 `guard.load_state` 是 `&self`（StateGate 内部处理）、CLAP 是 `&mut`——`Ok(instance)` 的 mut 两家不同。
+
+**帧间分片**（U9 扫描先例）：帧尾 `pump_export` 渲染 34 块（~90ms 音频）+ `request_repaint`；进度 = `musical_ticks / (end-start)`；到达终点 `pause()`（停在 end，tail 期间 transport_active=false 只放效果尾——audio 内容按设计止于 end）。空工程 window=(0,0)：Play 后立即 pause，只渲染 1s 尾音（空文件带尾）。Cancel 直接 drop job（半成品文件留给用户）。**writer finalize 才写 RIFF 头尺寸**——取消的半成品 wav 头是错的，可接受（文档写明）。
+
+**测试口径**：ADSR 默认 release **0.2s**（≈96 块@48k/128），不是采样播放器的 10ms——"Stop 后静音"断言要给足块数；探针（临时 debug 测试 + println + assert!(false)）是定位"链路哪一环无声"的最快手段，删净即可。

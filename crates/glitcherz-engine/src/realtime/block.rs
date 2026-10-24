@@ -435,6 +435,9 @@ impl BlockRunner {
             SequencerCommand::SetMidiTrackCount(count) => {
                 self.sequencer.set_track_count(count);
             }
+            SequencerCommand::SetArrangementFloor(floor) => {
+                self.sequencer.set_arrangement_floor(floor);
+            }
         }
     }
 
