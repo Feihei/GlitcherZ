@@ -102,6 +102,9 @@ mod tests {
             sample_rate: SR,
             frames: BLOCK,
             playback_sample_pos: 0,
+            song_ticks: 0.0,
+            transport_dt_ticks: 0.0,
+            transport_active: true,
         }
     }
 

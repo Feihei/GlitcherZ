@@ -280,6 +280,10 @@ const PANIC_SWEEP_BATCH: u8 = 24;
 /// the queue live in the ring buffer's preallocated storage; after the audio
 /// thread `take`s all heap resources, dropping the leftover values performs
 /// no heap operations.
+#[allow(clippy::large_enum_variant)] // SetTopology dwarfs SetAudioClips;
+// the queue preallocates by the largest
+// variant either way (same trade-off as
+// SequencerCommand::SetTrackClips).
 pub enum GraphUpdate {
     /// Swaps in the whole execution plan and applies incremental
     /// installs/removals (removals first, then installs).
@@ -294,6 +298,17 @@ pub enum GraphUpdate {
         removed: [u16; MAX_REMOVALS],
         /// Number of valid removals.
         removed_count: usize,
+    },
+    /// Replaces one audio-track node's clip table (U6, spec
+    /// `.agents/spec/audio-track.md` D4). The table carries
+    /// `Arc<SampleData>` (not `Copy`), which is exactly why it rides this
+    /// queue instead of the command queue. The block runner routes the
+    /// displaced old table into the trash queue — never dropped in place.
+    SetAudioClips {
+        /// Target node ID (the `NodeDoc::AudioTrack`'s engine id).
+        node_id: u64,
+        /// The new clip table (built on the control thread).
+        clips: crate::realtime::audio_track::AudioClipTable,
     },
 }
 
@@ -347,13 +362,19 @@ impl RtGraph {
     /// RT-safe: only pointer moves, `Copy` overwrites, and queue pushes; no
     /// allocation / heap drops.
     pub fn apply_update(&mut self, update: GraphUpdate, recycle: &mut Producer<RecycledNode>) {
+        // `SetAudioClips` is intercepted by the block runner before this
+        // point; reaching it here would be a wiring bug — refuse it rather
+        // than mis-handle the table.
         let GraphUpdate::SetTopology {
             plan,
             mut deployments,
             deployment_count,
             removed,
             removed_count,
-        } = update;
+        } = update
+        else {
+            return;
+        };
         for &slot in &removed[..removed_count] {
             if let Some(node) = self.slots[slot as usize].take() {
                 // If the recycle queue is full, skip the uninstall (keep
@@ -391,6 +412,24 @@ impl RtGraph {
         // emitted value so the next sampled block always delivers one (the
         // new target would otherwise wait for the curve to move).
         self.last_cc = [-1; MAX_AUTO_TRACKS];
+    }
+
+    /// Replaces one node's audio clip table (U6 D4). Returns the table that
+    /// must go to the trash queue: the displaced old one on success, or the
+    /// unconsumed input when the node is unknown / not an audio-track node.
+    /// RT-safe: a linear slot scan (≤ [`MAX_NODES`]) plus a move; nothing
+    /// drops here.
+    pub fn set_audio_clips(
+        &mut self,
+        node_id: u64,
+        clips: crate::realtime::audio_track::AudioClipTable,
+    ) -> Option<crate::realtime::audio_track::AudioClipTable> {
+        for slot in self.slots.iter_mut().flatten() {
+            if slot.node_id == node_id {
+                return slot.processor.swap_audio_clips(clips);
+            }
+        }
+        None
     }
 
     /// Processes one block: in topological order, sum in-edges → consume
@@ -2117,6 +2156,9 @@ mod tests {
             sample_rate: SR,
             frames: BLOCK,
             playback_sample_pos: 0,
+            song_ticks: 0.0,
+            transport_dt_ticks: 0.0,
+            transport_active: true,
         }
     }
 

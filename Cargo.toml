@@ -66,6 +66,9 @@ raw-window-handle = "0.6"
 # Vendored fork：修复 preset zone 合并语义（覆盖 + 仅 initialAttenuation 相加，
 # SF2 2.04 §8.5.2），待上游合入后切回 registry 版本。
 rustysynth-ext = { path = ".vendor/rustysynth-ext", features = ["sf3"] }
+# wav 解码（U5 采样播放器 / U6 audio track 共用；纯 Rust 零 unsafe，
+# 解码只在控制线程 sample 模块，RT 路径不 touch）
+hound = "3.5"
 glitcherz-model = { path = "crates/glitcherz-model" }
 glitcherz-command = { path = "crates/glitcherz-command" }
 glitcherz-clap-host = { path = "crates/glitcherz-clap-host" }

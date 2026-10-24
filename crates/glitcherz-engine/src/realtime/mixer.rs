@@ -208,6 +208,9 @@ mod tests {
             sample_rate: 48_000.0,
             frames: 8,
             playback_sample_pos: 0,
+            song_ticks: 0.0,
+            transport_dt_ticks: 0.0,
+            transport_active: true,
         }
     }
 

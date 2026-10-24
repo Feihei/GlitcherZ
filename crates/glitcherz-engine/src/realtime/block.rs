@@ -101,6 +101,15 @@ pub struct BlockRunner {
     commands: Consumer<EngineCommand>,
     structure: Consumer<GraphUpdate>,
     recycle: rtrb::Producer<RecycledNode>,
+    /// Displaced audio clip tables wait here for control-thread
+    /// deallocation (U6 D4). Pushed by this thread, drained by
+    /// [`crate::engine::AudioEngine`] — the tables are **moved**, never
+    /// dropped on the audio thread.
+    audio_trash: rtrb::Producer<crate::realtime::audio_track::AudioClipTable>,
+    /// A table that did not fit the trash queue last block (queue full);
+    /// retried every block before new traffic. Only reachable if the
+    /// control thread stops draining for ~64 updates.
+    audio_trash_pending: Option<crate::realtime::audio_track::AudioClipTable>,
     feedback: Feedback,
     played_samples: u64,
 }
@@ -120,6 +129,7 @@ impl BlockRunner {
         commands: Consumer<EngineCommand>,
         structure: Consumer<GraphUpdate>,
         recycle: rtrb::Producer<RecycledNode>,
+        audio_trash: rtrb::Producer<crate::realtime::audio_track::AudioClipTable>,
         feedback: Feedback,
     ) -> Self {
         Self {
@@ -136,6 +146,8 @@ impl BlockRunner {
             commands,
             structure,
             recycle,
+            audio_trash,
+            audio_trash_pending: None,
             feedback,
             played_samples: 0,
         }
@@ -181,18 +193,19 @@ impl BlockRunner {
             self.apply_command(cmd);
         }
         while let Ok(update) = self.structure.pop() {
-            self.graph.apply_update(update, &mut self.recycle);
+            match update {
+                GraphUpdate::SetAudioClips { node_id, clips } => {
+                    // U6: displaced (or unconsumed) tables go to the trash
+                    // queue — a move, never a drop on this thread.
+                    if let Some(trashed) = self.graph.set_audio_clips(node_id, clips) {
+                        self.trash_audio_clips(trashed);
+                    }
+                }
+                topology => self.graph.apply_update(topology, &mut self.recycle),
+            }
         }
 
-        // 2. This block's context (shared by the sequencer and the mixer).
-        let frames = self.fixed_block;
-        let ctx = ProcessContext {
-            sample_rate: self.sample_rate,
-            frames,
-            playback_sample_pos: self.played_samples,
-        };
-
-        // 3. Automation evaluation (only while playing) **before** the
+        // 2. Automation evaluation (only while playing) **before** the
         //    sequencer advances (U3b D4): a tempo curve must be sampled at the
         //    block's *start* position so the block it governs actually runs at
         //    the sampled rate — evaluating afterwards would always spend one
@@ -202,6 +215,22 @@ impl BlockRunner {
         if self.sequencer.is_playing() {
             self.evaluate_automation(position_before);
         }
+
+        // 3. This block's context, assembled **after** automation evaluation
+        //    so the tick-domain fields (U6) reflect any tempo curve governing
+        //    this block: `song_ticks` is the block's start position, the tick
+        //    step matches what `advance()` will use, and `transport_active`
+        //    silences timeline audio clips while stopped (a frozen position
+        //    would otherwise replay the same frames every block).
+        let frames = self.fixed_block;
+        let ctx = ProcessContext {
+            sample_rate: self.sample_rate,
+            frames,
+            playback_sample_pos: self.played_samples,
+            song_ticks: position_before,
+            transport_dt_ticks: self.sequencer.transport_dt_ticks(frames),
+            transport_active: self.sequencer.is_transport_active(),
+        };
 
         // 4. Sequencer scheduling: due note events fan out along the graph's
         //    MIDI routing table to the target instrument nodes (block-boundary
@@ -285,6 +314,32 @@ impl BlockRunner {
         }
     }
 
+    /// Forwards a displaced audio clip table to the trash queue (U6 D4).
+    ///
+    /// If the queue is momentarily full the table parks in
+    /// `audio_trash_pending` and is retried first at the next call — a full
+    /// queue never drops anything on this thread. The park slot itself is
+    /// single: the only producer of tables is the UI thread, which is also
+    /// the only drainer, so 64 slots plus one park cannot all be occupied
+    /// while the producer still runs. Should that invariant ever break,
+    /// the older parked table is `mem::forget`-ed (a bounded leak) rather
+    /// than deallocated here — the RT rule forbids the latter outright.
+    /// RT-safe.
+    fn trash_audio_clips(&mut self, table: crate::realtime::audio_track::AudioClipTable) {
+        // Retry last block's parked table first (the queue may have room now).
+        if let Some(parked) = self.audio_trash_pending.take() {
+            if let Err(rtrb::PushError::Full(parked)) = self.audio_trash.push(parked) {
+                self.audio_trash_pending = Some(parked);
+            }
+        }
+        if let Err(rtrb::PushError::Full(table)) = self.audio_trash.push(table) {
+            if let Some(parked) = self.audio_trash_pending.replace(table) {
+                std::mem::forget(parked);
+            }
+        }
+    }
+
+    /// Applies one control command at the block boundary.
     fn apply_command(&mut self, cmd: EngineCommand) {
         match cmd {
             EngineCommand::SetParam { id, value } => {
@@ -432,6 +487,9 @@ mod tests {
         let (tx, rx) = command_channel(64);
         let (graph_tx, graph_rx) = crate::realtime::voice::structure_channel();
         let (_recycle_tx, _recycle_rx) = crate::realtime::voice::recycle_channel();
+        let (audio_trash_tx, audio_trash_rx) =
+            crate::realtime::audio_track::audio_clip_trash_channel();
+        drop(audio_trash_rx);
         let (compiler, graph) = GraphCompiler::default_graph(SR, fixed_block);
         let feedback = Feedback::new();
         let sequencer = Sequencer::new(SR);
@@ -444,6 +502,7 @@ mod tests {
             rx,
             graph_rx,
             _recycle_tx,
+            audio_trash_tx,
             feedback.clone(),
         );
         (runner, tx, graph_tx, feedback, compiler)

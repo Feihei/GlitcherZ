@@ -1047,6 +1047,9 @@ mod tests {
             sample_rate: 48_000.0,
             frames: 128,
             playback_sample_pos: 0,
+            song_ticks: 0.0,
+            transport_dt_ticks: 0.0,
+            transport_active: true,
         };
         Some((instance, ctx))
     }
@@ -1646,6 +1649,9 @@ mod tests {
             sample_rate: 48_000.0,
             frames: 128,
             playback_sample_pos: 0,
+            song_ticks: 0.0,
+            transport_dt_ticks: 0.0,
+            transport_active: true,
         };
         let mut buffer = AudioBuffer::new(2, 128);
         buffer.set_len(128);
@@ -1952,6 +1958,9 @@ mod tests {
             sample_rate: 48_000.0,
             frames: 128,
             playback_sample_pos: 0,
+            song_ticks: 0.0,
+            transport_dt_ticks: 0.0,
+            transport_active: true,
         };
         let mut buffer = AudioBuffer::new(2, 128);
         buffer.set_len(128);
@@ -2241,6 +2250,9 @@ mod tests {
             sample_rate: 48_000.0,
             frames: 128,
             playback_sample_pos: 0,
+            song_ticks: 0.0,
+            transport_dt_ticks: 0.0,
+            transport_active: true,
         };
         let mut buffer = AudioBuffer::new(2, 128);
         buffer.set_len(128);
@@ -2327,6 +2339,9 @@ mod tests {
                 sample_rate: sr as f32,
                 frames: 128,
                 playback_sample_pos: 0,
+                song_ticks: 0.0,
+                transport_dt_ticks: 0.0,
+                transport_active: true,
             };
             let mut buf = AudioBuffer::new(2, 128);
             buf.set_len(128);
@@ -2496,6 +2511,8 @@ mod tests {
         let (mut tx, rx) = command_channel(64);
         let (graph_tx, graph_rx) = structure_channel();
         let (recycle_tx, _recycle_rx) = recycle_channel();
+        let (audio_trash_tx, _audio_trash_rx) =
+            glitcherz_engine::realtime::audio_track::audio_clip_trash_channel();
         let (mut compiler, graph) = GraphCompiler::default_graph(sr, fixed_block);
         let feedback = Feedback::new();
         let sequencer = Sequencer::new(sr);
@@ -2508,6 +2525,7 @@ mod tests {
             rx,
             graph_rx,
             recycle_tx,
+            audio_trash_tx,
             feedback.clone(),
         );
 
@@ -2713,6 +2731,9 @@ mod tests {
             sample_rate: 48_000.0,
             frames: 128,
             playback_sample_pos: 0,
+            song_ticks: 0.0,
+            transport_dt_ticks: 0.0,
+            transport_active: true,
         };
         let mut buf = AudioBuffer::new(2, 128);
         buf.set_len(128);

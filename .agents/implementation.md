@@ -510,3 +510,35 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 **Panic 为什么不发 `Off { note: 0 }`**：`note_off_all` 的毯式 off 到不了按 pitch 匹配的插件（Dexed 的挂音问题已记在 SF2/CLAP 两节）。真实释放要逐 pitch 走 0..127，但 **CLAP / VST3 两个宿主的 pending 队列都只有 32 条**（`MAX_PENDING_EVENTS`），一个 block 内塞 128 条会静默丢事件。所以 `RtGraph::panic()` 只设 `panic_sweep = Some(0)` 游标，`process_block` 开头每块发 `PANIC_SWEEP_BATCH = 24` 个 pitch 再推进（24 而非 32，给同 block 的常规事件留余量）：128/24 = 6 块，48 kHz / 128 frames 下约 16 ms。`EngineCommand::Panic` 额外先 `release_pending_notes()`（按 pitch 释放音序器已取走的待关音符）。**语义是静音不是停止**：transport 继续跑、参数一个不动，`--seconds` 冒烟与 `panic_sweeps_every_pitch_across_bounded_batches`（断言 128 个不同 pitch 全部到达）锁定。
 
 **验收坑**：master gain 的 `Slider` 用 `custom_formatter` 显示 dB（线性 0..1.5 → `-∞..+3.5 dB`）；拖动仍走 `begin_param_edit` / `commit_param_edit("master-gain")` / `drag_stopped` 三步，否则一次拖动会塞满 undo 栈，或者每帧写文档让标题永远带 `*`。
+### 采样播放器 instrument（U5，spec `sample-player.md`，2026-10-24）
+
+**模块镜像 SF2 布局**：`engine::sample`（非实时，hound 解码）+ `realtime/sample.rs`（RT processor），装配走 `install_node` 唯一入口。`SampleData` 把任何位深（int 8/16/24/32 经 hound 统一 `samples::<i32>` 有符号化 + 归一化，float 32）解码为 f32 立体声帧盒；**交错流组帧必须整块 `chunks_exact(2)`**（立体声）或 `into_iter().map(|v| [v, v])`（单声道），逐样本 push 会把右声道丢掉。`SampleLibrary` 是 path → `Arc<SampleData>` 的多样本会话缓存（与 sf2 单库不同：采样器一轨一样本），`obtain_sample_voice` 未命中才解码。
+
+**RT 内核三个易错点**：
+
+1. **步进系数合一**：`rate = 2^((note−root)/12) · wav_sr / engine_sr`——音高比率与采样率补偿是同一个 per-engine-frame 步进，不单独做重采样预处理；线性插值读取。voice 触发时 rate 定格（root note 参数变更只影响后续 note-on，sampler 惯例）。
+2. **OneShot 与毯式 off 的区分**：`Off { note: 0 }`（`held` 位图 key 0 未按住）= blanket sweep → **所有** voice 进 fade（含 OneShot，Stop/Panic 必须能停）；pitch-matched off 只进 Gate voice。voice 存 `one_shot` 快照（触发时的 play mode）。
+3. **池回收**：`voices[0..active_count]` 紧凑区，块尾 swap-compact（`!active` 的与尾部交换，交换后不推进索引重查）；池满偷 age 最大者（age 每块 +1）。渲染写预分配 scratch 再 `copy_channel` 覆盖 buffer（生成器语义，同 SF2）。
+
+**测试方法论（两条坑）**：① RT 审计的 `AuditScope` 内不许建 `AudioBuffer`——构造分配会被计入（3 次假阳性）；② ramp fixture 逐块上升、块间峰值不可比，**增益/衰减/复音堆叠断言必须用恒幅 fixture**（`flat_fixture`），"输出 = 源 × rate" 数学断言才用 ramp（整数游标处 frac=0 插值精确）。复音上限验证技巧：同 note 触发 16 次（同样本同 rate 同相位）→ 峰值 = 16 × 单 voice；第 17 次后仍 16×即证明偷音。
+
+**UI 接线**：`Add ▸ Instrument ▸ Sample…`（`PatchAction::PickSample` → rfd wav 对话框 → `NodeSource::Sample` → `create_patch_node` 一步 install）；Inspector `sample_section` 挂在 sf2 preset picker 之后（文件名 / root DragValue / play mode ComboBox / gain Slider，root+gain 走 `begin_param_edit("sample-params")` 手势合并，mode 是离散一步 undo）；patch 内联 `SAMPLE_INLINE`（root+gain）经 `apply_inline_param` 与面板同源；节点标签 `SAMPLE {stem}·{note名} · Track N`（`note_name`：`60 → C4`）。install_node 文件丢失回落 `SynthProcessor`（文档字段保留），`Effect + Sample` 防御性回落 Delay。`param_id_of`/`AutoParam` 未加 Sample 变体——automation 菜单的 Cutoff 选项对 Sample voice 不响应（与 SoundFont 同现状，spec §6 明确不做）。
+### Audio track（U6，spec `audio-track.md`，2026-10-24）
+
+**播放数学完全闭合在 tick 域**：帧位 = `(song_tick − start)/span × wav_frames`——比例映射是**纯函数**，loop 回卷 / seek 跳中段零游标零特判（位置即状态）。拖长 clip = 变速、tempo 变化 = 变调（磁带效应，用户确认取舍）。每输出帧 j 的 clip tick = `song_ticks + j·dt/frames`，线性插值读 wav（U5 `render_voice` 内核平移）。stop/pause 静音由 `ctx.transport_active` 门控——**没有它，冻结的 song_ticks 会每块重放同一帧区间**（循环卡带）。
+
+**非 Copy 数据的 RT 通道设计**（`Arc<SampleData>` 不能进 `EngineCommand`——其 Copy 是铁律）：
+
+- **clip 表走 structure 队列**：`GraphUpdate::SetAudioClips{node_id, table}`（结构队列本来就传 `Box<dyn Processor>`）。`RtGraph::set_audio_clips` 按 node_id 线性扫 slot → 调 **`Processor::swap_audio_clips` trait 默认方法**（None = 未消费，调用方把传入表进 trash）。
+- **displaced 表走 trash 队列**：`mem::replace` 是 move，音频线程零 dealloc；旧表 push `rtrb::RingBuffer<AudioClipTable>`（容量 64），控制线程 UI 帧尾 `engine.reclaim_audio_clips()` drain+drop。满则 park 单槽（`audio_trash_pending`）下块重试；park 被占的理论满 `mem::forget`（有界泄漏）优于 RT dealloc——唯一生产者（UI）同时是唯一 drainer，逻辑不可达。
+- **`rtrb::push` 失败把值还回来**：`Err(PushError::Full(v))` 解构取回，不是消耗。
+
+**ctx 构造顺序**（block.rs）：automation evaluate **之后**、advance 之前——`song_ticks` = evaluate 前的 position（本块起点）、`transport_dt_ticks` = evaluate 后 bpm 的步进（与 advance 内部同公式，`Sequencer::transport_dt_ticks` 公开）、`transport_active` = is_playing。**顺序错了 tempo 曲线就滞后一块**。
+
+**`swap_audio_clips` 放错 impl 块的静默失效**：曾写在 `impl AudioTrackProcessor`（固有块）而非 `impl Processor`——trait 走默认 `None`，`set_audio_clips` 永不消费表，编译零警告（固有方法被测试用到不算 dead）。修复后加 **trait 路径测试**（`Box<dyn Processor>` 上调 `swap_audio_clips` 断言 Some）锁定——这是 trait 默认方法 + 固有同名的经典陷阱。
+
+**timeline 三轨化**：`is_control: bool` → `TimelineLane{Midi, Control, Audio}` 枚举（`ClipSel`/action 字段全线 lane 化，编译器强制补全）。行交互全靠 `Placement` trait 对 `AudioClip` 的实现：`set_loop` no-op（loop==span 恒成立）、**`retain_from(offset)` = start += offset; span -= offset——split 右半段自动播 wav 后半**（比例映射的语义红利）。M4b modal（G/T/Shift+D）对 audio 关闭：`arm_modal` 过滤 Audio 选区（两表推理逻辑不动，v1 边界）；K 切刀/点选/框选/拖动/resize/右键删/批删全继承。**lane_row 内变量遮蔽坑**：`let (is_control, track) = row.key()` 脚本替换成 `let lane = ...` 后与行内 Rect 变量 `lane` 冲突——枚举值改名 `lane_kind`（块级遮蔽无碍，函数级遮蔽会炸掉后续所有 Rect 用法）。
+
+**波形"所见即所听"**：`SampleData` 加载期算 peaks（256 帧/列 min/max，双声道折叠）；`draw_waveform` 列 j ↔ peaks 子区间 [j/n,(j+1)/n) 的合并极值——与 RT 读取同一比例映射。UI 帧内波形源 = `SampleLibrary::get`（**只读查找，帧内不解码**——`&dyn Fn(&str) -> Option<Arc>` 不能是 FnMut，load 的 `&mut self` 进不了闭包）。
+
+**建 clip 的 span 换算**：wav 秒 × bpm/60 × TICKS_PER_QUARTER → ticks（clamp ≥1 bar、≤ 排列边界 − start）。

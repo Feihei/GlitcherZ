@@ -32,20 +32,23 @@ use eframe::egui;
 
 use glitcherz_clap_host::{ClapInstance, ClapInstanceConfig};
 use glitcherz_engine::AudioEngine;
+use glitcherz_engine::SampleError;
+use glitcherz_engine::SampleLibrary;
 use glitcherz_engine::Sf2Error;
 use glitcherz_engine::Sf2Library;
 use glitcherz_engine::convert;
 use glitcherz_engine::realtime::{
-    ChannelStripProcessor, DelayProcessor, EngineCommand, FeedbackProcessor, MAX_AUTO_POINTS,
-    MAX_CLIP_NOTES, MAX_MIDI_FANOUT, MAX_TRACK_CLIPS, MixerChannel as EngineMixerChannel,
-    MixerProcessor, NodeKind, NoteEvent, ParamId, Processor, RtAutoPoint, RtAutomation,
-    RtControlClip, RtMidiClip, RtNote, SequencerCommand, Sf2VoiceProcessor, SynthProcessor,
+    AudioTrackProcessor, ChannelStripProcessor, DelayProcessor, EngineCommand, FeedbackProcessor,
+    MAX_AUTO_POINTS, MAX_CLIP_NOTES, MAX_MIDI_FANOUT, MAX_TRACK_CLIPS,
+    MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent, ParamId, Processor,
+    RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtMidiClip, RtNote, SAMPLE_DEFAULT_ROOT,
+    SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor, SynthProcessor, empty_clip_table,
 };
 use glitcherz_model::{
     AutoParam, AutoPoint, CableKind, ControlClip, ControlTrack, DelayParams, GraphDoc,
-    MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS,
-    MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip, MidiSource, MidiTrack, NodeDoc, PortRef,
-    Project, SongLoop, SynthParams, VoiceSpec,
+    MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_MIDI_TRACKS,
+    MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip, MidiSource, MidiTrack,
+    NodeDoc, PortRef, Project, SamplePlayMode, SongLoop, SynthParams, TICKS_PER_QUARTER, VoiceSpec,
 };
 
 pub mod curve;
@@ -221,6 +224,8 @@ fn inline_param_id(p: patch::InlineParam) -> ParamId {
         patch::InlineParam::DelayMix => ParamId::DelayMix,
         patch::InlineParam::MixerOutPan => ParamId::MixerOutPan,
         patch::InlineParam::FeedbackGain => ParamId::FeedbackGain,
+        patch::InlineParam::SampleRoot => ParamId::SampleRootNote,
+        patch::InlineParam::SampleGain => ParamId::SampleGain,
     }
 }
 
@@ -674,6 +679,8 @@ pub struct GlitcherZApp {
     selected_track: usize,
     /// Automation track being edited.
     selected_auto: usize,
+    /// Audio track being edited (U6: row highlight + `- Audio` target).
+    selected_audio: usize,
     /// Arrangement timeline cross-frame state (zoom/drag).
     timeline_state: timeline::TimelineState,
     /// Which MIDI clip the Edit tab is targeting, as `(track, clip)`
@@ -797,6 +804,10 @@ pub struct GlitcherZApp {
     /// `sf2-loader.md` §6). Loaded via the library panel; document restores
     /// reuse it when the path matches to avoid re-reading a large file.
     sf2_library: Option<Arc<Sf2Library>>,
+    /// Session multi-sample cache (U5, spec `sample-player.md` D7): path →
+    /// decoded `Arc<SampleData>`. Every sample instrument shares it, so
+    /// reinstall / undo / document reload never re-reads a wav.
+    sample_library: SampleLibrary,
     /// Embedded plugin editor state (spec `plugin-gui.md` §4): `Some` while
     /// a CLAP instrument editor is open for a document node. Closed when the
     /// guard retires, the panel target changes, or the user toggles it off.
@@ -891,6 +902,7 @@ impl GlitcherZApp {
             node_map: HashMap::new(),
             selected_track: 0,
             selected_auto: 0,
+            selected_audio: 0,
             timeline_state: timeline::TimelineState::default(),
             edit_clip: None,
             roll_state: piano_roll::RollState::new(),
@@ -934,6 +946,7 @@ impl GlitcherZApp {
             voice_preset_selected: HashMap::new(),
             preset_name_input: String::new(),
             sf2_library: None,
+            sample_library: SampleLibrary::new(),
             plugin_editor: None,
             plugin_editor_wants_open: false,
             editor_user_open: false,
@@ -1089,6 +1102,13 @@ impl GlitcherZApp {
         self.engine
             .set_midi_track_count(self.project().midi_tracks.len());
 
+        // 5b) Audio clip tables (U6): the nodes were installed above with
+        //     their initial tables; this push keeps undo/redo of clip edits
+        //     and document reloads consistent through the same path.
+        for track in 0..self.project().audio_tracks.len() {
+            self.send_audio_clips_for_track(track);
+        }
+
         // 6) Song loop range (U1): metadata lives outside the graph, so the
         //    full rebuild is also the undo/redo/open refresh path for it.
         self.push_loop_range();
@@ -1109,6 +1129,36 @@ impl GlitcherZApp {
             match node {
                 NodeDoc::Instrument { voice, .. } => match voice {
                     VoiceSpec::Builtin => (Box::new(SynthProcessor::new(sr)), None, String::new()),
+                    VoiceSpec::Sample {
+                        path,
+                        root_note,
+                        play_mode,
+                        gain,
+                    } => {
+                        // Document voice restore (D9): the session sample
+                        // cache decodes once per path; a missing or broken
+                        // file falls back to the built-in synth (document
+                        // fields kept for a later retry).
+                        match self.obtain_sample_voice(path, sr) {
+                            Ok(mut processor) => {
+                                processor.set_param(ParamId::SampleRootNote, f32::from(*root_note));
+                                processor.set_param(
+                                    ParamId::SamplePlayMode,
+                                    if matches!(play_mode, SamplePlayMode::OneShot) {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    },
+                                );
+                                processor.set_param(ParamId::SampleGain, *gain);
+                                (Box::new(processor), None, String::new())
+                            }
+                            Err(err) => {
+                                log::error!("Failed to load sample {path}: {err}");
+                                (Box::new(SynthProcessor::new(sr)), None, String::new())
+                            }
+                        }
+                    }
                     VoiceSpec::SoundFont {
                         path,
                         bank,
@@ -1234,7 +1284,7 @@ impl GlitcherZApp {
                     }
                 },
                 NodeDoc::Effect { voice, .. } => match voice {
-                    VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } => {
+                    VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {
                         (Box::new(DelayProcessor::new(sr)), None, String::new())
                     }
                     VoiceSpec::Clap {
@@ -1355,6 +1405,17 @@ impl GlitcherZApp {
                 }
                 NodeDoc::ChannelStrip { .. } => {
                     (Box::new(ChannelStripProcessor::new()), None, String::new())
+                }
+                // U6: the audio-track generator. The clip table comes from
+                // the owning document track (decoded via the session sample
+                // cache); a missing file logs and leaves that clip silent.
+                NodeDoc::AudioTrack { track, .. } => {
+                    let table = self.build_audio_clip_table(*track);
+                    (
+                        Box::new(AudioTrackProcessor::new(table)),
+                        None,
+                        String::new(),
+                    )
                 }
                 // G6: unreachable — virtual keyboards return before the match
                 // (document-only node, no engine processor).
@@ -2045,6 +2106,22 @@ impl GlitcherZApp {
                         );
                     }
                 }
+                patch::PatchAction::PickSample { at } => {
+                    // U5: same flow as PickSoundFont — the modal dialog runs
+                    // here (outside the menu closure), the pick installs a
+                    // sample instrument at the clicked position.
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Wave", &["wav"])
+                        .pick_file()
+                    {
+                        self.create_patch_node(
+                            patch::NodeSource::Sample {
+                                path: path.display().to_string(),
+                            },
+                            at,
+                        );
+                    }
+                }
                 patch::PatchAction::RescanPlugins => {
                     self.plugin_catalog.rescan();
                     self.set_message("Rescanning plug-ins…".to_string());
@@ -2267,6 +2344,17 @@ impl GlitcherZApp {
                     path,
                     bank: 0,
                     program: 0,
+                },
+                synth: SynthParams::default(),
+            },
+            patch::NodeSource::Sample { path } => NodeDoc::Instrument {
+                node_id,
+                track,
+                voice: VoiceSpec::Sample {
+                    path,
+                    root_note: SAMPLE_DEFAULT_ROOT,
+                    play_mode: SamplePlayMode::Gate,
+                    gain: 1.0,
                 },
                 synth: SynthParams::default(),
             },
@@ -3256,6 +3344,112 @@ impl GlitcherZApp {
         )
     }
 
+    /// Build a sample voice processor from the session sample cache (U5,
+    /// spec `sample-player.md` D7): decodes once per path, then reuses the
+    /// shared `Arc<SampleData>`. Control thread only (D6).
+    fn obtain_sample_voice(
+        &mut self,
+        path: &str,
+        sample_rate: f32,
+    ) -> Result<SampleVoiceProcessor, SampleError> {
+        let data = self.sample_library.load(std::path::Path::new(path))?;
+        Ok(SampleVoiceProcessor::new(data, sample_rate))
+    }
+
+    /// Builds the RT clip table of one audio track (U6 D4) from the
+    /// document: each clip's wav decodes through the session sample cache
+    /// (shared with sample-player instruments); a missing file logs and
+    /// leaves the slot empty (silent clip, document kept for a retry).
+    /// **Control thread only** (decodes on cache miss).
+    fn build_audio_clip_table(
+        &mut self,
+        track: usize,
+    ) -> glitcherz_engine::realtime::AudioClipTable {
+        let mut table = empty_clip_table();
+        // Snapshot the placement first: decoding needs `&mut self` (the
+        // session cache), which cannot overlap the document borrow.
+        let clips: Vec<(String, u32, u32, f32)> = self
+            .project()
+            .audio_tracks
+            .get(track)
+            .map(|audio_track| {
+                audio_track
+                    .clips
+                    .iter()
+                    .take(MAX_TRACK_CLIPS)
+                    .map(|c| (c.path.clone(), c.start_ticks, c.span_ticks, c.gain))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (slot, (path, start_ticks, span_ticks, gain)) in clips.into_iter().enumerate() {
+            match self.sample_library.load(std::path::Path::new(&path)) {
+                Ok(data) => {
+                    table[slot] = Some(RtAudioClip {
+                        start_ticks: f64::from(start_ticks),
+                        span_ticks: f64::from(span_ticks),
+                        data,
+                        gain,
+                    });
+                }
+                Err(err) => {
+                    log::error!("Failed to load audio clip '{path}': {err}");
+                }
+            }
+        }
+        table
+    }
+
+    /// Pushes one audio track's clip table to its engine node (U6 D4).
+    /// No-op when the track has no node installed yet (dangling document
+    /// node — the next `apply_document` rebuild installs it).
+    fn send_audio_clips_for_track(&mut self, track: usize) {
+        let Some(doc_id) = self
+            .project()
+            .graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n, NodeDoc::AudioTrack { track: t, .. } if *t == track))
+            .map(NodeDoc::node_id)
+        else {
+            return;
+        };
+        let Some(engine_id) = self.engine_id(doc_id) else {
+            return;
+        };
+        let table = self.build_audio_clip_table(track);
+        if !self.engine.send_audio_clips(engine_id, table) {
+            log::warn!("Audio clip table push for track {track} failed (structure queue full)");
+        }
+    }
+
+    /// Switch a sample instrument's play mode (U5, spec D1): document field
+    /// as one undoable edit + node-param delivery.
+    fn set_sample_play_mode(&mut self, doc_id: u64, one_shot: bool) {
+        let before = self.begin_edit();
+        if let Some(NodeDoc::Instrument {
+            voice: VoiceSpec::Sample { play_mode, .. },
+            ..
+        }) = self.project_mut().graph.node_by_id_mut(doc_id)
+        {
+            *play_mode = if one_shot {
+                SamplePlayMode::OneShot
+            } else {
+                SamplePlayMode::Gate
+            };
+        }
+        if let Some(engine_id) = self.engine_id(doc_id) {
+            self.engine.set_node_param(
+                engine_id,
+                ParamId::SamplePlayMode,
+                if one_shot { 1.0 } else { 0.0 },
+            );
+            self.commit_edit("Sample Play Mode", before);
+            return;
+        }
+        self.commit_edit("Sample Play Mode", before);
+        self.set_message("Play mode switch failed: voice not installed".to_string());
+    }
+
     /// Switch a SoundFont instrument node's preset: document bank/program as
     /// one undoable edit + live node-param delivery (block-granularity, D7).
     fn set_soundfont_preset(&mut self, doc_id: u64, bank: u8, program: u8) {
@@ -3298,7 +3492,7 @@ impl GlitcherZApp {
                 VoiceSpec::Vst3 { path, class_id, .. } => {
                     Some(preset_plugin_key("vst3", path, class_id))
                 }
-                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } => None,
+                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => None,
             },
             _ => None,
         }
@@ -3372,7 +3566,7 @@ impl GlitcherZApp {
         {
             match voice {
                 VoiceSpec::Clap { state, .. } | VoiceSpec::Vst3 { state, .. } => *state = blob,
-                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } => {}
+                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {}
             }
         }
         self.commit_edit("Load Preset", before);
@@ -3439,7 +3633,7 @@ impl GlitcherZApp {
                 VoiceSpec::Clap { state, .. } | VoiceSpec::Vst3 { state, .. } => {
                     *state = Vec::new()
                 }
-                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } => {}
+                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {}
             }
         }
         self.commit_edit("Reset Preset", before);
@@ -3531,7 +3725,9 @@ impl GlitcherZApp {
                             .unwrap_or_else(|| "VST3".to_string()),
                         false,
                     )),
-                    VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } => None,
+                    VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {
+                        None
+                    }
                 },
                 _ => None,
             })
@@ -4041,12 +4237,19 @@ impl GlitcherZApp {
         let playing = self.engine.is_playing();
         let selected_track = self.selected_track;
         let selected_auto = self.selected_auto;
+        let selected_audio = self.selected_audio;
         let edit_target = self
             .edit_clip
             .map(|(track, clip)| timeline::EditHighlight { track, clip });
         // U4b: the selected control track's endpoint parameter drives the
         // inline band's vertical axis. Read before the destructuring below.
         let curve_param = self.project().graph.auto_endpoint(selected_auto);
+        // U6: audio clip bodies read peaks from the session sample cache
+        // (read-only lookup — decoding happens on the edit paths).
+        let waveform_of = {
+            let library = &self.sample_library;
+            move |path: &str| library.get(std::path::Path::new(path))
+        };
         let actions = {
             let Self {
                 session,
@@ -4057,15 +4260,21 @@ impl GlitcherZApp {
             // Read-only: the timeline is a view now; its edit actions come
             // back as data and are applied (undoably) below.
             let project = session.project();
-            let (midi, control) = (&project.midi_tracks, &project.control_tracks);
+            let (midi, control, audio) = (
+                &project.midi_tracks,
+                &project.control_tracks,
+                &project.audio_tracks,
+            );
             timeline::show(
                 ui,
                 state,
                 midi,
                 control,
+                audio,
                 timeline::TimelineParams {
                     selected_track,
                     selected_auto,
+                    selected_audio,
                     playhead_ticks: playhead,
                     playing,
                     edit_target,
@@ -4074,6 +4283,7 @@ impl GlitcherZApp {
                     // U3a: the document's bar length, not the 4/4 constant.
                     bar_ticks: project.ticks_per_bar(),
                     curve_param: curve_param.as_ref(),
+                    waveform_of: &waveform_of,
                 },
                 router,
             )
@@ -4088,12 +4298,17 @@ impl GlitcherZApp {
         match action {
             timeline::TimelineAction::MidiEdited(track) => self.send_track_clips(track),
             timeline::TimelineAction::ControlEdited(index) => self.send_control_clips(index),
+            timeline::TimelineAction::AudioEdited(track) => self.send_audio_clips_for_track(track),
             timeline::TimelineAction::SelectTrack(track) => {
                 self.selected_track = track;
                 self.edit_clip = None;
             }
             timeline::TimelineAction::SelectControlTrack(index) => {
                 self.selected_auto = index;
+                self.edit_clip = None;
+            }
+            timeline::TimelineAction::SelectAudioTrack(track) => {
+                self.selected_audio = track;
                 self.edit_clip = None;
             }
             timeline::TimelineAction::OpenMidiEditor { track, clip } => {
@@ -4122,35 +4337,38 @@ impl GlitcherZApp {
             }
             timeline::TimelineAction::AddMidiTrack => self.add_midi_track(),
             timeline::TimelineAction::RemoveLastMidiTrack => self.remove_last_midi_track(),
+            timeline::TimelineAction::AddAudioTrack => self.add_audio_track(),
+            timeline::TimelineAction::RemoveLastAudioTrack => self.remove_last_audio_track(),
             timeline::TimelineAction::ReorderMidiTrack { from, to } => {
                 self.reorder_midi_track(from, to)
             }
             timeline::TimelineAction::AddClip {
-                is_control,
+                lane,
                 track,
                 start_ticks,
-            } => self.timeline_add_clip(is_control, track, start_ticks),
+            } => self.timeline_add_clip(lane, track, start_ticks),
+            timeline::TimelineAction::AddAudioClip { track, start_ticks } => {
+                self.timeline_add_audio_clip(track, start_ticks)
+            }
             timeline::TimelineAction::MoveResizeClip {
-                is_control,
+                lane,
                 track,
                 clip,
                 start_ticks,
                 span_ticks,
-            } => self.timeline_move_resize_clip(is_control, track, clip, start_ticks, span_ticks),
-            timeline::TimelineAction::RemoveClip {
-                is_control,
-                track,
-                clip,
-            } => self.timeline_remove_clip(is_control, track, clip),
+            } => self.timeline_move_resize_clip(lane, track, clip, start_ticks, span_ticks),
+            timeline::TimelineAction::RemoveClip { lane, track, clip } => {
+                self.timeline_remove_clip(lane, track, clip)
+            }
             timeline::TimelineAction::RemoveClipsBatch { clips } => {
                 self.timeline_remove_clips_batch(clips)
             }
             timeline::TimelineAction::SplitClip {
-                is_control,
+                lane,
                 track,
                 clip,
                 at_ticks,
-            } => self.timeline_split_clip(is_control, track, clip, at_ticks),
+            } => self.timeline_split_clip(lane, track, clip, at_ticks),
             timeline::TimelineAction::MoveClipsBatch { moves } => {
                 self.timeline_move_clips_batch(moves)
             }
@@ -4265,13 +4483,14 @@ impl GlitcherZApp {
     /// Timeline clip edits: the view sends data, these apply it undoably.
     /// A drag frame goes through `commit_param_edit` with the gesture key, so
     /// one drag is one undo step.
-    fn timeline_add_clip(&mut self, is_control: bool, track: usize, start_ticks: u32) {
+    fn timeline_add_clip(&mut self, lane: timeline::TimelineLane, track: usize, start_ticks: u32) {
         let before = self.begin_edit();
         // A new clip is one bar long — of the document's meter (U3a), not the
         // 4/4 constant the model default carries.
         let bar = self.project().ticks_per_bar();
-        let added = if is_control {
-            self.project_mut()
+        let added = match lane {
+            timeline::TimelineLane::Control => self
+                .project_mut()
                 .control_tracks
                 .get_mut(track)
                 .map(|t| {
@@ -4285,9 +4504,29 @@ impl GlitcherZApp {
                         false
                     }
                 })
-                .unwrap_or(false)
-        } else {
-            self.project_mut()
+                .unwrap_or(false),
+            timeline::TimelineLane::Audio => self
+                .project_mut()
+                .audio_tracks
+                .get_mut(track)
+                .map(|t| {
+                    // Audio clips are born one bar; the caller resizes to the
+                    // wav's natural span right after picking the file.
+                    if t.clips.len() < MAX_CLIPS_PER_TRACK {
+                        t.clips.push(glitcherz_model::AudioClip {
+                            path: String::new(),
+                            start_ticks,
+                            span_ticks: bar,
+                            gain: 1.0,
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false),
+            timeline::TimelineLane::Midi => self
+                .project_mut()
                 .midi_tracks
                 .get_mut(track)
                 .map(|t| {
@@ -4301,25 +4540,78 @@ impl GlitcherZApp {
                         false
                     }
                 })
-                .unwrap_or(false)
+                .unwrap_or(false),
         };
         if added {
             self.commit_edit("Add Clip", before);
-            self.sync_clip_row(is_control, track);
+            self.sync_clip_row(lane, track);
+        }
+    }
+
+    /// U6 D2: double-click on empty audio-track space asked for a wav. The
+    /// modal dialog runs here (the timeline is a view); the clip is born at
+    /// the clicked tick with the span derived from the file's duration at
+    /// the current tempo (D1: stretched across the span on playback).
+    fn timeline_add_audio_clip(&mut self, track: usize, start_ticks: u32) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Wave", &["wav"])
+            .pick_file()
+        else {
+            return;
+        };
+        let path = path.display().to_string();
+        let Ok(data) = self.sample_library.load(std::path::Path::new(&path)) else {
+            self.set_message("Audio clip unreadable: not a supported wav".to_string());
+            return;
+        };
+        // Natural span: wav seconds → ticks at the current tempo. Clamped to
+        // the arrangement bound and at least one bar.
+        let seconds = data.frames().len() as f64 / f64::from(data.sample_rate());
+        let bpm = self.project().metadata.tempo_bpm;
+        let span = ((seconds * bpm / 60.0) * f64::from(TICKS_PER_QUARTER))
+            .round()
+            .clamp(
+                f64::from(self.project().ticks_per_bar()),
+                MAX_ARRANGEMENT_TICKS as f64,
+            ) as u32;
+        let span = span.min(MAX_ARRANGEMENT_TICKS as u32 - start_ticks).max(1);
+        let before = self.begin_edit();
+        let added = self
+            .project_mut()
+            .audio_tracks
+            .get_mut(track)
+            .map(|t| {
+                if t.clips.len() < MAX_CLIPS_PER_TRACK {
+                    t.clips.push(glitcherz_model::AudioClip {
+                        path,
+                        start_ticks,
+                        span_ticks: span,
+                        gain: 1.0,
+                    });
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if added {
+            self.commit_edit("Add Audio Clip", before);
+            self.send_audio_clips_for_track(track);
         }
     }
 
     fn timeline_move_resize_clip(
         &mut self,
-        is_control: bool,
+        lane: timeline::TimelineLane,
         track: usize,
         clip: usize,
         start_ticks: u32,
         span_ticks: u32,
     ) {
         let before = self.begin_edit();
-        let moved = if is_control {
-            self.project_mut()
+        let moved = match lane {
+            timeline::TimelineLane::Control => self
+                .project_mut()
                 .control_tracks
                 .get_mut(track)
                 .and_then(|t| t.clips.get_mut(clip))
@@ -4334,9 +4626,23 @@ impl GlitcherZApp {
                     c.loop_ticks = span_ticks;
                     changed
                 })
-                .unwrap_or(false)
-        } else {
-            self.project_mut()
+                .unwrap_or(false),
+            timeline::TimelineLane::Audio => self
+                .project_mut()
+                .audio_tracks
+                .get_mut(track)
+                .and_then(|t| t.clips.get_mut(clip))
+                .map(|c| {
+                    let changed = c.start_ticks != start_ticks || c.span_ticks != span_ticks;
+                    c.start_ticks = start_ticks;
+                    // No loop semantics (U6 D5): the span is the stretch
+                    // window; moving it = retiming, resizing = speed.
+                    c.span_ticks = span_ticks;
+                    changed
+                })
+                .unwrap_or(false),
+            timeline::TimelineLane::Midi => self
+                .project_mut()
                 .midi_tracks
                 .get_mut(track)
                 .and_then(|t| t.clips.get_mut(clip))
@@ -4349,36 +4655,48 @@ impl GlitcherZApp {
                     c.loop_ticks = span_ticks;
                     changed
                 })
-                .unwrap_or(false)
+                .unwrap_or(false),
         };
         if moved {
             // One drag = one undo step, even across dozens of frames.
             self.commit_param_edit(
                 "Move Clip",
                 before,
-                &format!("timeline:{}:{}:{}", is_control, track, clip),
+                &format!("timeline:{}:{}:{}", lane as u8, track, clip),
             );
+            // Audio clip tables are not part of the sequencer's Copy table
+            // push — they ride the structure queue, so every edit re-sends.
+            if matches!(lane, timeline::TimelineLane::Audio) {
+                self.send_audio_clips_for_track(track);
+            }
         }
     }
 
-    fn timeline_remove_clip(&mut self, is_control: bool, track: usize, clip: usize) {
+    fn timeline_remove_clip(&mut self, lane: timeline::TimelineLane, track: usize, clip: usize) {
         let before = self.begin_edit();
-        let removed = if is_control {
-            self.project_mut()
+        let removed = match lane {
+            timeline::TimelineLane::Control => self
+                .project_mut()
                 .control_tracks
                 .get_mut(track)
                 .map(|t| t.clips.remove(clip))
-                .is_some()
-        } else {
-            self.project_mut()
+                .is_some(),
+            timeline::TimelineLane::Audio => self
+                .project_mut()
+                .audio_tracks
+                .get_mut(track)
+                .map(|t| t.clips.remove(clip))
+                .is_some(),
+            timeline::TimelineLane::Midi => self
+                .project_mut()
                 .midi_tracks
                 .get_mut(track)
                 .map(|t| t.clips.remove(clip))
-                .is_some()
+                .is_some(),
         };
         if removed {
             self.commit_edit("Delete Clip", before);
-            self.sync_clip_row(is_control, track);
+            self.sync_clip_row(lane, track);
         }
     }
 
@@ -4450,23 +4768,24 @@ impl GlitcherZApp {
             return;
         }
         let before = self.begin_edit();
-        let mut by_key: Vec<(bool, usize, Vec<usize>)> = Vec::new();
+        let mut by_key: Vec<(timeline::TimelineLane, usize, Vec<usize>)> = Vec::new();
         for c in clips {
             if let Some((_, _, idxs)) = by_key
                 .iter_mut()
-                .find(|(k, t, _)| *k == c.is_control && *t == c.track)
+                .find(|(k, t, _)| *k == c.lane && *t == c.track)
             {
                 idxs.push(c.clip);
             } else {
-                by_key.push((c.is_control, c.track, vec![c.clip]));
+                by_key.push((c.lane, c.track, vec![c.clip]));
             }
         }
         let mut touched = Vec::new();
-        for (is_control, track, mut idxs) in by_key {
+        for (lane, track, mut idxs) in by_key {
             idxs.sort_unstable();
             idxs.dedup();
-            let removed = if is_control {
-                self.project_mut()
+            let removed = match lane {
+                timeline::TimelineLane::Control => self
+                    .project_mut()
                     .control_tracks
                     .get_mut(track)
                     .map(|t| {
@@ -4479,9 +4798,24 @@ impl GlitcherZApp {
                         }
                         n
                     })
-                    .unwrap_or(0)
-            } else {
-                self.project_mut()
+                    .unwrap_or(0),
+                timeline::TimelineLane::Audio => self
+                    .project_mut()
+                    .audio_tracks
+                    .get_mut(track)
+                    .map(|t| {
+                        let mut n = 0;
+                        for idx in idxs.iter().rev() {
+                            if *idx < t.clips.len() {
+                                t.clips.remove(*idx);
+                                n += 1;
+                            }
+                        }
+                        n
+                    })
+                    .unwrap_or(0),
+                timeline::TimelineLane::Midi => self
+                    .project_mut()
                     .midi_tracks
                     .get_mut(track)
                     .map(|t| {
@@ -4494,16 +4828,16 @@ impl GlitcherZApp {
                         }
                         n
                     })
-                    .unwrap_or(0)
+                    .unwrap_or(0),
             };
             if removed > 0 {
-                touched.push((is_control, track));
+                touched.push((lane, track));
             }
         }
         if !touched.is_empty() {
             self.commit_edit("Delete Clips", before);
-            for (is_control, track) in touched {
-                self.sync_clip_row(is_control, track);
+            for (lane, track) in touched {
+                self.sync_clip_row(lane, track);
             }
         }
     }
@@ -4513,28 +4847,41 @@ impl GlitcherZApp {
     /// with cloned content (loop-based clips both play the same loop). The
     /// selection is patched for the index shift (split entry dropped, later
     /// indices on the row bumped).
-    fn timeline_split_clip(&mut self, is_control: bool, track: usize, clip: usize, at_ticks: u32) {
+    fn timeline_split_clip(
+        &mut self,
+        lane: timeline::TimelineLane,
+        track: usize,
+        clip: usize,
+        at_ticks: u32,
+    ) {
         let before = self.begin_edit();
-        let split = if is_control {
-            self.project_mut()
+        let split = match lane {
+            timeline::TimelineLane::Control => self
+                .project_mut()
                 .control_tracks
                 .get_mut(track)
                 .map(|t| timeline::split_clip_in(&mut t.clips, at_ticks, clip))
-                .unwrap_or(false)
-        } else {
-            self.project_mut()
+                .unwrap_or(false),
+            timeline::TimelineLane::Audio => self
+                .project_mut()
+                .audio_tracks
+                .get_mut(track)
+                .map(|t| timeline::split_clip_in(&mut t.clips, at_ticks, clip))
+                .unwrap_or(false),
+            timeline::TimelineLane::Midi => self
+                .project_mut()
                 .midi_tracks
                 .get_mut(track)
                 .map(|t| timeline::split_clip_in(&mut t.clips, at_ticks, clip))
-                .unwrap_or(false)
+                .unwrap_or(false),
         };
         if split {
             self.commit_edit("Split Clip", before);
-            self.sync_clip_row(is_control, track);
+            self.sync_clip_row(lane, track);
             let sel = &mut self.timeline_state.selection;
-            sel.retain(|s| s.is_control != is_control || s.track != track || s.clip != clip);
+            sel.retain(|s| s.lane != lane || s.track != track || s.clip != clip);
             for s in sel.iter_mut() {
-                if s.is_control == is_control && s.track == track && s.clip > clip {
+                if s.lane == lane && s.track == track && s.clip > clip {
                     s.clip += 1;
                 }
             }
@@ -4558,14 +4905,14 @@ impl GlitcherZApp {
                     false,
                     moves
                         .iter()
-                        .filter(|m| !m.from.is_control)
+                        .filter(|m| !m.from.lane.is_control())
                         .collect::<Vec<_>>(),
                 ),
                 (
                     true,
                     moves
                         .iter()
-                        .filter(|m| m.from.is_control)
+                        .filter(|m| m.from.lane.is_control())
                         .collect::<Vec<_>>(),
                 ),
             ] {
@@ -4592,14 +4939,21 @@ impl GlitcherZApp {
                     relocate_in(tables.as_mut_slice(), &spec)
                 };
                 for r in rows {
-                    touched.push((is_control, r));
+                    touched.push((
+                        if is_control {
+                            timeline::TimelineLane::Control
+                        } else {
+                            timeline::TimelineLane::Midi
+                        },
+                        r,
+                    ));
                 }
             }
         }
         if !touched.is_empty() {
             self.commit_edit("Move Clips", before);
-            for (is_control, track) in touched {
-                self.sync_clip_row(is_control, track);
+            for (lane, track) in touched {
+                self.sync_clip_row(lane, track);
             }
         }
     }
@@ -4615,7 +4969,7 @@ impl GlitcherZApp {
         {
             let project = self.project_mut();
             for e in &spans {
-                let changed = if e.sel.is_control {
+                let changed = if e.sel.lane.is_control() {
                     project
                         .control_tracks
                         .get_mut(e.sel.track)
@@ -4639,15 +4993,15 @@ impl GlitcherZApp {
                         })
                         .is_some()
                 };
-                if changed && !touched.contains(&(e.sel.is_control, e.sel.track)) {
-                    touched.push((e.sel.is_control, e.sel.track));
+                if changed && !touched.contains(&(e.sel.lane, e.sel.track)) {
+                    touched.push((e.sel.lane, e.sel.track));
                 }
             }
         }
         if !touched.is_empty() {
             self.commit_edit("Stretch Clips", before);
-            for (is_control, track) in touched {
-                self.sync_clip_row(is_control, track);
+            for (lane, track) in touched {
+                self.sync_clip_row(lane, track);
             }
         }
     }
@@ -4666,7 +5020,7 @@ impl GlitcherZApp {
         {
             let project = self.project_mut();
             for d in &dups {
-                if d.from.is_control {
+                if d.from.lane.is_control() {
                     let Some(mut c) = project
                         .control_tracks
                         .get(d.from.track)
@@ -4685,12 +5039,12 @@ impl GlitcherZApp {
                     let index = t.clips.len();
                     t.clips.push(c);
                     new_sel.push(timeline::ClipSel {
-                        is_control: true,
+                        lane: timeline::TimelineLane::Control,
                         track: d.to_track,
                         clip: index,
                     });
-                    if !touched.contains(&(true, d.to_track)) {
-                        touched.push((true, d.to_track));
+                    if !touched.contains(&(timeline::TimelineLane::Control, d.to_track)) {
+                        touched.push((timeline::TimelineLane::Control, d.to_track));
                     }
                 } else {
                     let Some(mut c) = project
@@ -4711,31 +5065,31 @@ impl GlitcherZApp {
                     let index = t.clips.len();
                     t.clips.push(c);
                     new_sel.push(timeline::ClipSel {
-                        is_control: false,
+                        lane: timeline::TimelineLane::Midi,
                         track: d.to_track,
                         clip: index,
                     });
-                    if !touched.contains(&(false, d.to_track)) {
-                        touched.push((false, d.to_track));
+                    if !touched.contains(&(timeline::TimelineLane::Midi, d.to_track)) {
+                        touched.push((timeline::TimelineLane::Midi, d.to_track));
                     }
                 }
             }
         }
         if !new_sel.is_empty() {
             self.commit_edit("Duplicate Clips", before);
-            for (is_control, track) in touched {
-                self.sync_clip_row(is_control, track);
+            for (lane, track) in touched {
+                self.sync_clip_row(lane, track);
             }
             self.timeline_state.selection = new_sel;
         }
     }
 
     /// Re-pushes one timeline row's clip table after an undoable edit.
-    fn sync_clip_row(&mut self, is_control: bool, index: usize) {
-        if is_control {
-            self.send_control_clips(index);
-        } else {
-            self.send_track_clips(index);
+    fn sync_clip_row(&mut self, lane: timeline::TimelineLane, index: usize) {
+        match lane {
+            timeline::TimelineLane::Control => self.send_control_clips(index),
+            timeline::TimelineLane::Audio => self.send_audio_clips_for_track(index),
+            timeline::TimelineLane::Midi => self.send_track_clips(index),
         }
     }
 
@@ -5139,6 +5493,36 @@ impl GlitcherZApp {
                             ui.weak("(soundfont file not loaded this session — reopen it)");
                         }
                     }
+                }
+                // Sample instrument parameters (U5, spec `sample-player.md`
+                // D10): root note / play mode / gain. The root DragValue and
+                // gain slider follow the adsr_sliders pattern (live
+                // node-param delivery + one merged-undo document write);
+                // the play-mode combo is a discrete one-step edit.
+                let sample_state = self
+                    .project()
+                    .graph
+                    .node_by_id(instr_id)
+                    .and_then(|n| match n {
+                        NodeDoc::Instrument {
+                            voice:
+                                VoiceSpec::Sample {
+                                    path,
+                                    root_note,
+                                    play_mode,
+                                    gain,
+                                },
+                            ..
+                        } => Some((
+                            path.clone(),
+                            *root_note,
+                            matches!(play_mode, SamplePlayMode::OneShot),
+                            *gain,
+                        )),
+                        _ => None,
+                    });
+                if let Some((sample_path, root_note, one_shot, gain)) = sample_state {
+                    self.sample_section(ui, instr_id, &sample_path, root_note, one_shot, gain);
                 }
                 // Effects are added from the graph only (Add ▸ Effect, or the
                 // cable-midpoint insert — spec `plugin-browser.md` D12); the
@@ -5698,6 +6082,82 @@ impl GlitcherZApp {
 
     /// Delay three sliders (wet mix / time / feedback), bound to the target
     /// delay/effect node (G4).
+    /// Sample instrument parameter section (U5): file name, root note
+    /// DragValue, play-mode combo, gain slider. Root/gain edits deliver the
+    /// node param immediately and write the document with one merged undo
+    /// step per drag (the `adsr_sliders` pattern); the play-mode combo is a
+    /// discrete one-step undoable edit.
+    fn sample_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc_id: u64,
+        path: &str,
+        root_note: u8,
+        one_shot: bool,
+        gain: f32,
+    ) {
+        let stem = std::path::Path::new(path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string());
+        ui.label(format!("File: {stem}"));
+        let mut root = f32::from(root_note);
+        let mut gain_value = gain;
+        ui.horizontal(|ui| {
+            ui.label("Root note");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut root)
+                        .range(0.0..=127.0)
+                        .speed(1.0),
+                )
+                .changed()
+            {
+                self.send_node_param(doc_id, ParamId::SampleRootNote, root.round());
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Play mode");
+            let mut picked: Option<bool> = None;
+            egui::ComboBox::from_id_salt(format!("sample_mode_{doc_id}"))
+                .selected_text(if one_shot { "One-shot" } else { "Gate" })
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(!one_shot, "Gate").clicked() {
+                        picked = Some(false);
+                    }
+                    if ui.selectable_label(one_shot, "One-shot").clicked() {
+                        picked = Some(true);
+                    }
+                });
+            if let Some(next) = picked {
+                if next != one_shot {
+                    self.set_sample_play_mode(doc_id, next);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Gain");
+            if ui
+                .add(egui::Slider::new(&mut gain_value, 0.0..=2.0))
+                .changed()
+            {
+                self.send_node_param(doc_id, ParamId::SampleGain, gain_value);
+            }
+        });
+        let before = self.begin_param_edit();
+        if let Some(NodeDoc::Instrument {
+            voice: VoiceSpec::Sample {
+                root_note, gain, ..
+            },
+            ..
+        }) = self.project_mut().graph.node_by_id_mut(doc_id)
+        {
+            *root_note = root.round().clamp(0.0, 127.0) as u8;
+            *gain = gain_value.clamp(0.0, 2.0);
+        }
+        self.commit_param_edit("Sample Params", before, "sample-params");
+    }
+
     fn delay_sliders(&mut self, ui: &mut egui::Ui, doc_id: u64) {
         let delay = self.delay_of_node(doc_id).unwrap_or_default();
         let mut mix = delay.mix;
@@ -5812,6 +6272,30 @@ impl GlitcherZApp {
                         *gain = value;
                     }
                     self.commit_param_edit("Feedback Gain", before, "feedback-gain");
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::SampleRoot => {
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Instrument {
+                        voice: VoiceSpec::Sample { root_note, .. },
+                        ..
+                    }) = self.project_mut().graph.node_by_id_mut(node)
+                    {
+                        *root_note = value.round().clamp(0.0, 127.0) as u8;
+                    }
+                    self.commit_param_edit("Sample Root Note", before, "sample-root");
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::SampleGain => {
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Instrument {
+                        voice: VoiceSpec::Sample { gain, .. },
+                        ..
+                    }) = self.project_mut().graph.node_by_id_mut(node)
+                    {
+                        *gain = value.clamp(0.0, 2.0);
+                    }
+                    self.commit_param_edit("Sample Gain", before, "sample-gain");
                     self.send_node_param(node, inline_param_id(p), value);
                 }
             },
@@ -6339,6 +6823,143 @@ impl GlitcherZApp {
         self.commit_edit("Remove MIDI Track", before);
     }
 
+    /// 新增一条音频轨（U6 D3）：文档 `AudioTrack` + `NodeDoc::AudioTrack`
+    /// 节点 + mixer 空闲通道连线（自动扩容），引擎侧经 `install_node` 出生
+    /// 生成器节点。一步 undo（内部 mixer 扩容被 `suspend_history` 吸收）。
+    fn add_audio_track(&mut self) {
+        let track = self.project().audio_tracks.len();
+        if track >= glitcherz_model::MAX_AUDIO_TRACKS {
+            return;
+        }
+        // Engine slot check up front: a full node table must not leave a
+        // half-built document track behind.
+        if self.project().graph.nodes.len() >= MAX_NODES {
+            self.set_message("Add audio track failed: node table full".to_string());
+            return;
+        }
+        let before = self.begin_edit();
+        self.session.suspend_history();
+        let node_id = self
+            .project()
+            .graph
+            .nodes
+            .iter()
+            .map(|n| n.node_id())
+            .max()
+            .unwrap_or(1)
+            + 1;
+        self.project_mut()
+            .audio_tracks
+            .push(glitcherz_model::AudioTrack::default());
+        self.project_mut()
+            .graph
+            .nodes
+            .push(NodeDoc::AudioTrack { node_id, track });
+        // D18 (same wiring as MIDI tracks): the generator feeds the global
+        // mixer's first free channel (growing the mixer when full).
+        if let Some(mixer_doc) = self
+            .project()
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.is_mixer())
+            .map(NodeDoc::node_id)
+        {
+            let ch = match self.project().graph.first_free_channel(mixer_doc) {
+                Some(ch) => ch,
+                None => {
+                    self.mixer_add_channel(mixer_doc);
+                    self.project()
+                        .graph
+                        .first_free_channel(mixer_doc)
+                        .unwrap_or(u8::MAX)
+                }
+            };
+            if ch != u8::MAX {
+                self.project_mut()
+                    .graph
+                    .cables
+                    .push(glitcherz_model::CableDoc::audio_to_channel(
+                        node_id,
+                        PortRef::Node(mixer_doc),
+                        ch,
+                    ));
+            }
+        }
+        // Engine side: install the node (processor + engine id + mapping);
+        // the cable dispatch follows the same route `apply_document` uses.
+        let sample_rate = self.engine.info().sample_rate;
+        let node_doc = self
+            .project()
+            .graph
+            .node_by_id(node_id)
+            .cloned()
+            .expect("just pushed");
+        self.install_node(&node_doc, sample_rate);
+        if let Some(mixer_doc) = self
+            .project()
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.is_mixer())
+            .map(NodeDoc::node_id)
+        {
+            let (Some(&audio_e), Some(&mixer_e), Some(ch)) = (
+                self.node_map.get(&node_id),
+                self.node_map.get(&mixer_doc),
+                self.project().graph.first_free_channel(mixer_doc),
+            ) else {
+                self.session.resume_history();
+                self.commit_edit("Add Audio Track", before);
+                return;
+            };
+            self.engine.connect_nodes(audio_e, mixer_e, ch);
+        }
+        self.send_audio_clips_for_track(track);
+        self.session.resume_history();
+        self.commit_edit("Add Audio Track", before);
+    }
+
+    /// 删除最后一条音频轨（U6）：引擎节点移除 + 文档轨/节点/触及连线清
+    /// 理，一步 undo。空的 clip 表随节点一起被回收。
+    fn remove_last_audio_track(&mut self) {
+        let Some(last) = self.project().audio_tracks.len().checked_sub(1) else {
+            return;
+        };
+        let before = self.begin_edit();
+        let doc_ids: Vec<u64> = self
+            .project()
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| matches!(n, NodeDoc::AudioTrack { track: t, .. } if *t == last))
+            .map(|n| n.node_id())
+            .collect();
+        for doc_id in &doc_ids {
+            if let Some(&engine_id) = self.node_map.get(doc_id)
+                && !self.engine.remove_node(engine_id)
+            {
+                log::warn!("Audio track node {engine_id} removal failed");
+            }
+            self.node_map.remove(doc_id);
+        }
+        let removed: HashSet<u64> = doc_ids.into_iter().collect();
+        self.project_mut()
+            .graph
+            .nodes
+            .retain(|n| !matches!(n, NodeDoc::AudioTrack { track: t, .. } if *t == last));
+        self.project_mut().graph.cables.retain(|c| {
+            let touches_removed = match (&c.from, &c.to) {
+                (PortRef::Node(f), _) => removed.contains(f),
+                (_, PortRef::Node(t)) => removed.contains(t),
+                _ => false,
+            };
+            !touches_removed
+        });
+        self.project_mut().audio_tracks.pop();
+        self.commit_edit("Remove Audio Track", before);
+    }
+
     /// Reorders the MIDI tracks (the track at `from` is re-inserted so it
     /// ends up just before original index `to`): the track table, the
     /// per-track node `track` fields and the `MidiTrack` cable indices all
@@ -6397,7 +7018,7 @@ impl GlitcherZApp {
             *track = perm[*track];
         }
         for sel in &mut self.timeline_state.selection {
-            if !sel.is_control && sel.track < len {
+            if matches!(sel.lane, timeline::TimelineLane::Midi) && sel.track < len {
                 sel.track = perm[sel.track];
             }
         }
@@ -7135,6 +7756,11 @@ impl eframe::App for GlitcherZApp {
             }
         }
 
+        // U6: release displaced audio clip tables (control-thread drops of
+        // the old `Arc<SampleData>` refcounts; same frame cadence as the
+        // node recycling above).
+        self.engine.reclaim_audio_clips();
+
         // Transport stop edge: automation no longer overrides; restore manual parameter values
         // per node.
         let playing = self.engine.is_playing();
@@ -7504,6 +8130,19 @@ mod inline_param_tests {
         assert_eq!(
             inline_param_id(patch::InlineParam::MixerOutPan),
             ParamId::MixerOutPan
+        );
+        assert_eq!(
+            inline_param_id(patch::InlineParam::FeedbackGain),
+            ParamId::FeedbackGain
+        );
+        // U5: sample inline rows map to the sample processor's parameters.
+        assert_eq!(
+            inline_param_id(patch::InlineParam::SampleRoot),
+            ParamId::SampleRootNote
+        );
+        assert_eq!(
+            inline_param_id(patch::InlineParam::SampleGain),
+            ParamId::SampleGain
         );
         // Plugin rows bridge through the same PluginParam entry as the panel
         // and automation paths.

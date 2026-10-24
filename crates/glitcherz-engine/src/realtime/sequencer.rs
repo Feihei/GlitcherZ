@@ -264,6 +264,21 @@ impl Sequencer {
         self.position_ticks
     }
 
+    /// Tick width of a block of `frames` samples at the current effective
+    /// tempo (U6): the same step `advance()` uses, exposed so the block
+    /// runner can stamp it into [`crate::realtime::context::ProcessContext`]
+    /// **after** automation evaluation (a tempo curve governing this block
+    /// must already be applied). RT-safe.
+    pub fn transport_dt_ticks(&self, frames: usize) -> f64 {
+        frames as f64 * self.ticks_per_sample()
+    }
+
+    /// Whether the transport is playing (U6: audio clips stay silent
+    /// otherwise). RT-safe.
+    pub fn is_transport_active(&self) -> bool {
+        self.playing
+    }
+
     /// Ticks per sample (f64 intermediate computation).
     fn ticks_per_sample(&self) -> f64 {
         // ticks/second = BPM/60 × TPQN; divide by the sample rate to get ticks/sample.
@@ -715,6 +730,9 @@ mod tests {
             sample_rate: SR,
             frames: BLOCK,
             playback_sample_pos: pos,
+            song_ticks: 0.0,
+            transport_dt_ticks: 0.0,
+            transport_active: true,
         }
     }
 

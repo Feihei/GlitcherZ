@@ -15,3 +15,6 @@ thiserror = { workspace = true }
 # sample decode for SF3, via the sf3 feature) is control-thread only (sf2
 # module); RT hot paths audited allocation-free in S1 (spec section 7).
 rustysynth-ext = { workspace = true }
+# wav decoding (U5 sample player / U6 audio track): control-thread only
+# (sample module); the RT processor receives already-decoded f32 frames.
+hound = { workspace = true }

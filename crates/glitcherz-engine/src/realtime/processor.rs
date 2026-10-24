@@ -64,6 +64,21 @@ pub trait Processor: Send {
         let _ = (_channel, _controller, _value);
         false
     }
+
+    /// Replaces this node's audio clip table (U6, spec
+    /// `.agents/spec/audio-track.md` D4 — audio-track nodes only).
+    ///
+    /// Returns `Some(old_table)` on success; `None` means the node did not
+    /// consume the table (wrong node type or the table was rejected), and
+    /// the caller then routes the **input** table into the trash queue
+    /// instead. Either way nothing drops on the audio thread: the displaced
+    /// table is moved out, never dropped here. RT-safe.
+    fn swap_audio_clips(
+        &mut self,
+        _clips: crate::realtime::audio_track::AudioClipTable,
+    ) -> Option<crate::realtime::audio_track::AudioClipTable> {
+        None
+    }
 }
 
 /// Pre-allocated serial processing chain (the seed of an effect chain).
@@ -132,6 +147,9 @@ mod tests {
             sample_rate: 48_000.0,
             frames,
             playback_sample_pos: 0,
+            song_ticks: 0.0,
+            transport_dt_ticks: 0.0,
+            transport_active: true,
         }
     }
 

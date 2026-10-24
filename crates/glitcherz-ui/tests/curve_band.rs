@@ -105,10 +105,12 @@ impl Fixture {
                     state,
                     std::slice::from_ref(track),
                     std::slice::from_ref(control),
+                    &[],
                     TimelineParams {
                         selected_track: 0,
                         // The band only opens for the selected control track.
                         selected_auto: 0,
+                        selected_audio: 0,
                         playhead_ticks: 0.0,
                         playing: false,
                         edit_target: None,
@@ -116,6 +118,7 @@ impl Fixture {
                         markers: &[],
                         bar_ticks: TICKS_PER_BAR,
                         curve_param: Some(param),
+                        waveform_of: &|_| None,
                     },
                     router,
                 );

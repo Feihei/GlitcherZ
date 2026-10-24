@@ -63,6 +63,10 @@ pub const MAX_MIDI_TRACKS: usize = 16;
 /// uses the same value).
 pub const MAX_AUTO_TRACKS: usize = 16;
 
+/// Audio track capacity (U6). Capped well below the mixer channel budget
+/// so MIDI + audio tracks can coexist on the default single mixer.
+pub const MAX_AUDIO_TRACKS: usize = 8;
+
 /// Node graph capacity limit (D1; same value on the engine side).
 pub const MAX_NODES: usize = 64;
 
@@ -644,6 +648,61 @@ impl MidiClip {
     }
 }
 
+/// An audio clip placed on the arrangement timeline (U6, spec
+/// `.agents/spec/audio-track.md` D5).
+///
+/// The wav content is played **stretched across the span** (D1): the read
+/// frame is `(transport_tick − start)/span × wav_frames`, a pure function
+/// of the transport position — loop wrap and seek need no special cases.
+/// Resizing the clip therefore changes the playback speed (tape-style),
+/// and a tempo change repitches the material. No loop semantics: the span
+/// is the window, repeating is done by duplicating clips.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AudioClip {
+    /// Path to the .wav file (decoded via the session sample cache; a
+    /// missing file makes the clip silent, not invalid).
+    #[serde(default)]
+    pub path: String,
+    /// Absolute start position on the arrangement (tick).
+    #[serde(default)]
+    pub start_ticks: u32,
+    /// How long the clip stays active (tick) — the playback window the
+    /// wav is stretched across.
+    #[serde(default = "default_clip_span")]
+    pub span_ticks: u32,
+    /// Clip gain (linear, 0..=2, default 1.0). Field reserved for a later
+    /// UI; track-level volume is the mixer channel fader.
+    #[serde(default = "default_audio_gain")]
+    pub gain: f32,
+}
+
+impl Default for AudioClip {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            start_ticks: 0,
+            span_ticks: default_clip_span(),
+            gain: default_audio_gain(),
+        }
+    }
+}
+
+fn default_audio_gain() -> f32 {
+    1.0
+}
+
+impl AudioClip {
+    /// Convenience constructor: one-bar clip of `path` starting at
+    /// `start_ticks`.
+    pub fn new(path: &str, start_ticks: u32) -> Self {
+        Self {
+            path: path.to_string(),
+            start_ticks,
+            ..AudioClip::default()
+        }
+    }
+}
+
 /// A control (automation) clip placed on the arrangement timeline (D17).
 ///
 /// Same placement semantics as [`MidiClip`]; outside the span nothing is
@@ -769,6 +828,27 @@ pub enum VoiceSpec {
         #[serde(default)]
         program: u8,
     },
+    /// Wav sample player (spec `sample-player.md` D8): file path + root
+    /// note + play mode + gain. Decoded sample data stays out of the
+    /// document (session `SampleLibrary` cache on the engine side); a
+    /// missing file falls back to the built-in voice with the fields kept
+    /// (D9).
+    Sample {
+        /// Path to the .wav file.
+        #[serde(default)]
+        path: String,
+        /// Root MIDI note of the sample (0..=127, default 60 = C4):
+        /// playback rate = 2^((note − root)/12) with sample-rate
+        /// compensation folded in.
+        #[serde(default = "sample_default_root")]
+        root_note: u8,
+        /// How note-offs interact with the sample (default Gate).
+        #[serde(default)]
+        play_mode: SamplePlayMode,
+        /// Output gain (linear, 0..=2, default 1.0).
+        #[serde(default = "sample_default_gain")]
+        gain: f32,
+    },
     /// CLAP plugin: dynamic library path + plugin ID (instantiated on the
     /// non-real-time thread).
     Clap {
@@ -793,6 +873,27 @@ pub enum VoiceSpec {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         state: Vec<u8>,
     },
+}
+
+/// How a sample voice reacts to note-offs (spec `sample-player.md` D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum SamplePlayMode {
+    /// Note-off enters the fixed release fade (~10 ms, D2).
+    #[default]
+    Gate,
+    /// Pitch-matched note-offs are ignored; the sample plays to its end.
+    /// The blanket transport sweep (Stop / Panic) still stops the voice.
+    OneShot,
+}
+
+/// Serde default for [`VoiceSpec::Sample`]'s `root_note` (60 = C4).
+fn sample_default_root() -> u8 {
+    60
+}
+
+/// Serde default for [`VoiceSpec::Sample`]'s `gain`.
+fn sample_default_gain() -> f32 {
+    1.0
 }
 
 /// The note plane of one MIDI track (D12 v3 / v4 timeline).
@@ -914,6 +1015,19 @@ pub struct ControlTrack {
     /// Clips on the arrangement timeline (≤ [`MAX_CLIPS_PER_TRACK`], D15).
     #[serde(default)]
     pub clips: Vec<ControlClip>,
+}
+
+/// One audio track (U6, spec `.agents/spec/audio-track.md` D5): a lane on
+/// the arrangement timeline holding [`AudioClip`]s. Timbre/mix/effects are
+/// graph nodes as with MIDI tracks — the track itself only owns placement.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct AudioTrack {
+    /// Track name (if empty the UI shows "Audio N").
+    #[serde(default)]
+    pub name: String,
+    /// Clips on the arrangement timeline (≤ [`MAX_CLIPS_PER_TRACK`]).
+    #[serde(default)]
+    pub clips: Vec<AudioClip>,
 }
 
 /// One mixer channel's console state (P5f D15/D21: a virtual channel strip —
@@ -1068,6 +1182,20 @@ pub enum NodeDoc {
         #[serde(default = "default_feedback_gain")]
         gain: f32,
     },
+    /// Audio track node (U6, spec `.agents/spec/audio-track.md` D3): the
+    /// generator that plays the owning [`AudioTrack`]'s clips off the
+    /// transport clock. The clip table itself lives in
+    /// [`Project::audio_tracks`] (indexed by `track`), not in the node —
+    /// this is the same "placement in the track, identity in the graph"
+    /// split as MIDI tracks.
+    AudioTrack {
+        /// Persisted node ID.
+        #[serde(default)]
+        node_id: u64,
+        /// Owning audio track (index into `Project::audio_tracks`).
+        #[serde(default)]
+        track: usize,
+    },
     /// Legacy v4 channel strip — load-only (the v4→v5 migration converts it
     /// into a 2-channel [`NodeDoc::Mixer`]); new documents never emit it.
     ChannelStrip {
@@ -1110,6 +1238,7 @@ impl NodeDoc {
             | NodeDoc::Mixer { node_id, .. }
             | NodeDoc::Feedback { node_id, .. }
             | NodeDoc::Keyboard { node_id, .. }
+            | NodeDoc::AudioTrack { node_id, .. }
             | NodeDoc::ChannelStrip { node_id, .. } => *node_id,
         }
     }
@@ -1122,6 +1251,7 @@ impl NodeDoc {
             | NodeDoc::Mixer { track, .. }
             | NodeDoc::Feedback { track, .. }
             | NodeDoc::Keyboard { track, .. }
+            | NodeDoc::AudioTrack { track, .. }
             | NodeDoc::ChannelStrip { track, .. } => *track,
         }
     }
@@ -1870,6 +2000,9 @@ pub struct Project {
     /// Control (automation) tracks (D17, capped at [`MAX_AUTO_TRACKS`]).
     #[serde(default)]
     pub control_tracks: Vec<ControlTrack>,
+    /// Audio tracks (U6, capped at [`MAX_AUDIO_TRACKS`]).
+    #[serde(default)]
+    pub audio_tracks: Vec<AudioTrack>,
     /// Node graph document (D13 fully explicit).
     #[serde(default)]
     pub graph: GraphDoc,
@@ -1886,6 +2019,7 @@ impl Default for Project {
             master_gain: default_master_gain(),
             midi_tracks: vec![MidiTrack::default(); DEFAULT_MIDI_TRACKS],
             control_tracks: Vec::new(),
+            audio_tracks: Vec::new(),
             graph: default_graph_doc(DEFAULT_MIDI_TRACKS),
         }
     }
@@ -2076,6 +2210,25 @@ impl Project {
                 check_clip_placement(ti, ci, clip.start_ticks, clip.span_ticks, clip.loop_ticks)?;
             }
         }
+        if self.audio_tracks.len() > MAX_AUDIO_TRACKS {
+            return Err(format!(
+                "audio track count {} exceeds the limit {MAX_AUDIO_TRACKS}",
+                self.audio_tracks.len()
+            ));
+        }
+        for (ti, track) in self.audio_tracks.iter().enumerate() {
+            if track.clips.len() > MAX_CLIPS_PER_TRACK {
+                return Err(format!(
+                    "audio track #{ti} holds {} clips, exceeding the limit {MAX_CLIPS_PER_TRACK}",
+                    track.clips.len()
+                ));
+            }
+            for (ci, clip) in track.clips.iter().enumerate() {
+                // Audio clips have no loop semantics: the span is the
+                // window (loop == span satisfies the shared invariant).
+                check_clip_placement(ti, ci, clip.start_ticks, clip.span_ticks, clip.span_ticks)?;
+            }
+        }
         if u64::from(self.metadata.loop_range.end_ticks) > MAX_ARRANGEMENT_TICKS {
             return Err(format!(
                 "song loop end {} exceeds the {MAX_ARRANGEMENT_BARS}-bar arrangement bound",
@@ -2205,10 +2358,11 @@ impl Default for ProjectMetadata {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoParam, AutoPoint, CableDoc, CableKind, DEFAULT_MIDI_TRACKS, GraphDoc, MASTER_NODE_ID,
-        MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK,
-        MAX_NODES, MidiClip, MidiSource, MidiTrack, NodeDoc, PortRef, Project, SynthParams,
-        TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec, default_graph_doc,
+        AudioClip, AudioTrack, AutoParam, AutoPoint, CableDoc, CableKind, DEFAULT_MIDI_TRACKS,
+        GraphDoc, MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS, MAX_AUDIO_TRACKS,
+        MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES, MidiClip, MidiSource, MidiTrack, NodeDoc,
+        PortRef, Project, SamplePlayMode, SynthParams, TICKS_PER_BAR, TICKS_PER_QUARTER,
+        TICKS_PER_STEP, VoiceSpec, default_graph_doc,
     };
 
     #[test]
@@ -2245,6 +2399,78 @@ mod tests {
         assert_eq!(back.span_ticks, TICKS_PER_BAR);
         assert_eq!(back.loop_ticks, TICKS_PER_BAR);
         assert!(back.notes().is_empty());
+    }
+
+    /// U6: audio track round-trip + partial defaults + old-file loading.
+    #[test]
+    fn audio_track_roundtrip_and_defaults() {
+        let track = AudioTrack {
+            name: "Vocal".to_string(),
+            clips: vec![
+                AudioClip {
+                    path: "vox_1.wav".to_string(),
+                    start_ticks: TICKS_PER_BAR,
+                    span_ticks: 4 * TICKS_PER_BAR,
+                    gain: 0.5,
+                },
+                AudioClip::new("vox_2.wav", 8 * TICKS_PER_BAR),
+            ],
+        };
+        let text = ron::to_string(&track).expect("serialization failed");
+        let back: AudioTrack = ron::from_str(&text).expect("deserialization failed");
+        assert_eq!(track, back);
+
+        // Partial clip: only path + start written.
+        let clip: AudioClip =
+            ron::from_str("(path: \"a.wav\", start_ticks: 960)").expect("parse failed");
+        assert_eq!(clip.span_ticks, TICKS_PER_BAR);
+        assert_eq!(clip.gain, 1.0);
+
+        // Pre-U6 project files have no `audio_tracks` field: stripping it
+        // from a serialized file mimics one, and it loads as empty.
+        let legacy = ron::to_string(&Project::default())
+            .expect("serialize")
+            .replace("audio_tracks:[],", "");
+        assert!(!legacy.contains("audio_tracks"));
+        let parsed: Project = ron::from_str(&legacy).expect("legacy file must parse");
+        assert!(parsed.audio_tracks.is_empty());
+        parsed.validate().expect("legacy shape is valid");
+    }
+
+    /// U6: the audio-track validate section enforces the caps.
+    #[test]
+    fn audio_track_validation_rejects_overflow() {
+        let mut project = Project {
+            audio_tracks: vec![AudioTrack::default(); MAX_AUDIO_TRACKS],
+            ..Project::default()
+        };
+        project.validate().expect("at the cap is fine");
+        project.audio_tracks.push(AudioTrack::default());
+        assert!(project.validate().is_err(), "beyond the cap must fail");
+
+        project.audio_tracks.truncate(MAX_AUDIO_TRACKS);
+        project.audio_tracks[0] = AudioTrack {
+            clips: vec![AudioClip::default(); MAX_CLIPS_PER_TRACK + 1],
+            ..AudioTrack::default()
+        };
+        assert!(
+            project.validate().is_err(),
+            "clip count beyond the per-track cap must fail"
+        );
+
+        project.audio_tracks[0] = AudioTrack {
+            clips: vec![AudioClip {
+                path: "x.wav".to_string(),
+                start_ticks: 0,
+                span_ticks: 0,
+                gain: 1.0,
+            }],
+            ..AudioTrack::default()
+        };
+        assert!(
+            project.validate().is_err(),
+            "zero-length span must fail (no loop semantics)"
+        );
     }
 
     #[test]
@@ -2759,6 +2985,18 @@ mod tests {
                 bank: 0,
                 program: 40,
             },
+            VoiceSpec::Sample {
+                path: "kick.wav".to_string(),
+                root_note: 60,
+                play_mode: SamplePlayMode::Gate,
+                gain: 1.0,
+            },
+            VoiceSpec::Sample {
+                path: "hat.wav".to_string(),
+                root_note: 48,
+                play_mode: SamplePlayMode::OneShot,
+                gain: 0.5,
+            },
             VoiceSpec::Clap {
                 path: "a.clap".to_string(),
                 plugin_id: "x".to_string(),
@@ -2834,6 +3072,45 @@ mod tests {
                 program: 0
             }
         );
+    }
+
+    /// Sample voice (spec `sample-player.md` D8): internally tagged as
+    /// `sample`; files without root_note/play_mode/gain load as
+    /// 60/Gate/1.0 (serde default, additive field -- PROJECT_VERSION
+    /// untouched).
+    #[test]
+    fn voice_spec_sample_serde_compatibility() {
+        let sample = VoiceSpec::Sample {
+            path: "kick.wav".to_string(),
+            root_note: 48,
+            play_mode: SamplePlayMode::OneShot,
+            gain: 0.5,
+        };
+        let text = ron::to_string(&sample).expect("serialization failed");
+        assert!(
+            text.contains("type:\"sample\""),
+            "tag must be snake_case sample: {text}"
+        );
+        // Older files (or hand-written projects) without the optional
+        // fields: root 60 (C4), Gate, unity gain.
+        let partial: VoiceSpec =
+            ron::from_str("(type: \"sample\", path: \"kick.wav\")").expect("fields must default");
+        assert_eq!(
+            partial,
+            VoiceSpec::Sample {
+                path: "kick.wav".to_string(),
+                root_note: 60,
+                play_mode: SamplePlayMode::Gate,
+                gain: 1.0
+            }
+        );
+        // Serialized names of the play mode variants are snake_case.
+        assert!(
+            text.contains("OneShot"),
+            "play mode variant name must round-trip: {text}"
+        );
+        let back: VoiceSpec = ron::from_str(&text).expect("deserialization failed");
+        assert_eq!(back, sample);
     }
 
     #[test]

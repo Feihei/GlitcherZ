@@ -52,6 +52,10 @@ pub struct AudioEngine {
     /// [`AudioEngine::reclaim_nodes`], releasing old plugin nodes and their
     /// corresponding guards.
     recycle: rtrb::Consumer<crate::realtime::RecycledNode>,
+    /// Displaced audio clip tables (U6 D4): drained on the control thread
+    /// by [`AudioEngine::reclaim_audio_clips`] — the audio thread only
+    /// moves them into this queue, never drops them.
+    audio_trash: rtrb::Consumer<crate::realtime::audio_track::AudioClipTable>,
     /// Control-side graph state (non-real-time): authoritative topology copy +
     /// execution plan compiler. Entirely `Copy`, so the whole snapshot can be
     /// rolled back when a queue push fails.
@@ -92,6 +96,8 @@ impl AudioEngine {
         let sequencer = Sequencer::new(sample_rate_f32);
         let (structure_tx, structure_rx) = structure_channel();
         let (recycle_tx, recycle_rx) = recycle_channel();
+        let (audio_trash_tx, audio_trash_rx) =
+            crate::realtime::audio_track::audio_clip_trash_channel();
         let mut runner = BlockRunner::new(
             FIXED_BLOCK_SIZE,
             stream_config.channels as usize,
@@ -101,6 +107,7 @@ impl AudioEngine {
             command_rx,
             structure_rx,
             recycle_tx,
+            audio_trash_tx,
             feedback.clone(),
         );
 
@@ -125,6 +132,7 @@ impl AudioEngine {
             commands,
             structure: structure_tx,
             recycle: recycle_rx,
+            audio_trash: audio_trash_rx,
             compiler,
             feedback,
             info: AudioEngineInfo {
@@ -272,6 +280,33 @@ impl AudioEngine {
             ids.push(node_id);
         }
         ids
+    }
+
+    /// Replaces one audio-track node's clip table (U6, spec
+    /// `.agents/spec/audio-track.md` D4). The table (built by the caller
+    /// from the document's `AudioTrack::clips`) rides the structure queue;
+    /// the displaced old table comes back through the trash queue and is
+    /// released by [`AudioEngine::reclaim_audio_clips`]. Returns `false`
+    /// if the queue is full (the update is dropped — retry on the next
+    /// edit; playback keeps the old table).
+    pub fn send_audio_clips(
+        &mut self,
+        node_id: u64,
+        clips: crate::realtime::audio_track::AudioClipTable,
+    ) -> bool {
+        self.structure
+            .push(GraphUpdate::SetAudioClips { node_id, clips })
+            .is_ok()
+    }
+
+    /// Drains the displaced-audio-clip trash queue (U6 D4): drops old tables
+    /// on the **control thread** (this is the only place their `Arc`
+    /// refcounts may reach zero). The UI calls this every frame alongside
+    /// `reclaim_nodes`.
+    pub fn reclaim_audio_clips(&mut self) {
+        while let Ok(_table) = self.audio_trash.pop() {
+            // Dropped here: control-thread deallocation only.
+        }
     }
 
     /// Restores the given track's instrument to the built-in synthesizer (the

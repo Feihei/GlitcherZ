@@ -17,6 +17,10 @@
 //! - [`sf2`]: non-real-time SoundFont loading (S2) — file IO, parsing and
 //!   preset enumeration; the parsed [`Arc<rustysynth_ext::SoundFont>`] is
 //!   handed to the audio-side processor without any further parsing.
+//! - [`sample`]: non-real-time wav decoding (U5) — hound decode to f32
+//!   stereo frames plus the session-level [`sample::SampleLibrary`] cache;
+//!   the audio-side processor receives the already-decoded
+//!   [`Arc<sample::SampleData>`].
 //! - [`convert`]: the central point for f32 (audio path) / f64 (UI, time)
 //!   conversions.
 //! - [`host_gate`]: plugin-host infrastructure — the atomic handoff gate
@@ -37,10 +41,12 @@ pub mod convert;
 pub mod engine;
 pub mod host_gate;
 pub mod realtime;
+pub mod sample;
 pub mod sf2;
 
 #[cfg(test)]
 pub(crate) mod testing;
 
 pub use engine::{AudioEngine, AudioEngineInfo, EngineError, available_outputs};
+pub use sample::{SampleData, SampleError, SampleLibrary, StereoFrame};
 pub use sf2::{Sf2Error, Sf2Library, Sf2Preset};

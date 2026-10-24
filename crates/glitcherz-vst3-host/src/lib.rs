@@ -1344,6 +1344,9 @@ mod tests {
             sample_rate: 48_000.0,
             frames: 128,
             playback_sample_pos: 0,
+            song_ticks: 0.0,
+            transport_dt_ticks: 0.0,
+            transport_active: true,
         };
         Some((instance, ctx))
     }

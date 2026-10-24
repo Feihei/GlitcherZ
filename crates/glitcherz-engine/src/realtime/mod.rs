@@ -26,12 +26,16 @@
 //! - [`envelope`] / [`svf`] / [`synth`]: ADSR envelope, SVF filter, and full synthesizer;
 //! - [`sf2`]: SoundFont voice ([`Sf2VoiceProcessor`](sf2::Sf2VoiceProcessor)) — RT rendering
 //!   around the audited `rustysynth-ext` synthesizer (loading stays in [`crate::sf2`]);
+//! - [`sample`]: sample player voice ([`SampleVoiceProcessor`](sample::SampleVoiceProcessor)) —
+//!   RT rendering of a pre-decoded wav with a fixed voice pool (decoding stays in
+//!   [`crate::sample`]);
 //! - [`commands`]: `rtrb` command queue and [`EngineCommand`] / [`NoteEvent`] / [`ParamId`];
 //! - [`atomic`]: [`AtomicF32`] (audio thread → UI scalar feedback);
 //! - [`block`]: [`BlockRunner`] — splits the host's (cpal) arbitrarily long interleaved
 //!   buffer into fixed blocks, consumes commands at block boundaries, and reports state back.
 
 pub mod atomic;
+pub mod audio_track;
 pub mod automation;
 pub mod block;
 pub mod buffer;
@@ -43,6 +47,7 @@ pub mod gain;
 pub mod graph;
 pub mod mixer;
 pub mod processor;
+pub mod sample;
 pub mod sequencer;
 pub mod sf2;
 pub mod sine;
@@ -64,6 +69,11 @@ pub const MAX_MIDI_TRACKS: usize = 16;
 pub const DEFAULT_MIDI_TRACKS: usize = 4;
 
 pub use atomic::AtomicF32;
+
+pub use audio_track::{
+    AUDIO_CLIP_TRASH_CAPACITY, AudioClipTable, AudioTrackProcessor, RtAudioClip,
+    audio_clip_trash_channel, empty_clip_table,
+};
 pub use automation::{MAX_AUTO_POINTS, MAX_AUTO_TRACKS, RtAutoPoint, RtAutomation, RtControlClip};
 pub use block::{BlockRunner, Feedback};
 pub use buffer::AudioBuffer;
@@ -81,6 +91,7 @@ pub use graph::{
 };
 pub use mixer::{MixerChannel, MixerProcessor};
 pub use processor::{ChannelWeights, MAX_WEIGHT_CHANNELS, Processor, ProcessorChain};
+pub use sample::{SAMPLE_DEFAULT_ROOT, SAMPLE_POLYPHONY, SampleVoiceProcessor};
 pub use sequencer::{
     MAX_CLIP_NOTES, MAX_TIME_SIGNATURE_NUMERATOR, MAX_TRACK_CLIPS, MIN_VELOCITY, RtMidiClip,
     RtNote, Sequencer, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, ticks_per_bar_of,

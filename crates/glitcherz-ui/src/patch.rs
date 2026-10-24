@@ -43,6 +43,10 @@ pub enum InlineParam {
     MixerOutPan,
     /// Feedback tap gain (P6).
     FeedbackGain,
+    /// Sample player root note (U5, spec `sample-player.md` D10).
+    SampleRoot,
+    /// Sample player output gain (U5).
+    SampleGain,
 }
 
 /// Inline parameter addressing: built-in registry entry or an external
@@ -101,6 +105,19 @@ const FEEDBACK_INLINE: [InlineParamSpec; 1] = [InlineParamSpec {
     label: "fb",
 }];
 
+/// Sample player inline rows (U5): root note + gain (spec
+/// `sample-player.md` D10 — the two parameters that shape the sound most).
+const SAMPLE_INLINE: [InlineParamSpec; 2] = [
+    InlineParamSpec {
+        param: InlineParam::SampleRoot,
+        label: "root",
+    },
+    InlineParamSpec {
+        param: InlineParam::SampleGain,
+        label: "gain",
+    },
+];
+
 /// Static inline-parameter registry for one node (G5 spec §7). SoundFont
 /// instruments expose none (the preset picker is the primary operation);
 /// plugin nodes take their rows from the session enumeration instead
@@ -111,6 +128,10 @@ fn inline_params_of(node: &NodeDoc) -> &'static [InlineParamSpec] {
             voice: VoiceSpec::Builtin,
             ..
         } => &SYNTH_INLINE,
+        NodeDoc::Instrument {
+            voice: VoiceSpec::Sample { .. },
+            ..
+        } => &SAMPLE_INLINE,
         NodeDoc::Effect {
             voice: VoiceSpec::Builtin | VoiceSpec::SoundFont { .. },
             ..
@@ -219,6 +240,20 @@ fn inline_doc_value(node: &NodeDoc, param: InlineParam) -> (f64, f64, f64) {
         ),
         (NodeDoc::Mixer { out_pan, .. }, InlineParam::MixerOutPan) => (*out_pan as f64, -1.0, 1.0),
         (NodeDoc::Feedback { gain, .. }, InlineParam::FeedbackGain) => (*gain as f64, 0.0, 1.0),
+        (
+            NodeDoc::Instrument {
+                voice: VoiceSpec::Sample { root_note, .. },
+                ..
+            },
+            InlineParam::SampleRoot,
+        ) => (f64::from(*root_note), 0.0, 127.0),
+        (
+            NodeDoc::Instrument {
+                voice: VoiceSpec::Sample { gain, .. },
+                ..
+            },
+            InlineParam::SampleGain,
+        ) => (f64::from(*gain), 0.0, 2.0),
         _ => (0.0, 0.0, 1.0),
     }
 }
@@ -310,6 +345,12 @@ pub enum NodeSource {
         /// `.sf2` / `.sf3` path picked in the file dialog.
         path: String,
     },
+    /// Wav sample player (U5, spec `sample-player.md`): born with default
+    /// root 60 / Gate / unity gain.
+    Sample {
+        /// `.wav` path picked in the file dialog.
+        path: String,
+    },
     /// CLAP instrument plugin.
     ClapInstrument {
         /// Module path.
@@ -392,6 +433,11 @@ pub enum PatchAction {
     /// Open the SoundFont file dialog and create an instrument from the pick
     /// (the patch cannot run a modal dialog inside the menu closure).
     PickSoundFont {
+        at: Pos2,
+    },
+    /// Open the wav sample file dialog and create a sample instrument from
+    /// the pick (U5; same modal-dialog constraint as `PickSoundFont`).
+    PickSample {
         at: Pos2,
     },
     /// Re-scan every plugin module, ignoring the cached stats (U9 E2, spec
@@ -791,6 +837,8 @@ fn node_color(id: PatchId, doc: &GraphDoc) -> (Color32, Color32) {
             Some(NodeDoc::Mixer { .. }) => Color32::from_rgb(110, 190, 120),
             Some(NodeDoc::Keyboard { .. }) => Color32::from_rgb(95, 205, 190),
             Some(NodeDoc::Feedback { .. }) => Color32::from_rgb(215, 105, 160),
+            // U6: audio tracks share the sample-player family's warm tone.
+            Some(NodeDoc::AudioTrack { .. }) => Color32::from_rgb(205, 165, 90),
             Some(NodeDoc::ChannelStrip { .. }) => Color32::from_gray(140),
             None => Color32::from_gray(120),
         },
@@ -860,6 +908,26 @@ fn size_of(id: PatchId, deps: &PatchDeps) -> Vec2 {
     )
 }
 
+/// Short file stem for node labels (U5): `kick_01.wav` → `kick_01` (empty
+/// for unparseable paths).
+fn file_stem_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .map(|s| truncate(&s, 10))
+        .unwrap_or_default()
+}
+
+/// MIDI note number → scientific pitch name (`60` → `C4`).
+fn note_name(note: u8) -> String {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    let name = NAMES[(note % 12) as usize];
+    let octave = (note / 12) as i32 - 1;
+    format!("{name}{octave}")
+}
+
 /// Entity label.
 fn label_of(id: PatchId, doc: &GraphDoc) -> String {
     match id {
@@ -872,13 +940,21 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 VoiceSpec::SoundFont { bank, program, .. } => {
                     format!("SF2 {bank}:{program} · Track {}", track + 1)
                 }
+                VoiceSpec::Sample {
+                    path, root_note, ..
+                } => format!(
+                    "SAMPLE {}·{} · Track {}",
+                    file_stem_of(path),
+                    note_name(*root_note),
+                    track + 1
+                ),
                 VoiceSpec::Clap { plugin_id, .. } => {
                     format!("♪ {}", truncate(plugin_id, 16))
                 }
                 VoiceSpec::Vst3 { class_id, .. } => format!("♪ {}", truncate(class_id, 16)),
             },
             Some(NodeDoc::Effect { voice, track, .. }) => match voice {
-                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } => {
+                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {
                     format!("Delay · Track {}", track + 1)
                 }
                 VoiceSpec::Clap { plugin_id, .. } => {
@@ -894,6 +970,9 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 MidiSource::Device(name) => format!("Keyboard · {name}"),
             },
             Some(NodeDoc::Feedback { gain, .. }) => format!("Feedback {:.0}%", gain * 100.0),
+            Some(NodeDoc::AudioTrack { track, .. }) => {
+                format!("Audio · Track {}", track + 1)
+            }
             Some(NodeDoc::ChannelStrip { track, .. }) => {
                 format!("Strip (legacy) · Track {}", track + 1)
             }
@@ -1068,6 +1147,9 @@ impl PatchState {
                 NodeDoc::Mixer { .. } => (PatchId::Node(node.node_id()), Pos2::new(700.0, y)),
                 // P6: feedback taps sit just left of the mixer column.
                 NodeDoc::Feedback { .. } => (PatchId::Node(node.node_id()), Pos2::new(600.0, y)),
+                // U6: audio-track nodes sit in the instrument column (they
+                // are generators too — only the feed is the transport clock).
+                NodeDoc::AudioTrack { .. } => (PatchId::Node(node.node_id()), Pos2::new(260.0, y)),
                 // G6: input nodes stack in the left column below the
                 // timeline box (only a fallback — the menu places them at the
                 // click position).
@@ -1621,6 +1703,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     let mut picked_source: Option<NodeSource> = None;
     let mut picked_picker: Option<(Option<NodeCategory>, Option<PluginFormat>)> = None;
     let mut picked_soundfont = false;
+    let mut picked_sample = false;
     let mut rescan_plugins = false;
     if !(response.secondary_clicked() && ctrl) {
         response.context_menu(|ui| {
@@ -1638,6 +1721,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 }
                 if ui.button("SoundFont…").clicked() {
                     picked_soundfont = true;
+                }
+                if ui.button("Sample…").clicked() {
+                    picked_sample = true;
                 }
                 ui.separator();
                 if ui.button("CLAP…").clicked() {
@@ -1685,7 +1771,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         actions.push(PatchAction::RescanPlugins);
     }
     // The menu position is consumed by whichever action the user picked.
-    if picked_source.is_some() || picked_picker.is_some() || picked_soundfont {
+    if picked_source.is_some() || picked_picker.is_some() || picked_soundfont || picked_sample {
         if let Some(at) = state.add_menu_at.take() {
             if let Some(source) = picked_source {
                 actions.push(PatchAction::AddNode { source, at });
@@ -1695,6 +1781,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     format,
                     place: PickerPlace::Add { at },
                 });
+            } else if picked_sample {
+                actions.push(PatchAction::PickSample { at });
             } else {
                 actions.push(PatchAction::PickSoundFont { at });
             }
@@ -2663,6 +2751,24 @@ mod tests {
             "plugin nodes take their rows from the session enumeration"
         );
 
+        // U5: sample instruments expose root + gain inline rows.
+        let sample = NodeDoc::Instrument {
+            node_id: 7,
+            track: 0,
+            voice: VoiceSpec::Sample {
+                path: "kick.wav".to_string(),
+                root_note: 60,
+                play_mode: glitcherz_model::SamplePlayMode::Gate,
+                gain: 1.0,
+            },
+            synth: glitcherz_model::SynthParams::default(),
+        };
+        let params: Vec<InlineParam> = inline_params_of(&sample).iter().map(|s| s.param).collect();
+        assert_eq!(
+            params,
+            vec![InlineParam::SampleRoot, InlineParam::SampleGain]
+        );
+
         let delay = NodeDoc::Effect {
             node_id: 5,
             track: 0,
@@ -2845,6 +2951,24 @@ mod tests {
         let (v, min, max) = inline_doc_value(&mixer, InlineParam::MixerOutPan);
         assert_eq!(v, -0.5);
         assert_eq!((min, max), (-1.0, 1.0));
+
+        // U5: sample root / gain read from the voice spec fields; ranges
+        // mirror the Inspector DragValue (0..127) and slider (0..2).
+        let sample = NodeDoc::Instrument {
+            node_id: 5,
+            track: 0,
+            voice: VoiceSpec::Sample {
+                path: "kick.wav".to_string(),
+                root_note: 48,
+                play_mode: glitcherz_model::SamplePlayMode::OneShot,
+                gain: 0.5,
+            },
+            synth: glitcherz_model::SynthParams::default(),
+        };
+        let (v, min, max) = inline_doc_value(&sample, InlineParam::SampleRoot);
+        assert_eq!((v, min, max), (48.0, 0.0, 127.0));
+        let (v, min, max) = inline_doc_value(&sample, InlineParam::SampleGain);
+        assert_eq!((v, min, max), (0.5, 0.0, 2.0));
     }
 
     #[test]

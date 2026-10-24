@@ -24,8 +24,8 @@ use egui::{
     StrokeKind, Vec2, pos2,
 };
 use glitcherz_model::{
-    AutoParam, AutoPoint, ControlClip, ControlTrack, CtrlEvent, MAX_ARRANGEMENT_TICKS,
-    MAX_CLIPS_PER_TRACK, Marker, MidiClip, MidiTrack, Note, SongLoop,
+    AudioClip, AudioTrack, AutoParam, AutoPoint, ControlClip, ControlTrack, CtrlEvent,
+    MAX_ARRANGEMENT_TICKS, MAX_CLIPS_PER_TRACK, Marker, MidiClip, MidiTrack, Note, SongLoop,
 };
 
 /// Absolute arrangement ceiling in ticks (U3a). The bound is a **tick** count,
@@ -66,9 +66,25 @@ const SELECTED: Color32 = Color32::from_rgb(240, 190, 80);
 /// One selected clip, addressed across the arrangement (M4b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClipSel {
-    pub is_control: bool,
+    pub lane: TimelineLane,
     pub track: usize,
     pub clip: usize,
+}
+
+/// Which track table a clip belongs to (U6: three kinds now — the old
+/// `is_control: bool` collapsed under the third value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineLane {
+    Midi,
+    Control,
+    Audio,
+}
+
+impl TimelineLane {
+    /// Kept for the modal filter sites that still reason in two tables.
+    pub fn is_control(self) -> bool {
+        matches!(self, TimelineLane::Control)
+    }
 }
 
 /// One move of the G modal (M4b.3): the clip at `from` lands on `to_track`
@@ -138,13 +154,29 @@ struct Modal {
 enum RowKind {
     Midi(usize),
     Control(usize),
+    Audio(usize),
 }
 
 impl RowKind {
-    fn key(self) -> (bool, usize) {
+    fn key(self) -> (u8, usize) {
         match self {
-            RowKind::Midi(t) => (false, t),
-            RowKind::Control(t) => (true, t),
+            RowKind::Midi(t) => (0, t),
+            RowKind::Control(t) => (1, t),
+            RowKind::Audio(t) => (2, t),
+        }
+    }
+
+    fn lane(self) -> TimelineLane {
+        match self {
+            RowKind::Midi(_) => TimelineLane::Midi,
+            RowKind::Control(_) => TimelineLane::Control,
+            RowKind::Audio(_) => TimelineLane::Audio,
+        }
+    }
+
+    fn track(self) -> usize {
+        match self {
+            RowKind::Midi(t) | RowKind::Control(t) | RowKind::Audio(t) => t,
         }
     }
 }
@@ -312,7 +344,7 @@ impl TimelineState {
 
 /// One action for the caller (engine pushes / cross-panel state changes).
 ///
-/// Clip edits carry their data (`is_control` picks the track table): the
+/// Clip edits carry their data (`lane` picks the track table): the
 /// timeline is a view and must not mutate the document — the caller turns
 /// these into undoable edits (M1.4).
 #[derive(Debug, Clone, PartialEq)]
@@ -321,16 +353,25 @@ pub enum TimelineAction {
     MidiEdited(usize),
     /// A control track's clips changed; re-push to the engine.
     ControlEdited(usize),
+    /// An audio track's clips changed; re-push the RT clip table (U6).
+    AudioEdited(usize),
     /// Create a clip on a track at the snapped start tick.
     AddClip {
-        is_control: bool,
+        lane: TimelineLane,
+        track: usize,
+        start_ticks: u32,
+    },
+    /// Double-click on empty audio-track space (U6 D2): the caller opens a
+    /// wav file dialog and creates the clip at the (bar-snapped) click
+    /// position with the span derived from the file's duration.
+    AddAudioClip {
         track: usize,
         start_ticks: u32,
     },
     /// Move and/or resize a clip (one frame of a drag; the caller merges the
     /// gesture into a single undo step).
     MoveResizeClip {
-        is_control: bool,
+        lane: TimelineLane,
         track: usize,
         clip: usize,
         start_ticks: u32,
@@ -338,7 +379,7 @@ pub enum TimelineAction {
     },
     /// Delete the clip at `clip`.
     RemoveClip {
-        is_control: bool,
+        lane: TimelineLane,
         track: usize,
         clip: usize,
     },
@@ -351,11 +392,12 @@ pub enum TimelineAction {
     /// the left half keeps the start, the right half clones the content
     /// (loop-based clips both play the same loop). One undo step.
     SplitClip {
-        is_control: bool,
+        lane: TimelineLane,
         track: usize,
         clip: usize,
         at_ticks: u32,
     },
+
     /// Move every clip in the list (G modal finalize; may cross tracks of
     /// the same kind). One undo step.
     MoveClipsBatch {
@@ -435,6 +477,14 @@ pub enum TimelineAction {
     },
     AddMidiTrack,
     RemoveLastMidiTrack,
+    /// Add an audio track (U6): document track + generator node + mixer
+    /// channel wiring, one undo step.
+    AddAudioTrack,
+    /// Remove the last audio track (U6). One undo step.
+    RemoveLastAudioTrack,
+    /// An audio row was clicked / double-clicked: select that track (the
+    /// `- Audio` button and the wave-row highlight follow it).
+    SelectAudioTrack(usize),
 }
 
 /// The MIDI clip currently open in the Edit tab, outlined on the timeline so
@@ -450,6 +500,9 @@ pub struct EditHighlight {
 pub struct TimelineParams<'a> {
     pub selected_track: usize,
     pub selected_auto: usize,
+    /// Selected audio track (U6): highlights the row and receives
+    /// `- Audio`.
+    pub selected_audio: usize,
     pub playhead_ticks: f32,
     pub playing: bool,
     /// Clip to outline as "being edited" (from the floating editor window).
@@ -466,6 +519,9 @@ pub struct TimelineParams<'a> {
     /// band's vertical axis. `None` = the track has no cable yet; the band
     /// still draws with a normalized axis and says so.
     pub curve_param: Option<&'a AutoParam>,
+    /// Waveform lookup for audio clip bodies (U6 D6): path → decoded sample
+    /// (the app's session cache). `None` renders a flat placeholder body.
+    pub waveform_of: &'a dyn Fn(&str) -> Option<std::sync::Arc<glitcherz_engine::SampleData>>,
 }
 
 /// Placement semantics shared by MIDI and control clips.
@@ -563,6 +619,31 @@ impl Placement for ControlClip {
     }
 }
 
+impl Placement for AudioClip {
+    fn start(&self) -> u32 {
+        self.start_ticks
+    }
+    fn span(&self) -> u32 {
+        self.span_ticks
+    }
+    fn set_start(&mut self, v: u32) {
+        self.start_ticks = v;
+    }
+    fn set_span(&mut self, v: u32) {
+        self.span_ticks = v;
+    }
+    // Audio clips have no loop semantics (U6 D5): the span is the window the
+    // wav stretches across, so `loop == span` always holds; the setter is a
+    // no-op kept for the shared resize path.
+    fn set_loop(&mut self, _v: u32) {}
+    // The right half of a split plays the wav's second half: start shifts by
+    // the cut and the span shrinks — the proportional mapping does the rest.
+    fn retain_from(&mut self, offset: u32) {
+        self.start_ticks += offset;
+        self.span_ticks -= offset.min(self.span_ticks);
+    }
+}
+
 /// Splits `clips[index]` at `at` in place (M4b.2): the left half keeps the
 /// start with a shortened span, the right half is inserted at `index + 1`
 /// with the content from the cut onward shifted to its origin (notes
@@ -600,7 +681,7 @@ fn clip_geometry(
     control_tracks: &[ControlTrack],
     sel: ClipSel,
 ) -> Option<(u32, u32)> {
-    if sel.is_control {
+    if sel.lane.is_control() {
         let c = control_tracks.get(sel.track)?.clips.get(sel.clip)?;
         Some((c.start(), c.span()))
     } else {
@@ -664,7 +745,11 @@ fn grab_targets(
     let ptr = ptr?;
     let mut bar_delta = ((ptr.x - modal.grab.x) / px_per_bar).round() as i64;
     let mut row_delta = ((ptr.y - modal.grab.y) / row_h).round() as i32;
-    let is_control = modal.origin.first().map(|s| s.is_control).unwrap_or(false);
+    let is_control = modal
+        .origin
+        .first()
+        .map(|s| s.lane.is_control())
+        .unwrap_or(false);
     let rows = if is_control { rows_control } else { rows_midi };
     row_delta = clamp_row_delta(row_delta, &modal.origin, rows);
     // An axis lock zeroes the OTHER axis' delta (Blender convention: the
@@ -751,7 +836,7 @@ fn filter_covered(
     for (sel, target, to_track, is_control) in targets {
         let skip: Vec<usize> = moving
             .iter()
-            .filter(|m| m.is_control == is_control && m.track == to_track)
+            .filter(|m| m.lane.is_control() == is_control && m.track == to_track)
             .map(|m| m.clip)
             .collect();
         let existing = if is_control {
@@ -808,6 +893,23 @@ impl RowColors {
             edit_highlight: Color32::from_rgb(255, 215, 110),
         }
     }
+
+    /// U6: audio rows share the sample-player family's warm amber-gray
+    /// (distinct from the control track's orange-brown at a glance).
+    fn audio(selected: bool) -> Self {
+        Self {
+            lane_bg: Color32::from_gray(if selected { 34 } else { 28 }),
+            grid: Color32::from_gray(46),
+            clip_fill: if selected {
+                Color32::from_rgb(150, 120, 66)
+            } else {
+                Color32::from_rgb(112, 92, 54)
+            },
+            clip_stroke: Color32::from_rgb(215, 190, 130),
+            clip_text: Color32::from_rgb(245, 240, 225),
+            edit_highlight: Color32::from_rgb(235, 205, 130),
+        }
+    }
 }
 
 enum HeaderKind {
@@ -820,6 +922,10 @@ enum HeaderKind {
         index: usize,
         selected: bool,
     },
+    Audio {
+        index: usize,
+        selected: bool,
+    },
 }
 
 /// Draws the whole arrangement (toolbar, ruler, rows) and returns the actions
@@ -829,6 +935,7 @@ pub fn show(
     state: &mut TimelineState,
     midi_tracks: &[MidiTrack],
     control_tracks: &[ControlTrack],
+    audio_tracks: &[AudioTrack],
     p: TimelineParams<'_>,
     router: &mut crate::focus::FocusRouter,
 ) -> Vec<TimelineAction> {
@@ -942,6 +1049,16 @@ pub fn show(
             ui.separator();
             if ui.button("+ Track").clicked() {
                 actions.push(TimelineAction::AddMidiTrack);
+            }
+            if ui.button("+ Audio").on_hover_text("Add an audio track").clicked() {
+                actions.push(TimelineAction::AddAudioTrack);
+            }
+            if ui
+                .button("- Audio")
+                .on_hover_text("Remove the last audio track")
+                .clicked()
+            {
+                actions.push(TimelineAction::RemoveLastAudioTrack);
             }
             if ui.button("- Track").clicked() {
                 actions.push(TimelineAction::RemoveLastMidiTrack);
@@ -1279,6 +1396,7 @@ pub fn show(
                 RowColors::midi(p.selected_track == i),
                 highlight,
                 &|clip| format!("{} notes", clip.notes().len()),
+                &|_| None,
             );
         }
 
@@ -1318,6 +1436,7 @@ pub fn show(
                             format!("{} anchors", clip.curve.len())
                         }
                     },
+                    &|_| None,
                 );
                 // U4b: the selected control track opens its curve band right
                 // under its own row (LMMS song-editor semantics). The band
@@ -1337,6 +1456,48 @@ pub fn show(
                         p.curve_param,
                     );
                 }
+            }
+        }
+
+        // Audio rows (U6): waveform bodies, the same drag/resize/split/
+        // marquee/delete gestures (Placement), and double-click on empty
+        // space asking for a wav (AddAudioClip → app-side file dialog).
+        if !audio_tracks.is_empty() {
+            ui.add_space(4.0);
+            ui.weak("Audio tracks (double-click empty space to insert a wav)");
+            for (i, track) in audio_tracks.iter().enumerate() {
+                let header = HeaderKind::Audio {
+                    index: i,
+                    selected: p.selected_audio == i,
+                };
+                let highlight = None;
+                lane_row(
+                    ui,
+                    state,
+                    router,
+                    &mut actions,
+                    &mut marquee_hits,
+                    &mut geom,
+                    header,
+                    RowKind::Audio(i),
+                    &track.clips,
+                    px_per_tick,
+                    bar_ticks,
+                    row_h,
+                    content_px,
+                    p.playhead_ticks,
+                    RowColors::audio(p.selected_audio == i),
+                    highlight,
+                    &|clip: &AudioClip| {
+                        std::path::Path::new(&clip.path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "clip".to_string())
+                    },
+                    // Adapt the path-keyed lookup (TimelineParams) to the
+                    // clip-keyed parameter lane_row takes.
+                    &|clip: &AudioClip| (p.waveform_of)(&clip.path),
+                );
             }
         }
 
@@ -1401,10 +1562,11 @@ pub fn show(
                 Vec::new()
             };
             for (row, hits) in &marquee_hits {
-                let (is_control, track) = row.key();
+                let lane = row.lane();
+    let track = row.track();
                 for clip in hits {
                     let sel = ClipSel {
-                        is_control,
+                        lane,
                         track,
                         clip: *clip,
                     };
@@ -1472,7 +1634,7 @@ pub fn show(
                                                 mv.from,
                                                 (mv.start_ticks, span),
                                                 mv.to_track,
-                                                mv.from.is_control,
+                                                mv.from.lane.is_control(),
                                             ))
                                         })
                                         .collect();
@@ -1528,7 +1690,7 @@ pub fn show(
                                                 e.sel,
                                                 (e.start_ticks, e.span_ticks),
                                                 e.sel.track,
-                                                e.sel.is_control,
+                                                e.sel.lane.is_control(),
                                             )
                                         })
                                         .collect();
@@ -1578,7 +1740,7 @@ pub fn show(
                             .filter_map(|mv| {
                                 let (_, span) =
                                     clip_geometry(midi_tracks, control_tracks, mv.from)?;
-                                Some((mv.from.is_control, mv.to_track, mv.start_ticks, span))
+                                Some((mv.from.lane.is_control(), mv.to_track, mv.start_ticks, span))
                             })
                             .collect::<Vec<_>>()
                     }),
@@ -1592,7 +1754,7 @@ pub fn show(
                     )
                     .map(|es| {
                         es.into_iter()
-                            .map(|e| (e.sel.is_control, e.sel.track, e.start_ticks, e.span_ticks))
+                            .map(|e| (e.sel.lane.is_control(), e.sel.track, e.start_ticks, e.span_ticks))
                             .collect::<Vec<_>>()
                     }),
                 };
@@ -1600,7 +1762,7 @@ pub fn show(
                     for (is_control, track, start, span) in targets {
                         let Some((_, lane)) = geom
                             .iter()
-                            .find(|(row, _)| row.key() == (is_control, track))
+                            .find(|(row, _)| row.key() == (u8::from(is_control), track))
                         else {
                             continue;
                         };
@@ -1628,6 +1790,47 @@ pub fn show(
     actions
 }
 
+/// Draws one audio clip's waveform body (U6 D6): min/max peak columns
+/// spread across the clip rect — the same proportional mapping the RT
+/// reader uses (frame = (t − start)/span × wav), so what you see is what
+/// you hear. The peaks cover the whole file and the rect IS the span, so
+/// the mapping needs no extra inputs.
+fn draw_waveform(
+    painter: &egui::Painter,
+    rect: Rect,
+    data: &glitcherz_engine::SampleData,
+    color: Color32,
+) {
+    let peaks = data.peaks();
+    if peaks.is_empty() || rect.width() < 2.0 {
+        return;
+    }
+    let mid = rect.center().y;
+    let half = (rect.height() / 2.0).max(2.0);
+    let columns = (rect.width() / 1.5).floor().max(1.0) as usize;
+    let stroke = Stroke::new(1.0, color);
+    for column in 0..columns {
+        // Column j maps to the peaks slice [j/n, (j+1)/n) — the slice's
+        // combined extent is the column's min/max.
+        let from = column * peaks.len() / columns;
+        let to = ((column + 1) * peaks.len() / columns).max(from + 1);
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for &(p_min, p_max) in &peaks[from..to.min(peaks.len())] {
+            lo = lo.min(p_min);
+            hi = hi.max(p_max);
+        }
+        if lo > hi {
+            continue;
+        }
+        let x = rect.left() + (column as f32 + 0.5) * rect.width() / columns as f32;
+        let y0 = mid - hi.clamp(-1.0, 1.0) * half;
+        let y1 = mid - lo.clamp(-1.0, 1.0) * half;
+        let (y0, y1) = (y0.min(y1), y0.max(y1).max(y0 + 1.0));
+        painter.line_segment([pos2(x, y0), pos2(x, y1)], stroke);
+    }
+}
+
 /// One row: header cell + clip lane (grid, clips, playhead, interactions).
 #[allow(clippy::too_many_arguments)]
 fn lane_row<T: Placement>(
@@ -1648,6 +1851,9 @@ fn lane_row<T: Placement>(
     colors: RowColors,
     highlight: Option<usize>,
     clip_label: &dyn Fn(&T) -> String,
+    // Waveform source for the clip bodies (U6): `Some` renders peaks
+    // columns instead of the flat fill. MIDI/control rows pass `&|_| None`.
+    waveform_of: &dyn Fn(&T) -> Option<std::sync::Arc<glitcherz_engine::SampleData>>,
 ) {
     // The row's widget ids must be STABLE. The lane is the keyboard focus
     // carrier, and egui auto ids are positional: anything above the rows
@@ -1734,6 +1940,16 @@ fn lane_row<T: Placement>(
                 actions.push(TimelineAction::SelectControlTrack(index));
             }
         }
+        HeaderKind::Audio { index, selected } => {
+            let mut btn =
+                egui::Button::new(egui::RichText::new(format!("Audio {}", index + 1)).size(11.0));
+            if selected {
+                btn = btn.fill(Color32::from_rgb(60, 52, 34));
+            }
+            if ui.add_sized([HEADER_WIDTH, row_h - 4.0], btn).clicked() {
+                actions.push(TimelineAction::SelectAudioTrack(index));
+            }
+        }
     }
 
     // Lane surface.
@@ -1773,7 +1989,8 @@ fn lane_row<T: Placement>(
 
     let tick_at = |x: f32| ((x - lane.left()) / px_per_tick).max(0.0);
 
-    let (is_control, track) = row.key();
+    let lane_kind = row.lane();
+    let track = row.track();
 
     // Clip blocks.
     for (index, clip) in clips.iter().enumerate() {
@@ -1789,7 +2006,7 @@ fn lane_row<T: Placement>(
         // Modal convention (M4a.5): originals dim while the ghost is
         // live, so the preview stays visible where they overlap.
         let selected = state.selection.contains(&ClipSel {
-            is_control,
+            lane: lane_kind,
             track,
             clip: index,
         });
@@ -1810,8 +2027,13 @@ fn lane_row<T: Placement>(
             Stroke::new(1.0, colors.clip_stroke),
             StrokeKind::Inside,
         );
+        // U6: a clip with waveform data draws min/max peak columns across
+        // its body (stretched to the span, exactly like playback reads it).
+        if let Some(data) = waveform_of(clip) {
+            draw_waveform(&painter, rect, &data, colors.clip_stroke);
+        }
         if state.selection.contains(&ClipSel {
-            is_control,
+            lane: lane_kind,
             track,
             clip: index,
         }) {
@@ -1862,14 +2084,14 @@ fn lane_row<T: Placement>(
                 match knife_target(clips, tick_at(pos.x), bar_ticks) {
                     Some((index, at)) => {
                         actions.push(TimelineAction::SplitClip {
-                            is_control,
+                            lane: lane_kind,
                             track,
                             clip: index,
                             at_ticks: at,
                         });
-                        state.selection.retain(|s| {
-                            s.is_control != is_control || s.track != track || s.clip != index
-                        });
+                        state
+                            .selection
+                            .retain(|s| s.lane != lane_kind || s.track != track || s.clip != index);
                     }
                     None if hit_clip(clips, tick_at(pos.x)).is_some() => {
                         state.set_status("a cut needs at least one bar on both sides");
@@ -1912,18 +2134,31 @@ fn lane_row<T: Placement>(
                     RowKind::Control(t) => {
                         actions.push(TimelineAction::ShowControlCurve { track: t })
                     }
+                    // U6 D2: audio clips have no editor — the double-click
+                    // selects the track (highlight + `- Audio` target).
+                    RowKind::Audio(t) => {
+                        actions.push(TimelineAction::SelectAudioTrack(t));
+                    }
                 }
             } else if clips.len() < MAX_CLIPS_PER_TRACK {
                 let bound = ARRANGEMENT_LIMIT_TICKS - bar_ticks;
-                let (is_control, track) = match row {
-                    RowKind::Midi(t) => (false, t),
-                    RowKind::Control(t) => (true, t),
-                };
-                actions.push(TimelineAction::AddClip {
-                    is_control,
-                    track,
-                    start_ticks: snap_bar(tick, bar_ticks).min(bound),
-                });
+                let start = snap_bar(tick, bar_ticks).min(bound);
+                if let RowKind::Audio(t) = row {
+                    // U6 D2: an empty audio lane asks for a wav — the caller
+                    // opens the file dialog and creates the clip.
+                    actions.push(TimelineAction::AddAudioClip {
+                        track: t,
+                        start_ticks: start,
+                    });
+                } else {
+                    let lane = row.lane();
+                    let track = row.track();
+                    actions.push(TimelineAction::AddClip {
+                        lane,
+                        track,
+                        start_ticks: start,
+                    });
+                }
             }
         }
     }
@@ -1944,7 +2179,7 @@ fn lane_row<T: Placement>(
             if let Some(index) = hit_clip(clips, tick) {
                 let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
                 let sel = ClipSel {
-                    is_control,
+                    lane: lane_kind,
                     track,
                     clip: index,
                 };
@@ -1993,12 +2228,10 @@ fn lane_row<T: Placement>(
                         let limit = ARRANGEMENT_LIMIT_TICKS - span;
                         let start = snap_bar(tick_at(pos.x) - grab_ticks, bar_ticks).min(limit);
                         if clips[clip].start() != start {
-                            let (is_control, track) = match row {
-                                RowKind::Midi(t) => (false, t),
-                                RowKind::Control(t) => (true, t),
-                            };
+                            let lane = row.lane();
+                            let track = row.track();
                             actions.push(TimelineAction::MoveResizeClip {
-                                is_control,
+                                lane,
                                 track,
                                 clip,
                                 start_ticks: start,
@@ -2012,12 +2245,10 @@ fn lane_row<T: Placement>(
                         let span = snap_bar(tick_at(pos.x) - start as f32, bar_ticks)
                             .clamp(bar_ticks, limit.max(bar_ticks));
                         if clips[clip].span() != span {
-                            let (is_control, track) = match row {
-                                RowKind::Midi(t) => (false, t),
-                                RowKind::Control(t) => (true, t),
-                            };
+                            let lane = row.lane();
+                            let track = row.track();
                             actions.push(TimelineAction::MoveResizeClip {
-                                is_control,
+                                lane,
                                 track,
                                 clip,
                                 start_ticks: start,
@@ -2087,7 +2318,7 @@ fn lane_row<T: Placement>(
             match hit_clip(clips, tick_at(pos.x)) {
                 Some(index) => {
                     let sel = ClipSel {
-                        is_control,
+                        lane: lane_kind,
                         track,
                         clip: index,
                     };
@@ -2116,7 +2347,7 @@ fn lane_row<T: Placement>(
             if state.marquee.take().is_none() {
                 if let Some(index) = hit_clip(clips, tick_at(pos.x)) {
                     actions.push(TimelineAction::RemoveClip {
-                        is_control,
+                        lane: lane_kind,
                         track,
                         clip: index,
                     });
@@ -2267,21 +2498,31 @@ fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
         state.set_status("nothing selected \u{2014} G / Shift+D / T need a selection");
         return;
     }
+    // U6: audio clips edit by direct drag — the modal family (G / T /
+    // Shift+D) reasons in two tables and stays that way for v1.
+    if state
+        .selection
+        .iter()
+        .any(|s| matches!(s.lane, TimelineLane::Audio))
+    {
+        state.set_status("audio clips edit by direct drag — G / T / Shift+D are MIDI/curve only");
+        return;
+    }
     let Some(ptr) = ctx.pointer_hover_pos() else {
         return;
     };
     let kind = match arm {
         Arm::Grab => {
-            let first = state.selection[0].is_control;
-            if state.selection.iter().any(|s| s.is_control != first) {
+            let first = state.selection[0].lane;
+            if state.selection.iter().any(|s| s.lane != first) {
                 state.set_status("mixed selection: G moves one track kind at a time");
                 return;
             }
             ModalKind::Grab { locked: None }
         }
         Arm::Duplicate => {
-            let first = state.selection[0].is_control;
-            if state.selection.iter().any(|s| s.is_control != first) {
+            let first = state.selection[0].lane;
+            if state.selection.iter().any(|s| s.lane != first) {
                 state.set_status("mixed selection: Shift+D copies one track kind at a time");
                 return;
             }
@@ -3022,12 +3263,12 @@ mod tests {
         // +1 so the whole group fits, not push row 1 out.
         let sel = vec![
             ClipSel {
-                is_control: false,
+                lane: TimelineLane::Midi,
                 track: 0,
                 clip: 0,
             },
             ClipSel {
-                is_control: false,
+                lane: TimelineLane::Midi,
                 track: 1,
                 clip: 0,
             },
@@ -3038,12 +3279,12 @@ mod tests {
         // Selection on rows 1 and 2 can move down by one, not further.
         let low = vec![
             ClipSel {
-                is_control: false,
+                lane: TimelineLane::Midi,
                 track: 1,
                 clip: 0,
             },
             ClipSel {
-                is_control: false,
+                lane: TimelineLane::Midi,
                 track: 2,
                 clip: 0,
             },
@@ -3071,7 +3312,7 @@ mod tests {
         let modal = Modal {
             kind: ModalKind::Grab { locked: None },
             origin: vec![ClipSel {
-                is_control: false,
+                lane: TimelineLane::Midi,
                 track: 0,
                 clip: 0,
             }],
@@ -3212,7 +3453,7 @@ mod tests {
         let end = Modal {
             kind: ModalKind::Stretch { start_edge: false },
             origin: vec![ClipSel {
-                is_control: false,
+                lane: TimelineLane::Midi,
                 track: 0,
                 clip: 0,
             }],
@@ -3234,7 +3475,7 @@ mod tests {
         let start = Modal {
             kind: ModalKind::Stretch { start_edge: true },
             origin: vec![ClipSel {
-                is_control: false,
+                lane: TimelineLane::Midi,
                 track: 0,
                 clip: 0,
             }],

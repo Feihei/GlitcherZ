@@ -83,6 +83,18 @@ pub enum ParamId {
     /// non-finite values are ignored). The synth starts at its own default
     /// of 0.5.
     Sf2MasterVolume,
+    /// Sample voice: root MIDI note of the loaded sample (0..127, default
+    /// 60 = C4). Affects the playback rate of **subsequent** note-ons;
+    /// sounding voices keep their trigger-time rate (the sampler-standard
+    /// freeze semantics).
+    SampleRootNote,
+    /// Sample voice: output gain (linear, clamped 0..2; non-finite values
+    /// are ignored). Applies immediately to all sounding voices.
+    SampleGain,
+    /// Sample voice: play mode — 0 = Gate (note-off enters the release
+    /// fade), ≥ 0.5 = OneShot (pitch-matched note-offs are ignored; the
+    /// blanket transport sweep still stops the voice).
+    SamplePlayMode,
 }
 
 /// Note event (MIDI semantics). `note` is the MIDI note number (69 = A4),

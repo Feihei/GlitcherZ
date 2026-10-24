@@ -144,9 +144,11 @@ impl Fixture {
                     state,
                     &*tracks,
                     &[],
+                    &[],
                     TimelineParams {
                         selected_track: 0,
                         selected_auto: 0,
+                        selected_audio: 0,
                         playhead_ticks: 0.0,
                         playing: false,
                         edit_target: None,
@@ -154,6 +156,7 @@ impl Fixture {
                         markers: &[],
                         bar_ticks: glitcherz_model::TICKS_PER_BAR,
                         curve_param: None,
+                        waveform_of: &|_| None,
                     },
                     router,
                 );

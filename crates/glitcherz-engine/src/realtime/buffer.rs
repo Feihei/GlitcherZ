@@ -77,6 +77,17 @@ impl AudioBuffer {
     pub fn channel_mut(&mut self, ch: usize) -> Option<&mut [f32]> {
         self.data.get_mut(ch).map(|c| &mut c[..self.len])
     }
+
+    /// Mutable access to the active regions of channels 0 and 1 as a pair
+    /// (U6: stereo generators write both channels in one loop). Returns
+    /// `None` when there are fewer than two channels. RT-safe.
+    pub fn stereo_channels_mut(&mut self) -> Option<(&mut [f32], &mut [f32])> {
+        if self.data.len() < 2 {
+            return None;
+        }
+        let (first, second) = self.data.split_at_mut(1);
+        Some((&mut first[0][..self.len], &mut second[0][..self.len]))
+    }
 }
 
 #[cfg(test)]
