@@ -6,23 +6,26 @@
 //! Backward compatibility policy: `version` records the file format version;
 //! **new fields always get defaults via `#[serde(default)]`** (see the crate
 //! documentation conventions), so missing fields are automatically upgraded
-//! when reading older files; unknown fields are ignored by serde. Currently
-//! all files with a version ≤ [`PROJECT_VERSION`] are read with the same
-//! field-level tolerance; if a future version requires a destructive
-//! migration, handle it by branching on `version` in this module.
+//! when reading older files; unknown fields are ignored by serde. When a
+//! version needs a **destructive** migration (a field whose meaning changed
+//! rather than being added), [`parse_project`] branches on `version` and runs
+//! the chain — currently `migrate` (≤ v4), `migrate_v5_to_v6` (< 6) and
+//! `migrate_v6_to_v7` (< 7).
 
 use std::path::Path;
 
 use crate::Project;
 
-/// Current version of the project file format (v6: MIDI tick base 96 → 960
-/// PPQ and notes moved from the clip into `MidiClip::sequence` — M1).
+/// Current version of the project file format (v7: audio clips carry a
+/// seconds-domain trim window, `source_offset`/`source_len`, replacing the
+/// v6 tick `span_ticks` — U11).
 ///
-/// v5 and older documents go through [`Project::migrate_v5_to_v6`] (ticks
-/// ×10, legacy notes folded into the sequence); v4 documents additionally go
-/// through [`Project::migrate`] (ChannelStrip → mixer, master multi-input →
-/// synthetic mixer).
-pub const PROJECT_VERSION: u32 = 6;
+/// Migration chain on load: v4 and older go through [`Project::migrate`]
+/// (ChannelStrip → mixer, master multi-input → synthetic mixer); `version < 6`
+/// goes through [`Project::migrate_v5_to_v6`] (ticks ×10, legacy notes folded
+/// into the sequence); `version < 7` goes through
+/// [`Project::migrate_v6_to_v7`] (audio `span_ticks` → seconds trim window).
+pub const PROJECT_VERSION: u32 = 7;
 
 fn default_version() -> u32 {
     PROJECT_VERSION
@@ -95,8 +98,11 @@ pub fn parse_project(text: &str) -> Result<Project, ModelError> {
         _ => (ron::from_str(text)?, PROJECT_VERSION),
     };
     project.migrate();
-    if version < PROJECT_VERSION {
+    if version < 6 {
         project.migrate_v5_to_v6();
+    }
+    if version < 7 {
+        project.migrate_v6_to_v7();
     }
     project.validate().map_err(ModelError::InvalidGraph)?;
     Ok(project)

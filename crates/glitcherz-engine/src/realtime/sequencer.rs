@@ -286,6 +286,14 @@ impl Sequencer {
         self.playing
     }
 
+    /// Seconds per tick at the **base** tempo (U11 D2): audio clips map their
+    /// seconds-domain trim window onto the tick grid with this and do **not**
+    /// follow the tempo curve. `base_bpm` is always clamped to a sane range
+    /// by [`Self::set_base_bpm`], so this never divides by zero. RT-safe.
+    pub fn base_sec_per_tick(&self) -> f64 {
+        60.0 / (f64::from(self.base_bpm) * f64::from(TICKS_PER_QUARTER))
+    }
+
     /// Ticks per sample (f64 intermediate computation).
     fn ticks_per_sample(&self) -> f64 {
         // ticks/second = BPM/60 × TPQN; divide by the sample rate to get ticks/sample.
@@ -751,6 +759,7 @@ mod tests {
             song_ticks: 0.0,
             transport_dt_ticks: 0.0,
             transport_active: true,
+            sec_per_tick: 60.0 / (120.0 * 960.0),
         }
     }
 
@@ -1617,6 +1626,26 @@ mod tests {
             (seq.effective_bpm() - MAX_BPM).abs() < 1e-6,
             "a non-finite curve value must not poison the clock"
         );
+    }
+
+    /// U11 D2: audio clips convert ticks↔seconds at the **base** tempo, so
+    /// `base_sec_per_tick` must ignore the tempo curve override entirely.
+    #[test]
+    fn base_sec_per_tick_ignores_the_tempo_curve() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        let want = 60.0 / (120.0 * 960.0);
+        assert!((seq.base_sec_per_tick() - want).abs() < 1e-12);
+
+        seq.set_bpm_override(240.0);
+        assert!((seq.effective_bpm() - 240.0).abs() < 1e-6);
+        assert!(
+            (seq.base_sec_per_tick() - want).abs() < 1e-12,
+            "audio timing must follow the base tempo, not the curve"
+        );
+
+        seq.set_bpm(60.0);
+        assert!((seq.base_sec_per_tick() - 60.0 / (60.0 * 960.0)).abs() < 1e-12);
     }
 
     /// U3b: the override only lives while the transport is running (automation

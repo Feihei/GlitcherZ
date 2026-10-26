@@ -111,6 +111,7 @@ fn ctx(song_ticks: f64, active: bool) -> ProcessContext {
         song_ticks,
         transport_dt_ticks: 5.12,
         transport_active: active,
+        sec_per_tick: 60.0 / (120.0 * 960.0),
     }
 }
 
@@ -133,17 +134,19 @@ fn ramp_fixture_path() -> PathBuf {
     path
 }
 
-fn table_with(data: &Arc<SampleData>, start: f64, span: f64) -> AudioClipTable {
+fn table_with(data: &Arc<SampleData>, start: f64, len: f64) -> AudioClipTable {
     let mut table = empty_clip_table();
     table[0] = Some(RtAudioClip {
         start_ticks: start,
-        span_ticks: span,
+        source_offset: 0.0,
+        source_len: len,
         data: Arc::clone(data),
         gain: 1.0,
     });
     table[1] = Some(RtAudioClip {
         start_ticks: start + 200.0,
-        span_ticks: span,
+        source_offset: 0.0,
+        source_len: len,
         data: Arc::clone(data),
         gain: 0.5,
     });
@@ -154,7 +157,7 @@ fn table_with(data: &Arc<SampleData>, start: f64, span: f64) -> AudioClipTable {
 fn sustained_playback_is_allocation_free() {
     let _guard = AUDIT_LOCK.lock().unwrap();
     let data = Arc::new(SampleData::load(&ramp_fixture_path()).expect("decode"));
-    let mut proc = AudioTrackProcessor::new(table_with(&data, 0.0, 96_000.0));
+    let mut proc = AudioTrackProcessor::new(table_with(&data, 0.0, 2.0));
     let mut buffer = AudioBuffer::new(2, BLOCK);
 
     let scope = AuditScope::begin();
@@ -170,7 +173,7 @@ fn sustained_playback_is_allocation_free() {
 fn clip_table_swaps_are_allocation_free_and_drop_free() {
     let _guard = AUDIT_LOCK.lock().unwrap();
     let data = Arc::new(SampleData::load(&ramp_fixture_path()).expect("decode"));
-    let mut proc = AudioTrackProcessor::new(table_with(&data, 0.0, 96_000.0));
+    let mut proc = AudioTrackProcessor::new(table_with(&data, 0.0, 2.0));
     let mut buffer = AudioBuffer::new(2, BLOCK);
     // Parked outside the scope: displaced tables must outlive the audit
     // window (dropping them inside would count as a deallocation here —
@@ -181,7 +184,7 @@ fn clip_table_swaps_are_allocation_free_and_drop_free() {
     let scope = AuditScope::begin();
     for i in 0..16u32 {
         let start = f64::from(i) * 300.0;
-        let old = proc.swap_clips(table_with(&data, start, 48_000.0));
+        let old = proc.swap_clips(table_with(&data, start, 1.0));
         displaced.push(old);
         buffer.set_len(BLOCK);
         buffer.clear();

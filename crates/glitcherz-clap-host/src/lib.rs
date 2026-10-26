@@ -1050,6 +1050,7 @@ mod tests {
             song_ticks: 0.0,
             transport_dt_ticks: 0.0,
             transport_active: true,
+            sec_per_tick: 60.0 / (120.0 * 960.0),
         };
         Some((instance, ctx))
     }
@@ -1652,6 +1653,7 @@ mod tests {
             song_ticks: 0.0,
             transport_dt_ticks: 0.0,
             transport_active: true,
+            sec_per_tick: 60.0 / (120.0 * 960.0),
         };
         let mut buffer = AudioBuffer::new(2, 128);
         buffer.set_len(128);
@@ -1961,6 +1963,7 @@ mod tests {
             song_ticks: 0.0,
             transport_dt_ticks: 0.0,
             transport_active: true,
+            sec_per_tick: 60.0 / (120.0 * 960.0),
         };
         let mut buffer = AudioBuffer::new(2, 128);
         buffer.set_len(128);
@@ -2253,6 +2256,7 @@ mod tests {
             song_ticks: 0.0,
             transport_dt_ticks: 0.0,
             transport_active: true,
+            sec_per_tick: 60.0 / (120.0 * 960.0),
         };
         let mut buffer = AudioBuffer::new(2, 128);
         buffer.set_len(128);
@@ -2342,6 +2346,7 @@ mod tests {
                 song_ticks: 0.0,
                 transport_dt_ticks: 0.0,
                 transport_active: true,
+                sec_per_tick: 60.0 / (120.0 * 960.0),
             };
             let mut buf = AudioBuffer::new(2, 128);
             buf.set_len(128);
@@ -2734,6 +2739,7 @@ mod tests {
             song_ticks: 0.0,
             transport_dt_ticks: 0.0,
             transport_active: true,
+            sec_per_tick: 60.0 / (120.0 * 960.0),
         };
         let mut buf = AudioBuffer::new(2, 128);
         buf.set_len(128);

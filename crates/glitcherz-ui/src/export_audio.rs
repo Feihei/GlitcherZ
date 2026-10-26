@@ -85,7 +85,9 @@ pub fn export_end_ticks(project: &Project) -> u32 {
     }
     for track in &project.audio_tracks {
         for clip in &track.clips {
-            latest = latest.max(u64::from(clip.start_ticks) + u64::from(clip.span_ticks));
+            // U11: the tick footprint is derived from the seconds window.
+            latest = latest
+                .max(u64::from(clip.start_ticks) + u64::from(project.audio_clip_span_ticks(clip)));
         }
     }
     let end = if latest == 0 {
@@ -252,8 +254,11 @@ mod tests {
             project.audio_tracks[0].clips.push(AudioClip {
                 path: "x.wav".to_string(),
                 start_ticks: end.saturating_sub(TICKS_PER_BAR),
-                span_ticks: TICKS_PER_BAR,
+                // One bar at the default 120 BPM (U11: seconds, not ticks).
+                source_offset: 0.0,
+                source_len: 2.0,
                 gain: 1.0,
+                ..AudioClip::default()
             });
         }
         project

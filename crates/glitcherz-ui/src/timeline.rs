@@ -81,9 +81,18 @@ pub enum TimelineLane {
 }
 
 impl TimelineLane {
-    /// Kept for the modal filter sites that still reason in two tables.
+    /// Kept for the sites that still reason in two tables.
     pub fn is_control(self) -> bool {
         matches!(self, TimelineLane::Control)
+    }
+
+    /// Row-key index matching [`RowKind::key`] (0 MIDI / 1 control / 2 audio).
+    fn row_code(self) -> u8 {
+        match self {
+            TimelineLane::Midi => 0,
+            TimelineLane::Control => 1,
+            TimelineLane::Audio => 2,
+        }
     }
 }
 
@@ -515,6 +524,10 @@ pub struct TimelineParams<'a> {
     /// measures in bars — grid, snapping, knife edges, resize minimums — reads
     /// this instead of the 4/4 [`TICKS_PER_BAR`] constant.
     pub bar_ticks: u32,
+    /// Seconds per tick at the project's **base** tempo (U11 D3): audio clips
+    /// derive their tick footprint from their seconds window with this, and
+    /// the modal geometry uses it for the same reason.
+    pub sec_per_tick: f64,
     /// Endpoint parameter of the selected control track (U4b): the inline
     /// band's vertical axis. `None` = the track has no cable yet; the band
     /// still draws with a normalized axis and says so.
@@ -527,33 +540,41 @@ pub struct TimelineParams<'a> {
 /// Placement semantics shared by MIDI and control clips.
 pub(crate) trait Placement {
     fn start(&self) -> u32;
-    fn span(&self) -> u32;
+    /// Tick extent of the clip. `sec_per_tick` is the project's **base-tempo**
+    /// seconds-per-tick (U11 D3): audio derives its span from the seconds
+    /// trim window, MIDI/control ignore the argument.
+    fn span(&self, sec_per_tick: f64) -> u32;
     fn set_start(&mut self, v: u32);
-    fn set_span(&mut self, v: u32);
-    fn set_loop(&mut self, v: u32);
+    /// Sets the tick extent. For audio this rewrites the seconds window
+    /// (native-rate playback: it changes how much material is exposed, never
+    /// its speed).
+    fn set_span(&mut self, v: u32, sec_per_tick: f64);
+    fn set_loop(&mut self, v: u32, sec_per_tick: f64);
     /// Keeps only the content at/after `offset` (tick, relative to the clip
     /// start) and shifts it to the clip origin — the right half of a split.
-    /// Notes crossing the offset continue at the cut with their tail.
-    fn retain_from(&mut self, offset: u32);
+    /// Notes crossing the offset continue at the cut with their tail; audio
+    /// trims its head (start + offset, window offset += offset·sec_per_tick,
+    /// window length −= offset·sec_per_tick).
+    fn retain_from(&mut self, offset: u32, sec_per_tick: f64);
 }
 
 impl Placement for MidiClip {
     fn start(&self) -> u32 {
         self.start_ticks
     }
-    fn span(&self) -> u32 {
+    fn span(&self, _sec_per_tick: f64) -> u32 {
         self.span_ticks
     }
     fn set_start(&mut self, v: u32) {
         self.start_ticks = v;
     }
-    fn set_span(&mut self, v: u32) {
+    fn set_span(&mut self, v: u32, _sec_per_tick: f64) {
         self.span_ticks = v;
     }
-    fn set_loop(&mut self, v: u32) {
+    fn set_loop(&mut self, v: u32, _sec_per_tick: f64) {
         self.loop_ticks = v;
     }
-    fn retain_from(&mut self, offset: u32) {
+    fn retain_from(&mut self, offset: u32, _sec_per_tick: f64) {
         let o = i64::from(offset);
         self.sequence.notes = self
             .sequence
@@ -594,19 +615,19 @@ impl Placement for ControlClip {
     fn start(&self) -> u32 {
         self.start_ticks
     }
-    fn span(&self) -> u32 {
+    fn span(&self, _sec_per_tick: f64) -> u32 {
         self.span_ticks
     }
     fn set_start(&mut self, v: u32) {
         self.start_ticks = v;
     }
-    fn set_span(&mut self, v: u32) {
+    fn set_span(&mut self, v: u32, _sec_per_tick: f64) {
         self.span_ticks = v;
     }
-    fn set_loop(&mut self, v: u32) {
+    fn set_loop(&mut self, v: u32, _sec_per_tick: f64) {
         self.loop_ticks = v;
     }
-    fn retain_from(&mut self, offset: u32) {
+    fn retain_from(&mut self, offset: u32, _sec_per_tick: f64) {
         self.curve = self
             .curve
             .iter()
@@ -623,24 +644,31 @@ impl Placement for AudioClip {
     fn start(&self) -> u32 {
         self.start_ticks
     }
-    fn span(&self) -> u32 {
-        self.span_ticks
+    // U11 D3: the tick extent is *derived* from the seconds trim window at
+    // the base tempo — the document never stores it.
+    fn span(&self, sec_per_tick: f64) -> u32 {
+        let ticks = (self.source_len / sec_per_tick).round();
+        ticks.max(1.0) as u32
     }
     fn set_start(&mut self, v: u32) {
         self.start_ticks = v;
     }
-    fn set_span(&mut self, v: u32) {
-        self.span_ticks = v;
+    // U11: writing the tick extent rewrites the seconds window (native-rate
+    // playback → this exposes more/less material, it does not stretch it).
+    fn set_span(&mut self, v: u32, sec_per_tick: f64) {
+        self.source_len = f64::from(v).max(1.0) * sec_per_tick;
     }
-    // Audio clips have no loop semantics (U6 D5): the span is the window the
-    // wav stretches across, so `loop == span` always holds; the setter is a
-    // no-op kept for the shared resize path.
-    fn set_loop(&mut self, _v: u32) {}
-    // The right half of a split plays the wav's second half: start shifts by
-    // the cut and the span shrinks — the proportional mapping does the rest.
-    fn retain_from(&mut self, offset: u32) {
+    // Audio clips have no loop semantics (U6 D5 / U11): `loop == span` always
+    // held, so the setter is a no-op kept for the shared resize path.
+    fn set_loop(&mut self, _v: u32, _sec_per_tick: f64) {}
+    // The right half of a split plays the wav's second half (U11): trim the
+    // head — start shifts by the cut, the window start advances and the
+    // window length shrinks by the same seconds.
+    fn retain_from(&mut self, offset: u32, sec_per_tick: f64) {
+        let secs = f64::from(offset) * sec_per_tick;
         self.start_ticks += offset;
-        self.span_ticks -= offset.min(self.span_ticks);
+        self.source_offset += secs;
+        self.source_len = (self.source_len - secs).max(sec_per_tick);
     }
 }
 
@@ -655,22 +683,23 @@ pub(crate) fn split_clip_in<T: Placement + Clone>(
     clips: &mut Vec<T>,
     at: u32,
     index: usize,
+    sec_per_tick: f64,
 ) -> bool {
     let Some(c) = clips.get(index) else {
         return false;
     };
-    let (start, end) = (c.start(), c.start() + c.span());
+    let (start, end) = (c.start(), c.start() + c.span(sec_per_tick));
     if at <= start || at >= end || clips.len() >= MAX_CLIPS_PER_TRACK {
         return false;
     }
     let left_span = at - start;
     let mut right = clips[index].clone();
     right.set_start(at);
-    right.set_span(end - at);
-    right.set_loop(end - at);
-    right.retain_from(left_span);
-    clips[index].set_span(left_span);
-    clips[index].set_loop(left_span);
+    right.set_span(end - at, sec_per_tick);
+    right.set_loop(end - at, sec_per_tick);
+    right.retain_from(left_span, sec_per_tick);
+    clips[index].set_span(left_span, sec_per_tick);
+    clips[index].set_loop(left_span, sec_per_tick);
     clips.insert(index + 1, right);
     true
 }
@@ -679,14 +708,23 @@ pub(crate) fn split_clip_in<T: Placement + Clone>(
 fn clip_geometry(
     midi_tracks: &[MidiTrack],
     control_tracks: &[ControlTrack],
+    audio_tracks: &[AudioTrack],
+    sec_per_tick: f64,
     sel: ClipSel,
 ) -> Option<(u32, u32)> {
-    if sel.lane.is_control() {
-        let c = control_tracks.get(sel.track)?.clips.get(sel.clip)?;
-        Some((c.start(), c.span()))
-    } else {
-        let c = midi_tracks.get(sel.track)?.clips.get(sel.clip)?;
-        Some((c.start(), c.span()))
+    match sel.lane {
+        TimelineLane::Control => {
+            let c = control_tracks.get(sel.track)?.clips.get(sel.clip)?;
+            Some((c.start(), c.span(sec_per_tick)))
+        }
+        TimelineLane::Midi => {
+            let c = midi_tracks.get(sel.track)?.clips.get(sel.clip)?;
+            Some((c.start(), c.span(sec_per_tick)))
+        }
+        TimelineLane::Audio => {
+            let c = audio_tracks.get(sel.track)?.clips.get(sel.clip)?;
+            Some((c.start(), c.span(sec_per_tick)))
+        }
     }
 }
 
@@ -715,12 +753,12 @@ fn fully_covers(target: (u32, u32), existing: &[(u32, u32)]) -> bool {
 
 /// All clips of a track as (start, span) pairs, skipping every index in
 /// `skip` (the moving set's own originals do not block their targets).
-fn track_spans<T: Placement>(clips: &[T], skip: &[usize]) -> Vec<(u32, u32)> {
+fn track_spans<T: Placement>(clips: &[T], skip: &[usize], sec_per_tick: f64) -> Vec<(u32, u32)> {
     clips
         .iter()
         .enumerate()
         .filter(|(i, _)| !skip.contains(i))
-        .map(|(_, c)| (c.start(), c.span()))
+        .map(|(_, c)| (c.start(), c.span(sec_per_tick)))
         .collect()
 }
 
@@ -736,8 +774,11 @@ fn grab_targets(
     row_h: f32,
     rows_midi: usize,
     rows_control: usize,
+    rows_audio: usize,
     midi_tracks: &[MidiTrack],
     control_tracks: &[ControlTrack],
+    audio_tracks: &[AudioTrack],
+    sec_per_tick: f64,
 ) -> Option<Vec<ClipMove>> {
     let (ModalKind::Grab { locked } | ModalKind::Duplicate { locked }) = modal.kind else {
         return None;
@@ -745,12 +786,13 @@ fn grab_targets(
     let ptr = ptr?;
     let mut bar_delta = ((ptr.x - modal.grab.x) / px_per_bar).round() as i64;
     let mut row_delta = ((ptr.y - modal.grab.y) / row_h).round() as i32;
-    let is_control = modal
-        .origin
-        .first()
-        .map(|s| s.lane.is_control())
-        .unwrap_or(false);
-    let rows = if is_control { rows_control } else { rows_midi };
+    // The modal moves within one track kind (arm_modal enforces a single
+    // kind): MIDI / control / audio all clamp against their own row count.
+    let rows = match modal.origin.first()?.lane {
+        TimelineLane::Midi => rows_midi,
+        TimelineLane::Control => rows_control,
+        TimelineLane::Audio => rows_audio,
+    };
     row_delta = clamp_row_delta(row_delta, &modal.origin, rows);
     // An axis lock zeroes the OTHER axis' delta (Blender convention: the
     // named axis is the one that still moves).
@@ -764,7 +806,13 @@ fn grab_targets(
             .origin
             .iter()
             .filter_map(|sel| {
-                let (start, _) = clip_geometry(midi_tracks, control_tracks, *sel)?;
+                let (start, _) = clip_geometry(
+                    midi_tracks,
+                    control_tracks,
+                    audio_tracks,
+                    sec_per_tick,
+                    *sel,
+                )?;
                 let to_track = (sel.track as i32 + row_delta).max(0) as usize;
                 let new_start = (start as i64 + bar_delta * i64::from(bar_ticks)).max(0) as u32;
                 Some(ClipMove {
@@ -779,6 +827,7 @@ fn grab_targets(
 
 /// The T modal's per-clip span edits (bar-aligned, ≥ 1 bar, within the
 /// arrangement). `None` when the pointer is unavailable or not a Stretch.
+#[allow(clippy::too_many_arguments)]
 fn stretch_targets(
     modal: &Modal,
     ptr: Option<Pos2>,
@@ -786,6 +835,8 @@ fn stretch_targets(
     bar_ticks: u32,
     midi_tracks: &[MidiTrack],
     control_tracks: &[ControlTrack],
+    audio_tracks: &[AudioTrack],
+    sec_per_tick: f64,
 ) -> Option<Vec<ClipSpanEdit>> {
     let ModalKind::Stretch { start_edge } = modal.kind else {
         return None;
@@ -800,7 +851,13 @@ fn stretch_targets(
             .origin
             .iter()
             .filter_map(|sel| {
-                let (start, span) = clip_geometry(midi_tracks, control_tracks, *sel)?;
+                let (start, span) = clip_geometry(
+                    midi_tracks,
+                    control_tracks,
+                    audio_tracks,
+                    sec_per_tick,
+                    *sel,
+                )?;
                 let (new_start, new_span) = if start_edge {
                     let d = tick_delta.clamp(-(start as i64), span as i64 - bar);
                     ((start as i64 + d) as u32, (span as i64 - d) as u32)
@@ -819,8 +876,8 @@ fn stretch_targets(
 }
 
 /// One modal target awaiting overlap validation: the clip at `sel` wants
-/// the (start, span) rectangle on row `to_track` (kind in `is_control`).
-type ModalTarget = (ClipSel, (u32, u32), usize, bool);
+/// the (start, span) rectangle on row `to_track` of track kind `lane`.
+type ModalTarget = (ClipSel, (u32, u32), usize, TimelineLane);
 
 /// Post-finalize validation for a move/stretch batch (M4b decision ②):
 /// clips whose target completely covers an existing (non-moving) clip are
@@ -829,25 +886,29 @@ fn filter_covered(
     targets: Vec<ModalTarget>,
     midi_tracks: &[MidiTrack],
     control_tracks: &[ControlTrack],
+    audio_tracks: &[AudioTrack],
+    sec_per_tick: f64,
 ) -> (Vec<ModalTarget>, usize) {
     let moving: Vec<ClipSel> = targets.iter().map(|(sel, _, _, _)| *sel).collect();
     let mut kept = Vec::new();
     let mut refused = 0;
-    for (sel, target, to_track, is_control) in targets {
+    for (sel, target, to_track, lane) in targets {
         let skip: Vec<usize> = moving
             .iter()
-            .filter(|m| m.lane.is_control() == is_control && m.track == to_track)
+            .filter(|m| m.lane == lane && m.track == to_track)
             .map(|m| m.clip)
             .collect();
-        let existing = if is_control {
-            track_spans(&control_tracks[to_track].clips, &skip)
-        } else {
-            track_spans(&midi_tracks[to_track].clips, &skip)
+        let existing = match lane {
+            TimelineLane::Control => {
+                track_spans(&control_tracks[to_track].clips, &skip, sec_per_tick)
+            }
+            TimelineLane::Midi => track_spans(&midi_tracks[to_track].clips, &skip, sec_per_tick),
+            TimelineLane::Audio => track_spans(&audio_tracks[to_track].clips, &skip, sec_per_tick),
         };
         if fully_covers(target, &existing) {
             refused += 1;
         } else {
-            kept.push((sel, target, to_track, is_control));
+            kept.push((sel, target, to_track, lane));
         }
     }
     (kept, refused)
@@ -1390,6 +1451,7 @@ pub fn show(
                 &track.clips,
                 px_per_tick,
                 bar_ticks,
+                p.sec_per_tick,
                 row_h,
                 content_px,
                 p.playhead_ticks,
@@ -1424,6 +1486,7 @@ pub fn show(
                     &track.clips,
                     px_per_tick,
                     bar_ticks,
+                    p.sec_per_tick,
                     row_h,
                     content_px,
                     p.playhead_ticks,
@@ -1483,6 +1546,7 @@ pub fn show(
                     &track.clips,
                     px_per_tick,
                     bar_ticks,
+                    p.sec_per_tick,
                     row_h,
                     content_px,
                     p.playhead_ticks,
@@ -1621,25 +1685,36 @@ pub fn show(
                                     row_h,
                                     midi_tracks.len(),
                                     control_tracks.len(),
+                                    audio_tracks.len(),
                                     midi_tracks,
                                     control_tracks,
+                                    audio_tracks,
+                                    p.sec_per_tick,
                                 ) {
                                     let targets: Vec<_> = moves
                                         .into_iter()
                                         .filter_map(|mv| {
                                             let (_, span) = clip_geometry(
-                                                midi_tracks, control_tracks, mv.from,
+                                                midi_tracks,
+                                                control_tracks,
+                                                audio_tracks,
+                                                p.sec_per_tick,
+                                                mv.from,
                                             )?;
                                             Some((
                                                 mv.from,
                                                 (mv.start_ticks, span),
                                                 mv.to_track,
-                                                mv.from.lane.is_control(),
+                                                mv.from.lane,
                                             ))
                                         })
                                         .collect();
                                     let (kept, refused) = filter_covered(
-                                        targets, midi_tracks, control_tracks,
+                                        targets,
+                                        midi_tracks,
+                                        control_tracks,
+                                        audio_tracks,
+                                        p.sec_per_tick,
                                     );
                                     if refused > 0 {
                                         refused_msg = Some(format!(
@@ -1682,6 +1757,8 @@ pub fn show(
                                     bar_ticks,
                                     midi_tracks,
                                     control_tracks,
+                                    audio_tracks,
+                                    p.sec_per_tick,
                                 ) {
                                     let targets: Vec<_> = spans
                                         .iter()
@@ -1690,12 +1767,16 @@ pub fn show(
                                                 e.sel,
                                                 (e.start_ticks, e.span_ticks),
                                                 e.sel.track,
-                                                e.sel.lane.is_control(),
+                                                e.sel.lane,
                                             )
                                         })
                                         .collect();
                                     let (kept, refused) = filter_covered(
-                                        targets, midi_tracks, control_tracks,
+                                        targets,
+                                        midi_tracks,
+                                        control_tracks,
+                                        audio_tracks,
+                                        p.sec_per_tick,
                                     );
                                     if refused > 0 {
                                         refused_msg = Some(format!(
@@ -1732,15 +1813,23 @@ pub fn show(
                         row_h,
                         midi_tracks.len(),
                         control_tracks.len(),
+                        audio_tracks.len(),
                         midi_tracks,
                         control_tracks,
+                        audio_tracks,
+                        p.sec_per_tick,
                     )
                     .map(|ms| {
                         ms.into_iter()
                             .filter_map(|mv| {
-                                let (_, span) =
-                                    clip_geometry(midi_tracks, control_tracks, mv.from)?;
-                                Some((mv.from.lane.is_control(), mv.to_track, mv.start_ticks, span))
+                                let (_, span) = clip_geometry(
+                                    midi_tracks,
+                                    control_tracks,
+                                    audio_tracks,
+                                    p.sec_per_tick,
+                                    mv.from,
+                                )?;
+                                Some((mv.from.lane, mv.to_track, mv.start_ticks, span))
                             })
                             .collect::<Vec<_>>()
                     }),
@@ -1751,33 +1840,41 @@ pub fn show(
                         bar_ticks,
                         midi_tracks,
                         control_tracks,
+                        audio_tracks,
+                        p.sec_per_tick,
                     )
                     .map(|es| {
                         es.into_iter()
-                            .map(|e| (e.sel.lane.is_control(), e.sel.track, e.start_ticks, e.span_ticks))
+                            .map(|e| (e.sel.lane, e.sel.track, e.start_ticks, e.span_ticks))
                             .collect::<Vec<_>>()
                     }),
                 };
                 if let Some(targets) = targets {
-                    for (is_control, track, start, span) in targets {
-                        let Some((_, lane)) = geom
+                    for (lane_kind, track, start, span) in targets {
+                        let Some((_, lane_rect)) = geom
                             .iter()
-                            .find(|(row, _)| row.key() == (u8::from(is_control), track))
+                            .find(|(row, _)| row.key() == (lane_kind.row_code(), track))
                         else {
                             continue;
                         };
-                        let x0 = lane.left() + start as f32 * px_per_tick;
-                        let x1 = lane.left() + (start + span) as f32 * px_per_tick;
+                        let x0 = lane_rect.left() + start as f32 * px_per_tick;
+                        let x1 = lane_rect.left() + (start + span) as f32 * px_per_tick;
                         let rect = Rect::from_min_max(
-                            pos2(x0 + 1.0, lane.top() + 2.0),
-                            pos2(x1 - 1.0, lane.bottom() - 2.0),
+                            pos2(x0 + 1.0, lane_rect.top() + 2.0),
+                            pos2(x1 - 1.0, lane_rect.bottom() - 2.0),
                         );
-                        let ghost = if is_control {
-                            Color32::from_rgba_unmultiplied(235, 195, 130, 170)
-                        } else {
-                            Color32::from_rgba_unmultiplied(140, 180, 240, 170)
+                        let ghost = match lane_kind {
+                            TimelineLane::Midi => {
+                                Color32::from_rgba_unmultiplied(140, 180, 240, 170)
+                            }
+                            TimelineLane::Control => {
+                                Color32::from_rgba_unmultiplied(235, 195, 130, 170)
+                            }
+                            TimelineLane::Audio => {
+                                Color32::from_rgba_unmultiplied(215, 190, 130, 170)
+                            }
                         };
-                        let painter = ui.painter_at(*lane);
+                        let painter = ui.painter_at(*lane_rect);
                         painter.rect_filled(rect, 3.0, ghost);
                     }
                 }
@@ -1845,6 +1942,7 @@ fn lane_row<T: Placement>(
     clips: &[T],
     px_per_tick: f32,
     bar_ticks: u32,
+    sec_per_tick: f64,
     row_h: f32,
     content_px: f32,
     playhead_ticks: f32,
@@ -1995,7 +2093,7 @@ fn lane_row<T: Placement>(
     // Clip blocks.
     for (index, clip) in clips.iter().enumerate() {
         let x0 = lane.left() + clip.start() as f32 * px_per_tick;
-        let x1 = lane.left() + (clip.start() + clip.span()) as f32 * px_per_tick;
+        let x1 = lane.left() + (clip.start() + clip.span(sec_per_tick)) as f32 * px_per_tick;
         let rect = Rect::from_min_max(
             pos2(x0 + 1.0, lane.top() + 2.0),
             pos2(x1 - 1.0, lane.bottom() - 2.0),
@@ -2081,7 +2179,7 @@ fn lane_row<T: Placement>(
             if clips.len() >= MAX_CLIPS_PER_TRACK {
                 state.set_status("this track is full — cannot split");
             } else {
-                match knife_target(clips, tick_at(pos.x), bar_ticks) {
+                match knife_target(clips, tick_at(pos.x), bar_ticks, sec_per_tick) {
                     Some((index, at)) => {
                         actions.push(TimelineAction::SplitClip {
                             lane: lane_kind,
@@ -2093,7 +2191,7 @@ fn lane_row<T: Placement>(
                             .selection
                             .retain(|s| s.lane != lane_kind || s.track != track || s.clip != index);
                     }
-                    None if hit_clip(clips, tick_at(pos.x)).is_some() => {
+                    None if hit_clip(clips, tick_at(pos.x), sec_per_tick).is_some() => {
                         state.set_status("a cut needs at least one bar on both sides");
                     }
                     None => {}
@@ -2121,7 +2219,7 @@ fn lane_row<T: Placement>(
     if response.double_clicked() && state.modal.is_none() {
         if let Some(pos) = response.interact_pointer_pos() {
             let tick = tick_at(pos.x);
-            if let Some(index) = hit_clip(clips, tick) {
+            if let Some(index) = hit_clip(clips, tick, sec_per_tick) {
                 match row {
                     RowKind::Midi(t) => actions.push(TimelineAction::OpenMidiEditor {
                         track: t,
@@ -2176,7 +2274,7 @@ fn lane_row<T: Placement>(
     {
         if let Some(pos) = response.interact_pointer_pos() {
             let tick = tick_at(pos.x);
-            if let Some(index) = hit_clip(clips, tick) {
+            if let Some(index) = hit_clip(clips, tick, sec_per_tick) {
                 let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
                 let sel = ClipSel {
                     lane: lane_kind,
@@ -2192,8 +2290,8 @@ fn lane_row<T: Placement>(
                 } else if !state.selection.contains(&sel) {
                     state.selection = vec![sel];
                 }
-                let edge_x =
-                    lane.left() + (clips[index].start() + clips[index].span()) as f32 * px_per_tick;
+                let edge_x = lane.left()
+                    + (clips[index].start() + clips[index].span(sec_per_tick)) as f32 * px_per_tick;
                 if (pos.x - edge_x).abs() <= EDGE_GRAB {
                     state.drag = Some(Drag::Resize { row, clip: index });
                 } else {
@@ -2224,7 +2322,7 @@ fn lane_row<T: Placement>(
                     Some(Drag::Move {
                         clip, grab_ticks, ..
                     }) if clip < clips.len() => {
-                        let span = clips[clip].span();
+                        let span = clips[clip].span(sec_per_tick);
                         let limit = ARRANGEMENT_LIMIT_TICKS - span;
                         let start = snap_bar(tick_at(pos.x) - grab_ticks, bar_ticks).min(limit);
                         if clips[clip].start() != start {
@@ -2244,7 +2342,7 @@ fn lane_row<T: Placement>(
                         let limit = ARRANGEMENT_LIMIT_TICKS - start;
                         let span = snap_bar(tick_at(pos.x) - start as f32, bar_ticks)
                             .clamp(bar_ticks, limit.max(bar_ticks));
-                        if clips[clip].span() != span {
+                        if clips[clip].span(sec_per_tick) != span {
                             let lane = row.lane();
                             let track = row.track();
                             actions.push(TimelineAction::MoveResizeClip {
@@ -2278,7 +2376,8 @@ fn lane_row<T: Placement>(
             .enumerate()
             .filter(|(_, clip)| {
                 let x0 = lane.left() + clip.start() as f32 * px_per_tick;
-                let x1 = lane.left() + (clip.start() + clip.span()) as f32 * px_per_tick;
+                let x1 =
+                    lane.left() + (clip.start() + clip.span(sec_per_tick)) as f32 * px_per_tick;
                 Rect::from_min_max(pos2(x0, lane.top()), pos2(x1, lane.bottom())).intersects(band)
             })
             .map(|(index, _)| index)
@@ -2315,7 +2414,7 @@ fn lane_row<T: Placement>(
     if response.clicked() && !state.knife_armed && state.modal.is_none() {
         if let Some(pos) = response.interact_pointer_pos() {
             let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
-            match hit_clip(clips, tick_at(pos.x)) {
+            match hit_clip(clips, tick_at(pos.x), sec_per_tick) {
                 Some(index) => {
                     let sel = ClipSel {
                         lane: lane_kind,
@@ -2345,7 +2444,7 @@ fn lane_row<T: Placement>(
             state.knife_armed = false;
         } else if let Some(pos) = response.interact_pointer_pos() {
             if state.marquee.take().is_none() {
-                if let Some(index) = hit_clip(clips, tick_at(pos.x)) {
+                if let Some(index) = hit_clip(clips, tick_at(pos.x), sec_per_tick) {
                     actions.push(TimelineAction::RemoveClip {
                         lane: lane_kind,
                         track,
@@ -2498,16 +2597,9 @@ fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
         state.set_status("nothing selected \u{2014} G / Shift+D / T need a selection");
         return;
     }
-    // U6: audio clips edit by direct drag — the modal family (G / T /
-    // Shift+D) reasons in two tables and stays that way for v1.
-    if state
-        .selection
-        .iter()
-        .any(|s| matches!(s.lane, TimelineLane::Audio))
-    {
-        state.set_status("audio clips edit by direct drag — G / T / Shift+D are MIDI/curve only");
-        return;
-    }
+    // U11: the modal family is three-table now — audio clips arm G / T /
+    // Shift+D just like MIDI/control (the geometry layer derives audio spans
+    // from the seconds window at the base tempo).
     let Some(ptr) = ctx.pointer_hover_pos() else {
         return;
     };
@@ -2537,22 +2629,27 @@ fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
     });
 }
 
-fn hit_clip<T: Placement>(clips: &[T], tick: f32) -> Option<usize> {
+fn hit_clip<T: Placement>(clips: &[T], tick: f32, sec_per_tick: f64) -> Option<usize> {
     clips
         .iter()
-        .position(|c| tick >= c.start() as f32 && tick < (c.start() + c.span()) as f32)
+        .position(|c| tick >= c.start() as f32 && tick < (c.start() + c.span(sec_per_tick)) as f32)
 }
 
 /// Knife targeting (M4b.2): resolve a click at `tick` into the clip index
 /// and a bar-snapped cut position, requiring at least one bar of clip on
 /// both sides of the cut. `None` when the click misses every clip or the
 /// snapped position is too close to either edge.
-fn knife_target<T: Placement>(clips: &[T], tick: f32, bar_ticks: u32) -> Option<(usize, u32)> {
-    let index = hit_clip(clips, tick)?;
+fn knife_target<T: Placement>(
+    clips: &[T],
+    tick: f32,
+    bar_ticks: u32,
+    sec_per_tick: f64,
+) -> Option<(usize, u32)> {
+    let index = hit_clip(clips, tick, sec_per_tick)?;
     let clip = &clips[index];
     let at = snap_bar(tick, bar_ticks);
     let left_ok = at >= clip.start() + bar_ticks;
-    let right_ok = at + bar_ticks <= clip.start() + clip.span();
+    let right_ok = at + bar_ticks <= clip.start() + clip.span(sec_per_tick);
     (left_ok && right_ok).then_some((index, at))
 }
 
@@ -2944,6 +3041,10 @@ mod tests {
     // production, the constant is the 4/4 case they exercise.
     use glitcherz_model::TICKS_PER_BAR;
 
+    /// Seconds per tick at 120 BPM / 960 PPQ — the base-tempo conversion the
+    /// placement helpers take (U11 D3); MIDI/control clips ignore it.
+    const SPT: f64 = 60.0 / (120.0 * 960.0);
+
     fn clip(start: u32, span: u32) -> MidiClip {
         MidiClip {
             start_ticks: start,
@@ -3071,7 +3172,7 @@ mod tests {
         // 2.6 bars in → snaps to bar 3.
         let tick = 2.6 * TICKS_PER_BAR as f32;
         assert_eq!(
-            knife_target(&clips, tick, TICKS_PER_BAR),
+            knife_target(&clips, tick, TICKS_PER_BAR, SPT),
             Some((0, 3 * TICKS_PER_BAR)),
             "the cut lands on the nearest bar line"
         );
@@ -3082,17 +3183,17 @@ mod tests {
         let clips = vec![clip(0, 2 * TICKS_PER_BAR)];
         // Middle of a 2-bar clip snaps to bar 1 — valid.
         assert_eq!(
-            knife_target(&clips, TICKS_PER_BAR as f32, TICKS_PER_BAR),
+            knife_target(&clips, TICKS_PER_BAR as f32, TICKS_PER_BAR, SPT),
             Some((0, TICKS_PER_BAR))
         );
         // Near the start edge: snap lands on bar 0 → zero-length left half.
         assert_eq!(
-            knife_target(&clips, 0.2 * TICKS_PER_BAR as f32, TICKS_PER_BAR),
+            knife_target(&clips, 0.2 * TICKS_PER_BAR as f32, TICKS_PER_BAR, SPT),
             None
         );
         // Near the end edge: snap lands on the clip's end → zero right half.
         assert_eq!(
-            knife_target(&clips, 1.8 * TICKS_PER_BAR as f32, TICKS_PER_BAR),
+            knife_target(&clips, 1.8 * TICKS_PER_BAR as f32, TICKS_PER_BAR, SPT),
             None
         );
         // One-bar clips can never be split.
@@ -3100,7 +3201,8 @@ mod tests {
             knife_target(
                 &[clip(4 * TICKS_PER_BAR, TICKS_PER_BAR)],
                 4.4 * TICKS_PER_BAR as f32,
-                TICKS_PER_BAR
+                TICKS_PER_BAR,
+                SPT
             ),
             None
         );
@@ -3110,7 +3212,7 @@ mod tests {
     fn knife_misses_empty_lane() {
         let clips = vec![clip(0, 4 * TICKS_PER_BAR)];
         assert_eq!(
-            knife_target(&clips, 6.0 * TICKS_PER_BAR as f32, TICKS_PER_BAR),
+            knife_target(&clips, 6.0 * TICKS_PER_BAR as f32, TICKS_PER_BAR, SPT),
             None
         );
     }
@@ -3123,7 +3225,7 @@ mod tests {
         const SIX_EIGHT: u32 = 2880;
         let clips = vec![clip(0, 4 * TICKS_PER_BAR)];
         assert_eq!(
-            knife_target(&clips, 1.6 * SIX_EIGHT as f32, SIX_EIGHT),
+            knife_target(&clips, 1.6 * SIX_EIGHT as f32, SIX_EIGHT, SPT),
             Some((0, 2 * SIX_EIGHT))
         );
         assert_eq!(snap_bar(1.6 * SIX_EIGHT as f32, SIX_EIGHT), 2 * SIX_EIGHT);
@@ -3131,7 +3233,7 @@ mod tests {
         // on both sides), even though it is shorter than a 4/4 bar.
         let short = vec![clip(0, SIX_EIGHT)];
         assert_eq!(
-            knife_target(&short, 0.4 * SIX_EIGHT as f32, SIX_EIGHT),
+            knife_target(&short, 0.4 * SIX_EIGHT as f32, SIX_EIGHT, SPT),
             None
         );
     }
@@ -3164,7 +3266,7 @@ mod tests {
         ];
         let mut clips = vec![clip];
         let at = 4 * TICKS_PER_BAR;
-        assert!(split_clip_in(&mut clips, at, 0));
+        assert!(split_clip_in(&mut clips, at, 0, SPT));
         assert_eq!(clips.len(), 2);
         // Left: same start, ends at the cut, single-period.
         assert_eq!(clips[0].start_ticks, 2 * TICKS_PER_BAR);
@@ -3212,7 +3314,7 @@ mod tests {
         ];
         let mut clips = vec![clip];
         let at = 2 * TICKS_PER_BAR;
-        assert!(split_clip_in(&mut clips, at, 0));
+        assert!(split_clip_in(&mut clips, at, 0, SPT));
         // Left keeps its anchors untouched (data survives a shorten).
         assert_eq!(clips[0].span_ticks, TICKS_PER_BAR);
         assert_eq!(clips[0].loop_ticks, TICKS_PER_BAR);
@@ -3239,12 +3341,15 @@ mod tests {
     #[test]
     fn split_refuses_edges_and_out_of_bounds() {
         let mut clips = vec![clip(0, 2 * TICKS_PER_BAR)];
-        assert!(!split_clip_in(&mut clips, 0, 0), "at the start");
+        assert!(!split_clip_in(&mut clips, 0, 0, SPT), "at the start");
         assert!(
-            !split_clip_in(&mut clips, 2 * TICKS_PER_BAR, 0),
+            !split_clip_in(&mut clips, 2 * TICKS_PER_BAR, 0, SPT),
             "at the end"
         );
-        assert!(!split_clip_in(&mut clips, TICKS_PER_BAR, 5), "bad index");
+        assert!(
+            !split_clip_in(&mut clips, TICKS_PER_BAR, 5, SPT),
+            "bad index"
+        );
         assert_eq!(clips.len(), 1, "failed splits must not mutate");
     }
 
@@ -3253,7 +3358,7 @@ mod tests {
         let mut clips: Vec<MidiClip> = (0..MAX_CLIPS_PER_TRACK)
             .map(|i| clip(i as u32 * 2 * TICKS_PER_BAR, 2 * TICKS_PER_BAR))
             .collect();
-        assert!(!split_clip_in(&mut clips, TICKS_PER_BAR, 0));
+        assert!(!split_clip_in(&mut clips, TICKS_PER_BAR, 0, SPT));
         assert_eq!(clips.len(), MAX_CLIPS_PER_TRACK);
     }
 
@@ -3328,8 +3433,11 @@ mod tests {
             ROW_HEIGHT,
             2,
             1,
+            0,
             &midi,
             &[],
+            &[],
+            SPT,
         )
         .unwrap();
         assert_eq!(targets.len(), 1);
@@ -3351,8 +3459,11 @@ mod tests {
             ROW_HEIGHT,
             2,
             1,
+            0,
             &midi,
             &[],
+            &[],
+            SPT,
         )
         .unwrap();
         assert_eq!(targets[0].to_track, 0);
@@ -3372,8 +3483,11 @@ mod tests {
             ROW_HEIGHT,
             2,
             1,
+            0,
             &midi,
             &[],
+            &[],
+            SPT,
         )
         .unwrap();
         assert_eq!(targets[0].to_track, 1);
@@ -3466,6 +3580,8 @@ mod tests {
             TICKS_PER_BAR,
             &midi,
             &[],
+            &[],
+            SPT,
         )
         .unwrap();
         assert_eq!(targets[0].span_ticks, TICKS_PER_BAR);
@@ -3488,9 +3604,112 @@ mod tests {
             TICKS_PER_BAR,
             &midi,
             &[],
+            &[],
+            SPT,
         )
         .unwrap();
         assert_eq!(targets[0].start_ticks, 3 * TICKS_PER_BAR);
         assert_eq!(targets[0].span_ticks, TICKS_PER_BAR);
+    }
+
+    // ---- U11: audio clips take the same modal geometry ------------------
+
+    fn audio_clip(start_ticks: u32, source_offset: f64, source_len: f64) -> AudioClip {
+        AudioClip {
+            path: "a.wav".to_string(),
+            start_ticks,
+            source_offset,
+            source_len,
+            gain: 1.0,
+            ..AudioClip::default()
+        }
+    }
+
+    /// U11 D3: the audio tick span is derived from the seconds window at the
+    /// base tempo (2.0 s = one 3840-tick bar at 120 BPM).
+    #[test]
+    fn audio_clip_geometry_derives_the_span_from_seconds() {
+        let audio = vec![AudioTrack {
+            name: String::new(),
+            clips: vec![audio_clip(TICKS_PER_BAR, 0.25, 4.0)],
+        }];
+        let sel = ClipSel {
+            lane: TimelineLane::Audio,
+            track: 0,
+            clip: 0,
+        };
+        let (start, span) = clip_geometry(&[], &[], &audio, SPT, sel).unwrap();
+        assert_eq!(start, TICKS_PER_BAR);
+        assert_eq!(span, 2 * TICKS_PER_BAR, "4.0 s = two bars at 120 BPM");
+    }
+
+    /// U11: the G modal moves audio clips (three-table geometry).
+    #[test]
+    fn audio_clips_arm_the_grab_modal() {
+        let audio = vec![AudioTrack {
+            name: String::new(),
+            clips: vec![audio_clip(TICKS_PER_BAR, 0.0, 2.0)],
+        }];
+        let modal = Modal {
+            kind: ModalKind::Grab { locked: None },
+            origin: vec![ClipSel {
+                lane: TimelineLane::Audio,
+                track: 0,
+                clip: 0,
+            }],
+            grab: pos2(100.0, 100.0),
+        };
+        let ptr = pos2(100.0 + 2.0 * 56.0, 100.0);
+        let targets = grab_targets(
+            &modal,
+            Some(ptr),
+            56.0,
+            TICKS_PER_BAR,
+            ROW_HEIGHT,
+            0,
+            0,
+            1,
+            &[],
+            &[],
+            &audio,
+            SPT,
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].to_track, 0);
+        assert_eq!(targets[0].start_ticks, 3 * TICKS_PER_BAR);
+    }
+
+    /// U11: the T modal changes an audio clip's derived span (the app layer
+    /// turns it into a seconds-window trim).
+    #[test]
+    fn audio_clip_stretch_targets_grow_the_derived_span() {
+        let audio = vec![AudioTrack {
+            name: String::new(),
+            clips: vec![audio_clip(TICKS_PER_BAR, 0.0, 4.0)],
+        }];
+        let modal = Modal {
+            kind: ModalKind::Stretch { start_edge: false },
+            origin: vec![ClipSel {
+                lane: TimelineLane::Audio,
+                track: 0,
+                clip: 0,
+            }],
+            grab: pos2(100.0, 100.0),
+        };
+        let ptr = pos2(100.0 + 1.0 * 56.0, 100.0);
+        let targets = stretch_targets(
+            &modal,
+            Some(ptr),
+            56.0,
+            TICKS_PER_BAR,
+            &[],
+            &[],
+            &audio,
+            SPT,
+        )
+        .unwrap();
+        assert_eq!(targets[0].start_ticks, TICKS_PER_BAR);
+        assert_eq!(targets[0].span_ticks, 3 * TICKS_PER_BAR);
     }
 }

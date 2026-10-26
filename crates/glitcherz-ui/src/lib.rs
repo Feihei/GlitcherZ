@@ -48,7 +48,7 @@ use glitcherz_model::{
     AutoParam, AutoPoint, CableKind, ControlClip, ControlTrack, DelayParams, GraphDoc,
     MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_MIDI_TRACKS,
     MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip, MidiSource, MidiTrack,
-    NodeDoc, PortRef, Project, SamplePlayMode, SongLoop, SynthParams, TICKS_PER_QUARTER, VoiceSpec,
+    NodeDoc, PortRef, Project, SamplePlayMode, SongLoop, SynthParams, VoiceSpec,
 };
 
 pub mod curve;
@@ -3380,7 +3380,7 @@ impl GlitcherZApp {
         let mut table = empty_clip_table();
         // Snapshot the placement first: decoding needs `&mut self` (the
         // session cache), which cannot overlap the document borrow.
-        let clips: Vec<(String, u32, u32, f32)> = self
+        let clips: Vec<(String, u32, f64, f64, f32)> = self
             .project()
             .audio_tracks
             .get(track)
@@ -3389,16 +3389,27 @@ impl GlitcherZApp {
                     .clips
                     .iter()
                     .take(MAX_TRACK_CLIPS)
-                    .map(|c| (c.path.clone(), c.start_ticks, c.span_ticks, c.gain))
+                    .map(|c| {
+                        (
+                            c.path.clone(),
+                            c.start_ticks,
+                            c.source_offset,
+                            c.source_len,
+                            c.gain,
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default();
-        for (slot, (path, start_ticks, span_ticks, gain)) in clips.into_iter().enumerate() {
+        for (slot, (path, start_ticks, source_offset, source_len, gain)) in
+            clips.into_iter().enumerate()
+        {
             match self.sample_library.load(std::path::Path::new(&path)) {
                 Ok(data) => {
                     table[slot] = Some(RtAudioClip {
                         start_ticks: f64::from(start_ticks),
-                        span_ticks: f64::from(span_ticks),
+                        source_offset,
+                        source_len,
                         data,
                         gain,
                     });
@@ -4800,6 +4811,8 @@ impl GlitcherZApp {
                     markers: &project.metadata.markers,
                     // U3a: the document's bar length, not the 4/4 constant.
                     bar_ticks: project.ticks_per_bar(),
+                    // U11 D3: audio clip spans are derived at the base tempo.
+                    sec_per_tick: project.sec_per_tick(),
                     curve_param: curve_param.as_ref(),
                     waveform_of: &waveform_of,
                 },
@@ -5006,6 +5019,7 @@ impl GlitcherZApp {
         // A new clip is one bar long — of the document's meter (U3a), not the
         // 4/4 constant the model default carries.
         let bar = self.project().ticks_per_bar();
+        let sec_per_tick = self.project().sec_per_tick();
         let added = match lane {
             timeline::TimelineLane::Control => self
                 .project_mut()
@@ -5028,14 +5042,16 @@ impl GlitcherZApp {
                 .audio_tracks
                 .get_mut(track)
                 .map(|t| {
-                    // Audio clips are born one bar; the caller resizes to the
-                    // wav's natural span right after picking the file.
+                    // Audio clips are born one bar; the caller replaces the
+                    // empty path with a wav right after (U11: a seconds window).
                     if t.clips.len() < MAX_CLIPS_PER_TRACK {
                         t.clips.push(glitcherz_model::AudioClip {
                             path: String::new(),
                             start_ticks,
-                            span_ticks: bar,
+                            source_offset: 0.0,
+                            source_len: f64::from(bar) * sec_per_tick,
                             gain: 1.0,
+                            ..glitcherz_model::AudioClip::default()
                         });
                         true
                     } else {
@@ -5082,17 +5098,18 @@ impl GlitcherZApp {
             self.set_message("Audio clip unreadable: not a supported wav".to_string());
             return;
         };
-        // Natural span: wav seconds → ticks at the current tempo. Clamped to
-        // the arrangement bound and at least one bar.
+        // U11: the window IS the wav's natural duration (native-rate playback
+        // — no stretch). Clamp the resulting tick footprint to ≥ one bar and
+        // within the arrangement bound.
         let seconds = data.frames().len() as f64 / f64::from(data.sample_rate());
-        let bpm = self.project().metadata.tempo_bpm;
-        let span = ((seconds * bpm / 60.0) * f64::from(TICKS_PER_QUARTER))
-            .round()
-            .clamp(
-                f64::from(self.project().ticks_per_bar()),
-                MAX_ARRANGEMENT_TICKS as f64,
-            ) as u32;
-        let span = span.min(MAX_ARRANGEMENT_TICKS as u32 - start_ticks).max(1);
+        let sec_per_tick = self.project().sec_per_tick();
+        let min_len = f64::from(self.project().ticks_per_bar()) * sec_per_tick;
+        let max_len = f64::from(MAX_ARRANGEMENT_TICKS as u32 - start_ticks) * sec_per_tick;
+        let source_len = if max_len > min_len {
+            seconds.clamp(min_len, max_len)
+        } else {
+            min_len
+        };
         let before = self.begin_edit();
         let added = self
             .project_mut()
@@ -5103,8 +5120,10 @@ impl GlitcherZApp {
                     t.clips.push(glitcherz_model::AudioClip {
                         path,
                         start_ticks,
-                        span_ticks: span,
+                        source_offset: 0.0,
+                        source_len,
                         gain: 1.0,
+                        ..glitcherz_model::AudioClip::default()
                     });
                     true
                 } else {
@@ -5127,6 +5146,7 @@ impl GlitcherZApp {
         span_ticks: u32,
     ) {
         let before = self.begin_edit();
+        let sec_per_tick = self.project().sec_per_tick();
         let moved = match lane {
             timeline::TimelineLane::Control => self
                 .project_mut()
@@ -5151,11 +5171,22 @@ impl GlitcherZApp {
                 .get_mut(track)
                 .and_then(|t| t.clips.get_mut(clip))
                 .map(|c| {
-                    let changed = c.start_ticks != start_ticks || c.span_ticks != span_ticks;
+                    let old_span = (c.source_len / sec_per_tick).round().max(1.0) as u32;
+                    let old_start = c.start_ticks;
+                    let changed = old_start != start_ticks || old_span != span_ticks;
+                    // U11: resize = trim. Only a length change rewrites the
+                    // window; a move or a right-edge drag keeps the window start.
+                    if span_ticks != old_span {
+                        // A left-edge drag (the start moved too) advances the
+                        // window start so the remaining material stays put.
+                        if start_ticks != old_start {
+                            let delta = i64::from(start_ticks) - i64::from(old_start);
+                            c.source_offset =
+                                (c.source_offset + delta as f64 * sec_per_tick).max(0.0);
+                        }
+                        c.source_len = f64::from(span_ticks).max(1.0) * sec_per_tick;
+                    }
                     c.start_ticks = start_ticks;
-                    // No loop semantics (U6 D5): the span is the stretch
-                    // window; moving it = retiming, resizing = speed.
-                    c.span_ticks = span_ticks;
                     changed
                 })
                 .unwrap_or(false),
@@ -5372,25 +5403,26 @@ impl GlitcherZApp {
         clip: usize,
         at_ticks: u32,
     ) {
+        let sec_per_tick = self.project().sec_per_tick();
         let before = self.begin_edit();
         let split = match lane {
             timeline::TimelineLane::Control => self
                 .project_mut()
                 .control_tracks
                 .get_mut(track)
-                .map(|t| timeline::split_clip_in(&mut t.clips, at_ticks, clip))
+                .map(|t| timeline::split_clip_in(&mut t.clips, at_ticks, clip, sec_per_tick))
                 .unwrap_or(false),
             timeline::TimelineLane::Audio => self
                 .project_mut()
                 .audio_tracks
                 .get_mut(track)
-                .map(|t| timeline::split_clip_in(&mut t.clips, at_ticks, clip))
+                .map(|t| timeline::split_clip_in(&mut t.clips, at_ticks, clip, sec_per_tick))
                 .unwrap_or(false),
             timeline::TimelineLane::Midi => self
                 .project_mut()
                 .midi_tracks
                 .get_mut(track)
-                .map(|t| timeline::split_clip_in(&mut t.clips, at_ticks, clip))
+                .map(|t| timeline::split_clip_in(&mut t.clips, at_ticks, clip, sec_per_tick))
                 .unwrap_or(false),
         };
         if split {
@@ -5418,22 +5450,12 @@ impl GlitcherZApp {
         let mut touched = Vec::new();
         {
             let project = self.project_mut();
-            for (is_control, kind_moves) in [
-                (
-                    false,
-                    moves
-                        .iter()
-                        .filter(|m| !m.from.lane.is_control())
-                        .collect::<Vec<_>>(),
-                ),
-                (
-                    true,
-                    moves
-                        .iter()
-                        .filter(|m| m.from.lane.is_control())
-                        .collect::<Vec<_>>(),
-                ),
+            for lane in [
+                timeline::TimelineLane::Midi,
+                timeline::TimelineLane::Control,
+                timeline::TimelineLane::Audio,
             ] {
+                let kind_moves: Vec<_> = moves.iter().filter(|m| m.from.lane == lane).collect();
                 if kind_moves.is_empty() {
                     continue;
                 }
@@ -5441,30 +5463,34 @@ impl GlitcherZApp {
                     .iter()
                     .map(|m| (m.from.track, m.from.clip, m.to_track, m.start_ticks))
                     .collect();
-                let rows = if is_control {
-                    let mut tables: Vec<&mut Vec<ControlClip>> = project
-                        .control_tracks
-                        .iter_mut()
-                        .map(|t| &mut t.clips)
-                        .collect();
-                    relocate_in(tables.as_mut_slice(), &spec)
-                } else {
-                    let mut tables: Vec<&mut Vec<MidiClip>> = project
-                        .midi_tracks
-                        .iter_mut()
-                        .map(|t| &mut t.clips)
-                        .collect();
-                    relocate_in(tables.as_mut_slice(), &spec)
+                let rows = match lane {
+                    timeline::TimelineLane::Control => {
+                        let mut tables: Vec<&mut Vec<ControlClip>> = project
+                            .control_tracks
+                            .iter_mut()
+                            .map(|t| &mut t.clips)
+                            .collect();
+                        relocate_in(tables.as_mut_slice(), &spec)
+                    }
+                    timeline::TimelineLane::Midi => {
+                        let mut tables: Vec<&mut Vec<MidiClip>> = project
+                            .midi_tracks
+                            .iter_mut()
+                            .map(|t| &mut t.clips)
+                            .collect();
+                        relocate_in(tables.as_mut_slice(), &spec)
+                    }
+                    timeline::TimelineLane::Audio => {
+                        let mut tables: Vec<&mut Vec<glitcherz_model::AudioClip>> = project
+                            .audio_tracks
+                            .iter_mut()
+                            .map(|t| &mut t.clips)
+                            .collect();
+                        relocate_in(tables.as_mut_slice(), &spec)
+                    }
                 };
                 for r in rows {
-                    touched.push((
-                        if is_control {
-                            timeline::TimelineLane::Control
-                        } else {
-                            timeline::TimelineLane::Midi
-                        },
-                        r,
-                    ));
+                    touched.push((lane, r));
                 }
             }
         }
@@ -5482,13 +5508,14 @@ impl GlitcherZApp {
         if spans.is_empty() {
             return;
         }
+        let sec_per_tick = self.project().sec_per_tick();
         let before = self.begin_edit();
         let mut touched = Vec::new();
         {
             let project = self.project_mut();
             for e in &spans {
-                let changed = if e.sel.lane.is_control() {
-                    project
+                let changed = match e.sel.lane {
+                    timeline::TimelineLane::Control => project
                         .control_tracks
                         .get_mut(e.sel.track)
                         .and_then(|t| t.clips.get_mut(e.sel.clip))
@@ -5498,9 +5525,8 @@ impl GlitcherZApp {
                             c.span_ticks = e.span_ticks;
                             c.loop_ticks = e.span_ticks;
                         })
-                        .is_some()
-                } else {
-                    project
+                        .is_some(),
+                    timeline::TimelineLane::Midi => project
                         .midi_tracks
                         .get_mut(e.sel.track)
                         .and_then(|t| t.clips.get_mut(e.sel.clip))
@@ -5509,7 +5535,27 @@ impl GlitcherZApp {
                             c.span_ticks = e.span_ticks;
                             c.loop_ticks = e.span_ticks;
                         })
-                        .is_some()
+                        .is_some(),
+                    // U11: a stretch trims the seconds window (a left-edge
+                    // stretch also advances the window start).
+                    timeline::TimelineLane::Audio => project
+                        .audio_tracks
+                        .get_mut(e.sel.track)
+                        .and_then(|t| t.clips.get_mut(e.sel.clip))
+                        .map(|c| {
+                            let old_span = (c.source_len / sec_per_tick).round().max(1.0) as u32;
+                            let old_start = c.start_ticks;
+                            if e.span_ticks != old_span {
+                                if e.start_ticks != old_start {
+                                    let delta = i64::from(e.start_ticks) - i64::from(old_start);
+                                    c.source_offset =
+                                        (c.source_offset + delta as f64 * sec_per_tick).max(0.0);
+                                }
+                                c.source_len = f64::from(e.span_ticks).max(1.0) * sec_per_tick;
+                            }
+                            c.start_ticks = e.start_ticks;
+                        })
+                        .is_some(),
                 };
                 if changed && !touched.contains(&(e.sel.lane, e.sel.track)) {
                     touched.push((e.sel.lane, e.sel.track));
@@ -5538,57 +5584,89 @@ impl GlitcherZApp {
         {
             let project = self.project_mut();
             for d in &dups {
-                if d.from.lane.is_control() {
-                    let Some(mut c) = project
-                        .control_tracks
-                        .get(d.from.track)
-                        .and_then(|t| t.clips.get(d.from.clip))
-                        .cloned()
-                    else {
-                        continue;
-                    };
-                    let Some(t) = project.control_tracks.get_mut(d.to_track) else {
-                        continue;
-                    };
-                    if t.clips.len() >= MAX_CLIPS_PER_TRACK {
-                        continue;
+                match d.from.lane {
+                    timeline::TimelineLane::Control => {
+                        let Some(mut c) = project
+                            .control_tracks
+                            .get(d.from.track)
+                            .and_then(|t| t.clips.get(d.from.clip))
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        let Some(t) = project.control_tracks.get_mut(d.to_track) else {
+                            continue;
+                        };
+                        if t.clips.len() >= MAX_CLIPS_PER_TRACK {
+                            continue;
+                        }
+                        c.start_ticks = d.start_ticks;
+                        let index = t.clips.len();
+                        t.clips.push(c);
+                        new_sel.push(timeline::ClipSel {
+                            lane: timeline::TimelineLane::Control,
+                            track: d.to_track,
+                            clip: index,
+                        });
+                        if !touched.contains(&(timeline::TimelineLane::Control, d.to_track)) {
+                            touched.push((timeline::TimelineLane::Control, d.to_track));
+                        }
                     }
-                    c.start_ticks = d.start_ticks;
-                    let index = t.clips.len();
-                    t.clips.push(c);
-                    new_sel.push(timeline::ClipSel {
-                        lane: timeline::TimelineLane::Control,
-                        track: d.to_track,
-                        clip: index,
-                    });
-                    if !touched.contains(&(timeline::TimelineLane::Control, d.to_track)) {
-                        touched.push((timeline::TimelineLane::Control, d.to_track));
+                    timeline::TimelineLane::Midi => {
+                        let Some(mut c) = project
+                            .midi_tracks
+                            .get(d.from.track)
+                            .and_then(|t| t.clips.get(d.from.clip))
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        let Some(t) = project.midi_tracks.get_mut(d.to_track) else {
+                            continue;
+                        };
+                        if t.clips.len() >= MAX_CLIPS_PER_TRACK {
+                            continue;
+                        }
+                        c.start_ticks = d.start_ticks;
+                        let index = t.clips.len();
+                        t.clips.push(c);
+                        new_sel.push(timeline::ClipSel {
+                            lane: timeline::TimelineLane::Midi,
+                            track: d.to_track,
+                            clip: index,
+                        });
+                        if !touched.contains(&(timeline::TimelineLane::Midi, d.to_track)) {
+                            touched.push((timeline::TimelineLane::Midi, d.to_track));
+                        }
                     }
-                } else {
-                    let Some(mut c) = project
-                        .midi_tracks
-                        .get(d.from.track)
-                        .and_then(|t| t.clips.get(d.from.clip))
-                        .cloned()
-                    else {
-                        continue;
-                    };
-                    let Some(t) = project.midi_tracks.get_mut(d.to_track) else {
-                        continue;
-                    };
-                    if t.clips.len() >= MAX_CLIPS_PER_TRACK {
-                        continue;
-                    }
-                    c.start_ticks = d.start_ticks;
-                    let index = t.clips.len();
-                    t.clips.push(c);
-                    new_sel.push(timeline::ClipSel {
-                        lane: timeline::TimelineLane::Midi,
-                        track: d.to_track,
-                        clip: index,
-                    });
-                    if !touched.contains(&(timeline::TimelineLane::Midi, d.to_track)) {
-                        touched.push((timeline::TimelineLane::Midi, d.to_track));
+                    // U11: an audio copy clones the seconds window (same path,
+                    // same wav — no file duplication) at the new start.
+                    timeline::TimelineLane::Audio => {
+                        let Some(mut c) = project
+                            .audio_tracks
+                            .get(d.from.track)
+                            .and_then(|t| t.clips.get(d.from.clip))
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        let Some(t) = project.audio_tracks.get_mut(d.to_track) else {
+                            continue;
+                        };
+                        if t.clips.len() >= MAX_CLIPS_PER_TRACK {
+                            continue;
+                        }
+                        c.start_ticks = d.start_ticks;
+                        let index = t.clips.len();
+                        t.clips.push(c);
+                        new_sel.push(timeline::ClipSel {
+                            lane: timeline::TimelineLane::Audio,
+                            track: d.to_track,
+                            clip: index,
+                        });
+                        if !touched.contains(&(timeline::TimelineLane::Audio, d.to_track)) {
+                            touched.push((timeline::TimelineLane::Audio, d.to_track));
+                        }
                     }
                 }
             }
@@ -7374,7 +7452,11 @@ impl GlitcherZApp {
             .nodes
             .push(NodeDoc::AudioTrack { node_id, track });
         // D18 (same wiring as MIDI tracks): the generator feeds the global
-        // mixer's first free channel (growing the mixer when full).
+        // mixer's first free channel (growing the mixer when full). The chosen
+        // channel is remembered so the engine wire-up reuses the exact channel
+        // the doc cable records — recomputing it after the cable push would see
+        // the channel as taken and pick a different one (or none).
+        let mut wire: Option<(u64, u8)> = None;
         if let Some(mixer_doc) = self
             .project()
             .graph
@@ -7402,6 +7484,7 @@ impl GlitcherZApp {
                         PortRef::Node(mixer_doc),
                         ch,
                     ));
+                wire = Some((mixer_doc, ch));
             }
         }
         // Engine side: install the node (processor + engine id + mapping);
@@ -7414,24 +7497,12 @@ impl GlitcherZApp {
             .cloned()
             .expect("just pushed");
         self.install_node(&node_doc, sample_rate);
-        if let Some(mixer_doc) = self
-            .project()
-            .graph
-            .nodes
-            .iter()
-            .find(|n| n.is_mixer())
-            .map(NodeDoc::node_id)
-        {
-            let (Some(&audio_e), Some(&mixer_e), Some(ch)) = (
-                self.node_map.get(&node_id),
-                self.node_map.get(&mixer_doc),
-                self.project().graph.first_free_channel(mixer_doc),
-            ) else {
-                self.session.resume_history();
-                self.commit_edit("Add Audio Track", before);
-                return;
-            };
-            self.engine.connect_nodes(audio_e, mixer_e, ch);
+        if let Some((mixer_doc, ch)) = wire {
+            if let (Some(&audio_e), Some(&mixer_e)) =
+                (self.node_map.get(&node_id), self.node_map.get(&mixer_doc))
+            {
+                self.engine.connect_nodes(audio_e, mixer_e, ch);
+            }
         }
         self.send_audio_clips_for_track(track);
         self.session.resume_history();

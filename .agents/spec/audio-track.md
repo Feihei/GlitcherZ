@@ -1,6 +1,8 @@
 # Spec: Audio Track（时间轴音频轨）
 
 > 状态：已收官（2026-10-24，A1–A5 全部落地）。对应 `plan.md`「U6 audio track」。
+> **修订（2026-10-26，U11）**：D1「变速跟随」与 §5「不做 offset 裁剪 / 不做 G·T·Shift+D」两条
+> 已由 `spec/audio-trim.md` 取代（audio clip 改为**裁剪**语义不变调 + 开放 G/T/Shift+D 模态编辑）。
 > 前置：U5 采样播放器已交付（`engine::sample` 解码 + `SampleLibrary`
 > 缓存 + 插值内核可平移）；timeline 视图 / M4b clip 手势 /
 > `Placement` trait 已就绪。
@@ -16,7 +18,7 @@ arrangement 上混音"）没有载体——U5 解决的是"wav 当乐器弹"（n
 
 | # | 决策 | 结论 | 理由 |
 | :-- | :-- | :-- | :-- |
-| D1 | tempo 语义 | **变速跟随**：clip 的 `span_ticks` 固定，wav 内容按比例重采样铺满 span。帧位 = `(t − start)/span × wav_frames`，**数学完全闭合在 tick 域** | 用户确认（2026-10-24）：与 MIDI clip 完全同构，loop 回卷 / seek 零特判（比例映射自动重锚，无游标同步问题）；代价 = tempo 变化时音频变调（磁带加速效应）+ 拖长 clip 即变速 |
+| D1 | tempo 语义 | **变速跟随**：clip 的 `span_ticks` 固定，wav 内容按比例重采样铺满 span。帧位 = `(t − start)/span × wav_frames`，**数学完全闭合在 tick 域** | 用户确认（2026-10-24）：与 MIDI clip 完全同构，loop 回卷 / seek 零特判（比例映射自动重锚，无游标同步问题）；代价 = tempo 变化时音频变调（磁带加速效应）+ 拖长 clip 即变速。**（U11 修订：改为裁剪语义不变调，见 `spec/audio-trim.md`。）** |
 | D2 | 建 clip 入口 | **双击 audio 轨空白处弹 wav 文件对话框**（rfd），clip 出生在点击 tick（bar 吸附），`span_ticks` = wav 自然时长按当前 bpm 换算 | 用户确认：与 MIDI 轨双击建 clip 对称，可发现性好 |
 | D3 | 图拓扑 | 每轨一个 `NodeDoc::AudioTrack{node_id, track}` 节点：`NodeKind::Plain` 生成器（无入边、覆盖写私有 `node.output`，同 `Sf2VoiceProcessor` 语义）。加轨自动连 mixer 空闲通道（照 `add_midi_track` 的 delay→mixer 段）；用户可改拉到任意 mixer 通道 / master / 效果器链 | 节点图一等公民架构；timeline 不是引擎节点（P3 既有裁决），音频轨也走"每轨普通节点"通道，`ExecPlan`/`NodeKind` 零改动 |
 | D4 | 调度 | **`ProcessContext` 加 `song_ticks`（本块起始 transport tick）+ `transport_dt_ticks`（本块 tick 步进）**，block runner 在 `sequencer.advance` 之前从 `position_ticks` + effective_bpm 读取。`AudioTrackProcessor` 自持 clip 表，经 **`EngineCommand::SetAudioClips{node_id, clips}`** 更新（同 `SetTrackClips` 的逐帧重发模式） | processor 的唯一入口就是 `process(ctx)`；比例映射是绝对函数（每帧独立计算），ctx 两字段即够，无游标累积漂移 |
@@ -95,13 +97,14 @@ arrangement 上混音"）没有载体——U5 解决的是"wav 当乐器弹"（n
 ## 5. 边界与明确不做
 
 - **不做** 变速不变调（timestretch / sinc 多相）——D1 变速即变调。
-- **不做** `offset` 头部裁剪字段（比例映射自洽；trim 需求由改
-  start/span 表达）。
+- ~~**不做** `offset` 头部裁剪字段（比例映射自洽；trim 需求由改
+  start/span 表达）。~~ **已由 U11 取代**（`spec/audio-trim.md`：`AudioClip` 加 `source_offset` / `source_len`，裁剪语义替代比例拉伸）。
 - **不做** clip gain 的 UI（字段留位默认 1.0；轨级音量 = mixer 通道
   推子，现成）。
 - **不做** 拖放文件进 timeline（drag & drop）、音频录音。
 - **不做** audio clip 的钢琴卷帘式内容编辑（无内容语义；split /
   duplicate / move / resize 全部继承）。
-- **不做** warp / transient 检测 / beat 切片。- **不做** audio clip 的 G / T / Shift+D modal（两表推理逻辑不动，
+- **不做** warp / transient 检测 / beat 切片。
+- ~~**不做** audio clip 的 G / T / Shift+D modal（两表推理逻辑不动，
   `arm_modal` 过滤 Audio 选区；直接拖动/resize/K 切刀已覆盖——实测
-  有需求再三表化）。
+  有需求再三表化）。~~ **已由 U11 取代**（`spec/audio-trim.md`：audio 开放 G / T / Shift+D，modal 三表化）。

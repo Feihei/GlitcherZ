@@ -2,15 +2,18 @@
 //! D1 / D4 / D7).
 //!
 //! [`AudioTrackProcessor`] is the generator node behind one
-//! `NodeDoc::AudioTrack`: it reads wav material across the transport's tick
-//! domain, stretched to each clip's span (tape-style — resizing changes
-//! speed, tempo changes repitch).
+//! `NodeDoc::AudioTrack`: it plays wav material across the transport's tick
+//! domain as a **trim window** (U11). The wav runs at its **native rate** —
+//! only a sample-rate conversion, never a pitch-changing stretch — and each
+//! clip selects a window (`source_offset`/`source_len`, seconds) into it.
 //!
-//! Playback math (D1): the read frame is a **pure function of the transport
-//! position** — `frame = (song_tick − start)/span × wav_frames` — so loop
-//! wrap and seek need no cursor bookkeeping or special cases: the position
-//! *is* the state. Per output frame `j`, the clip tick is
-//! `song_ticks + j·dt/frames`, interpolated linearly between wav frames.
+//! Playback math (U11 D1/D2): per output frame `j` the clip's elapsed time is
+//! `elapsed = (song_ticks + j·dt/frames − start) · sec_per_tick` seconds; the
+//! read frame is `(source_offset + elapsed) · wav_sample_rate`. The mapping is
+//! a **pure function of the transport position** (loop wrap / seek need no
+//! cursor bookkeeping), and `sec_per_tick` is derived from the **base** tempo
+//! (D2): audio does not follow the tempo curve. Frames outside
+//! `[0, source_len)` or past the wav tail are silent.
 //!
 //! Clip table updates (D4): the table carries `Arc<SampleData>` (not
 //! `Copy`), so it travels through the **structure queue**, not the command
@@ -47,17 +50,21 @@ pub fn audio_clip_trash_channel() -> (
     rtrb::RingBuffer::new(AUDIO_CLIP_TRASH_CAPACITY)
 }
 
-/// One audio clip as seen by the audio thread: placement in the tick domain
-/// plus the shared, already-decoded sample data.
+/// One audio clip as seen by the audio thread: placement in the tick domain,
+/// its trim window into the wav (seconds), and the shared, already-decoded
+/// sample data.
 ///
-/// `start_ticks`/`span_ticks` are `f64` to match the sequencer's transport
-/// position without rounding at the block boundary.
+/// `start_ticks` is `f64` to match the sequencer's transport position without
+/// rounding at the block boundary; `source_offset`/`source_len` are seconds
+/// (U11 D1: native-rate playback, no stretch).
 #[derive(Debug, Clone)]
 pub struct RtAudioClip {
     /// Absolute start position (transport ticks).
     pub start_ticks: f64,
-    /// Playback window the wav is stretched across (ticks).
-    pub span_ticks: f64,
+    /// Trim window start inside the wav (seconds, `>= 0`).
+    pub source_offset: f64,
+    /// Trim window length (seconds, `> 0`).
+    pub source_len: f64,
     /// Decoded stereo frames (control-thread decode; shared, never
     /// reallocated on the audio side).
     pub data: Arc<SampleData>,
@@ -119,8 +126,9 @@ impl Processor for AudioTrackProcessor {
         buffer.clear();
         let t0 = ctx.song_ticks;
         let dt = ctx.transport_dt_ticks;
+        let sec_per_tick = ctx.sec_per_tick;
         for clip in self.clips.iter().flatten() {
-            render_clip(clip, t0, dt, frames, buffer);
+            render_clip(clip, t0, dt, sec_per_tick, frames, buffer);
         }
     }
 
@@ -137,21 +145,37 @@ impl Processor for AudioTrackProcessor {
     }
 }
 
-/// Renders one clip across the block: for output frame `j` the clip tick is
-/// `t0 + j·dt/frames`; frames outside `[start, start+span)` contribute
-/// nothing (clip boundaries cut mid-block without clicks at exactly the
-/// right tick). RT-safe: linear interpolation over pre-decoded frames.
-fn render_clip(clip: &RtAudioClip, t0: f64, dt: f64, frames: usize, buffer: &mut AudioBuffer) {
+/// Renders one clip across the block (U11 D1): the wav plays at its native
+/// rate — only a sample-rate conversion — the clip being a trim window into
+/// the source. For output frame `j` the clip's elapsed time is
+/// `(t − start) · sec_per_tick` seconds; outputs outside `[0, source_len)`
+/// contribute nothing (clip boundaries cut mid-block at exactly the right
+/// tick), and reads past the wav tail are silent. RT-safe: linear
+/// interpolation over pre-decoded frames.
+fn render_clip(
+    clip: &RtAudioClip,
+    t0: f64,
+    dt: f64,
+    sec_per_tick: f64,
+    frames: usize,
+    buffer: &mut AudioBuffer,
+) {
     let src = clip.data.frames();
-    if src.len() < 2 || clip.span_ticks <= 0.0 {
+    if src.len() < 2 || clip.source_len.is_nan() || clip.source_len <= 0.0 {
         return;
     }
-    let last = (src.len() - 1) as f64;
     let Some((out_l, out_r)) = buffer.stereo_channels_mut() else {
         return;
     };
     let start = clip.start_ticks;
-    let span = clip.span_ticks;
+    let offset = if clip.source_offset.is_finite() {
+        clip.source_offset.max(0.0)
+    } else {
+        0.0
+    };
+    let len = clip.source_len;
+    let wav_sr = f64::from(clip.data.sample_rate());
+    let last = src.len() as f64;
     let gain = if clip.gain.is_finite() {
         clip.gain
     } else {
@@ -159,16 +183,27 @@ fn render_clip(clip: &RtAudioClip, t0: f64, dt: f64, frames: usize, buffer: &mut
     };
     for j in 0..frames {
         let t = t0 + (j as f64 / frames as f64) * dt;
-        if t < start || t >= start + span {
+        let elapsed = (t - start) * sec_per_tick;
+        // NaN (a poisoned clip start) or outside the window: silent — the
+        // explicit `is_nan` keeps a NaN from poisoning the buffer.
+        if elapsed.is_nan() || elapsed < 0.0 || elapsed >= len {
             continue;
         }
-        let pos = ((t - start) / span) * last;
+        let pos = (offset + elapsed) * wav_sr;
+        // Before the window's file position or past the wav tail: silent.
+        if pos.is_nan() || pos < 0.0 || pos >= last {
+            continue;
+        }
         let i = pos.floor();
         let frac = (pos - i) as f32;
         let i = i as usize;
-        // `pos <= last` guarantees i+1 exists (src.len() >= 2).
-        let a = src[i];
-        let b = src[i + 1];
+        // `pos < last` and `src.len() >= 2`, but the last frame has no
+        // successor — interpolate against itself there.
+        let (a, b) = if i + 1 < src.len() {
+            (src[i], src[i + 1])
+        } else {
+            (src[i], src[i])
+        };
         let l = a[0] + (b[0] - a[0]) * frac;
         let r = a[1] + (b[1] - a[1]) * frac;
         out_l[j] += l * gain;

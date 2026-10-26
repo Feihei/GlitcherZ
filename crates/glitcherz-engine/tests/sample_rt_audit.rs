@@ -124,6 +124,7 @@ fn ctx() -> ProcessContext {
         song_ticks: 0.0,
         transport_dt_ticks: 0.0,
         transport_active: true,
+        sec_per_tick: 60.0 / (120.0 * 960.0),
     }
 }
 

@@ -648,15 +648,17 @@ impl MidiClip {
     }
 }
 
-/// An audio clip placed on the arrangement timeline (U6, spec
-/// `.agents/spec/audio-track.md` D5).
+/// An audio clip placed on the arrangement timeline (U6 / U11, spec
+/// `.agents/spec/audio-trim.md` D1/D4).
 ///
-/// The wav content is played **stretched across the span** (D1): the read
-/// frame is `(transport_tick − start)/span × wav_frames`, a pure function
-/// of the transport position — loop wrap and seek need no special cases.
-/// Resizing the clip therefore changes the playback speed (tape-style),
-/// and a tempo change repitches the material. No loop semantics: the span
-/// is the window, repeating is done by duplicating clips.
+/// The wav plays at its **native rate** (1×, only a sample-rate conversion —
+/// never a pitch-changing stretch): the clip is a **trim window** into the
+/// source file. `source_offset` is where the window starts inside the wav
+/// (seconds) and `source_len` how long it is. The clip's tick footprint on
+/// the arrangement is *derived* from `source_len` at the base tempo
+/// ([`Project::audio_clip_span_ticks`], D3) — never stored, so the window and
+/// its tick length cannot drift apart. Audio does not follow the tempo curve
+/// (D2): the base tempo is the single conversion source.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AudioClip {
     /// Path to the .wav file (decoded via the session sample cache; a
@@ -666,14 +668,22 @@ pub struct AudioClip {
     /// Absolute start position on the arrangement (tick).
     #[serde(default)]
     pub start_ticks: u32,
-    /// How long the clip stays active (tick) — the playback window the
-    /// wav is stretched across.
-    #[serde(default = "default_clip_span")]
-    pub span_ticks: u32,
+    /// Trim window start inside the wav (seconds, `>= 0`).
+    #[serde(default)]
+    pub source_offset: f64,
+    /// Trim window length (seconds, `> 0`) — the playback window.
+    #[serde(default = "default_audio_source_len")]
+    pub source_len: f64,
     /// Clip gain (linear, 0..=2, default 1.0). Field reserved for a later
     /// UI; track-level volume is the mixer channel fader.
     #[serde(default = "default_audio_gain")]
     pub gain: f32,
+    /// v6 documents stored the clip length as a tick `span_ticks` under the
+    /// old proportional-stretch semantics (U6 D1). Read-only: the v6→v7
+    /// migration turns it into `source_len` seconds at the base tempo and
+    /// clears it. Never written back (`skip_serializing`).
+    #[serde(default, rename = "span_ticks", skip_serializing)]
+    pub legacy_span_ticks: u32,
 }
 
 impl Default for AudioClip {
@@ -681,10 +691,18 @@ impl Default for AudioClip {
         Self {
             path: String::new(),
             start_ticks: 0,
-            span_ticks: default_clip_span(),
+            source_offset: 0.0,
+            source_len: default_audio_source_len(),
             gain: default_audio_gain(),
+            legacy_span_ticks: 0,
         }
     }
+}
+
+/// Default trim window: one bar at the default tempo (the audio analogue of
+/// the old one-bar `span_ticks` default; U11 D3 keeps it in seconds).
+fn default_audio_source_len() -> f64 {
+    f64::from(TICKS_PER_BAR) * 60.0 / (default_tempo() * f64::from(TICKS_PER_QUARTER))
 }
 
 fn default_audio_gain() -> f32 {
@@ -2147,11 +2165,47 @@ impl Project {
         }
     }
 
+    /// Upgrades a v6 document to v7 (U11): audio clips leave the tick-domain
+    /// proportional-stretch model (`span_ticks`) for a seconds-domain trim
+    /// window (`source_len`). The old span is converted at the base tempo;
+    /// the window starts at the file head (`source_offset = 0`) — v6 stored
+    /// no offset. Idempotent for documents that already carry `source_len`.
+    ///
+    /// Only call it for documents whose `version < 7`.
+    pub fn migrate_v6_to_v7(&mut self) {
+        let spt = self.sec_per_tick();
+        for track in &mut self.audio_tracks {
+            for clip in &mut track.clips {
+                if clip.legacy_span_ticks > 0 {
+                    clip.source_len = f64::from(clip.legacy_span_ticks) * spt;
+                }
+                clip.source_offset = 0.0;
+                clip.legacy_span_ticks = 0;
+            }
+        }
+    }
+
     /// The document's bar length in ticks (U3a): every bar-based measure
     /// (grid, loop snapping, arrangement rounding, ruler) reads this instead
     /// of the 4/4 [`TICKS_PER_BAR`] constant.
     pub fn ticks_per_bar(&self) -> u32 {
         self.metadata.time_signature.ticks_per_bar()
+    }
+
+    /// Seconds per tick at the project's **base** tempo (U11 D2). Audio clips
+    /// convert between the tick domain and seconds with this constant — they
+    /// deliberately do not follow the tempo curve.
+    pub fn sec_per_tick(&self) -> f64 {
+        60.0 / (self.metadata.tempo_bpm.max(1.0) * f64::from(TICKS_PER_QUARTER))
+    }
+
+    /// Tick footprint of an audio clip (U11 D3): its trim window (`source_len`
+    /// seconds) mapped back to ticks at the base tempo. Derived — never stored
+    /// on the clip. Always `>= 1` so the clip keeps a positive footprint.
+    pub fn audio_clip_span_ticks(&self, clip: &AudioClip) -> u32 {
+        let ticks = (clip.source_len / self.sec_per_tick()).round();
+        // `max` swallows NaN (returns 1.0); `as` saturates huge values.
+        ticks.max(1.0) as u32
     }
 
     /// Project-level validation: track counts, clip capacities/placement and
@@ -2224,9 +2278,26 @@ impl Project {
                 ));
             }
             for (ci, clip) in track.clips.iter().enumerate() {
-                // Audio clips have no loop semantics: the span is the
-                // window (loop == span satisfies the shared invariant).
-                check_clip_placement(ti, ci, clip.start_ticks, clip.span_ticks, clip.span_ticks)?;
+                // U11: the trim window replaces the old span/loop pair; the
+                // arrangement bound is checked on the derived tick footprint.
+                if clip.source_offset.is_nan() || clip.source_offset < 0.0 {
+                    return Err(format!(
+                        "audio track #{ti} clip #{ci} has an invalid source_offset {}",
+                        clip.source_offset
+                    ));
+                }
+                if clip.source_len.is_nan() || clip.source_len <= 0.0 {
+                    return Err(format!(
+                        "audio track #{ti} clip #{ci} has a non-positive source_len {}",
+                        clip.source_len
+                    ));
+                }
+                let span = self.audio_clip_span_ticks(clip);
+                if u64::from(clip.start_ticks) + u64::from(span) > MAX_ARRANGEMENT_TICKS {
+                    return Err(format!(
+                        "audio track #{ti} clip #{ci} ends beyond the {MAX_ARRANGEMENT_BARS}-bar arrangement bound"
+                    ));
+                }
             }
         }
         if u64::from(self.metadata.loop_range.end_ticks) > MAX_ARRANGEMENT_TICKS {
@@ -2362,7 +2433,7 @@ mod tests {
         GraphDoc, MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS, MAX_AUDIO_TRACKS,
         MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES, MidiClip, MidiSource, MidiTrack, NodeDoc,
         PortRef, Project, SamplePlayMode, SynthParams, TICKS_PER_BAR, TICKS_PER_QUARTER,
-        TICKS_PER_STEP, VoiceSpec, default_graph_doc,
+        TICKS_PER_STEP, VoiceSpec, default_audio_source_len, default_graph_doc,
     };
 
     #[test]
@@ -2401,7 +2472,7 @@ mod tests {
         assert!(back.notes().is_empty());
     }
 
-    /// U6: audio track round-trip + partial defaults + old-file loading.
+    /// U6/U11: audio track round-trip + partial defaults + old-file loading.
     #[test]
     fn audio_track_roundtrip_and_defaults() {
         let track = AudioTrack {
@@ -2410,8 +2481,10 @@ mod tests {
                 AudioClip {
                     path: "vox_1.wav".to_string(),
                     start_ticks: TICKS_PER_BAR,
-                    span_ticks: 4 * TICKS_PER_BAR,
+                    source_offset: 0.25,
+                    source_len: 2.5,
                     gain: 0.5,
+                    ..AudioClip::default()
                 },
                 AudioClip::new("vox_2.wav", 8 * TICKS_PER_BAR),
             ],
@@ -2420,11 +2493,14 @@ mod tests {
         let back: AudioTrack = ron::from_str(&text).expect("deserialization failed");
         assert_eq!(track, back);
 
-        // Partial clip: only path + start written.
+        // Partial clip: only path + start written — the trim window defaults
+        // to one bar at the default tempo (2.0 seconds).
         let clip: AudioClip =
             ron::from_str("(path: \"a.wav\", start_ticks: 960)").expect("parse failed");
-        assert_eq!(clip.span_ticks, TICKS_PER_BAR);
+        assert!((clip.source_len - default_audio_source_len()).abs() < 1e-9);
+        assert_eq!(clip.source_offset, 0.0);
         assert_eq!(clip.gain, 1.0);
+        assert_eq!(clip.legacy_span_ticks, 0);
 
         // Pre-U6 project files have no `audio_tracks` field: stripping it
         // from a serialized file mimics one, and it loads as empty.
@@ -2462,15 +2538,46 @@ mod tests {
             clips: vec![AudioClip {
                 path: "x.wav".to_string(),
                 start_ticks: 0,
-                span_ticks: 0,
+                source_offset: 0.0,
+                source_len: 0.0,
                 gain: 1.0,
+                ..AudioClip::default()
             }],
             ..AudioTrack::default()
         };
         assert!(
             project.validate().is_err(),
-            "zero-length span must fail (no loop semantics)"
+            "zero-length trim window must fail"
         );
+    }
+
+    /// U11: a v6 audio clip's tick span becomes seconds at the base tempo.
+    #[test]
+    fn audio_clip_v6_to_v7_migration() {
+        let mut project = Project {
+            audio_tracks: vec![AudioTrack {
+                name: String::new(),
+                clips: vec![AudioClip {
+                    path: "a.wav".to_string(),
+                    start_ticks: 0,
+                    source_offset: 1.0,
+                    source_len: 0.0,
+                    gain: 1.0,
+                    legacy_span_ticks: TICKS_PER_BAR,
+                }],
+            }],
+            ..Project::default()
+        };
+        project.migrate_v6_to_v7();
+        let clip = &project.audio_tracks[0].clips[0];
+        // One bar at the default 120 bpm is 2 seconds.
+        assert!(
+            (clip.source_len - 2.0).abs() < 1e-9,
+            "expected 2.0 s, got {}",
+            clip.source_len
+        );
+        assert_eq!(clip.source_offset, 0.0);
+        assert_eq!(clip.legacy_span_ticks, 0);
     }
 
     #[test]

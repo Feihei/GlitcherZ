@@ -230,6 +230,10 @@ impl BlockRunner {
             song_ticks: position_before,
             transport_dt_ticks: self.sequencer.transport_dt_ticks(frames),
             transport_active: self.sequencer.is_transport_active(),
+            // U11 D2: audio maps ticks↔seconds at the **base** tempo, never
+            // the tempo curve — so `effective_bpm` (driving dt_ticks) and
+            // `sec_per_tick` are intentionally different sources.
+            sec_per_tick: self.sequencer.base_sec_per_tick(),
         };
 
         // 4. Sequencer scheduling: due note events fan out along the graph's

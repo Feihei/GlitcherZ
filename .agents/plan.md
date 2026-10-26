@@ -223,6 +223,18 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
   - **双击路由**：`opens_inspector(node)` 只放行 Instrument / Effect / Mixer；Keyboard / Feedback / ChannelStrip 双击无反应（否则 Inspector 会 fallback 到某条轨的乐器，等于显示错东西）；Timeline → `MainView::Timeline`；Master / TimelineIn（master 组已在走带条、In 是纯汇）无动作。
   - 测试：几何（timeline 高度 = 表头 + 每端口一行、端口全在表头之下；mixer 端口夹在操作行与内联行之间）+ 按钮启用规则（默认工程最后一槽被轨线占用 → `- Slot` 禁用，腾出后可用，再接一根线又禁用）+ `opens_inspector` 门控。全仓 500 测试绿。
 
+## U11：audio clip 裁剪 + 模态编辑 ✅ 2026-10-26 交付（spec `spec/audio-trim.md`）
+
+用户实测驱动（U6 交付后的新方向）。**先修 bug**：`add_audio_track` 在文档 cable push 后重算 `first_free_channel` → 通道已被自己占用 → `None` → `return` 跳过 `connect_nodes`，audio 节点成孤立节点（实时无声、导出正常）。已修（复用首次算出的 `(mixer, ch)`，不再整体 `return`）。
+
+**主方向**：audio clip 的边界语义从 U6 D1「**变速跟随**」（拖边缘 = 变速变调）改为「**裁剪**」（从原 wav 裁一节，拖边缘 = 调裁剪窗口，不变调），default：用户「采样边界是把原 audio 文件裁剪出来一节，而不是时间上的拉伸；T 正是调整左右两端裁剪边界的功能」。**核心洞察**：要不变调，clip 时长必须从 tick 域挪到秒域——推翻 U6 D1 选 tick 域的理由（纯函数/loop 零特判），故为**时间基修订**而非字段加法。同时为 audio 开放 G / T / Shift+D（脚本现状 `arm_modal` 拒绝 audio）。
+
+核心决策（spec 见 `spec/audio-trim.md` D1–D11）：**1× 不重采样**；**绝对时间**（tick↔秒 用 `base_bpm`，不跟随 tempo 曲线）；`AudioClip` 加 `source_offset` / `source_len`（秒）删 `span_ticks`，clip tick 长度派生；**T 裸 = 裁尾（改 `source_len`）、`t+s` = 裁头（改 `start_ticks` + `source_offset`，剩余内容位置不变）**；**G = 移动（含跨 audio 轨）**；**Shift+D = 复制 + G**（与用户判断一致：G 是基础，Shift+D 建立其上）；modal 几何/targets/ghost/batch **两表 → 三表**；跨轨重推源轨+目标轨 clip 表并合并一步 undo；`PROJECT_VERSION` 6 → 7 迁移。**已知取舍**：audio 不跟随 tempo 曲线（有曲线段落与 midi 错位）+ clip 视觉长度随 `base_bpm` 变化。
+
+拆分 U11-A model / U11-B engine / U11-C UI 装配 / U11-D modal 三表化 / U11-E 测试验收。**状态：已交付（2026-10-26）**。实现要点：`AudioClip{path, start_ticks, source_offset(f64 秒), source_len(f64 秒), gain, legacy_span_ticks(read-only)}`；`Project::{sec_per_tick, audio_clip_span_ticks}` 派生 clip tick 长度；`migrate_v6_to_v7`（旧 `span_ticks`×spt→秒、offset=0）+ `PROJECT_VERSION` 6→7 + `parse_project` 迁移链按版本分派；engine `RtAudioClip` 秒域 + `render_clip` 原生速率读（窗口外/文件尾静音）+ `ProcessContext.sec_per_tick`（`Sequencer::base_sec_per_tick()`，**有意不走 tempo 曲线**）；**`Placement` trait 方法加 `sec_per_tick: f64` 参数**（MIDI/control 忽略，audio 派生 span/写回秒窗口）；`TimelineParams.sec_per_tick`；modal 几何/targets/ghost/batch **两表→三表**（`ModalTarget` 第 4 字段改 `TimelineLane`）+ `arm_modal` 放行 audio；direct drag 的 resize 与 T 统一为"裁剪"（左缘同时移 `start_ticks`+`source_offset`，右缘只改 `source_len`）；跨轨移动经 `relocate_in` + `sync_clip_row` 重推源/目标轨表并合并一步 undo；Shift+D 复制 clone（同 path，不复制文件）。测试：model 迁移/validate + engine 裁剪数学/RT 审计 + timeline audio 几何/grab/stretch。全仓 fmt/clippy/test 绿。本项取代 `spec/audio-track.md` §5 的「不做 offset 头部裁剪」「不做 G/T/Shift+D」两条边界。
+
+**缺口与未来方案（2026-10-26 用户确认接受）**：audio **不跟随 tempo 曲线**（有曲线的段落与 midi 会错位）——这是「裁剪不变调」的固有代价，当前**接受**。未来精确同步方案（时间基点改用 tempo 曲线 tick↔秒 积分 + block runner 维护 `song_sec` 累积 + clip 表改存 `start_sec` + 曲线编辑重推）已写入 `spec/audio-trim.md` §12 预留，**不在 U11 实施**，触发条件为实测错位不可接受。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：

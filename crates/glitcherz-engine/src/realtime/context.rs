@@ -23,6 +23,11 @@ pub struct ProcessContext {
     /// while stopped/paused (a frozen `song_ticks` would otherwise replay
     /// the same frames every block).
     pub transport_active: bool,
+    /// Seconds per tick at the **base** tempo (U11 D2): audio clips map their
+    /// seconds-domain trim window onto the tick grid with this constant and
+    /// deliberately do **not** follow the tempo curve (following it would
+    /// repitch the material, which trimming forbids). Constant per block.
+    pub sec_per_tick: f64,
 }
 
 impl ProcessContext {
@@ -46,6 +51,7 @@ mod tests {
             song_ticks: 0.0,
             transport_dt_ticks: 0.0,
             transport_active: true,
+            sec_per_tick: 60.0 / (120.0 * 960.0),
         };
         assert!((ctx.start_seconds() - 1.0).abs() < 1e-12);
     }
