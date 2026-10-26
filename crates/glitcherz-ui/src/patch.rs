@@ -116,19 +116,22 @@ fn inline_params_of(node: &NodeDoc) -> Vec<InlineParamSpec> {
         } => SAMPLE_INLINE.to_vec(),
         // Table-driven from the engine descriptor (spec `effects.md` D6): the
         // row order, labels and count all come from the effect's static table.
+        // Only slots flagged `INLINE` get a row — an eight-parameter EQ would
+        // otherwise turn the canvas node into a column of sliders.
         NodeDoc::Effect {
             voice: VoiceSpec::Builtin | VoiceSpec::SoundFont { .. },
             params,
             ..
-        } => crate::effect::descriptor(params)
-            .params
-            .iter()
-            .enumerate()
-            .map(|(slot, spec)| InlineParamSpec {
-                param: InlineParam::EffectSlot(slot as u8),
-                label: spec.short,
-            })
-            .collect(),
+        } => {
+            let descriptor = crate::effect::descriptor(params);
+            descriptor
+                .inline_slots()
+                .map(|slot| InlineParamSpec {
+                    param: InlineParam::EffectSlot(slot),
+                    label: descriptor.spec(slot).map_or("", |spec| spec.short),
+                })
+                .collect()
+        }
         NodeDoc::Mixer { .. } => MIXER_INLINE.to_vec(),
         NodeDoc::Feedback { .. } => FEEDBACK_INLINE.to_vec(),
         _ => Vec::new(),
@@ -2920,6 +2923,28 @@ mod tests {
         );
         let labels: Vec<&str> = inline_params_of(&delay).iter().map(|s| s.label).collect();
         assert_eq!(labels, vec!["time", "fdbk", "mix"]);
+
+        // E2: the big effects only expose their `INLINE` slots, so the canvas
+        // node stays three or four rows tall instead of eight.
+        let eq = NodeDoc::Effect {
+            node_id: 7,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params: glitcherz_model::EffectParams::Eq(Box::default()),
+            delay: None,
+        };
+        let labels: Vec<&str> = inline_params_of(&eq).iter().map(|s| s.label).collect();
+        assert_eq!(labels, vec!["low", "mid", "hi", "cut"]);
+
+        let comp = NodeDoc::Effect {
+            node_id: 8,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params: glitcherz_model::EffectParams::Compressor(Box::default()),
+            delay: None,
+        };
+        let labels: Vec<&str> = inline_params_of(&comp).iter().map(|s| s.label).collect();
+        assert_eq!(labels, vec!["thr", "ratio", "mkup"]);
 
         let mixer = NodeDoc::Mixer {
             node_id: 6,

@@ -8,13 +8,29 @@
 //! inline rows, Inspector sliders, param push, menu labels) goes through it, so
 //! a new effect only adds arms here.
 
-use glitcherz_engine::realtime::{BuiltinEffectKind, EffectDescriptor, ParamSpec, Unit, delay};
+use std::sync::Arc;
+
+use glitcherz_engine::realtime::{
+    BuiltinEffectKind, CompressorProcessor, DelayProcessor, EffectDescriptor, EffectMeters,
+    EqProcessor, ParamId, ParamSpec, Processor, Unit, compressor, delay, eq,
+};
 use glitcherz_model::{BuiltinEffectKind as DocEffectKind, EffectParams};
+
+/// A freshly built built-in effect processor.
+pub struct BuiltinProcessor {
+    /// The node the graph will install.
+    pub processor: Box<dyn Processor>,
+    /// Meter handle for effects that publish one (the compressor). The caller
+    /// keeps a clone in its `node_id → meters` map; `None` for the rest.
+    pub meters: Option<Arc<EffectMeters>>,
+}
 
 /// Engine kind of a document payload.
 pub fn engine_kind(params: &EffectParams) -> BuiltinEffectKind {
     match params.kind() {
         DocEffectKind::Delay => BuiltinEffectKind::Delay,
+        DocEffectKind::Eq => BuiltinEffectKind::Eq,
+        DocEffectKind::Compressor => BuiltinEffectKind::Compressor,
     }
 }
 
@@ -27,7 +43,35 @@ pub fn descriptor(params: &EffectParams) -> &'static EffectDescriptor {
 pub fn default_params(kind: DocEffectKind) -> EffectParams {
     match kind {
         DocEffectKind::Delay => EffectParams::Delay(glitcherz_model::DelayParams::default()),
+        DocEffectKind::Eq => EffectParams::Eq(Box::default()),
+        DocEffectKind::Compressor => EffectParams::Compressor(Box::default()),
     }
+}
+
+/// Builds the processor for `params` and seeds **every** slot from the
+/// document.
+///
+/// Seeding matters: the smoothers snap while the node has not rendered yet
+/// (D12), so a restored project starts at its saved values instead of ramping
+/// from the descriptor defaults — no fade-in, and the first block already
+/// matches the document (D15).
+pub fn processor(params: &EffectParams, sample_rate: f32) -> BuiltinProcessor {
+    let mut meters = None;
+    let mut processor: Box<dyn Processor> = match engine_kind(params) {
+        BuiltinEffectKind::Delay => Box::new(DelayProcessor::new(sample_rate)),
+        BuiltinEffectKind::Eq => Box::new(EqProcessor::new(sample_rate)),
+        BuiltinEffectKind::Compressor => {
+            let handle = Arc::new(EffectMeters::new());
+            meters = Some(handle.clone());
+            Box::new(CompressorProcessor::with_meters(sample_rate, Some(handle)))
+        }
+    };
+    let descriptor = descriptor(params);
+    for slot in 0..descriptor.params.len() {
+        let slot = slot as u8;
+        processor.set_param(ParamId::BuiltinParam(slot), value(params, slot));
+    }
+    BuiltinProcessor { processor, meters }
 }
 
 /// Value of `slot` in the document payload (`0.0` for an unknown slot).
@@ -37,6 +81,28 @@ pub fn value(params: &EffectParams, slot: u8) -> f32 {
             delay::SLOT_TIME => delay.time_s,
             delay::SLOT_FEEDBACK => delay.feedback,
             delay::SLOT_MIX => delay.mix,
+            _ => 0.0,
+        },
+        EffectParams::Eq(eq) => match slot {
+            eq::SLOT_LOW_GAIN => eq.low_gain,
+            eq::SLOT_LOW_FREQ => eq.low_freq,
+            eq::SLOT_MID_GAIN => eq.mid_gain,
+            eq::SLOT_MID_FREQ => eq.mid_freq,
+            eq::SLOT_MID_Q => eq.mid_q,
+            eq::SLOT_HIGH_GAIN => eq.high_gain,
+            eq::SLOT_HIGH_FREQ => eq.high_freq,
+            eq::SLOT_LOW_CUT => eq.low_cut,
+            _ => 0.0,
+        },
+        EffectParams::Compressor(comp) => match slot {
+            compressor::SLOT_THRESHOLD => comp.threshold,
+            compressor::SLOT_RATIO => comp.ratio,
+            compressor::SLOT_ATTACK => comp.attack,
+            compressor::SLOT_RELEASE => comp.release,
+            compressor::SLOT_KNEE => comp.knee,
+            compressor::SLOT_MAKEUP => comp.makeup,
+            compressor::SLOT_MIX => comp.mix,
+            compressor::SLOT_LINK => bool_value(comp.stereo_link),
             _ => 0.0,
         },
     }
@@ -51,7 +117,34 @@ pub fn set_value(params: &mut EffectParams, slot: u8, value: f32) {
             delay::SLOT_MIX => delay.mix = value,
             _ => {}
         },
+        EffectParams::Eq(eq) => match slot {
+            eq::SLOT_LOW_GAIN => eq.low_gain = value,
+            eq::SLOT_LOW_FREQ => eq.low_freq = value,
+            eq::SLOT_MID_GAIN => eq.mid_gain = value,
+            eq::SLOT_MID_FREQ => eq.mid_freq = value,
+            eq::SLOT_MID_Q => eq.mid_q = value,
+            eq::SLOT_HIGH_GAIN => eq.high_gain = value,
+            eq::SLOT_HIGH_FREQ => eq.high_freq = value,
+            eq::SLOT_LOW_CUT => eq.low_cut = value,
+            _ => {}
+        },
+        EffectParams::Compressor(comp) => match slot {
+            compressor::SLOT_THRESHOLD => comp.threshold = value,
+            compressor::SLOT_RATIO => comp.ratio = value,
+            compressor::SLOT_ATTACK => comp.attack = value,
+            compressor::SLOT_RELEASE => comp.release = value,
+            compressor::SLOT_KNEE => comp.knee = value,
+            compressor::SLOT_MAKEUP => comp.makeup = value,
+            compressor::SLOT_MIX => comp.mix = value,
+            compressor::SLOT_LINK => comp.stereo_link = value >= 0.5,
+            _ => {}
+        },
     }
+}
+
+/// `true` as `1.0` (switch slots are floats on the parameter path).
+fn bool_value(on: bool) -> f32 {
+    if on { 1.0 } else { 0.0 }
 }
 
 /// Range of a slot straight from the descriptor (`0..1` when unknown).
@@ -86,9 +179,13 @@ pub fn format_value(spec: &ParamSpec, value: f32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{descriptor, engine_kind, format_value, range, set_value, value};
-    use glitcherz_engine::realtime::BuiltinEffectKind;
-    use glitcherz_model::{DelayParams, EffectParams};
+    use super::{
+        default_params, descriptor, engine_kind, format_value, processor, range, set_value, value,
+    };
+    use glitcherz_engine::realtime::{
+        BuiltinEffectKind, compressor, delay, eq, validate_descriptor,
+    };
+    use glitcherz_model::{BuiltinEffectKind as DocEffectKind, DelayParams, EffectParams};
 
     fn delay_params() -> EffectParams {
         EffectParams::Delay(DelayParams {
@@ -98,27 +195,69 @@ mod tests {
         })
     }
 
+    fn eq_params() -> EffectParams {
+        EffectParams::Eq(Box::new(glitcherz_model::EqParams {
+            low_gain: 6.0,
+            mid_q: 2.0,
+            low_cut: 80.0,
+            ..Default::default()
+        }))
+    }
+
+    fn compressor_params() -> EffectParams {
+        EffectParams::Compressor(Box::new(glitcherz_model::CompressorParams {
+            threshold: -24.0,
+            stereo_link: false,
+            ..Default::default()
+        }))
+    }
+
     #[test]
     fn kind_maps_to_the_engine_roster() {
         assert_eq!(engine_kind(&delay_params()), BuiltinEffectKind::Delay);
         assert_eq!(descriptor(&delay_params()).name, "Delay");
+        assert_eq!(engine_kind(&eq_params()), BuiltinEffectKind::Eq);
+        assert_eq!(descriptor(&eq_params()).name, "EQ");
+        assert_eq!(
+            engine_kind(&compressor_params()),
+            BuiltinEffectKind::Compressor
+        );
+        assert_eq!(descriptor(&compressor_params()).name, "Compressor");
+        for kind in DocEffectKind::ALL {
+            assert_eq!(
+                validate_descriptor(descriptor(&default_params(*kind))),
+                Ok(())
+            );
+        }
     }
 
     #[test]
     fn slots_read_and_write_the_document_fields() {
         let mut params = delay_params();
-        assert!((value(&params, super::delay::SLOT_TIME) - 0.25).abs() < 1e-6);
-        set_value(&mut params, super::delay::SLOT_MIX, 0.1);
-        assert!((value(&params, super::delay::SLOT_MIX) - 0.1).abs() < 1e-6);
+        assert!((value(&params, delay::SLOT_TIME) - 0.25).abs() < 1e-6);
+        set_value(&mut params, delay::SLOT_MIX, 0.1);
+        assert!((value(&params, delay::SLOT_MIX) - 0.1).abs() < 1e-6);
         // Out-of-range slots are inert, never a panic.
         assert_eq!(value(&params, 9), 0.0);
         set_value(&mut params, 9, 1.0);
+
+        let mut params = eq_params();
+        assert!((value(&params, eq::SLOT_LOW_GAIN) - 6.0).abs() < 1e-6);
+        assert!((value(&params, eq::SLOT_MID_Q) - 2.0).abs() < 1e-6);
+        set_value(&mut params, eq::SLOT_HIGH_GAIN, -4.0);
+        assert!((value(&params, eq::SLOT_HIGH_GAIN) + 4.0).abs() < 1e-6);
+
+        let mut params = compressor_params();
+        assert_eq!(value(&params, compressor::SLOT_LINK), 0.0);
+        set_value(&mut params, compressor::SLOT_LINK, 1.0);
+        assert_eq!(value(&params, compressor::SLOT_LINK), 1.0);
+        assert!(params.as_compressor().unwrap().stereo_link);
     }
 
     #[test]
     fn ranges_come_from_the_descriptor() {
         let params = delay_params();
-        let (min, max) = range(&params, super::delay::SLOT_TIME);
+        let (min, max) = range(&params, delay::SLOT_TIME);
         assert!((min - 0.005).abs() < 1e-9);
         assert!((max - 1.0).abs() < 1e-9);
         assert_eq!(range(&params, 42), (0.0, 1.0));
@@ -127,10 +266,127 @@ mod tests {
     #[test]
     fn formatting_follows_the_unit() {
         let params = delay_params();
-        let spec = descriptor(&params).spec(super::delay::SLOT_TIME).unwrap();
+        let spec = descriptor(&params).spec(delay::SLOT_TIME).unwrap();
         assert_eq!(format_value(spec, 0.25), "250.0 ms");
         assert_eq!(format_value(spec, 1.5), "1.50 s");
-        let mix = descriptor(&params).spec(super::delay::SLOT_MIX).unwrap();
+        let mix = descriptor(&params).spec(delay::SLOT_MIX).unwrap();
         assert_eq!(format_value(mix, 0.5), "50 %");
+        let eq_spec = descriptor(&eq_params()).spec(eq::SLOT_LOW_GAIN).unwrap();
+        assert_eq!(format_value(eq_spec, -3.0), "-3.0 dB");
+        let attack = descriptor(&compressor_params())
+            .spec(compressor::SLOT_ATTACK)
+            .unwrap();
+        assert_eq!(format_value(attack, 10.0), "10.0 ms");
+    }
+
+    /// Guards the one thing that would silently drift: the document defaults
+    /// and the engine descriptor defaults must agree, or a new node starts at
+    /// values the Inspector never showed.
+    #[test]
+    fn model_defaults_match_the_engine_descriptors() {
+        for kind in DocEffectKind::ALL {
+            let params = default_params(*kind);
+            for (slot, spec) in descriptor(&params).params.iter().enumerate() {
+                let document = value(&params, slot as u8);
+                assert!(
+                    (document - spec.default).abs() < 1e-6,
+                    "{kind:?} slot {slot} ({}): document {document} vs descriptor {}",
+                    spec.name,
+                    spec.default
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn processors_are_seeded_from_the_document() {
+        for kind in DocEffectKind::ALL {
+            let params = default_params(*kind);
+            let built = processor(&params, 48_000.0);
+            assert_eq!(
+                built.meters.is_some(),
+                *kind == DocEffectKind::Compressor,
+                "{kind:?} meter handle"
+            );
+        }
+    }
+
+    const SR: f32 = 48_000.0;
+    const BLOCK: usize = 128;
+
+    fn ctx() -> glitcherz_engine::realtime::ProcessContext {
+        glitcherz_engine::realtime::ProcessContext {
+            sample_rate: SR,
+            frames: BLOCK,
+            playback_sample_pos: 0,
+            song_ticks: 0.0,
+            transport_dt_ticks: 0.0,
+            transport_active: true,
+            sec_per_tick: 60.0 / (120.0 * 960.0),
+        }
+    }
+
+    /// Renders a mono signal in fixed blocks through a built-in effect.
+    fn render(
+        processor: &mut dyn glitcherz_engine::realtime::Processor,
+        signal: &[f32],
+    ) -> Vec<f32> {
+        let mut buffer = glitcherz_engine::realtime::AudioBuffer::new(1, BLOCK);
+        let mut out = Vec::with_capacity(signal.len());
+        for chunk in signal.chunks(BLOCK) {
+            let frames = chunk.len();
+            buffer.set_len(frames);
+            if let Some(channel) = buffer.channel_mut(0) {
+                channel[..frames].copy_from_slice(chunk);
+            }
+            processor.process(&ctx(), &mut buffer);
+            if let Some(channel) = buffer.channel(0) {
+                out.extend_from_slice(&channel[..frames]);
+            }
+        }
+        out
+    }
+
+    /// End to end: document value → `set_value` → `processor` → DSP response.
+    ///
+    /// This is the seam a slot-order mistake would break silently — the slider
+    /// would move, the document would change, and the sound would not.
+    #[test]
+    fn document_values_reach_the_dsp() {
+        let mut params = default_params(DocEffectKind::Eq);
+        set_value(&mut params, eq::SLOT_LOW_GAIN, 12.0);
+        let mut builtin = processor(&params, SR);
+
+        let seconds = 1.0;
+        let frames = (SR * seconds) as usize;
+        let input: Vec<f32> = (0..frames)
+            .map(|i| (std::f32::consts::TAU * 25.0 * i as f32 / SR).sin())
+            .collect();
+        let out = render(builtin.processor.as_mut(), &input);
+
+        let tail = 4_096;
+        let rms = |s: &[f32]| (s.iter().map(|v| v * v).sum::<f32>() / s.len() as f32).sqrt();
+        let gain_db = 20.0 * (rms(&out[frames - tail..]) / rms(&input[frames - tail..])).log10();
+        assert!(
+            (10.5..12.5).contains(&gain_db),
+            "the document's +12 dB low shelf should boost 25 Hz, got {gain_db:.2} dB"
+        );
+    }
+
+    #[test]
+    fn compressor_document_reaches_the_dsp() {
+        let mut params = default_params(DocEffectKind::Compressor);
+        set_value(&mut params, compressor::SLOT_KNEE, 0.0);
+        set_value(&mut params, compressor::SLOT_ATTACK, 1.0);
+        let mut builtin = processor(&params, SR);
+
+        let input = vec![0.5f32; BLOCK * 64];
+        let out = render(builtin.processor.as_mut(), &input);
+        let tail = out[out.len() - 1];
+        // -18 dB threshold, 4:1, 0.5 → -6.02 dBFS ⇒ ~-9 dB GR ⇒ ~0.178.
+        assert!(
+            (tail / 0.1776 - 1.0).abs() < 0.02,
+            "expected the default curve to settle near 0.178, got {tail}"
+        );
     }
 }

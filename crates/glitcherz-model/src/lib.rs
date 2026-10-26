@@ -205,6 +205,151 @@ impl Default for DelayParams {
     }
 }
 
+/// Three-band EQ parameters (spec `effects.md` E2a; slot order matches the
+/// engine descriptor).
+///
+/// All gains are dB (`-18..18`), the corner/center frequencies Hz, `mid_q` the
+/// bell's quality factor and `low_cut` the high-pass corner. `low_cut` at
+/// [`EQ_LOW_CUT_OFF_HZ`] means "no low cut".
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EqParams {
+    /// Low-shelf gain (dB).
+    #[serde(default)]
+    pub low_gain: f32,
+    /// Low-shelf corner (Hz).
+    #[serde(default = "default_eq_low_freq")]
+    pub low_freq: f32,
+    /// Bell gain (dB).
+    #[serde(default)]
+    pub mid_gain: f32,
+    /// Bell center (Hz).
+    #[serde(default = "default_eq_mid_freq")]
+    pub mid_freq: f32,
+    /// Bell Q.
+    #[serde(default = "default_eq_mid_q")]
+    pub mid_q: f32,
+    /// High-shelf gain (dB).
+    #[serde(default)]
+    pub high_gain: f32,
+    /// High-shelf corner (Hz).
+    #[serde(default = "default_eq_high_freq")]
+    pub high_freq: f32,
+    /// Low-cut corner (Hz); `20` means off.
+    #[serde(default = "default_eq_low_cut")]
+    pub low_cut: f32,
+}
+
+/// `low_cut` value that means "no low cut" (mirrors the engine constant).
+pub const EQ_LOW_CUT_OFF_HZ: f32 = 20.0;
+
+fn default_eq_low_freq() -> f32 {
+    100.0
+}
+
+fn default_eq_mid_freq() -> f32 {
+    1_000.0
+}
+
+fn default_eq_mid_q() -> f32 {
+    1.0
+}
+
+fn default_eq_high_freq() -> f32 {
+    8_000.0
+}
+
+fn default_eq_low_cut() -> f32 {
+    EQ_LOW_CUT_OFF_HZ
+}
+
+impl Default for EqParams {
+    fn default() -> Self {
+        Self {
+            low_gain: 0.0,
+            low_freq: default_eq_low_freq(),
+            mid_gain: 0.0,
+            mid_freq: default_eq_mid_freq(),
+            mid_q: default_eq_mid_q(),
+            high_gain: 0.0,
+            high_freq: default_eq_high_freq(),
+            low_cut: default_eq_low_cut(),
+        }
+    }
+}
+
+/// Feed-forward peak compressor parameters (spec `effects.md` E2b; slot order
+/// matches the engine descriptor).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CompressorParams {
+    /// Threshold (dB).
+    #[serde(default = "default_comp_threshold")]
+    pub threshold: f32,
+    /// Compression ratio (`>= 1`).
+    #[serde(default = "default_comp_ratio")]
+    pub ratio: f32,
+    /// Attack time (ms).
+    #[serde(default = "default_comp_attack")]
+    pub attack: f32,
+    /// Release time (ms).
+    #[serde(default = "default_comp_release")]
+    pub release: f32,
+    /// Soft-knee width (dB, `0` = hard knee).
+    #[serde(default = "default_comp_knee")]
+    pub knee: f32,
+    /// Makeup gain (dB).
+    #[serde(default)]
+    pub makeup: f32,
+    /// Dry/wet mix (`1` = fully compressed).
+    #[serde(default = "default_mix_one")]
+    pub mix: f32,
+    /// Link both channels to one `max(|L|, |R|)` detector (D14).
+    #[serde(default = "default_true")]
+    pub stereo_link: bool,
+}
+
+fn default_comp_threshold() -> f32 {
+    -18.0
+}
+
+fn default_comp_ratio() -> f32 {
+    4.0
+}
+
+fn default_comp_attack() -> f32 {
+    10.0
+}
+
+fn default_comp_release() -> f32 {
+    100.0
+}
+
+fn default_comp_knee() -> f32 {
+    6.0
+}
+
+fn default_mix_one() -> f32 {
+    1.0
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for CompressorParams {
+    fn default() -> Self {
+        Self {
+            threshold: default_comp_threshold(),
+            ratio: default_comp_ratio(),
+            attack: default_comp_attack(),
+            release: default_comp_release(),
+            knee: default_comp_knee(),
+            makeup: 0.0,
+            mix: default_mix_one(),
+            stereo_link: default_true(),
+        }
+    }
+}
+
 /// Built-in effect kind (spec `.agents/spec/effects.md` D1).
 ///
 /// The wire format is the `kind` tag of [`EffectParams`]; this enum lets UI and
@@ -217,6 +362,10 @@ impl Default for DelayParams {
 pub enum BuiltinEffectKind {
     /// Feedback delay.
     Delay,
+    /// Three-band EQ with a low cut.
+    Eq,
+    /// Feed-forward peak compressor.
+    Compressor,
 }
 
 impl BuiltinEffectKind {
@@ -224,11 +373,17 @@ impl BuiltinEffectKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Delay => "Delay",
+            Self::Eq => "EQ",
+            Self::Compressor => "Compressor",
         }
     }
 
-    /// Every built-in kind, in menu order (E2+ appends here).
-    pub const ALL: &'static [BuiltinEffectKind] = &[BuiltinEffectKind::Delay];
+    /// Every built-in kind, in menu order.
+    pub const ALL: &'static [BuiltinEffectKind] = &[
+        BuiltinEffectKind::Delay,
+        BuiltinEffectKind::Eq,
+        BuiltinEffectKind::Compressor,
+    ];
 }
 
 /// Built-in effect parameter payload: **the tag is the kind**, so a node can
@@ -242,6 +397,10 @@ impl BuiltinEffectKind {
 pub enum EffectParams {
     /// Feedback delay.
     Delay(DelayParams),
+    /// Three-band EQ with a low cut (`Box` keeps `NodeDoc` small).
+    Eq(Box<EqParams>),
+    /// Feed-forward peak compressor.
+    Compressor(Box<CompressorParams>),
 }
 
 impl Default for EffectParams {
@@ -255,6 +414,8 @@ impl EffectParams {
     pub fn kind(&self) -> BuiltinEffectKind {
         match self {
             Self::Delay(_) => BuiltinEffectKind::Delay,
+            Self::Eq(_) => BuiltinEffectKind::Eq,
+            Self::Compressor(_) => BuiltinEffectKind::Compressor,
         }
     }
 
@@ -262,6 +423,7 @@ impl EffectParams {
     pub fn as_delay(&self) -> Option<&DelayParams> {
         match self {
             Self::Delay(params) => Some(params),
+            _ => None,
         }
     }
 
@@ -269,6 +431,39 @@ impl EffectParams {
     pub fn as_delay_mut(&mut self) -> Option<&mut DelayParams> {
         match self {
             Self::Delay(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// EQ parameters, when this is an EQ node.
+    pub fn as_eq(&self) -> Option<&EqParams> {
+        match self {
+            Self::Eq(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Mutable EQ parameters, when this is an EQ node.
+    pub fn as_eq_mut(&mut self) -> Option<&mut EqParams> {
+        match self {
+            Self::Eq(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Compressor parameters, when this is a compressor node.
+    pub fn as_compressor(&self) -> Option<&CompressorParams> {
+        match self {
+            Self::Compressor(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Mutable compressor parameters, when this is a compressor node.
+    pub fn as_compressor_mut(&mut self) -> Option<&mut CompressorParams> {
+        match self {
+            Self::Compressor(params) => Some(params),
+            _ => None,
         }
     }
 }
@@ -2663,6 +2858,59 @@ mod tests {
         assert!(!text.contains("delay:Some"), "legacy field written: {text}");
         let back: NodeDoc = ron::from_str(&text).expect("deserialize");
         assert_eq!(node, back);
+    }
+
+    // E2: every effect kind round-trips through the same tagged payload, and
+    // the tag always matches `kind()`.
+    #[test]
+    fn every_effect_kind_round_trips_with_its_tag() {
+        let cases = [
+            (EffectParams::Delay(super::DelayParams::default()), "delay"),
+            (EffectParams::Eq(Box::default()), "eq"),
+            (EffectParams::Compressor(Box::default()), "compressor"),
+        ];
+        for (params, tag) in cases {
+            let text = ron::to_string(&effect_node(params.clone())).expect("serialize");
+            assert!(
+                text.contains(&format!("kind:\"{tag}\"")),
+                "{tag} tag missing: {text}"
+            );
+            let back: NodeDoc = ron::from_str(&text).expect("deserialize");
+            match back {
+                NodeDoc::Effect { params: back, .. } => assert_eq!(back, params),
+                other => panic!("expected an effect node, got {other:?}"),
+            }
+        }
+    }
+
+    // E2: a payload written by a newer build without some fields still loads
+    // with the documented defaults (forward compatibility).
+    #[test]
+    fn partial_effect_payloads_take_their_defaults() {
+        let node: NodeDoc = ron::from_str(
+            r#"(type:"effect", node_id:3, track:0, voice:(type:"builtin"),
+                params:(kind:"compressor"))"#,
+        )
+        .expect("a bare compressor payload should parse");
+        let NodeDoc::Effect { params, .. } = node else {
+            panic!("expected an effect node");
+        };
+        let comp = params.as_compressor().expect("compressor payload");
+        assert_eq!(*comp, super::CompressorParams::default());
+        assert!(comp.stereo_link, "compression starts linked (D13)");
+
+        let node: NodeDoc = ron::from_str(
+            r#"(type:"effect", node_id:3, track:0, voice:(type:"builtin"),
+                params:(kind:"eq", low_gain:6.0))"#,
+        )
+        .expect("a partial EQ payload should parse");
+        let NodeDoc::Effect { params, .. } = node else {
+            panic!("expected an effect node");
+        };
+        let eq = params.as_eq().expect("eq payload");
+        assert_eq!(eq.low_gain, 6.0);
+        assert_eq!(eq.mid_q, 1.0);
+        assert_eq!(eq.low_cut, super::EQ_LOW_CUT_OFF_HZ);
     }
 
     // E1: a v7 node (sibling `delay` payload) still parses, and the migration

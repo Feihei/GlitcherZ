@@ -38,7 +38,7 @@ use glitcherz_engine::Sf2Error;
 use glitcherz_engine::Sf2Library;
 use glitcherz_engine::convert;
 use glitcherz_engine::realtime::{
-    AudioTrackProcessor, ChannelStripProcessor, Curve, DelayProcessor, EngineCommand,
+    AudioTrackProcessor, ChannelStripProcessor, Curve, EffectMeters, EngineCommand,
     FeedbackProcessor, MAX_AUTO_POINTS, MAX_CLIP_NOTES, MAX_MIDI_FANOUT, MAX_TRACK_CLIPS,
     MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent, ParamId, Processor,
     RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCurveInterp, RtMidiClip, RtNote,
@@ -820,6 +820,11 @@ pub struct GlitcherZApp {
     /// diagnostics/display only; actual parameter control still goes through
     /// the `PluginParam` bridge.
     voice_params: HashMap<u64, Vec<glitcherz_vst3_host::Vst3ParamInfo>>,
+    /// Meter handles of built-in effects that publish one (the compressor),
+    /// keyed by **document node_id**. The handle travels with the node: the
+    /// audio thread owns a clone, this map owns the other, and a recycled node
+    /// id can never read a stale meter (spec `effects.md` E2b).
+    effect_meters: HashMap<u64, std::sync::Arc<EffectMeters>>,
     /// Instrument CLAP parameter lists (read at instantiation), keyed by
     /// document node_id. Data source for automation cable targets; curve
     /// value semantics = raw plugin-range values.
@@ -999,6 +1004,7 @@ impl GlitcherZApp {
             picker_place: None,
             recent_plugins: ui_state.recent_plugins,
             voice_params: HashMap::new(),
+            effect_meters: HashMap::new(),
             clap_voice_params: HashMap::new(),
             clap_voice_values: HashMap::new(),
             vst3_voice_values: HashMap::new(),
@@ -1195,6 +1201,9 @@ impl GlitcherZApp {
         let sr = convert::sample_rate_to_f32(sample_rate);
         let doc_id = node.node_id();
         let track = node.track();
+        // Built-in effects that publish meters hand their handle back here; it
+        // is stored in `effect_meters` once the node is actually in the graph.
+        let mut effect_meter: Option<std::sync::Arc<EffectMeters>> = None;
         let (processor, guard, plugin_label): (Box<dyn Processor>, Option<PluginGuard>, String) =
             match node {
                 NodeDoc::Instrument { voice, .. } => match voice {
@@ -1353,9 +1362,13 @@ impl GlitcherZApp {
                         }
                     }
                 },
-                NodeDoc::Effect { voice, .. } => match voice {
+                NodeDoc::Effect { voice, params, .. } => match voice {
                     VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {
-                        (Box::new(DelayProcessor::new(sr)), None, String::new())
+                        // Kind-aware and seeded from the document (D15): a
+                        // restored EQ/compressor starts at its saved values.
+                        let built = crate::effect::processor(params, sr);
+                        effect_meter = built.meters;
+                        (built.processor, None, String::new())
                     }
                     VoiceSpec::Clap {
                         path,
@@ -1395,7 +1408,13 @@ impl GlitcherZApp {
                             }
                             Err(err) => {
                                 log::error!("Failed to instantiate CLAP effect {plugin_id}: {err}");
-                                (Box::new(DelayProcessor::new(sr)), None, String::new())
+                                // Fall back to the document's built-in payload
+                                // (a fresh effect node defaults to a delay).
+                                (
+                                    crate::effect::processor(params, sr).processor,
+                                    None,
+                                    String::new(),
+                                )
                             }
                         }
                     }
@@ -1439,7 +1458,11 @@ impl GlitcherZApp {
                             }
                             Err(err) => {
                                 log::error!("Failed to instantiate VST3 effect {class_id}: {err}");
-                                (Box::new(DelayProcessor::new(sr)), None, String::new())
+                                (
+                                    crate::effect::processor(params, sr).processor,
+                                    None,
+                                    String::new(),
+                                )
                             }
                         }
                     }
@@ -1505,6 +1528,9 @@ impl GlitcherZApp {
         };
         if self.engine.add_node(engine_id, kind, processor) {
             self.node_map.insert(doc_id, engine_id);
+            if let Some(meter) = effect_meter {
+                self.effect_meters.insert(doc_id, meter);
+            }
             if let Some(guard) = guard {
                 self.voice_guards.push(PluginGuardEntry {
                     node_id: engine_id,
@@ -2936,6 +2962,7 @@ impl GlitcherZApp {
             }
         }
         self.node_map.remove(&doc_id);
+        self.effect_meters.remove(&doc_id);
         if let Some(engine_id) = engine_id {
             self.retire_guard(engine_id);
         }
@@ -3637,9 +3664,9 @@ impl GlitcherZApp {
                     }
                 },
             },
-            NodeDoc::Effect { voice, .. } => match voice {
+            NodeDoc::Effect { voice, params, .. } => match voice {
                 VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {
-                    (Box::new(DelayProcessor::new(sr)), None)
+                    (crate::effect::processor(params, sr).processor, None)
                 }
                 VoiceSpec::Clap {
                     path,
@@ -3664,7 +3691,7 @@ impl GlitcherZApp {
                     }
                     Err(err) => {
                         log::error!("Export: CLAP effect {plugin_id} failed to spawn: {err}");
-                        (Box::new(DelayProcessor::new(sr)), None)
+                        (crate::effect::processor(params, sr).processor, None)
                     }
                 },
                 VoiceSpec::Vst3 {
@@ -3691,7 +3718,7 @@ impl GlitcherZApp {
                     }
                     Err(err) => {
                         log::error!("Export: VST3 effect {class_id} failed to spawn: {err}");
-                        (Box::new(DelayProcessor::new(sr)), None)
+                        (crate::effect::processor(params, sr).processor, None)
                     }
                 },
             },
@@ -4297,6 +4324,7 @@ impl GlitcherZApp {
                 .cables
                 .push(glitcherz_model::CableDoc::audio(in_from, out_to));
             self.node_map.remove(&effect_doc);
+            self.effect_meters.remove(&effect_doc);
             self.retire_guard(effect_engine);
             self.clap_effect_params.remove(&effect_doc);
             self.clap_effect_values.remove(&effect_doc);
@@ -6863,6 +6891,27 @@ impl GlitcherZApp {
             return;
         };
         let descriptor = crate::effect::descriptor(&initial);
+
+        // Gain-reduction row (E2b): only effects that publish meters have an
+        // entry in the map, so the row appears exactly where it makes sense.
+        if let Some(meters) = self.effect_meters.get(&doc_id) {
+            let reading = meters.read();
+            let reduction = (-reading.gr_db).max(0.0);
+            ui.horizontal(|ui| {
+                ui.label("GR");
+                ui.add(
+                    egui::ProgressBar::new((reduction / 24.0).clamp(0.0, 1.0))
+                        .desired_width(120.0)
+                        .text(format!("-{reduction:.1} dB")),
+                );
+                ui.label(format!(
+                    "peak {:.1} / {:.1} dB",
+                    level_db(reading.peak_l),
+                    level_db(reading.peak_r)
+                ));
+            });
+        }
+
         let slots = descriptor.params.len();
         let mut values: Vec<f32> = (0..slots)
             .map(|slot| crate::effect::value(&initial, slot as u8))
@@ -7486,6 +7535,7 @@ impl GlitcherZApp {
                 }
             }
             self.node_map.remove(doc_id);
+            self.effect_meters.remove(doc_id);
             // Node-keyed session caches (G4) go with the node.
             self.clap_effect_params.remove(doc_id);
             self.clap_effect_values.remove(doc_id);
