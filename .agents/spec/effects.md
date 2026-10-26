@@ -81,7 +81,7 @@ pub const MAX_EFFECT_PARAMS: usize = 12;
 /// One parameter's static metadata; **slot index = position in the slice**.
 pub struct ParamSpec {
     pub name: &'static str,      // English UI label ("threshold", "mix")
-    pub unit: Unit,              // Db | Hz | Ms | Ratio | Percent | Bool
+    pub unit: Unit,              // Db | Hz | Seconds | Ms | Ratio | Percent | Pan | Bool
     pub min: f32,
     pub max: f32,
     pub default: f32,
@@ -310,17 +310,17 @@ Master Limiter（前视，要吃 D16 的 `latency_samples`，并需要 PDC）。
 
 ## 10. 实现拆分
 
-- [ ] **E1 框架**（不改声音，全仓回归绿）
-  - [ ] engine：`realtime/effect/` 新模块（`mod.rs` / `smoothed.rs` / `bank.rs` / `descriptor.rs`），
+- [x] **E1 框架**（不改声音，全仓回归绿）
+  - [x] engine：`realtime/effect/` 新模块（`mod.rs` / `smoothed.rs` / `bank.rs` / `descriptor.rs`），
         `ParamId::BuiltinParam(u8)`，`Processor::latency_samples()` 默认 0
-  - [ ] `Smoothed` + `EffectParamBank` + descriptor 一致性测试（槽位界内、`min < default < max`、
+  - [x] `Smoothed` + `EffectParamBank` + descriptor 一致性测试（槽位界内、`min < default < max`、
         `Curve::Log ⇒ min > 0`、连续参数必须有 `smoothing_ms > 0`）
-  - [ ] `DelayProcessor` 迁到 `EffectParamBank`，旧 `ParamId::Delay*` 转发；`mix = 0` 直通与
+  - [x] `DelayProcessor` 迁到 `EffectParamBank`，旧 `ParamId::Delay*` 转发；`mix = 0` 直通与
         `single_tap_lands_at_configured_time` 等既有测试**一条不改**通过
-  - [ ] `GainProcessor` / `ChannelStripProcessor` 的 gain/pan 迁到 `Smoothed`（D8）
-  - [ ] model：`EffectParams` 枚举 + `legacy_delay` 桥 + `migrate_v7_to_v8` + `PROJECT_VERSION = 8`；
-        旧工程 fixture（v7 带 delay 载荷）加载后参数不丢
-  - [ ] UI：`effect_section`（表驱动滑条组）、inline 行由 descriptor 生成、
+  - [x] `GainProcessor` / `ChannelStripProcessor` 的 gain/pan 迁到 `Smoothed`（D8）
+  - [x] model：`EffectParams` 枚举 + `legacy_delay` 桥 + `migrate_v7_to_v8` + `PROJECT_VERSION = 8`；
+        旧工程 fixture（v7 带 delay 载荷）加载后参数不丢（`file.rs::v7_delay_payload_moves_into_effect_params`）
+  - [x] UI：`effect_section`（表驱动滑条组）、inline 行由 descriptor 生成、
         `Add ▸ Effect`/`Insert ▸ Effect` 菜单遍历效果器名册；`delay_sliders` / `DELAY_INLINE` / `InlineParam` 手写项退役
 - [ ] **E2** EQ-3 + Compressor（含 GR 表）
 - [ ] **E3** Reverb（FDN-8）
@@ -375,3 +375,18 @@ Master Limiter（前视，要吃 D16 的 `latency_samples`，并需要 PDC）。
 | 块率参数有 ≤2.7 ms 阶梯 | EQ 频点、压缩阈值在极快自动化下可能有轻微"台阶" | 若实测可闻 → 改块内线性插值参数 |
 | 联动切换不走交叉淡化 | 切换瞬间 GR 在 release 时间内收敛，可能有轻微电平跳变 | 若实测明显 → 加 5 ms 交叉淡化 |
 | 平滑对 `set_param` 一律生效（首次除外） | 自动化曲线极陡处会被 10 ms 平滑"抹圆" | 这类"瞬变"应改用 CC/事件而非参数——语义本就不同（见 `control-tracks.md` §3） |
+
+## 14. 实施勘误（E1）
+
+落地过程中与上文规格有出入、或规格未预见的点，按 `sample-player.md` 的惯例记在这里；
+**代码为准，本节的判断已回写进实现**。
+
+| # | 位置 | 规格原样 | 实际做法 | 原因 |
+| :-- | :-- | :-- | :-- | :-- |
+| 1 | `Unit` | 只有 `Ms` | 新增 `Unit::Seconds` 与 `ParamSpec::seconds()`，`Ms` 保留给"存储值就是毫秒"的参数（压缩器 attack/release） | Delay 的 `time_s` 存的是**秒**（0.005..1.0）。硬挂 `Unit::Ms` 会让 250 ms 的抽头显示成 "0.2 ms"。格式化按数量级切换：< 1 s 显示 ms，≥ 1 s 显示 s |
+| 2 | `Smoothed::tick` | `current += (target − current) · coeff` | 当 `current + delta·coeff == current` 时直接吸附到 `target` | **f32 精度停滞**：`delta·coeff` 跌到 state 半个 ULP 以下时加法恒等于自身，一阶低通会永久停在目标前 ~1e-5 处。测试 `replace_node_keeps_identity_and_recycles_old` 以 1e-6 容差暴露了它（停在 0.12500358） |
+| 3 | `delay_samples` | 未规定取整方式 | `(t · sr).round()` | 对数域平滑把时间过了 `ln`/`exp`，0.05 s × 48 kHz 会算成 2399.99…，截断后少一个样本，`channels_delay_independently` 直接失败 |
+| 4 | 既有测试 | 「一条不改」 | Delay / Gain 相关测试全部保持断言不变；**图级**测试（`master_gain_applies_after_summing` 等）加了"先跑若干块让平滑沉降"的循环 | D8 把推子/主增益也纳入平滑后，首块不再等于静态增益值——这是**规格想要的行为变化**，不是回归。改的是等待方式，不是期望值 |
+| 5 | `ParamSpec.short` | 未在 §5 列出 | 新增 `short` 字段（默认等于 `name`），`.short("fdbk")` 覆盖 | inline 行标签沿用既有 UI 约定（`time` / `fdbk` / `mix`），同时保持 descriptor 是唯一真源 |
+| 6 | `EffectDescriptor.kind` | §5 写了 `pub kind: BuiltinEffectKind` | 未加该字段；种类由 `BuiltinEffectKind::descriptor()` 反查 | 引擎侧 `descriptor` 已经挂在枚举的关联函数上，结构体再存一份会给出两个真源 |
+
