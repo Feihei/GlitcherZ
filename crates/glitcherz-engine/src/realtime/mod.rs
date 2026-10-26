@@ -74,7 +74,9 @@ pub use audio_track::{
     AUDIO_CLIP_TRASH_CAPACITY, AudioClipTable, AudioTrackProcessor, RtAudioClip,
     audio_clip_trash_channel, empty_clip_table,
 };
-pub use automation::{MAX_AUTO_POINTS, MAX_AUTO_TRACKS, RtAutoPoint, RtAutomation, RtControlClip};
+pub use automation::{
+    MAX_AUTO_POINTS, MAX_AUTO_TRACKS, RtAutoPoint, RtAutomation, RtControlClip, RtCurveInterp,
+};
 pub use block::{BlockRunner, Feedback};
 pub use buffer::AudioBuffer;
 pub use commands::{

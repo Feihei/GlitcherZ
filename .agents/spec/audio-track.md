@@ -43,7 +43,7 @@ arrangement 上混音"）没有载体——U5 解决的是"wav 当乐器弹"（n
 
 视图：timeline audio 行 → lane_row 泛型手势（Placement impl AudioClip
       免费：移动/resize/多选/split/duplicate）+ clip 体绘制回调画
-      peaks 波形列（视口裁剪同 curve_band 模式）
+      peaks 波形列（视口裁剪）
 ```
 
 ## 4. 实现拆分
@@ -93,6 +93,20 @@ arrangement 上混音"）没有载体——U5 解决的是"wav 当乐器弹"（n
 - **闭包波形源**：`TimelineParams.waveform_of` 是 `&dyn Fn(&str) ->
   Option<Arc<SampleData>>`（`SampleLibrary::get` 只读查找——帧内不解
   码，解码只在编辑路径）。
+- **patch 呈现层合并（2026-10-26）**：`NodeDoc::AudioTrack` 节点不再在
+  patch 里单独画框——它的输出端口折进 timeline node，端口序
+  **MIDI → Curve → Audio**（与 timeline tab 的三对增删按钮同序）。纯呈现
+  层合并：文档 / 引擎拓扑不变，音频仍由那个生成器节点产生信号。
+  - `ensure_positions` 跳过音频节点放置（不进 `positions`，故不绘制 /
+    不命中 / 不框选）；旧布局里的残留条目由同帧 `retain(wanted)` 剪掉。
+  - `patch_port_from(PortRef::Node(audio_id))` → timeline 的
+    `midi+auto+track` 号端口；`timeline_port_kind` 反向解码
+    （`TimelinePort::{Midi,Auto,Audio}`）。
+  - 从该端口拖出的 audio cable 仍以 `PortRef::Node(audio_id)` 记录，
+    drop 语义（mixer 通道 / master / effect 目标、in_port 选取）复用普通
+    节点出端口那条路径。
+  - timeline node 第三行 action `+ Audio` / `- Audio` 与 timeline tab 的
+    同名按钮走同一 `add_audio_track` / `remove_last_audio_track`。
 
 ## 5. 边界与明确不做
 

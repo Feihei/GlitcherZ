@@ -23,10 +23,23 @@ pub struct RtAutoPoint {
     pub value: f32,
 }
 
+/// Curve interpolation between anchors (U12; mirrors
+/// `glitcherz_model::CurveInterp`). The two sides must stay behaviorally
+/// identical — mirror tests assert the same sample points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RtCurveInterp {
+    /// Piecewise-linear segments (freehand / polyline).
+    #[default]
+    Linear,
+    /// Monotone cubic Hermite (Fritsch–Carlson / PCHIP style), overshoot-free.
+    Smooth,
+}
+
 /// An automation curve: **a pure anchor list** (D7, no embedded target parameter anymore).
 ///
-/// Anchors are sorted by tick ascending; values are linearly interpolated
-/// between adjacent anchors and held at the endpoint values outside the range.
+/// Anchors are sorted by tick ascending; values are interpolated between
+/// adjacent anchors (per [`RtCurveInterp`]) and held at the endpoint values
+/// outside the range.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RtAutomation {
     /// Whether enabled.
@@ -35,6 +48,8 @@ pub struct RtAutomation {
     pub points: [RtAutoPoint; MAX_AUTO_POINTS],
     /// Number of valid anchors.
     pub point_count: usize,
+    /// Interpolation between anchors (U12).
+    pub interp: RtCurveInterp,
 }
 
 impl Default for RtAutomation {
@@ -43,6 +58,7 @@ impl Default for RtAutomation {
             enabled: true,
             points: [RtAutoPoint::default(); MAX_AUTO_POINTS],
             point_count: 0,
+            interp: RtCurveInterp::Linear,
         }
     }
 }
@@ -63,34 +79,117 @@ impl RtAutomation {
 
     /// Returns the value at `tick` (a position already reduced modulo the
     /// clip's loop length).
-    /// Returns `None` for an empty/disabled curve; linear interpolation;
-    /// endpoint values held outside the range. RT-safe.
+    /// Returns `None` for an empty/disabled curve; interpolation follows
+    /// `self.interp`; endpoint values held outside the range. RT-safe: fixed
+    /// loops over pre-allocated memory, no allocation.
     pub fn value_at(&self, tick: f64) -> Option<f32> {
         if !self.is_active() {
             return None;
         }
-        let first = self.points[0];
-        let last = self.points[self.point_count - 1];
-        if tick <= f64::from(first.tick) {
-            return Some(first.value);
-        }
-        if tick >= f64::from(last.tick) {
-            return Some(last.value);
-        }
-        for window in self.points[..self.point_count].windows(2) {
-            let (a, b) = (window[0], window[1]);
-            if tick < f64::from(b.tick) {
-                let span = f64::from(b.tick) - f64::from(a.tick);
-                let ratio = if span > 0.0 {
-                    (tick - f64::from(a.tick)) / span
-                } else {
-                    0.0
-                };
-                return Some(a.value + (b.value - a.value) * ratio as f32);
-            }
-        }
-        Some(last.value)
+        sample_curve(&self.points[..self.point_count], self.interp, tick)
     }
+}
+
+/// Samples an ordered anchor slice at `tick` (mirror of
+/// `glitcherz_model::sample_curve`, U12). `None` for an empty slice;
+/// endpoint values held outside the range. RT-safe.
+fn sample_curve(points: &[RtAutoPoint], interp: RtCurveInterp, tick: f64) -> Option<f32> {
+    let first = *points.first()?;
+    let last = *points.last()?;
+    if tick <= f64::from(first.tick) {
+        return Some(first.value);
+    }
+    if tick >= f64::from(last.tick) {
+        return Some(last.value);
+    }
+    match interp {
+        RtCurveInterp::Linear => sample_linear(points, tick),
+        RtCurveInterp::Smooth => sample_smooth(points, tick),
+    }
+}
+
+/// Piecewise-linear segment lookup (the pre-U12 behavior).
+fn sample_linear(points: &[RtAutoPoint], tick: f64) -> Option<f32> {
+    for window in points.windows(2) {
+        let (a, b) = (window[0], window[1]);
+        if tick < f64::from(b.tick) {
+            let span = f64::from(b.tick) - f64::from(a.tick);
+            let ratio = if span > 0.0 {
+                (tick - f64::from(a.tick)) / span
+            } else {
+                0.0
+            };
+            return Some(a.value + (b.value - a.value) * ratio as f32);
+        }
+    }
+    points.last().map(|p| p.value)
+}
+
+/// One secant slope between two anchors (0 for a degenerate/duplicate tick).
+fn secant(a: RtAutoPoint, b: RtAutoPoint) -> f32 {
+    let h = f64::from(b.tick) - f64::from(a.tick);
+    if h <= 0.0 {
+        0.0
+    } else {
+        ((b.value - a.value) as f64 / h) as f32
+    }
+}
+
+/// Monotone-cubic (PCHIP / Fritsch–Carlson style) tangent at anchor `k`.
+/// Mirror of the model implementation; reads only `k-1..=k+1`.
+fn smooth_tangent(points: &[RtAutoPoint], k: usize) -> f32 {
+    let n = points.len();
+    if n < 2 {
+        return 0.0;
+    }
+    if k == 0 {
+        return secant(points[0], points[1]);
+    }
+    if k == n - 1 {
+        return secant(points[n - 2], points[n - 1]);
+    }
+    let d_prev = secant(points[k - 1], points[k]);
+    let d_next = secant(points[k], points[k + 1]);
+    if d_prev * d_next <= 0.0 {
+        return 0.0;
+    }
+    let h_prev = (f64::from(points[k].tick) - f64::from(points[k - 1].tick)) as f32;
+    let h_next = (f64::from(points[k + 1].tick) - f64::from(points[k].tick)) as f32;
+    let w1 = 2.0 * h_next + h_prev;
+    let w2 = h_next + 2.0 * h_prev;
+    let denom = w1 / d_prev + w2 / d_next;
+    if denom.abs() < f32::EPSILON {
+        0.0
+    } else {
+        (w1 + w2) / denom
+    }
+}
+
+/// Monotone cubic Hermite segment (U12 `Smooth`); falls back to linear on a
+/// degenerate (zero-width) segment.
+fn sample_smooth(points: &[RtAutoPoint], tick: f64) -> Option<f32> {
+    for i in 0..points.len().saturating_sub(1) {
+        let (a, b) = (points[i], points[i + 1]);
+        if tick >= f64::from(b.tick) {
+            continue;
+        }
+        let h = f64::from(b.tick) - f64::from(a.tick);
+        if h <= 0.0 {
+            return Some(a.value);
+        }
+        let t = ((tick - f64::from(a.tick)) / h) as f32;
+        let m0 = smooth_tangent(points, i);
+        let m1 = smooth_tangent(points, i + 1);
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+        let h10 = t3 - 2.0 * t2 + t;
+        let h01 = -2.0 * t3 + 3.0 * t2;
+        let h11 = t3 - t2;
+        let hf = h as f32;
+        return Some(h00 * a.value + h10 * hf * m0 + h01 * b.value + h11 * hf * m1);
+    }
+    points.last().map(|p| p.value)
 }
 
 /// A control (automation) clip placed on the arrangement timeline
@@ -148,7 +247,7 @@ impl RtControlClip {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_AUTO_POINTS, RtAutoPoint, RtAutomation, RtControlClip};
+    use super::{MAX_AUTO_POINTS, RtAutoPoint, RtAutomation, RtControlClip, RtCurveInterp};
 
     fn curve(points: &[(u32, f32)]) -> RtAutomation {
         let mut auto = RtAutomation {
@@ -171,6 +270,39 @@ mod tests {
         assert!((auto.value_at(48.0).unwrap() - 0.75).abs() < 1e-6);
         assert!((auto.value_at(1_000.0).unwrap()).abs() < 1e-6);
         assert!((auto.value_at(-5.0).unwrap() - 1.0).abs() < 1e-6);
+    }
+
+    /// U12: the default interpolation is `Linear` (old behavior), so an
+    /// unset curve samples exactly as before.
+    #[test]
+    fn default_interp_is_linear() {
+        assert_eq!(RtCurveInterp::default(), RtCurveInterp::Linear);
+        let auto = curve(&[(0, 1.0), (96, 0.5), (192, 0.0)]);
+        assert_eq!(auto.interp, RtCurveInterp::Linear);
+        assert!((auto.value_at(48.0).unwrap() - 0.75).abs() < 1e-6);
+    }
+
+    /// U12: `Smooth` is a monotone cubic — overshoot-free, hits the peak
+    /// anchor exactly, holds endpoints. This mirrors the model-side
+    /// `smooth_interp_is_overshoot_free_and_hits_anchors`.
+    #[test]
+    fn smooth_interp_is_overshoot_free_and_hits_anchors() {
+        let mut auto = curve(&[(0, 0.0), (50, 10.0), (100, 0.0)]);
+        auto.interp = RtCurveInterp::Smooth;
+        assert!((auto.value_at(-1.0).unwrap()).abs() < 1e-6, "head held");
+        assert!((auto.value_at(200.0).unwrap()).abs() < 1e-6, "tail held");
+        assert!(
+            (auto.value_at(50.0).unwrap() - 10.0).abs() < 1e-6,
+            "peak anchor hit exactly"
+        );
+        for k in 0..=400 {
+            let v = auto.value_at(f64::from(k) * 0.25).unwrap();
+            assert!(
+                (-1e-4..=10.0 + 1e-4).contains(&v),
+                "overshoot at tick {}: {v}",
+                f64::from(k) * 0.25
+            );
+        }
     }
 
     #[test]

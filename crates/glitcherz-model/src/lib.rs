@@ -721,6 +721,25 @@ impl AudioClip {
     }
 }
 
+/// How a control curve is interpolated between its anchors (U12, spec
+/// `.agents/spec/control-tracks.md` §8).
+///
+/// The editor offers three *input* tools (freehand draw / control-point
+/// polyline / control-point curve); only the last is a distinct data shape, so
+/// the mode is a single per-clip enum: `Linear` (freehand **and** polyline)
+/// vs `Smooth` (monotone cubic Hermite).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurveInterp {
+    /// Piecewise-linear segments between anchors (freehand / polyline).
+    #[default]
+    Linear,
+    /// Monotone cubic Hermite (Fritsch–Carlson / PCHIP style): smooth and
+    /// **overshoot-free** (a value never leaves the range of its two
+    /// bounding anchors), so it is safe for automation / CC / tempo.
+    Smooth,
+}
+
 /// A control (automation) clip placed on the arrangement timeline (D17).
 ///
 /// Same placement semantics as [`MidiClip`]; outside the span nothing is
@@ -740,6 +759,10 @@ pub struct ControlClip {
     /// Anchor curve (ticks relative to the clip start, ascending).
     #[serde(default)]
     pub curve: Vec<AutoPoint>,
+    /// Interpolation between anchors (U12; additive serde field, default
+    /// `Linear` — old documents read back with the original behavior).
+    #[serde(default)]
+    pub interp: CurveInterp,
 }
 
 impl Default for ControlClip {
@@ -749,6 +772,7 @@ impl Default for ControlClip {
             span_ticks: default_clip_span(),
             loop_ticks: default_clip_loop(),
             curve: Vec::new(),
+            interp: CurveInterp::default(),
         }
     }
 }
@@ -763,36 +787,12 @@ impl ControlClip {
     }
 
     /// Samples the value at a clip-relative tick: returns `None` when the
-    /// curve is empty; linear interpolation between anchors; clamps to the
-    /// endpoint values outside both ends. Requires anchors to be ordered
-    /// (editing interfaces maintain this).
+    /// curve is empty; otherwise the value is interpolated according to
+    /// [`ControlClip::interp`] and clamped to the endpoint values outside both
+    /// ends. Requires anchors to be ordered (editing interfaces maintain
+    /// this).
     pub fn value_at(&self, tick: f64) -> Option<f32> {
-        if self.curve.is_empty() {
-            return None;
-        }
-        let first = self.curve[0];
-        let last = *self.curve.last()?;
-        if tick <= f64::from(first.tick) {
-            return Some(first.value);
-        }
-        if tick >= f64::from(last.tick) {
-            return Some(last.value);
-        }
-        // Linear scan is enough: the number of anchors is finite, and the
-        // call frequency is once per block per curve.
-        for window in self.curve.windows(2) {
-            let (a, b) = (window[0], window[1]);
-            if tick < f64::from(b.tick) {
-                let span = f64::from(b.tick) - f64::from(a.tick);
-                let ratio = if span > 0.0 {
-                    (tick - f64::from(a.tick)) / span
-                } else {
-                    0.0
-                };
-                return Some(a.value + (b.value - a.value) * ratio as f32);
-            }
-        }
-        Some(last.value)
+        sample_curve(&self.curve, self.interp, tick)
     }
 
     /// Inserts or updates an anchor (overwrites the same tick), keeping
@@ -819,6 +819,115 @@ impl ControlClip {
         self.curve.remove(best);
         true
     }
+}
+
+/// Samples an ordered anchor list at `tick` (U12). `None` for an empty curve;
+/// endpoint values are held outside the range. The engine mirrors this
+/// exactly (`RtAutomation::value_at`) — the two must stay behaviorally
+/// identical (mirror tests assert the same sample points).
+pub fn sample_curve(points: &[AutoPoint], interp: CurveInterp, tick: f64) -> Option<f32> {
+    let first = *points.first()?;
+    let last = *points.last()?;
+    if tick <= f64::from(first.tick) {
+        return Some(first.value);
+    }
+    if tick >= f64::from(last.tick) {
+        return Some(last.value);
+    }
+    match interp {
+        CurveInterp::Linear => sample_linear(points, tick),
+        CurveInterp::Smooth => sample_smooth(points, tick),
+    }
+}
+
+/// Piecewise-linear segment lookup (the pre-U12 behavior).
+fn sample_linear(points: &[AutoPoint], tick: f64) -> Option<f32> {
+    for window in points.windows(2) {
+        let (a, b) = (window[0], window[1]);
+        if tick < f64::from(b.tick) {
+            let span = f64::from(b.tick) - f64::from(a.tick);
+            let ratio = if span > 0.0 {
+                (tick - f64::from(a.tick)) / span
+            } else {
+                0.0
+            };
+            return Some(a.value + (b.value - a.value) * ratio as f32);
+        }
+    }
+    points.last().map(|p| p.value)
+}
+
+/// One secant slope between two anchors (0 for a degenerate/duplicate tick).
+fn secant(a: AutoPoint, b: AutoPoint) -> f32 {
+    let h = f64::from(b.tick) - f64::from(a.tick);
+    if h <= 0.0 {
+        0.0
+    } else {
+        ((b.value - a.value) as f64 / h) as f32
+    }
+}
+
+/// Monotone-cubic (PCHIP / Fritsch–Carlson style) tangent at anchor `k`.
+///
+/// Interior tangents are the harmonically weighted mean of the adjacent
+/// secants (zero when their signs differ — that is what preserves
+/// monotonicity); endpoints use their single neighbouring secant. Only
+/// anchors `k-1..=k+1` are read, so Smooth stays a local, allocation-free
+/// function.
+fn smooth_tangent(points: &[AutoPoint], k: usize) -> f32 {
+    let n = points.len();
+    if n < 2 {
+        return 0.0;
+    }
+    if k == 0 {
+        return secant(points[0], points[1]);
+    }
+    if k == n - 1 {
+        return secant(points[n - 2], points[n - 1]);
+    }
+    let d_prev = secant(points[k - 1], points[k]);
+    let d_next = secant(points[k], points[k + 1]);
+    if d_prev * d_next <= 0.0 {
+        return 0.0;
+    }
+    let h_prev = (f64::from(points[k].tick) - f64::from(points[k - 1].tick)) as f32;
+    let h_next = (f64::from(points[k + 1].tick) - f64::from(points[k].tick)) as f32;
+    let w1 = 2.0 * h_next + h_prev;
+    let w2 = h_next + 2.0 * h_prev;
+    let denom = w1 / d_prev + w2 / d_next;
+    if denom.abs() < f32::EPSILON {
+        0.0
+    } else {
+        (w1 + w2) / denom
+    }
+}
+
+/// Monotone cubic Hermite segment (U12 `Smooth`): finds the segment holding
+/// `tick`, evaluates the standard cubic Hermite basis with the two bounding
+/// tangents. Falls back to linear on a degenerate (zero-width) segment.
+fn sample_smooth(points: &[AutoPoint], tick: f64) -> Option<f32> {
+    for i in 0..points.len().saturating_sub(1) {
+        let (a, b) = (points[i], points[i + 1]);
+        if tick >= f64::from(b.tick) {
+            continue;
+        }
+        let h = f64::from(b.tick) - f64::from(a.tick);
+        if h <= 0.0 {
+            return Some(a.value);
+        }
+        let t = ((tick - f64::from(a.tick)) / h) as f32;
+        let m0 = smooth_tangent(points, i);
+        let m1 = smooth_tangent(points, i + 1);
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+        let h10 = t3 - 2.0 * t2 + t;
+        let h01 = -2.0 * t3 + 3.0 * t2;
+        let h11 = t3 - t2;
+        let hf = h as f32;
+        return Some(h00 * a.value + h10 * hf * m0 + h01 * b.value + h11 * hf * m1);
+    }
+    points.last().map(|p| p.value)
 }
 
 /// Node voice: built-in (synthesizer/delay) or CLAP / VST3 plugin.
@@ -2928,6 +3037,7 @@ mod tests {
                     tick: 0,
                     value: 1.0,
                 }],
+                ..super::ControlClip::default()
             }],
         });
         // Control track 0 → global mixer (channel 0 gain).
@@ -3259,6 +3369,94 @@ mod tests {
             clip.value_at(48.0).is_none(),
             "empty curve produces no automation"
         );
+    }
+
+    /// U12: `Smooth` is a monotone cubic — the value never leaves the range of
+    /// its two bounding anchors (no overshoot), the peak anchor is hit
+    /// exactly, and endpoints are held outside the curve.
+    #[test]
+    fn smooth_interp_is_overshoot_free_and_hits_anchors() {
+        let clip = super::ControlClip {
+            interp: super::CurveInterp::Smooth,
+            curve: vec![
+                AutoPoint {
+                    tick: 0,
+                    value: 0.0,
+                },
+                AutoPoint {
+                    tick: 50,
+                    value: 10.0,
+                },
+                AutoPoint {
+                    tick: 100,
+                    value: 0.0,
+                },
+            ],
+            ..super::ControlClip::default()
+        };
+        assert!((clip.value_at(-1.0).unwrap()).abs() < 1e-6, "head held");
+        assert!((clip.value_at(200.0).unwrap()).abs() < 1e-6, "tail held");
+        assert!(
+            (clip.value_at(50.0).unwrap() - 10.0).abs() < 1e-6,
+            "peak anchor hit exactly"
+        );
+        for k in 0..=400 {
+            let v = clip.value_at(f64::from(k) * 0.25).unwrap();
+            assert!(
+                (-1e-4..=10.0 + 1e-4).contains(&v),
+                "overshoot at tick {}: {v}",
+                k as f64 * 0.25
+            );
+        }
+    }
+
+    /// U12: a monotone rising anchor set stays monotone under `Smooth`
+    /// (samples increase between consecutive anchors).
+    #[test]
+    fn smooth_interp_preserves_monotonicity() {
+        let clip = super::ControlClip {
+            interp: super::CurveInterp::Smooth,
+            curve: vec![
+                AutoPoint {
+                    tick: 0,
+                    value: 0.0,
+                },
+                AutoPoint {
+                    tick: 96,
+                    value: 3.0,
+                },
+                AutoPoint {
+                    tick: 192,
+                    value: 4.0,
+                },
+            ],
+            ..super::ControlClip::default()
+        };
+        let mut prev = clip.value_at(0.0).unwrap();
+        for k in 1..=192 {
+            let v = clip.value_at(f64::from(k)).unwrap();
+            assert!(v >= prev - 1e-5, "dip at tick {k}: {prev} -> {v}");
+            prev = v;
+        }
+        assert!((v_at(&clip, 192.0) - 4.0).abs() < 1e-6);
+    }
+
+    fn v_at(clip: &super::ControlClip, tick: f64) -> f32 {
+        clip.value_at(tick).unwrap()
+    }
+
+    /// U12: the new field is additive — an old document without `interp`
+    /// reads back as the original (`Linear`) behavior, and the default clip
+    /// carries `Linear`.
+    #[test]
+    fn curve_interp_defaults_to_linear_for_old_documents() {
+        assert_eq!(
+            super::ControlClip::default().interp,
+            super::CurveInterp::Linear
+        );
+        let ron = "(start_ticks:0,span_ticks:384,loop_ticks:384,curve:[(tick:0,value:1.0)])";
+        let clip: super::ControlClip = ron::from_str(ron).expect("legacy clip parses");
+        assert_eq!(clip.interp, super::CurveInterp::Linear);
     }
 
     #[test]

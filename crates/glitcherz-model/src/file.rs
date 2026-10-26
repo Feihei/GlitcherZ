@@ -158,6 +158,7 @@ mod tests {
                     tick: 0,
                     value: 1.0,
                 }],
+                ..crate::ControlClip::default()
             }],
         });
         let mixer = project.graph.first_mixer().unwrap().node_id();

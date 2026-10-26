@@ -39,8 +39,8 @@
 | D6 | **支持 CLAP 与 SoundFont，VST3 明确不支持** | CLAP 走 `MidiEvent::new(0, 0, [0xB0\|ch, cc, val])`（raw MIDI 1.0）；SF2 走 `process_midi_message(ch, 0xB0, cc, val)`。VST3 在 `vst3-0.3.0` 里 `DataEvent` 只有 `kMidiSysEx`，而 SDK 的 `kLegacyMIDICCOutEvent` 是**输出**事件，用作出生事件属于未定义行为——与其发一个插件大概会忽略的事件，不如诚实地返回 `false`（UI 在目标选择器里标注 `(CLAP/SF2)`）。VST3 用户走插件参数自动化。内置合成器没有 CC 映射，返回 `false`。 |
 | D7 | **值域就是 0..127，不归一化** | 曲线里存真实 CC 值（`AutoPoint.value` 0..127），与 `FilterCutoff` 存 Hz 同构；纵轴线性、中线 64。不让用户面对"0..1 对应 0..127"的二次换算。 |
 | D8 | **模型校验：CC 只能落在节点上，`Tempo` 只能落在 `Timeline In`** | `CableKind::Automation` 的目标是 `TimelineIn` 时 `param` 必须是 `Tempo`；目标是 `Node` 时 `param` 不得是 `Tempo`（`Cc` 在此合法）。`channel` 存 0..=15，UI 显示 1..=16（MIDI 惯例）；`controller` 0..=127，越界在 `AutoParam::new_cc` 处钳制。 |
-| D9 | **U4b：曲线展开在所选控制行下方** | 选中控制轨的行时，紧贴该行下插入一条 `LANE_HEIGHT` 高的曲线带（横跨整个 arrangement 宽度，含 header 列的轴标签）。带内按**绝对 tick** 绘制：每个 clip 在自己的 span 内把曲线按其 `loop_ticks` 重复铺开（与音频实际播出的完全一致）；点击/拖拽映射到"该 tick 所属 clip 的 loop 内 tick"（吸附 `TICKS_PER_STEP/2`），右键删除该 clip 内最近的锚点。点在没有任何 clip 的位置不做任何事并给状态提示。 |
-| D10 | **Edit tab 的曲线浮窗退休** | `EditTarget::Control` 删除，`control_editor_body` 整段删除。双击 control clip = 选中该轨（展开曲线带），不再切 Edit tab；Edit tab 只剩钢琴卷帘（`EditTarget::Midi`）。曲线**只有一个编辑入口**（inline 带），避免两套拖拽状态。 |
+| D9 | **U4b：曲线展开在所选控制行下方**（**已由 U12 §8 取代**） | 选中控制轨的行时，紧贴该行下插入一条 `LANE_HEIGHT` 高的曲线带（横跨整个 arrangement 宽度，含 header 列的轴标签）。带内按**绝对 tick** 绘制：每个 clip 在自己的 span 内把曲线按其 `loop_ticks` 重复铺开（与音频实际播出的完全一致）；点击/拖拽映射到"该 tick 所属 clip 的 loop 内 tick"（吸附 `TICKS_PER_STEP/2`），右键删除该 clip 内最近的锚点。点在没有任何 clip 的位置不做任何事并给状态提示。 |
+| D10 | **Edit tab 的曲线浮窗退休**（**已由 U12 §8 取代**） | `EditTarget::Control` 删除，`control_editor_body` 整段删除。双击 control clip = 选中该轨（展开曲线带），不再切 Edit tab；Edit tab 只剩钢琴卷帘（`EditTarget::Midi`）。曲线**只有一个编辑入口**（inline 带），避免两套拖拽状态。 |
 
 ## 5. 投递路径（U4a）
 
@@ -71,3 +71,23 @@ UI ──cable(Cc{ch,cc})→ engine.set_auto_cc_route(index, node_id, ch, cc)
 
 - **clip 级 CC 事件（`Sequence.ctrls`）仍无引擎通路**：M1.3 的模型与 piano roll 编辑已就位，但 `RtMidiClip` 只有 notes，CC 到不了插件。这与 U4 的曲线 CC 是两条独立来源（一种是"写在 clip 里的事件"，一种是"曲线采样的流"），落地时共用 `Processor::midi_cc` 即可，但需要 sequencer 侧按 tick 排序调度，单独立项。
 - **CC 曲线的平滑**：v1 是台阶（块级 + 7bit）。若插件对台阶敏感，可在量化前做一阶低通（需要每轨状态），留给实际听感反馈。
+## 8. U12（2026-10-26）：曲线编辑迁入 Edit tab + 曲线类型
+
+> **取代 D9 / D10**。U4b 把曲线编辑做成 timeline 内联可编辑带；用户实测后改为：曲线在 Edit tab（与钢琴卷帘同一个编辑器面板）编辑，timeline 上只留只读预览；并新增两种控制点曲线形态。
+
+| # | 决策 | 内容 |
+| :-- | :-- | :-- |
+| D11 | **每 clip 一个插值方式** | `ControlClip.interp: CurveInterp`（`Linear` 默认 / `Smooth`）。serde 加性字段，`PROJECT_VERSION` 不变（同 U6 的 `audio_tracks` 先例）。`Linear` = 现状分段线性；`Smooth` = **单调三次 Hermite**（Fritsch–Carlson / PCHIP 风格：内部切线取相邻割线的加权调和平均，端点取端割线，保证**不过冲**）。 |
+| D12 | **model / engine 数学同构 + 镜像测试** | `ControlClip::value_at`（model，`Vec`）与 `RtAutomation::value_at`（engine，定容数组）各自实现同一套 `interp` 采样；两边测试用同一组样例断言逐点相等（沿用现有 `value_at_matches_model_semantics` 的镜像方式）。RT：纯函数、无分配（Smooth 每段独立求切线，最多看 4 个邻居点）。 |
+| D13 | **timeline 内联可编辑带退役** | 删除 `curve_band`（可拖锚点那一版）与 `CurvePoint` / `CurveRemove` / `CurveDragEnd` 动作、`timeline_curve_point` / `timeline_curve_remove`、`TimelineState::curve_drag`。改为在每个 **control clip 块内部**绘制**只读**曲线预览（和 audio 的 waveform 预览同层同风格，对齐其它轨道行；不再多出一行 `CURVE_BAND_HEIGHT`）。 |
+| D14 | **双击 curve clip → Edit tab 曲线编辑器** | 新增 `TimelineAction::OpenControlEditor { track, clip }`（取代 `ShowControlCurve`）。`edit_clip` 升级为区分轨种的 `EditTarget::{Midi{track,clip}, Control{track,clip}}`；`edit_panel` 按 target 分派 `midi_editor_body` / 新 `control_editor_body`。 |
+| D15 | **编辑器三种工具** | `Draw`（freehand 直接绘多点，写 `Linear`）、`Line`（控制点折线，写 `Linear`）、`Curve`（控制点曲线，写 `Smooth`）。工具是**交互模式**（不持久化），`interp` 是持久化数据。锚点编辑沿用既有守卫/命令路径（一步 undo；拖动用 `execute_merged`/`begin_param_edit` 合并）。 |
+
+### 采样约定
+
+- 锚点按 tick 升序（编辑接口维持）；空曲线返回 `None`。
+- 区间外**保持端点值**（与现状一致）。
+- `Smooth` 每段 Hermite：`h = x₁−x₀, t = (x−x₀)/h`，切线 `m₀/m₁` 由相邻割线决定：
+  - 内部点 `m_i = (w₁+w₂)/(w₁/d_{i−1} + w₂/d_i)`，`w₁ = 2h_i + h_{i−1}`，`w₂ = h_i + 2h_{i−1}`；相邻割线异号或为 0 → `m_i = 0`（保单调）。
+  - 端点 `m₀ = d₀`，`m_{n−1} = d_{n−2}`。
+  - `value = h₀₀y₀ + h₁₀·h·m₀ + h₀₁y₁ + h₁₁·h·m₁`（标准三次 Hermite 基）。

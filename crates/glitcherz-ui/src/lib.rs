@@ -41,11 +41,12 @@ use glitcherz_engine::realtime::{
     AudioTrackProcessor, ChannelStripProcessor, DelayProcessor, EngineCommand, FeedbackProcessor,
     MAX_AUTO_POINTS, MAX_CLIP_NOTES, MAX_MIDI_FANOUT, MAX_TRACK_CLIPS,
     MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent, ParamId, Processor,
-    RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtMidiClip, RtNote, SAMPLE_DEFAULT_ROOT,
-    SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor, SynthProcessor, empty_clip_table,
+    RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCurveInterp, RtMidiClip, RtNote,
+    SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor, SynthProcessor,
+    empty_clip_table,
 };
 use glitcherz_model::{
-    AutoParam, AutoPoint, CableKind, ControlClip, ControlTrack, DelayParams, GraphDoc,
+    AutoParam, AutoPoint, CableKind, ControlClip, ControlTrack, CurveInterp, DelayParams, GraphDoc,
     MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_MIDI_TRACKS,
     MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip, MidiSource, MidiTrack,
     NodeDoc, PortRef, Project, SamplePlayMode, SongLoop, SynthParams, VoiceSpec,
@@ -210,6 +211,15 @@ fn cc_label(controller: u8, channel: u8) -> String {
     match name {
         Some(name) => format!("CC {controller} {name} · ch {}", channel + 1),
         None => format!("CC {controller} · ch {}", channel + 1),
+    }
+}
+
+/// Document curve interpolation → engine mirror (U12). The two enums are
+/// structurally identical; this is the one conversion point.
+fn rt_curve_interp(interp: CurveInterp) -> RtCurveInterp {
+    match interp {
+        CurveInterp::Linear => RtCurveInterp::Linear,
+        CurveInterp::Smooth => RtCurveInterp::Smooth,
     }
 }
 
@@ -623,9 +633,9 @@ enum MainView {
     /// Arrangement timeline (default view: the DAW's home screen).
     #[default]
     Timeline,
-    /// Piano roll for the targeted MIDI clip; double-clicking a MIDI clip in
-    /// the timeline jumps here. Control curves have no view of their own —
-    /// they are edited in the timeline's inline band (U4b D10).
+    /// Piano roll (MIDI clip) or curve editor (control clip) for the targeted
+    /// clip; double-clicking a timeline clip jumps here (U12: control clips
+    /// have their own curve editor here again).
     Edit,
     /// Node patch graph (full-height, dedicated view).
     Patch,
@@ -664,6 +674,48 @@ enum ConfirmChoice {
     Cancel,
 }
 
+/// Which clip the Edit tab is targeting (U12: it hosts both the MIDI piano
+/// roll and the control curve editor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditTarget {
+    /// MIDI clip (piano roll).
+    Midi { track: usize, clip: usize },
+    /// Control clip (curve editor).
+    Control { track: usize, clip: usize },
+}
+
+/// Curve editor input tool (U12, spec `control-tracks.md` §8 D15). Transient
+/// (never persisted): the persisted data is `ControlClip::interp`, which the
+/// tool selects — `Draw`/`Line` write `Linear`, `Curve` writes `Smooth`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CurveTool {
+    /// Control-point polyline (discrete points, straight segments).
+    #[default]
+    Line,
+    /// Freehand multi-point draw.
+    Draw,
+    /// Control-point smooth curve (monotone cubic).
+    Curve,
+}
+
+impl CurveTool {
+    /// The interpolation this tool writes into the document.
+    fn interp(self) -> CurveInterp {
+        match self {
+            CurveTool::Draw | CurveTool::Line => CurveInterp::Linear,
+            CurveTool::Curve => CurveInterp::Smooth,
+        }
+    }
+
+    /// The tool matching a clip's persisted interpolation.
+    fn of(interp: CurveInterp) -> Self {
+        match interp {
+            CurveInterp::Linear => CurveTool::Line,
+            CurveInterp::Smooth => CurveTool::Curve,
+        }
+    }
+}
+
 /// Main window app. Owns the [`AudioEngine`]: closing the window drops the engine and stops the
 /// audio stream.
 pub struct GlitcherZApp {
@@ -684,10 +736,14 @@ pub struct GlitcherZApp {
     selected_audio: usize,
     /// Arrangement timeline cross-frame state (zoom/drag).
     timeline_state: timeline::TimelineState,
-    /// Which MIDI clip the Edit tab is targeting, as `(track, clip)`
-    /// (`None` = closed). Control clips have no editor view: their curve
-    /// lives in the timeline's inline band (U4b D10).
-    edit_clip: Option<(usize, usize)>,
+    /// Which clip the Edit tab is targeting (`None` = closed). The target kind
+    /// picks the editor (MIDI piano roll vs control curve, U12).
+    edit_clip: Option<EditTarget>,
+    /// Curve editor tool (U12; transient input mode, not persisted).
+    curve_tool: CurveTool,
+    /// Anchor tick currently being dragged in the curve editor (U12; `None`
+    /// = no drag). The anchor's tick is its identity while it moves.
+    curve_drag: Option<u32>,
     /// Piano roll cross-frame state (scroll/drag).
     roll_state: piano_roll::RollState,
     /// Hover-follow keyboard focus arbiter (Blender-style context; see
@@ -914,6 +970,8 @@ impl GlitcherZApp {
             selected_audio: 0,
             timeline_state: timeline::TimelineState::default(),
             edit_clip: None,
+            curve_tool: CurveTool::default(),
+            curve_drag: None,
             roll_state: piano_roll::RollState::new(),
             focus_router: focus::FocusRouter::new(),
             patch_state: patch::PatchState::default(),
@@ -1891,7 +1949,10 @@ impl GlitcherZApp {
         // content is truncated, the document validator rejects it on save).
         let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
         for (slot, clip) in clips.iter_mut().zip(track.clips.iter()) {
-            let mut curve = RtAutomation::default();
+            let mut curve = RtAutomation {
+                interp: rt_curve_interp(clip.interp),
+                ..RtAutomation::default()
+            };
             for point in clip.curve.iter().take(MAX_AUTO_POINTS) {
                 curve.push(RtAutoPoint {
                     tick: point.tick,
@@ -1953,6 +2014,7 @@ impl GlitcherZApp {
     fn graph_patch(&mut self, ui: &mut egui::Ui) {
         let track_count = self.project().midi_tracks.len();
         let auto_count = self.project().control_tracks.len();
+        let audio_count = self.project().audio_tracks.len();
         let actions = {
             // Borrow splitting: an immutable snapshot (document / plugin param tables) goes to
             // the patch while the mutable patch state is borrowed separately; actions are
@@ -2082,6 +2144,7 @@ impl GlitcherZApp {
                     doc,
                     track_count,
                     auto_count,
+                    audio_count,
                     auto_options: &options,
                     plugin_inline: &plugin_inline,
                 },
@@ -2209,6 +2272,8 @@ impl GlitcherZApp {
                 patch::PatchAction::RemoveLastMidiTrack => self.remove_last_midi_track(),
                 patch::PatchAction::AddControlTrack => self.add_control_track(),
                 patch::PatchAction::RemoveControlTrack => self.remove_control_track(),
+                patch::PatchAction::AddAudioTrack => self.add_audio_track(),
+                patch::PatchAction::RemoveLastAudioTrack => self.remove_last_audio_track(),
                 patch::PatchAction::AddMixerSlot(mixer_doc) => {
                     self.mixer_add_channel(mixer_doc);
                 }
@@ -2930,7 +2995,7 @@ impl GlitcherZApp {
     pub fn undo(&mut self) {
         // Undo/redo invalidates every held index: drag, selection, marquee.
         self.roll_state.clear_gesture();
-        self.timeline_state.set_curve_drag(None);
+
         if self.session.undo() {
             // Undo can restore any kind of edit (a deleted node, a rerouted
             // cable), so the engine gets the full rebuild, not just clip
@@ -2945,7 +3010,7 @@ impl GlitcherZApp {
     pub fn redo(&mut self) {
         // Undo/redo invalidates every held index: drag, selection, marquee.
         self.roll_state.clear_gesture();
-        self.timeline_state.set_curve_drag(None);
+
         if self.session.redo() {
             self.apply_document();
         } else {
@@ -3767,7 +3832,10 @@ impl GlitcherZApp {
             };
             let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
             for (slot, clip) in clips.iter_mut().zip(control_track.clips.iter()) {
-                let mut curve = RtAutomation::default();
+                let mut curve = RtAutomation {
+                    interp: rt_curve_interp(clip.interp),
+                    ..RtAutomation::default()
+                };
                 for point in clip.curve.iter().take(MAX_AUTO_POINTS) {
                     curve.push(RtAutoPoint {
                         tick: point.tick,
@@ -4767,9 +4835,12 @@ impl GlitcherZApp {
         let selected_track = self.selected_track;
         let selected_auto = self.selected_auto;
         let selected_audio = self.selected_audio;
-        let edit_target = self
-            .edit_clip
-            .map(|(track, clip)| timeline::EditHighlight { track, clip });
+        let edit_target = self.edit_clip.and_then(|t| match t {
+            EditTarget::Midi { track, clip } => Some(timeline::EditHighlight { track, clip }),
+            // The MIDI row consumes this outline; a control target has no
+            // MIDI outline (its curve editor is separate, U12).
+            EditTarget::Control { .. } => None,
+        });
         // U4b: the selected control track's endpoint parameter drives the
         // inline band's vertical axis. Read before the destructuring below.
         let curve_param = self.project().graph.auto_endpoint(selected_auto);
@@ -4848,26 +4919,16 @@ impl GlitcherZApp {
                 self.set_edit_target(track, clip);
                 self.view = MainView::Edit;
             }
-            // U4b D10: a control clip has no editor view. Double-clicking it
-            // opens the inline curve band under its own row instead.
-            timeline::TimelineAction::ShowControlCurve { track } => {
+            // U12: a control clip opens the Edit tab's curve editor.
+            timeline::TimelineAction::OpenControlEditor { track, clip } => {
                 self.selected_auto = track;
-                self.edit_clip = None;
-            }
-            timeline::TimelineAction::CurvePoint {
-                track,
-                clip,
-                from,
-                tick,
-                value,
-                dragging,
-            } => self.timeline_curve_point(track, clip, from, tick, value, dragging),
-            timeline::TimelineAction::CurveDragEnd => self.end_param_edit(),
-            timeline::TimelineAction::CurveRemove { track, clip, tick } => {
-                self.timeline_curve_remove(track, clip, tick)
+                self.set_control_edit_target(track, clip);
+                self.view = MainView::Edit;
             }
             timeline::TimelineAction::AddMidiTrack => self.add_midi_track(),
             timeline::TimelineAction::RemoveLastMidiTrack => self.remove_last_midi_track(),
+            timeline::TimelineAction::AddControlTrack => self.add_control_track(),
+            timeline::TimelineAction::RemoveControlTrack => self.remove_control_track(),
             timeline::TimelineAction::AddAudioTrack => self.add_audio_track(),
             timeline::TimelineAction::RemoveLastAudioTrack => self.remove_last_audio_track(),
             timeline::TimelineAction::ReorderMidiTrack { from, to } => {
@@ -5249,12 +5310,12 @@ impl GlitcherZApp {
         }
     }
 
-    /// U4b inline curve band: insert an anchor, or move the one at `from` to
+    /// Curve editor (U12): inserts an anchor, or moves the one at `from` to
     /// `tick` (one frame of a drag).
     ///
     /// `dragging` frames go through the merged undo gesture (one Ctrl+Z for a
     /// whole drag); a click lands a single step.
-    fn timeline_curve_point(
+    fn curve_upsert(
         &mut self,
         track: usize,
         clip: usize,
@@ -5272,8 +5333,8 @@ impl GlitcherZApp {
         else {
             return;
         };
-        // Anchors are stored in loop space: the band repeats them across the
-        // clip, so a tick past the loop would neither draw nor play.
+        // Anchors live in loop space: a tick past the loop would neither draw
+        // nor play.
         let tick = tick.min(loop_ticks - 1);
         let before = self.begin_edit();
         let curve = &mut self.project_mut().control_tracks[track].clips[clip];
@@ -5293,9 +5354,9 @@ impl GlitcherZApp {
         self.send_control_clips(track);
     }
 
-    /// U4b inline curve band: right-click deletes the nearest anchor within
-    /// half a snap step of `tick` (clip-relative).
-    fn timeline_curve_remove(&mut self, track: usize, clip: usize, tick: u32) {
+    /// Curve editor: right-click deletes the nearest anchor within half a snap
+    /// step of `tick` (clip-relative).
+    fn curve_remove_point(&mut self, track: usize, clip: usize, tick: u32) {
         let before = self.begin_edit();
         let removed = self
             .project_mut()
@@ -5307,6 +5368,31 @@ impl GlitcherZApp {
             self.commit_edit("Delete Anchor", before);
             self.send_control_clips(track);
         }
+    }
+
+    /// Curve editor: sets a clip's interpolation (U12). One undo step; a no-op
+    /// when the value is unchanged.
+    fn set_clip_interp(&mut self, track: usize, clip: usize, interp: CurveInterp) {
+        let current = self
+            .project()
+            .control_tracks
+            .get(track)
+            .and_then(|t| t.clips.get(clip))
+            .map(|c| c.interp);
+        if current == Some(interp) {
+            return;
+        }
+        let before = self.begin_edit();
+        if let Some(target) = self
+            .project_mut()
+            .control_tracks
+            .get_mut(track)
+            .and_then(|t| t.clips.get_mut(clip))
+        {
+            target.interp = interp;
+        }
+        self.commit_edit("Curve Type", before);
+        self.send_control_clips(track);
     }
 
     /// Deletes every clip in the list as ONE undo step. Per track the
@@ -5716,9 +5802,9 @@ impl GlitcherZApp {
             });
             return;
         };
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let (track, clip) = target;
-            self.midi_editor_body(ui, track, clip);
+        egui::ScrollArea::vertical().show(ui, |ui| match target {
+            EditTarget::Midi { track, clip } => self.midi_editor_body(ui, track, clip),
+            EditTarget::Control { track, clip } => self.control_editor_body(ui, track, clip),
         });
     }
 
@@ -7411,7 +7497,7 @@ impl GlitcherZApp {
         self.project_mut().midi_tracks.pop();
         self.selected_track = self.selected_track.min(last.saturating_sub(1));
         // The editor may have targeted the removed track's clip.
-        if let Some((track, _)) = self.edit_clip
+        if let Some(EditTarget::Midi { track, .. }) = self.edit_clip
             && track == last
         {
             self.edit_clip = None;
@@ -7601,7 +7687,7 @@ impl GlitcherZApp {
         if self.selected_track < len {
             self.selected_track = perm[self.selected_track];
         }
-        if let Some((track, _)) = &mut self.edit_clip
+        if let Some(EditTarget::Midi { track, .. }) = &mut self.edit_clip
             && *track < len
         {
             *track = perm[*track];
@@ -7620,7 +7706,276 @@ impl GlitcherZApp {
     /// being edited.
     fn set_edit_target(&mut self, track: usize, clip: usize) {
         self.roll_state.clear_gesture();
-        self.edit_clip = Some((track, clip));
+        self.edit_clip = Some(EditTarget::Midi { track, clip });
+    }
+
+    /// Points the Edit tab at the control clip `(track, clip)` and syncs the
+    /// transient curve tool to the clip's persisted interpolation (U12).
+    fn set_control_edit_target(&mut self, track: usize, clip: usize) {
+        self.curve_tool = self
+            .project()
+            .control_tracks
+            .get(track)
+            .and_then(|t| t.clips.get(clip))
+            .map(|c| CurveTool::of(c.interp))
+            .unwrap_or_default();
+        self.edit_clip = Some(EditTarget::Control { track, clip });
+    }
+
+    /// Body of the curve editor (Edit tab, U12): edits the anchors of the
+    /// targeted control clip. The canvas shows **one loop period** (anchors
+    /// are loop-relative); the interpolation follows the selected tool
+    /// (Draw/Line → Linear, Curve → Smooth).
+    fn control_editor_body(&mut self, ui: &mut egui::Ui, track: usize, clip_index: usize) {
+        if self.project().control_tracks.is_empty() {
+            // The target track was removed underneath the editor.
+            self.edit_clip = None;
+            return;
+        }
+        let sel = track.min(self.project().control_tracks.len() - 1);
+        if self.project().control_tracks[sel].clips.is_empty() {
+            let before = self.begin_edit();
+            let bar = self.project().ticks_per_bar();
+            let mut clip = ControlClip::new(0);
+            clip.span_ticks = bar;
+            clip.loop_ticks = bar;
+            self.project_mut().control_tracks[sel].clips.push(clip);
+            self.commit_edit("New Clip", before);
+            self.send_control_clips(sel);
+        }
+        let clip_count = self.project().control_tracks[sel].clips.len();
+        let clip_index = if clip_index < clip_count {
+            clip_index
+        } else {
+            0
+        };
+
+        // ---- Header: identity + clip navigation + tool selector ----
+        let name = if self.project().control_tracks[sel].name.is_empty() {
+            format!("Curve {}", sel + 1)
+        } else {
+            self.project().control_tracks[sel].name.clone()
+        };
+        let mut goto: Option<usize> = None;
+        let mut tool_pick: Option<CurveTool> = None;
+        let curve_tool = self.curve_tool;
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{name} · clip {} (of {clip_count})",
+                clip_index + 1
+            ));
+            if ui
+                .add_enabled(clip_index > 0, egui::Button::new("←"))
+                .on_hover_text("Previous clip")
+                .clicked()
+            {
+                goto = Some(clip_index - 1);
+            }
+            if ui
+                .add_enabled(clip_index + 1 < clip_count, egui::Button::new("→"))
+                .on_hover_text("Next clip")
+                .clicked()
+            {
+                goto = Some(clip_index + 1);
+            }
+            ui.separator();
+            for (tool, label, hover) in [
+                (CurveTool::Draw, "Draw", "Freehand draw (linear)"),
+                (
+                    CurveTool::Line,
+                    "Line",
+                    "Control points, straight segments (linear)",
+                ),
+                (
+                    CurveTool::Curve,
+                    "Curve",
+                    "Control points, smooth monotone curve",
+                ),
+            ] {
+                if ui
+                    .selectable_label(curve_tool == tool, label)
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    tool_pick = Some(tool);
+                }
+            }
+        });
+        if let Some(next) = goto {
+            self.set_control_edit_target(sel, next);
+            return;
+        }
+        if let Some(tool) = tool_pick {
+            self.curve_tool = tool;
+            self.set_clip_interp(sel, clip_index, tool.interp());
+        }
+
+        // ---- Snapshot the clip (avoid holding a borrow of `self` across the
+        // widget calls below) ----
+        let param = self.project().graph.auto_endpoint(sel);
+        let (min, max, log) = param.as_ref().map_or((0.0, 1.0, false), crate::curve::axis);
+        let (loop_ticks, interp, curve) = {
+            let clip = &self.project().control_tracks[sel].clips[clip_index];
+            (clip.loop_ticks.max(1), clip.interp, clip.curve.clone())
+        };
+        let axis_label = param
+            .as_ref()
+            .map(crate::patch::auto_param_label)
+            .unwrap_or_else(|| "not connected".to_string());
+
+        // ---- Canvas ----
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width().max(200.0), 320.0),
+            egui::Sense::click_and_drag(),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(20, 22, 26));
+        let inner = rect.shrink(2.0);
+        let value_y =
+            |v: f32| inner.bottom() - crate::curve::to_norm(v, min, max, log) * inner.height();
+        let y_value =
+            |y: f32| crate::curve::from_norm((inner.bottom() - y) / inner.height(), min, max, log);
+        let x_at = |tick: f32| inner.left() + (tick / loop_ticks as f32) * inner.width();
+        let tick_at = |x: f32| (x - inner.left()) / inner.width() * loop_ticks as f32;
+
+        // Vertical grid (quarter notes) + value midline.
+        let quarter = glitcherz_model::TICKS_PER_QUARTER.max(1);
+        let mut t = 0u32;
+        while t < loop_ticks {
+            let x = x_at(t as f32);
+            painter.line_segment(
+                [egui::pos2(x, inner.top()), egui::pos2(x, inner.bottom())],
+                egui::Stroke::new(1.0, egui::Color32::from_gray(38)),
+            );
+            t += quarter;
+        }
+        let mid = crate::curve::from_norm(0.5, min, max, log);
+        painter.line_segment(
+            [
+                egui::pos2(inner.left(), value_y(mid)),
+                egui::pos2(inner.right(), value_y(mid)),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(46)),
+        );
+        painter.text(
+            egui::pos2(inner.left() + 4.0, inner.top() + 2.0),
+            egui::Align2::LEFT_TOP,
+            format!("{axis_label} · {min:.0}…{max:.0}"),
+            egui::FontId::proportional(11.0),
+            egui::Color32::from_gray(150),
+        );
+
+        // Curve, sampled with the **same** math the engine uses.
+        let color = egui::Color32::from_rgb(150, 200, 250);
+        let mut prev: Option<egui::Pos2> = None;
+        let mut x = inner.left();
+        while x <= inner.right() {
+            let phase = f64::from(tick_at(x).max(0.0));
+            if let Some(v) = glitcherz_model::sample_curve(&curve, interp, phase) {
+                let p = egui::pos2(x, value_y(v));
+                if let Some(prev) = prev {
+                    painter.line_segment([prev, p], egui::Stroke::new(2.0, color));
+                }
+                prev = Some(p);
+            }
+            x += 1.5;
+        }
+        // Anchors.
+        for a in &curve {
+            let p = egui::pos2(x_at(a.tick as f32), value_y(a.value));
+            painter.circle_filled(p, 4.0, egui::Color32::WHITE);
+            painter.circle_stroke(p, 4.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
+        }
+
+        // ---- Interaction ----
+        let snap = crate::curve::SNAP_TICKS.max(1);
+        let mapped = |pos: egui::Pos2| -> (u32, f32) {
+            let phase = tick_at(pos.x).max(0.0);
+            let tick = ((phase / snap as f32).round() as u32) * snap;
+            (tick.min(loop_ticks.saturating_sub(1)), y_value(pos.y))
+        };
+        let hit_anchor = |pos: egui::Pos2| -> Option<u32> {
+            curve
+                .iter()
+                .find(|a| {
+                    let p = egui::pos2(x_at(a.tick as f32), value_y(a.value));
+                    (pos - p).length() <= 8.0
+                })
+                .map(|a| a.tick)
+        };
+
+        let pointer = response.interact_pointer_pos();
+        let started = response.drag_started_by(egui::PointerButton::Primary);
+        let mut pending: Option<(Option<u32>, u32, f32, bool)> = None;
+        let mut remove: Option<u32> = None;
+        let mut drag_end = false;
+        if curve_tool == CurveTool::Draw {
+            if response.dragged_by(egui::PointerButton::Primary)
+                && let Some(pos) = pointer
+            {
+                let (tick, value) = mapped(pos);
+                pending = Some((None, tick, value, true));
+            } else if response.clicked_by(egui::PointerButton::Primary)
+                && let Some(pos) = pointer
+            {
+                let (tick, value) = mapped(pos);
+                pending = Some((None, tick, value, false));
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                drag_end = true;
+            }
+        } else {
+            if started && let Some(pos) = pointer {
+                let (tick, value) = mapped(pos);
+                let from = hit_anchor(pos);
+                self.curve_drag = Some(tick);
+                pending = Some((from, tick, value, true));
+            }
+            if response.clicked_by(egui::PointerButton::Primary)
+                && let Some(pos) = pointer
+                && hit_anchor(pos).is_none()
+            {
+                let (tick, value) = mapped(pos);
+                pending = Some((None, tick, value, false));
+            }
+            if !started
+                && response.dragged_by(egui::PointerButton::Primary)
+                && let Some(pos) = pointer
+                && self.curve_drag.is_some()
+            {
+                let (tick, value) = mapped(pos);
+                pending = Some((self.curve_drag, tick, value, true));
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary)
+                && self.curve_drag.take().is_some()
+            {
+                drag_end = true;
+            }
+        }
+        if response.secondary_clicked()
+            && let Some(pos) = pointer
+        {
+            let (tick, _) = mapped(pos);
+            remove = Some(tick);
+        }
+
+        // ---- Apply ----
+        if let Some((from, tick, value, dragging)) = pending {
+            if curve_tool == CurveTool::Draw && interp != CurveInterp::Linear {
+                self.set_clip_interp(sel, clip_index, CurveInterp::Linear);
+            }
+            self.curve_upsert(sel, clip_index, from, tick, value, dragging);
+            if dragging && curve_tool != CurveTool::Draw {
+                self.curve_drag = Some(tick);
+            }
+        }
+        if let Some(tick) = remove {
+            self.curve_remove_point(sel, clip_index, tick);
+        }
+        if drag_end {
+            self.end_param_edit();
+        }
+        ui.weak("Click to add an anchor · drag to move · right-click to delete · Draw paints as you drag");
     }
 
     /// Body of the piano-roll editor (Edit tab): edits the targeted clip,

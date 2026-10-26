@@ -52,13 +52,6 @@ const LOOP_EDGE_GRAB: f32 = 5.0;
 const MARKER_GRAB: f32 = 6.0;
 /// Half-width of the grab zone at a clip's right edge (resize handle).
 const EDGE_GRAB: f32 = 6.0;
-/// Height of the inline curve band (U4b) that opens under the selected
-/// control row. Taller than a row on purpose: a 28 px strip cannot show a
-/// usable value range.
-pub const CURVE_BAND_HEIGHT: f32 = 84.0;
-/// Anchor hit tolerance inside the curve band (pixels).
-const CURVE_HIT_X: f32 = 6.0;
-const CURVE_HIT_Y: f32 = 8.0;
 
 /// Accent color for selected clips (matches the roll's selection family).
 const SELECTED: Color32 = Color32::from_rgb(240, 190, 80);
@@ -273,10 +266,7 @@ pub struct TimelineState {
     /// Last frame's scroll viewport origin (screen coordinates) — the
     /// anchor math for pointer-anchored horizontal zoom.
     rows_viewport_min: Pos2,
-    /// Inline curve band drag (U4b): `(clip index, current anchor tick)`. The
-    /// tick is the anchor's identity while it moves — the document re-sorts
-    /// the curve on every edit, so an index would go stale between frames.
-    curve_drag: Option<(usize, u32)>,
+
     /// Track-reorder drag (header grab handle): the MIDI track index the
     /// grab started on.
     reorder: Option<usize>,
@@ -303,7 +293,6 @@ impl Default for TimelineState {
             modal_cancel: false,
             rows_rect: None,
             rows_viewport_min: Pos2::ZERO,
-            curve_drag: None,
             reorder: None,
             loop_drag: None,
         }
@@ -311,13 +300,6 @@ impl Default for TimelineState {
 }
 
 impl TimelineState {
-    /// Feeds back the anchor being dragged in the inline curve band (U4b):
-    /// the document re-sorts the curve on every edit, so the caller hands the
-    /// anchor's new tick back after applying the intent.
-    pub fn set_curve_drag(&mut self, drag: Option<(usize, u32)>) {
-        self.curve_drag = drag;
-    }
-
     /// Whether a lane row owns keyboard focus *right now*, per egui (no
     /// frame lag, no staleness once the timeline stops being laid out).
     ///
@@ -459,33 +441,18 @@ pub enum TimelineAction {
         track: usize,
         clip: usize,
     },
-    /// Double-click on a control clip: select that control track so its
-    /// inline curve band opens (U4b D10 — no separate editor view anymore).
-    ShowControlCurve {
-        track: usize,
-    },
-    /// Inline curve band: insert an anchor, or move the one identified by
-    /// `from` to `tick` (one frame of a drag; `dragging` asks the caller to
-    /// merge the gesture into one undo step).
-    CurvePoint {
+    /// Double-click on a control clip: open it in the Edit tab's curve editor
+    /// (U12, spec `control-tracks.md` §8 D14).
+    OpenControlEditor {
         track: usize,
         clip: usize,
-        from: Option<u32>,
-        tick: u32,
-        value: f32,
-        dragging: bool,
-    },
-    /// The inline curve band's drag ended: close the merged undo gesture.
-    CurveDragEnd,
-    /// Inline curve band right-click: delete the anchor nearest to `tick`
-    /// (clip-relative).
-    CurveRemove {
-        track: usize,
-        clip: usize,
-        tick: u32,
     },
     AddMidiTrack,
     RemoveLastMidiTrack,
+    /// Add a control (curve) track. One undo step.
+    AddControlTrack,
+    /// Remove the selected control (curve) track. One undo step.
+    RemoveControlTrack,
     /// Add an audio track (U6): document track + generator node + mixer
     /// channel wiring, one undo step.
     AddAudioTrack,
@@ -497,8 +464,9 @@ pub enum TimelineAction {
 }
 
 /// The MIDI clip currently open in the Edit tab, outlined on the timeline so
-/// a double-click gives immediate visual feedback. Control clips have no
-/// editor view (U4b D10), so there is nothing to outline for them.
+/// a double-click gives immediate visual feedback. Control clips edit their
+/// curve in the Edit tab too (U12) but the outline is MIDI-only, so
+/// `edit_target` is `None` for a control target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EditHighlight {
     pub track: usize,
@@ -1108,8 +1076,32 @@ pub fn show(
                 state.px_per_bar = (state.px_per_bar * 1.3).min(PX_PER_BAR_MAX);
             }
             ui.separator();
-            if ui.button("+ Track").clicked() {
+            // Three track kinds, each with an add / remove pair — the same
+            // rows (and order) the patch timeline node exposes: MIDI, then
+            // Curve, then Audio.
+            if ui.button("+ MIDI").on_hover_text("Add a MIDI track").clicked() {
                 actions.push(TimelineAction::AddMidiTrack);
+            }
+            if ui
+                .button("- MIDI")
+                .on_hover_text("Remove the last MIDI track")
+                .clicked()
+            {
+                actions.push(TimelineAction::RemoveLastMidiTrack);
+            }
+            if ui
+                .button("+ Curve")
+                .on_hover_text("Add a control (curve) track")
+                .clicked()
+            {
+                actions.push(TimelineAction::AddControlTrack);
+            }
+            if ui
+                .button("- Curve")
+                .on_hover_text("Remove the selected curve track")
+                .clicked()
+            {
+                actions.push(TimelineAction::RemoveControlTrack);
             }
             if ui.button("+ Audio").on_hover_text("Add an audio track").clicked() {
                 actions.push(TimelineAction::AddAudioTrack);
@@ -1120,9 +1112,6 @@ pub fn show(
                 .clicked()
             {
                 actions.push(TimelineAction::RemoveLastAudioTrack);
-            }
-            if ui.button("- Track").clicked() {
-                actions.push(TimelineAction::RemoveLastMidiTrack);
             }
             ui.separator();
             // Every variable hint must live INSIDE this child ui. Drawn in
@@ -1459,6 +1448,7 @@ pub fn show(
                 highlight,
                 &|clip| format!("{} notes", clip.notes().len()),
                 &|_| None,
+                &|_, _, _| {},
             );
         }
 
@@ -1471,8 +1461,9 @@ pub fn show(
                     index: i,
                     selected: p.selected_auto == i,
                 };
-                // U4b: a control clip is never "open in an editor" — the
-                // inline band below is the editor.
+                // U12: no inline editor band anymore — the curve is edited in
+                // the Edit tab, and a read-only preview is drawn on each clip
+                // block (same row as every other track kind).
                 let highlight = None;
                 lane_row(
                     ui,
@@ -1500,25 +1491,8 @@ pub fn show(
                         }
                     },
                     &|_| None,
+                    &|clip, painter, rect| draw_control_preview(painter, rect, clip, p.curve_param),
                 );
-                // U4b: the selected control track opens its curve band right
-                // under its own row (LMMS song-editor semantics). The band
-                // lines up with the clip lane above via the row's lane rect.
-                if p.selected_auto == i {
-                    let lane_left = geom.last().map_or(0.0, |(_, lane)| lane.left());
-                    curve_band(
-                        ui,
-                        state,
-                        &mut actions,
-                        i,
-                        track,
-                        lane_left,
-                        content_px,
-                        px_per_tick,
-                        bar_ticks,
-                        p.curve_param,
-                    );
-                }
             }
         }
 
@@ -1561,6 +1535,7 @@ pub fn show(
                     // Adapt the path-keyed lookup (TimelineParams) to the
                     // clip-keyed parameter lane_row takes.
                     &|clip: &AudioClip| (p.waveform_of)(&clip.path),
+                    &|_, _, _| {},
                 );
             }
         }
@@ -1952,6 +1927,9 @@ fn lane_row<T: Placement>(
     // Waveform source for the clip bodies (U6): `Some` renders peaks
     // columns instead of the flat fill. MIDI/control rows pass `&|_| None`.
     waveform_of: &dyn Fn(&T) -> Option<std::sync::Arc<glitcherz_engine::SampleData>>,
+    // Optional per-clip body decoration drawn over the clip block (U12: the
+    // read-only control curve preview). MIDI/audio rows pass a no-op.
+    clip_body: &dyn Fn(&T, &egui::Painter, Rect),
 ) {
     // The row's widget ids must be STABLE. The lane is the keyboard focus
     // carrier, and egui auto ids are positional: anything above the rows
@@ -2130,6 +2108,8 @@ fn lane_row<T: Placement>(
         if let Some(data) = waveform_of(clip) {
             draw_waveform(&painter, rect, &data, colors.clip_stroke);
         }
+        // U12: per-clip preview drawn over the block (control curve).
+        clip_body(clip, &painter, rect);
         if state.selection.contains(&ClipSel {
             lane: lane_kind,
             track,
@@ -2216,6 +2196,7 @@ fn lane_row<T: Placement>(
 
     // Double-click: open the clip's editor, or insert a new clip on empty
     // space. Not while a modal owns the pointer.
+
     if response.double_clicked() && state.modal.is_none() {
         if let Some(pos) = response.interact_pointer_pos() {
             let tick = tick_at(pos.x);
@@ -2225,13 +2206,12 @@ fn lane_row<T: Placement>(
                         track: t,
                         clip: index,
                     }),
-                    // U4b D10: the curve lives inline under the row, so a
-                    // double-click only has to select the track (and say so
-                    // when the curve is not visible yet because another
-                    // control row was expanded).
-                    RowKind::Control(t) => {
-                        actions.push(TimelineAction::ShowControlCurve { track: t })
-                    }
+                    // U12: a control clip's curve is edited in the Edit tab (no
+                    // inline band anymore).
+                    RowKind::Control(t) => actions.push(TimelineAction::OpenControlEditor {
+                        track: t,
+                        clip: index,
+                    }),
                     // U6 D2: audio clips have no editor — the double-click
                     // selects the track (highlight + `- Audio` target).
                     RowKind::Audio(t) => {
@@ -2705,333 +2685,43 @@ pub(crate) fn track_permutation(len: usize, from: usize, to: usize) -> Vec<usize
         .collect()
 }
 
-/// One clip's curve in **loop space**: a flat leading tail from 0 to the
-/// first anchor, the anchors, and a flat trailing tail to the loop end.
+/// Draws a read-only curve preview inside one control clip block (U12).
 ///
-/// The engine clamps the curve outside both ends (`ControlClip::value_at`), so
-/// the drawing and the sound must show the same shape — without the tails a
-/// curve whose first anchor sits at beat 2 would look like it starts there.
-fn loop_space_curve(clip: &ControlClip) -> Vec<(f32, f32)> {
-    let loop_ticks = clip.loop_ticks.max(1) as f32;
-    let mut points: Vec<(f32, f32)> = Vec::with_capacity(clip.curve.len() + 2);
-    if let Some(first) = clip.curve.first()
-        && first.tick > 0
-    {
-        points.push((0.0, first.value));
-    }
-    for point in &clip.curve {
-        let tick = point.tick as f32;
-        if tick < loop_ticks {
-            points.push((tick, point.value));
-        }
-    }
-    if let Some((tick, value)) = points.last().copied()
-        && tick < loop_ticks
-    {
-        points.push((loop_ticks, value));
-    }
-    points
-}
-
-/// Maps an offset (ticks) inside a clip to the **loop-relative** anchor tick.
-///
-/// Repeats fold back into the loop (`rel % loop_ticks`), so the anchor edited
-/// is the one drawn under the pointer however many times the clip repeats;
-/// the tick snaps to the anchor step and stays strictly inside the loop (a
-/// tick at the loop end would never draw).
-fn loop_tick_at(rel: f32, loop_ticks: u32) -> u32 {
-    let loop_ticks = loop_ticks.max(1);
-    let in_loop = (rel.max(0.0) as u32) % loop_ticks;
-    let snap = crate::curve::SNAP_TICKS.max(1);
-    let snapped = ((in_loop as f32 / snap as f32).round() as u32) * snap;
-    snapped.min(loop_ticks - 1)
-}
-
-/// Inline curve band of the selected control track (U4b, spec
-/// `control-tracks.md` D9).
-///
-/// Absolute ticks on the x axis: each clip repeats its curve over its span by
-/// `loop_ticks` — the same repetition the engine plays — and edits map back to
-/// the **loop-relative** tick of the clip under the pointer, so the document
-/// format is untouched. Clicks on empty arrangement (no clip) do nothing.
-#[allow(clippy::too_many_arguments)]
-fn curve_band(
-    parent: &mut egui::Ui,
-    state: &mut TimelineState,
-    actions: &mut Vec<TimelineAction>,
-    track_index: usize,
-    track: &ControlTrack,
-    lane_left: f32,
-    content_px: f32,
-    px_per_tick: f32,
-    bar_ticks: u32,
+/// The preview samples the clip's curve with the **same** interpolation the
+/// engine uses (`glitcherz_model::sample_curve`) and tiles it over the clip's
+/// span by `loop_ticks` — exactly what plays, mirrored on the block. There is
+/// no editing here: anchors are edited in the Edit tab (spec §8 D14).
+fn draw_control_preview(
+    painter: &egui::Painter,
+    rect: Rect,
+    clip: &ControlClip,
     param: Option<&AutoParam>,
 ) {
-    // Indent to the lane column so the band lines up with the clip row above
-    // (the header column stays empty — its label is drawn inside the band).
-    let cursor_left = parent.cursor().min.x;
-    if lane_left > cursor_left {
-        parent.add_space(lane_left - cursor_left);
+    if clip.curve.is_empty() || clip.span_ticks == 0 || rect.width() < 6.0 || rect.height() < 6.0 {
+        return;
     }
-    let (rect, response) = parent.allocate_exact_size(
-        egui::vec2(content_px, CURVE_BAND_HEIGHT),
-        Sense::click_and_drag(),
-    );
-    let painter = parent.painter_at(rect);
-    let visible = parent.clip_rect();
-    painter.rect_filled(rect, 2.0, Color32::from_gray(15));
-
-    // Vertical axis: the endpoint parameter's own range (0..127 for a CC,
-    // Hz for the cutoff, ...). An uncabled track shows a normalized 0..1 axis
-    // and says so instead of pretending a range.
     let (min, max, log) = param.map_or((0.0, 1.0, false), crate::curve::axis);
-    let value_y = |value: f32| {
-        rect.bottom() - crate::curve::to_norm(value, min, max, log) * CURVE_BAND_HEIGHT
-    };
-    let y_value =
-        |y: f32| crate::curve::from_norm((rect.bottom() - y) / CURVE_BAND_HEIGHT, min, max, log);
-
-    // Bar grid (viewport-culled) + value midline.
-    let bar_px = px_per_tick * bar_ticks as f32;
-    if bar_px > 6.0 {
-        let first = ((visible.left() - rect.left()) / bar_px).floor().max(0.0) as u32;
-        let last = ((visible.right() - rect.left()) / bar_px).ceil().max(0.0) as u32;
-        for bar in first..=last {
-            let x = rect.left() + bar as f32 * bar_px;
-            painter.line_segment(
-                [pos2(x, rect.top()), pos2(x, rect.bottom())],
-                Stroke::new(1.0, Color32::from_gray(30)),
-            );
-        }
-    }
-    let mid = crate::curve::from_norm(0.5, min, max, log);
-    painter.line_segment(
-        [
-            pos2(rect.left(), value_y(mid)),
-            pos2(rect.right(), value_y(mid)),
-        ],
-        Stroke::new(1.0, Color32::from_gray(38)),
-    );
-
-    // Curve per clip, repeated over the span.
-    let curve_color = Color32::from_rgb(120, 180, 240);
-    for clip in &track.clips {
-        if clip.span_ticks == 0 {
-            continue;
-        }
-        let start = clip.start_ticks;
-        let end = start + clip.span_ticks;
-        let x0 = rect.left() + start as f32 * px_per_tick;
-        let x1 = rect.left() + end as f32 * px_per_tick;
-        if x1 < visible.left() || x0 > visible.right() {
-            continue;
-        }
-        painter.rect_filled(
-            Rect::from_min_max(
-                pos2(x0 + 1.0, rect.top() + 1.0),
-                pos2(x1 - 1.0, rect.bottom() - 1.0),
-            ),
-            2.0,
-            Color32::from_gray(23),
-        );
-        let points = loop_space_curve(clip);
-        if points.len() < 2 {
-            continue;
-        }
-        let loop_ticks = clip.loop_ticks.max(1);
-        let loop_px = loop_ticks as f32 * px_per_tick;
-        let mut base = start;
-        while base < end {
-            let base_x = rect.left() + base as f32 * px_per_tick;
-            // Cull repeats outside the viewport: a 256-bar span with a
-            // one-bar loop would otherwise emit thousands of segments.
-            if base_x + loop_px < visible.left() || base_x > visible.right() {
-                base += loop_ticks;
-                continue;
+    let height = rect.height() - 2.0;
+    let value_y =
+        |value: f32| rect.bottom() - 1.0 - crate::curve::to_norm(value, min, max, log) * height;
+    let color = Color32::from_rgb(150, 200, 250);
+    let span = f64::from(clip.span_ticks.max(1));
+    let span_px = rect.width();
+    let loop_ticks = f64::from(clip.loop_ticks.max(1));
+    let mut prev: Option<Pos2> = None;
+    let mut x = rect.left();
+    while x <= rect.right() + 0.5 {
+        let offset = (f64::from(x - rect.left()) / f64::from(span_px)) * span;
+        let phase = offset.rem_euclid(loop_ticks);
+        if let Some(value) = glitcherz_model::sample_curve(&clip.curve, clip.interp, phase) {
+            let p = pos2(x, value_y(value));
+            if let Some(prev) = prev {
+                painter.line_segment([prev, p], Stroke::new(1.5, color));
             }
-            let repeat_end = (base + loop_ticks).min(end) as f32;
-            for window in points.windows(2) {
-                let t0 = base as f32 + window[0].0;
-                let t1 = base as f32 + window[1].0;
-                if t0 >= repeat_end {
-                    break;
-                }
-                // The last repeat of a shortened clip cuts the tail.
-                let (t1, v1) = if t1 > repeat_end {
-                    let k = (repeat_end - t0) / (t1 - t0).max(1e-6);
-                    (repeat_end, window[0].1 + (window[1].1 - window[0].1) * k)
-                } else {
-                    (t1, window[1].1)
-                };
-                painter.line_segment(
-                    [
-                        pos2(rect.left() + t0 * px_per_tick, value_y(window[0].1)),
-                        pos2(rect.left() + t1 * px_per_tick, value_y(v1)),
-                    ],
-                    Stroke::new(1.5, curve_color),
-                );
-            }
-            base += loop_ticks;
+            prev = Some(p);
         }
-        // Anchor dots, but only when the loop is wide enough to read: at
-        // 14 px per bar a 100-anchor curve would be a solid smear.
-        if loop_px >= 40.0 {
-            let mut base = start;
-            while base < end {
-                // Same viewport cull as the segments above.
-                let base_x = rect.left() + base as f32 * px_per_tick;
-                if base_x + loop_px < visible.left() || base_x > visible.right() {
-                    base += loop_ticks;
-                    continue;
-                }
-                for point in &clip.curve {
-                    if point.tick >= clip.loop_ticks.max(1) {
-                        continue;
-                    }
-                    let x = rect.left() + (base + point.tick) as f32 * px_per_tick;
-                    painter.circle_filled(
-                        pos2(x, value_y(point.value)),
-                        2.5,
-                        Color32::from_rgb(150, 200, 250),
-                    );
-                }
-                base += loop_ticks;
-            }
-        }
+        x += 2.0;
     }
-
-    // Labels: what this axis means, in the band's top-left corner.
-    let axis_label = match param {
-        Some(param) => crate::patch::auto_param_label(param),
-        None => "not connected".to_string(),
-    };
-    painter.text(
-        pos2(rect.left() + 6.0, rect.top() + 3.0),
-        Align2::LEFT_TOP,
-        axis_label,
-        FontId::proportional(10.0),
-        Color32::from_gray(150),
-    );
-    painter.text(
-        pos2(rect.left() + 6.0, rect.bottom() - 3.0),
-        Align2::LEFT_BOTTOM,
-        format!("{min:.0}…{max:.0}"),
-        FontId::proportional(9.0),
-        Color32::from_gray(90),
-    );
-
-    // ---- Interaction ----
-    let tick_at = |x: f32| ((x - rect.left()) / px_per_tick).max(0.0);
-    // Clip under an absolute tick (index + the tick's offset inside it).
-    let clip_at = |tick: f32| -> Option<(usize, f32)> {
-        track.clips.iter().enumerate().find_map(|(index, clip)| {
-            let start = clip.start_ticks as f32;
-            let end = start + clip.span_ticks as f32;
-            (clip.span_ticks > 0 && tick >= start && tick < end).then_some((index, tick - start))
-        })
-    };
-    // Map a pointer position to `(clip, loop-relative tick, value, offset in
-    // clip)`; the tick folds back into the loop, so any repeat edits the
-    // anchor drawn under the pointer.
-    let resolve = |pos: egui::Pos2| -> Option<(usize, u32, f32, f32)> {
-        let (clip_index, rel) = clip_at(tick_at(pos.x))?;
-        let clip = &track.clips[clip_index];
-        Some((
-            clip_index,
-            loop_tick_at(rel, clip.loop_ticks),
-            y_value(pos.y),
-            rel,
-        ))
-    };
-    // The repeat under the pointer: used to hit-test the dot the user sees.
-    let hit_anchor = |pos: egui::Pos2, clip_index: usize, rel: f32| -> Option<u32> {
-        let clip = track.clips.get(clip_index)?;
-        let loop_ticks = clip.loop_ticks.max(1) as f32;
-        let repeat = (rel / loop_ticks).floor();
-        clip.curve
-            .iter()
-            .find(|point| {
-                let x = rect.left()
-                    + (clip.start_ticks as f32 + repeat * loop_ticks + point.tick as f32)
-                        * px_per_tick;
-                (pos.x - x).abs() <= CURVE_HIT_X
-                    && (pos.y - value_y(point.value)).abs() <= CURVE_HIT_Y
-            })
-            .map(|point| point.tick)
-    };
-
-    // egui reports `drag_started` and `dragged` on the SAME frame the gesture
-    // begins. Only the start arm may emit then: it is the one that moves the
-    // anchor off its previous tick (the drag arm would re-insert at the same
-    // tick, a second write for nothing).
-    let started = response.drag_started_by(egui::PointerButton::Primary);
-    if started
-        && let Some(pos) = response.interact_pointer_pos()
-        && let Some((clip_index, tick, value, rel)) = resolve(pos)
-    {
-        // Either way the gesture continues from the tick under the pointer.
-        state.curve_drag = Some((clip_index, tick));
-        let from = hit_anchor(pos, clip_index, rel);
-        actions.push(TimelineAction::CurvePoint {
-            track: track_index,
-            clip: clip_index,
-            from,
-            tick,
-            value,
-            dragging: true,
-        });
-    }
-    // A plain click never crosses egui's drag threshold, so it arrives here
-    // instead: land an anchor where the pointer is, unless it is already on
-    // one (a click on an anchor must not nudge it — at low zoom a few pixels
-    // are a whole snap step).
-    if response.clicked_by(egui::PointerButton::Primary)
-        && let Some(pos) = response.interact_pointer_pos()
-        && let Some((clip_index, tick, value, rel)) = resolve(pos)
-        && hit_anchor(pos, clip_index, rel).is_none()
-    {
-        actions.push(TimelineAction::CurvePoint {
-            track: track_index,
-            clip: clip_index,
-            from: None,
-            tick,
-            value,
-            dragging: false,
-        });
-    }
-    if !started
-        && response.dragged_by(egui::PointerButton::Primary)
-        && let Some(pos) = response.interact_pointer_pos()
-        && let Some((clip_index, from)) = state.curve_drag
-        && clip_index < track.clips.len()
-        && let Some((_, tick, value, _)) = resolve(pos)
-    {
-        actions.push(TimelineAction::CurvePoint {
-            track: track_index,
-            clip: clip_index,
-            from: Some(from),
-            tick,
-            value,
-            dragging: true,
-        });
-    }
-    if response.drag_stopped_by(egui::PointerButton::Primary) && state.curve_drag.take().is_some() {
-        actions.push(TimelineAction::CurveDragEnd);
-    }
-    if response.secondary_clicked()
-        && let Some(pos) = response.interact_pointer_pos()
-        && let Some((clip_index, tick, _, _)) = resolve(pos)
-    {
-        actions.push(TimelineAction::CurveRemove {
-            track: track_index,
-            clip: clip_index,
-            tick,
-        });
-    }
-
-    let _ = response.on_hover_text(
-        "Click: add an anchor · drag: move · right-click: delete (edits the clip under the pointer)",
-    );
 }
 
 #[cfg(test)]
@@ -3045,53 +2735,15 @@ mod tests {
     /// placement helpers take (U11 D3); MIDI/control clips ignore it.
     const SPT: f64 = 60.0 / (120.0 * 960.0);
 
-    fn clip(start: u32, span: u32) -> MidiClip {
-        MidiClip {
-            start_ticks: start,
-            span_ticks: span,
-            ..MidiClip::new(start)
-        }
-    }
-
-    fn control_clip(start: u32, span: u32, loop_ticks: u32, curve: Vec<AutoPoint>) -> ControlClip {
-        let mut clip = ControlClip::new(start);
-        clip.span_ticks = span;
-        clip.loop_ticks = loop_ticks;
-        clip.curve = curve;
-        clip
-    }
-
-    /// U4b: the band draws the engine's clamped curve, so a curve whose first
-    /// anchor sits at beat 2 must show a flat lead-in — otherwise it looks
-    /// like the curve only starts there.
+    /// U12: the read-only curve preview on a control clip block draws a
+    /// normal clip and is a silent no-op for degenerate inputs (empty curve,
+    /// zero span, tiny rect) — it must never panic inside the lane draw.
     #[test]
-    fn loop_space_curve_pads_both_ends() {
-        let clip = control_clip(
-            0,
-            2 * TICKS_PER_BAR,
-            2 * TICKS_PER_BAR,
-            vec![AutoPoint {
-                tick: TICKS_PER_BAR,
-                value: 64.0,
-            }],
-        );
-        assert_eq!(
-            loop_space_curve(&clip),
-            vec![
-                (0.0, 64.0),
-                (TICKS_PER_BAR as f32, 64.0),
-                (2.0 * TICKS_PER_BAR as f32, 64.0)
-            ]
-        );
-    }
-
-    #[test]
-    fn loop_space_curve_does_not_duplicate_an_anchor_at_zero() {
-        let clip = control_clip(
-            0,
-            TICKS_PER_BAR,
-            TICKS_PER_BAR,
-            vec![
+    fn control_preview_handles_degenerate_inputs() {
+        let clip = ControlClip {
+            span_ticks: TICKS_PER_BAR,
+            loop_ticks: TICKS_PER_BAR,
+            curve: vec![
                 AutoPoint {
                     tick: 0,
                     value: 0.0,
@@ -3101,69 +2753,44 @@ mod tests {
                     value: 127.0,
                 },
             ],
+            ..ControlClip::default()
+        };
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 120.0));
+        let mut viewports = egui::ViewportIdMap::default();
+        viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                inner_rect: Some(screen),
+                ..Default::default()
+            },
         );
-        assert_eq!(
-            loop_space_curve(&clip),
-            vec![
-                (0.0, 0.0),
-                (TICKS_PER_BAR as f32 / 2.0, 127.0),
-                (TICKS_PER_BAR as f32, 127.0)
-            ]
-        );
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            viewports,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |root| {
+            egui::CentralPanel::default().show(root, |ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(300.0, 60.0), egui::Sense::hover());
+                let painter = ui.painter_at(rect);
+                draw_control_preview(&painter, rect, &clip, Some(&AutoParam::TrackGain));
+                // Degenerate cases: empty curve, and a rect too small to draw.
+                draw_control_preview(&painter, rect, &ControlClip::default(), None);
+                let tiny = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(3.0, 3.0));
+                draw_control_preview(&painter, tiny, &clip, None);
+            });
+        });
+        out.textures_delta.clear();
     }
 
-    /// Anchors left past the loop (a shortened clip, a shrunk loop) never
-    /// draw — and never play: the engine ignores them too.
-    #[test]
-    fn loop_space_curve_drops_anchors_past_the_loop() {
-        let clip = control_clip(
-            0,
-            TICKS_PER_BAR,
-            TICKS_PER_BAR,
-            vec![
-                AutoPoint {
-                    tick: 0,
-                    value: 1.0,
-                },
-                AutoPoint {
-                    tick: 3 * TICKS_PER_BAR,
-                    value: 9.0,
-                },
-            ],
-        );
-        assert_eq!(
-            loop_space_curve(&clip),
-            vec![(0.0, 1.0), (TICKS_PER_BAR as f32, 1.0)]
-        );
-    }
-
-    #[test]
-    fn loop_space_curve_of_an_empty_clip_is_empty() {
-        let clip = control_clip(0, TICKS_PER_BAR, TICKS_PER_BAR, Vec::new());
-        assert!(loop_space_curve(&clip).is_empty());
-    }
-
-    /// U4b: clicking the third repeat of a one-bar loop must land on the same
-    /// anchor tick as clicking the first — the band draws the repetition, so
-    /// the edit has to fold back into loop space.
-    #[test]
-    fn loop_ticks_fold_repeats_back_into_the_loop() {
-        let loop_ticks = TICKS_PER_BAR;
-        let snap = crate::curve::SNAP_TICKS;
-        assert_eq!(loop_tick_at(0.0, loop_ticks), 0);
-        assert_eq!(loop_tick_at(2.0 * TICKS_PER_BAR as f32, loop_ticks), 0);
-        // Halfway through the second repeat = halfway through the loop.
-        assert_eq!(
-            loop_tick_at(TICKS_PER_BAR as f32 * 1.5, loop_ticks),
-            TICKS_PER_BAR / 2
-        );
-        // Anchors stay strictly inside the loop (one that landed on the loop
-        // end would never draw or play).
-        assert!(loop_tick_at(TICKS_PER_BAR as f32 - 1.0, loop_ticks) < loop_ticks);
-        assert_eq!(
-            loop_tick_at(TICKS_PER_BAR as f32 * 1.5, loop_ticks) % snap,
-            0
-        );
+    fn clip(start: u32, span: u32) -> MidiClip {
+        MidiClip {
+            start_ticks: start,
+            span_ticks: span,
+            ..MidiClip::new(start)
+        }
     }
 
     #[test]

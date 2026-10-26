@@ -17,8 +17,9 @@ use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 use glitcherz_model::{
-    AutoParam, CableDoc, CableKind, GraphDoc, LayoutDoc, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS,
-    MAX_MIXER_CHANNELS, MIN_MIXER_CHANNELS, MidiSource, NodeDoc, PortRef, VoiceSpec,
+    AutoParam, CableDoc, CableKind, GraphDoc, LayoutDoc, MAX_AUDIO_TRACKS, MAX_AUTO_TRACKS,
+    MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MIN_MIXER_CHANNELS, MidiSource, NodeDoc, PortRef,
+    VoiceSpec,
 };
 
 use crate::plugin_catalog::PluginFormat;
@@ -263,8 +264,11 @@ fn inline_doc_value(node: &NodeDoc, param: InlineParam) -> (f64, f64, f64) {
 ///
 /// T4 (spec `.agents/spec/timeline.md`): the per-track source boxes merged into
 /// **one explicit Timeline node** — no inputs, `n` outputs (n = MIDI tracks +
-/// control tracks), undeletable. `PortRef::MidiTrack/AutoTrack` semantics are
-/// unchanged; this is a pure presentation-layer merge.
+/// control tracks + audio tracks, laid out MIDI → Curve → Audio), undeletable.
+/// MIDI / control ports keep their `PortRef::MidiTrack/AutoTrack` semantics;
+/// audio ports fold in the per-track `NodeDoc::AudioTrack` generator (U6),
+/// whose box would otherwise stand alone. This is a presentation-layer merge —
+/// the document topology is unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PatchId {
     /// Document node (persisted node_id, ≥ 2).
@@ -504,6 +508,9 @@ pub enum PatchAction {
     /// Timeline node body: append a control track / drop the selected one.
     AddControlTrack,
     RemoveControlTrack,
+    /// Timeline node body: append an audio track / drop the last one (U6).
+    AddAudioTrack,
+    RemoveLastAudioTrack,
     /// Mixer node body: append a channel / drop the last one (D21). The
     /// document node id comes from the box the button was drawn on.
     AddMixerSlot(u64),
@@ -545,8 +552,8 @@ struct NodeAction {
 }
 
 /// Buttons of one in-node action row. The timeline owns track management
-/// (row 0: MIDI tracks, row 1: control tracks); the mixer owns its slot
-/// count. Any other entity returns no buttons.
+/// (row 0: MIDI tracks, row 1: control tracks, row 2: audio tracks); the
+/// mixer owns its slot count. Any other entity returns no buttons.
 fn node_action_buttons(id: PatchId, row: usize, deps: &PatchDeps) -> Vec<NodeAction> {
     match id {
         PatchId::Timeline if row == 0 => vec![
@@ -563,7 +570,7 @@ fn node_action_buttons(id: PatchId, row: usize, deps: &PatchDeps) -> Vec<NodeAct
                 action: PatchAction::RemoveLastMidiTrack,
             },
         ],
-        PatchId::Timeline => vec![
+        PatchId::Timeline if row == 1 => vec![
             NodeAction {
                 label: "+ Curve",
                 enabled: deps.auto_count < MAX_AUTO_TRACKS,
@@ -577,6 +584,21 @@ fn node_action_buttons(id: PatchId, row: usize, deps: &PatchDeps) -> Vec<NodeAct
                 action: PatchAction::RemoveControlTrack,
             },
         ],
+        PatchId::Timeline if row == 2 => vec![
+            NodeAction {
+                label: "+ Audio",
+                enabled: deps.audio_count < MAX_AUDIO_TRACKS,
+                hover: "Add an audio track",
+                action: PatchAction::AddAudioTrack,
+            },
+            NodeAction {
+                label: "- Audio",
+                enabled: deps.audio_count > 0,
+                hover: "Remove the last audio track",
+                action: PatchAction::RemoveLastAudioTrack,
+            },
+        ],
+        PatchId::Timeline => Vec::new(),
         PatchId::Node(doc_id) => {
             let inputs = match deps.doc.node_by_id(doc_id) {
                 Some(NodeDoc::Mixer { inputs, .. }) => *inputs as usize,
@@ -620,6 +642,9 @@ pub struct PatchDeps<'a> {
     pub track_count: usize,
     /// Automation track count.
     pub auto_count: usize,
+    /// Audio track count (U6): drives the timeline node's third action row
+    /// and its audio output ports.
+    pub audio_count: usize,
     /// Given a document node id, return automatable parameter options `(label, parameter)`.
     pub auto_options: &'a dyn Fn(u64) -> Vec<(String, AutoParam)>,
     /// Given a document node id, return its external-plugin inline
@@ -757,10 +782,10 @@ const INLINE_MIN_ZOOM: f32 = ACTION_MIN_ZOOM;
 /// Timeline box size per output port row (width fixed, height scales).
 const TIMELINE_WIDTH: f32 = 150.0;
 const TIMELINE_ROW_HEIGHT: f32 = 26.0;
-/// Action rows inside the timeline box: `+ MIDI` / `- MIDI` and
-/// `+ Curve` / `- Curve`.
-const TIMELINE_ACTION_ROWS: usize = 2;
-/// Timeline header height: title band + the two action rows.
+/// Action rows inside the timeline box: `+ MIDI` / `- MIDI`, `+ Curve` /
+/// `- Curve` and `+ Audio` / `- Audio`.
+const TIMELINE_ACTION_ROWS: usize = 3;
+/// Timeline header height: title band + the three action rows.
 const TIMELINE_HEADER: f32 = NODE_TITLE_BAND + TIMELINE_ACTION_ROWS as f32 * ACTION_ROW_HEIGHT;
 /// Timeline In terminal size (U3b): one port row, same width as the timeline
 /// box it mirrors.
@@ -781,26 +806,45 @@ const MIDPOINT_HIT_RADIUS: f32 = 10.0;
 const ZOOM_MIN: f32 = 0.35;
 const ZOOM_MAX: f32 = 3.0;
 
-/// Timeline output port count (MIDI tracks first, then control tracks).
-fn timeline_port_count(midi_count: usize, auto_count: usize) -> usize {
-    midi_count + auto_count
+/// Timeline output port count (MIDI tracks first, then control tracks, then
+/// audio tracks — matches the top-to-bottom action-row order).
+fn timeline_port_count(midi_count: usize, auto_count: usize, audio_count: usize) -> usize {
+    midi_count + auto_count + audio_count
 }
 
-/// A timeline output port index → its `PortRef` (0..midi = MIDI tracks).
-fn timeline_port_ref(port: usize, midi_count: usize) -> PortRef {
+/// Which track kind one timeline output port addresses. The three kinds are
+/// laid out MIDI → Curve → Audio (the same order as the action rows), so a
+/// port index decodes to exactly one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelinePort {
+    /// MIDI track outlet (`PortRef::MidiTrack`).
+    Midi(usize),
+    /// Control (curve) track outlet (`PortRef::AutoTrack`).
+    Auto(usize),
+    /// Audio track outlet (U6): its engine node feeds the cable, but the
+    /// patch draws the port on the timeline box like the other kinds.
+    Audio(usize),
+}
+
+/// A timeline output port index → its track kind (`port >= midi + auto` is
+/// an audio track; `0..midi` MIDI, `midi..midi + auto` control).
+fn timeline_port_kind(port: usize, midi_count: usize, auto_count: usize) -> TimelinePort {
     if port < midi_count {
-        PortRef::MidiTrack(port)
+        TimelinePort::Midi(port)
+    } else if port < midi_count + auto_count {
+        TimelinePort::Auto(port - midi_count)
     } else {
-        PortRef::AutoTrack(port - midi_count)
+        TimelinePort::Audio(port - midi_count - auto_count)
     }
 }
 
 /// Timeline box size (height scales with the port count).
-fn timeline_size(midi_count: usize, auto_count: usize) -> Vec2 {
+fn timeline_size(midi_count: usize, auto_count: usize, audio_count: usize) -> Vec2 {
     Vec2::new(
         TIMELINE_WIDTH,
         TIMELINE_HEADER
-            + (TIMELINE_ROW_HEIGHT * timeline_port_count(midi_count, auto_count) as f32)
+            + (TIMELINE_ROW_HEIGHT
+                * timeline_port_count(midi_count, auto_count, audio_count) as f32)
                 .max(TIMELINE_ROW_HEIGHT),
     )
 }
@@ -889,7 +933,7 @@ fn inline_row_count(id: PatchId, deps: &PatchDeps) -> usize {
 /// grows downward by its inline parameter rows (G5).
 fn size_of(id: PatchId, deps: &PatchDeps) -> Vec2 {
     let base = match id {
-        PatchId::Timeline => timeline_size(deps.track_count, deps.auto_count),
+        PatchId::Timeline => timeline_size(deps.track_count, deps.auto_count, deps.audio_count),
         PatchId::TimelineIn => TIMELINE_IN_SIZE,
         PatchId::Node(node_id) => match deps.doc.node_by_id(node_id) {
             // Title + slot action row, then one port per channel.
@@ -1064,7 +1108,7 @@ impl PatchState {
             // The timeline input is a pure sink: no outputs (U3b).
             PatchId::TimelineIn => Vec::new(),
             PatchId::Timeline => {
-                let n = timeline_port_count(deps.track_count, deps.auto_count);
+                let n = timeline_port_count(deps.track_count, deps.auto_count, deps.audio_count);
                 let (top, bottom) = self.port_area(r, id, deps);
                 let step = (bottom - top) / n.max(1) as f32;
                 (0..n)
@@ -1117,7 +1161,17 @@ impl PatchState {
 
     /// Fill in default placements for missing entities (never overwrites existing positions;
     /// prunes stale entries).
-    fn ensure_positions(&mut self, doc: &GraphDoc, track_count: usize, auto_count: usize) {
+    ///
+    /// Audio-track nodes (U6) are **not placed**: the patch renders their
+    /// output ports on the timeline box instead of a separate node box, so
+    /// they never enter `positions` (and thus are never drawn / hit-tested).
+    fn ensure_positions(
+        &mut self,
+        doc: &GraphDoc,
+        track_count: usize,
+        auto_count: usize,
+        audio_count: usize,
+    ) {
         let mut wanted: Vec<PatchId> = Vec::new();
 
         // One column per track: instrument → effect stack → mixer.
@@ -1126,8 +1180,13 @@ impl PatchState {
         // box (the gap between the timeline and the instrument column is too
         // narrow for a 150 px box).
         let mut keyboard_slot = 0usize;
-        let keyboard_top = 32.0 + timeline_size(track_count, auto_count).y + 16.0;
+        let keyboard_top = 32.0 + timeline_size(track_count, auto_count, audio_count).y + 16.0;
         for node in &doc.nodes {
+            // U6: the audio-track node is folded into the timeline box (its
+            // port is drawn there); skip placing it as a standalone box.
+            if matches!(node, NodeDoc::AudioTrack { .. }) {
+                continue;
+            }
             let track = node.track().min(track_count.saturating_sub(1));
             let y = 32.0 + track as f32 * 132.0;
             let (id, pos) = match node {
@@ -1147,8 +1206,8 @@ impl PatchState {
                 NodeDoc::Mixer { .. } => (PatchId::Node(node.node_id()), Pos2::new(700.0, y)),
                 // P6: feedback taps sit just left of the mixer column.
                 NodeDoc::Feedback { .. } => (PatchId::Node(node.node_id()), Pos2::new(600.0, y)),
-                // U6: audio-track nodes sit in the instrument column (they
-                // are generators too — only the feed is the transport clock).
+                // U6: audio-track nodes are folded into the timeline box (see
+                // the guard at the top of this loop) — unreachable here.
                 NodeDoc::AudioTrack { .. } => (PatchId::Node(node.node_id()), Pos2::new(260.0, y)),
                 // G6: input nodes stack in the left column below the
                 // timeline box (only a fallback — the menu places them at the
@@ -1297,7 +1356,7 @@ impl PatchState {
         cable: &CableDoc,
         deps: &PatchDeps,
     ) -> Option<[Pos2; 4]> {
-        let (from, from_port) = patch_port_from(&cable.from, deps.track_count)?;
+        let (from, from_port) = patch_port_from(&cable.from, deps)?;
         let to = patch_port_to(&cable.to)?;
         let p0 = self
             .out_ports_screen(rect_min, from, deps)
@@ -1423,13 +1482,44 @@ fn track_of_node(picked: Option<PatchId>, doc: &GraphDoc) -> Option<usize> {
     }
 }
 
-/// `PortRef` → cable source entity + output port index (`midi_count` = MIDI
-/// track count; timeline ports are MIDI tracks first, then control tracks).
-fn patch_port_from(port: &PortRef, midi_count: usize) -> Option<(PatchId, usize)> {
+/// Engine/document node id of the audio-track generator for `track` (U6), or
+/// `None` when the track has no node. The patch folds this node into the
+/// timeline box's audio ports, so its id only crosses the boundary inside
+/// cable endpoints (never as a drawable box).
+fn audio_node_id(doc: &GraphDoc, track: usize) -> Option<u64> {
+    doc.nodes.iter().find_map(|n| match n {
+        NodeDoc::AudioTrack { node_id, track: t } if *t == track => Some(*node_id),
+        _ => None,
+    })
+}
+
+/// Inverse of [`audio_node_id`]: an audio-track node id → its track index.
+fn audio_track_of_node(doc: &GraphDoc, node_id: u64) -> Option<usize> {
+    doc.nodes.iter().find_map(|n| match n {
+        NodeDoc::AudioTrack { node_id: id, track } if *id == node_id => Some(*track),
+        _ => None,
+    })
+}
+
+/// `PortRef` → cable source entity + output port index. Timeline ports are
+/// laid out MIDI → Curve → Audio (`0..midi` = MIDI, `midi..midi+auto` =
+/// control, `midi+auto..` = audio). An audio-track document node resolves to
+/// the timeline box's matching audio port (U6), so its cable is drawn from
+/// the timeline like every other track kind.
+fn patch_port_from(port: &PortRef, deps: &PatchDeps) -> Option<(PatchId, usize)> {
     match port {
-        PortRef::Node(id) => Some((PatchId::Node(*id), 0)),
+        PortRef::Node(id) => {
+            if let Some(track) = audio_track_of_node(deps.doc, *id) {
+                Some((
+                    PatchId::Timeline,
+                    deps.track_count + deps.auto_count + track,
+                ))
+            } else {
+                Some((PatchId::Node(*id), 0))
+            }
+        }
         PortRef::MidiTrack(t) => Some((PatchId::Timeline, *t)),
-        PortRef::AutoTrack(i) => Some((PatchId::Timeline, midi_count + i)),
+        PortRef::AutoTrack(i) => Some((PatchId::Timeline, deps.track_count + i)),
         PortRef::Master => None, // The master output is not a valid audio source.
         PortRef::TimelineIn => None, // Pure sink: no output ports.
     }
@@ -1555,7 +1645,7 @@ fn bezier_points(c: [Pos2; 4], samples: usize) -> Vec<Pos2> {
 pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> Vec<PatchAction> {
     let mut actions = Vec::new();
     let doc = deps.doc;
-    state.ensure_positions(doc, deps.track_count, deps.auto_count);
+    state.ensure_positions(doc, deps.track_count, deps.auto_count, deps.audio_count);
 
     // ---- Toolbar ----
     ui.horizontal(|ui| {
@@ -1621,6 +1711,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
 
     // Shorthands for the port geometry (the timeline box grows with tracks).
     let midi_count = deps.track_count;
+    let auto_count = deps.auto_count;
 
     // ---- Press: hit-test and enter the matching drag ----
     // egui 0.36 (click+drag sense) only starts a drag after the pointer moves
@@ -1851,18 +1942,18 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     && let Some(target) = state.hit_node(rect.min, sp, &deps)
                 {
                     match drag.from {
-                        // Timeline port: MIDI tracks first, then control tracks
-                        // (mapping lives in `timeline_port_ref`).
+                        // Timeline port: MIDI tracks, then control tracks, then
+                        // audio tracks (mapping lives in `timeline_port_kind`).
                         PatchId::Timeline => {
-                            match timeline_port_ref(drag.port, midi_count) {
-                                PortRef::MidiTrack(track) => {
+                            match timeline_port_kind(drag.port, midi_count, auto_count) {
+                                TimelinePort::Midi(track) => {
                                     if accepts(CableKind::Midi, target, doc)
                                         && let PatchId::Node(to_doc) = target
                                     {
                                         actions.push(PatchAction::ConnectMidi { track, to_doc });
                                     }
                                 }
-                                PortRef::AutoTrack(index)
+                                TimelinePort::Auto(index)
                                     if accepts(CableKind::Automation, target, doc) =>
                                 {
                                     match target {
@@ -1881,8 +1972,42 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                                         _ => {}
                                     }
                                 }
-                                PortRef::AutoTrack(_) => {}
-                                _ => {}
+                                TimelinePort::Auto(_) => {}
+                                // U6: the audio-track node is folded into the
+                                // timeline box, so its audio cable is dragged
+                                // from this port (target / channel math mirrors
+                                // the ordinary node-out-port branch below).
+                                TimelinePort::Audio(track) => {
+                                    if accepts(CableKind::Audio, target, doc)
+                                        && let Some(from_doc) = audio_node_id(doc, track)
+                                    {
+                                        let to = match target {
+                                            PatchId::Node(id) => PortRef::Node(id),
+                                            PatchId::Master => PortRef::Master,
+                                            _ => PortRef::Master,
+                                        };
+                                        let in_port = match target {
+                                            PatchId::Node(to_doc)
+                                                if doc
+                                                    .node_by_id(to_doc)
+                                                    .is_some_and(|n| n.is_mixer()) =>
+                                            {
+                                                match state.hit_in_port(rect.min, sp, &deps) {
+                                                    Some((PatchId::Node(_), port)) => Some(port),
+                                                    _ => doc.first_free_channel(to_doc),
+                                                }
+                                            }
+                                            _ => Some(0),
+                                        };
+                                        if let Some(in_port) = in_port {
+                                            actions.push(PatchAction::ConnectAudio {
+                                                from_doc,
+                                                to,
+                                                in_port,
+                                            });
+                                        }
+                                    }
+                                }
                             }
                         }
                         PatchId::Node(from_doc) => {
@@ -2026,13 +2151,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     // ---- Cable drag preview ----
     if let Some(DragKind::Cable(drag)) = state.drag {
         let kind = match drag.from {
-            PatchId::Timeline => {
-                if drag.port < midi_count {
-                    CableKind::Midi
-                } else {
-                    CableKind::Automation
-                }
-            }
+            PatchId::Timeline => match timeline_port_kind(drag.port, midi_count, auto_count) {
+                TimelinePort::Midi(_) => CableKind::Midi,
+                TimelinePort::Auto(_) => CableKind::Automation,
+                TimelinePort::Audio(_) => CableKind::Audio,
+            },
             PatchId::Node(node_id) => {
                 // G6: the vk node's out port carries MIDI, not audio.
                 if doc.node_by_id(node_id).is_some_and(NodeDoc::is_keyboard) {
@@ -2118,8 +2241,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         // Output ports (the timeline draws one per track with a small label).
         for (port, p) in state.out_ports_screen(rect.min, id, &deps) {
             let port_color = match id {
-                PatchId::Timeline if port < midi_count => cable_color(CableKind::Midi),
-                PatchId::Timeline => cable_color(CableKind::Automation),
+                PatchId::Timeline => match timeline_port_kind(port, midi_count, auto_count) {
+                    TimelinePort::Midi(_) => cable_color(CableKind::Midi),
+                    TimelinePort::Auto(_) => cable_color(CableKind::Automation),
+                    TimelinePort::Audio(_) => cable_color(CableKind::Audio),
+                },
                 PatchId::Node(node_id)
                     if doc.node_by_id(node_id).is_some_and(NodeDoc::is_keyboard) =>
                 {
@@ -2130,10 +2256,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             painter.circle_filled(p, PORT_RADIUS, port_color);
             painter.circle_stroke(p, PORT_RADIUS, egui::Stroke::new(1.0, Color32::BLACK));
             if let PatchId::Timeline = id {
-                let label = if port < midi_count {
-                    format!("T{}", port + 1)
-                } else {
-                    format!("A{}", port - midi_count + 1)
+                let label = match timeline_port_kind(port, midi_count, auto_count) {
+                    TimelinePort::Midi(t) => format!("T{}", t + 1),
+                    TimelinePort::Auto(i) => format!("C{}", i + 1),
+                    TimelinePort::Audio(i) => format!("A{}", i + 1),
                 };
                 painter.text(
                     Pos2::new(p.x - 10.0, p.y),
@@ -2530,7 +2656,7 @@ mod tests {
         let track_count = project.midi_tracks.len();
         let auto_count = project.control_tracks.len();
         let mut state = PatchState::default();
-        state.ensure_positions(doc, track_count, auto_count);
+        state.ensure_positions(doc, track_count, auto_count, project.audio_tracks.len());
 
         for node in &doc.nodes {
             assert!(
@@ -2568,11 +2694,12 @@ mod tests {
             doc,
             track_count: project.midi_tracks.len(),
             auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
             auto_options: &|_| Vec::new(),
             plugin_inline: &|_| Vec::new(),
         };
         let mut state = PatchState::default();
-        state.ensure_positions(doc, deps.track_count, deps.auto_count);
+        state.ensure_positions(doc, deps.track_count, deps.auto_count, deps.audio_count);
 
         let min = Pos2::ZERO;
         assert!(
@@ -2597,10 +2724,7 @@ mod tests {
             patch_port_to(&PortRef::TimelineIn),
             Some(PatchId::TimelineIn)
         );
-        assert_eq!(
-            patch_port_from(&PortRef::TimelineIn, deps.track_count),
-            None
-        );
+        assert_eq!(patch_port_from(&PortRef::TimelineIn, &deps), None);
         assert!(!accepts(CableKind::Automation, PatchId::Timeline, doc));
 
         // The layout round-trips the sink's position like master / timeline.
@@ -2624,11 +2748,21 @@ mod tests {
         });
         let doc = &project.graph;
         let mut state = PatchState::default();
-        state.ensure_positions(doc, project.midi_tracks.len(), project.control_tracks.len());
+        state.ensure_positions(
+            doc,
+            project.midi_tracks.len(),
+            project.control_tracks.len(),
+            project.audio_tracks.len(),
+        );
 
         let at = Pos2::new(555.0, 77.0);
         state.place_node(new_id, at);
-        state.ensure_positions(doc, project.midi_tracks.len(), project.control_tracks.len());
+        state.ensure_positions(
+            doc,
+            project.midi_tracks.len(),
+            project.control_tracks.len(),
+            project.audio_tracks.len(),
+        );
 
         assert_eq!(state.positions.get(&PatchId::Node(new_id)), Some(&at));
     }
@@ -2648,7 +2782,12 @@ mod tests {
         });
         let doc = &project.graph;
         let mut state = PatchState::default();
-        state.ensure_positions(doc, project.midi_tracks.len(), project.control_tracks.len());
+        state.ensure_positions(
+            doc,
+            project.midi_tracks.len(),
+            project.control_tracks.len(),
+            project.audio_tracks.len(),
+        );
         // Stale entry: a node id that is no longer in the document.
         state
             .positions
@@ -2687,11 +2826,12 @@ mod tests {
             doc,
             track_count: project.midi_tracks.len(),
             auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
             auto_options: &|_| Vec::new(),
             plugin_inline: &|_| Vec::new(),
         };
         let mut state = PatchState::default();
-        state.ensure_positions(doc, deps.track_count, deps.auto_count);
+        state.ensure_positions(doc, deps.track_count, deps.auto_count, deps.audio_count);
 
         let rect_min = Pos2::ZERO; // pan = 0, zoom = 1 → screen == graph space
         let bez = state
@@ -2819,6 +2959,7 @@ mod tests {
             doc,
             track_count: project.midi_tracks.len(),
             auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
             auto_options: &|_| Vec::new(),
             plugin_inline: &|node| {
                 if node == plugin_node {
@@ -2877,7 +3018,7 @@ mod tests {
         // Fixed entities: no inline rows.
         assert_eq!(
             size_of(PatchId::Timeline, &deps),
-            timeline_size(deps.track_count, deps.auto_count)
+            timeline_size(deps.track_count, deps.auto_count, deps.audio_count)
         );
         assert_eq!(size_of(PatchId::Master, &deps), NODE_SIZE);
     }
@@ -3026,28 +3167,81 @@ mod tests {
 
     #[test]
     fn timeline_ports_map_to_track_refs() {
-        // 2 MIDI + 3 control tracks → 5 ports: 0..2 = MIDI, 2..5 = control.
+        // 2 MIDI + 3 control + 1 audio → 6 ports: MIDI, then curve, then audio.
         assert_eq!(
-            timeline_port_ref(0, 2),
-            PortRef::MidiTrack(0),
+            timeline_port_kind(0, 2, 3),
+            TimelinePort::Midi(0),
             "port 0 = MIDI track 0"
         );
         assert_eq!(
-            timeline_port_ref(1, 2),
-            PortRef::MidiTrack(1),
+            timeline_port_kind(1, 2, 3),
+            TimelinePort::Midi(1),
             "port 1 = MIDI track 1"
         );
         assert_eq!(
-            timeline_port_ref(2, 2),
-            PortRef::AutoTrack(0),
+            timeline_port_kind(2, 2, 3),
+            TimelinePort::Auto(0),
             "port 2 = control track 0"
         );
         assert_eq!(
-            timeline_port_ref(4, 2),
-            PortRef::AutoTrack(2),
+            timeline_port_kind(4, 2, 3),
+            TimelinePort::Auto(2),
             "port 4 = control track 2"
         );
-        assert_eq!(timeline_port_count(2, 3), 5);
+        assert_eq!(
+            timeline_port_kind(5, 2, 3),
+            TimelinePort::Audio(0),
+            "port 5 = audio track 0"
+        );
+        assert_eq!(timeline_port_count(2, 3, 1), 6);
+    }
+
+    /// U6 follow-up: an audio-track node is folded into the timeline box. It is
+    /// never placed as a standalone box (so never drawn / hit-tested), and its
+    /// cable is resolved from the timeline's matching audio port (the port
+    /// order is MIDI → Curve → Audio).
+    #[test]
+    fn audio_track_node_folds_into_timeline_ports() {
+        let mut project = Project::default();
+        project.audio_tracks.push(Default::default());
+        let node_id = project.graph.next_node_id();
+        project
+            .graph
+            .nodes
+            .push(NodeDoc::AudioTrack { node_id, track: 0 });
+        let doc = &project.graph;
+        let deps = PatchDeps {
+            doc,
+            track_count: project.midi_tracks.len(),
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &|_| Vec::new(),
+            plugin_inline: &|_| Vec::new(),
+        };
+
+        let mut state = PatchState::default();
+        state.ensure_positions(doc, deps.track_count, deps.auto_count, deps.audio_count);
+        assert!(
+            !state.positions.contains_key(&PatchId::Node(node_id)),
+            "the audio-track node is folded into the timeline box, not placed"
+        );
+
+        // Node id ↔ track index round-trips, and the cable endpoint resolves to
+        // the timeline's audio port (after every MIDI and curve port).
+        assert_eq!(audio_track_of_node(doc, node_id), Some(0));
+        assert_eq!(audio_node_id(doc, 0), Some(node_id));
+        let expected_port = deps.track_count + deps.auto_count;
+        assert_eq!(
+            patch_port_from(&PortRef::Node(node_id), &deps),
+            Some((PatchId::Timeline, expected_port))
+        );
+
+        let ports = state.out_ports_screen(Pos2::ZERO, PatchId::Timeline, &deps);
+        assert_eq!(
+            ports.len(),
+            deps.track_count + deps.auto_count + deps.audio_count,
+            "the timeline exposes one port per track of every kind"
+        );
     }
 
     #[test]
@@ -3100,6 +3294,7 @@ mod tests {
             doc: &doc,
             track_count: 1,
             auto_count: 0,
+            audio_count: 0,
             auto_options: &auto_options,
             plugin_inline: &plugin_inline,
         };
@@ -3135,10 +3330,12 @@ mod tests {
         let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
         let track_count = project.midi_tracks.len();
         let auto_count = 1;
+        let audio_count = 1;
         let deps = PatchDeps {
             doc,
             track_count,
             auto_count,
+            audio_count,
             auto_options: &auto_options,
             plugin_inline: &plugin_inline,
         };
@@ -3147,17 +3344,17 @@ mod tests {
         let mixer = doc.first_mixer().unwrap().node_id();
         state.place_node(mixer, Pos2::new(0.0, 400.0));
 
-        // Timeline: title + two action rows, then one row per port.
+        // Timeline: title + three action rows, then one row per port.
         assert_eq!(action_rows(PatchId::Timeline, &deps), TIMELINE_ACTION_ROWS);
         let r = state
             .screen_rect(Pos2::ZERO, PatchId::Timeline, &deps)
             .unwrap();
         assert_eq!(
             r.height(),
-            TIMELINE_HEADER + TIMELINE_ROW_HEIGHT * (track_count + auto_count) as f32
+            TIMELINE_HEADER + TIMELINE_ROW_HEIGHT * (track_count + auto_count + audio_count) as f32
         );
         let ports = state.out_ports_screen(Pos2::ZERO, PatchId::Timeline, &deps);
-        assert_eq!(ports.len(), track_count + auto_count);
+        assert_eq!(ports.len(), track_count + auto_count + audio_count);
         for (_, p) in &ports {
             assert!(p.y >= r.top() + TIMELINE_HEADER, "port under the buttons");
             assert!(p.y <= r.bottom());
@@ -3188,6 +3385,12 @@ mod tests {
             (curve_row[0].label, curve_row[1].label),
             ("+ Curve", "- Curve")
         );
+        let audio_row = node_action_buttons(PatchId::Timeline, 2, &deps);
+        assert_eq!(
+            (audio_row[0].label, audio_row[1].label),
+            ("+ Audio", "- Audio")
+        );
+        assert!(audio_row[0].enabled && audio_row[1].enabled);
         // Default project: every slot carries a track cable → remove refuses.
         let slot_row = node_action_buttons(mid, 0, &deps);
         assert!(slot_row[0].enabled);
@@ -3211,6 +3414,7 @@ mod tests {
             doc: &free.graph,
             track_count,
             auto_count,
+            audio_count,
             auto_options: &auto_options,
             plugin_inline: &plugin_inline,
         };
@@ -3227,6 +3431,7 @@ mod tests {
             doc: &free.graph,
             track_count,
             auto_count,
+            audio_count,
             auto_options: &auto_options,
             plugin_inline: &plugin_inline,
         };

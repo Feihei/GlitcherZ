@@ -235,6 +235,27 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 
 **缺口与未来方案（2026-10-26 用户确认接受）**：audio **不跟随 tempo 曲线**（有曲线的段落与 midi 会错位）——这是「裁剪不变调」的固有代价，当前**接受**。未来精确同步方案（时间基点改用 tempo 曲线 tick↔秒 积分 + block runner 维护 `song_sec` 累积 + clip 表改存 `start_sec` + 曲线编辑重推）已写入 `spec/audio-trim.md` §12 预留，**不在 U11 实施**，触发条件为实测错位不可接受。
 
+## patch timeline 节点：三类轨统一增删 + audio 节点折入（2026-10-26）
+
+用户提出：timeline 的 midi / curve / audio 三种轨应各有"加、删"一对按钮，且在 timeline tab 与 patch 的 timeline node 上都要有、功能一致；U6 的 audio 轨每建一条就冒出一个独立 track 节点，应在 timeline node 上出端口（"跟 curve 一样，只是输出数据类型不同"），端口序 **MIDI → Curve → Audio**。
+
+- [x] ✅ 2026-10-26：
+  - **timeline tab 工具栏**：`+ Track`/`- Track`（仅 MIDI）与 `+ Audio`/`- Audio` 补齐为三对同名按钮 `+/- MIDI`、`+/- Curve`、`+/- Audio`（新增 `TimelineAction::{AddControlTrack, RemoveControlTrack}`）；顺序与 patch node 的三行 action 一致。功能与 patch 版走同一批 `add_*` / `remove_*`（`- MIDI`/`- Audio` 删最后一条，`- Curve` 删选中控制轨）。
+  - **patch timeline node**：`TIMELINE_ACTION_ROWS` 2 → 3，第三行 `+ Audio`/`- Audio`（`PatchAction::{AddAudioTrack, RemoveLastAudioTrack}`）。
+  - **audio 节点折入（呈现层合并，不动文档/引擎拓扑）**：`ensure_positions` 跳过 `NodeDoc::AudioTrack` 放置（不进 `positions` → 不绘制/不命中/不框选，旧布局残留由 `retain(wanted)` 剪掉）；`patch_port_from(PortRef::Node(audio_id))` 把该音频节点映射到 timeline 的 `midi+auto+track` 号端口；`timeline_port_ref` 退役，改 `timeline_port_kind(port, midi, auto) -> TimelinePort::{Midi,Auto,Audio}` 做端口→轨唯一真源；从 audio 端口拖出的 audio cable 仍以 `PortRef::Node(audio_id)` 记录，drop 语义（mixer 通道/master/effect + in_port）复用普通节点出端口路径；端口标签 T/C/A。音频信号仍由那个生成器节点产生，`PatchDeps` 加 `audio_count`。
+  - 测试：`timeline_ports_map_to_track_refs`（含 audio 端口）、`audio_track_node_folds_into_timeline_ports`（不放置 + 双向映射）、`action_rows_reserve_space...`（第三行按钮）更新。全仓 fmt/clippy/test 绿。
+
+## U12：曲线编辑迁入 Edit tab + 曲线类型（2026-10-26，spec `control-tracks.md` §8）✅ 2026-10-26 交付
+
+用户提出：curve clip 双击应在 Edit tab（钢琴卷帘所在的编辑器）里编辑，而不是在 timeline 里直接画；曲线除多点直接绘制外，还要控制点 polyline 与控制点曲线两种方式；timeline 里不再内联可编辑，改为 clip 块上只读预览、对齐其它轨道行。**取代 U4b D9/D10**。
+
+- [x] 决策：① `ControlClip.interp: CurveInterp{Linear,Smooth}`（加性 serde 字段，版本不变）；② `Smooth` = 单调三次 Hermite（PCHIP 风格，不过冲），model/engine 同构 + 镜像测试；③ 内联可编辑带退役，改 clip 块内只读预览；④ 双击 curve clip → Edit tab 曲线编辑器（`EditTarget` 区分 Midi/Control）；⑤ 编辑器三工具 Draw/Line/Curve（Draw/Line 写 Linear，Curve 写 Smooth）。
+- [x] U12-A model：`CurveInterp` + `ControlClip.interp` + `sample_curve`/`sample_linear`/`sample_smooth`（`smooth_tangent` 调和平均切线）+ 测试（不过冲/命中锚点/保单调/旧文档默认 Linear）。
+- [x] U12-B engine：`RtCurveInterp` + `RtAutomation.interp` + 同构 `value_at` + 镜像测试；lib.rs `rt_curve_interp` 转换点。
+- [x] U12-C UI：删 `curve_band`/`CurvePoint`/`CurveRemove`/`CurveDragEnd`/`timeline_curve_point`/`timeline_curve_remove`/`TimelineState::curve_drag`/`loop_space_curve`/`loop_tick_at`/`CURVE_BAND_HEIGHT`；`lane_row` 加 `clip_body` 回调 → `draw_control_preview()`（clip 块内只读曲线，采样同引擎数学）；`edit_clip: Option<EditTarget>` + `control_editor_body()`（工具选择 + 画布 + `curve_upsert`/`curve_remove_point`/`set_clip_interp`）；`OpenControlEditor` 取代 `ShowControlCurve`。
+- [x] U12-D 测试验收：删旧 `tests/curve_band.rs`，加 `control_preview_handles_degenerate_inputs`（egui 画布 smoke）；全仓 fmt/clippy/test 绿。
+
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：

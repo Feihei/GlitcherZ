@@ -107,9 +107,13 @@
 - **时间戳取块边界**（D5）：CLAP 走 `MidiEvent::new(0, 0, data)`（`time = 0`），SF2 走块首 `process_midi_message`；采样级 CC 需要每采样事件队列，收益不可辨，明确不做。
 - **格式差异**（D6）：CLAP 组装 `0xB0 | channel` 注入输入事件流；SF2 **忽略外来 channel**（该节点所有音符都发在固定 `CHANNEL`，尊重外来 channel 反而静默失效）；**VST3 明确不支持**——`vst3-0.3.0` 的 `DataEvent` 只有 `kMidiSysEx`，`kLegacyMIDICCOutEvent` 是插件**输出**语义，宿主用它属未定义行为，`Vst3Node::midi_cc` 返回 `false`。
 - **UI 接线**：终点行多一条 `MIDI CC…`（就地 `CC`/`ch` 两个 DragValue，release 才提交 = 一次 undo）、端点显示 `cc_label()`、拖线菜单对 instrument 追加 8 条预设（1/2/7/10/11/64/71/74）；`set_auto_endpoint` 按 `param.cc_of()` 在 `set_auto_cc_route` / `set_auto_route` 间分派，文档重推（undo/open）那条路径同样分流。
-- **inline 曲线带**（U4b D9/D10）：选中控制轨时，其行**下方**展开 84 px 高的带（`curve_band()`），横轴是**绝对 tick**、每个 clip 按 `loop_ticks` 重复铺开——与引擎播出完全一致；指针位置折回 **loop 相对 tick**（`loop_tick_at()`：`rel % loop_ticks` 再按 `SNAP_TICKS` 吸附并夹在循环内），所以**文档格式不变**、点第 5 个重复格改的就是第 1 格的锚点。`loop_space_curve()` 给曲线补平直头尾：`ControlClip::value_at` 两端 clamp，不补的话"首锚点在 beat 2"看起来像曲线从那里才开始。
-- **单一编辑入口**（D10）：`EditTarget::Control` / `control_editor_body` / `OpenControlEditor` 全部删除，`edit_clip` 收敛成 `Option<(track, clip)>`，双击控制 clip 只做 `ShowControlCurve`（选中该轨、展开带）；`lane.rs` 改名 `curve.rs`，只留轴映射（`axis`/`to_norm`/`from_norm`/`SNAP_TICKS`），`LaneIntent`/`LaneState`/`lane::show` 整段退休——两套拖拽状态是 U4b 要消灭的东西。
-- **手势与 undo**：点击加锚（`dragging: false` → 单步 `Add Anchor`）、拖拽移动（`curve:{track}:{clip}` 合并键，drag end 收合并）、右键删最近锚（半格容差）。单击已有锚点时**不移动它**——低缩放下 6 px 命中容差可能跨过整格吸附，顺手改掉才是 bug。
+- **~~inline 曲线带~~（U4b D9/D10，已由 U12 取代）**：选中控制轨时，其行**下方**展开 84 px 高的带（`curve_band()`）……（历史记录，见下方 U12）
+- **~~单一编辑入口~~（D10，已由 U12 取代）**：`EditTarget::Control` / `control_editor_body` / `OpenControlEditor` 全部删除……（历史记录，见下方 U12）
+- **手势与 undo**：点击加锚（`dragging: false` → 单步 `Add Anchor`）、拖拽移动（`curve:{track}:{clip}` 合并键，drag end 收合并）、右键删最近锚（半格容差）。单击已有锚点时**不移动它**——低缩放下 6 px 命中容差可能跨过整格吸附，顺手改掉才是 bug。（U12 后这些手势搬进 Edit tab 的曲线编辑器，方法改名 `curve_upsert` / `curve_remove_point`。）
+- **U12（2026-10-26，spec `control-tracks.md` §8，取代 D9/D10）**：曲线编辑回到 **Edit tab**，timeline 只留只读预览。
+  - **曲线类型**：`ControlClip.interp: CurveInterp{Linear, Smooth}`（serde 加性字段，`PROJECT_VERSION` 不变）。`Linear` = 现状分段线性（freehand / polyline 共用）；`Smooth` = **单调三次 Hermite（PCHIP 风格）**——内部切线取相邻割线的加权调和平均、异号归零，端点取单侧割线，**不过冲**。model `sample_curve`（`Vec`）与 engine `RtAutomation::value_at`（定容数组）同构实现 + 镜像测试。
+  - **timeline 预览**：内联可编辑带退役（删 `curve_band` / `CurvePoint` / `CurveRemove` / `CurveDragEnd` / `timeline_curve_point` / `timeline_curve_remove` / `TimelineState::curve_drag`）；`lane_row` 加 `clip_body` 回调，控制行在 **clip 块内**用 `draw_control_preview()` 采样 `glitcherz_model::sample_curve` 画只读曲线（与引擎同数学），不再多一行。
+  - **Edit tab 曲线编辑器**：`edit_clip: Option<EditTarget::{Midi{..}, Control{..}}>`；双击控制 clip → `TimelineAction::OpenControlEditor{track, clip}`（取代 `ShowControlCurve`）→ `control_editor_body()`。画布显示**一个 loop 周期**；三工具 `CurveTool::{Draw, Line, Curve}`（Draw/Line 写 `Linear`，Curve 写 `Smooth`，`set_clip_interp` 一步 undo）；交互沿用 `curve_upsert`（drag 合并 undo）/ `curve_remove_point`；`curve_tool`/`curve_drag` 为 app 瞬态字段（`set_control_edit_target` 按 clip 的 `interp` 同步工具）。
 
 ### CLAP 宿主（`glitcherz-clap-host`，路线图第 9 步）
 
