@@ -262,7 +262,8 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 
 - [x] **E1 框架**：`EffectParams`（内部 tag 枚举，`NodeDoc::Effect` 载荷）+ `legacy_delay` 迁移桥 + `PROJECT_VERSION 7 → 8`；`ParamId::BuiltinParam(u8)` 槽位寻址 + `EffectDescriptor` / `EffectParamBank` / `Smoothed`（统一 one-pole 平滑，`Linear`/`Log` 双域，`Sample`/`Block` 双速率）；`Processor::latency_samples()` 口子；Delay 迁槽位（旧测试一条不改）；`GainProcessor`/`ChannelStripProcessor` 的 gain/pan 一并平滑；UI 全表驱动（`effect_section`、inline 行、Add/Insert 菜单遍历名册）
   - 落地细节与规格差异见 spec `effects.md` §14 实施勘误（`Unit::Seconds`、f32 平滑停滞保护、`delay_samples` 取整、图级测试需先沉降平滑）
-- [ ] **E2** EQ-3（复用 `svf.rs` TPT，含低切）+ Compressor（前馈峰值 + 软拐点 + GR 表；`StereoClass::Linkable`，联动取 `max(|L|,|R|)`）
+- [x] **E2** EQ-3（复用 `svf.rs` TPT，含低切）+ Compressor（前馈峰值 + 软拐点 + GR 表；`StereoClass::Linkable`，联动取 `max(|L|,|R|)`）
+  - 落地细节见 spec `effects.md` §15 实施勘误（`ParamFlags::INLINE`、低切旁通恒积分、一阶架式斜率、rt_audit 合成单测试）
 - [ ] **E3** Reverb（FDN-8 + 阻尼 + pre-delay，不用 Freeverb）
 - [ ] **E4** `ModDelay` 核心 → Chorus / Flanger；Delay 升级 ping-pong + tempo-sync
 - [ ] **E5（可选）** Saturation（过采样）/ Bitcrusher / Phaser / Limiter + PDC

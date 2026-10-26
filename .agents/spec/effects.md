@@ -88,7 +88,7 @@ pub struct ParamSpec {
     pub curve: Curve,            // Linear | Log (UI axis AND smoothing domain)
     pub smoothing_ms: f32,       // 0.0 = snap (discrete params)
     pub rate: Rate,              // Sample | Block
-    pub flags: ParamFlags,       // AUTOMATABLE | STEREO_LINK
+    pub flags: ParamFlags,       // AUTOMATABLE | STEREO_LINK | INLINE
 }
 
 pub struct EffectDescriptor {
@@ -322,7 +322,18 @@ Master Limiter（前视，要吃 D16 的 `latency_samples`，并需要 PDC）。
         旧工程 fixture（v7 带 delay 载荷）加载后参数不丢（`file.rs::v7_delay_payload_moves_into_effect_params`）
   - [x] UI：`effect_section`（表驱动滑条组）、inline 行由 descriptor 生成、
         `Add ▸ Effect`/`Insert ▸ Effect` 菜单遍历效果器名册；`delay_sliders` / `DELAY_INLINE` / `InlineParam` 手写项退役
-- [ ] **E2** EQ-3 + Compressor（含 GR 表）
+- [x] **E2** EQ-3 + Compressor（含 GR 表）
+  - [x] E2a `realtime/eq.rs`：一阶 TPT 低/高架 + SVF 峰值（`k = 1/Q`）+ SVF 低切（`k = √2`）；
+        平直设置（三增益 0 dB + `low_cut = 20`）是**采样级直通**，直接断言 `out == input`
+  - [x] E2b `realtime/compressor.rs`：`compute_gr_db` 纯函数（硬拐点/软拐点，两段在 `t = knee` 处
+        数值与斜率都连续）+ GR 域 attack/release 一阶平滑；`stereo_link` 取 `max(|L|,|R|)`
+  - [x] `effect/meters.rs`：`EffectMeters { gr_db, peak_l, peak_r }`（`AtomicF32`，每块写一次）；
+        `Arc` 由 UI 按 `node_id` 持有，节点生命周期即句柄生命周期
+  - [x] model：`EqParams` / `CompressorParams` + `EffectParams::{Eq, Compressor}`（`Box`），
+        两端 `BuiltinEffectKind` 各加两变体；无版本号变更（tag 变体是纯增量）
+  - [x] UI：`effect::processor()` 按种类构造并**用文档值预置全部槽位**（首次 process 前吸附，无淡入）；
+        4 处硬编码 `DelayProcessor` 构造点全部改为 kind-aware；Inspector 加 GR 条
+  - [x] `tests/effect_rt_audit.rs`：Eq / Compressor / Delay / meters 的 `set_param`+`process` 零分配
 - [ ] **E3** Reverb（FDN-8）
 - [ ] **E4** `ModDelay` 核心 → Chorus / Flanger；`DelayProcessor` 升级 ping-pong + tempo-sync
 - [ ] **E5（可选）** Saturation（过采样）/ Bitcrusher / Phaser / Limiter + PDC
@@ -389,4 +400,20 @@ Master Limiter（前视，要吃 D16 的 `latency_samples`，并需要 PDC）。
 | 4 | 既有测试 | 「一条不改」 | Delay / Gain 相关测试全部保持断言不变；**图级**测试（`master_gain_applies_after_summing` 等）加了"先跑若干块让平滑沉降"的循环 | D8 把推子/主增益也纳入平滑后，首块不再等于静态增益值——这是**规格想要的行为变化**，不是回归。改的是等待方式，不是期望值 |
 | 5 | `ParamSpec.short` | 未在 §5 列出 | 新增 `short` 字段（默认等于 `name`），`.short("fdbk")` 覆盖 | inline 行标签沿用既有 UI 约定（`time` / `fdbk` / `mix`），同时保持 descriptor 是唯一真源 |
 | 6 | `EffectDescriptor.kind` | §5 写了 `pub kind: BuiltinEffectKind` | 未加该字段；种类由 `BuiltinEffectKind::descriptor()` 反查 | 引擎侧 `descriptor` 已经挂在枚举的关联函数上，结构体再存一份会给出两个真源 |
+
+## 15. 实施勘误（E2）
+
+| # | 位置 | 规格原样 | 实际做法 | 原因 |
+| :-- | :-- | :-- | :-- | :-- |
+| 1 | `ParamFlags` | 只有 `AUTOMATABLE` / `STEREO_LINK` | 新增 `INLINE` + `ParamSpec::inline_row()`，patch 节点的 inline 行只遍历 `inline_slots()` | EQ 有 8 个参数，全塞进节点会把画布节点撑成一列滑条；Inspector 仍然显示全部槽位。Delay 三个参数全部标 `INLINE`，行为不变 |
+| 2 | `ParamSpec` | §5 只列了构造器语义，未列 `level` | 新增 `ParamSpec::level()`（dB、Linear、15 ms、Block） | 阈值/拐点是"喂给曲线或系数的 dB 值"，与 `gain()`（逐样本增益级）语义不同；混用会让 threshold 走 10 ms 逐样本平滑 |
+| 3 | EQ 低切 | `low_cut = 20 Hz` 视为关闭 | 关闭时**仍然积分**滤波器，只在输出端选择直通 | 若真正跳过，长期关闭后突然打开会从陈旧/零状态起步 → 咔嗒声。恒积分 + 输出选择既无咔嗒又是真旁通（代价约 6 次乘法/样本） |
+| 4 | EQ 平直 | 未规定 | 三增益 0 dB 且低切关闭时是**采样级直通**，测试用 `assert_eq!(out, input)` | `A − 1` 恰好为 0，四个级联级都退化为恒等；这条不变量和 delay 的 `mix = 0` 同一性质，用来钉住"没动参数就不该碰声音" |
+| 5 | EQ 架式斜率 | 一阶 TPT 高低架 | 保持一阶，但**拐点两倍频程外才到约 3/4 的增益**（12 kHz 处对 3 kHz 拐点的 -12 dB 架式得 -10 dB） | 一阶架式就是 6 dB/oct 过渡，这是物理结果不是 bug。测试按实际响应写死区间；若日后觉得不够"硬"，改二阶并同步改 §8 的说明 |
+| 6 | Compressor `mix` | §8 表未给默认值 | 默认 `1.0`（全湿） | 插入式压缩器的常识默认；`mix = 0` 的采样级直通不变量照旧成立 |
+| 7 | Compressor GR 平滑 | "attack/release 是对 GR 的一阶平滑" | 用与 `Smoothed` 相同的 `coeff_for()` 系数公式，并带**相同的 f32 停滞保护**（§14 第 2 条） | 两个平滑器必须是同一套时间常数语义，否则"5τ 收敛"在测试与耳朵上对不上 |
+| 8 | GR 表 | 未规定表内语义 | `gr_db` 存**本块内最负**的 GR（UI 取反显示为压了多少 dB）；`peak_l/r` 存本块输出峰值 | 峰值保持比"最后一块的瞬时值"更接近硬件表头，也更容易断言 |
+| 9 | 立体声联动 | 未规定非联动时的表头 | 联动时只有 `gr[0]` 有意义，表头读它 | 非联动是诊断场景；表头显示两声道中最需要关注的那个，避免加第二个表 |
+| 10 | rt_audit | §11 要求零分配 | 单独 `tests/effect_rt_audit.rs`，**合成一个测试函数** | 计数分配器是全局的，测试运行器并行跑多个测试函数时，别人的簿记分配会落进本测试的计数窗口（已实测：并行必挂、`--test-threads=1` 才过）。合成单测试 = 只有一个工作线程，稳定 |
+
 

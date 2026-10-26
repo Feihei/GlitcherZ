@@ -62,6 +62,14 @@
 | 音色预设 | preset | SoundFont 内的 bank:program 声源；区别于插件预设（plugin preset） |
 | 采样 | sample | SoundFont 内嵌 PCM 采样数据；不进文档 |
 | 湿声 / 干声 | wet / dry | 只作形容词或独立名词 |
+| 均衡器 | EQ / equalizer | `BuiltinEffectKind::Eq`；三段式（低架/峰值/高架）+ 低切 |
+| 低架 / 高架 | low shelf / high shelf | 只抬/只降低频或高频，另一端保持单位增益 |
+| 峰值（滤波） | bell / peaking | 单频段隆起或凹陷；参数为增益 + 中心频率 + Q |
+| 低切 | low cut | 高通滤波；`low_cut` 取最小值即关闭，不设独立开关 |
+| 压缩器 | compressor | `BuiltinEffectKind::Compressor`；前馈峰值检测 |
+| 增益衰减 | gain reduction (GR) | 压缩量，单位 dB 且 `<= 0`；表头显示时取反为"压了多少" |
+| 软拐点 | soft knee | `knee` 宽度的 dB 区间内二次插值，两端与硬拐点斜率连续 |
+| 立体声联动 | stereo link | 左右共用 `max(|L|,|R|)` 检测器，得到同一 GR |
 | 包络 | envelope | ADSR 音量包络 |
 | 截止频率 | cutoff frequency | 字段/参数名 `cutoff` |
 | 共振 | resonance | Simper SVF 语义 |
