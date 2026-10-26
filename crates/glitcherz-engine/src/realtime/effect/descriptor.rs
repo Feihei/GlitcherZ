@@ -71,6 +71,11 @@ impl ParamFlags {
     pub const AUTOMATABLE: Self = Self(1 << 0);
     /// The stereo-link switch of a detector-based effect (D13).
     pub const STEREO_LINK: Self = Self(1 << 1);
+    /// Gets a row on the patch node's inline strip. Effects with more than
+    /// three parameters mark only the handful that shape the sound most, so
+    /// the canvas node does not grow into a column of slider rows; the
+    /// Inspector always shows every slot.
+    pub const INLINE: Self = Self(1 << 2);
 
     /// Whether `flag` is set.
     pub const fn contains(self, flag: Self) -> bool {
@@ -145,6 +150,31 @@ impl ParamSpec {
     pub const fn short(mut self, short: &'static str) -> Self {
         self.short = short;
         self
+    }
+
+    /// Marks this parameter for the patch node's inline strip.
+    pub const fn inline_row(mut self) -> Self {
+        self.flags = self.flags.with(ParamFlags::INLINE);
+        self
+    }
+
+    /// dB level consumed at block rate (compressor threshold, knee).
+    ///
+    /// Distinct from [`ParamSpec::gain`], which is a per-sample gain stage:
+    /// these feed a curve or a coefficient and only need one update per block.
+    pub const fn level(name: &'static str, min: f32, max: f32, default: f32) -> Self {
+        Self {
+            name,
+            short: name,
+            unit: Unit::Db,
+            min,
+            max,
+            default,
+            curve: Curve::Linear,
+            smoothing_ms: 15.0,
+            rate: Rate::Block,
+            flags: ParamFlags::AUTOMATABLE,
+        }
     }
 
     /// Frequency: log domain, per-block, 20 ms.
@@ -313,6 +343,15 @@ impl EffectDescriptor {
             .iter()
             .position(|spec| spec.flags.contains(ParamFlags::STEREO_LINK))
             .map(|index| index as u8)
+    }
+
+    /// Slots marked [`ParamFlags::INLINE`], in table order (patch node rows).
+    pub fn inline_slots(&self) -> impl Iterator<Item = u8> + '_ {
+        self.params
+            .iter()
+            .enumerate()
+            .filter(|(_, spec)| spec.flags.contains(ParamFlags::INLINE))
+            .map(|(index, _)| index as u8)
     }
 }
 

@@ -22,9 +22,11 @@ static DELAY_PARAMS: [ParamSpec; 3] = [
     // `time_s` is stored in seconds (0.005..1.0), so the spec must say seconds
     // — `ParamSpec::time` would tag it as milliseconds and the slider would
     // read "0.2 ms" for a 250 ms tap.
-    ParamSpec::seconds("time", 0.005, MAX_DELAY_S, 0.3),
-    ParamSpec::gain("feedback", Unit::Percent, 0.0, 0.9, 0.35).short("fdbk"),
-    ParamSpec::gain("mix", Unit::Percent, 0.0, 1.0, 0.0),
+    ParamSpec::seconds("time", 0.005, MAX_DELAY_S, 0.3).inline_row(),
+    ParamSpec::gain("feedback", Unit::Percent, 0.0, 0.9, 0.35)
+        .short("fdbk")
+        .inline_row(),
+    ParamSpec::gain("mix", Unit::Percent, 0.0, 1.0, 0.0).inline_row(),
 ];
 
 /// Static parameter table (spec `.agents/spec/effects.md`).

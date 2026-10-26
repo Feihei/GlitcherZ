@@ -25,6 +25,8 @@
 //! - [`sine`] / [`gain`]: sine oscillator source and gain effect (`Processor` reference implementations);
 //! - [`effect`]: built-in effect framework — descriptors, [`Smoothed`](effect::Smoothed)
 //!   parameter smoothing and the [`EffectParamBank`](effect::EffectParamBank);
+//! - [`delay`] / [`eq`] / [`compressor`]: the built-in effects themselves (each owns its
+//!   static descriptor next to its DSP);
 //! - [`envelope`] / [`svf`] / [`synth`]: ADSR envelope, SVF filter, and full synthesizer;
 //! - [`sf2`]: SoundFont voice ([`Sf2VoiceProcessor`](sf2::Sf2VoiceProcessor)) — RT rendering
 //!   around the audited `rustysynth-ext` synthesizer (loading stays in [`crate::sf2`]);
@@ -42,10 +44,12 @@ pub mod automation;
 pub mod block;
 pub mod buffer;
 pub mod commands;
+pub mod compressor;
 pub mod context;
 pub mod delay;
 pub mod effect;
 pub mod envelope;
+pub mod eq;
 pub mod gain;
 pub mod graph;
 pub mod mixer;
@@ -85,13 +89,15 @@ pub use buffer::AudioBuffer;
 pub use commands::{
     COMMAND_QUEUE_CAPACITY, EngineCommand, NoteEvent, ParamId, SequencerCommand, command_channel,
 };
+pub use compressor::CompressorProcessor;
 pub use context::ProcessContext;
 pub use delay::DelayProcessor;
 pub use effect::{
-    BuiltinEffectKind, Curve, EffectDescriptor, EffectParamBank, MAX_EFFECT_PARAMS, ParamFlags,
-    ParamSpec, Rate, Smoothed, StereoClass, Unit, validate_descriptor,
+    BuiltinEffectKind, Curve, EffectDescriptor, EffectMeters, EffectParamBank, MAX_EFFECT_PARAMS,
+    MeterReading, ParamFlags, ParamSpec, Rate, Smoothed, StereoClass, Unit, validate_descriptor,
 };
 pub use envelope::AdsrProcessor;
+pub use eq::EqProcessor;
 pub use gain::GainProcessor;
 pub use graph::{
     AutoDest, AutoRoute, Cable, ChannelStripProcessor, ExecPlan, FeedbackProcessor, GraphCompiler,

@@ -18,6 +18,7 @@
 
 pub mod bank;
 pub mod descriptor;
+pub mod meters;
 pub mod smoothed;
 
 pub use bank::EffectParamBank;
@@ -25,6 +26,7 @@ pub use descriptor::{
     Curve, EffectDescriptor, MAX_EFFECT_PARAMS, ParamFlags, ParamSpec, Rate, StereoClass, Unit,
     validate_descriptor,
 };
+pub use meters::{EffectMeters, MeterReading};
 pub use smoothed::Smoothed;
 
 /// Built-in effect kinds the engine can instantiate.
@@ -35,18 +37,28 @@ pub use smoothed::Smoothed;
 /// with the DSP, so the roster is the only place that lists kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinEffectKind {
-    /// Feedback delay (the only built-in effect so far).
+    /// Feedback delay.
     Delay,
+    /// Three-band EQ with a low cut.
+    Eq,
+    /// Feed-forward peak compressor.
+    Compressor,
 }
 
 impl BuiltinEffectKind {
     /// Every built-in effect, in menu order.
-    pub const ALL: &'static [BuiltinEffectKind] = &[BuiltinEffectKind::Delay];
+    pub const ALL: &'static [BuiltinEffectKind] = &[
+        BuiltinEffectKind::Delay,
+        BuiltinEffectKind::Eq,
+        BuiltinEffectKind::Compressor,
+    ];
 
     /// Static descriptor of this kind.
     pub const fn descriptor(self) -> &'static EffectDescriptor {
         match self {
             BuiltinEffectKind::Delay => &crate::realtime::delay::DESCRIPTOR,
+            BuiltinEffectKind::Eq => &crate::realtime::eq::DESCRIPTOR,
+            BuiltinEffectKind::Compressor => &crate::realtime::compressor::DESCRIPTOR,
         }
     }
 }
