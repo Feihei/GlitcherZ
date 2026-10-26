@@ -16,16 +16,18 @@ use std::path::Path;
 
 use crate::Project;
 
-/// Current version of the project file format (v7: audio clips carry a
-/// seconds-domain trim window, `source_offset`/`source_len`, replacing the
-/// v6 tick `span_ticks` — U11).
+/// Current version of the project file format (v8: built-in effect nodes
+/// carry a tagged `params` enum instead of a sibling `delay` field — spec
+/// `.agents/spec/effects.md` D3).
 ///
 /// Migration chain on load: v4 and older go through [`Project::migrate`]
 /// (ChannelStrip → mixer, master multi-input → synthetic mixer); `version < 6`
 /// goes through [`Project::migrate_v5_to_v6`] (ticks ×10, legacy notes folded
 /// into the sequence); `version < 7` goes through
-/// [`Project::migrate_v6_to_v7`] (audio `span_ticks` → seconds trim window).
-pub const PROJECT_VERSION: u32 = 7;
+/// [`Project::migrate_v6_to_v7`] (audio `span_ticks` → seconds trim window);
+/// `version < 8` goes through [`Project::migrate_v7_to_v8`] (effect `delay`
+/// payload → `params`).
+pub const PROJECT_VERSION: u32 = 8;
 
 fn default_version() -> u32 {
     PROJECT_VERSION
@@ -103,6 +105,9 @@ pub fn parse_project(text: &str) -> Result<Project, ModelError> {
     }
     if version < 7 {
         project.migrate_v6_to_v7();
+    }
+    if version < 8 {
+        project.migrate_v7_to_v8();
     }
     project.validate().map_err(ModelError::InvalidGraph)?;
     Ok(project)
@@ -562,6 +567,75 @@ mod tests {
             "a v6 document must not be rescaled again"
         );
         assert_eq!(back.midi_tracks.len(), project.midi_tracks.len());
+    }
+
+    /// A v7 document: the built-in delay payload still lived in the effect
+    /// node's sibling `delay` field, and there was no `params` at all.
+    const V7_DOC: &str = r#"(
+    version: 7,
+    project: (
+        graph: (
+            nodes: [
+                (
+                    type: "effect",
+                    node_id: 3,
+                    track: 0,
+                    voice: (type: "builtin"),
+                    delay: (time_s: 0.42, feedback: 0.6, mix: 0.5),
+                ),
+            ],
+        ),
+    ),
+)"#;
+
+    #[test]
+    fn v7_delay_payload_moves_into_effect_params() {
+        let project = parse_project(V7_DOC).expect("v7 document should migrate and load");
+        match &project.graph.nodes[0] {
+            crate::NodeDoc::Effect { params, delay, .. } => {
+                assert!(delay.is_none(), "the bridge field is consumed on load");
+                assert_eq!(
+                    *params,
+                    crate::EffectParams::Delay(crate::DelayParams {
+                        time_s: 0.42,
+                        feedback: 0.6,
+                        mix: 0.5,
+                    }),
+                    "v7 delay settings must survive the upgrade"
+                );
+            }
+            other => panic!("expected an effect node, got {other:?}"),
+        }
+    }
+
+    /// The other half of D4: a current file never writes the bridge field, so
+    /// a v8 document is unambiguous about where the payload lives.
+    #[test]
+    fn saved_files_do_not_emit_the_legacy_delay_field() {
+        let mut project = Project::default();
+        project.graph.nodes.push(crate::NodeDoc::Effect {
+            node_id: 3,
+            track: 0,
+            voice: crate::VoiceSpec::Builtin,
+            params: crate::EffectParams::default(),
+            delay: None,
+        });
+        let text = ron::ser::to_string_pretty(
+            &ProjectFile {
+                version: PROJECT_VERSION,
+                project,
+            },
+            ron::ser::PrettyConfig::new(),
+        )
+        .expect("serialize");
+        assert!(
+            text.contains("kind:\"delay\"") || text.contains("kind: \"delay\""),
+            "the payload must carry its kind tag: {text}"
+        );
+        assert!(
+            !text.contains("delay: ("),
+            "the legacy sibling field must not be written again: {text}"
+        );
     }
 
     #[test]

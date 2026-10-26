@@ -35,6 +35,8 @@ use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::{NoteEvent, ParamId};
 use crate::realtime::context::ProcessContext;
 use crate::realtime::delay::DelayProcessor;
+use crate::realtime::effect::Smoothed;
+use crate::realtime::effect::descriptor::{ParamSpec, Unit};
 use crate::realtime::gain::GainProcessor;
 use crate::realtime::mixer::MixerProcessor;
 use crate::realtime::processor::{ChannelWeights, Processor};
@@ -756,6 +758,9 @@ fn route_slot(voice: u16, delay: u16, channel: u16, param: ParamId) -> u16 {
         ParamId::TrackGain | ParamId::TrackPan | ParamId::TrackMute => channel,
         ParamId::DelayTime | ParamId::DelayFeedback | ParamId::DelayMix => delay,
         ParamId::MasterGain => NO_EDGE,
+        // Built-in effect slots are node-addressed (`SetNodeParam` + the
+        // effect's own `node_id`), never part of a track's fixed trio.
+        ParamId::BuiltinParam(_) => NO_EDGE,
         _ => voice,
     }
 }
@@ -765,18 +770,30 @@ fn route_slot(voice: u16, delay: u16, channel: u16, param: ParamId) -> u16 {
 ///
 /// Semantics match the old `TrackStrip` summing stage: muted output is all
 /// zeros; pan p=0 → (1,1), p=±1 → one side full scale.
+/// Channel strip gain/pan specs (D8: both smoothed — fader moves are where
+/// zipper noise is most audible).
+const STRIP_GAIN_SPEC: ParamSpec = ParamSpec::gain("gain", Unit::Percent, 0.0, 1.5, 0.8);
+const STRIP_PAN_SPEC: ParamSpec = ParamSpec::pan("pan", -1.0, 1.0, 0.0);
+
 pub struct ChannelStripProcessor {
-    gain: f32,
-    pan: f32,
+    gain: Smoothed,
+    pan: Smoothed,
     muted: bool,
 }
 
 impl ChannelStripProcessor {
-    /// Default gain 0.8, pan centered, not muted (same as the old `TrackStrip::new`).
+    /// Default gain 0.8, pan centered, not muted (same as the old
+    /// `TrackStrip::new`). Assumes a 48 kHz stream; use
+    /// [`ChannelStripProcessor::new_at`] when the rate is known.
     pub fn new() -> Self {
+        Self::new_at(48_000.0)
+    }
+
+    /// Same as [`ChannelStripProcessor::new`] with an explicit sample rate.
+    pub fn new_at(sample_rate: f32) -> Self {
         Self {
-            gain: 0.8,
-            pan: 0.0,
+            gain: Smoothed::new(&STRIP_GAIN_SPEC, sample_rate),
+            pan: Smoothed::new(&STRIP_PAN_SPEC, sample_rate),
             muted: false,
         }
     }
@@ -798,23 +815,15 @@ impl Processor for ChannelStripProcessor {
             }
             return;
         }
-        let left = (1.0 - self.pan).clamp(0.0, 1.0);
-        let right = (1.0 + self.pan).clamp(0.0, 1.0);
-        let gain = self.gain;
-        for (ch, pan_gain) in [(0usize, left), (1usize, right)] {
-            let g = gain * pan_gain;
-            if g >= 1.0 {
-                continue; // Identity fast path
-            }
-            if g <= 0.0 {
+        let frames = buffer.len();
+        for index in 0..frames {
+            // One tick per frame: stereo must not double the ramp speed.
+            let gain = self.gain.tick();
+            let pan = self.pan.tick().clamp(-1.0, 1.0);
+            let weights = [(1.0 - pan).clamp(0.0, 1.0), (1.0 + pan).clamp(0.0, 1.0)];
+            for (ch, weight) in weights.iter().enumerate() {
                 if let Some(channel) = buffer.channel_mut(ch) {
-                    channel.fill(0.0);
-                }
-                continue;
-            }
-            if let Some(channel) = buffer.channel_mut(ch) {
-                for sample in channel.iter_mut() {
-                    *sample *= g;
+                    channel[index] *= gain * weight;
                 }
             }
         }
@@ -823,15 +832,11 @@ impl Processor for ChannelStripProcessor {
     fn set_param(&mut self, id: ParamId, value: f32) -> bool {
         match id {
             ParamId::TrackGain => {
-                if value.is_finite() {
-                    self.gain = value.clamp(0.0, 1.5);
-                }
+                self.gain.set(value);
                 true
             }
             ParamId::TrackPan => {
-                if value.is_finite() {
-                    self.pan = value.clamp(-1.0, 1.0);
-                }
+                self.pan.set(value);
                 true
             }
             ParamId::TrackMute => {
@@ -989,7 +994,7 @@ impl GraphCompiler {
         graph.install(
             master as usize,
             master_id,
-            Box::new(GainProcessor::new(1.0)),
+            Box::new(GainProcessor::new_at(1.0, compiler.sample_rate)),
             AudioBuffer::new(2, compiler.block_size),
         );
 
@@ -2108,7 +2113,7 @@ fn chain_processor(kind: usize, sample_rate: f32) -> Box<dyn Processor> {
     match kind {
         0 => Box::new(SynthProcessor::new(sample_rate)),
         1 => Box::new(DelayProcessor::new(sample_rate)),
-        _ => Box::new(ChannelStripProcessor::new()),
+        _ => Box::new(ChannelStripProcessor::new_at(sample_rate)),
     }
 }
 
@@ -2319,6 +2324,11 @@ mod tests {
         }
         let before = graph.process_block(&ctx());
         graph.master_set_param(ParamId::MasterGain, 0.25);
+        // Smoothing (D9): the 10 ms ramp has to settle before the ratio means
+        // anything. 100 blocks ≈ 27 time constants.
+        for _ in 0..100 {
+            graph.process_block(&ctx());
+        }
         let after = graph.process_block(&ctx());
         let ratio = after.master / before.master;
         assert!(
@@ -2817,14 +2827,15 @@ mod tests {
 
     #[test]
     fn channel_strip_applies_gain_pan_and_mute() {
-        let mut strip = ChannelStripProcessor::new();
-        let mut buf = AudioBuffer::new(2, 8);
-        buf.set_len(8);
         let fill = |buf: &mut AudioBuffer| {
             buf.channel_mut(0).unwrap().fill(0.5);
             buf.channel_mut(1).unwrap().fill(0.5);
         };
+        let mut buf = AudioBuffer::new(2, 8);
+        buf.set_len(8);
+
         // Default: gain 0.8, pan centered (pan gain 1) → both channels × 0.8.
+        let mut strip = ChannelStripProcessor::new();
         fill(&mut buf);
         strip.process(&ctx(), &mut buf);
         assert!(
@@ -2839,7 +2850,11 @@ mod tests {
                 .iter()
                 .all(|s| (*s - 0.4).abs() < 1e-6)
         );
+
         // Hard left: right channel zeroed, left channel still 0.5 × 0.8.
+        // A fresh strip with the pan set *before* the first render (the
+        // smoother snaps pre-start; a live pan move ramps by design).
+        let mut strip = ChannelStripProcessor::new();
         strip.set_param(ParamId::TrackPan, -1.0);
         fill(&mut buf);
         strip.process(&ctx(), &mut buf);
@@ -2850,12 +2865,27 @@ mod tests {
                 .all(|s| (*s - 0.4).abs() < 1e-6)
         );
         assert!(buf.channel(1).unwrap().iter().all(|s| s.abs() < 1e-9));
+
         // Muted: all zeros.
+        let mut strip = ChannelStripProcessor::new();
         strip.set_param(ParamId::TrackMute, 1.0);
         fill(&mut buf);
         strip.process(&ctx(), &mut buf);
         assert!(buf.channel(0).unwrap().iter().all(|s| s.abs() < 1e-12));
         assert!(buf.channel(1).unwrap().iter().all(|s| s.abs() < 1e-12));
+
+        // A runtime fader move must ramp, not jump (D8).
+        let mut strip = ChannelStripProcessor::new();
+        fill(&mut buf);
+        strip.process(&ctx(), &mut buf);
+        strip.set_param(ParamId::TrackGain, 0.0);
+        fill(&mut buf);
+        strip.process(&ctx(), &mut buf);
+        let first = buf.channel(0).unwrap()[0];
+        assert!(
+            first > 0.3 && first < 0.4,
+            "a runtime gain move must ramp, got {first}"
+        );
     }
 
     // ---- smoke tests stressing capacity limits ----
@@ -3115,6 +3145,10 @@ mod tests {
         }
         let before = graph.process_block(&ctx());
         assert!(graph.node_set_param(master_id, ParamId::MasterGain, 0.25));
+        // Let the 10 ms smoother settle (D9) before comparing levels.
+        for _ in 0..100 {
+            graph.process_block(&ctx());
+        }
         let after = graph.process_block(&ctx());
         let ratio = after.master / before.master;
         assert!(
@@ -3400,8 +3434,16 @@ mod tests {
 
         // node_id-addressed parameters still work after replacement.
         assert!(graph.node_set_param(3, ParamId::TrackGain, 0.5));
+        // The channel strip gain is smoothed (D8): settle the 10 ms ramp.
+        for _ in 0..100 {
+            graph.process_block(&ctx());
+        }
         let levels = graph.process_block(&ctx());
-        assert!((levels.master - 0.125).abs() < 1e-6);
+        assert!(
+            (levels.master - 0.125).abs() < 1e-6,
+            "expected 0.125 after settling, got {}",
+            levels.master
+        );
     }
 
     #[test]

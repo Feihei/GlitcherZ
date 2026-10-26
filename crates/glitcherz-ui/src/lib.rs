@@ -38,21 +38,23 @@ use glitcherz_engine::Sf2Error;
 use glitcherz_engine::Sf2Library;
 use glitcherz_engine::convert;
 use glitcherz_engine::realtime::{
-    AudioTrackProcessor, ChannelStripProcessor, DelayProcessor, EngineCommand, FeedbackProcessor,
-    MAX_AUTO_POINTS, MAX_CLIP_NOTES, MAX_MIDI_FANOUT, MAX_TRACK_CLIPS,
+    AudioTrackProcessor, ChannelStripProcessor, Curve, DelayProcessor, EngineCommand,
+    FeedbackProcessor, MAX_AUTO_POINTS, MAX_CLIP_NOTES, MAX_MIDI_FANOUT, MAX_TRACK_CLIPS,
     MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent, ParamId, Processor,
     RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCurveInterp, RtMidiClip, RtNote,
     SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor, SynthProcessor,
     empty_clip_table,
 };
 use glitcherz_model::{
-    AutoParam, AutoPoint, CableKind, ControlClip, ControlTrack, CurveInterp, DelayParams, GraphDoc,
-    MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_MIDI_TRACKS,
-    MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip, MidiSource, MidiTrack,
-    NodeDoc, PortRef, Project, SamplePlayMode, SongLoop, SynthParams, VoiceSpec,
+    AutoParam, AutoPoint, CableKind, ControlClip, ControlTrack, CurveInterp, EffectParams,
+    GraphDoc, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS,
+    MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip,
+    MidiSource, MidiTrack, NodeDoc, PortRef, Project, SamplePlayMode, SongLoop, SynthParams,
+    VoiceSpec,
 };
 
 pub mod curve;
+pub mod effect;
 pub mod event_list;
 pub mod export_audio;
 pub mod focus;
@@ -230,9 +232,7 @@ fn inline_param_id(p: patch::InlineParam) -> ParamId {
     match p {
         patch::InlineParam::Cutoff => ParamId::FilterCutoff,
         patch::InlineParam::Resonance => ParamId::FilterResonance,
-        patch::InlineParam::DelayTime => ParamId::DelayTime,
-        patch::InlineParam::DelayFeedback => ParamId::DelayFeedback,
-        patch::InlineParam::DelayMix => ParamId::DelayMix,
+        patch::InlineParam::EffectSlot(slot) => ParamId::BuiltinParam(slot),
         patch::InlineParam::MixerOutPan => ParamId::MixerOutPan,
         patch::InlineParam::FeedbackGain => ParamId::FeedbackGain,
         patch::InlineParam::SampleRoot => ParamId::SampleRootNote,
@@ -1721,11 +1721,22 @@ impl GlitcherZApp {
                     (ParamId::Sustain, synth.sustain),
                     (ParamId::Release, synth.release_s),
                 ],
-                NodeDoc::Effect { delay, .. } => vec![
-                    (ParamId::DelayTime, delay.time_s),
-                    (ParamId::DelayFeedback, delay.feedback),
-                    (ParamId::DelayMix, delay.mix),
-                ],
+                // Table-driven (spec `effects.md` D6): one entry per slot.
+                NodeDoc::Effect {
+                    voice: VoiceSpec::Builtin | VoiceSpec::SoundFont { .. },
+                    params,
+                    ..
+                } => crate::effect::descriptor(params)
+                    .params
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, _)| {
+                        (
+                            ParamId::BuiltinParam(slot as u8),
+                            crate::effect::value(params, slot as u8),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
                 _ => continue,
             };
             for (id, value) in params {
@@ -1888,18 +1899,18 @@ impl GlitcherZApp {
         }
     }
 
-    /// Built-in delay parameters of an effect node.
-    fn delay_of_node(&self, doc_id: u64) -> Option<DelayParams> {
+    /// Built-in effect payload of an effect node (ignored for plugins).
+    fn effect_params_of_node(&self, doc_id: u64) -> Option<EffectParams> {
         match self.project().graph.node_by_id(doc_id)? {
-            NodeDoc::Effect { delay, .. } => Some(*delay),
+            NodeDoc::Effect { params, .. } => Some(params.clone()),
             _ => None,
         }
     }
 
-    /// Built-in delay parameters of an effect node (mutable).
-    fn delay_mut_node(&mut self, doc_id: u64) -> Option<&mut DelayParams> {
+    /// Built-in effect payload of an effect node (mutable).
+    fn effect_params_mut_node(&mut self, doc_id: u64) -> Option<&mut EffectParams> {
         match self.project_mut().graph.node_by_id_mut(doc_id)? {
-            NodeDoc::Effect { delay, .. } => Some(delay),
+            NodeDoc::Effect { params, .. } => Some(params),
             _ => None,
         }
     }
@@ -2408,11 +2419,12 @@ impl GlitcherZApp {
                 voice: VoiceSpec::Builtin,
                 synth: SynthParams::default(),
             },
-            patch::NodeSource::BuiltinDelay => NodeDoc::Effect {
+            patch::NodeSource::Builtin(kind) => NodeDoc::Effect {
                 node_id,
                 track,
                 voice: VoiceSpec::Builtin,
-                delay: DelayParams::default(),
+                params: crate::effect::default_params(kind),
+                delay: None,
             },
             patch::NodeSource::SoundFont { path } => NodeDoc::Instrument {
                 node_id,
@@ -2463,7 +2475,8 @@ impl GlitcherZApp {
                     plugin_id,
                     state: Vec::new(),
                 },
-                delay: DelayParams::default(),
+                params: EffectParams::default(),
+                delay: None,
             },
             patch::NodeSource::Vst3Effect { path, class_id } => NodeDoc::Effect {
                 node_id,
@@ -2473,7 +2486,8 @@ impl GlitcherZApp {
                     class_id,
                     state: Vec::new(),
                 },
-                delay: DelayParams::default(),
+                params: EffectParams::default(),
+                delay: None,
             },
             patch::NodeSource::Mixer => NodeDoc::Mixer {
                 node_id,
@@ -6630,11 +6644,11 @@ impl GlitcherZApp {
                 (Some(NodeDoc::Instrument { .. }), Some(id)) => Some(id),
                 _ => None,
             };
-            // Delay sliders: an Effect panel target edits that node; the
+            // Effect sliders: an Effect panel target edits that node; the
             // instrument target (and the track fallback) edits the track's
             // built-in delay (pre-G4 behavior); a Mixer target shows none
             // (the console below owns mixer parameters).
-            let delay_target: Option<u64> = match (&target_doc, target) {
+            let effect_target: Option<u64> = match (&target_doc, target) {
                 (Some(NodeDoc::Effect { .. }), Some(id)) => Some(id),
                 (Some(NodeDoc::Mixer { .. }), _) => None,
                 _ => self
@@ -6647,10 +6661,10 @@ impl GlitcherZApp {
             // instrument's filter / amp envelope, the effect's delay. Master
             // gain and the output meter live on the transport bar (always
             // visible), so they must not look like part of this node.
-            if instr_target.is_some() || delay_target.is_some() {
+            if instr_target.is_some() || effect_target.is_some() {
                 ui.horizontal(|ui| {
                     ui.strong("Node Parameters");
-                    ui.weak("— filter / envelope / delay of the node above, not the master bus");
+                    ui.weak("— filter / envelope / effect of the node above, not the master bus");
                 });
             }
             egui::Grid::new("synth_params")
@@ -6712,9 +6726,13 @@ impl GlitcherZApp {
                     ui.end_row();
                     }
 
-                    if let Some(delay_id) = delay_target {
-                        ui.label("Delay");
-                        self.delay_sliders(ui, delay_id);
+                    if let Some(effect_id) = effect_target {
+                        let name = self
+                            .effect_params_of_node(effect_id)
+                            .map(|p| crate::effect::descriptor(&p).name)
+                            .unwrap_or("Effect");
+                        ui.label(name);
+                        self.effect_sliders(ui, effect_id);
                         ui.end_row();
                     }
                 });
@@ -6840,36 +6858,44 @@ impl GlitcherZApp {
         self.commit_param_edit("Sample Params", before, "sample-params");
     }
 
-    fn delay_sliders(&mut self, ui: &mut egui::Ui, doc_id: u64) {
-        let delay = self.delay_of_node(doc_id).unwrap_or_default();
-        let mut mix = delay.mix;
-        let mut time = delay.time_s;
-        let mut feedback = delay.feedback;
-        ui.horizontal(|ui| {
-            let sliders = [
-                ("Wet", &mut mix, DELAY_MIX_RANGE, ParamId::DelayMix),
-                ("Time", &mut time, DELAY_TIME_RANGE, ParamId::DelayTime),
-                (
-                    "Feedback",
-                    &mut feedback,
-                    DELAY_FB_RANGE,
-                    ParamId::DelayFeedback,
-                ),
-            ];
-            for (label, value, range, id) in sliders {
-                let resp = ui.add_sized([104.0, 20.0], egui::Slider::new(value, range).text(label));
+    fn effect_sliders(&mut self, ui: &mut egui::Ui, doc_id: u64) {
+        let Some(initial) = self.effect_params_of_node(doc_id) else {
+            return;
+        };
+        let descriptor = crate::effect::descriptor(&initial);
+        let slots = descriptor.params.len();
+        let mut values: Vec<f32> = (0..slots)
+            .map(|slot| crate::effect::value(&initial, slot as u8))
+            .collect();
+        ui.horizontal_wrapped(|ui| {
+            for (slot, spec) in descriptor.params.iter().enumerate() {
+                let id = ParamId::BuiltinParam(slot as u8);
+                if spec.is_discrete() {
+                    let mut on = values[slot] >= 0.5;
+                    if ui.checkbox(&mut on, spec.name).changed() {
+                        values[slot] = if on { 1.0 } else { 0.0 };
+                        self.send_node_param(doc_id, id, values[slot]);
+                    }
+                    continue;
+                }
+                let resp = ui.add_sized(
+                    [132.0, 20.0],
+                    egui::Slider::new(&mut values[slot], spec.min..=spec.max)
+                        .logarithmic(matches!(spec.curve, Curve::Log))
+                        .text(spec.name),
+                );
                 if resp.changed() {
-                    self.send_node_param(doc_id, id, *value);
+                    self.send_node_param(doc_id, id, values[slot]);
                 }
             }
         });
         let before = self.begin_param_edit();
-        if let Some(delay) = self.delay_mut_node(doc_id) {
-            delay.mix = mix;
-            delay.time_s = time;
-            delay.feedback = feedback;
+        if let Some(params) = self.effect_params_mut_node(doc_id) {
+            for (slot, value) in values.iter().enumerate() {
+                crate::effect::set_value(params, slot as u8, *value);
+            }
         }
-        self.commit_param_edit("Delay Params", before, "delay-params");
+        self.commit_param_edit("Effect Params", before, "effect-params");
     }
 
     /// Send one document node's parameter to the audio thread (G4 node
@@ -6921,19 +6947,12 @@ impl GlitcherZApp {
                     self.commit_param_edit("Filter Resonance", before, "synth-res");
                     self.send_node_param(node, inline_param_id(p), value);
                 }
-                patch::InlineParam::DelayTime
-                | patch::InlineParam::DelayFeedback
-                | patch::InlineParam::DelayMix => {
+                patch::InlineParam::EffectSlot(slot) => {
                     let before = self.begin_param_edit();
-                    if let Some(d) = self.delay_mut_node(node) {
-                        match p {
-                            patch::InlineParam::DelayTime => d.time_s = value,
-                            patch::InlineParam::DelayFeedback => d.feedback = value,
-                            patch::InlineParam::DelayMix => d.mix = value,
-                            _ => {}
-                        }
+                    if let Some(params) = self.effect_params_mut_node(node) {
+                        crate::effect::set_value(params, slot, value);
                     }
-                    self.commit_param_edit("Delay Params", before, "delay-params");
+                    self.commit_param_edit("Effect Params", before, "effect-params");
                     self.send_node_param(node, inline_param_id(p), value);
                 }
                 patch::InlineParam::MixerOutPan => {
@@ -7391,7 +7410,8 @@ impl GlitcherZApp {
             node_id: delay_id,
             track,
             voice: VoiceSpec::Builtin,
-            delay: DelayParams::default(),
+            params: EffectParams::default(),
+            delay: None,
         });
         self.project_mut()
             .graph
@@ -9072,16 +9092,8 @@ mod inline_param_tests {
             ParamId::FilterResonance
         );
         assert_eq!(
-            inline_param_id(patch::InlineParam::DelayTime),
-            ParamId::DelayTime
-        );
-        assert_eq!(
-            inline_param_id(patch::InlineParam::DelayFeedback),
-            ParamId::DelayFeedback
-        );
-        assert_eq!(
-            inline_param_id(patch::InlineParam::DelayMix),
-            ParamId::DelayMix
+            inline_param_id(patch::InlineParam::EffectSlot(1)),
+            ParamId::BuiltinParam(1)
         );
         assert_eq!(
             inline_param_id(patch::InlineParam::MixerOutPan),
@@ -9162,7 +9174,7 @@ mod splice_tests {
     fn only_effects_and_mixers_fit_an_audio_splice() {
         use patch::NodeSource;
         let insertable = [
-            NodeSource::BuiltinDelay,
+            NodeSource::Builtin(glitcherz_model::BuiltinEffectKind::Delay),
             NodeSource::ClapEffect {
                 path: "C:/p/fx.clap".to_string(),
                 plugin_id: "fx".to_string(),

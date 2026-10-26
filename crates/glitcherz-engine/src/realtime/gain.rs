@@ -3,29 +3,49 @@
 use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::ParamId;
 use crate::realtime::context::ProcessContext;
+use crate::realtime::effect::Smoothed;
+use crate::realtime::effect::descriptor::{ParamSpec, Unit};
 use crate::realtime::processor::Processor;
+
+/// Master gain parameter: linear, per-sample, 10 ms smoothing.
+const GAIN_SPEC: ParamSpec = ParamSpec::gain("gain", Unit::Percent, 0.0, 2.0, 1.0);
 
 /// Linear gain — the first effect and also the simplest `Processor`
 /// reference implementation.
 ///
+/// The gain is smoothed (spec `.agents/spec/effects.md` D8) so fader moves do
+/// not stair-step: constructor and pre-render `set_param` values snap, runtime
+/// changes ramp over 10 ms. Unity is an exact passthrough (`x * 1.0 == x`).
+///
 /// Comes with the standard effect tests (AGENTS.md "Testing"): silent input →
 /// silent output; full-scale input → no NaN/Inf.
 pub struct GainProcessor {
-    gain: f32,
+    gain: Smoothed,
 }
 
 impl GainProcessor {
-    /// Non-finite values fall back to 0 (silence), avoiding NaN pollution of
-    /// the signal.
+    /// Non-finite values fall back to 0 (silence). Assumes a 48 kHz stream;
+    /// use [`GainProcessor::new_at`] when the rate is known.
     pub fn new(gain: f32) -> Self {
-        Self {
-            gain: sanitize(gain),
-        }
+        Self::new_at(gain, 48_000.0)
     }
 
-    /// Sets the gain. Non-finite values are ignored (silence). RT-safe.
+    /// Same as [`GainProcessor::new`] with an explicit sample rate (the
+    /// smoothing coefficient depends on it). Construction time only.
+    pub fn new_at(gain: f32, sample_rate: f32) -> Self {
+        let mut smoothed = Smoothed::new(&GAIN_SPEC, sample_rate);
+        smoothed.snap(sanitize(gain));
+        Self { gain: smoothed }
+    }
+
+    /// Current gain. RT-safe.
+    pub fn gain(&self) -> f32 {
+        self.gain.value()
+    }
+
+    /// Sets the gain. Non-finite values are ignored. RT-safe.
     fn set_gain(&mut self, gain: f32) {
-        self.gain = sanitize(gain);
+        self.gain.set(gain);
     }
 }
 
@@ -35,13 +55,21 @@ fn sanitize(gain: f32) -> f32 {
 
 impl Processor for GainProcessor {
     fn process(&mut self, _ctx: &ProcessContext, buffer: &mut AudioBuffer) {
-        if self.gain == 1.0 {
-            return; // identity fast path
+        let frames = buffer.len();
+        let channels = buffer.channels();
+        let unity = self.gain.value() == 1.0 && self.gain.target() == 1.0;
+        if unity {
+            // Identity fast path: still advance so a later change ramps.
+            self.gain.advance(frames);
+            return;
         }
-        for ch in 0..buffer.channels() {
-            if let Some(channel) = buffer.channel_mut(ch) {
-                for sample in channel.iter_mut() {
-                    *sample *= self.gain;
+        for index in 0..frames {
+            // One tick per frame, not per channel, so stereo does not double
+            // the ramp speed.
+            let gain = self.gain.tick();
+            for ch in 0..channels {
+                if let Some(channel) = buffer.channel_mut(ch) {
+                    channel[index] *= gain;
                 }
             }
         }
@@ -132,5 +160,28 @@ mod tests {
         gain.process(&ctx(8), &mut buf);
         assert!(buf.channel(0).unwrap().iter().all(|s| s.is_finite()));
         assert!(buf.channel(0).unwrap().iter().all(|s| s.abs() < 1e-12));
+    }
+
+    #[test]
+    fn runtime_change_ramps_and_unity_is_exact() {
+        let mut gain = GainProcessor::new(1.0);
+        let mut buf = AudioBuffer::new(1, 32);
+        buf.set_len(32);
+        buf.channel_mut(0).unwrap().fill(0.5);
+        gain.process(&ctx(32), &mut buf);
+        assert_eq!(buf.channel(0).unwrap()[0], 0.5, "unity is exact");
+
+        gain.set_param(ParamId::MasterGain, 0.0);
+        buf.channel_mut(0).unwrap().fill(1.0);
+        gain.process(&ctx(32), &mut buf);
+        let first = buf.channel(0).unwrap()[0];
+        assert!(
+            first > 0.9 && first < 1.0,
+            "fader move must ramp, got {first}"
+        );
+        assert!(
+            gain.gain() < 1.0,
+            "the smoother must be heading towards the new target"
+        );
     }
 }

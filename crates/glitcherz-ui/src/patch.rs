@@ -17,9 +17,9 @@ use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 use glitcherz_model::{
-    AutoParam, CableDoc, CableKind, GraphDoc, LayoutDoc, MAX_AUDIO_TRACKS, MAX_AUTO_TRACKS,
-    MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MIN_MIXER_CHANNELS, MidiSource, NodeDoc, PortRef,
-    VoiceSpec,
+    AutoParam, BuiltinEffectKind, CableDoc, CableKind, GraphDoc, LayoutDoc, MAX_AUDIO_TRACKS,
+    MAX_AUTO_TRACKS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MIN_MIXER_CHANNELS, MidiSource, NodeDoc,
+    PortRef, VoiceSpec,
 };
 
 use crate::plugin_catalog::PluginFormat;
@@ -34,12 +34,9 @@ pub enum InlineParam {
     Cutoff,
     /// Built-in synth filter resonance.
     Resonance,
-    /// Built-in delay time (seconds).
-    DelayTime,
-    /// Built-in delay feedback.
-    DelayFeedback,
-    /// Built-in delay wet mix.
-    DelayMix,
+    /// Built-in effect parameter, addressed by its **descriptor slot**
+    /// (spec `effects.md` D5) — one variant for every built-in effect.
+    EffectSlot(u8),
     /// Mixer output-stage pan.
     MixerOutPan,
     /// Feedback tap gain (P6).
@@ -77,22 +74,6 @@ const SYNTH_INLINE: [InlineParamSpec; 2] = [
     },
 ];
 
-/// Built-in delay inline rows (time / feedback / mix).
-const DELAY_INLINE: [InlineParamSpec; 3] = [
-    InlineParamSpec {
-        param: InlineParam::DelayTime,
-        label: "time",
-    },
-    InlineParamSpec {
-        param: InlineParam::DelayFeedback,
-        label: "fdbk",
-    },
-    InlineParamSpec {
-        param: InlineParam::DelayMix,
-        label: "mix",
-    },
-];
-
 /// Mixer inline row (output-stage pan; channel parameters stay on the
 /// mixer console — spec §7).
 const MIXER_INLINE: [InlineParamSpec; 1] = [InlineParamSpec {
@@ -123,23 +104,34 @@ const SAMPLE_INLINE: [InlineParamSpec; 2] = [
 /// instruments expose none (the preset picker is the primary operation);
 /// plugin nodes take their rows from the session enumeration instead
 /// (first 2 parameters — see [`PatchDeps::plugin_inline`]).
-fn inline_params_of(node: &NodeDoc) -> &'static [InlineParamSpec] {
+fn inline_params_of(node: &NodeDoc) -> Vec<InlineParamSpec> {
     match node {
         NodeDoc::Instrument {
             voice: VoiceSpec::Builtin,
             ..
-        } => &SYNTH_INLINE,
+        } => SYNTH_INLINE.to_vec(),
         NodeDoc::Instrument {
             voice: VoiceSpec::Sample { .. },
             ..
-        } => &SAMPLE_INLINE,
+        } => SAMPLE_INLINE.to_vec(),
+        // Table-driven from the engine descriptor (spec `effects.md` D6): the
+        // row order, labels and count all come from the effect's static table.
         NodeDoc::Effect {
             voice: VoiceSpec::Builtin | VoiceSpec::SoundFont { .. },
+            params,
             ..
-        } => &DELAY_INLINE,
-        NodeDoc::Mixer { .. } => &MIXER_INLINE,
-        NodeDoc::Feedback { .. } => &FEEDBACK_INLINE,
-        _ => &[],
+        } => crate::effect::descriptor(params)
+            .params
+            .iter()
+            .enumerate()
+            .map(|(slot, spec)| InlineParamSpec {
+                param: InlineParam::EffectSlot(slot as u8),
+                label: spec.short,
+            })
+            .collect(),
+        NodeDoc::Mixer { .. } => MIXER_INLINE.to_vec(),
+        NodeDoc::Feedback { .. } => FEEDBACK_INLINE.to_vec(),
+        _ => Vec::new(),
     }
 }
 
@@ -212,7 +204,7 @@ fn inline_row_parts(row: Rect, z: f32) -> (Pos2, Rect, Pos2, Rect) {
 /// parameter (G5): reads the node's own fields (the ranges mirror the
 /// panel sliders — one source of slider geometry per parameter).
 fn inline_doc_value(node: &NodeDoc, param: InlineParam) -> (f64, f64, f64) {
-    use crate::{CUTOFF_RANGE, DELAY_FB_RANGE, DELAY_MIX_RANGE, DELAY_TIME_RANGE, RES_RANGE};
+    use crate::{CUTOFF_RANGE, RES_RANGE};
     match (node, param) {
         (NodeDoc::Instrument { synth, .. }, InlineParam::Cutoff) => (
             synth.cutoff_hz as f64,
@@ -224,21 +216,14 @@ fn inline_doc_value(node: &NodeDoc, param: InlineParam) -> (f64, f64, f64) {
             *RES_RANGE.start() as f64,
             *RES_RANGE.end() as f64,
         ),
-        (NodeDoc::Effect { delay, .. }, InlineParam::DelayTime) => (
-            delay.time_s as f64,
-            *DELAY_TIME_RANGE.start() as f64,
-            *DELAY_TIME_RANGE.end() as f64,
-        ),
-        (NodeDoc::Effect { delay, .. }, InlineParam::DelayFeedback) => (
-            delay.feedback as f64,
-            *DELAY_FB_RANGE.start() as f64,
-            *DELAY_FB_RANGE.end() as f64,
-        ),
-        (NodeDoc::Effect { delay, .. }, InlineParam::DelayMix) => (
-            delay.mix as f64,
-            *DELAY_MIX_RANGE.start() as f64,
-            *DELAY_MIX_RANGE.end() as f64,
-        ),
+        (NodeDoc::Effect { params, .. }, InlineParam::EffectSlot(slot)) => {
+            let (min, max) = crate::effect::range(params, slot);
+            (
+                f64::from(crate::effect::value(params, slot)),
+                f64::from(min),
+                f64::from(max),
+            )
+        }
         (NodeDoc::Mixer { out_pan, .. }, InlineParam::MixerOutPan) => (*out_pan as f64, -1.0, 1.0),
         (NodeDoc::Feedback { gain, .. }, InlineParam::FeedbackGain) => (*gain as f64, 0.0, 1.0),
         (
@@ -342,8 +327,10 @@ impl PickerPlace {
 pub enum NodeSource {
     /// Built-in synth voice.
     BuiltinSynth,
-    /// Built-in delay effect.
-    BuiltinDelay,
+    /// Built-in effect of the given kind (spec `effects.md` D1): the roster is
+    /// walked from `BuiltinEffectKind::ALL`, so a new effect needs no new
+    /// `NodeSource` variant.
+    Builtin(BuiltinEffectKind),
     /// SoundFont file at its default preset (bank 0 / program 0).
     SoundFont {
         /// `.sf2` / `.sf3` path picked in the file dialog.
@@ -402,7 +389,7 @@ impl NodeSource {
     pub fn fits_audio_insert(&self) -> bool {
         matches!(
             self,
-            NodeSource::BuiltinDelay
+            NodeSource::Builtin(_)
                 | NodeSource::ClapEffect { .. }
                 | NodeSource::Vst3Effect { .. }
                 | NodeSource::Mixer
@@ -1827,8 +1814,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 }
             });
             ui.menu_button("Effect", |ui| {
-                if ui.button("Built-in Delay").clicked() {
-                    picked_source = Some(NodeSource::BuiltinDelay);
+                for kind in BuiltinEffectKind::ALL {
+                    if ui.button(kind.label()).clicked() {
+                        picked_source = Some(NodeSource::Builtin(*kind));
+                    }
                 }
                 ui.separator();
                 if ui.button("CLAP…").clicked() {
@@ -2577,8 +2566,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     if is_audio {
                         ui.menu_button("Insert", |ui| {
                             ui.menu_button("Effect", |ui| {
-                                if ui.button("Built-in Delay").clicked() {
-                                    picked = Some(CablePick::Insert(NodeSource::BuiltinDelay));
+                                for kind in BuiltinEffectKind::ALL {
+                                    if ui.button(kind.label()).clicked() {
+                                        picked =
+                                            Some(CablePick::Insert(NodeSource::Builtin(*kind)));
+                                    }
                                 }
                                 ui.separator();
                                 if ui.button("CLAP…").clicked() {
@@ -2913,17 +2905,21 @@ mod tests {
             node_id: 5,
             track: 0,
             voice: VoiceSpec::Builtin,
-            delay: glitcherz_model::DelayParams::default(),
+            params: glitcherz_model::EffectParams::default(),
+            delay: None,
         };
         let params: Vec<InlineParam> = inline_params_of(&delay).iter().map(|s| s.param).collect();
         assert_eq!(
             params,
             vec![
-                InlineParam::DelayTime,
-                InlineParam::DelayFeedback,
-                InlineParam::DelayMix,
-            ]
+                InlineParam::EffectSlot(0),
+                InlineParam::EffectSlot(1),
+                InlineParam::EffectSlot(2),
+            ],
+            "one inline row per descriptor slot, in table order"
         );
+        let labels: Vec<&str> = inline_params_of(&delay).iter().map(|s| s.label).collect();
+        assert_eq!(labels, vec!["time", "fdbk", "mix"]);
 
         let mixer = NodeDoc::Mixer {
             node_id: 6,
@@ -3067,18 +3063,20 @@ mod tests {
             node_id: 3,
             track: 0,
             voice: VoiceSpec::Builtin,
-            delay,
+            params: glitcherz_model::EffectParams::Delay(delay),
+            delay: None,
         };
-        assert_eq!(inline_doc_value(&fx, InlineParam::DelayTime).0, 0.25);
-        assert!((inline_doc_value(&fx, InlineParam::DelayFeedback).0 - 0.4).abs() < 1e-6);
-        assert!((inline_doc_value(&fx, InlineParam::DelayMix).0 - 0.3).abs() < 1e-6);
-        let (_, min, max) = inline_doc_value(&fx, InlineParam::DelayTime);
+        assert_eq!(inline_doc_value(&fx, InlineParam::EffectSlot(0)).0, 0.25);
+        assert!((inline_doc_value(&fx, InlineParam::EffectSlot(1)).0 - 0.4).abs() < 1e-6);
+        assert!((inline_doc_value(&fx, InlineParam::EffectSlot(2)).0 - 0.3).abs() < 1e-6);
+        let (_, min, max) = inline_doc_value(&fx, InlineParam::EffectSlot(0));
         assert_eq!(
             (min, max),
             (
                 *crate::DELAY_TIME_RANGE.start() as f64,
                 *crate::DELAY_TIME_RANGE.end() as f64
-            )
+            ),
+            "the inline range comes from the engine descriptor"
         );
 
         let mixer = NodeDoc::Mixer {

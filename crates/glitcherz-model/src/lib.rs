@@ -205,6 +205,74 @@ impl Default for DelayParams {
     }
 }
 
+/// Built-in effect kind (spec `.agents/spec/effects.md` D1).
+///
+/// The wire format is the `kind` tag of [`EffectParams`]; this enum lets UI and
+/// engine code branch on the kind without matching every parameter field. It is
+/// deliberately **not** shared with the engine's own `BuiltinEffectKind`: the
+/// engine crate does not depend on this one, and the UI maps between them when
+/// it installs a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltinEffectKind {
+    /// Feedback delay.
+    Delay,
+}
+
+impl BuiltinEffectKind {
+    /// English label used by menus and node captions.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Delay => "Delay",
+        }
+    }
+
+    /// Every built-in kind, in menu order (E2+ appends here).
+    pub const ALL: &'static [BuiltinEffectKind] = &[BuiltinEffectKind::Delay];
+}
+
+/// Built-in effect parameter payload: **the tag is the kind**, so a node can
+/// never claim one kind while carrying another's parameters (D1).
+///
+/// Serialized as `params: (kind: "delay", time_s: 0.3, …)`. A v7 project
+/// stores the delay payload in a sibling `delay` field instead; loading runs
+/// `migrate_v7_to_v8` to move it here (D3/D4).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EffectParams {
+    /// Feedback delay.
+    Delay(DelayParams),
+}
+
+impl Default for EffectParams {
+    fn default() -> Self {
+        Self::Delay(DelayParams::default())
+    }
+}
+
+impl EffectParams {
+    /// Kind of this payload.
+    pub fn kind(&self) -> BuiltinEffectKind {
+        match self {
+            Self::Delay(_) => BuiltinEffectKind::Delay,
+        }
+    }
+
+    /// Delay parameters, when this is a delay node.
+    pub fn as_delay(&self) -> Option<&DelayParams> {
+        match self {
+            Self::Delay(params) => Some(params),
+        }
+    }
+
+    /// Mutable delay parameters, when this is a delay node.
+    pub fn as_delay_mut(&mut self) -> Option<&mut DelayParams> {
+        match self {
+            Self::Delay(params) => Some(params),
+        }
+    }
+}
+
 /// Note time base: ticks per quarter note.
 ///
 /// 960 PPQ is the Standard MIDI File convention and the de-facto industry
@@ -1230,7 +1298,8 @@ pub enum NodeDoc {
         #[serde(default)]
         synth: SynthParams,
     },
-    /// Effect node (1 in, 1 out). `Builtin` = built-in delay.
+    /// Effect node (1 in, 1 out). `Builtin` = built-in effect described by
+    /// `params`.
     Effect {
         /// Persisted node ID.
         #[serde(default)]
@@ -1241,9 +1310,16 @@ pub enum NodeDoc {
         /// Effect specification.
         #[serde(default)]
         voice: VoiceSpec,
-        /// Built-in delay parameters (ignored for external plugins).
+        /// Built-in effect parameters (ignored for external plugins); the tag
+        /// inside is the effect kind (spec `effects.md` D1).
         #[serde(default)]
-        delay: DelayParams,
+        params: EffectParams,
+        /// v7 compatibility bridge (D4): the delay payload used to live in
+        /// this sibling field. `migrate_v7_to_v8` moves it into `params`; new
+        /// files never write it (`skip_serializing_if`), so it is always
+        /// `None` at runtime.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delay: Option<DelayParams>,
     },
     /// Mixer node (P5f D15/D21): the explicit summing point. Absorbs the old
     /// ChannelStrip — per-channel gain/pan/mute/solo faders + an output
@@ -2070,7 +2146,8 @@ pub fn default_graph_doc(track_count: usize) -> GraphDoc {
             node_id: delay_id,
             track,
             voice: VoiceSpec::Builtin,
-            delay: DelayParams::default(),
+            params: EffectParams::default(),
+            delay: None,
         });
         cables.push(CableDoc::audio(voice_id, delay_id));
         cables.push(CableDoc::midi(track, voice_id));
@@ -2290,6 +2367,23 @@ impl Project {
                 }
                 clip.source_offset = 0.0;
                 clip.legacy_span_ticks = 0;
+            }
+        }
+    }
+
+    /// v7 → v8 (spec `.agents/spec/effects.md` D3/D4): the built-in effect
+    /// payload moved from a sibling `delay` field into the tagged `params`
+    /// enum, so the kind and its parameters cannot disagree.
+    ///
+    /// Nodes that never had a legacy payload keep the default (`Delay` with
+    /// default values), which is exactly what v7 meant by an effect node with
+    /// the built-in voice.
+    pub fn migrate_v7_to_v8(&mut self) {
+        for node in &mut self.graph.nodes {
+            if let NodeDoc::Effect { params, delay, .. } = node {
+                if let Some(delay) = delay.take() {
+                    *params = EffectParams::Delay(delay);
+                }
             }
         }
     }
@@ -2539,11 +2633,81 @@ impl Default for ProjectMetadata {
 mod tests {
     use super::{
         AudioClip, AudioTrack, AutoParam, AutoPoint, CableDoc, CableKind, DEFAULT_MIDI_TRACKS,
-        GraphDoc, MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS, MAX_AUDIO_TRACKS,
-        MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES, MidiClip, MidiSource, MidiTrack, NodeDoc,
-        PortRef, Project, SamplePlayMode, SynthParams, TICKS_PER_BAR, TICKS_PER_QUARTER,
-        TICKS_PER_STEP, VoiceSpec, default_audio_source_len, default_graph_doc,
+        EffectParams, GraphDoc, MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS,
+        MAX_AUDIO_TRACKS, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES, MidiClip, MidiSource,
+        MidiTrack, NodeDoc, PortRef, Project, SamplePlayMode, SynthParams, TICKS_PER_BAR,
+        TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec, default_audio_source_len, default_graph_doc,
     };
+
+    fn effect_node(params: EffectParams) -> NodeDoc {
+        NodeDoc::Effect {
+            node_id: 3,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params,
+            delay: None,
+        }
+    }
+
+    // E1: the effect payload's tag *is* the kind (D1), and the legacy sibling
+    // field is never written again (D4).
+    #[test]
+    fn effect_params_serde_carries_the_kind_tag() {
+        let node = effect_node(EffectParams::Delay(super::DelayParams {
+            time_s: 0.42,
+            feedback: 0.6,
+            mix: 0.5,
+        }));
+        let text = ron::to_string(&node).expect("serialize");
+        assert!(text.contains("kind:\"delay\""), "tag missing: {text}");
+        assert!(!text.contains("delay:Some"), "legacy field written: {text}");
+        let back: NodeDoc = ron::from_str(&text).expect("deserialize");
+        assert_eq!(node, back);
+    }
+
+    // E1: a v7 node (sibling `delay` payload) still parses, and the migration
+    // moves those values into `params` (D3/D4).
+    #[test]
+    fn legacy_v7_delay_field_deserializes_and_migrates() {
+        let text = r#"(type:"effect", node_id:3, track:0, voice:(type:"builtin"),
+            delay:(time_s:0.42, feedback:0.6, mix:0.5))"#;
+        let node: NodeDoc = ron::from_str(text).expect("v7 effect node should parse");
+        let mut project = Project::default();
+        project.graph.nodes = vec![node];
+        project.migrate_v7_to_v8();
+
+        match &project.graph.nodes[0] {
+            NodeDoc::Effect { params, delay, .. } => {
+                assert!(delay.is_none(), "the bridge must be consumed");
+                assert_eq!(
+                    params,
+                    &EffectParams::Delay(super::DelayParams {
+                        time_s: 0.42,
+                        feedback: 0.6,
+                        mix: 0.5,
+                    })
+                );
+            }
+            other => panic!("expected an effect node, got {other:?}"),
+        }
+    }
+
+    // E1: an effect node without any payload keeps the delay defaults, which is
+    // exactly what a v7 built-in effect meant.
+    #[test]
+    fn effect_params_default_to_delay() {
+        let node: NodeDoc =
+            ron::from_str(r#"(type:"effect", node_id:3, track:0, voice:(type:"builtin"))"#)
+                .expect("payload-less effect node should parse");
+        match node {
+            NodeDoc::Effect { params, delay, .. } => {
+                assert!(delay.is_none());
+                assert_eq!(params.kind(), super::BuiltinEffectKind::Delay);
+                assert_eq!(params, EffectParams::default());
+            }
+            other => panic!("expected an effect node, got {other:?}"),
+        }
+    }
 
     #[test]
     fn midi_clip_ron_roundtrip() {
@@ -3740,7 +3904,8 @@ mod tests {
             node_id: 8,
             track: 0,
             voice: VoiceSpec::Builtin,
-            delay: Default::default(),
+            params: EffectParams::default(),
+            delay: None,
         });
         doc.cables.push(CableDoc::keyboard_midi(6, 8));
         assert!(

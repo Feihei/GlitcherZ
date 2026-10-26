@@ -25,6 +25,16 @@ pub trait Processor: Send {
     /// Processes one fixed block.
     fn process(&mut self, ctx: &ProcessContext, buffer: &mut AudioBuffer);
 
+    /// Number of samples of latency this node introduces (spec
+    /// `.agents/spec/effects.md` D16).
+    ///
+    /// Every built-in effect is zero-latency in v1; the hook exists so a future
+    /// look-ahead limiter or oversampled saturator can report its delay without
+    /// changing this trait again (plugin delay compensation will consume it).
+    fn latency_samples(&self) -> usize {
+        0
+    }
+
     /// Per-input-channel summing weights (D20): `Some` = the graph applies
     /// these L/R weights while summing each in-edge into this node's buffer
     /// (mixer nodes: per-channel gain/pan/mute/solo); `None` (the default) =

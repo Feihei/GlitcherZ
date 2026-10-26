@@ -23,6 +23,8 @@
 //! - [`graph`]: node graph core ([`RtGraph`](graph::RtGraph), [`ExecPlan`](graph::ExecPlan),
 //!   structure update protocol, and control-side compiler);
 //! - [`sine`] / [`gain`]: sine oscillator source and gain effect (`Processor` reference implementations);
+//! - [`effect`]: built-in effect framework — descriptors, [`Smoothed`](effect::Smoothed)
+//!   parameter smoothing and the [`EffectParamBank`](effect::EffectParamBank);
 //! - [`envelope`] / [`svf`] / [`synth`]: ADSR envelope, SVF filter, and full synthesizer;
 //! - [`sf2`]: SoundFont voice ([`Sf2VoiceProcessor`](sf2::Sf2VoiceProcessor)) — RT rendering
 //!   around the audited `rustysynth-ext` synthesizer (loading stays in [`crate::sf2`]);
@@ -42,6 +44,7 @@ pub mod buffer;
 pub mod commands;
 pub mod context;
 pub mod delay;
+pub mod effect;
 pub mod envelope;
 pub mod gain;
 pub mod graph;
@@ -84,6 +87,10 @@ pub use commands::{
 };
 pub use context::ProcessContext;
 pub use delay::DelayProcessor;
+pub use effect::{
+    BuiltinEffectKind, Curve, EffectDescriptor, EffectParamBank, MAX_EFFECT_PARAMS, ParamFlags,
+    ParamSpec, Rate, Smoothed, StereoClass, Unit, validate_descriptor,
+};
 pub use envelope::AdsrProcessor;
 pub use gain::GainProcessor;
 pub use graph::{

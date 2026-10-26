@@ -49,6 +49,17 @@ pub enum ParamId {
     DelayFeedback,
     /// Delay wet mix ratio (0..1).
     DelayMix,
+    /// Built-in effect parameter addressed by **slot index** into the node's
+    /// [`EffectDescriptor`](crate::realtime::effect::EffectDescriptor) (spec
+    /// `.agents/spec/effects.md` D5).
+    ///
+    /// The slot is the parameter's position in the effect's static table, and
+    /// the node itself is addressed by `EngineCommand::SetNodeParam`'s
+    /// `node_id` — so two reverbs on different nodes never collide, and adding
+    /// an effect does not grow this enum. The three `Delay*` variants above are
+    /// the legacy fixed track trio (`track_delay`) and forward to the same
+    /// slots inside `DelayProcessor`.
+    BuiltinParam(u8),
     /// Feedback tap gain (P6; 0..1). Applied to the one-block-delayed sum
     /// of the feedback node's in-edges.
     FeedbackGain,

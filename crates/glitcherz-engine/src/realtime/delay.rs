@@ -3,19 +3,49 @@
 use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::ParamId;
 use crate::realtime::context::ProcessContext;
+use crate::realtime::effect::EffectParamBank;
+use crate::realtime::effect::descriptor::{EffectDescriptor, ParamSpec, StereoClass, Unit};
 use crate::realtime::processor::Processor;
 
 /// Maximum delay time (seconds) — the ring buffers are pre-allocated once at
 /// this capacity during construction.
 pub const MAX_DELAY_S: f32 = 1.0;
 
+/// Slot of the delay time parameter.
+pub const SLOT_TIME: u8 = 0;
+/// Slot of the feedback amount.
+pub const SLOT_FEEDBACK: u8 = 1;
+/// Slot of the wet mix ratio.
+pub const SLOT_MIX: u8 = 2;
+
+static DELAY_PARAMS: [ParamSpec; 3] = [
+    // `time_s` is stored in seconds (0.005..1.0), so the spec must say seconds
+    // — `ParamSpec::time` would tag it as milliseconds and the slider would
+    // read "0.2 ms" for a 250 ms tap.
+    ParamSpec::seconds("time", 0.005, MAX_DELAY_S, 0.3),
+    ParamSpec::gain("feedback", Unit::Percent, 0.0, 0.9, 0.35).short("fdbk"),
+    ParamSpec::gain("mix", Unit::Percent, 0.0, 1.0, 0.0),
+];
+
+/// Static parameter table (spec `.agents/spec/effects.md`).
+pub static DESCRIPTOR: EffectDescriptor = EffectDescriptor {
+    name: "Delay",
+    params: &DELAY_PARAMS,
+    stereo: StereoClass::Mono,
+};
+
 /// Feedback delay (one pre-allocated ring buffer per channel, L/R).
 ///
 /// Classic feedback delay: `wet = ring[read]`, write `input + wet * feedback`,
 /// output `dry * (1 - mix) + wet * mix`. Feedback is clamped to <= 0.9 to keep
 /// the decay bounded; denormals are flushed on write. The delay time is an
-/// integer number of samples (no interpolation), so changing it at runtime
-/// jumps the read position instantly (audible; smoothing left for later).
+/// integer number of samples (no interpolation).
+///
+/// Parameters live in an [`EffectParamBank`] (D5/D7): `set_param` accepts the
+/// legacy [`ParamId::Delay*`](ParamId) variants (the fixed track trio) and the
+/// slot-addressed [`ParamId::BuiltinParam`], both landing in the same smoothed
+/// slots. Block-rate parameters step once per block, gain-like ones per sample;
+/// `mix = 0` stays a sample-exact passthrough at steady state.
 /// All paths are RT-safe.
 pub struct DelayProcessor {
     sample_rate: f32,
@@ -23,9 +53,7 @@ pub struct DelayProcessor {
     /// Per-channel write pointer (channels are processed in order; sharing a
     /// pointer would desynchronize the two rings).
     write_pos: [usize; 2],
-    time_s: f32,
-    feedback: f32,
-    mix: f32,
+    params: EffectParamBank,
 }
 
 impl DelayProcessor {
@@ -45,47 +73,62 @@ impl DelayProcessor {
                 vec![0.0; capacity].into_boxed_slice(),
             ],
             write_pos: [0; 2],
-            time_s: 0.3,
-            feedback: 0.35,
-            mix: 0.0,
+            params: EffectParamBank::new(&DESCRIPTOR, sr),
         }
     }
 
     /// Current wet mix ratio. RT-safe.
     pub fn mix(&self) -> f32 {
-        self.mix
+        self.params.value(SLOT_MIX)
     }
 
-    /// Delay length (integer samples).
-    fn delay_samples(&self) -> usize {
-        let t = if self.time_s.is_finite() {
-            self.time_s.clamp(0.005, MAX_DELAY_S)
-        } else {
-            0.3
-        };
-        (t * self.sample_rate) as usize
+    /// Current delay length in seconds. RT-safe.
+    pub fn time_s(&self) -> f32 {
+        self.params.value(SLOT_TIME)
     }
+
+    /// Current feedback amount. RT-safe.
+    pub fn feedback(&self) -> f32 {
+        self.params.value(SLOT_FEEDBACK)
+    }
+}
+
+/// Delay length in integer samples, clamped to the supported window.
+///
+/// Rounded (not truncated): the log-domain smoother round-trips the time
+/// through `ln`/`exp`, so a truncated product can land one sample short
+/// (0.05 s → 2399.99… samples).
+fn delay_samples(time_s: f32, sample_rate: f32) -> usize {
+    let t = if time_s.is_finite() {
+        time_s.clamp(0.005, MAX_DELAY_S)
+    } else {
+        0.3
+    };
+    (t * sample_rate).round() as usize
 }
 
 impl Processor for DelayProcessor {
     fn process(&mut self, _ctx: &ProcessContext, buffer: &mut AudioBuffer) {
-        let mix = self.mix.clamp(0.0, 1.0);
-        let feedback = if self.feedback.is_finite() {
-            self.feedback.clamp(0.0, 0.9)
-        } else {
-            0.0
-        };
-        let delay = self.delay_samples();
+        let frames = buffer.len();
+        let channels = buffer.channels().min(2);
+        if frames == 0 || channels == 0 {
+            return;
+        }
         let capacity = self.rings[0].len();
+        // Block-rate parameter (D11): one smoothed step per block.
+        let delay = delay_samples(self.params.advance(SLOT_TIME, frames), self.sample_rate)
+            .min(capacity - 1);
 
-        for ch in 0..buffer.channels().min(2) {
-            let Some(channel) = buffer.channel_mut(ch) else {
-                continue;
-            };
-            let ring = &mut self.rings[ch];
-            let mut write_pos = self.write_pos[ch];
-            for sample in channel.iter_mut() {
-                let input = *sample;
+        for index in 0..frames {
+            let mix = self.params.tick(SLOT_MIX).clamp(0.0, 1.0);
+            let feedback = self.params.tick(SLOT_FEEDBACK).clamp(0.0, 0.9);
+            for ch in 0..channels {
+                let Some(channel) = buffer.channel_mut(ch) else {
+                    continue;
+                };
+                let input = channel[index];
+                let ring = &mut self.rings[ch];
+                let write_pos = self.write_pos[ch];
                 let read_pos = (write_pos + capacity - delay) % capacity;
                 let wet = ring[read_pos];
                 let mut injected = input + wet * feedback;
@@ -93,41 +136,27 @@ impl Processor for DelayProcessor {
                     injected = 0.0; // flush denormals so silent tails don't burn CPU
                 }
                 ring[write_pos] = injected;
-                *sample = input * (1.0 - mix) + wet * mix;
-                write_pos = (write_pos + 1) % capacity;
+                channel[index] = input * (1.0 - mix) + wet * mix;
+                self.write_pos[ch] = (write_pos + 1) % capacity;
             }
-            self.write_pos[ch] = write_pos;
         }
     }
 
     fn set_param(&mut self, id: ParamId, value: f32) -> bool {
-        if !value.is_finite() {
-            return matches!(
-                id,
-                ParamId::DelayTime | ParamId::DelayFeedback | ParamId::DelayMix
-            );
-        }
-        match id {
-            ParamId::DelayTime => {
-                self.time_s = value.clamp(0.005, MAX_DELAY_S);
-                true
-            }
-            ParamId::DelayFeedback => {
-                self.feedback = value.clamp(0.0, 0.9);
-                true
-            }
-            ParamId::DelayMix => {
-                self.mix = value.clamp(0.0, 1.0);
-                true
-            }
-            _ => false,
-        }
+        let slot = match id {
+            ParamId::DelayTime => SLOT_TIME,
+            ParamId::DelayFeedback => SLOT_FEEDBACK,
+            ParamId::DelayMix => SLOT_MIX,
+            ParamId::BuiltinParam(slot) => slot,
+            _ => return false,
+        };
+        self.params.set(slot, value)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DelayProcessor, MAX_DELAY_S};
+    use super::{DESCRIPTOR, DelayProcessor, MAX_DELAY_S, SLOT_FEEDBACK, SLOT_MIX, SLOT_TIME};
     use crate::realtime::buffer::AudioBuffer;
     use crate::realtime::commands::ParamId;
     use crate::realtime::context::ProcessContext;
@@ -279,14 +308,60 @@ mod tests {
     fn params_are_clamped() {
         let mut delay = DelayProcessor::new(SR);
         assert!(delay.set_param(ParamId::DelayTime, 10.0));
-        assert!((delay.time_s - MAX_DELAY_S).abs() < 1e-6);
+        assert!((delay.time_s() - MAX_DELAY_S).abs() < 1e-6);
         delay.set_param(ParamId::DelayFeedback, 5.0);
-        assert!((delay.feedback - 0.9).abs() < 1e-6);
+        assert!((delay.feedback() - 0.9).abs() < 1e-6);
         delay.set_param(ParamId::DelayMix, -1.0);
-        assert!((delay.mix - 0.0).abs() < 1e-6);
+        assert!((delay.mix() - 0.0).abs() < 1e-6);
         assert!(
             !delay.set_param(ParamId::MasterGain, 1.0),
             "unhandled params must return false"
+        );
+    }
+
+    #[test]
+    fn slot_params_match_legacy_variants() {
+        let mut legacy = DelayProcessor::new(SR);
+        let mut slotted = DelayProcessor::new(SR);
+        assert!(legacy.set_param(ParamId::DelayTime, 0.2));
+        assert!(slotted.set_param(ParamId::BuiltinParam(SLOT_TIME), 0.2));
+        assert!((legacy.time_s() - slotted.time_s()).abs() < 1e-9);
+        assert!(slotted.set_param(ParamId::BuiltinParam(SLOT_FEEDBACK), 0.6));
+        assert!((slotted.feedback() - 0.6).abs() < 1e-9);
+        assert!(slotted.set_param(ParamId::BuiltinParam(SLOT_MIX), 0.4));
+        assert!((slotted.mix() - 0.4).abs() < 1e-9);
+        assert!(
+            !slotted.set_param(ParamId::BuiltinParam(9), 1.0),
+            "slot past the descriptor must be rejected"
+        );
+    }
+
+    #[test]
+    fn descriptor_is_well_formed() {
+        assert_eq!(
+            crate::realtime::effect::validate_descriptor(&DESCRIPTOR),
+            Ok(())
+        );
+        assert_eq!(DESCRIPTOR.name, "Delay");
+        assert_eq!(DESCRIPTOR.params.len(), 3);
+    }
+
+    #[test]
+    fn runtime_mix_change_ramps_instead_of_jumping() {
+        let mut delay = DelayProcessor::new(SR);
+        let mut buf = AudioBuffer::new(1, 128);
+        buf.set_len(128);
+        buf.channel_mut(0).unwrap().fill(1.0);
+        delay.process(&ctx(128), &mut buf); // mark the smoothers started
+
+        delay.set_param(ParamId::DelayMix, 1.0);
+        buf.set_len(128);
+        buf.channel_mut(0).unwrap().fill(1.0);
+        delay.process(&ctx(128), &mut buf);
+        let first = buf.channel(0).unwrap()[0];
+        assert!(
+            first > 0.9 && first < 1.0,
+            "a runtime mix change must ramp, first sample was {first}"
         );
     }
 }
