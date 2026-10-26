@@ -256,6 +256,18 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 - [x] U12-D 测试验收：删旧 `tests/curve_band.rs`，加 `control_preview_handles_degenerate_inputs`（egui 画布 smoke）；全仓 fmt/clippy/test 绿。
 
 
+## E 系列：内建效果器 + 统一参数平滑（2026-10-26，spec `effects.md`）草案
+
+用户提出：内建效果器只有 delay，需要补上常用的 EQ / 压缩 / 混响 / 合唱 / 镶边等；**参数平滑统一**、**加立体声联动参数**。spec 已落 `.agents/spec/effects.md`（D1–D17），实施分五批，E1 为纯基础设施（不改音频输出）。
+
+- [ ] **E1 框架**：`EffectParams`（内部 tag 枚举，`NodeDoc::Effect` 载荷）+ `legacy_delay` 迁移桥 + `PROJECT_VERSION 7 → 8`；`ParamId::BuiltinParam(u8)` 槽位寻址 + `EffectDescriptor` / `EffectParamBank` / `Smoothed`（统一 one-pole 平滑，`Linear`/`Log` 双域，`Sample`/`Block` 双速率）；`Processor::latency_samples()` 口子；Delay 迁槽位（旧测试一条不改）；`GainProcessor`/`ChannelStripProcessor` 的 gain/pan 一并平滑；UI 全表驱动（`effect_section`、inline 行、Add/Insert 菜单遍历名册）
+- [ ] **E2** EQ-3（复用 `svf.rs` TPT，含低切）+ Compressor（前馈峰值 + 软拐点 + GR 表；`StereoClass::Linkable`，联动取 `max(|L|,|R|)`）
+- [ ] **E3** Reverb（FDN-8 + 阻尼 + pre-delay，不用 Freeverb）
+- [ ] **E4** `ModDelay` 核心 → Chorus / Flanger；Delay 升级 ping-pong + tempo-sync
+- [ ] **E5（可选）** Saturation（过采样）/ Bitcrusher / Phaser / Limiter + PDC
+
+明确不做：Echo 节点（Delay 即回声）、Gain 节点（通道条已是增益级）、每效果 sidechain。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：

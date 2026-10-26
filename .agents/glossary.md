@@ -74,6 +74,12 @@
 | 主控组 | master section | 走带条右侧的 master gain + 立体声电平表 + Panic；全局量，不属于任何节点 |
 | 全停 | panic | 释放所有发声音符（逐 pitch 扫 0..127），transport 与参数不动；区别于 Stop |
 | 冲洗反规范数 | flush denormals | 指注入 0.0 消除 denormal 的处理 |
+| 参数槽位 | parameter slot | 内建效果器参数按 descriptor 下标寻址（`ParamId::BuiltinParam`）；不写 param index |
+| 效果描述表 | effect descriptor | 每效果一张 `EffectDescriptor`：名称 + 参数规格 + 立体声类别；UI 与 DSP 的单一真源 |
+| 参数平滑 | parameter smoothing | 一阶低通平滑器 `Smoothed`；"平滑"专指此机制，不泛化为 interpolation |
+| 立体声联动 | stereo link | 动态类效果的检测器联动开关；不写 stereo chain / stereo couple |
+| 干湿比 | mix | 参数名统一 `mix`（不用 wet/dry 作参数名） |
+| 反馈 | feedback | 延迟/镶边的回授量，参数名 `feedback`；P6 的反馈**节点**写作大写 `Feedback` |
 
 ## 时间轴与音序
 
