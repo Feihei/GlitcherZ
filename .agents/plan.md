@@ -15,7 +15,7 @@
 9. ✅ CLAP 插件宿主（先于 VST3，API 更简洁）
 10. ✅ VST3 插件宿主（乐器/效果器已集成进 model/UI；遗留项见下）
 
-## 当前状态（2026-10-24）
+## 当前状态（2026-10-28）
 
 路线图 1–10 全部落地。乐器插件（CLAP / VST3）为一等声源，效果器节点已接入，自动化桥接到插件参数。节点图 P1–P5f 与 MIDI 编辑 M1–M4 全部交付；**SF2/SF3 音色库方向 S1–S6 全部完成**（RT 审计零分配 → 非实时加载 `engine::sf2` → 实时渲染 `Sf2VoiceProcessor` → `VoiceSpec::SoundFont` 文档变体 → UI 音色库面板（加载/preset 下拉/声源绑定，undoable）→ sf3 feature 常开 + 审计复跑 + 真实库端到端验收）。SF2 声源现为四等声源之一（内置合成器 / 插件 / SoundFont / 采样播放器）。**插件 GUI 宿主 G1–G7 全部交付**（CLAP 编辑嵌入 + 参数回接 + 面板节点化 + 内联参数 + vk 节点 + VST3 `IPlugView` 镜像）；**P6 反馈环路交付**（显式 Feedback 节点，1 块延迟由拓扑排序反转实现）。**可用性提升 U 系列全部收官**：U1（走带完整化 + seek 基建）、U2（文件管理）、U3（拍号文档化 + tempo 曲线）、U4（控制轨 CC 输出 + timeline 一等化）、U5（采样播放器 instrument）、U6（audio track + 波形 timeline）、U7（Export Audio 离线渲染）、U8（Inspector 重构）、U9（E1–E5 插件浏览器）、U10（patch 节点内联管理）全部交付。**R 系列已交付**（多 clip 钢琴卷帘 + 音高曲线，spec `roll-multiclip.md`；P0/P1/P2/P3/P4 全交付，P5 部分交付——折叠已做，其余三项明确不做）。
 
