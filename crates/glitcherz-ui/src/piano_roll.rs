@@ -34,13 +34,24 @@
 //! every edit is undoable (M1.4). Drags emit one intent per frame and are
 //! expected to be run through a merged gesture, so a whole drag is a single
 //! undo step.
+//!
+//! **Several clips share one time axis** (P3, spec `roll-multiclip.md` D4–D7):
+//! a [`RollSubject`] carries the *focus* clip (writable, fully interactive)
+//! plus a *context* of further clips drawn as read-only ghosts. Ghosts are
+//! paint-only — they never enter a hit test — and the focus is switched from
+//! the caller's chip strip, never by clicking a ghost.
 
 use eframe::egui;
 
 use crate::grid::GridValue;
-use glitcherz_model::{MidiClip, Note, TICKS_PER_QUARTER, TICKS_PER_STEP};
+use glitcherz_model::{MidiClip, MidiTrack, Note, TICKS_PER_QUARTER, TICKS_PER_STEP};
 
 pub use crate::grid::NoteValue;
+
+/// How many clips one roll may show at once (spec `roll-multiclip.md` D4).
+/// Beyond this the context is truncated in timeline-selection order with a
+/// status hint — the cap exists so the per-frame paint cost stays bounded.
+pub const MAX_ROLL_CONTEXT: usize = 8;
 
 /// Height of each semitone row (pixels).
 pub const ROW_HEIGHT: f32 = 9.0;
@@ -65,6 +76,14 @@ const DEFAULT_NOTE_LENGTH: i64 = TICKS_PER_STEP as i64;
 
 /// Accent color for selected notes / velocity bars.
 const SELECTED: egui::Color32 = egui::Color32::from_rgb(240, 190, 80);
+
+/// Ghost clip notes: the focus clip's note colour at ~22% alpha (P3, D6).
+/// Deliberately *not* velocity-shaded — a ghost answers "what else is around
+/// here", not "how loud is it".
+/// Ghost clip notes: the focus clip's note colour at ~22% alpha, premultiplied
+/// so this can stay a `const` (P3, D6). Deliberately *not* velocity-shaded — a
+/// ghost answers "what else is around here", not "how loud is it".
+const GHOST_NOTE: egui::Color32 = egui::Color32::from_rgba_premultiplied(14, 35, 21, 56);
 
 /// Pointer distance (px) to a note's start/end that turns a grab into an
 /// edge trim instead of a move.
@@ -169,6 +188,140 @@ pub enum RollIntent {
     DeleteNotes { indices: Vec<usize> },
     /// Set absolute velocities (index, velocity) pairs.
     SetVelocities { updates: Vec<(usize, u8)> },
+}
+
+/// Which table a [`ClipRef`] points into (P3, spec `roll-multiclip.md` D4).
+/// P4 adds `Control`, whose clips render in overlay lanes rather than in the
+/// main area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollLane {
+    Midi,
+}
+
+/// One clip addressed inside the project tables — the roll's unit of context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipRef {
+    pub lane: RollLane,
+    pub track: usize,
+    pub clip: usize,
+}
+
+impl ClipRef {
+    /// A MIDI clip at `(track, clip)`.
+    pub fn midi(track: usize, clip: usize) -> Self {
+        Self {
+            lane: RollLane::Midi,
+            track,
+            clip,
+        }
+    }
+}
+
+/// What one roll frame shows: the writable **focus** clip plus the read-only
+/// **context** drawn behind it as ghosts (P3, spec `roll-multiclip.md` D4).
+///
+/// The focus is always a member of the context. Notes and commands stay
+/// clip-local, so nothing above the geometry layer needs to know that more
+/// than one clip is on screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollSubject {
+    /// The clip being edited (index into `context`).
+    focus: usize,
+    /// Every visible clip, in timeline-selection order, focus included.
+    context: Vec<ClipRef>,
+    /// How many live selection entries did not fit under
+    /// [`MAX_ROLL_CONTEXT`] — the caller surfaces it as a status hint.
+    dropped: usize,
+}
+
+impl RollSubject {
+    /// A subject showing exactly one clip — the pre-P3 behaviour, and what an
+    /// empty timeline selection degenerates to.
+    pub fn single(track: usize, clip: usize) -> Self {
+        Self {
+            focus: 0,
+            context: vec![ClipRef::midi(track, clip)],
+            dropped: 0,
+        }
+    }
+
+    /// Builds a subject from a selection: `focus` is the double-clicked clip,
+    /// which joins the context at the front when the selection does not
+    /// already contain it. Truncated to [`MAX_ROLL_CONTEXT`]; the focus is
+    /// always kept.
+    ///
+    /// `clips` is the number of MIDI clips per track, used to drop stale
+    /// entries (a selection outlives a clip deletion).
+    pub fn assemble(focus: ClipRef, selection: &[ClipRef], clips: impl Fn(usize) -> usize) -> Self {
+        let live = |c: &ClipRef| matches!(c.lane, RollLane::Midi) && c.clip < clips(c.track);
+        let mut context: Vec<ClipRef> = Vec::with_capacity(MAX_ROLL_CONTEXT);
+        context.push(focus);
+        let mut dropped = 0;
+        for clip in selection {
+            if *clip == focus || !live(clip) || context.contains(clip) {
+                continue;
+            }
+            if context.len() == MAX_ROLL_CONTEXT {
+                dropped += 1;
+                continue;
+            }
+            context.push(*clip);
+        }
+        Self {
+            focus: 0,
+            context,
+            dropped,
+        }
+    }
+
+    /// Selection entries that did not fit in the context (status hint).
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// The writable clip.
+    pub fn focus(&self) -> ClipRef {
+        // `focus` indexes `context`, which `assemble`/`single` keep non-empty.
+        self.context[self.focus.min(self.context.len() - 1)]
+    }
+
+    /// Every visible clip, focus first.
+    pub fn context(&self) -> &[ClipRef] {
+        &self.context
+    }
+
+    /// Mutable view of the context — for app-side index remapping (track
+    /// reorder) where every member has to move together.
+    pub fn context_mut(&mut self) -> &mut [ClipRef] {
+        &mut self.context
+    }
+
+    /// Moves the focus to `clip` (a context member) — D7: a pure view-state
+    /// change, never a document edit. Returns `false` when `clip` is not in
+    /// the context, leaving the subject untouched.
+    pub fn set_focus(&mut self, clip: ClipRef) -> bool {
+        match self.context.iter().position(|c| *c == clip) {
+            Some(index) => {
+                self.focus = index;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The next focus in context order, wrapping — `Tab` forward, `Shift+Tab`
+    /// backward (D7). A one-clip subject stays put.
+    pub fn cycle_focus(&mut self, backward: bool) -> ClipRef {
+        let len = self.context.len();
+        if len > 1 {
+            self.focus = if backward {
+                (self.focus + len - 1) % len
+            } else {
+                (self.focus + 1) % len
+            };
+        }
+        self.focus()
+    }
 }
 
 /// State persisted across frames (scroll, grid, selection, gesture).
@@ -830,6 +983,15 @@ impl RollGeom {
         }
     }
 
+    /// Same time axis for a clip with another arrangement origin — the only
+    /// thing a ghost needs (P3, spec `roll-multiclip.md` D6).
+    fn at_origin(&self, origin_tick: i64) -> Self {
+        Self {
+            origin_tick,
+            ..*self
+        }
+    }
+
     /// The on-screen rectangle a note is painted into — the single source of
     /// truth for both painting and hit-testing, so the two cannot drift.
     fn note_rect(&self, note: &Note) -> egui::Rect {
@@ -873,9 +1035,10 @@ impl RollGeom {
     }
 }
 
-/// The absolute tick range the roll may scroll within (P2, spec
-/// `roll-multiclip.md` D2). P3 widens it to the whole context (focus + ghost
-/// clips); with one clip it is exactly that clip.
+/// The absolute tick range the roll may scroll within (P2/P3, spec
+/// `roll-multiclip.md` D2). It is the whole context — focus plus every ghost
+/// clip — so scrolling can leave the focus and look at a neighbour. With one
+/// clip it is exactly that clip.
 #[derive(Debug, Clone, Copy)]
 struct ViewWindow {
     start: f32,
@@ -883,6 +1046,34 @@ struct ViewWindow {
 }
 
 impl ViewWindow {
+    /// The absolute tick range the whole roll context occupies (P3, spec
+    /// `roll-multiclip.md` D2/D3): the earliest visible clip start to the
+    /// latest `start + loop`. A stale clip reference (deleted underneath the
+    /// editor) is skipped; with no live clip the window collapses to zero at
+    /// the focus origin, which the callers never reach because `show` bails
+    /// out first.
+    fn of(tracks: &[MidiTrack], subject: &RollSubject) -> Self {
+        let mut start = f32::INFINITY;
+        let mut end = f32::NEG_INFINITY;
+        for ctx in subject.context() {
+            let Some(clip) = track_clip(tracks, *ctx) else {
+                continue;
+            };
+            let origin = clip.start_ticks as f32;
+            let span = clip.loop_ticks.max(TICKS_PER_STEP) as f32;
+            start = start.min(origin);
+            end = end.max(origin + span);
+        }
+        if start.is_finite() && end.is_finite() {
+            Self { start, end }
+        } else {
+            Self {
+                start: 0.0,
+                end: 0.0,
+            }
+        }
+    }
+
     /// Clamps the left-edge tick so the window stays inside `[start, end]`. A
     /// window wider than the range (zoomed past fit) pins to `start`, which is
     /// the existing "zoom out shows the whole clip, no blank on the left"
@@ -893,32 +1084,44 @@ impl ViewWindow {
     }
 }
 
+/// The clip a [`ClipRef`] points at, or `None` when the document moved on
+/// (a clip deleted while the editor was open).
+fn track_clip(tracks: &[MidiTrack], clip: ClipRef) -> Option<&MidiClip> {
+    match clip.lane {
+        RollLane::Midi => tracks.get(clip.track)?.clips.get(clip.clip),
+    }
+}
+
 /// Draw one frame of the roll + velocity lane and return the edit the gesture
 /// produced (at most one per frame).
+// Eight arguments is the component's public surface (document table, subject,
+// state, transport readout, meter, focus router); bundling the three scalars
+// into a struct would only move the count, not reduce it.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
-    clip: &MidiClip,
+    tracks: &[MidiTrack],
+    subject: &RollSubject,
     state: &mut RollState,
     playhead_ticks: f32,
     playing: bool,
     bar_ticks: u32,
     router: &mut crate::focus::FocusRouter,
 ) -> Option<RollIntent> {
+    let focus = subject.focus();
+    let clip = track_clip(tracks, focus)?;
     let loop_ticks = i64::from(clip.loop_ticks.max(TICKS_PER_STEP)).max(1);
-    // P2: the clip's arrangement origin and the tick range the view may show.
-    // With one clip the window is exactly the clip; P3 replaces both with the
-    // context's span (`roll-multiclip.md` D2/D3).
+    // P3: the focus clip's origin, and the visible window = the whole context
+    // (`roll-multiclip.md` D2/D3). With one clip both degenerate to exactly
+    // the P2 behaviour.
     let origin_tick = i64::from(clip.start_ticks);
-    let window = ViewWindow {
-        start: origin_tick as f32,
-        end: (origin_tick + loop_ticks) as f32,
-    };
+    let window = ViewWindow::of(tracks, subject);
     // `scroll_x` is absolute now, and the state outlives target switches: a
     // clip starting at bar 9 must open on its own left edge, not inherit a
     // scroll borrowed from the previous clip.
     if state.view_origin != Some(origin_tick) {
         state.view_origin = Some(origin_tick);
-        state.scroll_x = origin_tick as f32;
+        state.scroll_x = window.start;
     }
     let grid_ticks = state
         .grid
@@ -1049,7 +1252,12 @@ pub fn show(
     // zooms the pitch axis (egui's vertical-only zoom), Shift+wheel scrolls
     // the time axis, the plain wheel scrolls pitch, middle-drag pans both
     // axes. Zoom is anchored on the pointer so the note under it stays put.
-    let fit_ticks_to_x = width / loop_ticks as f32;
+    //
+    // The fit basis is the **context** span (P3, D3), so a multi-clip subject
+    // opens with every ghost on screen; one clip degenerates to its own loop
+    // length, which keeps P2's behaviour byte-identical.
+    let fit_ticks = (window.end - window.start).max(bar_ticks.max(1) as f32);
+    let fit_ticks_to_x = width / fit_ticks.max(1.0);
     let (zoom2, wheel, nav_mods) = ui
         .ctx()
         .input(|i| (i.zoom_delta_2d(), i.smooth_scroll_delta, i.modifiers));
@@ -1144,6 +1352,10 @@ pub fn show(
             .clamp(0.0, 127.0) as u8
     };
     let hit_note = |pos: egui::Pos2| geom.note_at(clip, pos);
+    // D2: the view may scroll past the focus clip (to show a ghost), but
+    // editing stops at its edges — a click out there must not conjure a note
+    // clamped to tick 0.
+    let over_focus = |pos: egui::Pos2| (0.0..loop_ticks as f32).contains(&geom.local_at(pos.x));
     let snap = |ticks: f32| -> i64 { snap_ticks(ticks, grid_ticks) };
     let modifiers = ui.ctx().input(|i| i.modifiers);
     let additive = modifiers.shift || modifiers.ctrl;
@@ -1210,6 +1422,33 @@ pub fn show(
                 stroke,
             );
             tick += grid_ticks;
+        }
+    }
+
+    // 2b. Ghost clips (P3, D6): the rest of the context, painted *behind* the
+    //     focus so the writable clip always reads as the foreground. Paint
+    //     only — ghosts never enter `note_at`, the marquee, the knife or any
+    //     drag, which is what keeps "empty-space drag = marquee" unambiguous.
+    for ctx in subject.context() {
+        if *ctx == focus {
+            continue;
+        }
+        let Some(ghost_clip) = track_clip(tracks, *ctx) else {
+            continue;
+        };
+        let ghost_geom = geom.at_origin(i64::from(ghost_clip.start_ticks));
+        let ghost_loop = i64::from(ghost_clip.loop_ticks.max(TICKS_PER_STEP)).max(1);
+        for note in ghost_clip.notes() {
+            // Past a shortened span: kept in the data, never drawn (same rule
+            // as the focus clip).
+            if note.start >= ghost_loop {
+                continue;
+            }
+            let note_i = i32::from(note.note);
+            if !(min_note..=top_note).contains(&note_i) {
+                continue;
+            }
+            painter.rect_filled(ghost_geom.note_rect(note), 2.0, GHOST_NOTE);
         }
     }
 
@@ -1557,6 +1796,16 @@ pub fn show(
                         }
                     }
                     None if additive => {} // modifier click on empty: leave the selection alone
+                    None if !over_focus(pos) => {
+                        // D2: outside the focus clip — explain the no-op
+                        // instead of silently doing nothing.
+                        state.selection.clear();
+                        if response.double_clicked() {
+                            state.note_status(
+                                "Outside the clip being edited — switch focus from the strip above",
+                            );
+                        }
+                    }
                     None => {
                         if response.double_clicked() {
                             // No awaiting_create: a follow-up drag would have
@@ -1745,7 +1994,14 @@ pub fn show(
                         }
                     }
                     None => {
-                        if additive {
+                        if !over_focus(pos) && !additive {
+                            // D2: drawing stops at the focus clip's edges. A
+                            // marquee would be pointless out here (ghosts are
+                            // not selectable), so a plain drag is a no-op.
+                            state.note_status(
+                                "Outside the clip being edited — switch focus from the strip above",
+                            );
+                        } else if additive {
                             // Shift/Ctrl + drag on empty space: additive
                             // rubber band.
                             state.marquee = Some(Marquee {
@@ -2273,15 +2529,15 @@ fn grid_label(grid: &GridValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AwaitCreate, Axis, DragKind, DragSelection, EDGE_PX, HIT_SLOP, Modal, ModalFrame,
-        ModalKind, ROLL_HEIGHT, ROW_HEIGHT, RollGeom, RollIntent, RollMode, RollState, StretchEdge,
-        ViewWindow, clamped_move, draw_end, edge_zone, is_black_key, knife_crossing, modal_ghost,
-        scale_max_k, selection_bbox, snap_ticks, trim_start, zoom_scroll_anchor,
-        zoom_top_note_anchor,
+        AwaitCreate, Axis, ClipRef, DragKind, DragSelection, EDGE_PX, HIT_SLOP, MAX_ROLL_CONTEXT,
+        Modal, ModalFrame, ModalKind, ROLL_HEIGHT, ROW_HEIGHT, RollGeom, RollIntent, RollMode,
+        RollState, RollSubject, StretchEdge, ViewWindow, clamped_move, draw_end, edge_zone,
+        is_black_key, knife_crossing, modal_ghost, scale_max_k, selection_bbox, snap_ticks,
+        trim_start, zoom_scroll_anchor, zoom_top_note_anchor,
     };
     use crate::grid::{GridValue, NoteValue};
     use eframe::egui;
-    use glitcherz_model::{MidiClip, Note, TICKS_PER_STEP};
+    use glitcherz_model::{MidiClip, MidiTrack, Note, TICKS_PER_STEP};
 
     fn note(start: i64, length: i64, note: u8) -> Note {
         Note {
@@ -3200,5 +3456,85 @@ mod tests {
     fn scale_max_k_caps_the_stretch_at_the_loop_end() {
         assert!((scale_max_k(0, 720, 3840) - 3840.0 / 720.0).abs() < 1e-3);
         assert!((scale_max_k(240, 720, 3840) - 3600.0 / 480.0).abs() < 1e-3);
+    }
+
+    // ---- P3: subject assembly, focus cycling, context-wide view window ----
+
+    /// D5: the double-clicked clip leads; duplicates and references to clips
+    /// that no longer exist are dropped without taking a context slot.
+    #[test]
+    fn a_subject_leads_with_the_focus_and_drops_stale_entries() {
+        let focus = ClipRef::midi(1, 2);
+        let selection = [
+            ClipRef::midi(0, 0),
+            ClipRef::midi(1, 2), // the focus itself
+            ClipRef::midi(3, 9), // track 3 has one clip: stale
+            ClipRef::midi(0, 0), // duplicate
+        ];
+        let clips = |track: usize| if track == 3 { 1 } else { 4 };
+        let subject = RollSubject::assemble(focus, &selection, clips);
+        assert_eq!(subject.focus(), focus);
+        assert_eq!(subject.context(), &[focus, ClipRef::midi(0, 0)]);
+        assert_eq!(
+            subject.dropped(),
+            0,
+            "stale/duplicate entries are not truncation"
+        );
+    }
+
+    /// D4: the cap truncates in selection order, keeps the focus, and reports
+    /// how many clips it could not show.
+    #[test]
+    fn the_context_cap_keeps_the_focus_and_counts_what_it_dropped() {
+        let focus = ClipRef::midi(0, 0);
+        let selection: Vec<ClipRef> = (0..12).map(|clip| ClipRef::midi(0, clip)).collect();
+        let subject = RollSubject::assemble(focus, &selection, |_| 16);
+        assert_eq!(subject.context().len(), MAX_ROLL_CONTEXT);
+        assert_eq!(subject.focus(), focus);
+        // 12 selection entries, one of which is the focus → 11 candidates,
+        // MAX_ROLL_CONTEXT − 1 of which fit beside it.
+        assert_eq!(subject.dropped(), 11 - (MAX_ROLL_CONTEXT - 1));
+    }
+
+    /// D7: Tab / Shift+Tab cycle the focus within the context and wrap.
+    #[test]
+    fn tab_cycles_the_focus_and_wraps() {
+        let focus = ClipRef::midi(0, 0);
+        let selection = [ClipRef::midi(0, 1), ClipRef::midi(0, 2)];
+        let mut subject = RollSubject::assemble(focus, &selection, |_| 4);
+        assert_eq!(subject.cycle_focus(false), ClipRef::midi(0, 1));
+        assert_eq!(subject.cycle_focus(false), ClipRef::midi(0, 2));
+        assert_eq!(subject.cycle_focus(false), focus, "forward wraps");
+        assert_eq!(
+            subject.cycle_focus(true),
+            ClipRef::midi(0, 2),
+            "backward steps to the last"
+        );
+        // Focusing something outside the context is refused, not clamped.
+        assert!(!subject.set_focus(ClipRef::midi(9, 9)));
+    }
+
+    /// D2/D3: the view window covers the whole context, so a ghost is on
+    /// screen the first time a multi-clip subject opens.
+    #[test]
+    fn the_view_window_is_the_whole_context() {
+        let early = MidiClip {
+            start_ticks: 0,
+            loop_ticks: 960,
+            ..MidiClip::default()
+        };
+        let late = MidiClip {
+            start_ticks: 1920,
+            loop_ticks: 960,
+            ..MidiClip::default()
+        };
+        let tracks = [MidiTrack {
+            clips: vec![early, late],
+            ..MidiTrack::default()
+        }];
+        let subject = RollSubject::assemble(ClipRef::midi(0, 1), &[ClipRef::midi(0, 0)], |_| 2);
+        let window = ViewWindow::of(&tracks, &subject);
+        assert_eq!(window.start, 0.0);
+        assert_eq!(window.end, 2880.0);
     }
 }

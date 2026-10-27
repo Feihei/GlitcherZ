@@ -687,10 +687,11 @@ enum ConfirmChoice {
 
 /// Which clip the Edit tab is targeting (U12: it hosts both the MIDI piano
 /// roll and the control curve editor).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum EditTarget {
-    /// MIDI clip (piano roll).
-    Midi { track: usize, clip: usize },
+    /// MIDI clips: the writable focus plus the read-only ghost context (P3,
+    /// spec `roll-multiclip.md` D4).
+    Midi(piano_roll::RollSubject),
     /// Control clip (curve editor).
     Control { track: usize, clip: usize },
 }
@@ -4898,8 +4899,15 @@ impl GlitcherZApp {
         let selected_track = self.selected_track;
         let selected_auto = self.selected_auto;
         let selected_audio = self.selected_audio;
-        let edit_target = self.edit_clip.and_then(|t| match t {
-            EditTarget::Midi { track, clip } => Some(timeline::EditHighlight { track, clip }),
+        let edit_target = self.edit_clip.as_ref().and_then(|t| match t {
+            // P3: the outline follows the *focus* clip, not the whole context.
+            EditTarget::Midi(subject) => {
+                let focus = subject.focus();
+                Some(timeline::EditHighlight {
+                    track: focus.track,
+                    clip: focus.clip,
+                })
+            }
             // The MIDI row consumes this outline; a control target has no
             // MIDI outline (its curve editor is separate, U12).
             EditTarget::Control { .. } => None,
@@ -5842,7 +5850,9 @@ impl GlitcherZApp {
     /// the timeline jumps here). With no targeted clip it offers the
     /// selected track's first clip.
     fn edit_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(target) = self.edit_clip else {
+        // Cloned rather than borrowed: the body needs `&mut self` (focus chip
+        // strip, roll state), and a roll subject is a handful of indices.
+        let Some(target) = self.edit_clip.clone() else {
             ui.vertical_centered(|ui| {
                 ui.add_space(48.0);
                 ui.heading("Edit");
@@ -5866,7 +5876,7 @@ impl GlitcherZApp {
             return;
         };
         egui::ScrollArea::vertical().show(ui, |ui| match target {
-            EditTarget::Midi { track, clip } => self.midi_editor_body(ui, track, clip),
+            EditTarget::Midi(subject) => self.midi_editor_body(ui, &subject),
             EditTarget::Control { track, clip } => self.control_editor_body(ui, track, clip),
         });
     }
@@ -7605,8 +7615,8 @@ impl GlitcherZApp {
         self.project_mut().midi_tracks.pop();
         self.selected_track = self.selected_track.min(last.saturating_sub(1));
         // The editor may have targeted the removed track's clip.
-        if let Some(EditTarget::Midi { track, .. }) = self.edit_clip
-            && track == last
+        if let Some(EditTarget::Midi(subject)) = &self.edit_clip
+            && subject.focus().track == last
         {
             self.edit_clip = None;
         }
@@ -7795,10 +7805,14 @@ impl GlitcherZApp {
         if self.selected_track < len {
             self.selected_track = perm[self.selected_track];
         }
-        if let Some(EditTarget::Midi { track, .. }) = &mut self.edit_clip
-            && *track < len
-        {
-            *track = perm[*track];
+        // P3: every context member follows the permutation, not just the
+        // focus — a ghost left on the old index would point at another track.
+        if let Some(EditTarget::Midi(subject)) = &mut self.edit_clip {
+            for clip in subject.context_mut() {
+                if clip.track < len {
+                    clip.track = perm[clip.track];
+                }
+            }
         }
         for sel in &mut self.timeline_state.selection {
             if matches!(sel.lane, timeline::TimelineLane::Midi) && sel.track < len {
@@ -7809,12 +7823,61 @@ impl GlitcherZApp {
         self.commit_edit("Reorder Tracks", before);
     }
 
+    /// `Track N` or the track's own name — the label every clip reference
+    /// shows (edit header, roll focus chips).
+    fn track_label(&self, track: usize) -> String {
+        match self.project().midi_tracks.get(track) {
+            Some(t) if !t.name.is_empty() => t.name.clone(),
+            _ => format!("Track {}", track + 1),
+        }
+    }
+
     /// Points the Edit tab at the MIDI clip `(track, clip)`, dropping any
     /// in-flight roll gesture: selection indices refer to the clip that was
     /// being edited.
+    ///
+    /// P3 (spec `roll-multiclip.md` D5): the roll's ghost context is the
+    /// timeline's clip selection, so whatever was multi-selected in the
+    /// arrangement is what shows up behind the focus.
     fn set_edit_target(&mut self, track: usize, clip: usize) {
+        // Clears the gesture *and* the note selection (the indices belong to
+        // whichever clip used to be focused).
         self.roll_state.clear_gesture();
-        self.edit_clip = Some(EditTarget::Midi { track, clip });
+        let focus = piano_roll::ClipRef::midi(track, clip);
+        let selection: Vec<piano_roll::ClipRef> = self
+            .timeline_state
+            .selection
+            .iter()
+            .filter(|sel| matches!(sel.lane, timeline::TimelineLane::Midi))
+            .map(|sel| piano_roll::ClipRef::midi(sel.track, sel.clip))
+            .collect();
+        let subject = {
+            let project = self.project();
+            piano_roll::RollSubject::assemble(focus, &selection, |track| {
+                project.midi_tracks.get(track).map_or(0, |t| t.clips.len())
+            })
+        };
+        let dropped = subject.dropped();
+        self.edit_clip = Some(EditTarget::Midi(subject));
+        if dropped > 0 {
+            self.set_message(format!(
+                "{dropped} clip(s) not shown: the roll holds at most {}",
+                piano_roll::MAX_ROLL_CONTEXT
+            ));
+        }
+    }
+
+    /// Retargets the roll's focus inside its current context (P3 D7): a pure
+    /// view-state change — no command, no undo entry, no document touch. The
+    /// note selection is dropped because its indices belong to the old focus.
+    fn set_roll_focus(&mut self, clip: piano_roll::ClipRef) {
+        let Some(EditTarget::Midi(subject)) = &mut self.edit_clip else {
+            return;
+        };
+        if subject.focus() == clip || !subject.set_focus(clip) {
+            return;
+        }
+        self.roll_state.clear_gesture();
     }
 
     /// Points the Edit tab at the control clip `(track, clip)` and syncs the
@@ -8088,13 +8151,17 @@ impl GlitcherZApp {
 
     /// Body of the piano-roll editor (Edit tab): edits the targeted clip,
     /// pushes edits to the audio thread immediately.
-    fn midi_editor_body(&mut self, ui: &mut egui::Ui, track: usize, clip_index: usize) {
+    /// Edit tab body for a MIDI subject (P3, spec `roll-multiclip.md` D4–D7):
+    /// the focus clip's roll, the rest of the context as read-only ghosts, and
+    /// a chip strip to switch focus.
+    fn midi_editor_body(&mut self, ui: &mut egui::Ui, subject: &piano_roll::RollSubject) {
         if self.project().midi_tracks.is_empty() {
             // The target track was removed underneath the editor.
             self.edit_clip = None;
             return;
         }
-        let sel = track.min(self.project().midi_tracks.len() - 1);
+        let focus = subject.focus();
+        let sel = focus.track.min(self.project().midi_tracks.len() - 1);
         if self.project().midi_tracks[sel].clips.is_empty() {
             let before = self.begin_edit();
             let bar = self.project().ticks_per_bar();
@@ -8106,16 +8173,17 @@ impl GlitcherZApp {
             self.send_track_clips(sel);
         }
         let clip_count = self.project().midi_tracks[sel].clips.len();
-        let clip_index = if clip_index < clip_count {
-            clip_index
-        } else {
-            0
-        };
-        let track_name = if self.project().midi_tracks[sel].name.is_empty() {
-            format!("Track {}", sel + 1)
-        } else {
-            self.project().midi_tracks[sel].name.clone()
-        };
+        // A clip deleted underneath the editor (the context outlives it):
+        // fall back to the track's first clip and let the next frame rebuild
+        // the subject.
+        if focus.clip >= clip_count {
+            self.set_edit_target(sel, 0);
+            return;
+        }
+        let clip_index = focus.clip;
+        // U3a: the roll's bar lines follow the document meter.
+        let bar_ticks = self.project().ticks_per_bar();
+        let track_name = self.track_label(sel);
         ui.horizontal(|ui| {
             ui.label(format!(
                 "{track_name} · clip {} (of {clip_count})",
@@ -8139,11 +8207,63 @@ impl GlitcherZApp {
                 self.edit_clip = None;
             }
         });
+        // P3 (D7): the focus chip strip. Ghosts are read-only and never take
+        // clicks, so focus is switched *here* — a chip click or Tab/Shift+Tab.
+        // Clicking a ghost would re-open the "empty drag = marquee" ambiguity
+        // M4 spent a whole spec closing.
+        if subject.context().len() > 1 {
+            let mut switch: Option<piano_roll::ClipRef> = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::Label::new(egui::RichText::new("showing").weak()));
+                for clip in subject.context() {
+                    let Some(c) = self
+                        .project()
+                        .midi_tracks
+                        .get(clip.track)
+                        .and_then(|t| t.clips.get(clip.clip))
+                    else {
+                        continue;
+                    };
+                    let label = format!(
+                        "{} · bar {}",
+                        self.track_label(clip.track),
+                        c.start_ticks / bar_ticks.max(1) + 1
+                    );
+                    let focused = *clip == focus;
+                    if ui
+                        .selectable_label(focused, label)
+                        .on_hover_text(if focused {
+                            "Editing this clip (writable)"
+                        } else {
+                            "Click (or Tab) to edit this clip · its notes are ghosts until then"
+                        })
+                        .clicked()
+                        && !focused
+                    {
+                        switch = Some(*clip);
+                    }
+                }
+            });
+            if let Some(clip) = switch {
+                self.set_roll_focus(clip);
+            }
+            // Tab / Shift+Tab cycle the focus (D7). Consumed here so egui's
+            // focus traversal never steals it; the roll itself never reads Tab.
+            let backward = ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+            let forward =
+                !backward && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+            if backward || forward {
+                let next = match &mut self.edit_clip {
+                    Some(EditTarget::Midi(subject)) => Some(subject.cycle_focus(backward)),
+                    _ => None,
+                };
+                if next.is_some() {
+                    self.roll_state.clear_gesture();
+                }
+            }
+        }
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
-        // U3a: the roll's bar lines follow the document meter; read it before
-        // the destructuring below (which borrows `self` field by field).
-        let bar_ticks = self.project().ticks_per_bar();
         let intent = {
             // Destructured: `project()` borrows all of `self`, which would
             // collide with the `&mut self.roll_state` below.
@@ -8153,8 +8273,16 @@ impl GlitcherZApp {
                 focus_router: router,
                 ..
             } = self;
-            let clip = &session.project().midi_tracks[sel].clips[clip_index];
-            piano_roll::show(ui, clip, roll_state, playhead, playing, bar_ticks, router)
+            piano_roll::show(
+                ui,
+                &session.project().midi_tracks,
+                subject,
+                roll_state,
+                playhead,
+                playing,
+                bar_ticks,
+                router,
+            )
         };
         // Intents run as commands, so every roll edit is undoable. A drag
         // emits one intent per frame under the same gesture key: one drag,

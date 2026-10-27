@@ -15,8 +15,8 @@
 //! and the measured panel width.
 
 use eframe::egui;
-use glitcherz_model::{MidiClip, Note, Sequence, TICKS_PER_BAR};
-use glitcherz_ui::piano_roll::{ROW_HEIGHT, RollIntent, RollMode, RollState};
+use glitcherz_model::{MidiClip, MidiTrack, Note, Sequence, TICKS_PER_BAR};
+use glitcherz_ui::piano_roll::{ClipRef, ROW_HEIGHT, RollIntent, RollMode, RollState, RollSubject};
 
 const SCREEN: egui::Vec2 = egui::vec2(800.0, 600.0);
 
@@ -28,7 +28,12 @@ const SCREEN: egui::Vec2 = egui::vec2(800.0, 600.0);
 /// - loop: one bar (3840 ticks), default grid 1/16 (240 ticks)
 struct Fixture {
     ctx: egui::Context,
-    clip: MidiClip,
+    /// One track holding the focus clip — the roll takes the project table
+    /// now (P3: a subject addresses clips by track/clip index). A test may
+    /// push a ghost clip in and point the subject's context at it.
+    tracks: Vec<MidiTrack>,
+    /// What the roll shows; defaults to the single focus clip.
+    subject: RollSubject,
     state: RollState,
     /// Hover-follow focus arbiter, mirroring the app's per-frame flow.
     router: glitcherz_ui::focus::FocusRouter,
@@ -65,7 +70,11 @@ impl Fixture {
         };
         let mut fixture = Self {
             ctx: egui::Context::default(),
-            clip,
+            tracks: vec![MidiTrack {
+                clips: vec![clip],
+                ..MidiTrack::default()
+            }],
+            subject: RollSubject::single(0, 0),
             state: RollState::new(),
             router: glitcherz_ui::focus::FocusRouter::new(),
             left: 0.0,
@@ -90,7 +99,7 @@ impl Fixture {
         });
         out.textures_delta.clear();
         self.left = rect.left();
-        self.ticks_to_x = rect.width() / self.clip.loop_ticks as f32;
+        self.ticks_to_x = rect.width() / self.tracks[0].clips[0].loop_ticks as f32;
     }
 
     /// Probes clicks down a vertical line until one lands on note A,
@@ -148,7 +157,8 @@ impl Fixture {
         let raw = self.raw(events);
         let Self {
             ctx,
-            clip,
+            tracks,
+            subject,
             state,
             router,
             ..
@@ -161,7 +171,8 @@ impl Fixture {
             egui::CentralPanel::default().show(ctx, |ui| {
                 intent = glitcherz_ui::piano_roll::show(
                     ui,
-                    clip,
+                    tracks,
+                    subject,
                     state,
                     0.0,
                     false,
@@ -937,5 +948,88 @@ fn ctrl_drag_still_copies_the_selection() {
     assert!(
         has_move(&intents),
         "the copies are dragged: got {intents:?}"
+    );
+}
+
+/// P3 (spec `roll-multiclip.md` D6): a ghost clip is painted but has no
+/// presence in the hit test. Clicking a ghost note must land on empty space —
+/// if it ever selects the *focus* clip's note at that index, the ghost leaked
+/// into `note_at`.
+#[test]
+fn a_ghost_note_is_painted_but_never_hit() {
+    let mut f = Fixture::new();
+    let bar = TICKS_PER_BAR;
+    // Ghost clip one bar after the focus, same pitch row as note A.
+    f.tracks[0].clips.push(MidiClip {
+        start_ticks: bar,
+        span_ticks: bar,
+        loop_ticks: bar,
+        sequence: Sequence {
+            notes: vec![Note {
+                start: 0,
+                length: 240,
+                note: 60,
+                ..Note::default()
+            }],
+            ..Sequence::default()
+        },
+        ..MidiClip::default()
+    });
+    f.subject = RollSubject::assemble(ClipRef::midi(0, 0), &[ClipRef::midi(0, 1)], |_| 2);
+
+    // The fit now spans both clips, so a tick is half the single-clip scale
+    // the fixture measured.
+    let t_x = f.ticks_to_x / 2.0;
+    // Sanity first: the focus note is still selectable at its own position,
+    // so a failure below cannot be blamed on a stale geometry.
+    f.click(egui::pos2(f.left + 5.0, f.y60));
+    assert_eq!(f.state.selection, vec![0], "the focus note must still hit");
+
+    // The ghost's note body, one bar to the right.
+    let x = f.left + bar as f32 * t_x + 5.0;
+    f.click(egui::pos2(x, f.y60));
+    assert!(
+        f.state.selection.is_empty(),
+        "a ghost note must not be selectable (selection {:?})",
+        f.state.selection
+    );
+}
+
+/// P3 (spec `roll-multiclip.md` D2): the view may scroll past the focus clip,
+/// but drawing stays inside it. A draw drag over a ghost creates nothing —
+/// otherwise the note would land clamped to tick 0, far from the pointer.
+#[test]
+fn drawing_stops_at_the_focus_clips_edges() {
+    let mut f = Fixture::new();
+    let bar = TICKS_PER_BAR;
+    f.tracks[0].clips.push(MidiClip {
+        start_ticks: bar,
+        span_ticks: bar,
+        loop_ticks: bar,
+        ..MidiClip::default()
+    });
+    f.subject = RollSubject::assemble(ClipRef::midi(0, 0), &[ClipRef::midi(0, 1)], |_| 2);
+    f.state.mode = RollMode::Draw;
+    // Two clips in the fit ⇒ half the single-clip pixel scale.
+    let t_x = f.ticks_to_x / 2.0;
+    let (left, y60) = (f.left, f.y60);
+    let at = move |tick: f32| egui::pos2(left + tick * t_x, y60);
+
+    // Sanity: inside the focus clip a draw drag creates a note.
+    let inside = f.drag(at(1000.0), at(1200.0));
+    assert!(
+        inside
+            .iter()
+            .any(|intent| matches!(intent, RollIntent::AddNote { .. })),
+        "inside the clip a draw must create: got {inside:?}"
+    );
+
+    // One bar to the right — over the ghost — nothing is created.
+    let outside = f.drag(at(bar as f32 + 100.0), at(bar as f32 + 300.0));
+    assert!(
+        !outside
+            .iter()
+            .any(|intent| matches!(intent, RollIntent::AddNote { .. })),
+        "a draw over a ghost must not create: got {outside:?}"
     );
 }
