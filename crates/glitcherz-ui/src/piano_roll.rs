@@ -181,8 +181,15 @@ pub struct RollState {
     pub zoom_x: f32,
     /// Vertical zoom (multiplier over [`ROW_HEIGHT`]; 1.0 = 9 px rows).
     pub zoom_y: f32,
-    /// Horizontal scroll offset: the tick at the roll's left edge.
+    /// Horizontal scroll offset: the **absolute** (arrangement) tick at the
+    /// roll's left edge (P2, spec `roll-multiclip.md` D1/D2). Absolute rather
+    /// than clip-local so several clips can share one time axis.
     pub scroll_x: f32,
+    /// The focus clip's arrangement start the current `scroll_x` was anchored
+    /// on. The state outlives target switches, so a new clip re-anchors the
+    /// view to its own start instead of inheriting a scroll that may lie
+    /// outside its range.
+    view_origin: Option<i64>,
     /// Snap granularity / grid density.
     pub grid: GridValue,
     /// Indices into `clip.notes()` of the selected notes.
@@ -619,6 +626,7 @@ impl RollState {
             zoom_x: 1.0,
             zoom_y: 1.0,
             scroll_x: 0.0,
+            view_origin: None,
             grid: GridValue::Note(NoteValue {
                 division: 16,
                 dotted: false,
@@ -772,6 +780,119 @@ fn is_black_key(note: i32) -> bool {
     matches!(note.rem_euclid(12), 1 | 3 | 6 | 8 | 10)
 }
 
+/// Time / pitch mapping shared by every paint and hit test (P2, spec
+/// `roll-multiclip.md` D1).
+///
+/// `t0_x` maps **absolute** tick 0 to the screen, and `origin_tick` is the
+/// arrangement start of the clip whose local ticks are being drawn, so a local
+/// tick `t` lands at `t0_x + (origin_tick + t) * ticks_to_x`. Keeping that one
+/// conversion in a struct is what lets several clips — each with its own
+/// origin — share a single time axis in P3/P4 without touching the note-level
+/// math (commands, modals and clamps all keep working in local ticks).
+#[derive(Debug, Clone, Copy)]
+struct RollGeom {
+    /// Arrangement tick of the clip the local ticks belong to.
+    origin_tick: i64,
+    /// Screen x of absolute tick 0.
+    t0_x: f32,
+    ticks_to_x: f32,
+    /// Pitch of the row at `area.top()`.
+    top_note: i32,
+    row_h: f32,
+    /// The strip whose rows this geometry maps (`top()` anchors the pitches).
+    area: egui::Rect,
+}
+
+impl RollGeom {
+    /// Screen x of a **clip-local** tick.
+    fn x_of(&self, local_tick: f32) -> f32 {
+        self.t0_x + (self.origin_tick as f32 + local_tick) * self.ticks_to_x
+    }
+
+    /// Clip-local tick under a screen x (negative left of the clip origin;
+    /// callers that create notes clamp it themselves).
+    fn local_at(&self, x: f32) -> f32 {
+        (x - self.t0_x) / self.ticks_to_x - self.origin_tick as f32
+    }
+
+    /// Screen y of the row for `note`.
+    fn y_of(&self, note: u8) -> f32 {
+        self.area.top() + (self.top_note as f32 - f32::from(note)) * self.row_h
+    }
+
+    /// Same time axis over another strip (the velocity lane, later the
+    /// overlay curve lanes): only the vertical anchor and the left edge move.
+    fn over(&self, area: egui::Rect) -> Self {
+        Self {
+            t0_x: self.t0_x + (area.left() - self.area.left()),
+            area,
+            ..*self
+        }
+    }
+
+    /// The on-screen rectangle a note is painted into — the single source of
+    /// truth for both painting and hit-testing, so the two cannot drift.
+    fn note_rect(&self, note: &Note) -> egui::Rect {
+        let x = self.x_of(note.start as f32);
+        let w = (note.length as f32 * self.ticks_to_x).max(3.0);
+        let y = self.y_of(note.note);
+        egui::Rect::from_min_max(
+            egui::pos2(x, y + 1.0),
+            egui::pos2(x + w, y + self.row_h - 1.0),
+        )
+    }
+
+    /// Left / right pixel edges of a note's drawn rectangle. Edge trims are
+    /// measured against these — the *visual* edges, without slop.
+    fn note_edges(&self, note: &Note) -> (f32, f32) {
+        let x = self.x_of(note.start as f32);
+        (x, x + (note.length as f32 * self.ticks_to_x).max(3.0))
+    }
+
+    /// The hit-testing rectangle: the drawn one plus [`HIT_SLOP`]. Kept
+    /// separate from [`Self::note_rect`] so painting and the edge zones stay
+    /// exact — only *landing on* a note is forgiving.
+    fn note_hit_rect(&self, note: &Note) -> egui::Rect {
+        self.note_rect(note).expand2(HIT_SLOP)
+    }
+
+    /// The index of the note whose hit-testing rectangle covers `pos`.
+    ///
+    /// Hit-testing mirrors **drawing**: the same pixels, not a tick range. A
+    /// tick-range test (`start <= tick < end`) disagrees with the drawn width
+    /// in two ways that both read as bugs to the user — the minimum 3 px width
+    /// makes short notes look wider than their ticks, and the half-open range
+    /// excludes the right edge itself, so grabbing a note's tail lands on
+    /// empty space and paints a *new* note there. The slop keeps the last few
+    /// pixels of aim error on the note instead of falling through to the
+    /// draw-on-empty gesture.
+    fn note_at(&self, clip: &MidiClip, pos: egui::Pos2) -> Option<usize> {
+        clip.notes()
+            .iter()
+            .position(|n| self.note_hit_rect(n).contains(pos))
+    }
+}
+
+/// The absolute tick range the roll may scroll within (P2, spec
+/// `roll-multiclip.md` D2). P3 widens it to the whole context (focus + ghost
+/// clips); with one clip it is exactly that clip.
+#[derive(Debug, Clone, Copy)]
+struct ViewWindow {
+    start: f32,
+    end: f32,
+}
+
+impl ViewWindow {
+    /// Clamps the left-edge tick so the window stays inside `[start, end]`. A
+    /// window wider than the range (zoomed past fit) pins to `start`, which is
+    /// the existing "zoom out shows the whole clip, no blank on the left"
+    /// behaviour.
+    fn clamp_scroll(self, scroll: f32, width: f32, ticks_to_x: f32) -> f32 {
+        let max = (self.end - width / ticks_to_x).max(self.start);
+        scroll.clamp(self.start, max)
+    }
+}
+
 /// Draw one frame of the roll + velocity lane and return the edit the gesture
 /// produced (at most one per frame).
 pub fn show(
@@ -784,6 +905,21 @@ pub fn show(
     router: &mut crate::focus::FocusRouter,
 ) -> Option<RollIntent> {
     let loop_ticks = i64::from(clip.loop_ticks.max(TICKS_PER_STEP)).max(1);
+    // P2: the clip's arrangement origin and the tick range the view may show.
+    // With one clip the window is exactly the clip; P3 replaces both with the
+    // context's span (`roll-multiclip.md` D2/D3).
+    let origin_tick = i64::from(clip.start_ticks);
+    let window = ViewWindow {
+        start: origin_tick as f32,
+        end: (origin_tick + loop_ticks) as f32,
+    };
+    // `scroll_x` is absolute now, and the state outlives target switches: a
+    // clip starting at bar 9 must open on its own left edge, not inherit a
+    // scroll borrowed from the previous clip.
+    if state.view_origin != Some(origin_tick) {
+        state.view_origin = Some(origin_tick);
+        state.scroll_x = origin_tick as f32;
+    }
     let grid_ticks = state
         .grid
         .ticks(TICKS_PER_QUARTER, 120.0, 48_000.0, 30.0)
@@ -939,7 +1075,7 @@ pub fn show(
                     );
                     state.zoom_x = new_zoom;
                     let t_x = fit_ticks_to_x * new_zoom;
-                    state.scroll_x = scroll.clamp(0.0, (loop_ticks as f32 - width / t_x).max(0.0));
+                    state.scroll_x = window.clamp_scroll(scroll, width, t_x);
                 }
                 if zy != 1.0 && !uniform {
                     let new_zoom = (state.zoom_y * zy).clamp(ZOOM_Y_MIN, ZOOM_Y_MAX);
@@ -958,8 +1094,7 @@ pub fn show(
             }
         } else if wheel.x != 0.0 {
             let t_x = fit_ticks_to_x * state.zoom_x;
-            state.scroll_x = (state.scroll_x - wheel.x / t_x)
-                .clamp(0.0, (loop_ticks as f32 - width / t_x).max(0.0));
+            state.scroll_x = window.clamp_scroll(state.scroll_x - wheel.x / t_x, width, t_x);
             ui.ctx().request_repaint();
         } else if wheel.y != 0.0 {
             let row_h = ROW_HEIGHT * state.zoom_y;
@@ -974,8 +1109,7 @@ pub fn show(
         let d = ui.ctx().input(|i| i.pointer.delta());
         let t_x = fit_ticks_to_x * state.zoom_x;
         let row_h = ROW_HEIGHT * state.zoom_y;
-        state.scroll_x =
-            (state.scroll_x - d.x / t_x).clamp(0.0, (loop_ticks as f32 - width / t_x).max(0.0));
+        state.scroll_x = window.clamp_scroll(state.scroll_x - d.x / t_x, width, t_x);
         let rows = (ROLL_HEIGHT / row_h).max(1.0);
         state.top_note = (state.top_note + d.y / row_h).clamp(rows - 1.0, 127.0);
         ui.ctx().request_repaint();
@@ -984,23 +1118,32 @@ pub fn show(
     let ticks_to_x = fit_ticks_to_x * state.zoom_x;
     let row_h = ROW_HEIGHT * state.zoom_y;
     let visible_rows = (ROLL_HEIGHT / row_h).ceil().max(1.0) as i32;
-    // Tick 0's screen x (scroll + zoom applied). Every note / grid draw and
-    // every hit test derives from this, so painting and hit-testing can never
-    // drift apart.
-    let t0_x = rect.left() - state.scroll_x * ticks_to_x;
-    let painter = ui.painter_at(rect);
     let top_note = state.top_note.round() as i32;
     let min_note = top_note - visible_rows + 1;
+    // Absolute tick 0's screen x (scroll + zoom applied). Every note / grid
+    // draw and every hit test derives from this one pair, so painting and
+    // hit-testing can never drift apart.
+    let geom = RollGeom {
+        origin_tick,
+        t0_x: rect.left() - state.scroll_x * ticks_to_x,
+        ticks_to_x,
+        top_note,
+        row_h,
+        area: rect,
+    };
+    let painter = ui.painter_at(rect);
 
     // ---- Pointer → tick/pitch helpers (the keyboard section needs them
     // for the modal grab point; the interaction sections below reuse them).
-    let pointer_tick = |pos: egui::Pos2| ((pos.x - t0_x) / ticks_to_x).max(0.0);
+    // Ticks stay **clip-local**: every command, modal and clamp is expressed
+    // in local ticks, so only the geometry knows about the origin.
+    let pointer_tick = |pos: egui::Pos2| geom.local_at(pos.x).max(0.0);
     let pointer_note = |pos: egui::Pos2| {
         (top_note as f32 - (pos.y - rect.top()) / row_h)
             .round()
             .clamp(0.0, 127.0) as u8
     };
-    let hit_note = |pos: egui::Pos2| note_at(clip, pos, rect, t0_x, ticks_to_x, top_note, row_h);
+    let hit_note = |pos: egui::Pos2| geom.note_at(clip, pos);
     let snap = |ticks: f32| -> i64 { snap_ticks(ticks, grid_ticks) };
     let modifiers = ui.ctx().input(|i| i.modifiers);
     let additive = modifiers.shift || modifiers.ctrl;
@@ -1053,7 +1196,7 @@ pub fn show(
         let mut tick = bar_start;
         while tick < bar_end {
             let is_bar_line = tick % bar_ticks == 0;
-            let x = t0_x + tick as f32 * ticks_to_x;
+            let x = geom.x_of(tick as f32);
             let stroke = egui::Stroke::new(
                 if is_bar_line { 1.5 } else { 1.0 },
                 if is_bar_line {
@@ -1084,7 +1227,6 @@ pub fn show(
         if !(min_note..=top_note).contains(&note_i) {
             continue;
         }
-        let y = rect.top() + (top_note as f32 - note.note as f32) * row_h;
         let selected = state.selection.contains(&index);
         let dragging = state.drag.is_some() && selected;
         let base = if dragging {
@@ -1105,7 +1247,7 @@ pub fn show(
         } else {
             fill
         };
-        painter.rect_filled(note_rect(t0_x, note, ticks_to_x, y, row_h), 2.0, fill);
+        painter.rect_filled(geom.note_rect(note), 2.0, fill);
     }
 
     // 3b. Modal ghosts: the selection at its transformed geometry. Preview
@@ -1119,9 +1261,8 @@ pub fn show(
                 continue;
             };
             let ghost = modal_ghost(note, frame);
-            let y = rect.top() + (top_note as f32 - f32::from(ghost.note)) * row_h;
             painter.rect_filled(
-                note_rect(t0_x, &ghost, ticks_to_x, y, row_h),
+                geom.note_rect(&ghost),
                 2.0,
                 egui::Color32::from_rgba_unmultiplied(240, 190, 80, 170),
             );
@@ -1154,10 +1295,12 @@ pub fn show(
         ));
     }
 
-    // 5. Playhead (musical position modulo loop length).
+    // 5. Playhead: the transport position wrapped into the clip's content.
+    //    The clip loops from its own origin, so the wrapped position is the
+    //    one that actually plays there.
     if playing {
         let pos = playhead_ticks.rem_euclid(loop_ticks as f32);
-        let x = t0_x + pos * ticks_to_x;
+        let x = geom.x_of(pos);
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
             egui::Stroke::new(2.0, egui::Color32::YELLOW),
@@ -1167,11 +1310,13 @@ pub fn show(
     // ---- Velocity lane (M2.4): bars under the roll, drag to set. ----
     let (lane_rect, lane_response) =
         ui.allocate_exact_size(egui::vec2(width, LANE_HEIGHT), egui::Sense::drag());
-    let lane_t0_x = lane_rect.left() - state.scroll_x * ticks_to_x;
+    // Same time axis, its own strip: `over` moves only the left edge and the
+    // vertical anchor, so the bars line up with the notes above them.
+    let lane_geom = geom.over(lane_rect);
     let lane_painter = ui.painter_at(lane_rect);
     lane_painter.rect_filled(lane_rect, 0.0, egui::Color32::from_gray(20));
     for (index, note) in clip.notes().iter().enumerate() {
-        let x = lane_t0_x + note.start as f32 * ticks_to_x;
+        let x = lane_geom.x_of(note.start as f32);
         let w = (note.length as f32 * ticks_to_x).clamp(3.0, 8.0);
         let h = (LANE_HEIGHT - 4.0) * f32::from(note.velocity) / 127.0;
         let selected = state.selection.contains(&index);
@@ -1191,7 +1336,7 @@ pub fn show(
     }
     if playing {
         let pos = playhead_ticks.rem_euclid(loop_ticks as f32);
-        let x = lane_t0_x + pos * ticks_to_x;
+        let x = lane_geom.x_of(pos);
         lane_painter.line_segment(
             [
                 egui::pos2(x, lane_rect.top()),
@@ -1490,7 +1635,7 @@ pub fn show(
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             } else if let Some(index) = hit_note(pos) {
                 let note = &clip.notes()[index];
-                let (x0, x1) = note_edges(t0_x, note, ticks_to_x);
+                let (x0, x1) = geom.note_edges(note);
                 if edge_zone(pos.x, x0, x1).is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
@@ -1537,7 +1682,7 @@ pub fn show(
                 // note's start/end the grab trims that edge instead of moving.
                 let edge = hit_note(pos).and_then(|index| {
                     let note = &clip.notes()[index];
-                    let (x0, x1) = note_edges(t0_x, note, ticks_to_x);
+                    let (x0, x1) = geom.note_edges(note);
                     edge_zone(pos.x, x0, x1)
                 });
                 match hit_note(pos) {
@@ -1668,9 +1813,7 @@ pub fn show(
                     if knife.cuts.iter().any(|(cut, _)| *cut == index) {
                         continue; // one cut per note per stroke
                     }
-                    if let Some(tick) =
-                        knife_crossing(from, pos, rect, note, t0_x, ticks_to_x, top_note, row_h)
-                    {
+                    if let Some(tick) = knife_crossing(from, pos, note, &geom) {
                         knife.cuts.push((index, tick));
                     }
                 }
@@ -1773,10 +1916,7 @@ pub fn show(
                 .notes()
                 .iter()
                 .enumerate()
-                .filter(|(_, n)| {
-                    let y0 = rect.top() + (top_note as f32 - n.note as f32) * row_h;
-                    band.intersects(note_rect(t0_x, n, ticks_to_x, y0, row_h))
-                })
+                .filter(|(_, n)| band.intersects(geom.note_rect(n)))
                 .map(|(i, _)| i)
                 .collect();
             if marquee.additive {
@@ -1836,7 +1976,7 @@ pub fn show(
                 .round()
                 .clamp(1.0, 127.0) as u8;
             let updates: Vec<(usize, u8)> = if state.selection.is_empty() {
-                let tick = ((pos.x - lane_t0_x) / ticks_to_x).max(0.0) as i64;
+                let tick = lane_geom.local_at(pos.x).max(0.0) as i64;
                 clip.notes()
                     .iter()
                     .enumerate()
@@ -1971,23 +2111,14 @@ fn edge_zone(x: f32, left: f32, right: f32) -> Option<DragKind> {
 /// a precision operation, not a grid one. `None` when the segment never
 /// enters the note (including when it merely touches the note's boundary,
 /// which would cut off a zero-length half).
-#[allow(clippy::too_many_arguments)]
-fn knife_crossing(
-    from: egui::Pos2,
-    to: egui::Pos2,
-    rect: egui::Rect,
-    note: &Note,
-    t0_x: f32,
-    ticks_to_x: f32,
-    top: i32,
-    row_h: f32,
-) -> Option<i64> {
-    let row_top = rect.top() + (top as f32 - f32::from(note.note)) * row_h;
-    let centre = row_top + row_h / 2.0;
-    let x_left = t0_x + note.start as f32 * ticks_to_x;
-    let x_right = x_left + (note.length as f32 * ticks_to_x).max(3.0);
+///
+/// Returns a **clip-local** tick, like every other note-level helper.
+fn knife_crossing(from: egui::Pos2, to: egui::Pos2, note: &Note, geom: &RollGeom) -> Option<i64> {
+    let row_top = geom.y_of(note.note);
+    let centre = row_top + geom.row_h / 2.0;
+    let (x_left, x_right) = geom.note_edges(note);
     let cut_at = |x: f32| -> Option<i64> {
-        let tick = ((x - t0_x) / ticks_to_x).round() as i64;
+        let tick = geom.local_at(x).round() as i64;
         (tick > note.start && tick < note.end()).then_some(tick)
     };
 
@@ -2000,7 +2131,7 @@ fn knife_crossing(
     }
     // Sweeping along the note's own row: cut in the middle of the span the
     // segment covered.
-    let band = row_top..=(row_top + row_h);
+    let band = row_top..=(row_top + geom.row_h);
     if band.contains(&ya) && band.contains(&yb) {
         let lo = from.x.min(to.x).max(x_left);
         let hi = from.x.max(to.x).min(x_right);
@@ -2066,53 +2197,6 @@ fn modal_ghost(note: &Note, frame: &ModalFrame) -> Note {
         ghost.note = (i32::from(ghost.note) + i32::from(frame.delta_note)).clamp(0, 127) as u8;
     }
     ghost
-}
-
-/// The note whose hit-testing rectangle covers `pos`, if any.
-///
-/// Hit-testing mirrors **drawing** (`note_rect`) plus [`HIT_SLOP`]: the
-/// same pixels, not a tick range. A tick-range test (`start <= tick <
-/// end`) disagrees with the drawn width in two ways that both read as
-/// bugs to the user — the minimum 3 px width makes short notes look wider
-/// than their ticks, and the half-open range excludes the right edge
-/// itself, so grabbing a note's tail lands on empty space and paints a
-/// *new* note there. The slop keeps the last few pixels of aim error on
-/// the note instead of falling through to the draw-on-empty gesture.
-fn note_at(
-    clip: &MidiClip,
-    pos: egui::Pos2,
-    rect: egui::Rect,
-    t0_x: f32,
-    ticks_to_x: f32,
-    top: i32,
-    row_h: f32,
-) -> Option<usize> {
-    clip.notes().iter().position(|n| {
-        let y = rect.top() + (top as f32 - f32::from(n.note)) * row_h;
-        note_hit_rect(t0_x, n, ticks_to_x, y, row_h).contains(pos)
-    })
-}
-
-/// The on-screen rectangle a note is painted into. The single source of
-/// truth for both painting and hit-testing, so the two can never drift.
-fn note_rect(t0_x: f32, note: &Note, ticks_to_x: f32, y: f32, row_h: f32) -> egui::Rect {
-    let x = t0_x + note.start as f32 * ticks_to_x;
-    let w = (note.length as f32 * ticks_to_x).max(3.0);
-    egui::Rect::from_min_max(egui::pos2(x, y + 1.0), egui::pos2(x + w, y + row_h - 1.0))
-}
-
-/// Left / right pixel edges of a note's drawn rectangle. Edge trims are
-/// measured against these — the *visual* edges, without slop.
-fn note_edges(t0_x: f32, note: &Note, ticks_to_x: f32) -> (f32, f32) {
-    let x = t0_x + note.start as f32 * ticks_to_x;
-    (x, x + (note.length as f32 * ticks_to_x).max(3.0))
-}
-
-/// The hit-testing rectangle: the drawn one plus [`HIT_SLOP`]. Kept
-/// separate from [`note_rect`] so painting and the edge zones stay exact
-/// — only *landing on* a note is forgiving.
-fn note_hit_rect(t0_x: f32, note: &Note, ticks_to_x: f32, y: f32, row_h: f32) -> egui::Rect {
-    note_rect(t0_x, note, ticks_to_x, y, row_h).expand2(HIT_SLOP)
 }
 
 /// A uniform move clamped on the UI side so no note crosses the engine's
@@ -2190,9 +2274,9 @@ fn grid_label(grid: &GridValue) -> String {
 mod tests {
     use super::{
         AwaitCreate, Axis, DragKind, DragSelection, EDGE_PX, HIT_SLOP, Modal, ModalFrame,
-        ModalKind, ROLL_HEIGHT, ROW_HEIGHT, RollIntent, RollMode, RollState, StretchEdge,
-        clamped_move, draw_end, edge_zone, is_black_key, knife_crossing, modal_ghost, note_at,
-        note_rect, scale_max_k, selection_bbox, snap_ticks, trim_start, zoom_scroll_anchor,
+        ModalKind, ROLL_HEIGHT, ROW_HEIGHT, RollGeom, RollIntent, RollMode, RollState, StretchEdge,
+        ViewWindow, clamped_move, draw_end, edge_zone, is_black_key, knife_crossing, modal_ghost,
+        scale_max_k, selection_bbox, snap_ticks, trim_start, zoom_scroll_anchor,
         zoom_top_note_anchor,
     };
     use crate::grid::{GridValue, NoteValue};
@@ -2582,17 +2666,28 @@ mod tests {
     /// The tail grab used to land on empty space and paint a *new* note:
     /// the old tick-range hit test (`start <= tick < end`) excluded the
     /// right edge that the 3 px minimum width had just drawn there.
+    /// Test geometry: tick 0 sits at the strip's left edge, so a clip-local
+    /// tick equals the number of pixels once `ticks_to_x` is 1.
+    fn geom(rect: egui::Rect, origin: i64, ticks_to_x: f32, top: i32) -> RollGeom {
+        RollGeom {
+            origin_tick: origin,
+            t0_x: rect.left() - origin as f32 * ticks_to_x,
+            ticks_to_x,
+            top_note: top,
+            row_h: ROW_HEIGHT,
+            area: rect,
+        }
+    }
+
     #[test]
     fn a_note_hit_test_matches_the_rectangle_it_is_drawn_into() {
         let rect = egui::Rect::from_min_size(egui::pos2(100.0, 200.0), egui::vec2(400.0, 200.0));
         let mut clip = MidiClip::default();
         // start 0, length 240; ticks_to_x = 1.0 → drawn 100.0 .. 340.0.
         clip.sequence.notes = vec![note(0, 240, 60)];
-        let ticks_to_x = 1.0f32;
-        let top = 60i32;
-        let y = rect.top();
+        let g = geom(rect, 0, 1.0, 60);
 
-        let drawn = note_rect(rect.left(), &clip.notes()[0], ticks_to_x, y, ROW_HEIGHT);
+        let drawn = g.note_rect(&clip.notes()[0]);
         assert_eq!(drawn.left(), 100.0);
         assert_eq!(drawn.right(), 340.0);
 
@@ -2600,7 +2695,7 @@ mod tests {
         for x in [drawn.left(), drawn.center().x, drawn.right() - 0.5] {
             let pos = egui::pos2(x, drawn.center().y);
             assert_eq!(
-                note_at(&clip, pos, rect, rect.left(), ticks_to_x, top, ROW_HEIGHT),
+                g.note_at(&clip, pos),
                 Some(0),
                 "x={x} is inside the drawn rect and must hit"
             );
@@ -2608,42 +2703,24 @@ mod tests {
         // HIT_SLOP keeps an off-by-a-few-pixels tail grab on the note
         // instead of letting it fall through to "draw a new note".
         assert_eq!(
-            note_at(
-                &clip,
-                egui::pos2(drawn.right() + 1.0, drawn.center().y),
-                rect,
-                rect.left(),
-                ticks_to_x,
-                top,
-                ROW_HEIGHT
-            ),
+            g.note_at(&clip, egui::pos2(drawn.right() + 1.0, drawn.center().y)),
             Some(0),
             "a press a pixel past the tail still hits (aim error is not empty space)"
         );
         // Past the slack it really is empty space.
         assert_eq!(
-            note_at(
+            g.note_at(
                 &clip,
-                egui::pos2(drawn.right() + HIT_SLOP.x + 0.5, drawn.center().y),
-                rect,
-                rect.left(),
-                ticks_to_x,
-                top,
-                ROW_HEIGHT
+                egui::pos2(drawn.right() + HIT_SLOP.x + 0.5, drawn.center().y)
             ),
             None
         );
         // A neighbouring pitch row does not hit either (the y slack only
         // fills this note's own row gutter).
         assert_eq!(
-            note_at(
+            g.note_at(
                 &clip,
-                egui::pos2(drawn.center().x, drawn.center().y + ROW_HEIGHT),
-                rect,
-                rect.left(),
-                ticks_to_x,
-                top,
-                ROW_HEIGHT
+                egui::pos2(drawn.center().x, drawn.center().y + ROW_HEIGHT)
             ),
             None
         );
@@ -2657,21 +2734,12 @@ mod tests {
         let mut clip = MidiClip::default();
         clip.sequence.notes = vec![note(0, 1, 60)];
         // ticks_to_x = 0.1 → one tick is 0.1 px, floored to the 3 px minimum.
-        let ticks_to_x = 0.1f32;
-        let y = rect.top();
-        let drawn = note_rect(rect.left(), &clip.notes()[0], ticks_to_x, y, ROW_HEIGHT);
+        let g = geom(rect, 0, 0.1, 60);
+        let drawn = g.note_rect(&clip.notes()[0]);
         assert_eq!(drawn.width(), 3.0, "the minimum width is what gets drawn");
         for x in [drawn.left() + 0.5, drawn.right() - 0.5] {
             assert_eq!(
-                note_at(
-                    &clip,
-                    egui::pos2(x, drawn.center().y),
-                    rect,
-                    rect.left(),
-                    ticks_to_x,
-                    60,
-                    ROW_HEIGHT
-                ),
+                g.note_at(&clip, egui::pos2(x, drawn.center().y)),
                 Some(0),
                 "x={x} within the drawn 3 px must hit the note"
             );
@@ -3031,14 +3099,11 @@ mod tests {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0));
         let mut clip = MidiClip::default();
         clip.sequence.notes = vec![note(0, 240, 60)]; // x span 0..24 px at 0.1 px/tick
-        let ttx = 0.1f32;
-        let top = 60;
+        let g = geom(rect, 0, 0.1, 60);
         let n = &clip.notes()[0];
         let row_top = rect.top();
         let centre = row_top + ROW_HEIGHT / 2.0;
-        let k = |from: egui::Pos2, to: egui::Pos2| {
-            knife_crossing(from, to, rect, n, rect.left(), ttx, top, ROW_HEIGHT)
-        };
+        let k = |from: egui::Pos2, to: egui::Pos2| knife_crossing(from, to, n, &g);
 
         // A vertical slash at tick 120 crosses the row centreline inside.
         let to = egui::pos2(12.0, centre + 20.0);
@@ -3067,6 +3132,58 @@ mod tests {
         let from = egui::pos2(2.0, centre + 5.0 * ROW_HEIGHT);
         let to = egui::pos2(20.0, centre + 5.0 * ROW_HEIGHT);
         assert_eq!(k(from, to), None);
+    }
+
+    /// P2: the time axis is absolute — two clips at different arrangement
+    /// starts land at their own absolute x on one shared pixel scale, while
+    /// every note-level number (and every command) stays clip-local.
+    #[test]
+    fn clips_with_different_origins_share_one_time_axis() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0));
+        let (t_x, top) = (0.1f32, 60);
+        // One scroll position for both: absolute tick 0 sits at x = 0.
+        let a = RollGeom {
+            origin_tick: 0,
+            t0_x: 0.0,
+            ticks_to_x: t_x,
+            top_note: top,
+            row_h: ROW_HEIGHT,
+            area: rect,
+        };
+        let b = RollGeom {
+            origin_tick: 960,
+            ..a
+        };
+        // Local tick 0 of the second clip is one quarter note to the right…
+        assert_eq!(a.x_of(0.0), 0.0);
+        assert_eq!(b.x_of(0.0), 96.0);
+        // …and the same note in both clips keeps its relative layout.
+        let n = note(0, 240, 60);
+        assert_eq!(b.note_rect(&n).left() - a.note_rect(&n).left(), 96.0);
+        // Absolute positions agree: a's local 960 is where b's local 0 is.
+        assert_eq!(a.x_of(960.0), b.x_of(0.0));
+        // The inverse mapping is clip-local too: one pixel, two meanings.
+        assert!((a.local_at(96.0) - 960.0).abs() < 1e-3);
+        assert!(b.local_at(96.0).abs() < 1e-3);
+    }
+
+    /// P2: scroll is clamped to the clip's absolute span, so a clip starting
+    /// at tick 960 opens on its own left edge and cannot scroll off it.
+    #[test]
+    fn the_scroll_window_is_the_clip_span() {
+        let window = ViewWindow {
+            start: 960.0,
+            end: 960.0 + 3840.0,
+        };
+        let (width, t_x) = (400.0f32, 1.0f32);
+        assert_eq!(
+            window.clamp_scroll(0.0, width, t_x),
+            960.0,
+            "left of the clip pins to its own start"
+        );
+        assert_eq!(window.clamp_scroll(10_000.0, width, t_x), 4400.0);
+        // Zoomed past fit the whole span fits: pin to the start, no blank.
+        assert_eq!(window.clamp_scroll(2000.0, width, 0.05), 960.0);
     }
 
     #[test]
