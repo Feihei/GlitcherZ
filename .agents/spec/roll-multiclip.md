@@ -1,6 +1,6 @@
 # 多 clip 钢琴卷帘 + 音高曲线 Spec
 
-> 状态：草案（2026-10-27，经一轮设计讨论；同日 **P0 / P2 已交付**，偏差见 §9 / §10）。2026-10-28 **P3 已交付**（偏差见 §11）。P4 待实施，P1 可并行。
+> 状态：**P0 / P2 / P3 / P4 已交付，P1 已交付，P5 部分交付**（2026-10-27 奠定，2026-10-28 完成）。各阶段偏差见 §9–§14。
 > 上游：`timeline.md`（clip 模型 / 平铺语义）、`editing-model.md`（M4 交互模型：常驻态只有 Select、语义决策源不得回到指针）、`control-tracks.md`（曲线一等实体、`AutoDest`、U4a CC 通路、§7 开放问题）、`sf2-loader.md`（bend range）、`effects.md`（`Smoothed`）。
 
 ## 1. 背景与问题
@@ -109,15 +109,15 @@ RollSubject { focus, context }        ← MAX_ROLL_CONTEXT = 8
 
 - [x] **P0 `ctrls` 链路补齐** ✅ 2026-10-27（D14）：SMF 导入解析 + 引擎调度投递 + 导出写入三段；`Processor::midi_pitch_bend` 新通道；UI 仍无编辑入口（一写多读）。落地偏差见 §9。
   - 验收：`ctrl_events_round_trip` / `single_data_byte_ctrls_do_not_shift_later_events` / `clip_ctrls_fire_at_their_positions` / `clip_ctrls_tile_with_the_loop` / `clip_ctrls_precede_notes_in_the_same_block` / `clip_ctrl_table_is_fixed_capacity` / `track_ctrl_delivers_cc_and_pitch_bend` / `track_ctrl_rejects_unknown_tracks`。
-- [ ] **P1 音高通路**（D9–D12）：`AutoParam::PitchBend` + `AutoDest::PitchBend` + `ParamId::PitchOffset` + synth/sample 逐样本实现 + 分流表落地。
-  - 验收：内置 synth 的 pitch 曲线无台阶（逐样本）；CLAP/SF2 收到 `0xE0`；VST3 返回 false 且 UI 标注。
+- [x] **P1 音高通路** ✅ 2026-10-28（D9–D12）：`AutoParam::PitchBend { channel, range_semitones }` + `AutoDest::PitchBend` + `ParamId::PitchOffset`；sine/synth 与 sample 各自逐样本平滑；分流表在**投递端**按"节点是否收 bend"决定，不新增第二个 UI 目标。偏差见 §12。
+  - 验收：`pitch_offset_glides_within_one_block`（同一 block 内半周期由 100px 缩到 50px、稳定后 ratio = 2.0）、`pitch_offset_clamps_and_ignores_non_finite`、`auto_pitch_bend_route_scales_semitones_into_14_bits`、`bend_falls_back_to_the_pitch_offset_parameter`、`auto_pitch_bend_route_requires_a_live_node`、`pitch_bend_parameter_clamps_range_and_channel`、`pitch_offset_glides_into_the_new_read_rate`、`pitch_offset_moves_a_voice_that_is_already_playing`。
 - [x] **P2 坐标系绝对化** ✅ 2026-10-27（D1–D3）：`RollGeom { origin_tick, t0_x, ticks_to_x, top_note, row_h, area }` 结构体化（绘制/命中/刀切/框选共用一套 `note_rect`/`note_edges`/`note_hit_rect`/`note_at`）、`scroll_x` 改绝对 tick、`ViewWindow` 接管滚动钳制、origin 变化时重锚。P3/P4 只需给 ghost 各自换 `origin_tick` 与把 `ViewWindow` 换成 context 跨度。
   - 验收：单 clip 下所有既有 roll 测试与实测行为**逐项等价**（37 项原测试全部通过；仅 3 处直接调用自由函数 `note_rect`/`note_at`/`knife_crossing` 的测试改为调 `RollGeom`，断言一字未改）；新增 `clips_with_different_origins_share_one_time_axis` / `the_scroll_window_is_the_clip_span`。偏差见 §10。
 - [x] **P3 多 clip 主体** ✅ 2026-10-28（D4–D7）：`RollSubject { focus, context, dropped }` + `ClipRef`；`show()` 改收 `&[MidiTrack]` + `&RollSubject`；ghost 绘制（底层、alpha 0.22、不命中）；`ViewWindow::of` 覆盖 context 跨度 + fit 基准改 context 跨度；Edit tab 焦点 chip 条 + Tab/Shift+Tab；`set_edit_target` 从 timeline 选区装配 context。偏差见 §11。
   - 验收：`a_ghost_note_is_painted_but_never_hit`（点击 ghost 位置不选中、同坐标点 focus 音符仍可选作为对照）、`drawing_stops_at_the_focus_clips_edges`（窗外 draw 不创建）、`a_subject_leads_with_the_focus_and_drops_stale_entries`、`the_context_cap_keeps_the_focus_and_counts_what_it_dropped`、`tab_cycles_the_focus_and_wraps`、`the_view_window_is_the_whole_context`。
-- [ ] **P4 曲线泳道**（D8、D16、D17）：多泳道栈 + 纵轴按 `AutoDest` + 可写 curve 编辑。
-  - 验收：pitch 曲线在音符正下方对齐绘制、可拖动锚点、undo 一步；CC lane 纵轴 0..127；bend lane 纵轴按 `range_semitones`。
-- [ ] **P5（可选）泳道打磨**：ghost velocity、泳道折叠记忆、lane 高度拖动、context 上限调整。
+- [x] **P4 曲线泳道** ✅ 2026-10-28（D8、D16、D17）：`RollLane::Control` + `OverlayLane`；泳道栈在 velocity 条之下、共用 `RollGeom` 时间轴与各 clip 自己的 `at_origin`；纵轴由调用方按 `curve::axis(&param)` 给出；写入走 `CurveUpsert` / `CurveRemove` / `CurveDragEnd` 三个意图 → 既有 `curve_upsert` / `curve_remove_point`。偏差见 §13。
+  - 验收：`a_lane_shares_the_time_axis_with_the_notes`（同一 tick 在泳道与音符区同一 x）、`a_lane_click_adds_an_anchor_at_the_clicked_value`、`dragging_a_lane_anchor_reports_the_anchor_it_moved`、`a_lane_right_click_deletes_the_anchor_under_it`。
+- [~] **P5（可选）泳道打磨**：**泳道折叠**已交付（`the_lane_toggle_collapses_the_lane`）；其余三项按下述理由不做，见 §14。
 
 依赖：P2 必须先于 P3/P4；P1 与 P2 可并行；P0 独立。
 
@@ -165,3 +165,37 @@ RollSubject { focus, context }        ← MAX_ROLL_CONTEXT = 8
 - **focus 切换**已经是纯 view-state（`set_roll_focus` + `cycle_focus`），P4 往 context 里加 control clip 时只需扩展 `RollLane` 与 `view` 的分支——`note_at` / 命令族 / 模态仍只认 focus。
 
 一条被测试钉住的边界值得记：**ghost 与 focus 时间重叠时，重叠区的点击属于 focus**（`note_at` 只看 focus）。所以"点击看起来落在 ghost 音符上"在重叠情况下会创建/选中 focus 的内容——这不是 bug，D6 的定义就是 ghost 无命中实体；真正的歧义由 chip 条解决。
+
+## 12. P1 实施勘误（2026-10-28）
+
+| # | spec 原判 | 实际 | 原因 |
+| :-- | :-- | :-- | :-- |
+| E19 | D10 的分流表读起来像"按声源类型在编译期选一个 `AutoDest`" | 只有**一个** `AutoDest::PitchBend`；分流发生在 `auto_deliver`：先 `slot_midi_pitch_bend`，节点返回 `false` 才回退到 `slot_set_param(PitchOffset, semitones)` | 声源类型在 UI 侧并不可靠（同一节点可以是内置 synth、CLAP、VST3，取决于载入了什么），而在音频线程查类型表等于把文档知识搬进 RT 路径。让节点自己回答"我收不收 bend"既准确又零成本：内置源本来就把 `midi_pitch_bend` 实现为 `false` |
+| E20 | 未提回退路径的去重 | 回退参数与事件**共用**一个 `last_bend: [i32; MAX_AUTO_TRACKS]` 变化检测表 | 一条曲线每 block 都会采样一次；不检测变化就是每秒 375 次相同的 `set_param`。共用表的代价是参数路径按 `range/8192` 量化（±2 st 时 0.00024 半音，比 1 cent 细 40 倍），听觉上不可辨别 |
+| E21 | 未提"bend 是否需要 `Copy`/`Eq`" | `AutoDest` **失去 `Eq`**（bend 带 f32 range） | `AutoRoute` 只在 `assert_eq`/比较里用 `PartialEq`，`Eq` 没有实际用途；保留它就只能把 range 存成 i16 半音，反而多一层换算 |
+| E22 | D9：`range_semitones` 钳到 0.5..=24 | 钳制写在**模型**（`AutoParam::pitch_bend`）与**引擎**（`set_auto_pitch_bend_route`）两处，常量各存一份 | 引擎 crate 刻意不依赖 model（RT 层独立），跨 crate 复用常量会把依赖方向拉反。两处都写注释指向对方，`pitch_bend_parameter_clamps_range_and_channel` 钉住模型侧 |
+| E23 | D11：synth 的 voice 存 `base_freq`，每样本乘 `2^(offset/12)` | `SineProcessor` 自己持有 `pitch_ratio` 并逐样本推进；`SynthProcessor` 只把 `PitchOffset` 转发给振荡器 | 音高是振荡器的属性，不是包络的；把 ratio 放在 synth 层意味着每样本要把频率写回振荡器，等于把平滑拆成两处。副作用是**裸 sine 节点也能弯音**——这是好事 |
+| E24 | D11："sample 的 `rate = base_rate * 2^(offset/12)`" | 每 block 先算一条 `pitch_ramp: [f32]`（逐样本），`render_voice` 按帧取用 | 16 个 voice 各自推进同一个平滑器会在每个 voice 循环里重复计算，而且一个和弦里各 voice 会以不同相位漂移。共享 ramp 保证整块和声一起滑 |
+| E25 | 未提 | `AutoParam::PitchBend` 的曲线纵轴是**对称** `(-range, +range)` | 曲线存的是半音（D9），range 就是满量程偏转；不对称轴会让"0"不在中线，用户无法从图形判断"没弯" |
+
+**为什么"没有第二个 UI 目标"是对的**：如果为内置源另开一个 `AutoParam::PitchOffset`，用户就得先知道节点类型再选目标，而选错只是静音（没有任何提示）。现在一个"Pitch Bend"目标对三类声源都有确定行为：CLAP/SF2 走 `0xE0`、内置源走参数、VST3 静音（悬停文案已说明）。这也让 `ControlClip` 的"一写多读"保持成立。
+
+## 13. P4 实施勘误（2026-10-28）
+
+| # | spec 原判 | 实际 | 原因 |
+| :-- | :-- | :-- | :-- |
+| E26 | D8：`OverlayLane { clip: ClipRef }` | `OverlayLane` 还带 `data: &ControlClip`、`axis: (min,max,log)`、`label: String` | 卷帘不该知道"这条曲线是给哪个参数的"：那是电缆的事（`control_track_param` 在 app 侧查 `PortRef::AutoTrack`）。把 axis 传进来，卷帘就只依赖 `curve` 模块的两个纯函数，模型 ↔ 视图的边界保住 |
+| E27 | D8："多泳道栈，纵向可滚动、可折叠" | 栈**不滚动**（直接接在 velocity 条后面），折叠是 P5 才加的 12px 方块 | 卷帘已经在一个 `ScrollArea` 里，再嵌一个纵向滚动区会吞掉它的滚轮；栈高（8 条 = 512px）由折叠解决，比嵌套滚动更直接 |
+| E28 | D16："命令走既有 `curve_upsert` / `curve_remove_point`" | 意图多了一个 `CurveDragEnd` | 合并 undo 的收口在 app 的 `end_param_edit()`，而一次拖拽的结束帧没有任何值变化（`dragged` 已为 false），不额外发一个"结束"意图就只能把收口挂在下一帧上 |
+| E29 | 未提"按下点 vs 当前点" | 抓取锚点用 `pointer.press_origin()`，不用 `interact_pointer_pos()` | egui 报告 `drag_started` 时指针**已经移动**；用当前位置找锚点会在"按下锚点后快速拖开"时找不到它，于是把旧锚点留在原地又新建一个（一次拖拽变成两个点）。这与音符拖拽"按按下点分类"的既有规则一致 |
+| E30 | 未提布局顺序 | `lane_rects` 由卷帘每帧发布到 `RollState` | 泳道栈在 velocity 条**之下**，位置取决于工具栏高度（egui 决定）与两个公开常量；让测试或将来任何调用方重新推导这套几何，等于把布局知识复制一份。发布 rect 一次，命中与测试都用同一份 |
+| E31 | 未提折叠的生效时机 | 点击切换当帧只改状态，**布局下一帧才变** | `allocate_exact_size` 发生在处理点击之前；这在 app 里是 16 ms 的延迟、不可感知，但测试必须多跑一帧（写进了测试注释） |
+
+## 14. P5 的裁决（2026-10-28）
+
+| 项 | 结论 | 理由 |
+| :-- | :-- | :-- |
+| 泳道折叠 | **做**（`RollState.collapsed_lanes`，按 control **track** 记；view-state，不入 undo） | 8 条全展开是 512px，而通常只有一条曲线是需要盯着画的。按 track 而不是按 clip 记：同一轨的多个 clip 是同一条曲线的分段，折叠意图属于轨 |
+| ghost velocity | **不做** | 与 D6 直接冲突（ghost "无 velocity 条"）。若要看邻轨力度，正解是切焦点（Tab），不是给 ghost 叠信息 |
+| lane 高度拖动 | **不做** | 需要一个持久的布局状态，而 app 目前没有"视图布局"的持久化位置（`UiState` 只存 recent files / plugin cache）；为一个可折叠的栈引入第三个持久化块不划算 |
+| context 上限调整 | **不做** | `MAX_ROLL_CONTEXT = 8` 已经大于"一屏能看清"的量；配合折叠，8 条泳道是 8×18px 的标题条。提高上限只会让 chip 条溢出 |

@@ -609,3 +609,41 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 
 **track 重排要改全体**：`reorder_midi_track` 原来只重映射 focus 的 `track`，现在必须遍历 `context_mut()`——漏改会让 ghost 指向另一条轨的音符。
 
+
+## 音高通路（P1）：一个目标，两种投递
+
+**曲线存半音，不存归一化**：`AutoParam::PitchBend { channel, range_semitones }` 的曲线值域是 `[-range, +range]` 半音（默认 ±2）。range 是**文档字段**而不是常量，因为同一个曲线在不同音源上可以是 ±2 的揉弦也可能是 ±12 的大滑音；存归一化再乘 range 会让"改了 range 曲线跟着变形"，存半音则改 range 只影响投递换算。`pitch_bend(channel, range)` 构造器钳制 `0..=15` / `0.5..=24`（NaN 回落 2.0），这与 MIDI 14 bit 的可表示精度对齐（±24 半音时 1 LSB ≈ 0.003 半音）。
+
+**只有 `AutoDest::PitchBend` 一个目标，没有"内置源 PitchBend / 插件 PitchBend"两个**：spec 早期草案按声源类型分支，实测那样等于把"哪类节点吃什么"这张表搬到 RT 线程维护，节点自己最清楚。现在的投递顺序是：
+
+```rust
+if self.slot_midi_pitch_bend(route.slot, channel, bend) { return; }   // CLAP / SF2
+let _ = self.slot_set_param(route.slot, ParamId::PitchOffset, value); // synth / sample
+```
+
+`slot_midi_pitch_bend` 只有实现了 `Processor::midi_pitch_bend` 的节点返回 true；内置合成器与采样播放器返回 false，于是自然落到逐样本参数。**VST3 两边都没有 = 静音失败**，这是有意的（VST3 侧要给逐样本音高需要 `ProcessData` 里的 `PitchBend` 事件，宿主层还没接，spec 记为"不支持"而非"假装支持"）。UI 悬停文案把这个差异直接写给用户看。
+
+**14 bit 换算与去重**：`ratio = (value / range).clamp(-1, 1)`，正向 `×8191`、负向 `×8192`（MIDI 的 0..16383 中心在 8192，两侧不对称，用同一个 8191 会让 +1 全量偏差 1 LSB）。`last_bend: [i32; MAX_AUTO_TRACKS]` 与 `last_cc` 同构——同一 block 内重复值不重复下发，否则 16 分音符的平坦段每块发一次 bend，把插件的事件队列喂爆。
+
+**逐样本平滑是必须的，块级会响**：曲线在拖拽时逐帧跳值，块级跳变在低频上就是 click。`SineProcessor` 用 self 携带的 `pitch_ratio/target/coeff`（`coeff_for(5.0ms, sr)`）逐样本 `ratio += (target - ratio) * coeff`，然后 `phase += (base_inc * ratio).clamp(0.0, 0.5)`——`clamp` 上界是 0.5（每样本半周期），防止极端弯音把相位增量推过 Nyquist。`SampleVoiceProcessor` 的难点是 16 个 voice 共享同一个 block 级平滑：**每块先填一条 `pitch_ramp: Box<[f32]>`，再让每个 voice 按 `voice.pos += voice.rate * ramp[f]` 读**，这样 16 个 voice 的滑音曲线完全一致，也避免每个 voice 各存一份状态（原先 voice 结构体是纯 POD，加了状态就得在 note-on 时重置，容易漏）。`render_voice` 因此涨到 8 个参数，`#[allow(clippy::too_many_arguments)]` + 注释说明比拆结构体更可读。
+
+**测试用"半周期"验证而不是听感**：`pitch_offset_glides_within_one_block` 断言块内前半段与后半段的过零间隔比例趋近目标 ratio；`pitch_offset_moves_a_voice_that_is_already_playing`（`tests/sample_voice.rs`，配 `cursor_advance` helper）专门覆盖"note 已经开声之后再弯音"——这是最容易漏的路径，因为 ramp 只在 `process` 开头填，voice 若在块中途 pop 进来就会用到上一块的旧值。
+
+
+## 曲线泳道（P4）与折叠（P5）
+
+**卷帘不认识电缆**：`OverlayLane<'a> { clip: ClipRef, data: &'a ControlClip, axis: (f32, f32, bool), label: String }` 由 app 侧 `midi_editor_body` 组装——纵轴 `(min, max, symmetric)` 来自 `curve::axis(&param)`，`param` 来自 `control_track_param(project, track)`（按 `PortRef::AutoTrack` + `CableKind::Automation` 反查电缆）。卷帘只负责"给一个矩形，按这个值域画折线"。这样自动化目标换了、值域变了，卷帘一行不用改。
+
+**时间轴复用而不是再推一遍**：每条 lane `allocate_exact_size` 拿到自己的 rect 后，`geom.at_origin(clip.start_ticks).over(rect)`——`over` 换掉 `area` 但保留 `origin/t0_x/ticks_to_x`。于是泳道与音符**逐像素对齐**，`a_lane_shares_the_time_axis_with_the_notes` 就是拿同一 tick 在两个 rect 里的 x 相减断言为 0。
+
+**`ViewWindow` 要并上 lane 的跨度**：context 里可能有"没有音符但有一条长曲线"的 clip，只看音符会让窗口截掉曲线尾巴。`show` 里用 `fold(..., |w, lane| w.union(ViewWindow::of(...)))`，`union` 取 min/max。
+
+**逐像素采样画折线**：不是"连锚点"，而是对矩形内每个 x 求 tick → `value_at(phase)` → y。原因是曲线是分段插值 + 可能循环，连锚点会在 loop 边界画出一条横跨全屏的假线。空曲线（`points` 空）时 `value_at` 返回 None，直接断开（不画 0 线）。`rem_euclid` 处理循环：`phase = (tick - clip.start) mod loop`。
+
+**拖拽分类靠 `press_origin()`**：单击（加锚点）与拖动（移动锚点）在 `response.dragged()` 上无法区分——第一帧拖动就已经有 delta。判据是"按下时的位置是否落在某个锚点的 `ANCHOR_RADIUS` 内"：是则 `CurveUpsert { from: Some(tick), dragging: true }`，否则 `from: None`（新建）。松手发 `CurveDragEnd` → app 层 `end_param_edit()` 收口 undo 事务。这个 bug 在测试里表现得很典型：`dragging_a_lane_anchor_reports_the_anchor_it_moved` 最初收到 `from: Some(960)`（拖到的新位置）而不是原点。
+
+**`lane_rects` 是布局的公开产物，测试用它而不是自己推**：测试 fixture 一开始自己按 `ROLL_HEIGHT + LANE_HEIGHT * i` 推算泳道 y，漏了 velocity 条，导致"点 (x, 0.0) 得到 0.25"。现在 `RollState.lane_rects: Vec<egui::Rect>` 每帧由 `show` 填充，`lane_pos()` 直接查。同理折叠：**点击处理发生在布局之后**，所以切换折叠状态当帧的 rect 还是旧的，`the_lane_toggle_collapses_the_lane` 必须多跑一帧才看到 18 px。
+
+**折叠是 view-state，按 track 索引**：`collapsed_lanes: Vec<usize>` 存的是 control lane 的序号（= `lanes` 数组下标），不落文档——它是"我暂时不想看这条"的临时偏好，跟工程语义无关。折叠后高度 `CURVE_LANE_COLLAPSED_HEIGHT = 18.0`（够放一个小方块 + label），方块点击在 `curve_lanes` 里 `continue` 掉，不进入曲线交互。
+
+

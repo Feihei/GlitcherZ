@@ -151,6 +151,8 @@
 | 音高曲线 | pitch curve | 驱动音高的控制曲线统称；不写 pitch envelope（那是 ADSR） |
 | 弯音 | pitch bend | MIDI `0xE0`，14bit、每通道一条；曲线侧为 `AutoParam::PitchBend{channel, range_semitones}` |
 | 弯音范围 | bend range | 曲线"半音"到 14bit 的换算基准，文档字段（默认 2.0，钳 0.5..24） |
+| 泳道折叠 | lane collapse | 把叠加泳道压到 18px 只留标题；view-state，不落文档 |
+| 音色分流 | voice routing | 同一 `AutoDest::PitchBend` 按节点自答分流：`midi_pitch_bend` 收则走 MIDI，否则回落 `PitchOffset` |
 
 ## 符号白名单（egui 默认字体，硬约束）
 

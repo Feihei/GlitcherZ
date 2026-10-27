@@ -17,7 +17,7 @@
 
 ## 当前状态（2026-10-24）
 
-路线图 1–10 全部落地。乐器插件（CLAP / VST3）为一等声源，效果器节点已接入，自动化桥接到插件参数。节点图 P1–P5f 与 MIDI 编辑 M1–M4 全部交付；**SF2/SF3 音色库方向 S1–S6 全部完成**（RT 审计零分配 → 非实时加载 `engine::sf2` → 实时渲染 `Sf2VoiceProcessor` → `VoiceSpec::SoundFont` 文档变体 → UI 音色库面板（加载/preset 下拉/声源绑定，undoable）→ sf3 feature 常开 + 审计复跑 + 真实库端到端验收）。SF2 声源现为四等声源之一（内置合成器 / 插件 / SoundFont / 采样播放器）。**插件 GUI 宿主 G1–G7 全部交付**（CLAP 编辑嵌入 + 参数回接 + 面板节点化 + 内联参数 + vk 节点 + VST3 `IPlugView` 镜像）；**P6 反馈环路交付**（显式 Feedback 节点，1 块延迟由拓扑排序反转实现）。**可用性提升 U 系列全部收官**：U1（走带完整化 + seek 基建）、U2（文件管理）、U3（拍号文档化 + tempo 曲线）、U4（控制轨 CC 输出 + timeline 一等化）、U5（采样播放器 instrument）、U6（audio track + 波形 timeline）、U7（Export Audio 离线渲染）、U8（Inspector 重构）、U9（E1–E5 插件浏览器）、U10（patch 节点内联管理）全部交付。**下一方向 R 系列已立项**（多 clip 钢琴卷帘 + 音高曲线，spec `roll-multiclip.md`；P0、P2、P3 已交付，P1/P4/P5 待实施）。
+路线图 1–10 全部落地。乐器插件（CLAP / VST3）为一等声源，效果器节点已接入，自动化桥接到插件参数。节点图 P1–P5f 与 MIDI 编辑 M1–M4 全部交付；**SF2/SF3 音色库方向 S1–S6 全部完成**（RT 审计零分配 → 非实时加载 `engine::sf2` → 实时渲染 `Sf2VoiceProcessor` → `VoiceSpec::SoundFont` 文档变体 → UI 音色库面板（加载/preset 下拉/声源绑定，undoable）→ sf3 feature 常开 + 审计复跑 + 真实库端到端验收）。SF2 声源现为四等声源之一（内置合成器 / 插件 / SoundFont / 采样播放器）。**插件 GUI 宿主 G1–G7 全部交付**（CLAP 编辑嵌入 + 参数回接 + 面板节点化 + 内联参数 + vk 节点 + VST3 `IPlugView` 镜像）；**P6 反馈环路交付**（显式 Feedback 节点，1 块延迟由拓扑排序反转实现）。**可用性提升 U 系列全部收官**：U1（走带完整化 + seek 基建）、U2（文件管理）、U3（拍号文档化 + tempo 曲线）、U4（控制轨 CC 输出 + timeline 一等化）、U5（采样播放器 instrument）、U6（audio track + 波形 timeline）、U7（Export Audio 离线渲染）、U8（Inspector 重构）、U9（E1–E5 插件浏览器）、U10（patch 节点内联管理）全部交付。**R 系列已交付**（多 clip 钢琴卷帘 + 音高曲线，spec `roll-multiclip.md`；P0/P1/P2/P3/P4 全交付，P5 部分交付——折叠已做，其余三项明确不做）。
 
 ## 遗留任务
 
@@ -270,7 +270,7 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 
 明确不做：Echo 节点（Delay 即回声）、Gain 节点（通道条已是增益级）、每效果 sidechain。
 
-## R 系列：多 clip 钢琴卷帘 + 音高曲线（2026-10-27 立项，spec `roll-multiclip.md`）草案
+## R 系列：多 clip 钢琴卷帘 + 音高曲线（2026-10-27 立项，2026-10-28 收官，spec `roll-multiclip.md`）
 
 用户提出：LMMS 的 piano roll 内画 pitch 曲线很方便，但只对部分 instrument 有效（SF2 等仍要独立 curve clip 并对齐 midi clip）；GlitcherZ 想要类似能力，同时希望 piano roll **同时显示/编辑时间上重叠的多个 clip**（可选编辑哪个、其余锁定）。用户的推论——"既然能同屏，就不需要 MIDI clip 内嵌曲线"——经验证成立。
 
@@ -279,11 +279,11 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 核心决策（spec D1–D17）：横轴绝对 tick + `RollGeom`；`RollSubject{focus, context}`（上限 8，来源 = timeline 选区）；**ghost 只读、不参与 hit test**（焦点切换走 chip 条，避免退回 M3.8 的指针中心语义）；曲线用统一 `OverlayLane` 抽象且**可写**（写入各自 control clip，这是"对着音符画 pitch"的正面回答）；`AutoParam::PitchBend{channel, range_semitones}` + `ParamId::PitchOffset` 按声源分流（内置逐样本参数 / CLAP·SF2 块级 bend / VST3 不支持）；`Sequence.ctrls` **一写多读**（只补齐引擎与导出，不做内嵌编辑）；不做 curve↔midi 绑定（用 timeline 批量移动代替）。
 
 - [x] **P0 `ctrls` 链路补齐** ✅ 2026-10-27（独立，修 latent bug）：`RtMidiClip` 加定容 ctrl 表（32/clip）、`SequencerSink` trait 取代 `advance` 的闭包参数、sequencer 扫描投递（同块 ctrl 先于 note）、`Processor::midi_pitch_bend`、`graph::track_ctrl`、SF2/CLAP 实现；**另补 SMF 导入解析**（原实现 `_ => skip(2)` 整段丢弃）与导出写入（`SmfEvent` 按 status 决定 data byte 数）。偏差与细节见 spec §9 / implementation.md
-- [ ] **P1 音高通路**：`AutoParam::PitchBend` / `AutoDest::PitchBend` / `ParamId::PitchOffset` + synth·sample 逐样本 `Smoothed` 实现（在唱 voice，与 root note 语义相反）+ 分流表
+- [x] **P1 音高通路** ✅ 2026-10-28：`AutoParam::PitchBend{channel, range_semitones}`（曲线值 = 半音，range 为文档字段）+ `AutoDest::PitchBend` + `ParamId::PitchOffset`；synth·sample 逐样本 one-pole 平滑（5 ms），sample 每块预生成共享 `pitch_ramp` 供 16 voice 共用；**分流由节点自答**——`slot_midi_pitch_bend` 返回 false 才回退 `slot_set_param(PitchOffset)`，RT 侧不维护声源类型表；VST3 无 pitch 通道 = 静音（spec E19–E25）
 - [x] **P2 坐标系绝对化** ✅ 2026-10-27（纯重构，行为等价）：`RollGeom` 结构体化（origin + t0_x + ticks_to_x + top_note + row_h + area）、`scroll_x` 改绝对 tick、`ViewWindow` 收口滚动钳制、origin 变化重锚（`view_origin`）；37 项原 roll 测试全绿 + 2 项新增。fit 基准与 margin 留给 P3（spec §10 E7/E8）
 - [x] **P3 多 clip 主体** ✅ 2026-10-28：`RollSubject{focus,context,dropped}` + `ClipRef`；`show()` 收 `&[MidiTrack]` + subject；ghost 底层绘制（alpha 0.22、不进命中/框选/刀切）；`ViewWindow::of` 覆盖 context + fit 基准改 context 跨度；`over_focus` 让窗外点击成为带提示的 no-op；Edit tab 焦点 chip 条 + Tab/Shift+Tab；context 由 timeline 选区装配（M4b 的 `TimelineState.selection` 直接可用）。6 项新测试（含"点击 ghost 不选中"与窗内对照）。偏差见 spec §11
-- [ ] **P4 曲线泳道**：多泳道栈 + 纵轴按 `AutoDest` + 可写 curve（control clip 进 context）
-- [ ] **P5（可选）**：ghost velocity、泳道折叠记忆、高度拖动、context 上限调整
+- [x] **P4 曲线泳道** ✅ 2026-10-28：`OverlayLane{clip,data,axis,label}` 由 app 组装（卷帘不认识电缆），时间轴复用 `geom.at_origin` + `over`；纵轴对称/单极由 `curve::axis` 给；泳道内**可写**（左键加锚点 / 拖动改值 / 右键删点，写入各自 control clip，走既有 undo）；control clip 经 `ClipRef::control` 进 context 参与 ghost（spec §13）
+- [~] **P5（可选）**：折叠 ✅ / 其余不做。**已做**：泳道折叠（`collapsed_lanes`，按 control track 索引、view-state 不落文档）。**明确不做**（spec §14 裁决）：ghost velocity（velocity 条只表达 focus，免得两套值域混淆）、泳道高度拖动（64 px 固定，折叠已覆盖"腾地方"诉求）、context 上限调整（8 已够用）
 
 依赖：P2 必须先于 P3/P4；P1 与 P2 并行；P0 独立可先做。
 
