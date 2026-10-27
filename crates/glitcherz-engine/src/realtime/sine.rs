@@ -5,7 +5,17 @@ use std::f32::consts::TAU;
 use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::ParamId;
 use crate::realtime::context::ProcessContext;
+use crate::realtime::effect::smoothed::coeff_for;
 use crate::realtime::processor::Processor;
+
+/// One-pole time constant for pitch changes (ms). Short enough that a
+/// deliberate slide keeps its shape, long enough that a curve sampled per
+/// block arrives as a ramp rather than as steps (D11: the whole point of the
+/// parameter path over MIDI bend).
+const PITCH_SMOOTHING_MS: f32 = 5.0;
+
+/// Pitch-offset span accepted by [`ParamId::PitchOffset`] (semitones).
+const PITCH_OFFSET_LIMIT: f32 = 24.0;
 
 /// Sine wave generator (the demo instrument from roadmap step 1).
 ///
@@ -17,6 +27,12 @@ pub struct SineProcessor {
     phase: f32,
     frequency_hz: f32,
     gain: f32,
+    /// Current pitch multiplier (`2^(offset/12)`), advanced **per sample**.
+    pitch_ratio: f32,
+    /// Where the multiplier is heading (set once per block by the curve).
+    pitch_target: f32,
+    /// Per-sample one-pole coefficient.
+    pitch_coeff: f32,
 }
 
 impl SineProcessor {
@@ -24,15 +40,19 @@ impl SineProcessor {
     /// tolerance, not on the real-time path).
     pub fn new(sample_rate: f32) -> Self {
         debug_assert!(sample_rate > 0.0, "sample_rate must be positive");
+        let sample_rate = if sample_rate > 0.0 {
+            sample_rate
+        } else {
+            48_000.0
+        };
         Self {
-            sample_rate: if sample_rate > 0.0 {
-                sample_rate
-            } else {
-                48_000.0
-            },
+            sample_rate,
             phase: 0.0,
             frequency_hz: 440.0,
             gain: 0.25,
+            pitch_ratio: 1.0,
+            pitch_target: 1.0,
+            pitch_coeff: coeff_for(PITCH_SMOOTHING_MS, sample_rate),
         }
     }
 
@@ -62,6 +82,23 @@ impl SineProcessor {
             self.gain = gain.clamp(0.0, 4.0);
         }
     }
+
+    /// Sets the pitch offset in semitones (clamped ±24, non-finite ignored).
+    ///
+    /// Stored as a **ratio target**: the render loop interpolates toward it
+    /// per sample, so a curve sampled once per block is heard as a glide.
+    /// RT-safe.
+    pub fn set_pitch_offset(&mut self, semitones: f32) {
+        if semitones.is_finite() {
+            let semitones = semitones.clamp(-PITCH_OFFSET_LIMIT, PITCH_OFFSET_LIMIT);
+            self.pitch_target = (semitones / 12.0).exp2();
+        }
+    }
+
+    /// Current pitch multiplier (`1.0` = no offset). RT-safe.
+    pub fn pitch_ratio(&self) -> f32 {
+        self.pitch_ratio
+    }
 }
 
 impl Processor for SineProcessor {
@@ -70,8 +107,11 @@ impl Processor for SineProcessor {
         if frames == 0 || buffer.channels() == 0 {
             return;
         }
-        let inc = (self.frequency_hz / self.sample_rate).clamp(0.0, 0.5);
+        let base_inc = self.frequency_hz / self.sample_rate;
         let gain = self.gain;
+        let target = self.pitch_target;
+        let coeff = self.pitch_coeff;
+        let mut ratio = self.pitch_ratio;
         let mut phase = self.phase;
 
         // Generate into channel 0 first, then copy to the remaining channels,
@@ -79,12 +119,18 @@ impl Processor for SineProcessor {
         if let Some(ch0) = buffer.channel_mut(0) {
             for slot in ch0.iter_mut() {
                 *slot = (TAU * phase).sin() * gain;
-                phase += inc;
+                // P1/D11: the pitch multiplier moves **inside** the sample
+                // loop. Moving it per block is what makes a MIDI bend sound
+                // like a staircase; here a block-boundary step becomes a
+                // 5 ms glide and the spectrum stays clean.
+                phase += (base_inc * ratio).clamp(0.0, 0.5);
                 if phase >= 1.0 {
                     phase -= 1.0;
                 }
+                ratio += (target - ratio) * coeff;
             }
         }
+        self.pitch_ratio = ratio;
         for ch in 1..buffer.channels() {
             // Copy per channel: take the read-only sample first, then the
             // mutable slot (avoids holding two borrows at once).
@@ -108,6 +154,10 @@ impl Processor for SineProcessor {
             }
             ParamId::SineGain => {
                 self.set_gain(value);
+                true
+            }
+            ParamId::PitchOffset => {
+                self.set_pitch_offset(value);
                 true
             }
             _ => false,
@@ -240,6 +290,73 @@ mod tests {
         assert!(
             (chunked as i64 - whole as i64).abs() <= 1,
             "chunked = {chunked}, whole = {whole}"
+        );
+    }
+
+    /// Indices of rising zero crossings (the sine's positive half-cycles).
+    fn rising_crossings(samples: &[f32]) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut prev = 0.0f32;
+        for (i, sample) in samples.iter().enumerate() {
+            if prev <= 0.0 && *sample > 0.0 {
+                out.push(i);
+            }
+            prev = *sample;
+        }
+        out
+    }
+
+    /// P1/D11: a pitch-offset change must be a **ramp inside the block**, not
+    /// a step at the block boundary. Block-rate application would leave every
+    /// half-cycle in the block the same length; per-sample smoothing cannot.
+    #[test]
+    fn pitch_offset_glides_within_one_block() {
+        let mut sine = SineProcessor::new(SR);
+        // Asked before the first sample: the smoother starts at 1.0 and has to
+        // travel to 2.0 during the very block we measure.
+        sine.set_pitch_offset(12.0);
+        let out = render(&mut sine, 8); // 1024 frames
+        let crossings = rising_crossings(&out);
+        assert!(
+            crossings.len() >= 12,
+            "need enough cycles to compare, got {}",
+            crossings.len()
+        );
+        let first = crossings[1] - crossings[0];
+        let last = crossings[crossings.len() - 1] - crossings[crossings.len() - 2];
+        assert!(
+            last + 10 < first,
+            "half-cycles must shorten as the pitch rises (first = {first}, last = {last})"
+        );
+        // …and the octave is reached, not merely approached.
+        assert!(
+            (sine.pitch_ratio() - 2.0).abs() < 0.02,
+            "ratio = {}",
+            sine.pitch_ratio()
+        );
+    }
+
+    #[test]
+    fn pitch_offset_clamps_and_ignores_non_finite() {
+        let mut sine = SineProcessor::new(SR);
+        sine.set_pitch_offset(1_000.0);
+        assert!(
+            (sine.pitch_ratio() - 1.0).abs() < 1e-6,
+            "the ratio only moves when rendered"
+        );
+        // 24 semitones = two octaves.
+        let _ = render(&mut sine, 400);
+        assert!(
+            (sine.pitch_ratio() - 4.0).abs() < 0.05,
+            "clamped to ±24 st, ratio = {}",
+            sine.pitch_ratio()
+        );
+        let before = sine.pitch_ratio();
+        sine.set_pitch_offset(f32::NAN);
+        let _ = render(&mut sine, 10);
+        assert!(
+            (sine.pitch_ratio() - before).abs() < 1e-6,
+            "NaN must not move the pitch"
         );
     }
 }

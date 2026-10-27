@@ -443,3 +443,65 @@ fn sample_accessor_returns_the_source() {
     assert_eq!(proc.sample().frames().len(), n);
     assert_eq!(proc.sample().sample_rate(), 48_000);
 }
+
+/// Source frames consumed by one block, read back out of the ramp fixture
+/// (`value = slope · cursor`, so the value delta *is* the cursor delta).
+fn cursor_advance(block: &[f32], slope: f32) -> f32 {
+    (block[block.len() - 1] - block[0]) / slope
+}
+
+/// P1/D11: the sample player bends through `PitchOffset`, and the bend is a
+/// **glide**: the block right after the change has not reached the new rate
+/// yet (a block-rate snap would land exactly on it).
+#[test]
+fn pitch_offset_glides_into_the_new_read_rate() {
+    let slope = 1.0e-4;
+    // Long enough that a 2× read never runs off the end during the test.
+    let fixture = ramp_fixture("pitch-offset", 30_000, 48_000, slope);
+    let mut proc = make_processor(&fixture);
+    proc.note_event(note_on(ROOT));
+
+    let base = cursor_advance(&first_block_left(&mut proc), slope);
+    assert!(
+        (base - 127.0).abs() < 1.0,
+        "root note reads one frame per frame, got {base}"
+    );
+
+    proc.set_param(ParamId::PitchOffset, 12.0);
+    let first = cursor_advance(&first_block_left(&mut proc), slope);
+    assert!(
+        first > base && first < 1.8 * base,
+        "the first block must still be ramping, got {first} (base {base})"
+    );
+
+    // The 5 ms smoother settles within a few blocks; then it is an octave.
+    for _ in 0..8 {
+        let _ = first_block_left(&mut proc);
+    }
+    let settled = cursor_advance(&first_block_left(&mut proc), slope);
+    assert!(
+        (settled / base - 2.0).abs() < 0.02,
+        "an octave up reads twice as fast, got {settled} vs {base}"
+    );
+}
+
+/// The offset is the one pitch control that reaches **sounding** voices
+/// (unlike `SampleRootNote`, whose trigger-time freeze is what D4 asks for).
+#[test]
+fn pitch_offset_moves_a_voice_that_is_already_playing() {
+    let slope = 1.0e-4;
+    let fixture = ramp_fixture("pitch-live", 30_000, 48_000, slope);
+    let mut proc = make_processor(&fixture);
+    proc.note_event(note_on(ROOT));
+    // Settle the voice itself; no new note-on happens after this point.
+    let _ = render_blocks(&mut proc, 4);
+    proc.set_param(ParamId::PitchOffset, -12.0);
+    for _ in 0..8 {
+        let _ = first_block_left(&mut proc);
+    }
+    let slowed = cursor_advance(&first_block_left(&mut proc), slope);
+    assert!(
+        (slowed / 127.0 - 0.5).abs() < 0.02,
+        "an octave down halves the rate without a retrigger, got {slowed}"
+    );
+}

@@ -1575,7 +1575,40 @@ pub enum AutoParam {
         #[serde(default)]
         channel: u8,
     },
+    /// Pitch bend injected into the target node's MIDI input (P1, spec
+    /// `.agents/spec/roll-multiclip.md` D9).
+    ///
+    /// Like [`AutoParam::Cc`] this is an **event stream**, not a parameter:
+    /// it never takes the `set_param` path in the engine, and the built-in
+    /// sources answer the resulting `midi_pitch_bend` with `false` because
+    /// their pitch automation runs through `ParamId::PitchOffset` instead
+    /// (D10/D11 — per-sample, no 14-bit quantization, no bend range).
+    ///
+    /// The curve stores **semitones**, so the vertical axis has a meaning the
+    /// user picked: `range_semitones` defines the full-scale bend at
+    /// ±8192/8191. It is a document field rather than something probed from
+    /// the plugin host, because a plugin's bend range is not readable through
+    /// the wiring this app has (and SF2 presets disagree with each other).
+    PitchBend {
+        /// MIDI channel 0..=15 (the UI shows 1..=16).
+        #[serde(default)]
+        channel: u8,
+        /// Bend range in semitones at full scale (clamped 0.5..=24).
+        #[serde(default = "default_bend_range")]
+        range_semitones: f32,
+    },
 }
+
+/// Default pitch-bend range: the General MIDI default of ±2 semitones.
+fn default_bend_range() -> f32 {
+    2.0
+}
+
+/// Allowed pitch-bend range span (semitones). Narrower than this makes the
+/// axis unusable, wider than an octave is not a range any receiver ships with.
+pub const MIN_BEND_RANGE: f32 = 0.5;
+/// Upper bound of [`AutoParam::PitchBend::range_semitones`].
+pub const MAX_BEND_RANGE: f32 = 24.0;
 
 impl AutoParam {
     /// Whether this parameter is only legal on the Timeline In endpoint.
@@ -1600,6 +1633,33 @@ impl AutoParam {
                 controller,
                 channel,
             } => Some((*controller, *channel)),
+            _ => None,
+        }
+    }
+
+    /// A pitch-bend destination with both fields clamped into range
+    /// (`channel` 0..=15, `range_semitones` 0.5..=24). Same hygiene as
+    /// [`Self::cc`]: no path can put an out-of-range value on the wire or
+    /// produce an axis with no meaning.
+    pub fn pitch_bend(channel: u8, range_semitones: f32) -> Self {
+        let range = if range_semitones.is_finite() {
+            range_semitones.clamp(MIN_BEND_RANGE, MAX_BEND_RANGE)
+        } else {
+            default_bend_range()
+        };
+        AutoParam::PitchBend {
+            channel: channel.min(15),
+            range_semitones: range,
+        }
+    }
+
+    /// `(channel, range_semitones)` when this is a pitch-bend destination.
+    pub fn pitch_bend_of(&self) -> Option<(u8, f32)> {
+        match self {
+            AutoParam::PitchBend {
+                channel,
+                range_semitones,
+            } => Some((*channel, *range_semitones)),
             _ => None,
         }
     }
@@ -3053,9 +3113,10 @@ mod tests {
     use super::{
         AudioClip, AudioTrack, AutoParam, AutoPoint, CableDoc, CableKind, DEFAULT_MIDI_TRACKS,
         EffectParams, GraphDoc, MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS,
-        MAX_AUDIO_TRACKS, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES, MidiClip, MidiSource,
-        MidiTrack, NodeDoc, PortRef, Project, SamplePlayMode, SynthParams, TICKS_PER_BAR,
-        TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec, default_audio_source_len, default_graph_doc,
+        MAX_AUDIO_TRACKS, MAX_BEND_RANGE, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES,
+        MIN_BEND_RANGE, MidiClip, MidiSource, MidiTrack, NodeDoc, PortRef, Project, SamplePlayMode,
+        SynthParams, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec,
+        default_audio_source_len, default_graph_doc,
     };
 
     fn effect_node(params: EffectParams) -> NodeDoc {
@@ -4521,6 +4582,38 @@ mod tests {
         let cable = CableDoc::automation(0, 2, AutoParam::cc(74, 3));
         let text = ron::to_string(&cable).expect("serialize");
         assert!(text.contains("Cc"), "parameter tag: {text}");
+        let back: CableDoc = ron::from_str(&text).expect("deserialize");
+        assert_eq!(back, cable);
+    }
+
+    /// P1/D9: the bend range is clamped into its documented span on
+    /// construction, because the range is what makes the curve's semitone
+    /// axis meaningful — a zero or negative one would divide it away.
+    #[test]
+    fn pitch_bend_parameter_clamps_range_and_channel() {
+        let param = AutoParam::pitch_bend(99, 1_000.0);
+        assert_eq!(param.pitch_bend_of(), Some((15, MAX_BEND_RANGE)));
+        assert_eq!(
+            AutoParam::pitch_bend(3, 0.0).pitch_bend_of(),
+            Some((3, MIN_BEND_RANGE))
+        );
+        assert_eq!(
+            AutoParam::pitch_bend(3, f32::NAN).pitch_bend_of(),
+            Some((3, 2.0)),
+            "a malformed range falls back to the GM default"
+        );
+        assert_eq!(
+            AutoParam::pitch_bend(0, 2.0).pitch_bend_of(),
+            Some((0, 2.0))
+        );
+        assert_eq!(AutoParam::TrackGain.pitch_bend_of(), None);
+        assert!(!param.is_timeline_in_only());
+
+        // The destination survives the saved format unchanged, and a document
+        // written before P1 (no such variant) still loads.
+        let cable = CableDoc::automation(0, 2, AutoParam::pitch_bend(1, 7.5));
+        let text = ron::to_string(&cable).expect("serialize");
+        assert!(text.contains("PitchBend"), "parameter tag: {text}");
         let back: CableDoc = ron::from_str(&text).expect("deserialize");
         assert_eq!(back, cable);
     }

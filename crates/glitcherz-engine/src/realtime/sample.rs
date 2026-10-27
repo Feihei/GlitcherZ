@@ -24,6 +24,7 @@ use crate::realtime::FIXED_BLOCK_SIZE;
 use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::{NoteEvent, ParamId};
 use crate::realtime::context::ProcessContext;
+use crate::realtime::effect::smoothed::coeff_for;
 use crate::realtime::processor::Processor;
 use crate::sample::SampleData;
 
@@ -38,6 +39,13 @@ pub const SAMPLE_DEFAULT_ROOT: u8 = 60;
 /// Release fade length in seconds (D2): just enough to avoid a hard-cut
 /// click; the sample itself is the timbre.
 const RELEASE_SECONDS: f32 = 0.01;
+
+/// One-pole time constant for pitch changes (ms), same value as the sine
+/// source so the two built-in instruments glide alike (P1/D11).
+const PITCH_SMOOTHING_MS: f32 = 5.0;
+
+/// Pitch-offset span accepted by [`ParamId::PitchOffset`] (semitones).
+const PITCH_OFFSET_LIMIT: f32 = 24.0;
 
 /// One playing instance of the sample.
 ///
@@ -107,6 +115,16 @@ pub struct SampleVoiceProcessor {
     release_frames: f32,
     left: Box<[f32]>,
     right: Box<[f32]>,
+    /// Current pitch multiplier (`2^(offset/12)`), advanced **per frame**
+    /// (P1/D11). `1.0` = the note's own rate.
+    pitch_ratio: f32,
+    /// Where the multiplier is heading (one curve sample per block).
+    pitch_target: f32,
+    /// Per-frame one-pole coefficient.
+    pitch_coeff: f32,
+    /// Per-frame multipliers for the current block. Computed once and shared
+    /// by every voice, so a 16-voice chord still glides as one unit.
+    pitch_ramp: Box<[f32]>,
 }
 
 impl SampleVoiceProcessor {
@@ -133,6 +151,10 @@ impl SampleVoiceProcessor {
             release_frames: (RELEASE_SECONDS * rate).max(1.0),
             left: vec![0.0; FIXED_BLOCK_SIZE].into_boxed_slice(),
             right: vec![0.0; FIXED_BLOCK_SIZE].into_boxed_slice(),
+            pitch_ratio: 1.0,
+            pitch_target: 1.0,
+            pitch_coeff: coeff_for(PITCH_SMOOTHING_MS, rate),
+            pitch_ramp: vec![1.0; FIXED_BLOCK_SIZE].into_boxed_slice(),
         }
     }
 
@@ -212,6 +234,14 @@ impl Processor for SampleVoiceProcessor {
         self.left[..frames].fill(0.0);
         self.right[..frames].fill(0.0);
 
+        // P1: one shared pitch ramp per block (see `pitch_ramp`'s doc).
+        let mut ratio = self.pitch_ratio;
+        for slot in self.pitch_ramp[..frames].iter_mut() {
+            *slot = ratio;
+            ratio += (self.pitch_target - ratio) * self.pitch_coeff;
+        }
+        self.pitch_ratio = ratio;
+
         for i in 0..self.active_count {
             render_voice(
                 &mut self.voices[i],
@@ -219,6 +249,7 @@ impl Processor for SampleVoiceProcessor {
                 frames,
                 self.release_frames,
                 self.gain,
+                &self.pitch_ramp[..frames],
                 &mut self.left[..frames],
                 &mut self.right[..frames],
             );
@@ -317,6 +348,16 @@ impl Processor for SampleVoiceProcessor {
             ParamId::SamplePlayMode => {
                 self.one_shot = value >= 0.5;
             }
+            // P1/D11: unlike `SampleRootNote`, the offset applies to
+            // **sounding** voices too — a bend that only affected new notes
+            // could not slide.
+            ParamId::PitchOffset if value.is_finite() => {
+                let semitones = value.clamp(-PITCH_OFFSET_LIMIT, PITCH_OFFSET_LIMIT);
+                self.pitch_target = (semitones / 12.0).exp2();
+            }
+            // A NaN offset would poison every sounding voice's rate; refuse it
+            // the way the gain path does.
+            ParamId::PitchOffset => return false,
             _ => return false,
         }
         true
@@ -329,12 +370,17 @@ impl Processor for SampleVoiceProcessor {
 /// The fade (D2) is linear over `release_frames`; a voice ends when it
 /// either plays past the last frame pair (natural end, no fade — the
 /// sample itself is the timbre) or completes its fade.
+// The voice owns its cursor/gain state, the processor its sample/gain/pitch
+// ramp, and the two output slices are the destination — bundling them into a
+// context struct would allocate or borrow-split what is a hot inner loop.
+#[allow(clippy::too_many_arguments)]
 fn render_voice(
     voice: &mut Voice,
     data: &SampleData,
     frames: usize,
     release_frames: f32,
     master_gain: f32,
+    pitch_ramp: &[f32],
     out_l: &mut [f32],
     out_r: &mut [f32],
 ) {
@@ -360,7 +406,7 @@ fn render_voice(
         let b = src[i + 1];
         out_l[f] += (a[0] + (b[0] - a[0]) * frac) * g;
         out_r[f] += (a[1] + (b[1] - a[1]) * frac) * g;
-        voice.pos += voice.rate;
+        voice.pos += voice.rate * f64::from(pitch_ramp.get(f).copied().unwrap_or(1.0));
     }
     // Natural end inside the block: only clamp when the cursor has run
     // past the final pair (checked again on the next block's first frame).

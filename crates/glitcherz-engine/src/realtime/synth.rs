@@ -66,7 +66,9 @@ impl Processor for SynthProcessor {
 
     fn set_param(&mut self, id: ParamId, value: f32) -> bool {
         match id {
-            ParamId::SineFrequency | ParamId::SineGain => self.osc.set_param(id, value),
+            ParamId::SineFrequency | ParamId::SineGain | ParamId::PitchOffset => {
+                self.osc.set_param(id, value)
+            }
             ParamId::Attack | ParamId::Decay | ParamId::Sustain | ParamId::Release => {
                 self.env.set_param(id, value)
             }

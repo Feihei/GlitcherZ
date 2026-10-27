@@ -438,6 +438,21 @@ impl AudioEngine {
         })
     }
 
+    /// Timeline wiring: routes automation track `auto_index` to a **pitch
+    /// bend** on `node_id` (P1): the curve carries semitones and the graph
+    /// quantizes to 14 bits using `range_semitones`.
+    pub fn set_auto_pitch_bend_route(
+        &mut self,
+        auto_index: usize,
+        node_id: u64,
+        channel: u8,
+        range_semitones: f32,
+    ) -> bool {
+        self.apply_plan_update(|compiler| {
+            compiler.set_auto_pitch_bend_route(auto_index, node_id, channel, range_semitones)
+        })
+    }
+
     /// Timeline wiring: connects automation track `auto_index` to the
     /// **Timeline In** endpoint (U3b): the curve overrides the transport BPM
     /// per block instead of driving a node parameter.

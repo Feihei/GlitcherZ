@@ -121,11 +121,14 @@ impl NodeKind {
 
 /// What one automation cable delivers (U4a, spec `control-tracks.md` D2).
 ///
-/// A curve can drive a node **parameter** or emit a **MIDI CC** into the
-/// node's MIDI input. The two are different channels, not two spellings of the
-/// same thing (a plugin's `Cutoff` parameter and CC74 are unrelated), so the
-/// route carries the distinction instead of overloading `ParamId`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A curve can drive a node **parameter**, emit a **MIDI CC**, or send a
+/// **pitch bend** into the node's MIDI input. These are different channels,
+/// not three spellings of the same thing (a plugin's `Cutoff` parameter and
+/// CC74 are unrelated), so the route carries the distinction instead of
+/// overloading `ParamId`.
+///
+/// `Eq` is deliberately absent: the bend variant carries a float range.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AutoDest {
     /// Node parameter value (`Processor::set_param`).
     Param(ParamId),
@@ -135,6 +138,17 @@ pub enum AutoDest {
         controller: u8,
         /// MIDI channel 0..=15.
         channel: u8,
+    },
+    /// MIDI pitch bend (`Processor::midi_pitch_bend`), P1 / D9.
+    ///
+    /// The curve value arrives in **semitones**; the graph divides by
+    /// `range_semitones` and quantizes to the 14-bit wire value. Like
+    /// [`AutoDest::Cc`] this is an event, never a `set_param` write.
+    PitchBend {
+        /// MIDI channel 0..=15.
+        channel: u8,
+        /// Bend range at full scale (semitones, > 0).
+        range_semitones: f32,
     },
 }
 
@@ -269,12 +283,23 @@ pub struct RtGraph {
     /// yet. A control change is an **absolute** value, so resending an
     /// unchanged one is pure overhead (375 blocks/s otherwise).
     last_cc: [i16; MAX_AUTO_TRACKS],
+    /// Last 14-bit bend emitted per automation track (P1): `i32::MIN` = none
+    /// yet. Same de-duplication rationale as [`Self::last_cc`] — a bend is an
+    /// absolute value, and 375 identical events per second is pure overhead.
+    last_bend: [i32; MAX_AUTO_TRACKS],
 }
 
 /// Pitches released per block by a panic sweep. Kept below the plugin hosts'
 /// 32-event pending queue (`MAX_PENDING_EVENTS`) so a sweep never crowds out
 /// regular events queued in the same block.
 const PANIC_SWEEP_BATCH: u8 = 24;
+
+/// Pitch-bend range clamp (semitones), mirroring the document's
+/// `glitcherz_model::{MIN_BEND_RANGE, MAX_BEND_RANGE}`. The engine crate
+/// deliberately does not depend on the model crate, so the pair is repeated
+/// here rather than imported — keep the two in sync.
+const BEND_RANGE_MIN: f32 = 0.5;
+const BEND_RANGE_MAX: f32 = 24.0;
 
 /// Structural update payload: one topology change = new execution plan +
 /// incremental installs + incremental removals.
@@ -341,6 +366,7 @@ impl RtGraph {
             block_size: block_size.max(1),
             panic_sweep: None,
             last_cc: [-1; MAX_AUTO_TRACKS],
+            last_bend: [i32::MIN; MAX_AUTO_TRACKS],
         }
     }
 
@@ -415,6 +441,7 @@ impl RtGraph {
         // emitted value so the next sampled block always delivers one (the
         // new target would otherwise wait for the curve to move).
         self.last_cc = [-1; MAX_AUTO_TRACKS];
+        self.last_bend = [i32::MIN; MAX_AUTO_TRACKS];
     }
 
     /// Replaces one node's audio clip table (U6 D4). Returns the table that
@@ -692,6 +719,52 @@ impl RtGraph {
                 }
                 let _ = self.slot_midi_cc(route.slot, channel, controller, value as u8);
             }
+            AutoDest::PitchBend {
+                channel,
+                range_semitones,
+            } => {
+                if !value.is_finite() {
+                    return;
+                }
+                // The curve carries semitones (D9). A malformed range (0, NaN,
+                // negative) would divide the axis by nothing, so fall back to
+                // the GM default instead of emitting garbage.
+                let range = if range_semitones.is_finite() && range_semitones > 0.0 {
+                    range_semitones
+                } else {
+                    2.0
+                };
+                let ratio = (value / range).clamp(-1.0, 1.0);
+                // Symmetric around 0 with the wire's asymmetric extremes:
+                // +8191 up, -8192 down. Rounding keeps the centre exact.
+                let bend = if ratio >= 0.0 {
+                    (f64::from(ratio) * 8191.0).round() as i16
+                } else {
+                    (f64::from(ratio) * 8192.0).round() as i16
+                };
+                if self.last_bend.get(auto_index) == Some(&i32::from(bend)) {
+                    return;
+                }
+                if let Some(slot) = self.last_bend.get_mut(auto_index) {
+                    *slot = i32::from(bend);
+                }
+                // D10's per-source split, resolved by asking the node instead
+                // of keeping a node-kind table on the audio thread: whoever
+                // answers `midi_pitch_bend` wants the event (CLAP raw 0xE0,
+                // SF2 through its preset bend range). Built-in sources answer
+                // `false` because a 14-bit block-rate event is exactly what
+                // they must not use — they get the semitone value through
+                // `PitchOffset`, which they smooth per sample (D11). A VST3
+                // node answers neither and stays silent (documented in the
+                // UI, D10).
+                if self.slot_midi_pitch_bend(route.slot, channel, bend) {
+                    return;
+                }
+                // The change detector above quantizes to the wire grid first;
+                // for the parameter path that grid is `range/8192` semitones
+                // (0.00024 st at the default ±2), i.e. 40× finer than a cent.
+                let _ = self.slot_set_param(route.slot, ParamId::PitchOffset, value);
+            }
         }
     }
 
@@ -751,6 +824,15 @@ impl RtGraph {
             .get_mut(slot as usize)
             .and_then(|s| s.as_mut())
             .is_some_and(|n| n.processor.midi_cc(channel, controller, value))
+    }
+
+    /// Pitch bend into one slot (P1): same shape as [`Self::slot_midi_cc`].
+    /// RT-safe.
+    fn slot_midi_pitch_bend(&mut self, slot: u16, channel: u8, value: i16) -> bool {
+        self.slots
+            .get_mut(slot as usize)
+            .and_then(|s| s.as_mut())
+            .is_some_and(|n| n.processor.midi_pitch_bend(channel, value))
     }
 
     /// Read-only access to the master output buffer (for `BlockRunner`
@@ -1819,6 +1901,36 @@ impl GraphCompiler {
             dest: AutoDest::Cc {
                 controller: controller.min(127),
                 channel: channel.min(15),
+            },
+        };
+        Ok(self.build_update(self.compile()?, Vec::new(), &[]))
+    }
+
+    /// Timeline wiring: routes automation track `auto_index` to a **pitch
+    /// bend** on `node_id` (P1, D9). The curve stores semitones; the graph
+    /// converts with `range_semitones` at delivery time, so re-ranging does
+    /// not rewrite a single anchor.
+    pub fn set_auto_pitch_bend_route(
+        &mut self,
+        auto_index: usize,
+        node_id: u64,
+        channel: u8,
+        range_semitones: f32,
+    ) -> Result<GraphUpdate, TopologyError> {
+        if auto_index >= MAX_AUTO_TRACKS {
+            return Err(TopologyError::InvalidIndex);
+        }
+        let slot = self.node_slot(node_id).ok_or(TopologyError::InvalidSlot)?;
+        let range = if range_semitones.is_finite() && range_semitones > 0.0 {
+            range_semitones.clamp(BEND_RANGE_MIN, BEND_RANGE_MAX)
+        } else {
+            2.0
+        };
+        self.auto_routes[auto_index] = AutoRoute {
+            slot,
+            dest: AutoDest::PitchBend {
+                channel: channel.min(15),
+                range_semitones: range,
             },
         };
         Ok(self.build_update(self.compile()?, Vec::new(), &[]))
@@ -3240,6 +3352,130 @@ mod tests {
         ));
         assert!(matches!(
             compiler.set_auto_cc_route(MAX_AUTO_TRACKS, 1, 0, 74),
+            Err(TopologyError::InvalidIndex)
+        ));
+    }
+
+    /// P1: a semitone curve becomes a 14-bit bend at the **route's** range,
+    /// delivered once per change, and an out-of-range curve value saturates
+    /// instead of wrapping.
+    #[test]
+    fn auto_pitch_bend_route_scales_semitones_into_14_bits() {
+        let (mut compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let bends = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (update, _) = expect_swap(
+            compiler.set_voice(
+                0,
+                Box::new(CtrlRecorder {
+                    ccs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                    bends: std::sync::Arc::clone(&bends),
+                }),
+            ),
+            "swap in the bend recorder",
+        );
+        graph.apply_update(update, &mut recycle_tx);
+        let voice_id = compiler
+            .track_voice_node_id(0)
+            .expect("instrument should exist");
+        let update = compiler
+            .set_auto_pitch_bend_route(0, voice_id, 2, 2.0)
+            .expect("bend route should succeed");
+        graph.apply_update(update, &mut recycle_tx);
+
+        graph.auto_deliver(0, 0.0); // centre
+        graph.auto_deliver(0, 0.0); // unchanged → not resent
+        graph.auto_deliver(0, 1.0); // half of ±2 st
+        graph.auto_deliver(0, -1.0); // the other half
+        graph.auto_deliver(0, 2.0); // full up
+        graph.auto_deliver(0, 99.0); // saturates to the same full-up value
+        graph.auto_deliver(0, f32::NAN); // ignored
+
+        let seen = bends.lock().expect("recorder lock").clone();
+        assert_eq!(
+            seen,
+            vec![(2, 0), (2, 4096), (2, -4096), (2, 8191)],
+            "semitones → 14-bit at the route's range, change-only, ch carried"
+        );
+
+        // Re-ranging rescales the same curve without touching the anchors.
+        let update = compiler
+            .set_auto_pitch_bend_route(0, voice_id, 2, 12.0)
+            .expect("re-range should succeed");
+        graph.apply_update(update, &mut recycle_tx);
+        graph.auto_deliver(0, 6.0);
+        let seen = bends.lock().expect("recorder lock").clone();
+        assert_eq!(
+            seen.last(),
+            Some(&(2, 4096)),
+            "6 st is half of a ±12 st range, i.e. the same wire value"
+        );
+    }
+
+    /// A node that answers `false` to a bend but accepts `PitchOffset` — the
+    /// built-in sources' shape (D10/D11).
+    struct OffsetRecorder {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+    }
+
+    impl Processor for OffsetRecorder {
+        fn process(&mut self, _ctx: &ProcessContext, _buffer: &mut AudioBuffer) {}
+
+        fn set_param(&mut self, id: ParamId, value: f32) -> bool {
+            if id != ParamId::PitchOffset {
+                return false;
+            }
+            self.seen.lock().expect("recorder lock").push(value);
+            true
+        }
+    }
+
+    /// P1/D10: the same curve reaches a built-in source as a **semitone
+    /// parameter**, not as a quantized event — no node-kind table involved,
+    /// the delivery path just asks the node which one it accepts.
+    #[test]
+    fn bend_falls_back_to_the_pitch_offset_parameter() {
+        let (mut compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (update, _) = expect_swap(
+            compiler.set_voice(
+                0,
+                Box::new(OffsetRecorder {
+                    seen: std::sync::Arc::clone(&seen),
+                }),
+            ),
+            "swap in the offset recorder",
+        );
+        graph.apply_update(update, &mut recycle_tx);
+        let voice_id = compiler
+            .track_voice_node_id(0)
+            .expect("instrument should exist");
+        let update = compiler
+            .set_auto_pitch_bend_route(0, voice_id, 0, 2.0)
+            .expect("bend route should succeed");
+        graph.apply_update(update, &mut recycle_tx);
+
+        graph.auto_deliver(0, 0.75);
+        graph.auto_deliver(0, -1.5);
+
+        let seen = seen.lock().expect("recorder lock").clone();
+        assert_eq!(
+            seen,
+            vec![0.75, -1.5],
+            "the parameter path gets semitones, not a re-quantized ratio"
+        );
+    }
+
+    #[test]
+    fn auto_pitch_bend_route_requires_a_live_node() {
+        let (mut compiler, _graph) = GraphCompiler::default_graph(SR, BLOCK);
+        assert!(matches!(
+            compiler.set_auto_pitch_bend_route(0, u64::MAX, 0, 2.0),
+            Err(TopologyError::InvalidSlot)
+        ));
+        assert!(matches!(
+            compiler.set_auto_pitch_bend_route(MAX_AUTO_TRACKS, 1, 0, 2.0),
             Err(TopologyError::InvalidIndex)
         ));
     }

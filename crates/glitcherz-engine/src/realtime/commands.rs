@@ -21,6 +21,15 @@ pub enum ParamId {
     SineFrequency,
     /// Sine source output gain (linear).
     SineGain,
+    /// Pitch offset in **semitones** (−24..24, `0` = no offset), P1 /
+    /// spec `roll-multiclip.md` D10/D11.
+    ///
+    /// The built-in sources' answer to "bend this note": a real-valued offset
+    /// that they apply **per sample** with a one-pole smoother, instead of a
+    /// 14-bit MIDI event applied at block boundaries. No bend range, no
+    /// quantization, and it works on sounding voices (which `SampleRootNote`
+    /// deliberately does not).
+    PitchOffset,
     /// Master output gain (linear).
     MasterGain,
     /// Filter cutoff frequency (Hz).
