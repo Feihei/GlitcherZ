@@ -39,18 +39,18 @@ use glitcherz_engine::Sf2Library;
 use glitcherz_engine::convert;
 use glitcherz_engine::realtime::{
     AudioTrackProcessor, ChannelStripProcessor, Curve, EffectMeters, EngineCommand,
-    FeedbackProcessor, MAX_AUTO_POINTS, MAX_CLIP_NOTES, MAX_MIDI_FANOUT, MAX_TRACK_CLIPS,
-    MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent, ParamId, Processor,
-    RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCurveInterp, RtMidiClip, RtNote,
-    SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor, SynthProcessor,
-    Unit, empty_clip_table,
+    FeedbackProcessor, MAX_AUTO_POINTS, MAX_CLIP_CTRLS, MAX_CLIP_NOTES, MAX_MIDI_FANOUT,
+    MAX_TRACK_CLIPS, MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent,
+    ParamId, Processor, RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCtrl, RtCtrlKind,
+    RtCurveInterp, RtMidiClip, RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand,
+    Sf2VoiceProcessor, SynthProcessor, Unit, empty_clip_table,
 };
 use glitcherz_model::{
-    AutoParam, AutoPoint, CableKind, ControlClip, ControlTrack, CurveInterp, EffectParams,
-    GraphDoc, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS,
-    MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip,
-    MidiSource, MidiTrack, NodeDoc, PortRef, Project, SamplePlayMode, SongLoop, SynthParams,
-    VoiceSpec,
+    AutoParam, AutoPoint, CableKind, ControlClip, ControlTrack, CtrlKind, CurveInterp,
+    EffectParams, GraphDoc, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK,
+    MAX_MARKERS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker,
+    MidiClip, MidiSource, MidiTrack, NodeDoc, PortRef, Project, SamplePlayMode, SongLoop,
+    SynthParams, VoiceSpec,
 };
 
 pub mod curve;
@@ -222,6 +222,17 @@ fn rt_curve_interp(interp: CurveInterp) -> RtCurveInterp {
     match interp {
         CurveInterp::Linear => RtCurveInterp::Linear,
         CurveInterp::Smooth => RtCurveInterp::Smooth,
+    }
+}
+
+/// Document controller kind → engine form (P0, spec `roll-multiclip.md` D14).
+fn rt_ctrl_kind(kind: CtrlKind) -> RtCtrlKind {
+    match kind {
+        CtrlKind::Cc(controller) => RtCtrlKind::Cc(controller),
+        CtrlKind::PitchBend => RtCtrlKind::PitchBend,
+        CtrlKind::ChannelPressure => RtCtrlKind::ChannelPressure,
+        CtrlKind::PolyPressure(pitch) => RtCtrlKind::PolyPressure(pitch),
+        CtrlKind::Program => RtCtrlKind::Program,
     }
 }
 
@@ -3005,6 +3016,16 @@ impl GlitcherZApp {
                     note.note,
                     note.channel,
                     note.velocity,
+                ));
+            }
+            // P0: controller events ride along with the clip they belong to —
+            // imported CC/bend must sound, not vanish at the document edge.
+            for ctrl in clip.sequence.ctrls.iter().take(MAX_CLIP_CTRLS) {
+                rt.push_ctrl(RtCtrl::new(
+                    ctrl.tick,
+                    ctrl.channel,
+                    rt_ctrl_kind(ctrl.kind),
+                    ctrl.value,
                 ));
             }
             *slot = rt;

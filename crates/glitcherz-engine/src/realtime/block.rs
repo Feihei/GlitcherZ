@@ -10,8 +10,27 @@ use crate::realtime::automation::MAX_AUTO_TRACKS;
 use crate::realtime::commands::{EngineCommand, NoteEvent, SequencerCommand};
 use crate::realtime::context::ProcessContext;
 use crate::realtime::graph::{GraphLevels, GraphUpdate, NO_EDGE, RtGraph, TIMELINE_IN};
-use crate::realtime::sequencer::Sequencer;
+use crate::realtime::sequencer::{RtCtrl, Sequencer, SequencerSink};
 use crate::realtime::voice::RecycledNode;
+
+/// Routes sequencer output (notes + controllers) into the live graph.
+///
+/// A single adapter rather than two closures: both event kinds must reach the
+/// **same** `&mut RtGraph`, and two closures capturing it would borrow it
+/// mutably twice (P0, spec `roll-multiclip.md` D14).
+struct GraphSink<'a> {
+    graph: &'a mut RtGraph,
+}
+
+impl SequencerSink for GraphSink<'_> {
+    fn note(&mut self, track: usize, event: NoteEvent) {
+        self.graph.track_note(track, event);
+    }
+
+    fn ctrl(&mut self, track: usize, ctrl: RtCtrl) {
+        self.graph.track_ctrl(track, ctrl);
+    }
+}
 
 /// Engine → UI state feedback handle: a set of atomics shared with [`BlockRunner`].
 ///
@@ -243,9 +262,7 @@ impl BlockRunner {
         let Self {
             sequencer, graph, ..
         } = self;
-        sequencer.advance(&ctx, &mut |track, event| {
-            graph.track_note(track, event);
-        });
+        sequencer.advance(&ctx, &mut GraphSink { graph });
 
         // 5. The node graph processes one block (topological order: sum inputs → process in place → master output).
         let levels: GraphLevels = self.graph.process_block(&ctx);

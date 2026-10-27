@@ -75,6 +75,20 @@ pub trait Processor: Send {
         false
     }
 
+    /// Delivers one MIDI pitch bend into this node's MIDI input at a block
+    /// boundary (P0, spec `roll-multiclip.md` D9).
+    ///
+    /// A bend is an event like a CC and must never take the `set_param` path;
+    /// `value` is centred (-8192..=8191, `0` = no bend), mirroring the wire
+    /// format. Built-in sources answer `false` on purpose: their pitch
+    /// automation goes through `ParamId::PitchOffset` with per-sample
+    /// smoothing instead (D11), which needs no bend range and no 14-bit
+    /// quantization. Implementations must not allocate or panic.
+    fn midi_pitch_bend(&mut self, _channel: u8, _value: i16) -> bool {
+        let _ = (_channel, _value);
+        false
+    }
+
     /// Replaces this node's audio clip table (U6, spec
     /// `.agents/spec/audio-track.md` D4 — audio-track nodes only).
     ///

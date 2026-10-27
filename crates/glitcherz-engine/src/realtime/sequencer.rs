@@ -79,6 +79,93 @@ pub const MAX_CLIP_NOTES: usize = 64;
 /// Maximum number of clips per track (D15; mirrors `glitcherz_model::MAX_CLIPS_PER_TRACK`).
 pub const MAX_TRACK_CLIPS: usize = 8;
 
+/// Maximum number of controller events per clip (P0, spec
+/// `roll-multiclip.md` D14; mirrors `glitcherz_model::MAX_CLIP_CTRLS`).
+///
+/// Controllers are point events with no length, so a dense pitch curve in an
+/// imported file crowds this budget faster than notes do: a bend sampled at a
+/// sixteenth-note rate over two 4/4 bars is already 32 events.
+pub const MAX_CLIP_CTRLS: usize = 32;
+
+/// Audio-thread-side controller kind (mirrors `glitcherz_model::CtrlKind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtCtrlKind {
+    /// Control change number 0..=127.
+    Cc(u8),
+    /// Pitch bend, value -8192..=8191 (0 = no bend).
+    PitchBend,
+    /// Channel (mono) aftertouch, value 0..=127.
+    ChannelPressure,
+    /// Polyphonic aftertouch for the given pitch, value 0..=127.
+    PolyPressure(u8),
+    /// Program change, value 0..=127.
+    Program,
+}
+
+impl Default for RtCtrlKind {
+    /// CC 0 — what a zeroed [`RtCtrl`] slot holds. `#[default]` cannot be used
+    /// here: the first variant carries a payload.
+    fn default() -> Self {
+        Self::Cc(0)
+    }
+}
+
+/// Audio-thread-side controller event (mirrors `glitcherz_model::CtrlEvent`).
+///
+/// A controller is an **event**, not a parameter: it must be delivered through
+/// the `midi_*` channels of [`Processor`](crate::realtime::Processor), never
+/// through `set_param` (spec `control-tracks.md` D3).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct RtCtrl {
+    /// Position within the clip (ticks, relative to the clip start).
+    pub tick_ticks: u32,
+    /// MIDI channel 0..=15.
+    pub channel: u8,
+    /// Which controller this drives.
+    pub kind: RtCtrlKind,
+    /// Value in the controller's own range (see [`RtCtrlKind`]).
+    pub value: i32,
+}
+
+impl RtCtrl {
+    /// Builds the audio-thread form from raw document values, clamping the
+    /// tick range and the MIDI domains the same way [`RtNote::new`] does.
+    pub fn new(tick_ticks: i64, channel: u8, kind: RtCtrlKind, value: i32) -> Self {
+        Self {
+            tick_ticks: tick_ticks.clamp(0, i64::from(u32::MAX)) as u32,
+            channel: channel.min(15),
+            kind,
+            value,
+        }
+    }
+
+    /// Value clamped into the 7-bit controller range.
+    pub fn value_7bit(&self) -> u8 {
+        self.value.clamp(0, 127) as u8
+    }
+
+    /// Value clamped into the centred 14-bit pitch-bend range.
+    pub fn value_i14(&self) -> i16 {
+        self.value.clamp(-8192, 8191) as i16
+    }
+}
+
+/// Receives the events [`Sequencer::advance`] produces.
+///
+/// Notes and controllers travel side by side but must not share one enum: a
+/// note carries pitch+velocity semantics, a controller carries a controller id
+/// in its own domain (spec `control-tracks.md` D3). A trait — rather than two
+/// closures — lets both kinds reach the graph through **one** `&mut` borrow,
+/// which two closures capturing the same graph could not do.
+pub trait SequencerSink {
+    /// Note on/off for `track`.
+    fn note(&mut self, track: usize, event: NoteEvent);
+
+    /// Controller event for `track` (default: dropped, so note-only sinks stay
+    /// single-method implementations).
+    fn ctrl(&mut self, _track: usize, _ctrl: RtCtrl) {}
+}
+
 /// Audio-thread-side representation of a piano-roll note (mirrors `glitcherz_model::Note`).
 ///
 /// Unsigned ticks and a normalized velocity: the audio thread never sees the
@@ -132,6 +219,11 @@ pub struct RtMidiClip {
     pub notes: [RtNote; MAX_CLIP_NOTES],
     /// Number of valid notes.
     pub note_count: usize,
+    /// Controller collection (the first `ctrl_count` are valid, relative to
+    /// the clip start; P0).
+    pub ctrls: [RtCtrl; MAX_CLIP_CTRLS],
+    /// Number of valid controller events.
+    pub ctrl_count: usize,
 }
 
 impl Default for RtMidiClip {
@@ -145,6 +237,8 @@ impl Default for RtMidiClip {
             loop_ticks: TICKS_PER_BAR,
             notes: [RtNote::default(); MAX_CLIP_NOTES],
             note_count: 0,
+            ctrls: [RtCtrl::default(); MAX_CLIP_CTRLS],
+            ctrl_count: 0,
         }
     }
 }
@@ -155,6 +249,14 @@ impl RtMidiClip {
         if self.note_count < MAX_CLIP_NOTES {
             self.notes[self.note_count] = note;
             self.note_count += 1;
+        }
+    }
+
+    /// Appends a controller event; silently dropped beyond [`MAX_CLIP_CTRLS`].
+    pub fn push_ctrl(&mut self, ctrl: RtCtrl) {
+        if self.ctrl_count < MAX_CLIP_CTRLS {
+            self.ctrls[self.ctrl_count] = ctrl;
+            self.ctrl_count += 1;
         }
     }
 }
@@ -523,13 +625,14 @@ impl Sequencer {
     }
 
     /// Advances one block: sends note offs and note ons falling due within the
-    /// `[t0, t1)` (tick) window via `emit(track, event)` (offs before ons
-    /// within the same block). The window is clamped at the arrangement end
+    /// `[t0, t1)` (tick) window via `sink` (offs before ons within the same
+    /// block; controller events fire at the block containing their tick).
+    /// The window is clamped at the arrangement end
     /// (D16): when the transport reaches it, scheduling stops and the
     /// transport auto-stops; pending offs keep draining afterwards so the
     /// last notes release naturally.
     /// RT-safe.
-    pub fn advance(&mut self, ctx: &ProcessContext, emit: &mut dyn FnMut(usize, NoteEvent)) {
+    pub fn advance(&mut self, ctx: &ProcessContext, sink: &mut dyn SequencerSink) {
         let tps = self.ticks_per_sample();
         let samples_per_tick = 1.0 / tps;
         let block_start = ctx.playback_sample_pos;
@@ -541,7 +644,7 @@ impl Sequencer {
             for pending in slots.iter_mut() {
                 if let Some((time, note)) = *pending {
                     if time < block_start + ctx.frames as u64 {
-                        emit(track, NoteEvent::Off { note });
+                        sink.note(track, NoteEvent::Off { note });
                         *pending = None;
                     }
                 }
@@ -581,7 +684,7 @@ impl Sequencer {
                         seg_end,
                         block_start,
                         samples_per_tick,
-                        emit,
+                        sink,
                     );
                 }
                 budget -= (seg_end - t).min(budget);
@@ -609,7 +712,7 @@ impl Sequencer {
                         seg_end,
                         block_start,
                         samples_per_tick,
-                        emit,
+                        sink,
                     );
                 }
                 budget -= (seg_end - t).min(budget);
@@ -631,6 +734,8 @@ impl Sequencer {
     /// One track's clip table: for every clip audible in the window, note
     /// occurrences (`start + m·loop + note.start`, strictly before the clip
     /// end) starting within the window fire an On + a length-based pending Off.
+    /// Controller events (P0) tile the same way, yet carry no length: they
+    /// fire once and need no pending-off bookkeeping.
     #[allow(clippy::too_many_arguments)]
     fn schedule_track_clips(
         &mut self,
@@ -639,16 +744,42 @@ impl Sequencer {
         t1: f64,
         block_start: u64,
         samples_per_tick: f64,
-        emit: &mut dyn FnMut(usize, NoteEvent),
+        sink: &mut dyn SequencerSink,
     ) {
         let clips = self.clips[track];
         for clip in &clips {
-            if clip.note_count == 0 || clip.loop_ticks == 0 || clip.span_ticks == 0 {
+            if (clip.note_count == 0 && clip.ctrl_count == 0)
+                || clip.loop_ticks == 0
+                || clip.span_ticks == 0
+            {
                 continue;
             }
             let start = f64::from(clip.start_ticks);
             let clip_end = start + f64::from(clip.span_ticks);
             let loop_ticks = f64::from(clip.loop_ticks);
+            // Controller occurrences come **before** the notes of the same
+            // block: a pitch bend or program change sets the state a note
+            // starts in, so it must land first (mirrors the SMF export's
+            // off → controller → on ordering). Same tiling as notes, but a
+            // controller is a point event — no length, no pending off, no
+            // retrigger guard.
+            for ctrl in &clip.ctrls[..clip.ctrl_count] {
+                let offset = f64::from(ctrl.tick_ticks);
+                let mut m = ((t0 - start - offset) / loop_ticks).ceil();
+                if m < 0.0 {
+                    m = 0.0;
+                }
+                loop {
+                    let at = start + m * loop_ticks + offset;
+                    if at >= t1 || at >= clip_end {
+                        break; // past the window or past the clip span
+                    }
+                    if at >= t0 {
+                        sink.ctrl(track, *ctrl);
+                    }
+                    m += 1.0;
+                }
+            }
             for note in &clip.notes[..clip.note_count] {
                 let start_offset = f64::from(note.start_ticks);
                 let length = f64::from(note.length_ticks.max(1));
@@ -675,11 +806,11 @@ impl Sequencer {
                             if let Some((_, pending_note)) = *slot {
                                 if pending_note == note.note {
                                     *slot = None;
-                                    emit(track, NoteEvent::Off { note: note.note });
+                                    sink.note(track, NoteEvent::Off { note: note.note });
                                 }
                             }
                         }
-                        emit(
+                        sink.note(
                             track,
                             NoteEvent::On {
                                 note: note.note,
@@ -740,8 +871,8 @@ impl Sequencer {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BPM, MAX_CLIP_NOTES, MAX_TRACK_CLIPS, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR,
-        TICKS_PER_QUARTER, TICKS_PER_STEP,
+        MAX_BPM, MAX_CLIP_CTRLS, MAX_CLIP_NOTES, MAX_TRACK_CLIPS, RtCtrl, RtCtrlKind, RtMidiClip,
+        RtNote, Sequencer, SequencerSink, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP,
     };
     use crate::realtime::MAX_MIDI_TRACKS;
     use crate::realtime::automation::{MAX_AUTO_TRACKS, RtAutoPoint, RtControlClip};
@@ -773,16 +904,50 @@ mod tests {
     /// Same as [`run`], but the fake sample clock continues from `start`
     /// (pending offs are absolute sample positions — spanning several `run`
     /// calls needs a continuous clock).
-    fn run_from(seq: &mut Sequencer, start: u64, blocks: usize) -> Vec<Event> {
-        let mut events = Vec::new();
+    /// Collects both event kinds so a test can assert on either.
+    struct VecSink<'a> {
+        notes: &'a mut Vec<Event>,
+        ctrls: &'a mut Vec<(usize, RtCtrl)>,
+    }
+
+    impl SequencerSink for VecSink<'_> {
+        fn note(&mut self, track: usize, event: NoteEvent) {
+            self.notes.push((track, event));
+        }
+
+        fn ctrl(&mut self, track: usize, ctrl: RtCtrl) {
+            self.ctrls.push((track, ctrl));
+        }
+    }
+
+    fn run_both(
+        seq: &mut Sequencer,
+        start: u64,
+        blocks: usize,
+    ) -> (Vec<Event>, Vec<(usize, RtCtrl)>) {
+        let mut notes = Vec::new();
+        let mut ctrls = Vec::new();
         let mut pos = start;
         for _ in 0..blocks {
-            seq.advance(&ctx(pos), &mut |track, event| {
-                events.push((track, event));
-            });
+            seq.advance(
+                &ctx(pos),
+                &mut VecSink {
+                    notes: &mut notes,
+                    ctrls: &mut ctrls,
+                },
+            );
             pos += BLOCK as u64;
         }
-        events
+        (notes, ctrls)
+    }
+
+    fn run_from(seq: &mut Sequencer, start: u64, blocks: usize) -> Vec<Event> {
+        run_both(seq, start, blocks).0
+    }
+
+    /// Advances `blocks` blocks and collects only controller events.
+    fn run_ctrls(seq: &mut Sequencer, blocks: usize) -> Vec<(usize, RtCtrl)> {
+        run_both(seq, 0, blocks).1
     }
 
     fn clip_note(start: u32, length: u32, note: u8) -> RtNote {
@@ -818,6 +983,34 @@ mod tests {
         seq.set_track_clips(track, clips);
     }
 
+    /// One clip on one track carrying only controller events (P0).
+    fn place_ctrls(
+        seq: &mut Sequencer,
+        track: usize,
+        start: u32,
+        span: u32,
+        loop_ticks: u32,
+        ctrls: &[RtCtrl],
+    ) {
+        let mut clip = RtMidiClip {
+            start_ticks: start,
+            span_ticks: span,
+            loop_ticks,
+            ..RtMidiClip::default()
+        };
+        for ctrl in ctrls {
+            clip.push_ctrl(*ctrl);
+        }
+        let mut clips = [RtMidiClip::default(); MAX_TRACK_CLIPS];
+        clips[0] = clip;
+        seq.set_track_clips(track, clips);
+    }
+
+    /// A CC event at `tick`, channel 0.
+    fn ctrl_at(tick: u32, controller: u8, value: i32) -> RtCtrl {
+        RtCtrl::new(i64::from(tick), 0, RtCtrlKind::Cc(controller), value)
+    }
+
     fn ons(events: &[Event]) -> Vec<(usize, u8)> {
         events
             .iter()
@@ -826,6 +1019,87 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// P0: the controller table is fixed-capacity — events past the limit are
+    /// dropped rather than overwriting a neighbour.
+    #[test]
+    fn clip_ctrl_table_is_fixed_capacity() {
+        let mut clip = RtMidiClip::default();
+        for i in 0..(MAX_CLIP_CTRLS + 4) {
+            clip.push_ctrl(RtCtrl::new(i as i64, 0, RtCtrlKind::Cc(1), i as i32));
+        }
+        assert_eq!(clip.ctrl_count, MAX_CLIP_CTRLS);
+        assert_eq!(
+            clip.ctrls[MAX_CLIP_CTRLS - 1].tick_ticks as usize,
+            MAX_CLIP_CTRLS - 1
+        );
+    }
+
+    /// P0: a clip's controller event is delivered once, on its own track, in
+    /// the block containing its tick.
+    #[test]
+    fn clip_ctrls_fire_at_their_positions() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        place_ctrls(&mut seq, 0, 0, 384, 384, &[ctrl_at(192, 11, 100)]);
+        seq.play();
+
+        let ctrls = run_ctrls(&mut seq, 400); // ~2048 ticks at 120 BPM
+        assert_eq!(ctrls.len(), 1, "one event per occurrence: {ctrls:?}");
+        assert_eq!(ctrls[0].0, 0, "delivered on the clip's track");
+        assert_eq!(ctrls[0].1.kind, RtCtrlKind::Cc(11));
+        assert_eq!(ctrls[0].1.value, 100);
+        assert_eq!(ctrls[0].1.tick_ticks, 192, "relative to the clip start");
+    }
+
+    /// P0: controllers tile with the clip loop exactly like notes — one
+    /// occurrence per period inside the span, nothing past the span end.
+    #[test]
+    fn clip_ctrls_tile_with_the_loop() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        // Two-bar span, one-bar loop: the same event fires once per period.
+        place_ctrls(&mut seq, 0, 0, 768, 384, &[ctrl_at(0, 1, 42)]);
+        seq.play();
+
+        let ctrls = run_ctrls(&mut seq, 400);
+        assert_eq!(ctrls.len(), 2, "one per loop period: {ctrls:?}");
+    }
+
+    /// P0: within one block, controllers are delivered before notes — a pitch
+    /// bend must set the pitch a note starts at, not arrive a block late.
+    #[test]
+    fn clip_ctrls_precede_notes_in_the_same_block() {
+        struct Order(Vec<&'static str>);
+        impl SequencerSink for Order {
+            fn note(&mut self, _track: usize, _event: NoteEvent) {
+                self.0.push("note");
+            }
+
+            fn ctrl(&mut self, _track: usize, _ctrl: RtCtrl) {
+                self.0.push("ctrl");
+            }
+        }
+
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        let mut clip = RtMidiClip {
+            start_ticks: 0,
+            span_ticks: 384,
+            loop_ticks: 384,
+            ..RtMidiClip::default()
+        };
+        clip.push(clip_note(0, 96, 60));
+        clip.push_ctrl(RtCtrl::new(0, 0, RtCtrlKind::PitchBend, 4096));
+        let mut clips = [RtMidiClip::default(); MAX_TRACK_CLIPS];
+        clips[0] = clip;
+        seq.set_track_clips(0, clips);
+        seq.play();
+
+        let mut order = Order(Vec::new());
+        seq.advance(&ctx(0), &mut order);
+        assert_eq!(order.0, vec!["ctrl", "note"], "bend must land first");
     }
 
     /// Transport stop drains pending offs as **pitch-matched** note offs:

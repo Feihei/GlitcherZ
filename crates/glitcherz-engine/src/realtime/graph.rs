@@ -40,6 +40,7 @@ use crate::realtime::effect::descriptor::{ParamSpec, Unit};
 use crate::realtime::gain::GainProcessor;
 use crate::realtime::mixer::MixerProcessor;
 use crate::realtime::processor::{ChannelWeights, Processor};
+use crate::realtime::sequencer::{RtCtrl, RtCtrlKind};
 use crate::realtime::synth::SynthProcessor;
 use crate::realtime::voice::RecycledNode;
 
@@ -541,6 +542,47 @@ impl RtGraph {
             delivered |= self.slot_note(slot, event);
         }
         delivered
+    }
+
+    /// Delivers a controller event to a MIDI track: same fan-out and routing
+    /// table as [`Self::track_note`] (P0, spec `roll-multiclip.md` D14).
+    /// RT-safe.
+    pub fn track_ctrl(&mut self, track: usize, ctrl: RtCtrl) -> bool {
+        if track >= MAX_MIDI_TRACKS {
+            return false;
+        }
+        let count = self.plan.midi_target_counts[track] as usize;
+        let targets = self.plan.midi_targets[track];
+        let mut delivered = false;
+        for &slot in &targets[..count] {
+            delivered |= self.slot_ctrl(slot, ctrl);
+        }
+        delivered
+    }
+
+    /// Fan-out leaf for controllers: resolves the slot and dispatches on the
+    /// controller kind.
+    ///
+    /// P0 delivers CC and pitch bend only. Aftertouch and program change have
+    /// no consumer today — SF2 programs go through the `Sf2ProgramChange`
+    /// parameter path (spec `sf2-loader.md`), and none of the built-in sources
+    /// exposes per-note pressure — so they are dropped rather than guessed at.
+    fn slot_ctrl(&mut self, slot: u16, ctrl: RtCtrl) -> bool {
+        self.slots
+            .get_mut(slot as usize)
+            .and_then(|s| s.as_mut())
+            .is_some_and(|n| match ctrl.kind {
+                RtCtrlKind::Cc(controller) => {
+                    n.processor
+                        .midi_cc(ctrl.channel, controller & 0x7F, ctrl.value_7bit())
+                }
+                RtCtrlKind::PitchBend => {
+                    n.processor.midi_pitch_bend(ctrl.channel, ctrl.value_i14())
+                }
+                RtCtrlKind::ChannelPressure | RtCtrlKind::PolyPressure(_) | RtCtrlKind::Program => {
+                    false
+                }
+            })
     }
 
     /// Releases all connected targets' current notes (call before transport
@@ -2129,6 +2171,7 @@ mod tests {
     use crate::realtime::context::ProcessContext;
     use crate::realtime::mixer::MixerProcessor;
     use crate::realtime::processor::Processor;
+    use crate::realtime::sequencer::{RtCtrl, RtCtrlKind};
     use crate::realtime::voice::{RecycledNode, recycle_channel};
 
     const SR: f32 = 48_000.0;
@@ -3071,6 +3114,78 @@ mod tests {
                 .push((channel, controller, value));
             true
         }
+    }
+
+    /// Records controllers as the processor sees them (P0 delivery tests).
+    struct CtrlRecorder {
+        ccs: std::sync::Arc<std::sync::Mutex<Vec<(u8, u8, u8)>>>,
+        bends: std::sync::Arc<std::sync::Mutex<Vec<(u8, i16)>>>,
+    }
+
+    impl Processor for CtrlRecorder {
+        fn process(&mut self, _ctx: &ProcessContext, _buffer: &mut AudioBuffer) {}
+
+        fn midi_cc(&mut self, channel: u8, controller: u8, value: u8) -> bool {
+            self.ccs
+                .lock()
+                .expect("recorder lock")
+                .push((channel, controller, value));
+            true
+        }
+
+        fn midi_pitch_bend(&mut self, channel: u8, value: i16) -> bool {
+            self.bends
+                .lock()
+                .expect("recorder lock")
+                .push((channel, value));
+            true
+        }
+    }
+
+    /// P0: clip controller events reach the track's instrument through the
+    /// same routing table as notes, with their domains clamped at delivery.
+    #[test]
+    fn track_ctrl_delivers_cc_and_pitch_bend() {
+        let (mut compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let ccs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bends = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (update, _) = expect_swap(
+            compiler.set_voice(
+                0,
+                Box::new(CtrlRecorder {
+                    ccs: std::sync::Arc::clone(&ccs),
+                    bends: std::sync::Arc::clone(&bends),
+                }),
+            ),
+            "swap in the controller recorder",
+        );
+        graph.apply_update(update, &mut recycle_tx);
+
+        assert!(graph.track_ctrl(0, RtCtrl::new(0, 3, RtCtrlKind::Cc(11), 200)));
+        assert!(graph.track_ctrl(0, RtCtrl::new(0, 3, RtCtrlKind::PitchBend, -8191)));
+        // Out-of-range values clamp instead of reaching the wire raw.
+        assert!(graph.track_ctrl(0, RtCtrl::new(0, 3, RtCtrlKind::PitchBend, 99_999)));
+
+        assert_eq!(
+            *ccs.lock().expect("recorder lock"),
+            vec![(3, 11, 127)],
+            "CC values clamp to 7 bits"
+        );
+        assert_eq!(
+            *bends.lock().expect("recorder lock"),
+            vec![(3, -8191), (3, 8191)],
+            "bend keeps its 14-bit range"
+        );
+    }
+
+    #[test]
+    fn track_ctrl_rejects_unknown_tracks() {
+        let mut graph = default_graph();
+        assert!(
+            !graph.track_ctrl(MAX_MIDI_TRACKS, RtCtrl::new(0, 0, RtCtrlKind::Cc(1), 1)),
+            "a track beyond the fixed table is refused"
+        );
     }
 
     #[test]

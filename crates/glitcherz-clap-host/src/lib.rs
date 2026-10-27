@@ -1000,6 +1000,18 @@ impl Processor for ClapNode {
             data: [status, controller & 0x7F, value & 0x7F],
         })
     }
+
+    /// P0: a clip's pitch-bend controller event (spec `roll-multiclip.md`
+    /// D9/D14). Stored as raw MIDI 1.0 — 14 bits centred at 8192, LSB first —
+    /// because CLAP plugins interpret the wire format themselves and each
+    /// plugin owns its bend range.
+    fn midi_pitch_bend(&mut self, channel: u8, value: i16) -> bool {
+        let raw = (i32::from(value.clamp(-8192, 8191)) + 8192) as u16;
+        let status = 0xE0 | (channel & 0x0F);
+        self.stash(PendingClapEvent::Midi {
+            data: [status, (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8],
+        })
+    }
 }
 
 #[cfg(test)]

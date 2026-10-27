@@ -147,6 +147,17 @@ impl Processor for Sf2VoiceProcessor {
         true
     }
 
+    /// P0: pitch bend from a clip's controller events (spec
+    /// `roll-multiclip.md` D14). Same channel policy as
+    /// [`Self::midi_cc`] — this node's fixed channel wins. The wire format is
+    /// 14 bits centred at 8192, LSB first.
+    fn midi_pitch_bend(&mut self, _channel: u8, value: i16) -> bool {
+        let raw = i32::from(value.clamp(-8192, 8191)) + 8192;
+        self.synth
+            .process_midi_message(CHANNEL, 0xE0, raw & 0x7F, (raw >> 7) & 0x7F);
+        true
+    }
+
     /// Applies SF2 parameters. RT-safe: `process_midi_message` and
     /// `set_master_volume` are audited allocation-free plain field writes.
     fn set_param(&mut self, id: ParamId, value: f32) -> bool {

@@ -10,7 +10,9 @@
 //! behavior, and structural violations return [`SmfError`] with the byte
 //! offset. Event and track counts are capped.
 
-use crate::{MidiClip, MidiTrack, Note, Sequence, TICKS_PER_QUARTER, TimeSignature};
+use crate::{
+    CtrlEvent, CtrlKind, MidiClip, MidiTrack, Note, Sequence, TICKS_PER_QUARTER, TimeSignature,
+};
 
 /// Parser safety limits.
 pub const MAX_TRACKS: usize = 4096;
@@ -72,21 +74,59 @@ pub fn export_smf(project: &crate::Project) -> Vec<u8> {
     write_chunk(&mut out, b"MTrk", &conductor);
 
     for track in &project.midi_tracks {
-        let mut events: Vec<(i64, u8, u8, u8)> = Vec::new(); // (tick, status, d1, d2)
+        let mut events: Vec<SmfEvent> = Vec::new();
         for clip in &track.clips {
             for (offset, note) in tiled_notes(clip) {
                 let offset = offset + clip.start_ticks as i64;
                 let channel = note.channel.min(15);
-                events.push((offset, 0x90 | channel, note.note, note.velocity.max(1)));
-                events.push((offset + note.length.max(1), 0x80 | channel, note.note, 0));
+                events.push(SmfEvent::two(
+                    offset,
+                    0x90 | channel,
+                    note.note,
+                    note.velocity.max(1),
+                ));
+                events.push(SmfEvent::two(
+                    offset + note.length.max(1),
+                    0x80 | channel,
+                    note.note,
+                    0,
+                ));
+            }
+            // P0: controller events travel with the clip they belong to, so a
+            // file exported from a project that imported CC/bend keeps them.
+            for (offset, ctrl) in tiled_ctrls(clip) {
+                events.push(ctrl_event(offset + clip.start_ticks as i64, &ctrl));
             }
         }
-        // Same tick: note-offs before note-ons (a repeated pitch must not
-        // cut itself off).
-        events.sort_by_key(|(tick, status, _, _)| (*tick, status & 0xF0));
+        // Same tick: releases, then controllers, then note-ons (a repeated
+        // pitch must not cut itself off, and a bend must precede the note it
+        // applies to).
+        events.sort_by_key(|event| (event.tick, event.order_rank()));
         write_track(&mut out, &track.name, &events);
     }
     out
+}
+
+/// A clip's controller events with their loop repetitions laid out, as
+/// absolute offsets from the clip start (P0; mirrors [`tiled_notes`]' rules:
+/// content beyond one loop plays once, not tiled).
+fn tiled_ctrls(clip: &MidiClip) -> Vec<(i64, CtrlEvent)> {
+    let loop_ticks = clip.loop_ticks.max(1) as i64;
+    let span = clip.span_ticks.max(loop_ticks as u32) as i64;
+    let periods = (span + loop_ticks - 1) / loop_ticks;
+    let mut result = Vec::with_capacity(clip.sequence.ctrls.len() * periods as usize);
+    for period in 0..periods {
+        let shift = period * loop_ticks;
+        for ctrl in &clip.sequence.ctrls {
+            if ctrl.tick >= loop_ticks {
+                continue; // events beyond one loop play once, not tiled
+            }
+            let mut ctrl = *ctrl;
+            ctrl.tick += shift;
+            result.push((ctrl.tick, ctrl));
+        }
+    }
+    result
 }
 
 /// A clip's notes with their loop repetitions laid out, as absolute offsets
@@ -116,7 +156,82 @@ fn write_chunk(out: &mut Vec<u8>, id: &[u8; 4], payload: &[u8]) {
     out.extend_from_slice(payload);
 }
 
-fn write_track(out: &mut Vec<u8>, name: &str, events: &[(i64, u8, u8, u8)]) {
+/// One MIDI channel event as written to a track.
+///
+/// `data_len` is not cosmetic: `0xC0` (program change) and `0xD0` (channel
+/// pressure) carry a **single** data byte, and writing a second one would
+/// shift every following event — a file that still parses, as garbage.
+#[derive(Debug, Clone, Copy)]
+struct SmfEvent {
+    tick: i64,
+    status: u8,
+    data1: u8,
+    data2: u8,
+    data_len: u8,
+}
+
+impl SmfEvent {
+    /// Two data bytes (notes, CC, pitch bend, poly pressure).
+    fn two(tick: i64, status: u8, data1: u8, data2: u8) -> Self {
+        Self {
+            tick,
+            status,
+            data1,
+            data2,
+            data_len: 2,
+        }
+    }
+
+    /// One data byte (`0xC0` program change, `0xD0` channel pressure).
+    fn one(tick: i64, status: u8, data1: u8) -> Self {
+        Self {
+            tick,
+            status,
+            data1,
+            data2: 0,
+            data_len: 1,
+        }
+    }
+
+    /// Same-tick ordering: releases first, then controllers, then note-ons.
+    ///
+    /// Controllers sit in the middle on purpose — a bend or a program change
+    /// must land **before** the note that depends on it, or the first note of
+    /// the block starts at the wrong pitch/timbre.
+    fn order_rank(&self) -> u8 {
+        match self.status & 0xF0 {
+            0x80 => 0,
+            0x90 => 2,
+            _ => 1,
+        }
+    }
+}
+
+/// Encodes one controller event as the channel message it stands for.
+///
+/// Pitch bend is centred 14-bit (8192 = no bend), written LSB first — the
+/// mirror of [`parse_track`]'s decode.
+fn ctrl_event(tick: i64, ctrl: &CtrlEvent) -> SmfEvent {
+    let channel = ctrl.channel & 0x0F;
+    let value7 = ctrl.value.clamp(0, 127) as u8;
+    match ctrl.kind {
+        CtrlKind::Cc(controller) => SmfEvent::two(tick, 0xB0 | channel, controller & 0x7F, value7),
+        CtrlKind::PitchBend => {
+            let raw = (ctrl.value.clamp(-8192, 8191) + 8192) as u16;
+            SmfEvent::two(
+                tick,
+                0xE0 | channel,
+                (raw & 0x7F) as u8,
+                ((raw >> 7) & 0x7F) as u8,
+            )
+        }
+        CtrlKind::ChannelPressure => SmfEvent::one(tick, 0xD0 | channel, value7),
+        CtrlKind::PolyPressure(note) => SmfEvent::two(tick, 0xA0 | channel, note & 0x7F, value7),
+        CtrlKind::Program => SmfEvent::one(tick, 0xC0 | channel, value7),
+    }
+}
+
+fn write_track(out: &mut Vec<u8>, name: &str, events: &[SmfEvent]) {
     let mut body = Vec::new();
     if !name.is_empty() {
         body.extend_from_slice(&vlq(0));
@@ -127,10 +242,14 @@ fn write_track(out: &mut Vec<u8>, name: &str, events: &[(i64, u8, u8, u8)]) {
         body.extend_from_slice(bytes);
     }
     let mut last = 0i64;
-    for (tick, status, d1, d2) in events {
-        body.extend_from_slice(&vlq(*tick - last));
-        last = *tick;
-        body.extend_from_slice(&[*status, *d1, *d2]);
+    for event in events {
+        body.extend_from_slice(&vlq(event.tick - last));
+        last = event.tick;
+        body.push(event.status);
+        body.push(event.data1);
+        if event.data_len > 1 {
+            body.push(event.data2);
+        }
     }
     body.extend_from_slice(&vlq(0));
     body.extend_from_slice(&[0xFF, 0x2F, 0x00]);
@@ -307,6 +426,7 @@ fn parse_track(
     // (channel, pitch) → stack of (on-tick, velocity), FIFO matched.
     let mut open: OpenNotes = Vec::new();
     let mut notes: Vec<Note> = Vec::new();
+    let mut ctrls: Vec<CtrlEvent> = Vec::new();
     let mut name = String::new();
 
     while cursor.offset < payload.len() {
@@ -356,6 +476,60 @@ fn parse_track(
                     }
                 }
             }
+            // Control change: controller number + 7-bit value.
+            0xB0..=0xBF => {
+                let controller = cursor.u8()?;
+                let value = cursor.u8()?;
+                ctrls.push(CtrlEvent {
+                    tick,
+                    channel: status & 0x0F,
+                    kind: CtrlKind::Cc(controller & 0x7F),
+                    value: i32::from(value & 0x7F),
+                });
+            }
+            // Pitch bend: 14 bits centred at 8192, LSB first.
+            0xE0..=0xEF => {
+                let lsb = cursor.u8()?;
+                let msb = cursor.u8()?;
+                let raw = (i32::from(msb & 0x7F) << 7) | i32::from(lsb & 0x7F);
+                ctrls.push(CtrlEvent {
+                    tick,
+                    channel: status & 0x0F,
+                    kind: CtrlKind::PitchBend,
+                    value: raw - 8192,
+                });
+            }
+            // Channel pressure: a single data byte.
+            0xD0..=0xDF => {
+                let value = cursor.u8()?;
+                ctrls.push(CtrlEvent {
+                    tick,
+                    channel: status & 0x0F,
+                    kind: CtrlKind::ChannelPressure,
+                    value: i32::from(value & 0x7F),
+                });
+            }
+            // Polyphonic pressure: pitch + value.
+            0xA0..=0xAF => {
+                let pitch = cursor.u8()?;
+                let value = cursor.u8()?;
+                ctrls.push(CtrlEvent {
+                    tick,
+                    channel: status & 0x0F,
+                    kind: CtrlKind::PolyPressure(pitch & 0x7F),
+                    value: i32::from(value & 0x7F),
+                });
+            }
+            // Program change: a single data byte.
+            0xC0..=0xCF => {
+                let program = cursor.u8()?;
+                ctrls.push(CtrlEvent {
+                    tick,
+                    channel: status & 0x0F,
+                    kind: CtrlKind::Program,
+                    value: i32::from(program & 0x7F),
+                });
+            }
             // Meta events.
             0xFF => {
                 let kind = cursor.u8()?;
@@ -387,7 +561,9 @@ fn parse_track(
                 let length = cursor.vlq()? as usize;
                 cursor.skip(length)?;
             }
-            // Two-data-byte channel messages we ignore (CC, pitch bend, ...).
+            // Unknown / unsupported status: skip what a two-data-byte message
+            // would carry (nothing left in the channel-message range at this
+            // point, so this is defensive only).
             _ => {
                 cursor.skip(2)?;
             }
@@ -418,18 +594,34 @@ fn parse_track(
         note.start = rescale(note.start);
         note.length = rescale(note.length);
     }
+    for ctrl in &mut ctrls {
+        ctrl.tick = rescale(ctrl.tick);
+    }
 
     // Import hygiene: dedupe before the editor ever sees the file.
     notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
-    // The clip sits at the earliest note's absolute tick; the notes become
+    // Stable, so same-tick controllers keep their file order.
+    ctrls.sort_by_key(|c| c.tick);
+    // The clip sits at the earliest **event**'s absolute tick — a
+    // controller-only track has no note to anchor on; everything becomes
     // relative to it (our clip semantics), keeping the arrangement position.
-    let origin = notes.first().map(|n| n.start).unwrap_or(0);
+    let origin = notes
+        .first()
+        .map(|n| n.start)
+        .into_iter()
+        .chain(ctrls.first().map(|c| c.tick))
+        .min()
+        .unwrap_or(0);
     for note in &mut notes {
         note.start -= origin;
+    }
+    for ctrl in &mut ctrls {
+        ctrl.tick -= origin;
     }
     let span = notes
         .iter()
         .map(|n| n.start + n.length)
+        .chain(ctrls.iter().map(|c| c.tick + 1))
         .max()
         .unwrap_or(0)
         .max(1);
@@ -439,10 +631,7 @@ fn parse_track(
             start_ticks: u32::try_from(origin).unwrap_or(u32::MAX),
             span_ticks: u32::try_from(span).unwrap_or(u32::MAX),
             loop_ticks: u32::try_from(span).unwrap_or(u32::MAX),
-            sequence: Sequence {
-                notes,
-                ctrls: Vec::new(),
-            },
+            sequence: Sequence { notes, ctrls },
             legacy_notes: Vec::new(),
         }],
     })
@@ -462,7 +651,9 @@ fn entry(map: &mut OpenNotes, key: (u8, u8)) -> &mut Vec<(i64, u8)> {
 #[cfg(test)]
 mod tests {
     use super::{MAX_EVENTS, export_smf, import_smf, vlq};
-    use crate::{MidiClip, MidiTrack, Note, Project, TICKS_PER_QUARTER, TimeSignature};
+    use crate::{
+        CtrlEvent, CtrlKind, MidiClip, MidiTrack, Note, Project, TICKS_PER_QUARTER, TimeSignature,
+    };
 
     fn project_with(tracks: Vec<MidiTrack>, bpm: f64) -> Project {
         let mut project = Project::default();
@@ -533,6 +724,132 @@ mod tests {
         // Fields survived.
         let lead = notes.iter().find(|n| n.note == 60).expect("C4");
         assert_eq!((lead.length, lead.velocity, lead.channel), (240, 90, 2));
+    }
+
+    /// P0: controller events survive export → import with their kinds,
+    /// channels, values and relative positions intact, including the full
+    /// 14-bit pitch-bend range.
+    #[test]
+    fn ctrl_events_round_trip() {
+        let mut clip = MidiClip {
+            start_ticks: TICKS_PER_QUARTER, // one bar in
+            span_ticks: TICKS_PER_QUARTER * 4,
+            loop_ticks: TICKS_PER_QUARTER * 4,
+            ..Default::default()
+        };
+        clip.sequence.notes = vec![Note {
+            start: 0,
+            length: 240,
+            note: 60,
+            velocity: 90,
+            channel: 2,
+        }];
+        clip.sequence.ctrls = vec![
+            CtrlEvent {
+                tick: 0,
+                channel: 2,
+                kind: CtrlKind::Cc(11),
+                value: 100,
+            },
+            CtrlEvent {
+                tick: 480,
+                channel: 2,
+                kind: CtrlKind::PitchBend,
+                value: -8192,
+            },
+            CtrlEvent {
+                tick: 720,
+                channel: 2,
+                kind: CtrlKind::PitchBend,
+                value: 8191,
+            },
+            CtrlEvent {
+                tick: 960,
+                channel: 2,
+                kind: CtrlKind::Program,
+                value: 42,
+            },
+        ];
+        let project = project_with(
+            vec![MidiTrack {
+                name: "ctrl".into(),
+                clips: vec![clip],
+            }],
+            120.0,
+        );
+
+        let bytes = export_smf(&project);
+        let imported = import_smf(&bytes).expect("parse");
+        let mut tracks = imported.tracks;
+        let track = tracks.pop().expect("one track");
+        // The arrangement position survived and the events are relative to it.
+        assert_eq!(track.clips[0].start_ticks, TICKS_PER_QUARTER);
+        let ctrls = &track.clips[0].sequence.ctrls;
+        assert_eq!(ctrls.len(), 4, "{ctrls:?}");
+        assert_eq!(
+            ctrls
+                .iter()
+                .map(|c| (c.tick, c.channel, c.kind, c.value))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 2, CtrlKind::Cc(11), 100),
+                (480, 2, CtrlKind::PitchBend, -8192),
+                (720, 2, CtrlKind::PitchBend, 8191),
+                (960, 2, CtrlKind::Program, 42),
+            ]
+        );
+    }
+
+    /// P0: `0xC0` (program) and `0xD0` (channel pressure) carry a **single**
+    /// data byte. A second one would shift every following event, so a note
+    /// scheduled after them must still parse.
+    #[test]
+    fn single_data_byte_ctrls_do_not_shift_later_events() {
+        let mut clip = MidiClip {
+            start_ticks: 0,
+            span_ticks: TICKS_PER_QUARTER * 2,
+            loop_ticks: TICKS_PER_QUARTER * 2,
+            ..Default::default()
+        };
+        clip.sequence.notes = vec![Note {
+            start: 480,
+            length: 240,
+            note: 72,
+            velocity: 100,
+            channel: 0,
+        }];
+        clip.sequence.ctrls = vec![
+            CtrlEvent {
+                tick: 0,
+                channel: 0,
+                kind: CtrlKind::Program,
+                value: 5,
+            },
+            CtrlEvent {
+                tick: 240,
+                channel: 0,
+                kind: CtrlKind::ChannelPressure,
+                value: 33,
+            },
+        ];
+        let project = project_with(
+            vec![MidiTrack {
+                name: "one-byte".into(),
+                clips: vec![clip],
+            }],
+            120.0,
+        );
+
+        let bytes = export_smf(&project);
+        let imported = import_smf(&bytes).expect("parse");
+        let track = &imported.tracks[0];
+        assert_eq!(
+            track.clips[0].sequence.notes.len(),
+            1,
+            "the note after two one-byte messages must survive"
+        );
+        assert_eq!(track.clips[0].sequence.notes[0].note, 72);
+        assert_eq!(track.clips[0].sequence.ctrls.len(), 2);
     }
 
     #[test]
