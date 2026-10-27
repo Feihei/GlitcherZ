@@ -1,6 +1,6 @@
 # 多 clip 钢琴卷帘 + 音高曲线 Spec
 
-> 状态：草案（2026-10-27，经一轮设计讨论；同日 **P0 / P2 已交付**，偏差见 §9 / §10）。P3/P4 待实施，P1 可并行。
+> 状态：草案（2026-10-27，经一轮设计讨论；同日 **P0 / P2 已交付**，偏差见 §9 / §10）。2026-10-28 **P3 已交付**（偏差见 §11）。P4 待实施，P1 可并行。
 > 上游：`timeline.md`（clip 模型 / 平铺语义）、`editing-model.md`（M4 交互模型：常驻态只有 Select、语义决策源不得回到指针）、`control-tracks.md`（曲线一等实体、`AutoDest`、U4a CC 通路、§7 开放问题）、`sf2-loader.md`（bend range）、`effects.md`（`Smoothed`）。
 
 ## 1. 背景与问题
@@ -113,8 +113,8 @@ RollSubject { focus, context }        ← MAX_ROLL_CONTEXT = 8
   - 验收：内置 synth 的 pitch 曲线无台阶（逐样本）；CLAP/SF2 收到 `0xE0`；VST3 返回 false 且 UI 标注。
 - [x] **P2 坐标系绝对化** ✅ 2026-10-27（D1–D3）：`RollGeom { origin_tick, t0_x, ticks_to_x, top_note, row_h, area }` 结构体化（绘制/命中/刀切/框选共用一套 `note_rect`/`note_edges`/`note_hit_rect`/`note_at`）、`scroll_x` 改绝对 tick、`ViewWindow` 接管滚动钳制、origin 变化时重锚。P3/P4 只需给 ghost 各自换 `origin_tick` 与把 `ViewWindow` 换成 context 跨度。
   - 验收：单 clip 下所有既有 roll 测试与实测行为**逐项等价**（37 项原测试全部通过；仅 3 处直接调用自由函数 `note_rect`/`note_at`/`knife_crossing` 的测试改为调 `RollGeom`，断言一字未改）；新增 `clips_with_different_origins_share_one_time_axis` / `the_scroll_window_is_the_clip_span`。偏差见 §10。
-- [ ] **P3 多 clip 主体**（D4–D7）：`RollSubject` + ghost 渲染 + chip 条 + 焦点切换 + context 装配。
-  - 验收：重叠加跨轨的 3 个 clip 同时可见；ghost 点击/框选/刀切均无反应；切换焦点后 selection 清空且编辑落到新 focus。
+- [x] **P3 多 clip 主体** ✅ 2026-10-28（D4–D7）：`RollSubject { focus, context, dropped }` + `ClipRef`；`show()` 改收 `&[MidiTrack]` + `&RollSubject`；ghost 绘制（底层、alpha 0.22、不命中）；`ViewWindow::of` 覆盖 context 跨度 + fit 基准改 context 跨度；Edit tab 焦点 chip 条 + Tab/Shift+Tab；`set_edit_target` 从 timeline 选区装配 context。偏差见 §11。
+  - 验收：`a_ghost_note_is_painted_but_never_hit`（点击 ghost 位置不选中、同坐标点 focus 音符仍可选作为对照）、`drawing_stops_at_the_focus_clips_edges`（窗外 draw 不创建）、`a_subject_leads_with_the_focus_and_drops_stale_entries`、`the_context_cap_keeps_the_focus_and_counts_what_it_dropped`、`tab_cycles_the_focus_and_wraps`、`the_view_window_is_the_whole_context`。
 - [ ] **P4 曲线泳道**（D8、D16、D17）：多泳道栈 + 纵轴按 `AutoDest` + 可写 curve 编辑。
   - 验收：pitch 曲线在音符正下方对齐绘制、可拖动锚点、undo 一步；CC lane 纵轴 0..127；bend lane 纵轴按 `range_semitones`。
 - [ ] **P5（可选）泳道打磨**：ghost velocity、泳道折叠记忆、lane 高度拖动、context 上限调整。
@@ -146,3 +146,22 @@ RollSubject { focus, context }        ← MAX_ROLL_CONTEXT = 8
 
 一处设计收益值得记录：`RollGeom` 把 `t0_x` / `ticks_to_x` / `top_note` / `row_h` / `area` 收进一个 `Copy` 结构后，图案绘制、命中测试、刀切、框选、velocity 泳道**共用同一对映射**，`note_rect` 从"5 个参数的自由函数"变成"1 个参数的方法"。P3 加 ghost 时不需要再复制一份坐标公式——每个 ghost 只是换一个 `origin_tick`。
 
+
+## 11. P3 实施勘误（2026-10-28）
+
+| # | spec 原判 | 实际 | 原因 |
+| :-- | :-- | :-- | :-- |
+| E12 | D2：创建音符限制在 focus 的 `[start, start + span)` | 用 `[start, start + loop_ticks)` | 与 P2 E7 同因：`span_ticks ≥ loop_ticks`，可编辑区只能是"会被演奏的内容"，span 的后半段画不出音符也没有网格 |
+| E13 | D2：窗外点击 = no-op + 状态提示（只提"创建音符"） | `over_focus` 同时管住**框选与空拖**：窗外单击只清空选择 + 提示，窗外拖不起框选 | ghost 不可选，窗外框选必然空手；启动一个注定空的框选只会让"我框到了吗"变成疑问。窗内的空拖行为完全不变 |
+| E14 | D4：`EditTarget::Midi { track, clip }` 升级为 `EditTarget::Midi(RollSubject)` | 同为元组变体，但 `EditTarget` 因此**失去 `Copy`**：`edit_panel` 每帧 `clone()` subject（≤ 8 个索引），track 重排改为遍历 `context_mut()` 全体 | 原来重排只改 focus 的 `track`；有了 ghost 后漏改会把 ghost 指到另一条轨上。clone 的代价是一次 ≤ 80 字节的分配，可接受 |
+| E15 | D5：context 来源 = timeline 选区 | 落地时发现 `TimelineState.selection: Vec<ClipSel>` **已由 M4b 交付**，无需新建选型状态；但**切换焦点不重新装配 context** | 每次 Tab 都按选区重排 chip 会让条上的顺序随焦点跳动（焦点在 context 里的位置也会被重置）。装配只在 `set_edit_target`（双击 / ← → / 打开编辑器）发生，chip 与 Tab 只移动 `focus` 索引 |
+| E16 | D7：Edit tab 顶部一条 chip 条 | 只在 `context.len() > 1` 时出现 | 单 clip 时那是一条只有一个 chip 的装饰行，会破坏 P2 的"单 clip 逐项等价"。多 clip 才需要它表达"还有别的 clip 在屏幕上" |
+| E17 | D4：超出上限"截断 + 状态栏提示" | `RollSubject` 多了 `dropped: usize`；**stale / 重复**条目不计入 | 提示需要数字；而"指向已删除 clip"和"同一 clip 出现两次"不是截断，报给用户只会误导 |
+| E18 | 未提 | `show()` 参数到 8 个，`#[allow(clippy::too_many_arguments)]` | 把 `playhead / playing / bar_ticks` 打包成 struct 只移动了计数，没有降低耦合；这三个量都是"本帧的传输状态"，不值得一个新类型 |
+
+两处 P4 的现成接点：
+
+- **ghost 的坐标**只用了 `RollGeom::at_origin(origin)`，P4 的曲线泳道用 `RollGeom::over(lane_rect).at_origin(..)` 即可，两条都在 P2/P3 落地。
+- **focus 切换**已经是纯 view-state（`set_roll_focus` + `cycle_focus`），P4 往 context 里加 control clip 时只需扩展 `RollLane` 与 `view` 的分支——`note_at` / 命令族 / 模态仍只认 focus。
+
+一条被测试钉住的边界值得记：**ghost 与 focus 时间重叠时，重叠区的点击属于 focus**（`note_at` 只看 focus）。所以"点击看起来落在 ghost 音符上"在重叠情况下会创建/选中 focus 的内容——这不是 bug，D6 的定义就是 ghost 无命中实体；真正的歧义由 chip 条解决。

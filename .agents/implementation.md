@@ -595,3 +595,17 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 **fit 基准与 margin 留给 P3**：spec 原写"fit 改 context 跨度、钳制加 margin"，实测 `span_ticks ≥ loop_ticks`（活跃时长可长于内容），用 span 拟合会让单 clip 视图缩小，违反等价验收；P3 改用"context 内各 clip `start + loop` 的最大跨度"，单 clip 退化为现在的 `loop_ticks`。
 
 
+## 多 clip 卷帘（P3）：subject / ghost / 焦点
+
+**`RollSubject` 是"这一帧画什么"的唯一来源**：`{ focus: usize, context: Vec<ClipRef>, dropped: usize }`，`ClipRef { lane, track, clip }`。`focus` 是 `context` 的下标（不是独立的 clip 引用），这样"焦点必须在可见集合里"由类型结构保证，不需要额外断言。`single(track, clip)` 是退化构造，`assemble(focus, selection, clips)` 是 app 侧装配入口——`clips(track)` 回调用来判断引用是否已失效（选区活得比 clip 久）。
+
+**ghost = 换一个 origin 的同一套几何**：`geom.at_origin(clip.start_ticks)` 之后直接复用 `note_rect`，颜色换成 `GHOST_NOTE`（`from_rgba_premultiplied(14,35,21,56)`，即 focus 色 22% alpha 的预乘值）。**它必须是 `const`**，而 `Color32::from_rgba_unmultiplied` 不是 const fn——所以写预乘值，注释里记原色。ghost 循环里没有"命中测试"代码可删，因为它压根没被喂进 `note_at`；测试 `a_ghost_note_is_painted_but_never_hit` 用"同坐标点 focus 音符仍能选中"做对照，防止坐标算错造成的假通过。
+
+**`over_focus` 是 ghost 带来的新边界**：窗口现在是 context 跨度，指针可以落在 focus 之外。创建音符的 `snap(...).min(loop_ticks-1)` 会把窗外点击变成"在 tick 0 创建"，所以入口先判 `(0.0..loop_ticks).contains(&geom.local_at(x))`，窗外单击只清空选择 + 状态提示，窗外空拖不起框选（ghost 不可选，框选必然空手）。
+
+**焦点切换是纯 view-state**：`set_roll_focus` 只改 `subject.focus` 并 `clear_gesture()`（顺带清 selection——索引属于旧 focus）。chip 条与 Tab 都在 `midi_editor_body` 里、`show()` 之前绘制，所以 `show` 不需要知道"焦点可能换人"。**Tab 用 `input_mut().consume_key` 消费**，否则 egui 的焦点遍历会先吃掉它；这也意味着多 clip 时编辑器内 Tab 不再切换控件焦点（单 clip 时不消费，保持原行为）。
+
+**`EditTarget` 失去 `Copy`**：`Midi(RollSubject)` 带 `Vec`，`edit_panel` 改为 `self.edit_clip.clone()`。80 字节级 clone 每帧一次，比"拆成只读引用 + 内部再取一次 &mut self"容易读得多。
+
+**track 重排要改全体**：`reorder_midi_track` 原来只重映射 focus 的 `track`，现在必须遍历 `context_mut()`——漏改会让 ghost 指向另一条轨的音符。
+
