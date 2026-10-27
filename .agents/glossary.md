@@ -137,6 +137,21 @@
 | 操作行 | action row | 节点框内、标题之下的一行小按钮（Timeline 的 `+/- MIDI` / `+/- Curve`、Mixer 的 `+/- Slot`）；占头部带高度，端口从它下方开始铺 |
 | 双击路由 | double-click routing | patch 双击的目标分派：节点 → Inspector（仅当有参数可显示）、Timeline → Timeline tab、其余实体无动作 |
 
+## 多 clip 卷帘与音高（R 系列，spec/roll-multiclip.md）
+
+| 中文 | 英文 | 约定 |
+| :--- | :--- | :--- |
+| 编辑主体 | roll subject | `RollSubject`：`focus` + `context`；不写 roll target（`EditTarget` 是 tab 分派） |
+| 焦点片段 | focus clip | context 中唯一可写的一个；音符编辑全部落在它身上 |
+| 幽灵片段 | ghost clip | 非焦点的可见片段，低 alpha 只读渲染，**不参与命中测试**；不写 locked clip（"锁定"只由 ghost 表达，没有可切换的锁状态） |
+| 编辑上下文 | roll context | 同屏可见片段集合，上限 `MAX_ROLL_CONTEXT = 8`，来源 = timeline 选区 |
+| 焦点条 | focus chips | Edit tab 顶部切换 focus 的 chip 行 |
+| 叠加泳道 | overlay lane | 卷帘下方、与音符共享横轴的曲线泳道；速度泳道是其特例（focus 专属） |
+| 音高偏移 | pitch offset | `ParamId::PitchOffset`，f32 半音，逐样本作用于**在唱** voice（与 root note 只影响后续 voice 相反） |
+| 音高曲线 | pitch curve | 驱动音高的控制曲线统称；不写 pitch envelope（那是 ADSR） |
+| 弯音 | pitch bend | MIDI `0xE0`，14bit、每通道一条；曲线侧为 `AutoParam::PitchBend{channel, range_semitones}` |
+| 弯音范围 | bend range | 曲线"半音"到 14bit 的换算基准，文档字段（默认 2.0，钳 0.5..24） |
+
 ## 符号白名单（egui 默认字体，硬约束）
 
 egui 0.36 默认字体（Ubuntu-Light + NotoEmoji + emoji-icon-font）**没有的字形一律渲染成方块**。窗口内出现的文案（按钮/标签/状态栏/浮窗）只允许以下符号：

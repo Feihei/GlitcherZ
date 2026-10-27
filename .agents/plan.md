@@ -17,7 +17,7 @@
 
 ## 当前状态（2026-10-24）
 
-路线图 1–10 全部落地。乐器插件（CLAP / VST3）为一等声源，效果器节点已接入，自动化桥接到插件参数。节点图 P1–P5f 与 MIDI 编辑 M1–M4 全部交付；**SF2/SF3 音色库方向 S1–S6 全部完成**（RT 审计零分配 → 非实时加载 `engine::sf2` → 实时渲染 `Sf2VoiceProcessor` → `VoiceSpec::SoundFont` 文档变体 → UI 音色库面板（加载/preset 下拉/声源绑定，undoable）→ sf3 feature 常开 + 审计复跑 + 真实库端到端验收）。SF2 声源现为四等声源之一（内置合成器 / 插件 / SoundFont / 采样播放器）。**插件 GUI 宿主 G1–G7 全部交付**（CLAP 编辑嵌入 + 参数回接 + 面板节点化 + 内联参数 + vk 节点 + VST3 `IPlugView` 镜像）；**P6 反馈环路交付**（显式 Feedback 节点，1 块延迟由拓扑排序反转实现）。**可用性提升 U 系列全部收官**：U1（走带完整化 + seek 基建）、U2（文件管理）、U3（拍号文档化 + tempo 曲线）、U4（控制轨 CC 输出 + timeline 一等化）、U5（采样播放器 instrument）、U6（audio track + 波形 timeline）、U7（Export Audio 离线渲染）、U8（Inspector 重构）、U9（E1–E5 插件浏览器）、U10（patch 节点内联管理）全部交付。无固定下一项——待用户实测提出新方向。
+路线图 1–10 全部落地。乐器插件（CLAP / VST3）为一等声源，效果器节点已接入，自动化桥接到插件参数。节点图 P1–P5f 与 MIDI 编辑 M1–M4 全部交付；**SF2/SF3 音色库方向 S1–S6 全部完成**（RT 审计零分配 → 非实时加载 `engine::sf2` → 实时渲染 `Sf2VoiceProcessor` → `VoiceSpec::SoundFont` 文档变体 → UI 音色库面板（加载/preset 下拉/声源绑定，undoable）→ sf3 feature 常开 + 审计复跑 + 真实库端到端验收）。SF2 声源现为四等声源之一（内置合成器 / 插件 / SoundFont / 采样播放器）。**插件 GUI 宿主 G1–G7 全部交付**（CLAP 编辑嵌入 + 参数回接 + 面板节点化 + 内联参数 + vk 节点 + VST3 `IPlugView` 镜像）；**P6 反馈环路交付**（显式 Feedback 节点，1 块延迟由拓扑排序反转实现）。**可用性提升 U 系列全部收官**：U1（走带完整化 + seek 基建）、U2（文件管理）、U3（拍号文档化 + tempo 曲线）、U4（控制轨 CC 输出 + timeline 一等化）、U5（采样播放器 instrument）、U6（audio track + 波形 timeline）、U7（Export Audio 离线渲染）、U8（Inspector 重构）、U9（E1–E5 插件浏览器）、U10（patch 节点内联管理）全部交付。**下一方向 R 系列已立项**（多 clip 钢琴卷帘 + 音高曲线，spec `roll-multiclip.md`，P0–P5 待实施）。
 
 ## 遗留任务
 
@@ -269,6 +269,23 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 - [ ] **E5（可选）** Saturation（过采样）/ Bitcrusher / Phaser / Limiter + PDC
 
 明确不做：Echo 节点（Delay 即回声）、Gain 节点（通道条已是增益级）、每效果 sidechain。
+
+## R 系列：多 clip 钢琴卷帘 + 音高曲线（2026-10-27 立项，spec `roll-multiclip.md`）草案
+
+用户提出：LMMS 的 piano roll 内画 pitch 曲线很方便，但只对部分 instrument 有效（SF2 等仍要独立 curve clip 并对齐 midi clip）；GlitcherZ 想要类似能力，同时希望 piano roll **同时显示/编辑时间上重叠的多个 clip**（可选编辑哪个、其余锁定）。用户的推论——"既然能同屏，就不需要 MIDI clip 内嵌曲线"——经验证成立。
+
+关键判断：① 内嵌曲线与 SMF 不是"不兼容"，而是**有损转换 + 语义限制 + 四条链路工程**；② 本项目 `Sequence.ctrls` 从 M1.3 起就存在，但**引擎不发声、UI 不可编辑、SMF 导出丢失**（latent bug，与是否做 pitch 曲线无关）；③ `AutoParam` 至今没有任何 pitch 目标；④ 卷帘横轴**已经是绝对 tick 线性映射**（`scroll_x` 即左缘 tick），多 clip 同屏是"加 clip 原点 + 放开可见范围"，属中等重构而非重写。
+
+核心决策（spec D1–D17）：横轴绝对 tick + `RollGeom`；`RollSubject{focus, context}`（上限 8，来源 = timeline 选区）；**ghost 只读、不参与 hit test**（焦点切换走 chip 条，避免退回 M3.8 的指针中心语义）；曲线用统一 `OverlayLane` 抽象且**可写**（写入各自 control clip，这是"对着音符画 pitch"的正面回答）；`AutoParam::PitchBend{channel, range_semitones}` + `ParamId::PitchOffset` 按声源分流（内置逐样本参数 / CLAP·SF2 块级 bend / VST3 不支持）；`Sequence.ctrls` **一写多读**（只补齐引擎与导出，不做内嵌编辑）；不做 curve↔midi 绑定（用 timeline 批量移动代替）。
+
+- [ ] **P0 `ctrls` 链路补齐**（独立，修 latent bug）：`RtMidiClip` 加定容 ctrl 表（32/clip）、sequencer 扫描投递、`Processor::midi_pitch_bend`、`export_smf` 补 CC/bend
+- [ ] **P1 音高通路**：`AutoParam::PitchBend` / `AutoDest::PitchBend` / `ParamId::PitchOffset` + synth·sample 逐样本 `Smoothed` 实现（在唱 voice，与 root note 语义相反）+ 分流表
+- [ ] **P2 坐标系绝对化**（纯重构，行为等价）：`RollGeom` 结构体化 + clip 原点 + 可见范围放开 + fit 基准改 context 跨度
+- [ ] **P3 多 clip 主体**：`RollSubject` + ghost 渲染 + chip 条焦点切换 + context 装配（只收 MIDI）
+- [ ] **P4 曲线泳道**：多泳道栈 + 纵轴按 `AutoDest` + 可写 curve（control clip 进 context）
+- [ ] **P5（可选）**：ghost velocity、泳道折叠记忆、高度拖动、context 上限调整
+
+依赖：P2 必须先于 P3/P4；P1 与 P2 并行；P0 独立可先做。
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 

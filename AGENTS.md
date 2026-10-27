@@ -113,7 +113,7 @@ cargo build --release -p glitcherz-app
 | `.agents/glossary.md` | 术语表：中英对照 + 文案风格约定 | 写注释/日志/UI 文案、引入新概念前 |
 | `.agents/implementation.md` | 已落地模块的实现要点、协议细节、版本 gotchas | 改现有功能、排查问题时 |
 | `.agents/plan.md` | 路线图、当前状态、遗留任务、进行中的方向 | 规划下一步、同步进度时 |
-| `.agents/spec/` | 特性 spec：`node-graph.md`（节点图）、`timeline.md`（编曲时间轴）、`editing-model.md`（MIDI 编辑）、`plugin-*.md`（插件宿主）、`sf2-loader.md`、`tempo-meter.md`（U3 拍号 + tempo 曲线）、`control-tracks.md`（U4 控制轨 CC 输出 + inline 曲线）、`effects.md`（内建效果器框架 + 统一参数平滑 + 立体声联动） | 实施对应特性前 |
+| `.agents/spec/` | 特性 spec：`node-graph.md`（节点图）、`timeline.md`（编曲时间轴）、`editing-model.md`（MIDI 编辑）、`plugin-*.md`（插件宿主）、`sf2-loader.md`、`tempo-meter.md`（U3 拍号 + tempo 曲线）、`control-tracks.md`（U4 控制轨 CC 输出 + U12 曲线编辑：Edit tab · Linear/Smooth）、`roll-multiclip.md`（R 系列：多 clip 卷帘 + 音高曲线）、`effects.md`（内建效果器框架 + 统一参数平滑 + 立体声联动） | 实施对应特性前 |
 
 目录约定：`.agents/` 只放 agent / 开发向文档；`docs/` 只放面向用户的文档与 assets 素材（图片、示例工程等），二者不要混放。
 

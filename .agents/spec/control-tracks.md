@@ -69,7 +69,7 @@ UI ──cable(Cc{ch,cc})→ engine.set_auto_cc_route(index, node_id, ch, cc)
 
 ## 7. 开放问题（不在 U4）
 
-- **clip 级 CC 事件（`Sequence.ctrls`）仍无引擎通路**：M1.3 的模型与 piano roll 编辑已就位，但 `RtMidiClip` 只有 notes，CC 到不了插件。这与 U4 的曲线 CC 是两条独立来源（一种是"写在 clip 里的事件"，一种是"曲线采样的流"），落地时共用 `Processor::midi_cc` 即可，但需要 sequencer 侧按 tick 排序调度，单独立项。
+- **clip 级 CC 事件（`Sequence.ctrls`）仍无引擎通路** → **已由 `roll-multiclip.md` D14 / P0 接手**。现状是"只进不出"的孤岛：M1.3 的模型（含 `CtrlKind::PitchBend`）在，但 `RtMidiClip` 只有 notes（不发声）、UI 无 ctrl 编辑、`export_smf` 只写音符（**导入的 CC/bend 导出即丢**）。P0 补定容 ctrl 表 + sequencer 按 tick 投递 + `Processor::midi_pitch_bend` + 导出编码；**不开放编辑路径**——`ControlClip` 保持唯一书写路径（`roll-multiclip.md` D13 一写多读）。这与 U4 的曲线 CC 是两条独立来源（"写在 clip 里的事件"vs"曲线采样的流"），共用 `Processor::midi_cc`。
 - **CC 曲线的平滑**：v1 是台阶（块级 + 7bit）。若插件对台阶敏感，可在量化前做一阶低通（需要每轨状态），留给实际听感反馈。
 ## 8. U12（2026-10-26）：曲线编辑迁入 Edit tab + 曲线类型
 
