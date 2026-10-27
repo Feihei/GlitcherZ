@@ -559,3 +559,24 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 **帧间分片**（U9 扫描先例）：帧尾 `pump_export` 渲染 34 块（~90ms 音频）+ `request_repaint`；进度 = `musical_ticks / (end-start)`；到达终点 `pause()`（停在 end，tail 期间 transport_active=false 只放效果尾——audio 内容按设计止于 end）。空工程 window=(0,0)：Play 后立即 pause，只渲染 1s 尾音（空文件带尾）。Cancel 直接 drop job（半成品文件留给用户）。**writer finalize 才写 RIFF 头尺寸**——取消的半成品 wav 头是错的，可接受（文档写明）。
 
 **测试口径**：ADSR 默认 release **0.2s**（≈96 块@48k/128），不是采样播放器的 10ms——"Stop 后静音"断言要给足块数；探针（临时 debug 测试 + println + assert!(false)）是定位"链路哪一环无声"的最快手段，删净即可。
+
+### clip 级 controller 事件（P0，spec `roll-multiclip.md`，2026-10-27）
+
+**`Sequence.ctrls` 此前是四段全空**：模型自 M1.3 就有 `CtrlEvent`/`CtrlKind`（含 `PitchBend`），但 SMF 导入的兜底分支是 `_ => cursor.skip(2)?`（CC/bend/aftertouch/program **全部丢弃**）、导出只写 `0x90`/`0x80`、`RtMidiClip` 只有 `notes`、UI 无编辑入口——所以 P0 的实际范围是"导入解析 + 引擎调度 + 导出写入"三段，不是 spec 最初写的"导出补齐"。
+
+**`advance` 的回调换成 trait**：原先 `emit: &mut dyn FnMut(usize, NoteEvent)`；加 ctrl 若再加一个闭包参数，block runner 需要两个闭包同时持有 `&mut RtGraph`（两次可变借用，编译不过）。改为 `sink: &mut dyn SequencerSink`（`note` / `ctrl` 两方法，`ctrl` 默认空实现让纯音符 sink 保持单方法），block runner 侧 `GraphSink(&mut RtGraph)` 一个适配器把两类事件送进同一张图。
+
+**同 block 内的顺序是 ctrl → note**：pitch bend / program change 设定的是"音符起始状态"，晚一块到就是错音高/错音色。调度里 ctrl 循环放在 note 循环**之前**；SMF 导出同样把同 tick 顺序定为 off(0) → ctrl(1) → on(2)（`SmfEvent::order_rank`）。两者对齐，导入导出往返后行为一致。
+
+**`write_track` 必须按 status 决定 data byte 数**：原格式 `(tick, status, d1, d2)` 固定写 3 字节；`0xC0`（program）与 `0xD0`（channel pressure）只有 **1 个** data byte，多写一个会让后续每个事件错位（文件仍能被"解析"，只是全乱）。改 `SmfEvent{tick,status,data1,data2,data_len}` + `two()`/`one()`。回归测试 `single_data_byte_ctrls_do_not_shift_later_events` 用 program→pressure→note 序列锁定。
+
+**导入的 `origin` 改为"最早事件"**：原来只看 `notes.first()`；controller-only 的轨（只有弯音没有音符）会落 origin=0 且 span=1。现在 `min(note.start, ctrl.tick)`，span 也把 `ctrl.tick + 1` 算进去。
+
+**`RtCtrlKind` 不能用 `#[derive(Default)]` + `#[default]`**：`#[default]` 只允许 unit 变体，首变体是 `Cc(u8)` → 手写 `Default`（`Cc(0)`），供 `[RtCtrl; MAX_CLIP_CTRLS]` 的数组初始化。
+
+**定容与内存**：`MAX_CLIP_CTRLS = 32`（controller 是零长度点事件，密集弯音比音符更快吃满上限）；`RtCtrl` 12 字节 → `RtMidiClip` 从 ~1.0 KB 涨到 ~1.4 KB，`SequencerCommand::SetTrackClips` 单条涨约 30%，队列按元素大小预分配故可接受（`commands.rs` 的注释已记该取舍）。
+
+**只投递 CC 与 pitch bend**：`graph::slot_ctrl` 对 `ChannelPressure`/`PolyPressure`/`Program` 明确返回 `false`——内置声源没有对应的消费面，SF2 的 program 走 `ParamId::Sf2ProgramChange` 参数路径。VST3 宿主无 `Processor::midi_cc` 实现（`vst3-0.3.0` 的 `DataEvent` 只有 SysEx），因此拿到默认 `false`，与 U4 D6 一致。
+
+**内置声源对 bend 返回 `false` 是有意的**：P1 会让它们的音高走 `ParamId::PitchOffset`（逐样本 `Smoothed`），既能表达细腻 vibrato，也不需要用户定义 bend range。
+

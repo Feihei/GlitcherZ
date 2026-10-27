@@ -1,6 +1,6 @@
 # 多 clip 钢琴卷帘 + 音高曲线 Spec
 
-> 状态：草案（2026-10-27，经一轮设计讨论）。P0 可独立先行，P2 先于 P3/P4，P1 可并行。
+> 状态：草案（2026-10-27，经一轮设计讨论；同日 **P0 已交付**，偏差见 §9）。P2 先于 P3/P4，P1 可并行。
 > 上游：`timeline.md`（clip 模型 / 平铺语义）、`editing-model.md`（M4 交互模型：常驻态只有 Select、语义决策源不得回到指针）、`control-tracks.md`（曲线一等实体、`AutoDest`、U4a CC 通路、§7 开放问题）、`sf2-loader.md`（bend range）、`effects.md`（`Smoothed`）。
 
 ## 1. 背景与问题
@@ -107,8 +107,8 @@ RollSubject { focus, context }        ← MAX_ROLL_CONTEXT = 8
 
 ## 8. 分阶段
 
-- [ ] **P0 `ctrls` 链路补齐**（D14）：model→engine→export 三段；`midi_pitch_bend` trait 方法；RT 零分配审计。UI 不动。
-  - 验收：导入含 CC/bend 的 MIDI → 发声正确；导出 → 事件不丢；`smf` 往返测试。
+- [x] **P0 `ctrls` 链路补齐** ✅ 2026-10-27（D14）：SMF 导入解析 + 引擎调度投递 + 导出写入三段；`Processor::midi_pitch_bend` 新通道；UI 仍无编辑入口（一写多读）。落地偏差见 §9。
+  - 验收：`ctrl_events_round_trip` / `single_data_byte_ctrls_do_not_shift_later_events` / `clip_ctrls_fire_at_their_positions` / `clip_ctrls_tile_with_the_loop` / `clip_ctrls_precede_notes_in_the_same_block` / `clip_ctrl_table_is_fixed_capacity` / `track_ctrl_delivers_cc_and_pitch_bend` / `track_ctrl_rejects_unknown_tracks`。
 - [ ] **P1 音高通路**（D9–D12）：`AutoParam::PitchBend` + `AutoDest::PitchBend` + `ParamId::PitchOffset` + synth/sample 逐样本实现 + 分流表落地。
   - 验收：内置 synth 的 pitch 曲线无台阶（逐样本）；CLAP/SF2 收到 `0xE0`；VST3 返回 false 且 UI 标注。
 - [ ] **P2 坐标系绝对化**（D1–D3）：`RollGeom` 结构体化、clip 原点、可见范围放开、fit 基准改 context 跨度。
@@ -120,3 +120,17 @@ RollSubject { focus, context }        ← MAX_ROLL_CONTEXT = 8
 - [ ] **P5（可选）泳道打磨**：ghost velocity、泳道折叠记忆、lane 高度拖动、context 上限调整。
 
 依赖：P2 必须先于 P3/P4；P1 与 P2 可并行；P0 独立。
+
+## 9. P0 实施勘误（2026-10-27）
+
+| # | spec 原判 | 实际 | 原因 |
+| :-- | :-- | :-- | :-- |
+| E1 | "导出补 ctrl" | **导入也要补** | `parse_track` 的兜底分支原本是 `_ => cursor.skip(2)?`，CC/bend/aftertouch/program 全部丢弃——四段链路全空，不是只有导出 |
+| E2 | `advance` 加一个 `emit_ctrl` 回调 | 改为 `SequencerSink` trait | block runner 需要两类事件进入**同一** `&mut RtGraph`；两个闭包会同时可变借用 |
+| E3 | 未提同块顺序 | **ctrl 先于 note**（调度与导出两侧都如此） | bend/program 设定音符的起始状态，晚一块就是错音高/错音色 |
+| E4 | "RT 零分配审计" | 未加独立 audit 二进制 | ctrl 路径是纯标量 + 定容数组复制（无 `Vec`/`Box`/`Arc`），静态可判定；三个既有 audit 都用于有堆对象的路径 |
+| E5 | 未提 `0xC0`/`0xD0` | `write_track` 事件格式改为 `SmfEvent{data_len}` | 这两个消息只有 1 个 data byte，固定写 3 字节会让后续全部错位 |
+| E6 | `AutoParam::PitchBend` 在 P0 | 仍在 P1 | P0 只保证**导入的** bend 能响、能原样导出；曲线侧没有 bend 目标前，UI 无法产生新的 bend |
+
+额外落地细节（`RtCtrlKind` 手写 `Default`、`MAX_CLIP_CTRLS = 32`、`origin` 改取最早事件、`slot_ctrl` 只投递 CC/bend）见 `.agents/implementation.md` 的「clip 级 controller 事件」一节。
+
