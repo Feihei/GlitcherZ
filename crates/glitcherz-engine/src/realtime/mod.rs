@@ -25,8 +25,8 @@
 //! - [`sine`] / [`gain`]: sine oscillator source and gain effect (`Processor` reference implementations);
 //! - [`effect`]: built-in effect framework — descriptors, [`Smoothed`](effect::Smoothed)
 //!   parameter smoothing and the [`EffectParamBank`](effect::EffectParamBank);
-//! - [`delay`] / [`eq`] / [`compressor`]: the built-in effects themselves (each owns its
-//!   static descriptor next to its DSP);
+//! - [`delay`] / [`eq`] / [`compressor`] / [`reverb`]: the built-in effects themselves (each
+//!   owns its static descriptor next to its DSP);
 //! - [`envelope`] / [`svf`] / [`synth`]: ADSR envelope, SVF filter, and full synthesizer;
 //! - [`sf2`]: SoundFont voice ([`Sf2VoiceProcessor`](sf2::Sf2VoiceProcessor)) — RT rendering
 //!   around the audited `rustysynth-ext` synthesizer (loading stays in [`crate::sf2`]);
@@ -43,6 +43,7 @@ pub mod audio_track;
 pub mod automation;
 pub mod block;
 pub mod buffer;
+pub mod chorus;
 pub mod commands;
 pub mod compressor;
 pub mod context;
@@ -50,10 +51,13 @@ pub mod delay;
 pub mod effect;
 pub mod envelope;
 pub mod eq;
+pub mod flanger;
 pub mod gain;
 pub mod graph;
 pub mod mixer;
+pub mod mod_delay;
 pub mod processor;
+pub mod reverb;
 pub mod sample;
 pub mod sequencer;
 pub mod sf2;
@@ -86,6 +90,7 @@ pub use automation::{
 };
 pub use block::{BlockRunner, Feedback};
 pub use buffer::AudioBuffer;
+pub use chorus::ChorusProcessor;
 pub use commands::{
     COMMAND_QUEUE_CAPACITY, EngineCommand, NoteEvent, ParamId, SequencerCommand, command_channel,
 };
@@ -98,6 +103,7 @@ pub use effect::{
 };
 pub use envelope::AdsrProcessor;
 pub use eq::EqProcessor;
+pub use flanger::FlangerProcessor;
 pub use gain::GainProcessor;
 pub use graph::{
     AutoDest, AutoRoute, Cable, ChannelStripProcessor, ExecPlan, FeedbackProcessor, GraphCompiler,
@@ -106,6 +112,7 @@ pub use graph::{
 };
 pub use mixer::{MixerChannel, MixerProcessor};
 pub use processor::{ChannelWeights, MAX_WEIGHT_CHANNELS, Processor, ProcessorChain};
+pub use reverb::ReverbProcessor;
 pub use sample::{SAMPLE_DEFAULT_ROOT, SAMPLE_POLYPHONY, SampleVoiceProcessor};
 pub use sequencer::{
     MAX_CLIP_NOTES, MAX_TIME_SIGNATURE_NUMERATOR, MAX_TRACK_CLIPS, MIN_VELOCITY, RtMidiClip,

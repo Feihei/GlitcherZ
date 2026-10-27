@@ -174,6 +174,9 @@ impl Default for SynthParams {
 }
 
 /// Per-track delay effect parameters (`mix = 0` means bypass).
+///
+/// E4 added the stereo/tempo fields; they are additive (`serde(default)`), so
+/// older documents keep loading without a version bump.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DelayParams {
     /// Delay time (seconds, 0.005..1).
@@ -185,6 +188,15 @@ pub struct DelayParams {
     /// Wet mix ratio (0..1).
     #[serde(default)]
     pub mix: f32,
+    /// Ping-pong (cross-fed stereo) switch (E4).
+    #[serde(default)]
+    pub ping_pong: bool,
+    /// Whether the delay time follows the project tempo (E4).
+    #[serde(default)]
+    pub sync: bool,
+    /// Synced note-division index (see the engine's `delay::DIVISION_TICKS`).
+    #[serde(default = "default_delay_division")]
+    pub sync_division: u8,
 }
 
 fn default_delay_time() -> f32 {
@@ -195,12 +207,20 @@ fn default_delay_feedback() -> f32 {
     0.35
 }
 
+/// Default synced division: index 2 = 1/4 note (mirrors the engine descriptor).
+fn default_delay_division() -> u8 {
+    2
+}
+
 impl Default for DelayParams {
     fn default() -> Self {
         Self {
             time_s: default_delay_time(),
             feedback: default_delay_feedback(),
             mix: 0.0,
+            ping_pong: false,
+            sync: false,
+            sync_division: default_delay_division(),
         }
     }
 }
@@ -350,6 +370,141 @@ impl Default for CompressorParams {
     }
 }
 
+/// Stereo FDN-8 reverb parameters (spec `effects.md` E3; slot order matches the
+/// engine descriptor).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ReverbParams {
+    /// Stereo pre-delay (ms).
+    #[serde(default)]
+    pub pre_delay: f32,
+    /// RT60 decay time (seconds).
+    #[serde(default = "default_reverb_decay")]
+    pub decay: f32,
+    /// Damping (high-frequency loss in the feedback loop, 0..1).
+    #[serde(default = "default_reverb_damping")]
+    pub damping: f32,
+    /// Low-cut corner (Hz).
+    #[serde(default = "default_reverb_low_cut")]
+    pub low_cut: f32,
+    /// Stereo width (0 = mono, 1 = full spread).
+    #[serde(default = "default_mix_one")]
+    pub width: f32,
+    /// Dry/wet mix (`0` = fully dry).
+    #[serde(default = "default_reverb_mix")]
+    pub mix: f32,
+}
+
+fn default_reverb_decay() -> f32 {
+    2.0
+}
+
+fn default_reverb_damping() -> f32 {
+    0.5
+}
+
+fn default_reverb_low_cut() -> f32 {
+    20.0
+}
+
+fn default_reverb_mix() -> f32 {
+    0.3
+}
+
+impl Default for ReverbParams {
+    fn default() -> Self {
+        Self {
+            pre_delay: 0.0,
+            decay: default_reverb_decay(),
+            damping: default_reverb_damping(),
+            low_cut: default_reverb_low_cut(),
+            width: default_mix_one(),
+            mix: default_reverb_mix(),
+        }
+    }
+}
+
+/// Stereo chorus parameters (spec `effects.md` E4; slot order matches the
+/// engine descriptor).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ChorusParams {
+    /// LFO rate (Hz).
+    #[serde(default = "default_chorus_rate")]
+    pub rate: f32,
+    /// Modulation depth (0..1).
+    #[serde(default = "default_chorus_depth")]
+    pub depth: f32,
+    /// Stereo width (0 = in phase, 1 = fully spread).
+    #[serde(default = "default_half")]
+    pub width: f32,
+    /// Dry/wet mix (`0` = fully dry).
+    #[serde(default = "default_half")]
+    pub mix: f32,
+}
+
+fn default_chorus_rate() -> f32 {
+    1.0
+}
+
+fn default_chorus_depth() -> f32 {
+    0.5
+}
+
+fn default_half() -> f32 {
+    0.5
+}
+
+impl Default for ChorusParams {
+    fn default() -> Self {
+        Self {
+            rate: default_chorus_rate(),
+            depth: default_chorus_depth(),
+            width: default_half(),
+            mix: default_half(),
+        }
+    }
+}
+
+/// Stereo flanger parameters (spec `effects.md` E4; slot order matches the
+/// engine descriptor).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FlangerParams {
+    /// LFO rate (Hz).
+    #[serde(default = "default_flanger_rate")]
+    pub rate: f32,
+    /// Modulation depth (0..1).
+    #[serde(default = "default_flanger_depth")]
+    pub depth: f32,
+    /// Feedback amount (`-0.95..0.95`).
+    #[serde(default = "default_half")]
+    pub feedback: f32,
+    /// Stereo width (0 = in phase, 1 = fully spread).
+    #[serde(default = "default_half")]
+    pub width: f32,
+    /// Dry/wet mix (`0` = fully dry).
+    #[serde(default = "default_half")]
+    pub mix: f32,
+}
+
+fn default_flanger_rate() -> f32 {
+    0.5
+}
+
+fn default_flanger_depth() -> f32 {
+    0.7
+}
+
+impl Default for FlangerParams {
+    fn default() -> Self {
+        Self {
+            rate: default_flanger_rate(),
+            depth: default_flanger_depth(),
+            feedback: default_half(),
+            width: default_half(),
+            mix: default_half(),
+        }
+    }
+}
+
 /// Built-in effect kind (spec `.agents/spec/effects.md` D1).
 ///
 /// The wire format is the `kind` tag of [`EffectParams`]; this enum lets UI and
@@ -366,6 +521,12 @@ pub enum BuiltinEffectKind {
     Eq,
     /// Feed-forward peak compressor.
     Compressor,
+    /// Stereo FDN-8 reverb.
+    Reverb,
+    /// Stereo chorus.
+    Chorus,
+    /// Stereo flanger.
+    Flanger,
 }
 
 impl BuiltinEffectKind {
@@ -375,6 +536,9 @@ impl BuiltinEffectKind {
             Self::Delay => "Delay",
             Self::Eq => "EQ",
             Self::Compressor => "Compressor",
+            Self::Reverb => "Reverb",
+            Self::Chorus => "Chorus",
+            Self::Flanger => "Flanger",
         }
     }
 
@@ -383,6 +547,9 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Delay,
         BuiltinEffectKind::Eq,
         BuiltinEffectKind::Compressor,
+        BuiltinEffectKind::Reverb,
+        BuiltinEffectKind::Chorus,
+        BuiltinEffectKind::Flanger,
     ];
 }
 
@@ -401,6 +568,12 @@ pub enum EffectParams {
     Eq(Box<EqParams>),
     /// Feed-forward peak compressor.
     Compressor(Box<CompressorParams>),
+    /// Stereo FDN-8 reverb.
+    Reverb(Box<ReverbParams>),
+    /// Stereo chorus.
+    Chorus(Box<ChorusParams>),
+    /// Stereo flanger.
+    Flanger(Box<FlangerParams>),
 }
 
 impl Default for EffectParams {
@@ -416,6 +589,9 @@ impl EffectParams {
             Self::Delay(_) => BuiltinEffectKind::Delay,
             Self::Eq(_) => BuiltinEffectKind::Eq,
             Self::Compressor(_) => BuiltinEffectKind::Compressor,
+            Self::Reverb(_) => BuiltinEffectKind::Reverb,
+            Self::Chorus(_) => BuiltinEffectKind::Chorus,
+            Self::Flanger(_) => BuiltinEffectKind::Flanger,
         }
     }
 
@@ -463,6 +639,54 @@ impl EffectParams {
     pub fn as_compressor_mut(&mut self) -> Option<&mut CompressorParams> {
         match self {
             Self::Compressor(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Reverb parameters, when this is a reverb node.
+    pub fn as_reverb(&self) -> Option<&ReverbParams> {
+        match self {
+            Self::Reverb(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Mutable reverb parameters, when this is a reverb node.
+    pub fn as_reverb_mut(&mut self) -> Option<&mut ReverbParams> {
+        match self {
+            Self::Reverb(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Chorus parameters, when this is a chorus node.
+    pub fn as_chorus(&self) -> Option<&ChorusParams> {
+        match self {
+            Self::Chorus(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Mutable chorus parameters, when this is a chorus node.
+    pub fn as_chorus_mut(&mut self) -> Option<&mut ChorusParams> {
+        match self {
+            Self::Chorus(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Flanger parameters, when this is a flanger node.
+    pub fn as_flanger(&self) -> Option<&FlangerParams> {
+        match self {
+            Self::Flanger(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Mutable flanger parameters, when this is a flanger node.
+    pub fn as_flanger_mut(&mut self) -> Option<&mut FlangerParams> {
+        match self {
+            Self::Flanger(params) => Some(params),
             _ => None,
         }
     }
@@ -2852,6 +3076,7 @@ mod tests {
             time_s: 0.42,
             feedback: 0.6,
             mix: 0.5,
+            ..Default::default()
         }));
         let text = ron::to_string(&node).expect("serialize");
         assert!(text.contains("kind:\"delay\""), "tag missing: {text}");
@@ -2868,6 +3093,9 @@ mod tests {
             (EffectParams::Delay(super::DelayParams::default()), "delay"),
             (EffectParams::Eq(Box::default()), "eq"),
             (EffectParams::Compressor(Box::default()), "compressor"),
+            (EffectParams::Reverb(Box::default()), "reverb"),
+            (EffectParams::Chorus(Box::default()), "chorus"),
+            (EffectParams::Flanger(Box::default()), "flanger"),
         ];
         for (params, tag) in cases {
             let text = ron::to_string(&effect_node(params.clone())).expect("serialize");
@@ -2933,6 +3161,7 @@ mod tests {
                         time_s: 0.42,
                         feedback: 0.6,
                         mix: 0.5,
+                        ..Default::default()
                     })
                 );
             }

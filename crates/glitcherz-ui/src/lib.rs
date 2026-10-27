@@ -43,7 +43,7 @@ use glitcherz_engine::realtime::{
     MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent, ParamId, Processor,
     RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCurveInterp, RtMidiClip, RtNote,
     SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor, SynthProcessor,
-    empty_clip_table,
+    Unit, empty_clip_table,
 };
 use glitcherz_model::{
     AutoParam, AutoPoint, CableKind, ControlClip, ControlTrack, CurveInterp, EffectParams,
@@ -6919,6 +6919,23 @@ impl GlitcherZApp {
         ui.horizontal_wrapped(|ui| {
             for (slot, spec) in descriptor.params.iter().enumerate() {
                 let id = ParamId::BuiltinParam(slot as u8);
+                if spec.unit == Unit::Enum {
+                    // Discrete choice (e.g. delay tempo-sync division): a combo
+                    // box instead of a slider (the raw value is an index).
+                    let current = values[slot].round().max(0.0) as usize;
+                    let selected = spec.choices.get(current).copied().unwrap_or("-");
+                    egui::ComboBox::from_id_salt(format!("effect_enum_{doc_id}_{slot}"))
+                        .selected_text(format!("{}: {}", spec.name, selected))
+                        .show_ui(ui, |ui| {
+                            for (index, choice) in spec.choices.iter().enumerate() {
+                                if ui.selectable_label(index == current, *choice).clicked() {
+                                    values[slot] = index as f32;
+                                    self.send_node_param(doc_id, id, values[slot]);
+                                }
+                            }
+                        });
+                    continue;
+                }
                 if spec.is_discrete() {
                     let mut on = values[slot] >= 0.5;
                     if ui.checkbox(&mut on, spec.name).changed() {

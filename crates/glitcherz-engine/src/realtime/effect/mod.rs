@@ -43,6 +43,12 @@ pub enum BuiltinEffectKind {
     Eq,
     /// Feed-forward peak compressor.
     Compressor,
+    /// Stereo FDN-8 reverb.
+    Reverb,
+    /// Stereo chorus.
+    Chorus,
+    /// Stereo flanger.
+    Flanger,
 }
 
 impl BuiltinEffectKind {
@@ -51,6 +57,9 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Delay,
         BuiltinEffectKind::Eq,
         BuiltinEffectKind::Compressor,
+        BuiltinEffectKind::Reverb,
+        BuiltinEffectKind::Chorus,
+        BuiltinEffectKind::Flanger,
     ];
 
     /// Static descriptor of this kind.
@@ -59,6 +68,9 @@ impl BuiltinEffectKind {
             BuiltinEffectKind::Delay => &crate::realtime::delay::DESCRIPTOR,
             BuiltinEffectKind::Eq => &crate::realtime::eq::DESCRIPTOR,
             BuiltinEffectKind::Compressor => &crate::realtime::compressor::DESCRIPTOR,
+            BuiltinEffectKind::Reverb => &crate::realtime::reverb::DESCRIPTOR,
+            BuiltinEffectKind::Chorus => &crate::realtime::chorus::DESCRIPTOR,
+            BuiltinEffectKind::Flanger => &crate::realtime::flanger::DESCRIPTOR,
         }
     }
 }

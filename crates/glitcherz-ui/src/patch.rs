@@ -3083,6 +3083,7 @@ mod tests {
             time_s: 0.25,
             feedback: 0.4,
             mix: 0.3,
+            ..Default::default()
         };
         let fx = NodeDoc::Effect {
             node_id: 3,

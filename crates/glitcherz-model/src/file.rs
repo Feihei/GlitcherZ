@@ -600,6 +600,7 @@ mod tests {
                         time_s: 0.42,
                         feedback: 0.6,
                         mix: 0.5,
+                        ..Default::default()
                     }),
                     "v7 delay settings must survive the upgrade"
                 );

@@ -11,8 +11,9 @@
 use std::sync::Arc;
 
 use glitcherz_engine::realtime::{
-    BuiltinEffectKind, CompressorProcessor, DelayProcessor, EffectDescriptor, EffectMeters,
-    EqProcessor, ParamId, ParamSpec, Processor, Unit, compressor, delay, eq,
+    BuiltinEffectKind, ChorusProcessor, CompressorProcessor, DelayProcessor, EffectDescriptor,
+    EffectMeters, EqProcessor, FlangerProcessor, ParamId, ParamSpec, Processor, ReverbProcessor,
+    Unit, chorus, compressor, delay, eq, flanger, reverb,
 };
 use glitcherz_model::{BuiltinEffectKind as DocEffectKind, EffectParams};
 
@@ -31,6 +32,9 @@ pub fn engine_kind(params: &EffectParams) -> BuiltinEffectKind {
         DocEffectKind::Delay => BuiltinEffectKind::Delay,
         DocEffectKind::Eq => BuiltinEffectKind::Eq,
         DocEffectKind::Compressor => BuiltinEffectKind::Compressor,
+        DocEffectKind::Reverb => BuiltinEffectKind::Reverb,
+        DocEffectKind::Chorus => BuiltinEffectKind::Chorus,
+        DocEffectKind::Flanger => BuiltinEffectKind::Flanger,
     }
 }
 
@@ -45,6 +49,9 @@ pub fn default_params(kind: DocEffectKind) -> EffectParams {
         DocEffectKind::Delay => EffectParams::Delay(glitcherz_model::DelayParams::default()),
         DocEffectKind::Eq => EffectParams::Eq(Box::default()),
         DocEffectKind::Compressor => EffectParams::Compressor(Box::default()),
+        DocEffectKind::Reverb => EffectParams::Reverb(Box::default()),
+        DocEffectKind::Chorus => EffectParams::Chorus(Box::default()),
+        DocEffectKind::Flanger => EffectParams::Flanger(Box::default()),
     }
 }
 
@@ -65,6 +72,9 @@ pub fn processor(params: &EffectParams, sample_rate: f32) -> BuiltinProcessor {
             meters = Some(handle.clone());
             Box::new(CompressorProcessor::with_meters(sample_rate, Some(handle)))
         }
+        BuiltinEffectKind::Reverb => Box::new(ReverbProcessor::new(sample_rate)),
+        BuiltinEffectKind::Chorus => Box::new(ChorusProcessor::new(sample_rate)),
+        BuiltinEffectKind::Flanger => Box::new(FlangerProcessor::new(sample_rate)),
     };
     let descriptor = descriptor(params);
     for slot in 0..descriptor.params.len() {
@@ -81,6 +91,9 @@ pub fn value(params: &EffectParams, slot: u8) -> f32 {
             delay::SLOT_TIME => delay.time_s,
             delay::SLOT_FEEDBACK => delay.feedback,
             delay::SLOT_MIX => delay.mix,
+            delay::SLOT_PING_PONG => bool_value(delay.ping_pong),
+            delay::SLOT_SYNC => bool_value(delay.sync),
+            delay::SLOT_DIVISION => delay.sync_division as f32,
             _ => 0.0,
         },
         EffectParams::Eq(eq) => match slot {
@@ -105,6 +118,30 @@ pub fn value(params: &EffectParams, slot: u8) -> f32 {
             compressor::SLOT_LINK => bool_value(comp.stereo_link),
             _ => 0.0,
         },
+        EffectParams::Reverb(rev) => match slot {
+            reverb::SLOT_PRE_DELAY => rev.pre_delay,
+            reverb::SLOT_DECAY => rev.decay,
+            reverb::SLOT_DAMPING => rev.damping,
+            reverb::SLOT_LOW_CUT => rev.low_cut,
+            reverb::SLOT_WIDTH => rev.width,
+            reverb::SLOT_MIX => rev.mix,
+            _ => 0.0,
+        },
+        EffectParams::Chorus(ch) => match slot {
+            chorus::SLOT_RATE => ch.rate,
+            chorus::SLOT_DEPTH => ch.depth,
+            chorus::SLOT_WIDTH => ch.width,
+            chorus::SLOT_MIX => ch.mix,
+            _ => 0.0,
+        },
+        EffectParams::Flanger(fl) => match slot {
+            flanger::SLOT_RATE => fl.rate,
+            flanger::SLOT_DEPTH => fl.depth,
+            flanger::SLOT_FEEDBACK => fl.feedback,
+            flanger::SLOT_WIDTH => fl.width,
+            flanger::SLOT_MIX => fl.mix,
+            _ => 0.0,
+        },
     }
 }
 
@@ -115,6 +152,9 @@ pub fn set_value(params: &mut EffectParams, slot: u8, value: f32) {
             delay::SLOT_TIME => delay.time_s = value,
             delay::SLOT_FEEDBACK => delay.feedback = value,
             delay::SLOT_MIX => delay.mix = value,
+            delay::SLOT_PING_PONG => delay.ping_pong = value >= 0.5,
+            delay::SLOT_SYNC => delay.sync = value >= 0.5,
+            delay::SLOT_DIVISION => delay.sync_division = value.round().clamp(0.0, 7.0) as u8,
             _ => {}
         },
         EffectParams::Eq(eq) => match slot {
@@ -137,6 +177,30 @@ pub fn set_value(params: &mut EffectParams, slot: u8, value: f32) {
             compressor::SLOT_MAKEUP => comp.makeup = value,
             compressor::SLOT_MIX => comp.mix = value,
             compressor::SLOT_LINK => comp.stereo_link = value >= 0.5,
+            _ => {}
+        },
+        EffectParams::Reverb(rev) => match slot {
+            reverb::SLOT_PRE_DELAY => rev.pre_delay = value,
+            reverb::SLOT_DECAY => rev.decay = value,
+            reverb::SLOT_DAMPING => rev.damping = value,
+            reverb::SLOT_LOW_CUT => rev.low_cut = value,
+            reverb::SLOT_WIDTH => rev.width = value,
+            reverb::SLOT_MIX => rev.mix = value,
+            _ => {}
+        },
+        EffectParams::Chorus(ch) => match slot {
+            chorus::SLOT_RATE => ch.rate = value,
+            chorus::SLOT_DEPTH => ch.depth = value,
+            chorus::SLOT_WIDTH => ch.width = value,
+            chorus::SLOT_MIX => ch.mix = value,
+            _ => {}
+        },
+        EffectParams::Flanger(fl) => match slot {
+            flanger::SLOT_RATE => fl.rate = value,
+            flanger::SLOT_DEPTH => fl.depth = value,
+            flanger::SLOT_FEEDBACK => fl.feedback = value,
+            flanger::SLOT_WIDTH => fl.width = value,
+            flanger::SLOT_MIX => fl.mix = value,
             _ => {}
         },
     }
@@ -172,9 +236,20 @@ pub fn format_value(spec: &ParamSpec, value: f32) -> String {
         Unit::Pan if value.abs() < 0.005 => "C".to_string(),
         Unit::Pan if value < 0.0 => format!("L{:.0}", -value * 100.0),
         Unit::Pan => format!("R{:.0}", value * 100.0),
+        Unit::Enum => enum_label(spec.choices, value),
         Unit::Bool if value >= 0.5 => "On".to_string(),
         Unit::Bool => "Off".to_string(),
     }
+}
+
+/// Label of an [`Unit::Enum`] value (out-of-range falls back to `"-"`).
+fn enum_label(choices: &[&str], value: f32) -> String {
+    let index = if value.is_finite() {
+        value.round().max(0.0) as usize
+    } else {
+        0
+    };
+    choices.get(index).copied().unwrap_or("-").to_string()
 }
 
 #[cfg(test)]
@@ -192,6 +267,7 @@ mod tests {
             time_s: 0.25,
             feedback: 0.5,
             mix: 0.75,
+            ..Default::default()
         })
     }
 
@@ -277,6 +353,30 @@ mod tests {
             .spec(compressor::SLOT_ATTACK)
             .unwrap();
         assert_eq!(format_value(attack, 10.0), "10.0 ms");
+    }
+
+    #[test]
+    fn enum_values_format_with_their_labels() {
+        let params = default_params(DocEffectKind::Delay);
+        let spec = descriptor(&params).spec(delay::SLOT_DIVISION).unwrap();
+        assert_eq!(format_value(spec, 0.0), "1/1");
+        assert_eq!(format_value(spec, 2.0), "1/4");
+        assert_eq!(format_value(spec, 7.0), "1/8D");
+        assert_eq!(format_value(spec, 99.0), "-", "out-of-range falls back");
+    }
+
+    #[test]
+    fn delay_stereo_and_sync_slots_round_trip() {
+        let mut params = default_params(DocEffectKind::Delay);
+        set_value(&mut params, delay::SLOT_PING_PONG, 1.0);
+        set_value(&mut params, delay::SLOT_SYNC, 1.0);
+        set_value(&mut params, delay::SLOT_DIVISION, 3.0);
+        assert_eq!(value(&params, delay::SLOT_PING_PONG), 1.0);
+        assert_eq!(value(&params, delay::SLOT_SYNC), 1.0);
+        assert_eq!(value(&params, delay::SLOT_DIVISION), 3.0);
+        let delay_params = params.as_delay().unwrap();
+        assert!(delay_params.ping_pong && delay_params.sync);
+        assert_eq!(delay_params.sync_division, 3);
     }
 
     /// Guards the one thing that would silently drift: the document defaults

@@ -334,8 +334,8 @@ Master Limiter（前视，要吃 D16 的 `latency_samples`，并需要 PDC）。
   - [x] UI：`effect::processor()` 按种类构造并**用文档值预置全部槽位**（首次 process 前吸附，无淡入）；
         4 处硬编码 `DelayProcessor` 构造点全部改为 kind-aware；Inspector 加 GR 条
   - [x] `tests/effect_rt_audit.rs`：Eq / Compressor / Delay / meters 的 `set_param`+`process` 零分配
-- [ ] **E3** Reverb（FDN-8）
-- [ ] **E4** `ModDelay` 核心 → Chorus / Flanger；`DelayProcessor` 升级 ping-pong + tempo-sync
+- [x] **E3** Reverb（FDN-8）
+- [x] **E4** `ModDelay` 核心 → Chorus / Flanger；`DelayProcessor` 升级 ping-pong + tempo-sync
 - [ ] **E5（可选）** Saturation（过采样）/ Bitcrusher / Phaser / Limiter + PDC
 
 ### 落地时必须核对的 UI 触点
@@ -415,5 +415,38 @@ Master Limiter（前视，要吃 D16 的 `latency_samples`，并需要 PDC）。
 | 8 | GR 表 | 未规定表内语义 | `gr_db` 存**本块内最负**的 GR（UI 取反显示为压了多少 dB）；`peak_l/r` 存本块输出峰值 | 峰值保持比"最后一块的瞬时值"更接近硬件表头，也更容易断言 |
 | 9 | 立体声联动 | 未规定非联动时的表头 | 联动时只有 `gr[0]` 有意义，表头读它 | 非联动是诊断场景；表头显示两声道中最需要关注的那个，避免加第二个表 |
 | 10 | rt_audit | §11 要求零分配 | 单独 `tests/effect_rt_audit.rs`，**合成一个测试函数** | 计数分配器是全局的，测试运行器并行跑多个测试函数时，别人的簿记分配会落进本测试的计数窗口（已实测：并行必挂、`--test-threads=1` 才过）。合成单测试 = 只有一个工作线程，稳定 |
+
+## 16. 实施勘误（E3）
+
+| # | 位置 | 规格原样 | 实际做法 | 原因 |
+| :-- | :-- | :-- | :-- | :-- |
+| 1 | 默认值 | §8 E3 表未列默认 | `pre_delay = 0`、`decay = 2.0`、`damping = 0.5`、`low_cut = 20`（最低 = 近似关闭）、`width = 1.0`、`mix = 0.3` | `mix = 0.3` 让插入混响立刻可闻（与 Delay 的 `mix = 0` 保守默认不同——Delay 是历史迁移值）；文档默认与 descriptor 默认由 `model_defaults_match_the_engine_descriptors` 测试锁定 |
+| 2 | inline 行 | 未规定 | `decay` / `damping` / `mix` 三个槽标 `INLINE`（`pre_delay` / `low_cut` / `width` 仅 Inspector） | 与 E2 的「节点只放最能塑形的少数参数」一致，避免画布节点膨胀 |
+| 3 | `pre_delay` 曲线 | 表写 Linear / 20 ms / Block | 用模块内 `block_spec` 常量构造（Linear 域、Block 速率），不是 `ParamSpec::time`（后者是 Log 域） | pre-delay 的「等步长」听感是线性毫秒，不是等比例；沿用 §6 表的曲线列 |
+| 4 | 延迟线长度 | 「20–70 ms 互质样本数」 | 固定 8 个非谐和毫秒基准（21.1…65.1 ms），按采样率取整为样本 | 互质样本数在不同采样率下无法同时成立；非谐和的毫秒比例足够打散模态，`feed_lines_are_mutually_non_harmonic_and_allocated` 锁定 8 条长度互异 |
+| 5 | 阻尼 + 低切位置 | 「每线一阶阻尼 + 低切」 | 两者都放**反馈环内**（每条线读出口先 one-pole 阻尼、再一阶 TPT 高通），不是输出级滤波 | 输出级滤波无法阻止低频在环内堆积；环内滤波让尾音自然失去高频与低频 |
+| 6 | `width` 数学 | 「立体声展开度」 | 网络前 4 线收 L、后 4 线收 R，输出按 `mid ± width·side` 重组；`width = 0` 两声道逐样本相等 | 单套参数 + 展开度语义，与 §7 表「Reverb = Mono」一致；`width_zero_collapses_to_mono` 锁定 |
+| 7 | Hadamard 实现 | 「Hadamard 反馈矩阵」 | 快速蝶形变换（O(n log n)）+ `1/√8` 归一化，非 8×8 矩阵乘 | 环内逐样本，蝶形少 7/8 的乘加；归一化保证 `H·Hᵀ = I`、网络对任何 `g < 1` 稳定（`hadamard_is_orthonormal` 锁定） |
+| 8 | `pre_delay` 缓冲 | 「pre-delay 200 ms 两级」 | 左右各一条 200 ms 环形缓冲（两级 = 两声道），块率整数样本读位置 | 独立两通道 pre-delay 是立体声所需的「两级」；块率跳读即 spec §6 表对时间类参数的既定取舍 |
+| 9 | 版本号 | —— | **不变**（`PROJECT_VERSION` 仍 8） | 新 kind 是纯 tag 增量（与 E2 同），旧文件无 `reverb` 字段不受影响 |
+| 10 | `rt_audit` | §11 要求零分配 | 追加 `ReverbProcessor` 到既有单测试 | 同 §15 第 10 条：计数分配器全局，必须合成单测试 |
+
+## 17. 实施勘误（E4）
+
+E4 分两批落地：**E4a** Chorus / Flanger（ModDelay 核心），**E4b** Delay 升级 ping-pong + tempo-sync。
+
+| # | 位置 | 规格原样 | 实际做法 | 原因 |
+| :-- | :-- | :-- | :-- | :-- |
+| 1 | `Unit` | 列表无「枚举」 | 新增 `Unit::Enum` + `ParamSpec.choices: &'static [&'static str]` 字段 + `ParamSpec::enumeration(name, choices, default_index)` 构造器；`validate_descriptor` 要求 `Enum` 至少两个选项；UI 对 `Enum` 走 `ComboBox`（`effect_sliders`），`format_value` 显示选项标签 | tempo-sync 需要「音符时值」多档离散选择；规格 §5 的 `Unit` 列表未预见（`Bool` 只能表达开关）。框架级扩展，其他效果器（如未来 filter mode）可复用 |
+| 2 | ModDelay 核心 | 「≤4 个读抽头、分数延迟…正弦 LFO」 | 抽头数随效果定：Chorus 每声道 2 抽头、Flanger 每声道 1 抽头；LFO 用归一化相位 + `sin(2πφ)`，**不用**多抽头抽象（两效果各内联自己的读法） | 抽头布局是每个效果的语义（中心/摆动/相位偏移不同），过度抽象反而难读；共享的只有 `ModDelayLine`（分数读）+ `Lfo` |
+| 3 | Chorus 参数 | 「中心延迟 12–30 ms 双抽头」 | 中心 21 ms、`depth` 调制 ±9 ms（`depth=1` → 12..30 ms）；第二抽头相位偏移 `0.37` 周期；rate Log/Block、depth/width/mix Linear/Sample（同 §6 表） | 取区间中点 + 对称摆动；非 0.5 的抽头相位差让立体声更宽，避免对称抵消 |
+| 4 | Flanger 参数 | 「中心 0.5–5 ms、单抽头 + 反馈」 | 中心 2.75 ms、`depth` 调制 ±2.25 ms（`depth=1` → 0.5..5 ms）；`feedback` 限 `±0.95`（spec 已定）；`mix` 默认 0.5 | 同上取中点 + 对称摆动；反馈留 5 % 余量（spec E4 原文） |
+| 5 | `width` 语义 | 「L/R 相位差由 width 决定」 | 右声道 LFO 相位 = 左 + `width·0.5` 周期；`width=0` 两声道逐样本相等，`width=1` 最大去相关 | 0.5 周期是「全立体声」的通行值；两效果 `width_zero_*` 测试锁定 |
+| 6 | ping-pong 实现 | 「Delay 升级 ping-pong」（无细节） | 交叉**输入** + 交叉**反馈**写（`write_l = in_r + fb·wet_r`、`write_r = in_l + fb·wet_l`），输出仍取本侧 tap。左脉冲首回声落**右**声道，然后 L→R→L 交替 | 只有交叉反馈会让首回声留在原侧；交叉输入才实现「首回声对侧」的经典 ping-pong 听感（`ping_pong_starts_on_the_opposite_channel` 锁定） |
+| 7 | tempo-sync | 「tempo-sync」（无细节） | `sync` 开时 delay 秒数 = `division_ticks · ctx.sec_per_tick`；`division` 为 8 档（1/1…1/8D，`TICKS_PER_QUARTER` 派生）；`sec_per_tick` 取 `ProcessContext` 的 base tempo 常量 | `ProcessContext` 已携带 `sec_per_tick`（U11 D2）；跟随 base tempo 而非 tempo 曲线，与 audio clip 一致（spec `audio-track` 取舍） |
+| 8 | Delay 缓冲 | 原 `MAX_DELAY_S = 1.0` 缓冲 | `time` 滑块上限仍 1.0 s，但**环形缓冲扩到 4 s**（`MAX_BUFFER_S`），给慢 tempo 的同步时值留空间；超出截断到 4 s | 1/1 @ 60 BPM 需 4 s；缓冲是构造期一次性分配，扩大无 RT 代价 |
+| 9 | 版本号 | —— | **不变**（`PROJECT_VERSION` 仍 8） | `Chorus`/`Flanger` 是纯 tag 增量；`DelayParams` 新增的 `ping_pong`/`sync`/`sync_division` 用 `serde(default)`（default 与 descriptor 一致：division 索引 2 = 1/4），旧文件无感加载 |
+| 10 | 默认值 | §8 E4 表未列默认 | Chorus：rate 1.0、depth 0.5、width 0.5、mix 0.5；Flanger：rate 0.5、depth 0.7、feedback 0.5、width 0.5、mix 0.5；Delay `sync_division` 默认 2（1/4） | 与 E3 同 `model_defaults_match_the_engine_descriptors` 锁定 |
+| 11 | `rt_audit` | §11 要求零分配 | 追加 `ChorusProcessor` / `FlangerProcessor` 到既有单测试 | 同 §15/§16 第 10 条：计数分配器全局，必须合成单测试 |
 
 

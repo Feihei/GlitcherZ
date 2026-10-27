@@ -264,8 +264,8 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
   - 落地细节与规格差异见 spec `effects.md` §14 实施勘误（`Unit::Seconds`、f32 平滑停滞保护、`delay_samples` 取整、图级测试需先沉降平滑）
 - [x] **E2** EQ-3（复用 `svf.rs` TPT，含低切）+ Compressor（前馈峰值 + 软拐点 + GR 表；`StereoClass::Linkable`，联动取 `max(|L|,|R|)`）
   - 落地细节见 spec `effects.md` §15 实施勘误（`ParamFlags::INLINE`、低切旁通恒积分、一阶架式斜率、rt_audit 合成单测试）
-- [ ] **E3** Reverb（FDN-8 + 阻尼 + pre-delay，不用 Freeverb）
-- [ ] **E4** `ModDelay` 核心 → Chorus / Flanger；Delay 升级 ping-pong + tempo-sync
+- [x] **E3** Reverb（FDN-8 + 阻尼 + pre-delay，不用 Freeverb）✅ 2026-10-27：`realtime/reverb.rs`（8 条非谐和延迟线 + 快速 Hadamard 蝶形反馈 + 环内逐线 one-pole 阻尼 / 一阶 TPT 低切 + 左右两条 200 ms pre-delay + `width` 立体声重组；反馈增益由 RT60 反解，构造期一次分配）；engine `BuiltinEffectKind::Reverb` + descriptor；model `ReverbParams` + `EffectParams::Reverb`（无版本变更，纯 tag 增量）；UI `effect.rs` 桥接；12 项单测 + `effect_rt_audit` 追加零分配。落地细节见 spec `effects.md` §16 实施勘误。全仓 fmt/clippy/test 绿
+- [x] **E4** `ModDelay` 核心 → Chorus / Flanger；Delay 升级 ping-pong + tempo-sync ✅ 2026-10-27：`realtime/mod_delay.rs`（分数延迟线 + 线性插值 + 正弦 LFO + `sampler` 参数助手）；`realtime/chorus.rs`（21 ms 中心双抽头，±9 ms 扫 12–30 ms，无反馈）+ `realtime/flanger.rs`（2.75 ms 中心单抽头，±2.25 ms 扫 0.5–5 ms，feedback ±0.95）；`DelayProcessor` 加 `ping_pong`（交叉馈送，首回声落对侧）+ `sync`/`division`（8 档音符时值 × `sec_per_tick`，缓冲扩到 4 s）；框架新增 `Unit::Enum` + `ParamSpec::choices`/`enumeration`（离散多档，UI 走 ComboBox）。model `ChorusParams`/`FlangerParams` + `EffectParams::{Chorus,Flanger}`；`DelayParams` 加 3 字段（serde default，无版本变更）。落地细节见 spec `effects.md` §17。全仓 fmt/clippy/test 绿
 - [ ] **E5（可选）** Saturation（过采样）/ Bitcrusher / Phaser / Limiter + PDC
 
 明确不做：Echo 节点（Delay 即回声）、Gain 节点（通道条已是增益级）、每效果 sidechain。

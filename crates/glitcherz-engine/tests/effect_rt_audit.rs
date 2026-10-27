@@ -26,7 +26,10 @@ use glitcherz_engine::realtime::buffer::AudioBuffer;
 use glitcherz_engine::realtime::commands::ParamId;
 use glitcherz_engine::realtime::context::ProcessContext;
 use glitcherz_engine::realtime::processor::Processor;
-use glitcherz_engine::realtime::{CompressorProcessor, DelayProcessor, EffectMeters, EqProcessor};
+use glitcherz_engine::realtime::{
+    ChorusProcessor, CompressorProcessor, DelayProcessor, EffectMeters, EqProcessor,
+    FlangerProcessor, ReverbProcessor,
+};
 
 // ---------------------------------------------------------------------------
 // Counting allocator
@@ -181,6 +184,31 @@ fn built_in_effects_are_allocation_free() {
     let scope = AuditScope::begin();
     exercise(&mut delay, &mut delay_buffer, 64);
     assert_zero_alloc(&scope, "DelayProcessor process/set_param");
+
+    // Reverb: the FDN runs feedback, filters and the Hadamard matrix per
+    // sample; it must stay allocation-free.
+    let mut reverb = ReverbProcessor::new(SR);
+    let mut reverb_buffer = fixture();
+    exercise(&mut reverb, &mut reverb_buffer, 2);
+    let scope = AuditScope::begin();
+    exercise(&mut reverb, &mut reverb_buffer, 64);
+    assert_zero_alloc(&scope, "ReverbProcessor process/set_param");
+
+    // Chorus / Flanger: fractional reads and (for the flanger) feedback every
+    // sample; both must stay allocation-free.
+    let mut chorus = ChorusProcessor::new(SR);
+    let mut chorus_buffer = fixture();
+    exercise(&mut chorus, &mut chorus_buffer, 2);
+    let scope = AuditScope::begin();
+    exercise(&mut chorus, &mut chorus_buffer, 64);
+    assert_zero_alloc(&scope, "ChorusProcessor process/set_param");
+
+    let mut flanger = FlangerProcessor::new(SR);
+    let mut flanger_buffer = fixture();
+    exercise(&mut flanger, &mut flanger_buffer, 2);
+    let scope = AuditScope::begin();
+    exercise(&mut flanger, &mut flanger_buffer, 64);
+    assert_zero_alloc(&scope, "FlangerProcessor process/set_param");
 
     // The meter handle itself is written from the audio thread.
     let meters = EffectMeters::new();

@@ -35,6 +35,8 @@ pub enum Unit {
     Pan,
     /// Discrete 0 / 1 (on/off).
     Bool,
+    /// Discrete choice: the value is an index into [`ParamSpec::choices`].
+    Enum,
 }
 
 /// Value curve: the UI slider axis **and** the domain the smoother works in.
@@ -111,6 +113,8 @@ pub struct ParamSpec {
     pub rate: Rate,
     /// Optional properties.
     pub flags: ParamFlags,
+    /// Labels for [`Unit::Enum`] parameters; empty for every other unit.
+    pub choices: &'static [&'static str],
 }
 
 impl ParamSpec {
@@ -127,6 +131,7 @@ impl ParamSpec {
             smoothing_ms: 10.0,
             rate: Rate::Sample,
             flags: ParamFlags::AUTOMATABLE,
+            choices: &[],
         }
     }
 
@@ -143,6 +148,7 @@ impl ParamSpec {
             smoothing_ms: 15.0,
             rate: Rate::Sample,
             flags: ParamFlags::AUTOMATABLE,
+            choices: &[],
         }
     }
 
@@ -174,6 +180,7 @@ impl ParamSpec {
             smoothing_ms: 15.0,
             rate: Rate::Block,
             flags: ParamFlags::AUTOMATABLE,
+            choices: &[],
         }
     }
 
@@ -190,6 +197,7 @@ impl ParamSpec {
             smoothing_ms: 20.0,
             rate: Rate::Block,
             flags: ParamFlags::AUTOMATABLE,
+            choices: &[],
         }
     }
 
@@ -210,6 +218,7 @@ impl ParamSpec {
             smoothing_ms: 20.0,
             rate: Rate::Block,
             flags: ParamFlags::AUTOMATABLE,
+            choices: &[],
         }
     }
 
@@ -226,6 +235,7 @@ impl ParamSpec {
             smoothing_ms: 20.0,
             rate: Rate::Block,
             flags: ParamFlags::AUTOMATABLE,
+            choices: &[],
         }
     }
 
@@ -242,6 +252,7 @@ impl ParamSpec {
             smoothing_ms: 20.0,
             rate: Rate::Block,
             flags: ParamFlags::AUTOMATABLE,
+            choices: &[],
         }
     }
 
@@ -258,6 +269,7 @@ impl ParamSpec {
             smoothing_ms: 0.0,
             rate: Rate::Block,
             flags: ParamFlags::NONE,
+            choices: &[],
         }
     }
 
@@ -268,9 +280,31 @@ impl ParamSpec {
         spec
     }
 
+    /// Discrete choice: value is the index into `choices` (snaps at the block
+    /// boundary, never an automation target — spec §12).
+    pub const fn enumeration(
+        name: &'static str,
+        choices: &'static [&'static str],
+        default_index: u8,
+    ) -> Self {
+        Self {
+            name,
+            short: name,
+            unit: Unit::Enum,
+            min: 0.0,
+            max: choices.len().saturating_sub(1) as f32,
+            default: default_index as f32,
+            curve: Curve::Linear,
+            smoothing_ms: 0.0,
+            rate: Rate::Block,
+            flags: ParamFlags::NONE,
+            choices,
+        }
+    }
+
     /// Whether this parameter is discrete (no interpolation).
     pub const fn is_discrete(&self) -> bool {
-        matches!(self.unit, Unit::Bool) || self.smoothing_ms <= 0.0
+        matches!(self.unit, Unit::Bool | Unit::Enum) || self.smoothing_ms <= 0.0
     }
 
     /// Whether this parameter may appear in the automation target list.
@@ -407,7 +441,14 @@ pub fn validate_descriptor(descriptor: &EffectDescriptor) -> Result<(), String> 
                 descriptor.name, spec.name
             ));
         }
-        if spec.unit != Unit::Bool && discrete {
+        if spec.unit == Unit::Enum {
+            if spec.choices.len() < 2 {
+                return Err(format!(
+                    "{}: slot {slot} ({}) is an enum but has fewer than two choices",
+                    descriptor.name, spec.name
+                ));
+            }
+        } else if spec.unit != Unit::Bool && discrete {
             return Err(format!(
                 "{}: slot {slot} ({}) is continuous but has no smoothing",
                 descriptor.name, spec.name
