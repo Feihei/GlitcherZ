@@ -44,7 +44,7 @@
 use eframe::egui;
 
 use crate::grid::GridValue;
-use glitcherz_model::{MidiClip, MidiTrack, Note, TICKS_PER_QUARTER, TICKS_PER_STEP};
+use glitcherz_model::{ControlClip, MidiClip, MidiTrack, Note, TICKS_PER_QUARTER, TICKS_PER_STEP};
 
 pub use crate::grid::NoteValue;
 
@@ -62,6 +62,25 @@ pub const ROLL_HEIGHT: f32 = ROW_HEIGHT * 32.0;
 /// Velocity lane height (pixels), below the roll.
 pub const LANE_HEIGHT: f32 = 48.0;
 
+/// Height of one overlay curve lane (pixels), stacked under the velocity
+/// lane. Taller than the velocity strip because it carries a real value axis
+/// the user drags within.
+pub const CURVE_LANE_HEIGHT: f32 = 64.0;
+
+/// Anchor hit radius (px) inside a curve lane.
+const ANCHOR_RADIUS: f32 = 8.0;
+
+/// Height of a collapsed curve lane: just its caption strip (P5).
+pub const CURVE_LANE_COLLAPSED_HEIGHT: f32 = 18.0;
+
+/// Side of the collapse/expand toggle square in a lane's caption.
+const LANE_TOGGLE: f32 = 12.0;
+
+/// Overlay-lane curve stroke and anchor colour: cool blue, distinct from the
+/// green notes and the yellow playhead so a curve never reads as a selection.
+const CURVE_LINE: egui::Color32 = egui::Color32::from_rgb(110, 170, 235);
+const ANCHOR: egui::Color32 = egui::Color32::from_rgb(190, 220, 255);
+
 /// Horizontal zoom bounds (multiplier over the fit-to-width scale; 1.0 shows
 /// the whole loop).
 const ZOOM_X_MIN: f32 = 0.2;
@@ -77,9 +96,6 @@ const DEFAULT_NOTE_LENGTH: i64 = TICKS_PER_STEP as i64;
 /// Accent color for selected notes / velocity bars.
 const SELECTED: egui::Color32 = egui::Color32::from_rgb(240, 190, 80);
 
-/// Ghost clip notes: the focus clip's note colour at ~22% alpha (P3, D6).
-/// Deliberately *not* velocity-shaded — a ghost answers "what else is around
-/// here", not "how loud is it".
 /// Ghost clip notes: the focus clip's note colour at ~22% alpha, premultiplied
 /// so this can stay a `const` (P3, D6). Deliberately *not* velocity-shaded — a
 /// ghost answers "what else is around here", not "how loud is it".
@@ -188,6 +204,26 @@ pub enum RollIntent {
     DeleteNotes { indices: Vec<usize> },
     /// Set absolute velocities (index, velocity) pairs.
     SetVelocities { updates: Vec<(usize, u8)> },
+    /// One frame of an overlay-lane anchor edit (P4, D16): upsert `tick` (clip
+    /// relative) at `value`, first removing the anchor at `from` when the drag
+    /// is moving one. `dragging` selects the merged undo gesture, exactly like
+    /// the standalone curve editor — one drag, one Ctrl+Z.
+    CurveUpsert {
+        track: usize,
+        clip: usize,
+        from: Option<u32>,
+        tick: u32,
+        value: f32,
+        dragging: bool,
+    },
+    /// Delete the nearest anchor within half a snap step of `tick`.
+    CurveRemove {
+        track: usize,
+        clip: usize,
+        tick: u32,
+    },
+    /// The lane drag ended: close the merged undo gesture.
+    CurveDragEnd,
 }
 
 /// Which table a [`ClipRef`] points into (P3, spec `roll-multiclip.md` D4).
@@ -196,6 +232,42 @@ pub enum RollIntent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RollLane {
     Midi,
+    /// An automation (control) clip: its curve gets an overlay lane below the
+    /// roll (P4, spec `roll-multiclip.md` D8/D16).
+    Control,
+}
+
+/// One curve lane drawn under the roll (P4, D8).
+///
+/// The roll stays ignorant of cables and parameters: the caller resolves the
+/// vertical axis from the clip's automation destination (`curve::axis`) and
+/// supplies a caption. What the roll owns is the **time axis**, which is the
+/// same [`RollGeom`] the notes use — that is the whole point of the feature
+/// (a pitch curve lining up with the notes it bends).
+pub struct OverlayLane<'a> {
+    /// The control clip this lane edits. Writing targets this clip and only
+    /// this clip (D16: the roll writes notes, lanes write curves).
+    pub clip: ClipRef,
+    /// The clip's curve, borrowed for this frame.
+    pub data: &'a ControlClip,
+    /// Vertical axis `(min, max, log)` from the automation destination.
+    pub axis: (f32, f32, bool),
+    /// Caption drawn in the lane's top-left corner.
+    pub label: String,
+}
+
+impl OverlayLane<'_> {
+    fn value_to_y(&self, value: f32, rect: egui::Rect) -> f32 {
+        let (min, max, log) = self.axis;
+        let norm = crate::curve::to_norm(value, min, max, log);
+        rect.bottom() - norm * rect.height()
+    }
+
+    fn y_to_value(&self, y: f32, rect: egui::Rect) -> f32 {
+        let (min, max, log) = self.axis;
+        let norm = ((rect.bottom() - y) / rect.height().max(1.0)).clamp(0.0, 1.0);
+        crate::curve::from_norm(norm, min, max, log)
+    }
 }
 
 /// One clip addressed inside the project tables — the roll's unit of context.
@@ -211,6 +283,15 @@ impl ClipRef {
     pub fn midi(track: usize, clip: usize) -> Self {
         Self {
             lane: RollLane::Midi,
+            track,
+            clip,
+        }
+    }
+
+    /// A control clip at `(track, clip)` — P4: shown as an overlay lane.
+    pub fn control(track: usize, clip: usize) -> Self {
+        Self {
+            lane: RollLane::Control,
             track,
             clip,
         }
@@ -252,8 +333,19 @@ impl RollSubject {
     ///
     /// `clips` is the number of MIDI clips per track, used to drop stale
     /// entries (a selection outlives a clip deletion).
-    pub fn assemble(focus: ClipRef, selection: &[ClipRef], clips: impl Fn(usize) -> usize) -> Self {
-        let live = |c: &ClipRef| matches!(c.lane, RollLane::Midi) && c.clip < clips(c.track);
+    pub fn assemble(
+        focus: ClipRef,
+        selection: &[ClipRef],
+        midi_clips: impl Fn(usize) -> usize,
+        control_clips: impl Fn(usize) -> usize,
+    ) -> Self {
+        // P4: a control clip joins the context as an overlay lane. `live`
+        // asks each table for its clip count, so a selection that outlived a
+        // deleted clip is dropped instead of pointing at a stranger's clip.
+        let live = |c: &ClipRef| match c.lane {
+            RollLane::Midi => c.clip < midi_clips(c.track),
+            RollLane::Control => c.clip < control_clips(c.track),
+        };
         let mut context: Vec<ClipRef> = Vec::with_capacity(MAX_ROLL_CONTEXT);
         context.push(focus);
         let mut dropped = 0;
@@ -385,6 +477,18 @@ pub struct RollState {
     /// Monotonic id for press-draw gestures: each draw (AddNote + its
     /// ResizeEnd frames) becomes one undo step.
     draw_seq: u64,
+    /// In-flight overlay-lane anchor drag (P4): `(lane index, the anchor it
+    /// grabbed)`. `None` inside the tuple means the press **created** the
+    /// anchor, so subsequent frames only move it.
+    curve_drag: Option<(usize, Option<u32>)>,
+    /// Screen rect of each overlay lane, in the order they were handed to
+    /// [`show`]. Published so callers (and tests) can map pointer positions
+    /// onto a lane without re-deriving the stack geometry.
+    pub lane_rects: Vec<egui::Rect>,
+    /// Control **track** indices whose overlay lane is collapsed to its
+    /// caption (P5). Sorted, view-state only — collapsing is not a document
+    /// edit and never enters undo.
+    pub collapsed_lanes: Vec<usize>,
 }
 
 /// Persistent mode: what a left-drag on the roll means (M4).
@@ -797,6 +901,9 @@ impl RollState {
             knife: None,
             awaiting_create: None,
             draw_seq: 0,
+            curve_drag: None,
+            lane_rects: Vec::new(),
+            collapsed_lanes: Vec::new(),
         }
     }
 
@@ -853,6 +960,7 @@ impl RollState {
         self.modal = None;
         self.knife = None;
         self.knife_armed = false;
+        self.curve_drag = None;
         self.selection.clear();
     }
 
@@ -1074,6 +1182,15 @@ impl ViewWindow {
         }
     }
 
+    /// Widens the window by one more clip's occupied ticks (P4: an overlay
+    /// lane may sit outside every MIDI clip, and the first frame must show it).
+    fn union(self, start: f32, end: f32) -> Self {
+        Self {
+            start: self.start.min(start),
+            end: self.end.max(end),
+        }
+    }
+
     /// Clamps the left-edge tick so the window stays inside `[start, end]`. A
     /// window wider than the range (zoomed past fit) pins to `start`, which is
     /// the existing "zoom out shows the whole clip, no blank on the left"
@@ -1089,18 +1206,22 @@ impl ViewWindow {
 fn track_clip(tracks: &[MidiTrack], clip: ClipRef) -> Option<&MidiClip> {
     match clip.lane {
         RollLane::Midi => tracks.get(clip.track)?.clips.get(clip.clip),
+        // A control clip is not a MIDI clip: the roll never asks for one here
+        // (the focus is always MIDI; control clips only feed overlay lanes).
+        RollLane::Control => None,
     }
 }
 
-/// Draw one frame of the roll + velocity lane and return the edit the gesture
-/// produced (at most one per frame).
-// Eight arguments is the component's public surface (document table, subject,
-// state, transport readout, meter, focus router); bundling the three scalars
-// into a struct would only move the count, not reduce it.
+/// Draw one frame of the roll + velocity lane + overlay curve lanes and return
+/// the edit the gesture produced (at most one per frame).
+// Nine arguments is the component's public surface (document table, overlay
+// lanes, subject, state, transport readout, meter, focus router); bundling the
+// scalars into a struct would only move the count, not reduce it.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
     tracks: &[MidiTrack],
+    lanes: &[OverlayLane<'_>],
     subject: &RollSubject,
     state: &mut RollState,
     playhead_ticks: f32,
@@ -1115,7 +1236,15 @@ pub fn show(
     // (`roll-multiclip.md` D2/D3). With one clip both degenerate to exactly
     // the P2 behaviour.
     let origin_tick = i64::from(clip.start_ticks);
-    let window = ViewWindow::of(tracks, subject);
+    // P4: overlay lanes may extend past every MIDI clip, so the view window
+    // (and therefore the fit scale) has to cover them too.
+    let window = lanes
+        .iter()
+        .fold(ViewWindow::of(tracks, subject), |window, lane| {
+            let start = lane.data.start_ticks as f32;
+            let span = lane.data.loop_ticks.max(TICKS_PER_STEP) as f32;
+            window.union(start, start + span)
+        });
     // `scroll_x` is absolute now, and the state outlives target switches: a
     // clip starting at bar 9 must open on its own left edge, not inherit a
     // scroll borrowed from the previous clip.
@@ -1584,6 +1713,11 @@ pub fn show(
             egui::Stroke::new(2.0, egui::Color32::YELLOW),
         );
     }
+
+    // ---- Overlay curve lanes (P4, D8/D16): one strip per control clip in
+    // the context, sharing the roll's time axis and carrying its own value
+    // axis. They are writable and write **their own** clip, never the focus.
+    let lane_intent = curve_lanes(ui, width, &geom, lanes, state);
 
     // ---- Keyboard: mode + the modal command family (M4a). ----
     // Gated on focus so the keys never leak into text fields elsewhere.
@@ -2283,6 +2417,229 @@ pub fn show(
         }
     }
 
+    // A lane edit and a note gesture cannot start in the same frame (one
+    // pointer), but the lane is drawn first — let it win if both are set.
+    lane_intent.or(intent)
+}
+
+/// Draws the overlay curve lanes and returns their edit for this frame.
+///
+/// Layout: one strip per lane, stacked directly under the velocity lane, all
+/// using the roll's time axis (`geom.over`) and the lane's clip origin
+/// (`at_origin`). Nothing here touches the note machinery — a lane edit is a
+/// curve command on its own control clip (D16).
+fn curve_lanes(
+    ui: &mut egui::Ui,
+    width: f32,
+    geom: &RollGeom,
+    lanes: &[OverlayLane<'_>],
+    state: &mut RollState,
+) -> Option<RollIntent> {
+    state.lane_rects.clear();
+    if lanes.is_empty() {
+        // A stale drag index must not survive the lanes disappearing.
+        state.curve_drag = None;
+        return None;
+    }
+    let mut intent = None;
+    for (index, lane) in lanes.iter().enumerate() {
+        let collapsed = state.collapsed_lanes.contains(&lane.clip.track);
+        let height = if collapsed {
+            CURVE_LANE_COLLAPSED_HEIGHT
+        } else {
+            CURVE_LANE_HEIGHT
+        };
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+        // Time axis of *this* clip: same pixels per tick, own origin.
+        state.lane_rects.push(rect);
+        let lane_geom = geom.at_origin(i64::from(lane.data.start_ticks)).over(rect);
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, egui::Color32::from_gray(16));
+        painter.line_segment(
+            [rect.left_top(), rect.right_top()],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(52)),
+        );
+        // Collapse toggle (P5): a 12 px square in the caption. A stack of
+        // eight lanes is 512 px of roll the notes do not get, and the usual
+        // case is "one curve matters, the rest are scenery".
+        let toggle = egui::Rect::from_min_size(
+            rect.left_top() + egui::vec2(3.0, 3.0),
+            egui::vec2(LANE_TOGGLE, LANE_TOGGLE),
+        );
+        painter.rect_filled(
+            toggle,
+            2.0,
+            if response.hovered() {
+                egui::Color32::from_gray(70)
+            } else {
+                egui::Color32::from_gray(40)
+            },
+        );
+        painter.text(
+            toggle.center(),
+            egui::Align2::CENTER_CENTER,
+            if collapsed { "+" } else { "-" },
+            egui::FontId::monospace(10.0),
+            egui::Color32::from_gray(190),
+        );
+        painter.text(
+            rect.left_top() + egui::vec2(20.0, 3.0),
+            egui::Align2::LEFT_TOP,
+            &lane.label,
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_gray(150),
+        );
+        // The toggle is checked before any curve interaction: a click there
+        // folds the lane, it does not add an anchor.
+        if response.clicked_by(egui::PointerButton::Primary)
+            && response
+                .interact_pointer_pos()
+                .is_some_and(|pos| toggle.contains(pos))
+        {
+            if collapsed {
+                state.collapsed_lanes.retain(|t| *t != lane.clip.track);
+            } else {
+                state.collapsed_lanes.push(lane.clip.track);
+                state.collapsed_lanes.sort_unstable();
+            }
+            continue;
+        }
+        if collapsed {
+            continue;
+        }
+
+        let loop_ticks = i64::from(lane.data.loop_ticks.max(1));
+        let span_ticks = i64::from(lane.data.span_ticks.max(1));
+        // Only the clip's active span is drawn: outside it the engine plays
+        // nothing, so drawing a held value would claim otherwise.
+        let x_start = lane_geom.x_of(0.0).max(rect.left());
+        let x_end = lane_geom.x_of(span_ticks as f32).min(rect.right());
+
+        // Curve: one sample per pixel, folded into the loop the same way the
+        // sequencer tiles control clips (D17). A seam between tiles is a jump
+        // and is drawn as one — no smoothing across it.
+        let mut points: Vec<egui::Pos2> = Vec::new();
+        let mut x = x_start;
+        while x <= x_end {
+            let local = lane_geom.local_at(x);
+            let phase = local.rem_euclid(loop_ticks as f32);
+            match lane.data.value_at(f64::from(phase)) {
+                Some(value) => points.push(egui::pos2(x, lane.value_to_y(value, rect))),
+                // An empty curve has nothing to draw; leave the gap.
+                None => {
+                    if points.len() > 1 {
+                        painter.add(egui::Shape::line(
+                            std::mem::take(&mut points),
+                            egui::Stroke::new(1.5, CURVE_LINE),
+                        ));
+                    }
+                    points.clear();
+                }
+            }
+            x += 1.0;
+        }
+        if points.len() > 1 {
+            painter.add(egui::Shape::line(
+                points,
+                egui::Stroke::new(1.5, CURVE_LINE),
+            ));
+        }
+
+        // Anchors. Only the first loop's anchors are real; the tiled repeats
+        // are the same points played again.
+        let mut anchor_positions: Vec<(u32, egui::Pos2)> = Vec::new();
+        for anchor in &lane.data.curve {
+            let pos = egui::pos2(
+                lane_geom.x_of(anchor.tick as f32),
+                lane.value_to_y(anchor.value, rect),
+            );
+            if pos.x < rect.left() - 4.0 || pos.x > rect.right() + 4.0 {
+                continue;
+            }
+            anchor_positions.push((anchor.tick, pos));
+            painter.circle_filled(pos, 3.0, ANCHOR);
+        }
+
+        // ---- Interaction: click adds, drag moves, right-click deletes ----
+        let snap = crate::curve::SNAP_TICKS.max(1);
+        let mapped = |pos: egui::Pos2| -> (u32, f32) {
+            let local = lane_geom.local_at(pos.x).max(0.0);
+            let tick = ((local / snap as f32).round() as u32) * snap;
+            (
+                tick.min(loop_ticks as u32 - 1),
+                lane.y_to_value(pos.y, rect),
+            )
+        };
+        let hit_anchor = |pos: egui::Pos2| -> Option<u32> {
+            anchor_positions
+                .iter()
+                .find(|(_, p)| (*p - pos).length() <= ANCHOR_RADIUS)
+                .map(|(tick, _)| *tick)
+        };
+        let pointer = response.interact_pointer_pos();
+        // A drag is classified by the **press** point (the same rule the note
+        // gestures follow): by the time egui reports `drag_started` the
+        // pointer has already moved, and grabbing the anchor under the moved
+        // pointer would let go of the one the user actually pressed on.
+        let press_pos = ui.ctx().input(|i| i.pointer.press_origin()).or(pointer);
+        let dragging = state.curve_drag.is_some_and(|(i, _)| i == index);
+        if response.drag_started_by(egui::PointerButton::Primary)
+            && let Some(pos) = press_pos
+        {
+            let (tick, value) = mapped(pos);
+            let from = hit_anchor(pos);
+            state.curve_drag = Some((index, from));
+            intent = Some(RollIntent::CurveUpsert {
+                track: lane.clip.track,
+                clip: lane.clip.clip,
+                from,
+                tick,
+                value,
+                dragging: true,
+            });
+        } else if dragging
+            && response.dragged_by(egui::PointerButton::Primary)
+            && let Some(pos) = pointer
+        {
+            let (tick, value) = mapped(pos);
+            let from = state.curve_drag.and_then(|(_, from)| from);
+            // The anchor now lives at `tick`; the next frame moves *that* one.
+            state.curve_drag = Some((index, Some(tick)));
+            intent = Some(RollIntent::CurveUpsert {
+                track: lane.clip.track,
+                clip: lane.clip.clip,
+                from,
+                tick,
+                value,
+                dragging: true,
+            });
+        } else if response.drag_stopped_by(egui::PointerButton::Primary) && dragging {
+            state.curve_drag = None;
+            intent = Some(RollIntent::CurveDragEnd);
+        } else if response.clicked_by(egui::PointerButton::Primary)
+            && let Some(pos) = pointer
+        {
+            let (tick, value) = mapped(pos);
+            intent = Some(RollIntent::CurveUpsert {
+                track: lane.clip.track,
+                clip: lane.clip.clip,
+                from: None,
+                tick,
+                value,
+                dragging: false,
+            });
+        } else if response.secondary_clicked()
+            && let Some(pos) = pointer
+        {
+            let (tick, _) = mapped(pos);
+            intent = Some(RollIntent::CurveRemove {
+                track: lane.clip.track,
+                clip: lane.clip.clip,
+                tick,
+            });
+        }
+    }
     intent
 }
 
@@ -3472,7 +3829,7 @@ mod tests {
             ClipRef::midi(0, 0), // duplicate
         ];
         let clips = |track: usize| if track == 3 { 1 } else { 4 };
-        let subject = RollSubject::assemble(focus, &selection, clips);
+        let subject = RollSubject::assemble(focus, &selection, clips, |_| 0);
         assert_eq!(subject.focus(), focus);
         assert_eq!(subject.context(), &[focus, ClipRef::midi(0, 0)]);
         assert_eq!(
@@ -3488,7 +3845,7 @@ mod tests {
     fn the_context_cap_keeps_the_focus_and_counts_what_it_dropped() {
         let focus = ClipRef::midi(0, 0);
         let selection: Vec<ClipRef> = (0..12).map(|clip| ClipRef::midi(0, clip)).collect();
-        let subject = RollSubject::assemble(focus, &selection, |_| 16);
+        let subject = RollSubject::assemble(focus, &selection, |_| 16, |_| 0);
         assert_eq!(subject.context().len(), MAX_ROLL_CONTEXT);
         assert_eq!(subject.focus(), focus);
         // 12 selection entries, one of which is the focus → 11 candidates,
@@ -3501,7 +3858,7 @@ mod tests {
     fn tab_cycles_the_focus_and_wraps() {
         let focus = ClipRef::midi(0, 0);
         let selection = [ClipRef::midi(0, 1), ClipRef::midi(0, 2)];
-        let mut subject = RollSubject::assemble(focus, &selection, |_| 4);
+        let mut subject = RollSubject::assemble(focus, &selection, |_| 4, |_| 0);
         assert_eq!(subject.cycle_focus(false), ClipRef::midi(0, 1));
         assert_eq!(subject.cycle_focus(false), ClipRef::midi(0, 2));
         assert_eq!(subject.cycle_focus(false), focus, "forward wraps");
@@ -3532,7 +3889,8 @@ mod tests {
             clips: vec![early, late],
             ..MidiTrack::default()
         }];
-        let subject = RollSubject::assemble(ClipRef::midi(0, 1), &[ClipRef::midi(0, 0)], |_| 2);
+        let subject =
+            RollSubject::assemble(ClipRef::midi(0, 1), &[ClipRef::midi(0, 0)], |_| 2, |_| 0);
         let window = ViewWindow::of(&tracks, &subject);
         assert_eq!(window.start, 0.0);
         assert_eq!(window.end, 2880.0);

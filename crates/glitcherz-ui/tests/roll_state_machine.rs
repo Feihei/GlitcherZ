@@ -15,8 +15,11 @@
 //! and the measured panel width.
 
 use eframe::egui;
-use glitcherz_model::{MidiClip, MidiTrack, Note, Sequence, TICKS_PER_BAR};
-use glitcherz_ui::piano_roll::{ClipRef, ROW_HEIGHT, RollIntent, RollMode, RollState, RollSubject};
+use glitcherz_model::{AutoPoint, ControlClip, MidiClip, MidiTrack, Note, Sequence, TICKS_PER_BAR};
+use glitcherz_ui::piano_roll::{
+    CURVE_LANE_COLLAPSED_HEIGHT, ClipRef, OverlayLane, ROW_HEIGHT, RollIntent, RollMode, RollState,
+    RollSubject,
+};
 
 const SCREEN: egui::Vec2 = egui::vec2(800.0, 600.0);
 
@@ -43,6 +46,18 @@ struct Fixture {
     /// Screen y of pitch 60's row (calibrated, not derived).
     y60: f32,
     time: f64,
+    /// Overlay curve lanes handed to the roll this frame (P4). The owned
+    /// data lives here; `frame()` re-borrows it into `OverlayLane`s.
+    lanes: Vec<LaneFixture>,
+}
+
+/// One P4 lane: the clip, its curve, and the value axis the caller derives
+/// from the automation destination.
+struct LaneFixture {
+    clip: ClipRef,
+    data: ControlClip,
+    axis: (f32, f32, bool),
+    label: String,
 }
 
 impl Fixture {
@@ -81,6 +96,7 @@ impl Fixture {
             ticks_to_x: 0.0,
             y60: 0.0,
             time: 0.0,
+            lanes: Vec::new(),
         };
         fixture.measure();
         fixture.calibrate();
@@ -161,8 +177,20 @@ impl Fixture {
             subject,
             state,
             router,
+            lanes,
             ..
         } = self;
+        // P4: the harness owns the lane data; the roll borrows it for the
+        // frame (exactly what the app does with the project's control clips).
+        let lane_views: Vec<OverlayLane<'_>> = lanes
+            .iter()
+            .map(|lane| OverlayLane {
+                clip: lane.clip,
+                data: &lane.data,
+                axis: lane.axis,
+                label: lane.label.clone(),
+            })
+            .collect();
         let mut intent = None;
         let mut out = ctx.run_ui(raw, |ctx| {
             // Same order as the app: the router resolves hover focus before
@@ -172,6 +200,7 @@ impl Fixture {
                 intent = glitcherz_ui::piano_roll::show(
                     ui,
                     tracks,
+                    &lane_views,
                     subject,
                     state,
                     0.0,
@@ -273,6 +302,25 @@ impl Fixture {
         }
         intents.extend(self.click(to));
         intents
+    }
+
+    /// Screen position of `(tick, value)` inside overlay lane `index` (P4).
+    ///
+    /// Derived, not probed: the lane stack starts right below the roll and
+    /// the velocity strip, and `y60` pins the roll's own top (the calibrated
+    /// row begins one pixel above the first pixel that hits, because of
+    /// `HIT_SLOP`).
+    fn lane_pos(&self, index: usize, tick: f32, value: f32) -> egui::Pos2 {
+        // The roll publishes the lane rects it just laid out — no geometry is
+        // re-derived here (the stack sits below the roll *and* the velocity
+        // strip, and both heights are the widget's business).
+        let rect = self.state.lane_rects[index];
+        let (min, max, _) = self.lanes[index].axis;
+        let norm = ((value - min) / (max - min)).clamp(0.0, 1.0);
+        egui::pos2(
+            rect.left() + tick * self.ticks_to_x,
+            rect.bottom() - norm * rect.height(),
+        )
     }
 
     /// The confirming intent of a modal sweep (the last MoveNotes /
@@ -975,7 +1023,7 @@ fn a_ghost_note_is_painted_but_never_hit() {
         },
         ..MidiClip::default()
     });
-    f.subject = RollSubject::assemble(ClipRef::midi(0, 0), &[ClipRef::midi(0, 1)], |_| 2);
+    f.subject = RollSubject::assemble(ClipRef::midi(0, 0), &[ClipRef::midi(0, 1)], |_| 2, |_| 0);
 
     // The fit now spans both clips, so a tick is half the single-clip scale
     // the fixture measured.
@@ -1008,7 +1056,7 @@ fn drawing_stops_at_the_focus_clips_edges() {
         loop_ticks: bar,
         ..MidiClip::default()
     });
-    f.subject = RollSubject::assemble(ClipRef::midi(0, 0), &[ClipRef::midi(0, 1)], |_| 2);
+    f.subject = RollSubject::assemble(ClipRef::midi(0, 0), &[ClipRef::midi(0, 1)], |_| 2, |_| 0);
     f.state.mode = RollMode::Draw;
     // Two clips in the fit ⇒ half the single-clip pixel scale.
     let t_x = f.ticks_to_x / 2.0;
@@ -1031,5 +1079,192 @@ fn drawing_stops_at_the_focus_clips_edges() {
             .iter()
             .any(|intent| matches!(intent, RollIntent::AddNote { .. })),
         "a draw over a ghost must not create: got {outside:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P4: overlay curve lanes
+// ---------------------------------------------------------------------------
+
+/// A fixture with one automation lane: a ±2-semitone pitch curve with an
+/// anchor at each end, exactly what a bend clip looks like.
+fn lane_fixture() -> Fixture {
+    let mut fixture = Fixture::new();
+    let data = ControlClip {
+        start_ticks: 0,
+        span_ticks: TICKS_PER_BAR,
+        loop_ticks: TICKS_PER_BAR,
+        curve: vec![
+            AutoPoint {
+                tick: 0,
+                value: -2.0,
+            },
+            AutoPoint {
+                tick: 960,
+                value: 2.0,
+            },
+        ],
+        ..ControlClip::default()
+    };
+    fixture.lanes.push(LaneFixture {
+        clip: ClipRef::control(0, 0),
+        data,
+        axis: (-2.0, 2.0, false),
+        label: "Pitch Bend ±2.0 st".to_string(),
+    });
+    // One idle frame lays the lanes out, so `lane_rects` is populated for the
+    // pointer math below (the fixture measures geometry by *running* frames).
+    let _ = fixture.frame(vec![]);
+    fixture
+}
+
+/// The lane shares the roll's time axis: the same tick sits at the same x in
+/// the lane and in the note area (this is the whole point of P4).
+#[test]
+fn a_lane_shares_the_time_axis_with_the_notes() {
+    let f = lane_fixture();
+    for tick in [0.0, 960.0, 1920.0] {
+        assert_eq!(
+            f.lane_pos(0, tick, 0.0).x,
+            f.pos(tick, 60).x,
+            "tick {tick} must line up"
+        );
+    }
+}
+
+#[test]
+fn a_lane_click_adds_an_anchor_at_the_clicked_value() {
+    let mut f = lane_fixture();
+    let pos = f.lane_pos(0, 1920.0, 0.0);
+    let intents = f.click(pos);
+    let upsert = intents
+        .iter()
+        .rev()
+        .find_map(|intent| match intent {
+            RollIntent::CurveUpsert {
+                track,
+                clip,
+                from,
+                tick,
+                value,
+                dragging,
+            } => Some((*track, *clip, *from, *tick, *value, *dragging)),
+            _ => None,
+        })
+        .expect("a lane click must upsert an anchor");
+    assert_eq!((upsert.0, upsert.1), (0, 0), "writes its own control clip");
+    assert_eq!(upsert.2, None, "the click created the anchor");
+    assert_eq!(upsert.3, 1920);
+    assert!(
+        upsert.4.abs() < 0.1,
+        "the middle of a ±2 axis is 0, got {}",
+        upsert.4
+    );
+    assert!(!upsert.5, "a click is a single undo step");
+}
+
+#[test]
+fn dragging_a_lane_anchor_reports_the_anchor_it_moved() {
+    let mut f = lane_fixture();
+    let from = f.lane_pos(0, 0.0, -2.0);
+    let to = f.lane_pos(0, 1440.0, 0.0);
+    let intents = f.drag(from, to);
+    assert!(
+        intents.iter().any(|intent| matches!(
+            intent,
+            RollIntent::CurveUpsert {
+                from: Some(0),
+                dragging: true,
+                ..
+            }
+        )),
+        "the drag must move the anchor that was grabbed: {intents:?}"
+    );
+    assert!(
+        intents
+            .iter()
+            .any(|intent| matches!(intent, RollIntent::CurveDragEnd)),
+        "the release closes the merged undo gesture: {intents:?}"
+    );
+    // The anchor lands where the pointer was released, still as one of the
+    // moved-from frames (the harness sends two move frames; a real drag sends
+    // one per frame, each tracking the anchor the previous frame left behind).
+    assert!(
+        intents.iter().any(|intent| matches!(
+            intent,
+            RollIntent::CurveUpsert {
+                tick: 1440,
+                from: Some(0),
+                dragging: true,
+                ..
+            }
+        )),
+        "the drag lands on the release tick: {intents:?}"
+    );
+}
+
+#[test]
+fn a_lane_right_click_deletes_the_anchor_under_it() {
+    let mut f = lane_fixture();
+    let pos = f.lane_pos(0, 960.0, 2.0);
+    let button = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Secondary,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    };
+    let intents = [
+        f.frame(vec![hover(pos)]),
+        f.frame(vec![hover(pos), button(true)]),
+        f.frame(vec![hover(pos)]),
+        f.frame(vec![hover(pos), button(false)]),
+    ];
+    let removed = intents
+        .iter()
+        .flatten()
+        .find_map(|intent| match intent {
+            RollIntent::CurveRemove { track, clip, tick } => Some((*track, *clip, *tick)),
+            _ => None,
+        })
+        .expect("right-click must delete an anchor");
+    assert_eq!(removed, (0, 0, 960), "the anchor under the pointer goes");
+}
+
+/// P5: the caption's toggle folds the lane down to its header — and that
+/// click must not also drop an anchor on the curve underneath.
+#[test]
+fn the_lane_toggle_collapses_the_lane() {
+    let mut f = lane_fixture();
+    let toggle_at = |f: &Fixture| {
+        let rect = f.state.lane_rects[0];
+        egui::pos2(rect.left() + 9.0, rect.top() + 9.0)
+    };
+    let pos = toggle_at(&f);
+    let intents = f.click(pos);
+    assert!(
+        !intents
+            .iter()
+            .any(|intent| matches!(intent, RollIntent::CurveUpsert { .. })),
+        "the toggle is not a curve edit: {intents:?}"
+    );
+    assert_eq!(f.state.collapsed_lanes, vec![0]);
+    // The rect lags by one frame: layout runs before the click is handled, so
+    // the fold shows up on the next pass (one frame in the app).
+    let _ = f.frame(vec![]);
+    assert!(
+        (f.state.lane_rects[0].height() - CURVE_LANE_COLLAPSED_HEIGHT).abs() < 0.5,
+        "collapsed height = {}",
+        f.state.lane_rects[0].height()
+    );
+
+    // Clicking the same square again restores the lane.
+    let pos = toggle_at(&f);
+    let _ = f.click(pos);
+    assert!(f.state.collapsed_lanes.is_empty());
+    let _ = f.frame(vec![]);
+    assert!(
+        f.state.lane_rects[0].height() > CURVE_LANE_COLLAPSED_HEIGHT,
+        "expanded again: {}",
+        f.state.lane_rects[0].height()
     );
 }

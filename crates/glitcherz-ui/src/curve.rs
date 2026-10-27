@@ -32,6 +32,20 @@ pub(crate) fn axis(param: &AutoParam) -> (f32, f32, bool) {
         // U4a: the curve stores the real 7-bit CC value (spec D7), so the
         // axis is the MIDI range rather than a normalized 0..1.
         AutoParam::Cc { .. } => (0.0, 127.0, false),
+        // P1/D9: the bend curve stores **semitones** and `range_semitones`
+        // is the full-scale deflection, so the axis is symmetric about zero.
+        // This is the reason the range is a document field: an axis without
+        // a defined span would make "how far does this dip go" unanswerable.
+        AutoParam::PitchBend {
+            range_semitones, ..
+        } => {
+            let range = if range_semitones.is_finite() && *range_semitones > 0.0 {
+                *range_semitones
+            } else {
+                2.0
+            };
+            (-range, range, false)
+        }
     }
 }
 

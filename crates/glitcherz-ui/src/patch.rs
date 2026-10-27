@@ -1026,6 +1026,8 @@ pub(crate) fn auto_param_label(param: &AutoParam) -> String {
         // U4a: cable labels sit in the patch, where the channel matters less
         // than knowing the destination is a controller.
         AutoParam::Cc { controller, .. } => format!("CC {controller}"),
+        // P1: a bend is a controller too; the range lives in its editor.
+        AutoParam::PitchBend { .. } => "Pitch Bend".to_string(),
     }
 }
 

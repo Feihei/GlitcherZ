@@ -174,16 +174,16 @@ enum AutoTarget {
 /// Document automation parameter → engine parameter ID.
 ///
 /// `None` for [`AutoParam::Tempo`] (the engine route uses the Timeline In
-/// sentinel instead, U3b D1/D7) and for [`AutoParam::Cc`]: a control change is
-/// an event in the node's MIDI input, not a parameter slot (U4a D2/D3), and
-/// must never reach `set_node_param`.
+/// sentinel instead, U3b D1/D7), for [`AutoParam::Cc`] and
+/// [`AutoParam::PitchBend`]: those are events in the node's MIDI input, not
+/// parameter slots (U4a D2/D3, P1 D9), and must never reach `set_node_param`.
 fn param_id_of(param: &AutoParam) -> Option<ParamId> {
     match param {
         AutoParam::TrackGain => Some(ParamId::TrackGain),
         AutoParam::TrackPan => Some(ParamId::TrackPan),
         AutoParam::FilterCutoff => Some(ParamId::FilterCutoff),
         AutoParam::PluginParam { param_id, .. } => Some(ParamId::PluginParam(*param_id)),
-        AutoParam::Tempo | AutoParam::Cc { .. } => None,
+        AutoParam::Tempo | AutoParam::Cc { .. } | AutoParam::PitchBend { .. } => None,
     }
 }
 
@@ -214,6 +214,29 @@ fn cc_label(controller: u8, channel: u8) -> String {
         Some(name) => format!("CC {controller} {name} · ch {}", channel + 1),
         None => format!("CC {controller} · ch {}", channel + 1),
     }
+}
+
+/// Human-readable bend destination label (`Pitch Bend ±2 st · ch 1`).
+fn bend_label(range_semitones: f32, channel: u8) -> String {
+    format!("Pitch Bend ±{range_semitones:.1} st · ch {}", channel + 1)
+}
+
+/// The automation destination of control track `track` (P4): the parameter
+/// carried by the cable that starts at `PortRef::AutoTrack(track)`.
+///
+/// `None` when the track has no cable (a curve nobody drives). The overlay
+/// lane then draws on the neutral 0..127 axis — the piano roll has no way to
+/// know what the user intends, and refusing to draw would hide the clip.
+fn control_track_param(project: &Project, track: usize) -> Option<AutoParam> {
+    project
+        .graph
+        .cables
+        .iter()
+        .find(|cable| {
+            matches!(cable.from, PortRef::AutoTrack(index) if index == track)
+                && cable.kind == CableKind::Automation
+        })
+        .map(|cable| cable.param.clone())
 }
 
 /// Document curve interpolation → engine mirror (U12). The two enums are
@@ -1175,6 +1198,18 @@ impl GlitcherZApp {
                         }
                         continue;
                     }
+                    // P1: same shape for a bend — an event route, not a
+                    // parameter route. Undo / open must rebuild it the same
+                    // way the picker created it.
+                    if let Some((channel, range)) = cable.param.pitch_bend_of() {
+                        if !self
+                            .engine
+                            .set_auto_pitch_bend_route(*index, to, channel, range)
+                        {
+                            log::warn!("Pitch-bend cable (track {index} → {to}) dispatch failed");
+                        }
+                        continue;
+                    }
                     let Some(id) = param_id_of(&cable.param) else {
                         log::warn!("Automation cable carries a non-node parameter: {cable:?}");
                         continue;
@@ -2046,7 +2081,11 @@ impl GlitcherZApp {
                                 .set_auto_cc_route(index, engine_id, channel, controller);
                         }
                         None => {
-                            if let Some(id) = param_id_of(&param) {
+                            // P1: a bend is the other event-stream destination.
+                            if let Some((channel, range)) = param.pitch_bend_of() {
+                                self.engine
+                                    .set_auto_pitch_bend_route(index, engine_id, channel, range);
+                            } else if let Some(id) = param_id_of(&param) {
                                 self.engine.set_auto_route(index, engine_id, id);
                             }
                         }
@@ -2131,6 +2170,8 @@ impl GlitcherZApp {
                     for (number, name) in CC_PRESETS {
                         v.push((format!("CC {number} {name}"), AutoParam::cc(number, 0)));
                     }
+                    // P1: pitch bend is the other event-stream destination.
+                    v.push(("Pitch Bend".to_string(), AutoParam::pitch_bend(0, 2.0)));
                 }
                 v
             };
@@ -7844,18 +7885,36 @@ impl GlitcherZApp {
         // whichever clip used to be focused).
         self.roll_state.clear_gesture();
         let focus = piano_roll::ClipRef::midi(track, clip);
+        // P4: control clips in the selection ride along as overlay lanes; the
+        // focus itself stays a MIDI clip (a control clip opens the curve
+        // editor instead).
         let selection: Vec<piano_roll::ClipRef> = self
             .timeline_state
             .selection
             .iter()
-            .filter(|sel| matches!(sel.lane, timeline::TimelineLane::Midi))
-            .map(|sel| piano_roll::ClipRef::midi(sel.track, sel.clip))
+            .filter_map(|sel| match sel.lane {
+                timeline::TimelineLane::Midi => {
+                    Some(piano_roll::ClipRef::midi(sel.track, sel.clip))
+                }
+                timeline::TimelineLane::Control => {
+                    Some(piano_roll::ClipRef::control(sel.track, sel.clip))
+                }
+                timeline::TimelineLane::Audio => None,
+            })
             .collect();
         let subject = {
             let project = self.project();
-            piano_roll::RollSubject::assemble(focus, &selection, |track| {
-                project.midi_tracks.get(track).map_or(0, |t| t.clips.len())
-            })
+            piano_roll::RollSubject::assemble(
+                focus,
+                &selection,
+                |track| project.midi_tracks.get(track).map_or(0, |t| t.clips.len()),
+                |track| {
+                    project
+                        .control_tracks
+                        .get(track)
+                        .map_or(0, |t| t.clips.len())
+                },
+            )
         };
         let dropped = subject.dropped();
         self.edit_clip = Some(EditTarget::Midi(subject));
@@ -8273,9 +8332,43 @@ impl GlitcherZApp {
                 focus_router: router,
                 ..
             } = self;
+            let project = session.project();
+            // P4: one overlay lane per control clip in the context. The
+            // vertical axis comes from the *automation destination* of that
+            // track's cable — the same mapping the standalone curve editor
+            // uses, so a curve looks identical in both places.
+            let lanes: Vec<piano_roll::OverlayLane<'_>> = subject
+                .context()
+                .iter()
+                .filter(|c| matches!(c.lane, piano_roll::RollLane::Control))
+                .filter_map(|c| {
+                    let data = project.control_tracks.get(c.track)?.clips.get(c.clip)?;
+                    let param = control_track_param(project, c.track);
+                    let axis = param
+                        .as_ref()
+                        .map(crate::curve::axis)
+                        .unwrap_or((0.0, 127.0, false));
+                    let name = if project.control_tracks[c.track].name.is_empty() {
+                        format!("Curve {}", c.track + 1)
+                    } else {
+                        project.control_tracks[c.track].name.clone()
+                    };
+                    let dest = param
+                        .as_ref()
+                        .map(crate::patch::auto_param_label)
+                        .unwrap_or_else(|| "Not connected".to_string());
+                    Some(piano_roll::OverlayLane {
+                        clip: *c,
+                        data,
+                        axis,
+                        label: format!("{name} · {dest}"),
+                    })
+                })
+                .collect();
             piano_roll::show(
                 ui,
-                &session.project().midi_tracks,
+                &project.midi_tracks,
+                &lanes,
                 subject,
                 roll_state,
                 playhead,
@@ -8359,6 +8452,32 @@ impl GlitcherZApp {
     fn apply_roll_intent(&mut self, track: usize, clip: usize, intent: piano_roll::RollIntent) {
         use piano_roll::RollIntent;
         use serde_json::json;
+
+        // P4: an overlay lane writes **its own** control clip, so these never
+        // fall through to the note commands (which target the focus clip) nor
+        // to the MIDI clip push at the bottom.
+        match &intent {
+            RollIntent::CurveUpsert {
+                track,
+                clip,
+                from,
+                tick,
+                value,
+                dragging,
+            } => {
+                self.curve_upsert(*track, *clip, *from, *tick, *value, *dragging);
+                return;
+            }
+            RollIntent::CurveRemove { track, clip, tick } => {
+                self.curve_remove_point(*track, *clip, *tick);
+                return;
+            }
+            RollIntent::CurveDragEnd => {
+                self.end_param_edit();
+                return;
+            }
+            _ => {}
+        }
 
         let mut selection_changed = false;
         // Draw gestures share one undo key across their frames: the creating
@@ -8524,6 +8643,13 @@ impl GlitcherZApp {
                     &json!({ "track": track, "clip": clip, "set_each": set_each }),
                     &format!("roll-vel:{track}:{clip}"),
                 )
+            }
+            // Handled (and returned) by the early match at the top of this
+            // function; listed here so the compiler keeps the enum covered.
+            RollIntent::CurveUpsert { .. }
+            | RollIntent::CurveRemove { .. }
+            | RollIntent::CurveDragEnd => {
+                unreachable!("curve intents never reach the note command table")
             }
         };
         if let Some((index, start, length)) = created {
@@ -8788,6 +8914,23 @@ impl GlitcherZApp {
                 })
                 .response
                 .on_hover_text("CLAP / SoundFont. VST3 cannot receive host CC.");
+                // P1: pitch bend is a sibling destination, not a CC number.
+                // The hover text is the honest part of D10: the VST3 binding
+                // in use has no event type for bend, so a bend cable on a
+                // VST3 node is silent by construction.
+                ui.menu_button("Pitch Bend…", |ui| {
+                    ui.weak("Into the track instrument's MIDI input");
+                    if ui.button("±2 st · ch 1").clicked() {
+                        picked = Some((AutoTarget::Node(doc), AutoParam::pitch_bend(0, 2.0)));
+                        ui.close();
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "CLAP / SoundFont receive a MIDI bend. Built-in instruments take the same \
+                     curve as a per-sample smoothed pitch offset (finer than any MIDI bend). \
+                     VST3 cannot receive host pitch bend, so the curve is silent there.",
+                );
             }
             if let Some((target, param)) = picked {
                 self.set_auto_endpoint(index, target, param);
@@ -8809,6 +8952,13 @@ impl GlitcherZApp {
                             channel,
                         },
                     ) => cc_label(*controller, *channel),
+                    (
+                        _,
+                        AutoParam::PitchBend {
+                            channel,
+                            range_semitones,
+                        },
+                    ) => bend_label(*range_semitones, *channel),
                 })
                 .unwrap_or_else(|| "Not connected".to_string());
             ui.weak(format!("-> {current}"));
@@ -8840,6 +8990,45 @@ impl GlitcherZApp {
             });
             if commit && (cc, ch) != (controller, channel) {
                 self.set_auto_endpoint(index, AutoTarget::Node(doc), AutoParam::cc(cc, ch));
+            }
+        }
+        // P1: the bend range is a **document field** (D9), so it is editable
+        // here rather than probed from the receiver. Changing it rescales the
+        // axis, not the anchors: the curve stores semitones, so re-ranging
+        // leaves every point musically where it was.
+        if let Some((
+            PortRef::Node(doc),
+            AutoParam::PitchBend {
+                channel,
+                range_semitones,
+            },
+        )) = endpoint
+        {
+            let (mut range, mut ch) = (range_semitones, channel);
+            let mut commit = false;
+            ui.horizontal(|ui| {
+                ui.label("±");
+                let range_response = ui.add(
+                    egui::DragValue::new(&mut range)
+                        .range(glitcherz_model::MIN_BEND_RANGE..=glitcherz_model::MAX_BEND_RANGE)
+                        .speed(0.1)
+                        .suffix(" st"),
+                );
+                ui.label("ch");
+                let mut shown = u16::from(ch) + 1;
+                let channel_response = ui.add(egui::DragValue::new(&mut shown).range(1..=16));
+                commit = range_response.drag_stopped()
+                    || range_response.lost_focus()
+                    || channel_response.drag_stopped()
+                    || channel_response.lost_focus();
+                ch = shown.saturating_sub(1).min(15) as u8;
+            });
+            if commit && (range != range_semitones || ch != channel) {
+                self.set_auto_endpoint(
+                    index,
+                    AutoTarget::Node(doc),
+                    AutoParam::pitch_bend(ch, range),
+                );
             }
         }
     }
