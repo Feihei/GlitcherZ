@@ -17,7 +17,7 @@
 
 ## 当前状态（2026-10-24）
 
-路线图 1–10 全部落地。乐器插件（CLAP / VST3）为一等声源，效果器节点已接入，自动化桥接到插件参数。节点图 P1–P5f 与 MIDI 编辑 M1–M4 全部交付；**SF2/SF3 音色库方向 S1–S6 全部完成**（RT 审计零分配 → 非实时加载 `engine::sf2` → 实时渲染 `Sf2VoiceProcessor` → `VoiceSpec::SoundFont` 文档变体 → UI 音色库面板（加载/preset 下拉/声源绑定，undoable）→ sf3 feature 常开 + 审计复跑 + 真实库端到端验收）。SF2 声源现为四等声源之一（内置合成器 / 插件 / SoundFont / 采样播放器）。**插件 GUI 宿主 G1–G7 全部交付**（CLAP 编辑嵌入 + 参数回接 + 面板节点化 + 内联参数 + vk 节点 + VST3 `IPlugView` 镜像）；**P6 反馈环路交付**（显式 Feedback 节点，1 块延迟由拓扑排序反转实现）。**可用性提升 U 系列全部收官**：U1（走带完整化 + seek 基建）、U2（文件管理）、U3（拍号文档化 + tempo 曲线）、U4（控制轨 CC 输出 + timeline 一等化）、U5（采样播放器 instrument）、U6（audio track + 波形 timeline）、U7（Export Audio 离线渲染）、U8（Inspector 重构）、U9（E1–E5 插件浏览器）、U10（patch 节点内联管理）全部交付。**下一方向 R 系列已立项**（多 clip 钢琴卷帘 + 音高曲线，spec `roll-multiclip.md`；P0 已交付，P1–P5 待实施）。
+路线图 1–10 全部落地。乐器插件（CLAP / VST3）为一等声源，效果器节点已接入，自动化桥接到插件参数。节点图 P1–P5f 与 MIDI 编辑 M1–M4 全部交付；**SF2/SF3 音色库方向 S1–S6 全部完成**（RT 审计零分配 → 非实时加载 `engine::sf2` → 实时渲染 `Sf2VoiceProcessor` → `VoiceSpec::SoundFont` 文档变体 → UI 音色库面板（加载/preset 下拉/声源绑定，undoable）→ sf3 feature 常开 + 审计复跑 + 真实库端到端验收）。SF2 声源现为四等声源之一（内置合成器 / 插件 / SoundFont / 采样播放器）。**插件 GUI 宿主 G1–G7 全部交付**（CLAP 编辑嵌入 + 参数回接 + 面板节点化 + 内联参数 + vk 节点 + VST3 `IPlugView` 镜像）；**P6 反馈环路交付**（显式 Feedback 节点，1 块延迟由拓扑排序反转实现）。**可用性提升 U 系列全部收官**：U1（走带完整化 + seek 基建）、U2（文件管理）、U3（拍号文档化 + tempo 曲线）、U4（控制轨 CC 输出 + timeline 一等化）、U5（采样播放器 instrument）、U6（audio track + 波形 timeline）、U7（Export Audio 离线渲染）、U8（Inspector 重构）、U9（E1–E5 插件浏览器）、U10（patch 节点内联管理）全部交付。**下一方向 R 系列已立项**（多 clip 钢琴卷帘 + 音高曲线，spec `roll-multiclip.md`；P0、P2 已交付，P1/P3–P5 待实施）。
 
 ## 遗留任务
 
@@ -280,7 +280,7 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 
 - [x] **P0 `ctrls` 链路补齐** ✅ 2026-10-27（独立，修 latent bug）：`RtMidiClip` 加定容 ctrl 表（32/clip）、`SequencerSink` trait 取代 `advance` 的闭包参数、sequencer 扫描投递（同块 ctrl 先于 note）、`Processor::midi_pitch_bend`、`graph::track_ctrl`、SF2/CLAP 实现；**另补 SMF 导入解析**（原实现 `_ => skip(2)` 整段丢弃）与导出写入（`SmfEvent` 按 status 决定 data byte 数）。偏差与细节见 spec §9 / implementation.md
 - [ ] **P1 音高通路**：`AutoParam::PitchBend` / `AutoDest::PitchBend` / `ParamId::PitchOffset` + synth·sample 逐样本 `Smoothed` 实现（在唱 voice，与 root note 语义相反）+ 分流表
-- [ ] **P2 坐标系绝对化**（纯重构，行为等价）：`RollGeom` 结构体化 + clip 原点 + 可见范围放开 + fit 基准改 context 跨度
+- [x] **P2 坐标系绝对化** ✅ 2026-10-27（纯重构，行为等价）：`RollGeom` 结构体化（origin + t0_x + ticks_to_x + top_note + row_h + area）、`scroll_x` 改绝对 tick、`ViewWindow` 收口滚动钳制、origin 变化重锚（`view_origin`）；37 项原 roll 测试全绿 + 2 项新增。fit 基准与 margin 留给 P3（spec §10 E7/E8）
 - [ ] **P3 多 clip 主体**：`RollSubject` + ghost 渲染 + chip 条焦点切换 + context 装配（只收 MIDI）
 - [ ] **P4 曲线泳道**：多泳道栈 + 纵轴按 `AutoDest` + 可写 curve（control clip 进 context）
 - [ ] **P5（可选）**：ghost velocity、泳道折叠记忆、高度拖动、context 上限调整

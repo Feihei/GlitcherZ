@@ -580,3 +580,18 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 
 **内置声源对 bend 返回 `false` 是有意的**：P1 会让它们的音高走 `ParamId::PitchOffset`（逐样本 `Smoothed`），既能表达细腻 vibrato，也不需要用户定义 bend range。
 
+### 卷帘坐标系绝对化（P2，spec `roll-multiclip.md`，2026-10-27）
+
+**`RollGeom` 是唯一的坐标真相**：`{ origin_tick, t0_x, ticks_to_x, top_note, row_h, area }`，`x_of(local) = t0_x + (origin + local) * ticks_to_x`、`local_at(x)` 是其逆。绘制（音符/网格/播放头/modal ghost）、命中（`note_at`/`note_edges`）、刀切（`knife_crossing`）、框选、velocity 泳道全部走它。原来这些是 5–7 个参数的自由函数，每加一处绘制就复制一次公式；现在 `note_rect(&note)` 一个参数，P3 的 ghost 只是换 `origin_tick`。
+
+**tick 仍全程 clip-local**：只有几何知道 origin。`pointer_tick` 变成 `geom.local_at(pos.x).max(0.0)`——钳制必须在**局部**坐标做，先钳绝对 tick 会让 clip 起点左侧的点击变成负的局部 tick。命令、模态、`clamped_move`、`selection_bbox`、`scale_max_k` 一行未改，这是"纯重构"能成立的原因。
+
+**`scroll_x` 从局部 tick 变绝对 tick**：`ViewWindow { start, end }` 收口滚动钳制（原来三处在 zoom / wheel / middle-drag 里各写一遍 `clamp(0.0, loop - width/t_x)`）。P2 的窗口就是 `[clip.start, clip.start + loop]`，P3 换成 context 跨度即可。
+
+**`RollState.view_origin` 是必需的，不是可选优化**：state 跨 target 存活，绝对 scroll 会让"打开一个从第 9 小节开始的 clip"继承上一个 clip 的 scroll（整个落在窗外）。origin 变化时重锚到自身起点，首帧 `None` 也走这条路径——这正是旧的"打开 clip 看到它开头"行为。
+
+**等价性怎么保证**：`t0_x = rect.left() - scroll * t_x`，scroll = origin 时，音符 x = `t0_x + (origin + local) * t_x = rect.left() + local * t_x`，与改造前逐像素相同。37 项原测试全部通过（3 处直接调自由函数的改为调方法，断言未改），另加 `clips_with_different_origins_share_one_time_axis`（同一 `t0_x` 下两个 origin 的音符相隔一个 origin 的距离、逆映射各自正确）与 `the_scroll_window_is_the_clip_span`。
+
+**fit 基准与 margin 留给 P3**：spec 原写"fit 改 context 跨度、钳制加 margin"，实测 `span_ticks ≥ loop_ticks`（活跃时长可长于内容），用 span 拟合会让单 clip 视图缩小，违反等价验收；P3 改用"context 内各 clip `start + loop` 的最大跨度"，单 clip 退化为现在的 `loop_ticks`。
+
+

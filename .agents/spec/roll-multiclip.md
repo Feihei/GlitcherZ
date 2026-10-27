@@ -1,6 +1,6 @@
 # 多 clip 钢琴卷帘 + 音高曲线 Spec
 
-> 状态：草案（2026-10-27，经一轮设计讨论；同日 **P0 已交付**，偏差见 §9）。P2 先于 P3/P4，P1 可并行。
+> 状态：草案（2026-10-27，经一轮设计讨论；同日 **P0 / P2 已交付**，偏差见 §9 / §10）。P3/P4 待实施，P1 可并行。
 > 上游：`timeline.md`（clip 模型 / 平铺语义）、`editing-model.md`（M4 交互模型：常驻态只有 Select、语义决策源不得回到指针）、`control-tracks.md`（曲线一等实体、`AutoDest`、U4a CC 通路、§7 开放问题）、`sf2-loader.md`（bend range）、`effects.md`（`Smoothed`）。
 
 ## 1. 背景与问题
@@ -111,8 +111,8 @@ RollSubject { focus, context }        ← MAX_ROLL_CONTEXT = 8
   - 验收：`ctrl_events_round_trip` / `single_data_byte_ctrls_do_not_shift_later_events` / `clip_ctrls_fire_at_their_positions` / `clip_ctrls_tile_with_the_loop` / `clip_ctrls_precede_notes_in_the_same_block` / `clip_ctrl_table_is_fixed_capacity` / `track_ctrl_delivers_cc_and_pitch_bend` / `track_ctrl_rejects_unknown_tracks`。
 - [ ] **P1 音高通路**（D9–D12）：`AutoParam::PitchBend` + `AutoDest::PitchBend` + `ParamId::PitchOffset` + synth/sample 逐样本实现 + 分流表落地。
   - 验收：内置 synth 的 pitch 曲线无台阶（逐样本）；CLAP/SF2 收到 `0xE0`；VST3 返回 false 且 UI 标注。
-- [ ] **P2 坐标系绝对化**（D1–D3）：`RollGeom` 结构体化、clip 原点、可见范围放开、fit 基准改 context 跨度。
-  - 验收：单 clip 下所有既有 roll 测试与实测行为**逐项等价**（这是纯重构，行为不变）。
+- [x] **P2 坐标系绝对化** ✅ 2026-10-27（D1–D3）：`RollGeom { origin_tick, t0_x, ticks_to_x, top_note, row_h, area }` 结构体化（绘制/命中/刀切/框选共用一套 `note_rect`/`note_edges`/`note_hit_rect`/`note_at`）、`scroll_x` 改绝对 tick、`ViewWindow` 接管滚动钳制、origin 变化时重锚。P3/P4 只需给 ghost 各自换 `origin_tick` 与把 `ViewWindow` 换成 context 跨度。
+  - 验收：单 clip 下所有既有 roll 测试与实测行为**逐项等价**（37 项原测试全部通过；仅 3 处直接调用自由函数 `note_rect`/`note_at`/`knife_crossing` 的测试改为调 `RollGeom`，断言一字未改）；新增 `clips_with_different_origins_share_one_time_axis` / `the_scroll_window_is_the_clip_span`。偏差见 §10。
 - [ ] **P3 多 clip 主体**（D4–D7）：`RollSubject` + ghost 渲染 + chip 条 + 焦点切换 + context 装配。
   - 验收：重叠加跨轨的 3 个 clip 同时可见；ghost 点击/框选/刀切均无反应；切换焦点后 selection 清空且编辑落到新 focus。
 - [ ] **P4 曲线泳道**（D8、D16、D17）：多泳道栈 + 纵轴按 `AutoDest` + 可写 curve 编辑。
@@ -133,4 +133,16 @@ RollSubject { focus, context }        ← MAX_ROLL_CONTEXT = 8
 | E6 | `AutoParam::PitchBend` 在 P0 | 仍在 P1 | P0 只保证**导入的** bend 能响、能原样导出；曲线侧没有 bend 目标前，UI 无法产生新的 bend |
 
 额外落地细节（`RtCtrlKind` 手写 `Default`、`MAX_CLIP_CTRLS = 32`、`origin` 改取最早事件、`slot_ctrl` 只投递 CC/bend）见 `.agents/implementation.md` 的「clip 级 controller 事件」一节。
+
+## 10. P2 实施勘误（2026-10-27）
+
+| # | spec 原判 | 实际 | 原因 |
+| :-- | :-- | :-- | :-- |
+| E7 | fit 基准改 context 跨度 `(max_end - min_start).max(bar_ticks)` | 仍是 `loop_ticks`（内容长度） | `span_ticks ≥ loop_ticks`（clip 的活跃时长可以长于内容），用 span 拟合会让**单 clip** 视图缩小，直接违反 P2 的"逐项等价"验收。P3 的基准改用"context 内各 clip 的 `start + loop` 的最大跨度"，单 clip 时退化为 `loop`，与现在一致 |
+| E8 | `scroll_x` 钳制 `[min_start - margin, max_end + margin - width/t_x]` | `[clip.start, clip.start + loop]`，margin = 0 | context 与 margin 是 P3 的概念。P2 先落地**机制**：`ViewWindow::clamp_scroll` 一处收口（原来三处重复的 `clamp(0.0, loop - w/t_x)`），P3 只换窗口的 start/end |
+| E9 | 未提 | 新增 `RollState.view_origin: Option<i64>` | `scroll_x` 变成绝对 tick 后，state 仍跨 target 存活：打开一个从第 9 小节开始的 clip 会继承上一个 clip 的 scroll（可能整个落在窗外）。origin 变化时把 scroll 重锚到自己的起点，这正是旧的"打开 clip 看到它开头"行为。首帧 `None` → 也走同一条路径 |
+| E10 | 未提 | 播放头仍按 `rem_euclid(loop_ticks)` 取内容位置 | clip 内容从自己的 origin 循环，wrap 后的位置才是该 clip 实际发声的位置；经 `geom.x_of(pos)` 换算后，单 clip（含 origin ≠ 0）视觉与改造前完全一致 |
+| E11 | 指针 → tick 直接读 | `pointer_tick` 统一走 `geom.local_at` 并 `.max(0.0)` | 负 tick 的钳制必须发生在**局部**坐标：若先钳绝对 tick，clip 起点左侧的点击会变成"局部 tick = -origin"而不是 0 |
+
+一处设计收益值得记录：`RollGeom` 把 `t0_x` / `ticks_to_x` / `top_note` / `row_h` / `area` 收进一个 `Copy` 结构后，图案绘制、命中测试、刀切、框选、velocity 泳道**共用同一对映射**，`note_rect` 从"5 个参数的自由函数"变成"1 个参数的方法"。P3 加 ghost 时不需要再复制一份坐标公式——每个 ghost 只是换一个 `origin_tick`。
 
