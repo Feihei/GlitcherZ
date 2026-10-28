@@ -78,8 +78,13 @@ pub const MAX_CABLES: usize = 256;
 pub const MIN_MIXER_CHANNELS: usize = 2;
 pub const MAX_MIXER_CHANNELS: usize = 32;
 
-/// Clips per track capacity limit (D15; the engine side uses the same value).
-pub const MAX_CLIPS_PER_TRACK: usize = 8;
+/// Clips per track capacity limit (D15 as revised 2026-10-28; the engine side
+/// `MAX_TRACK_CLIPS` uses the same value).
+///
+/// 32 since both clip tables moved to the structure queue: the limit no longer
+/// multiplies into command-queue memory, so it can cover a real song (verse /
+/// chorus / bridge edits on one track) instead of forcing a single clip.
+pub const MAX_CLIPS_PER_TRACK: usize = 32;
 
 /// Notes per MIDI clip capacity limit (D15 as revised 2026-10-28).
 ///

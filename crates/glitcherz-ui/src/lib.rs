@@ -2161,7 +2161,11 @@ impl GlitcherZApp {
                 curve,
             };
         }
-        self.send_sequencer(SequencerCommand::SetControlClips { index, clips });
+        // D15 revision: control tables ride the structure queue (they are
+        // ~17 KB at 32 clips — too big for the command queue).
+        if !self.engine.set_control_clips(index, clips) {
+            log::warn!("structure queue full: control clips of track {index} not updated");
+        }
     }
 
     /// Redirect an automation track's cable endpoint (the document cable stores the **document**
@@ -4321,9 +4325,7 @@ impl GlitcherZApp {
                     curve,
                 };
             }
-            let _ = engine.send(EngineCommand::Sequencer(
-                SequencerCommand::SetControlClips { index, clips },
-            ));
+            let _ = engine.set_control_clips(index, clips);
         }
         for track in 0..self.project().audio_tracks.len() {
             let Some(&engine_id) = self
@@ -9245,10 +9247,9 @@ impl GlitcherZApp {
         self.commit_edit("Remove Automation Track", before);
         let _ = self.engine.clear_auto_route(index);
         // Engine side: clear that index to an empty clip table.
-        self.send_sequencer(SequencerCommand::SetControlClips {
-            index,
-            clips: [RtControlClip::default(); MAX_TRACK_CLIPS],
-        });
+        let _ = self
+            .engine
+            .set_control_clips(index, [RtControlClip::default(); MAX_TRACK_CLIPS]);
         self.selected_auto = index.min(self.project().control_tracks.len().saturating_sub(1));
     }
 

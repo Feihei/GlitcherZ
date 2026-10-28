@@ -352,6 +352,18 @@ pub enum GraphUpdate {
         /// The new clip table (built on the control thread).
         clips: crate::realtime::sequencer::MidiClipTable,
     },
+    /// Replace one control track's clip table (D15 revision 2026-10-28).
+    ///
+    /// D17 note: the delivery endpoint is **not** part of the table — it stays
+    /// decided by the automation routing table (`AudioEngine::set_auto_route`).
+    /// The table owns no heap, so no trash receipt is needed: the runner
+    /// overwrites the previous table in place.
+    SetControlClips {
+        /// Target automation track index (the document's `control_tracks` order).
+        index: usize,
+        /// The new clip table (built on the control thread).
+        clips: crate::realtime::sequencer::ControlClipTable,
+    },
 }
 
 /// One node install: control-side-constructed processor + dedicated output

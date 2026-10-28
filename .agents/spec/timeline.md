@@ -21,7 +21,7 @@
 | # | 决策 | 内容 |
 | :--- | :--- | :--- |
 | D14 | Steps 退役 | `TrackSource::Steps` / pattern / 16-step 面板移除，统一 clip 模型。**未来特性（记录不实施）**：clip 在 timeline 上平铺——一个 clip 的内容在 span 时间段内循环，编辑 clip 即改变整段循环（类似 step 在时段内循环的体验）。为此一期就把 `span_ticks` / `loop_ticks` 语义建进 Clip 模型（调度按周期平铺），UI 一期只做单周期呈现。 |
-| D15 | clip 表走结构队列（2026-10-28 修订） | 每轨 ≤ 8 个 clip；**单 clip 音符 / controller 数不再有引擎侧上限**（原 `MAX_CLIP_NOTES = 64` 是「整表塞进 `Copy` 命令槽」的副产物：真实 MIDI 一轨常 1000+ 音符，导入后直接不可保存）。修订后 note/ctrl 集合是**控制线程拥有的 `Vec`**：`MidiClipTable` 经结构队列（`GraphUpdate::SetMidiClips`）下发，音频线程 `mem::replace` 换入、把旧表推到 MIDI 垃圾队列由控制线程释放——与 audio clip 表（U6 D4）同一协议。命令队列回到小结构（`SetControlClips` 仍承载定容 `RtControlClip` 表）。文档侧 `MAX_CLIP_NOTES = 65536` 仅作病态文件防线；导入按 `smf::IMPORT_CLIP_NOTES = 4096` 分块（同 start tick 的音符不切开，块数超 `MAX_CLIPS_PER_TRACK` 时自适应放大块长）。 |
+| D15 | clip 表走结构队列（2026-10-28 修订） | 每轨 ≤ **32** 个 clip（2026-10-28 二次修订：原 8 个是命令队列时代的副产物）；**单 clip 音符 / controller 数不再有引擎侧上限**（原 `MAX_CLIP_NOTES = 64` 是「整表塞进 `Copy` 命令槽」的副产物：真实 MIDI 一轨常 1000+ 音符，导入后直接不可保存）。修订后 note/ctrl 集合是**控制线程拥有的 `Vec`**：`MidiClipTable` 经结构队列（`GraphUpdate::SetMidiClips`）下发，音频线程 `mem::replace` 换入、把旧表推到 MIDI 垃圾队列由控制线程释放——与 audio clip 表（U6 D4）同一协议。命令队列回到小结构——control clip 表（`ControlClipTable`，定容 `Copy`、无堆所有权）也一并迁到 `GraphUpdate::SetControlClips`，纯因体积（32 × ~544 B ≈ 17 KB/槽）而非所有权；它不需要垃圾回执：音频线程直接原地覆盖旧表。文档侧 `MAX_CLIP_NOTES = 65536` 仅作病态文件防线；导入按 `smf::IMPORT_CLIP_NOTES = 4096` 分块（同 start tick 的音符不切开，块数超 `MAX_CLIPS_PER_TRACK` 时自适应放大块长）。 |
 | D25 | clip 数据 vs 命令分离（2026-10-28） | 结构性大数据（MIDI clip 表、audio clip 表）一律走结构队列 + 垃圾回执；命令队列只承载小而 `Copy` 的标量命令。判据：**载荷里带堆所有权（`Vec` / `Arc`）就不得进命令队列**——rtrb 按最大变体预分配，带 `Vec` 的变体只占一个表头（~24 B），定容数组变体却会把整条队列撑到 MB 级。 |
 | D16 | 编曲长度内容自适应 | arrangement 末尾 = 所有 clip 结束位置向上取整到小节；播放到末尾自动停止；一期不做 loop region。安全上限 256 小节（防病态文档）。 |
 | D17 | control clip 终点由连线决定 | 延续 D7：control 轨在 timeline 上只是时间容器，投递终点由节点图连线（`auto_routes`）决定；clip span 之外不投递（目标保持最后值）。删轨/改图不产生悬空绑定。 |
@@ -37,7 +37,7 @@ ControlClip: ( start_ticks, span_ticks, loop_ticks, curve: [AutoPoint] )
 ```
 
 - 移除：`pattern` / `source` / 单 `clip` 字段、`TrackSource`。
-- 校验：每轨 clip ≤ 8、单 clip 音符 ≤ 65536（病态文件防线，见 D15 修订）、`span_ticks ≥ loop_ticks`、`start_ticks + span_ticks ≤ 256 小节`；越界报错不截断。
+- 校验：每轨 clip ≤ 32、单 clip 音符 ≤ 65536（病态文件防线，见 D15 修订）、`span_ticks ≥ loop_ticks`、`start_ticks + span_ticks ≤ 256 小节`；越界报错不截断。
 - `PROJECT_VERSION = 4`，无兼容读路径（Q5 延续）。
 
 ## 5. 引擎调度（Sequencer 重写）

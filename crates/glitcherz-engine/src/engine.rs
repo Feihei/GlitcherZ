@@ -441,14 +441,19 @@ impl AudioEngine {
     /// out-of-bounds indices are ignored on the real-time side). The curves
     /// have no target — the routing endpoint is set separately via
     /// [`AudioEngine::set_auto_route`] (D7/D17).
+    ///
+    /// D15 revision (2026-10-28): the table rides the **structure queue**, like
+    /// the MIDI clip tables. It owns no heap, but at 32 clips it is ~17 KB —
+    /// far too big for the `Copy` command queue. Returns `false` when the
+    /// queue is full (the update is dropped; the next edit re-sends it).
     pub fn set_control_clips(
         &mut self,
         index: usize,
-        clips: [crate::realtime::RtControlClip; crate::realtime::MAX_TRACK_CLIPS],
+        clips: crate::realtime::ControlClipTable,
     ) -> bool {
-        self.send(EngineCommand::Sequencer(
-            SequencerCommand::SetControlClips { index, clips },
-        ))
+        self.structure
+            .push(GraphUpdate::SetControlClips { index, clips })
+            .is_ok()
     }
 
     /// Timeline wiring: connects automation track `auto_index` to a target

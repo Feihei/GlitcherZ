@@ -33,7 +33,7 @@
       → AudioEngine::start_offline(engine_rate)
       → 逐文档节点 spawn_offline_node（影子 node_map + guards）
       → 连线（Audio/Midi/Automation 含 tempo 哨兵）/ register_track_chain
-      → clip 表三套下发（SetTrackClips / SetControlClips / SetAudioClips）
+      → clip 表三套下发（SetMidiClips / SetControlClips，经结构队列；SetAudioClips）
       → seek(start) + Play
 
 推进：每帧尾 pump_export：渲染 ~34 块，render_interleaved →

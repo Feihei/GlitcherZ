@@ -116,10 +116,10 @@ pub use processor::{ChannelWeights, MAX_WEIGHT_CHANNELS, Processor, ProcessorCha
 pub use reverb::ReverbProcessor;
 pub use sample::{SAMPLE_DEFAULT_ROOT, SAMPLE_POLYPHONY, SampleVoiceProcessor};
 pub use sequencer::{
-    MAX_TIME_SIGNATURE_NUMERATOR, MAX_TRACK_CLIPS, MIDI_CLIP_TRASH_CAPACITY, MIN_VELOCITY,
-    MidiClipTable, RtCtrl, RtCtrlKind, RtMidiClip, RtNote, Sequencer, SequencerSink, TICKS_PER_BAR,
-    TICKS_PER_QUARTER, TICKS_PER_STEP, empty_midi_clip_table, midi_clip_trash_channel,
-    ticks_per_bar_of,
+    ControlClipTable, MAX_TIME_SIGNATURE_NUMERATOR, MAX_TRACK_CLIPS, MIDI_CLIP_TRASH_CAPACITY,
+    MIN_VELOCITY, MidiClipTable, RtCtrl, RtCtrlKind, RtMidiClip, RtNote, Sequencer, SequencerSink,
+    TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, empty_midi_clip_table,
+    midi_clip_trash_channel, ticks_per_bar_of,
 };
 pub use sf2::{SF2_POLYPHONY, Sf2VoiceProcessor};
 pub use silent::SilentProcessor;

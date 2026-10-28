@@ -73,8 +73,23 @@ pub fn ticks_per_bar_of(numerator: u8, denominator: u8) -> u32 {
 /// Lowest note-on velocity (a note-off; silence).
 pub const MIN_VELOCITY: u8 = 1;
 
-/// Maximum number of clips per track (D15; mirrors `glitcherz_model::MAX_CLIPS_PER_TRACK`).
-pub const MAX_TRACK_CLIPS: usize = 8;
+/// Maximum number of clips per track (D15 revision 2026-10-28; mirrors
+/// `glitcherz_model::MAX_CLIPS_PER_TRACK`).
+///
+/// 32 since the control clip table left the command queue: neither clip table
+/// is a `Copy` command payload any more, so the limit no longer multiplies
+/// into queue memory. A control table is `32 × ~544 B ≈ 17 KB`, which the
+/// 256-slot structure queue absorbs as a one-time pre-allocation (~4.5 MB),
+/// while the command queue keeps its small variants.
+pub const MAX_TRACK_CLIPS: usize = 32;
+
+/// One control track's clip table (D15 revision 2026-10-28).
+///
+/// Unlike [`MidiClipTable`] this owns **no heap** — every curve is a
+/// fixed-capacity `Copy` array — so it needs no trash channel: the block
+/// runner simply overwrites the old table in place. It still travels on the
+/// structure queue rather than the command queue, purely because of its size.
+pub type ControlClipTable = [RtControlClip; MAX_TRACK_CLIPS];
 
 /// Trash-queue capacity for displaced MIDI clip tables (D15 revision,
 /// 2026-10-28). The control thread drains it every UI frame; 64 slots absorb
@@ -328,7 +343,12 @@ pub struct Sequencer {
     /// replaced one track at a time through the structure queue).
     clips: [MidiClipTable; MAX_MIDI_TRACKS],
     /// Per-control-track clip tables (D15/D17).
-    control_clips: [[RtControlClip; MAX_TRACK_CLIPS]; MAX_AUTO_TRACKS],
+    /// Control clip tables, **boxed**: `16 × 32 × ~544 B ≈ 278 KB` inline
+    /// would make every `Sequencer` move a 278 KB stack copy (debug builds
+    /// even overflow a 2 MB test-thread stack). One heap allocation at
+    /// construction — which happens on the control thread, before the stream
+    /// starts — and never again. RT-safe to read and overwrite.
+    control_clips: Box<[ControlClipTable; MAX_AUTO_TRACKS]>,
     /// Arrangement end in ticks (D16: the latest clip end rounded up to a
     /// bar); `0` = unbounded (empty arrangement, free run).
     arrangement_end_ticks: u32,
@@ -364,7 +384,9 @@ impl Sequencer {
             position_ticks: 0.0,
             track_count: crate::realtime::DEFAULT_MIDI_TRACKS,
             clips: std::array::from_fn(|_| empty_midi_clip_table()),
-            control_clips: [[RtControlClip::default(); MAX_TRACK_CLIPS]; MAX_AUTO_TRACKS],
+            control_clips: Box::new(std::array::from_fn(|_| {
+                [RtControlClip::default(); MAX_TRACK_CLIPS]
+            })),
             arrangement_end_ticks: 0,
             arrangement_floor_ticks: 0,
             loop_start_ticks: 0,
@@ -589,9 +611,11 @@ impl Sequencer {
         Some(displaced)
     }
 
-    /// Replaces one control track's clip table in one block (D15 batch;
-    /// out-of-range indices ignored). Also refreshes the arrangement end. RT-safe.
-    pub fn set_control_clips(&mut self, index: usize, clips: [RtControlClip; MAX_TRACK_CLIPS]) {
+    /// Replaces one control track's clip table in one block (D15 revision;
+    /// out-of-range indices ignored). Also refreshes the arrangement end.
+    /// RT-safe: the table is `Copy` and owns no heap, so the overwrite needs
+    /// no trash receipt.
+    pub fn set_control_clips(&mut self, index: usize, clips: ControlClipTable) {
         if let Some(slot) = self.control_clips.get_mut(index) {
             *slot = clips;
             self.refresh_arrangement_end();
@@ -600,7 +624,7 @@ impl Sequencer {
 
     /// Read-only access to all control clip tables (for the block runner to
     /// sample per the routing table). RT-safe.
-    pub fn control_clips(&self) -> &[[RtControlClip; MAX_TRACK_CLIPS]; MAX_AUTO_TRACKS] {
+    pub fn control_clips(&self) -> &[ControlClipTable; MAX_AUTO_TRACKS] {
         &self.control_clips
     }
 
@@ -1596,6 +1620,37 @@ mod tests {
         assert_eq!(seq.step_index(), 0);
         run(&mut seq, 5); // 6400 samples = 25.6 ticks: entering step 1
         assert_eq!(seq.step_index(), 1);
+    }
+
+    /// D15 revision (2026-10-28): a control track holds 32 clips, not 8.
+    ///
+    /// Pins both halves of the change: the limit itself, and the fact that the
+    /// whole 17 KB table round-trips through `set_control_clips` (it is now a
+    /// structure-queue payload) with the arrangement end derived from the
+    /// **last** slot — the old 8-slot table would have dropped 24 of them
+    /// silently.
+    #[test]
+    fn control_table_accepts_32_clips() {
+        let mut seq = Sequencer::new(SR);
+        assert_eq!(MAX_TRACK_CLIPS, 32, "model and engine must agree");
+        let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
+        for (i, slot) in clips.iter_mut().enumerate() {
+            *slot = RtControlClip {
+                start_ticks: i as u32 * TICKS_PER_BAR,
+                span_ticks: TICKS_PER_BAR,
+                loop_ticks: TICKS_PER_BAR,
+                ..RtControlClip::default()
+            };
+        }
+        seq.set_control_clips(0, clips);
+        let table = seq.control_clips()[0];
+        assert_eq!(table[0].start_ticks, 0);
+        assert_eq!(table[31].start_ticks, 31 * TICKS_PER_BAR);
+        assert_eq!(
+            seq.arrangement_end_ticks(),
+            32 * TICKS_PER_BAR,
+            "the last clip must set the arrangement end"
+        );
     }
 
     #[test]

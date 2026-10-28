@@ -237,6 +237,11 @@ impl BlockRunner {
                         self.trash_midi_clips(trashed);
                     }
                 }
+                GraphUpdate::SetControlClips { index, clips } => {
+                    // D15 revision: a control table owns no heap, so the old
+                    // one is simply overwritten — no trash receipt.
+                    self.sequencer.set_control_clips(index, clips);
+                }
                 topology => self.graph.apply_update(topology, &mut self.recycle),
             }
         }
@@ -482,9 +487,6 @@ impl BlockRunner {
                 numerator,
                 denominator,
             } => self.sequencer.set_time_signature(numerator, denominator),
-            SequencerCommand::SetControlClips { index, clips } => {
-                self.sequencer.set_control_clips(index, clips);
-            }
             SequencerCommand::SetMidiTrackCount(count) => {
                 self.sequencer.set_track_count(count);
             }
@@ -865,10 +867,9 @@ mod tests {
             loop_ticks: TICKS_PER_BAR,
             curve,
         };
-        tx.push(EngineCommand::Sequencer(
-            SequencerCommand::SetControlClips { index: 0, clips },
-        ))
-        .expect("queue not full");
+        structure_tx
+            .push(GraphUpdate::SetControlClips { index: 0, clips })
+            .expect("structure queue not full");
         let update = compiler
             .set_auto_route(0, mixer_id, ParamId::MixerGain(0))
             .expect("automation routing should succeed");
@@ -994,10 +995,9 @@ mod tests {
             loop_ticks: TICKS_PER_BAR,
             curve,
         };
-        tx.push(EngineCommand::Sequencer(
-            SequencerCommand::SetControlClips { index: 0, clips },
-        ))
-        .expect("queue not full");
+        structure_tx
+            .push(GraphUpdate::SetControlClips { index: 0, clips })
+            .expect("structure queue not full");
         let update = compiler
             .set_auto_route(0, voice_id, ParamId::PluginParam(1))
             .expect("automation routing should succeed");
@@ -1101,10 +1101,9 @@ mod tests {
         let (mut runner, mut tx, mut structure_tx, feedback, mut compiler) = make_runner(128, 2);
         let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
         clips[0] = tempo_clip(0, TICKS_PER_BAR, 240.0);
-        tx.push(EngineCommand::Sequencer(
-            SequencerCommand::SetControlClips { index: 0, clips },
-        ))
-        .expect("queue not full");
+        structure_tx
+            .push(GraphUpdate::SetControlClips { index: 0, clips })
+            .expect("structure queue not full");
         let update = compiler
             .set_timeline_in_route(0)
             .expect("tempo routing should succeed");
@@ -1146,10 +1145,9 @@ mod tests {
         let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
         clips[0] = tempo_clip(0, TICKS_PER_BAR, 240.0);
         clips[1] = tempo_clip(2 * TICKS_PER_BAR, TICKS_PER_BAR, 240.0);
-        tx.push(EngineCommand::Sequencer(
-            SequencerCommand::SetControlClips { index: 0, clips },
-        ))
-        .expect("queue not full");
+        structure_tx
+            .push(GraphUpdate::SetControlClips { index: 0, clips })
+            .expect("structure queue not full");
         let update = compiler
             .set_timeline_in_route(0)
             .expect("tempo routing should succeed");
@@ -1181,10 +1179,9 @@ mod tests {
         let (mut runner, mut tx, mut structure_tx, feedback, mut compiler) = make_runner(128, 2);
         let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
         clips[0] = tempo_clip(0, TICKS_PER_BAR, 240.0);
-        tx.push(EngineCommand::Sequencer(
-            SequencerCommand::SetControlClips { index: 0, clips },
-        ))
-        .expect("queue not full");
+        structure_tx
+            .push(GraphUpdate::SetControlClips { index: 0, clips })
+            .expect("structure queue not full");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
             .expect("queue not full");
 
