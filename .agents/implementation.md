@@ -584,6 +584,8 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 
 **control clip 表也迁出命令队列（同一修订的第二步）**：`ControlClipTable = [RtControlClip; MAX_TRACK_CLIPS]` 是纯 `Copy`（每条曲线定容 `[RtAutoPoint; 64]`，无堆所有权），但它有 32 × ~544 B ≈ 17 KB。留在命令队列就是 1024 槽 × 17 KB ≈ 17 MB 的启动预分配，且把 `SequencerCommand` 的每个变体都撑大。改成 `GraphUpdate::SetControlClips` 后，代价挪到结构队列的一次性 256 × 17 KB ≈ 4.5 MB。**它不需要垃圾回执**（没有 `Vec`/`Arc` 要释放），block runner 直接 `sequencer.set_control_clips(index, table)` 原地覆盖。这是一条通用判据（D25 的补充）：**载荷大就要走结构队列，载荷带堆所有权才需要回执队列**。
 
+**`Sequencer.control_clips` 必须「直接填堆」，不只是装箱**：16 轨 × 32 clip × 544 B ≈ 278 KB 内联会让每次 `Sequencer` move 变成 278 KB 栈拷贝。第一步只写成 `Box::new(std::array::from_fn(...))` —— **这不够**：`Box::new(expr)` 要先把整个数组在栈上造出来再拷进堆，峰值仍是 ~550 KB。在 Windows 上主线程默认只有 1 MB 栈，实测 `cargo run` 一启动就 `STATUS_STACK_OVERFLOW (0xc00000fd)`；而 `cargo test` 的测试线程有 2 MB，所以单测全绿、app 挂——**这就是为什么这个 bug 没被测试抓住**。正解是 `Box<[ControlClipTable]>` + `(0..N).map(...).collect()`：`collect` 走 `Vec → into_boxed_slice`，逐元素写进堆缓冲区，栈上只有单个元素（17 KB）的临时量。通用教训：**给实时结构加定容大数组前先算 `size_of`，超过 ~16 KB 就该装箱；装箱还要确认临时量没有落回栈上**。
+
 **为什么 `Vec` 而不是更大的定容数组**：队列里带 `Vec` 的变体只占表头（~24 B ×2 ×32 clip ≈ 1.5 KB），音符本体在堆上且长度随内容；定容数组则是 `32 × N × 12 B` 的无条件内存，且每次编辑要整表 memcpy（`push_all_clips` 每轨一份 × 16 轨）。`Vec` 版 `push`/`push_ctrl` 天然只能控制线程调用（可能扩容），文档注释已锁死这一点。
 
 **`schedule_track_clips` 的借用调整**：原实现 `let clips = self.clips[track];` 靠 `Copy` 复制整表来避开 `&self` / `&mut self.pending_offs` 冲突。`Vec` 不可 `Copy`，改为两个不相交字段借用（`&self.clips[track]` + `&mut self.pending_offs[track]`），并把 `set_pending_off` 从方法降为自由函数（接收 `&mut` 槽位数组）——否则调用它要再借整个 `self`。

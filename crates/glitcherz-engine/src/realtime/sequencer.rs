@@ -343,12 +343,19 @@ pub struct Sequencer {
     /// replaced one track at a time through the structure queue).
     clips: [MidiClipTable; MAX_MIDI_TRACKS],
     /// Per-control-track clip tables (D15/D17).
-    /// Control clip tables, **boxed**: `16 × 32 × ~544 B ≈ 278 KB` inline
-    /// would make every `Sequencer` move a 278 KB stack copy (debug builds
-    /// even overflow a 2 MB test-thread stack). One heap allocation at
-    /// construction — which happens on the control thread, before the stream
-    /// starts — and never again. RT-safe to read and overwrite.
-    control_clips: Box<[ControlClipTable; MAX_AUTO_TRACKS]>,
+    ///
+    /// **Heap-owned, and filled straight into the heap allocation**: at 32
+    /// clips a table is ~17 KB, so 16 tracks inline would be ~278 KB, and
+    /// every `Sequencer` move would be a 278 KB stack copy (debug builds
+    /// overflowed a 1 MB main-thread stack at startup). Note that
+    /// `Box::new([...])` is *not* enough — it materialises the whole array on
+    /// the stack first and then copies it into the heap, which costs the same
+    /// ~550 KB peak. Hence `Box<[T]>` built through a `Vec` (`collect`),
+    /// which writes each element directly into the heap buffer.
+    ///
+    /// One allocation at construction, on the control thread, before the
+    /// stream starts — never again. RT-safe to read and overwrite.
+    control_clips: Box<[ControlClipTable]>,
     /// Arrangement end in ticks (D16: the latest clip end rounded up to a
     /// bar); `0` = unbounded (empty arrangement, free run).
     arrangement_end_ticks: u32,
@@ -384,9 +391,11 @@ impl Sequencer {
             position_ticks: 0.0,
             track_count: crate::realtime::DEFAULT_MIDI_TRACKS,
             clips: std::array::from_fn(|_| empty_midi_clip_table()),
-            control_clips: Box::new(std::array::from_fn(|_| {
-                [RtControlClip::default(); MAX_TRACK_CLIPS]
-            })),
+            // `collect::<Box<[T]>>` fills the heap buffer element by element —
+            // no full-size stack temporary (see the field docs).
+            control_clips: (0..MAX_AUTO_TRACKS)
+                .map(|_| [RtControlClip::default(); MAX_TRACK_CLIPS])
+                .collect(),
             arrangement_end_ticks: 0,
             arrangement_floor_ticks: 0,
             loop_start_ticks: 0,
@@ -624,7 +633,7 @@ impl Sequencer {
 
     /// Read-only access to all control clip tables (for the block runner to
     /// sample per the routing table). RT-safe.
-    pub fn control_clips(&self) -> &[ControlClipTable; MAX_AUTO_TRACKS] {
+    pub fn control_clips(&self) -> &[ControlClipTable] {
         &self.control_clips
     }
 
