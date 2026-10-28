@@ -289,7 +289,7 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 
 依赖：P2 必须先于 P3/P4；P1 与 P2 并行；P0 独立可先做。
 
-## U13：SoundFont 节点自足化（2026-10-28 立项，spec `sf2-loader.md` D10–D15 待补）
+## U13：SoundFont 节点自足化（2026-10-28 立项，spec `sf2-loader.md` D10–D17）
 
 用户提出：SF2 节点现在"添加时选文件、之后锁死"，希望加完节点就能直接出现，节点上有 `Load File…` 按钮，加载后显示字体名，还能反复换；bank/patch 下拉也要放到节点上，与 Inspector 同等效力；并问 SF2 一贯音量偏小该不该加节点级 gain。
 
@@ -303,6 +303,7 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 - [x] **S4 patch 节点 UI** ✅ 2026-10-28：`Load File…` / `Replace…` 按钮行 + `bank`/`patch` 两个自绘 chip 行（点击弹 `Area` 列表，非 `ComboBox`——节点是缩放绘制，原生控件会溢出）+ `gain` 滑条行；`PatchDeps` 增 `sf2_presets` 回调；`PatchAction::LoadSoundFont{node}`；`size_of` 通用节点按 action 行增高（SF2 盒 130 px），动作按钮按数量均分宽度；标签改 `SF2 · <stem>` / `SF2 · (no file)`；Add 菜单的 `SoundFont…` 改为直接创建空节点
 - [x] **S5 Inspector** ✅ 2026-10-28：`sf2_section`（文件行 + Load/Replace + Bank/Patch 下拉 + gain 滑条），与节点按钮调**同一对**函数（`pick_sound_font` / `set_soundfont_preset`）；patch 的 bank 切换沿用 Inspector 的 program 保留规则
 - [x] **S6 收尾** ✅ 2026-10-28：spec `sf2-loader.md` §8 补 D10–D14；`cargo fmt` + `clippy -D warnings` + `test --workspace` 全绿（713 项，新增 6 项）
+- [x] **S7 试用手感修复** ✅ 2026-10-28（spec 补 D15–D17）：① 节点内操作行改**手绘** `action_button`（`egui::Button` 有 18 pt 最小高度，缩小时顶出到标题上）；② 状态栏消息改读取即过期——原 `take_if` 把消息在首帧取走，所有提示只活 16 ms，加载失败看起来完全静默；失败走 `set_error`（红 + 16 s）；③ vendored `rustysynth-ext` 补 RIFF 偶数对齐（SF3 的 `smpl` 常为奇数长度，错位一字节导致所有 SF3 被判 invalid）；实测 Airfont380 `.sf3` 3 MB → 1 preset 加载成功
 
 **已知边界**：`SoundFont` 解析后是 `Vec<i16>`（**常驻 ≈ 文件大小**），但加载过程先 alloc `Vec<u8>` 原始字节再转 i16 → **峰值 ≈ 2×**；解析在控制线程，2 GB 文件会冻结 UI 数秒。S3c 只解决"看得见"（banner），不解决"不阻塞"——窗口阻塞期间没有消息泵，Windows 可能短暂标记未响应。真要异步只剩一条路：`Box<dyn FnOnce>` 换成 worker 线程 + job id 去重，加载函数已是纯函数（`sf2_library_for`），切换点集中在一处。
 
