@@ -289,6 +289,23 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 
 依赖：P2 必须先于 P3/P4；P1 与 P2 并行；P0 独立可先做。
 
+## U13：SoundFont 节点自足化（2026-10-28 立项，spec `sf2-loader.md` D10–D15 待补）
+
+用户提出：SF2 节点现在"添加时选文件、之后锁死"，希望加完节点就能直接出现，节点上有 `Load File…` 按钮，加载后显示字体名，还能反复换；bank/patch 下拉也要放到节点上，与 Inspector 同等效力；并问 SF2 一贯音量偏小该不该加节点级 gain。
+
+决策（用户拍板）：**空节点静音**（不回落内置合成器）、**gain 默认 1.0**（顺带修掉 rustysynth `master_volume` 默认 0.5 的隐藏 -6 dB）、字体缓存 cap 待定（推荐 2）。
+
+- [x] **S1 engine** ✅ 2026-10-28：`realtime/silent.rs` 新增 `SilentProcessor`（`process` 清零、`note_event`/`midi_cc`/`midi_pitch_bend` 显式返回 `true` 吃掉事件，不 fallback）；`ParamId::Sf2MasterVolume` 改名 `Sf2Gain`（线性 0..2，非有限值丢弃），`Sf2VoiceProcessor::new` 构造期 `set_master_volume(1.0)` 抵消 crate 默认 0.5；单元测试 1 项（静音 + 吞事件）
+- [x] **S2 model** ✅ 2026-10-28：`VoiceSpec::SoundFont { gain }`（`serde(default = 1.0)`，PROJECT_VERSION 不动，旧文件读作 1.0）
+- [x] **S3a UI 装配（空节点 + gain 下发）** ✅ 2026-10-28：`install_node` / `spawn_offline_node` 空 `path` → `SilentProcessor`（缺文件仍走 D8 内置回落），非空路径构造期下发 `Sf2Gain`；`create_patch_node` 默认 gain 1.0
+- [x] **S3b 字体库 + 换文件** ✅ 2026-10-28：`sf2_libraries: Vec<(PathBuf, Arc<Sf2Library>)>` LRU（cap 2，用户拍板）+ 独立 `sf2_preset_names` 名表（淘汰后仍能列 preset）；`load_sound_font(doc_id)` = 解析 → 写文档 → `engine.replace_node` 原位换装（保 node id，线缆/端口/MIDI 路由零改动）→ 一步 undo；preset 回落 `resolve_sf2_preset`（同址 → 同 bank 首 patch → 0:0 → 首个）
+- [x] **S3c 阻塞任务 + loading 提示** ✅ 2026-10-28（用户拍板：**不做异步**）：`BlockingJob` 三相位状态机（排队帧 → 画 banner 帧 → 结尾运行帧），`ui()` 末尾驱动；banner 与插件扫描条同一槽位（`Spinner` + 文案，带文件大小与峰值 RAM 估算）。机制通用，其它阻塞操作可复用
+- [x] **S4 patch 节点 UI** ✅ 2026-10-28：`Load File…` / `Replace…` 按钮行 + `bank`/`patch` 两个自绘 chip 行（点击弹 `Area` 列表，非 `ComboBox`——节点是缩放绘制，原生控件会溢出）+ `gain` 滑条行；`PatchDeps` 增 `sf2_presets` 回调；`PatchAction::LoadSoundFont{node}`；`size_of` 通用节点按 action 行增高（SF2 盒 130 px），动作按钮按数量均分宽度；标签改 `SF2 · <stem>` / `SF2 · (no file)`；Add 菜单的 `SoundFont…` 改为直接创建空节点
+- [x] **S5 Inspector** ✅ 2026-10-28：`sf2_section`（文件行 + Load/Replace + Bank/Patch 下拉 + gain 滑条），与节点按钮调**同一对**函数（`pick_sound_font` / `set_soundfont_preset`）；patch 的 bank 切换沿用 Inspector 的 program 保留规则
+- [x] **S6 收尾** ✅ 2026-10-28：spec `sf2-loader.md` §8 补 D10–D14；`cargo fmt` + `clippy -D warnings` + `test --workspace` 全绿（713 项，新增 6 项）
+
+**已知边界**：`SoundFont` 解析后是 `Vec<i16>`（**常驻 ≈ 文件大小**），但加载过程先 alloc `Vec<u8>` 原始字节再转 i16 → **峰值 ≈ 2×**；解析在控制线程，2 GB 文件会冻结 UI 数秒。S3c 只解决"看得见"（banner），不解决"不阻塞"——窗口阻塞期间没有消息泵，Windows 可能短暂标记未响应。真要异步只剩一条路：`Box<dyn FnOnce>` 换成 worker 线程 + job id 去重，加载函数已是纯函数（`sf2_library_for`），切换点集中在一处。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：

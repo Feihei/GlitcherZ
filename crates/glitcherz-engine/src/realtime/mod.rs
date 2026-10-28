@@ -61,6 +61,7 @@ pub mod reverb;
 pub mod sample;
 pub mod sequencer;
 pub mod sf2;
+pub mod silent;
 pub mod sine;
 pub mod svf;
 pub mod synth;
@@ -121,6 +122,7 @@ pub use sequencer::{
     ticks_per_bar_of,
 };
 pub use sf2::{SF2_POLYPHONY, Sf2VoiceProcessor};
+pub use silent::SilentProcessor;
 pub use sine::SineProcessor;
 pub use svf::{FilterMode, SvfProcessor};
 pub use synth::{SynthProcessor, note_to_frequency};

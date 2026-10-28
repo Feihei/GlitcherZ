@@ -1436,6 +1436,10 @@ pub enum VoiceSpec {
     /// address (spec `sf2-loader.md` D7). Sample data stays out of the
     /// document; a missing file falls back to the built-in voice with the
     /// fields kept (D8).
+    ///
+    /// U13: a node may be born with an **empty path** (no file dialog at
+    /// add time) and stay silent until `Load File…` picks one; the path is
+    /// re-pickable at any time.
     SoundFont {
         /// Path to the .sf2/.sf3 file.
         #[serde(default)]
@@ -1446,6 +1450,11 @@ pub enum VoiceSpec {
         /// Preset program number (0..=255).
         #[serde(default)]
         program: u8,
+        /// Node output trim (linear, 0..=2, default 1.0 = the font's own
+        /// level). SoundFonts are routinely mastered quiet, so the trim
+        /// belongs to the source instead of costing a graph node (U13).
+        #[serde(default = "soundfont_default_gain")]
+        gain: f32,
     },
     /// Wav sample player (spec `sample-player.md` D8): file path + root
     /// note + play mode + gain. Decoded sample data stays out of the
@@ -1512,6 +1521,13 @@ fn sample_default_root() -> u8 {
 
 /// Serde default for [`VoiceSpec::Sample`]'s `gain`.
 fn sample_default_gain() -> f32 {
+    1.0
+}
+
+/// Serde default for [`VoiceSpec::SoundFont`]'s `gain` (U13): unity = the
+/// font's own level, which is also what the engine's processor is built
+/// with.
+fn soundfont_default_gain() -> f32 {
     1.0
 }
 
@@ -3908,6 +3924,7 @@ mod tests {
                 path: "General.sf2".to_string(),
                 bank: 0,
                 program: 40,
+                gain: 1.0,
             },
             VoiceSpec::Sample {
                 path: "kick.wav".to_string(),
@@ -3978,6 +3995,7 @@ mod tests {
             path: "General.sf2".to_string(),
             bank: 0,
             program: 40,
+            gain: 1.0,
         };
         let text = ron::to_string(&soundfont).expect("serialization failed");
         assert!(
@@ -3993,7 +4011,8 @@ mod tests {
             VoiceSpec::SoundFont {
                 path: "General.sf2".to_string(),
                 bank: 0,
-                program: 0
+                program: 0,
+                gain: 1.0,
             }
         );
     }

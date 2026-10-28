@@ -99,10 +99,12 @@ pub enum ParamId {
     /// SF2 voice: program change. Value carries the **literal program
     /// number** (rounded); applies the currently latched bank.
     Sf2ProgramChange,
-    /// SF2 voice: synthesizer master volume (linear, clamped 0..1;
-    /// non-finite values are ignored). The synth starts at its own default
-    /// of 0.5.
-    Sf2MasterVolume,
+    /// SF2 voice: node output gain (linear, clamped 0..2; non-finite values
+    /// are ignored). `1.0` = the font's own level: the processor overrides
+    /// the synthesizer's built-in 0.5 default at construction (U13), since
+    /// the crate default is a hidden -6 dB that made every SoundFont node
+    /// sound quiet.
+    Sf2Gain,
     /// Sample voice: root MIDI note of the loaded sample (0..127, default
     /// 60 = C4). Affects the playback rate of **subsequent** note-ons;
     /// sounding voices keep their trigger-time rate (the sampler-standard

@@ -24,7 +24,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,7 +35,6 @@ use glitcherz_engine::AudioEngine;
 use glitcherz_engine::SampleError;
 use glitcherz_engine::SampleLibrary;
 use glitcherz_engine::Sf2Error;
-use glitcherz_engine::Sf2Library;
 use glitcherz_engine::convert;
 use glitcherz_engine::realtime::{
     AudioTrackProcessor, ChannelStripProcessor, Curve, EffectMeters, EngineCommand,
@@ -43,9 +42,10 @@ use glitcherz_engine::realtime::{
     MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent, ParamId, Processor,
     RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCtrl, RtCtrlKind, RtCurveInterp,
     RtMidiClip, RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand,
-    Sf2VoiceProcessor, SynthProcessor, Unit, empty_clip_table,
+    Sf2VoiceProcessor, SilentProcessor, SynthProcessor, Unit, empty_clip_table,
     empty_midi_clip_table,
 };
+use glitcherz_engine::{Sf2Library, Sf2Preset};
 use glitcherz_model::{
     AutoParam, AutoPoint, CableKind, ControlClip, ControlTrack, CtrlKind, CurveInterp,
     EffectParams, GraphDoc, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK,
@@ -272,6 +272,11 @@ fn inline_param_id(p: patch::InlineParam) -> ParamId {
         patch::InlineParam::FeedbackGain => ParamId::FeedbackGain,
         patch::InlineParam::SampleRoot => ParamId::SampleRootNote,
         patch::InlineParam::SampleGain => ParamId::SampleGain,
+        patch::InlineParam::Sf2Gain => ParamId::Sf2Gain,
+        // Bank / patch rows go through `set_soundfont_preset` (they need the
+        // preset list to keep a valid address), never straight to a param.
+        patch::InlineParam::Sf2Bank => ParamId::Sf2BankSelect,
+        patch::InlineParam::Sf2Program => ParamId::Sf2ProgramChange,
     }
 }
 
@@ -477,6 +482,54 @@ const PLUGIN_CACHE_KEY: &str = "plugin_cache";
 
 /// Status bar message display duration.
 const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(8);
+
+/// How many parsed SoundFonts stay resident (U13 D12). Two covers both real
+/// cases — one file shared by several nodes, and A/B between two fonts.
+/// Eviction costs a re-read on the next reinstall, never a dropped note.
+const SF2_LIBRARY_CACHE_CAP: usize = 2;
+
+/// Byte count for a human (`1.9 GB`, `240 MB`).
+fn human_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.0} MB", b / MB)
+    } else {
+        format!("{:.0} KB", (b / KB).max(1.0))
+    }
+}
+
+/// Address the document's preset inside a freshly loaded font (U13 D13).
+///
+/// Swapping files almost always loses `bank:program` (a MuseScore General
+/// patch number means nothing in a drum font). Fall back in four steps, each
+/// one the closest still-playable answer: same address → first patch of the
+/// same bank → GM `0:0` → whatever the file has first. `Sf2Library::load`
+/// rejects preset-less files, so the last step always succeeds.
+fn resolve_sf2_preset(presets: &[Sf2Preset], bank: u8, program: u8) -> (u8, u8) {
+    let has = |bank: u8, program: u8| {
+        presets
+            .iter()
+            .any(|p| p.bank == bank && p.program == program)
+    };
+    if has(bank, program) {
+        return (bank, program);
+    }
+    if let Some(first) = presets.iter().find(|p| p.bank == bank) {
+        return (first.bank, first.program);
+    }
+    if has(0, 0) {
+        return (0, 0);
+    }
+    // `Sf2Library::load` rejects preset-less files, so there is always one.
+    presets
+        .first()
+        .map_or((0, 0), |first| (first.bank, first.program))
+}
 
 /// External plugin instance guard (CLAP / VST3).
 #[allow(dead_code)] // guard held only to extend lifetime; the field itself is never read
@@ -752,6 +805,32 @@ impl CurveTool {
     }
 }
 
+/// A control-thread job that blocks the UI while it runs (U13).
+///
+/// The motivating case is loading a SoundFont: `SoundFont::new` parses the
+/// whole RIFF tree and decodes the sample data in one call, seconds for a
+/// 100 MB font and tens of seconds for a multi-GB one. There is no way to
+/// chunk it, and a worker thread would add a whole class of races (a second
+/// load, a project close, an undo arriving mid-parse) for one blocking call.
+///
+/// Because egui only paints *after* `ui()` returns, the notice has to be on
+/// screen **before** the work starts. Hence the three phases:
+///
+/// | phase | frame does |
+/// | :--- | :--- |
+/// | 0 | queues the job; banner is not on screen yet → ask for another frame |
+/// | 1 | draws the banner; nothing else → paint lands after `ui()` returns |
+/// | 2 | draws the banner again, then runs the job (the screen keeps showing frame 1's paint) |
+pub struct BlockingJob {
+    /// Banner caption; says what the window is busy with.
+    label: String,
+    /// Phase 0 → 1 → 2 (run). See the table above.
+    phase: u8,
+    /// The work itself, handed a `&mut GlitcherZApp` so it can do anything a
+    /// menu handler could.
+    run: Box<dyn FnOnce(&mut GlitcherZApp)>,
+}
+
 /// Main window app. Owns the [`AudioEngine`]: closing the window drops the engine and stops the
 /// audio stream.
 pub struct GlitcherZApp {
@@ -898,10 +977,23 @@ pub struct GlitcherZApp {
     voice_preset_selected: HashMap<u64, String>,
     /// "Save preset" name input.
     preset_name_input: String,
-    /// Shared session SoundFont (v1: one library per session, spec
-    /// `sf2-loader.md` §6). Loaded via the library panel; document restores
-    /// reuse it when the path matches to avoid re-reading a large file.
-    sf2_library: Option<Arc<Sf2Library>>,
+    /// Loaded SoundFonts, **least recently used first** (U13 D12). Two
+    /// entries cover the shapes that actually happen — one file shared by
+    /// several nodes, and A/B between two fonts — without hoarding hundreds
+    /// of MB per unused file. Evicting is safe: every live synthesizer owns
+    /// its own `Arc<SoundFont>`, so an evicted entry only costs a re-read the
+    /// next time a node is reinstalled (undo / project open / file swap).
+    sf2_libraries: Vec<(PathBuf, Arc<Sf2Library>)>,
+    /// Preset names by path (U13), kept even after the parsed font above is
+    /// evicted. A few KB of text per font, and it is what lets the Inspector
+    /// and the node's combos still list the presets of a font that only
+    /// survives inside a live synthesizer.
+    sf2_preset_names: HashMap<PathBuf, Vec<(u8, u8, String)>>,
+    /// A control-thread job that blocks the UI while it runs (U13).
+    /// SoundFont parsing cannot be chunked, so the banner is painted on one
+    /// frame and the job runs at the end of the next one (see
+    /// [`BlockingJob`]).
+    blocking_job: Option<BlockingJob>,
     /// Session multi-sample cache (U5, spec `sample-player.md` D7): path →
     /// decoded `Arc<SampleData>`. Every sample instrument shares it, so
     /// reinstall / undo / document reload never re-reads a wav.
@@ -1054,7 +1146,9 @@ impl GlitcherZApp {
             voice_default_state: HashMap::new(),
             voice_preset_selected: HashMap::new(),
             preset_name_input: String::new(),
-            sf2_library: None,
+            sf2_libraries: Vec::new(),
+            sf2_preset_names: HashMap::new(),
+            blocking_job: None,
             sample_library: SampleLibrary::new(),
             plugin_editor: None,
             plugin_editor_wants_open: false,
@@ -1079,7 +1173,10 @@ impl GlitcherZApp {
             });
         }
         if let Some(path) = config.open_path {
-            app.do_open(path);
+            // Startup (`--open`): run it inline. There is no window to update
+            // yet, so the blocking banner would buy nothing — and opening
+            // here keeps the first painted frame the real project.
+            app.do_open_now(path);
         }
         app
     }
@@ -1290,21 +1387,34 @@ impl GlitcherZApp {
                         path,
                         bank,
                         program,
+                        gain,
                     } => {
-                        // Document voice restore (D8): prefer the shared
-                        // session library (avoids re-reading a large .sf2
-                        // on every reinstall), otherwise load here; a
-                        // missing or broken file falls back to the built-in
-                        // synth (document fields kept for a later retry).
-                        match self.obtain_sf2_voice(path, sr) {
-                            Ok(mut processor) => {
-                                processor.set_param(ParamId::Sf2BankSelect, f32::from(*bank));
-                                processor.set_param(ParamId::Sf2ProgramChange, f32::from(*program));
-                                (Box::new(processor), None, String::new())
-                            }
-                            Err(err) => {
-                                log::error!("Failed to load SoundFont {path}: {err}");
-                                (Box::new(SynthProcessor::new(sr)), None, String::new())
+                        if path.is_empty() {
+                            // U13: born without a file — silent until the
+                            // node's `Load File…` swaps a real voice in.
+                            // Deliberately not the built-in fallback below:
+                            // a node labelled SoundFont must not quietly play
+                            // a synth patch.
+                            (Box::new(SilentProcessor::new()), None, String::new())
+                        } else {
+                            // Document voice restore (D8): prefer the shared
+                            // session library (avoids re-reading a large .sf2
+                            // on every reinstall), otherwise load here; a
+                            // missing or broken file falls back to the
+                            // built-in synth (document fields kept for a
+                            // later retry).
+                            match self.obtain_sf2_voice(path, sr) {
+                                Ok(mut processor) => {
+                                    processor.set_param(ParamId::Sf2BankSelect, f32::from(*bank));
+                                    processor
+                                        .set_param(ParamId::Sf2ProgramChange, f32::from(*program));
+                                    processor.set_param(ParamId::Sf2Gain, *gain);
+                                    (Box::new(processor), None, String::new())
+                                }
+                                Err(err) => {
+                                    log::error!("Failed to load SoundFont {path}: {err}");
+                                    (Box::new(SynthProcessor::new(sr)), None, String::new())
+                                }
                             }
                         }
                     }
@@ -2117,6 +2227,7 @@ impl GlitcherZApp {
                 voice_params: vst3,
                 clap_voice_values: clap_values,
                 vst3_voice_values: vst3_values,
+                sf2_preset_names,
                 ..
             } = self;
             // Immutable reborrow aliases: two closures (auto_options /
@@ -2228,6 +2339,27 @@ impl GlitcherZApp {
                 }
                 v
             };
+            // SoundFont preset table for the node's bank / patch combos
+            // (U13): read from the resident library of the node's own path,
+            // so the patch and the Inspector list exactly the same entries.
+            // Empty = not resident (or no file yet) → the combos stay
+            // disabled instead of showing a lie.
+            let sf2_presets = move |node_id: u64| -> Vec<(u8, u8, String)> {
+                let Some(NodeDoc::Instrument {
+                    voice: VoiceSpec::SoundFont { path, .. },
+                    ..
+                }) = doc.node_by_id(node_id)
+                else {
+                    return Vec::new();
+                };
+                if path.is_empty() {
+                    return Vec::new();
+                }
+                sf2_preset_names
+                    .get(std::path::Path::new(path))
+                    .cloned()
+                    .unwrap_or_default()
+            };
             patch::show(
                 ui,
                 patch_state,
@@ -2238,6 +2370,7 @@ impl GlitcherZApp {
                     audio_count,
                     auto_options: &options,
                     plugin_inline: &plugin_inline,
+                    sf2_presets: &sf2_presets,
                 },
             )
         };
@@ -2259,18 +2392,10 @@ impl GlitcherZApp {
                 } => {
                     self.open_plugin_picker(category, format, place);
                 }
-                patch::PatchAction::PickSoundFont { at } => {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("SoundFont", &["sf2", "sf3"])
-                        .pick_file()
-                    {
-                        self.create_patch_node(
-                            patch::NodeSource::SoundFont {
-                                path: path.display().to_string(),
-                            },
-                            at,
-                        );
-                    }
+                patch::PatchAction::LoadSoundFont { node } => {
+                    // U13: the node's own `Load File…` button. Same function
+                    // as the Inspector button — one dialog, one undo step.
+                    self.pick_sound_font(node);
                 }
                 patch::PatchAction::PickSample { at } => {
                     // U5: same flow as PickSoundFont — the modal dialog runs
@@ -2513,6 +2638,7 @@ impl GlitcherZApp {
                     path,
                     bank: 0,
                     program: 0,
+                    gain: 1.0,
                 },
                 synth: SynthParams::default(),
             },
@@ -3484,6 +3610,21 @@ impl GlitcherZApp {
     /// Load from disk, replace the document, rebuild the engine graph per the document, and
     /// re-push all parameters.
     fn do_open(&mut self, path: PathBuf) {
+        // U13 D14: opening a project installs every node (`apply_document`),
+        // which parses SoundFonts and instantiates every external plugin —
+        // seconds on a big session. Same banner mechanism as the font swap:
+        // queue it, let the banner paint, then run it.
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.queue_blocking_job(format!("Opening {name}…"), move |app| {
+            app.do_open_now(path)
+        });
+    }
+
+    /// The blocking half of [`Self::do_open`].
+    fn do_open_now(&mut self, path: PathBuf) {
         match glitcherz_model::load_project(&path) {
             Ok(project) => {
                 self.session.replace(project);
@@ -3523,26 +3664,227 @@ impl GlitcherZApp {
         self.status_message = Some((text, Instant::now()));
     }
 
-    /// Build a SoundFont voice processor from the shared session library
-    /// (v1: one library per session, spec §6): reuse the cached font when
-    /// the path matches, otherwise load (and replace the cache). Control
-    /// thread only (D3).
+    /// Build a SoundFont voice processor from the shared session cache
+    /// (U13 D12): reuse the parsed library when the path is still resident,
+    /// otherwise load it. Control thread only (D3).
     fn obtain_sf2_voice(
         &mut self,
         path: &str,
         sample_rate: f32,
     ) -> Result<Sf2VoiceProcessor, Sf2Error> {
-        if let Some(lib) = self.sf2_library.as_ref() {
-            if lib.path() == std::path::Path::new(path) {
-                return Sf2VoiceProcessor::new(lib.font(), sample_rate);
-            }
+        let library = self.sf2_library_for(Path::new(path))?;
+        Sf2VoiceProcessor::new(library.font(), sample_rate)
+    }
+
+    /// Resident library for `path`, refreshed as most-recently-used.
+    fn sf2_cached(&mut self, path: &Path) -> Option<Arc<Sf2Library>> {
+        let index = self.sf2_libraries.iter().position(|(p, _)| p == path)?;
+        let entry = self.sf2_libraries.remove(index);
+        let library = entry.1.clone();
+        self.sf2_libraries.push(entry);
+        Some(library)
+    }
+
+    /// Insert a freshly parsed library, evicting past the cap (LRU first).
+    fn sf2_store(&mut self, path: PathBuf, library: Arc<Sf2Library>) -> Arc<Sf2Library> {
+        // Names outlive the parsed font: they are cheap and losing them
+        // would blind the preset pickers on a still-playing node.
+        self.sf2_preset_names.insert(
+            path.clone(),
+            library
+                .presets()
+                .iter()
+                .map(|p| (p.bank, p.program, p.name.clone()))
+                .collect(),
+        );
+        self.sf2_libraries.retain(|(p, _)| p != &path);
+        self.sf2_libraries.push((path, library.clone()));
+        while self.sf2_libraries.len() > SF2_LIBRARY_CACHE_CAP {
+            self.sf2_libraries.remove(0);
         }
-        let library = Sf2Library::load(std::path::Path::new(path))?;
-        self.sf2_library = Some(Arc::new(library));
-        Sf2VoiceProcessor::new(
-            self.sf2_library.as_ref().expect("just set").font(),
-            sample_rate,
-        )
+        library
+    }
+
+    /// Library for `path`: cache hit, otherwise a full parse (control thread,
+    /// D3). A miss on a multi-GB font blocks for seconds, so interactive
+    /// callers go through [`Self::pick_sound_font`] and its banner instead.
+    fn sf2_library_for(&mut self, path: &Path) -> Result<Arc<Sf2Library>, Sf2Error> {
+        if let Some(library) = self.sf2_cached(path) {
+            return Ok(library);
+        }
+        let library = Arc::new(Sf2Library::load(path)?);
+        Ok(self.sf2_store(path.to_path_buf(), library))
+    }
+
+    /// Queue a UI-blocking job (U13). The banner paints on the next frame and
+    /// the work runs at the end of the one after that, so the user sees what
+    /// the window is stuck on. Jobs replace each other — the window between
+    /// queueing and running is two frames.
+    fn queue_blocking_job(
+        &mut self,
+        label: impl Into<String>,
+        run: impl FnOnce(&mut GlitcherZApp) + 'static,
+    ) {
+        self.blocking_job = Some(BlockingJob {
+            label: label.into(),
+            phase: 0,
+            run: Box::new(run),
+        });
+    }
+
+    /// Thin banner naming the job the window is about to block on (same slot
+    /// and shape as the plugin-scan banner).
+    fn blocking_banner(&self, ui: &mut egui::Ui) {
+        let Some(job) = self.blocking_job.as_ref() else {
+            return;
+        };
+        egui::Panel::top("glitcherz_blocking").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.strong(&job.label);
+            });
+        });
+    }
+
+    /// Advance the [`BlockingJob`] state machine at the end of the frame.
+    /// Returns `true` when the job ran (the caller repaints).
+    fn run_blocking_job(&mut self) -> bool {
+        let Some(job) = self.blocking_job.as_mut() else {
+            return false;
+        };
+        if job.phase < 2 {
+            job.phase += 1;
+            return false;
+        }
+        let job = self.blocking_job.take().expect("checked above");
+        (job.run)(self);
+        true
+    }
+
+    /// `Load File…` on a SoundFont node (U13): pick a file, then swap the
+    /// node's voice in place. The patch node's button and the Inspector call
+    /// this one function, so both entry points write the same document and
+    /// record the same single undo step.
+    fn pick_sound_font(&mut self, doc_id: u64) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("SoundFont", &["sf2", "sf3"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.pick_sound_font_from(doc_id, path);
+    }
+
+    /// [`Self::pick_sound_font`] with the file already chosen (the dialog is
+    /// the only part that needs the click).
+    fn pick_sound_font_from(&mut self, doc_id: u64, path: PathBuf) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        // Peak RAM is the number users get bitten by, not the file size:
+        // `SoundFontSampleData::read` holds the raw byte block and the i16
+        // copy at the same time.
+        let label = format!(
+            "Loading {name} ({}, peak RAM ≈ {})…",
+            human_bytes(size),
+            human_bytes(size.saturating_mul(2))
+        );
+        self.queue_blocking_job(label, move |app| app.load_sound_font(doc_id, path));
+    }
+
+    /// The blocking half of [`Self::pick_sound_font_from`]: parse (cached),
+    /// resolve a preset that exists in the new file, then swap the engine
+    /// processor **in place** — `replace_node` keeps the node id, so cables,
+    /// ports and MIDI routing are untouched. One undo step.
+    fn load_sound_font(&mut self, doc_id: u64, path: PathBuf) {
+        let started = Instant::now();
+        let Some((old_bank, old_program, gain)) = self.sf2_voice_fields(doc_id) else {
+            self.set_message("Load failed: node is not a SoundFont instrument".to_string());
+            return;
+        };
+        let library = match self.sf2_library_for(&path) {
+            Ok(library) => library,
+            Err(err) => {
+                self.set_message(format!("Sound font failed to load: {err}"));
+                return;
+            }
+        };
+        // The old `bank:program` usually does not exist in the new file
+        // (U13 D13): same address → same bank → GM 0:0 → first preset.
+        let (bank, program) = resolve_sf2_preset(library.presets(), old_bank, old_program);
+        let Some(engine_id) = self.engine_id(doc_id) else {
+            self.set_message("Load failed: node is not installed".to_string());
+            return;
+        };
+        let sample_rate = self.engine.info().sample_rate as f32;
+        let mut processor = match Sf2VoiceProcessor::new(library.font(), sample_rate) {
+            Ok(processor) => processor,
+            Err(err) => {
+                self.set_message(format!("Sound font failed to instantiate: {err}"));
+                return;
+            }
+        };
+        processor.set_param(ParamId::Sf2BankSelect, f32::from(bank));
+        processor.set_param(ParamId::Sf2ProgramChange, f32::from(program));
+        processor.set_param(ParamId::Sf2Gain, gain);
+
+        let before = self.begin_edit();
+        if let Some(NodeDoc::Instrument {
+            voice:
+                VoiceSpec::SoundFont {
+                    path: doc_path,
+                    bank: doc_bank,
+                    program: doc_program,
+                    ..
+                },
+            ..
+        }) = self.project_mut().graph.node_by_id_mut(doc_id)
+        {
+            *doc_path = path.display().to_string();
+            *doc_bank = bank;
+            *doc_program = program;
+        }
+        if self
+            .engine
+            .replace_node(engine_id, Box::new(processor))
+            .is_none()
+        {
+            self.session.restore(before);
+            self.set_message("Sound font swap failed (engine busy) — try again".to_string());
+            return;
+        }
+        self.commit_edit("Load Sound Font", before);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        log::info!(
+            "swapped node {doc_id} to sound font {name} at {bank}:{program} in {:.2}s",
+            started.elapsed().as_secs_f32()
+        );
+        self.set_message(format!(
+            "Loaded {name} at {bank}:{program} ({:.1} s)",
+            started.elapsed().as_secs_f32()
+        ));
+    }
+
+    /// `(bank, program, gain)` of a SoundFont instrument node.
+    fn sf2_voice_fields(&self, doc_id: u64) -> Option<(u8, u8, f32)> {
+        match self.project().graph.node_by_id(doc_id)? {
+            NodeDoc::Instrument {
+                voice:
+                    VoiceSpec::SoundFont {
+                        bank,
+                        program,
+                        gain,
+                        ..
+                    },
+                ..
+            } => Some((*bank, *program, *gain)),
+            _ => None,
+        }
     }
 
     /// Build a sample voice processor from the session sample cache (U5,
@@ -3682,17 +4024,26 @@ impl GlitcherZApp {
                     path,
                     bank,
                     program,
-                } => match self.obtain_sf2_voice(path, sr) {
-                    Ok(mut processor) => {
-                        processor.set_param(ParamId::Sf2BankSelect, f32::from(*bank));
-                        processor.set_param(ParamId::Sf2ProgramChange, f32::from(*program));
-                        (Box::new(processor), None)
+                    gain,
+                } => {
+                    if path.is_empty() {
+                        // U13: empty node renders silence on export too.
+                        (Box::new(SilentProcessor::new()), None)
+                    } else {
+                        match self.obtain_sf2_voice(path, sr) {
+                            Ok(mut processor) => {
+                                processor.set_param(ParamId::Sf2BankSelect, f32::from(*bank));
+                                processor.set_param(ParamId::Sf2ProgramChange, f32::from(*program));
+                                processor.set_param(ParamId::Sf2Gain, *gain);
+                                (Box::new(processor), None)
+                            }
+                            Err(err) => {
+                                log::error!("Export: sound font {path} failed to load: {err}");
+                                (Box::new(SynthProcessor::new(sr)), None)
+                            }
+                        }
                     }
-                    Err(err) => {
-                        log::error!("Export: sound font {path} failed to load: {err}");
-                        (Box::new(SynthProcessor::new(sr)), None)
-                    }
-                },
+                }
                 VoiceSpec::Clap {
                     path,
                     plugin_id,
@@ -6179,133 +6530,26 @@ impl GlitcherZApp {
                 // SoundFont): presets enumerated from the shared session
                 // library; the selection is one undoable edit + live
                 // node-param delivery (D7).
-                let sf2_state = self
-                    .project()
-                    .graph
-                    .node_by_id(instr_id)
-                    .and_then(|n| match n {
+                // SoundFont panel (U13): file row, preset, output gain.
+                // Every control here is the *same* function the node's own
+                // body calls, so the two entry points can never drift.
+                let sf2_state = self.project().graph.node_by_id(instr_id).and_then(|n| {
+                    match n {
                         NodeDoc::Instrument {
                             voice:
                                 VoiceSpec::SoundFont {
                                     path,
                                     bank,
                                     program,
+                                    gain,
                                 },
                             ..
-                        } => Some((path.clone(), *bank, *program)),
+                        } => Some((path.clone(), *bank, *program, *gain)),
                         _ => None,
-                    });
-                if let Some((sf2_path, sf2_bank, sf2_program)) = sf2_state {
-                    // Snapshot the preset list (releases the library borrow
-                    // before the picker's undoable edit runs).
-                    let presets: Option<Vec<(u8, u8, String)>> = self
-                        .sf2_library
-                        .as_ref()
-                        .filter(|lib| lib.path() == std::path::Path::new(&sf2_path))
-                        .map(|lib| {
-                            lib.presets()
-                                .iter()
-                                .map(|p| (p.bank, p.program, p.name.clone()))
-                                .collect()
-                        });
-                    match presets {
-                        Some(presets) => {
-                            // Bank-grouped picker (LMMS-style): the bank
-                            // selector narrows the patch list; patches are
-                            // ordered by program (GM order) inside a bank.
-                            let mut banks: std::collections::BTreeMap<u8, Vec<(u8, String)>> =
-                                std::collections::BTreeMap::new();
-                            for (bank, program, name) in &presets {
-                                banks.entry(*bank).or_default().push((*program, name.clone()));
-                            }
-                            for patches in banks.values_mut() {
-                                patches.sort_unstable_by_key(|(program, _)| *program);
-                            }
-                            let bank_list: Vec<(u8, Vec<(u8, String)>)> = banks.into_iter().collect();
-                            let current_name = |bank: u8, program: u8| -> Option<String> {
-                                bank_list
-                                    .iter()
-                                    .find(|(b, _)| *b == bank)
-                                    .and_then(|(_, patches)| {
-                                        patches
-                                            .iter()
-                                            .find(|(p, _)| *p == program)
-                                            .map(|(_, name)| name.clone())
-                                    })
-                            };
-                            ui.horizontal(|ui| {
-                                ui.label("Preset");
-                                let mut bank_picked: Option<u8> = None;
-                                let mut preset_picked: Option<(u8, u8)> = None;
-                                egui::ComboBox::from_id_salt(format!("sf2_bank_{instr_id}"))
-                                    .selected_text(format!("Bank {sf2_bank}"))
-                                    .show_ui(ui, |ui| {
-                                        for (bank, _) in &bank_list {
-                                            if ui
-                                                .selectable_label(
-                                                    *bank == sf2_bank,
-                                                    format!("Bank {bank}"),
-                                                )
-                                                .clicked()
-                                            {
-                                                bank_picked = Some(*bank);
-                                            }
-                                        }
-                                    });
-                                let patch_label = match current_name(sf2_bank, sf2_program) {
-                                    Some(name) => format!("{sf2_program}. {name}"),
-                                    None => format!("{sf2_bank}:{sf2_program}"),
-                                };
-                                egui::ComboBox::from_id_salt(format!("sf2_preset_{instr_id}"))
-                                    .selected_text(patch_label)
-                                    .show_ui(ui, |ui| {
-                                        if let Some((_, patches)) =
-                                            bank_list.iter().find(|(b, _)| *b == sf2_bank)
-                                        {
-                                            for (program, name) in patches {
-                                                if ui
-                                                    .selectable_label(
-                                                        *program == sf2_program,
-                                                        format!("{program}. {name}"),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    preset_picked = Some((sf2_bank, *program));
-                                                }
-                                            }
-                                        }
-                                    });
-                                if let Some(bank) = bank_picked {
-                                    if bank != sf2_bank {
-                                        // Keep the program number when the new
-                                        // bank has it; otherwise fall back to
-                                        // the bank's first patch.
-                                        let target = bank_list
-                                            .iter()
-                                            .find(|(b, _)| *b == bank)
-                                            .and_then(|(_, patches)| {
-                                                patches
-                                                    .iter()
-                                                    .find(|(p, _)| *p == sf2_program)
-                                                    .map(|_| sf2_program)
-                                                    .or_else(|| {
-                                                        patches.first().map(|(p, _)| *p)
-                                                    })
-                                            });
-                                        if let Some(program) = target {
-                                            preset_picked = Some((bank, program));
-                                        }
-                                    }
-                                }
-                                if let Some((bank, program)) = preset_picked {
-                                    self.set_soundfont_preset(instr_id, bank, program);
-                                }
-                            });
-                        }
-                        None => {
-                            ui.weak("(soundfont file not loaded this session — reopen it)");
-                        }
                     }
+                });
+                if let Some((sf2_path, sf2_bank, sf2_program, sf2_gain)) = sf2_state {
+                    self.sf2_section(ui, instr_id, &sf2_path, sf2_bank, sf2_program, sf2_gain);
                 }
                 // Sample instrument parameters (U5, spec `sample-player.md`
                 // D10): root note / play mode / gain. The root DragValue and
@@ -6904,6 +7148,189 @@ impl GlitcherZApp {
     /// node param immediately and write the document with one merged undo
     /// step per drag (the `adsr_sliders` pattern); the play-mode combo is a
     /// discrete one-step undoable edit.
+    /// SoundFont instrument panel (U13 D10–D13).
+    ///
+    /// Three things, in the order they matter: which file this node plays,
+    /// which preset inside it, and how loud it comes out. The file row is
+    /// the node's own `Load File…` — a swap here and a swap on the canvas
+    /// node run the same [`Self::pick_sound_font`], so both write the same
+    /// document fields and record the same single undo step.
+    fn sf2_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc_id: u64,
+        path: &str,
+        bank: u8,
+        program: u8,
+        gain: f32,
+    ) {
+        ui.separator();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if path.is_empty() {
+                ui.weak("No sound font loaded");
+            } else {
+                let name = Path::new(path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string());
+                // File name on the label, full path on hover: short enough
+                // to read, complete enough to tell two "General.sf2" apart.
+                ui.label(format!("File: {name}")).on_hover_text(path);
+            }
+            let caption = if path.is_empty() {
+                "Load File…"
+            } else {
+                "Replace…"
+            };
+            if ui
+                .button(caption)
+                .on_hover_text("Pick a .sf2 / .sf3 file for this node")
+                .clicked()
+            {
+                self.pick_sound_font(doc_id);
+            }
+        });
+
+        // Bank groups the patch list (LMMS style): a GM font has one bank
+        // with 128 patches, a drum library one bank per kit. Entries come
+        // from the *resident* library of this node's own path — the same
+        // table the node's inline combos show.
+        match self.sf2_presets_of(path) {
+            Some(presets) => {
+                let mut banks: std::collections::BTreeMap<u8, Vec<(u8, String)>> =
+                    std::collections::BTreeMap::new();
+                for (bank, program, name) in &presets {
+                    banks
+                        .entry(*bank)
+                        .or_default()
+                        .push((*program, name.clone()));
+                }
+                for patches in banks.values_mut() {
+                    patches.sort_unstable_by_key(|(program, _)| *program);
+                }
+                let bank_list: Vec<(u8, Vec<(u8, String)>)> = banks.into_iter().collect();
+                let current_name = |bank: u8, program: u8| -> Option<String> {
+                    bank_list
+                        .iter()
+                        .find(|(b, _)| *b == bank)
+                        .and_then(|(_, patches)| {
+                            patches
+                                .iter()
+                                .find(|(p, _)| *p == program)
+                                .map(|(_, name)| name.clone())
+                        })
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Preset");
+                    let mut bank_picked: Option<u8> = None;
+                    let mut preset_picked: Option<(u8, u8)> = None;
+                    egui::ComboBox::from_id_salt(format!("sf2_bank_{doc_id}"))
+                        .selected_text(format!("Bank {bank}"))
+                        .show_ui(ui, |ui| {
+                            for (choice, _) in &bank_list {
+                                if ui
+                                    .selectable_label(*choice == bank, format!("Bank {choice}"))
+                                    .clicked()
+                                {
+                                    bank_picked = Some(*choice);
+                                }
+                            }
+                        });
+                    let patch_label = match current_name(bank, program) {
+                        Some(name) => format!("{program}. {name}"),
+                        None => format!("{bank}:{program}"),
+                    };
+                    egui::ComboBox::from_id_salt(format!("sf2_preset_{doc_id}"))
+                        .selected_text(patch_label)
+                        .show_ui(ui, |ui| {
+                            if let Some((_, patches)) = bank_list.iter().find(|(b, _)| *b == bank) {
+                                egui::ScrollArea::vertical()
+                                    .max_height(240.0)
+                                    .show(ui, |ui| {
+                                        for (candidate, name) in patches {
+                                            if ui
+                                                .selectable_label(
+                                                    *candidate == program,
+                                                    format!("{candidate}. {name}"),
+                                                )
+                                                .clicked()
+                                            {
+                                                preset_picked = Some((bank, *candidate));
+                                            }
+                                        }
+                                    });
+                            }
+                        });
+                    if let Some(next) = bank_picked {
+                        if next != bank {
+                            // Keep the program number when the new bank has
+                            // it; otherwise fall back to the bank's first.
+                            let target = bank_list.iter().find(|(b, _)| *b == next).and_then(
+                                |(_, patches)| {
+                                    patches
+                                        .iter()
+                                        .find(|(p, _)| *p == program)
+                                        .map(|_| program)
+                                        .or_else(|| patches.first().map(|(p, _)| *p))
+                                },
+                            );
+                            if let Some(program) = target {
+                                preset_picked = Some((next, program));
+                            }
+                        }
+                    }
+                    if let Some((bank, program)) = preset_picked {
+                        self.set_soundfont_preset(doc_id, bank, program);
+                    }
+                });
+            }
+            None => {
+                ui.weak(if path.is_empty() {
+                    "(load a file to pick a preset)"
+                } else {
+                    "(not loaded this session — Replace… re-reads it)"
+                });
+            }
+        }
+
+        // Output gain. A font's level is a **source** property, so the trim
+        // belongs to the node rather than to an extra gain node in the
+        // graph: it travels with the document, undoes with it, and cannot
+        // be accidentally left behind when the voice is swapped. Default is
+        // 1.0 — the engine forces rustysynth's own default back from 0.5,
+        // which was silently costing every SoundFont 6 dB.
+        ui.horizontal(|ui| {
+            ui.label("Gain");
+            let mut value = gain;
+            if ui
+                .add(egui::Slider::new(&mut value, 0.0..=2.0).fixed_decimals(2))
+                .changed()
+            {
+                self.send_node_param(doc_id, ParamId::Sf2Gain, value);
+                let before = self.begin_param_edit();
+                if let Some(NodeDoc::Instrument {
+                    voice: VoiceSpec::SoundFont { gain, .. },
+                    ..
+                }) = self.project_mut().graph.node_by_id_mut(doc_id)
+                {
+                    *gain = value.clamp(0.0, 2.0);
+                }
+                self.commit_param_edit("SoundFont Gain", before, "sf2-gain");
+            }
+        });
+    }
+
+    /// Preset table of the node's font, when it is resident (U13). `None`
+    /// means "not loaded this session" — the panel says so instead of
+    /// offering an empty list.
+    fn sf2_presets_of(&self, path: &str) -> Option<Vec<(u8, u8, String)>> {
+        if path.is_empty() {
+            return None;
+        }
+        self.sf2_preset_names.get(Path::new(path)).cloned()
+    }
+
     fn sample_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -7153,6 +7580,58 @@ impl GlitcherZApp {
                     }
                     self.commit_param_edit("Sample Gain", before, "sample-gain");
                     self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::Sf2Gain => {
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Instrument {
+                        voice: VoiceSpec::SoundFont { gain, .. },
+                        ..
+                    }) = self.project_mut().graph.node_by_id_mut(node)
+                    {
+                        *gain = value.clamp(0.0, 2.0);
+                    }
+                    self.commit_param_edit("SoundFont Gain", before, "sf2-gain");
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+                // Bank / patch are one discrete edit each and have to keep a
+                // playable address, so both route through the same preset
+                // setter the Inspector uses (U13 "equal effect").
+                patch::InlineParam::Sf2Bank => {
+                    let Some((path, program)) =
+                        self.project().graph.node_by_id(node).and_then(|n| match n {
+                            NodeDoc::Instrument {
+                                voice: VoiceSpec::SoundFont { path, program, .. },
+                                ..
+                            } => Some((path.clone(), *program)),
+                            _ => None,
+                        })
+                    else {
+                        return;
+                    };
+                    let bank = value.round().clamp(0.0, 255.0) as u8;
+                    // Keep the program number when the new bank has it,
+                    // otherwise take the bank's lowest program.
+                    let next = self
+                        .sf2_presets_of(&path)
+                        .and_then(|presets| {
+                            presets
+                                .iter()
+                                .find(|(b, p, _)| *b == bank && *p == program)
+                                .map(|(_, p, _)| *p)
+                                .or_else(|| {
+                                    presets
+                                        .iter()
+                                        .filter(|(b, _, _)| *b == bank)
+                                        .map(|(_, p, _)| *p)
+                                        .min()
+                                })
+                        })
+                        .unwrap_or(program);
+                    self.set_soundfont_preset(node, bank, next);
+                }
+                patch::InlineParam::Sf2Program => {
+                    let bank = self.sf2_voice_fields(node).map_or(0, |(bank, _, _)| bank);
+                    self.set_soundfont_preset(node, bank, value.round().clamp(0.0, 255.0) as u8);
                 }
             },
             patch::InlineParamId::Plugin(id) => {
@@ -9163,6 +9642,10 @@ impl eframe::App for GlitcherZApp {
         // will block on, spec D14). The U7 export banner shares the slot.
         self.plugin_scan_banner(ui);
         self.export_banner(ui);
+        // U13: same slot for a UI-blocking job (a SoundFont parse the user
+        // asked for). It must draw before the panels so the paint that lands
+        // after `ui()` returns already shows what the window is busy with.
+        self.blocking_banner(ui);
         self.transport_panel(ui);
         self.status_panel(ui);
         self.view_tabs(ui);
@@ -9350,6 +9833,13 @@ impl eframe::App for GlitcherZApp {
         // and wants repaints while it runs so the progress bar moves.
         self.pump_export();
         if self.export_job.is_some() {
+            ui.ctx().request_repaint();
+        }
+
+        // U13: the blocking job advances last — its `run` phase is the one
+        // that stops the window (nothing paints until `ui()` returns, which
+        // is exactly why the banner was drawn two frames ago).
+        if self.run_blocking_job() || self.blocking_job.is_some() {
             ui.ctx().request_repaint();
         }
 
@@ -9632,5 +10122,63 @@ mod splice_tests {
         for source in &rejected {
             assert!(!source.fits_audio_insert(), "{source:?} must not insert");
         }
+    }
+}
+
+/// U13: the preset fallback chain and the size readout used by the loading
+/// banner. Both are pure, so they are tested without a window or a font.
+#[cfg(test)]
+mod sf2_tests {
+    use super::*;
+
+    fn preset(bank: u8, program: u8, name: &str) -> Sf2Preset {
+        Sf2Preset {
+            bank,
+            program,
+            name: name.to_string(),
+        }
+    }
+
+    /// The old address wins when the new font still has it.
+    #[test]
+    fn resolve_keeps_a_preset_that_exists() {
+        let presets = vec![preset(0, 0, "Piano"), preset(0, 40, "Violin")];
+        assert_eq!(resolve_sf2_preset(&presets, 0, 40), (0, 40));
+    }
+
+    /// Same bank, different program: take the bank's first patch rather than
+    /// falling through to GM 0:0 — the bank carries the user's intent (a drum
+    /// kit bank must not resolve to a piano).
+    #[test]
+    fn resolve_prefers_the_same_bank() {
+        let presets = vec![
+            preset(0, 0, "Piano"),
+            preset(8, 24, "Kit A"),
+            preset(8, 0, "Kit B"),
+        ];
+        assert_eq!(resolve_sf2_preset(&presets, 8, 40), (8, 24));
+    }
+
+    /// Bank gone entirely: GM 0:0 if the font has it.
+    #[test]
+    fn resolve_falls_back_to_general_midi() {
+        let presets = vec![preset(4, 2, "Pad"), preset(0, 0, "Piano")];
+        assert_eq!(resolve_sf2_preset(&presets, 127, 12), (0, 0));
+    }
+
+    /// A font with neither the bank nor 0:0 still yields a playable address.
+    #[test]
+    fn resolve_never_returns_an_empty_address() {
+        let presets = vec![preset(3, 7, "Only")];
+        assert_eq!(resolve_sf2_preset(&presets, 9, 9), (3, 7));
+        assert_eq!(resolve_sf2_preset(&[], 9, 9), (0, 0));
+    }
+
+    #[test]
+    fn human_bytes_reads_like_a_file_manager() {
+        assert_eq!(human_bytes(0), "1 KB");
+        assert_eq!(human_bytes(900 * 1024), "900 KB");
+        assert_eq!(human_bytes(240 * 1024 * 1024), "240 MB");
+        assert_eq!(human_bytes(2 * 1024 * 1024 * 1024), "2.0 GB");
     }
 }

@@ -63,7 +63,11 @@ impl Sf2VoiceProcessor {
         settings.block_size = FIXED_BLOCK_SIZE;
         settings.maximum_polyphony = SF2_POLYPHONY;
         settings.enable_reverb_and_chorus = true;
-        let synth = Synthesizer::new(font, &settings)?;
+        let mut synth = Synthesizer::new(font, &settings)?;
+        // U13: the crate default is 0.5 (a hidden -6 dB that pushed every
+        // node towards "too quiet"). Unity here makes `1.0` mean the font's
+        // own level, and `ParamId::Sf2Gain` is the only trim on top of it.
+        synth.set_master_volume(1.0);
         Ok(Self {
             synth,
             left: vec![0.0; FIXED_BLOCK_SIZE].into_boxed_slice(),
@@ -172,11 +176,13 @@ impl Processor for Sf2VoiceProcessor {
                 self.synth
                     .process_midi_message(CHANNEL, 0xC0, param_to_int(value), 0);
             }
-            ParamId::Sf2MasterVolume => {
-                // Non-finite values are dropped instead of poisoning the
-                // render gain (NaN would propagate into every sample).
+            ParamId::Sf2Gain => {
+                // Node trim on top of the font's own level (U13): 0..2 so a
+                // quiet font can be pushed up. Non-finite values are dropped
+                // instead of poisoning the render gain (NaN would propagate
+                // into every sample).
                 if value.is_finite() {
-                    self.synth.set_master_volume(value.clamp(0.0, 1.0));
+                    self.synth.set_master_volume(value.clamp(0.0, 2.0));
                 }
             }
             _ => return false,

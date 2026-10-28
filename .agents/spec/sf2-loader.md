@@ -113,3 +113,17 @@ C 构建链依赖的 SF2 加载与合成路径。
   `set_master_volume` 纯写入可挂 `ParamId` 参数路径。
 - **测试自身坑（已注释在案）**：断言 label 的 `format!` 若在计数窗口内求值会被
   计入——真实库审计首跑的"1 次分配"即此假阳性，label 构建须移到 scope 之外。
+
+## 8. U13：自足节点（2026-10-28）
+
+S5 的原形态是"添加节点时选文件、之后锁死"（会话单库 `sf2_library`，见 §5 S5）。用户实际使用中发现三条硬伤：换字体只能删节点重建（线缆全丢）、节点上看不到字体名、bank/patch 只有 Inspector 能改。本节把节点做成**自足**的。
+
+| # | 决策 | 结论 | 理由 |
+| :-- | :--- | :--- | :--- |
+| D10 | 节点自足 | Add 菜单的 `SoundFont` 直接创建**空 path** 节点，节点体内是 `Load File…` / `Replace…` 按钮行 + `bank`/`patch` 两个选择行 + `gain` 滑条行（盒高 130 px）。Inspector 同一组控件调**同一对函数** | "节点拥有它的文件"是本 spec 的核心前提；两套 UI 若各写一遍必然分叉，故只保留一个入口函数（`pick_sound_font`）与一个 preset setter（`set_soundfont_preset`） |
+| D11 | 空节点静音 | `path` 为空 → `SilentProcessor`（`process` 清零，`note_event`/`midi_cc`/`midi_pitch_bend` 返回 `true` 吃掉事件），**不**回落内置合成器；文件丢失（D8）仍回落内置合成器 | 标签写着 SoundFont 的节点偷偷弹合成器音是骗人；缺文件回落则是"提示你文件没了"，语义不同 |
+| D12 | 多库 LRU | `sf2_libraries: Vec<(PathBuf, Arc<Sf2Library>)>`，**cap = 2**（用户拍板），命中移到队尾；另存 `sf2_preset_names: HashMap<PathBuf, Vec<(bank, program, name)>>`，**不随淘汰丢失** | cap 只决定"热备份"数量，不决定播放：`Synthesizer` 自持 `Arc<SoundFont>`，淘汰不影响发声，只影响下次重装是否重读。2 覆盖两种真实场景（同字体多节点 / AB 两库）。名表单独留一份的理由：淘汰后节点仍在发声，preset 下拉不该变瞎 |
+| D13 | 换文件 | `engine.replace_node(engine_id, processor)` **原位换装**（保 node id）+ 一步 `commit_edit`；preset 回落 `resolve_sf2_preset`：同址 → 同 bank 首 patch → GM `0:0` → 文件首 preset | `apply_document()` 会重载全部插件并打断所有发声音符；同 bank 优先于 GM 0:0，因为 bank 携带用户意图（鼓组 bank 不该回落成钢琴） |
+| D14 | 阻塞提示 | `BlockingJob` 三相位（排队帧 → 画 banner 帧 → 帧尾运行帧）；banner 与插件扫描条同槽位（`Spinner` + 文案，含文件大小与峰值 RAM）。**不做异步**（用户拍板） | egui 只在 `ui()` 返回后绘制，所以"边转圈边加载"必须把工作推到 banner 已上屏的下一帧。异步会引入"连点两次 / 加载途中关工程 / 撤销到达"三类竞态，为一个阻塞调用不值 |
+
+**内存现实（决定 cap 的量级）**：解析完常驻 ≈ 文件大小（`wave_data: Vec<i16>`），加载过程先 alloc `Vec<u8>` 再转 i16 → **峰值 ≈ 2×**（2 GB 字体瞬时 4 GB）；SF3 是例外，200 MB 可能解成 1 GB+。彻底吃下 2 GB 级字体只有 mmap + 惰性解码（要 fork rustysynth），明确不做。

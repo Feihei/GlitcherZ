@@ -262,28 +262,28 @@ fn param_routing() {
     let mut proc = make_processor(&common::minimal_sf2_bytes());
     assert!(proc.set_param(ParamId::Sf2BankSelect, 0.0));
     assert!(proc.set_param(ParamId::Sf2ProgramChange, 0.0));
-    assert!(proc.set_param(ParamId::Sf2MasterVolume, 0.5));
+    assert!(proc.set_param(ParamId::Sf2Gain, 0.5));
     assert!(!proc.set_param(ParamId::SineFrequency, 440.0));
     assert!(!proc.set_param(ParamId::MasterGain, 1.0));
     assert!(!proc.set_param(ParamId::Attack, 0.1));
 }
 
 #[test]
-fn master_volume_mutes_and_restores() {
+fn gain_mutes_and_restores() {
     let mut proc = make_processor(&common::minimal_sf2_bytes());
     proc.note_event(note_on(60));
     let (_, sounding) = render_blocks(&mut proc, 4);
     assert!(sounding > 0.01);
 
-    proc.set_param(ParamId::Sf2MasterVolume, 0.0);
+    proc.set_param(ParamId::Sf2Gain, 0.0);
     let (_, muted) = render_blocks(&mut proc, 4);
-    assert!(muted < 1e-9, "volume 0 must mute, got {muted}");
+    assert!(muted < 1e-9, "gain 0 must mute, got {muted}");
 
     // Non-finite values are ignored — the note must still sound afterwards.
-    proc.set_param(ParamId::Sf2MasterVolume, f32::NAN);
-    proc.set_param(ParamId::Sf2MasterVolume, 0.5);
+    proc.set_param(ParamId::Sf2Gain, f32::NAN);
+    proc.set_param(ParamId::Sf2Gain, 0.5);
     let (_, restored) = render_blocks(&mut proc, 4);
-    assert!(restored > 0.01, "volume 0.5 must restore the note");
+    assert!(restored > 0.01, "gain 0.5 must restore the note");
 }
 
 #[test]

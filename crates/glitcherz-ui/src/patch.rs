@@ -45,6 +45,31 @@ pub enum InlineParam {
     SampleRoot,
     /// Sample player output gain (U5).
     SampleGain,
+    /// SoundFont output gain (U13): a slider row.
+    Sf2Gain,
+    /// SoundFont bank selector (U13): a combo row, not a slider.
+    Sf2Bank,
+    /// SoundFont patch (program) selector (U13): a combo row.
+    Sf2Program,
+}
+
+/// How an inline row is presented (U13). Discrete selectors such as a
+/// SoundFont bank cannot be dragged: their row draws a chip and opens a
+/// popup list instead of a slider rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    Slider,
+    Combo,
+}
+
+impl InlineParam {
+    /// Presentation of this parameter's row.
+    fn row_kind(self) -> RowKind {
+        match self {
+            InlineParam::Sf2Bank | InlineParam::Sf2Program => RowKind::Combo,
+            _ => RowKind::Slider,
+        }
+    }
 }
 
 /// Inline parameter addressing: built-in registry entry or an external
@@ -100,10 +125,28 @@ const SAMPLE_INLINE: [InlineParamSpec; 2] = [
     },
 ];
 
+/// SoundFont inline rows (U13): the preset address and the output trim —
+/// the three things a SoundFont node can be adjusted on without opening the
+/// Inspector. Bank / patch are combos (see [`RowKind`]), gain is a slider.
+const SF2_INLINE: [InlineParamSpec; 3] = [
+    InlineParamSpec {
+        param: InlineParam::Sf2Bank,
+        label: "bank",
+    },
+    InlineParamSpec {
+        param: InlineParam::Sf2Program,
+        label: "patch",
+    },
+    InlineParamSpec {
+        param: InlineParam::Sf2Gain,
+        label: "gain",
+    },
+];
+
 /// Static inline-parameter registry for one node (G5 spec §7). SoundFont
-/// instruments expose none (the preset picker is the primary operation);
-/// plugin nodes take their rows from the session enumeration instead
-/// (first 2 parameters — see [`PatchDeps::plugin_inline`]).
+/// instruments expose bank / patch / gain (U13); plugin nodes take their
+/// rows from the session enumeration instead (first 2 parameters — see
+/// [`PatchDeps::plugin_inline`]).
 fn inline_params_of(node: &NodeDoc) -> Vec<InlineParamSpec> {
     match node {
         NodeDoc::Instrument {
@@ -114,6 +157,10 @@ fn inline_params_of(node: &NodeDoc) -> Vec<InlineParamSpec> {
             voice: VoiceSpec::Sample { .. },
             ..
         } => SAMPLE_INLINE.to_vec(),
+        NodeDoc::Instrument {
+            voice: VoiceSpec::SoundFont { .. },
+            ..
+        } => SF2_INLINE.to_vec(),
         // Table-driven from the engine descriptor (spec `effects.md` D6): the
         // row order, labels and count all come from the effect's static table.
         // Only slots flagged `INLINE` get a row — an eight-parameter EQ would
@@ -243,7 +290,75 @@ fn inline_doc_value(node: &NodeDoc, param: InlineParam) -> (f64, f64, f64) {
             },
             InlineParam::SampleGain,
         ) => (f64::from(*gain), 0.0, 2.0),
+        (
+            NodeDoc::Instrument {
+                voice: VoiceSpec::SoundFont { bank, .. },
+                ..
+            },
+            InlineParam::Sf2Bank,
+        ) => (f64::from(*bank), 0.0, 255.0),
+        (
+            NodeDoc::Instrument {
+                voice: VoiceSpec::SoundFont { program, .. },
+                ..
+            },
+            InlineParam::Sf2Program,
+        ) => (f64::from(*program), 0.0, 255.0),
+        (
+            NodeDoc::Instrument {
+                voice: VoiceSpec::SoundFont { gain, .. },
+                ..
+            },
+            InlineParam::Sf2Gain,
+        ) => (f64::from(*gain), 0.0, 2.0),
         _ => (0.0, 0.0, 1.0),
+    }
+}
+
+/// One drawn inline row (G5 / U13): everything the drawing loop needs,
+/// already resolved from the document and the session snapshots.
+struct InlineRow {
+    /// Row caption (`cut`, `bank`, `gain`, a plugin parameter name).
+    label: String,
+    /// Parameter the row edits.
+    param: InlineParamId,
+    /// Current value.
+    value: f64,
+    /// Slider range (ignored by combo rows).
+    min: f64,
+    max: f64,
+    /// Combo rows: `(value, caption)`; empty for sliders, and empty for a
+    /// combo whose list is unavailable (no font loaded).
+    choices: Vec<(u8, String)>,
+}
+
+/// Choice list of a SoundFont combo row (U13).
+///
+/// Bank lists the font's distinct banks; patch lists the patches of the
+/// **current bank**, sorted by program number so the list reads in GM order
+/// instead of file order. Captions are truncated to the node's width — the
+/// popup is 220 px wide, a MuseScore-General patch name is not.
+fn sf2_choices(presets: &[(u8, u8, String)], param: InlineParam, bank: u8) -> Vec<(u8, String)> {
+    match param {
+        InlineParam::Sf2Bank => {
+            let mut banks: Vec<u8> = presets.iter().map(|(bank, _, _)| *bank).collect();
+            banks.sort_unstable();
+            banks.dedup();
+            banks
+                .into_iter()
+                .map(|bank| (bank, format!("Bank {bank}")))
+                .collect()
+        }
+        InlineParam::Sf2Program => {
+            let mut patches: Vec<(u8, String)> = presets
+                .iter()
+                .filter(|(preset_bank, _, _)| *preset_bank == bank)
+                .map(|(_, program, name)| (*program, format!("{program}. {}", truncate(name, 22))))
+                .collect();
+            patches.sort_unstable_by_key(|(program, _)| *program);
+            patches
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -334,9 +449,11 @@ pub enum NodeSource {
     /// walked from `BuiltinEffectKind::ALL`, so a new effect needs no new
     /// `NodeSource` variant.
     Builtin(BuiltinEffectKind),
-    /// SoundFont file at its default preset (bank 0 / program 0).
+    /// SoundFont instrument (U13). The path may be **empty** — that is the
+    /// normal "born empty" node, silent until its `Load File…` button swaps a
+    /// real voice in.
     SoundFont {
-        /// `.sf2` / `.sf3` path picked in the file dialog.
+        /// `.sf2` / `.sf3` path, or empty for a node waiting for one.
         path: String,
     },
     /// Wav sample player (U5, spec `sample-player.md`): born with default
@@ -424,10 +541,13 @@ pub enum PatchAction {
         /// Where the pick lands.
         place: PickerPlace,
     },
-    /// Open the SoundFont file dialog and create an instrument from the pick
-    /// (the patch cannot run a modal dialog inside the menu closure).
-    PickSoundFont {
-        at: Pos2,
+    /// Open the SoundFont file dialog for an **existing** node and swap its
+    /// voice (U13; the patch cannot run a modal dialog inside the menu
+    /// closure). The app parses, resolves a preset that exists in the new
+    /// file and swaps the processor in place — same function the Inspector's
+    /// `Load File…` calls.
+    LoadSoundFont {
+        node: u64,
     },
     /// Open the wav sample file dialog and create a sample instrument from
     /// the pick (U5; same modal-dialog constraint as `PickSoundFont`).
@@ -590,6 +710,29 @@ fn node_action_buttons(id: PatchId, row: usize, deps: &PatchDeps) -> Vec<NodeAct
         ],
         PatchId::Timeline => Vec::new(),
         PatchId::Node(doc_id) => {
+            // U13: a SoundFont node owns its file, so the swap lives on the
+            // box. Empty path = "Load File…", loaded = "Replace…" — the same
+            // button in both states, because there is nothing to "reset to".
+            if let Some(NodeDoc::Instrument {
+                voice: VoiceSpec::SoundFont { path, .. },
+                ..
+            }) = deps.doc.node_by_id(doc_id)
+            {
+                return if row == 0 {
+                    vec![NodeAction {
+                        label: if path.is_empty() {
+                            "Load File…"
+                        } else {
+                            "Replace…"
+                        },
+                        enabled: true,
+                        hover: "Pick a .sf2 / .sf3 file for this node",
+                        action: PatchAction::LoadSoundFont { node: doc_id },
+                    }]
+                } else {
+                    Vec::new()
+                };
+            }
             let inputs = match deps.doc.node_by_id(doc_id) {
                 Some(NodeDoc::Mixer { inputs, .. }) => *inputs as usize,
                 _ => return Vec::new(),
@@ -641,6 +784,11 @@ pub struct PatchDeps<'a> {
     /// controls (first enumerated parameters, G5 spec §7). Empty for
     /// built-in nodes — their rows come from the static registry.
     pub plugin_inline: &'a dyn Fn(u64) -> Vec<InlinePluginControl>,
+    /// Given a SoundFont instrument node, return its font's preset table
+    /// `(bank, program, name)` (U13). Empty when no file is loaded or the
+    /// library is not resident this session — the node's bank / patch combos
+    /// then stay inert instead of offering a list the engine cannot play.
+    pub sf2_presets: &'a dyn Fn(u64) -> Vec<(u8, u8, String)>,
 }
 
 /// Cable being dragged (source = the entity + output port owning the drag).
@@ -679,6 +827,10 @@ pub struct PatchState {
     /// graph-space insert position, frame it was opened)`. `u64::MAX` marks "opened this
     /// frame" so the same-frame click does not immediately close it.
     pending_cable_menu: Option<(usize, Pos2, Pos2, u64)>,
+    /// SoundFont combo row awaiting a pick (U13): `(node, parameter, popup
+    /// screen position, frame it was opened)` — same frame-stamp trick as
+    /// the cable menu, because a click opens it.
+    pending_sf2_choice: Option<(u64, InlineParam, Pos2, u64)>,
 }
 
 impl Default for PatchState {
@@ -693,6 +845,7 @@ impl Default for PatchState {
             add_menu_at: None,
             cut_path: None,
             pending_cable_menu: None,
+            pending_sf2_choice: None,
         }
     }
 }
@@ -847,6 +1000,11 @@ fn action_rows(id: PatchId, deps: &PatchDeps) -> usize {
         PatchId::Timeline => TIMELINE_ACTION_ROWS,
         PatchId::Node(node_id) => match deps.doc.node_by_id(node_id) {
             Some(node) if node.is_mixer() => 1,
+            // U13: the SoundFont file button row.
+            Some(NodeDoc::Instrument {
+                voice: VoiceSpec::SoundFont { .. },
+                ..
+            }) => 1,
             _ => 0,
         },
         _ => 0,
@@ -932,7 +1090,12 @@ fn size_of(id: PatchId, deps: &PatchDeps) -> Vec2 {
                 header_band(id, deps) + (*inputs as f32 * PORT_SPACING).max(NODE_HEIGHT_MIN),
             ),
             Some(NodeDoc::Keyboard { .. }) => KEYBOARD_SIZE,
-            _ => NODE_SIZE,
+            // U13: a node that owns an action row (the SoundFont file
+            // button) reserves it on top of the title band.
+            _ => Vec2::new(
+                NODE_SIZE.x,
+                NODE_SIZE.y + action_rows(id, deps) as f32 * ACTION_ROW_HEIGHT,
+            ),
         },
         _ => NODE_SIZE,
     };
@@ -971,8 +1134,15 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
         PatchId::Node(node_id) => match doc.node_by_id(node_id) {
             Some(NodeDoc::Instrument { voice, track, .. }) => match voice {
                 VoiceSpec::Builtin => format!("Synth · Track {}", track + 1),
-                VoiceSpec::SoundFont { bank, program, .. } => {
-                    format!("SF2 {bank}:{program} · Track {}", track + 1)
+                // U13: the file is the node's identity now (the preset is
+                // on the combos below); the old `bank:program` label went
+                // stale the moment a file could be swapped.
+                VoiceSpec::SoundFont { path, .. } => {
+                    if path.is_empty() {
+                        "SF2 · (no file)".to_string()
+                    } else {
+                        format!("SF2 · {}", file_stem_of(path))
+                    }
                 }
                 VoiceSpec::Sample {
                     path, root_note, ..
@@ -1785,7 +1955,6 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     // entries in a submenu (D4/D5); the built-in leaves create directly.
     let mut picked_source: Option<NodeSource> = None;
     let mut picked_picker: Option<(Option<NodeCategory>, Option<PluginFormat>)> = None;
-    let mut picked_soundfont = false;
     let mut picked_sample = false;
     let mut rescan_plugins = false;
     if !(response.secondary_clicked() && ctrl) {
@@ -1802,8 +1971,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 if ui.button("Built-in Synth").clicked() {
                     picked_source = Some(NodeSource::BuiltinSynth);
                 }
-                if ui.button("SoundFont…").clicked() {
-                    picked_soundfont = true;
+                // U13: born empty on purpose — the node carries its own
+                // `Load File…` button, so adding one never blocks on a
+                // dialog and a file can be swapped later without rebuilding
+                // the node (and its cables).
+                if ui.button("SoundFont").clicked() {
+                    picked_source = Some(NodeSource::SoundFont {
+                        path: String::new(),
+                    });
                 }
                 if ui.button("Sample…").clicked() {
                     picked_sample = true;
@@ -1856,7 +2031,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         actions.push(PatchAction::RescanPlugins);
     }
     // The menu position is consumed by whichever action the user picked.
-    if picked_source.is_some() || picked_picker.is_some() || picked_soundfont || picked_sample {
+    if picked_source.is_some() || picked_picker.is_some() || picked_sample {
         if let Some(at) = state.add_menu_at.take() {
             if let Some(source) = picked_source {
                 actions.push(PatchAction::AddNode { source, at });
@@ -1866,10 +2041,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     format,
                     place: PickerPlace::Add { at },
                 });
-            } else if picked_sample {
-                actions.push(PatchAction::PickSample { at });
             } else {
-                actions.push(PatchAction::PickSoundFont { at });
+                actions.push(PatchAction::PickSample { at });
             }
         }
     }
@@ -2300,7 +2473,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         let Some(node) = doc.node_by_id(doc_id) else {
             continue;
         };
-        let rows: Vec<(String, InlineParamId, f64, f64, f64)> = match node {
+        // One row per registered parameter; SoundFont bank / patch rows are
+        // combos, so they also carry their choice list (U13).
+        let mut rows: Vec<InlineRow> = match node {
             NodeDoc::Instrument {
                 voice: VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. },
                 ..
@@ -2310,30 +2485,48 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 ..
             } => (deps.plugin_inline)(doc_id)
                 .into_iter()
-                .map(|c| {
-                    (
-                        c.label,
-                        InlineParamId::Plugin(c.param_id),
-                        c.value,
-                        c.min,
-                        c.max,
-                    )
+                .map(|c| InlineRow {
+                    label: c.label,
+                    param: InlineParamId::Plugin(c.param_id),
+                    value: c.value,
+                    min: c.min,
+                    max: c.max,
+                    choices: Vec::new(),
                 })
                 .collect(),
             _ => inline_params_of(node)
                 .iter()
                 .map(|spec| {
                     let (value, min, max) = inline_doc_value(node, spec.param);
-                    (
-                        spec.label.to_string(),
-                        InlineParamId::BuiltIn(spec.param),
+                    InlineRow {
+                        label: spec.label.to_string(),
+                        param: InlineParamId::BuiltIn(spec.param),
                         value,
                         min,
                         max,
-                    )
+                        choices: Vec::new(),
+                    }
                 })
                 .collect(),
         };
+        // SoundFont combo rows: the preset table is a session snapshot (the
+        // patch cannot read a parsed font), so it arrives through `deps`.
+        // Without it (no file yet / library not resident) the row stays
+        // visible but inert — the same "say why" rule as a disabled button.
+        if let NodeDoc::Instrument {
+            voice: VoiceSpec::SoundFont { bank, .. },
+            ..
+        } = node
+        {
+            let presets = (deps.sf2_presets)(doc_id);
+            for row in &mut rows {
+                if let InlineParamId::BuiltIn(param) = row.param
+                    && param.row_kind() == RowKind::Combo
+                {
+                    row.choices = sf2_choices(&presets, param, *bank);
+                }
+            }
+        }
         if rows.is_empty() {
             continue;
         }
@@ -2352,11 +2545,19 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         }
         let row_h = INLINE_ROW_HEIGHT * state.zoom;
         let n = rows.len();
-        for (i, (label, param, mut value, min, max)) in rows.into_iter().enumerate() {
+        for (i, row) in rows.into_iter().enumerate() {
             let top = r.bottom() - (n - i) as f32 * row_h;
-            let row =
+            let strip =
                 Rect::from_min_max(Pos2::new(r.left(), top), Pos2::new(r.right(), top + row_h));
-            let (label_pos, rail, value_pos, hit) = inline_row_parts(row, state.zoom);
+            let (label_pos, rail, value_pos, hit) = inline_row_parts(strip, state.zoom);
+            let InlineRow {
+                label,
+                param,
+                mut value,
+                min,
+                max,
+                choices,
+            } = row;
             painter.text(
                 label_pos,
                 egui::Align2::LEFT_CENTER,
@@ -2364,6 +2565,95 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 FontId::proportional(9.0 * state.zoom),
                 Color32::from_gray(190),
             );
+            // ---- Combo row (U13): a chip that opens a list ----
+            if matches!(param, InlineParamId::BuiltIn(p) if p.row_kind() == RowKind::Combo) {
+                let caption = choices
+                    .iter()
+                    .find(|(choice, _)| f64::from(*choice) == value)
+                    .map(|(_, caption)| caption.clone())
+                    .unwrap_or_else(|| format!("{}", value.round() as i64));
+                // The chip spans the slider's footprint: label stays on the
+                // left, the whole rest is the click target.
+                let chip = Rect::from_min_max(
+                    Pos2::new(rail.left(), top + 1.5 * state.zoom),
+                    Pos2::new(hit.right(), top + row_h - 1.5 * state.zoom),
+                );
+                let enabled = !choices.is_empty();
+                painter.rect_filled(
+                    chip,
+                    2.0 * state.zoom,
+                    if enabled {
+                        Color32::from_gray(52)
+                    } else {
+                        Color32::from_gray(38)
+                    },
+                );
+                painter.rect_stroke(
+                    chip,
+                    2.0 * state.zoom,
+                    egui::Stroke::new(1.0, Color32::from_gray(if enabled { 90 } else { 60 })),
+                    egui::StrokeKind::Inside,
+                );
+                painter.text(
+                    Pos2::new(chip.left() + 4.0 * state.zoom, chip.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &caption,
+                    FontId::proportional(9.0 * state.zoom),
+                    Color32::from_gray(if enabled { 215 } else { 120 }),
+                );
+                // Chevron drawn as two strokes, not a "▾" glyph: the
+                // default font has no such character and painted a tofu box
+                // in its place (verified in the running UI).
+                let arrow = Stroke::new(
+                    1.2 * state.zoom,
+                    Color32::from_gray(if enabled { 190 } else { 110 }),
+                );
+                let tip_x = chip.right() - 5.0 * state.zoom;
+                let tip_y = chip.center().y;
+                let wing = 2.6 * state.zoom;
+                painter.line_segment(
+                    [
+                        Pos2::new(tip_x - wing, tip_y - wing * 0.7),
+                        Pos2::new(tip_x, tip_y + wing * 0.7),
+                    ],
+                    arrow,
+                );
+                painter.line_segment(
+                    [
+                        Pos2::new(tip_x, tip_y + wing * 0.7),
+                        Pos2::new(tip_x + wing, tip_y - wing * 0.7),
+                    ],
+                    arrow,
+                );
+                // Real widget over the chip: a press opens the list instead
+                // of dragging the node (same priority as the sliders).
+                let resp = ui
+                    .allocate_rect(chip, Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                let resp = if enabled {
+                    resp
+                } else {
+                    resp.on_hover_text("Load a sound font first")
+                };
+                if enabled && resp.clicked() {
+                    if let Some(sp) = resp.interact_pointer_pos() {
+                        state.pending_sf2_choice = Some((
+                            doc_id,
+                            match param {
+                                InlineParamId::BuiltIn(p) => p,
+                                InlineParamId::Plugin(_) => continue,
+                            },
+                            sp + Vec2::new(4.0, 4.0),
+                            u64::MAX,
+                        ));
+                    }
+                }
+                if enabled {
+                    resp.on_hover_text(format!("{label}: {caption}"));
+                }
+                continue;
+            }
+            // ---- Slider row (G5) ----
             // Rail with a filled run up to the handle, then the handle dot —
             // every measure multiplied by the zoom so the row stays inside
             // its rect at any scale.
@@ -2418,6 +2708,89 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         }
     }
 
+    // ---- SoundFont bank / patch list (U13) ----
+    // Opened by a combo row. An `Area` (not a `ComboBox`) because the row is
+    // a hand-painted strip scaled by the zoom: a native combo would keep its
+    // own font size and overflow the box at low zoom, and the list has to
+    // stay readable while the patch itself is zoomed out.
+    // Stamp the opening frame first — the click that opened this menu is an
+    // `any_click` in the same frame.
+    if let Some((_, _, _, frame)) = &mut state.pending_sf2_choice
+        && *frame == u64::MAX
+    {
+        *frame = ui.ctx().cumulative_frame_nr();
+    }
+    // The node can disappear while the list is open (delete / undo).
+    if state
+        .pending_sf2_choice
+        .is_some_and(|(node, ..)| doc.node_by_id(node).is_none())
+    {
+        state.pending_sf2_choice = None;
+    }
+    if let Some((doc_id, param, menu_pos, opened)) = state.pending_sf2_choice {
+        let bank = match doc.node_by_id(doc_id) {
+            Some(NodeDoc::Instrument {
+                voice: VoiceSpec::SoundFont { bank, .. },
+                ..
+            }) => *bank,
+            _ => 0,
+        };
+        let presets = (deps.sf2_presets)(doc_id);
+        let choices = sf2_choices(&presets, param, bank);
+        let current = doc
+            .node_by_id(doc_id)
+            .map_or(0.0, |node| inline_doc_value(node, param).0);
+        let title = match param {
+            InlineParam::Sf2Bank => "SoundFont Bank",
+            _ => "SoundFont Patch",
+        };
+        let mut picked: Option<u8> = None;
+        egui::Area::new(egui::Id::new("glitcherz_patch_sf2_choice"))
+            .fixed_pos(menu_pos)
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(220.0);
+                    ui.strong(title);
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            for (value, caption) in &choices {
+                                if ui
+                                    .selectable_label(
+                                        f64::from(*value) == current,
+                                        caption.as_str(),
+                                    )
+                                    .clicked()
+                                {
+                                    picked = Some(*value);
+                                }
+                            }
+                        });
+                });
+            });
+        match picked {
+            Some(value) => {
+                actions.push(PatchAction::SetInlineParam {
+                    node: doc_id,
+                    param: InlineParamId::BuiltIn(param),
+                    value: f32::from(value),
+                });
+                state.pending_sf2_choice = None;
+            }
+            None => {
+                // Ignore the click that opened the menu (same frame).
+                if opened != ui.ctx().cumulative_frame_nr()
+                    && ui
+                        .ctx()
+                        .input(|i| i.pointer.any_click() || i.key_pressed(egui::Key::Escape))
+                {
+                    state.pending_sf2_choice = None;
+                }
+            }
+        }
+    }
+
     // ---- In-node action rows ----
     // Track management belongs to the timeline and the slot count to the
     // mixer, so those buttons sit on the boxes that own them instead of a
@@ -2438,9 +2811,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             let z = state.zoom;
             let row_h = ACTION_ROW_HEIGHT * z;
             let gap = 4.0 * z;
-            let btn_w = ((r.width() - 2.0 * INLINE_INSET * z - gap) * 0.5).max(1.0);
             for row in 0..rows {
                 let buttons = node_action_buttons(id, row, &deps);
+                // Buttons share the row evenly: two for the timeline /
+                // mixer, one for a SoundFont node's file button (U13).
+                let count = buttons.len().max(1) as f32;
+                let btn_w =
+                    ((r.width() - 2.0 * INLINE_INSET * z - gap * (count - 1.0)) / count).max(1.0);
                 let top = r.top() + (NODE_TITLE_BAND + row as f32 * ACTION_ROW_HEIGHT) * z + 1.0;
                 for (k, b) in buttons.into_iter().enumerate() {
                     let btn_rect = Rect::from_min_size(
@@ -2694,6 +3071,7 @@ mod tests {
             audio_count: project.audio_tracks.len(),
             auto_options: &|_| Vec::new(),
             plugin_inline: &|_| Vec::new(),
+            sf2_presets: &|_| Vec::new(),
         };
         let mut state = PatchState::default();
         state.ensure_positions(doc, deps.track_count, deps.auto_count, deps.audio_count);
@@ -2826,6 +3204,7 @@ mod tests {
             audio_count: project.audio_tracks.len(),
             auto_options: &|_| Vec::new(),
             plugin_inline: &|_| Vec::new(),
+            sf2_presets: &|_| Vec::new(),
         };
         let mut state = PatchState::default();
         state.ensure_positions(doc, deps.track_count, deps.auto_count, deps.audio_count);
@@ -2865,13 +3244,23 @@ mod tests {
                 path: String::new(),
                 bank: 0,
                 program: 0,
+                gain: 1.0,
             },
             synth: glitcherz_model::SynthParams::default(),
         };
-        assert!(
-            inline_params_of(&sf2).is_empty(),
-            "SoundFont instruments expose no inline rows"
+        // U13: bank / patch (combos) + gain (slider).
+        let sf2_params: Vec<InlineParam> = inline_params_of(&sf2).iter().map(|s| s.param).collect();
+        assert_eq!(
+            sf2_params,
+            vec![
+                InlineParam::Sf2Bank,
+                InlineParam::Sf2Program,
+                InlineParam::Sf2Gain
+            ]
         );
+        assert_eq!(InlineParam::Sf2Bank.row_kind(), RowKind::Combo);
+        assert_eq!(InlineParam::Sf2Program.row_kind(), RowKind::Combo);
+        assert_eq!(InlineParam::Sf2Gain.row_kind(), RowKind::Slider);
 
         let clap = NodeDoc::Instrument {
             node_id: 4,
@@ -2984,6 +3373,7 @@ mod tests {
             auto_count: project.control_tracks.len(),
             audio_count: project.audio_tracks.len(),
             auto_options: &|_| Vec::new(),
+            sf2_presets: &|_| Vec::new(),
             plugin_inline: &|node| {
                 if node == plugin_node {
                     vec![
@@ -3243,6 +3633,7 @@ mod tests {
             audio_count: project.audio_tracks.len(),
             auto_options: &|_| Vec::new(),
             plugin_inline: &|_| Vec::new(),
+            sf2_presets: &|_| Vec::new(),
         };
 
         let mut state = PatchState::default();
@@ -3316,6 +3707,7 @@ mod tests {
         });
         let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
         let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
         let deps = PatchDeps {
             doc: &doc,
             track_count: 1,
@@ -3323,6 +3715,7 @@ mod tests {
             audio_count: 0,
             auto_options: &auto_options,
             plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
         };
         let vk = PatchId::Node(99);
 
@@ -3354,6 +3747,7 @@ mod tests {
         let doc = &project.graph;
         let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
         let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
         let track_count = project.midi_tracks.len();
         let auto_count = 1;
         let audio_count = 1;
@@ -3364,6 +3758,7 @@ mod tests {
             audio_count,
             auto_options: &auto_options,
             plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
         };
         let mut state = PatchState::default();
         state.positions.insert(PatchId::Timeline, Pos2::ZERO);
@@ -3443,6 +3838,7 @@ mod tests {
             audio_count,
             auto_options: &auto_options,
             plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
         };
         assert!(node_action_buttons(PatchId::Node(fm), 0, &fdeps)[1].enabled);
         let from = free
@@ -3460,6 +3856,7 @@ mod tests {
             audio_count,
             auto_options: &auto_options,
             plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
         };
         assert!(!node_action_buttons(PatchId::Node(fm), 0, &fdeps)[1].enabled);
 
@@ -3472,5 +3869,124 @@ mod tests {
             .expect("default project has a keyboard node");
         assert!(!opens_inspector(Some(&keyboard)));
         assert!(opens_inspector(doc.node_by_id(mixer)));
+    }
+
+    /// U13: a SoundFont node is self-sufficient. Its box carries the file
+    /// button, the preset address (two combos) and the output gain, its
+    /// label names the **file** (a `bank:program` label goes stale the moment
+    /// the file can be swapped), and its preset lists come from the session
+    /// table rather than from the document.
+    #[test]
+    fn soundfont_node_owns_file_preset_and_gain() {
+        let presets: Vec<(u8, u8, String)> = vec![
+            (0, 40, "Violin".to_string()),
+            (0, 0, "Grand Piano".to_string()),
+            (8, 0, "Standard Kit".to_string()),
+        ];
+        let mut project = Project::default();
+        let node = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::Instrument {
+            node_id: node,
+            track: 0,
+            voice: VoiceSpec::SoundFont {
+                path: String::new(),
+                bank: 0,
+                program: 0,
+                gain: 1.0,
+            },
+            synth: glitcherz_model::SynthParams::default(),
+        });
+        let id = PatchId::Node(node);
+
+        // Born empty: silent, one file button, no preset to offer yet.
+        {
+            let table = |target: u64| -> Vec<(u8, u8, String)> {
+                if target == node {
+                    presets.clone()
+                } else {
+                    Vec::new()
+                }
+            };
+            let deps = PatchDeps {
+                doc: &project.graph,
+                track_count: 1,
+                auto_count: 0,
+                audio_count: 0,
+                auto_options: &|_| Vec::new(),
+                plugin_inline: &|_| Vec::new(),
+                sf2_presets: &table,
+            };
+            assert_eq!(label_of(id, &project.graph), "SF2 · (no file)");
+            assert_eq!(action_rows(id, &deps), 1);
+            assert_eq!(header_band(id, &deps), NODE_TITLE_BAND + ACTION_ROW_HEIGHT);
+            let row = node_action_buttons(id, 0, &deps);
+            assert_eq!(row.len(), 1);
+            assert_eq!(row[0].label, "Load File…");
+            assert!(matches!(
+                row[0].action,
+                PatchAction::LoadSoundFont { node: target } if target == node
+            ));
+            // Box: title band + file row + bank / patch / gain.
+            assert_eq!(inline_row_count(id, &deps), 3);
+            assert_eq!(
+                size_of(id, &deps),
+                Vec2::new(
+                    NODE_SIZE.x,
+                    NODE_SIZE.y + ACTION_ROW_HEIGHT + 3.0 * INLINE_ROW_HEIGHT
+                )
+            );
+        }
+
+        // Loaded: the label switches to the file stem, the button to Replace.
+        if let Some(NodeDoc::Instrument { voice, .. }) = project.graph.node_by_id_mut(node) {
+            *voice = VoiceSpec::SoundFont {
+                path: "C:/fonts/GPiano.sf2".to_string(),
+                bank: 0,
+                program: 0,
+                gain: 1.0,
+            };
+        }
+        {
+            let table = |target: u64| -> Vec<(u8, u8, String)> {
+                if target == node {
+                    presets.clone()
+                } else {
+                    Vec::new()
+                }
+            };
+            let deps = PatchDeps {
+                doc: &project.graph,
+                track_count: 1,
+                auto_count: 0,
+                audio_count: 0,
+                auto_options: &|_| Vec::new(),
+                plugin_inline: &|_| Vec::new(),
+                sf2_presets: &table,
+            };
+            // Stem, not the full name: `file_stem_of` truncates for the box.
+            assert_eq!(label_of(id, &project.graph), "SF2 · GPiano");
+            assert_eq!(node_action_buttons(id, 0, &deps)[0].label, "Replace…");
+            // Row values come from the document, not from the session table.
+            let doc_node = project.graph.node_by_id(node).unwrap();
+            assert_eq!(inline_doc_value(doc_node, InlineParam::Sf2Bank).0, 0.0);
+            assert_eq!(inline_doc_value(doc_node, InlineParam::Sf2Program).0, 0.0);
+            assert_eq!(inline_doc_value(doc_node, InlineParam::Sf2Gain).0, 1.0);
+        }
+
+        // Combo lists: distinct banks ascending; patches of the current bank
+        // ordered by program (GM order, not file order).
+        assert_eq!(
+            sf2_choices(&presets, InlineParam::Sf2Bank, 0),
+            vec![(0, "Bank 0".to_string()), (8, "Bank 8".to_string())]
+        );
+        let patches = sf2_choices(&presets, InlineParam::Sf2Program, 0);
+        assert_eq!(patches[0], (0, "0. Grand Piano".to_string()));
+        assert_eq!(patches[1], (40, "40. Violin".to_string()));
+        assert_eq!(
+            sf2_choices(&presets, InlineParam::Sf2Program, 8),
+            vec![(0, "0. Standard Kit".to_string())]
+        );
+        // A slider parameter has no choices.
+        assert!(sf2_choices(&presets, InlineParam::Sf2Gain, 0).is_empty());
     }
 }
