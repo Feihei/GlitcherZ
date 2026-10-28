@@ -428,6 +428,11 @@ fn inline_param_id(p: patch::InlineParam) -> ParamId {
         patch::InlineParam::Resonance => ParamId::FilterResonance,
         patch::InlineParam::EffectSlot(slot) => ParamId::BuiltinParam(slot),
         patch::InlineParam::MixerOutPan => ParamId::MixerOutPan,
+        // U14: the mixer channel strips on the canvas edit the same channel
+        // params the Inspector console does.
+        patch::InlineParam::MixerGain(ch) => ParamId::MixerGain(ch),
+        patch::InlineParam::MixerMute(ch) => ParamId::MixerMute(ch),
+        patch::InlineParam::MixerSolo(ch) => ParamId::MixerSolo(ch),
         patch::InlineParam::FeedbackGain => ParamId::FeedbackGain,
         patch::InlineParam::SampleRoot => ParamId::SampleRootNote,
         patch::InlineParam::SampleGain => ParamId::SampleGain,
@@ -7732,6 +7737,43 @@ impl GlitcherZApp {
                     }
                     self.commit_param_edit("Mixer Out Pan", before, "mixer-out-pan");
                     self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::MixerGain(ch) => {
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Mixer { channels, .. }) =
+                        self.project_mut().graph.node_by_id_mut(node)
+                        && let Some(c) = channels.get_mut(ch as usize)
+                    {
+                        c.gain = value;
+                    }
+                    // Key carries the channel: two faders dragged in a row are
+                    // two undo steps, not one merged step.
+                    self.commit_param_edit("Mixer Gain", before, &format!("mixer-gain-{ch}"));
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::MixerMute(ch) => {
+                    let muted = value >= 0.5;
+                    let before = self.begin_edit();
+                    if let Some(NodeDoc::Mixer { channels, .. }) =
+                        self.project_mut().graph.node_by_id_mut(node)
+                        && let Some(c) = channels.get_mut(ch as usize)
+                    {
+                        c.muted = muted;
+                    }
+                    self.commit_edit("Mixer Mute", before);
+                    self.send_node_param(node, inline_param_id(p), if muted { 1.0 } else { 0.0 });
+                }
+                patch::InlineParam::MixerSolo(ch) => {
+                    let solo = value >= 0.5;
+                    let before = self.begin_edit();
+                    if let Some(NodeDoc::Mixer { channels, .. }) =
+                        self.project_mut().graph.node_by_id_mut(node)
+                        && let Some(c) = channels.get_mut(ch as usize)
+                    {
+                        c.solo = solo;
+                    }
+                    self.commit_edit("Mixer Solo", before);
+                    self.send_node_param(node, inline_param_id(p), if solo { 1.0 } else { 0.0 });
                 }
                 patch::InlineParam::FeedbackGain => {
                     let before = self.begin_param_edit();

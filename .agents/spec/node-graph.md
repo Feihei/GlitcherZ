@@ -43,6 +43,7 @@ related: [../plan.md, ../architecture.md]
 | D19 | 旁路语义修订 | `remove_node` 旁路重连仅适用于 ≤1 入边的节点（效果器 1入1出照旧旁通）；mixer/master 不可旁路（多入边无处重连）——删除 mixer 时其触及连线直接移除 |
 | D20 | 入边权重与调参解耦 | per-channel 有效权重（gain × pan 声像系数 × mute × solo）以**立体声 L/R 权重表**参与求和：`Processor` trait 增带默认实现的 `input_weights() -> Option<&[[f32; 2]; MAX_IN_EDGES]>`（默认 `None` = 单位权重，插件零改动），`MixerProcessor` 覆写返回按通道状态实时计算的权重表；求和循环逐边乘权。**推子/pan/mute/solo 拖动走参数命令路径，永不触发拓扑重建**（守 D5） |
 | D21 | 通道数管理（2026-10-09 评审拍板） | **手动增减**：mixer 面板提供添加/删除通道按钮，下限 2 无法删、上限 32 无法加。通道设置（fader/pan/mute/solo）**与插线状态解耦**——拔线不丢设置、常驻通道可预先留空。连线可落到**任意空通道**（不要求顺序占口）。否决"入口数 = 入边数 + 1 自动增减"方案：拆线丢状态 + 口位重排/留洞语义复杂 + 自动化需要稳定端口身份 |
+| D22 | 画布上的通道条（U14，2026-10-28） | mixer 节点盒内**每个输入口一行**，行内横排 `fader + M + S`：条高 `22`（图空间，< `PORT_SPACING` 30），左起 `22`（避开端口圆点与 `PORT_HIT_RADIUS` 18 的拉线判定），右至盒内缩进 8；`M` 在内、`S` 在最外。**写入走与 Inspector 同一条路**：`PatchAction::SetInlineParam{MixerGain/MixerMute/MixerSolo(ch)}` → `apply_inline_param` → 文档 `channels[ch]` + `ParamId::MixerGain/Mute/Solo(ch)`；fader 用 `commit_param_edit`（key `mixer-gain-{ch}`，一次拖动一步 undo），M/S 用 `begin_edit`/`commit_edit` 各一步 | 调音台之所以好用，是因为推子压在它管的那根线上——底部再堆 32 行会脱离端口。宽度是硬约束：150 图空间的盒子里 fader 76 + M/S 各 18 刚好，故**不加 pan**（窄到放不下，仍留在 Inspector）。fader 命中区取整条高度（3 px 的 rail 抓不住），M/S 自绘（`egui::Button` 保不住 22 × zoom 的行高，与 D15 同一病因） |
 
 ## 3. 节点类型与端口剖面
 

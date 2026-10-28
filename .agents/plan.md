@@ -307,6 +307,19 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 
 **已知边界**：`SoundFont` 解析后是 `Vec<i16>`（**常驻 ≈ 文件大小**），但加载过程先 alloc `Vec<u8>` 原始字节再转 i16 → **峰值 ≈ 2×**；解析在控制线程，2 GB 文件会冻结 UI 数秒。S3c 只解决"看得见"（banner），不解决"不阻塞"——窗口阻塞期间没有消息泵，Windows 可能短暂标记未响应。真要异步只剩一条路：`Box<dyn FnOnce>` 换成 worker 线程 + job id 去重，加载函数已是纯函数（`sf2_library_for`），切换点集中在一处。
 
+## U14：mixer 通道条上画布（2026-10-28 立项，spec `node-graph.md` D22）
+
+用户提出：mixer 节点上要能直接看到每个通道的音量 + mute/solo，横排显示在对应输入口的位置，与 Inspector 互相同步，"这样在 patch 中调整更方便"。
+
+决策：**一个输入口一行**（不是把所有通道排成一行 fader 墙，也不是把 32 行堆在盒底）——推子压在它管的那根线上；`M` 在内、`S` 在最外（solo 更重，不放在容易误触的位置）；**不加 pan**（150 图空间里 fader 76 + M/S 各 18 已占满，pan 留在 Inspector）。
+
+- [x] **S1 参数与几何** ✅ 2026-10-28：`InlineParam::{MixerGain(ch), MixerMute(ch), MixerSolo(ch)}` + `inline_doc_value` 三分支（读 `NodeDoc::Mixer.channels`，越界降级为 0 不 panic）；`CHANNEL_STRIP_*` 常量 + `channel_strip_rect` / `channel_strip_cells`（条高 22 < `PORT_SPACING` 30，左起 22 避开 `PORT_HIT_RADIUS` 18）；`draw_fader_rail` 抽出与 inline 行共用
+- [x] **S2 绘制与命中** ✅ 2026-10-28：`channel_toggle` 自绘 M/S chip（`Sense::click`，激活态染色：mute 红 / solo 黄）；fader 命中区取整条高度（3 px rail 抓不住）；全部发 `PatchAction::SetInlineParam`，与 inline 滑条同一套指针优先级
+- [x] **S3 写入同步** ✅ 2026-10-28：`inline_param_id` 三条映射 + `apply_inline_param` 三分支（fader `commit_param_edit`，key `mixer-gain-{ch}` 带通道号；M/S `begin_edit`/`commit_edit` 各一步 undo）；文档字段与 Inspector 共用，引擎侧 `ParamId::MixerGain/Mute/Solo(ch)` 已存在，引擎零改动
+- [x] **S4 测试与文档** ✅ 2026-10-28：`mixer_channel_strips_clear_the_ports_at_any_zoom`（0.6/0.8/1.0/2.0 四缩放 × 4 通道：不碰拉线半径、不出盒、不塌陷、三格互不重叠）+ `mixer_strips_read_the_console_fields`；spec `node-graph.md` 补 D22
+
+**已知边界**：fader 拖动精度由条宽决定（76 图空间 → 0.6 缩放时 45 px 覆盖 0..1.5，约 3 % / px），比 Inspector 的 110 px 竖推子粗；要精调仍走 Inspector。32 通道时条高 22 + 间距 8，垂直方向仍可点，但缩放到 0.6 时 M/S 只有 11 px——与节点内其它按钮同阈值（`INLINE_MIN_ZOOM`），不额外做"缩小时隐藏"。
+
 ## U4c / A 阶段：节点参数自动化词汇表（2026-10-28 立项，spec `control-tracks.md` §9）
 
 用户提出：「patch 图中各个节点的参数现在还不能接受输入，比如 gain」。核查结论：**引擎侧早就通了**（`set_auto_route(index, node_id, ParamId)` → `auto_deliver` → `slot_set_param` 能写任意节点的任意 `ParamId`，`MixerGain(ch)`/`BuiltinParam(slot)`/`Sf2Gain` 全已实现，引擎测试 `auto_route_delivers_curve_values_to_target_param` 就是 mixer 通道 gain 的端到端证明）。缺口全在上层三处：

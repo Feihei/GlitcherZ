@@ -51,6 +51,14 @@ pub enum InlineParam {
     Sf2Bank,
     /// SoundFont patch (program) selector (U13): a combo row.
     Sf2Program,
+    /// Mixer channel fader (U14), addressed by channel index. Draws as the
+    /// strip beside the channel's own input port, not as a bottom row — a
+    /// console works because each fader sits on the line it governs.
+    MixerGain(u8),
+    /// Mixer channel mute toggle (U14): a discrete chip, value 0 / 1.
+    MixerMute(u8),
+    /// Mixer channel solo toggle (U14): a discrete chip, value 0 / 1.
+    MixerSolo(u8),
 }
 
 /// How an inline row is presented (U13). Discrete selectors such as a
@@ -275,6 +283,34 @@ fn inline_doc_value(node: &NodeDoc, param: InlineParam) -> (f64, f64, f64) {
             )
         }
         (NodeDoc::Mixer { out_pan, .. }, InlineParam::MixerOutPan) => (*out_pan as f64, -1.0, 1.0),
+        // U14: the channel strips read the same document fields the Inspector
+        // console does, so the two surfaces cannot drift apart.
+        (NodeDoc::Mixer { channels, .. }, InlineParam::MixerGain(ch)) => {
+            let gain = channels.get(ch as usize).map_or(0.0, |c| c.gain);
+            (
+                f64::from(gain),
+                f64::from(*crate::TRACK_GAIN_RANGE.start()),
+                f64::from(*crate::TRACK_GAIN_RANGE.end()),
+            )
+        }
+        (NodeDoc::Mixer { channels, .. }, InlineParam::MixerMute(ch)) => (
+            if channels.get(ch as usize).is_some_and(|c| c.muted) {
+                1.0
+            } else {
+                0.0
+            },
+            0.0,
+            1.0,
+        ),
+        (NodeDoc::Mixer { channels, .. }, InlineParam::MixerSolo(ch)) => (
+            if channels.get(ch as usize).is_some_and(|c| c.solo) {
+                1.0
+            } else {
+                0.0
+            },
+            0.0,
+            1.0,
+        ),
         (NodeDoc::Feedback { gain, .. }, InlineParam::FeedbackGain) => (*gain as f64, 0.0, 1.0),
         (
             NodeDoc::Instrument {
@@ -986,6 +1022,17 @@ const INLINE_VALUE_WIDTH: f32 = 30.0;
 /// reserves the rows (stable box / port layout while zooming), mirroring the
 /// action-button threshold.
 const INLINE_MIN_ZOOM: f32 = ACTION_MIN_ZOOM;
+/// Mixer channel strip height (U14, graph space). Kept under `PORT_SPACING`
+/// so two neighbouring strips never touch, and tall enough for the `M` / `S`
+/// chips to stay clickable at [`ACTION_MIN_ZOOM`].
+const CHANNEL_STRIP_HEIGHT: f32 = 22.0;
+/// Left edge of a channel strip, clear of the port dot and of
+/// `PORT_HIT_RADIUS` — a press inside the dot must still start a cable drag.
+const CHANNEL_STRIP_LEFT: f32 = 22.0;
+/// Width of one `M` / `S` toggle chip.
+const CHANNEL_TOGGLE_W: f32 = 18.0;
+/// Gap between the two toggles and between the fader and the mute chip.
+const CHANNEL_TOGGLE_GAP: f32 = 3.0;
 /// Timeline box size per output port row (width fixed, height scales).
 const TIMELINE_WIDTH: f32 = 150.0;
 const TIMELINE_ROW_HEIGHT: f32 = 26.0;
@@ -1115,6 +1162,119 @@ fn action_button_rects(band: Rect, count: usize, zoom: f32) -> Vec<Rect> {
             )
         })
         .collect()
+}
+
+/// Paints the slider rail of one inline row or channel strip: a dim full-run
+/// rail, a brighter run up to the handle and the handle dot itself. Shared so
+/// the mixer strips and the inline rows look like one family of controls.
+fn draw_fader_rail(painter: &egui::Painter, rail: Rect, t: f32, z: f32) {
+    let mid_y = rail.center().y;
+    let handle_x = rail.left() + t * rail.width();
+    painter.line_segment(
+        [
+            Pos2::new(rail.left(), mid_y),
+            Pos2::new(rail.right(), mid_y),
+        ],
+        Stroke::new(2.0 * z, Color32::from_gray(80)),
+    );
+    if t > 0.0 {
+        painter.line_segment(
+            [Pos2::new(rail.left(), mid_y), Pos2::new(handle_x, mid_y)],
+            Stroke::new(2.0 * z, Color32::from_gray(160)),
+        );
+    }
+    painter.circle_filled(
+        Pos2::new(handle_x, mid_y),
+        (4.0 * z).max(1.5),
+        Color32::from_gray(215),
+    );
+}
+
+/// Screen rect of one mixer channel strip (U14): centred on the channel's
+/// input port, running from just right of the port dot to the node's right
+/// inset. One strip per channel is what makes the fader sit on the line it
+/// governs instead of in a detached list at the bottom of the box.
+fn channel_strip_rect(port: Pos2, node: Rect, z: f32) -> Rect {
+    let h = CHANNEL_STRIP_HEIGHT * z;
+    Rect::from_min_max(
+        Pos2::new(port.x + CHANNEL_STRIP_LEFT * z, port.y - h * 0.5),
+        Pos2::new(node.right() - INLINE_INSET * z, port.y + h * 0.5),
+    )
+}
+
+/// Cells inside one channel strip: the fader rail and the two toggles, laid
+/// out right-to-left so the fader takes whatever width is left.
+struct ChannelStripCells {
+    rail: Rect,
+    mute: Rect,
+    solo: Rect,
+}
+
+fn channel_strip_cells(strip: Rect, z: f32) -> ChannelStripCells {
+    let chip = CHANNEL_TOGGLE_W * z;
+    let gap = CHANNEL_TOGGLE_GAP * z;
+    let pad = 2.0 * z;
+    // `S` is the outermost chip: solo is the rarer, more destructive press,
+    // so it does not sit in the middle where a slip would hit it.
+    let solo = Rect::from_min_max(
+        Pos2::new(strip.right() - chip, strip.top() + pad),
+        Pos2::new(strip.right(), strip.bottom() - pad),
+    );
+    let mute = solo.translate(Vec2::new(-(chip + gap), 0.0));
+    let mid = strip.center().y;
+    let rail = Rect::from_min_max(
+        Pos2::new(strip.left(), mid - 1.5 * z),
+        Pos2::new(mute.left() - 5.0 * z, mid + 1.5 * z),
+    );
+    ChannelStripCells { rail, mute, solo }
+}
+
+/// Paints one `M` / `S` toggle chip and reports a click. Same hand-painted
+/// treatment as the action buttons: a native button cannot shrink below
+/// `interact_size.y`, and the strip is 22 * zoom tall.
+fn channel_toggle(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    z: f32,
+    label: &str,
+    active: bool,
+    tint: Color32,
+    hover: &str,
+) -> bool {
+    let resp = ui.allocate_rect(rect, Sense::click());
+    let hot = resp.hovered();
+    let (fill, text) = if active {
+        (tint, Color32::from_gray(20))
+    } else if hot {
+        (Color32::from_gray(72), Color32::from_gray(235))
+    } else {
+        (Color32::from_gray(48), Color32::from_gray(160))
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0 * z, fill);
+    painter.rect_stroke(
+        rect,
+        2.0 * z,
+        Stroke::new(
+            1.0,
+            if active {
+                Color32::from_gray(200)
+            } else {
+                Color32::from_gray(84)
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        FontId::proportional((9.0 * z).min(rect.height() * 0.8).max(1.0)),
+        text,
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(hover)
+        .clicked()
 }
 
 /// Type coloring (spec P5d): stroke varies by type, fill is a dark base.
@@ -2802,26 +2962,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             // every measure multiplied by the zoom so the row stays inside
             // its rect at any scale.
             let t = inline_ratio(value, min, max) as f32;
-            let handle_x = rail.left() + t * rail.width();
-            let mid_y = rail.center().y;
-            painter.line_segment(
-                [
-                    Pos2::new(rail.left(), mid_y),
-                    Pos2::new(rail.right(), mid_y),
-                ],
-                Stroke::new(2.0 * state.zoom, Color32::from_gray(80)),
-            );
-            if t > 0.0 {
-                painter.line_segment(
-                    [Pos2::new(rail.left(), mid_y), Pos2::new(handle_x, mid_y)],
-                    Stroke::new(2.0 * state.zoom, Color32::from_gray(160)),
-                );
-            }
-            painter.circle_filled(
-                Pos2::new(handle_x, mid_y),
-                (4.0 * state.zoom).max(1.5),
-                Color32::from_gray(215),
-            );
+            draw_fader_rail(&painter, rail, t, state.zoom);
             painter.text(
                 value_pos,
                 egui::Align2::RIGHT_CENTER,
@@ -2849,6 +2990,99 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             resp = resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
             let _ =
                 resp.on_hover_text(format!("{} = {}", label, fmt_inline_value(value, min, max)));
+        }
+    }
+
+    // ---- Mixer channel strips (U14) ----
+    // One strip per input port: fader + mute + solo across the row the
+    // channel's cable lands on, so a fader is always next to the line it
+    // governs. Values are read from the same document fields the Inspector
+    // console edits — the two surfaces cannot disagree, and an edit here
+    // raises the same undo step through the same param path.
+    for &id in state.positions.keys() {
+        let PatchId::Node(doc_id) = id else {
+            continue;
+        };
+        let Some(NodeDoc::Mixer { channels, .. }) = doc.node_by_id(doc_id) else {
+            continue;
+        };
+        if state.zoom < INLINE_MIN_ZOOM {
+            continue;
+        }
+        let Some(r) = state.screen_rect(rect.min, id, &deps) else {
+            continue;
+        };
+        if !r.intersects(rect) {
+            continue;
+        }
+        let z = state.zoom;
+        for (port, port_pos) in state.in_ports_screen(rect.min, id, &deps) {
+            let Some(ch) = channels.get(port as usize) else {
+                continue;
+            };
+            let strip = channel_strip_rect(port_pos, r, z);
+            let cells = channel_strip_cells(strip, z);
+            let gain_min = *crate::TRACK_GAIN_RANGE.start();
+            let gain_max = *crate::TRACK_GAIN_RANGE.end();
+            draw_fader_rail(
+                &painter,
+                cells.rail,
+                inline_ratio(f64::from(ch.gain), f64::from(gain_min), f64::from(gain_max)) as f32,
+                z,
+            );
+            // The fader grabs the whole strip height: a 3 px rail would be
+            // impossible to hit, and this row has no inline label to drag.
+            let hit = Rect::from_min_max(
+                Pos2::new(cells.rail.left(), strip.top()),
+                Pos2::new(cells.rail.right(), strip.bottom()),
+            );
+            let resp = ui.allocate_rect(hit, Sense::click_and_drag());
+            if (resp.dragged() || resp.clicked())
+                && let Some(sp) = resp.interact_pointer_pos()
+                && cells.rail.width() > 0.0
+            {
+                let k = ((sp.x - cells.rail.left()) / cells.rail.width()).clamp(0.0, 1.0);
+                actions.push(PatchAction::SetInlineParam {
+                    node: doc_id,
+                    param: InlineParamId::BuiltIn(InlineParam::MixerGain(port)),
+                    value: gain_min + k * (gain_max - gain_min),
+                });
+            }
+            let _ = resp
+                .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+                .on_hover_text(format!("Ch {} volume {:.0}%", port + 1, ch.gain * 100.0));
+            let mute = channel_toggle(
+                ui,
+                cells.mute,
+                z,
+                "M",
+                ch.muted,
+                Color32::from_rgb(190, 85, 70),
+                "Mute this channel",
+            );
+            if mute {
+                actions.push(PatchAction::SetInlineParam {
+                    node: doc_id,
+                    param: InlineParamId::BuiltIn(InlineParam::MixerMute(port)),
+                    value: if ch.muted { 0.0 } else { 1.0 },
+                });
+            }
+            let solo = channel_toggle(
+                ui,
+                cells.solo,
+                z,
+                "S",
+                ch.solo,
+                Color32::from_rgb(205, 175, 65),
+                "Solo this channel (the others fall silent)",
+            );
+            if solo {
+                actions.push(PatchAction::SetInlineParam {
+                    node: doc_id,
+                    param: InlineParamId::BuiltIn(InlineParam::MixerSolo(port)),
+                    value: if ch.solo { 0.0 } else { 1.0 },
+                });
+            }
         }
     }
 
@@ -4023,6 +4257,92 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// U14: a mixer channel strip has to clear the port dot (whose drag hit
+    /// radius is 18 pt — closer and pressing the fader would start a cable),
+    /// stay inside the box, never overlap the neighbouring channel, and keep
+    /// all three cells apart. If the rail collapsed to zero width the fader
+    /// would be unclickable rather than merely small.
+    #[test]
+    fn mixer_channel_strips_clear_the_ports_at_any_zoom() {
+        for z in [INLINE_MIN_ZOOM, 0.8, 1.0, 2.0] {
+            // A 4-channel mixer box: title band + the slot action row, then
+            // one `PORT_SPACING` row per channel.
+            let mixer_header = NODE_TITLE_BAND + ACTION_ROW_HEIGHT;
+            let node = Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(NODE_SIZE.x, mixer_header + 4.0 * PORT_SPACING) * z,
+            );
+            for port in 0..4 {
+                let y = node.top() + (mixer_header + (port as f32 + 0.5) * PORT_SPACING) * z;
+                let dot = Pos2::new(node.left(), y);
+                let strip = channel_strip_rect(dot, node, z);
+                assert!(
+                    strip.left() >= dot.x + PORT_HIT_RADIUS * z,
+                    "port {port} at zoom {z}: the strip overlaps the port drag radius"
+                );
+                assert!(
+                    strip.right() <= node.right() - INLINE_INSET * z + 0.01,
+                    "port {port} at zoom {z}: the strip leaves the box"
+                );
+                assert!(strip.height() <= PORT_SPACING * z + 0.01);
+                let cells = channel_strip_cells(strip, z);
+                assert!(
+                    cells.rail.width() > 1.0,
+                    "port {port} at zoom {z}: no fader"
+                );
+                assert!(cells.rail.right() < cells.mute.left());
+                assert!(cells.mute.right() < cells.solo.left() + 0.01);
+                assert!(cells.solo.right() <= strip.right() + 0.01);
+                for cell in [cells.rail, cells.mute, cells.solo] {
+                    assert!(
+                        cell.top() >= strip.top() - 0.01 && cell.bottom() <= strip.bottom() + 0.01
+                    );
+                }
+            }
+        }
+    }
+
+    /// U14: the strips read the console's document fields, so a fader moved on
+    /// the canvas and the same channel in the Inspector always agree. This is
+    /// the half of "同步" that can be tested without a window; the other half
+    /// is the shared `PatchAction` → `apply_inline_param` path.
+    #[test]
+    fn mixer_strips_read_the_console_fields() {
+        let node = NodeDoc::Mixer {
+            node_id: 7,
+            track: 0,
+            inputs: 2,
+            channels: vec![
+                glitcherz_model::MixerChannel {
+                    gain: 0.5,
+                    pan: 0.0,
+                    muted: true,
+                    solo: false,
+                },
+                glitcherz_model::MixerChannel {
+                    gain: 1.25,
+                    pan: 0.0,
+                    muted: false,
+                    solo: true,
+                },
+            ],
+            out_pan: 0.0,
+            out_muted: false,
+        };
+        let (gain0, min, max) = inline_doc_value(&node, InlineParam::MixerGain(0));
+        assert!((gain0 - 0.5).abs() < 1e-6);
+        assert!(min < 0.5 && max > 1.25);
+        assert_eq!(inline_doc_value(&node, InlineParam::MixerGain(1)).0, 1.25);
+        assert_eq!(inline_doc_value(&node, InlineParam::MixerMute(0)).0, 1.0);
+        assert_eq!(inline_doc_value(&node, InlineParam::MixerMute(1)).0, 0.0);
+        assert_eq!(inline_doc_value(&node, InlineParam::MixerSolo(0)).0, 0.0);
+        assert_eq!(inline_doc_value(&node, InlineParam::MixerSolo(1)).0, 1.0);
+        // Out-of-range channels degrade to silence-neutral values instead of
+        // panicking (the strip loop can outlive a channel removal by a frame).
+        assert_eq!(inline_doc_value(&node, InlineParam::MixerGain(9)).0, 0.0);
+        assert_eq!(inline_doc_value(&node, InlineParam::MixerMute(9)).0, 0.0);
     }
 
     /// U13: a SoundFont node is self-sufficient. Its box carries the file

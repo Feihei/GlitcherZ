@@ -4,6 +4,15 @@
 
 ## 已落地
 
+### mixer 通道条上画布（U14，spec `node-graph.md` D22，2026-10-28）
+
+- **一行一个通道，压在端口上**：绘制段在 inline 参数循环之后（后注册 → 指针优先于节点拖拽），位置**由 `in_ports_screen` 的端口坐标推导**（`channel_strip_rect(port_pos, box, zoom)`），而不是另起一套均分——端口位置一改，条自动跟随，不会出现"推子飘在两根线中间"。条高 22 < `PORT_SPACING` 30，所以 2 通道（`port_area` 只有 48 图空间、step 24）时上下仍各留 1 px。
+- **左边界必须是 22，不是端口半径 6**：拉线的判定半径是 `PORT_HIT_RADIUS`（18），条从端口圆点右侧 22 起才开始，否则按 fader 会变成拉线。右边界 = 盒右 − `INLINE_INSET`(8)；150 宽的盒子里 fader 76 + M/S 各 18 刚好，**所以没有 pan**。
+- **`egui::Button` 又一次不可用**：M/S chip 只有 `22 × zoom` 高，原生按钮 18 pt 下限会顶出条外——与 D15 的 `action_button` 同一病因，故 `channel_toggle` 自绘（fill + stroke + 居中文字，字号 `min(9z, 高×0.8)`），命中靠 `allocate_rect(Sense::click())`。激活色：mute 红 (190,85,70)、solo 黄 (205,175,65)，文字用深灰（20）保证在彩底上可读。
+- **fader 命中区取整条高度**：rail 只有 3 pt 高，直接 `allocate_rect(rail)` 抓不住；命中矩形用 rail 的 x 范围 × strip 的 y 范围，与 inline 滑条的 `hit` 同一思路。
+- **写入复用既有三条通道**：`InlineParam::{MixerGain,MixerMute,MixerSolo}(ch)` → `inline_doc_value`（读 `channels[ch]`，索引越界返回 0 而非 panic——通道删除与绘制可能差一帧）→ `PatchAction::SetInlineParam` → `apply_inline_param`。fader 用 `commit_param_edit`，**merge key 必须带通道号**（`mixer-gain-{ch}`），否则连续拖两个通道的推子会合并成一步 undo；M/S 是离散点击，`begin_edit`/`commit_edit` 各一步。
+- **同步是结构性的，不是同步代码**：两侧都读写 `NodeDoc::Mixer.channels`，引擎侧都发 `ParamId::MixerGain/Mute/Solo(ch)`（`set_node_param`），所以"patch 改完 Inspector 显示旧值"这类漂移不可能发生——不需要任何额外的一致性逻辑。
+
 ### 一批 UI 修正（2026-10-23：meter 横放 / timeline mute 移除 / 编辑器坐标 / 参数面板门控 / picker 点击）
 
 - **Master meter 横放**：`master_meter` 改两条水平条（上 L 下 R，各 7px 高），`allocate_exact_size(ui.available_width(), 18.0)` 吃掉走带行剩余宽度；调用顺序 = gain 推子 → `Panic` → meter（meter 在 Panic 右侧）。
