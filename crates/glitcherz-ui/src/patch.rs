@@ -767,6 +767,70 @@ fn node_action_buttons(id: PatchId, row: usize, deps: &PatchDeps) -> Vec<NodeAct
     }
 }
 
+/// Paints one in-node action button and reports whether it was clicked.
+///
+/// Hand-painted rather than `egui::Button`: a native button is never
+/// shorter than `Style::spacing.interact_size.y` (18 pt), so while the patch
+/// was zoomed out it overflowed its `18 * zoom` row, got centred on it and
+/// painted over the node title band. Every measure here scales with `z`, the
+/// caption is truncated to the button width and the painter is clipped to the
+/// button rect, so a row stays inside its band at any zoom.
+fn action_button(ui: &mut egui::Ui, rect: Rect, z: f32, action: &NodeAction) -> bool {
+    let resp = ui.allocate_rect(rect, Sense::click());
+    let hot = action.enabled && resp.hovered();
+    let (fill, stroke, text) = if !action.enabled {
+        (
+            Color32::from_gray(34),
+            Color32::from_gray(58),
+            Color32::from_gray(115),
+        )
+    } else if hot {
+        (
+            Color32::from_gray(72),
+            Color32::from_gray(130),
+            Color32::from_gray(240),
+        )
+    } else {
+        (
+            Color32::from_gray(52),
+            Color32::from_gray(92),
+            Color32::from_gray(205),
+        )
+    };
+    let r = rect.shrink(0.5 * z);
+    let painter = ui.painter().with_clip_rect(r);
+    painter.rect_filled(r, 2.0 * z, fill);
+    painter.rect_stroke(
+        r,
+        2.0 * z,
+        Stroke::new(1.0, stroke),
+        egui::StrokeKind::Inside,
+    );
+    // Font capped by the row height: a galley is ~1.3x its font size, so a
+    // fixed 11 pt caption is what used to poke out of a zoomed-out row.
+    let px = (11.0 * z).min(r.height() * 0.72).max(1.0);
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        action.label.to_owned(),
+        FontId::proportional(px),
+        text,
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width((r.width() - 4.0 * z).max(1.0));
+    let galley = painter.layout_job(job);
+    let pos = Pos2::new(
+        r.center().x - galley.size().x * 0.5,
+        r.center().y - galley.size().y * 0.5,
+    );
+    painter.galley(pos, galley, text);
+    let resp = resp
+        .on_hover_cursor(if action.enabled {
+            egui::CursorIcon::PointingHand
+        } else {
+            egui::CursorIcon::Default
+        })
+        .on_hover_text(action.hover);
+    action.enabled && resp.clicked()
+}
+
 /// Snapshot of external data the patch depends on (immutable borrows to avoid borrow conflicts).
 pub struct PatchDeps<'a> {
     /// Project graph document (nodes + cables).
@@ -1014,6 +1078,43 @@ fn action_rows(id: PatchId, deps: &PatchDeps) -> usize {
 /// Height of the band above the port area (title + action rows), graph space.
 fn header_band(id: PatchId, deps: &PatchDeps) -> f32 {
     NODE_TITLE_BAND + action_rows(id, deps) as f32 * ACTION_ROW_HEIGHT
+}
+
+/// Screen rect of one in-node action row: the `row`-th `ACTION_ROW_HEIGHT`
+/// strip below the title band, inset a little vertically so the button does
+/// not touch the band edges. Always inside the node box — the drawing code
+/// and the tests share this one measure.
+fn action_row_band(r: Rect, row: usize, zoom: f32) -> Rect {
+    let pad = 1.5 * zoom;
+    let top = r.top() + (NODE_TITLE_BAND + row as f32 * ACTION_ROW_HEIGHT) * zoom + pad;
+    Rect::from_min_max(
+        Pos2::new(r.left(), top),
+        Pos2::new(
+            r.right(),
+            top + (ACTION_ROW_HEIGHT * zoom - 2.0 * pad).max(1.0),
+        ),
+    )
+}
+
+/// Buttons of one action row: they share the band width evenly, inset by
+/// [`INLINE_INSET`] on both sides (same gutter as the inline rows).
+fn action_button_rects(band: Rect, count: usize, zoom: f32) -> Vec<Rect> {
+    let count = count.max(1);
+    let gap = 4.0 * zoom;
+    let width = ((band.width() - 2.0 * INLINE_INSET * zoom - gap * (count - 1) as f32)
+        / count as f32)
+        .max(1.0);
+    (0..count)
+        .map(|k| {
+            Rect::from_min_size(
+                Pos2::new(
+                    band.left() + INLINE_INSET * zoom + k as f32 * (width + gap),
+                    band.top(),
+                ),
+                Vec2::new(width, band.height()),
+            )
+        })
+        .collect()
 }
 
 /// Type coloring (spec P5d): stroke varies by type, fill is a dark base.
@@ -2794,8 +2895,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     // ---- In-node action rows ----
     // Track management belongs to the timeline and the slot count to the
     // mixer, so those buttons sit on the boxes that own them instead of a
-    // side panel. Real widgets placed over the painted box, exactly like the
-    // inline sliders: a press here is a button press, never a node drag.
+    // side panel. Drawn and hit-tested here (not with `egui::Button`), so the
+    // whole row scales with the zoom like the inline rows do.
     if state.zoom >= ACTION_MIN_ZOOM {
         for &id in state.positions.keys() {
             let rows = action_rows(id, &deps);
@@ -2809,37 +2910,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 continue;
             }
             let z = state.zoom;
-            let row_h = ACTION_ROW_HEIGHT * z;
-            let gap = 4.0 * z;
             for row in 0..rows {
                 let buttons = node_action_buttons(id, row, &deps);
-                // Buttons share the row evenly: two for the timeline /
-                // mixer, one for a SoundFont node's file button (U13).
-                let count = buttons.len().max(1) as f32;
-                let btn_w =
-                    ((r.width() - 2.0 * INLINE_INSET * z - gap * (count - 1.0)) / count).max(1.0);
-                let top = r.top() + (NODE_TITLE_BAND + row as f32 * ACTION_ROW_HEIGHT) * z + 1.0;
-                for (k, b) in buttons.into_iter().enumerate() {
-                    let btn_rect = Rect::from_min_size(
-                        Pos2::new(r.left() + INLINE_INSET * z + k as f32 * (btn_w + gap), top),
-                        Vec2::new(btn_w, row_h - 2.0),
-                    );
-                    let mut clicked = false;
-                    ui.scope_builder(
-                        egui::UiBuilder::new().max_rect(btn_rect).layout(
-                            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                        ),
-                        |ui| {
-                            ui.spacing_mut().button_padding = Vec2::new(2.0, 0.0);
-                            let text = egui::RichText::new(b.label).size((11.0 * z).max(8.0));
-                            let resp = ui.add_enabled(b.enabled, egui::Button::new(text));
-                            if resp.clicked() {
-                                clicked = true;
-                            }
-                            resp.on_hover_text(b.hover);
-                        },
-                    );
-                    if clicked {
+                let band = action_row_band(r, row, z);
+                // Two buttons for the timeline / mixer, one for a SoundFont
+                // node's file button (U13) — the row is split evenly.
+                let rects = action_button_rects(band, buttons.len(), z);
+                for (b, btn_rect) in buttons.into_iter().zip(rects) {
+                    if action_button(ui, btn_rect, z, &b) {
                         actions.push(b.action);
                     }
                 }
@@ -3869,6 +3947,38 @@ mod tests {
             .expect("default project has a keyboard node");
         assert!(!opens_inspector(Some(&keyboard)));
         assert!(opens_inspector(doc.node_by_id(mixer)));
+    }
+
+    /// Regression: the in-node action rows are hand-painted because an
+    /// `egui::Button` never gets shorter than `interact_size.y` (18 pt). At
+    /// zoom < 1 that floor made the button taller than its `18 * zoom` row,
+    /// so it was centred on the row and painted over the node title. The
+    /// geometry must keep every button inside its band at any zoom.
+    #[test]
+    fn action_buttons_stay_inside_their_band_at_any_zoom() {
+        for z in [ACTION_MIN_ZOOM, 0.75, 1.0, 1.75] {
+            // A SoundFont node: title band + one action row + body.
+            let rect = Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(NODE_SIZE.x, NODE_SIZE.y + ACTION_ROW_HEIGHT) * z,
+            );
+            for row in 0..2 {
+                let band = action_row_band(rect, row, z);
+                let band_top = rect.top() + (NODE_TITLE_BAND + row as f32 * ACTION_ROW_HEIGHT) * z;
+                assert!(
+                    band.top() >= band_top,
+                    "row {row} at zoom {z} starts above its band"
+                );
+                assert!(
+                    band.bottom() <= rect.bottom(),
+                    "row {row} at zoom {z} leaves the node box"
+                );
+                for b in action_button_rects(band, 2, z) {
+                    assert!(b.top() >= band.top() - 0.01 && b.bottom() <= band.bottom() + 0.01);
+                    assert!(b.left() >= rect.left() && b.right() <= rect.right() + 0.01);
+                }
+            }
+        }
     }
 
     /// U13: a SoundFont node is self-sufficient. Its box carries the file
