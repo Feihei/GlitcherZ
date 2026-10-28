@@ -307,6 +307,27 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 
 **已知边界**：`SoundFont` 解析后是 `Vec<i16>`（**常驻 ≈ 文件大小**），但加载过程先 alloc `Vec<u8>` 原始字节再转 i16 → **峰值 ≈ 2×**；解析在控制线程，2 GB 文件会冻结 UI 数秒。S3c 只解决"看得见"（banner），不解决"不阻塞"——窗口阻塞期间没有消息泵，Windows 可能短暂标记未响应。真要异步只剩一条路：`Box<dyn FnOnce>` 换成 worker 线程 + job id 去重，加载函数已是纯函数（`sf2_library_for`），切换点集中在一处。
 
+## U4c / A 阶段：节点参数自动化词汇表（2026-10-28 立项，spec `control-tracks.md` §9）
+
+用户提出：「patch 图中各个节点的参数现在还不能接受输入，比如 gain」。核查结论：**引擎侧早就通了**（`set_auto_route(index, node_id, ParamId)` → `auto_deliver` → `slot_set_param` 能写任意节点的任意 `ParamId`，`MixerGain(ch)`/`BuiltinParam(slot)`/`Sf2Gain` 全已实现，引擎测试 `auto_route_delivers_curve_values_to_target_param` 就是 mixer 通道 gain 的端到端证明）。缺口全在上层三处：
+
+1. 词汇表：`AutoParam` 只有 7 个变体，表达不了"mixer 第 3 通道 gain"；
+2. 入口：`accepts()` 只允许 automation 落到乐器节点，`auto_options` 也只给乐器出 Cutoff/插件参数——**列表里根本没有 gain**；
+3. 值域：`curve::axis(&AutoParam)` 上下文无关，效果器 slot 的真实范围无从获得。
+
+A 阶段**只补这三处，不开参数端口**（每参数一个输入口 = 后续 B 阶段，未立项）。
+
+- [x] **A1 模型词汇表** ✅ 2026-10-28：`AutoParam::Node(NodeParam)` + `NodeParam`（`EffectSlot` / `MixerChannel{channel, param}` / `MixerOutPan` / `MixerOutMute` / `FeedbackGain` / `Sf2Gain` / `SampleGain` / `Resonance` / `Attack` / `Decay` / `Sustain` / `Release`）+ `ChannelParam`；加性变体，`PROJECT_VERSION` 不动（旧变体原样保留，零迁移）
+- [x] **A2 校验** ✅ 2026-10-28：`GraphDoc::check_node_param` 只强校验 mixer 家族（`channel < inputs`、`MixerOut*` 必须在 mixer 上）——通道索引是文档能主动作废的唯一参数身份；删 mixer 通道时同一步删掉指向它的 automation 电缆 + 清引擎路由（否则下次保存被校验拒绝）
+- [x] **A3 菜单与入口** ✅ 2026-10-28：新增 `node_auto_options`（两个入口共用的唯一枚举）+ `plugin_params_of`（乐器/效果器参数表分家）；`accepts` 放开到 乐器/效果器/Mixer/Feedback；patch 弹窗与 Inspector Target 行都改为调它（Inspector 侧顺带补上"内置效果器 slot"与"本条轨的 mixer 通道"，以前只有 CLAP/VST3 效果器）
+- [x] **A4 曲线轴** ✅ 2026-10-28：`curve::node_param_axis`（各参数对齐面板 range：mixer gain 0..1.5、pan ±1、sf2/sample gain 0..2、ADSR 0..2/0..1/0..3、resonance 0..0.98、mute/solo 0..1）+ `curve::axis_in(param, doc, target)` 解析效果器 descriptor 真实范围与 log 轴；三个调用点（Edit tab 曲线编辑器 / 卷帘 overlay / timeline 预览，后者改为传 `curve_axis` 元组）全部改走带上下文版本
+- [x] **A5 测试与文档** ✅ 2026-10-28：模型（mixer 通道越界/非 mixer 目标/输出级参数、`NodeParam` RON 往返）、UI（地址→`ParamId` 全覆盖、`node_auto_options` 的 mixer/效果器/合成器枚举、`accepts` 放开）、曲线轴（各参数 range + 效果器 slot 走 descriptor + 无上下文回落）；spec `control-tracks.md` §9 D16–D21
+
+**已知边界**：
+- **块级更新，无块内斜坡**（spec D21）：内置效果器自带 `Smoothed`，但 mixer 通道权重是块内常量，快速 LFO 形态的 gain 曲线会有 375 Hz 台阶（推子慢推可忽略）。A2 后续项：`Processor` 增加"上一块权重"接口 + 求和循环逐样本插值，需要顺带调整 mixer 求和数学测试的期望值。
+- **旧 "Volume" 电缆不会自动重映射**：v3 时代 `AutoParam::TrackGain` 落在 mixer 上的电缆现在仍是 `ParamId::TrackGain`，mixer 不认（静默 no-op）。新菜单给出的是 `MixerChannel{Gain}`；老工程需重新 Pick 目标。
+- **一条控制轨仍只有一个终点**（`auto_routes[index]` 单槽）：一条曲线扇出到多个参数需要引擎侧改多槽，未立项。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：

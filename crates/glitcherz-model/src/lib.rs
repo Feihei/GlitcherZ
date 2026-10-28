@@ -1553,6 +1553,64 @@ pub struct MidiTrack {
     pub clips: Vec<MidiClip>,
 }
 
+/// Node parameter address for automation (U4c, spec
+/// `.agents/spec/control-tracks.md` §9): the *parameter* half of a
+/// `(node, parameter)` cable endpoint.
+///
+/// The node half comes from the cable's destination port
+/// ([`PortRef::Node`]), so this enum only has to say **which** parameter of
+/// that node a curve drives. It mirrors the continuous / discrete node
+/// parameters the engine understands (`ParamId`), but deliberately lives in
+/// the model crate: the engine keeps its own `ParamId`, and the UI translates
+/// one into the other in a single place (spec D16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum NodeParam {
+    /// Built-in effect parameter addressed by its **descriptor slot**
+    /// (spec `effects.md` D5). The range comes from the node's own effect
+    /// descriptor, so the axis needs the document (spec D18).
+    EffectSlot(u8),
+    /// One mixer channel's console parameter (D15/D21).
+    MixerChannel {
+        /// Channel index (0-based; must stay inside the mixer's `inputs`).
+        channel: u8,
+        /// Which console control the curve drives.
+        param: ChannelParam,
+    },
+    /// Mixer output-stage pan (-1..1).
+    MixerOutPan,
+    /// Mixer output-stage mute (≥ 0.5 = muted).
+    MixerOutMute,
+    /// Feedback node tap gain (P6, 0..1).
+    FeedbackGain,
+    /// SoundFont node output gain (U13, 0..2).
+    Sf2Gain,
+    /// Sample-player node output gain (U5, 0..2).
+    SampleGain,
+    /// Built-in synth filter resonance (0..0.98).
+    Resonance,
+    /// Built-in synth envelope attack (seconds, 0..2).
+    Attack,
+    /// Built-in synth envelope decay (seconds, 0..2).
+    Decay,
+    /// Built-in synth envelope sustain level (0..1).
+    Sustain,
+    /// Built-in synth envelope release (seconds, 0..3).
+    Release,
+}
+
+/// Which control of a mixer channel a curve drives ([`NodeParam::MixerChannel`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ChannelParam {
+    /// Fader (linear, 0..1.5).
+    Gain,
+    /// Pan (-1..1).
+    Pan,
+    /// Mute (≥ 0.5 = muted — a step curve is the point).
+    Mute,
+    /// Solo (≥ 0.5 = soloed).
+    Solo,
+}
+
 /// Automatable / cable-connected node parameter (automation cable endpoint
 /// payload).
 ///
@@ -1623,6 +1681,16 @@ pub enum AutoParam {
         #[serde(default = "default_bend_range")]
         range_semitones: f32,
     },
+    /// A node parameter addressed by the cable's destination port (U4c, spec
+    /// `.agents/spec/control-tracks.md` §9).
+    ///
+    /// Unlike the legacy variants above (which are really "the track's
+    /// fader" / "the filter cutoff of whatever node this lands on"), this one
+    /// is explicit about *which* parameter of the target node moves — the
+    /// difference between a mixer channel fader and its pan, or between two
+    /// slots of the same effect, becomes expressible without growing this
+    /// enum per node kind.
+    Node(NodeParam),
 }
 
 /// Default pitch-bend range: the General MIDI default of ±2 semitones.
@@ -2563,12 +2631,20 @@ impl GraphDoc {
                     // must not reach a node's `set_param` path, and every
                     // other parameter must not reach the clock.
                     match cable.to {
-                        PortRef::Node(_) => {
+                        PortRef::Node(id) => {
                             if cable.param.is_timeline_in_only() {
                                 return Err(format!(
                                     "{:?} is only valid on the timeline input (it is a clock, not a node parameter)",
                                     cable.param
                                 ));
+                            }
+                            // U4c (spec §9 D20): a mixer channel address must
+                            // resolve to an existing channel. This is the one
+                            // parameter family a document edit can invalidate
+                            // (shrink the mixer) and the engine cannot ignore
+                            // meaningfully, so it is the one we enforce.
+                            if let AutoParam::Node(param) = &cable.param {
+                                self.check_node_param(param, id)?;
                             }
                         }
                         PortRef::TimelineIn => {
@@ -2622,6 +2698,42 @@ impl GraphDoc {
             PortRef::TimelineIn => {}
         }
         Ok(())
+    }
+
+    /// Checks one [`NodeParam`] against the node it lands on (U4c, spec §9
+    /// D20).
+    ///
+    /// Only the **mixer** family is enforced: a channel address is a
+    /// positional identity that a document edit (shrinking the mixer) can
+    /// invalidate, and the engine cannot do anything sensible with an
+    /// out-of-range channel. Voice-dependent parameters (resonance / ADSR /
+    /// SoundFont gain / effect slots) are *not* checked against the node
+    /// kind: swapping a node's voice would then make an existing project
+    /// unsavable, while the engine already ignores a parameter the processor
+    /// does not recognize.
+    fn check_node_param(&self, param: &NodeParam, node_id: u64) -> Result<(), String> {
+        let mixer_inputs = match self.node_by_id(node_id) {
+            Some(NodeDoc::Mixer { inputs, .. }) => Some(*inputs),
+            _ => None,
+        };
+        match param {
+            NodeParam::MixerChannel { channel, .. } => match mixer_inputs {
+                Some(inputs) if *channel < inputs => Ok(()),
+                Some(inputs) => Err(format!(
+                    "automation targets mixer {node_id} channel {channel} out of range (inputs = {inputs})"
+                )),
+                None => Err(format!(
+                    "automation targets mixer channel {channel}, but node {node_id} is not a mixer"
+                )),
+            },
+            NodeParam::MixerOutPan | NodeParam::MixerOutMute => match mixer_inputs {
+                Some(_) => Ok(()),
+                None => Err(format!(
+                    "automation targets the mixer output stage, but node {node_id} is not a mixer"
+                )),
+            },
+            _ => Ok(()),
+        }
     }
 }
 
@@ -3137,12 +3249,12 @@ impl Default for ProjectMetadata {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioClip, AudioTrack, AutoParam, AutoPoint, CableDoc, CableKind, DEFAULT_MIDI_TRACKS,
-        EffectParams, GraphDoc, MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS,
-        MAX_AUDIO_TRACKS, MAX_BEND_RANGE, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES,
-        MIN_BEND_RANGE, MidiClip, MidiSource, MidiTrack, NodeDoc, PortRef, Project, SamplePlayMode,
-        SynthParams, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec,
-        default_audio_source_len, default_graph_doc,
+        AudioClip, AudioTrack, AutoParam, AutoPoint, CableDoc, CableKind, ChannelParam,
+        DEFAULT_MIDI_TRACKS, EffectParams, GraphDoc, MASTER_NODE_ID, MAX_ARRANGEMENT_BARS,
+        MAX_ARRANGEMENT_TICKS, MAX_AUDIO_TRACKS, MAX_BEND_RANGE, MAX_CLIP_NOTES,
+        MAX_CLIPS_PER_TRACK, MAX_NODES, MIN_BEND_RANGE, MidiClip, MidiSource, MidiTrack, NodeDoc,
+        NodeParam, PortRef, Project, SamplePlayMode, SynthParams, TICKS_PER_BAR, TICKS_PER_QUARTER,
+        TICKS_PER_STEP, VoiceSpec, default_audio_source_len, default_graph_doc,
     };
 
     fn effect_node(params: EffectParams) -> NodeDoc {
@@ -4692,5 +4804,64 @@ mod tests {
             doc.validate(2, 1).is_err(),
             "the terminal's only v1 port is Tempo"
         );
+    }
+
+    /// U4c (spec `control-tracks.md` §9 D20): a mixer channel address is the
+    /// one node parameter the document can invalidate (shrinking the mixer),
+    /// so validation is strict about it — and only about it.
+    #[test]
+    fn mixer_channel_automation_is_range_checked() {
+        let mut doc = default_graph_doc(3);
+        let mixer = doc.first_mixer().expect("global mixer").node_id();
+        let channel = |channel: u8| {
+            AutoParam::Node(NodeParam::MixerChannel {
+                channel,
+                param: ChannelParam::Gain,
+            })
+        };
+        doc.cables.push(CableDoc::automation(0, mixer, channel(2)));
+        assert!(doc.validate(3, 1).is_ok(), "channel 2 of a 3-in mixer");
+
+        // Past the last channel: the engine would silently write an unused
+        // slot, so the document must refuse it.
+        doc.cables.last_mut().unwrap().param = channel(3);
+        assert!(doc.validate(3, 1).is_err());
+
+        // Same address on a node that is not a mixer.
+        let voice = doc.instrument_of_track(0).unwrap().node_id();
+        doc.cables.last_mut().unwrap().to = PortRef::Node(voice);
+        assert!(doc.validate(3, 1).is_err());
+
+        // Output-stage params are mixer-only too.
+        doc.cables.last_mut().unwrap().param = AutoParam::Node(NodeParam::MixerOutPan);
+        assert!(doc.validate(3, 1).is_err());
+        doc.cables.last_mut().unwrap().to = PortRef::Node(mixer);
+        assert!(doc.validate(3, 1).is_ok());
+
+        // Voice-dependent parameters are deliberately **not** checked against
+        // the node kind: swapping a node's voice must not make a project
+        // unsavable (the engine ignores a parameter it does not recognize).
+        doc.cables.last_mut().unwrap().to = PortRef::Node(voice);
+        doc.cables.last_mut().unwrap().param = AutoParam::Node(NodeParam::Sf2Gain);
+        assert!(doc.validate(3, 1).is_ok());
+    }
+
+    /// U4c: the nested `NodeParam` payload has to survive the RON round trip —
+    /// the whole point of putting the address in the document.
+    #[test]
+    fn node_param_cable_roundtrips_through_ron() {
+        for param in [
+            AutoParam::Node(NodeParam::EffectSlot(3)),
+            AutoParam::Node(NodeParam::MixerChannel {
+                channel: 1,
+                param: ChannelParam::Solo,
+            }),
+            AutoParam::Node(NodeParam::SampleGain),
+        ] {
+            let cable = CableDoc::automation(2, 9, param);
+            let text = ron::to_string(&cable).expect("serialize");
+            let back: CableDoc = ron::from_str(&text).expect("deserialize");
+            assert_eq!(back, cable, "round trip must be lossless: {text}");
+        }
     }
 }

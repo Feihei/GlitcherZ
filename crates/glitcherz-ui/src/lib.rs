@@ -47,11 +47,11 @@ use glitcherz_engine::realtime::{
 };
 use glitcherz_engine::{Sf2Library, Sf2Preset};
 use glitcherz_model::{
-    AutoParam, AutoPoint, CableKind, ControlClip, ControlTrack, CtrlKind, CurveInterp,
-    EffectParams, GraphDoc, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK,
-    MAX_MARKERS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker,
-    MidiClip, MidiSource, MidiTrack, NodeDoc, PortRef, Project, SamplePlayMode, SongLoop,
-    SynthParams, VoiceSpec,
+    AutoParam, AutoPoint, CableKind, ChannelParam, ControlClip, ControlTrack, CtrlKind,
+    CurveInterp, EffectParams, GraphDoc, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS,
+    MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES,
+    MIN_MIXER_CHANNELS, Marker, MidiClip, MidiSource, MidiTrack, NodeDoc, NodeParam, PortRef,
+    Project, SamplePlayMode, SongLoop, SynthParams, VoiceSpec,
 };
 
 pub mod curve;
@@ -184,8 +184,185 @@ fn param_id_of(param: &AutoParam) -> Option<ParamId> {
         AutoParam::TrackPan => Some(ParamId::TrackPan),
         AutoParam::FilterCutoff => Some(ParamId::FilterCutoff),
         AutoParam::PluginParam { param_id, .. } => Some(ParamId::PluginParam(*param_id)),
+        AutoParam::Node(param) => Some(node_param_id(*param)),
         AutoParam::Tempo | AutoParam::Cc { .. } | AutoParam::PitchBend { .. } => None,
     }
+}
+
+/// Node parameter address (model) → engine parameter ID (U4c, spec
+/// `control-tracks.md` §9 D16).
+///
+/// The single translation point between the document's [`NodeParam`] and the
+/// engine's `ParamId`: the model stays engine-free, and every consumer (the
+/// automation route and the menus) goes through here.
+fn node_param_id(param: NodeParam) -> ParamId {
+    match param {
+        NodeParam::EffectSlot(slot) => ParamId::BuiltinParam(slot),
+        NodeParam::MixerChannel { channel, param } => match param {
+            ChannelParam::Gain => ParamId::MixerGain(channel),
+            ChannelParam::Pan => ParamId::MixerPan(channel),
+            ChannelParam::Mute => ParamId::MixerMute(channel),
+            ChannelParam::Solo => ParamId::MixerSolo(channel),
+        },
+        NodeParam::MixerOutPan => ParamId::MixerOutPan,
+        NodeParam::MixerOutMute => ParamId::MixerOutMute,
+        NodeParam::FeedbackGain => ParamId::FeedbackGain,
+        NodeParam::Sf2Gain => ParamId::Sf2Gain,
+        NodeParam::SampleGain => ParamId::SampleGain,
+        NodeParam::Resonance => ParamId::FilterResonance,
+        NodeParam::Attack => ParamId::Attack,
+        NodeParam::Decay => ParamId::Decay,
+        NodeParam::Sustain => ParamId::Sustain,
+        NodeParam::Release => ParamId::Release,
+    }
+}
+
+/// Plugin parameter tables of one node (U4c): instruments and effects keep
+/// **separate** session tables (the same split the panels use), so the caller
+/// has to know which pair to hand over.
+fn plugin_params_of<'a>(
+    doc: &GraphDoc,
+    node_id: u64,
+    clap_voice: &'a HashMap<u64, Vec<glitcherz_clap_host::ClapParamInfo>>,
+    clap_fx: &'a HashMap<u64, Vec<glitcherz_clap_host::ClapParamInfo>>,
+    vst3_voice: &'a HashMap<u64, Vec<glitcherz_vst3_host::Vst3ParamInfo>>,
+    vst3_fx: &'a HashMap<u64, Vec<glitcherz_vst3_host::Vst3ParamInfo>>,
+) -> (
+    Option<&'a [glitcherz_clap_host::ClapParamInfo]>,
+    Option<&'a [glitcherz_vst3_host::Vst3ParamInfo]>,
+) {
+    let (clap, vst3) = match doc.node_by_id(node_id) {
+        Some(NodeDoc::Instrument { .. }) => (clap_voice, vst3_voice),
+        Some(NodeDoc::Effect { .. }) => (clap_fx, vst3_fx),
+        _ => return (None, None),
+    };
+    (
+        clap.get(&node_id).map(Vec::as_slice),
+        vst3.get(&node_id).map(Vec::as_slice),
+    )
+}
+
+/// Every automatable parameter of one node, as `(menu label, endpoint)`
+/// (U4c, spec `control-tracks.md` §9 D19).
+///
+/// One source of truth for **both** entry points (the patch's cable popup and
+/// the Inspector's Target row): the two menus used to be maintained separately,
+/// which is exactly how the mixer faders ended up with no automation target at
+/// all.
+fn node_auto_options(
+    doc: &GraphDoc,
+    node_id: u64,
+    clap: Option<&[glitcherz_clap_host::ClapParamInfo]>,
+    vst3: Option<&[glitcherz_vst3_host::Vst3ParamInfo]>,
+) -> Vec<(String, AutoParam)> {
+    let mut options = Vec::new();
+    let Some(node) = doc.node_by_id(node_id) else {
+        return options;
+    };
+    // Built-in parameters first (the node's own sound), plugin parameters
+    // after — a plugin with 2000 parameters must not bury `Gain`.
+    match node {
+        NodeDoc::Instrument {
+            voice: VoiceSpec::Builtin,
+            ..
+        } => {
+            options.push(("Cutoff".to_string(), AutoParam::FilterCutoff));
+            options.push((
+                "Resonance".to_string(),
+                AutoParam::Node(NodeParam::Resonance),
+            ));
+            for (label, param) in [
+                ("Attack", NodeParam::Attack),
+                ("Decay", NodeParam::Decay),
+                ("Sustain", NodeParam::Sustain),
+                ("Release", NodeParam::Release),
+            ] {
+                options.push((format!("Env {label}"), AutoParam::Node(param)));
+            }
+        }
+        NodeDoc::Instrument {
+            voice: VoiceSpec::SoundFont { .. },
+            ..
+        } => options.push(("Gain".to_string(), AutoParam::Node(NodeParam::Sf2Gain))),
+        NodeDoc::Instrument {
+            voice: VoiceSpec::Sample { .. },
+            ..
+        } => options.push(("Gain".to_string(), AutoParam::Node(NodeParam::SampleGain))),
+        NodeDoc::Instrument { .. } => {}
+        // Table-driven (spec `effects.md` D6): every slot, not just the inline
+        // ones — an EQ band that is not on the node body is still automatable.
+        NodeDoc::Effect {
+            voice: VoiceSpec::Builtin | VoiceSpec::SoundFont { .. },
+            params,
+            ..
+        } => {
+            let descriptor = crate::effect::descriptor(params);
+            for (slot, spec) in descriptor.params.iter().enumerate() {
+                options.push((
+                    spec.name.to_string(),
+                    AutoParam::Node(NodeParam::EffectSlot(slot as u8)),
+                ));
+            }
+        }
+        NodeDoc::Effect { .. } => {}
+        NodeDoc::Mixer { inputs, .. } => {
+            for channel in 0..*inputs {
+                for (label, param) in [
+                    ("Gain", ChannelParam::Gain),
+                    ("Pan", ChannelParam::Pan),
+                    ("Mute", ChannelParam::Mute),
+                    ("Solo", ChannelParam::Solo),
+                ] {
+                    options.push((
+                        format!("Ch {} {label}", channel + 1),
+                        AutoParam::Node(NodeParam::MixerChannel { channel, param }),
+                    ));
+                }
+            }
+            options.push((
+                "Out Pan".to_string(),
+                AutoParam::Node(NodeParam::MixerOutPan),
+            ));
+            options.push((
+                "Out Mute".to_string(),
+                AutoParam::Node(NodeParam::MixerOutMute),
+            ));
+        }
+        NodeDoc::Feedback { .. } => options.push((
+            "Feedback".to_string(),
+            AutoParam::Node(NodeParam::FeedbackGain),
+        )),
+        _ => {}
+    }
+    for param in clap.unwrap_or_default() {
+        let label = if param.name.is_empty() {
+            format!("Param {}", param.id)
+        } else {
+            param.name.clone()
+        };
+        options.push((
+            format!("CLAP {label}"),
+            AutoParam::PluginParam {
+                param_id: param.id,
+                name: label,
+            },
+        ));
+    }
+    for param in vst3.unwrap_or_default() {
+        let label = if param.title.is_empty() {
+            format!("Param {}", param.id)
+        } else {
+            param.title.clone()
+        };
+        options.push((
+            format!("VST3 {label}"),
+            AutoParam::PluginParam {
+                param_id: param.id,
+                name: label,
+            },
+        ));
+    }
+    options
 }
 
 /// Control-change destinations offered by the automation target menus (U4a).
@@ -220,24 +397,6 @@ fn cc_label(controller: u8, channel: u8) -> String {
 /// Human-readable bend destination label (`Pitch Bend ±2 st · ch 1`).
 fn bend_label(range_semitones: f32, channel: u8) -> String {
     format!("Pitch Bend ±{range_semitones:.1} st · ch {}", channel + 1)
-}
-
-/// The automation destination of control track `track` (P4): the parameter
-/// carried by the cable that starts at `PortRef::AutoTrack(track)`.
-///
-/// `None` when the track has no cable (a curve nobody drives). The overlay
-/// lane then draws on the neutral 0..127 axis — the piano roll has no way to
-/// know what the user intends, and refusing to draw would hide the clip.
-fn control_track_param(project: &Project, track: usize) -> Option<AutoParam> {
-    project
-        .graph
-        .cables
-        .iter()
-        .find(|cable| {
-            matches!(cable.from, PortRef::AutoTrack(index) if index == track)
-                && cable.kind == CableKind::Automation
-        })
-        .map(|cable| cable.param.clone())
 }
 
 /// Document curve interpolation → engine mirror (U12). The two enums are
@@ -2250,6 +2409,8 @@ impl GlitcherZApp {
                 patch_state,
                 clap_voice_params: clap,
                 voice_params: vst3,
+                clap_effect_params: clap_fx,
+                vst3_effect_params: vst3_fx,
                 clap_voice_values: clap_values,
                 vst3_voice_values: vst3_values,
                 sf2_preset_names,
@@ -2260,47 +2421,15 @@ impl GlitcherZApp {
             let doc = &session.project().graph;
             let clap = &*clap;
             let vst3 = &*vst3;
+            let clap_fx = &*clap_fx;
+            let vst3_fx = &*vst3_fx;
             let clap_values = &*clap_values;
             let vst3_values = &*vst3_values;
             let options = move |node_id: u64| -> Vec<(String, AutoParam)> {
-                let mut v = Vec::new();
-                let Some(node) = doc.node_by_id(node_id) else {
-                    return v;
-                };
-                if let NodeDoc::Instrument { .. } = node {
-                    v.push(("Cutoff".to_string(), AutoParam::FilterCutoff));
-                    if let Some(params) = clap.get(&node_id) {
-                        for p in params {
-                            let label = if p.name.is_empty() {
-                                format!("Param {}", p.id)
-                            } else {
-                                p.name.clone()
-                            };
-                            v.push((
-                                format!("CLAP {label}"),
-                                AutoParam::PluginParam {
-                                    param_id: p.id,
-                                    name: label,
-                                },
-                            ));
-                        }
-                    }
-                    if let Some(params) = vst3.get(&node_id) {
-                        for p in params {
-                            let label = if p.title.is_empty() {
-                                format!("Param {}", p.id)
-                            } else {
-                                p.title.clone()
-                            };
-                            v.push((
-                                format!("VST3 {label}"),
-                                AutoParam::PluginParam {
-                                    param_id: p.id,
-                                    name: label,
-                                },
-                            ));
-                        }
-                    }
+                let (clap_params, vst3_params) =
+                    plugin_params_of(doc, node_id, clap, clap_fx, vst3, vst3_fx);
+                let mut v = node_auto_options(doc, node_id, clap_params, vst3_params);
+                if matches!(doc.node_by_id(node_id), Some(NodeDoc::Instrument { .. })) {
                     // U4a: CC is a separate destination family for the same
                     // instrument; the presets mirror the automation strip's
                     // menu so both entry points offer the same list.
@@ -5355,9 +5484,16 @@ impl GlitcherZApp {
             // MIDI outline (its curve editor is separate, U12).
             EditTarget::Control { .. } => None,
         });
-        // U4b: the selected control track's endpoint parameter drives the
-        // inline band's vertical axis. Read before the destructuring below.
-        let curve_param = self.project().graph.auto_endpoint(selected_auto);
+        // U4b/U4c: the selected control track's endpoint drives the preview's
+        // vertical axis. Resolved against the target node while the document
+        // borrow is alive (an effect slot's range lives in its descriptor).
+        let curve_axis = {
+            let graph = &self.project().graph;
+            match graph.auto_target(selected_auto) {
+                Some((port, param)) => crate::curve::axis_in(&param, graph, &port),
+                None => (0.0, 127.0, false),
+            }
+        };
         // U6: audio clip bodies read peaks from the session sample cache
         // (read-only lookup — decoding happens on the edit paths).
         let waveform_of = {
@@ -5398,7 +5534,7 @@ impl GlitcherZApp {
                     bar_ticks: project.ticks_per_bar(),
                     // U11 D3: audio clip spans are derived at the base tempo.
                     sec_per_tick: project.sec_per_tick(),
-                    curve_param: curve_param.as_ref(),
+                    curve_axis,
                     waveform_of: &waveform_of,
                 },
                 router,
@@ -8021,6 +8157,11 @@ impl GlitcherZApp {
 
     /// Shrink the mixer by one channel (D21): rejected when the last channel
     /// still has an audio cable landed on it (occupied ports are protected).
+    ///
+    /// U4c (spec `control-tracks.md` §9 D20): an automation cable addressing
+    /// the removed channel is dropped in the same undo step — a channel index
+    /// that no longer exists would otherwise fail the next save's validation,
+    /// and the engine would keep writing into an unused slot.
     fn mixer_remove_channel(&mut self, mixer_doc: u64) {
         // Read the channel count first (immutable borrow; the mutation happens
         // after the cable scan).
@@ -8041,6 +8182,26 @@ impl GlitcherZApp {
             ));
             return;
         }
+        // Control tracks whose curve drives this channel (their routes must be
+        // cleared on the engine side too).
+        let orphaned: Vec<usize> = self
+            .project()
+            .graph
+            .cables
+            .iter()
+            .filter(|c| {
+                c.kind == CableKind::Automation
+                    && c.to == PortRef::Node(mixer_doc)
+                    && matches!(
+                        c.param,
+                        AutoParam::Node(NodeParam::MixerChannel { channel, .. }) if channel == last
+                    )
+            })
+            .filter_map(|c| match c.from {
+                PortRef::AutoTrack(index) => Some(index),
+                _ => None,
+            })
+            .collect();
         let before = self.begin_edit();
         if let Some(NodeDoc::Mixer {
             inputs, channels, ..
@@ -8049,7 +8210,25 @@ impl GlitcherZApp {
             *inputs = last;
             channels.pop();
         }
+        self.project_mut().graph.cables.retain(|c| {
+            !(c.kind == CableKind::Automation
+                && c.to == PortRef::Node(mixer_doc)
+                && matches!(
+                    c.param,
+                    AutoParam::Node(NodeParam::MixerChannel { channel, .. }) if channel == last
+                ))
+        });
         self.commit_edit("Remove Mixer Channel", before);
+        let dropped = orphaned.len();
+        for index in orphaned {
+            let _ = self.engine.clear_auto_route(index);
+        }
+        if dropped > 0 {
+            self.set_message(format!(
+                "Removed channel {} and its {dropped} automation cable(s)",
+                last + 1
+            ));
+        }
     }
 
     /// 新增一条 MIDI 轨：文档两件套节点（voice + delay，P5f D18 不再有
@@ -8654,16 +8833,28 @@ impl GlitcherZApp {
 
         // ---- Snapshot the clip (avoid holding a borrow of `self` across the
         // widget calls below) ----
-        let param = self.project().graph.auto_endpoint(sel);
-        let (min, max, log) = param.as_ref().map_or((0.0, 1.0, false), crate::curve::axis);
+        // U4c: the axis needs the endpoint *and* its target node (an effect
+        // slot's range lives in the node's descriptor), so resolve it through
+        // `axis_in` while the document borrow is still alive.
+        let (min, max, log, axis_label) = {
+            let graph = &self.project().graph;
+            match graph.auto_target(sel) {
+                Some((port, param)) => {
+                    let (min, max, log) = crate::curve::axis_in(&param, graph, &port);
+                    (
+                        min,
+                        max,
+                        log,
+                        crate::patch::auto_param_label_at(&param, graph, &port),
+                    )
+                }
+                None => (0.0, 1.0, false, "not connected".to_string()),
+            }
+        };
         let (loop_ticks, interp, curve) = {
             let clip = &self.project().control_tracks[sel].clips[clip_index];
             (clip.loop_ticks.max(1), clip.interp, clip.curve.clone())
         };
-        let axis_label = param
-            .as_ref()
-            .map(crate::patch::auto_param_label)
-            .unwrap_or_else(|| "not connected".to_string());
 
         // ---- Canvas ----
         let (rect, response) = ui.allocate_exact_size(
@@ -8954,20 +9145,20 @@ impl GlitcherZApp {
                 .filter(|c| matches!(c.lane, piano_roll::RollLane::Control))
                 .filter_map(|c| {
                     let data = project.control_tracks.get(c.track)?.clips.get(c.clip)?;
-                    let param = control_track_param(project, c.track);
-                    let axis = param
-                        .as_ref()
-                        .map(crate::curve::axis)
-                        .unwrap_or((0.0, 127.0, false));
+                    // U4c: axis + label resolve against the cable's target node
+                    // (effect slot ranges come from the node's descriptor).
+                    let (axis, dest) = match project.graph.auto_target(c.track) {
+                        Some((port, param)) => (
+                            crate::curve::axis_in(&param, &project.graph, &port),
+                            crate::patch::auto_param_label_at(&param, &project.graph, &port),
+                        ),
+                        None => ((0.0, 127.0, false), "Not connected".to_string()),
+                    };
                     let name = if project.control_tracks[c.track].name.is_empty() {
                         format!("Curve {}", c.track + 1)
                     } else {
                         project.control_tracks[c.track].name.clone()
                     };
-                    let dest = param
-                        .as_ref()
-                        .map(crate::patch::auto_param_label)
-                        .unwrap_or_else(|| "Not connected".to_string());
                     Some(piano_roll::OverlayLane {
                         clip: *c,
                         data,
@@ -9380,98 +9571,72 @@ impl GlitcherZApp {
             AutoTarget::TimelineIn,
             AutoParam::Tempo,
         ));
-        let voice_doc = self
-            .project()
-            .graph
-            .instrument_of_track(sel)
-            .map(NodeDoc::node_id);
-        if let Some(voice_doc) = voice_doc {
-            options.push((
-                "Cutoff".to_string(),
-                AutoTarget::Node(voice_doc),
-                AutoParam::FilterCutoff,
-            ));
-            if let Some(params) = self.clap_voice_params.get(&voice_doc) {
-                for param in params {
-                    let label = if param.name.is_empty() {
-                        format!("Param {}", param.id)
-                    } else {
-                        param.name.clone()
-                    };
-                    options.push((
-                        format!("CLAP {label}"),
-                        AutoTarget::Node(voice_doc),
-                        AutoParam::PluginParam {
-                            param_id: param.id,
-                            name: label,
-                        },
-                    ));
+        // U4c: the track's whole chain — instrument, its effects (built-in
+        // ones included) and the mixer channel it feeds — through the same
+        // enumeration the patch popup uses.
+        let graph = &self.project().graph;
+        let voice_doc = graph.instrument_of_track(sel).map(NodeDoc::node_id);
+        {
+            let mut push_node_options = |doc_id: u64, prefix: &str| {
+                let (clap, vst3) = plugin_params_of(
+                    graph,
+                    doc_id,
+                    &self.clap_voice_params,
+                    &self.clap_effect_params,
+                    &self.voice_params,
+                    &self.vst3_effect_params,
+                );
+                for (label, param) in node_auto_options(graph, doc_id, clap, vst3) {
+                    options.push((format!("{prefix}{label}"), AutoTarget::Node(doc_id), param));
                 }
+            };
+            if let Some(voice_doc) = voice_doc {
+                push_node_options(voice_doc, "");
             }
-            if let Some(params) = self.voice_params.get(&voice_doc) {
-                for param in params {
-                    let label = if param.title.is_empty() {
-                        format!("Param {}", param.id)
-                    } else {
-                        param.title.clone()
-                    };
-                    options.push((
-                        format!("VST3 {label}"),
-                        AutoTarget::Node(voice_doc),
-                        AutoParam::PluginParam {
-                            param_id: param.id,
-                            name: label,
-                        },
-                    ));
+            for node in graph.nodes.iter().filter(|n| n.track() == sel) {
+                if let NodeDoc::Effect { node_id, .. } = node {
+                    push_node_options(*node_id, "FX ");
                 }
             }
         }
-
-        // External effect parameters (node-addressed endpoints land on the
-        // effect node itself; the same CLAP raw / VST3 normalized domain
-        // split as the instruments).
-        for (fx_doc, fx_label, is_clap) in self.track_external_fx(sel) {
-            if is_clap {
-                if let Some(params) = self.clap_effect_params.get(&fx_doc) {
-                    for param in params {
-                        let label = if param.name.is_empty() {
-                            format!("Param {}", param.id)
-                        } else {
-                            param.name.clone()
-                        };
-                        options.push((
-                            format!("FX CLAP {fx_label} · {label}"),
-                            AutoTarget::Node(fx_doc),
-                            AutoParam::PluginParam {
-                                param_id: param.id,
-                                name: label,
-                            },
-                        ));
-                    }
-                }
-            } else if let Some(params) = self.vst3_effect_params.get(&fx_doc) {
-                for param in params {
-                    let label = if param.title.is_empty() {
-                        format!("Param {}", param.id)
-                    } else {
-                        param.title.clone()
-                    };
-                    options.push((
-                        format!("FX VST3 {fx_label} · {label}"),
-                        AutoTarget::Node(fx_doc),
-                        AutoParam::PluginParam {
-                            param_id: param.id,
-                            name: label,
-                        },
-                    ));
-                }
+        if let Some((mixer_doc, channel)) = self.track_channel_target(sel) {
+            for (label, param) in [
+                ("Gain", ChannelParam::Gain),
+                ("Pan", ChannelParam::Pan),
+                ("Mute", ChannelParam::Mute),
+                ("Solo", ChannelParam::Solo),
+            ] {
+                options.push((
+                    format!("Mixer Ch {} {label}", channel + 1),
+                    AutoTarget::Node(mixer_doc),
+                    AutoParam::Node(NodeParam::MixerChannel { channel, param }),
+                ));
             }
         }
+        // The endpoint label resolves against the target node too (an effect
+        // slot reads `mix` rather than `param 2`); snapshot it now, before the
+        // widget closures start borrowing `self` mutably.
+        let endpoint = self.project().graph.auto_target(index);
+        let current = {
+            let graph = &self.project().graph;
+            endpoint
+                .as_ref()
+                .map(|(port, param)| match param {
+                    AutoParam::Tempo => "Song Tempo".to_string(),
+                    AutoParam::Cc {
+                        controller,
+                        channel,
+                    } => cc_label(*controller, *channel),
+                    AutoParam::PitchBend {
+                        channel,
+                        range_semitones,
+                    } => bend_label(*range_semitones, *channel),
+                    other => crate::patch::auto_param_label_at(other, graph, port),
+                })
+                .unwrap_or_else(|| "Not connected".to_string())
+        };
 
         let mut picked: Option<(AutoTarget, AutoParam)> = None;
-        // Read once: the strip below renumbers an existing CC destination, and
-        // the horizontal closure only displays it.
-        let endpoint = self.project().graph.auto_target(index);
         ui.horizontal(|ui| {
             ui.label("Target");
             ui.menu_button("Pick Parameter…", |ui| {
@@ -9545,32 +9710,9 @@ impl GlitcherZApp {
             if let Some((target, param)) = picked {
                 self.set_auto_endpoint(index, target, param);
             }
-            // Current endpoint display.
-            let current = endpoint
-                .as_ref()
-                .map(|(port, param)| match (port, param) {
-                    (PortRef::TimelineIn, _) => "Song Tempo".to_string(),
-                    (_, AutoParam::TrackGain) => "Volume".to_string(),
-                    (_, AutoParam::TrackPan) => "Pan".to_string(),
-                    (_, AutoParam::FilterCutoff) => "Cutoff".to_string(),
-                    (_, AutoParam::PluginParam { name, .. }) => name.clone(),
-                    (_, AutoParam::Tempo) => "Song Tempo".to_string(),
-                    (
-                        _,
-                        AutoParam::Cc {
-                            controller,
-                            channel,
-                        },
-                    ) => cc_label(*controller, *channel),
-                    (
-                        _,
-                        AutoParam::PitchBend {
-                            channel,
-                            range_semitones,
-                        },
-                    ) => bend_label(*range_semitones, *channel),
-                })
-                .unwrap_or_else(|| "Not connected".to_string());
+            // Current endpoint display (computed before this closure — it
+            // needs an immutable document borrow that the menu widgets above
+            // would conflict with).
             ui.weak(format!("-> {current}"));
         });
         // The preset list is a shortcut, not a limit: a picked CC can be
@@ -10155,6 +10297,115 @@ mod inline_param_tests {
         );
         // U3b: tempo has no ParamId — it never reaches a node's set_param.
         assert_eq!(param_id_of(&AutoParam::Tempo), None);
+    }
+
+    /// U4c: every node parameter address has an engine counterpart — a
+    /// missing arm would make the curve a silent no-op, which is the exact
+    /// failure mode this feature exists to fix.
+    #[test]
+    fn node_param_addresses_map_to_engine_params() {
+        let cases = [
+            (NodeParam::EffectSlot(2), ParamId::BuiltinParam(2)),
+            (
+                NodeParam::MixerChannel {
+                    channel: 5,
+                    param: ChannelParam::Gain,
+                },
+                ParamId::MixerGain(5),
+            ),
+            (
+                NodeParam::MixerChannel {
+                    channel: 5,
+                    param: ChannelParam::Pan,
+                },
+                ParamId::MixerPan(5),
+            ),
+            (
+                NodeParam::MixerChannel {
+                    channel: 1,
+                    param: ChannelParam::Mute,
+                },
+                ParamId::MixerMute(1),
+            ),
+            (
+                NodeParam::MixerChannel {
+                    channel: 1,
+                    param: ChannelParam::Solo,
+                },
+                ParamId::MixerSolo(1),
+            ),
+            (NodeParam::MixerOutPan, ParamId::MixerOutPan),
+            (NodeParam::MixerOutMute, ParamId::MixerOutMute),
+            (NodeParam::FeedbackGain, ParamId::FeedbackGain),
+            (NodeParam::Sf2Gain, ParamId::Sf2Gain),
+            (NodeParam::SampleGain, ParamId::SampleGain),
+            (NodeParam::Resonance, ParamId::FilterResonance),
+            (NodeParam::Attack, ParamId::Attack),
+            (NodeParam::Decay, ParamId::Decay),
+            (NodeParam::Sustain, ParamId::Sustain),
+            (NodeParam::Release, ParamId::Release),
+        ];
+        for (param, expected) in cases {
+            assert_eq!(param_id_of(&AutoParam::Node(param)), Some(expected));
+        }
+    }
+
+    /// U4c (spec §9 D19): the target menu enumerates the node's real
+    /// parameters — this is where "gain cannot be automated" came from, so a
+    /// mixer must offer one Gain row per channel, and a built-in effect every
+    /// descriptor slot.
+    #[test]
+    fn auto_options_cover_mixer_channels_and_effect_slots() {
+        let project = Project::default();
+        let doc = &project.graph;
+        let mixer = doc.first_mixer().expect("default mixer");
+        let (NodeDoc::Mixer { inputs, .. }, mixer_id) = (mixer, mixer.node_id()) else {
+            unreachable!()
+        };
+        let labels: Vec<String> = node_auto_options(doc, mixer_id, None, None)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        let channels = *inputs as usize;
+        assert_eq!(
+            labels.len(),
+            channels * 4 + 2,
+            "four rows per channel + output pan/mute, got {labels:?}"
+        );
+        assert!(labels.contains(&"Ch 1 Gain".to_string()), "{labels:?}");
+        assert!(
+            labels.contains(&format!("Ch {channels} Solo")),
+            "the last channel must be offered too: {labels:?}"
+        );
+
+        // A built-in delay exposes its whole descriptor, not just the inline
+        // rows on the node body.
+        let delay = doc.builtin_delay_of_track(0).expect("track delay");
+        let options = node_auto_options(doc, delay.node_id(), None, None);
+        let NodeDoc::Effect { params, .. } = delay else {
+            unreachable!()
+        };
+        let slots = crate::effect::descriptor(params).params.len();
+        assert_eq!(
+            options.len(),
+            slots,
+            "one row per descriptor slot: {options:?}"
+        );
+        assert!(
+            options
+                .iter()
+                .any(|(_, param)| matches!(param, AutoParam::Node(NodeParam::EffectSlot(0))))
+        );
+
+        // Built-in synth: cutoff + resonance + the four envelope stages.
+        let synth = doc.instrument_of_track(0).expect("track instrument");
+        let labels: Vec<String> = node_auto_options(doc, synth.node_id(), None, None)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(labels.len(), 6, "{labels:?}");
+        assert!(labels.contains(&"Cutoff".to_string()));
+        assert!(labels.contains(&"Env Release".to_string()));
     }
 }
 

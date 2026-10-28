@@ -680,3 +680,16 @@ let _ = self.slot_set_param(route.slot, ParamId::PitchOffset, value); // synth /
 **折叠是 view-state，按 track 索引**：`collapsed_lanes: Vec<usize>` 存的是 control lane 的序号（= `lanes` 数组下标），不落文档——它是"我暂时不想看这条"的临时偏好，跟工程语义无关。折叠后高度 `CURVE_LANE_COLLAPSED_HEIGHT = 18.0`（够放一个小方块 + label），方块点击在 `curve_lanes` 里 `continue` 掉，不进入曲线交互。
 
 
+## 节点参数自动化词汇表（U4c / A，2026-10-28）
+
+**缺的从来不是通路，是词汇表。** 引擎的自动化链路 `set_auto_route(index, node_id, ParamId)` → `auto_deliver` → `slot_set_param` 一直能写任意节点的任意 `ParamId`（`graph.rs` 里 `auto_route_delivers_curve_values_to_target_param` 就是 mixer 通道 gain 的端到端断言）。用户看到"gain 收不到控制"，是因为 `AutoParam` 只有 7 个变体 + `accepts()` 只认乐器 + `auto_options` 只出 Cutoff/插件参数 —— 菜单里压根没有 gain 这一项。
+
+实现要点：
+
+- **地址进 model，翻译在 UI**：`AutoParam::Node(NodeParam)`，`NodeParam` 覆盖 mixer 通道/输出级、效果器 slot、Feedback/SF2/Sample gain、resonance 与 ADSR。engine 的 `ParamId` 仍只由 `lib.rs::node_param_id` 单点翻译（model 不依赖 engine，沿用原分层）。加性变体 → `PROJECT_VERSION` 不变，旧工程零迁移。
+- **两个菜单合一**：`node_auto_options(doc, node_id, clap, vst3)` 是 patch 弹窗与 Inspector Target 行的唯一枚举来源。以前两处各写一遍，正是"mixer 通道从没进过列表"的原因。`plugin_params_of` 负责乐器/效果器的参数表分家（`clap_voice_params` vs `clap_effect_params`），顺带把内置效果器的 descriptor slot 补进 Inspector 菜单（原先只有 CLAP/VST3 效果器）。
+- **曲线轴需要节点上下文**：`curve::axis(&AutoParam)` 保持上下文无关（各参数对齐面板 range），但效果器 slot 的真实范围在节点 descriptor 里 → 新增 `axis_in(param, doc, target)`，三个绘制点（Edit tab 曲线编辑器、卷帘 overlay、timeline 只读预览）全部改走它。timeline 的 `TimelineParams::curve_param: Option<&AutoParam>` 因此换成 `curve_axis: (f32, f32, bool)` 元组（预览只需要轴，不需要参数身份）。
+- **只校验 mixer 家族**：`check_node_param` 强校验 `channel < inputs` 与 `MixerOut*` 必须在 mixer 上 —— 通道索引是文档能主动作废的唯一参数身份（删通道）。resonance/SF2 gain 这类与 voice 绑定的参数不校验：换 voice 会让老工程保存失败，而引擎对不认识的参数本来就返回 `false`。
+- **删通道要在同一步收尾**：`mixer_remove_channel` 除了 `inputs -= 1` + `channels.pop()`，还要 `retain` 掉指向该通道的 automation 电缆并 `clear_auto_route(index)`，否则下次保存被校验拒绝、引擎也会继续往闲置通道写值。
+
+**已知边界**：参数仍是块边界写入（≤2.7 ms）。内置效果器有自己的 `Smoothed`，但 **mixer 通道权重是块内常量**（`input_weights()` 每块读一次，`sum_into_weighted` 逐样本乘同一权重），所以 LFO 形态的 gain 曲线会有 375 Hz 台阶；推子慢推听不出来。块内线性斜坡是 A2 的后续项：`Processor` 增加"上一块权重"接口 + 求和循环在 `from`/`to` 之间插值，代价是 mixer 求和数学测试的期望值要跟着改成"块内均值"。

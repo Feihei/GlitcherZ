@@ -24,8 +24,8 @@ use egui::{
     StrokeKind, Vec2, pos2,
 };
 use glitcherz_model::{
-    AudioClip, AudioTrack, AutoParam, AutoPoint, ControlClip, ControlTrack, CtrlEvent,
-    MAX_ARRANGEMENT_TICKS, MAX_CLIPS_PER_TRACK, Marker, MidiClip, MidiTrack, Note, SongLoop,
+    AudioClip, AudioTrack, AutoPoint, ControlClip, ControlTrack, CtrlEvent, MAX_ARRANGEMENT_TICKS,
+    MAX_CLIPS_PER_TRACK, Marker, MidiClip, MidiTrack, Note, SongLoop,
 };
 
 /// Absolute arrangement ceiling in ticks (U3a). The bound is a **tick** count,
@@ -496,10 +496,12 @@ pub struct TimelineParams<'a> {
     /// derive their tick footprint from their seconds window with this, and
     /// the modal geometry uses it for the same reason.
     pub sec_per_tick: f64,
-    /// Endpoint parameter of the selected control track (U4b): the inline
-    /// band's vertical axis. `None` = the track has no cable yet; the band
-    /// still draws with a normalized axis and says so.
-    pub curve_param: Option<&'a AutoParam>,
+    /// Vertical axis `(min, max, log)` of the selected control track's
+    /// endpoint (U4b/U4c): the curve preview's value mapping. The app resolves
+    /// it from the cable's target node — effect slots get their real descriptor
+    /// range, not a placeholder. A track with no cable keeps the neutral 0..127
+    /// axis and says so on its header.
+    pub curve_axis: (f32, f32, bool),
     /// Waveform lookup for audio clip bodies (U6 D6): path → decoded sample
     /// (the app's session cache). `None` renders a flat placeholder body.
     pub waveform_of: &'a dyn Fn(&str) -> Option<std::sync::Arc<glitcherz_engine::SampleData>>,
@@ -1491,7 +1493,7 @@ pub fn show(
                         }
                     },
                     &|_| None,
-                    &|clip, painter, rect| draw_control_preview(painter, rect, clip, p.curve_param),
+                    &|clip, painter, rect| draw_control_preview(painter, rect, clip, p.curve_axis),
                 );
             }
         }
@@ -2695,12 +2697,12 @@ fn draw_control_preview(
     painter: &egui::Painter,
     rect: Rect,
     clip: &ControlClip,
-    param: Option<&AutoParam>,
+    axis: (f32, f32, bool),
 ) {
     if clip.curve.is_empty() || clip.span_ticks == 0 || rect.width() < 6.0 || rect.height() < 6.0 {
         return;
     }
-    let (min, max, log) = param.map_or((0.0, 1.0, false), crate::curve::axis);
+    let (min, max, log) = axis;
     let height = rect.height() - 2.0;
     let value_y =
         |value: f32| rect.bottom() - 1.0 - crate::curve::to_norm(value, min, max, log) * height;
@@ -2775,11 +2777,11 @@ mod tests {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(300.0, 60.0), egui::Sense::hover());
                 let painter = ui.painter_at(rect);
-                draw_control_preview(&painter, rect, &clip, Some(&AutoParam::TrackGain));
+                draw_control_preview(&painter, rect, &clip, (0.0, 1.5, false));
                 // Degenerate cases: empty curve, and a rect too small to draw.
-                draw_control_preview(&painter, rect, &ControlClip::default(), None);
+                draw_control_preview(&painter, rect, &ControlClip::default(), (0.0, 1.0, false));
                 let tiny = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(3.0, 3.0));
-                draw_control_preview(&painter, tiny, &clip, None);
+                draw_control_preview(&painter, tiny, &clip, (0.0, 1.0, false));
             });
         });
         out.textures_delta.clear();

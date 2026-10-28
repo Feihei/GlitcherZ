@@ -83,6 +83,21 @@ UI ──cable(Cc{ch,cc})→ engine.set_auto_cc_route(index, node_id, ch, cc)
 | D14 | **双击 curve clip → Edit tab 曲线编辑器** | 新增 `TimelineAction::OpenControlEditor { track, clip }`（取代 `ShowControlCurve`）。`edit_clip` 升级为区分轨种的 `EditTarget::{Midi{track,clip}, Control{track,clip}}`；`edit_panel` 按 target 分派 `midi_editor_body` / 新 `control_editor_body`。 |
 | D15 | **编辑器三种工具** | `Draw`（freehand 直接绘多点，写 `Linear`）、`Line`（控制点折线，写 `Linear`）、`Curve`（控制点曲线，写 `Smooth`）。工具是**交互模式**（不持久化），`interp` 是持久化数据。锚点编辑沿用既有守卫/命令路径（一步 undo；拖动用 `execute_merged`/`begin_param_edit` 合并）。 |
 
+## 9. U4c / A 阶段（2026-10-28）：节点参数自动化词汇表
+
+> 起因：patch 里节点的 `gain` 之类的参数**根本不在自动化目标列表里**——`AutoParam` 只有 7 个变体（Track/Filter/Plugin/Tempo/CC/Bend），`auto_options` 只给乐器节点出 Cutoff 与插件参数，`accepts()` 又只允许 automation 电缆落在乐器节点。引擎侧其实早已能往**任意**节点的任意 `ParamId` 写值（`set_auto_route` + `auto_deliver` + `slot_set_param`），缺口全在上层的词汇表、入口与值域三处。
+>
+> 本阶段（A）**只补词汇表，不开参数端口**：仍沿用"整节点一条 automation 电缆 + 弹菜单选参数"的现有交互；每参数一个输入口留待 B（`param-ports`，未落地）。
+
+| # | 决策 | 内容 |
+| :-- | :-- | :-- |
+| D16 | **参数地址进 model，不进 engine** | 新增 `AutoParam::Node(NodeParam)`，`NodeParam` 是 model 侧的封闭枚举（`EffectSlot(u8)` / `MixerChannel{channel, param: ChannelParam}` / `MixerOutPan` / `MixerOutMute` / `FeedbackGain` / `Sf2Gain` / `SampleGain` / `Resonance` / `Attack` / `Decay` / `Sustain` / `Release`）。engine 的 `ParamId` 仍由 UI 单点翻译（`param_id_of`），model 不依赖 engine（沿用既有分层）。 |
+| D17 | **加性变体，不动 `PROJECT_VERSION`** | 旧变体（`TrackGain`/`TrackPan`/`FilterCutoff`/`PluginParam`/`Tempo`/`Cc`/`PitchBend`）全部保留原语义，既有工程文件零迁移（同 U13 `VoiceFmt.gain` 先例）。不合并旧变体：合并要 v9 + 迁移，收益只是少几个 arm。 |
+| D18 | **曲线轴按"参数 + 节点"解析** | `curve::axis(&AutoParam)` 保持上下文无关（mixer 通道 gain 0..1.5、pan ±1、sf2/sample gain 0..2、ADSR 0..2/0..1/0..3、resonance 0..0.98、mute/solo 0..1）；效果器 slot 的真实范围来自节点 descriptor，新增 `curve::axis_in(param, doc, target)` 解析，三个调用点（Edit tab 曲线编辑器 / 卷帘 overlay lane / timeline 只读预览）改用带上下文的版本。曲线值**始终存真实物理值**（与 `FilterCutoff` 存 Hz 同构）。 |
+| D19 | **automation 电缆放开到所有可自动化节点** | `patch::accepts` 从"仅乐器"放宽到 乐器 / 效果器 / Mixer / Feedback（Keyboard 与 AudioTrack 仍拒绝——没有可自动化参数）。菜单（patch 弹窗与 Inspector 的 Target 行）按节点类型枚举：乐器 = Cutoff/Resonance/ADSR/(SF2/Sample gain)/插件参数/CC/Bend；内置效果器 = descriptor 全部 slot；Mixer = 每通道 Gain/Pan/Mute/Solo + 输出 pan/mute；Feedback = gain。 |
+| D20 | **一条通道一个来源** | 新增校验：`MixerChannel{channel}` 的目标必须是 mixer 且 `channel < inputs`；`MixerOut*` 必须落在 mixer 上。删除 mixer 通道时**同时删掉指向该通道的 automation 电缆**（同一 undo 步），否则保存会被校验拒绝。其余节点类型不做强校验——参数不匹配时 `set_param` 返回 `false`，引擎静默忽略（与乱塞 `ParamId` 的现有语义一致）。 |
+| D21 | **块级更新，不做采样级斜坡（本阶段）** | 参数仍在块边界写入（≤2.7 ms）。内置效果器有自己的 `Smoothed`；**mixer 通道权重目前是块内常量**，因此快速 LFO 形态的 gain 曲线会有 375 Hz 台阶（推子慢速推拉可忽略）。块内线性斜坡留作 A2（需给 `Processor` 增加"上一块权重"接口，并调整 mixer 求和数学测试的期望值），不在 A 内混入。 |
+
 ### 采样约定
 
 - 锚点按 tick 升序（编辑接口维持）；空曲线返回 `None`。

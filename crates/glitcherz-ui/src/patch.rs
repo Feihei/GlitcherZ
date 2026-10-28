@@ -17,9 +17,9 @@ use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 use glitcherz_model::{
-    AutoParam, BuiltinEffectKind, CableDoc, CableKind, GraphDoc, LayoutDoc, MAX_AUDIO_TRACKS,
-    MAX_AUTO_TRACKS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MIN_MIXER_CHANNELS, MidiSource, NodeDoc,
-    PortRef, VoiceSpec,
+    AutoParam, BuiltinEffectKind, CableDoc, CableKind, ChannelParam, GraphDoc, LayoutDoc,
+    MAX_AUDIO_TRACKS, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MIN_MIXER_CHANNELS,
+    MidiSource, NodeDoc, NodeParam, PortRef, VoiceSpec,
 };
 
 use crate::plugin_catalog::PluginFormat;
@@ -1287,6 +1287,9 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
 }
 
 /// Short label for an automation cable endpoint parameter.
+///
+/// Node parameters get a context-free label (`param 2` for an effect slot);
+/// [`auto_param_label_at`] upgrades it with the target node's own names.
 pub(crate) fn auto_param_label(param: &AutoParam) -> String {
     match param {
         AutoParam::TrackGain => "Volume".to_string(),
@@ -1299,7 +1302,38 @@ pub(crate) fn auto_param_label(param: &AutoParam) -> String {
         AutoParam::Cc { controller, .. } => format!("CC {controller}"),
         // P1: a bend is a controller too; the range lives in its editor.
         AutoParam::PitchBend { .. } => "Pitch Bend".to_string(),
+        AutoParam::Node(param) => match param {
+            NodeParam::EffectSlot(slot) => format!("Param {slot}"),
+            NodeParam::MixerChannel { channel, param } => match param {
+                ChannelParam::Gain => format!("Ch {} Gain", channel + 1),
+                ChannelParam::Pan => format!("Ch {} Pan", channel + 1),
+                ChannelParam::Mute => format!("Ch {} Mute", channel + 1),
+                ChannelParam::Solo => format!("Ch {} Solo", channel + 1),
+            },
+            NodeParam::MixerOutPan => "Out Pan".to_string(),
+            NodeParam::MixerOutMute => "Out Mute".to_string(),
+            NodeParam::FeedbackGain => "Feedback".to_string(),
+            NodeParam::Sf2Gain | NodeParam::SampleGain => "Gain".to_string(),
+            NodeParam::Resonance => "Resonance".to_string(),
+            NodeParam::Attack => "Attack".to_string(),
+            NodeParam::Decay => "Decay".to_string(),
+            NodeParam::Sustain => "Sustain".to_string(),
+            NodeParam::Release => "Release".to_string(),
+        },
     }
+}
+
+/// [`auto_param_label`] with the destination node's context (U4c): a built-in
+/// effect slot is labelled by its descriptor entry (`time`, `mix`, …) instead
+/// of a slot number, because "Param 2" on a cable tells the user nothing.
+pub(crate) fn auto_param_label_at(param: &AutoParam, doc: &GraphDoc, target: &PortRef) -> String {
+    if let (AutoParam::Node(NodeParam::EffectSlot(slot)), PortRef::Node(node_id)) = (param, target)
+        && let Some(NodeDoc::Effect { params, .. }) = doc.node_by_id(*node_id)
+        && let Some(spec) = crate::effect::descriptor(params).spec(*slot)
+    {
+        return spec.short.to_string();
+    }
+    auto_param_label(param)
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -1812,8 +1846,17 @@ fn accepts(kind: CableKind, target: PatchId, doc: &GraphDoc) -> bool {
                 )
             }
             CableKind::Midi => matches!(node, NodeDoc::Instrument { .. }),
-            // Mixer-fader automation is deferred (P5f decision): instruments only.
-            CableKind::Automation => matches!(node, NodeDoc::Instrument { .. }),
+            // U4c (spec `control-tracks.md` §9 D19): every node kind that owns
+            // an automatable parameter accepts an automation cable. The
+            // keyboard (MIDI source) and the audio-track node (no parameters)
+            // stay out — a cable there could never do anything.
+            CableKind::Automation => matches!(
+                node,
+                NodeDoc::Instrument { .. }
+                    | NodeDoc::Effect { .. }
+                    | NodeDoc::Mixer { .. }
+                    | NodeDoc::Feedback { .. }
+            ),
         }
     } else {
         match target {
@@ -2380,7 +2423,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             painter.text(
                 mid + Vec2::new(0.0, -12.0),
                 egui::Align2::CENTER_CENTER,
-                auto_param_label(&cable.param),
+                auto_param_label_at(&cable.param, doc, &cable.to),
                 FontId::proportional(11.0),
                 cable_color(CableKind::Automation),
             );
@@ -3756,18 +3799,19 @@ mod tests {
         assert!(accepts(CableKind::Midi, PatchId::Node(instrument), doc));
         assert!(!accepts(CableKind::Midi, PatchId::Node(mixer), doc));
         assert!(!accepts(CableKind::Midi, PatchId::Master, doc));
-        // Automation: instruments accept (mixer-fader automation deferred).
+        // Automation (U4c, spec `control-tracks.md` §9 D19): every node with
+        // automatable parameters accepts it — instruments, built-in effects,
+        // mixers and feedback; master (not a node) and the timeline do not.
         assert!(accepts(
             CableKind::Automation,
             PatchId::Node(instrument),
             doc
         ));
-        assert!(!accepts(CableKind::Automation, PatchId::Node(mixer), doc));
-        assert!(accepts(
-            CableKind::Automation,
-            PatchId::Node(instrument),
-            doc
-        ));
+        assert!(accepts(CableKind::Automation, PatchId::Node(delay), doc));
+        assert!(
+            accepts(CableKind::Automation, PatchId::Node(mixer), doc),
+            "mixer channel faders are automation targets now"
+        );
         assert!(!accepts(CableKind::Automation, PatchId::Master, doc));
     }
 
