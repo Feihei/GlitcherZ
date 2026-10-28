@@ -629,6 +629,19 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 **track 重排要改全体**：`reorder_midi_track` 原来只重映射 focus 的 `track`，现在必须遍历 `context_mut()`——漏改会让 ghost 指向另一条轨的音符。
 
 
+## Edit tab 跟随 timeline 选区（2026-10-28）
+
+**Edit tab 没有自己的开关**：目标由 `edit_clip` 变成"从 `timeline_state.selection` 派生"（`sync_edit_target` 每帧在视图分发前跑一次）。双击不再是唯一入口，只是"选中 + 切到 Edit"的快捷方式；反过来，切走选区（点空白、Esc、删除、换选）就自动关掉编辑器。`× Close` 按钮因此退役——面板不再拥有自己的生命周期，空选区时它像 Inspector 一样给提示（"回 Timeline 选一个 clip"），只选中 audio clip 时明说音频 clip 没有编辑器。
+
+**`edit_selection` 快照是必需的，不是缓存**：装配 subject 只在**选区变化**时发生（spec `roll-multiclip.md` E15 的约束）。没有快照就只能每帧重装，那会把 chip 条 / Tab 换来的 focus 抹回"最后选中的那个"。快照同时被 `set_edit_target` / `set_control_edit_target` 写，所以 ← → 翻 clip、双击打开这些不走选区的路径也不会触发下一次重装。
+
+**谁当焦点 = 选区里最后一个"活着且可编辑"的 clip**（`lane != Audio` 且 `clips.get(clip)` 命中）：反向扫描等价于"最后点的那个"，与双击落点一致；存活性检查是因为选区活得比 clip/轨道久（删轨、undo 都会留下死索引），死索引不能进 subject。
+
+**目标消失时不再回退到 clip 0**：`midi_editor_body` / `control_editor_body` 原来会把越界索引钳到 0，选区驱动的语义下那等于"悄悄换了 clip"。现在置空 `edit_clip` 交给下一帧的 `sync_edit_target` 重算——选区里还有活着的 clip 就换过去，全死了就回到提示态。
+
+**行选中不再关编辑器**：`SelectTrack` / `SelectControlTrack` / `SelectAudioTrack` 原来顺手清 `edit_clip`，现在只改行高亮——轨道选中与 clip 选区是两件事，后者才是 Edit tab 的输入。`do_open_now` 额外清 `timeline_state.selection`（它索引的是**上一个**文档），`reorder_midi_track` 在重映射选区后同步快照。
+
+
 ## 音高通路（P1）：一个目标，两种投递
 
 **曲线存半音，不存归一化**：`AutoParam::PitchBend { channel, range_semitones }` 的曲线值域是 `[-range, +range]` 半音（默认 ±2）。range 是**文档字段**而不是常量，因为同一个曲线在不同音源上可以是 ±2 的揉弦也可能是 ±12 的大滑音；存归一化再乘 range 会让"改了 range 曲线跟着变形"，存半音则改 range 只影响投递换算。`pitch_bend(channel, range)` 构造器钳制 `0..=15` / `0.5..=24`（NaN 回落 2.0），这与 MIDI 14 bit 的可表示精度对齐（±24 半音时 1 LSB ≈ 0.003 半音）。

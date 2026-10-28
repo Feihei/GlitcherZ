@@ -13,7 +13,7 @@
 
 ## 2. 目标形态
 
-- 多轨 **arrangement timeline**：行 = 轨道（MIDI 轨 + control 轨，动态增删），轨上插 clip（有绝对位置与长度），双击 clip 跳转 Edit 标签页（MIDI clip → piano roll；control clip → 曲线编辑）。
+- 多轨 **arrangement timeline**：行 = 轨道（MIDI 轨 + control 轨，动态增删），轨上插 clip（有绝对位置与长度）。Edit 标签页跟随 clip 选区：选中后切到 Edit 即打开该 clip（MIDI clip → piano roll；control clip → 曲线编辑），双击是同一件事的快捷方式；没有可编辑的选中 clip 时 Edit 只给提示。
 - 节点图中 **timeline 作为一个无输入口、多输出口（n = MIDI 轨数 + control 轨数）的不可删除节点**，把 MIDI / control 数据流投递到 instrument / effect 节点。
 
 ## 3. 决策

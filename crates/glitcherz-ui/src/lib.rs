@@ -721,9 +721,11 @@ enum MainView {
     /// Arrangement timeline (default view: the DAW's home screen).
     #[default]
     Timeline,
-    /// Piano roll (MIDI clip) or curve editor (control clip) for the targeted
-    /// clip; double-clicking a timeline clip jumps here (U12: control clips
-    /// have their own curve editor here again).
+    /// Piano roll (MIDI clip) or curve editor (control clip) for the
+    /// timeline's selected clip (U12: control clips have their own curve
+    /// editor here again). The tab has no target of its own: it follows the
+    /// clip selection, so a double-click and a plain "select, then open Edit"
+    /// land on the same view.
     Edit,
     /// Node patch graph (full-height, dedicated view).
     Patch,
@@ -851,9 +853,16 @@ pub struct GlitcherZApp {
     selected_audio: usize,
     /// Arrangement timeline cross-frame state (zoom/drag).
     timeline_state: timeline::TimelineState,
-    /// Which clip the Edit tab is targeting (`None` = closed). The target kind
-    /// picks the editor (MIDI piano roll vs control curve, U12).
+    /// Which clip the Edit tab is targeting (`None` = nothing selected, the
+    /// tab shows its hint). Derived from the timeline's clip selection by
+    /// [`Self::sync_edit_target`]: the target kind picks the editor (MIDI
+    /// piano roll vs control curve, U12).
     edit_clip: Option<EditTarget>,
+    /// Timeline selection the current [`Self::edit_clip`] was assembled from.
+    /// Kept so [`Self::sync_edit_target`] only rebuilds the roll when the
+    /// selection actually moved — the roll's own focus (chip strip / Tab)
+    /// would otherwise be reset every frame (spec `roll-multiclip.md` E15).
+    edit_selection: Vec<timeline::ClipSel>,
     /// Curve editor tool (U12; transient input mode, not persisted).
     curve_tool: CurveTool,
     /// Anchor tick currently being dragged in the curve editor (U12; `None`
@@ -1103,6 +1112,7 @@ impl GlitcherZApp {
             selected_audio: 0,
             timeline_state: timeline::TimelineState::default(),
             edit_clip: None,
+            edit_selection: Vec::new(),
             curve_tool: CurveTool::default(),
             curve_drag: None,
             roll_state: piano_roll::RollState::new(),
@@ -3330,6 +3340,7 @@ impl GlitcherZApp {
         self.selected_track = 0;
         self.selected_auto = 0;
         self.edit_clip = None;
+        self.edit_selection.clear();
         self.roll_state = piano_roll::RollState::new();
         self.timeline_state = timeline::TimelineState::default();
         self.patch_state = patch::PatchState::default();
@@ -3642,6 +3653,9 @@ impl GlitcherZApp {
                 self.selected_track = 0;
                 self.selected_auto = 0;
                 self.edit_clip = None;
+                // The selection indexes the *previous* document.
+                self.edit_selection.clear();
+                self.timeline_state.selection.clear();
                 self.roll_state = piano_roll::RollState::new();
                 self.push_all_params();
                 // U1: the opened document's song loop reaches the engine.
@@ -5383,17 +5397,16 @@ impl GlitcherZApp {
             timeline::TimelineAction::MidiEdited(track) => self.send_track_clips(track),
             timeline::TimelineAction::ControlEdited(index) => self.send_control_clips(index),
             timeline::TimelineAction::AudioEdited(track) => self.send_audio_clips_for_track(track),
+            // Selecting a track row no longer closes the editor: the Edit tab
+            // follows the **clip** selection, which this action does not touch.
             timeline::TimelineAction::SelectTrack(track) => {
                 self.selected_track = track;
-                self.edit_clip = None;
             }
             timeline::TimelineAction::SelectControlTrack(index) => {
                 self.selected_auto = index;
-                self.edit_clip = None;
             }
             timeline::TimelineAction::SelectAudioTrack(track) => {
                 self.selected_audio = track;
-                self.edit_clip = None;
             }
             timeline::TimelineAction::OpenMidiEditor { track, clip } => {
                 self.selected_track = track;
@@ -6257,31 +6270,33 @@ impl GlitcherZApp {
         }
     }
 
-    /// Edit tab: the clip editor as a main view (double-clicking a clip in
-    /// the timeline jumps here). With no targeted clip it offers the
-    /// selected track's first clip.
+    /// Edit tab: the clip editor as a main view. Its target is the timeline's
+    /// clip selection (see [`Self::sync_edit_target`]), so this panel never
+    /// opens or closes anything itself — with no editable clip selected it
+    /// states that and points back at the Timeline, like the Inspector does.
     fn edit_panel(&mut self, ui: &mut egui::Ui) {
         // Cloned rather than borrowed: the body needs `&mut self` (focus chip
         // strip, roll state), and a roll subject is a handful of indices.
         let Some(target) = self.edit_clip.clone() else {
+            let audio_only = !self.timeline_state.selection.is_empty();
             ui.vertical_centered(|ui| {
                 ui.add_space(48.0);
                 ui.heading("Edit");
                 ui.add_space(8.0);
-                ui.label("Double-click a clip in the Timeline to edit it here.");
-                ui.add_space(12.0);
-                if !self.project().midi_tracks.is_empty() {
-                    let track = self
-                        .selected_track
-                        .min(self.project().midi_tracks.len() - 1);
-                    let name = if self.project().midi_tracks[track].name.is_empty() {
-                        format!("Track {}", track + 1)
-                    } else {
-                        self.project().midi_tracks[track].name.clone()
-                    };
-                    if ui.button(format!("Edit {name} · clip 1")).clicked() {
-                        self.set_edit_target(track, 0);
-                    }
+                if audio_only {
+                    ui.label("Audio clips have no editor.");
+                    ui.add_space(4.0);
+                    ui.weak(
+                        "Select a MIDI clip (piano roll) or a curve clip (curve editor) \
+                         in the Timeline.",
+                    );
+                } else {
+                    ui.label("No clip selected.");
+                    ui.add_space(4.0);
+                    ui.weak(
+                        "Go back to the Timeline and select a clip — it opens here, \
+                         exactly like a double-click.",
+                    );
                 }
             });
             return;
@@ -8358,6 +8373,10 @@ impl GlitcherZApp {
                 sel.track = perm[sel.track];
             }
         }
+        // The subject was remapped in place, so its snapshot has to follow:
+        // an out-of-date snapshot would re-assemble (and reset the focus).
+        self.edit_selection
+            .clone_from(&self.timeline_state.selection);
         self.apply_document();
         self.commit_edit("Reorder Tracks", before);
     }
@@ -8416,6 +8435,8 @@ impl GlitcherZApp {
         };
         let dropped = subject.dropped();
         self.edit_clip = Some(EditTarget::Midi(subject));
+        self.edit_selection
+            .clone_from(&self.timeline_state.selection);
         if dropped > 0 {
             self.set_message(format!(
                 "{dropped} clip(s) not shown: the roll holds at most {}",
@@ -8448,6 +8469,65 @@ impl GlitcherZApp {
             .map(|c| CurveTool::of(c.interp))
             .unwrap_or_default();
         self.edit_clip = Some(EditTarget::Control { track, clip });
+        self.edit_selection
+            .clone_from(&self.timeline_state.selection);
+    }
+
+    /// Re-derives the Edit tab's target from the timeline's clip selection.
+    ///
+    /// The selection is the single source of truth — the same rule the
+    /// Inspector follows. Opening the Edit tab therefore shows the selected
+    /// clip without a double-click, and deselecting (or deleting) the clip
+    /// takes the editor away instead of leaving it on a dead index.
+    ///
+    /// Only a **changed** selection re-assembles the roll: `edit_selection`
+    /// snapshots what the current target was built from, so the roll's own
+    /// focus switches (chip strip, Tab) survive (spec `roll-multiclip.md`
+    /// E15 — assembly happens on open, focus moves are view state). The most
+    /// recently selected clip wins, since that is the one a double-click on
+    /// the same spot would have opened; audio clips have no editor and are
+    /// skipped (their selection alone leaves the tab on its hint).
+    fn sync_edit_target(&mut self) {
+        if self.edit_clip.is_some() && self.timeline_state.selection == self.edit_selection {
+            return;
+        }
+        self.edit_selection
+            .clone_from(&self.timeline_state.selection);
+        // Live check: a selection outlives a clip or track removal, and the
+        // editor must not point at a clip that no longer exists.
+        let primary = {
+            let project = self.session.project();
+            self.edit_selection
+                .iter()
+                .rev()
+                .copied()
+                .find(|sel| match sel.lane {
+                    timeline::TimelineLane::Midi => project
+                        .midi_tracks
+                        .get(sel.track)
+                        .is_some_and(|t| sel.clip < t.clips.len()),
+                    timeline::TimelineLane::Control => project
+                        .control_tracks
+                        .get(sel.track)
+                        .is_some_and(|t| sel.clip < t.clips.len()),
+                    timeline::TimelineLane::Audio => false,
+                })
+        };
+        let Some(primary) = primary else {
+            // Nothing editable selected: the tab shows its "pick a clip" hint.
+            if self.edit_clip.take().is_some() {
+                self.roll_state.clear_gesture();
+            }
+            return;
+        };
+        match primary.lane {
+            timeline::TimelineLane::Midi => self.set_edit_target(primary.track, primary.clip),
+            timeline::TimelineLane::Control => {
+                self.set_control_edit_target(primary.track, primary.clip);
+            }
+            // Filtered out above.
+            timeline::TimelineLane::Audio => {}
+        }
     }
 
     /// Body of the curve editor (Edit tab, U12): edits the anchors of the
@@ -8472,11 +8552,12 @@ impl GlitcherZApp {
             self.send_control_clips(sel);
         }
         let clip_count = self.project().control_tracks[sel].clips.len();
-        let clip_index = if clip_index < clip_count {
-            clip_index
-        } else {
-            0
-        };
+        // Same rule as the roll body: a vanished clip closes the editor rather
+        // than retargeting a neighbour (see `sync_edit_target`).
+        if clip_index >= clip_count {
+            self.edit_clip = None;
+            return;
+        }
 
         // ---- Header: identity + clip navigation + tool selector ----
         let name = if self.project().control_tracks[sel].name.is_empty() {
@@ -8730,11 +8811,13 @@ impl GlitcherZApp {
             self.send_track_clips(sel);
         }
         let clip_count = self.project().midi_tracks[sel].clips.len();
-        // A clip deleted underneath the editor (the context outlives it):
-        // fall back to the track's first clip and let the next frame rebuild
-        // the subject.
+        // A clip deleted underneath the editor (an undo, or a removal from a
+        // path that did not clear the selection): close instead of silently
+        // editing a neighbour — `sync_edit_target` re-derives the target from
+        // the selection on the next frame, and falls back to the hint when
+        // nothing live is left there.
         if focus.clip >= clip_count {
-            self.set_edit_target(sel, 0);
+            self.edit_clip = None;
             return;
         }
         let clip_index = focus.clip;
@@ -8759,9 +8842,6 @@ impl GlitcherZApp {
                 .clicked()
             {
                 self.set_edit_target(sel, clip_index + 1);
-            }
-            if ui.button("× Close").clicked() {
-                self.edit_clip = None;
             }
         });
         // P3 (D7): the focus chip strip. Ghosts are read-only and never take
@@ -9650,6 +9730,9 @@ impl eframe::App for GlitcherZApp {
         self.transport_panel(ui);
         self.status_panel(ui);
         self.view_tabs(ui);
+        // The Edit tab follows the timeline's clip selection (no target of its
+        // own), so the target is re-derived before the view that consumes it.
+        self.sync_edit_target();
 
         // Central content per view. Every view owns the full central area; the
         // tab bar decides which one is shown (fixes the old "patch buried
