@@ -480,8 +480,18 @@ const UI_STATE_KEY: &str = "glitcherz_ui_state";
 /// `plugin-browser.md` D11).
 const PLUGIN_CACHE_KEY: &str = "plugin_cache";
 
-/// Status bar message display duration.
+/// Status bar message display duration (errors linger twice as long — a
+/// failed SoundFont load is worth reading, not glimpsing).
 const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(8);
+const STATUS_ERROR_TTL: Duration = Duration::from_secs(16);
+
+/// How severe a status-bar message is. Failures are painted red and stay up
+/// longer; everything else is the neutral info blue.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MessageKind {
+    Info,
+    Error,
+}
 
 /// How many parsed SoundFonts stay resident (U13 D12). Two covers both real
 /// cases — one file shared by several nodes, and A/B between two fonts.
@@ -904,8 +914,9 @@ pub struct GlitcherZApp {
     project_path: Option<PathBuf>,
     /// Recently opened project files (persisted).
     recent: Vec<PathBuf>,
-    /// Status bar message (text + time shown; disappears automatically after a timeout).
-    status_message: Option<(String, Instant)>,
+    /// Status bar message (text + time shown + severity; disappears
+    /// automatically after a timeout).
+    status_message: Option<(String, Instant, MessageKind)>,
     /// Desired window title.
     window_title: String,
     /// Title already sent to the windowing system (avoids resending the command every frame).
@@ -3679,7 +3690,14 @@ impl GlitcherZApp {
 
     /// Set a status bar message (disappears automatically after a timeout).
     fn set_message(&mut self, text: String) {
-        self.status_message = Some((text, Instant::now()));
+        self.status_message = Some((text, Instant::now(), MessageKind::Info));
+    }
+
+    /// Set a **failure** status message: red, and up twice as long as an
+    /// info line. Silent failures were the norm before this — a load that
+    /// returned early only left a one-frame info label behind.
+    fn set_error(&mut self, text: String) {
+        self.status_message = Some((text, Instant::now(), MessageKind::Error));
     }
 
     /// Build a SoundFont voice processor from the shared session cache
@@ -3819,13 +3837,13 @@ impl GlitcherZApp {
     fn load_sound_font(&mut self, doc_id: u64, path: PathBuf) {
         let started = Instant::now();
         let Some((old_bank, old_program, gain)) = self.sf2_voice_fields(doc_id) else {
-            self.set_message("Load failed: node is not a SoundFont instrument".to_string());
+            self.set_error("Load failed: node is not a SoundFont instrument".to_string());
             return;
         };
         let library = match self.sf2_library_for(&path) {
             Ok(library) => library,
             Err(err) => {
-                self.set_message(format!("Sound font failed to load: {err}"));
+                self.set_error(format!("Sound font failed to load: {err}"));
                 return;
             }
         };
@@ -3833,14 +3851,14 @@ impl GlitcherZApp {
         // (U13 D13): same address → same bank → GM 0:0 → first preset.
         let (bank, program) = resolve_sf2_preset(library.presets(), old_bank, old_program);
         let Some(engine_id) = self.engine_id(doc_id) else {
-            self.set_message("Load failed: node is not installed".to_string());
+            self.set_error("Load failed: node is not installed".to_string());
             return;
         };
         let sample_rate = self.engine.info().sample_rate as f32;
         let mut processor = match Sf2VoiceProcessor::new(library.font(), sample_rate) {
             Ok(processor) => processor,
             Err(err) => {
-                self.set_message(format!("Sound font failed to instantiate: {err}"));
+                self.set_error(format!("Sound font failed to instantiate: {err}"));
                 return;
             }
         };
@@ -3870,7 +3888,7 @@ impl GlitcherZApp {
             .is_none()
         {
             self.session.restore(before);
-            self.set_message("Sound font swap failed (engine busy) — try again".to_string());
+            self.set_error("Sound font swap failed (engine busy) — try again".to_string());
             return;
         }
         self.commit_edit("Load Sound Font", before);
@@ -6386,10 +6404,21 @@ impl GlitcherZApp {
                 .join(" ");
             format!("{} synth(s) {list}", self.vk_targets.len())
         };
-        // Status message (disappears automatically after a timeout).
-        let message = self
-            .status_message
-            .take_if(|(_, at)| at.elapsed() < STATUS_MESSAGE_TTL);
+        // Status message (disappears automatically after the timeout). This
+        // used to be `take_if(.. elapsed() < TTL)`, which *consumed* the
+        // message on the first frame that drew it: every notice — including
+        // "sound font failed to load" — painted for one frame and read as if
+        // the action had failed silently. Expire it, don't steal it.
+        if let Some((_, at, kind)) = self.status_message
+            && at.elapsed()
+                >= match kind {
+                    MessageKind::Info => STATUS_MESSAGE_TTL,
+                    MessageKind::Error => STATUS_ERROR_TTL,
+                }
+        {
+            self.status_message = None;
+        }
+        let message = self.status_message.clone();
 
         let response = egui::Panel::bottom("glitcherz_status").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -6431,9 +6460,13 @@ impl GlitcherZApp {
                         "focus: live={pos:?} retained={retained:?} down={down} owner={focused:?} kb={kb} nz={nz}"
                     ));
                 }
-                if let Some((text, _)) = message {
+                if let Some((text, _, kind)) = message {
                     ui.separator();
-                    ui.colored_label(egui::Color32::LIGHT_BLUE, text);
+                    let color = match kind {
+                        MessageKind::Info => egui::Color32::LIGHT_BLUE,
+                        MessageKind::Error => egui::Color32::from_rgb(255, 120, 110),
+                    };
+                    ui.colored_label(color, text);
                 }
             });
         });
