@@ -3,7 +3,7 @@
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::realtime::automation::RtControlClip;
-use crate::realtime::sequencer::{MAX_TRACK_CLIPS, RtMidiClip};
+use crate::realtime::sequencer::MAX_TRACK_CLIPS;
 
 /// Default capacity of the control command queue. When full, new commands are
 /// dropped by the sender (see
@@ -129,13 +129,11 @@ pub enum NoteEvent {
 
 /// Sequencer transport and configuration commands.
 ///
-/// `SetTrackClips` carries an entire `Copy` clip table (8 clips ≈ 6 KB),
-/// making this enum significantly larger than the other variants — a
-/// deliberate trade-off for "zero heap allocation on the real-time side": the
-/// command queue allocates slots for the largest variant (1024 × ≈6 KB ≈ 6 MB,
-/// pre-allocated once). If clip tables grow in the future, this could become a
-/// separate bulk data channel (non-real-time pre-written shared buffer + small
-/// command notification).
+/// Clip tables are **not** here (D15 revision, 2026-10-28): MIDI and control
+/// clip tables carry control-side-owned `Vec`s and ride the structure queue
+/// (`GraphUpdate::SetMidiClips` / `SetControlClips`), so they never inflate the
+/// command-queue slot size. This enum stays small and `Copy`, and the queue
+/// keeps its 1024 slots at a negligible footprint.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy)]
 pub enum SequencerCommand {
@@ -162,12 +160,6 @@ pub enum SequencerCommand {
     /// position is kept — a meter is notation plus a bar length, not a data
     /// transform. Invalid fields are clamped on the real-time side.
     SetTimeSignature { numerator: u8, denominator: u8 },
-    /// Replace one MIDI track's clip table in one block (D15 batch Copy;
-    /// also refreshes the arrangement end, D16).
-    SetTrackClips {
-        track: usize,
-        clips: [RtMidiClip; MAX_TRACK_CLIPS],
-    },
     /// Replace one control track's clip table in one block (D15 batch Copy;
     /// D17: the delivery endpoint stays decided by the automation routing
     /// table, set via `AudioEngine::set_auto_route`).

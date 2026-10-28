@@ -21,7 +21,8 @@
 | # | 决策 | 内容 |
 | :--- | :--- | :--- |
 | D14 | Steps 退役 | `TrackSource::Steps` / pattern / 16-step 面板移除，统一 clip 模型。**未来特性（记录不实施）**：clip 在 timeline 上平铺——一个 clip 的内容在 span 时间段内循环，编辑 clip 即改变整段循环（类似 step 在时段内循环的体验）。为此一期就把 `span_ticks` / `loop_ticks` 语义建进 Clip 模型（调度按周期平铺），UI 一期只做单周期呈现。 |
-| D15 | 引擎定容 Copy | 每轨 ≤ 8 个 clip、单 clip ≤ 64 音符（沿用 `MAX_CLIP_NOTES`）；结构命令**按轨批量**下发（`SetTrackClips` / `SetControlClips`），延续全 Copy 无堆共享的 RT 约束。超容报错不截断（与图容量同哲学）。 |
+| D15 | clip 表走结构队列（2026-10-28 修订） | 每轨 ≤ 8 个 clip；**单 clip 音符 / controller 数不再有引擎侧上限**（原 `MAX_CLIP_NOTES = 64` 是「整表塞进 `Copy` 命令槽」的副产物：真实 MIDI 一轨常 1000+ 音符，导入后直接不可保存）。修订后 note/ctrl 集合是**控制线程拥有的 `Vec`**：`MidiClipTable` 经结构队列（`GraphUpdate::SetMidiClips`）下发，音频线程 `mem::replace` 换入、把旧表推到 MIDI 垃圾队列由控制线程释放——与 audio clip 表（U6 D4）同一协议。命令队列回到小结构（`SetControlClips` 仍承载定容 `RtControlClip` 表）。文档侧 `MAX_CLIP_NOTES = 65536` 仅作病态文件防线；导入按 `smf::IMPORT_CLIP_NOTES = 4096` 分块（同 start tick 的音符不切开，块数超 `MAX_CLIPS_PER_TRACK` 时自适应放大块长）。 |
+| D25 | clip 数据 vs 命令分离（2026-10-28） | 结构性大数据（MIDI clip 表、audio clip 表）一律走结构队列 + 垃圾回执；命令队列只承载小而 `Copy` 的标量命令。判据：**载荷里带堆所有权（`Vec` / `Arc`）就不得进命令队列**——rtrb 按最大变体预分配，带 `Vec` 的变体只占一个表头（~24 B），定容数组变体却会把整条队列撑到 MB 级。 |
 | D16 | 编曲长度内容自适应 | arrangement 末尾 = 所有 clip 结束位置向上取整到小节；播放到末尾自动停止；一期不做 loop region。安全上限 256 小节（防病态文档）。 |
 | D17 | control clip 终点由连线决定 | 延续 D7：control 轨在 timeline 上只是时间容器，投递终点由节点图连线（`auto_routes`）决定；clip span 之外不投递（目标保持最后值）。删轨/改图不产生悬空绑定。 |
 
@@ -36,7 +37,7 @@ ControlClip: ( start_ticks, span_ticks, loop_ticks, curve: [AutoPoint] )
 ```
 
 - 移除：`pattern` / `source` / 单 `clip` 字段、`TrackSource`。
-- 校验：每轨 clip ≤ 8、音符 ≤ 64、`span_ticks ≥ loop_ticks`、`start_ticks + span_ticks ≤ 256 小节`；越界报错不截断。
+- 校验：每轨 clip ≤ 8、单 clip 音符 ≤ 65536（病态文件防线，见 D15 修订）、`span_ticks ≥ loop_ticks`、`start_ticks + span_ticks ≤ 256 小节`；越界报错不截断。
 - `PROJECT_VERSION = 4`，无兼容读路径（Q5 延续）。
 
 ## 5. 引擎调度（Sequencer 重写）
@@ -50,6 +51,6 @@ ControlClip: ( start_ticks, span_ticks, loop_ticks, curve: [AutoPoint] )
 
 - [x] **T0 快修**（不动数据模型）：默认音源切 `Clip`（piano roll 立即可听）；移除步进音序器 UI 区块；加/删 MIDI 轨按钮（引擎 `register_track_chain` / `remove_node` 已有，文档与引擎同步）。✅ `5915e99`
 - [x] **T1 模型 v4**：`MidiClip`/`ControlClip` + 校验 + 往返测试；`PROJECT_VERSION = 4`。Steps/Pattern/TrackSource/gate 退役，`AutomationTrack` → `ControlTrack`（clips 顶层化）；UI 过渡期 piano roll / lane 暂编**首 clip**，engine 仍按首 clip 循环调度（SetSource 强制 Clip），窗口调度重写归 T2。
-- [x] **T2 引擎 timeline 调度**：`RtMidiClip`/`RtControlClip` 定容 + `SetTrackClips`/`SetControlClips` 命令 + 窗口调度 + 内容自适应停止 + automation clip 求值。✅ `Sequencer` 重写为绝对时间窗口扫描（clip 平铺 `start + k·loop`、span 边界截断、arrangement end 自动停但 pending off 继续放完）；`SetPattern/SetSource/SetGate/SetClip/SetAutoTrack` 全部退役（engine 默认 clip span=0=空表）；控制轨求值改为首个覆盖当前位置的 clip。
+- [x] **T2 引擎 timeline 调度**：`RtMidiClip`/`RtControlClip` + clip 表下发（T2 时经命令队列；2026-10-28 起 MIDI 表改走结构队列，见 D15 修订 / D25）+ 窗口调度 + 内容自适应停止 + automation clip 求值。✅ `Sequencer` 重写为绝对时间窗口扫描（clip 平铺 `start + k·loop`、span 边界截断、arrangement end 自动停但 pending off 继续放完）；`SetPattern/SetSource/SetGate/SetClip/SetAutoTrack` 全部退役（engine 默认 clip span=0=空表）；控制轨求值改为首个覆盖当前位置的 clip。
 - [x] **T3 编曲视图**：`timeline.rs`——行 = 轨、clip 块（拖动移位/拖边调长/删除）、双击跳转 Edit 标签页（piano roll / lane 复用）、轨头（增删轨/静音/选择）、标尺与小节网格、播放头。
 - [x] **T4 画布 timeline 节点**：显式 Timeline 节点（无输入、n 输出口、不可删除），per-track 源小节点从画布移除；`PortRef::MidiTrack/AutoTrack` 语义不变，纯呈现层合并。✅ 画布单 Timeline 实体（端口 = MIDI 轨 + control 轨，带 T/A 标签），`timeline_port_ref` 为端口→轨映射唯一真源；`CanvasId::MidiTrack/AutoTrack` 退役。**2026-10-26 扩展**：端口序 = **MIDI → Curve → Audio**，映射唯一真源改 `timeline_port_kind`（`TimelinePort::{Midi,Auto,Audio}`）；U6 的 `NodeDoc::AudioTrack` 节点也折进 timeline node（不再单独画框，端口标签 T/C/A），见 `audio-track.md` §4 补充决策。

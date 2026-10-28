@@ -57,6 +57,10 @@ pub struct AudioEngine {
     /// by [`AudioEngine::reclaim_audio_clips`] — the audio thread only
     /// moves them into this queue, never drops them.
     audio_trash: rtrb::Consumer<crate::realtime::audio_track::AudioClipTable>,
+    /// Displaced MIDI clip tables (D15 revision): drained by
+    /// [`AudioEngine::reclaim_midi_clips`]. The tables own `Vec`s, so the
+    /// audio thread must never drop them.
+    midi_trash: rtrb::Consumer<crate::realtime::MidiClipTable>,
     /// Control-side graph state (non-real-time): authoritative topology copy +
     /// execution plan compiler. Entirely `Copy`, so the whole snapshot can be
     /// rolled back when a queue push fails.
@@ -104,6 +108,7 @@ impl AudioEngine {
         let (recycle_tx, recycle_rx) = recycle_channel();
         let (audio_trash_tx, audio_trash_rx) =
             crate::realtime::audio_track::audio_clip_trash_channel();
+        let (midi_trash_tx, midi_trash_rx) = crate::realtime::midi_clip_trash_channel();
         let mut runner = BlockRunner::new(
             FIXED_BLOCK_SIZE,
             stream_config.channels as usize,
@@ -114,6 +119,7 @@ impl AudioEngine {
             structure_rx,
             recycle_tx,
             audio_trash_tx,
+            midi_trash_tx,
             feedback.clone(),
         );
 
@@ -139,6 +145,7 @@ impl AudioEngine {
             structure: structure_tx,
             recycle: recycle_rx,
             audio_trash: audio_trash_rx,
+            midi_trash: midi_trash_rx,
             compiler,
             offline_runner: None,
             feedback,
@@ -170,6 +177,7 @@ impl AudioEngine {
         let (recycle_tx, recycle_rx) = recycle_channel();
         let (audio_trash_tx, audio_trash_rx) =
             crate::realtime::audio_track::audio_clip_trash_channel();
+        let (midi_trash_tx, midi_trash_rx) = crate::realtime::midi_clip_trash_channel();
         let runner = BlockRunner::new(
             FIXED_BLOCK_SIZE,
             2,
@@ -180,6 +188,7 @@ impl AudioEngine {
             structure_rx,
             recycle_tx,
             audio_trash_tx,
+            midi_trash_tx,
             feedback.clone(),
         );
         Ok(Self {
@@ -188,6 +197,7 @@ impl AudioEngine {
             structure: structure_tx,
             recycle: recycle_rx,
             audio_trash: audio_trash_rx,
+            midi_trash: midi_trash_rx,
             compiler,
             offline_runner: Some(runner),
             feedback,
@@ -380,6 +390,31 @@ impl AudioEngine {
     /// `reclaim_nodes`.
     pub fn reclaim_audio_clips(&mut self) {
         while let Ok(_table) = self.audio_trash.pop() {
+            // Dropped here: control-thread deallocation only.
+        }
+    }
+
+    /// Replaces one MIDI track's clip table (D15 revision, 2026-10-28).
+    ///
+    /// The table (built by the caller from the document's `MidiTrack::clips`)
+    /// carries control-side-owned note/controller `Vec`s, so it rides the
+    /// **structure queue** instead of the `Copy` command queue — that is what
+    /// removed the old 64-notes-per-clip cap. The displaced old table comes
+    /// back through the trash queue and is released by
+    /// [`AudioEngine::reclaim_midi_clips`]. Returns `false` if the queue is
+    /// full (the update is dropped — retry on the next edit; playback keeps
+    /// the old table).
+    pub fn send_midi_clips(&mut self, track: usize, clips: crate::realtime::MidiClipTable) -> bool {
+        self.structure
+            .push(GraphUpdate::SetMidiClips { track, clips })
+            .is_ok()
+    }
+
+    /// Drains the displaced-MIDI-clip trash queue (D15 revision): drops old
+    /// tables (and their `Vec` allocations) on the **control thread**. The UI
+    /// calls this every frame alongside `reclaim_audio_clips`.
+    pub fn reclaim_midi_clips(&mut self) {
+        while let Ok(_table) = self.midi_trash.pop() {
             // Dropped here: control-thread deallocation only.
         }
     }

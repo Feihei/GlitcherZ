@@ -39,11 +39,12 @@ use glitcherz_engine::Sf2Library;
 use glitcherz_engine::convert;
 use glitcherz_engine::realtime::{
     AudioTrackProcessor, ChannelStripProcessor, Curve, EffectMeters, EngineCommand,
-    FeedbackProcessor, MAX_AUTO_POINTS, MAX_CLIP_CTRLS, MAX_CLIP_NOTES, MAX_MIDI_FANOUT,
-    MAX_TRACK_CLIPS, MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent,
-    ParamId, Processor, RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCtrl, RtCtrlKind,
-    RtCurveInterp, RtMidiClip, RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand,
+    FeedbackProcessor, MAX_AUTO_POINTS, MAX_MIDI_FANOUT, MAX_TRACK_CLIPS, MidiClipTable,
+    MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent, ParamId, Processor,
+    RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCtrl, RtCtrlKind, RtCurveInterp,
+    RtMidiClip, RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand,
     Sf2VoiceProcessor, SynthProcessor, Unit, empty_clip_table,
+    empty_midi_clip_table,
 };
 use glitcherz_model::{
     AutoParam, AutoPoint, CableKind, ControlClip, ControlTrack, CtrlKind, CurveInterp,
@@ -3037,10 +3038,12 @@ impl GlitcherZApp {
         self.register_track_chain(track);
     }
 
-    /// Document clip table → engine representation (D15 batch, truncated to capacity, `Copy`
-    /// structs, zero heap allocation).
-    fn rt_clips(&self, track: usize) -> [RtMidiClip; MAX_TRACK_CLIPS] {
-        let mut clips = [RtMidiClip::default(); MAX_TRACK_CLIPS];
+    /// Document clip table → engine representation (D15 revision): the note and
+    /// controller vectors are built here, on the control thread, where
+    /// allocation is allowed; the audio thread only reads them. **Nothing is
+    /// truncated** — a clip holds as many notes as the document does.
+    fn rt_clips(&self, track: usize) -> MidiClipTable {
+        let mut clips = empty_midi_clip_table();
         for (slot, clip) in clips
             .iter_mut()
             .zip(self.project().midi_tracks[track].clips.iter())
@@ -3051,7 +3054,7 @@ impl GlitcherZApp {
                 loop_ticks: clip.loop_ticks,
                 ..RtMidiClip::default()
             };
-            for note in clip.notes().iter().take(MAX_CLIP_NOTES) {
+            for note in clip.notes() {
                 rt.push(RtNote::new(
                     note.start,
                     note.length,
@@ -3062,7 +3065,7 @@ impl GlitcherZApp {
             }
             // P0: controller events ride along with the clip they belong to —
             // imported CC/bend must sound, not vanish at the document edge.
-            for ctrl in clip.sequence.ctrls.iter().take(MAX_CLIP_CTRLS) {
+            for ctrl in &clip.sequence.ctrls {
                 rt.push_ctrl(RtCtrl::new(
                     ctrl.tick,
                     ctrl.channel,
@@ -3078,7 +3081,11 @@ impl GlitcherZApp {
     /// Push the current clip table of one track (D15 batch).
     fn send_track_clips(&mut self, track: usize) {
         let clips = self.rt_clips(track);
-        self.send_sequencer(SequencerCommand::SetTrackClips { track, clips });
+        // D15 revision: clip tables ride the structure queue (they own `Vec`s);
+        // a full queue drops the update, and the next edit re-sends it.
+        if !self.engine.send_midi_clips(track, clips) {
+            log::warn!("structure queue full: MIDI clips of track {track} not updated");
+        }
     }
 
     /// Re-push every track's clip table to the sequencer.
@@ -3290,6 +3297,14 @@ impl GlitcherZApp {
             self.set_message(format!("No notes found in {}", display_name(source)));
             return;
         }
+        // D15 revision: a dense track arrives as several clips (chunked by the
+        // importer). Say so — a sudden row of clips must not look like a bug.
+        let split_tracks = imported.iter().filter(|t| t.clips.len() > 1).count();
+        let split_clips = imported
+            .iter()
+            .filter(|t| t.clips.len() > 1)
+            .map(|t| t.clips.len())
+            .sum::<usize>();
         let unwritten = project_files::is_unwritten(self.project());
         let plan = project_files::plan_import(&self.project().midi_tracks, imported_len);
         let before = self.begin_edit();
@@ -3323,6 +3338,11 @@ impl GlitcherZApp {
         }
         let skipped = imported_len.saturating_sub(placed);
         let mut message = format!("Imported {placed} track(s) from {}", display_name(source));
+        if split_tracks > 0 {
+            message.push_str(&format!(
+                " — {split_tracks} dense track(s) split into {split_clips} clips"
+            ));
+        }
         if skipped > 0 {
             message.push_str(&format!(
                 " — {skipped} skipped (track limit {MAX_MIDI_TRACKS})"
@@ -3925,10 +3945,7 @@ impl GlitcherZApp {
         // The three clip-table pushes (control clips keep automation — and
         // the tempo curve — live in the export; audio clips included).
         for track in 0..self.project().midi_tracks.len() {
-            let _ = engine.send(EngineCommand::Sequencer(SequencerCommand::SetTrackClips {
-                track,
-                clips: self.rt_clips(track),
-            }));
+            let _ = engine.send_midi_clips(track, self.rt_clips(track));
         }
         for index in 0..self.project().control_tracks.len() {
             let Some(control_track) = self.project().control_tracks.get(index) else {
@@ -9129,6 +9146,9 @@ impl eframe::App for GlitcherZApp {
         // the old `Arc<SampleData>` refcounts; same frame cadence as the
         // node recycling above).
         self.engine.reclaim_audio_clips();
+        // D15 revision: same cadence for displaced MIDI clip tables (their
+        // `Vec`s must be released on the control thread).
+        self.engine.reclaim_midi_clips();
 
         // Transport stop edge: automation no longer overrides; restore manual parameter values
         // per node.

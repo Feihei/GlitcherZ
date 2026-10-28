@@ -338,6 +338,20 @@ pub enum GraphUpdate {
         /// The new clip table (built on the control thread).
         clips: crate::realtime::audio_track::AudioClipTable,
     },
+    /// Replaces one MIDI track's clip table (D15 revision, 2026-10-28).
+    ///
+    /// The table carries control-side-owned note/controller `Vec`s, so it
+    /// cannot ride the `Copy` command queue — this is the "bulk data channel"
+    /// the old D15 note anticipated. The block runner peels this variant
+    /// before the graph sees it (see [`Self::SetAudioClips`]); the displaced
+    /// table is moved to the MIDI trash queue and dropped on the control
+    /// thread. There is **no** per-clip note cap any more.
+    SetMidiClips {
+        /// Target track index (the document's `midi_tracks` order).
+        track: usize,
+        /// The new clip table (built on the control thread).
+        clips: crate::realtime::sequencer::MidiClipTable,
+    },
 }
 
 /// One node install: control-side-constructed processor + dedicated output

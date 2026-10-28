@@ -73,19 +73,21 @@ pub fn ticks_per_bar_of(numerator: u8, denominator: u8) -> u32 {
 /// Lowest note-on velocity (a note-off; silence).
 pub const MIN_VELOCITY: u8 = 1;
 
-/// Maximum number of notes per clip (D15; mirrors `glitcherz_model::MAX_CLIP_NOTES`).
-pub const MAX_CLIP_NOTES: usize = 64;
-
 /// Maximum number of clips per track (D15; mirrors `glitcherz_model::MAX_CLIPS_PER_TRACK`).
 pub const MAX_TRACK_CLIPS: usize = 8;
 
-/// Maximum number of controller events per clip (P0, spec
-/// `roll-multiclip.md` D14; mirrors `glitcherz_model::MAX_CLIP_CTRLS`).
-///
-/// Controllers are point events with no length, so a dense pitch curve in an
-/// imported file crowds this budget faster than notes do: a bend sampled at a
-/// sixteenth-note rate over two 4/4 bars is already 32 events.
-pub const MAX_CLIP_CTRLS: usize = 32;
+/// Trash-queue capacity for displaced MIDI clip tables (D15 revision,
+/// 2026-10-28). The control thread drains it every UI frame; 64 slots absorb
+/// an edit storm before updates start parking.
+pub const MIDI_CLIP_TRASH_CAPACITY: usize = 64;
+
+/// Creates the MIDI-clip trash channel pair (D15 revision): the producer end
+/// goes to the block runner (the audio thread pushes displaced tables), the
+/// consumer end to the engine (the control thread drains and drops them).
+/// **Not RT-safe**; call only before the stream starts.
+pub fn midi_clip_trash_channel() -> (rtrb::Producer<MidiClipTable>, rtrb::Consumer<MidiClipTable>) {
+    rtrb::RingBuffer::new(MIDI_CLIP_TRASH_CAPACITY)
+}
 
 /// Audio-thread-side controller kind (mirrors `glitcherz_model::CtrlKind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,8 +208,19 @@ impl RtNote {
 }
 
 /// Audio-thread-side representation of a MIDI clip placed on the arrangement
-/// timeline (mirrors `glitcherz_model::MidiClip`, fixed-capacity `Copy`; D14/D15).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// timeline (mirrors `glitcherz_model::MidiClip`; D15 as revised 2026-10-28).
+///
+/// **Ownership protocol (D15 revision)**: note and controller collections are
+/// `Vec`s *owned by the control side*. A table is built on the control thread
+/// (where allocation is allowed), travels through the **structure queue** (not
+/// the fixed-size command queue), and is swapped in on the audio thread with
+/// `mem::replace`; the displaced table travels back through the trash queue and
+/// is dropped on the control thread. The audio thread only ever **reads** these
+/// vectors — no allocation, no deallocation, no locks.
+///
+/// This is why there is no per-clip note cap any more: the old design capped
+/// clips at 64 notes so a whole clip table fit in a `Copy` command slot.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RtMidiClip {
     /// Absolute start position on the arrangement (in ticks).
     pub start_ticks: u32,
@@ -215,15 +228,10 @@ pub struct RtMidiClip {
     pub span_ticks: u32,
     /// Content loop length (in ticks).
     pub loop_ticks: u32,
-    /// Note collection (the first `note_count` are valid, relative to the clip start).
-    pub notes: [RtNote; MAX_CLIP_NOTES],
-    /// Number of valid notes.
-    pub note_count: usize,
-    /// Controller collection (the first `ctrl_count` are valid, relative to
-    /// the clip start; P0).
-    pub ctrls: [RtCtrl; MAX_CLIP_CTRLS],
-    /// Number of valid controller events.
-    pub ctrl_count: usize,
+    /// Notes, relative to the clip start.
+    pub notes: Vec<RtNote>,
+    /// Controller events, relative to the clip start (P0).
+    pub ctrls: Vec<RtCtrl>,
 }
 
 impl Default for RtMidiClip {
@@ -235,30 +243,39 @@ impl Default for RtMidiClip {
             // own placement.
             span_ticks: 0,
             loop_ticks: TICKS_PER_BAR,
-            notes: [RtNote::default(); MAX_CLIP_NOTES],
-            note_count: 0,
-            ctrls: [RtCtrl::default(); MAX_CLIP_CTRLS],
-            ctrl_count: 0,
+            notes: Vec::new(),
+            ctrls: Vec::new(),
         }
     }
 }
 
 impl RtMidiClip {
-    /// Appends a note; silently dropped beyond [`MAX_CLIP_NOTES`].
+    /// Appends a note.
+    ///
+    /// **Control thread only** — this may grow the vector, which the real-time
+    /// rules forbid on the audio thread.
     pub fn push(&mut self, note: RtNote) {
-        if self.note_count < MAX_CLIP_NOTES {
-            self.notes[self.note_count] = note;
-            self.note_count += 1;
-        }
+        self.notes.push(note);
     }
 
-    /// Appends a controller event; silently dropped beyond [`MAX_CLIP_CTRLS`].
+    /// Appends a controller event. **Control thread only** (see [`Self::push`]).
     pub fn push_ctrl(&mut self, ctrl: RtCtrl) {
-        if self.ctrl_count < MAX_CLIP_CTRLS {
-            self.ctrls[self.ctrl_count] = ctrl;
-            self.ctrl_count += 1;
-        }
+        self.ctrls.push(ctrl);
     }
+
+    /// Whether the clip carries no content at all.
+    pub fn is_empty(&self) -> bool {
+        self.notes.is_empty() && self.ctrls.is_empty()
+    }
+}
+
+/// Clip table of one MIDI track: at most [`MAX_TRACK_CLIPS`] clips, indexed
+/// exactly like the document's `MidiTrack::clips` order (D15).
+pub type MidiClipTable = [RtMidiClip; MAX_TRACK_CLIPS];
+
+/// An empty table (no clips — silent track).
+pub fn empty_midi_clip_table() -> MidiClipTable {
+    std::array::from_fn(|_| RtMidiClip::default())
 }
 
 /// Multi-track sequencer over the arrangement timeline: one global transport
@@ -307,9 +324,9 @@ pub struct Sequencer {
     /// via `SetMidiTrackCount`, scheduling only scans `0..track_count`;
     /// unconfigured tracks have default-empty clip tables).
     track_count: usize,
-    /// Per-track clip tables (D15: ≤ [`MAX_TRACK_CLIPS`] clips each, batch
-    /// replaced via `SetTrackClips`).
-    clips: [[RtMidiClip; MAX_TRACK_CLIPS]; MAX_MIDI_TRACKS],
+    /// Per-track clip tables (D15 revision: ≤ [`MAX_TRACK_CLIPS`] clips each,
+    /// replaced one track at a time through the structure queue).
+    clips: [MidiClipTable; MAX_MIDI_TRACKS],
     /// Per-control-track clip tables (D15/D17).
     control_clips: [[RtControlClip; MAX_TRACK_CLIPS]; MAX_AUTO_TRACKS],
     /// Arrangement end in ticks (D16: the latest clip end rounded up to a
@@ -346,7 +363,7 @@ impl Sequencer {
             bar_ticks: TICKS_PER_BAR,
             position_ticks: 0.0,
             track_count: crate::realtime::DEFAULT_MIDI_TRACKS,
-            clips: [[RtMidiClip::default(); MAX_TRACK_CLIPS]; MAX_MIDI_TRACKS],
+            clips: std::array::from_fn(|_| empty_midi_clip_table()),
             control_clips: [[RtControlClip::default(); MAX_TRACK_CLIPS]; MAX_AUTO_TRACKS],
             arrangement_end_ticks: 0,
             arrangement_floor_ticks: 0,
@@ -561,13 +578,15 @@ impl Sequencer {
         self.bar_ticks
     }
 
-    /// Replaces one MIDI track's clip table in one block (D15 batch; out-of-range
-    /// tracks ignored). Also refreshes the arrangement end. RT-safe.
-    pub fn set_track_clips(&mut self, track: usize, clips: [RtMidiClip; MAX_TRACK_CLIPS]) {
-        if let Some(slot) = self.clips.get_mut(track) {
-            *slot = clips;
-            self.refresh_arrangement_end();
-        }
+    /// Replaces one MIDI track's clip table in one block (D15 revision; the
+    /// displaced table is returned so the caller can move it to the trash
+    /// queue — the audio thread must never drop it). Out-of-range tracks are
+    /// ignored and return `None`. Also refreshes the arrangement end. RT-safe.
+    pub fn set_track_clips(&mut self, track: usize, clips: MidiClipTable) -> Option<MidiClipTable> {
+        let slot = self.clips.get_mut(track)?;
+        let displaced = std::mem::replace(slot, clips);
+        self.refresh_arrangement_end();
+        Some(displaced)
     }
 
     /// Replaces one control track's clip table in one block (D15 batch;
@@ -746,12 +765,12 @@ impl Sequencer {
         samples_per_tick: f64,
         sink: &mut dyn SequencerSink,
     ) {
-        let clips = self.clips[track];
-        for clip in &clips {
-            if (clip.note_count == 0 && clip.ctrl_count == 0)
-                || clip.loop_ticks == 0
-                || clip.span_ticks == 0
-            {
+        // Disjoint field borrows: the clip table is read-only while scheduling,
+        // the pending-offs table is written as notes are triggered.
+        let clips = &self.clips[track];
+        let pending = &mut self.pending_offs[track];
+        for clip in clips {
+            if clip.is_empty() || clip.loop_ticks == 0 || clip.span_ticks == 0 {
                 continue;
             }
             let start = f64::from(clip.start_ticks);
@@ -763,7 +782,7 @@ impl Sequencer {
             // off → controller → on ordering). Same tiling as notes, but a
             // controller is a point event — no length, no pending off, no
             // retrigger guard.
-            for ctrl in &clip.ctrls[..clip.ctrl_count] {
+            for ctrl in &clip.ctrls {
                 let offset = f64::from(ctrl.tick_ticks);
                 let mut m = ((t0 - start - offset) / loop_ticks).ceil();
                 if m < 0.0 {
@@ -780,7 +799,7 @@ impl Sequencer {
                     m += 1.0;
                 }
             }
-            for note in &clip.notes[..clip.note_count] {
+            for note in &clip.notes {
                 let start_offset = f64::from(note.start_ticks);
                 let length = f64::from(note.length_ticks.max(1));
                 // The m-th occurrence is at start + m·loop + s; find the first
@@ -802,7 +821,7 @@ impl Sequencer {
                         // would overwrite the single pending-off slot,
                         // leaving the old voice hanging forever on
                         // pitch-matching plugins. Release it first instead.
-                        for slot in self.pending_offs[track].iter_mut() {
+                        for slot in pending.iter_mut() {
                             if let Some((_, pending_note)) = *slot {
                                 if pending_note == note.note {
                                     *slot = None;
@@ -817,8 +836,8 @@ impl Sequencer {
                                 velocity,
                             },
                         );
-                        self.set_pending_off(
-                            track,
+                        set_pending_off(
+                            pending,
                             on_tick + length,
                             t0,
                             block_start,
@@ -831,48 +850,48 @@ impl Sequencer {
             }
         }
     }
+}
 
-    /// Records a note off: converted to an absolute sample position, landing
-    /// at least in the next block (guaranteeing the off comes after the on
-    /// already emitted in the same block). The sample clock is continuous
-    /// across a song-loop wrap, so an off whose tick lands beyond the loop
-    /// end still fires at `on + length` — no wrap mapping needed (U1).
-    /// RT-safe.
-    #[allow(clippy::too_many_arguments)]
-    fn set_pending_off(
-        &mut self,
-        track: usize,
-        off_tick: f64,
-        t0: f64,
-        block_start: u64,
-        samples_per_tick: f64,
-        note: u8,
-    ) {
-        let offset_samples = ((off_tick - t0) * samples_per_tick).max(1.0);
-        let at = block_start + offset_samples as u64;
-        let slots = &mut self.pending_offs[track];
-        // Reuse the slot already holding this pitch, else take the first free
-        // one; if every slot is busy, fall back to slot 0.
-        let mut target = None;
-        for (i, slot) in slots.iter().enumerate() {
-            match slot {
-                Some((_, held)) if *held == note => {
-                    target = Some(i);
-                    break;
-                }
-                None if target.is_none() => target = Some(i),
-                _ => {}
+/// Records a note off: converted to an absolute sample position, landing at
+/// least in the next block (guaranteeing the off comes after the on already
+/// emitted in the same block). The sample clock is continuous across a
+/// song-loop wrap, so an off whose tick lands beyond the loop end still fires
+/// at `on + length` — no wrap mapping needed (U1).
+///
+/// A free function (not a `Sequencer` method) so the caller can hold the clip
+/// table and the pending-off table as disjoint borrows. RT-safe.
+#[allow(clippy::too_many_arguments)]
+fn set_pending_off(
+    slots: &mut [Option<(u64, u8)>; MAX_PENDING_OFFS_PER_TRACK],
+    off_tick: f64,
+    t0: f64,
+    block_start: u64,
+    samples_per_tick: f64,
+    note: u8,
+) {
+    let offset_samples = ((off_tick - t0) * samples_per_tick).max(1.0);
+    let at = block_start + offset_samples as u64;
+    // Reuse the slot already holding this pitch, else take the first free one;
+    // if every slot is busy, fall back to slot 0.
+    let mut target = None;
+    for (i, slot) in slots.iter().enumerate() {
+        match slot {
+            Some((_, held)) if *held == note => {
+                target = Some(i);
+                break;
             }
+            None if target.is_none() => target = Some(i),
+            _ => {}
         }
-        slots[target.unwrap_or(0)] = Some((at, note));
     }
+    slots[target.unwrap_or(0)] = Some((at, note));
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BPM, MAX_CLIP_CTRLS, MAX_CLIP_NOTES, MAX_TRACK_CLIPS, RtCtrl, RtCtrlKind, RtMidiClip,
-        RtNote, Sequencer, SequencerSink, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP,
+        MAX_BPM, MAX_TRACK_CLIPS, RtCtrl, RtCtrlKind, RtMidiClip, RtNote, Sequencer, SequencerSink,
+        TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, empty_midi_clip_table,
     };
     use crate::realtime::MAX_MIDI_TRACKS;
     use crate::realtime::automation::{MAX_AUTO_TRACKS, RtAutoPoint, RtControlClip};
@@ -978,9 +997,9 @@ mod tests {
         for note in notes {
             clip.push(*note);
         }
-        let mut clips = [RtMidiClip::default(); MAX_TRACK_CLIPS];
+        let mut clips = empty_midi_clip_table();
         clips[0] = clip;
-        seq.set_track_clips(track, clips);
+        let _ = seq.set_track_clips(track, clips);
     }
 
     /// One clip on one track carrying only controller events (P0).
@@ -1001,9 +1020,9 @@ mod tests {
         for ctrl in ctrls {
             clip.push_ctrl(*ctrl);
         }
-        let mut clips = [RtMidiClip::default(); MAX_TRACK_CLIPS];
+        let mut clips = empty_midi_clip_table();
         clips[0] = clip;
-        seq.set_track_clips(track, clips);
+        let _ = seq.set_track_clips(track, clips);
     }
 
     /// A CC event at `tick`, channel 0.
@@ -1021,19 +1040,17 @@ mod tests {
             .collect()
     }
 
-    /// P0: the controller table is fixed-capacity — events past the limit are
-    /// dropped rather than overwriting a neighbour.
+    /// D15 revision: a clip's controller collection is a control-side `Vec` —
+    /// nothing is dropped at any realistic density (a dense imported pitch bend
+    /// used to be truncated at 32 events).
     #[test]
-    fn clip_ctrl_table_is_fixed_capacity() {
+    fn clip_ctrl_collection_is_not_capped() {
         let mut clip = RtMidiClip::default();
-        for i in 0..(MAX_CLIP_CTRLS + 4) {
-            clip.push_ctrl(RtCtrl::new(i as i64, 0, RtCtrlKind::Cc(1), i as i32));
+        for i in 0..256 {
+            clip.push_ctrl(RtCtrl::new(i, 0, RtCtrlKind::Cc(1), i as i32));
         }
-        assert_eq!(clip.ctrl_count, MAX_CLIP_CTRLS);
-        assert_eq!(
-            clip.ctrls[MAX_CLIP_CTRLS - 1].tick_ticks as usize,
-            MAX_CLIP_CTRLS - 1
-        );
+        assert_eq!(clip.ctrls.len(), 256);
+        assert_eq!(clip.ctrls[255].tick_ticks, 255);
     }
 
     /// P0: a clip's controller event is delivered once, on its own track, in
@@ -1092,9 +1109,9 @@ mod tests {
         };
         clip.push(clip_note(0, 96, 60));
         clip.push_ctrl(RtCtrl::new(0, 0, RtCtrlKind::PitchBend, 4096));
-        let mut clips = [RtMidiClip::default(); MAX_TRACK_CLIPS];
+        let mut clips = empty_midi_clip_table();
         clips[0] = clip;
-        seq.set_track_clips(0, clips);
+        let _ = seq.set_track_clips(0, clips);
         seq.play();
 
         let mut order = Order(Vec::new());
@@ -1301,8 +1318,8 @@ mod tests {
         seq.set_control_clips(0, clips);
         assert_eq!(seq.arrangement_end_ticks(), 6 * TICKS_PER_BAR);
         // Removing all content makes the arrangement unbounded again.
-        seq.set_track_clips(0, [RtMidiClip::default(); MAX_TRACK_CLIPS]);
-        seq.set_track_clips(1, [RtMidiClip::default(); MAX_TRACK_CLIPS]);
+        let _ = seq.set_track_clips(0, empty_midi_clip_table());
+        let _ = seq.set_track_clips(1, empty_midi_clip_table());
         seq.set_control_clips(0, [RtControlClip::default(); MAX_TRACK_CLIPS]);
         assert_eq!(seq.arrangement_end_ticks(), 0);
     }
@@ -1434,16 +1451,32 @@ mod tests {
         assert_eq!(offs, 2, "every note should have a length-based off");
     }
 
+    /// D15 revision: no per-clip note cap — a 300-note clip (a dense imported
+    /// piano track) plays every note instead of silently losing the tail.
     #[test]
-    fn clip_over_capacity_is_truncated() {
-        let mut clip = RtMidiClip::default();
-        for i in 0..(MAX_CLIP_NOTES + 10) {
-            clip.push(clip_note(i as u32 * TICKS_PER_STEP, TICKS_PER_STEP, 60));
+    fn dense_clip_plays_every_note() {
+        let mut clip = RtMidiClip {
+            span_ticks: 600,
+            loop_ticks: 600,
+            ..RtMidiClip::default()
+        };
+        for i in 0..300u32 {
+            clip.push(clip_note(i * 2, 1, 60));
         }
-        assert_eq!(
-            clip.note_count, MAX_CLIP_NOTES,
-            "notes beyond capacity should be dropped"
-        );
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        let mut clips = empty_midi_clip_table();
+        clips[0] = clip;
+        let _ = seq.set_track_clips(0, clips);
+        seq.play();
+
+        // 130 blocks ≈ 665 ticks at 120 BPM: past the clip's 600-tick span.
+        let events = run(&mut seq, 130);
+        let count = events
+            .iter()
+            .filter(|(_, e)| matches!(e, NoteEvent::On { .. }))
+            .count();
+        assert_eq!(count, 300, "every note of a dense clip must fire");
     }
 
     #[test]
@@ -1472,9 +1505,9 @@ mod tests {
         for i in 0..16u32 {
             clip.push(clip_note(i * TICKS_PER_STEP, TICKS_PER_STEP, 60));
         }
-        let mut clips = [RtMidiClip::default(); MAX_TRACK_CLIPS];
+        let mut clips = empty_midi_clip_table();
         clips[0] = clip;
-        seq.set_track_clips(0, clips);
+        let _ = seq.set_track_clips(0, clips);
 
         let count_ons = |events: &[Event]| {
             events

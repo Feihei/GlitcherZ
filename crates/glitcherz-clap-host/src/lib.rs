@@ -2486,7 +2486,7 @@ mod tests {
             EngineCommand, SequencerCommand, command_channel,
         };
         use glitcherz_engine::realtime::graph::GraphCompiler;
-        use glitcherz_engine::realtime::sequencer::{RtMidiClip, RtNote, Sequencer};
+        use glitcherz_engine::realtime::sequencer::{RtNote, Sequencer, empty_midi_clip_table};
         use glitcherz_engine::realtime::voice::{recycle_channel, structure_channel};
 
         let sr = 48_000.0f32;
@@ -2530,6 +2530,8 @@ mod tests {
         let (recycle_tx, _recycle_rx) = recycle_channel();
         let (audio_trash_tx, _audio_trash_rx) =
             glitcherz_engine::realtime::audio_track::audio_clip_trash_channel();
+        let (midi_trash_tx, _midi_trash_rx) =
+            glitcherz_engine::realtime::sequencer::midi_clip_trash_channel();
         let (mut compiler, graph) = GraphCompiler::default_graph(sr, fixed_block);
         let feedback = Feedback::new();
         let sequencer = Sequencer::new(sr);
@@ -2543,6 +2545,7 @@ mod tests {
             graph_rx,
             recycle_tx,
             audio_trash_tx,
+            midi_trash_tx,
             feedback.clone(),
         );
 
@@ -2556,16 +2559,14 @@ mod tests {
         graph_tx.push(update).expect("structure queue");
 
         // One bar-long note, sequencer velocity 127 (0..1 = 1.0).
-        let mut clips = [RtMidiClip::default(); 8];
+        let mut clips = empty_midi_clip_table();
         clips[0].start_ticks = 0;
         clips[0].span_ticks = 384;
         clips[0].loop_ticks = 384;
         clips[0].push(RtNote::new(0, 384, 60, 0, 127));
-        tx.push(EngineCommand::Sequencer(SequencerCommand::SetTrackClips {
-            track: 0,
-            clips,
-        }))
-        .expect("queue");
+        graph_tx
+            .push(glitcherz_engine::realtime::graph::GraphUpdate::SetMidiClips { track: 0, clips })
+            .expect("structure queue");
 
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
             .expect("queue");
@@ -2656,17 +2657,20 @@ mod tests {
         // release. A single per-track pending-off slot used to orphan the first
         // note, leaving Dexed's voice sounding forever — heard as a stuck /
         // arpeggiated drone that a blanket `Off { note: 0 }` cannot clear.
-        let mut chords = [RtMidiClip::default(); 8];
+        let mut chords = empty_midi_clip_table();
         chords[0].start_ticks = 0;
         chords[0].span_ticks = 384;
         chords[0].loop_ticks = 384;
         chords[0].push(RtNote::new(0, 384, 58, 0, 100)); // Bb3
         chords[0].push(RtNote::new(0, 384, 53, 0, 100)); // F3
-        tx.push(EngineCommand::Sequencer(SequencerCommand::SetTrackClips {
-            track: 0,
-            clips: chords,
-        }))
-        .expect("queue");
+        graph_tx
+            .push(
+                glitcherz_engine::realtime::graph::GraphUpdate::SetMidiClips {
+                    track: 0,
+                    clips: chords,
+                },
+            )
+            .expect("structure queue");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
             .expect("queue");
         let mut held_peak = 0.0f32;

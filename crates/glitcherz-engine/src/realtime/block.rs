@@ -129,6 +129,13 @@ pub struct BlockRunner {
     /// retried every block before new traffic. Only reachable if the
     /// control thread stops draining for ~64 updates.
     audio_trash_pending: Option<crate::realtime::audio_track::AudioClipTable>,
+    /// Displaced MIDI clip tables (D15 revision): same protocol as
+    /// `audio_trash` — pushed here by the audio thread, drained and dropped by
+    /// [`crate::engine::AudioEngine`]. The tables own `Vec`s, so dropping them
+    /// here would deallocate on the real-time thread.
+    midi_trash: rtrb::Producer<crate::realtime::sequencer::MidiClipTable>,
+    /// Parked MIDI table that did not fit the trash queue last block.
+    midi_trash_pending: Option<crate::realtime::sequencer::MidiClipTable>,
     feedback: Feedback,
     played_samples: u64,
 }
@@ -149,6 +156,7 @@ impl BlockRunner {
         structure: Consumer<GraphUpdate>,
         recycle: rtrb::Producer<RecycledNode>,
         audio_trash: rtrb::Producer<crate::realtime::audio_track::AudioClipTable>,
+        midi_trash: rtrb::Producer<crate::realtime::sequencer::MidiClipTable>,
         feedback: Feedback,
     ) -> Self {
         Self {
@@ -167,6 +175,8 @@ impl BlockRunner {
             recycle,
             audio_trash,
             audio_trash_pending: None,
+            midi_trash,
+            midi_trash_pending: None,
             feedback,
             played_samples: 0,
         }
@@ -218,6 +228,13 @@ impl BlockRunner {
                     // queue — a move, never a drop on this thread.
                     if let Some(trashed) = self.graph.set_audio_clips(node_id, clips) {
                         self.trash_audio_clips(trashed);
+                    }
+                }
+                GraphUpdate::SetMidiClips { track, clips } => {
+                    // D15 revision: the sequencer's displaced table owns
+                    // `Vec`s — move it to the trash queue, never drop it here.
+                    if let Some(trashed) = self.sequencer.set_track_clips(track, clips) {
+                        self.trash_midi_clips(trashed);
                     }
                 }
                 topology => self.graph.apply_update(topology, &mut self.recycle),
@@ -360,6 +377,24 @@ impl BlockRunner {
         }
     }
 
+    /// Forwards a displaced MIDI clip table to the trash queue (D15 revision).
+    ///
+    /// Same protocol as [`Self::trash_audio_clips`]: park on a full queue and
+    /// retry next block; never deallocate here (the tables own `Vec`s).
+    /// RT-safe.
+    fn trash_midi_clips(&mut self, table: crate::realtime::sequencer::MidiClipTable) {
+        if let Some(parked) = self.midi_trash_pending.take() {
+            if let Err(rtrb::PushError::Full(parked)) = self.midi_trash.push(parked) {
+                self.midi_trash_pending = Some(parked);
+            }
+        }
+        if let Err(rtrb::PushError::Full(table)) = self.midi_trash.push(table) {
+            if let Some(parked) = self.midi_trash_pending.replace(table) {
+                std::mem::forget(parked);
+            }
+        }
+    }
+
     /// Applies one control command at the block boundary.
     fn apply_command(&mut self, cmd: EngineCommand) {
         match cmd {
@@ -447,9 +482,6 @@ impl BlockRunner {
                 numerator,
                 denominator,
             } => self.sequencer.set_time_signature(numerator, denominator),
-            SequencerCommand::SetTrackClips { track, clips } => {
-                self.sequencer.set_track_clips(track, clips);
-            }
             SequencerCommand::SetControlClips { index, clips } => {
                 self.sequencer.set_control_clips(index, clips);
             }
@@ -490,7 +522,7 @@ mod tests {
     use crate::realtime::processor::Processor;
     use crate::realtime::sequencer::{
         MAX_TRACK_CLIPS, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR, TICKS_PER_QUARTER,
-        TICKS_PER_STEP,
+        TICKS_PER_STEP, empty_midi_clip_table,
     };
     use crate::testing::count_positive_crossings;
 
@@ -514,6 +546,8 @@ mod tests {
         let (audio_trash_tx, audio_trash_rx) =
             crate::realtime::audio_track::audio_clip_trash_channel();
         drop(audio_trash_rx);
+        let (midi_trash_tx, midi_trash_rx) = crate::realtime::sequencer::midi_clip_trash_channel();
+        drop(midi_trash_rx);
         let (compiler, graph) = GraphCompiler::default_graph(SR, fixed_block);
         let feedback = Feedback::new();
         let sequencer = Sequencer::new(SR);
@@ -527,6 +561,7 @@ mod tests {
             graph_rx,
             _recycle_tx,
             audio_trash_tx,
+            midi_trash_tx,
             feedback.clone(),
         );
         (runner, tx, graph_tx, feedback, compiler)
@@ -729,7 +764,7 @@ mod tests {
     /// synthesizer sounds → state feedback.
     /// Enqueues a one-clip table for a track: notes at `positions` (16th-note
     /// grid), one bar loop, one bar span.
-    fn send_track_clips(tx: &mut Producer<EngineCommand>, track: usize, notes: &[(u32, u8)]) {
+    fn send_track_clips(tx: &mut Producer<GraphUpdate>, track: usize, notes: &[(u32, u8)]) {
         let mut clip = RtMidiClip {
             span_ticks: TICKS_PER_BAR,
             loop_ticks: TICKS_PER_BAR,
@@ -744,21 +779,18 @@ mod tests {
                 velocity: 100,
             });
         }
-        let mut clips = [RtMidiClip::default(); MAX_TRACK_CLIPS];
+        let mut clips = empty_midi_clip_table();
         clips[0] = clip;
-        tx.push(EngineCommand::Sequencer(SequencerCommand::SetTrackClips {
-            track,
-            clips,
-        }))
-        .expect("queue not full");
+        tx.push(GraphUpdate::SetMidiClips { track, clips })
+            .expect("queue not full");
     }
 
     #[test]
     fn sequencer_drives_synth_through_command_queue() {
-        let (mut runner, mut tx, _voice_tx, feedback, _compiler) = make_runner(128, 2);
+        let (mut runner, mut tx, mut structure_tx, feedback, _compiler) = make_runner(128, 2);
 
         // Clip: track 0 fires A4 at ticks 0/48/96; BPM 240.
-        send_track_clips(&mut tx, 0, &[(0, 69), (48, 69), (96, 69)]);
+        send_track_clips(&mut structure_tx, 0, &[(0, 69), (48, 69), (96, 69)]);
         tx.push(EngineCommand::Sequencer(SequencerCommand::SetBpm(240.0)))
             .expect("queue not full");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
@@ -793,8 +825,8 @@ mod tests {
 
     #[test]
     fn silent_when_sequencer_not_playing() {
-        let (mut runner, mut tx, _voice_tx, feedback, _compiler) = make_runner(128, 2);
-        send_track_clips(&mut tx, 0, &[(0, 60)]);
+        let (mut runner, _tx, mut structure_tx, feedback, _compiler) = make_runner(128, 2);
+        send_track_clips(&mut structure_tx, 0, &[(0, 60)]);
         let mut out = vec![0.0f32; 22_050];
         runner.render_interleaved(&mut out);
         assert!(

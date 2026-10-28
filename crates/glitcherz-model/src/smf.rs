@@ -18,6 +18,16 @@ use crate::{
 pub const MAX_TRACKS: usize = 4096;
 pub const MAX_EVENTS: usize = 5_000_000;
 
+/// Notes per imported clip: the chunk size the importer splits a dense track
+/// at.
+///
+/// A real MIDI track (one piano part, three minutes) routinely holds a few
+/// thousand notes. Before the D15 revision the importer put the whole track in
+/// one clip, which then overflowed the 64-note clip limit and could not be
+/// saved at all. Clips are unbounded now, but the editor stays responsive with
+/// a bounded amount of content per clip, so import chunks at this size.
+pub const IMPORT_CLIP_NOTES: usize = 4_096;
+
 /// A parse failure with the offending byte offset.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("SMF error at byte {offset}: {message}")]
@@ -602,9 +612,25 @@ fn parse_track(
     notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
     // Stable, so same-tick controllers keep their file order.
     ctrls.sort_by_key(|c| c.tick);
-    // The clip sits at the earliest **event**'s absolute tick — a
-    // controller-only track has no note to anchor on; everything becomes
-    // relative to it (our clip semantics), keeping the arrangement position.
+    Ok(MidiTrack {
+        name,
+        clips: split_into_clips(notes, ctrls),
+    })
+}
+
+/// Splits one imported track's **absolute-tick** events into clip-sized
+/// chunks.
+///
+/// A dense track becomes several clips laid end to end (each placed at its
+/// chunk's first event, non-looping: `loop == span`). Chunks are cut between
+/// notes that do *not* share a start tick, so a chord is never split across two
+/// clips. Controller events follow the chunk their tick falls in.
+///
+/// The chunk size starts at [`IMPORT_CLIP_NOTES`] and grows when needed to stay
+/// inside the document's clips-per-track capacity — material is never dropped
+/// here; a track large enough to exceed both limits at once is beyond the
+/// document's sanity bound and gets rejected by the validator instead.
+fn split_into_clips(notes: Vec<Note>, ctrls: Vec<CtrlEvent>) -> Vec<MidiClip> {
     let origin = notes
         .first()
         .map(|n| n.start)
@@ -612,29 +638,69 @@ fn parse_track(
         .chain(ctrls.first().map(|c| c.tick))
         .min()
         .unwrap_or(0);
-    for note in &mut notes {
-        note.start -= origin;
+
+    // Chunk start ticks: the first event, then a new chunk whenever the note
+    // budget is spent. `sat` keeps a pathological track from asking for more
+    // clips than the document holds.
+    let chunk_notes = IMPORT_CLIP_NOTES.max(notes.len().div_ceil(crate::MAX_CLIPS_PER_TRACK));
+    let mut starts: Vec<i64> = vec![origin];
+    let mut in_chunk = 0usize;
+    for (index, note) in notes.iter().enumerate() {
+        if in_chunk >= chunk_notes && note.start != notes[index - 1].start {
+            starts.push(note.start);
+            in_chunk = 0;
+        }
+        in_chunk += 1;
     }
-    for ctrl in &mut ctrls {
-        ctrl.tick -= origin;
-    }
-    let span = notes
-        .iter()
-        .map(|n| n.start + n.length)
-        .chain(ctrls.iter().map(|c| c.tick + 1))
-        .max()
-        .unwrap_or(0)
-        .max(1);
-    Ok(MidiTrack {
-        name,
-        clips: vec![MidiClip {
-            start_ticks: u32::try_from(origin).unwrap_or(u32::MAX),
+
+    let mut clips = Vec::with_capacity(starts.len());
+    for (k, &start) in starts.iter().enumerate() {
+        // A chunk owns notes whose start lies in `[start, next_start)`; the
+        // controller window is the same.
+        let end = starts.get(k + 1).copied();
+        let in_range = |tick: i64| tick >= start && end.is_none_or(|e| tick < e);
+
+        let mut chunk_notes: Vec<Note> = notes
+            .iter()
+            .filter(|n| in_range(n.start))
+            .cloned()
+            .collect();
+        let mut chunk_ctrls: Vec<CtrlEvent> =
+            ctrls.iter().filter(|c| in_range(c.tick)).cloned().collect();
+
+        // The clip sits at its chunk's earliest event (notes and controllers
+        // both count); everything becomes relative to it (our clip semantics).
+        let clip_origin = chunk_notes
+            .iter()
+            .map(|n| n.start)
+            .chain(chunk_ctrls.iter().map(|c| c.tick))
+            .min()
+            .unwrap_or(start);
+        for note in &mut chunk_notes {
+            note.start -= clip_origin;
+        }
+        for ctrl in &mut chunk_ctrls {
+            ctrl.tick -= clip_origin;
+        }
+        let span = chunk_notes
+            .iter()
+            .map(|n| n.start + n.length)
+            .chain(chunk_ctrls.iter().map(|c| c.tick + 1))
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        clips.push(MidiClip {
+            start_ticks: u32::try_from(clip_origin).unwrap_or(u32::MAX),
             span_ticks: u32::try_from(span).unwrap_or(u32::MAX),
             loop_ticks: u32::try_from(span).unwrap_or(u32::MAX),
-            sequence: Sequence { notes, ctrls },
+            sequence: Sequence {
+                notes: chunk_notes,
+                ctrls: chunk_ctrls,
+            },
             legacy_notes: Vec::new(),
-        }],
-    })
+        });
+    }
+    clips
 }
 
 fn entry(map: &mut OpenNotes, key: (u8, u8)) -> &mut Vec<(i64, u8)> {
@@ -650,10 +716,92 @@ fn entry(map: &mut OpenNotes, key: (u8, u8)) -> &mut Vec<(i64, u8)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_EVENTS, export_smf, import_smf, vlq};
+    use super::{MAX_EVENTS, export_smf, import_smf, split_into_clips, vlq};
     use crate::{
         CtrlEvent, CtrlKind, MidiClip, MidiTrack, Note, Project, TICKS_PER_QUARTER, TimeSignature,
     };
+
+    /// A note at `start`, fixed length/pitch/velocity.
+    fn note(start: i64) -> Note {
+        Note {
+            start,
+            length: 8,
+            note: 60,
+            velocity: 100,
+            channel: 0,
+        }
+    }
+
+    /// D15 revision: a dense track is chunked instead of being put in one
+    /// oversized clip — nothing is dropped, clip count stays legal.
+    #[test]
+    fn dense_track_is_split_into_legal_clips() {
+        let notes: Vec<Note> = (0..5_000).map(|i| note(i * 4)).collect();
+        let clips = split_into_clips(notes, Vec::new());
+
+        assert_eq!(clips.len(), 2, "5000 notes / 4096 per clip = 2 chunks");
+        assert_eq!(clips[0].sequence.notes.len(), super::IMPORT_CLIP_NOTES);
+        assert_eq!(
+            clips[1].sequence.notes.len(),
+            5_000 - super::IMPORT_CLIP_NOTES
+        );
+        // Both clips are non-looping single periods placed end to end.
+        for clip in &clips {
+            assert_eq!(clip.loop_ticks, clip.span_ticks);
+        }
+        // Chunks are placed end to end; the first clip's span reaches one
+        // note length past the cut (its last note), which is fine — the second
+        // clip simply starts while that note still rings.
+        assert_eq!(clips[1].start_ticks, 4_096 * 4);
+        assert!(clips[0].span_ticks >= clips[1].start_ticks);
+        // Timeline positions are preserved: absolute = start_ticks + relative.
+        let absolute: Vec<i64> = clips
+            .iter()
+            .flat_map(|clip| {
+                clip.sequence
+                    .notes
+                    .iter()
+                    .map(move |n| i64::from(clip.start_ticks) + n.start)
+            })
+            .collect();
+        assert_eq!(absolute, (0..5_000).map(|i| i * 4).collect::<Vec<_>>());
+    }
+
+    /// The reported bug: a 294-note imported clip used to overflow the old
+    /// 64-note cap and could not be saved at all.
+    #[test]
+    fn imported_dense_track_stays_savable() {
+        let mut clip = MidiClip::new(0);
+        for i in 0..300 {
+            clip.sequence.notes.push(Note {
+                start: i * 8,
+                length: 8,
+                note: 60 + (i % 12) as u8,
+                velocity: 100,
+                channel: 0,
+            });
+        }
+        let bytes = export_smf(&project_with(
+            vec![MidiTrack {
+                name: "dense".to_string(),
+                clips: vec![clip],
+            }],
+            120.0,
+        ));
+
+        let imported = import_smf(&bytes).expect("parse");
+        assert_eq!(imported.tracks.len(), 1);
+        assert_eq!(imported.tracks[0].clips.len(), 1, "300 notes fit one clip");
+        assert_eq!(imported.tracks[0].clips[0].sequence.notes.len(), 300);
+
+        // A default project's graph already wires one timeline port per
+        // default track, so the imported track takes slot 0.
+        let mut project = Project::default();
+        project.midi_tracks[0] = imported.tracks.into_iter().next().expect("one track");
+        project
+            .validate()
+            .expect("an imported dense track must be savable");
+    }
 
     fn project_with(tracks: Vec<MidiTrack>, bpm: f64) -> Project {
         let mut project = Project::default();

@@ -574,7 +574,22 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 
 **`RtCtrlKind` 不能用 `#[derive(Default)]` + `#[default]`**：`#[default]` 只允许 unit 变体，首变体是 `Cc(u8)` → 手写 `Default`（`Cc(0)`），供 `[RtCtrl; MAX_CLIP_CTRLS]` 的数组初始化。
 
-**定容与内存**：`MAX_CLIP_CTRLS = 32`（controller 是零长度点事件，密集弯音比音符更快吃满上限）；`RtCtrl` 12 字节 → `RtMidiClip` 从 ~1.0 KB 涨到 ~1.4 KB，`SequencerCommand::SetTrackClips` 单条涨约 30%，队列按元素大小预分配故可接受（`commands.rs` 的注释已记该取舍）。
+**定容与内存（2026-10-28 已作废，见下条）**：~~`MAX_CLIP_CTRLS = 32`…队列按元素大小预分配故可接受~~——该取舍正是 64 音符上限的成因，D15 修订后定容数组整体退场。
+
+### clip 表改走结构队列（D15 修订，2026-10-28）
+
+**触发**：导入一段 294 音符的 MIDI → 保存报 `MIDI track #0 clip #0 holds 294 notes, exceeding the limit 64`。旧 D15 让整张 clip 表（`[RtMidiClip; 8]`，音符/controller 定容数组）搭 `SequencerCommand::SetTrackClips` 这个 `Copy` 变体过命令队列；rtrb 按**最大变体**预分配 1024 个槽，于是"单 clip 音符数"和"队列内存"直接相乘：64 音符 ≈ 9.5 KB/槽 ≈ 9.7 MB 队列，512 音符就要 ~54 MB。真实 MIDI 一轨上千音符，上限根本抬不动。
+
+**改法**：`RtMidiClip` 的 `notes`/`ctrls` 变成 `Vec`（控制线程拥有），`MidiClipTable = [RtMidiClip; MAX_TRACK_CLIPS]`。表经**结构队列**（`GraphUpdate::SetMidiClips`，与 `SetAudioClips` 同队列）下发；block runner 在结构更新循环里 `sequencer.set_track_clips(track, table)`，返回值是被顶下来的旧表，立刻走 `trash_midi_clips`（满则 park 到 `midi_trash_pending`，下一块重试；极端情况下 `mem::forget` 有界泄漏，绝不在音频线程 drop）。控制线程每帧 `AudioEngine::reclaim_midi_clips()` 排空释放。与 U6 D4 的 audio clip 表完全同构。
+
+**为什么 `Vec` 而不是更大的定容数组**：队列里带 `Vec` 的变体只占表头（~24 B ×2 ×8 clip ≈ 0.5 KB），音符本体在堆上且长度随内容；定容数组则是 `8 × N × 12 B` 的无条件内存，且每次编辑要整表 memcpy（`push_all_clips` 每轨一份 × 16 轨）。`Vec` 版 `push`/`push_ctrl` 天然只能控制线程调用（可能扩容），文档注释已锁死这一点。
+
+**`schedule_track_clips` 的借用调整**：原实现 `let clips = self.clips[track];` 靠 `Copy` 复制整表来避开 `&self` / `&mut self.pending_offs` 冲突。`Vec` 不可 `Copy`，改为两个不相交字段借用（`&self.clips[track]` + `&mut self.pending_offs[track]`），并把 `set_pending_off` 从方法降为自由函数（接收 `&mut` 槽位数组）——否则调用它要再借整个 `self`。
+
+**导入分块**：`smf::split_into_clips` 按 `IMPORT_CLIP_NOTES = 4096` 切块，切点落在 start tick 变化处（和弦不跨 clip），块起点 = 块内最早事件，`loop == span` 单周期；块数超过 `MAX_CLIPS_PER_TRACK` 时用 `div_ceil` 放大块长，不丢材料。UI 在导入状态栏补一句「N dense track(s) split into M clips」，避免一排气 clip 看着像 bug。
+
+**行为变化**：单 clip 音符上限从 64 抬到文档级 `MAX_CLIP_NOTES = 65536`（仅防病态文件）；`MAX_CLIP_CTRLS` 常量删除（controller 也换成 `Vec`，密集弯音不再被 32 截断）；`SequencerCommand::SetTrackClips` 变体删除，命令枚举回到小结构。
+
 
 **只投递 CC 与 pitch bend**：`graph::slot_ctrl` 对 `ChannelPressure`/`PolyPressure`/`Program` 明确返回 `false`——内置声源没有对应的消费面，SF2 的 program 走 `ParamId::Sf2ProgramChange` 参数路径。VST3 宿主无 `Processor::midi_cc` 实现（`vst3-0.3.0` 的 `DataEvent` 只有 SysEx），因此拿到默认 `false`，与 U4 D6 一致。
 

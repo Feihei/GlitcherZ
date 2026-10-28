@@ -81,9 +81,14 @@ pub const MAX_MIXER_CHANNELS: usize = 32;
 /// Clips per track capacity limit (D15; the engine side uses the same value).
 pub const MAX_CLIPS_PER_TRACK: usize = 8;
 
-/// Notes per MIDI clip capacity limit (D15; the engine side
-/// `MAX_CLIP_NOTES` uses the same value).
-pub const MAX_CLIP_NOTES: usize = 64;
+/// Notes per MIDI clip capacity limit (D15 as revised 2026-10-28).
+///
+/// This is now a **document sanity bound only**: the engine keeps notes in a
+/// control-side-owned `Vec` per clip (no fixed-capacity array), so a clip is
+/// not truncated at playback time any more. The bound exists so a hostile or
+/// corrupted file cannot make the editor allocate without limit; the importer
+/// chunks dense tracks well below it (see `smf::IMPORT_CLIP_NOTES`).
+pub const MAX_CLIP_NOTES: usize = 65_536;
 
 /// Anchor points per control clip capacity limit (the engine-side
 /// `MAX_AUTO_POINTS` uses the same value).
@@ -4214,6 +4219,23 @@ mod tests {
         }
         let err = project.validate().expect_err("should reject");
         assert!(err.contains("clips"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_a_dense_clip() {
+        // D15 revision regression: 300 notes in one clip (a real imported
+        // piano part) used to fail validation at save time.
+        let mut project = Project::default();
+        let mut clip = MidiClip::default();
+        for i in 0..300 {
+            clip.notes_mut().push(super::Note {
+                start: (i as i64) * i64::from(TICKS_PER_STEP),
+                length: i64::from(TICKS_PER_STEP),
+                ..super::Note::default()
+            });
+        }
+        project.midi_tracks[0].clips.push(clip);
+        project.validate().expect("a dense clip must validate");
     }
 
     #[test]
