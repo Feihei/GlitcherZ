@@ -78,6 +78,10 @@ impl SoundFontInfo {
                 b"ISFT" => tools = Some(BinaryReader::read_fixed_length_string(reader, size)?),
                 _ => return Err(SoundFontError::ListContainsUnknownId(id)),
             }
+
+            // RIFF pads odd-sized chunks; without the skip the next id read
+            // lands one byte early and the list looks corrupt.
+            BinaryReader::discard_padding(reader, size)?;
         }
 
         let version = version.unwrap_or_else(SoundFontVersion::default);

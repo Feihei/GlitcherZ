@@ -72,6 +72,10 @@ impl SoundFontParameters {
                 b"shdr" => sample_headers = Some(SampleHeader::read_from_chunk(reader, size)?),
                 _ => return Err(SoundFontError::ListContainsUnknownId(id)),
             }
+
+            // RIFF pads odd-sized chunks (the record tables are even, but a
+            // hand-made font can still declare an odd size).
+            BinaryReader::discard_padding(reader, size)?;
         }
 
         let preset_infos = preset_infos.ok_or(SoundFontError::SubChunkNotFound(

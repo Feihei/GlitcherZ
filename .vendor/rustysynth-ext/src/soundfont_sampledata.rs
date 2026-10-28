@@ -47,6 +47,9 @@ impl SoundFontSampleData {
                 b"sm24" => BinaryReader::discard_data(reader, size)?,
                 _ => return Err(SoundFontError::ListContainsUnknownId(id)),
             }
+
+            // SoundFont3 sample data is usually odd-sized (Ogg streams).
+            BinaryReader::discard_padding(reader, size)?;
         }
 
         sample_data.ok_or(SoundFontError::SampleDataNotFound)
@@ -101,5 +104,45 @@ impl SoundFontSampleData {
             bits_per_sample: 16,
             wave_data,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::Cursor;
+
+    fn chunk(id: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + data.len() + 1);
+        out.extend_from_slice(id);
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(data);
+        // RIFF pads odd-sized chunks to an even boundary.
+        if data.len() % 2 == 1 {
+            out.push(0);
+        }
+        out
+    }
+
+    /// Regression: SoundFont3 sample data is a concatenation of Ogg Vorbis
+    /// streams and is frequently odd-sized. The pad byte that RIFF requires
+    /// after it is part of the enclosing LIST size, so it must be read —
+    /// otherwise the next chunk id comes out one byte early (`?LIS`) and the
+    /// whole font is reported as corrupt.
+    #[test]
+    fn reads_an_odd_sized_smpl_chunk_followed_by_another_chunk() {
+        let mut chunks = Vec::new();
+        chunks.extend_from_slice(b"sdta");
+        chunks.extend_from_slice(&chunk(b"smpl", &[1, 2, 3]));
+        chunks.extend_from_slice(&chunk(b"sm24", &[0, 0]));
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"LIST");
+        bytes.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&chunks);
+
+        let data = SoundFontSampleData::read(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(data, vec![1, 2, 3]);
     }
 }

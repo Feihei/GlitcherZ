@@ -142,4 +142,19 @@ impl BinaryReader {
         reader.read_exact(&mut data)?;
         Ok(data)
     }
+
+    /// Skips the pad byte that RIFF requires after an odd-sized chunk.
+    ///
+    /// The SF2 tables have even record sizes, so this never fired there — but
+    /// SoundFont3 sample data is a concatenation of Ogg Vorbis streams and is
+    /// often odd, and the pad byte *is* counted in the enclosing LIST size.
+    /// Without the skip the next chunk id is read one byte early (`?LIS`
+    /// instead of `LIST`) and the whole file is rejected as invalid.
+    pub(crate) fn discard_padding<R: Read>(reader: &mut R, size: usize) -> Result<(), io::Error> {
+        if size % 2 == 1 {
+            let mut pad: [u8; 1] = [0; 1];
+            reader.read_exact(&mut pad)?;
+        }
+        Ok(())
+    }
 }
