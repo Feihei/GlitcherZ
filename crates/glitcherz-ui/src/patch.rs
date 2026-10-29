@@ -3388,6 +3388,9 @@ mod tests {
         state.ensure_positions(doc, track_count, auto_count, project.audio_tracks.len());
 
         for node in &doc.nodes {
+            if matches!(node, NodeDoc::AudioTrack { .. }) {
+                continue; // folded into the timeline box (no standalone position)
+            }
             assert!(
                 state.positions.contains_key(&PatchId::Node(node.node_id())),
                 "document node {} should have a position",
@@ -3721,6 +3724,14 @@ mod tests {
             },
             synth: glitcherz_model::SynthParams::default(),
         });
+        let delay_id = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::Effect {
+            node_id: delay_id,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params: glitcherz_model::EffectParams::default(),
+            delay: None,
+        });
         let doc = &project.graph;
         let deps = PatchDeps {
             doc,
@@ -3754,7 +3765,7 @@ mod tests {
         };
 
         let instr = doc.instrument_of_track(0).unwrap().node_id();
-        let delay = doc.builtin_delay_of_track(0).unwrap().node_id();
+        let delay = delay_id;
         let mixer = doc.first_mixer().unwrap().node_id();
         let NodeDoc::Mixer { inputs, .. } = doc.node_by_id(mixer).unwrap() else {
             unreachable!()
@@ -3973,14 +3984,9 @@ mod tests {
     /// order is MIDI → Curve → Audio).
     #[test]
     fn audio_track_node_folds_into_timeline_ports() {
-        let mut project = Project::default();
-        project.audio_tracks.push(Default::default());
-        let node_id = project.graph.next_node_id();
-        project
-            .graph
-            .nodes
-            .push(NodeDoc::AudioTrack { node_id, track: 0 });
+        let project = Project::default();
         let doc = &project.graph;
+        let node_id = audio_node_id(doc, 0).expect("default audio-track node");
         let deps = PatchDeps {
             doc,
             track_count: project.midi_tracks.len(),
@@ -4018,11 +4024,19 @@ mod tests {
 
     #[test]
     fn port_type_rules_reject_mismatches() {
-        let project = Project::default();
+        let mut project = Project::default();
+        let delay_id = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::Effect {
+            node_id: delay_id,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params: glitcherz_model::EffectParams::default(),
+            delay: None,
+        });
         let doc = &project.graph;
         let instrument = doc.instrument_of_track(0).unwrap().node_id();
         let mixer = doc.first_mixer().unwrap().node_id();
-        let delay = doc.builtin_delay_of_track(0).unwrap().node_id();
+        let delay = delay_id;
 
         // Audio: effects/mixers/master output accept; instruments reject.
         assert!(accepts(CableKind::Audio, PatchId::Node(delay), doc));
@@ -4090,7 +4104,11 @@ mod tests {
         assert!(state.in_ports_screen(min, vk, &deps).is_empty());
         assert_eq!(label_of(vk, &doc), "Keyboard · KeyStep");
         // The default project ships a computer-keyboard node instead.
-        assert_eq!(label_of(PatchId::Node(11), &doc), "Keyboard · Computer");
+        let default_vk = doc.computer_keyboard().expect("default keyboard node");
+        assert_eq!(
+            label_of(PatchId::Node(default_vk), &doc),
+            "Keyboard · Computer"
+        );
     }
 
     /// U10: the timeline and mixer boxes reserve action rows for their own

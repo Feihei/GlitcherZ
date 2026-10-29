@@ -80,10 +80,10 @@
 - **单输入纪律（D14/D16）**：compile 期按 `NodeKind`（`Plain` / `Mixer` / `Master`）校验入边——Plain 与 Master ≤1、Mixer ≤32 且 `in_port` 唯一，超限整个计划拒绝（`FanInOverflow`）。隐式加合废止：新连线落到已占用 `(to, in_port)` 槽位时**顶掉旧线**（`add_cable` 严格替换语义，精确重复幂等）。
 - **`MixerProcessor`（D15/D20）**：语义分两段——**per-channel 权重**（gain × pan 声像系数 × mute × solo）在图求和循环逐边乘（求和后通道分离不复存在，权重必须在求和时生效），经 `Processor::input_weights()` 暴露——带默认实现返回 `None` = 单位权重，全部内置与 CLAP/VST3 节点零改动，仅 Mixer 覆写；权重在 `set_param` 时重算缓存。**输出段**（pan/mute）原地处理，与旧通道条同数学。solo 作用域 = 单台 mixer（任一通道 solo → 未 solo 通道权重清零），级联 mixer 各自独立。
 - **参数路径（D5/D20）**：`ParamId::{MixerGain(u8), MixerPan(u8), MixerMute(u8), MixerSolo(u8), MixerOutPan, MixerOutMute}`——推子/pan/mute/solo 全走节点参数路径（块边界生效），**永不触发拓扑重建**。
-- **默认图（D18）**：每轨 `声源→延迟→mixer.ch[i]` + 单个全局 Mixer（通道数 = max(轨数, 2)）→ master；`allocate_track_chain` 缩为 voice+delay 两节点，轨电平点（`track_channel`）= 轨道链末端 delay（pre-mixer，mute 不影响其读数）。
+- **默认图（D18，2026-10-29 精简）**：默认 = 一条可弹 MIDI 轨（内置乐器 → `mixer.ch0`）+ 单个全局 Mixer（默认 1 通道）→ master + Computer 键盘 → 该乐器 + 每条 audio 轨一个未接线的生成器节点；默认**不挂 delay**。新建 MIDI 轨只增加空轨道位（`track_present` 表标记占用，不建节点/不接线/不扩 mixer），用户在 patch 自行搭链。`allocate_track_chain` 仅保留给引擎参考拓扑/测试，其电费点（`track_channel`）= 轨道链末端 delay。
 - **旁路修订（D19）**：`remove_node` 旁路重连仅适用于 ≤1 入边节点（效果器照旧旁通，直连保留目标 `in_port`）；mixer/master 多入边无处重连——删除即弃线。
-- **model（Q-B 决议）**：`NodeDoc::Mixer{node_id, track, inputs: u8(2..=32), channels: Vec<MixerChannel>, out_pan, out_muted}` 替代 ChannelStrip（旧变体保留仅作加载读路径，新文档不再产出）；加载期自动迁移——strip → 2 通道 mixer（原 gain/pan/mute 进通道 0）、master 入边 >1 时插入合成 mixer 承接。文档校验（load/save 双端）：非 mixer ≤1 音频入边、mixer `in_port` 唯一且 < `inputs`、通道数 2..=32。
-- **UI**：mixer 节点画 N 个输入口（节点盒随通道数伸缩）+ 按口命中落线（精确口命中优先、否则自动落第一个空通道——任意空口可落，D21）+ 调音台风格面板（每通道 solo/mute/竖直推子/pan + 输出段 pan/mute + 通道增删按钮 2..=32，占用口不可删）；ChannelStrip 面板退役。
+- **model（Q-B 决议）**：`NodeDoc::Mixer{node_id, track, inputs: u8(1..=32), channels: Vec<MixerChannel>, out_pan, out_muted}` 替代 ChannelStrip（旧变体保留仅作加载读路径，新文档不再产出）；加载期自动迁移——strip → 1 通道 mixer（原 gain/pan/mute 进通道 0）、master 入边 >1 时插入合成 mixer 承接。文档校验（load/save 双端）：非 mixer ≤1 音频入边、mixer `in_port` 唯一且 < `inputs`、通道数 1..=32。
+- **UI**：mixer 节点画 N 个输入口（节点盒随通道数伸缩）+ 按口命中落线（精确口命中优先、否则自动落第一个空通道——任意空口可落，D21）+ 调音台风格面板（每通道 solo/mute/竖直推子/pan + 输出段 pan/mute + 通道增删按钮 1..=32，占用口不可删）；ChannelStrip 面板退役。
 - **轨寻址（P5f ④）**：UI `track_channel_target(track)` 沿轨链连线走到首个 mixer 节点得 `(mixer_doc_id, in_port)`；轨推子/mute 读写对应 mixer 通道（文档与引擎参数路径同步），未接入 mixer 的轨回落默认值。`register_track_chain` 的 channel 槽位退化为电平点（传 delay）。
 - **容量**：`MAX_IN_EDGES` 8→32（仅 mixer 可达）、`MAX_CABLES` 128→256（32 口 mixer 单节点即占 32 线）；32 通道求和 ≈8K FMA/块 ≈ 8µs，48kHz 下 <0.5% 单核。
 
@@ -195,7 +195,7 @@ G1（gui 扩展宿主）/ G2（Win32 嵌入容器）/ G3（参数回接）已落
 - **绑定（A 设计）**：`source: MidiSource = Computer | Device(name)`，`#[serde(default)] = Computer`。**一源一节点**由 `validate` 强制（`validate_rejects_two_nodes_bound_to_the_same_source`）；`create_patch_node` 在已有 Computer 节点时拒绝再加一个（否则写出自己 validate 会拒的文档）。`track` 只作 patch 摆放分组，**不再是路由依据**。
 - **无 fallback**：`send_to_vk_targets` 在 `vk_targets` 为空时只发一次状态提示（"cable the input node to an instrument (Ctrl+L)"）然后静音——旧的 `EngineCommand::Note { track }` 回落分支已删除。`send_note_event_at(doc, event)` 只做 `node_map` 查表，查不到就丢（节点刚删）。`--auto-play-note` 例外：它直发 `EngineCommand::Note { track }`，因为那是音频链诊断，不是路由。
 - **路由纯函数**：`GraphDoc::computer_keyboard() -> Option<node_id>` + `keyboard_routes_from(vk) -> Vec<u64>`。沿 `kind == Midi && from == Node(id)` 做 BFS，最后**按文档序遍历 nodes 收集全部 Instrument**（不是 BFS 出队顺序——多目标时结果确定）。非 instrument 终点会被遍历但永不返回（MIDI 不穿透效果器）。
-- **默认工程**：`default_graph_doc` 末尾追加一个 `Computer` 节点（id = 现有最大 id + 1）并 `keyboard_midi(vk, track0 voice)`——新工程开箱能弹，但那条线是可见可删的真实连线。默认图节点数/连线数断言已相应 +1/+1。
+- **默认工程**：`default_graph_doc` 末尾追加一个 `Computer` 节点（id = 现有最大 id + 1）并 `keyboard_midi(vk, track0 voice)`——新工程开箱能弹，但那条线是可见可删的真实连线。默认模板（2026-10-29 精简）节点 = 乐器 + mixer + keyboard + 每条 audio 轨的生成器节点；连线 = MIDI 自连 + 乐器→mixer.ch0 + mixer→master + keyboard→乐器。
 - **多出线（2026-10-22）**：一个输出口可拉多条 Midi 连线（多出 / 单入，与 track outlet 同规则），一次按键送到全部目标 → 无混音器即可叠音。`connect_keyboard_midi` 是「追加 + 去重 + 上限 `MAX_MIDI_FANOUT`(4)」——旧的 `retain` 同源连线把它锁成单目标，正是"只能拉一条线"的根因。上限只在 dispatch 层拦（文档 `validate` 放行，加载别人多连线的工程不会整份失败）。
 - **音符号直达**：引擎 `EngineCommand::NoteAtNode { node_id, event }` → `RtGraph::node_note`（slot 线性扫描找 `node_id`，无分配；未知 id 返回 false 静默丢弃）。这条路径**绕开轨道扇出表**，因此能弹一个没接时间轴 MIDI 线的悬空 instrument。
 - **UI 状态机**：`GlitcherZApp::vk_targets: Vec<u64>`（文档 instrument id，文档序），每帧 `ui()` 开头由 `computer_keyboard()` 重算；`send_to_vk_targets` 按索引循环逐个投递。**只在"掉出路由"的目标上补 Off**：新增目标不切断正在响的音，删节点/连线时旧目标全部掉出 → 全部释放（否则挂音永远收不到 note-off——与 Dexed "Stop 停不了" 同一类坑）。
@@ -246,7 +246,7 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 #### 文件管理（U2，2026-10-22）
 
 - **`project_files` 模块**：只放纯函数与文件 IO（标题格式化、导出默认名、空轨判定、导入落位计划、SMF 读写包装），app 壳负责对话框 / undo / 引擎推送，因此不必起 egui 上下文即可测试。
-- **导入落位**（`plan_import`）：先复用**空轨**（无音符且无 CC 任意 clip）再追加新轨，容量按 `MAX_MIDI_TRACKS`，超出部分丢弃并报数。`Project::default()` 有 4 条空轨，所以「新建 → 导入」不会留下占位空轨。
+- **导入落位**（`plan_import`）：先复用**空轨**（无音符且无 CC 任意 clip）再追加新轨，容量按 `MAX_MIDI_TRACKS`，超出部分丢弃并报数。`Project::default()` 有 1 条空 MIDI 轨，所以「新建 → 小导入」落在它里面，其余按需追加。
 - **整次导入 = 一步 undo**：外层 `begin_edit` + `suspend_history`，内层 `add_midi_track()` 自身的 `commit_edit` 在挂起期间被丢弃；收尾 `resume_history` 后一次性 commit。轨道内容写入后逐轨 `send_track_clips`（不走 `apply_document` 全量重建，节点已由 `add_midi_track` 装好）。
 - **`Session::is_dirty` 的可信度是前提**（此前形同虚设）：任何每帧执行的 `project_mut()` 都会置脏，于是保存后标题立刻变 `*`。三个元凶全部改为「读局部值 → `changed()` 才写」或「读取走 `project()`」——走带条的 tempo `DragValue`、Synth 面板的 master gain `Slider`、`control_editor_body` 的 `auto_endpoint` 读取。**新增每帧代码时不要直接 `DragValue::new(&mut self.project_mut()...)`**。
 - **未保存确认**：`FileAction{New, Open(PathBuf), Exit}` 统一走 `request_file_action`；dirty 时挂进 `pending_file_action` 并弹 `egui::Modal`（Save / Discard changes / Cancel）。**Save 失败或用户取消保存时对话框保持打开、动作不执行**（`do_save` 因此返回 `bool`）。关窗拦截 = `viewport().close_requested()` → `CancelClose` → 答复后 `allow_close` 回放；auto-close 冒烟路径直接置 `allow_close` 绕过。modal 打开期间跳过 `handle_keyboard_input`（否则 Space 会边弹窗边播放）。
@@ -272,7 +272,7 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 - **UI**：patch 里从控制轨出口拖到 `Timeline In` 的 box 上直接成线（`PatchAction::ConnectTempoIn`，跳过参数弹窗——单端口没有可选项）；Synth 面板的 `Pick Parameter…` 顶部固定一条 `Song Tempo (BPM)`（`AutoTarget::TimelineIn`）。走带 BPM 字段永远显示**用户基值**，播放中若曲线接管，旁边追加 `→ 143.2 auto`（读 `Feedback.bpm` 原子）。曲线纵轴 20..300 对数轴（`lane::axis`）。
 - **`param_id_of` 改返回 `Option<ParamId>`**：`Tempo` 没有也不该有 `ParamId`（它不进 `set_param`）。返回 `Some(default)` 之类的占位值会在将来某次重构里悄悄把 tempo 送进节点通路，宁可让类型系统顶住。调用点只有两处（`apply_document` 的自动化分支、`set_auto_endpoint`）。
 - **测试**：model `timeline_in_accepts_only_tempo_automation`（3 条非法连线逐一拒绝）+ RON 往返（tag `timeline_in` / `Tempo`）；engine `tempo_override_overrides_base_until_cleared` / `transport_edges_drop_the_tempo_override` / `tempo_curve_overrides_the_transport_clock`（位置按 `bpm/60×TPQ/sr` 公式算，**别按 48 kHz 硬编码**——block 测试的 harness 是 44.1 kHz）/ `tempo_curve_gap_falls_back_to_base` / `no_tempo_route_keeps_the_base_bpm`（含"接线 → 生效 → 剪线 → 回落"）；patch `timeline_in_ports_and_cable_rules`。
-- **已知取舍**：`Project::default()` 仍是 0 条控制轨，所以新工程要按 Synth 面板的 `+ Add` 才有一条可拖的 A1 出口。默认轨的取舍留给 U4（控制轨一等化进 timeline 时一并决定），U3 不动默认工程。
+- **默认模板（2026-10-29）**：`Project::default()` = 1 条 MIDI 轨（带内置乐器、无 delay）+ 1 条控制轨 + 1 条 audio 轨（生成器节点默认未接 mixer）+ 单通道全局 mixer。新建 MIDI 轨只加空轨道位，自动化/音频轨可由工具栏显式添加。
 
 #### 钢琴卷帘拖动协议（`piano_roll::DragSelection`）
 

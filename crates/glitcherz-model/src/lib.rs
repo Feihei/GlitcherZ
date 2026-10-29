@@ -74,8 +74,9 @@ pub const MAX_NODES: usize = 64;
 /// full 32-channel mixer consumes 32 cables on its own).
 pub const MAX_CABLES: usize = 256;
 
-/// Mixer node capacity limits (P5f D15/D21): channel count 2..=32.
-pub const MIN_MIXER_CHANNELS: usize = 2;
+/// Mixer node capacity limits (P5f D15/D21): channel count 1..=32. A mixer
+/// starts with a single channel and users grow it on demand.
+pub const MIN_MIXER_CHANNELS: usize = 1;
 pub const MAX_MIXER_CHANNELS: usize = 32;
 
 /// Clips per track capacity limit (D15 as revised 2026-10-28; the engine side
@@ -103,8 +104,16 @@ pub const MAX_CURVE_POINTS: usize = 64;
 /// documents).
 pub const MAX_ARRANGEMENT_BARS: u32 = 256;
 
-/// Number of MIDI tracks in the default (new) project.
-pub const DEFAULT_MIDI_TRACKS: usize = 4;
+/// Number of MIDI tracks in the default (new) project. A fresh project ships
+/// one playable MIDI track; further tracks start empty and are built by the
+/// user.
+pub const DEFAULT_MIDI_TRACKS: usize = 1;
+
+/// Number of control (curve) tracks in the default (new) project.
+pub const DEFAULT_CONTROL_TRACKS: usize = 1;
+
+/// Number of audio tracks in the default (new) project.
+pub const DEFAULT_AUDIO_TRACKS: usize = 1;
 
 /// Reserved node_id of the master output (D6: always present, cannot be
 /// deleted, not listed in the document node table).
@@ -1906,7 +1915,7 @@ pub enum NodeDoc {
         /// Owning track (grouping only; a mixer usually serves many tracks).
         #[serde(default)]
         track: usize,
-        /// Channel (input port) count, 2..=32 (D21: add/remove buttons).
+        /// Channel (input port) count, 1..=32 (D21: add/remove buttons).
         #[serde(default = "default_mixer_inputs")]
         inputs: u8,
         /// Per-channel console state; `len() == inputs as usize`.
@@ -2737,42 +2746,42 @@ impl GraphDoc {
     }
 }
 
-/// Generates the default node graph document (P5f D18): per track
-/// `voice → delay → mixer.ch[i]` + one global mixer (`inputs =
-/// max(track_count, 2)`) → master output + this track's MIDI self-connection.
+/// Generates the default node graph document (P5f D18, revised 2026-10-29):
+/// one playable MIDI track (built-in instrument → mixer.ch0), one global
+/// mixer with a single channel → master output, the track's MIDI
+/// self-connection, this track's computer-keyboard input, and one generator
+/// node per audio track (left unwired so the user patches it).
 ///
-/// node_ids are allocated consecutively starting from [`MASTER_NODE_ID`] + 1.
-pub fn default_graph_doc(track_count: usize) -> GraphDoc {
+/// Further MIDI tracks start empty: adding a track does not create an
+/// instrument, an effect or a mixer channel. node_ids are allocated
+/// consecutively starting from [`MASTER_NODE_ID`] + 1.
+pub fn default_graph_doc(midi_track_count: usize, audio_track_count: usize) -> GraphDoc {
     let mut nodes = Vec::new();
     let mut cables = Vec::new();
     let mut next_id = MASTER_NODE_ID + 1;
-    let mut voice_ids = Vec::new();
-    let mut delay_ids = Vec::new();
-    for track in 0..track_count {
+
+    // Only the first MIDI track ships an instrument (so a fresh project plays
+    // from the computer keyboard); the rest are bare tracks the user builds.
+    let first_voice = if midi_track_count > 0 {
         let voice_id = next_id;
-        let delay_id = next_id + 1;
-        next_id += 2;
-        voice_ids.push(voice_id);
+        next_id += 1;
         nodes.push(NodeDoc::Instrument {
             node_id: voice_id,
-            track,
+            track: 0,
             voice: VoiceSpec::Builtin,
             synth: SynthParams::default(),
         });
-        nodes.push(NodeDoc::Effect {
-            node_id: delay_id,
-            track,
-            voice: VoiceSpec::Builtin,
-            params: EffectParams::default(),
-            delay: None,
-        });
-        cables.push(CableDoc::audio(voice_id, delay_id));
-        cables.push(CableDoc::midi(track, voice_id));
-        delay_ids.push(delay_id);
-    }
-    // One global mixer: one channel per track (D21 minimum 2).
-    let inputs = track_count.max(MIN_MIXER_CHANNELS);
+        cables.push(CableDoc::midi(0, voice_id));
+        Some(voice_id)
+    } else {
+        None
+    };
+
+    // One global mixer with the minimum channel count (1) → master. The user
+    // grows it when a second source needs a home.
     let mixer_id = next_id;
+    next_id += 1;
+    let inputs = MIN_MIXER_CHANNELS;
     nodes.push(NodeDoc::Mixer {
         node_id: mixer_id,
         track: 0,
@@ -2781,24 +2790,36 @@ pub fn default_graph_doc(track_count: usize) -> GraphDoc {
         out_pan: 0.0,
         out_muted: false,
     });
-    for (ch, delay_id) in delay_ids.iter().enumerate() {
-        cables.push(CableDoc::audio_to_channel(*delay_id, mixer_id, ch as u8));
-    }
     cables.push(CableDoc::audio(mixer_id, PortRef::Master));
+    if let Some(voice_id) = first_voice {
+        cables.push(CableDoc::audio_to_channel(voice_id, mixer_id, 0));
+    }
+
     // One computer-keyboard input node, cabled to the first track's
     // instrument (spec `plugin-gui.md` §8): a fresh project plays from the
     // computer keyboard, but through an explicit, visible, deletable route
     // instead of the old implicit track fallback.
-    next_id += 1;
-    let keyboard_id = next_id;
-    nodes.push(NodeDoc::Keyboard {
-        node_id: keyboard_id,
-        track: 0,
-        source: MidiSource::Computer,
-    });
-    if let Some(voice_id) = voice_ids.first() {
-        cables.push(CableDoc::keyboard_midi(keyboard_id, *voice_id));
+    if let Some(voice_id) = first_voice {
+        let keyboard_id = next_id;
+        next_id += 1;
+        nodes.push(NodeDoc::Keyboard {
+            node_id: keyboard_id,
+            track: 0,
+            source: MidiSource::Computer,
+        });
+        cables.push(CableDoc::keyboard_midi(keyboard_id, voice_id));
     }
+
+    // Audio tracks get their generator node so the lane is visible in the
+    // patch; it starts unwired (the single mixer channel is already taken),
+    // and the user decides where it lands.
+    for track in 0..audio_track_count {
+        let node_id = next_id;
+        next_id += 1;
+        nodes.push(NodeDoc::AudioTrack { node_id, track });
+    }
+    let _ = next_id;
+
     GraphDoc {
         nodes,
         cables,
@@ -2839,9 +2860,9 @@ impl Default for Project {
             metadata: ProjectMetadata::default(),
             master_gain: default_master_gain(),
             midi_tracks: vec![MidiTrack::default(); DEFAULT_MIDI_TRACKS],
-            control_tracks: Vec::new(),
-            audio_tracks: Vec::new(),
-            graph: default_graph_doc(DEFAULT_MIDI_TRACKS),
+            control_tracks: vec![ControlTrack::default(); DEFAULT_CONTROL_TRACKS],
+            audio_tracks: vec![AudioTrack::default(); DEFAULT_AUDIO_TRACKS],
+            graph: default_graph_doc(DEFAULT_MIDI_TRACKS, DEFAULT_AUDIO_TRACKS),
         }
     }
 }
@@ -2879,15 +2900,12 @@ impl Project {
                     node_id: *node_id,
                     track: *track,
                     inputs: MIN_MIXER_CHANNELS as u8,
-                    channels: vec![
-                        MixerChannel {
-                            gain: *gain,
-                            pan: *pan,
-                            muted: *muted,
-                            solo: false,
-                        },
-                        MixerChannel::default(),
-                    ],
+                    channels: vec![MixerChannel {
+                        gain: *gain,
+                        pan: *pan,
+                        muted: *muted,
+                        solo: false,
+                    }],
                     out_pan: 0.0,
                     out_muted: false,
                 };
@@ -3250,11 +3268,12 @@ impl Default for ProjectMetadata {
 mod tests {
     use super::{
         AudioClip, AudioTrack, AutoParam, AutoPoint, CableDoc, CableKind, ChannelParam,
-        DEFAULT_MIDI_TRACKS, EffectParams, GraphDoc, MASTER_NODE_ID, MAX_ARRANGEMENT_BARS,
-        MAX_ARRANGEMENT_TICKS, MAX_AUDIO_TRACKS, MAX_BEND_RANGE, MAX_CLIP_NOTES,
-        MAX_CLIPS_PER_TRACK, MAX_NODES, MIN_BEND_RANGE, MidiClip, MidiSource, MidiTrack, NodeDoc,
-        NodeParam, PortRef, Project, SamplePlayMode, SynthParams, TICKS_PER_BAR, TICKS_PER_QUARTER,
-        TICKS_PER_STEP, VoiceSpec, default_audio_source_len, default_graph_doc,
+        DEFAULT_AUDIO_TRACKS, DEFAULT_CONTROL_TRACKS, DEFAULT_MIDI_TRACKS, EffectParams, GraphDoc,
+        MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS, MAX_AUDIO_TRACKS,
+        MAX_BEND_RANGE, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES, MIN_BEND_RANGE, MidiClip,
+        MidiSource, MidiTrack, MixerChannel, NodeDoc, NodeParam, PortRef, Project, SamplePlayMode,
+        SynthParams, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec,
+        default_audio_source_len, default_graph_doc,
     };
 
     fn effect_node(params: EffectParams) -> NodeDoc {
@@ -3451,9 +3470,11 @@ mod tests {
         assert_eq!(clip.gain, 1.0);
         assert_eq!(clip.legacy_span_ticks, 0);
 
-        // Pre-U6 project files have no `audio_tracks` field: stripping it
-        // from a serialized file mimics one, and it loads as empty.
-        let legacy = ron::to_string(&Project::default())
+        // Pre-U6 project files have no `audio_tracks` field: stripping it from a
+        // serialized file mimics one, and it loads as empty.
+        let mut legacy_project = Project::default();
+        legacy_project.audio_tracks.clear();
+        let legacy = ron::to_string(&legacy_project)
             .expect("serialize")
             .replace("audio_tracks:[],", "");
         assert!(!legacy.contains("audio_tracks"));
@@ -3820,35 +3841,48 @@ mod tests {
         assert_eq!(super::Note { velocity: 127, ..n }.velocity_f32(), 1.0);
     }
 
+    /// D13/D18 (revised 2026-10-29): the default document fully describes a
+    /// minimal template — one playable MIDI track (instrument → mixer.ch0),
+    /// one global mixer with a single channel → master, the keyboard input,
+    /// and one unwired generator node for the audio lane.
     #[test]
     fn default_project_graph_is_fully_explicit() {
-        // D13/D18: the default document fully describes the default topology
-        // (per-track voice → delay + one global mixer → master + the
-        // computer-keyboard input node).
         let project = Project::default();
         assert_eq!(project.midi_tracks.len(), DEFAULT_MIDI_TRACKS);
+        assert_eq!(project.control_tracks.len(), DEFAULT_CONTROL_TRACKS);
+        assert_eq!(project.audio_tracks.len(), DEFAULT_AUDIO_TRACKS);
         let graph = &project.graph;
         assert_eq!(
             graph.nodes.len(),
-            DEFAULT_MIDI_TRACKS * 2 + 2,
-            "two nodes per track + the global mixer + the keyboard input node"
+            4,
+            "instrument + mixer + keyboard + audio-track node"
         );
-        // Cables: voice→delay + midi self-connection per track, then
-        // delay→mixer.ch per track + mixer→master + keyboard→track 0 voice.
-        assert_eq!(graph.cables.len(), DEFAULT_MIDI_TRACKS * 3 + 2);
-        for t in 0..DEFAULT_MIDI_TRACKS {
-            let voice = graph.instrument_of_track(t).expect("voice should exist");
-            let delay = graph.builtin_delay_of_track(t).expect("delay should exist");
-            assert_eq!(voice.node_id(), (MASTER_NODE_ID + 1) + (t as u64) * 2);
-            let landing = graph
-                .cables
-                .iter()
-                .find(|c| c.from == PortRef::Node(delay.node_id()))
-                .expect("delay should feed the mixer");
-            assert_eq!(landing.in_port, t as u8, "track t lands on channel t");
-        }
+        // Cables: midi self-connection + instrument→mixer + mixer→master +
+        // keyboard→instrument.
+        assert_eq!(graph.cables.len(), 4);
+        let voice = graph
+            .instrument_of_track(0)
+            .expect("track 0 keeps a playable instrument");
+        assert_eq!(voice.node_id(), MASTER_NODE_ID + 1);
+        assert!(
+            graph.builtin_delay_of_track(0).is_none(),
+            "the default template no longer ships a delay node"
+        );
+        let landing = graph
+            .cables
+            .iter()
+            .find(|c| c.from == PortRef::Node(voice.node_id()))
+            .expect("instrument should feed the mixer");
+        assert_eq!(landing.in_port, 0);
         let mixer = graph.first_mixer().expect("global mixer should exist");
-        assert!(matches!(mixer, NodeDoc::Mixer { inputs: 4, .. }));
+        assert!(matches!(mixer, NodeDoc::Mixer { inputs: 1, .. }));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n, NodeDoc::AudioTrack { track: 0, .. })),
+            "the audio lane has its generator node (unwired by default)"
+        );
         assert!(project.validate().is_ok());
     }
 
@@ -4003,15 +4037,15 @@ mod tests {
 
     #[test]
     fn next_node_id_and_track_lookups() {
-        let graph = default_graph_doc(2);
-        // ids: track0 voice=2 delay=3, track1 voice=4 delay=5, mixer=6,
-        // computer keyboard=7.
-        assert_eq!(graph.next_node_id(), 8);
+        let graph = default_graph_doc(2, 0);
+        // ids: track0 voice=2, mixer=3, computer keyboard=4. Track 1 starts
+        // bare (the user builds it), so it owns no node.
+        assert_eq!(graph.next_node_id(), 5);
         assert_eq!(
-            graph.instrument_of_track(1).map(NodeDoc::node_id),
-            Some(MASTER_NODE_ID + 3)
+            graph.instrument_of_track(0).map(NodeDoc::node_id),
+            Some(MASTER_NODE_ID + 1)
         );
-        assert!(graph.instrument_of_track(2).is_none());
+        assert!(graph.instrument_of_track(1).is_none());
         assert_eq!(graph.auto_endpoint(0), None);
     }
 
@@ -4021,7 +4055,7 @@ mod tests {
     /// an implicit track fallback.
     #[test]
     fn default_project_ships_one_routed_computer_keyboard() {
-        let graph = default_graph_doc(DEFAULT_MIDI_TRACKS);
+        let graph = default_graph_doc(DEFAULT_MIDI_TRACKS, 0);
         let vk = graph.computer_keyboard().expect("default keyboard node");
         let first_voice = graph.instrument_of_track(0).expect("track 0 voice");
         assert_eq!(graph.keyboard_routes_from(vk), vec![first_voice.node_id()]);
@@ -4650,7 +4684,7 @@ mod tests {
     /// (the identity is not instantiable).
     #[test]
     fn timeline_in_accepts_only_tempo_automation() {
-        let mut doc = default_graph_doc(2);
+        let mut doc = default_graph_doc(2, 0);
         doc.cables.push(CableDoc::tempo(0));
         assert!(
             doc.validate(2, 1).is_ok(),
@@ -4664,7 +4698,7 @@ mod tests {
         assert!(!doc.auto_targets_timeline_in(1), "track 1 is not cabled");
 
         // Audio cables have no port there (the terminal is a pure sink).
-        let mut doc = default_graph_doc(2);
+        let mut doc = default_graph_doc(2, 0);
         doc.cables.push(CableDoc::audio(2, PortRef::TimelineIn));
         assert!(
             doc.validate(2, 0).is_err(),
@@ -4672,7 +4706,7 @@ mod tests {
         );
 
         // Neither do MIDI cables.
-        let mut doc = default_graph_doc(2);
+        let mut doc = default_graph_doc(2, 0);
         doc.cables.push(CableDoc {
             kind: CableKind::Midi,
             from: PortRef::MidiTrack(0),
@@ -4686,7 +4720,7 @@ mod tests {
         );
 
         // Tempo is a clock, not a node parameter: it must not reach a node.
-        let mut doc = default_graph_doc(2);
+        let mut doc = default_graph_doc(2, 0);
         let voice = doc
             .instrument_of_track(0)
             .expect("track 0 has an instrument")
@@ -4699,7 +4733,7 @@ mod tests {
         );
 
         // v1 has a single port: other parameters cannot enter through it.
-        let mut doc = default_graph_doc(2);
+        let mut doc = default_graph_doc(2, 0);
         doc.cables.push(CableDoc {
             kind: CableKind::Automation,
             from: PortRef::AutoTrack(0),
@@ -4780,7 +4814,7 @@ mod tests {
     /// the conductor terminal, and a node target accepts it.
     #[test]
     fn cc_cable_must_target_a_node() {
-        let mut doc = default_graph_doc(2);
+        let mut doc = default_graph_doc(2, 0);
         let voice = doc
             .instrument_of_track(0)
             .expect("track 0 has an instrument")
@@ -4792,7 +4826,7 @@ mod tests {
             "a CC cable into an instrument is legal"
         );
 
-        let mut doc = default_graph_doc(2);
+        let mut doc = default_graph_doc(2, 0);
         doc.cables.push(CableDoc {
             kind: CableKind::Automation,
             from: PortRef::AutoTrack(0),
@@ -4811,8 +4845,16 @@ mod tests {
     /// so validation is strict about it — and only about it.
     #[test]
     fn mixer_channel_automation_is_range_checked() {
-        let mut doc = default_graph_doc(3);
+        let mut doc = default_graph_doc(3, 0);
         let mixer = doc.first_mixer().expect("global mixer").node_id();
+        // Grow the mixer explicitly: the default template ships one channel.
+        if let Some(NodeDoc::Mixer {
+            inputs, channels, ..
+        }) = doc.node_by_id_mut(mixer)
+        {
+            *inputs = 3;
+            *channels = vec![MixerChannel::default(); 3];
+        }
         let channel = |channel: u8| {
             AutoParam::Node(NodeParam::MixerChannel {
                 channel,

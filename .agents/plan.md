@@ -341,6 +341,17 @@ A 阶段**只补这三处，不开参数端口**（每参数一个输入口 = �
 - **旧 "Volume" 电缆不会自动重映射**：v3 时代 `AutoParam::TrackGain` 落在 mixer 上的电缆现在仍是 `ParamId::TrackGain`，mixer 不认（静默 no-op）。新菜单给出的是 `MixerChannel{Gain}`；老工程需重新 Pick 目标。
 - **一条控制轨仍只有一个终点**（`auto_routes[index]` 单槽）：一条曲线扇出到多个参数需要引擎侧改多槽，未立项。
 
+## 默认工程模板精简（2026-10-29，已交付）
+
+用户提出：默认工程 4 条 MIDI 轨各挂内置乐器 + delay + mixer 通道太重，演示角度只需 MIDI / curve / audio 各一条，mixer 只要一个通道；新建 MIDI 轨也不应自动挂乐器 / delay / mixer 通道，留给用户自定义。
+
+- [x] **T1 model 模板** ✅ 2026-10-29：`DEFAULT_MIDI_TRACKS` 4→1，新增 `DEFAULT_CONTROL_TRACKS = 1` / `DEFAULT_AUDIO_TRACKS = 1`；`default_graph_doc(midi_count, audio_count)` 改为「track0 内置乐器 → mixer.ch0、单通道 mixer → master、keyboard → 乐器、每条 audio 轨一个未接线生成器节点」，默认不再挂 delay；`MIN_MIXER_CHANNELS` 2→1（migrate 的 strip→mixer 同步改 1 通道）
+- [x] **T2 engine 裸轨** ✅ 2026-10-29：`GraphCompiler` 新增 `track_present` 占用表（与 `track_voice` 解耦，裸轨也能被计数/删除）；`set_present_track_count` 由 `AudioEngine::set_midi_track_count` 驱动；`remove_midi_track` 允许删除无节点的裸轨；`MixerProcessor::new` 下限 1
+- [x] **T3 UI** ✅ 2026-10-29：`add_midi_track` 改为只 push 空 `MidiTrack` + 下发轨道数（不建节点 / 不接线 / 不扩 mixer）；`remove_last_midi_track` 不再误删复用了 `track` 字段的 audio 轨节点；mixer 增删下限随 `MIN_MIXER_CHANNELS` 自动变为 1
+- [x] **T4 测试与文档** ✅ 2026-10-29：model / engine / ui 相关断言更新，`cargo fmt` + `clippy --workspace --all-targets -D warnings` + `test --workspace` 全绿；spec `node-graph.md` D15/D18/D21 与 `implementation.md` Mixer / 默认工程段落同步
+
+**已知边界**：默认 audio 轨有生成器节点但未接 mixer（单通道已被乐器占用），用户需自行接 mixer 或先加通道；新建 MIDI 轨后同样需要在 patch 手动放乐器并连 MIDI 线。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：

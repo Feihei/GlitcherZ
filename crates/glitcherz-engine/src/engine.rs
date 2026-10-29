@@ -585,6 +585,9 @@ impl AudioEngine {
     /// Sets the number of active MIDI tracks (D12; clamped to the capacity
     /// limit on the real-time side).
     pub fn set_midi_track_count(&mut self, count: usize) -> bool {
+        // Occupancy is decoupled from the node slots: a bare track still
+        // exists even when the user has not built its instrument yet.
+        self.compiler.set_present_track_count(count);
         self.send(EngineCommand::Sequencer(
             SequencerCommand::SetMidiTrackCount(count),
         ))

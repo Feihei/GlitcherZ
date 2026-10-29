@@ -1095,6 +1095,9 @@ pub struct GraphCompiler {
     track_delay: [u16; MAX_MIDI_TRACKS],
     track_channel: [u16; MAX_MIDI_TRACKS],
     track_effects: [[u16; EFFECT_SLOTS]; MAX_MIDI_TRACKS],
+    /// Track occupancy, independent of node slots: a bare (user-built) MIDI
+    /// track has no instrument/delay yet but still exists on the timeline.
+    track_present: [bool; MAX_MIDI_TRACKS],
     /// Timeline MIDI routing table (fan-out destination slots).
     midi_targets: [[u16; MAX_MIDI_FANOUT]; MAX_MIDI_TRACKS],
     midi_target_counts: [u8; MAX_MIDI_TRACKS],
@@ -1129,6 +1132,7 @@ impl GraphCompiler {
             track_delay: [NO_EDGE; MAX_MIDI_TRACKS],
             track_channel: [NO_EDGE; MAX_MIDI_TRACKS],
             track_effects: [[NO_EDGE; EFFECT_SLOTS]; MAX_MIDI_TRACKS],
+            track_present: [false; MAX_MIDI_TRACKS],
             midi_targets: [[NO_EDGE; MAX_MIDI_FANOUT]; MAX_MIDI_TRACKS],
             midi_target_counts: [0; MAX_MIDI_TRACKS],
             auto_routes: [AutoRoute::default(); MAX_AUTO_TRACKS],
@@ -1187,7 +1191,7 @@ impl GraphCompiler {
         graph.install(
             mixer_slot as usize,
             mixer_id,
-            Box::new(MixerProcessor::new(track_count.max(2))),
+            Box::new(MixerProcessor::new(track_count.max(1))),
             AudioBuffer::new(2, bs),
         );
         for t in 0..track_count {
@@ -1221,6 +1225,7 @@ impl GraphCompiler {
         self.track_voice[track] = voice;
         self.track_delay[track] = delay;
         self.track_channel[track] = delay; // metering point = chain end (P5f)
+        self.track_present[track] = true;
         // Cables: instrument → delay (acyclic by construction; panic ok).
         self.add_cable(voice, delay, 0).expect("fresh chain cables");
         // Timeline default wiring: MIDI track t → its own instrument (mirrors
@@ -1252,6 +1257,8 @@ impl GraphCompiler {
         self.track_voice[track] = NO_EDGE;
         self.track_delay[track] = NO_EDGE;
         self.track_channel[track] = NO_EDGE;
+        self.track_effects[track] = [NO_EDGE; EFFECT_SLOTS];
+        self.track_present[track] = false;
         self.midi_targets[track] = [NO_EDGE; MAX_MIDI_FANOUT];
         self.midi_target_counts[track] = 0;
     }
@@ -1328,12 +1335,24 @@ impl GraphCompiler {
     }
 
     /// Number of currently configured MIDI tracks (the contiguous run of
-    /// `track_voice` that is not `NO_EDGE`).
+    /// [`Self::track_present`]). A bare track counts even when it has no
+    /// instrument or delay.
     pub fn midi_track_count(&self) -> usize {
-        self.track_voice
+        self.track_present
             .iter()
-            .position(|&s| s == NO_EDGE)
+            .position(|&present| !present)
             .unwrap_or(MAX_MIDI_TRACKS)
+    }
+
+    /// Marks the `0..count` track slots as present and the rest as absent.
+    /// The UI calls this whenever the project's MIDI-track list changes
+    /// (document rebuild, add/remove track): occupancy no longer follows
+    /// `track_voice`, so a user-built bare track is still addressable.
+    pub fn set_present_track_count(&mut self, count: usize) {
+        let count = count.min(MAX_MIDI_TRACKS);
+        for (track, present) in self.track_present.iter_mut().enumerate() {
+            *present = track < count;
+        }
     }
 
     // ---- cable list primitives ----
@@ -1765,9 +1784,10 @@ impl GraphCompiler {
     /// → [`TopologyError::NoFreeSlot`]; over-capacity cables →
     /// [`TopologyError::TooManyCables`].
     pub fn add_midi_track(&mut self) -> Result<(GraphUpdate, [u64; 2]), TopologyError> {
-        let Some(track) = self.track_voice.iter().position(|&s| s == NO_EDGE) else {
+        let Some(track) = self.track_present.iter().position(|&present| !present) else {
             return Err(TopologyError::NoFreeTrack);
         };
+        self.track_present[track] = true;
         // Precheck capacity (alloc_slot panics when full, so it must be
         // blocked early).
         if self.occupied.iter().filter(|&&o| !o).count() < 2 {
@@ -1793,9 +1813,10 @@ impl GraphCompiler {
 
     /// Tears down a MIDI track: the trio plus all its effects are removed
     /// (cable cleanup + slot release + routing table cleared), nodes released
-    /// via the recycle queue. Idempotent success for unconfigured tracks.
+    /// via the recycle queue. A bare track (present but no instrument / delay
+    /// / effects) is torn down just as successfully.
     pub fn remove_midi_track(&mut self, track: usize) -> Result<GraphUpdate, TopologyError> {
-        if track >= MAX_MIDI_TRACKS || self.track_voice[track] == NO_EDGE {
+        if track >= MAX_MIDI_TRACKS || !self.track_present[track] {
             return Err(TopologyError::InvalidTrack);
         }
         let mut slots = [NO_EDGE; 3 + EFFECT_SLOTS];
@@ -1825,6 +1846,7 @@ impl GraphCompiler {
         self.track_delay[track] = NO_EDGE;
         self.track_channel[track] = NO_EDGE;
         self.track_effects[track] = [NO_EDGE; EFFECT_SLOTS];
+        self.track_present[track] = false;
         self.midi_targets[track] = [NO_EDGE; MAX_MIDI_FANOUT];
         self.midi_target_counts[track] = 0;
         let plan = self.compile()?;
@@ -2061,6 +2083,7 @@ impl GraphCompiler {
         self.track_delay[track] = resolve(self, delay)?;
         self.track_channel[track] = resolve(self, channel)?;
         self.track_effects[track] = [NO_EDGE; EFFECT_SLOTS];
+        self.track_present[track] = true;
         Ok(self.build_update(self.compile()?, Vec::new(), &[]))
     }
 

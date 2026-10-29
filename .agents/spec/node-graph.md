@@ -36,13 +36,13 @@ related: [../plan.md, ../architecture.md]
 | D12 | 轨道动态化 | MIDI 轨 `Vec<MidiTrack>`（引擎侧定容 `MAX_MIDI_TRACKS = 16` + 活跃轨数控制侧下发；`midi_targets`/路由表/音序器全部扩容）；自动化轨道顶层 `Vec<AutomationTrack>`（引擎已定容 16） |
 | D13 | 默认图全显式 | 默认拓扑（每轨 `声源→延迟→通道条→主输出` + MIDI 自连）全部以 `nodes + cables` 写入项目文档；加载器**纯按文档重建**引擎图，`GraphCompiler::default_graph` 退役为"新建项目生成初始文档"的参考实现；文档与引擎一张皮 |
 | D14 | 单输入语义（修订 D4，2026-10-09） | 音频节点**不允许多入边隐式加合**：每个音频入口 ≤1 条入边（乐器 0 条）。需要混合必须显式经 Mixer 节点（模块合成器式显式混音，消除不可见的隐式求和）。compile 期按节点类型校验，违反 → 拒绝连线 |
-| D15 | Mixer 节点 | 新节点类型吸收 ChannelStrip（strip 退役）：**输入通道数可变 2..32**（D21），每通道独立 **gain / pan / mute / solo**（虚拟通道条，2026-10-09 评审升级：弱化传统 DAW 轨道管理，按舞台调音台方式管理 solo/mute/pan）；输出级 pan/mute（主控段）。**solo 语义**：同一 mixer 内任一通道 solo 时，未 solo 通道静音（solo 作用域 = 单台 mixer，级联 mixer 各自独立） |
+| D15 | Mixer 节点 | 新节点类型吸收 ChannelStrip（strip 退役）：**输入通道数可变 1..32**（D21），每通道独立 **gain / pan / mute / solo**（虚拟通道条，2026-10-09 评审升级：弱化传统 DAW 轨道管理，按舞台调音台方式管理 solo/mute/pan）；输出级 pan/mute（主控段）。**solo 语义**：同一 mixer 内任一通道 solo 时，未 solo 通道静音（solo 作用域 = 单台 mixer，级联 mixer 各自独立） |
 | D16 | 主输出单输入 | master 同样遵守单输入（≤1 条音频入边）；多路汇入必须经 mixer（可级联）进 master。MasterGain 参数保留 |
 | D17 | 连线↔输入口绑定 | `CableDoc` 增 `in_port: u8`：mixer 目标的输入口下标（唯一、< 当前口数），其余节点恒 0。per-input 推子与线的绑定关系随文件持久化，删线不错位。UI 连线到 mixer 时自动落第一个空口 |
-| D18 | 默认图拓扑（修订 D13） | 默认图改为：每轨 `声源→延迟→mixer.in[i]` + **单个全局 Mixer（通道数 = max(轨数, 2)）→ master**。轨寻址与 metering 点随之调整（见 P5f） |
+| D18 | 默认图拓扑（修订 D13，2026-10-29 精简） | 默认图 = **一条可弹的 MIDI 轨**（内置乐器 `voice→mixer.ch0`）+ **单个全局 Mixer（默认 1 通道）→ master** + MIDI 自连 + Computer 键盘 → 该乐器 + 每条 audio 轨一个**未接线**的生成器节点；**不再默认挂 delay**。新建 MIDI 轨只增加**空轨道位**（不建 Instrument / delay、不接 mixer、不扩通道），音源与路由由用户在 patch 自行搭建 |
 | D19 | 旁路语义修订 | `remove_node` 旁路重连仅适用于 ≤1 入边的节点（效果器 1入1出照旧旁通）；mixer/master 不可旁路（多入边无处重连）——删除 mixer 时其触及连线直接移除 |
 | D20 | 入边权重与调参解耦 | per-channel 有效权重（gain × pan 声像系数 × mute × solo）以**立体声 L/R 权重表**参与求和：`Processor` trait 增带默认实现的 `input_weights() -> Option<&[[f32; 2]; MAX_IN_EDGES]>`（默认 `None` = 单位权重，插件零改动），`MixerProcessor` 覆写返回按通道状态实时计算的权重表；求和循环逐边乘权。**推子/pan/mute/solo 拖动走参数命令路径，永不触发拓扑重建**（守 D5） |
-| D21 | 通道数管理（2026-10-09 评审拍板） | **手动增减**：mixer 面板提供添加/删除通道按钮，下限 2 无法删、上限 32 无法加。通道设置（fader/pan/mute/solo）**与插线状态解耦**——拔线不丢设置、常驻通道可预先留空。连线可落到**任意空通道**（不要求顺序占口）。否决"入口数 = 入边数 + 1 自动增减"方案：拆线丢状态 + 口位重排/留洞语义复杂 + 自动化需要稳定端口身份 |
+| D21 | 通道数管理（2026-10-09 评审拍板；2026-10-29 下限改 1） | **手动增减**：mixer 面板提供添加/删除通道按钮，下限 1 无法删、上限 32 无法加。通道设置（fader/pan/mute/solo）**与插线状态解耦**——拔线不丢设置、常驻通道可预先留空。连线可落到**任意空通道**（不要求顺序占口）。否决"入口数 = 入边数 + 1 自动增减"方案：拆线丢状态 + 口位重排/留洞语义复杂 + 自动化需要稳定端口身份 |
 | D22 | 画布上的通道条（U14，2026-10-28） | mixer 节点盒内**每个输入口一行**，行内横排 `fader + M + S`：条高 `22`（图空间，< `PORT_SPACING` 30），左起 `22`（避开端口圆点与 `PORT_HIT_RADIUS` 18 的拉线判定），右至盒内缩进 8；`M` 在内、`S` 在最外。**写入走与 Inspector 同一条路**：`PatchAction::SetInlineParam{MixerGain/MixerMute/MixerSolo(ch)}` → `apply_inline_param` → 文档 `channels[ch]` + `ParamId::MixerGain/Mute/Solo(ch)`；fader 用 `commit_param_edit`（key `mixer-gain-{ch}`，一次拖动一步 undo），M/S 用 `begin_edit`/`commit_edit` 各一步 | 调音台之所以好用，是因为推子压在它管的那根线上——底部再堆 32 行会脱离端口。宽度是硬约束：150 图空间的盒子里 fader 76 + M/S 各 18 刚好，故**不加 pan**（窄到放不下，仍留在 Inspector）。fader 命中区取整条高度（3 px 的 rail 抓不住），M/S 自绘（`egui::Button` 保不住 22 × zoom 的行高，与 D15 同一病因） |
 
 ## 3. 节点类型与端口剖面
@@ -51,7 +51,7 @@ related: [../plan.md, ../architecture.md]
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | 乐器（内置合成器 / CLAP / VST3 乐器） | 0 | 1 | MIDI 入 | ✓ | 只能做音频源头 |
 | 效果器（内置 / CLAP / VST3 效果） | 1 | 1 | 参数入 | ✓ | 链式串联 |
-| Mixer | 2..32（通道数按钮增减，D21；每通道 gain/pan/mute/solo） | 1 | 参数入（通道自动化后续版本） | ✓ | 显式混合点（D15）；吸收原 ChannelStrip；输出级 pan/mute |
+| Mixer | 1..32（通道数按钮增减，D21；每通道 gain/pan/mute/solo） | 1 | 参数入（通道自动化后续版本） | ✓ | 显式混合点（D15）；吸收原 ChannelStrip；输出级 pan/mute |
 | 主输出 | 1（单输入，D16） | 1（→硬件） | MasterGain 参数 | ✗ 固定 | 拓扑排序的汇点 |
 | 时间轴 | 0 | 0 | MIDI 出 ×n + 自动化出 ×n | ✗ 固定 | 见 §6 |
 
@@ -203,7 +203,7 @@ pub struct CableDoc {
 
 - **Q-A（已决）**：弱化传统 DAW 轨道管理，按舞台调音台方式管理 solo/mute/pan——per-channel `gain/pan/mute/solo`（D15 升级）；用户仍可每轨道对应一个 mixer 通道（默认图 D18 即如此）。
 - **Q-B（已决）**：strip 确认退役，多通道 mixer 直连 master。**v3 → v4 采用加载期自动迁移**（ChannelStrip → 2 通道 Mixer，原 gain/pan/mute 进通道 0；master 入边 >1 时插入一个合成 Mixer 承接全部原 master 入边）——迁移逻辑确定可测，项目文件尚少。
-- **Q-C（已决）**：通道数管理采用**方案一：面板按钮手动增减**（D21），下限 2 无法删、上限 32 无法加；通道设置与插线状态解耦，拔线不丢；连线可落任意空通道。否决"入口数 = 入边数 + 1 自动增减"（拆线丢状态、口位重排/留洞语义复杂、自动化需稳定端口身份）。
+- **Q-C（已决）**：通道数管理采用**方案一：面板按钮手动增减**（D21），下限 1 无法删、上限 32 无法加；通道设置与插线状态解耦，拔线不丢；连线可落任意空通道。否决"入口数 = 入边数 + 1 自动增减"（拆线丢状态、口位重排/留洞语义复杂、自动化需稳定端口身份）。
 
 **遗留（不阻塞）**：
 

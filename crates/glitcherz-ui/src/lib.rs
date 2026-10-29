@@ -8273,97 +8273,21 @@ impl GlitcherZApp {
         }
     }
 
-    /// 新增一条 MIDI 轨：文档两件套节点（voice + delay，P5f D18 不再有
-    /// strip）+ 连线（voice→delay + delay→mixer.ch[i] + MIDI 自连）+
-    /// 引擎默认链（`add_midi_track`）+ node_map 映射 + 活跃轨数下发。
-    /// mixer 通道满员时自动扩容（D21 上限 32）。
+    /// 新增一条 MIDI 轨：只增加一条空轨道位（文档 `MidiTrack` + 引擎轨占用），
+    /// 不建 Instrument / delay 节点、不接线、不扩 mixer——音源与路由交给用户
+    /// 在 patch 里自行搭建。一步 undo。
     fn add_midi_track(&mut self) {
         let track = self.project().midi_tracks.len();
         if track >= MAX_MIDI_TRACKS {
             return;
         }
-        let Some([voice_e, delay_e]) = self.engine.add_midi_track() else {
-            self.set_message("Add track failed (engine slots or queue full)".to_string());
-            return;
-        };
-        // One undo step for the whole operation: the mixer may grow inside
-        // (mixer_add_channel is itself undoable), and its sub-step must not
-        // split the history.
         let before = self.begin_edit();
-        self.session.suspend_history();
-        // 文档侧新 id：从现有最大 node_id 之后分配（1 = 主输出保留）。
-        let next = self
-            .project()
-            .graph
-            .nodes
-            .iter()
-            .map(|n| n.node_id())
-            .max()
-            .unwrap_or(1)
-            + 1;
-        let (voice_id, delay_id) = (next, next + 1);
         self.project_mut()
             .midi_tracks
             .push(glitcherz_model::MidiTrack::default());
-        self.project_mut().graph.nodes.push(NodeDoc::Instrument {
-            node_id: voice_id,
-            track,
-            voice: VoiceSpec::Builtin,
-            synth: SynthParams::default(),
-        });
-        self.project_mut().graph.nodes.push(NodeDoc::Effect {
-            node_id: delay_id,
-            track,
-            voice: VoiceSpec::Builtin,
-            params: EffectParams::default(),
-            delay: None,
-        });
-        self.project_mut()
-            .graph
-            .cables
-            .push(glitcherz_model::CableDoc::audio(voice_id, delay_id));
-        self.project_mut()
-            .graph
-            .cables
-            .push(glitcherz_model::CableDoc::midi(track, voice_id));
-        // D18: wire the chain end into the global mixer's first free channel
-        // (growing the mixer when it is full).
-        if let Some(mixer_doc) = self
-            .project()
-            .graph
-            .nodes
-            .iter()
-            .find(|n| n.is_mixer())
-            .map(NodeDoc::node_id)
-        {
-            let ch = match self.project().graph.first_free_channel(mixer_doc) {
-                Some(ch) => ch,
-                None => {
-                    self.mixer_add_channel(mixer_doc);
-                    (self.project().graph.first_free_channel(mixer_doc)).unwrap_or(u8::MAX)
-                }
-            };
-            if ch != u8::MAX {
-                self.project_mut()
-                    .graph
-                    .cables
-                    .push(glitcherz_model::CableDoc::audio_to_channel(
-                        delay_id,
-                        PortRef::Node(mixer_doc),
-                        ch,
-                    ));
-                if let Some(mixer_engine) = self.engine_id(mixer_doc) {
-                    self.engine.connect_nodes(delay_e, mixer_engine, ch);
-                }
-            }
-        }
-        self.node_map.insert(voice_id, voice_e);
-        self.node_map.insert(delay_id, delay_e);
         self.engine
             .set_midi_track_count(self.project().midi_tracks.len());
         self.selected_track = track;
-        self.push_node_params();
-        self.session.resume_history();
         self.commit_edit("Add MIDI Track", before);
     }
 
@@ -8381,7 +8305,13 @@ impl GlitcherZApp {
             .graph
             .nodes
             .iter()
-            .filter(|n| n.track() == last && !n.is_mixer())
+            .filter(|n| {
+                n.track() == last
+                    && !n.is_mixer()
+                    // Audio-track nodes reuse `track` for the audio lane index;
+                    // removing a MIDI track must not take them with it.
+                    && !matches!(n, NodeDoc::AudioTrack { .. })
+            })
             .map(|n| n.node_id())
             .collect();
         for doc_id in &doc_ids {
@@ -8411,7 +8341,9 @@ impl GlitcherZApp {
         // 文档：删节点 + 删触及连线（含 MidiTrack(last) 自连；外部连到
         // 本轨节点的扇出线因触及被删节点一并移除）。
         let removed: HashSet<u64> = doc_ids.into_iter().collect();
-        self.project_mut().graph.nodes.retain(|n| n.track() != last);
+        self.project_mut().graph.nodes.retain(|n| {
+            !(n.track() == last && !n.is_mixer() && !matches!(n, NodeDoc::AudioTrack { .. }))
+        });
         self.project_mut().graph.cables.retain(|c| {
             let touches_removed = match (&c.from, &c.to) {
                 (PortRef::Node(f), _) => removed.contains(f),
@@ -10251,18 +10183,31 @@ mod panel_target_tests {
 
     #[test]
     fn selection_wins_over_track_fallback() {
-        let project = Project::default();
+        let mut project = Project::default();
+        let t1 = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::Instrument {
+            node_id: t1,
+            track: 1,
+            voice: VoiceSpec::Builtin,
+            synth: SynthParams::default(),
+        });
         let doc = &project.graph;
-        let t1 = doc.instrument_of_track(1).unwrap().node_id();
         // Cross-track patch target: the selection addresses the panel.
         assert_eq!(resolve_panel_target(doc, &[t1], 0), Some(t1));
     }
 
     #[test]
     fn effect_and_mixer_nodes_are_editable_targets() {
-        let project = Project::default();
+        let mut project = Project::default();
+        let delay = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::Effect {
+            node_id: delay,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params: EffectParams::default(),
+            delay: None,
+        });
         let doc = &project.graph;
-        let delay = doc.builtin_delay_of_track(0).unwrap().node_id();
         let mixer = doc.first_mixer().unwrap().node_id();
         assert_eq!(resolve_panel_target(doc, &[delay], 0), Some(delay));
         assert_eq!(resolve_panel_target(doc, &[mixer], 0), Some(mixer));
@@ -10281,13 +10226,20 @@ mod panel_target_tests {
 
     #[test]
     fn document_order_breaks_multi_selection_ties() {
-        let project = Project::default();
-        let doc = &project.graph;
+        let mut project = Project::default();
+        let doc = &mut project.graph;
         let t0 = doc.instrument_of_track(0).unwrap().node_id();
-        let delay1 = doc.builtin_delay_of_track(1).unwrap().node_id();
+        let t1 = doc.next_node_id();
+        doc.nodes.push(NodeDoc::Instrument {
+            node_id: t1,
+            track: 1,
+            voice: VoiceSpec::Builtin,
+            synth: SynthParams::default(),
+        });
+        let doc = &project.graph;
         // Selection order is irrelevant: document order decides.
-        assert_eq!(resolve_panel_target(doc, &[delay1, t0], 0), Some(t0));
-        assert_eq!(resolve_panel_target(doc, &[t0, delay1], 0), Some(t0));
+        assert_eq!(resolve_panel_target(doc, &[t1, t0], 0), Some(t0));
+        assert_eq!(resolve_panel_target(doc, &[t0, t1], 0), Some(t0));
     }
 }
 #[cfg(test)]
@@ -10398,7 +10350,15 @@ mod inline_param_tests {
     /// descriptor slot.
     #[test]
     fn auto_options_cover_mixer_channels_and_effect_slots() {
-        let project = Project::default();
+        let mut project = Project::default();
+        let delay_id = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::Effect {
+            node_id: delay_id,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params: EffectParams::default(),
+            delay: None,
+        });
         let doc = &project.graph;
         let mixer = doc.first_mixer().expect("default mixer");
         let (NodeDoc::Mixer { inputs, .. }, mixer_id) = (mixer, mixer.node_id()) else {
@@ -10420,9 +10380,9 @@ mod inline_param_tests {
             "the last channel must be offered too: {labels:?}"
         );
 
-        // A built-in delay exposes its whole descriptor, not just the inline
+        // A built-in effect exposes its whole descriptor, not just the inline
         // rows on the node body.
-        let delay = doc.builtin_delay_of_track(0).expect("track delay");
+        let delay = doc.node_by_id(delay_id).expect("explicit track delay");
         let options = node_auto_options(doc, delay.node_id(), None, None);
         let NodeDoc::Effect { params, .. } = delay else {
             unreachable!()

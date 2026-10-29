@@ -178,11 +178,11 @@ mod tests {
     #[test]
     fn import_reuses_empty_tracks_before_appending() {
         // A fresh project ships with DEFAULT_MIDI_TRACKS empty tracks, so a
-        // small import lands entirely in them.
+        // small import lands in them and appends the rest.
         let project = Project::default();
         let plan = plan_import(&project.midi_tracks, 3);
-        assert_eq!(plan.reuse, vec![0, 1, 2]);
-        assert_eq!(plan.append, 0);
+        assert_eq!(plan.reuse, vec![0]);
+        assert_eq!(plan.append, 2);
         assert_eq!(plan.dropped, 0);
 
         // More tracks than empty slots: the rest are appended.

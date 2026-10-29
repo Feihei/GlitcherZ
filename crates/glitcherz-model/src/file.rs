@@ -418,7 +418,8 @@ mod tests {
     ),
 )"#;
         let project = parse_project(text).expect("v4 document should migrate and load");
-        // No strip remains; both strips became 2-channel mixers.
+        // No strip remains; both strips became single-channel mixers (the
+        // minimum is one channel since the 2026-10-29 template revision).
         assert!(
             !project
                 .graph
@@ -438,8 +439,8 @@ mod tests {
         else {
             panic!("expected a mixer node");
         };
-        assert_eq!(*inputs, 2);
-        assert_eq!(channels.len(), 2);
+        assert_eq!(*inputs, 1);
+        assert_eq!(channels.len(), 1);
         assert!((channels[0].gain - 0.6).abs() < 1e-6);
         assert!((channels[0].pan + 0.5).abs() < 1e-6);
         assert!(channels[0].muted, "strip mute should carry into channel 0");

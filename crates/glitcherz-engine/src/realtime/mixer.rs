@@ -53,11 +53,11 @@ pub struct MixerProcessor {
 }
 
 impl MixerProcessor {
-    /// Mixer with `count` channels (clamped to 2..=[`MAX_WEIGHT_CHANNELS`]);
+    /// Mixer with `count` channels (clamped to 1..=[`MAX_WEIGHT_CHANNELS`]);
     /// all channels at console defaults.
     pub fn new(count: usize) -> Self {
         Self::with_channels(
-            &vec![MixerChannel::default(); count.clamp(2, MAX_WEIGHT_CHANNELS)],
+            &vec![MixerChannel::default(); count.clamp(1, MAX_WEIGHT_CHANNELS)],
             0.0,
             false,
         )
