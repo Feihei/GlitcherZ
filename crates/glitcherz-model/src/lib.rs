@@ -1809,8 +1809,13 @@ pub struct AudioTrack {
 
 /// One mixer channel's console state (P5f D15/D21: a virtual channel strip —
 /// the stage-console metaphor; channel state is decoupled from cabling).
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MixerChannel {
+    /// Channel name as typed in the console (empty = show the default
+    /// "Ch N" / "Ch N · <track>" label). Renaming a channel is presentation
+    /// only — it never touches the routing or the fader state.
+    #[serde(default)]
+    pub name: String,
     /// Channel gain (linear, 0..1.5).
     #[serde(default = "default_track_gain")]
     pub gain: f32,
@@ -1828,6 +1833,7 @@ pub struct MixerChannel {
 impl Default for MixerChannel {
     fn default() -> Self {
         Self {
+            name: String::new(),
             gain: default_track_gain(),
             pan: 0.0,
             muted: false,
@@ -3339,6 +3345,7 @@ impl Project {
                     track: *track,
                     inputs: MIN_MIXER_CHANNELS as u8,
                     channels: vec![MixerChannel {
+                        name: String::new(),
                         gain: *gain,
                         pan: *pan,
                         muted: *muted,

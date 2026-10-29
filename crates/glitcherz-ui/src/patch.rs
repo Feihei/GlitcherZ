@@ -4526,12 +4526,14 @@ mod tests {
             inputs: 2,
             channels: vec![
                 glitcherz_model::MixerChannel {
+                    name: String::new(),
                     gain: 0.5,
                     pan: 0.0,
                     muted: true,
                     solo: false,
                 },
                 glitcherz_model::MixerChannel {
+                    name: String::new(),
                     gain: 1.25,
                     pan: 0.0,
                     muted: false,

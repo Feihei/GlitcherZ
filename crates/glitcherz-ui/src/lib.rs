@@ -105,6 +105,50 @@ pub const MASTER_GAIN_RANGE: RangeInclusive<f32> = 0.0..=1.5;
 /// Meter scale floor in dB (the transport meter's bottom of travel).
 const METER_FLOOR_DB: f32 = -60.0;
 
+/// Width reserved for the mixer console's pinned right column (channel
+/// add/remove + output stage) next to the horizontally scrolling strip row.
+const MIXER_STRIP_CONTROLS_W: f32 = 120.0;
+
+/// Id salt of the mixer console's strip row scroll area. The middle-drag pan
+/// resolves the id from the ScrollArea output, so this only keeps the state
+/// stable across frames (and across mixer nodes — one console at a time).
+const MIXER_STRIP_SCROLL: &str = "glitcherz_mixer_strip_scroll";
+
+/// Id salt of the strip row's child Ui (the horizontal band that holds the
+/// scrolling strips plus the pinned right column). Explicit so the scroll
+/// area's own id — derived from this Ui — survives layout churn above.
+const MIXER_STRIP_ROW: &str = "glitcherz_mixer_strip_row";
+
+/// Width of one mixer strip column (its controls are all built to this
+/// width, so the title cell matches them).
+const MIXER_STRIP_W: f32 = 96.0;
+
+/// Minimum height of a strip's title cell (the real height is one line of body
+/// text, measured per frame — this only floors it so a very small font still
+/// leaves room for the inline rename field).
+const MIXER_STRIP_TITLE_MIN_H: f32 = 18.0;
+
+/// First-frame height of the strip row (bootstrap only — the real height is
+/// measured from the laid-out strips one frame later, so a font or DPI change
+/// corrects itself). Roughly label + S/M + meter + fader + pan + spacing.
+const MIXER_STRIP_MIN_H: f32 = 240.0;
+
+/// One in-progress channel-title rename in the mixer console. The console
+/// strips are drawn inside a closure, so the state is `take()`n out of the app
+/// before the row lays out and put back afterwards.
+struct ChannelRename {
+    /// Mixer node owning the channel (only one console is visible at a time,
+    /// but the node id keeps a stale editor from landing on another mixer).
+    node: u64,
+    /// Channel index inside that node.
+    channel: usize,
+    /// Draft text (empty on commit clears the custom name).
+    draft: String,
+    /// The right-click that opened the editor lands one frame before the text
+    /// field exists — request focus on the first frame that draws it.
+    needs_focus: bool,
+}
+
 /// Short row label for one plugin inline control (G5): the node-body label
 /// column is narrow, so the display name is truncated to its first few
 /// characters; an empty name falls back to the parameter id.
@@ -1023,6 +1067,20 @@ pub struct GlitcherZApp {
     focus_router: focus::FocusRouter,
     /// Node patch cross-frame state (pan/zoom/selection/drag).
     patch_state: patch::PatchState,
+    /// Mixer strip row viewport as of the last frame: scroll area id + visible
+    /// rect. The middle-drag pan reads it **before** the ScrollArea lays out,
+    /// so the offset and the pointer move in the same frame (the same trick
+    /// the timeline plays with `rows_rect`).
+    mixer_strip_view: Option<(egui::Id, egui::Rect)>,
+    /// Height of the mixer strip band, measured from the last laid-out row.
+    /// The strip row is laid out in a child Ui with an **explicit** height:
+    /// `ui.horizontal` would give it one row (~18 px), which collapses the
+    /// scroll area's viewport and with it the middle-drag hit box and the
+    /// scroll bar position.
+    mixer_strip_h: f32,
+    /// In-progress channel-title rename in the mixer console (right-click a
+    /// strip title, type, Enter commits). `None` = no editor open.
+    channel_rename: Option<ChannelRename>,
     /// Active main view (tab bar).
     view: MainView,
     /// Octave base (MIDI number of C, default 60 = C4).
@@ -1266,6 +1324,9 @@ impl GlitcherZApp {
             roll_state: piano_roll::RollState::new(),
             focus_router: focus::FocusRouter::new(),
             patch_state: patch::PatchState::default(),
+            mixer_strip_view: None,
+            mixer_strip_h: MIXER_STRIP_MIN_H,
+            channel_rename: None,
             view: MainView::default(),
             octave_base: 60,
             vk_targets: Vec::new(),
@@ -5727,6 +5788,48 @@ impl GlitcherZApp {
             timeline::TimelineAction::ReorderMidiTrack { from, to } => {
                 self.reorder_midi_track(from, to)
             }
+            // Inline header rename (right-click → type → Enter). Presentation
+            // only: no engine push, no node retarget — one undo step.
+            timeline::TimelineAction::RenameTrack { lane, track, name } => {
+                let current = match lane {
+                    timeline::TimelineLane::Midi => self
+                        .project()
+                        .midi_tracks
+                        .get(track)
+                        .map(|t| t.name.clone()),
+                    timeline::TimelineLane::Control => self
+                        .project()
+                        .control_tracks
+                        .get(track)
+                        .map(|t| t.name.clone()),
+                    timeline::TimelineLane::Audio => self
+                        .project()
+                        .audio_tracks
+                        .get(track)
+                        .map(|t| t.name.clone()),
+                };
+                if current.is_some_and(|n| n != name) {
+                    let before = self.begin_edit();
+                    match lane {
+                        timeline::TimelineLane::Midi => {
+                            if let Some(t) = self.project_mut().midi_tracks.get_mut(track) {
+                                t.name = name;
+                            }
+                        }
+                        timeline::TimelineLane::Control => {
+                            if let Some(t) = self.project_mut().control_tracks.get_mut(track) {
+                                t.name = name;
+                            }
+                        }
+                        timeline::TimelineLane::Audio => {
+                            if let Some(t) = self.project_mut().audio_tracks.get_mut(track) {
+                                t.name = name;
+                            }
+                        }
+                    }
+                    self.commit_edit("Rename Track", before);
+                }
+            }
             timeline::TimelineAction::AddClip {
                 lane,
                 track,
@@ -8060,6 +8163,10 @@ impl GlitcherZApp {
     /// add/remove buttons (2..=32, D21) and the output pan/mute stage. The
     /// channel a track feeds is labeled with the track name.
     ///
+    /// The strip row scrolls horizontally (17+ channels overflow any panel):
+    /// wheel / Shift+wheel scroll it, middle-drag pans it, and the add/remove
+    /// + output column stays pinned on the right.
+    ///
     /// Only rendered while the selected patch node **is** a mixer: the
     /// console edits that node's fields, so it must not appear next to an
     /// instrument's parameters. Track add/remove lives in the timeline
@@ -8113,123 +8220,324 @@ impl GlitcherZApp {
         let mut remove_ch_clicked = false;
         let mut out_mute_edit: Option<bool> = None;
         let mut out_pan_edit: Option<f32> = None;
+        // Inline title editor state: taken out of `self` so the strips closure
+        // can hold a `&mut` to the draft, put back once the row has laid out.
+        let mut rename = self.channel_rename.take();
+        let mut rename_commit: Option<(usize, String)> = None;
 
-        ui.horizontal(|ui| {
-            for (ch_idx, ch) in channels.iter().enumerate() {
-                ui.vertical(|ui| {
-                    let name = match channel_track.get(ch_idx).copied().flatten() {
-                        Some(t) if self.project().midi_tracks[t].name.is_empty() => {
-                            format!("Ch {} · T{}", ch_idx + 1, t + 1)
-                        }
-                        Some(t) => {
-                            format!("Ch {} · {}", ch_idx + 1, self.project().midi_tracks[t].name)
-                        }
-                        None => format!("Ch {}", ch_idx + 1),
-                    };
-                    ui.weak(name);
+        // ---- Strip row: horizontally scrollable ----
+        // A console with 17+ channels is wider than any panel, so the strips
+        // live in their own horizontal ScrollArea. Deliberately **not**
+        // `ScrollArea::both` on the whole panel: a horizontally scrolling
+        // content Ui hands every child an infinite available width, which
+        // would stretch the parameter stack above the console. Navigation
+        // matches the timeline / piano roll / patch viewports — wheel /
+        // Shift+wheel scroll, middle-drag pans.
+        //
+        // The pan runs against **last frame's** viewport rect so the offset
+        // and the pointer move in the same frame (same approach as the
+        // timeline's wheel/pan block).
+        if let Some((scroll_id, view_rect)) = self.mixer_strip_view
+            && ui
+                .ctx()
+                .pointer_hover_pos()
+                .is_some_and(|p| view_rect.contains(p))
+        {
+            let (panning, delta) = ui.ctx().input(|i| {
+                (
+                    i.pointer.button_down(egui::PointerButton::Middle),
+                    i.pointer.delta(),
+                )
+            });
+            if panning
+                && delta != egui::Vec2::ZERO
+                && let Some(mut s) = egui::containers::scroll_area::State::load(ui.ctx(), scroll_id)
+            {
+                s.offset.x = (s.offset.x - delta.x).max(0.0);
+                s.store(ui.ctx(), scroll_id);
+            }
+        }
 
-                    // Solo / mute row.
+        let strip_width = (ui.available_width() - MIXER_STRIP_CONTROLS_W).max(160.0);
+        // The row is a child Ui with an **explicit height**, not a
+        // `ui.horizontal`: that helper hands its child a one-row-tall
+        // max_rect, which collapses the scroll area's viewport — and with it
+        // the middle-drag hit box and the scroll bar position — to ~18 px
+        // (the strips themselves still overflow and paint, so it only shows
+        // up as "pan does nothing"). The height is last frame's measured
+        // strip band (self-correcting, since the strips are partly
+        // font-sized), with the constant as the first-frame bootstrap.
+        let row_rect = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2(ui.available_width(), self.mixer_strip_h),
+        );
+        let mut row = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(row_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Min))
+                .id_salt(MIXER_STRIP_ROW),
+        );
+        let (strip_id, strip_band, strip_content_h) = {
+            // One line of body text — the same style the old `ui.weak(name)`
+            // used — measured so the cell never clips at another DPI/font.
+            let title_h = row
+                .text_style_height(&egui::TextStyle::Body)
+                .max(MIXER_STRIP_TITLE_MIN_H);
+            let strips = egui::ScrollArea::horizontal()
+                .id_salt(MIXER_STRIP_SCROLL)
+                .max_width(strip_width)
+                .auto_shrink([true, true])
+                .show(&mut row, |ui| {
                     ui.horizontal(|ui| {
-                        let mut solo_btn = egui::Button::new(if ch.solo { "S" } else { "s" });
-                        if ch.solo {
-                            solo_btn = solo_btn.fill(egui::Color32::from_rgb(200, 170, 60));
-                        }
-                        if ui.add_sized([32.0, 20.0], solo_btn).clicked() {
-                            solo_edits[ch_idx] = Some(!ch.solo);
-                        }
-                        let mut mute_btn = egui::Button::new(if ch.muted { "M" } else { "m" });
-                        if ch.muted {
-                            mute_btn = mute_btn.fill(egui::Color32::from_rgb(140, 60, 50));
-                        }
-                        if ui.add_sized([32.0, 20.0], mute_btn).clicked() {
-                            mute_edits[ch_idx] = Some(!ch.muted);
+                        for (ch_idx, ch) in channels.iter().enumerate() {
+                            ui.vertical(|ui| {
+                                // Default label from the channel→track map;
+                                // a typed-in channel name wins over it.
+                                let default_label =
+                                    match channel_track.get(ch_idx).copied().flatten() {
+                                        Some(t)
+                                            if self.project().midi_tracks[t].name.is_empty() =>
+                                        {
+                                            format!("Ch {} · T{}", ch_idx + 1, t + 1)
+                                        }
+                                        Some(t) => {
+                                            format!(
+                                                "Ch {} · {}",
+                                                ch_idx + 1,
+                                                self.project().midi_tracks[t].name
+                                            )
+                                        }
+                                        None => format!("Ch {}", ch_idx + 1),
+                                    };
+                                let custom = !ch.name.is_empty();
+                                let display = if custom {
+                                    ch.name.clone()
+                                } else {
+                                    default_label.clone()
+                                };
+                                let editing = rename
+                                    .as_ref()
+                                    .is_some_and(|r| r.node == mixer_doc && r.channel == ch_idx);
+                                // Title cell, one fixed-size text line. A plain
+                                // wrapping label is what blew the header up
+                                // ("Ch 10"+ re-flowed to one glyph per line):
+                                // the strip is a child of the scrolling row,
+                                // so its available width shrinks with every
+                                // column drawn before it, and the label wrapped
+                                // to fit whatever was left. A cell of a fixed
+                                // size with a truncating label is immune — and
+                                // the whole cell is the click target, so the
+                                // right-click does not have to land on a glyph.
+                                let (cell, cell_resp) = ui.allocate_exact_size(
+                                    egui::vec2(MIXER_STRIP_W, title_h),
+                                    if editing {
+                                        egui::Sense::hover()
+                                    } else {
+                                        egui::Sense::click()
+                                    },
+                                );
+                                if editing {
+                                    let mut cancel = false;
+                                    let mut finish = false;
+                                    if let Some(r) = rename.as_mut() {
+                                        let resp = ui.put(
+                                            cell,
+                                            egui::TextEdit::singleline(&mut r.draft)
+                                                .hint_text(default_label.clone()),
+                                        );
+                                        if std::mem::take(&mut r.needs_focus) {
+                                            resp.request_focus();
+                                        }
+                                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                            cancel = true;
+                                        } else if resp.lost_focus() {
+                                            // Enter, Tab and a click elsewhere
+                                            // all end the edit; empty clears
+                                            // the custom name (back to default).
+                                            rename_commit =
+                                                Some((ch_idx, r.draft.trim().to_owned()));
+                                            finish = true;
+                                        }
+                                    }
+                                    if cancel || finish {
+                                        rename = None;
+                                    }
+                                } else {
+                                    let mut cell_ui =
+                                        ui.new_child(egui::UiBuilder::new().max_rect(cell).layout(
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                        ));
+                                    cell_ui.add(
+                                        egui::Label::new(egui::RichText::new(&display).weak())
+                                            .truncate(),
+                                    );
+                                    let resp = cell_resp.on_hover_text(format!(
+                                        "{display}\nRight-click to rename this channel"
+                                    ));
+                                    if resp.secondary_clicked() {
+                                        rename = Some(ChannelRename {
+                                            node: mixer_doc,
+                                            channel: ch_idx,
+                                            draft: ch.name.clone(),
+                                            needs_focus: true,
+                                        });
+                                    }
+                                }
+
+                                // Solo / mute row.
+                                ui.horizontal(|ui| {
+                                    let mut solo_btn =
+                                        egui::Button::new(if ch.solo { "S" } else { "s" });
+                                    if ch.solo {
+                                        solo_btn =
+                                            solo_btn.fill(egui::Color32::from_rgb(200, 170, 60));
+                                    }
+                                    if ui.add_sized([32.0, 20.0], solo_btn).clicked() {
+                                        solo_edits[ch_idx] = Some(!ch.solo);
+                                    }
+                                    let mut mute_btn =
+                                        egui::Button::new(if ch.muted { "M" } else { "m" });
+                                    if ch.muted {
+                                        mute_btn =
+                                            mute_btn.fill(egui::Color32::from_rgb(140, 60, 50));
+                                    }
+                                    if ui.add_sized([32.0, 20.0], mute_btn).clicked() {
+                                        mute_edits[ch_idx] = Some(!ch.muted);
+                                    }
+                                });
+
+                                // Post-fader level bar (metering point = the feeding track's chain end).
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(96.0, 10.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter()
+                                    .rect_filled(rect, 2.0, egui::Color32::from_gray(40));
+                                let level = channel_track
+                                    .get(ch_idx)
+                                    .copied()
+                                    .flatten()
+                                    .map(|t| self.engine.track_level(t).clamp(0.0, 1.0))
+                                    .unwrap_or(0.0);
+                                let filled = egui::Rect::from_min_size(
+                                    rect.min,
+                                    egui::vec2(rect.width() * level, rect.height()),
+                                );
+                                ui.painter().rect_filled(
+                                    filled,
+                                    2.0,
+                                    egui::Color32::from_rgb(70, 160, 90),
+                                );
+
+                                // Fader + pan.
+                                let mut gain = ch.gain;
+                                let fader = ui.add_sized(
+                                    [96.0, 110.0],
+                                    egui::Slider::new(&mut gain, TRACK_GAIN_RANGE).vertical(),
+                                );
+                                if fader.changed() {
+                                    gain_edits[ch_idx] = Some(gain);
+                                }
+                                let mut pan = ch.pan;
+                                let pan_resp = ui.add_sized(
+                                    [96.0, 20.0],
+                                    egui::Slider::new(&mut pan, PAN_RANGE).text("Pan"),
+                                );
+                                if pan_resp.changed() {
+                                    pan_edits[ch_idx] = Some(pan);
+                                }
+                            });
+                            if ch_idx + 1 < channels.len() {
+                                ui.separator();
+                            }
                         }
                     });
-
-                    // Post-fader level bar (metering point = the feeding track's chain end).
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(96.0, 10.0), egui::Sense::hover());
-                    ui.painter()
-                        .rect_filled(rect, 2.0, egui::Color32::from_gray(40));
-                    let level = channel_track
-                        .get(ch_idx)
-                        .copied()
-                        .flatten()
-                        .map(|t| self.engine.track_level(t).clamp(0.0, 1.0))
-                        .unwrap_or(0.0);
-                    let filled = egui::Rect::from_min_size(
-                        rect.min,
-                        egui::vec2(rect.width() * level, rect.height()),
-                    );
-                    ui.painter()
-                        .rect_filled(filled, 2.0, egui::Color32::from_rgb(70, 160, 90));
-
-                    // Fader + pan.
-                    let mut gain = ch.gain;
-                    let fader = ui.add_sized(
-                        [96.0, 110.0],
-                        egui::Slider::new(&mut gain, TRACK_GAIN_RANGE).vertical(),
-                    );
-                    if fader.changed() {
-                        gain_edits[ch_idx] = Some(gain);
-                    }
-                    let mut pan = ch.pan;
-                    let pan_resp = ui.add_sized(
-                        [96.0, 20.0],
-                        egui::Slider::new(&mut pan, PAN_RANGE).text("Pan"),
-                    );
-                    if pan_resp.changed() {
-                        pan_edits[ch_idx] = Some(pan);
-                    }
                 });
-                if ch_idx + 1 < channels.len() {
-                    ui.separator();
-                }
+            // Hit box for the middle-drag pan: the strip band as it is on
+            // screen (viewport width, strip height). The row height is
+            // explicit, so this is the real band — scroll bar included.
+            (
+                strips.id,
+                egui::Rect::from_min_size(
+                    strips.inner_rect.min,
+                    egui::vec2(
+                        strips.inner_rect.width(),
+                        strips.content_size.y.min(strips.inner_rect.height()),
+                    ),
+                ),
+                strips.content_size.y,
+            )
+        };
+
+        // ---- Channel add / remove (D21) — pinned right ----
+        // Outside the ScrollArea: reachable at every scroll offset, which
+        // is exactly how a channel gets added once the row overflows.
+        row.separator();
+        row.vertical(|ui| {
+            ui.weak("Channels");
+            if ui
+                .add_enabled(
+                    (inputs as usize) < MAX_MIXER_CHANNELS,
+                    egui::Button::new("+ Ch"),
+                )
+                .clicked()
+            {
+                add_ch_clicked = true;
+            }
+            if ui
+                .add_enabled(
+                    (inputs as usize) > MIN_MIXER_CHANNELS,
+                    egui::Button::new("- Ch"),
+                )
+                .clicked()
+            {
+                remove_ch_clicked = true;
             }
 
-            // ---- Channel add / remove (D21) ----
-            ui.separator();
-            ui.vertical(|ui| {
-                ui.weak("Channels");
-                if ui
-                    .add_enabled(
-                        (inputs as usize) < MAX_MIXER_CHANNELS,
-                        egui::Button::new("+ Ch"),
-                    )
-                    .clicked()
-                {
-                    add_ch_clicked = true;
-                }
-                if ui
-                    .add_enabled(
-                        (inputs as usize) > MIN_MIXER_CHANNELS,
-                        egui::Button::new("- Ch"),
-                    )
-                    .clicked()
-                {
-                    remove_ch_clicked = true;
-                }
-
-                // Output stage.
-                ui.add_space(8.0);
-                ui.weak("Out");
-                let mut out_btn = egui::Button::new(if out_muted { "M" } else { "m" });
-                if out_muted {
-                    out_btn = out_btn.fill(egui::Color32::from_rgb(140, 60, 50));
-                }
-                if ui.add_sized([72.0, 22.0], out_btn).clicked() {
-                    out_mute_edit = Some(!out_muted);
-                }
-                let mut op = out_pan;
-                let op_resp = ui.add_sized(
-                    [96.0, 20.0],
-                    egui::Slider::new(&mut op, PAN_RANGE).text("Pan"),
-                );
-                if op_resp.changed() {
-                    out_pan_edit = Some(op);
-                }
-            });
+            // Output stage.
+            ui.add_space(8.0);
+            ui.weak("Out");
+            let mut out_btn = egui::Button::new(if out_muted { "M" } else { "m" });
+            if out_muted {
+                out_btn = out_btn.fill(egui::Color32::from_rgb(140, 60, 50));
+            }
+            if ui.add_sized([72.0, 22.0], out_btn).clicked() {
+                out_mute_edit = Some(!out_muted);
+            }
+            let mut op = out_pan;
+            let op_resp = ui.add_sized(
+                [96.0, 20.0],
+                egui::Slider::new(&mut op, PAN_RANGE).text("Pan"),
+            );
+            if op_resp.changed() {
+                out_pan_edit = Some(op);
+            }
         });
+        // The child Ui does not advance the parent cursor by itself
+        // (`ui.horizontal` would); without this the next section draws on top
+        // of the console.
+        ui.advance_cursor_after_rect(row.min_rect());
+        // Remember the viewport for next frame's middle-drag pan, and the
+        // strip band's height so next frame's row viewport is exact (content
+        // + the scroll bar it allocates — `allocated_width` is the bar's
+        // thickness, and 0 when the bar floats over the content).
+        self.mixer_strip_view = Some((strip_id, strip_band));
+        self.mixer_strip_h = (strip_content_h + ui.spacing().scroll.allocated_width()).max(1.0);
+        // Put the (possibly still open) title editor back — unless it belongs
+        // to another console or to a channel that has since been removed.
+        self.channel_rename = rename.filter(|r| r.node == mixer_doc && r.channel < n);
+        if let Some((idx, name)) = rename_commit {
+            // Renaming is presentation only: no engine param, no rebuild —
+            // one undoable document edit.
+            let before = self.begin_edit();
+            if let Some(NodeDoc::Mixer { channels, .. }) =
+                self.project_mut().graph.node_by_id_mut(mixer_doc)
+                && let Some(c) = channels.get_mut(idx)
+            {
+                c.name = name;
+            }
+            self.commit_edit("Rename Channel", before);
+        }
 
         // ---- Apply edits (document + engine node-param path, D20) ----
         let send_mixer = |ui_app: &mut Self, id: ParamId, value: f32| {

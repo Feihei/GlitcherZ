@@ -273,6 +273,12 @@ pub struct TimelineState {
     /// Song-loop drag on the ruler (U1): `None` means an in-progress ruler
     /// drag is a plain seek scrub instead.
     loop_drag: Option<LoopDrag>,
+    /// Inline track-rename editor (right-click a track name, type, Enter
+    /// commits): which lane and track, plus the draft text.
+    rename: Option<(TimelineLane, usize, String)>,
+    /// The right-click that opens the editor lands one frame before the text
+    /// field exists, so the first frame that draws it asks for focus.
+    rename_focus: bool,
 }
 
 impl Default for TimelineState {
@@ -295,6 +301,8 @@ impl Default for TimelineState {
             rows_viewport_min: Pos2::ZERO,
             reorder: None,
             loop_drag: None,
+            rename: None,
+            rename_focus: false,
         }
     }
 }
@@ -436,6 +444,14 @@ pub enum TimelineAction {
     ReorderMidiTrack {
         from: usize,
         to: usize,
+    },
+    /// Rename a track from the inline header editor (one undo step; works for
+    /// MIDI, control and audio rows). An empty name is legal: the header
+    /// falls back to the generated "Track N" / "Curve N" / "Audio N" label.
+    RenameTrack {
+        lane: TimelineLane,
+        track: usize,
+        name: String,
     },
     OpenMidiEditor {
         track: usize,
@@ -943,18 +959,31 @@ impl RowColors {
     }
 }
 
+/// Header cell contents. All three row kinds are renameable (right-click the
+/// name), so each carries the document's raw name next to the display label.
 enum HeaderKind {
     Midi {
         index: usize,
+        /// Display label ("Track N" when the document name is empty).
         name: String,
+        /// The document's raw name — the inline rename editor starts from
+        /// this, so pressing Enter on an untouched editor keeps "empty =
+        /// default label" instead of freezing the generated name.
+        raw_name: String,
         selected: bool,
     },
     Control {
         index: usize,
+        /// Display label ("Curve N" when the document name is empty).
+        name: String,
+        raw_name: String,
         selected: bool,
     },
     Audio {
         index: usize,
+        /// Display label ("Audio N" when the document name is empty).
+        name: String,
+        raw_name: String,
         selected: bool,
     },
 }
@@ -1425,6 +1454,7 @@ pub fn show(
             let header = HeaderKind::Midi {
                 index: i,
                 name,
+                raw_name: track.name.clone(),
                 selected: p.selected_track == i,
             };
             let highlight = p
@@ -1461,6 +1491,12 @@ pub fn show(
             for (i, track) in control_tracks.iter().enumerate() {
                 let header = HeaderKind::Control {
                     index: i,
+                    name: if track.name.is_empty() {
+                        format!("Curve {}", i + 1)
+                    } else {
+                        track.name.clone()
+                    },
+                    raw_name: track.name.clone(),
                     selected: p.selected_auto == i,
                 };
                 // U12: no inline editor band anymore — the curve is edited in
@@ -1507,6 +1543,12 @@ pub fn show(
             for (i, track) in audio_tracks.iter().enumerate() {
                 let header = HeaderKind::Audio {
                     index: i,
+                    name: if track.name.is_empty() {
+                        format!("Audio {}", i + 1)
+                    } else {
+                        track.name.clone()
+                    },
+                    raw_name: track.name.clone(),
                     selected: p.selected_audio == i,
                 };
                 let highlight = None;
@@ -1905,6 +1947,75 @@ fn draw_waveform(
     }
 }
 
+/// A row header's name cell: the name button, or — once a right-click opened
+/// the inline rename editor — a same-size singleline field (so opening it
+/// never re-lays-out the row). Enter or a click elsewhere commits through
+/// [`TimelineAction::RenameTrack`], Esc cancels, and an empty draft clears the
+/// custom name back to `default_label` ("Track 3", "Curve 1", …).
+#[allow(clippy::too_many_arguments)]
+fn track_header_cell(
+    ui: &mut egui::Ui,
+    state: &mut TimelineState,
+    actions: &mut Vec<TimelineAction>,
+    lane: TimelineLane,
+    index: usize,
+    name: &str,
+    raw_name: String,
+    width: f32,
+    height: f32,
+    selected_fill: Option<Color32>,
+    select_action: TimelineAction,
+    default_label: &str,
+) {
+    if state
+        .rename
+        .as_ref()
+        .is_some_and(|(l, i, _)| *l == lane && *i == index)
+    {
+        let mut cancel = false;
+        let mut commit = false;
+        if let Some((_, _, draft)) = state.rename.as_mut() {
+            let resp = ui.add_sized(
+                [width, height],
+                egui::TextEdit::singleline(draft)
+                    .font(egui::TextStyle::Small)
+                    .hint_text(default_label.to_owned()),
+            );
+            if std::mem::take(&mut state.rename_focus) {
+                resp.request_focus();
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                cancel = true;
+            } else if resp.lost_focus() {
+                actions.push(TimelineAction::RenameTrack {
+                    lane,
+                    track: index,
+                    name: draft.trim().to_owned(),
+                });
+                commit = true;
+            }
+        }
+        if cancel || commit {
+            state.rename = None;
+        }
+    } else {
+        let mut btn = egui::Button::new(egui::RichText::new(name).size(11.0));
+        if let Some(fill) = selected_fill {
+            btn = btn.fill(fill);
+        }
+        let resp = ui
+            .add_sized([width, height], btn)
+            .on_hover_text("Right-click to rename this track".to_owned());
+        if resp.clicked() {
+            actions.push(select_action);
+        }
+        if resp.secondary_clicked() {
+            state.rename = Some((lane, index, raw_name));
+            state.rename_focus = true;
+        }
+    }
+}
+
 /// One row: header cell + clip lane (grid, clips, playhead, interactions).
 #[allow(clippy::too_many_arguments)]
 fn lane_row<T: Placement>(
@@ -1968,6 +2079,7 @@ fn lane_row<T: Placement>(
         HeaderKind::Midi {
             index,
             name,
+            raw_name,
             selected,
         } => {
             // Reorder grab handle (MIDI rows only): a drag on the dots
@@ -1997,36 +2109,62 @@ fn lane_row<T: Placement>(
             if grip_response.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
             }
-            let mut btn = egui::Button::new(egui::RichText::new(name).size(11.0));
-            if selected {
-                btn = btn.fill(Color32::from_rgb(60, 90, 140));
-            }
-            if ui
-                .add_sized([HEADER_WIDTH - 16.0, row_h - 4.0], btn)
-                .clicked()
-            {
-                actions.push(TimelineAction::SelectTrack(index));
-            }
+            track_header_cell(
+                ui,
+                state,
+                actions,
+                TimelineLane::Midi,
+                index,
+                &name,
+                raw_name,
+                HEADER_WIDTH - 16.0,
+                row_h - 4.0,
+                selected.then_some(Color32::from_rgb(60, 90, 140)),
+                TimelineAction::SelectTrack(index),
+                &format!("Track {}", index + 1),
+            );
         }
-        HeaderKind::Control { index, selected } => {
-            let mut btn =
-                egui::Button::new(egui::RichText::new(format!("Curve {}", index + 1)).size(11.0));
-            if selected {
-                btn = btn.fill(Color32::from_rgb(120, 90, 40));
-            }
-            if ui.add_sized([HEADER_WIDTH, row_h - 4.0], btn).clicked() {
-                actions.push(TimelineAction::SelectControlTrack(index));
-            }
+        HeaderKind::Control {
+            index,
+            name,
+            raw_name,
+            selected,
+        } => {
+            track_header_cell(
+                ui,
+                state,
+                actions,
+                TimelineLane::Control,
+                index,
+                &name,
+                raw_name,
+                HEADER_WIDTH,
+                row_h - 4.0,
+                selected.then_some(Color32::from_rgb(120, 90, 40)),
+                TimelineAction::SelectControlTrack(index),
+                &format!("Curve {}", index + 1),
+            );
         }
-        HeaderKind::Audio { index, selected } => {
-            let mut btn =
-                egui::Button::new(egui::RichText::new(format!("Audio {}", index + 1)).size(11.0));
-            if selected {
-                btn = btn.fill(Color32::from_rgb(60, 52, 34));
-            }
-            if ui.add_sized([HEADER_WIDTH, row_h - 4.0], btn).clicked() {
-                actions.push(TimelineAction::SelectAudioTrack(index));
-            }
+        HeaderKind::Audio {
+            index,
+            name,
+            raw_name,
+            selected,
+        } => {
+            track_header_cell(
+                ui,
+                state,
+                actions,
+                TimelineLane::Audio,
+                index,
+                &name,
+                raw_name,
+                HEADER_WIDTH,
+                row_h - 4.0,
+                selected.then_some(Color32::from_rgb(60, 52, 34)),
+                TimelineAction::SelectAudioTrack(index),
+                &format!("Audio {}", index + 1),
+            );
         }
     }
 
