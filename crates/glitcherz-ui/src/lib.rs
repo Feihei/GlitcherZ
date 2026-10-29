@@ -462,33 +462,6 @@ fn splice_endpoints(cable: &glitcherz_model::CableDoc) -> Result<(u64, PortRef, 
     Ok((from_doc, cable.to.clone(), cable.in_port))
 }
 
-/// Final node source for a plugin picked in the popup (U9 E3).
-///
-/// The entry's own classification decides instrument vs effect (spec D9): a
-/// mixed-up plugin still becomes a node of the kind it actually is, even when
-/// the user reached it through the global `Search Plug-ins…` entry.
-fn pick_to_source(choice: plugin_picker::PickChoice) -> patch::NodeSource {
-    use plugin_catalog::PluginFormat;
-    match (choice.is_instrument, choice.format) {
-        (true, PluginFormat::Clap) => patch::NodeSource::ClapInstrument {
-            path: choice.path,
-            plugin_id: choice.id,
-        },
-        (true, PluginFormat::Vst3) => patch::NodeSource::Vst3Instrument {
-            path: choice.path,
-            class_id: choice.id,
-        },
-        (false, PluginFormat::Clap) => patch::NodeSource::ClapEffect {
-            path: choice.path,
-            plugin_id: choice.id,
-        },
-        (false, PluginFormat::Vst3) => patch::NodeSource::Vst3Effect {
-            path: choice.path,
-            class_id: choice.id,
-        },
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Host-side preset library
 // ---------------------------------------------------------------------------
@@ -1544,27 +1517,36 @@ impl GlitcherZApp {
                         play_mode,
                         gain,
                     } => {
-                        // Document voice restore (D9): the session sample
-                        // cache decodes once per path; a missing or broken
-                        // file falls back to the built-in synth (document
-                        // fields kept for a later retry).
-                        match self.obtain_sample_voice(path, sr) {
-                            Ok(mut processor) => {
-                                processor.set_param(ParamId::SampleRootNote, f32::from(*root_note));
-                                processor.set_param(
-                                    ParamId::SamplePlayMode,
-                                    if matches!(play_mode, SamplePlayMode::OneShot) {
-                                        1.0
-                                    } else {
-                                        0.0
-                                    },
-                                );
-                                processor.set_param(ParamId::SampleGain, *gain);
-                                (Box::new(processor), None, String::new())
-                            }
-                            Err(err) => {
-                                log::error!("Failed to load sample {path}: {err}");
-                                (Box::new(SynthProcessor::new(sr)), None, String::new())
+                        if path.is_empty() {
+                            // v3: born without a file — silent until the
+                            // node's `Load File…` swaps a real voice in. Not
+                            // the synth fallback: a node labelled Sample must
+                            // not quietly play a synth patch.
+                            (Box::new(SilentProcessor::new()), None, String::new())
+                        } else {
+                            // Document voice restore (D9): the session sample
+                            // cache decodes once per path; a missing or broken
+                            // file falls back to the built-in synth (document
+                            // fields kept for a later retry).
+                            match self.obtain_sample_voice(path, sr) {
+                                Ok(mut processor) => {
+                                    processor
+                                        .set_param(ParamId::SampleRootNote, f32::from(*root_note));
+                                    processor.set_param(
+                                        ParamId::SamplePlayMode,
+                                        if matches!(play_mode, SamplePlayMode::OneShot) {
+                                            1.0
+                                        } else {
+                                            0.0
+                                        },
+                                    );
+                                    processor.set_param(ParamId::SampleGain, *gain);
+                                    (Box::new(processor), None, String::new())
+                                }
+                                Err(err) => {
+                                    log::error!("Failed to load sample {path}: {err}");
+                                    (Box::new(SynthProcessor::new(sr)), None, String::new())
+                                }
                             }
                         }
                     }
@@ -2544,33 +2526,19 @@ impl GlitcherZApp {
                 patch::PatchAction::AddNode { source, at } => {
                     self.add_patch_node(source, at);
                 }
-                patch::PatchAction::OpenPluginPicker {
-                    category,
-                    format,
-                    place,
-                } => {
-                    self.open_plugin_picker(category, format, place);
+                patch::PatchAction::OpenPluginPicker { category, place } => {
+                    self.open_plugin_picker(category, place);
                 }
                 patch::PatchAction::LoadSoundFont { node } => {
                     // U13: the node's own `Load File…` button. Same function
                     // as the Inspector button — one dialog, one undo step.
                     self.pick_sound_font(node);
                 }
-                patch::PatchAction::PickSample { at } => {
-                    // U5: same flow as PickSoundFont — the modal dialog runs
-                    // here (outside the menu closure), the pick installs a
-                    // sample instrument at the clicked position.
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Wave", &["wav"])
-                        .pick_file()
-                    {
-                        self.create_patch_node(
-                            patch::NodeSource::Sample {
-                                path: path.display().to_string(),
-                            },
-                            at,
-                        );
-                    }
+                patch::PatchAction::LoadSample { node } => {
+                    // v3: the sample node's own `Load File…` / `Replace…`.
+                    // Mirrors the SoundFont swap — the node keeps its id,
+                    // cables and parameters.
+                    self.pick_sample_file(node);
                 }
                 patch::PatchAction::RescanPlugins => {
                     self.plugin_catalog.rescan();
@@ -2662,29 +2630,28 @@ impl GlitcherZApp {
         }
     }
 
-    /// Open the filterable plugin popup for a leaf of the `Add` menu (U9 E3,
-    /// spec `plugin-browser.md` §6). `category`/`format` narrow the list; both
-    /// `None` is the global `Search Plug-ins…` entry, whose pick decides the
-    /// node category from the entry's own classification (spec D5).
+    /// Open the filterable picker for a leaf of the `Add` menu / a cable
+    /// midpoint (U9 E3, spec `plugin-browser.md` §6). `category` narrows the
+    /// list to instruments or effects (built-in rows and plugins alike, v3
+    /// D15/D16); `None` is the global `Search Nodes…` entry, whose pick
+    /// decides the node category from the row's own classification (spec D5).
     fn open_plugin_picker(
         &mut self,
         category: Option<patch::NodeCategory>,
-        format: Option<plugin_catalog::PluginFormat>,
         place: patch::PickerPlace,
     ) {
         self.picker_place = Some(place);
-        self.picker.open(plugin_picker::PickFilter {
-            want_instrument: category.map(patch::NodeCategory::is_instrument),
-            format,
-        });
+        self.picker.open(plugin_picker::PickFilter::category(
+            category.map(patch::NodeCategory::is_instrument),
+        ));
     }
 
     /// Draw the plugin popup and create the picked node (U9 E3), or splice it
     /// into a cable (U9 E4 — same popup, different receiver).
     ///
-    /// The popup is drawn above every panel (`Order::Foreground`); a pick is
-    /// turned into the node's **final** source here, so the creation path
-    /// installs the plugin exactly once (spec D1).
+    /// The popup is drawn above every panel (`Order::Foreground`); a row
+    /// carries its **final** node source, so the creation path installs the
+    /// plugin exactly once (spec D1) and a built-in row needs no mapping.
     fn plugin_picker_frame(&mut self, ctx: &egui::Context) {
         let scan_progress = self
             .plugin_catalog
@@ -2698,11 +2665,12 @@ impl GlitcherZApp {
         );
         match outcome {
             Some(plugin_picker::PickOutcome::Picked(choice)) => {
+                // Only plugins are remembered; built-ins are always in the list.
                 plugin_picker::remember(&mut self.recent_plugins, &choice);
                 let Some(place) = self.picker_place.take() else {
                     return;
                 };
-                let source = pick_to_source(choice);
+                let source = choice.source;
                 match place {
                     patch::PickerPlace::Add { at } => {
                         self.add_patch_node(source, at);
@@ -3962,6 +3930,108 @@ impl GlitcherZApp {
             human_bytes(size.saturating_mul(2))
         );
         self.queue_blocking_job(label, move |app| app.load_sound_font(doc_id, path));
+    }
+
+    /// `Load File…` / `Replace…` on a sample node (v3): pick a `.wav`, then
+    /// swap the node's voice in place. Mirrors [`Self::pick_sound_font`] —
+    /// the node's button and the Inspector run this one function.
+    fn pick_sample_file(&mut self, doc_id: u64) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Wave", &["wav"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.pick_sample_file_from(doc_id, path);
+    }
+
+    /// [`Self::pick_sample_file`] with the file already chosen (the dialog is
+    /// the only part that needs the click).
+    fn pick_sample_file_from(&mut self, doc_id: u64, path: PathBuf) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let label = format!("Loading {name}…");
+        self.queue_blocking_job(label, move |app| app.load_sample_file(doc_id, path));
+    }
+
+    /// The blocking half of [`Self::pick_sample_file_from`]: decode through
+    /// the session cache (shared with audio clips), then swap the engine
+    /// processor **in place** — `replace_node` keeps the node id, so cables,
+    /// ports, MIDI routing, root note, play mode and gain all survive. One
+    /// undo step.
+    fn load_sample_file(&mut self, doc_id: u64, path: PathBuf) {
+        let Some((root_note, play_mode, gain)) = self.sample_voice_fields(doc_id) else {
+            self.set_error("Load failed: node is not a sample instrument".to_string());
+            return;
+        };
+        let Some(engine_id) = self.engine_id(doc_id) else {
+            self.set_error("Load failed: node is not installed".to_string());
+            return;
+        };
+        let sample_rate = self.engine.info().sample_rate as f32;
+        let path_text = path.display().to_string();
+        let mut processor = match self.obtain_sample_voice(&path_text, sample_rate) {
+            Ok(processor) => processor,
+            Err(err) => {
+                // The document keeps its old path: a broken pick is not a
+                // state change, just a failed one.
+                self.set_error(format!("Sample failed to load: {err}"));
+                return;
+            }
+        };
+        processor.set_param(ParamId::SampleRootNote, f32::from(root_note));
+        processor.set_param(
+            ParamId::SamplePlayMode,
+            if matches!(play_mode, SamplePlayMode::OneShot) {
+                1.0
+            } else {
+                0.0
+            },
+        );
+        processor.set_param(ParamId::SampleGain, gain);
+
+        let before = self.begin_edit();
+        if let Some(NodeDoc::Instrument {
+            voice: VoiceSpec::Sample { path: doc_path, .. },
+            ..
+        }) = self.project_mut().graph.node_by_id_mut(doc_id)
+        {
+            *doc_path = path_text;
+        }
+        if self
+            .engine
+            .replace_node(engine_id, Box::new(processor))
+            .is_none()
+        {
+            self.session.restore(before);
+            self.set_error("Sample swap failed (engine busy) — try again".to_string());
+            return;
+        }
+        self.commit_edit("Load Sample", before);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        self.set_message(format!(
+            "Loaded {}",
+            name.unwrap_or_else(|| path.display().to_string())
+        ));
+    }
+
+    /// `(root_note, play_mode, gain)` of a sample instrument node.
+    fn sample_voice_fields(&self, doc_id: u64) -> Option<(u8, SamplePlayMode, f32)> {
+        match self.project().graph.node_by_id(doc_id)? {
+            NodeDoc::Instrument {
+                voice:
+                    VoiceSpec::Sample {
+                        root_note,
+                        play_mode,
+                        gain,
+                        ..
+                    },
+                ..
+            } => Some((*root_note, *play_mode, *gain)),
+            _ => None,
+        }
     }
 
     /// The blocking half of [`Self::pick_sound_font_from`]: parse (cached),
@@ -7531,11 +7601,34 @@ impl GlitcherZApp {
         one_shot: bool,
         gain: f32,
     ) {
-        let stem = std::path::Path::new(path)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string());
-        ui.label(format!("File: {stem}"));
+        // File row first, exactly like the SoundFont panel: which file this
+        // node plays is the question that matters most, and the node's own
+        // button runs the same `pick_sample_file`.
+        ui.separator();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if path.is_empty() {
+                ui.weak("No sample loaded");
+            } else {
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string());
+                ui.label(format!("File: {name}")).on_hover_text(path);
+            }
+            let caption = if path.is_empty() {
+                "Load File…"
+            } else {
+                "Replace…"
+            };
+            if ui
+                .button(caption)
+                .on_hover_text("Pick a .wav file for this node")
+                .clicked()
+            {
+                self.pick_sample_file(doc_id);
+            }
+        });
         let mut root = f32::from(root_note);
         let mut gain_value = gain;
         ui.horizontal(|ui| {

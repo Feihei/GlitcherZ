@@ -22,8 +22,6 @@ use glitcherz_model::{
     MidiSource, NodeDoc, NodeParam, PortRef, VoiceSpec,
 };
 
-use crate::plugin_catalog::PluginFormat;
-
 /// Inline parameter identity for built-in node kinds (G5, spec
 /// `plugin-gui.md` §7): one small slider row under the node body. The
 /// `ParamId` translation lives in the app glue (the patch stays
@@ -492,10 +490,12 @@ pub enum NodeSource {
         /// `.sf2` / `.sf3` path, or empty for a node waiting for one.
         path: String,
     },
-    /// Wav sample player (U5, spec `sample-player.md`): born with default
-    /// root 60 / Gate / unity gain.
+    /// Wav sample player (U5, spec `sample-player.md`). Like [`Self::SoundFont`]
+    /// the path may be **empty**: that is the normal "born empty" node, silent
+    /// until its own `Load File…` button swaps a real voice in (v3) — adding
+    /// one never blocks on a dialog, and a wrong pick is one click to replace.
     Sample {
-        /// `.wav` path picked in the file dialog.
+        /// `.wav` path, or empty for a node waiting for one.
         path: String,
     },
     /// CLAP instrument plugin.
@@ -564,16 +564,16 @@ pub enum PatchAction {
         source: NodeSource,
         at: Pos2,
     },
-    /// Open the plugin picker for `category` / `format` (spec `plugin-browser.md`
-    /// D4/D5): `None` category = the global `Search Plug-ins…` entry, whose
-    /// pick decides the node category from the entry's own classification.
+    /// Open the plugin picker for `category` (spec `plugin-browser.md` D4/D5,
+    /// v3 D16): `None` category = the global `Search Nodes…` entry, whose pick
+    /// decides the node category from the entry's own classification. The
+    /// picker lists built-in nodes and plugins alike (tagged `BUILT-IN` /
+    /// `CLAP` / `VST3`), so there is no format argument any more.
     /// `place` says whether the pick becomes a dangling node or is spliced into
     /// a cable.
     OpenPluginPicker {
-        /// Category the leaf menu asked for (`None` = both).
+        /// Category the menu leaf asked for (`None` = both).
         category: Option<NodeCategory>,
-        /// Binary format the leaf menu asked for (`None` = both).
-        format: Option<PluginFormat>,
         /// Where the pick lands.
         place: PickerPlace,
     },
@@ -585,10 +585,12 @@ pub enum PatchAction {
     LoadSoundFont {
         node: u64,
     },
-    /// Open the wav sample file dialog and create a sample instrument from
-    /// the pick (U5; same modal-dialog constraint as `PickSoundFont`).
-    PickSample {
-        at: Pos2,
+    /// Open the wav file dialog for an **existing** sample node and swap its
+    /// voice in place (v3, mirrors `LoadSoundFont`): the node keeps its id,
+    /// cables, root note, play mode and gain, so a wrong file is one click to
+    /// fix instead of delete + re-add.
+    LoadSample {
+        node: u64,
     },
     /// Re-scan every plugin module, ignoring the cached stats (U9 E2, spec
     /// `plugin-browser.md` §5.4). The catalog queues the work; the caller only
@@ -749,6 +751,7 @@ fn node_action_buttons(id: PatchId, row: usize, deps: &PatchDeps) -> Vec<NodeAct
             // U13: a SoundFont node owns its file, so the swap lives on the
             // box. Empty path = "Load File…", loaded = "Replace…" — the same
             // button in both states, because there is nothing to "reset to".
+            // v3: the sample player works exactly the same way.
             if let Some(NodeDoc::Instrument {
                 voice: VoiceSpec::SoundFont { path, .. },
                 ..
@@ -764,6 +767,26 @@ fn node_action_buttons(id: PatchId, row: usize, deps: &PatchDeps) -> Vec<NodeAct
                         enabled: true,
                         hover: "Pick a .sf2 / .sf3 file for this node",
                         action: PatchAction::LoadSoundFont { node: doc_id },
+                    }]
+                } else {
+                    Vec::new()
+                };
+            }
+            if let Some(NodeDoc::Instrument {
+                voice: VoiceSpec::Sample { path, .. },
+                ..
+            }) = deps.doc.node_by_id(doc_id)
+            {
+                return if row == 0 {
+                    vec![NodeAction {
+                        label: if path.is_empty() {
+                            "Load File…"
+                        } else {
+                            "Replace…"
+                        },
+                        enabled: true,
+                        hover: "Pick a .wav file for this node",
+                        action: PatchAction::LoadSample { node: doc_id },
                     }]
                 } else {
                     Vec::new()
@@ -868,6 +891,11 @@ fn action_button(ui: &mut egui::Ui, rect: Rect, z: f32, action: &NodeAction) -> 
 }
 
 /// Snapshot of external data the patch depends on (immutable borrows to avoid borrow conflicts).
+///
+/// `Copy` on purpose: every field is a reference or a `usize`, so a per-frame
+/// snapshot is free — a value type here keeps `show` callable from closures
+/// that egui captures mutably (headless tests, panels).
+#[derive(Clone, Copy)]
 pub struct PatchDeps<'a> {
     /// Project graph document (nodes + cables).
     pub doc: &'a GraphDoc,
@@ -918,15 +946,12 @@ pub struct PatchState {
     /// Parameters awaiting selection after dropping an automation cable drag: `(track index,
     /// target document node, popup position)`.
     pending_auto: Option<(usize, u64, Pos2)>,
-    /// Graph-space position where the add-node context menu was opened (consumed when a
-    /// node kind is picked).
-    add_menu_at: Option<Pos2>,
+    /// Open add-node menu (right-click / `Shift+A`, spec D17).
+    add_menu: Option<AddMenu>,
     /// Ctrl + right-drag cable cut in progress: screen-space pointer path.
     cut_path: Option<Vec<Pos2>>,
-    /// Cable-midpoint menu awaiting a pick: `(cable index, popup screen position,
-    /// graph-space insert position, frame it was opened)`. `u64::MAX` marks "opened this
-    /// frame" so the same-frame click does not immediately close it.
-    pending_cable_menu: Option<(usize, Pos2, Pos2, u64)>,
+    /// Cable-midpoint menu awaiting a pick (D18: one flat level).
+    pending_cable_menu: Option<CableMenu>,
     /// SoundFont combo row awaiting a pick (U13): `(node, parameter, popup
     /// screen position, frame it was opened)` — same frame-stamp trick as
     /// the cable menu, because a click opens it.
@@ -942,12 +967,52 @@ impl Default for PatchState {
             selection: Selection::default(),
             drag: None,
             pending_auto: None,
-            add_menu_at: None,
+            add_menu: None,
             cut_path: None,
             pending_cable_menu: None,
             pending_sf2_choice: None,
         }
     }
+}
+
+/// Open add-node menu: where the new node lands and where the popup sits.
+///
+/// The popup's open state lives in egui (`Popup::open_memory`), so this only
+/// carries the *placement* plus the one-shot open command: `fresh` is taken on
+/// the frame the menu is opened (right-click / `Shift+A`) and is `false`
+/// afterwards — issuing the command every frame would re-open the menu right
+/// after a pick closed it.
+#[derive(Debug, Clone, Copy)]
+struct AddMenu {
+    /// Graph-space position the new node is created at.
+    at: Pos2,
+    /// Screen-space popup anchor.
+    pos: Pos2,
+    /// Set on the frame the popup must be opened.
+    fresh: bool,
+}
+
+/// Cable-midpoint menu (spec D18): insert a processor into the cable, or cut it.
+#[derive(Debug, Clone, Copy)]
+struct CableMenu {
+    /// Index into [`GraphDoc::cables`].
+    cable: usize,
+    /// Graph-space position the inserted node is created at.
+    at: Pos2,
+    /// Screen-space popup anchor.
+    pos: Pos2,
+    /// Set on the frame the popup must be opened.
+    fresh: bool,
+}
+
+/// Popup ids — one per menu, so egui remembers each open state independently
+/// and `Popup::is_id_open` can report that a menu closed itself.
+fn add_menu_id() -> egui::Id {
+    egui::Id::new("glitcherz_patch_add_menu")
+}
+
+fn cable_menu_id() -> egui::Id {
+    egui::Id::new("glitcherz_patch_cable_menu")
 }
 
 /// Current selection (multi-select: marquee box selection can select several nodes).
@@ -1111,9 +1176,9 @@ fn action_rows(id: PatchId, deps: &PatchDeps) -> usize {
         PatchId::Timeline => TIMELINE_ACTION_ROWS,
         PatchId::Node(node_id) => match deps.doc.node_by_id(node_id) {
             Some(node) if node.is_mixer() => 1,
-            // U13: the SoundFont file button row.
+            // U13/v3: the SoundFont and sample file buttons.
             Some(NodeDoc::Instrument {
-                voice: VoiceSpec::SoundFont { .. },
+                voice: VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. },
                 ..
             }) => 1,
             _ => 0,
@@ -1407,20 +1472,34 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 }
                 VoiceSpec::Sample {
                     path, root_note, ..
-                } => format!(
-                    "SAMPLE {}·{} · Track {}",
-                    file_stem_of(path),
-                    note_name(*root_note),
-                    track + 1
-                ),
+                } => {
+                    if path.is_empty() {
+                        format!("SAMPLE (no file) · Track {}", track + 1)
+                    } else {
+                        format!(
+                            "SAMPLE {}·{} · Track {}",
+                            file_stem_of(path),
+                            note_name(*root_note),
+                            track + 1
+                        )
+                    }
+                }
                 VoiceSpec::Clap { plugin_id, .. } => {
                     format!("♪ {}", truncate(plugin_id, 16))
                 }
                 VoiceSpec::Vst3 { class_id, .. } => format!("♪ {}", truncate(class_id, 16)),
             },
-            Some(NodeDoc::Effect { voice, track, .. }) => match voice {
+            Some(NodeDoc::Effect {
+                voice,
+                track,
+                params,
+                ..
+            }) => match voice {
+                // The built-in roster has six kinds since U10 — the caption
+                // takes the payload's own tag, so an EQ node never reads
+                // "Delay".
                 VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {
-                    format!("Delay · Track {}", track + 1)
+                    format!("{} · Track {}", params.kind().label(), track + 1)
                 }
                 VoiceSpec::Clap { plugin_id, .. } => {
                     format!("Fx {}", truncate(plugin_id, 14))
@@ -1908,7 +1987,12 @@ impl PatchState {
                 self.pan.x + (sp.x - rect_min.x) / self.zoom,
                 self.pan.y + (sp.y - rect_min.y) / self.zoom,
             );
-            self.pending_cable_menu = Some((i, sp + Vec2::new(4.0, 4.0), graph_at, u64::MAX));
+            self.pending_cable_menu = Some(CableMenu {
+                cable: i,
+                at: graph_at,
+                pos: sp + Vec2::new(2.0, 2.0),
+                fresh: true,
+            });
             None
         } else if let Some(i) = self.hit_cable(rect_min, sp, deps) {
             if shift {
@@ -2126,7 +2210,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             state.pan = Vec2::ZERO;
             state.zoom = 1.0;
         }
-        ui.weak("Right-click to add node · Ctrl+right-drag to cut cables · click a cable dot to insert/delete · click to select · drag bg to box-select · middle-drag to pan · scroll to zoom · drag ports to connect · Delete to remove");
+        ui.weak("Shift+A / right-click to add node · Ctrl+right-drag to cut cables · click a cable dot to insert/delete · click to select · drag bg to box-select · middle-drag to pan · scroll to zoom · drag ports to connect · Delete to remove");
     });
 
     // ---- Patch ----
@@ -2238,116 +2322,116 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         }
     }
 
-    // ---- Right-click: add-node context menu (any position; the new node appears where
-    // the user clicked). With Ctrl held the right button belongs to the cable-cut
-    // interaction instead (Blender-style knife) and the menu is suppressed. ----
-    if response.secondary_clicked()
-        && !ctrl
-        && let Some(sp) = pointer
-    {
-        state.add_menu_at = Some(Pos2::new(
-            state.pan.x + (sp.x - rect.min.x) / state.zoom,
-            state.pan.y + (sp.y - rect.min.y) / state.zoom,
-        ));
-    }
-    // egui manages the open/close lifecycle (Escape / click elsewhere close it); the
-    // closure runs only while the menu is open. egui 0.36's `context_menu` closure
-    // returns `()`, so the pick is collected through captured outer variables.
-    //
-    // Structure (spec `plugin-browser.md` §6.1): category first, then source. The
-    // plugin leaves open the filterable picker instead of listing hundreds of
-    // entries in a submenu (D4/D5); the built-in leaves create directly.
-    let mut picked_source: Option<NodeSource> = None;
-    let mut picked_picker: Option<(Option<NodeCategory>, Option<PluginFormat>)> = None;
-    let mut picked_sample = false;
-    let mut rescan_plugins = false;
-    if !(response.secondary_clicked() && ctrl) {
-        response.context_menu(|ui| {
-            ui.set_min_width(160.0);
-            ui.strong("Add Node");
-            ui.separator();
-            // D5: cross-category jump — the entry's own classification decides
-            // whether an instrument or an effect node is created.
-            if ui.button("Search Plug-ins…").clicked() {
-                picked_picker = Some((None, None));
-            }
-            ui.menu_button("Instrument", |ui| {
-                if ui.button("Built-in Synth").clicked() {
-                    picked_source = Some(NodeSource::BuiltinSynth);
-                }
-                // U13: born empty on purpose — the node carries its own
-                // `Load File…` button, so adding one never blocks on a
-                // dialog and a file can be swapped later without rebuilding
-                // the node (and its cables).
-                if ui.button("SoundFont").clicked() {
-                    picked_source = Some(NodeSource::SoundFont {
-                        path: String::new(),
-                    });
-                }
-                if ui.button("Sample…").clicked() {
-                    picked_sample = true;
-                }
-                ui.separator();
-                if ui.button("CLAP…").clicked() {
-                    picked_picker =
-                        Some((Some(NodeCategory::Instrument), Some(PluginFormat::Clap)));
-                }
-                if ui.button("VST3…").clicked() {
-                    picked_picker =
-                        Some((Some(NodeCategory::Instrument), Some(PluginFormat::Vst3)));
-                }
-            });
-            ui.menu_button("Effect", |ui| {
-                for kind in BuiltinEffectKind::ALL {
-                    if ui.button(kind.label()).clicked() {
-                        picked_source = Some(NodeSource::Builtin(*kind));
-                    }
-                }
-                ui.separator();
-                if ui.button("CLAP…").clicked() {
-                    picked_picker = Some((Some(NodeCategory::Effect), Some(PluginFormat::Clap)));
-                }
-                if ui.button("VST3…").clicked() {
-                    picked_picker = Some((Some(NodeCategory::Effect), Some(PluginFormat::Vst3)));
-                }
-            });
-            ui.separator();
-            // No source dimension: one level is enough (spec §6.1).
-            if ui.button("Mixer").clicked() {
-                picked_source = Some(NodeSource::Mixer);
-            }
-            if ui.button("Keyboard In (computer)").clicked() {
-                picked_source = Some(NodeSource::Keyboard);
-            }
-            if ui.button("Feedback Tap").clicked() {
-                picked_source = Some(NodeSource::Feedback);
-            }
-            ui.separator();
-            // U9 E2: full plugin re-scan on demand (the startup scan is
-            // cached, so this is the escape hatch after installing or
-            // removing plugins while the app is closed).
-            if ui.button("Rescan Plug-ins").clicked() {
-                rescan_plugins = true;
-            }
+    // ---- Add-node menu: right-click, or `Shift+A` (spec D17) ----
+    // Right-click anywhere on the canvas; with Ctrl held the right button
+    // belongs to the cable-cut interaction instead (Blender-style knife), so
+    // the menu is suppressed. `Shift+A` opens the same popup at the cursor,
+    // which is why the menu is a `Popup` with an explicit open command rather
+    // than `Response::context_menu` (that one only opens on a click).
+    let shift_a = !ctrl
+        && !ui.ctx().egui_wants_keyboard_input()
+        && ui
+            .ctx()
+            .input(|i| i.modifiers.shift && !i.modifiers.command && i.key_pressed(egui::Key::A));
+    let open_at = if response.secondary_clicked() && !ctrl {
+        pointer
+    } else if shift_a {
+        Some(
+            ui.ctx()
+                .pointer_latest_pos()
+                .filter(|p| rect.contains(*p))
+                .unwrap_or_else(|| rect.center()),
+        )
+    } else {
+        None
+    };
+    if let Some(sp) = open_at {
+        state.add_menu = Some(AddMenu {
+            at: Pos2::new(
+                state.pan.x + (sp.x - rect.min.x) / state.zoom,
+                state.pan.y + (sp.y - rect.min.y) / state.zoom,
+            ),
+            pos: sp + Vec2::new(2.0, 2.0),
+            fresh: true,
         });
     }
-    if rescan_plugins {
-        actions.push(PatchAction::RescanPlugins);
+
+    // One flat level (spec D16): every leaf either creates a node directly or
+    // opens the picker; egui owns the open/close lifecycle (Escape / click
+    // elsewhere / pick), and `add_menu` only carries the placement.
+    #[derive(Clone)]
+    enum AddPick {
+        Add(NodeSource),
+        Picker(Option<NodeCategory>),
+        Rescan,
     }
-    // The menu position is consumed by whichever action the user picked.
-    if picked_source.is_some() || picked_picker.is_some() || picked_sample {
-        if let Some(at) = state.add_menu_at.take() {
-            if let Some(source) = picked_source {
-                actions.push(PatchAction::AddNode { source, at });
-            } else if let Some((category, format)) = picked_picker {
-                actions.push(PatchAction::OpenPluginPicker {
+    if let Some(menu) = state.add_menu.as_mut() {
+        let open_cmd = if std::mem::take(&mut menu.fresh) {
+            Some(egui::SetOpenCommand::Bool(true))
+        } else {
+            None
+        };
+        let pick = egui::Popup::from_response(&response)
+            .id(add_menu_id())
+            .kind(egui::PopupKind::Menu)
+            .layout(egui::Layout::top_down_justified(egui::Align::Min))
+            .at_position(menu.pos)
+            .open_memory(open_cmd)
+            .show(|ui| {
+                ui.set_min_width(180.0);
+                ui.strong("Add Node");
+                ui.separator();
+                // D5: cross-category jump — the entry's own classification
+                // decides whether an instrument or an effect node is created.
+                if ui.button("Search Nodes…").clicked() {
+                    return Some(AddPick::Picker(None));
+                }
+                // D16: the category leaves ARE the picker (search + list +
+                // built-in/CLAP/VST3 tags) — no second level to click through.
+                if ui.button("Instrument…").clicked() {
+                    return Some(AddPick::Picker(Some(NodeCategory::Instrument)));
+                }
+                if ui.button("Effect…").clicked() {
+                    return Some(AddPick::Picker(Some(NodeCategory::Effect)));
+                }
+                ui.separator();
+                // No source dimension: one level is enough.
+                if ui.button("Mixer").clicked() {
+                    return Some(AddPick::Add(NodeSource::Mixer));
+                }
+                if ui.button("Keyboard In (computer)").clicked() {
+                    return Some(AddPick::Add(NodeSource::Keyboard));
+                }
+                if ui.button("Feedback Tap").clicked() {
+                    return Some(AddPick::Add(NodeSource::Feedback));
+                }
+                ui.separator();
+                // U9 E2: full plugin re-scan on demand (the startup scan is
+                // cached, so this is the escape hatch after installing or
+                // removing plugins while the app is closed).
+                if ui.button("Rescan Plug-ins").clicked() {
+                    return Some(AddPick::Rescan);
+                }
+                None
+            })
+            .and_then(|inner| inner.inner);
+        if let Some(pick) = pick {
+            match pick {
+                AddPick::Add(source) => actions.push(PatchAction::AddNode {
+                    source,
+                    at: menu.at,
+                }),
+                AddPick::Picker(category) => actions.push(PatchAction::OpenPluginPicker {
                     category,
-                    format,
-                    place: PickerPlace::Add { at },
-                });
-            } else {
-                actions.push(PatchAction::PickSample { at });
+                    place: PickerPlace::Add { at: menu.at },
+                }),
+                AddPick::Rescan => actions.push(PatchAction::RescanPlugins),
             }
+        }
+        // A closed popup (Escape / click outside / pick handled above) clears
+        // the placement so the next right-click starts clean.
+        if !egui::Popup::is_id_open(ui.ctx(), add_menu_id()) {
+            state.add_menu = None;
         }
     }
 
@@ -3271,94 +3355,74 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     }
 
     // ---- Cable midpoint menu (click the control dot): insert node / delete ----
-    // Stamp the opening frame first so the click that opened the menu (any_click in
-    // the same frame) does not close it immediately.
-    if let Some((_, _, _, frame)) = &mut state.pending_cable_menu
-        && *frame == u64::MAX
-    {
-        *frame = ui.ctx().cumulative_frame_nr();
-    }
-    if let Some((cable_i, menu_pos, at, opened)) = state.pending_cable_menu {
+    // One flat level (spec D18). The old nested `Insert ▸ Effect ▸ …` submenu
+    // was unclickable: the menu closed itself on *any* click of that frame,
+    // and opening a submenu is a click that picks no leaf — so "Insert"
+    // visibly did nothing. A `Popup` keeps the lifecycle (Escape / click
+    // outside) in egui's hands, and the picker now answers "which effect".
+    if let Some(menu) = state.pending_cable_menu.as_mut() {
         #[derive(Clone)]
         enum CablePick {
+            InsertPicker,
             Insert(NodeSource),
-            OpenPicker(PluginFormat),
             Delete,
         }
-        let mut picked: Option<CablePick> = None;
-        egui::Area::new(egui::Id::new("glitcherz_patch_cable_menu"))
-            .fixed_pos(menu_pos)
-            .order(egui::Order::Foreground)
-            .show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(140.0);
-                    ui.strong("Cable");
-                    // Same type-first shape as the add menu (spec §6.1), so the
-                    // two places a node can be born read alike. MIDI / automation
-                    // cables accept no processors at all.
-                    let is_audio = doc
-                        .cables
-                        .get(cable_i)
-                        .is_some_and(|c| c.kind == CableKind::Audio);
-                    if is_audio {
-                        ui.menu_button("Insert", |ui| {
-                            ui.menu_button("Effect", |ui| {
-                                for kind in BuiltinEffectKind::ALL {
-                                    if ui.button(kind.label()).clicked() {
-                                        picked =
-                                            Some(CablePick::Insert(NodeSource::Builtin(*kind)));
-                                    }
-                                }
-                                ui.separator();
-                                if ui.button("CLAP…").clicked() {
-                                    picked = Some(CablePick::OpenPicker(PluginFormat::Clap));
-                                }
-                                if ui.button("VST3…").clicked() {
-                                    picked = Some(CablePick::OpenPicker(PluginFormat::Vst3));
-                                }
-                            });
-                            // A mixer is not an "effect"; it gets its own leaf.
-                            if ui.button("Mixer").clicked() {
-                                picked = Some(CablePick::Insert(NodeSource::Mixer));
-                            }
-                        });
+        let open_cmd = if std::mem::take(&mut menu.fresh) {
+            Some(egui::SetOpenCommand::Bool(true))
+        } else {
+            None
+        };
+        // A cable can disappear between opening the menu and picking from it.
+        let is_audio = doc
+            .cables
+            .get(menu.cable)
+            .is_some_and(|c| c.kind == CableKind::Audio);
+        let pick = egui::Popup::from_response(&response)
+            .id(cable_menu_id())
+            .kind(egui::PopupKind::Menu)
+            .layout(egui::Layout::top_down_justified(egui::Align::Min))
+            .at_position(menu.pos)
+            .open_memory(open_cmd)
+            .show(|ui| {
+                ui.set_min_width(150.0);
+                ui.strong("Cable");
+                // MIDI / automation cables accept no processors at all.
+                if is_audio {
+                    if ui.button("Insert Effect…").clicked() {
+                        return Some(CablePick::InsertPicker);
                     }
-                    if ui.button("Delete Cable").clicked() {
-                        picked = Some(CablePick::Delete);
+                    // A mixer is not an "effect"; it gets its own leaf.
+                    if ui.button("Insert Mixer").clicked() {
+                        return Some(CablePick::Insert(NodeSource::Mixer));
                     }
-                });
-            });
-        match picked {
-            Some(CablePick::Insert(source)) => {
-                actions.push(PatchAction::InsertNode {
-                    cable: cable_i,
-                    source,
-                    at,
-                });
-                state.pending_cable_menu = None;
-            }
-            Some(CablePick::OpenPicker(format)) => {
-                actions.push(PatchAction::OpenPluginPicker {
-                    // Only effects can be spliced into an audio cable: the
-                    // instrument leaves would produce a silent node.
-                    category: Some(NodeCategory::Effect),
-                    format: Some(format),
-                    place: PickerPlace::Insert { cable: cable_i, at },
-                });
-                state.pending_cable_menu = None;
-            }
-            Some(CablePick::Delete) => {
-                actions.push(PatchAction::DeleteCable(cable_i));
-                state.pending_cable_menu = None;
-            }
-            None => {
-                let close = ui
-                    .ctx()
-                    .input(|i| i.pointer.any_click() || i.key_pressed(egui::Key::Escape));
-                if close && ui.ctx().cumulative_frame_nr() != opened {
-                    state.pending_cable_menu = None;
+                    ui.separator();
                 }
-            }
+                if ui.button("Delete Cable").clicked() {
+                    return Some(CablePick::Delete);
+                }
+                None
+            })
+            .and_then(|inner| inner.inner);
+        match pick {
+            Some(CablePick::InsertPicker) => actions.push(PatchAction::OpenPluginPicker {
+                // Only effects can be spliced into an audio cable: an
+                // instrument would be born without a MIDI feed.
+                category: Some(NodeCategory::Effect),
+                place: PickerPlace::Insert {
+                    cable: menu.cable,
+                    at: menu.at,
+                },
+            }),
+            Some(CablePick::Insert(source)) => actions.push(PatchAction::InsertNode {
+                cable: menu.cable,
+                source,
+                at: menu.at,
+            }),
+            Some(CablePick::Delete) => actions.push(PatchAction::DeleteCable(menu.cable)),
+            None => {}
+        }
+        if !egui::Popup::is_id_open(ui.ctx(), cable_menu_id()) {
+            state.pending_cable_menu = None;
         }
     }
 
@@ -3413,6 +3477,111 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// Run one `patch::show` frame headless and return the intents it produced.
+    fn drive(
+        ctx: &egui::Context,
+        state: &mut PatchState,
+        deps: PatchDeps<'_>,
+        events: Vec<egui::Event>,
+        t: f64,
+    ) -> Vec<PatchAction> {
+        let mut viewports = egui::ViewportIdMap::default();
+        viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                inner_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                ..Default::default()
+            },
+        );
+        let raw = egui::RawInput {
+            events,
+            time: Some(t),
+            viewports,
+            ..Default::default()
+        };
+        let mut actions = Vec::new();
+        let mut output = ctx.run_ui(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                actions = show(ui, state, deps);
+            });
+        });
+        output.textures_delta.clear();
+        actions
+    }
+
+    /// Regression (v3, spec D18): clicking a cable's midpoint dot must open the
+    /// cable menu, and the click that opened it must not dismiss it again.
+    ///
+    /// The old hand-rolled `Area` closed itself on *any* click of the opening
+    /// frame, so opening `Insert ▸ …` visibly did nothing. The menu is now a
+    /// real `Popup`, whose open state egui owns.
+    #[test]
+    fn cable_midpoint_menu_opens_and_survives_its_opening_frame() {
+        let project = Project::default();
+        let deps = PatchDeps {
+            doc: &project.graph,
+            track_count: project.midi_tracks.len(),
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &|_| Vec::new(),
+            plugin_inline: &|_| Vec::new(),
+            sf2_presets: &|_| Vec::new(),
+        };
+        let mut state = PatchState::default();
+        state.ensure_positions(
+            &project.graph,
+            project.midi_tracks.len(),
+            project.control_tracks.len(),
+            project.audio_tracks.len(),
+        );
+
+        // Any audio cable whose midpoint dot is not covered by a node box.
+        let mid = project
+            .graph
+            .cables
+            .iter()
+            .filter_map(|cable| {
+                let controls = state.cable_controls(Pos2::ZERO, cable, &deps)?;
+                let mid = bezier_points(controls, 24)[12];
+                state
+                    .hit_node(Pos2::ZERO, mid, &deps)
+                    .is_none()
+                    .then_some(mid)
+            })
+            .next()
+            .expect("the default project has a clickable audio cable");
+
+        // The click that opens the menu only records the placement…
+        assert!(state.point_select(Pos2::ZERO, mid, &deps, false).is_none());
+        assert!(
+            state.pending_cable_menu.is_some(),
+            "clicking the midpoint dot must set up the menu"
+        );
+
+        // …and the popup then survives its own opening frame.
+        let ctx = egui::Context::default();
+        drive(&ctx, &mut state, deps, vec![], 0.0);
+        drive(&ctx, &mut state, deps, vec![], 0.1);
+        assert!(
+            egui::Popup::is_id_open(&ctx, cable_menu_id()),
+            "the cable menu closed itself on the frame it opened"
+        );
+        assert!(state.pending_cable_menu.is_some());
+
+        // Escape closes it, and the pending state follows.
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        drive(&ctx, &mut state, deps, vec![escape], 0.2);
+        drive(&ctx, &mut state, deps, vec![], 0.3);
+        assert!(!egui::Popup::is_id_open(&ctx, cable_menu_id()));
+        assert!(state.pending_cable_menu.is_none());
     }
 
     /// U3b D1/D7: the conductor terminal is a pure sink with a single
@@ -4480,5 +4649,105 @@ mod tests {
         );
         // A slider parameter has no choices.
         assert!(sf2_choices(&presets, InlineParam::Sf2Gain, 0).is_empty());
+    }
+
+    /// v3: the sample player owns its file exactly like the SoundFont node —
+    /// one `Load File…` / `Replace…` button on the box, no file dialog at
+    /// creation time (spec `plugin-browser.md` D16).
+    #[test]
+    fn sample_node_owns_its_file() {
+        let mut project = Project::default();
+        let node = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::Instrument {
+            node_id: node,
+            track: 0,
+            voice: VoiceSpec::Sample {
+                path: String::new(),
+                root_note: 60,
+                play_mode: glitcherz_model::SamplePlayMode::Gate,
+                gain: 1.0,
+            },
+            synth: glitcherz_model::SynthParams::default(),
+        });
+        let id = PatchId::Node(node);
+        // Born empty: silent, one file button, the caption says so.
+        {
+            let deps = PatchDeps {
+                doc: &project.graph,
+                track_count: project.midi_tracks.len(),
+                auto_count: 0,
+                audio_count: 0,
+                auto_options: &|_| Vec::new(),
+                plugin_inline: &|_| Vec::new(),
+                sf2_presets: &|_| Vec::new(),
+            };
+            assert_eq!(label_of(id, &project.graph), "SAMPLE (no file) · Track 1");
+            assert_eq!(action_rows(id, &deps), 1);
+            assert_eq!(header_band(id, &deps), NODE_TITLE_BAND + ACTION_ROW_HEIGHT);
+            let row = node_action_buttons(id, 0, &deps);
+            assert_eq!(row.len(), 1);
+            assert_eq!(row[0].label, "Load File…");
+            assert!(matches!(
+                row[0].action,
+                PatchAction::LoadSample { node: target } if target == node
+            ));
+            // Box: title band + file row + root / gain.
+            assert_eq!(inline_row_count(id, &deps), 2);
+            assert_eq!(
+                size_of(id, &deps),
+                Vec2::new(
+                    NODE_SIZE.x,
+                    NODE_SIZE.y + ACTION_ROW_HEIGHT + 2.0 * INLINE_ROW_HEIGHT
+                )
+            );
+        }
+
+        // Loaded: the caption turns into the file stem, the button to Replace.
+        if let Some(NodeDoc::Instrument { voice, .. }) = project.graph.node_by_id_mut(node) {
+            *voice = VoiceSpec::Sample {
+                path: "C:/samples/kick.wav".to_string(),
+                root_note: 60,
+                play_mode: glitcherz_model::SamplePlayMode::Gate,
+                gain: 1.0,
+            };
+        }
+        let deps = PatchDeps {
+            doc: &project.graph,
+            track_count: project.midi_tracks.len(),
+            auto_count: 0,
+            audio_count: 0,
+            auto_options: &|_| Vec::new(),
+            plugin_inline: &|_| Vec::new(),
+            sf2_presets: &|_| Vec::new(),
+        };
+        assert_eq!(label_of(id, &project.graph), "SAMPLE kick·C4 · Track 1");
+        assert_eq!(node_action_buttons(id, 0, &deps)[0].label, "Replace…");
+    }
+
+    /// The built-in roster has six kinds: a node caption must name the payload's
+    /// own kind instead of always saying "Delay".
+    #[test]
+    fn builtin_effect_caption_names_its_kind() {
+        let mut project = Project::default();
+        let node = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::Effect {
+            node_id: node,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params: crate::effect::default_params(BuiltinEffectKind::Eq),
+            delay: None,
+        });
+        assert_eq!(
+            label_of(PatchId::Node(node), &project.graph),
+            "EQ · Track 1"
+        );
+
+        if let Some(NodeDoc::Effect { params, .. }) = project.graph.node_by_id_mut(node) {
+            *params = crate::effect::default_params(BuiltinEffectKind::Reverb);
+        }
+        assert_eq!(
+            label_of(PatchId::Node(node), &project.graph),
+            "Reverb · Track 1"
+        );
     }
 }

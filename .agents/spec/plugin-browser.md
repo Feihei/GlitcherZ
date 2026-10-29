@@ -1,6 +1,6 @@
 # Spec — 插件浏览器与添加节点菜单（plugin-browser）
 
-> 状态：**定稿**（2026-10-22，三项决策已拍板；同日 v2 修订：① 取消"换源"动作，换源 = 删了重建；② 扫描改**前台分片 + 进度条**，不用后台线程）。
+> 状态：**定稿**（2026-10-22，三项决策已拍板；同日 v2 修订：① 取消"换源"动作，换源 = 删了重建；② 扫描改**前台分片 + 进度条**，不用后台线程；2026-10-29 **v3 修订**：③ 添加菜单去掉二级/三级层，`Instrument` / `Effect` 一步进 picker，内置条目与插件同列、按 `built-in / CLAP / VST3` tag 分组；④ 新增 `Shift+A` 在光标处打开同一菜单；⑤ 连线中点菜单扁平化，修掉"点 Insert 无反应"；⑥ Sample 与 SoundFont 对齐——先建空节点、再在节点上选文件，可替换；2026-10-29 **v3.1 修订**：⑦ picker 在关键词之外增加**按源 tag 过滤**（D19）。
 > 关联：`plugin-gui.md`（G4 面板按选中节点分派、U8 Inspector 收口）、`node-graph.md`（D2 端口剖面、D6 悬空语义、D19 旁路重连、P5e.2 连线中点插入）。
 > 验收锚点：启动时插件扫描带进度条、窗口不冻结；热启动列表毫秒级打开；200+ 插件目录下靠"层级 + 过滤框"三次以内点击直达；加节点 = **一步 undo**、引擎只 install 一次。
 > 覆盖关系：本 spec 接管 `plan.md` U8 中"Instrument 面板收敛为**源选择** + preset + 参数 + 编辑器区"的**源选择**部分——源选择移到 patch，Inspector 只留 preset / 参数 / 编辑器。
@@ -54,6 +54,11 @@
 | D12 | Add 不自动连线 | 新节点按 `node-graph.md` D6 **悬空出生**；"插到现有链路"由连线中点菜单承担（复用同一 picker） | `insert_effect_common`（`lib.rs:3232`）现在会隐式插到轨链尾（mixer 前），这条隐式捷径与"图是显式的"相冲突 |
 | D13 | 实例化仍同步 | 选中即 `spawn_rt`，期间状态栏 `Loading <name>…` + `request_repaint` | 异步实例化要处理插件线程亲和性（VST3 controller 的 main-thread 契约），风险远超本 spec，列 §11.6 |
 | D14 | 分片粒度 | 每帧**最多一个模块**，且在**帧末**执行 | 帧末执行保证"挂住时屏幕上已经画出了肇事文件名"；一个模块一帧让冷启动进度可预期（200 个库 ≈ 200 帧 ≈ 3–7 s，期间 UI 可用） |
+| D15 | **内置条目进 picker**（v3） | picker 的行列表 = 内置注册表 + 插件目录，行上带 `BUILT-IN / CLAP / VST3` tag，同 tag 连续成组 | 菜单层级每多一层就多一次点击与一次"点错重来"；内置只有 3 类乐器 + 6 个效果，与插件放在一个可搜索的列表里，`delay` 这类查询能同时命中内置 Delay 与插件 |
+| D16 | **菜单两级封顶**（v3） | 添加菜单只剩一级：`Search Nodes… / Instrument… / Effect… / Mixer / Keyboard / Feedback Tap / Rescan`；`Instrument…` / `Effect…` 直接开 picker（不再有 `CLAP… / VST3…` 叶子） | 格式维度已由行上的 tag 表达，再在菜单里分叉等于让用户先做一次"我要 CLAP 还是 VST3"的元决策；内置正弦波只是内置乐器之一，未来加内置乐器不必改菜单 |
+| D17 | **键盘入口**（v3） | `Shift+A` 在光标处打开与右键**同一个**菜单（同一份代码、同一个 popup id） | 图编辑器通用手感（Blender/ComfyUI）；不另写一份菜单，避免两条路径迟早分叉 |
+| D18 | **连线中点菜单扁平**（v3） | `Insert Effect…`（开 picker，落点 = 插入）/ `Insert Mixer` / `Delete Cable`，不再有 `Insert ▸ Effect ▸ …` 子菜单 | 旧实现是自绘 `Area` + "本帧有点击就关"的判定：点子菜单按钮那一帧 `picked` 仍为空，于是整张菜单同帧被关掉 —— 表现为"点 Insert 没反应" |
+| D19 | **tag 即过滤器**（v3.1） | 搜索框下面一排 `BUILT-IN / CLAP / VST3` 开关（多选，默认全开）；关掉某源 = 该源的行（**含 `Recent`**）全部消失。只画当前类别下**确实有条目**的源，且可用源只有一个时不画这一排 |关键词单独不够用：100 个插件里找**内置** Delay，`delay` 会命中一堆第三方 delay。把行上已有的 tag 复用成筛选维度，比再加一个下拉少一次点击，也不用在 `PickChoice` 之外多存字段；隐藏空源与“单源不画”是为了让没有 VST3 的机器不出现一枚永远点不出东西的胶囊 |
 
 ## 4 插件目录模型
 
@@ -152,35 +157,36 @@ pub struct PluginCatalog {
 
 ## 6 添加菜单与 picker
 
-### 6.1 结构
+### 6.1 结构（v3：两级封顶）
 
 ```text
-Add ▸ 🔍 Search plugins…                 ← D5 全局，跨类别
-    ▸ Instrument ▸ Built-in Synth        ← 动作：直接建
-                 ▸ SoundFont…            ← 动作：文件对话框 → 建
-                 ▸ CLAP…                 ← picker(kind=Instrument, format=Clap)
-                 ▸ VST3…                 ← picker(kind=Instrument, format=Vst3)
-    ▸ Effect     ▸ Built-in Delay        ← 动作：直接建
-                 ▸ CLAP…                 ← picker(kind=Effect, format=Clap)
-                 ▸ VST3…                 ← picker(kind=Effect, format=Vst3)
+Add ▸ 🔍 Search Nodes…          ← D5 全局，跨类别（含内置）
+    ▸ Instrument…               ← picker(Instrument)：内置 Synth / SoundFont / Sample + CLAP / VST3 乐器
+    ▸ Effect…                   ← picker(Effect)：内置 Delay / EQ / Compressor / Reverb / Chorus / Flanger + CLAP / VST3 效果
     ▸ Mixer
-    ▸ Feedback Tap
     ▸ Keyboard In
+    ▸ Feedback Tap
+    ▸ Rescan Plug-ins
 ```
 
+- 打开方式两种、**同一个菜单**：右键（画布任意位置）与 `Shift+A`（光标处，D17）。新节点落在菜单打开时的指针位置。
+- `Instrument…` / `Effect…` 已经是叶子，点了就直接进 picker —— 不再有 `CLAP… / VST3…` 中间层（D16）。格式信息改由行上的 tag 表达。
 - `Mixer` / `Feedback Tap` / `Keyboard In` 保持一级（没有声源维度，多套一层只是噪音）。
-- 内置效果器目前只有 Delay（README 承诺的 EQ / 压缩 / 混响是后续功能）。**增长路径**：内置效果器 ≥2 个时，`Effect ▸ Built-in` 改为打开同一个 picker（数据源 = 内置注册表），菜单代码不动——picker 只吃条目列表，内置条目可用同一结构描述（`format` 位置放 `Builtin` 变体）。
-- 连线中点菜单的 `Insert ▸ Effect ▸ CLAP… / VST3…` 复用同一 picker（换效果器的实际路径，见 §8.2）。
+- 内置条目**只有一个来源**：`plugin_picker::builtin_instruments()`（3 条）+ `BuiltinEffectKind::ALL`（6 条）。加一个内置乐器 = 在那个函数里加一行，菜单与 picker 代码不动。
+- 连线中点菜单（v3 扁平）：`Insert Effect…`（开 picker，`PickerPlace::Insert`）/ `Insert Mixer` / `Delete Cable`；MIDI / 自动化线只有 `Delete Cable`（D18）。
 
 ### 6.2 过滤规则
 
 | 项 | 规则 |
 | :--- | :--- |
-| 匹配字段 | `name` + `path`（漏了 path 就搜不到同名不同厂商的库） |
+| 匹配字段 | `name` + `path`（漏了 path 就搜不到同名不同厂商的库）；内置条目只有 `name` |
 | 分词 | `query.split_whitespace()` 全部命中（AND），大小写不敏感子串 |
-| 空查询 | 分组显示 `Recent`（≤5）+ `All`（按 name 排序） |
-| 零命中 | `No match for "xxx"` + `Show all plugins…`（清空查询，D9 兜底） |
-| 排序 | 名称不区分大小写；稳定次序以 `(format, path, id)` 断开 |
+| 空查询 | `Recent`（≤5）→ `Built-in` → `CLAP` → `VST3`，每组一条淡色小标题 |
+| 源过滤（D19） | 搜索框下一排 `BUILT-IN / CLAP / VST3` 胶囊，多选、默认全开；关闭的源其行（**含 `Recent`**）不出现。只画当前类别下**有条目**的源，可用源 ≤1 时整排不画 |
+| 零命中 | `No match for "xxx"` + `Clear search`；源被全关时 `Every source is switched off.` + `Show all sources`；跨类别兜底靠菜单里的 `Search Nodes…`（D9 的新落点） |
+| 排序 | 先按 tag 分组（Built-in → CLAP → VST3），组内按名称不区分大小写 |
+
+内置条目同样吃查询：输入 `delay` 会同时命中内置 `Delay` 与名字带 Delay 的插件；输入 `sf2` / `sample` 能直接跳到对应的内置行。
 
 ### 6.3 picker 交互细则
 
@@ -191,22 +197,37 @@ Add ▸ 🔍 Search plugins…                 ← D5 全局，跨类别
 | 尺寸 | 420 × 380（列表区高度自适应，上限 300） |
 | 打开 | 输入框 `request_focus` + 全选 |
 | 关闭 | `Esc` / 点击外部 / 选中条目 |
-| 行高 | 22；左 `name`（超宽省略号），右淡色 `CLAP` / `VST3` 标签 |
-| Tooltip | 完整模块路径 |
+| 行高 | 22；左 `name`（超宽省略号），右淡色 `BUILT-IN` / `CLAP` / `VST3` 标签 |
+| 分组 | 相邻行 tag 变化时插一条淡色组标题（`Built-in` / `CLAP` / `VST3`）；组标题不占行号，键盘索引只数真正的行 |
+| Tooltip | 插件 = 完整模块路径；内置 = 一句话说明（如 `SoundFont (.sf2 / .sf3) — the file is picked on the node`） |
+| 源胶囊 | 高亮 = 该源在显示（选中色填充）；关闭态用弱文字色。点击**只过滤、不选中**，同帧即重建列表并把高亮归零；tooltip 说明当前是"显示中"还是"已隐藏" |
 | 键盘 | `↑`/`↓` 移动高亮（初始第 0 行）、`Enter` 确认——输入框聚焦时仍拦截 |
 | 选中 | 关闭 → 建节点；状态栏 `Loading <name>…` + `ctx.request_repaint()`（实例化同步，D13） |
 
-两处复用（D3 取消换源后剩两态，E3/E4 均已落地）。**落点与筛选条件分开**：`PickFilter`（类别 + 格式）决定列表内容，`PickerPlace` 决定选中的东西去哪 —— 同一个 popup 因此不需要为「插入」再写一份：
+两处复用（D3 取消换源后剩两态，E3/E4 均已落地）。**落点与筛选条件分开**：`PickFilter`（只按类别分乐器/效果/全部）决定列表内容，`PickerPlace` 决定选中的东西去哪 —— 同一个 popup 因此不需要为「插入」再写一份：
 
 ```rust
+// plugin_picker.rs（v3.1：两个正交维度 —— 类别来自菜叶子，源来自胶囊；query 是 popup 自己的状态）
+pub struct PickFilter {
+    pub want_instrument: Option<bool>,  // 菜叶子决定的类别
+    pub tags: PickTags,                 // D19：BUILT-IN / CLAP / VST3 的开关位图
+}
+
 // patch.rs
 pub enum PickerPlace {
     Add { at: Pos2 },                        // 悬空出生（D6）
     Insert { cable: usize, at: Pos2 },       // 连线中点：A → new → B
 }
+
+// plugin_picker.rs（v3：行内容 = 名称 + tag + 现成的节点源）
+pub struct PickChoice {
+    pub name: String,
+    pub tag: PickTag,        // BuiltIn / Clap / Vst3
+    pub source: NodeSource,  // 选中即建它，不再二次映射
+}
 ```
 
-`insert_node_in_cable` 的落点约束：只有 `NodeSource::fits_audio_insert()`（`BuiltinDelay` / `ClapEffect` / `Vst3Effect` / `Mixer`）能进音频线；乐器进来会没有 MIDI 输入而永久静音，直接在动作层拒绝。拼接**原样保留下游槽位**（`in_port`，D17：mixer 推子与线缆的绑定不能断）。
+`insert_node_in_cable` 的落点约束：只有 `NodeSource::fits_audio_insert()`（内置效果 / `ClapEffect` / `Vst3Effect` / `Mixer`）能进音频线；乐器进来会没有 MIDI 输入而永久静音，直接在动作层拒绝。拼接**原样保留下游槽位**（`in_port`，D17：mixer 推子与线缆的绑定不能断）。
 
 ## 7 节点创建路径
 
@@ -218,10 +239,13 @@ pub enum NodeCategory { Instrument, Effect }
 // E3 实际落地形态：插件源按"乐器/效果"分成显式变体 —— install_node 的
 // Instrument / Effect 分支需要的 VoiceSpec 形状不同，扁平枚举让
 // create_patch_node 的 match 一眼可读（无需再交叉查 category）。
+// U13/v3：SoundFont 与 Sample 都支持 path 为空 —— 那是"先建节点、再在节点上
+// 选文件"的正常出生态（静音，等 Load File… 换入真声音）。
 pub enum NodeSource {
     BuiltinSynth,
-    BuiltinDelay,
-    SoundFont { path: String },                              // bank 0 / program 0
+    Builtin(BuiltinEffectKind),                              // 内置效果，roster 走 ALL
+    SoundFont { path: String },                              // 空路径 = 待选文件
+    Sample { path: String },                                 // 空路径 = 待选文件（v3）
     ClapInstrument { path: String, plugin_id: String },
     Vst3Instrument { path: String, class_id: String },
     ClapEffect { path: String, plugin_id: String },
@@ -261,8 +285,9 @@ pub enum NodeSource {
 
 | 节点类型 | 换源流程 | 代价 |
 | :--- | :--- | :--- |
-| 效果器 | `Delete`（`node-graph.md` D19 旁路重连：`A→fx→B` 自动变 `A→B`）→ 右键连线中点 → `Insert ▸ Effect ▸ CLAP…` → picker | 链路不断，几乎无痛（拼接本身也已是一步 undo） |
-| 乐器 | `Delete`（出线 + MIDI 入线一并移除）→ `Add ▸ Instrument ▸ CLAP…` → 重拉 MIDI 与音频两根线 | 多两次拖线；**用户已确认接受**（参数本来也搬不过去） |
+| 效果器 | `Delete`（`node-graph.md` D19 旁路重连：`A→fx→B` 自动变 `A→B`）→ 点连线中点 → `Insert Effect…` → picker | 链路不断，几乎无痛（拼接本身也已是一步 undo） |
+| 乐器 | `Delete`（出线 + MIDI 入线一并移除）→ `Shift+A` / 右键 → `Instrument…` → picker → 重拉 MIDI 与音频两根线 | 多两次拖线；**用户已确认接受**（参数本来也搬不过去） |
+| SoundFont / Sample | **换文件不算换源**：节点本体不动，`Replace…` 就地换处理器（U13 既有行为，v3 扩到 Sample） | 零代价，连线/参数/音量全部保留 |
 
 删节点本身是一步 undo；重建是另一步 undo —— 不合并为一步（想让"删+建"变成一步就得记住旧节点身份，等于把 Replace 偷渡回来）。
 
@@ -285,6 +310,8 @@ Q3 推荐理由：缓存是**派生数据**，不需要用户可见、不需要�
 - [x] **E3 picker 与菜单** ✅ 2026-10-23：`plugin_picker.rs`（`PickFilter` / `PickChoice` / `RecentPlugin` / `matches_query` / `visible` / `visible_recents` / `PluginPicker` 浮层：过滤框 + ↑↓/Enter/Esc + Recent 分组 + `Show all plug-ins…` 兜底）+ `patch.rs` 的 `Add` 三级菜单（`Search Plug-ins…` / Instrument{Built-in Synth, SoundFont…, CLAP…, VST3…} / Effect{Built-in Delay, CLAP…, VST3…} / Mixer / Keyboard / Feedback / Rescan）+ `NodeCategory` & `NodeSource`（取代 `AddNodeKind`）+ `create_patch_node(source)` 单次 install（插件实例化失败即回滚，不留空壳）+ Recent 存 `UiState`；8 项单测（含 4 项 headless egui 帧驱动：键盘选取、Esc 取消、Recent 置顶、开帧点击不自关）；全仓 492 项绿
 - [x] **E4 连线中点 Insert 复用 picker** ✅ 2026-10-23：cable 中点菜单改为 `Insert ▸ Effect ▸ Built-in Delay / CLAP… / VST3…` + `Insert ▸ Mixer`（MIDI / 自动化线只有 `Delete Cable`）；picker 增 `PickerPlace::Insert`（携带 `cable` 下标，`PickFilter` 仍是「效果器」）；`insert_node_in_cable` 接受插件效果器、**归属上游节点所在轨**（`create_patch_node_on`，不再用当前选中轨）、`suspend_history` 包住「建 + 断 + 接两根」使整次拼接 **一步 undo**；纯函数 `splice_endpoints` 守住「下游槽位不变」与「非音频线 / 无上游节点的线拒收」。5 项单测（槽位保留、master 目标、MIDI 拒收、无源拒收、可插入源白名单）。**注**：`NodeCategory` / `NodeSource` 拆分与单次 install 已在 E3 落地（创建路径必须先于 picker 可用）
 - [x] **E5 Inspector 收口** ✅ 2026-10-23：删源选择行与 effects 快捷加载、`Clear All Effects` 挪到效果节点列表头部；验收：面板只剩 preset / 参数 / 编辑器 / 内联参数，且删除源选择后无残留缓存字段（`clap_plugins` / `clap_effects` / `vst3_*` 四个 `Option` 已由 `PluginCatalog` 取代）。实现见 `implementation.md`「Inspector 收口（U9 E5）」
+- [x] **E6 菜单扁平化 + 内置条目进 picker**（v3，2026-10-29）：`PickChoice` 改为 `{name, tag, source: NodeSource}`、新增 `PickTag{BuiltIn,Clap,Vst3}`、`rows()` 合并 recents/内置/插件并按 tag 分组、`PickFilter` 去掉 format 维度；添加菜单改一级（`Search Nodes… / Instrument… / Effect… / Mixer / Keyboard / Feedback / Rescan`），用 `egui::Popup`（菜单 kind + `open_memory`）同时承接右键与 `Shift+A`；连线中点菜单扁平为 `Insert Effect… / Insert Mixer / Delete Cable`（修 D18 的"点 Insert 无反应"）；Sample 节点补 `Load File… / Replace…`（与 SoundFont 同款就地换处理器），`Add ▸ Sample` 不再弹文件框而是先建空节点
+- [x] **E7 按源 tag 过滤**（v3.1，2026-10-29）：`PickTags` 位图（`ALL` / `NONE` / `has` / `set` / `toggle` / `count` / `is_all`）挂到 `PickFilter.tags`；`builtin_choices` / `plugin_choices` / `rows`（含 `Recent`）三处都按 `tags.has` 过滤；`available_tags(entries, filter)` 只看类别（不看 query 与开关）决定画哪几个胶囊；搜索框下新增自绘胶囊条（显式 id，可被 headless 测试点击），点子即**同帧**重建列表并归零高亮；空列表区分"无匹配"与"源被全关"，后者给 `Show all sources`。单测 +5（源过滤裁行 / 关掉内置 / 过滤 Recent / `available_tags` 不随开关变化 / 点击胶囊同帧生效且不关窗），ui lib 169 项绿
 
 门槛：`cargo fmt && cargo clippy --workspace -- -D warnings && cargo test --workspace` 全绿；手工验收 Dexed（CLAP）+ 本地 200+ VST3 目录。
 
