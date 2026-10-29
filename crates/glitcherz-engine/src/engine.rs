@@ -69,7 +69,12 @@ pub struct AudioEngine {
     /// engine moves its runner into the cpal callback and leaves `None`
     /// here; an offline engine keeps it on the field so the control thread
     /// can drive blocks via [`AudioEngine::render_offline_block`].
-    offline_runner: Option<BlockRunner>,
+    ///
+    /// **Boxed** for the same reason the live runner is: `BlockRunner` is a
+    /// large fixed-capacity struct (~50 KB once the graph's per-node event
+    /// buffers are included), and an unboxed copy here would also inflate
+    /// every by-value move of [`AudioEngine`] itself.
+    offline_runner: Option<Box<BlockRunner>>,
     feedback: Feedback,
     info: AudioEngineInfo,
 }
@@ -109,7 +114,15 @@ impl AudioEngine {
         let (audio_trash_tx, audio_trash_rx) =
             crate::realtime::audio_track::audio_clip_trash_channel();
         let (midi_trash_tx, midi_trash_rx) = crate::realtime::midi_clip_trash_channel();
-        let mut runner = BlockRunner::new(
+        // Boxed on purpose: `BlockRunner` is ~50 KB (the graph carries a fixed
+        // per-node event buffer table), and cpal's `build_output_stream` passes
+        // the callback closure by value through a stack of generic
+        // sample-format layers. Each of those layers keeps its own copy, which
+        // is fine for a pointer-sized capture but overflows the main thread's
+        // 1 MiB stack when the capture is a whole runner (STATUS_STACK_OVERFLOW
+        // at startup). The RT path is unaffected: the box is allocated here,
+        // before the stream starts.
+        let mut runner = Box::new(BlockRunner::new(
             FIXED_BLOCK_SIZE,
             stream_config.channels as usize,
             sample_rate_f32,
@@ -121,7 +134,7 @@ impl AudioEngine {
             audio_trash_tx,
             midi_trash_tx,
             feedback.clone(),
-        );
+        ));
 
         // Data callback: all code constrained by the real-time iron rules is
         // concentrated inside BlockRunner.
@@ -178,7 +191,7 @@ impl AudioEngine {
         let (audio_trash_tx, audio_trash_rx) =
             crate::realtime::audio_track::audio_clip_trash_channel();
         let (midi_trash_tx, midi_trash_rx) = crate::realtime::midi_clip_trash_channel();
-        let runner = BlockRunner::new(
+        let runner = Box::new(BlockRunner::new(
             FIXED_BLOCK_SIZE,
             2,
             sample_rate_f32,
@@ -190,7 +203,7 @@ impl AudioEngine {
             audio_trash_tx,
             midi_trash_tx,
             feedback.clone(),
-        );
+        ));
         Ok(Self {
             _stream: None,
             commands,
