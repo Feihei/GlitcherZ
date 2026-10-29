@@ -37,6 +37,7 @@ use crate::realtime::context::ProcessContext;
 use crate::realtime::delay::DelayProcessor;
 use crate::realtime::effect::Smoothed;
 use crate::realtime::effect::descriptor::{ParamSpec, Unit};
+use crate::realtime::events::{MAX_EVENT_CABLES, MAX_EVENT_FANOUT, NodeEvents, RtEvent};
 use crate::realtime::gain::GainProcessor;
 use crate::realtime::mixer::MixerProcessor;
 use crate::realtime::processor::{ChannelWeights, Processor};
@@ -182,6 +183,43 @@ impl Default for AutoRoute {
     }
 }
 
+/// Direction of one node-to-node event cable (spec `midi-nodes.md` D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    /// MIDI event stream (`note` / controller) handed to the destination's
+    /// `note_event` / `midi_cc` / `midi_pitch_bend`.
+    Midi,
+    /// Scalar control value delivered as `dest` (parameter / CC / bend).
+    Control,
+}
+
+/// One node-to-node event or control cable (spec `midi-nodes.md` D4).
+///
+/// Kept in a separate table from audio [`Cable`]s: event edges join the
+/// topological sort, but they must not be spliced/bypassed like audio edges
+/// when a node is removed (D9).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EventCable {
+    /// Source slot.
+    pub from: u16,
+    /// Destination slot.
+    pub to: u16,
+    /// What travels on this cable.
+    pub kind: EventKind,
+    /// Compiled control destination; ignored for [`EventKind::Midi`].
+    pub dest: AutoDest,
+}
+
+impl EventCable {
+    /// Placeholder used by the fixed-capacity plan arrays.
+    pub const EMPTY: Self = Self {
+        from: NO_EDGE,
+        to: NO_EDGE,
+        kind: EventKind::Midi,
+        dest: AutoDest::Param(ParamId::MasterGain),
+    };
+}
+
 /// Precompiled execution plan: fully `Copy`; the audio thread traverses only
 /// this per block (D5).
 ///
@@ -223,6 +261,12 @@ pub struct ExecPlan {
     /// Timeline automation routing table: delivery destinations indexed by
     /// automation track (D7).
     pub auto_routes: [AutoRoute; MAX_AUTO_TRACKS],
+    /// Event/control out-edges per slot (spec `midi-nodes.md` D4). In-degrees
+    /// live only on the compiler (they are needed while sorting, not at
+    /// runtime).
+    pub event_out: [[EventCable; MAX_EVENT_FANOUT]; MAX_NODES],
+    /// Valid out-edge count of each slot.
+    pub event_out_counts: [u8; MAX_NODES],
 }
 
 impl ExecPlan {
@@ -244,6 +288,8 @@ impl ExecPlan {
             slot: NO_EDGE,
             dest: AutoDest::Param(ParamId::MasterGain),
         }; MAX_AUTO_TRACKS],
+        event_out: [[EventCable::EMPTY; MAX_EVENT_FANOUT]; MAX_NODES],
+        event_out_counts: [0; MAX_NODES],
     };
 }
 
@@ -262,11 +308,13 @@ pub struct GraphLevels {
     pub master_lr: [f32; 2],
 }
 
-/// Runtime node slot: processor + dedicated stereo output buffer.
+/// Runtime node slot: processor + dedicated stereo output buffer + this
+/// block's outgoing event bus.
 struct NodeSlot {
     node_id: u64,
     processor: Box<dyn Processor>,
     output: AudioBuffer,
+    events: NodeEvents,
 }
 
 /// Runtime graph: fixed-capacity slots + the current execution plan.
@@ -287,6 +335,12 @@ pub struct RtGraph {
     /// yet. Same de-duplication rationale as [`Self::last_cc`] — a bend is an
     /// absolute value, and 375 identical events per second is pure overhead.
     last_bend: [i32; MAX_AUTO_TRACKS],
+    /// De-duplication memory for **control cables** (spec `midi-nodes.md`
+    /// D6), keyed by destination slot: one target can receive only one
+    /// control cable (`GraphDoc::validate` / `connect_event`), so slot keying
+    /// is unambiguous.
+    last_edge_cc: [i16; MAX_NODES],
+    last_edge_bend: [i32; MAX_NODES],
 }
 
 /// Pitches released per block by a panic sweep. Kept below the plugin hosts'
@@ -393,6 +447,8 @@ impl RtGraph {
             panic_sweep: None,
             last_cc: [-1; MAX_AUTO_TRACKS],
             last_bend: [i32::MIN; MAX_AUTO_TRACKS],
+            last_edge_cc: [-1; MAX_NODES],
+            last_edge_bend: [i32::MIN; MAX_NODES],
         }
     }
 
@@ -409,6 +465,7 @@ impl RtGraph {
             node_id,
             processor,
             output,
+            events: NodeEvents::default(),
         });
     }
 
@@ -460,6 +517,7 @@ impl RtGraph {
                 node_id: dep.node_id,
                 processor,
                 output,
+                events: NodeEvents::default(),
             });
         }
         self.plan = plan;
@@ -468,6 +526,8 @@ impl RtGraph {
         // new target would otherwise wait for the curve to move).
         self.last_cc = [-1; MAX_AUTO_TRACKS];
         self.last_bend = [i32::MIN; MAX_AUTO_TRACKS];
+        self.last_edge_cc = [-1; MAX_NODES];
+        self.last_edge_bend = [i32::MIN; MAX_NODES];
     }
 
     /// Replaces one node's audio clip table (U6 D4). Returns the table that
@@ -528,7 +588,47 @@ impl RtGraph {
                 }
             }
             node.processor.process(ctx, &mut node.output);
+            // Event/control bus (spec `midi-nodes.md` D4/D5): produce this
+            // block's output, then hand it to the already-sorted downstream
+            // slots. The topology guarantees they have not run yet, so
+            // delivery stays inside the same block.
+            node.events.clear();
+            node.processor.process_events(ctx, &mut node.events);
+            let event_count = self.plan.event_out_counts[s] as usize;
+            let event_out = self.plan.event_out[s];
+            let control = node.events.control;
+            for edge in &event_out[..event_count] {
+                if edge.kind != EventKind::Midi {
+                    continue;
+                }
+                let Some(target) = self
+                    .slots
+                    .get_mut(edge.to as usize)
+                    .and_then(|slot| slot.as_mut())
+                else {
+                    continue;
+                };
+                for event in node.events.iter() {
+                    match event {
+                        RtEvent::Note(note) => {
+                            let _ = target.processor.note_event(note);
+                        }
+                        RtEvent::Ctrl(ctrl) => {
+                            let _ = dispatch_ctrl(&mut *target.processor, ctrl);
+                        }
+                    }
+                }
+            }
             self.slots[s] = Some(node);
+            // Control values need `&mut self` (de-duplication tables), so they
+            // are delivered after the slot goes back.
+            if let Some(value) = control {
+                for edge in &event_out[..event_count] {
+                    if edge.kind == EventKind::Control {
+                        self.deliver_dest(edge.to, edge.dest, value, DedupKey::Slot(edge.to));
+                    }
+                }
+            }
         }
         let mut levels = GraphLevels::default();
         for (t, &slot) in self.plan.track_channel.iter().enumerate() {
@@ -624,18 +724,7 @@ impl RtGraph {
         self.slots
             .get_mut(slot as usize)
             .and_then(|s| s.as_mut())
-            .is_some_and(|n| match ctrl.kind {
-                RtCtrlKind::Cc(controller) => {
-                    n.processor
-                        .midi_cc(ctrl.channel, controller & 0x7F, ctrl.value_7bit())
-                }
-                RtCtrlKind::PitchBend => {
-                    n.processor.midi_pitch_bend(ctrl.channel, ctrl.value_i14())
-                }
-                RtCtrlKind::ChannelPressure | RtCtrlKind::PolyPressure(_) | RtCtrlKind::Program => {
-                    false
-                }
-            })
+            .is_some_and(|n| dispatch_ctrl(&mut *n.processor, ctrl))
     }
 
     /// Releases all connected targets' current notes (call before transport
@@ -723,9 +812,20 @@ impl RtGraph {
         if route.slot == TIMELINE_IN {
             return;
         }
-        match route.dest {
+        self.deliver_dest(route.slot, route.dest, value, DedupKey::Auto(auto_index));
+    }
+
+    /// Delivers one sampled control value to a node destination (U4a; shared
+    /// with node-to-node control cables, spec `midi-nodes.md` D6).
+    ///
+    /// Parameter destinations write the value through; CC and bend
+    /// destinations quantize to their wire grids and **only emit on change**
+    /// (U4a D4). `key` selects the de-duplication memory: one per automation
+    /// track, or one per destination slot for control cables.
+    fn deliver_dest(&mut self, slot: u16, dest: AutoDest, value: f32, key: DedupKey) {
+        match dest {
             AutoDest::Param(id) => {
-                let _ = self.slot_set_param(route.slot, id, value);
+                let _ = self.slot_set_param(slot, id, value);
             }
             AutoDest::Cc {
                 controller,
@@ -737,13 +837,18 @@ impl RtGraph {
                 // MIDI CC is a 7-bit integer: round rather than truncate so a
                 // 0.5 anchor lands on 64, not 0.
                 let value = value.clamp(0.0, 127.0).round() as i16;
-                if self.last_cc.get(auto_index) == Some(&value) {
+                let last = match key {
+                    DedupKey::Auto(index) => self.last_cc.get_mut(index),
+                    DedupKey::Slot(slot) => self.last_edge_cc.get_mut(slot as usize),
+                };
+                let Some(last) = last else {
+                    return;
+                };
+                if *last == value {
                     return;
                 }
-                if let Some(slot) = self.last_cc.get_mut(auto_index) {
-                    *slot = value;
-                }
-                let _ = self.slot_midi_cc(route.slot, channel, controller, value as u8);
+                *last = value;
+                let _ = self.slot_midi_cc(slot, channel, controller, value as u8);
             }
             AutoDest::PitchBend {
                 channel,
@@ -768,12 +873,17 @@ impl RtGraph {
                 } else {
                     (f64::from(ratio) * 8192.0).round() as i16
                 };
-                if self.last_bend.get(auto_index) == Some(&i32::from(bend)) {
+                let last = match key {
+                    DedupKey::Auto(index) => self.last_bend.get_mut(index),
+                    DedupKey::Slot(slot) => self.last_edge_bend.get_mut(slot as usize),
+                };
+                let Some(last) = last else {
+                    return;
+                };
+                if *last == i32::from(bend) {
                     return;
                 }
-                if let Some(slot) = self.last_bend.get_mut(auto_index) {
-                    *slot = i32::from(bend);
-                }
+                *last = i32::from(bend);
                 // D10's per-source split, resolved by asking the node instead
                 // of keeping a node-kind table on the audio thread: whoever
                 // answers `midi_pitch_bend` wants the event (CLAP raw 0xE0,
@@ -783,13 +893,13 @@ impl RtGraph {
                 // `PitchOffset`, which they smooth per sample (D11). A VST3
                 // node answers neither and stays silent (documented in the
                 // UI, D10).
-                if self.slot_midi_pitch_bend(route.slot, channel, bend) {
+                if self.slot_midi_pitch_bend(slot, channel, bend) {
                     return;
                 }
                 // The change detector above quantizes to the wire grid first;
                 // for the parameter path that grid is `range/8192` semitones
                 // (0.00024 st at the default ±2), i.e. 40× finer than a cent.
-                let _ = self.slot_set_param(route.slot, ParamId::PitchOffset, value);
+                let _ = self.slot_set_param(slot, ParamId::PitchOffset, value);
             }
         }
     }
@@ -868,6 +978,27 @@ impl RtGraph {
             .get(self.plan.master_slot as usize)
             .and_then(|s| s.as_ref())
             .and_then(|n| n.output.channel(ch))
+    }
+}
+
+/// De-duplication memory selector for [`RtGraph::deliver_dest`].
+#[derive(Clone, Copy)]
+enum DedupKey {
+    /// Automation track index (`auto_routes` entry).
+    Auto(usize),
+    /// Destination slot of a node-to-node control cable.
+    Slot(u16),
+}
+
+/// Dispatches one controller event into a processor (shared by the timeline
+/// route table and the node event bus). RT-safe.
+fn dispatch_ctrl(processor: &mut dyn Processor, ctrl: RtCtrl) -> bool {
+    match ctrl.kind {
+        RtCtrlKind::Cc(controller) => {
+            processor.midi_cc(ctrl.channel, controller & 0x7F, ctrl.value_7bit())
+        }
+        RtCtrlKind::PitchBend => processor.midi_pitch_bend(ctrl.channel, ctrl.value_i14()),
+        RtCtrlKind::ChannelPressure | RtCtrlKind::PolyPressure(_) | RtCtrlKind::Program => false,
     }
 }
 
@@ -1070,6 +1201,13 @@ pub enum TopologyError {
     FanInOverflow,
     /// MIDI track fan-out exceeds the limit (> [`MAX_MIDI_FANOUT`]).
     MidiFanOutOverflow,
+    /// An event destination already has an in-edge of the same kind
+    /// (spec `midi-nodes.md`: MIDI in ≤ 1, control in ≤ 1 per node).
+    EventFanInOverflow,
+    /// An event source exceeds [`MAX_EVENT_FANOUT`] outgoing cables.
+    EventFanOutOverflow,
+    /// Event/control cable count over capacity (> [`MAX_EVENT_CABLES`]).
+    TooManyEventCables,
 }
 
 /// Control-side graph state (**non-real-time**): slot occupancy + node_id
@@ -1090,6 +1228,10 @@ pub struct GraphCompiler {
     /// single-out-edge `out_edge`).
     cables: [Cable; MAX_CABLES],
     cable_count: usize,
+    /// Event/control cable list (spec `midi-nodes.md` D4). Kept separate from
+    /// audio cables so removal can drop them instead of bypassing (D9).
+    event_cables: [EventCable; MAX_EVENT_CABLES],
+    event_cable_count: usize,
     master_slot: u16,
     track_voice: [u16; MAX_MIDI_TRACKS],
     track_delay: [u16; MAX_MIDI_TRACKS],
@@ -1127,6 +1269,8 @@ impl GraphCompiler {
                 in_port: 0,
             }; MAX_CABLES],
             cable_count: 0,
+            event_cables: [EventCable::EMPTY; MAX_EVENT_CABLES],
+            event_cable_count: 0,
             master_slot: 0,
             track_voice: [NO_EDGE; MAX_MIDI_TRACKS],
             track_delay: [NO_EDGE; MAX_MIDI_TRACKS],
@@ -1247,6 +1391,7 @@ impl GraphCompiler {
     fn deallocate_track_chain(&mut self, track: usize) {
         let slots = [self.track_voice[track], self.track_delay[track]];
         self.remove_cables_touching(&slots);
+        self.remove_event_cables_touching(&slots);
         for slot in slots {
             if slot != NO_EDGE {
                 self.occupied[slot as usize] = false;
@@ -1427,6 +1572,70 @@ impl GraphCompiler {
         }
     }
 
+    // ---- event cable primitives (spec `midi-nodes.md`) ----
+
+    fn has_event_cable(&self, from: u16, to: u16, kind: EventKind) -> bool {
+        self.event_cables[..self.event_cable_count]
+            .iter()
+            .any(|c| c.from == from && c.to == to && c.kind == kind)
+    }
+
+    fn event_in_count(&self, to: u16, kind: EventKind) -> usize {
+        self.event_cables[..self.event_cable_count]
+            .iter()
+            .filter(|c| c.to == to && c.kind == kind)
+            .count()
+    }
+
+    fn event_out_count(&self, from: u16) -> usize {
+        self.event_cables[..self.event_cable_count]
+            .iter()
+            .filter(|c| c.from == from)
+            .count()
+    }
+
+    /// Whether a timeline MIDI track already targets `slot` (the timeline
+    /// feed counts toward the same "one MIDI source" budget as a node event
+    /// cable).
+    fn timeline_targets_slot(&self, slot: u16) -> bool {
+        (0..MAX_MIDI_TRACKS).any(|track| {
+            let count = self.midi_target_counts[track] as usize;
+            self.midi_targets[track][..count].contains(&slot)
+        })
+    }
+
+    /// Removes one event cable (idempotent; returns `false` when absent).
+    fn remove_event_cable(&mut self, from: u16, to: u16, kind: EventKind) -> bool {
+        let Some(pos) = self.event_cables[..self.event_cable_count]
+            .iter()
+            .position(|c| c.from == from && c.to == to && c.kind == kind)
+        else {
+            return false;
+        };
+        self.event_cables
+            .copy_within(pos + 1..self.event_cable_count, pos);
+        self.event_cable_count -= 1;
+        true
+    }
+
+    /// Drops every event/control cable touching any of the given slots. No
+    /// bypass: a removed MIDI effect rewrites the stream, so rejoining the
+    /// endpoints would not restore the original signal (D9).
+    fn remove_event_cables_touching(&mut self, slots: &[u16]) {
+        let mut i = 0;
+        while i < self.event_cable_count {
+            if slots.contains(&self.event_cables[i].from)
+                || slots.contains(&self.event_cables[i].to)
+            {
+                self.event_cables
+                    .copy_within(i + 1..self.event_cable_count, i);
+                self.event_cable_count -= 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     fn alloc_slot(&mut self) -> u16 {
         let slot = self
             .occupied
@@ -1524,6 +1733,17 @@ impl GraphCompiler {
                 degree[cable.from as usize] += 1;
             }
         }
+        // Event/control cables constrain `to` after `from` (spec
+        // `midi-nodes.md` D4): an arpeggiator must emit before the instrument
+        // that consumes it, otherwise delivery slips by a block. Unlike the
+        // audio taps above, event edges are never reversed (a Feedback node
+        // has no event port).
+        for cable in &self.event_cables[..self.event_cable_count] {
+            if !self.occupied[cable.from as usize] || !self.occupied[cable.to as usize] {
+                continue;
+            }
+            degree[cable.to as usize] += 1;
+        }
         let mut work = [0u16; MAX_NODES];
         let mut work_len = 0usize;
         let mut head = 0usize;
@@ -1555,6 +1775,27 @@ impl GraphCompiler {
                 if degree[d] > 0 {
                     degree[d] -= 1;
                 }
+                if degree[d] == 0 {
+                    work[work_len] = cable.to;
+                    work_len += 1;
+                }
+            }
+            // Event/control out-edges release their destinations the same
+            // way. Guarded against a destination already released by an
+            // audio edge in this same pass (double-push would overflow
+            // `work`).
+            for cable in &self.event_cables[..self.event_cable_count] {
+                if cable.from as usize != s
+                    || !self.occupied[cable.from as usize]
+                    || !self.occupied[cable.to as usize]
+                {
+                    continue;
+                }
+                let d = cable.to as usize;
+                if degree[d] == 0 {
+                    continue;
+                }
+                degree[d] -= 1;
                 if degree[d] == 0 {
                     work[work_len] = cable.to;
                     work_len += 1;
@@ -1599,6 +1840,21 @@ impl GraphCompiler {
         plan.midi_targets = self.midi_targets;
         plan.midi_target_counts = self.midi_target_counts;
         plan.auto_routes = self.auto_routes;
+        // Materialize the out-edge table for runtime forwarding. The per-source
+        // fan-out cap is checked here as well (the compiler's `connect_event`
+        // already enforces it; `compile` must stay sound for hand-built state).
+        for cable in &self.event_cables[..self.event_cable_count] {
+            if !self.occupied[cable.from as usize] || !self.occupied[cable.to as usize] {
+                continue;
+            }
+            let source = cable.from as usize;
+            let count = plan.event_out_counts[source] as usize;
+            if count >= MAX_EVENT_FANOUT {
+                return Err(TopologyError::EventFanOutOverflow);
+            }
+            plan.event_out[source][count] = *cable;
+            plan.event_out_counts[source] += 1;
+        }
         Ok(plan)
     }
 
@@ -1838,6 +2094,7 @@ impl GraphCompiler {
             }
         }
         self.remove_cables_touching(&slots[..count]);
+        self.remove_event_cables_touching(&slots[..count]);
         for &slot in &slots[..count] {
             self.occupied[slot as usize] = false;
             self.slot_ids[slot as usize] = 0;
@@ -1872,6 +2129,11 @@ impl GraphCompiler {
             // current plan).
             return Ok(self.build_update(self.compile()?, Vec::new(), &[]));
         }
+        // One MIDI source per destination (spec `midi-nodes.md` §7): a node
+        // already fed by an event cable cannot also take a track feed.
+        if self.event_in_count(slot, EventKind::Midi) > 0 {
+            return Err(TopologyError::EventFanInOverflow);
+        }
         let count = self.midi_target_counts[track] as usize;
         if count >= MAX_MIDI_FANOUT {
             return Err(TopologyError::MidiFanOutOverflow);
@@ -1902,6 +2164,77 @@ impl GraphCompiler {
         self.midi_targets[track].copy_within(pos + 1..count, pos);
         self.midi_targets[track][count - 1] = NO_EDGE;
         self.midi_target_counts[track] -= 1;
+        Ok(self.build_update(self.compile()?, Vec::new(), &[]))
+    }
+
+    /// Connects a node-to-node event or control cable (spec `midi-nodes.md`
+    /// D4, **node_id addressing**).
+    ///
+    /// `kind` decides the traffic (`Midi` events or one `Control` value per
+    /// block delivered as `dest`). MIDI destinations take at most one source
+    /// — a timeline / keyboard feed counts too — and control destinations at
+    /// most one source; duplicates are idempotent. Cycles are rejected by the
+    /// compile pass and the new cable is rolled back.
+    pub fn connect_event(
+        &mut self,
+        from_id: u64,
+        to_id: u64,
+        kind: EventKind,
+        dest: AutoDest,
+    ) -> Result<GraphUpdate, TopologyError> {
+        let from = self.node_slot(from_id).ok_or(TopologyError::InvalidSlot)?;
+        let to = self.node_slot(to_id).ok_or(TopologyError::InvalidSlot)?;
+        if from == to {
+            return Err(TopologyError::Cycle);
+        }
+        if self.has_event_cable(from, to, kind) {
+            return Ok(self.build_update(self.compile()?, Vec::new(), &[]));
+        }
+        match kind {
+            EventKind::Midi => {
+                if self.event_in_count(to, EventKind::Midi) > 0 || self.timeline_targets_slot(to) {
+                    return Err(TopologyError::EventFanInOverflow);
+                }
+            }
+            EventKind::Control => {
+                if self.event_in_count(to, EventKind::Control) > 0 {
+                    return Err(TopologyError::EventFanInOverflow);
+                }
+            }
+        }
+        if self.event_out_count(from) >= MAX_EVENT_FANOUT {
+            return Err(TopologyError::EventFanOutOverflow);
+        }
+        if self.event_cable_count >= MAX_EVENT_CABLES {
+            return Err(TopologyError::TooManyEventCables);
+        }
+        self.event_cables[self.event_cable_count] = EventCable {
+            from,
+            to,
+            kind,
+            dest,
+        };
+        self.event_cable_count += 1;
+        match self.compile() {
+            Ok(plan) => Ok(self.build_update(plan, Vec::new(), &[])),
+            Err(err) => {
+                self.remove_event_cable(from, to, kind);
+                Err(err)
+            }
+        }
+    }
+
+    /// Disconnects a node-to-node event/control cable (idempotent success when
+    /// unconnected).
+    pub fn disconnect_event(
+        &mut self,
+        from_id: u64,
+        to_id: u64,
+        kind: EventKind,
+    ) -> Result<GraphUpdate, TopologyError> {
+        let from = self.node_slot(from_id).ok_or(TopologyError::InvalidSlot)?;
+        let to = self.node_slot(to_id).ok_or(TopologyError::InvalidSlot)?;
+        self.remove_event_cable(from, to, kind);
         Ok(self.build_update(self.compile()?, Vec::new(), &[]))
     }
 
@@ -2264,6 +2597,9 @@ impl GraphCompiler {
             }
         }
         self.remove_cables_touching(&[slot]);
+        // Spec `midi-nodes.md` D9: event/control cables are dropped, never
+        // bypassed (a MIDI effect rewrites the stream).
+        self.remove_event_cables_touching(&[slot]);
         for bypass_cable in &bypass[..bypass_count] {
             let _ = self.add_cable(bypass_cable.from, bypass_cable.to, bypass_cable.in_port);
         }
@@ -2323,17 +2659,21 @@ fn chain_processor(kind: usize, sample_rate: f32) -> Box<dyn Processor> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelStripProcessor, DEFAULT_MIDI_TRACKS, GraphCompiler, GraphUpdate, MAX_AUTO_TRACKS,
-        MAX_CABLES, MAX_MIDI_FANOUT, MAX_MIDI_TRACKS, NO_EDGE, NodeKind, RtGraph, TopologyError,
-        chain_processor,
+        AutoDest, ChannelStripProcessor, DEFAULT_MIDI_TRACKS, EventKind, GraphCompiler,
+        GraphUpdate, MAX_AUTO_TRACKS, MAX_CABLES, MAX_MIDI_FANOUT, MAX_MIDI_TRACKS, NO_EDGE,
+        NodeKind, RtGraph, TopologyError, chain_processor,
     };
     use crate::realtime::buffer::AudioBuffer;
     use crate::realtime::commands::{NoteEvent, ParamId};
     use crate::realtime::context::ProcessContext;
+    use crate::realtime::events::NodeEvents;
+    use crate::realtime::gain::GainProcessor;
     use crate::realtime::mixer::MixerProcessor;
     use crate::realtime::processor::Processor;
     use crate::realtime::sequencer::{RtCtrl, RtCtrlKind};
     use crate::realtime::voice::{RecycledNode, recycle_channel};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
     const SR: f32 = 48_000.0;
     const BLOCK: usize = 128;
@@ -3901,6 +4241,343 @@ mod tests {
             compiler.compile().expect("plan").auto_routes[0].slot,
             NO_EDGE,
             "automation cables pointing to the removed node should be cleaned up"
+        );
+    }
+
+    // ---- M1: node event/control bus (spec `midi-nodes.md`) ----
+
+    /// Emits one note-on plus an optional controller / control value every
+    /// block. Stands in for a MIDI effect until M3 lands.
+    struct EventSource {
+        note: u8,
+        ctrl: Option<RtCtrl>,
+        control: Option<f32>,
+    }
+
+    impl Processor for EventSource {
+        fn process(&mut self, _ctx: &ProcessContext, _buffer: &mut AudioBuffer) {}
+        fn process_events(&mut self, _ctx: &ProcessContext, out: &mut NodeEvents) {
+            out.push_note(note_on(self.note));
+            if let Some(ctrl) = self.ctrl {
+                out.push_ctrl(ctrl);
+            }
+            out.control = self.control;
+        }
+    }
+
+    /// Records deliveries in atomics (the processor lives inside the graph).
+    struct EventSink {
+        notes: Arc<AtomicUsize>,
+        ccs: Arc<AtomicUsize>,
+        params: Arc<AtomicUsize>,
+        last_param: Arc<AtomicU32>,
+    }
+
+    impl Processor for EventSink {
+        fn process(&mut self, _ctx: &ProcessContext, _buffer: &mut AudioBuffer) {}
+        fn note_event(&mut self, _event: NoteEvent) -> bool {
+            self.notes.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        fn midi_cc(&mut self, _channel: u8, _controller: u8, _value: u8) -> bool {
+            self.ccs.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        fn set_param(&mut self, _id: ParamId, value: f32) -> bool {
+            self.params.fetch_add(1, Ordering::Relaxed);
+            self.last_param.store(value.to_bits(), Ordering::Relaxed);
+            true
+        }
+    }
+
+    fn empty_with_nodes(ids: &[(u64, u8)]) -> (GraphCompiler, RtGraph) {
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        for &(id, note) in ids {
+            let update = compiler
+                .add_node(
+                    id,
+                    NodeKind::Plain,
+                    Box::new(EventSource {
+                        note,
+                        ctrl: None,
+                        control: None,
+                    }),
+                )
+                .expect("source node");
+            graph.apply_update(update, &mut recycle_tx);
+        }
+        (compiler, graph)
+    }
+
+    #[test]
+    fn event_cable_propagates_within_the_same_block() {
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let notes = Arc::new(AtomicUsize::new(0));
+        let ccs = Arc::new(AtomicUsize::new(0));
+        let params = Arc::new(AtomicUsize::new(0));
+        let last_param = Arc::new(AtomicU32::new(0));
+
+        let source = 2;
+        let sink = 3;
+        let update = compiler
+            .add_node(
+                source,
+                NodeKind::Plain,
+                Box::new(EventSource {
+                    note: 60,
+                    ctrl: Some(RtCtrl {
+                        tick_ticks: 0,
+                        channel: 0,
+                        kind: RtCtrlKind::Cc(74),
+                        value: 99,
+                    }),
+                    control: None,
+                }),
+            )
+            .expect("source node");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler
+            .add_node(
+                sink,
+                NodeKind::Plain,
+                Box::new(EventSink {
+                    notes: notes.clone(),
+                    ccs: ccs.clone(),
+                    params: params.clone(),
+                    last_param: last_param.clone(),
+                }),
+            )
+            .expect("sink node");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler
+            .connect_event(source, sink, EventKind::Midi, AutoDest::default())
+            .expect("event cable");
+        graph.apply_update(update, &mut recycle_tx);
+
+        let source_slot = compiler.node_slot(source).expect("source slot");
+        let sink_slot = compiler.node_slot(sink).expect("sink slot");
+        let order = &graph.plan.order[..graph.plan.order_len];
+        let source_pos = order
+            .iter()
+            .position(|&s| s == source_slot)
+            .expect("source in plan");
+        let sink_pos = order
+            .iter()
+            .position(|&s| s == sink_slot)
+            .expect("sink in plan");
+        assert!(
+            source_pos < sink_pos,
+            "the event source must run before its consumer"
+        );
+
+        graph.process_block(&ctx());
+        assert_eq!(notes.load(Ordering::Relaxed), 1, "note arrives this block");
+        assert_eq!(
+            ccs.load(Ordering::Relaxed),
+            1,
+            "controller arrives this block"
+        );
+        assert_eq!(
+            params.load(Ordering::Relaxed),
+            0,
+            "no control value emitted"
+        );
+    }
+
+    #[test]
+    fn event_cycle_and_second_midi_source_are_rejected() {
+        let (mut compiler, mut graph) = empty_with_nodes(&[(2, 60), (3, 62), (4, 64)]);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let update = compiler
+            .connect_event(2, 3, EventKind::Midi, AutoDest::default())
+            .expect("forward cable");
+        graph.apply_update(update, &mut recycle_tx);
+        assert!(matches!(
+            compiler.connect_event(3, 2, EventKind::Midi, AutoDest::default()),
+            Err(TopologyError::Cycle)
+        ));
+        assert!(matches!(
+            compiler.connect_event(4, 3, EventKind::Midi, AutoDest::default()),
+            Err(TopologyError::EventFanInOverflow)
+        ));
+        assert_eq!(
+            compiler.event_cable_count, 1,
+            "failed attempts must roll back"
+        );
+        assert!(compiler.compile().is_ok());
+    }
+
+    #[test]
+    fn timeline_feed_and_event_cable_share_the_midi_source_budget() {
+        let (mut compiler, mut graph) = empty_with_nodes(&[(2, 60), (3, 62), (4, 64)]);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        // Timeline first: an event cable into the same node is rejected.
+        let update = compiler.connect_midi(0, 2).expect("timeline feed");
+        graph.apply_update(update, &mut recycle_tx);
+        assert!(matches!(
+            compiler.connect_event(3, 2, EventKind::Midi, AutoDest::default()),
+            Err(TopologyError::EventFanInOverflow)
+        ));
+        // Event cable first: a timeline feed into the same node is rejected.
+        let update = compiler
+            .connect_event(4, 3, EventKind::Midi, AutoDest::default())
+            .expect("event cable");
+        graph.apply_update(update, &mut recycle_tx);
+        assert!(matches!(
+            compiler.connect_midi(1, 3),
+            Err(TopologyError::EventFanInOverflow)
+        ));
+    }
+
+    #[test]
+    fn control_cable_writes_params_and_dedups_cc() {
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let cc_count = Arc::new(AtomicUsize::new(0));
+        let param_count = Arc::new(AtomicUsize::new(0));
+        let last_param = Arc::new(AtomicU32::new(0));
+
+        let update = compiler
+            .add_node(
+                2,
+                NodeKind::Plain,
+                Box::new(EventSource {
+                    note: 60,
+                    ctrl: None,
+                    control: Some(100.0),
+                }),
+            )
+            .expect("control source");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler
+            .add_node(
+                3,
+                NodeKind::Plain,
+                Box::new(EventSink {
+                    notes: Arc::new(AtomicUsize::new(0)),
+                    ccs: cc_count.clone(),
+                    params: param_count.clone(),
+                    last_param: last_param.clone(),
+                }),
+            )
+            .expect("cc sink");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler
+            .connect_event(
+                2,
+                3,
+                EventKind::Control,
+                AutoDest::Cc {
+                    controller: 74,
+                    channel: 0,
+                },
+            )
+            .expect("cc cable");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler
+            .add_node(
+                4,
+                NodeKind::Plain,
+                Box::new(EventSink {
+                    notes: Arc::new(AtomicUsize::new(0)),
+                    ccs: Arc::new(AtomicUsize::new(0)),
+                    params: param_count.clone(),
+                    last_param: last_param.clone(),
+                }),
+            )
+            .expect("param sink");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler
+            .connect_event(
+                2,
+                4,
+                EventKind::Control,
+                AutoDest::Param(ParamId::PitchOffset),
+            )
+            .expect("param cable");
+        graph.apply_update(update, &mut recycle_tx);
+
+        graph.process_block(&ctx());
+        assert_eq!(cc_count.load(Ordering::Relaxed), 1);
+        assert_eq!(param_count.load(Ordering::Relaxed), 1);
+        graph.process_block(&ctx());
+        assert_eq!(
+            cc_count.load(Ordering::Relaxed),
+            1,
+            "an unchanged CC is not resent"
+        );
+        assert_eq!(
+            param_count.load(Ordering::Relaxed),
+            2,
+            "parameter values are absolute, so they are written every block"
+        );
+        assert!(
+            (f32::from_bits(last_param.load(Ordering::Relaxed)) - 100.0).abs() < 1e-6,
+            "the sampled control value reaches set_param unchanged"
+        );
+    }
+
+    #[test]
+    fn removing_an_event_node_drops_cables_without_touching_audio_bypass() {
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let master = compiler.master_node_id();
+        let update = compiler
+            .add_node(
+                2,
+                NodeKind::Plain,
+                Box::new(EventSource {
+                    note: 60,
+                    ctrl: None,
+                    control: None,
+                }),
+            )
+            .expect("audio source");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler
+            .add_node(
+                3,
+                NodeKind::Plain,
+                Box::new(EventSource {
+                    note: 64,
+                    ctrl: None,
+                    control: None,
+                }),
+            )
+            .expect("midi effect");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler
+            .add_node(4, NodeKind::Plain, Box::new(GainProcessor::new(1.0)))
+            .expect("audio effect");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler.connect_nodes(2, 4, 0).expect("audio in");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler.connect_nodes(4, master, 0).expect("audio out");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler
+            .connect_event(3, 4, EventKind::Midi, AutoDest::default())
+            .expect("event cable");
+        graph.apply_update(update, &mut recycle_tx);
+        assert_eq!(compiler.event_cable_count, 1);
+
+        let update = compiler.remove_node(3).expect("remove midi effect");
+        graph.apply_update(update, &mut recycle_tx);
+        assert_eq!(
+            compiler.event_cable_count, 0,
+            "event cables are dropped, never bypassed"
+        );
+        let s2 = compiler.node_slot(2).expect("source slot");
+        let s4 = compiler.node_slot(4).expect("effect slot");
+        let s_master = compiler.node_slot(master).expect("master slot");
+        assert!(compiler.has_cable(s2, s4), "audio input survives");
+
+        let update = compiler.remove_node(4).expect("remove audio effect");
+        graph.apply_update(update, &mut recycle_tx);
+        assert!(
+            compiler.has_cable(s2, s_master),
+            "audio bypass still rejoins the chain"
         );
     }
 }

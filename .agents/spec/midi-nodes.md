@@ -1,6 +1,6 @@
 # MIDI 事件处理节点 Spec
 
-> 状态：草案（2026-10-29）。未实施。
+> 状态：草案（2026-10-29）。**M1 + M2 已实施（2026-10-29）**，M3–M5 待做。
 > 上游：`node-graph.md`（D3 连线三类型、D5 结构更新、D9 实施策略）、`control-tracks.md`（D3 `midi_cc` / D4 去重、`AutoDest::PitchBend`）、`roll-multiclip.md` D9–D11（`PitchOffset` 逐样本平滑）。
 
 ## 1. 背景与问题

@@ -358,8 +358,8 @@ A 阶段**只补这三处，不开参数端口**（每参数一个输入口 = �
 
 关键判断：现状图只有音频缓冲一条通路，MIDI 是「时间轴/键盘 → 处理器方法」的块边界投递，节点间没有事件线。因此三个模块共用一次架构投入：**块内事件/控制总线**（`Processor::process_events` 默认空实现、`NodeEvents` 定容 32、`EventCable` 参与 Kahn 排序）+ 三种节点（`Arpeggiator` / `Portamento` / `MidiEnvelope`）。滑音器输出半音偏移经 `PitchOffset`（内置，逐样本平滑）或 `PitchBend`（SF2/CLAP，节点自答分流），不必塞进 instrument 内部。
 
-- [ ] **M1 事件/控制通道**：`events.rs`、`NodeSlot.events`、`ExecPlan` 事件边、排序叠加、转发、删除语义
-- [ ] **M2 model**：三个 `NodeDoc` 变体 + 校验矩阵（MIDI 入 ≤1、Control 入 ≤1、Tempo 规则），`PROJECT_VERSION` 不变
+- [x] **M1 事件/控制通道** ✅ 2026-10-29：`realtime/events.rs`（`RtEvent` / `NodeEvents` 定容 32 / `MAX_EVENT_*`）+ `Processor::process_events` 默认空实现（插件零改动）；`GraphCompiler` 新增独立 `event_cables` 表（不旁路、不混入音频电缆）、Kahn 排序叠加（同块传播）、`compile` 产出每槽 `event_out`；`RtGraph::process_block` 在节点处理后转发 Note/CC/bend 与控制值；`dispatch_ctrl` / `deliver_dest` 抽取（automation 与节点控制线共用，控制线去重按目标槽位）；`connect_event` / `disconnect_event` + `EventFanInOverflow` / `EventFanOutOverflow` / `TooManyEventCables`；时间轴/键盘 feed 与事件入边共享「每目标一个 MIDI 源」预算；删除节点丢弃事件线（D9）。测试 7 项（同块传播、排序、环、双源、CC 去重、删除语义、总线溢出）
+- [x] **M2 model** ✅ 2026-10-29：`NodeDoc::{Arpeggiator, Portamento, MidiEnvelope}` + 参数结构（`ArpMode` / `ARP_DIVISION_COUNT` / sanitized 钳制走 `migrate` 第 0 步）；`NodeDoc` 端口谓词（`has_midi_out/in` / `has_control_out` / `accepts_control` / `has_audio_ports`）；`GraphDoc::validate` 校验矩阵——MIDI 源放宽到 MIDI 效果器、事件入 ≤1 且与时间轴/键盘 feed 互斥、automation 源放宽到控制节点、控制入 ≤1、节点源禁 Tempo/TimelineIn、无音频端口节点禁音频线；UI 侧 match 补全（patch 颜色/标签/布局 + SilentProcessor 占位，M3/M4 落地时替换）；`PROJECT_VERSION` 保持 8。测试 6 项（RON 往返、合法链、非法端点、单源规则、migrate 钳制、版本断言）
 - [ ] **M3 Arpeggiator**：held 表、step 时钟（复用 division 思路）、四种模式、octave、latch、blanket off 透传
 - [ ] **M4 MidiEnvelope + Portamento**：ADSR 控制源、偏移收敛、Param/CC/bend 三态投递与去重
 - [ ] **M5 UI**：patch 节点/Add 菜单（MIDI FX）/拉线规则/Inspector

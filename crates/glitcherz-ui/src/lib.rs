@@ -1840,6 +1840,13 @@ impl GlitcherZApp {
                 NodeDoc::Keyboard { .. } => {
                     (Box::new(SynthProcessor::new(sr)), None, String::new())
                 }
+                // M2 placeholders: silent processors until M3/M4 land the
+                // arpeggiator / portamento / envelope DSP.
+                NodeDoc::Arpeggiator { .. }
+                | NodeDoc::Portamento { .. }
+                | NodeDoc::MidiEnvelope { .. } => {
+                    (Box::new(SilentProcessor::new()), None, String::new())
+                }
             };
         let engine_id = self.engine.fresh_node_id();
         // D15: the mixer is the only multi-input node; the engine compiler
@@ -4428,6 +4435,10 @@ impl GlitcherZApp {
             }
             // Unreachable (returned above); kept for exhaustiveness.
             NodeDoc::Keyboard { .. } => (Box::new(SynthProcessor::new(sr)), None),
+            // M2 placeholders (silent until M3/M4 land).
+            NodeDoc::Arpeggiator { .. }
+            | NodeDoc::Portamento { .. }
+            | NodeDoc::MidiEnvelope { .. } => (Box::new(SilentProcessor::new()), None),
         };
         let engine_id = engine.fresh_node_id();
         let kind = match node {

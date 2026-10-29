@@ -3,6 +3,7 @@
 use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::{NoteEvent, ParamId};
 use crate::realtime::context::ProcessContext;
+use crate::realtime::events::NodeEvents;
 
 /// Max channel count a per-input-weighted node (the mixer) can address
 /// (D15: mixer inputs 2..=32; equals the graph's `MAX_IN_EDGES`).
@@ -87,6 +88,17 @@ pub trait Processor: Send {
     fn midi_pitch_bend(&mut self, _channel: u8, _value: i16) -> bool {
         let _ = (_channel, _value);
         false
+    }
+
+    /// Emits this node's MIDI events and control value for the current block
+    /// (spec `.agents/spec/midi-nodes.md` D2).
+    ///
+    /// Runs after [`Processor::process`], once per block. Only MIDI effects and
+    /// control sources override it; every other node keeps the empty default
+    /// (CLAP / VST3 nodes are untouched). Implementations must obey the
+    /// real-time rules: no allocation, no locks, no panics.
+    fn process_events(&mut self, _ctx: &ProcessContext, _out: &mut NodeEvents) {
+        let _ = (_ctx, _out);
     }
 
     /// Replaces this node's audio clip table (U6, spec

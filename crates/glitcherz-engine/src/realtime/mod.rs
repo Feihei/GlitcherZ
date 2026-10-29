@@ -51,6 +51,7 @@ pub mod delay;
 pub mod effect;
 pub mod envelope;
 pub mod eq;
+pub mod events;
 pub mod flanger;
 pub mod gain;
 pub mod graph;
@@ -104,12 +105,13 @@ pub use effect::{
 };
 pub use envelope::AdsrProcessor;
 pub use eq::EqProcessor;
+pub use events::{MAX_EVENT_CABLES, MAX_EVENT_FANOUT, MAX_NODE_EVENTS, NodeEvents, RtEvent};
 pub use flanger::FlangerProcessor;
 pub use gain::GainProcessor;
 pub use graph::{
-    AutoDest, AutoRoute, Cable, ChannelStripProcessor, ExecPlan, FeedbackProcessor, GraphCompiler,
-    GraphLevels, GraphUpdate, MASTER_NODE_ID, MAX_CABLES, MAX_MIDI_FANOUT, NodeKind, RtGraph,
-    TIMELINE_IN, TopologyError,
+    AutoDest, AutoRoute, Cable, ChannelStripProcessor, EventCable, EventKind, ExecPlan,
+    FeedbackProcessor, GraphCompiler, GraphLevels, GraphUpdate, MASTER_NODE_ID, MAX_CABLES,
+    MAX_MIDI_FANOUT, NodeKind, RtGraph, TIMELINE_IN, TopologyError,
 };
 pub use mixer::{MixerChannel, MixerProcessor};
 pub use processor::{ChannelWeights, MAX_WEIGHT_CHANNELS, Processor, ProcessorChain};

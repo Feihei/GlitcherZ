@@ -1854,6 +1854,251 @@ pub enum MidiSource {
     Device(String),
 }
 
+/// Arpeggiator step order (spec `midi-nodes.md` §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArpMode {
+    /// Ascending.
+    #[default]
+    Up,
+    /// Descending.
+    Down,
+    /// Up then down, endpoints not repeated.
+    UpDown,
+    /// Seeded random walk (reproducible per node).
+    Random,
+}
+
+/// Step division choices, in the order the engine's `ARP_DIVISION_TICKS` table
+/// uses (spec `midi-nodes.md` §5.1).
+pub const ARP_DIVISION_COUNT: usize = 7;
+/// Default division index: 1/16.
+pub const ARP_DEFAULT_DIVISION: u8 = 4;
+
+/// Arpeggiator parameters (spec `midi-nodes.md` §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ArpeggiatorParams {
+    /// Division index into [`ARP_DIVISION_COUNT`].
+    #[serde(default = "default_arp_division")]
+    pub division: u8,
+    /// Note-on length as a fraction of one step (0.05..=1).
+    #[serde(default = "default_arp_gate")]
+    pub gate: f32,
+    /// Step order.
+    #[serde(default)]
+    pub mode: ArpMode,
+    /// Octave layers (1..=4).
+    #[serde(default = "default_arp_octaves")]
+    pub octaves: u8,
+    /// Keep running after all keys are released.
+    #[serde(default)]
+    pub latch: bool,
+}
+
+fn default_arp_division() -> u8 {
+    ARP_DEFAULT_DIVISION
+}
+
+fn default_arp_gate() -> f32 {
+    0.5
+}
+
+fn default_arp_octaves() -> u8 {
+    1
+}
+
+impl Default for ArpeggiatorParams {
+    fn default() -> Self {
+        Self {
+            division: ARP_DEFAULT_DIVISION,
+            gate: default_arp_gate(),
+            mode: ArpMode::Up,
+            octaves: 1,
+            latch: false,
+        }
+    }
+}
+
+impl ArpeggiatorParams {
+    /// Returns a load-time-safe copy (out-of-range values degrade to defaults
+    /// or the nearest bound — spec `midi-nodes.md` §7).
+    pub fn sanitized(self) -> Self {
+        Self {
+            division: if (self.division as usize) < ARP_DIVISION_COUNT {
+                self.division
+            } else {
+                ARP_DEFAULT_DIVISION
+            },
+            gate: if self.gate.is_finite() {
+                self.gate.clamp(0.05, 1.0)
+            } else {
+                0.5
+            },
+            mode: self.mode,
+            octaves: self.octaves.clamp(1, 4),
+            latch: self.latch,
+        }
+    }
+}
+
+/// Portamento parameters (spec `midi-nodes.md` §5.2).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PortamentoParams {
+    /// Glide time constant in milliseconds (0..=2000).
+    #[serde(default = "default_portamento_time")]
+    pub time_ms: f32,
+    /// Output scale, low end (semitones).
+    #[serde(default = "default_portamento_min")]
+    pub min: f32,
+    /// Output scale, high end (semitones).
+    #[serde(default = "default_portamento_max")]
+    pub max: f32,
+    /// Glide only while the previous note is still held.
+    #[serde(default = "default_true")]
+    pub legato_only: bool,
+}
+
+fn default_portamento_time() -> f32 {
+    120.0
+}
+
+fn default_portamento_min() -> f32 {
+    -24.0
+}
+
+fn default_portamento_max() -> f32 {
+    24.0
+}
+
+impl Default for PortamentoParams {
+    fn default() -> Self {
+        Self {
+            time_ms: default_portamento_time(),
+            min: default_portamento_min(),
+            max: default_portamento_max(),
+            legato_only: true,
+        }
+    }
+}
+
+impl PortamentoParams {
+    /// Load-time clamp (spec `midi-nodes.md` §7).
+    pub fn sanitized(self) -> Self {
+        let time_ms = if self.time_ms.is_finite() {
+            self.time_ms.clamp(0.0, 2000.0)
+        } else {
+            default_portamento_time()
+        };
+        let min = if self.min.is_finite() {
+            self.min.clamp(-24.0, 24.0)
+        } else {
+            default_portamento_min()
+        };
+        let max = if self.max.is_finite() {
+            self.max.clamp(-24.0, 24.0)
+        } else {
+            default_portamento_max()
+        };
+        if min > max {
+            Default::default()
+        } else {
+            Self {
+                time_ms,
+                min,
+                max,
+                legato_only: self.legato_only,
+            }
+        }
+    }
+}
+
+/// MIDI-triggered envelope parameters (spec `midi-nodes.md` §5.3).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MidiEnvelopeParams {
+    /// Attack time in seconds (0..=5).
+    #[serde(default = "default_env_attack")]
+    pub attack: f32,
+    /// Decay time in seconds (0..=5).
+    #[serde(default = "default_env_decay")]
+    pub decay: f32,
+    /// Sustain level (0..=1).
+    #[serde(default = "default_env_sustain")]
+    pub sustain: f32,
+    /// Release time in seconds (0..=10).
+    #[serde(default = "default_env_release")]
+    pub release: f32,
+    /// Output scale, low end.
+    #[serde(default)]
+    pub min: f32,
+    /// Output scale, high end (driving a CC uses 0..=127).
+    #[serde(default = "default_env_max")]
+    pub max: f32,
+}
+
+fn default_env_attack() -> f32 {
+    0.01
+}
+
+fn default_env_decay() -> f32 {
+    0.2
+}
+
+fn default_env_sustain() -> f32 {
+    0.7
+}
+
+fn default_env_release() -> f32 {
+    0.4
+}
+
+fn default_env_max() -> f32 {
+    1.0
+}
+
+impl Default for MidiEnvelopeParams {
+    fn default() -> Self {
+        Self {
+            attack: default_env_attack(),
+            decay: default_env_decay(),
+            sustain: default_env_sustain(),
+            release: default_env_release(),
+            min: 0.0,
+            max: default_env_max(),
+        }
+    }
+}
+
+impl MidiEnvelopeParams {
+    /// Load-time clamp (spec `midi-nodes.md` §7).
+    pub fn sanitized(self) -> Self {
+        let segment = |value: f32, max: f32, fallback: f32| {
+            if value.is_finite() {
+                value.clamp(0.0, max)
+            } else {
+                fallback
+            }
+        };
+        let min = if self.min.is_finite() {
+            self.min.clamp(-127.0, 127.0)
+        } else {
+            0.0
+        };
+        let max = if self.max.is_finite() {
+            self.max.clamp(-127.0, 127.0)
+        } else {
+            default_env_max()
+        };
+        Self {
+            attack: segment(self.attack, 5.0, default_env_attack()),
+            decay: segment(self.decay, 5.0, default_env_decay()),
+            sustain: segment(self.sustain, 1.0, default_env_sustain()),
+            release: segment(self.release, 10.0, default_env_release()),
+            min,
+            max: if min > max { min } else { max },
+        }
+    }
+}
+
 /// Document node (spec §7 `NodeDoc`): node identity in the engine graph +
 /// parameter persistence.
 ///
@@ -1950,6 +2195,45 @@ pub enum NodeDoc {
         #[serde(default)]
         source: MidiSource,
     },
+    /// MIDI effect: arpeggiator (1 MIDI in, 1 MIDI out, no audio ports;
+    /// spec `.agents/spec/midi-nodes.md` §5.1).
+    Arpeggiator {
+        /// Persisted node ID.
+        #[serde(default)]
+        node_id: u64,
+        /// Owning track (grouping only).
+        #[serde(default)]
+        track: usize,
+        /// Step / order parameters.
+        #[serde(default)]
+        params: ArpeggiatorParams,
+    },
+    /// MIDI effect + control source: portamento (1 MIDI in, 1 MIDI out,
+    /// 1 control out, no audio ports; spec `midi-nodes.md` §5.2).
+    Portamento {
+        /// Persisted node ID.
+        #[serde(default)]
+        node_id: u64,
+        /// Owning track (grouping only).
+        #[serde(default)]
+        track: usize,
+        /// Glide parameters.
+        #[serde(default)]
+        params: PortamentoParams,
+    },
+    /// Control source: MIDI-triggered envelope (1 MIDI in, 1 control out, no
+    /// audio ports; spec `midi-nodes.md` §5.3).
+    MidiEnvelope {
+        /// Persisted node ID.
+        #[serde(default)]
+        node_id: u64,
+        /// Owning track (grouping only).
+        #[serde(default)]
+        track: usize,
+        /// ADSR + output scale.
+        #[serde(default)]
+        params: MidiEnvelopeParams,
+    },
     /// Feedback tap node (P6, spec `node-graph.md` D10): the explicit,
     /// self-documenting loop breaker. Its in-edges are summed **one block
     /// late** (the engine orders it before its tap sources), which is what
@@ -2024,6 +2308,9 @@ impl NodeDoc {
             | NodeDoc::Feedback { node_id, .. }
             | NodeDoc::Keyboard { node_id, .. }
             | NodeDoc::AudioTrack { node_id, .. }
+            | NodeDoc::Arpeggiator { node_id, .. }
+            | NodeDoc::Portamento { node_id, .. }
+            | NodeDoc::MidiEnvelope { node_id, .. }
             | NodeDoc::ChannelStrip { node_id, .. } => *node_id,
         }
     }
@@ -2037,6 +2324,9 @@ impl NodeDoc {
             | NodeDoc::Feedback { track, .. }
             | NodeDoc::Keyboard { track, .. }
             | NodeDoc::AudioTrack { track, .. }
+            | NodeDoc::Arpeggiator { track, .. }
+            | NodeDoc::Portamento { track, .. }
+            | NodeDoc::MidiEnvelope { track, .. }
             | NodeDoc::ChannelStrip { track, .. } => *track,
         }
     }
@@ -2050,6 +2340,57 @@ impl NodeDoc {
     /// node — no engine processor, no audio ports).
     pub fn is_keyboard(&self) -> bool {
         matches!(self, NodeDoc::Keyboard { .. })
+    }
+
+    /// Whether this node has a MIDI output port (virtual keyboard or a MIDI
+    /// effect — spec `midi-nodes.md` §3).
+    pub fn has_midi_out(&self) -> bool {
+        matches!(
+            self,
+            NodeDoc::Keyboard { .. } | NodeDoc::Arpeggiator { .. } | NodeDoc::Portamento { .. }
+        )
+    }
+
+    /// Whether this node has a MIDI input port (instrument or MIDI effect).
+    pub fn has_midi_in(&self) -> bool {
+        matches!(
+            self,
+            NodeDoc::Instrument { .. }
+                | NodeDoc::Arpeggiator { .. }
+                | NodeDoc::Portamento { .. }
+                | NodeDoc::MidiEnvelope { .. }
+        )
+    }
+
+    /// Whether this node has a control output port (spec §3).
+    pub fn has_control_out(&self) -> bool {
+        matches!(
+            self,
+            NodeDoc::Portamento { .. } | NodeDoc::MidiEnvelope { .. }
+        )
+    }
+
+    /// Whether this node accepts control cables as a destination (spec §7).
+    pub fn accepts_control(&self) -> bool {
+        matches!(
+            self,
+            NodeDoc::Instrument { .. }
+                | NodeDoc::Effect { .. }
+                | NodeDoc::Mixer { .. }
+                | NodeDoc::Feedback { .. }
+        )
+    }
+
+    /// Whether this node has audio ports at all (keyboard, MIDI effects and
+    /// control sources have none — spec §3).
+    pub fn has_audio_ports(&self) -> bool {
+        !matches!(
+            self,
+            NodeDoc::Keyboard { .. }
+                | NodeDoc::Arpeggiator { .. }
+                | NodeDoc::Portamento { .. }
+                | NodeDoc::MidiEnvelope { .. }
+        )
     }
 }
 
@@ -2515,6 +2856,16 @@ impl GraphDoc {
         // in_port); everything else ≤ 1, master included.
         let mut audio_in_count: std::collections::BTreeMap<u64, usize> = Default::default();
         let mut mixer_ports: std::collections::BTreeMap<u64, Vec<u8>> = Default::default();
+        // MIDI event-cable bookkeeping (spec `midi-nodes.md` §7): node event
+        // in-edges are at most one per destination, and they cannot coexist
+        // with a timeline / keyboard feed (two independent event sources into
+        // one node have no merge semantics). Timeline + keyboard together stay
+        // legal (the default document wires both to the same instrument).
+        let mut midi_event_in: std::collections::BTreeMap<u64, usize> = Default::default();
+        let mut midi_external_in: std::collections::BTreeMap<u64, usize> = Default::default();
+        // Node-to-node control in-edges are at most one per destination; the
+        // timeline automation tables keep their existing (looser) rules.
+        let mut control_event_in: std::collections::BTreeMap<u64, usize> = Default::default();
         for cable in &self.cables {
             self.check_port(&cable.from, &node_ids, midi_count, auto_count)?;
             self.check_port(&cable.to, &node_ids, midi_count, auto_count)?;
@@ -2523,13 +2874,14 @@ impl GraphDoc {
                     if !matches!(cable.from, PortRef::Node(_)) {
                         return Err("audio cable source port must be a node".to_string());
                     }
-                    // G6: a virtual keyboard has no audio ports at all.
+                    // G6 + spec `midi-nodes.md` §3: keyboards, MIDI effects and control
+                    // sources have no audio ports at all.
                     if let PortRef::Node(id) = cable.from
-                        && self.node_by_id(id).is_some_and(NodeDoc::is_keyboard)
+                        && self
+                            .node_by_id(id)
+                            .is_some_and(|node| !node.has_audio_ports())
                     {
-                        return Err(format!(
-                            "virtual keyboard node {id} has no audio output (MIDI only)"
-                        ));
+                        return Err(format!("node {id} has no audio output (MIDI/control only)"));
                     }
                     let dest_key = match &cable.to {
                         PortRef::Node(id) => *id,
@@ -2541,9 +2893,12 @@ impl GraphDoc {
                             );
                         }
                     };
-                    if self.node_by_id(dest_key).is_some_and(NodeDoc::is_keyboard) {
+                    if self
+                        .node_by_id(dest_key)
+                        .is_some_and(|node| !node.has_audio_ports())
+                    {
                         return Err(format!(
-                            "virtual keyboard node {dest_key} has no audio input (MIDI only)"
+                            "node {dest_key} has no audio input (MIDI/control only)"
                         ));
                     }
                     if dest_key == MASTER_NODE_ID {
@@ -2591,49 +2946,94 @@ impl GraphDoc {
                     }
                 }
                 CableKind::Midi => {
-                    // D3 + G6: MIDI sources are the timeline MIDI track
-                    // outlets and virtual keyboard nodes (the only node kind
-                    // with a MIDI out port).
+                    // D3 + G6 + spec `midi-nodes.md` §7: MIDI sources are the
+                    // timeline track outlets, virtual keyboards and MIDI
+                    // effects (Arpeggiator / Portamento); destinations are
+                    // instruments and MIDI effects.
                     match cable.from {
                         PortRef::MidiTrack(_) => {}
                         PortRef::Node(id) => {
-                            if !self.node_by_id(id).is_some_and(NodeDoc::is_keyboard) {
+                            let source = self.node_by_id(id).ok_or_else(|| {
+                                format!("MIDI cable source node {id} does not exist")
+                            })?;
+                            if !source.has_midi_out() {
                                 return Err(format!(
-                                    "MIDI cable source node {id} is not a virtual keyboard (D3: track outlets and vk nodes only)"
+                                    "MIDI cable source node {id} has no MIDI output (keyboard / MIDI-effect nodes only)"
                                 ));
                             }
                         }
                         _ => {
                             return Err(
-                                "MIDI cable source port must be a timeline MIDI track or a virtual keyboard node"
+                                "MIDI cable source port must be a timeline MIDI track, a virtual keyboard or a MIDI-effect node"
                                     .to_string(),
                             );
                         }
                     }
-                    match cable.to {
-                        PortRef::Node(id) => {
-                            if !self.nodes.iter().any(|n| {
-                                n.node_id() == id && matches!(n, NodeDoc::Instrument { .. })
-                            }) {
-                                return Err(format!(
-                                    "MIDI cable target node_id {id} is not an instrument node"
-                                ));
+                    let PortRef::Node(target_id) = cable.to else {
+                        return Err(
+                            "MIDI cable target port must be an instrument or MIDI-effect node"
+                                .to_string(),
+                        );
+                    };
+                    let target = self.node_by_id(target_id).ok_or_else(|| {
+                        format!("MIDI cable target node {target_id} does not exist")
+                    })?;
+                    if !target.has_midi_in() {
+                        return Err(format!(
+                            "MIDI cable target node {target_id} has no MIDI input (instrument / MIDI-effect nodes only)"
+                        ));
+                    }
+                    match cable.from {
+                        PortRef::MidiTrack(_) => {
+                            *midi_external_in.entry(target_id).or_insert(0) += 1;
+                        }
+                        PortRef::Node(source_id) => {
+                            if self.node_by_id(source_id).is_some_and(NodeDoc::is_keyboard) {
+                                *midi_external_in.entry(target_id).or_insert(0) += 1;
+                            } else {
+                                let count = midi_event_in.entry(target_id).or_insert(0);
+                                *count += 1;
+                                if *count > 1 {
+                                    return Err(format!(
+                                        "node {target_id} receives multiple MIDI-effect cables (one event source per node)"
+                                    ));
+                                }
                             }
                         }
-                        _ => {
-                            return Err(
-                                "MIDI cable target port must be an instrument node".to_string()
-                            );
-                        }
+                        _ => {}
+                    }
+                    if midi_event_in.get(&target_id).copied().unwrap_or(0) > 0
+                        && midi_external_in.get(&target_id).copied().unwrap_or(0) > 0
+                    {
+                        return Err(format!(
+                            "node {target_id} receives both a timeline/keyboard feed and a MIDI-effect cable (one event source per node)"
+                        ));
                     }
                 }
                 CableKind::Automation => {
-                    if !matches!(cable.from, PortRef::AutoTrack(_)) {
-                        return Err(
-                            "automation cable source port must be a timeline automation track"
-                                .to_string(),
-                        );
-                    }
+                    // spec `midi-nodes.md` §7: automation sources are timeline
+                    // automation tracks or control-output nodes
+                    // (Portamento / MidiEnvelope).
+                    let control_source = match cable.from {
+                        PortRef::AutoTrack(_) => None,
+                        PortRef::Node(id) => {
+                            let source = self.node_by_id(id).ok_or_else(|| {
+                                format!("automation cable source node {id} does not exist")
+                            })?;
+                            if !source.has_control_out() {
+                                return Err(format!(
+                                    "automation cable source node {id} has no control output (Portamento / MidiEnvelope only)"
+                                ));
+                            }
+                            Some(id)
+                        }
+                        _ => {
+                            return Err(
+                                "automation cable source port must be a timeline automation track or a control-output node"
+                                    .to_string(),
+                            );
+                        }
+                    };
                     // U3b D1/D7: the only valid automation destination is a
                     // node parameter port, or the fixed Timeline In endpoint
                     // whose sole v1 port is `Tempo`. Tempo is a clock, so it
@@ -2647,6 +3047,28 @@ impl GraphDoc {
                                     cable.param
                                 ));
                             }
+                            let target = self.node_by_id(id).ok_or_else(|| {
+                                format!("automation cable target node {id} does not exist")
+                            })?;
+                            if !target.accepts_control() {
+                                return Err(format!(
+                                    "automation cable target node {id} does not accept control input (instrument / effect / mixer / feedback only)"
+                                ));
+                            }
+                            if control_source == Some(id) {
+                                return Err(format!(
+                                    "node {id} cannot receive a control cable from itself"
+                                ));
+                            }
+                            if control_source.is_some() {
+                                let count = control_event_in.entry(id).or_insert(0);
+                                *count += 1;
+                                if *count > 1 {
+                                    return Err(format!(
+                                        "node {id} receives multiple control cables (one control source per node)"
+                                    ));
+                                }
+                            }
                             // U4c (spec §9 D20): a mixer channel address must
                             // resolve to an existing channel. This is the one
                             // parameter family a document edit can invalidate
@@ -2657,6 +3079,12 @@ impl GraphDoc {
                             }
                         }
                         PortRef::TimelineIn => {
+                            if control_source.is_some() {
+                                return Err(
+                                    "the timeline input only accepts timeline automation tracks"
+                                        .to_string(),
+                                );
+                            }
                             if !matches!(cable.param, AutoParam::Tempo) {
                                 return Err("the timeline input only accepts the tempo port (v1)"
                                     .to_string());
@@ -2886,6 +3314,16 @@ impl Project {
     /// Idempotent: migrated documents pass through unchanged. Call before
     /// [`Project::validate`].
     pub fn migrate(&mut self) {
+        // 0) Load-time parameter clamp for the MIDI nodes (spec
+        // `midi-nodes.md` §7). Additive: no version change, idempotent.
+        for node in &mut self.graph.nodes {
+            match node {
+                NodeDoc::Arpeggiator { params, .. } => *params = params.sanitized(),
+                NodeDoc::Portamento { params, .. } => *params = params.sanitized(),
+                NodeDoc::MidiEnvelope { params, .. } => *params = params.sanitized(),
+                _ => {}
+            }
+        }
         // 1) ChannelStrip → Mixer.
         for node in &mut self.graph.nodes {
             if let NodeDoc::ChannelStrip {
@@ -3267,13 +3705,13 @@ impl Default for ProjectMetadata {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioClip, AudioTrack, AutoParam, AutoPoint, CableDoc, CableKind, ChannelParam,
-        DEFAULT_AUDIO_TRACKS, DEFAULT_CONTROL_TRACKS, DEFAULT_MIDI_TRACKS, EffectParams, GraphDoc,
-        MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS, MAX_AUDIO_TRACKS,
-        MAX_BEND_RANGE, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES, MIN_BEND_RANGE, MidiClip,
-        MidiSource, MidiTrack, MixerChannel, NodeDoc, NodeParam, PortRef, Project, SamplePlayMode,
-        SynthParams, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec,
-        default_audio_source_len, default_graph_doc,
+        ArpMode, ArpeggiatorParams, AudioClip, AudioTrack, AutoParam, AutoPoint, CableDoc,
+        CableKind, ChannelParam, DEFAULT_AUDIO_TRACKS, DEFAULT_CONTROL_TRACKS, DEFAULT_MIDI_TRACKS,
+        EffectParams, GraphDoc, MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS,
+        MAX_AUDIO_TRACKS, MAX_BEND_RANGE, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES,
+        MIN_BEND_RANGE, MidiClip, MidiEnvelopeParams, MidiSource, MidiTrack, MixerChannel, NodeDoc,
+        NodeParam, PortRef, PortamentoParams, Project, SamplePlayMode, SynthParams, TICKS_PER_BAR,
+        TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec, default_audio_source_len, default_graph_doc,
     };
 
     fn effect_node(params: EffectParams) -> NodeDoc {
@@ -4905,5 +5343,310 @@ mod tests {
             let back: CableDoc = ron::from_str(&text).expect("deserialize");
             assert_eq!(back, cable, "round trip must be lossless: {text}");
         }
+    }
+
+    // ---- M2: MIDI event nodes (spec `midi-nodes.md`) ----
+
+    fn arp_node(id: u64) -> NodeDoc {
+        NodeDoc::Arpeggiator {
+            node_id: id,
+            track: 0,
+            params: ArpeggiatorParams::default(),
+        }
+    }
+
+    fn glide_node(id: u64) -> NodeDoc {
+        NodeDoc::Portamento {
+            node_id: id,
+            track: 0,
+            params: PortamentoParams::default(),
+        }
+    }
+
+    fn env_node(id: u64) -> NodeDoc {
+        NodeDoc::MidiEnvelope {
+            node_id: id,
+            track: 0,
+            params: MidiEnvelopeParams::default(),
+        }
+    }
+
+    fn mixer_node(id: u64) -> NodeDoc {
+        NodeDoc::Mixer {
+            node_id: id,
+            track: 0,
+            inputs: 1,
+            channels: vec![MixerChannel::default()],
+            out_pan: 0.0,
+            out_muted: false,
+        }
+    }
+
+    /// Node-to-node MIDI cable (any source with a MIDI out).
+    fn node_midi(from: u64, to: u64) -> CableDoc {
+        CableDoc {
+            kind: CableKind::Midi,
+            from: PortRef::Node(from),
+            to: PortRef::Node(to),
+            param: AutoParam::default(),
+            in_port: 0,
+        }
+    }
+
+    /// Node-to-node control cable.
+    fn control_cable(from: u64, to: u64, param: AutoParam) -> CableDoc {
+        CableDoc {
+            kind: CableKind::Automation,
+            from: PortRef::Node(from),
+            to: PortRef::Node(to),
+            param,
+            in_port: 0,
+        }
+    }
+
+    /// instrument(2) + instrument(3) + arp(4) + portamento(5) + envelope(6)
+    /// + mixer(7), no cables.
+    fn midi_node_doc() -> GraphDoc {
+        GraphDoc {
+            nodes: vec![
+                NodeDoc::Instrument {
+                    node_id: 2,
+                    track: 0,
+                    voice: VoiceSpec::Builtin,
+                    synth: SynthParams::default(),
+                },
+                NodeDoc::Instrument {
+                    node_id: 3,
+                    track: 1,
+                    voice: VoiceSpec::Builtin,
+                    synth: SynthParams::default(),
+                },
+                arp_node(4),
+                glide_node(5),
+                env_node(6),
+                mixer_node(7),
+            ],
+            cables: Vec::new(),
+            layout: Default::default(),
+        }
+    }
+
+    #[test]
+    fn midi_event_nodes_round_trip_through_ron() {
+        for (node, tag) in [
+            (arp_node(4), "arpeggiator"),
+            (glide_node(5), "portamento"),
+            (env_node(6), "midi_envelope"),
+        ] {
+            let text = ron::to_string(&node).expect("serialize");
+            assert!(
+                text.contains(&format!("type:\"{tag}\"")),
+                "tag missing: {text}"
+            );
+            let back: NodeDoc = ron::from_str(&text).expect("deserialize");
+            assert_eq!(node, back);
+        }
+        // Non-default parameter payload survives too.
+        let node = NodeDoc::Arpeggiator {
+            node_id: 4,
+            track: 1,
+            params: ArpeggiatorParams {
+                division: 2,
+                gate: 0.75,
+                mode: ArpMode::UpDown,
+                octaves: 3,
+                latch: true,
+            },
+        };
+        let back: NodeDoc = ron::from_str(&ron::to_string(&node).unwrap()).unwrap();
+        assert_eq!(node, back);
+    }
+
+    #[test]
+    fn midi_node_cable_matrix_accepts_legal_chains() {
+        let mut doc = midi_node_doc();
+        // Timeline → arp → portamento → instrument (full MIDI effect chain).
+        doc.cables.push(CableDoc::midi(0, 4));
+        doc.cables.push(node_midi(4, 5));
+        doc.cables.push(node_midi(5, 2));
+        // Envelope driven by the same chain's keyboard-side input is a
+        // separate legal edge: arp → envelope (it has a MIDI in).
+        doc.cables.push(node_midi(4, 6));
+        // Control cables: envelope → instrument param, portamento → bend on
+        // a second instrument (one control source per destination).
+        doc.cables
+            .push(control_cable(6, 2, AutoParam::Node(NodeParam::Resonance)));
+        doc.cables.push(control_cable(
+            5,
+            3,
+            AutoParam::PitchBend {
+                channel: 0,
+                range_semitones: 2.0,
+            },
+        ));
+        assert!(doc.validate(1, 0).is_ok(), "legal chain must validate");
+    }
+
+    #[test]
+    fn midi_node_cable_matrix_rejects_bad_endpoints() {
+        // MIDI cable into a node without a MIDI input (mixer).
+        let mut doc = midi_node_doc();
+        doc.cables.push(node_midi(4, 7));
+        assert!(doc.validate(1, 0).is_err(), "mixer has no MIDI in");
+
+        // MIDI cable out of a node without a MIDI output (envelope).
+        let mut doc = midi_node_doc();
+        doc.cables.push(node_midi(6, 2));
+        assert!(doc.validate(1, 0).is_err(), "envelope has no MIDI out");
+
+        // Audio cables cannot touch MIDI-only nodes (either direction).
+        let mut doc = midi_node_doc();
+        doc.cables
+            .push(CableDoc::audio(PortRef::Node(4), PortRef::Node(2)));
+        assert!(doc.validate(1, 0).is_err(), "arp has no audio out");
+        let mut doc = midi_node_doc();
+        doc.cables
+            .push(CableDoc::audio(PortRef::Node(2), PortRef::Node(6)));
+        assert!(doc.validate(1, 0).is_err(), "envelope has no audio in");
+
+        // Automation source without a control output (instrument).
+        let mut doc = midi_node_doc();
+        doc.cables
+            .push(control_cable(2, 7, AutoParam::Node(NodeParam::MixerOutPan)));
+        assert!(doc.validate(1, 0).is_err(), "instrument has no control out");
+
+        // Automation into a node that does not accept control (arp).
+        let mut doc = midi_node_doc();
+        doc.cables
+            .push(control_cable(6, 4, AutoParam::Node(NodeParam::Resonance)));
+        assert!(doc.validate(1, 0).is_err(), "arp does not take control in");
+
+        // Tempo from a node source (clocks only come from the timeline).
+        let mut doc = midi_node_doc();
+        doc.cables.push(control_cable(6, 2, AutoParam::Tempo));
+        assert!(doc.validate(1, 0).is_err(), "tempo is timeline-only");
+        let mut doc = midi_node_doc();
+        doc.cables.push(CableDoc {
+            kind: CableKind::Automation,
+            from: PortRef::Node(6),
+            to: PortRef::TimelineIn,
+            param: AutoParam::Tempo,
+            in_port: 0,
+        });
+        assert!(
+            doc.validate(1, 0).is_err(),
+            "the timeline input only accepts timeline automation tracks"
+        );
+    }
+
+    #[test]
+    fn midi_node_single_event_and_control_source_rules() {
+        // A node fed by a MIDI-effect cable refuses a timeline feed.
+        let mut doc = midi_node_doc();
+        doc.cables.push(node_midi(4, 2));
+        doc.cables.push(CableDoc::midi(0, 2));
+        assert!(
+            doc.validate(1, 0).is_err(),
+            "timeline feed + event cable into one node"
+        );
+
+        // Two event cables into one destination.
+        let mut doc = midi_node_doc();
+        doc.cables.push(node_midi(4, 2));
+        doc.cables.push(node_midi(5, 2));
+        assert!(doc.validate(1, 0).is_err(), "two MIDI-effect cables");
+
+        // Two control cables into one destination.
+        let mut doc = midi_node_doc();
+        doc.cables
+            .push(control_cable(6, 2, AutoParam::Node(NodeParam::Resonance)));
+        doc.cables.push(control_cable(
+            5,
+            2,
+            AutoParam::PitchBend {
+                channel: 0,
+                range_semitones: 2.0,
+            },
+        ));
+        assert!(doc.validate(1, 0).is_err(), "two control cables");
+    }
+
+    #[test]
+    fn midi_node_params_clamp_on_migrate() {
+        let graph = GraphDoc {
+            nodes: vec![
+                NodeDoc::Arpeggiator {
+                    node_id: 4,
+                    track: 0,
+                    params: ArpeggiatorParams {
+                        division: 99,
+                        gate: f32::NAN,
+                        mode: ArpMode::Random,
+                        octaves: 9,
+                        latch: true,
+                    },
+                },
+                NodeDoc::Portamento {
+                    node_id: 5,
+                    track: 0,
+                    params: PortamentoParams {
+                        time_ms: f32::INFINITY,
+                        min: 10.0,
+                        max: -10.0,
+                        legato_only: false,
+                    },
+                },
+                NodeDoc::MidiEnvelope {
+                    node_id: 6,
+                    track: 0,
+                    params: MidiEnvelopeParams {
+                        attack: -1.0,
+                        decay: f32::NAN,
+                        sustain: 5.0,
+                        release: 999.0,
+                        min: 200.0,
+                        max: -5.0,
+                    },
+                },
+            ],
+            cables: Vec::new(),
+            layout: Default::default(),
+        };
+        let mut project = Project {
+            graph,
+            ..Project::default()
+        };
+        project.migrate();
+        let NodeDoc::Arpeggiator { params, .. } = &project.graph.nodes[0] else {
+            panic!("arp node must survive");
+        };
+        assert_eq!(params.division, super::ARP_DEFAULT_DIVISION);
+        assert_eq!(params.gate, 0.5);
+        assert_eq!(params.mode, ArpMode::Random);
+        assert_eq!(params.octaves, 4);
+        assert!(params.latch);
+
+        let NodeDoc::Portamento { params, .. } = &project.graph.nodes[1] else {
+            panic!("portamento node must survive");
+        };
+        // min > max degrades to the whole default rather than an empty scale.
+        assert_eq!(*params, PortamentoParams::default());
+
+        let NodeDoc::MidiEnvelope { params, .. } = &project.graph.nodes[2] else {
+            panic!("envelope node must survive");
+        };
+        assert_eq!(params.attack, 0.0);
+        assert_eq!(params.decay, 0.2);
+        assert_eq!(params.sustain, 1.0);
+        assert_eq!(params.release, 10.0);
+        // min > max collapses onto min after the ±127 clamp.
+        assert_eq!((params.min, params.max), (127.0, 127.0));
+    }
+
+    /// D11: the new node variants are purely additive — the version must not
+    /// move (bumping it here means old files suddenly "need" a migration).
+    #[test]
+    fn project_version_unchanged_by_midi_nodes() {
+        assert_eq!(super::PROJECT_VERSION, 8);
     }
 }

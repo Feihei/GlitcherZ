@@ -1357,6 +1357,11 @@ fn node_color(id: PatchId, doc: &GraphDoc) -> (Color32, Color32) {
             Some(NodeDoc::Feedback { .. }) => Color32::from_rgb(215, 105, 160),
             // U6: audio tracks share the sample-player family's warm tone.
             Some(NodeDoc::AudioTrack { .. }) => Color32::from_rgb(205, 165, 90),
+            // MIDI FX / control sources carry the MIDI cable's green (spec
+            // `midi-nodes.md` §8).
+            Some(NodeDoc::Arpeggiator { .. }) => Color32::from_rgb(90, 200, 110),
+            Some(NodeDoc::Portamento { .. }) => Color32::from_rgb(80, 190, 100),
+            Some(NodeDoc::MidiEnvelope { .. }) => Color32::from_rgb(70, 180, 90),
             Some(NodeDoc::ChannelStrip { .. }) => Color32::from_gray(140),
             None => Color32::from_gray(120),
         },
@@ -1517,6 +1522,11 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
             Some(NodeDoc::AudioTrack { track, .. }) => {
                 format!("Audio · Track {}", track + 1)
             }
+            Some(NodeDoc::Arpeggiator { .. }) => "Arpeggiator".to_string(),
+            Some(NodeDoc::Portamento { params, .. }) => {
+                format!("Portamento · {:.0} ms", params.time_ms)
+            }
+            Some(NodeDoc::MidiEnvelope { .. }) => "MIDI Env".to_string(),
             Some(NodeDoc::ChannelStrip { track, .. }) => {
                 format!("Strip (legacy) · Track {}", track + 1)
             }
@@ -1749,6 +1759,19 @@ impl PatchState {
                 // timeline box (only a fallback — the menu places them at the
                 // click position).
                 NodeDoc::Keyboard { .. } => {
+                    let k = keyboard_slot;
+                    keyboard_slot += 1;
+                    (
+                        PatchId::Node(node.node_id()),
+                        Pos2::new(16.0, keyboard_top + k as f32 * 68.0),
+                    )
+                }
+                // MIDI FX / control sources stack in the same left column
+                // (chain heads, spec `midi-nodes.md`; the menu places new ones
+                // at the click position — this is the fallback).
+                NodeDoc::Arpeggiator { .. }
+                | NodeDoc::Portamento { .. }
+                | NodeDoc::MidiEnvelope { .. } => {
                     let k = keyboard_slot;
                     keyboard_slot += 1;
                     (
