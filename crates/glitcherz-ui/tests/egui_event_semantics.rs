@@ -324,3 +324,82 @@ fn ctrl_wheel_reaches_zoom_delta() {
         "ctrl+wheel must produce a zoom factor via zoom_delta (COMMAND == ctrl off macOS)"
     );
 }
+/// Transport keys (Space / Home / End) must stay global while a click-sensing
+/// surface (timeline lane, piano roll) owns keyboard focus. egui reports
+/// `egui_wants_keyboard_input() == true` for ANY focused widget, so gating on
+/// it kills transport keys exactly when the editors hold focus; the app must
+/// gate on `text_edit_focused()` instead. Consuming the Space event before the
+/// widget pass also keeps egui from turning it into a fake primary click.
+#[test]
+fn space_reaches_the_app_while_a_click_surface_has_focus() {
+    struct Obs {
+        wants_keyboard: bool,
+        text_edit: bool,
+        fake_click: bool,
+    }
+
+    fn run(ctx: &egui::Context, t: f64, consume: bool) -> Obs {
+        let id = egui::Id::new("focused_click_surface");
+        let mut viewports = egui::ViewportIdMap::default();
+        viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                inner_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+                ..Default::default()
+            },
+        );
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            time: Some(t),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+            viewports,
+            ..Default::default()
+        };
+        let mut obs = Obs {
+            wants_keyboard: false,
+            text_edit: false,
+            fake_click: false,
+        };
+        let mut out = ctx.run_ui(raw, |root| {
+            // Focus a click-sensing surface, like a timeline lane or roll.
+            root.memory_mut(|m| m.request_focus(id));
+            obs.wants_keyboard = root.egui_wants_keyboard_input();
+            obs.text_edit = root.text_edit_focused();
+            if consume {
+                root.input_mut(|i| i.consume_key(Default::default(), egui::Key::Space));
+            }
+            let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(100.0, 100.0));
+            let r = root.interact(rect, id, egui::Sense::click());
+            obs.fake_click = r.clicked();
+        });
+        out.textures_delta.clear();
+        obs
+    }
+
+    let ctx = egui::Context::default();
+    let unguarded = run(&ctx, 0.0, false);
+    assert!(
+        unguarded.wants_keyboard,
+        "a focused click surface counts as 'wants keyboard input' — too broad for transport keys"
+    );
+    assert!(
+        !unguarded.text_edit,
+        "the focused surface is not a text edit, so the narrow guard lets transport keys through"
+    );
+    assert!(
+        unguarded.fake_click,
+        "without consuming the event egui turns Space into a fake primary click on the focused surface"
+    );
+
+    let consumed = run(&ctx, 0.1, true);
+    assert!(
+        !consumed.fake_click,
+        "the app consumes Space before the widget pass, so no fake click reaches the editor"
+    );
+}

@@ -5122,6 +5122,12 @@ impl GlitcherZApp {
     fn handle_keyboard_input(&mut self, ctx: &egui::Context) {
         let roll_owns_focus = self.roll_state.owns_keyboard_focus(ctx)
             || self.timeline_state.owns_keyboard_focus(ctx);
+        // Transport keys stay global under any focus owner (roll, timeline,
+        // patch, buttons); only a live text edit keeps them for itself
+        // (Space types a space, Home/End move the caret). `egui_wants_keyboard_input`
+        // is too broad here: it is true whenever ANY widget is focused, which
+        // includes our hover-follow roll / timeline surfaces.
+        let text_edit_owns_keys = ctx.text_edit_focused();
         let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
         for event in events {
             let egui::Event::Key {
@@ -5134,6 +5140,69 @@ impl GlitcherZApp {
             else {
                 continue;
             };
+            // Global transport (Space / Home / End / marker and bar jumps). The
+            // events are also consumed from egui's queue so a focused
+            // click-sensing surface does not treat Space as a fake primary
+            // click.
+            if !text_edit_owns_keys {
+                match key {
+                    egui::Key::Space if pressed && !modifiers.ctrl => {
+                        ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::Space));
+                        if !repeat {
+                            if self.engine.is_playing() {
+                                self.engine.pause();
+                            } else {
+                                self.send_sequencer(SequencerCommand::Play);
+                            }
+                        }
+                        continue;
+                    }
+                    egui::Key::Home if pressed && !modifiers.ctrl => {
+                        ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::Home));
+                        if !repeat {
+                            self.engine.seek_ticks(0.0);
+                        }
+                        continue;
+                    }
+                    egui::Key::End if pressed && !modifiers.ctrl => {
+                        ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::End));
+                        if !repeat {
+                            let end = f64::from(self.arrangement_end_ticks());
+                            self.engine.seek_ticks(end);
+                        }
+                        continue;
+                    }
+                    egui::Key::Comma if pressed && !modifiers.ctrl => {
+                        ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::Comma));
+                        if !repeat {
+                            self.seek_to_previous_marker();
+                        }
+                        continue;
+                    }
+                    egui::Key::Period if pressed && !modifiers.ctrl => {
+                        ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::Period));
+                        if !repeat {
+                            self.seek_to_next_marker();
+                        }
+                        continue;
+                    }
+                    egui::Key::ArrowLeft if pressed && modifiers.ctrl => {
+                        ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::ArrowLeft));
+                        if !repeat {
+                            self.seek_by_bars(-1);
+                        }
+                        continue;
+                    }
+                    egui::Key::ArrowRight if pressed && modifiers.ctrl => {
+                        ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::ArrowRight));
+                        if !repeat {
+                            self.seek_by_bars(1);
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             if repeat {
                 continue;
             }
@@ -5176,32 +5245,7 @@ impl GlitcherZApp {
                     }
                 }
             }
-            // Global play/pause (U1): works regardless of which editor owns
-            // focus, but not while a text field is being edited (it would
-            // steal the space that ends the edit).
-            if key == egui::Key::Space && pressed && !ctx.egui_wants_keyboard_input() {
-                if self.engine.is_playing() {
-                    self.engine.pause();
-                } else {
-                    self.send_sequencer(SequencerCommand::Play);
-                }
-                continue;
-            }
-            // Home / End: transport jump (U1) — same text-edit guard.
-            if pressed && !ctx.egui_wants_keyboard_input() {
-                match key {
-                    egui::Key::Home => {
-                        self.engine.seek_ticks(0.0);
-                        continue;
-                    }
-                    egui::Key::End => {
-                        let end = f64::from(self.arrangement_end_ticks());
-                        self.engine.seek_ticks(end);
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
+
             match (key, pressed) {
                 (egui::Key::Z, true) => {
                     self.octave_base = (self.octave_base.saturating_sub(12)).max(24);
@@ -5342,10 +5386,14 @@ impl GlitcherZApp {
                     let enable = !loop_on;
                     self.timeline_toggle_loop(enable);
                 }
-                if ui.button("‹").on_hover_text("Previous marker").clicked() {
+                if ui
+                    .button("‹")
+                    .on_hover_text("Previous marker (,)")
+                    .clicked()
+                {
                     self.seek_to_previous_marker();
                 }
-                if ui.button("›").on_hover_text("Next marker").clicked() {
+                if ui.button("›").on_hover_text("Next marker (.)").clicked() {
                     self.seek_to_next_marker();
                 }
                 ui.separator();
@@ -5480,6 +5528,16 @@ impl GlitcherZApp {
             latest.div_ceil(bar) * bar
         };
         end.min(u64::from(u32::MAX)) as u32
+    }
+
+    /// Moves the playhead by whole bars at the current meter (Ctrl+←/→).
+    /// Never goes before the arrangement start; moving past the end is
+    /// allowed, like dragging the playhead there.
+    fn seek_by_bars(&mut self, bars: i64) {
+        let bar_ticks = f64::from(self.project().ticks_per_bar());
+        let pos = f64::from(self.engine.musical_ticks());
+        let target = (pos + bar_ticks * bars as f64).max(0.0);
+        self.engine.seek_ticks(target);
     }
 
     /// Seeks to the nearest marker strictly before the playhead (U1);
