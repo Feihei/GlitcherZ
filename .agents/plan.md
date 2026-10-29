@@ -352,6 +352,20 @@ A 阶段**只补这三处，不开参数端口**（每参数一个输入口 = �
 
 **已知边界**：默认 audio 轨有生成器节点但未接 mixer（单通道已被乐器占用），用户需自行接 mixer 或先加通道；新建 MIDI 轨后同样需要在 patch 手动放乐器并连 MIDI 线。
 
+## MIDI 事件处理节点（2026-10-29 立项，spec `midi-nodes.md`，未实施）
+
+用户提出：在现有节点图之上加 MIDI 事件效果——琶音器（MIDI → MIDI）、包络器（MIDI → 控制曲线）、滑音器（MIDI → pitch 曲线）。
+
+关键判断：现状图只有音频缓冲一条通路，MIDI 是「时间轴/键盘 → 处理器方法」的块边界投递，节点间没有事件线。因此三个模块共用一次架构投入：**块内事件/控制总线**（`Processor::process_events` 默认空实现、`NodeEvents` 定容 32、`EventCable` 参与 Kahn 排序）+ 三种节点（`Arpeggiator` / `Portamento` / `MidiEnvelope`）。滑音器输出半音偏移经 `PitchOffset`（内置，逐样本平滑）或 `PitchBend`（SF2/CLAP，节点自答分流），不必塞进 instrument 内部。
+
+- [ ] **M1 事件/控制通道**：`events.rs`、`NodeSlot.events`、`ExecPlan` 事件边、排序叠加、转发、删除语义
+- [ ] **M2 model**：三个 `NodeDoc` 变体 + 校验矩阵（MIDI 入 ≤1、Control 入 ≤1、Tempo 规则），`PROJECT_VERSION` 不变
+- [ ] **M3 Arpeggiator**：held 表、step 时钟（复用 division 思路）、四种模式、octave、latch、blanket off 透传
+- [ ] **M4 MidiEnvelope + Portamento**：ADSR 控制源、偏移收敛、Param/CC/bend 三态投递与去重
+- [ ] **M5 UI**：patch 节点/Add 菜单（MIDI FX）/拉线规则/Inspector
+
+**已知边界**：块粒度（≈2.7 ms）无采样内偏移；复音滑音不逐 voice 独立；transport stop 的 blanket off 只覆盖时间轴目标链首，键盘直连链依赖节点自身透传。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：

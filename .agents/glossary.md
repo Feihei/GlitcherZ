@@ -105,6 +105,18 @@
 | 泳道 | lane | 自动化曲线的编辑器行 |
 | 锚点 | anchor | 曲线上的控制点 |
 
+## MIDI 事件处理（spec midi-nodes.md）
+
+| 中文 | 英文 | 约定 |
+| :--- | :--- | :--- |
+| MIDI 效果器 | MIDI effect | 1 MIDI in / 1 MIDI out、无音频端口的节点；不写 MIDI FX 节点 |
+| 控制源 | control source | 事件触发、每块输出一个控制值的节点（包络器 / 滑音器）；区别于「控制轨」 |
+| 事件总线 | event bus | `NodeEvents`：块内定容事件队列，含 note / ctrl / 控制值 |
+| 控制边 | control cable | 节点 → 节点的自动化线；控制轨 → 节点仍叫 automation cable |
+| 琶音器 | arpeggiator | `Arpeggiator`；按 step 重发 held 音符，不透传原音 |
+| 滑音器 | portamento | `Portamento`；透传 note + 输出半音偏移控制值；glide 只指平滑机制 |
+| 包络器 | MIDI envelope | `MidiEnvelope`；可路由的控制源，区别于合成器内部 ADSR envelope |
+
 ## 文件与 UI
 
 | 中文 | 英文 | 约定 |
