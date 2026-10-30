@@ -3469,38 +3469,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
 
     // ---- Automation parameter popup menu ----
     if let Some((source, to_doc, menu_pos)) = state.pending_auto {
-        let mut options = (deps.auto_options)(to_doc);
+        let options = (deps.auto_options)(to_doc);
         let from_node = matches!(source, AutoSource::Node(_));
-        // Pitch-family destination for control sources (spec `curve-map.md` D8):
-        // built-in / sample voices take `PitchOffset` directly, SF2 takes a
-        // bend spanning the node's explicit `bend_range`, and plugins keep
-        // their own ±2 st GM range.
-        if from_node && let Some(NodeDoc::Instrument { voice, .. }) = doc.node_by_id(to_doc) {
-            match voice {
-                glitcherz_model::VoiceSpec::Builtin | glitcherz_model::VoiceSpec::Sample { .. } => {
-                    options.push((
-                        "Pitch ±24 st".to_string(),
-                        AutoParam::Node(NodeParam::PitchOffset),
-                    ));
-                }
-                glitcherz_model::VoiceSpec::SoundFont { bend_range, .. } => {
-                    options.push((
-                        format!("Pitch Bend ±{bend_range:.0} st"),
-                        AutoParam::PitchBend {
-                            channel: 0,
-                            range_semitones: *bend_range,
-                        },
-                    ));
-                }
-                _ => options.push((
-                    "Pitch Bend ±2 st".to_string(),
-                    AutoParam::PitchBend {
-                        channel: 0,
-                        range_semitones: 2.0,
-                    },
-                )),
-            }
-        }
+        // Pitch targets come from `auto_options` (the app's shared table with
+        // the timeline menu), so adding them here would duplicate every row.
         let mut picked: Option<AutoParam> = None;
         egui::Area::new(egui::Id::new("glitcherz_patch_auto_menu"))
             .fixed_pos(menu_pos)
