@@ -1437,6 +1437,10 @@ pub fn show(
         let mut geom: Vec<(RowKind, Rect)> = Vec::new();
         state.had_focus = false;
         let rows_top = ui.cursor().min.y;
+        // Rows must butt against each other vertically: their clip lanes are
+        // stacked with no gap, so the per-lane playhead segments join into
+        // one continuous line through every track.
+        ui.spacing_mut().item_spacing.y = 0.0;
 
         // MIDI rows.
         for (i, track) in midi_tracks.iter().enumerate() {
@@ -2068,6 +2072,12 @@ fn lane_row<T: Placement>(
             .max_rect(row_rect),
     );
     let ui = &mut row_ui;
+    // Every header must occupy the same horizontal footprint as the ruler's
+    // left spacer (HEADER_WIDTH plus one item gap), otherwise each lane —
+    // and the playhead drawn from it — starts at a different x. MIDI rows
+    // carry an extra reorder grip, so their name cell is narrowed by that
+    // grip plus the gap instead of letting the header grow past the column.
+    let header_gap = ui.spacing().item_spacing.x;
     // Header cell.
     match header {
         HeaderKind::Midi {
@@ -2111,7 +2121,7 @@ fn lane_row<T: Placement>(
                 index,
                 &name,
                 raw_name,
-                HEADER_WIDTH - 16.0,
+                HEADER_WIDTH - 12.0 - header_gap,
                 row_h - 4.0,
                 selected.then_some(Color32::from_rgb(60, 90, 140)),
                 TimelineAction::SelectTrack(index),
