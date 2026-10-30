@@ -1789,6 +1789,32 @@ impl AutoParam {
         }
     }
 
+    /// Effective bend range of this destination, in semitones.
+    ///
+    /// SF2's range is a property of the **instrument** (`VoiceSpec::SoundFont`
+    /// `bend_range`, spec `curve-map.md` D8), not of the cable: reading it from
+    /// the node here is what lets an inspector edit move an existing curve
+    /// instead of leaving a stale copy behind. Everything else falls back to
+    /// the value recorded on the cable, then to the GM default.
+    pub fn bend_range(&self, graph: &GraphDoc, target: &PortRef) -> f32 {
+        if let PortRef::Node(id) = target
+            && let Some(NodeDoc::Instrument {
+                voice: VoiceSpec::SoundFont { bend_range, .. },
+                ..
+            }) = graph.node_by_id(*id)
+            && bend_range.is_finite()
+            && *bend_range > 0.0
+        {
+            return *bend_range;
+        }
+        match self {
+            AutoParam::PitchBend {
+                range_semitones, ..
+            } if range_semitones.is_finite() && *range_semitones > 0.0 => *range_semitones,
+            _ => default_bend_range(),
+        }
+    }
+
     /// Default mapping of this destination's axis (spec `curve-map.md` D2).
     ///
     /// The one place that knows "how big is this parameter": the curve editor
@@ -1810,14 +1836,8 @@ impl AutoParam {
             // 7-bit wire range (U4a D7).
             AutoParam::Cc { .. } => MapSpec::linear(0.0, 127.0),
             // Symmetric about zero: `range_semitones` is full-scale (P1 D9).
-            AutoParam::PitchBend {
-                range_semitones, ..
-            } => {
-                let range = if range_semitones.is_finite() && *range_semitones > 0.0 {
-                    *range_semitones
-                } else {
-                    default_bend_range()
-                };
+            AutoParam::PitchBend { .. } => {
+                let range = self.bend_range(graph, target);
                 MapSpec::linear(-range, range)
             }
             AutoParam::Node(param) => node_param_map(*param, graph, target),
@@ -4017,38 +4037,37 @@ impl Project {
     }
 
     /// v8 → v9 (spec `.agents/spec/curve-map.md` D1/D7): curve anchors move
-    /// from the target's real domain to the normalized `[-1, 1]` domain, and
-    /// every automation cable adopts the map it now needs.
+    /// from the target's real domain to the normalized `[-1, 1]` domain.
     ///
-    /// Each cable's map is resolved **first** (target axis, including effect
-    /// slot ranges which live in the target node's payload), then every anchor
-    /// of that track is inverse-mapped through it, so an old project's curves
-    /// keep their shape and their sound.
+    /// The axis is resolved **before** the anchors are moved (target axis,
+    /// including effect slot ranges which live in the target node's payload),
+    /// so an old project's curves keep their shape and their sound. Nothing is
+    /// written onto the cables: `map: None` means "derive from the target",
+    /// which keeps a curve glued to the range of whatever it points at later
+    /// instead of to the range it happened to have at migration time.
     ///
     /// D7 last clause: a curve on a track with no cable has no axis to invert.
     /// Its values are clamped into `[-1, 1]` and kept — silently, because such
     /// a curve is not driving anything (it only becomes audible once the user
     /// routes it, at which point they pick the axis).
     pub fn migrate_v8_to_v9(&mut self) {
-        // One map per control track, plus the explicit field on the cable.
-        let mut specs: Vec<(usize, MapSpec)> = Vec::new();
+        // One resolved axis per control track.
         let mut track_maps: Vec<Option<MapSpec>> = vec![None; self.control_tracks.len()];
-        for (index, cable) in self.graph.cables.iter().enumerate() {
+        for cable in &self.graph.cables {
             if cable.kind != CableKind::Automation {
                 continue;
             }
-            let map = cable
-                .map
-                .unwrap_or_else(|| cable.param.default_map(&self.graph, &cable.to));
-            specs.push((index, map));
-            if let PortRef::AutoTrack(track) = cable.from
-                && let Some(slot) = track_maps.get_mut(track)
-            {
-                *slot = Some(map);
-            }
-        }
-        for (index, map) in specs {
-            self.graph.cables[index].map = Some(map);
+            let PortRef::AutoTrack(track) = cable.from else {
+                continue;
+            };
+            let Some(slot) = track_maps.get_mut(track) else {
+                continue;
+            };
+            *slot = Some(
+                cable
+                    .map
+                    .unwrap_or_else(|| cable.param.default_map(&self.graph, &cable.to)),
+            );
         }
         for (track, track_map) in self.control_tracks.iter_mut().zip(track_maps) {
             for clip in &mut track.clips {
@@ -6575,6 +6594,36 @@ mod tests {
         );
     }
 
+    /// D12: SF2's bend range belongs to the **instrument**, so the axis has to
+    /// follow the node. Otherwise raising the range in the inspector would
+    /// leave every stored cable squeezed into the old, narrower wire.
+    #[test]
+    fn a_bend_axis_follows_the_instruments_range() {
+        let mut graph = GraphDoc::default();
+        graph.nodes.push(NodeDoc::Instrument {
+            node_id: 11,
+            track: 0,
+            voice: VoiceSpec::SoundFont {
+                path: "font.sf2".to_string(),
+                bank: 0,
+                program: 0,
+                gain: 1.0,
+                bend_range: 12.0,
+            },
+            synth: SynthParams::default(),
+        });
+        // The cable still says ±2 (it was routed before the range changed).
+        let param = AutoParam::pitch_bend(0, 2.0);
+        let target = PortRef::Node(11);
+        assert_eq!(param.bend_range(&graph, &target), 12.0);
+        assert_eq!(
+            param.default_map(&graph, &target),
+            MapSpec::linear(-12.0, 12.0)
+        );
+        // No instrument to ask (a plugin, or a dangling cable): the copy wins.
+        assert_eq!(param.bend_range(&graph, &PortRef::Master), 2.0);
+    }
+
     /// D7: an old project's curves keep their shape — every anchor is
     /// inverse-mapped through the same axis the old value lived on, and the
     /// cable records the map it now needs.
@@ -6646,19 +6695,25 @@ mod tests {
         assert_eq!(pitch[0].value, 0.0);
         assert!((pitch[1].value - 0.5).abs() < 1e-5);
         assert_eq!(pitch[2].value, -1.0);
+        // The cable stores nothing: the axis stays derivable from the target,
+        // so it moves if that target's range ever changes.
+        assert_eq!(project.graph.cables[0].map, None);
         assert_eq!(
-            project.graph.cables[0].map,
-            Some(MapSpec::linear(-24.0, 24.0))
+            project.graph.cables[0]
+                .param
+                .default_map(&project.graph, &project.graph.cables[0].to),
+            MapSpec::linear(-24.0, 24.0)
         );
 
         let tempo = project.control_tracks[1].clips[0].curve[0].value;
         let spec = MapSpec::log(MIN_TEMPO_BPM, MAX_TEMPO_BPM);
         assert!((spec.map(tempo) - 120.0).abs() < 0.01, "tempo {tempo}");
-        assert_eq!(project.graph.cables[1].map, Some(spec));
+        assert_eq!(project.graph.cables[1].map, None);
 
         let loose = &project.control_tracks[2].clips[0].curve;
         assert_eq!((loose[0].value, loose[1].value), (1.0, -1.0));
-        assert!(project.graph.cables[0].map.is_some());
+        // A dangling curve stays dangling: migration never invents a cable.
+        assert!(project.graph.auto_target(2).is_none());
     }
 
     /// A v9 document round-trips: the map rides the cable, the anchors stay

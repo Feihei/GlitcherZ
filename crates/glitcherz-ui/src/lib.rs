@@ -244,17 +244,19 @@ fn param_id_of(param: &AutoParam) -> Option<ParamId> {
 ///
 /// CC / bend keep their event-stream semantics (they are not parameters);
 /// everything else lands on the same `ParamId` the automation tables use.
-fn event_dest_of(param: &AutoParam) -> AutoDest {
+fn event_dest_of(param: &AutoParam, graph: &GraphDoc, target: &PortRef) -> AutoDest {
     if let Some((controller, channel)) = param.cc_of() {
         return AutoDest::Cc {
             controller,
             channel,
         };
     }
-    if let Some((channel, range)) = param.pitch_bend_of() {
+    if let Some((channel, _)) = param.pitch_bend_of() {
+        // Same derivation as the axis (spec `curve-map.md` D12): the range is
+        // the instrument's, so an SF2 range edit reaches this route too.
         return AutoDest::PitchBend {
             channel,
-            range_semitones: range,
+            range_semitones: param.bend_range(graph, target),
         };
     }
     AutoDest::Param(param_id_of(param).unwrap_or(ParamId::MasterGain))
@@ -266,6 +268,17 @@ fn event_dest_of(param: &AutoParam) -> AutoDest {
 /// routes it); a cable from an older file derives it from the target, which is
 /// exactly what the v8 → v9 migration would have written.
 fn cable_map(cable: &glitcherz_model::CableDoc, graph: &GraphDoc) -> glitcherz_model::MapSpec {
+    // A Curve Map source owns the axis of the hop after it (spec `curve-map.md`
+    // D6), and it is read from the node rather than from a copy: editing Low /
+    // High in the inspector moves the hop with it, no re-wiring needed.
+    if let PortRef::Node(id) = &cable.from
+        && let Some(NodeDoc::CurveMap { params, .. }) = graph.node_by_id(*id)
+    {
+        return params.map();
+    }
+    // `None` means "derive from the target", so a curve follows the range of
+    // whatever it points at *now* — including a range that changes later
+    // (SF2 bend range, an effect node swapped for another, a map node edit).
     cable
         .map
         .unwrap_or_else(|| cable.param.default_map(graph, &cable.to))
@@ -1634,7 +1647,7 @@ impl GlitcherZApp {
                             from,
                             to,
                             EventKind::Control,
-                            event_dest_of(&cable.param),
+                            event_dest_of(&cable.param, &graph, &cable.to),
                             engine_map(cable_map(cable, &graph)),
                         ) {
                             log::warn!(
@@ -1679,7 +1692,11 @@ impl GlitcherZApp {
                     // P1: same shape for a bend — an event route, not a
                     // parameter route. Undo / open must rebuild it the same
                     // way the picker created it.
-                    if let Some((channel, range)) = cable.param.pitch_bend_of() {
+                    if let Some((channel, _)) = cable.param.pitch_bend_of() {
+                        // The range is the instrument's (SF2), not the cable's
+                        // copy — same reason as the axis itself (D12): an
+                        // edited bend range must reach the existing route.
+                        let range = cable.param.bend_range(&graph, &cable.to);
                         if !self.engine.set_auto_pitch_bend_route(
                             *index,
                             to,
@@ -2615,18 +2632,18 @@ impl GlitcherZApp {
     fn set_auto_endpoint(&mut self, index: usize, target: AutoTarget, param: AutoParam) {
         let before = self.begin_edit();
         self.project_mut().graph.remove_auto_cable(index);
-        let mut cable = match target {
+        let cable = match target {
             AutoTarget::Node(doc_id) => {
                 glitcherz_model::CableDoc::automation(index, doc_id, param.clone())
             }
             // U3b: the terminal's single port fixes the parameter to Tempo.
             AutoTarget::TimelineIn => glitcherz_model::CableDoc::tempo(index),
         };
-        // The axis travels with the cable (spec `curve-map.md` D2/D4): picking
-        // a target *is* picking how the normalized curve maps onto it, and the
-        // anchors keep their shape across the change (D1).
+        // The axis travels with the cable (spec `curve-map.md` D2/D4), but it is
+        // *derived*, never copied: picking a target makes the normalized curve
+        // read through that target's range (D1 keeps the shape), and a later
+        // range change moves it along.
         let map = cable_map(&cable, &self.project().graph);
-        cable.map = Some(map);
         self.project_mut().graph.cables.push(cable);
         self.commit_edit("Route Automation", before);
         match target {
@@ -2634,6 +2651,7 @@ impl GlitcherZApp {
                 self.engine.set_timeline_in_route(index, engine_map(map));
             }
             AutoTarget::Node(doc_id) => {
+                let bend_range = param.bend_range(&self.project().graph, &PortRef::Node(doc_id));
                 if let Some(engine_id) = self.engine_id(doc_id) {
                     match param.cc_of() {
                         // U4a: an event stream, not a parameter — the route
@@ -2649,12 +2667,12 @@ impl GlitcherZApp {
                         }
                         None => {
                             // P1: a bend is the other event-stream destination.
-                            if let Some((channel, range)) = param.pitch_bend_of() {
+                            if let Some((channel, _)) = param.pitch_bend_of() {
                                 self.engine.set_auto_pitch_bend_route(
                                     index,
                                     engine_id,
                                     channel,
-                                    range,
+                                    bend_range,
                                     engine_map(map),
                                 );
                             } else if let Some(id) = param_id_of(&param) {
@@ -2664,6 +2682,40 @@ impl GlitcherZApp {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Re-derive every automation cable that ends on `doc_id` (spec
+    /// `curve-map.md` D12).
+    ///
+    /// A parameter's *range* can change without the cable moving, and SF2's
+    /// bend range is the case that matters: it scales the whole curve, so a
+    /// stale axis would squeeze every bend into a fraction of the wire.
+    fn refresh_maps_for(&mut self, doc_id: u64) {
+        let Some(engine_id) = self.engine_id(doc_id) else {
+            return;
+        };
+        let graph = self.project().graph.clone();
+        for cable in &graph.cables {
+            let PortRef::AutoTrack(index) = &cable.from else {
+                continue;
+            };
+            if cable.to != PortRef::Node(doc_id) {
+                continue;
+            }
+            let map = engine_map(cable_map(cable, &graph));
+            if let Some((channel, _)) = cable.param.pitch_bend_of() {
+                let range = cable.param.bend_range(&graph, &cable.to);
+                let _ = self
+                    .engine
+                    .set_auto_pitch_bend_route(*index, engine_id, channel, range, map);
+            } else if let Some((controller, channel)) = cable.param.cc_of() {
+                let _ = self
+                    .engine
+                    .set_auto_cc_route(*index, engine_id, channel, controller, map);
+            } else if let Some(id) = param_id_of(&cable.param) {
+                let _ = self.engine.set_auto_route(*index, engine_id, id, map);
             }
         }
     }
@@ -3498,7 +3550,7 @@ impl GlitcherZApp {
             CableKind::Automation => self.clear_control_sources(to_doc),
             CableKind::Audio => {}
         }
-        let mut cable = glitcherz_model::CableDoc {
+        let cable = glitcherz_model::CableDoc {
             kind,
             from: PortRef::Node(from_doc),
             to: PortRef::Node(to_doc),
@@ -3510,21 +3562,15 @@ impl GlitcherZApp {
             in_port: 0,
             map: None,
         };
-        // Control cables carry their axis (spec `curve-map.md` D2/D4); a MIDI
-        // cable delivers events, so there is nothing to map. A Curve Map
-        // source owns the axis of the hop after it (D6), so the document
-        // records *its* range rather than the target's default — the engine
-        // resolves the same answer through `Processor::map_spec`.
+        // Control cables derive their axis from the target (`map: None`), so
+        // the curve keeps its shape and follows the target's range; a Curve Map
+        // source overrides that derivation in `cable_map`. A MIDI cable
+        // delivers events, so there is nothing to map.
         let map = if kind == CableKind::Midi {
             glitcherz_model::MapSpec::UNIT
-        } else if let Some(NodeDoc::CurveMap { params, .. }) =
-            self.project().graph.node_by_id(from_doc)
-        {
-            params.map()
         } else {
             cable_map(&cable, &self.project().graph)
         };
-        cable.map = (kind != CableKind::Midi).then_some(map);
         self.project_mut().graph.cables.push(cable);
         self.commit_edit(
             if kind == CableKind::Midi {
@@ -3539,6 +3585,9 @@ impl GlitcherZApp {
         } else {
             EventKind::Control
         };
+        // Resolved before the engine call: `self.project()` is an immutable
+        // borrow that cannot overlap the mutable `self.engine`.
+        let dest = event_dest_of(&param, &self.project().graph, &PortRef::Node(to_doc));
         if let (Some(from_engine), Some(to_engine)) = (
             self.node_map.get(&from_doc).copied(),
             self.node_map.get(&to_doc).copied(),
@@ -3546,7 +3595,7 @@ impl GlitcherZApp {
             from_engine,
             to_engine,
             event_kind,
-            event_dest_of(&param),
+            dest,
             engine_map(map),
         ) {
             // The engine refused (cycle / second MIDI source / caps): roll the
@@ -5160,7 +5209,7 @@ impl GlitcherZApp {
                                 from,
                                 to,
                                 EventKind::Control,
-                                event_dest_of(&cable.param),
+                                event_dest_of(&cable.param, &graph, &cable.to),
                                 engine_map(cable_map(cable, &graph)),
                             );
                         }
@@ -5187,12 +5236,12 @@ impl GlitcherZApp {
                         );
                         continue;
                     }
-                    if let Some((channel, range)) = cable.param.pitch_bend_of() {
+                    if let Some((channel, _)) = cable.param.pitch_bend_of() {
                         let _ = engine.set_auto_pitch_bend_route(
                             *index,
                             to,
                             channel,
-                            range,
+                            cable.param.bend_range(&graph, &cable.to),
                             engine_map(cable_map(cable, &graph)),
                         );
                         continue;
@@ -8692,6 +8741,9 @@ impl GlitcherZApp {
                     *bend_range = value.clamp(1.0, 24.0);
                 }
                 self.commit_param_edit("SoundFont Bend Range", before, "sf2-bend-range");
+                // The axis of every bend cable on this node is the range
+                // (D12), so it has to be re-sent, not just stored.
+                self.refresh_maps_for(doc_id);
             }
         });
     }
@@ -11792,6 +11844,77 @@ mod inline_param_tests {
         assert_eq!(options[0].0, "Curve In · ±1");
         // And it routes to the engine's pass-through slot, not a parameter.
         assert_eq!(param_id_of(&AutoParam::CurveMap), Some(ParamId::CurveMapIn));
+    }
+
+    /// Spec `curve-map.md` D2/D6 (revised 2026-10-30): a cable never stores a
+    /// *copy* of its axis. `None` derives it from the target, and a Curve Map
+    /// source is read live from its node, so the hop follows a range change
+    /// instead of keeping a stale one.
+    #[test]
+    fn a_cable_derives_its_axis_instead_of_storing_it() {
+        let mut project = Project::default();
+        let map_id = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::CurveMap {
+            node_id: map_id,
+            track: 0,
+            params: glitcherz_model::CurveMapParams {
+                min: 20.0,
+                max: 18_000.0,
+                mode: glitcherz_model::MapMode::Log,
+            },
+        });
+        let voice = project
+            .graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node, NodeDoc::Instrument { .. }))
+            .map(NodeDoc::node_id)
+            .expect("the default patch ships an instrument");
+        project.graph.cables.push(glitcherz_model::CableDoc {
+            kind: glitcherz_model::CableKind::Automation,
+            from: PortRef::Node(map_id),
+            to: PortRef::Node(voice),
+            param: AutoParam::FilterCutoff,
+            in_port: 0,
+            map: None,
+        });
+        let cable = project.graph.cables.last().unwrap();
+        assert_eq!(
+            cable_map(cable, &project.graph),
+            glitcherz_model::MapSpec::log(20.0, 18_000.0)
+        );
+
+        // Edit the node's range: the hop moves with it, no re-wiring.
+        if let Some(NodeDoc::CurveMap { params, .. }) = project
+            .graph
+            .nodes
+            .iter_mut()
+            .find(|node| matches!(node, NodeDoc::CurveMap { .. }))
+        {
+            params.max = 4_000.0;
+        }
+        let cable = project.graph.cables.last().unwrap();
+        assert_eq!(
+            cable_map(cable, &project.graph),
+            glitcherz_model::MapSpec::log(20.0, 4_000.0)
+        );
+
+        // A plain target-axis cable derives from the target too, so changing
+        // the parameter changes the axis without touching the cable.
+        let cable = project.graph.cables.last_mut().unwrap();
+        cable.from = PortRef::AutoTrack(0);
+        let cable = project.graph.cables.last().unwrap();
+        assert_eq!(
+            cable_map(cable, &project.graph),
+            glitcherz_model::MapSpec::log(20.0, 18_000.0),
+            "cutoff keeps its own log axis"
+        );
+        project.graph.cables.last_mut().unwrap().param = AutoParam::TrackPan;
+        let cable = project.graph.cables.last().unwrap();
+        assert_eq!(
+            cable_map(cable, &project.graph),
+            glitcherz_model::MapSpec::linear(-1.0, 1.0)
+        );
     }
 
     /// U4c (spec §9 D19): the target menu enumerates the node's real
