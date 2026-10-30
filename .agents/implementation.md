@@ -113,7 +113,7 @@
 
 - **CC 是电缆的"目标模式"，不是新的电缆类型**（D1）：端点仍走 `CableKind::Automation`（`AutoTrack → Node`），拖线、删除、单源约束、`validate` 全部零改动——节点目标已拒绝 timeline-only 参数、`TimelineIn` 只收 `Tempo`，所以 CC 自动落在正确位置，**结构本身保证合法性**。
 - **`AutoDest` 分派**（D2）：引擎侧 `AutoRoute{slot, param: ParamId}` 换成 `AutoRoute{slot, dest: AutoDest}`，`Param(ParamId) | Cc{controller, channel}`；`RtGraph::auto_set_param` 改名 `auto_deliver`，按 dest 分派到 `slot_set_param` 或 `slot_midi_cc`。`Processor::midi_cc(channel, controller, value) -> bool` 是**新开的一条显式通道**（D3），不复用 `NoteEvent` 变体——音符路径的消费方（SF2 voice 池、插件事件槽）与 CC 无关，混进来只会让两边的分支都变脏。
-- **值域与去重**（D4/D7）：曲线存**真实 7bit CC 值**（不是归一化的 0..1），纵轴 0..127；投递时 `clamp(0,127).round()`（round 而非 truncate，否则曲线停在 0.4 附近永远发 0），`last_cc: [i16; MAX_AUTO_TRACKS]` 记上次发送值（`-1` = 从未发）→ **变化才发**。`apply_update` 末尾把 `last_cc` 清成全 `-1`：重定向到新目标后必须立刻收到一次当前值，否则要等曲线动起来才生效。
+- **值域与去重**（D4/D7，值域部分**已被 C1 归一化取代**，见下节；去重逻辑仍然有效）：曲线存**真实 7bit CC 值**（不是归一化的 0..1），纵轴 0..127；投递时 `clamp(0,127).round()`（round 而非 truncate，否则曲线停在 0.4 附近永远发 0），`last_cc: [i16; MAX_AUTO_TRACKS]` 记上次发送值（`-1` = 从未发）→ **变化才发**。`apply_update` 末尾把 `last_cc` 清成全 `-1`：重定向到新目标后必须立刻收到一次当前值，否则要等曲线动起来才生效。
 - **时间戳取块边界**（D5）：CLAP 走 `MidiEvent::new(0, 0, data)`（`time = 0`），SF2 走块首 `process_midi_message`；采样级 CC 需要每采样事件队列，收益不可辨，明确不做。
 - **格式差异**（D6）：CLAP 组装 `0xB0 | channel` 注入输入事件流；SF2 **忽略外来 channel**（该节点所有音符都发在固定 `CHANNEL`，尊重外来 channel 反而静默失效）；**VST3 明确不支持**——`vst3-0.3.0` 的 `DataEvent` 只有 `kMidiSysEx`，`kLegacyMIDICCOutEvent` 是插件**输出**语义，宿主用它属未定义行为，`Vst3Node::midi_cc` 返回 `false`。
 - **UI 接线**：终点行多一条 `MIDI CC…`（就地 `CC`/`ch` 两个 DragValue，release 才提交 = 一次 undo）、端点显示 `cc_label()`、拖线菜单对 instrument 追加 8 条预设（1/2/7/10/11/64/71/74）；`set_auto_endpoint` 按 `param.cc_of()` 在 `set_auto_cc_route` / `set_auto_route` 间分派，文档重推（undo/open）那条路径同样分流。
@@ -127,7 +127,7 @@
 
 ### 曲线归一化与 Curve Map 节点（C1–C3，spec `curve-map.md`，2026-10-30）
 
-- **存储域整体搬迁**（D1）：`AutoPoint::value` 从「目标域」（cutoff Hz / gain / 秒 / CC / 半音 / BPM）改为**归一化 `[-1,1]`**，`0` = 轴中心。轴跟着**目标**走：`MapSpec { min, max, mode }` 由 `AutoParam::default_map` 解出，`CableDoc::map` 把解析结果写进文档（`skip_serializing_if`，老文件不带 → 回落到按目标重新解析，等价于迁移会写的值）。
+- **存储域整体搬迁**（D1）：`AutoPoint::value` 从「目标域」（cutoff Hz / gain / 秒 / CC / 半音 / BPM）改为**归一化 `[-1,1]`**，`0` = 轴中心。轴跟着**目标**走：`MapSpec { min, max, mode }` 由 `AutoParam::default_map` 解出，**不写进文档**（D12：`CableDoc::map` 只在显式覆盖时才 `Some`，平时是 `None` = 按目标推导）。
 - **`PROJECT_VERSION` 8 → 9**，`migrate_v8_to_v9` 是**唯一带逆映射的迁移**：先按每条 `CableKind::Automation` 连线的目标轴求 `MapSpec`（含效果器槽位 → `effect_slot_map` → 目标节点 payload），写进 `cable.map`，再对每条控制轨的每个锚点 `map.unmap(value)`；**悬空曲线**（无连线 / 目标不存在）保留数值并 `clamp(-1,1)`（用户选择：静默，不加提示）。
 - **引擎只做一次算术**（D4/D10）：`AutoRoute.map` / `EventCable.map` 在编译期带上，`deliver_dest` 先 `if !value.is_finite() { return }` 再 `map.map(value)` 然后分派。`MapSpec` 是引擎自己的 `Copy` 类型（model 不依赖 engine），UI 的 `engine_map` / `engine_mode` 是唯一跨界点。
 - **控制源声明自己的轴**（D6）：`Processor::map_spec() -> Option<MapSpec>` 默认 `None`；`MidiEnvelope`（min..max，倒置范围自动交换）与 `Portamento`（半音范围）返回 `Some`，投递循环里 `slot_map_spec(source).unwrap_or(edge.map)` —— 不需要第二遍解析，也不需要节点种类表。两者的输出值同时改为归一化（`level*2-1` / 对 `min..max` 归一）。
@@ -137,6 +137,8 @@
 - **轴表两份、测试对齐**：model 的 `effect_slot_axis`（迁移与无 map 连线要读，但 model 不能依赖 engine 的 `EffectDescriptor`）镜像引擎描述符的 `min/max`；UI 的 `axis_table_matches_the_engine_descriptors` 遍历全部效果器全部槽位，任何一边改范围就红。
 - **UI**（C3）：`curve.rs` 只剩归一化 ↔ 屏幕映射（`y_of` / `norm_of_y`）、`axis_caption` 与 `map_in`；曲线编辑器/时间轴预览/piano-roll overlay 按归一化取高度，所以**换目标形状不变**。目标菜单每行追加轴摘要（`Cutoff · 20–18k Log`、`Pitch · ±24`）；map 节点体显示 `Map 20..18k · Log`，单控制端口拖线**直接连**（`single_control_port`），Inspector 有 Low/High/Mode 与 `−1 → x  0 → y  +1 → z` 读数。
 - **顺带修掉的 M5 遗留 bug**：`resolve_panel_target` 的可编辑集合只有 instrument/effect/mixer，选中 MIDI FX / 控制节点时会一路回退到本轨乐器，于是 `midi_fx_params()` **实际不可达**（M5 的三个参数面板一直是死代码）。C3 把 Arp/Portamento/MidiEnvelope/CurveMap 补进集合——否则 Curve Map 的范围没有任何入口可改。测试 `control_nodes_are_editable_targets` 钉住。
+- **D12 修订（轴推导而非快照）**：连接时不再把解析结果写进 `cable.map`（`connect_event_cable` / `set_auto_endpoint` 都留 `None`），`cable_map` 的优先级是「Curve Map 源从节点实时读（`params.map()`）→ `cable.map` 显式覆盖 → 目标默认轴」。`migrate_v8_to_v9` 也只在内存里解析一次用于逆映射锚点，不落文档。这样目标范围后改（效果器换类型、map 节点改 min/max、SF2 bend range）都不会让文档与引擎分叉。
+- **bend range 多套了一层**：`AutoParam::PitchBend { range_semitones }` 本身是节点 `bend_range` 的副本，只推导 `default_map` 仍会读到旧值。`AutoParam::bend_range(graph, target)` 优先读 `VoiceSpec::SoundFont::bend_range`，没有再回落到参数值；`default_map` 与四处引擎分派（`apply_document`、`event_dest_of`、`set_auto_endpoint`、离线导出）共用它，`refresh_maps_for(doc_id)` 在 Inspector 改范围后重发该节点上的路由。分母对了，曲线才不会被压成几分之一。
 
 ### CLAP 宿主（`glitcherz-clap-host`，路线图第 9 步）
 

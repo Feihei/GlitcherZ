@@ -380,6 +380,17 @@ A 阶段**只补这三处，不开参数端口**（每参数一个输入口 = �
 
 测试：model 133（+4：RON 往返/恒等默认、控制入合法矩阵、非法入与外来端口、migrate 修复）、engine lib 300（+7 `curve_map` 单测 +1 `a_curve_map_replaces_the_axis_of_the_hop_after_it` 端到端）、UI 173（+4：`curve_map_caption_stays_short`、`only_the_curve_map_has_one_control_port`、`a_curve_map_offers_its_single_pass_through_port`、`control_nodes_are_editable_targets`，另有 `axis_table_matches_the_engine_descriptors` 守住 model 槽位轴表与引擎 descriptor 范围不漂移）；`cargo fmt` + `clippy --workspace --all-targets -D warnings` + `test --workspace`（812 项）全绿。
 
+### D12 修订：轴是推导出来的，不是存下来的
+
+用户追问「第一次连目标是否自动探测 range」「是否每个 curve 都必须过 map 节点」。核实后确认探测本来就是有的（`cable_map` = `map.unwrap_or_else(default_map)`），但连接时把结果**快照**进了 `cable.map`，于是目标范围后改就分叉。改为推导：
+
+- [x] **连接不再写 map**：`connect_event_cable` / `set_auto_endpoint` 都留 `None`；`cable_map` 的优先级变成「Curve Map 源从节点实时读 → `cable.map` 显式覆盖 → 目标默认轴」。`migrate_v8_to_v9` 同理：解析出来只用于逆映射锚点，不落文档（否则迁移那一刻的范围会被永久钉住）
+- [x] **bend range 也要推导**：`AutoParam::PitchBend { range_semitones }` 是 SF2 节点 `bend_range` 的副本，光推导 `default_map` 仍读到旧值。新增 `AutoParam::bend_range(graph, target)`：优先读节点的 `VoiceSpec::SoundFont::bend_range`，没有 SF2 节点才回落到参数值；`default_map` 与四处引擎分派（`apply_document` / `connect_event_cable` 的 `event_dest_of` / `set_auto_endpoint` / 离线导出）共用它
+- [x] **改范围后要重发**：`refresh_maps_for(doc_id)` 重算该节点上所有自动化/控制线的轴并重发路由，SF2 `Bend Range` 滑条提交后调用 —— 否则要等下次重载才生效（`deliver_dest` 的 `value / range` 一旦分母是旧的，整条曲线被压成几分之一）
+- [ ] **C5 一曲线多目标（候选，未做）**：结论是**不需要**强制 map 节点 —— 轴本来就是每条边自己的，放开多路后每路按目标各自推导即可。真正的阻塞在别处：`auto_routes` 每轨只 1 槽、`DedupKey::Auto` 是 per-track 的 CC/bend last-value 记忆（两条分支会互相污染）、model 的 `auto_endpoint` / `auto_target` / `remove_auto_cable` 都是单值语义
+
+测试：model 134（+1 `a_bend_axis_follows_the_instruments_range`）、UI 174（+1 `a_cable_derives_its_axis_instead_of_storing_it`），全仓 814 项
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：

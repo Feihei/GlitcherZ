@@ -1,6 +1,6 @@
 # 曲线归一化与 Curve Map 节点 Spec
 
-> 状态：**已实施**（2026-10-30）。D1–D11 全部落地：C1 协议+迁移、C2 Curve Map 节点、C3 UI（C4 pitch 输入口同日先期交付）。`PROJECT_VERSION` 8 → 9。
+> 状态：**已实施**（2026-10-30）。D1–D12 落地：C1 协议+迁移、C2 Curve Map 节点、C3 UI（C4 pitch 输入口同日先期交付）。`PROJECT_VERSION` 8 → 9。D12（轴推导而非快照）是同日修订；C5（一曲线多目标）仍是候选。
 > 关联：`control-tracks.md`（曲线编辑 / `AutoDest`）、`midi-nodes.md`（D6 控制边、D13 滑音）、`effects.md`（参数轴）、`sf2-loader.md`。
 
 ## 1. 背景与问题
@@ -40,7 +40,7 @@
 | # | 决策 | 内容 |
 | :--- | :--- | :--- |
 | D1 | **归一化域 `[-1, 1]`** | 曲线点与 `NodeEvents.control` 都存归一化值；0 是轴中心。参数轴的非线性只影响显示，不影响存储。 |
-| D2 | **目标端口携带 `MapSpec`** | `MapSpec { min: f32, max: f32, mode: MapMode::{Linear, Log, Exp} }`。参数目标取 `node_param_axis`；CC 固定 `0..127` + Linear；bend 取节点的 bend range；`PitchOffset` 固定 `-24..24` + Linear；Tempo 取 `20..1000` + Log。 |
+| D2 | **映射由目标端口推导（不存副本）** | `MapSpec { min: f32, max: f32, mode: MapMode::{Linear, Log, Exp} }`。参数目标取 `node_param_axis`；CC 固定 `0..127` + Linear；bend 取节点的 bend range；`PitchOffset` 固定 `-24..24` + Linear；Tempo 取 `20..300` + Log。`CableDoc::map` 的 `None` 就是「按目标推导」，`Some` 只留给显式覆盖（见 D12）。 |
 | D3 | **映射公式统一以 `t = (u+1)/2` 为输入** | Linear：`min + t·(max-min)`；Log：`min·(max/min)^t`（要求 `min>0`）；Exp：`min + t²·(max-min)`。`max<min` 或 Log 的下界非正时回落 Linear。 |
 | D4 | **映射在编译期解析，不进入实时回调的参数轴查询** | `CableDoc` / `AutoRoute` 编译成引擎侧 `Dest { slot, map }`；`deliver_dest` 只做算术。目标轴变化（如 SF2 bend range）触发一次结构更新。 |
 | D5 | **Curve Map 是控制节点** | 1 Control in / 1 Control out、无音频/MIDI 端口；参数 `min`、`max`、`mode`；透传输入值并按自己的 `MapSpec` 重映射。它同时是 UI 上的“映射说明卡”（节点体显示范围与模式）。 |
@@ -50,6 +50,7 @@
 | D9 | **SF2 bend range 走标准 RPN** | `ParamId::Sf2BendRange` 在 `set_param` 中发 `CC101=0, CC100=0, CC6=range, CC38=0`；rustysynth 的 `Channel::get_pitch_bend_range` 即生效，不改 vendor。 |
 | D10 | **实时安全** | 映射是每块每目标一次标量运算；`MapSpec` 是 `Copy`；无表查询、无分配、无锁。 |
 | D11 | **显示轴不迁移** | 曲线编辑器的 y 轴仍显示目标域值（由 `node_param_axis` + `MapSpec` 正向换算）；用户看到的刻度不变，只是存储层归一化。 |
+| D12 | **推导，不快照**（2026-10-30 修订） | 连线**不保存**轴的副本：`map: None` 表示「按目标实时推导」，每次装图重算；`Some` 只表示显式覆盖。否则目标范围后改（SF2 bend range、效果器换类型、map 节点改范围）会让文档与引擎分叉。Curve Map 源的轴从节点实时读（`params.map()`），同样是推导而非拷贝。 |
 
 ## 4. 数据结构
 
@@ -91,11 +92,18 @@ fn map_value(map: MapSpec, norm: f32) -> f32          // RT-safe，clamp 输入
 | **C2 Curve Map 节点** ✅ | model + engine 节点（Control in/out，透传重映射）+ 校验 | 节点串联、范围/模式生效、Control 入 ≤1 |
 | **C3 UI** ✅ | 曲线轴换算、目标菜单范围显示、Add 菜单、节点体、Inspector | 手动：曲线换目标不变形；map 节点改范围即时生效 |
 | **C4 pitch 输入口** ✅ | 内置 `Pitch`、SF2 `bend_range` + RPN、插件 `±2` | SF2 设 12 st 后远距离滑音可到位；内置 ±24 内不受限 |
+| **C5 一曲线多目标（候选）** ⬜ | 未实施。前提三件：`auto_routes` 每轨多槽、`DedupKey::Auto` 改 per-route（CC/bend 的 last-value 记忆会互相污染）、model 的 `auto_endpoint` / `auto_target` / `remove_auto_cable` 从单值改多值。**不需要** map 节点：轴是每条边自己的（D12），每路按目标各自推导即可。 | 同一条曲线送三个目标，各按自己的范围生效 |
 
 **实施备注（C2/C3 落地时的两处细化）**
 
 - 进入 Curve Map 的那一跳**强制恒等**（engine `is_curve_map_in` / 时间轴 `auto_deliver` 同规则）：上游控制源（包络/滑音）声明的轴只对「越过 map 之后」的目标生效，否则同一个刻度会被算两次。
 - `validate` 对 map 输入的限制**不分来源**（时间轴曲线与节点控制源共用一个直通寄存器），而普通节点的 `control in ≤ 1` 仍只约束节点源——这是两者唯一的差别。
+
+**实施备注（D12 修订时补的）**
+
+- 连接时**不写** `cable.map`：写进去就成了快照，目标范围一改就分叉（改 map 节点 min/max 后文档说旧范围、引擎按 `Processor::map_spec()` 用新范围，是最隐蔽的一种）。
+- SF2 bend range 还多套了一层：`AutoParam::PitchBend { range_semitones }` 是节点范围的**副本**。所以 `AutoParam::bend_range(graph, target)` 优先读节点、只在没有 SF2 节点时回落到参数值，`default_map` 与四处引擎分派（apply / connect / endpoint / export）共用它；Inspector 改范围后调 `refresh_maps_for(doc_id)` 重发该节点上的路由，否则要等下次重载才生效。
+- 强制「每个 curve 过 map 节点」的方案被否：它想换来的扇出在引擎侧本来就不成立（每轨一路 + map 源覆盖所有出边），做出来是静默失效；而扇出真正需要的是多槽路由表（C5），与 map 节点无关。
 
 ## 7. 被否决的备选
 
@@ -109,7 +117,7 @@ fn map_value(map: MapSpec, norm: f32) -> f32          // RT-safe，clamp 输入
 
 ## 8. 开放问题
 
-- **多目标曲线**：一条曲线连多个目标且轴不同时，归一化后如何显示？当前 `auto_routes` 是单目标，节点控制线也是单目标；若未来允许扇出，UI 需要一个“主目标”概念。
+- **多目标曲线**：见 C5 候选。轴是每条边自己的，因此扇出不需要 map 节点；真正要动的是路由表基数、去重键与 model 的单值 API。UI 侧在放开前需要定「一条曲线三个目标时，曲线编辑器显示哪条轴」（建议：显示缩放，或选一个主目标）。
 - **Exp 公式**：`min + t²(max-min)` 会在高端压缩；是否需要可调曲率参数。
 - **迁移警告**：无目标曲线被 clamp 后应提示一次，还是静默保留。
 - **插件参数的轴**：CLAP raw / VST3 0..1 的轴表已有；归一化后插件参数是否需要独立的映射方式（部分插件参数本身是对数刻度）。
