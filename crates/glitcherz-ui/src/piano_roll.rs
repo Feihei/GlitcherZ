@@ -250,23 +250,20 @@ pub struct OverlayLane<'a> {
     pub clip: ClipRef,
     /// The clip's curve, borrowed for this frame.
     pub data: &'a ControlClip,
-    /// Vertical axis `(min, max, log)` from the automation destination.
-    pub axis: (f32, f32, bool),
     /// Caption drawn in the lane's top-left corner.
     pub label: String,
 }
 
 impl OverlayLane<'_> {
+    /// Anchors are normalized (`curve-map.md` D1), so the lane's geometry is
+    /// the same for every destination: -1 at the bottom, +1 at the top. The
+    /// caption carries the target, not the mapping.
     fn value_to_y(&self, value: f32, rect: egui::Rect) -> f32 {
-        let (min, max, log) = self.axis;
-        let norm = crate::curve::to_norm(value, min, max, log);
-        rect.bottom() - norm * rect.height()
+        rect.bottom() - crate::curve::y_of(value) * rect.height()
     }
 
     fn y_to_value(&self, y: f32, rect: egui::Rect) -> f32 {
-        let (min, max, log) = self.axis;
-        let norm = ((rect.bottom() - y) / rect.height().max(1.0)).clamp(0.0, 1.0);
-        crate::curve::from_norm(norm, min, max, log)
+        crate::curve::norm_of_y((rect.bottom() - y) / rect.height().max(1.0))
     }
 }
 

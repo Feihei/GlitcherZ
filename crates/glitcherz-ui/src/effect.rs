@@ -260,7 +260,7 @@ mod tests {
     use glitcherz_engine::realtime::{
         BuiltinEffectKind, compressor, delay, eq, validate_descriptor,
     };
-    use glitcherz_model::{BuiltinEffectKind as DocEffectKind, DelayParams, EffectParams};
+    use glitcherz_model::{BuiltinEffectKind as DocEffectKind, DelayParams, EffectParams, MapSpec};
 
     fn delay_params() -> EffectParams {
         EffectParams::Delay(DelayParams {
@@ -395,6 +395,34 @@ mod tests {
                     spec.default
                 );
             }
+        }
+    }
+
+    /// Same guard for the curve axes (spec `curve-map.md` D2): the model keeps
+    /// its own slot table (the migration and map-less cables read it), so it
+    /// has to agree with the descriptor the Inspector shows — otherwise the
+    /// curve would sweep a range nobody can dial in.
+    #[test]
+    fn axis_table_matches_the_engine_descriptors() {
+        for kind in DocEffectKind::ALL {
+            let params = default_params(*kind);
+            for (slot, spec) in descriptor(&params).params.iter().enumerate() {
+                let axis = glitcherz_model::effect_slot_axis(&params, slot as u8);
+                assert!(
+                    (axis.min - spec.min).abs() < 1e-6 && (axis.max - spec.max).abs() < 1e-6,
+                    "{kind:?} slot {slot} ({}): axis {}..{} vs descriptor {}..{}",
+                    spec.name,
+                    axis.min,
+                    axis.max,
+                    spec.min,
+                    spec.max
+                );
+            }
+            // A stale / plugin slot is a normalized pass-through.
+            assert_eq!(
+                glitcherz_model::effect_slot_axis(&params, 99),
+                MapSpec::linear(0.0, 1.0)
+            );
         }
     }
 

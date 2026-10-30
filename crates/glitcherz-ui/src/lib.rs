@@ -38,20 +38,22 @@ use glitcherz_engine::Sf2Error;
 use glitcherz_engine::convert;
 use glitcherz_engine::realtime::{
     ArpeggiatorProcessor, AudioTrackProcessor, AutoDest, ChannelStripProcessor, Curve,
-    EffectMeters, EngineCommand, EventKind, FeedbackProcessor, MAX_AUTO_POINTS, MAX_MIDI_FANOUT,
-    MAX_TRACK_CLIPS, MidiClipTable, MidiEnvelopeProcessor, MixerChannel as EngineMixerChannel,
-    MixerProcessor, NodeKind, NoteEvent, ParamId, PortamentoProcessor, Processor, RtAudioClip,
-    RtAutoPoint, RtAutomation, RtControlClip, RtCtrl, RtCtrlKind, RtCurveInterp, RtMidiClip,
-    RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor,
+    CurveMapProcessor, EffectMeters, EngineCommand, EventKind, FeedbackProcessor, MAX_AUTO_POINTS,
+    MAX_MIDI_FANOUT, MAX_TRACK_CLIPS, MapMode as EngineMapMode, MapSpec as EngineMapSpec,
+    MidiClipTable, MidiEnvelopeProcessor, MixerChannel as EngineMixerChannel, MixerProcessor,
+    NodeKind, NoteEvent, ParamId, PortamentoProcessor, Processor, RtAudioClip, RtAutoPoint,
+    RtAutomation, RtControlClip, RtCtrl, RtCtrlKind, RtCurveInterp, RtMidiClip, RtNote,
+    SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor,
     SilentProcessor, SynthProcessor, Unit, empty_clip_table, empty_midi_clip_table,
+    mode_value as curve_mode_value,
 };
 use glitcherz_engine::{Sf2Library, Sf2Preset};
 use glitcherz_model::{
     ArpeggiatorParams, AutoParam, AutoPoint, CableKind, ChannelParam, ControlClip, ControlTrack,
-    CtrlKind, CurveInterp, EffectParams, GraphDoc, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS,
-    MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES,
-    MIN_MIXER_CHANNELS, Marker, MidiClip, MidiEnvelopeParams, MidiSource, MidiTrack, NodeDoc,
-    NodeParam, PortRef, PortamentoParams, Project, SamplePlayMode, SongLoop, SynthParams,
+    CtrlKind, CurveInterp, CurveMapParams, EffectParams, GraphDoc, MAX_ARRANGEMENT_TICKS,
+    MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS,
+    MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip, MidiEnvelopeParams, MidiSource, MidiTrack,
+    NodeDoc, NodeParam, PortRef, PortamentoParams, Project, SamplePlayMode, SongLoop, SynthParams,
     VoiceSpec,
 };
 
@@ -230,6 +232,9 @@ fn param_id_of(param: &AutoParam) -> Option<ParamId> {
         AutoParam::FilterCutoff => Some(ParamId::FilterCutoff),
         AutoParam::PluginParam { param_id, .. } => Some(ParamId::PluginParam(*param_id)),
         AutoParam::Node(param) => Some(node_param_id(*param)),
+        // The curve map's input port is a pass-through, not a parameter
+        // (spec `curve-map.md` D5): the value is normalized on the wire.
+        AutoParam::CurveMap => Some(ParamId::CurveMapIn),
         AutoParam::Tempo | AutoParam::Cc { .. } | AutoParam::PitchBend { .. } => None,
     }
 }
@@ -253,6 +258,37 @@ fn event_dest_of(param: &AutoParam) -> AutoDest {
         };
     }
     AutoDest::Param(param_id_of(param).unwrap_or(ParamId::MasterGain))
+}
+
+/// The map a document cable delivers through (spec `curve-map.md` D2/D4).
+///
+/// New documents carry it explicitly on the cable (written whenever the UI
+/// routes it); a cable from an older file derives it from the target, which is
+/// exactly what the v8 → v9 migration would have written.
+fn cable_map(cable: &glitcherz_model::CableDoc, graph: &GraphDoc) -> glitcherz_model::MapSpec {
+    cable
+        .map
+        .unwrap_or_else(|| cable.param.default_map(graph, &cable.to))
+}
+
+/// Document map → engine map. The two crates keep their own `Copy` types on
+/// purpose (model stays engine-free), so this is the single crossing point.
+fn engine_map(map: glitcherz_model::MapSpec) -> EngineMapSpec {
+    EngineMapSpec {
+        min: map.min,
+        max: map.max,
+        mode: engine_mode(map.mode),
+    }
+}
+
+/// Document mapping mode → engine mapping mode (same crossing point as
+/// [`engine_map`]).
+fn engine_mode(mode: glitcherz_model::MapMode) -> EngineMapMode {
+    match mode {
+        glitcherz_model::MapMode::Linear => EngineMapMode::Linear,
+        glitcherz_model::MapMode::Log => EngineMapMode::Log,
+        glitcherz_model::MapMode::Exp => EngineMapMode::Exp,
+    }
 }
 
 /// Node parameter address (model) → engine parameter ID (U4c, spec
@@ -399,6 +435,8 @@ fn node_auto_options(
             "Feedback".to_string(),
             AutoParam::Node(NodeParam::FeedbackGain),
         )),
+        // D5: the map node's single port — the signal itself, not a value.
+        NodeDoc::CurveMap { .. } => options.push(("Curve In".to_string(), AutoParam::CurveMap)),
         _ => {}
     }
     for param in clap.unwrap_or_default() {
@@ -429,7 +467,35 @@ fn node_auto_options(
             },
         ));
     }
+    // Spec `curve-map.md` §5: every row shows the axis it would drive. A
+    // curve's range is then visible *before* the cable exists, and a user
+    // picking between `Cutoff 20–18k Log` and `Resonance 0–0.98` can tell
+    // which one their shape was drawn for.
+    let target = PortRef::Node(node_id);
+    for (label, param) in &mut options {
+        label.push_str(" · ");
+        label.push_str(&axis_hint(&param.default_map(doc, &target)));
+    }
     options
+}
+
+/// `20–18k Log`, `±24`, `0–1` — the axis summary a target menu row shows.
+fn axis_hint(map: &glitcherz_model::MapSpec) -> String {
+    let map = map.sanitized();
+    // Symmetric axes read better as ±N (pitch, pan, bend).
+    let span = if map.min == -map.max && map.min < 0.0 {
+        format!("±{}", crate::patch::axis_number(map.max))
+    } else {
+        format!(
+            "{}–{}",
+            crate::patch::axis_number(map.min),
+            crate::patch::axis_number(map.max)
+        )
+    };
+    match map.mode {
+        glitcherz_model::MapMode::Linear => span,
+        mode => format!("{span} {}", mode.label()),
+    }
 }
 
 /// Control-change destinations offered by the automation target menus (U4a).
@@ -809,18 +875,28 @@ struct GuiParamBatch {
 }
 
 /// Resolves the Inspector's editing target (spec `plugin-gui.md` §6):
-/// the first **editable** document node (instrument / effect / mixer) in the
-/// patch selection, in document order; with nothing selected the panel falls
-/// back to the selected track's first-match instrument (the pre-G4
-/// track-driven behavior). Stale selection ids (deleted nodes) are filtered
-/// by the document walk.
+/// the first **editable** document node in the patch selection, in document
+/// order; with nothing selected the panel falls back to the selected track's
+/// first-match instrument (the pre-G4 track-driven behavior). Stale selection
+/// ids (deleted nodes) are filtered by the document walk.
+///
+/// "Editable" includes the built-in MIDI FX / control nodes (M5) and the Curve
+/// Map (spec `curve-map.md` §5): their Inspector panel *is* their only UI, so
+/// leaving them out made `midi_fx_params` unreachable — selecting one fell
+/// back to the track's instrument instead.
 fn resolve_panel_target(doc: &GraphDoc, selected: &[u64], track: usize) -> Option<u64> {
     if !selected.is_empty() {
         for node in &doc.nodes {
             if selected.contains(&node.node_id())
                 && matches!(
                     node,
-                    NodeDoc::Instrument { .. } | NodeDoc::Effect { .. } | NodeDoc::Mixer { .. }
+                    NodeDoc::Instrument { .. }
+                        | NodeDoc::Effect { .. }
+                        | NodeDoc::Mixer { .. }
+                        | NodeDoc::Arpeggiator { .. }
+                        | NodeDoc::Portamento { .. }
+                        | NodeDoc::MidiEnvelope { .. }
+                        | NodeDoc::CurveMap { .. }
                 )
             {
                 return Some(node.node_id());
@@ -1466,9 +1542,13 @@ impl GlitcherZApp {
             self.register_track_chain(track);
         }
 
-        // 4) Connect cables per the document.
+        // 4) Connect cables per the document. The graph is cloned once: the
+        //    engine calls below need `&mut self.engine`, which would collide
+        //    with a live borrow of the document's graph (maps resolve through
+        //    the target's axis, and effect slots need the node payload).
         let master = self.engine.master_node_id();
-        let cables = self.project().graph.cables.clone();
+        let graph = self.project().graph.clone();
+        let cables = graph.cables.clone();
         for cable in &cables {
             let from = match &cable.from {
                 PortRef::Node(id) => self.node_map.get(id).copied(),
@@ -1525,6 +1605,7 @@ impl GlitcherZApp {
                                 to,
                                 EventKind::Midi,
                                 AutoDest::default(),
+                                EngineMapSpec::UNIT,
                             ) {
                                 log::warn!(
                                     "MIDI event cable ({from} → {to}) dispatch failed (cycle / limit exceeded / queue full)"
@@ -1554,6 +1635,7 @@ impl GlitcherZApp {
                             to,
                             EventKind::Control,
                             event_dest_of(&cable.param),
+                            engine_map(cable_map(cable, &graph)),
                         ) {
                             log::warn!(
                                 "Control cable ({from} → {to}) dispatch failed (cycle / queue full)"
@@ -1567,7 +1649,10 @@ impl GlitcherZApp {
                     // U3b: the conductor terminal has no engine node — the
                     // route is a sentinel slot, not a node lookup.
                     if cable.to == PortRef::TimelineIn {
-                        if !self.engine.set_timeline_in_route(*index) {
+                        if !self
+                            .engine
+                            .set_timeline_in_route(*index, engine_map(cable_map(cable, &graph)))
+                        {
                             log::warn!("Tempo cable (track {index} → Timeline In) dispatch failed");
                         }
                         continue;
@@ -1580,10 +1665,13 @@ impl GlitcherZApp {
                     // parameter route — undo / open must rebuild it the same
                     // way the picker created it.
                     if let Some((controller, channel)) = cable.param.cc_of() {
-                        if !self
-                            .engine
-                            .set_auto_cc_route(*index, to, channel, controller)
-                        {
+                        if !self.engine.set_auto_cc_route(
+                            *index,
+                            to,
+                            channel,
+                            controller,
+                            engine_map(cable_map(cable, &graph)),
+                        ) {
                             log::warn!("CC cable (track {index} → {to}) dispatch failed");
                         }
                         continue;
@@ -1592,10 +1680,13 @@ impl GlitcherZApp {
                     // parameter route. Undo / open must rebuild it the same
                     // way the picker created it.
                     if let Some((channel, range)) = cable.param.pitch_bend_of() {
-                        if !self
-                            .engine
-                            .set_auto_pitch_bend_route(*index, to, channel, range)
-                        {
+                        if !self.engine.set_auto_pitch_bend_route(
+                            *index,
+                            to,
+                            channel,
+                            range,
+                            engine_map(cable_map(cable, &graph)),
+                        ) {
                             log::warn!("Pitch-bend cable (track {index} → {to}) dispatch failed");
                         }
                         continue;
@@ -1604,7 +1695,12 @@ impl GlitcherZApp {
                         log::warn!("Automation cable carries a non-node parameter: {cable:?}");
                         continue;
                     };
-                    if !self.engine.set_auto_route(*index, to, id) {
+                    if !self.engine.set_auto_route(
+                        *index,
+                        to,
+                        id,
+                        engine_map(cable_map(cable, &graph)),
+                    ) {
                         log::warn!("Automation cable (track {index} → {to}) dispatch failed");
                     }
                 }
@@ -2011,6 +2107,12 @@ impl GlitcherZApp {
                     );
                     processor.set_param(ParamId::EnvMin, params.min);
                     processor.set_param(ParamId::EnvMax, params.max);
+                    (Box::new(processor), None, String::new())
+                }
+                // D5: the control pass-through, seeded with its declared axis.
+                NodeDoc::CurveMap { params, .. } => {
+                    let mut processor = CurveMapProcessor::new();
+                    processor.apply_params(params.min, params.max, engine_mode(params.mode));
                     (Box::new(processor), None, String::new())
                 }
             };
@@ -2513,18 +2615,23 @@ impl GlitcherZApp {
     fn set_auto_endpoint(&mut self, index: usize, target: AutoTarget, param: AutoParam) {
         let before = self.begin_edit();
         self.project_mut().graph.remove_auto_cable(index);
-        let cable = match target {
+        let mut cable = match target {
             AutoTarget::Node(doc_id) => {
                 glitcherz_model::CableDoc::automation(index, doc_id, param.clone())
             }
             // U3b: the terminal's single port fixes the parameter to Tempo.
             AutoTarget::TimelineIn => glitcherz_model::CableDoc::tempo(index),
         };
+        // The axis travels with the cable (spec `curve-map.md` D2/D4): picking
+        // a target *is* picking how the normalized curve maps onto it, and the
+        // anchors keep their shape across the change (D1).
+        let map = cable_map(&cable, &self.project().graph);
+        cable.map = Some(map);
         self.project_mut().graph.cables.push(cable);
         self.commit_edit("Route Automation", before);
         match target {
             AutoTarget::TimelineIn => {
-                self.engine.set_timeline_in_route(index);
+                self.engine.set_timeline_in_route(index, engine_map(map));
             }
             AutoTarget::Node(doc_id) => {
                 if let Some(engine_id) = self.engine_id(doc_id) {
@@ -2532,16 +2639,27 @@ impl GlitcherZApp {
                         // U4a: an event stream, not a parameter — the route
                         // carries the controller/channel instead of a ParamId.
                         Some((controller, channel)) => {
-                            self.engine
-                                .set_auto_cc_route(index, engine_id, channel, controller);
+                            self.engine.set_auto_cc_route(
+                                index,
+                                engine_id,
+                                channel,
+                                controller,
+                                engine_map(map),
+                            );
                         }
                         None => {
                             // P1: a bend is the other event-stream destination.
                             if let Some((channel, range)) = param.pitch_bend_of() {
-                                self.engine
-                                    .set_auto_pitch_bend_route(index, engine_id, channel, range);
+                                self.engine.set_auto_pitch_bend_route(
+                                    index,
+                                    engine_id,
+                                    channel,
+                                    range,
+                                    engine_map(map),
+                                );
                             } else if let Some(id) = param_id_of(&param) {
-                                self.engine.set_auto_route(index, engine_id, id);
+                                self.engine
+                                    .set_auto_route(index, engine_id, id, engine_map(map));
                             }
                         }
                     }
@@ -3042,6 +3160,12 @@ impl GlitcherZApp {
                 track,
                 params: MidiEnvelopeParams::default(),
             },
+            // C3: the control map (spec `curve-map.md` D5).
+            patch::NodeSource::CurveMap => NodeDoc::CurveMap {
+                node_id,
+                track,
+                params: CurveMapParams::default(),
+            },
         };
         if node.is_keyboard() {
             let before = self.begin_edit();
@@ -3374,20 +3498,34 @@ impl GlitcherZApp {
             CableKind::Automation => self.clear_control_sources(to_doc),
             CableKind::Audio => {}
         }
-        self.project_mut()
-            .graph
-            .cables
-            .push(glitcherz_model::CableDoc {
-                kind,
-                from: PortRef::Node(from_doc),
-                to: PortRef::Node(to_doc),
-                param: if kind == CableKind::Midi {
-                    AutoParam::default()
-                } else {
-                    param.clone()
-                },
-                in_port: 0,
-            });
+        let mut cable = glitcherz_model::CableDoc {
+            kind,
+            from: PortRef::Node(from_doc),
+            to: PortRef::Node(to_doc),
+            param: if kind == CableKind::Midi {
+                AutoParam::default()
+            } else {
+                param.clone()
+            },
+            in_port: 0,
+            map: None,
+        };
+        // Control cables carry their axis (spec `curve-map.md` D2/D4); a MIDI
+        // cable delivers events, so there is nothing to map. A Curve Map
+        // source owns the axis of the hop after it (D6), so the document
+        // records *its* range rather than the target's default — the engine
+        // resolves the same answer through `Processor::map_spec`.
+        let map = if kind == CableKind::Midi {
+            glitcherz_model::MapSpec::UNIT
+        } else if let Some(NodeDoc::CurveMap { params, .. }) =
+            self.project().graph.node_by_id(from_doc)
+        {
+            params.map()
+        } else {
+            cable_map(&cable, &self.project().graph)
+        };
+        cable.map = (kind != CableKind::Midi).then_some(map);
+        self.project_mut().graph.cables.push(cable);
         self.commit_edit(
             if kind == CableKind::Midi {
                 "Connect MIDI FX"
@@ -3409,6 +3547,7 @@ impl GlitcherZApp {
             to_engine,
             event_kind,
             event_dest_of(&param),
+            engine_map(map),
         ) {
             // The engine refused (cycle / second MIDI source / caps): roll the
             // document back so it never claims a cable the audio thread does
@@ -4908,6 +5047,11 @@ impl GlitcherZApp {
                 processor.set_param(ParamId::EnvMax, params.max);
                 (Box::new(processor), None)
             }
+            NodeDoc::CurveMap { params, .. } => {
+                let mut processor = CurveMapProcessor::new();
+                processor.apply_params(params.min, params.max, engine_mode(params.mode));
+                (Box::new(processor), None)
+            }
         };
         let engine_id = engine.fresh_node_id();
         let kind = match node {
@@ -4969,7 +5113,8 @@ impl GlitcherZApp {
         // Cables (the mirror of apply_document's dispatch, minus vk
         // document-only routing — the export never routes the keyboard).
         let master = engine.master_node_id();
-        let cables = self.project().graph.cables.clone();
+        let graph = self.project().graph.clone();
+        let cables = graph.cables.clone();
         for cable in &cables {
             let from = match &cable.from {
                 PortRef::Node(id) => node_map.get(id).copied(),
@@ -4999,6 +5144,7 @@ impl GlitcherZApp {
                                 to,
                                 EventKind::Midi,
                                 AutoDest::default(),
+                                EngineMapSpec::UNIT,
                             );
                         }
                     }
@@ -5015,6 +5161,7 @@ impl GlitcherZApp {
                                 to,
                                 EventKind::Control,
                                 event_dest_of(&cable.param),
+                                engine_map(cable_map(cable, &graph)),
                             );
                         }
                         continue;
@@ -5023,18 +5170,40 @@ impl GlitcherZApp {
                         continue;
                     };
                     if cable.to == PortRef::TimelineIn {
-                        let _ = engine.set_timeline_in_route(*index);
+                        let _ = engine
+                            .set_timeline_in_route(*index, engine_map(cable_map(cable, &graph)));
                         continue;
                     }
                     let Some(to) = to_node else {
                         continue;
                     };
                     if let Some((controller, channel)) = cable.param.cc_of() {
-                        let _ = engine.set_auto_cc_route(*index, to, channel, controller);
+                        let _ = engine.set_auto_cc_route(
+                            *index,
+                            to,
+                            channel,
+                            controller,
+                            engine_map(cable_map(cable, &graph)),
+                        );
+                        continue;
+                    }
+                    if let Some((channel, range)) = cable.param.pitch_bend_of() {
+                        let _ = engine.set_auto_pitch_bend_route(
+                            *index,
+                            to,
+                            channel,
+                            range,
+                            engine_map(cable_map(cable, &graph)),
+                        );
                         continue;
                     }
                     if let Some(id) = param_id_of(&cable.param) {
-                        let _ = engine.set_auto_route(*index, to, id);
+                        let _ = engine.set_auto_route(
+                            *index,
+                            to,
+                            id,
+                            engine_map(cable_map(cable, &graph)),
+                        );
                     }
                 }
             }
@@ -6124,16 +6293,6 @@ impl GlitcherZApp {
             // MIDI outline (its curve editor is separate, U12).
             EditTarget::Control { .. } => None,
         });
-        // U4b/U4c: the selected control track's endpoint drives the preview's
-        // vertical axis. Resolved against the target node while the document
-        // borrow is alive (an effect slot's range lives in its descriptor).
-        let curve_axis = {
-            let graph = &self.project().graph;
-            match graph.auto_target(selected_auto) {
-                Some((port, param)) => crate::curve::axis_in(&param, graph, &port),
-                None => (0.0, 127.0, false),
-            }
-        };
         // U6: audio clip bodies read peaks from the session sample cache
         // (read-only lookup — decoding happens on the edit paths).
         let waveform_of = {
@@ -6174,7 +6333,6 @@ impl GlitcherZApp {
                     bar_ticks: project.ticks_per_bar(),
                     // U11 D3: audio clip spans are derived at the base tempo.
                     sec_per_tick: project.sec_per_tick(),
-                    curve_axis,
                     waveform_of: &waveform_of,
                 },
                 router,
@@ -7325,6 +7483,7 @@ impl GlitcherZApp {
                 (Some(NodeDoc::MidiEnvelope { .. }), Some(id)) => {
                     format!("MIDI Envelope #{id}")
                 }
+                (Some(NodeDoc::CurveMap { .. }), Some(id)) => format!("Curve Map #{id}"),
                 _ => {
                     if self.project().midi_tracks[sel].name.is_empty() {
                         format!("Track {}", sel + 1)
@@ -7344,6 +7503,7 @@ impl GlitcherZApp {
                         NodeDoc::Arpeggiator { .. }
                             | NodeDoc::Portamento { .. }
                             | NodeDoc::MidiEnvelope { .. }
+                            | NodeDoc::CurveMap { .. }
                     )
                 )
             {
@@ -8234,6 +8394,63 @@ impl GlitcherZApp {
                         *params = p;
                     }
                     self.commit_param_edit("MIDI Envelope", before, "midi-fx-params");
+                }
+            }
+            // C3: the mapping card (spec `curve-map.md` §5). Three controls,
+            // plus a live read-out of where the three anchor values land —
+            // that read-out is what makes an axis understandable without
+            // opening a curve.
+            NodeDoc::CurveMap { params, .. } => {
+                let mut p = params;
+                let mut changed = false;
+                egui::Grid::new("curve_map_params")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Low");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut p.min).speed(0.01))
+                            .changed();
+                        ui.end_row();
+                        ui.label("High");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut p.max).speed(0.01))
+                            .changed();
+                        ui.end_row();
+                        ui.label("Mode");
+                        egui::ComboBox::from_id_salt("curve_map_mode")
+                            .selected_text(p.mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in glitcherz_model::MapMode::ALL {
+                                    changed |= ui
+                                        .selectable_value(&mut p.mode, mode, mode.label())
+                                        .changed();
+                                }
+                            });
+                        ui.end_row();
+                    });
+                let spec = p.map().sanitized();
+                ui.small(format!(
+                    "−1 → {}    0 → {}    +1 → {}",
+                    crate::patch::axis_number(spec.map(-1.0)),
+                    crate::patch::axis_number(spec.map(0.0)),
+                    crate::patch::axis_number(spec.map(1.0)),
+                ));
+                if changed {
+                    self.send_node_param(doc_id, ParamId::CurveMapMin, p.min);
+                    self.send_node_param(doc_id, ParamId::CurveMapMax, p.max);
+                    self.send_node_param(
+                        doc_id,
+                        ParamId::CurveMapMode,
+                        curve_mode_value(engine_mode(p.mode)),
+                    );
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::CurveMap { params, .. }) =
+                        self.project_mut().graph.node_by_id_mut(doc_id)
+                    {
+                        *params = p;
+                    }
+                    self.commit_param_edit("Curve Map", before, "curve-map-params");
                 }
             }
             _ => {}
@@ -10002,22 +10219,17 @@ impl GlitcherZApp {
 
         // ---- Snapshot the clip (avoid holding a borrow of `self` across the
         // widget calls below) ----
-        // U4c: the axis needs the endpoint *and* its target node (an effect
-        // slot's range lives in the node's descriptor), so resolve it through
-        // `axis_in` while the document borrow is still alive.
-        let (min, max, log, axis_label) = {
+        // The axis needs the endpoint *and* its target node (an effect slot's
+        // range lives in the node's payload), and it is now only a **caption**:
+        // the curve itself is stored normalized (spec `curve-map.md` D1/D11).
+        let (map, axis_label) = {
             let graph = &self.project().graph;
             match graph.auto_target(sel) {
-                Some((port, param)) => {
-                    let (min, max, log) = crate::curve::axis_in(&param, graph, &port);
-                    (
-                        min,
-                        max,
-                        log,
-                        crate::patch::auto_param_label_at(&param, graph, &port),
-                    )
-                }
-                None => (0.0, 1.0, false, "not connected".to_string()),
+                Some((port, param)) => (
+                    crate::curve::map_in(&param, graph, &port),
+                    crate::patch::auto_param_label_at(&param, graph, &port),
+                ),
+                None => (glitcherz_model::MapSpec::UNIT, "not connected".to_string()),
             }
         };
         let (loop_ticks, interp, curve) = {
@@ -10033,10 +10245,10 @@ impl GlitcherZApp {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(20, 22, 26));
         let inner = rect.shrink(2.0);
-        let value_y =
-            |v: f32| inner.bottom() - crate::curve::to_norm(v, min, max, log) * inner.height();
-        let y_value =
-            |y: f32| crate::curve::from_norm((inner.bottom() - y) / inner.height(), min, max, log);
+        // Normalized geometry: -1 at the bottom, 0 mid, +1 at the top (D1).
+        // The axis caption is the only thing that speaks in real units.
+        let value_y = |v: f32| inner.bottom() - crate::curve::y_of(v) * inner.height();
+        let y_value = |y: f32| crate::curve::norm_of_y((inner.bottom() - y) / inner.height());
         let x_at = |tick: f32| inner.left() + (tick / loop_ticks as f32) * inner.width();
         let tick_at = |x: f32| (x - inner.left()) / inner.width() * loop_ticks as f32;
 
@@ -10051,18 +10263,18 @@ impl GlitcherZApp {
             );
             t += quarter;
         }
-        let mid = crate::curve::from_norm(0.5, min, max, log);
+        // The centre line is the axis centre — always normalized 0.
         painter.line_segment(
             [
-                egui::pos2(inner.left(), value_y(mid)),
-                egui::pos2(inner.right(), value_y(mid)),
+                egui::pos2(inner.left(), value_y(0.0)),
+                egui::pos2(inner.right(), value_y(0.0)),
             ],
             egui::Stroke::new(1.0, egui::Color32::from_gray(46)),
         );
         painter.text(
             egui::pos2(inner.left() + 4.0, inner.top() + 2.0),
             egui::Align2::LEFT_TOP,
-            format!("{axis_label} · {min:.0}…{max:.0}"),
+            format!("{axis_label} · {}", crate::curve::axis_caption(map)),
             egui::FontId::proportional(11.0),
             egui::Color32::from_gray(150),
         );
@@ -10314,14 +10526,14 @@ impl GlitcherZApp {
                 .filter(|c| matches!(c.lane, piano_roll::RollLane::Control))
                 .filter_map(|c| {
                     let data = project.control_tracks.get(c.track)?.clips.get(c.clip)?;
-                    // U4c: axis + label resolve against the cable's target node
-                    // (effect slot ranges come from the node's descriptor).
-                    let (axis, dest) = match project.graph.auto_target(c.track) {
-                        Some((port, param)) => (
-                            crate::curve::axis_in(&param, &project.graph, &port),
-                            crate::patch::auto_param_label_at(&param, &project.graph, &port),
-                        ),
-                        None => ((0.0, 127.0, false), "Not connected".to_string()),
+                    // The caption names the destination (its range comes from
+                    // the same map table the engine uses); the lane geometry
+                    // itself is normalized now, so no axis travels with it.
+                    let dest = match project.graph.auto_target(c.track) {
+                        Some((port, param)) => {
+                            crate::patch::auto_param_label_at(&param, &project.graph, &port)
+                        }
+                        None => "Not connected".to_string(),
                     };
                     let name = if project.control_tracks[c.track].name.is_empty() {
                         format!("Curve {}", c.track + 1)
@@ -10331,7 +10543,6 @@ impl GlitcherZApp {
                     Some(piano_roll::OverlayLane {
                         clip: *c,
                         data,
-                        axis,
                         label: format!("{name} · {dest}"),
                     })
                 })
@@ -11419,6 +11630,30 @@ mod panel_target_tests {
         assert_eq!(resolve_panel_target(doc, &[], 99), None);
     }
 
+    /// C3 regression: the built-in MIDI FX / control panels (and the Curve
+    /// Map, whose only UI is its Inspector) must be reachable by selecting
+    /// the node — the panel used to resolve straight past them to the track
+    /// instrument.
+    #[test]
+    fn control_nodes_are_editable_targets() {
+        let mut project = Project::default();
+        let map = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::CurveMap {
+            node_id: map,
+            track: 0,
+            params: CurveMapParams::default(),
+        });
+        let env = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::MidiEnvelope {
+            node_id: env,
+            track: 0,
+            params: MidiEnvelopeParams::default(),
+        });
+        let doc = &project.graph;
+        assert_eq!(resolve_panel_target(doc, &[map], 0), Some(map));
+        assert_eq!(resolve_panel_target(doc, &[env], 0), Some(env));
+    }
+
     #[test]
     fn document_order_breaks_multi_selection_ties() {
         let mut project = Project::default();
@@ -11539,6 +11774,26 @@ mod inline_param_tests {
         }
     }
 
+    /// C3 (spec `curve-map.md` D5/§5): the map node offers exactly one target
+    /// — its own pass-through port — and the row says what that port means.
+    #[test]
+    fn a_curve_map_offers_its_single_pass_through_port() {
+        let mut project = Project::default();
+        let id = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::CurveMap {
+            node_id: id,
+            track: 0,
+            params: CurveMapParams::default(),
+        });
+        let options = node_auto_options(&project.graph, id, None, None);
+        assert_eq!(options.len(), 1, "{options:?}");
+        assert_eq!(options[0].1, AutoParam::CurveMap);
+        // `±1` is the signal's own domain, not a musical axis (D1).
+        assert_eq!(options[0].0, "Curve In · ±1");
+        // And it routes to the engine's pass-through slot, not a parameter.
+        assert_eq!(param_id_of(&AutoParam::CurveMap), Some(ParamId::CurveMapIn));
+    }
+
     /// U4c (spec §9 D19): the target menu enumerates the node's real
     /// parameters — this is where "gain cannot be automated" came from, so a
     /// mixer must offer one Gain row per channel, and a built-in effect every
@@ -11569,9 +11824,14 @@ mod inline_param_tests {
             channels * 4 + 2,
             "four rows per channel + output pan/mute, got {labels:?}"
         );
-        assert!(labels.contains(&"Ch 1 Gain".to_string()), "{labels:?}");
         assert!(
-            labels.contains(&format!("Ch {channels} Solo")),
+            labels.iter().any(|l| l.starts_with("Ch 1 Gain · ")),
+            "rows carry their axis (spec `curve-map.md` §5): {labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.starts_with(&format!("Ch {channels} Solo · "))),
             "the last channel must be offered too: {labels:?}"
         );
 
@@ -11601,8 +11861,14 @@ mod inline_param_tests {
             .map(|(label, _)| label)
             .collect();
         assert_eq!(labels.len(), 6, "{labels:?}");
-        assert!(labels.contains(&"Cutoff".to_string()));
-        assert!(labels.contains(&"Env Release".to_string()));
+        assert!(
+            labels.iter().any(|l| l.starts_with("Cutoff · ")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.starts_with("Env Release · ")),
+            "{labels:?}"
+        );
     }
 }
 

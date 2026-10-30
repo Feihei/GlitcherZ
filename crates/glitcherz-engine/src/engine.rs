@@ -13,8 +13,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::convert;
 use crate::realtime::{
     AutoDest, BlockRunner, COMMAND_QUEUE_CAPACITY, EngineCommand, EventKind, FIXED_BLOCK_SIZE,
-    Feedback, GraphCompiler, GraphUpdate, ParamId, Sequencer, SequencerCommand, command_channel,
-    recycle_channel, structure_channel,
+    Feedback, GraphCompiler, GraphUpdate, MapSpec, ParamId, Sequencer, SequencerCommand,
+    command_channel, recycle_channel, structure_channel,
 };
 
 /// Basic engine info (for UI display).
@@ -472,8 +472,14 @@ impl AudioEngine {
     /// Timeline wiring: connects automation track `auto_index` to a target
     /// node parameter (**node_id addressing**, P5b). Calling again
     /// re-routes.
-    pub fn set_auto_route(&mut self, auto_index: usize, node_id: u64, param: ParamId) -> bool {
-        self.apply_plan_update(|compiler| compiler.set_auto_route(auto_index, node_id, param))
+    pub fn set_auto_route(
+        &mut self,
+        auto_index: usize,
+        node_id: u64,
+        param: ParamId,
+        map: MapSpec,
+    ) -> bool {
+        self.apply_plan_update(|compiler| compiler.set_auto_route(auto_index, node_id, param, map))
     }
 
     /// Timeline wiring: routes automation track `auto_index` to a **MIDI CC**
@@ -485,9 +491,10 @@ impl AudioEngine {
         node_id: u64,
         channel: u8,
         controller: u8,
+        map: MapSpec,
     ) -> bool {
         self.apply_plan_update(|compiler| {
-            compiler.set_auto_cc_route(auto_index, node_id, channel, controller)
+            compiler.set_auto_cc_route(auto_index, node_id, channel, controller, map)
         })
     }
 
@@ -500,17 +507,18 @@ impl AudioEngine {
         node_id: u64,
         channel: u8,
         range_semitones: f32,
+        map: MapSpec,
     ) -> bool {
         self.apply_plan_update(|compiler| {
-            compiler.set_auto_pitch_bend_route(auto_index, node_id, channel, range_semitones)
+            compiler.set_auto_pitch_bend_route(auto_index, node_id, channel, range_semitones, map)
         })
     }
 
     /// Timeline wiring: connects automation track `auto_index` to the
     /// **Timeline In** endpoint (U3b): the curve overrides the transport BPM
     /// per block instead of driving a node parameter.
-    pub fn set_timeline_in_route(&mut self, auto_index: usize) -> bool {
-        self.apply_plan_update(|compiler| compiler.set_timeline_in_route(auto_index))
+    pub fn set_timeline_in_route(&mut self, auto_index: usize, map: MapSpec) -> bool {
+        self.apply_plan_update(|compiler| compiler.set_timeline_in_route(auto_index, map))
     }
 
     /// Timeline wiring: disconnects automation track `auto_index`.
@@ -721,8 +729,9 @@ impl AudioEngine {
         to_id: u64,
         kind: EventKind,
         dest: AutoDest,
+        map: MapSpec,
     ) -> bool {
-        self.apply_plan_update(|compiler| compiler.connect_event(from_id, to_id, kind, dest))
+        self.apply_plan_update(|compiler| compiler.connect_event(from_id, to_id, kind, dest, map))
     }
 
     /// Removes a node-to-node event/control cable (idempotent when not

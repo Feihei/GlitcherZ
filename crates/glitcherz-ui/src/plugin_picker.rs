@@ -167,6 +167,10 @@ impl PickChoice {
             NodeSource::MidiEnvelope => {
                 "Control source: MIDI-triggered envelope (MIDI in / control out)".to_string()
             }
+            NodeSource::CurveMap => {
+                "Control map: 1 control in / 1 out, declares the destination's range and curve"
+                    .to_string()
+            }
             NodeSource::Mixer | NodeSource::Feedback | NodeSource::Keyboard => String::new(),
         }
     }
@@ -453,6 +457,13 @@ pub fn builtin_midi_fx() -> Vec<PickChoice> {
             name: "MIDI Envelope".to_string(),
             tag: PickTag::BuiltIn,
             source: NodeSource::MidiEnvelope,
+        },
+        // Spec `curve-map.md` §5: the map node lives in the control family —
+        // it is the only node whose parameters describe a *destination*.
+        PickChoice {
+            name: "Curve Map".to_string(),
+            tag: PickTag::BuiltIn,
+            source: NodeSource::CurveMap,
         },
     ]
 }
@@ -1652,7 +1663,10 @@ mod tests {
     fn midi_fx_filter_lists_only_builtin_midi_effects() {
         let rows = builtin_choices(PickFilter::midi_fx(), "");
         let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
-        assert_eq!(names, vec!["Arpeggiator", "Portamento", "MIDI Envelope"]);
+        assert_eq!(
+            names,
+            vec!["Arpeggiator", "Portamento", "MIDI Envelope", "Curve Map"]
+        );
         assert!(rows.iter().all(|row| row.tag == PickTag::BuiltIn));
 
         // Instruments / effects filters never show them.

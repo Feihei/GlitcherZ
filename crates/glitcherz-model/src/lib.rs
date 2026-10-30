@@ -1714,6 +1714,14 @@ pub enum AutoParam {
     /// slots of the same effect, becomes expressible without growing this
     /// enum per node kind.
     Node(NodeParam),
+    /// The control input of a [`NodeDoc::CurveMap`] node (spec `curve-map.md`
+    /// D5).
+    ///
+    /// Deliberately *not* a parameter: the node has nothing to set on that
+    /// port, it only forwards the normalized signal. The cable therefore
+    /// carries the identity map ([`MapSpec::UNIT`]), so the value arrives
+    /// untouched — the node's own axis applies to its **output**, not here.
+    CurveMap,
 }
 
 /// Default pitch-bend range: the General MIDI default of ±2 semitones.
@@ -1780,15 +1788,291 @@ impl AutoParam {
             _ => None,
         }
     }
+
+    /// Default mapping of this destination's axis (spec `curve-map.md` D2).
+    ///
+    /// The one place that knows "how big is this parameter": the curve editor
+    /// (axis labels), the cable compiler (engine `MapSpec`) and the v8 → v9
+    /// migration all read it, so a curve that moves to another target keeps
+    /// its shape everywhere at once.
+    ///
+    /// `graph` / `target` supply the node context an effect slot needs (its
+    /// range lives in the node's [`EffectParams`], not in the enum).
+    pub fn default_map(&self, graph: &GraphDoc, target: &PortRef) -> MapSpec {
+        match self {
+            AutoParam::TrackGain => MapSpec::linear(0.0, 1.5),
+            AutoParam::TrackPan => MapSpec::linear(-1.0, 1.0),
+            AutoParam::FilterCutoff => MapSpec::log(20.0, 18_000.0),
+            AutoParam::Tempo => MapSpec::log(MIN_TEMPO_BPM, MAX_TEMPO_BPM),
+            // Plugin range is not readable through the wiring this app has;
+            // the clip rectangle is the 0..1 the plugin itself speaks.
+            AutoParam::PluginParam { .. } => MapSpec::linear(0.0, 1.0),
+            // 7-bit wire range (U4a D7).
+            AutoParam::Cc { .. } => MapSpec::linear(0.0, 127.0),
+            // Symmetric about zero: `range_semitones` is full-scale (P1 D9).
+            AutoParam::PitchBend {
+                range_semitones, ..
+            } => {
+                let range = if range_semitones.is_finite() && *range_semitones > 0.0 {
+                    *range_semitones
+                } else {
+                    default_bend_range()
+                };
+                MapSpec::linear(-range, range)
+            }
+            AutoParam::Node(param) => node_param_map(*param, graph, target),
+            // The Curve Map input takes the signal as-is (D5/D6): its own
+            // axis belongs to the hop *after* the node.
+            AutoParam::CurveMap => MapSpec::UNIT,
+        }
+    }
 }
 
-/// Automation anchor: tick position + real parameter value.
+/// Context-free map of one [`NodeParam`] (ranges mirror the panel sliders —
+/// one source of truth per parameter, spec `control-tracks.md` §9).
+///
+/// Effect slots have no context-free range: they fall back to 0..1 and are
+/// resolved against the node's payload by [`effect_slot_map`].
+pub fn node_param_map(param: NodeParam, graph: &GraphDoc, target: &PortRef) -> MapSpec {
+    match param {
+        NodeParam::EffectSlot(slot) => effect_slot_map(graph, target, slot),
+        NodeParam::MixerChannel { param, .. } => match param {
+            ChannelParam::Gain => MapSpec::linear(0.0, 1.5),
+            ChannelParam::Pan => MapSpec::linear(-1.0, 1.0),
+            ChannelParam::Mute | ChannelParam::Solo => MapSpec::linear(0.0, 1.0),
+        },
+        NodeParam::MixerOutPan => MapSpec::linear(-1.0, 1.0),
+        NodeParam::MixerOutMute => MapSpec::linear(0.0, 1.0),
+        NodeParam::FeedbackGain => MapSpec::linear(0.0, 1.0),
+        NodeParam::Sf2Gain | NodeParam::SampleGain => MapSpec::linear(0.0, 2.0),
+        NodeParam::PitchOffset => MapSpec::linear(-24.0, 24.0),
+        NodeParam::Resonance => MapSpec::linear(0.0, 0.98),
+        NodeParam::Attack | NodeParam::Decay => MapSpec::linear(0.0, 2.0),
+        NodeParam::Sustain => MapSpec::linear(0.0, 1.0),
+        NodeParam::Release => MapSpec::linear(0.0, 3.0),
+    }
+}
+
+/// Map of one built-in effect parameter slot (spec `effects.md` D6).
+///
+/// The engine's `EffectDescriptor` is the slider's source of truth, but the
+/// engine crate is not a dependency of the model, so this table mirrors it
+/// slot by slot. `glitcherz-ui`'s `effect_axis_matches_descriptor` test walks
+/// every descriptor and fails on drift.
+///
+/// A plugin effect (or a node that is not an effect at all) has no descriptor
+/// here: 0..1 is what a plugin parameter speaks anyway.
+pub fn effect_slot_map(graph: &GraphDoc, target: &PortRef, slot: u8) -> MapSpec {
+    let Some(NodeDoc::Effect { params, .. }) = (match target {
+        PortRef::Node(id) => graph.node_by_id(*id),
+        _ => None,
+    }) else {
+        return MapSpec::linear(0.0, 1.0);
+    };
+    effect_slot_axis(params, slot)
+}
+
+/// Range + mode of one slot of a built-in effect payload.
+pub fn effect_slot_axis(params: &EffectParams, slot: u8) -> MapSpec {
+    use MapSpec as M;
+    match (params, slot) {
+        // time (s), feedback, mix, ping-pong, sync, division (0..7).
+        (EffectParams::Delay(_), 0) => M::log(0.005, 1.0),
+        (EffectParams::Delay(_), 1) => M::linear(0.0, 0.9),
+        (EffectParams::Delay(_), 2) => M::linear(0.0, 1.0),
+        (EffectParams::Delay(_), 3) => M::linear(0.0, 1.0),
+        (EffectParams::Delay(_), 4) => M::linear(0.0, 1.0),
+        (EffectParams::Delay(_), 5) => M::linear(0.0, 7.0),
+        // low gain (dB), low freq, mid gain, mid freq, mid Q, high gain,
+        // high freq, low cut.
+        (EffectParams::Eq(_), 0) => M::linear(-18.0, 18.0),
+        (EffectParams::Eq(_), 1) => M::log(30.0, 500.0),
+        (EffectParams::Eq(_), 2) => M::linear(-18.0, 18.0),
+        (EffectParams::Eq(_), 3) => M::log(200.0, 5_000.0),
+        (EffectParams::Eq(_), 4) => M::log(0.3, 8.0),
+        (EffectParams::Eq(_), 5) => M::linear(-18.0, 18.0),
+        (EffectParams::Eq(_), 6) => M::log(1_500.0, 16_000.0),
+        (EffectParams::Eq(_), 7) => M::log(20.0, 500.0),
+        // threshold (dB), ratio, attack (ms), release (ms), knee (dB),
+        // makeup (dB), mix, stereo link.
+        (EffectParams::Compressor(_), 0) => M::linear(-60.0, 0.0),
+        (EffectParams::Compressor(_), 1) => M::log(1.0, 20.0),
+        (EffectParams::Compressor(_), 2) => M::log(0.1, 200.0),
+        (EffectParams::Compressor(_), 3) => M::log(5.0, 2_000.0),
+        (EffectParams::Compressor(_), 4) => M::linear(0.0, 24.0),
+        (EffectParams::Compressor(_), 5) => M::linear(0.0, 24.0),
+        (EffectParams::Compressor(_), 6) => M::linear(0.0, 1.0),
+        (EffectParams::Compressor(_), 7) => M::linear(0.0, 1.0),
+        // pre-delay (ms), decay (s), damping, low cut, width, mix.
+        (EffectParams::Reverb(_), 0) => M::linear(0.0, 200.0),
+        (EffectParams::Reverb(_), 1) => M::log(0.2, 12.0),
+        (EffectParams::Reverb(_), 2) => M::linear(0.0, 1.0),
+        (EffectParams::Reverb(_), 3) => M::log(20.0, 500.0),
+        (EffectParams::Reverb(_), 4) => M::linear(0.0, 1.0),
+        (EffectParams::Reverb(_), 5) => M::linear(0.0, 1.0),
+        // rate, depth, width, mix.
+        (EffectParams::Chorus(_), 0) => M::log(0.05, 8.0),
+        (EffectParams::Chorus(_), 1) => M::linear(0.0, 1.0),
+        (EffectParams::Chorus(_), 2) => M::linear(0.0, 1.0),
+        (EffectParams::Chorus(_), 3) => M::linear(0.0, 1.0),
+        // rate, depth, feedback, width, mix.
+        (EffectParams::Flanger(_), 0) => M::log(0.02, 5.0),
+        (EffectParams::Flanger(_), 1) => M::linear(0.0, 1.0),
+        (EffectParams::Flanger(_), 2) => M::linear(-0.95, 0.95),
+        (EffectParams::Flanger(_), 3) => M::linear(0.0, 1.0),
+        (EffectParams::Flanger(_), 4) => M::linear(0.0, 1.0),
+        // Out-of-range slot (a plugin payload, or a document that kept a
+        // stale slot after the effect changed kind): normalized pass-through.
+        _ => M::linear(0.0, 1.0),
+    }
+}
+
+/// Mapping mode of a [`MapSpec`] (spec `.agents/spec/curve-map.md` D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MapMode {
+    /// `min + t·(max-min)`.
+    #[default]
+    Linear,
+    /// `min·(max/min)^t` — equal ratios take equal axis distance (cutoff,
+    /// tempo). Requires `min > 0`.
+    Log,
+    /// `min + t²·(max-min)` — the top of the range gets the room.
+    Exp,
+}
+
+impl MapMode {
+    /// UI label (English, like every other node caption).
+    pub fn label(self) -> &'static str {
+        match self {
+            MapMode::Linear => "Linear",
+            MapMode::Log => "Log",
+            MapMode::Exp => "Exp",
+        }
+    }
+
+    /// Every mode in menu order.
+    pub const ALL: [MapMode; 3] = [MapMode::Linear, MapMode::Log, MapMode::Exp];
+}
+
+/// Range + mapping of a normalized `[-1, 1]` control signal onto a target's
+/// real axis (spec `.agents/spec/curve-map.md` D2).
+///
+/// Curves and control sources store normalized values, so the mapping lives
+/// with the **destination**, not with the data: re-routing a curve to another
+/// parameter keeps its shape (D1). `-1` maps to `min`, `0` to the axis centre
+/// and `+1` to `max` for every mode.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MapSpec {
+    /// Value at `norm = -1`.
+    pub min: f32,
+    /// Value at `norm = +1`.
+    pub max: f32,
+    /// Mapping mode.
+    #[serde(default)]
+    pub mode: MapMode,
+}
+
+impl Default for MapSpec {
+    /// Identity: the normalized value pass-through (`-1..1` linear).
+    fn default() -> Self {
+        Self::UNIT
+    }
+}
+
+impl MapSpec {
+    /// Identity map — the normalized value is used as the real value.
+    pub const UNIT: Self = Self {
+        min: -1.0,
+        max: 1.0,
+        mode: MapMode::Linear,
+    };
+
+    /// Linear map of `min..max`.
+    pub fn linear(min: f32, max: f32) -> Self {
+        Self {
+            min,
+            max,
+            mode: MapMode::Linear,
+        }
+    }
+
+    /// Logarithmic map of `min..max` (requires `min > 0`; falls back to linear).
+    pub fn log(min: f32, max: f32) -> Self {
+        Self {
+            min,
+            max,
+            mode: MapMode::Log,
+        }
+    }
+
+    /// Repairs a hand-written document: non-finite bounds collapse to the
+    /// identity map, `max < min` and a non-positive `Log` range fall back to
+    /// `Linear` (D3).
+    pub fn sanitized(self) -> Self {
+        if !self.min.is_finite() || !self.max.is_finite() || self.max < self.min {
+            return Self::UNIT;
+        }
+        let mode = match self.mode {
+            MapMode::Log if self.min <= 0.0 => MapMode::Linear,
+            mode => mode,
+        };
+        Self {
+            min: self.min,
+            max: self.max,
+            mode,
+        }
+    }
+
+    /// Normalized `[-1, 1]` → real axis value. RT-safe: clamp + arithmetic.
+    pub fn map(self, norm: f32) -> f32 {
+        if !norm.is_finite() {
+            return self.min;
+        }
+        let spec = self.sanitized();
+        let t = (norm.clamp(-1.0, 1.0) + 1.0) * 0.5;
+        match spec.mode {
+            MapMode::Linear => spec.min + t * (spec.max - spec.min),
+            MapMode::Log => spec.min * (spec.max / spec.min).powf(t),
+            MapMode::Exp => spec.min + t * t * (spec.max - spec.min),
+        }
+    }
+
+    /// Real axis value → normalized `[-1, 1]` (inverse of [`Self::map`]).
+    ///
+    /// Used by the v8 → v9 migration and by the editor when it reads an
+    /// externally supplied value; out-of-range input clamps to the ends.
+    pub fn unmap(self, value: f32) -> f32 {
+        let spec = self.sanitized();
+        if !value.is_finite() || spec.max <= spec.min {
+            return 0.0;
+        }
+        let value = value.clamp(spec.min, spec.max);
+        let t = match spec.mode {
+            MapMode::Linear => (value - spec.min) / (spec.max - spec.min),
+            MapMode::Log => (value / spec.min).ln() / (spec.max / spec.min).ln(),
+            MapMode::Exp => ((value - spec.min) / (spec.max - spec.min)).max(0.0).sqrt(),
+        };
+        (t * 2.0 - 1.0).clamp(-1.0, 1.0)
+    }
+}
+
+/// Lowest song tempo a tempo curve can produce (the transport's own floor,
+/// `sequencer::MIN_BPM`). The engine clamps to the same range, so the axis is
+/// the range the user can actually hear (spec `curve-map.md` D2).
+pub const MIN_TEMPO_BPM: f32 = 20.0;
+/// Highest song tempo a tempo curve can produce (`sequencer::MAX_BPM`).
+pub const MAX_TEMPO_BPM: f32 = 300.0;
+
+/// Automation anchor: tick position + **normalized** control value.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct AutoPoint {
     /// Position (tick, relative to loop start).
     #[serde(default)]
     pub tick: u32,
-    /// Parameter value (real units, not normalized).
+    /// Control value in `[-1, 1]` (spec `curve-map.md` D1): the cable's
+    /// [`MapSpec`] turns it into the target's real units, so one curve means
+    /// the same thing on any destination.
     #[serde(default)]
     pub value: f32,
 }
@@ -2231,6 +2515,67 @@ impl MidiEnvelopeParams {
     }
 }
 
+/// Curve Map node parameters (spec `.agents/spec/curve-map.md` D5).
+///
+/// The node is a **pure pass-through with an opinion**: it takes the
+/// normalized control value it receives and re-emits it unchanged, while
+/// declaring the axis ([`MapSpec`]) the *next* hop should deliver through
+/// (D6). So `min`/`max`/`mode` describe the destination, not the value —
+/// which is why the defaults (`-1..1` linear) change nothing until the user
+/// edits them.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CurveMapParams {
+    /// Value the next hop sees at `norm = -1`.
+    #[serde(default = "default_curve_map_min")]
+    pub min: f32,
+    /// Value the next hop sees at `norm = +1`.
+    #[serde(default = "default_curve_map_max")]
+    pub max: f32,
+    /// Mapping mode of the declared axis.
+    #[serde(default)]
+    pub mode: MapMode,
+}
+
+fn default_curve_map_min() -> f32 {
+    -1.0
+}
+
+fn default_curve_map_max() -> f32 {
+    1.0
+}
+
+impl Default for CurveMapParams {
+    fn default() -> Self {
+        Self {
+            min: default_curve_map_min(),
+            max: default_curve_map_max(),
+            mode: MapMode::Linear,
+        }
+    }
+}
+
+impl CurveMapParams {
+    /// The axis this node declares for its output.
+    pub fn map(self) -> MapSpec {
+        MapSpec {
+            min: self.min,
+            max: self.max,
+            mode: self.mode,
+        }
+    }
+
+    /// Load-time repair (same rule as [`MapSpec::sanitized`]): a hand-written
+    /// file cannot leave the node with a backwards or non-finite axis.
+    pub fn sanitized(self) -> Self {
+        let map = self.map().sanitized();
+        Self {
+            min: map.min,
+            max: map.max,
+            mode: map.mode,
+        }
+    }
+}
+
 /// Document node (spec §7 `NodeDoc`): node identity in the engine graph +
 /// parameter persistence.
 ///
@@ -2366,6 +2711,25 @@ pub enum NodeDoc {
         #[serde(default)]
         params: MidiEnvelopeParams,
     },
+    /// Control map: 1 control in, 1 control out, no audio / MIDI ports
+    /// (spec `curve-map.md` D5).
+    ///
+    /// Sits between a curve / control source and its destination and declares
+    /// the axis the destination is driven through (D6), which is how a curve
+    /// can be reshaped (or moved to a differently-scaled target) without
+    /// editing a single anchor. The value itself is untouched — mapping stays
+    /// one arithmetic step on the receiving side (D4).
+    CurveMap {
+        /// Persisted node ID.
+        #[serde(default)]
+        node_id: u64,
+        /// Owning track (grouping only).
+        #[serde(default)]
+        track: usize,
+        /// Declared axis of the output.
+        #[serde(default)]
+        params: CurveMapParams,
+    },
     /// Feedback tap node (P6, spec `node-graph.md` D10): the explicit,
     /// self-documenting loop breaker. Its in-edges are summed **one block
     /// late** (the engine orders it before its tap sources), which is what
@@ -2443,6 +2807,7 @@ impl NodeDoc {
             | NodeDoc::Arpeggiator { node_id, .. }
             | NodeDoc::Portamento { node_id, .. }
             | NodeDoc::MidiEnvelope { node_id, .. }
+            | NodeDoc::CurveMap { node_id, .. }
             | NodeDoc::ChannelStrip { node_id, .. } => *node_id,
         }
     }
@@ -2459,6 +2824,7 @@ impl NodeDoc {
             | NodeDoc::Arpeggiator { track, .. }
             | NodeDoc::Portamento { track, .. }
             | NodeDoc::MidiEnvelope { track, .. }
+            | NodeDoc::CurveMap { track, .. }
             | NodeDoc::ChannelStrip { track, .. } => *track,
         }
     }
@@ -2498,7 +2864,7 @@ impl NodeDoc {
     pub fn has_control_out(&self) -> bool {
         matches!(
             self,
-            NodeDoc::Portamento { .. } | NodeDoc::MidiEnvelope { .. }
+            NodeDoc::Portamento { .. } | NodeDoc::MidiEnvelope { .. } | NodeDoc::CurveMap { .. }
         )
     }
 
@@ -2510,11 +2876,12 @@ impl NodeDoc {
                 | NodeDoc::Effect { .. }
                 | NodeDoc::Mixer { .. }
                 | NodeDoc::Feedback { .. }
+                | NodeDoc::CurveMap { .. }
         )
     }
 
-    /// Whether this node has audio ports at all (keyboard, MIDI effects and
-    /// control sources have none — spec §3).
+    /// Whether this node has audio ports at all (keyboard, MIDI effects,
+    /// control sources and the Curve Map have none — spec §3).
     pub fn has_audio_ports(&self) -> bool {
         !matches!(
             self,
@@ -2522,6 +2889,7 @@ impl NodeDoc {
                 | NodeDoc::Arpeggiator { .. }
                 | NodeDoc::Portamento { .. }
                 | NodeDoc::MidiEnvelope { .. }
+                | NodeDoc::CurveMap { .. }
         )
     }
 }
@@ -2585,6 +2953,12 @@ pub struct CableDoc {
     /// every other target.
     #[serde(default)]
     pub in_port: u8,
+    /// Mapping of the normalized curve onto the target's real axis (spec
+    /// `curve-map.md` D2/D4). Written whenever the UI (re)routes an automation
+    /// cable; `None` means "derive from the target" ([`AutoParam::default_map`])
+    /// and only survives in documents that never went through the editor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map: Option<MapSpec>,
 }
 
 impl CableDoc {
@@ -2596,6 +2970,7 @@ impl CableDoc {
             to: to.into(),
             param: AutoParam::default(),
             in_port: 0,
+            map: None,
         }
     }
 
@@ -2615,6 +2990,7 @@ impl CableDoc {
             to: PortRef::Node(to_node),
             param: AutoParam::default(),
             in_port: 0,
+            map: None,
         }
     }
 
@@ -2627,6 +3003,7 @@ impl CableDoc {
             to: PortRef::Node(to_node),
             param: AutoParam::default(),
             in_port: 0,
+            map: None,
         }
     }
 
@@ -2638,6 +3015,7 @@ impl CableDoc {
             to: PortRef::Node(to_node),
             param,
             in_port: 0,
+            map: None,
         }
     }
 
@@ -2650,6 +3028,7 @@ impl CableDoc {
             to: PortRef::TimelineIn,
             param: AutoParam::Tempo,
             in_port: 0,
+            map: None,
         }
     }
 }
@@ -2998,6 +3377,9 @@ impl GraphDoc {
         // Node-to-node control in-edges are at most one per destination; the
         // timeline automation tables keep their existing (looser) rules.
         let mut control_event_in: std::collections::BTreeMap<u64, usize> = Default::default();
+        // Curve Map inputs are single-source for **every** source kind (spec
+        // `curve-map.md` D5), so they get their own counter.
+        let mut curve_map_in: std::collections::BTreeMap<u64, usize> = Default::default();
         for cable in &self.cables {
             self.check_port(&cable.from, &node_ids, midi_count, auto_count)?;
             self.check_port(&cable.to, &node_ids, midi_count, auto_count)?;
@@ -3184,7 +3566,32 @@ impl GraphDoc {
                             })?;
                             if !target.accepts_control() {
                                 return Err(format!(
-                                    "automation cable target node {id} does not accept control input (instrument / effect / mixer / feedback only)"
+                                    "automation cable target node {id} does not accept control input (instrument / effect / mixer / feedback / curve map only)"
+                                ));
+                            }
+                            // Curve Map (spec `curve-map.md` D5/D6): one
+                            // control in, whatever the source kind — a
+                            // timeline curve and a control node would
+                            // otherwise fight over the same pass-through.
+                            // Its port has no axis of its own, so the cable
+                            // must say so (`AutoParam::CurveMap`).
+                            if matches!(target, NodeDoc::CurveMap { .. }) {
+                                if cable.param != AutoParam::CurveMap {
+                                    return Err(format!(
+                                        "curve map node {id} only accepts the curve-map port (a mapped signal, not {:?})",
+                                        cable.param
+                                    ));
+                                }
+                                let count = curve_map_in.entry(id).or_insert(0);
+                                *count += 1;
+                                if *count > 1 {
+                                    return Err(format!(
+                                        "curve map node {id} receives multiple control cables (one control input)"
+                                    ));
+                                }
+                            } else if cable.param == AutoParam::CurveMap {
+                                return Err(format!(
+                                    "the curve-map port is only valid on a curve map node ({id} is not one)"
                                 ));
                             }
                             if control_source == Some(id) {
@@ -3453,6 +3860,10 @@ impl Project {
                 NodeDoc::Arpeggiator { params, .. } => *params = params.sanitized(),
                 NodeDoc::Portamento { params, .. } => *params = params.sanitized(),
                 NodeDoc::MidiEnvelope { params, .. } => *params = params.sanitized(),
+                // Curve Map axis (spec `curve-map.md` D5): a hand-written
+                // file must not reach the audio thread with a backwards or
+                // non-finite range.
+                NodeDoc::CurveMap { params, .. } => *params = params.sanitized(),
                 // SF2 bend range (spec `curve-map.md` D8): 1..=24 st, GM 2.
                 NodeDoc::Instrument {
                     voice: VoiceSpec::SoundFont { bend_range, .. },
@@ -3600,6 +4011,53 @@ impl Project {
             if let NodeDoc::Effect { params, delay, .. } = node {
                 if let Some(delay) = delay.take() {
                     *params = EffectParams::Delay(delay);
+                }
+            }
+        }
+    }
+
+    /// v8 → v9 (spec `.agents/spec/curve-map.md` D1/D7): curve anchors move
+    /// from the target's real domain to the normalized `[-1, 1]` domain, and
+    /// every automation cable adopts the map it now needs.
+    ///
+    /// Each cable's map is resolved **first** (target axis, including effect
+    /// slot ranges which live in the target node's payload), then every anchor
+    /// of that track is inverse-mapped through it, so an old project's curves
+    /// keep their shape and their sound.
+    ///
+    /// D7 last clause: a curve on a track with no cable has no axis to invert.
+    /// Its values are clamped into `[-1, 1]` and kept — silently, because such
+    /// a curve is not driving anything (it only becomes audible once the user
+    /// routes it, at which point they pick the axis).
+    pub fn migrate_v8_to_v9(&mut self) {
+        // One map per control track, plus the explicit field on the cable.
+        let mut specs: Vec<(usize, MapSpec)> = Vec::new();
+        let mut track_maps: Vec<Option<MapSpec>> = vec![None; self.control_tracks.len()];
+        for (index, cable) in self.graph.cables.iter().enumerate() {
+            if cable.kind != CableKind::Automation {
+                continue;
+            }
+            let map = cable
+                .map
+                .unwrap_or_else(|| cable.param.default_map(&self.graph, &cable.to));
+            specs.push((index, map));
+            if let PortRef::AutoTrack(track) = cable.from
+                && let Some(slot) = track_maps.get_mut(track)
+            {
+                *slot = Some(map);
+            }
+        }
+        for (index, map) in specs {
+            self.graph.cables[index].map = Some(map);
+        }
+        for (track, track_map) in self.control_tracks.iter_mut().zip(track_maps) {
+            for clip in &mut track.clips {
+                for point in &mut clip.curve {
+                    point.value = match track_map {
+                        Some(map) => map.unmap(point.value),
+                        None if point.value.is_finite() => point.value.clamp(-1.0, 1.0),
+                        None => 0.0,
+                    };
                 }
             }
         }
@@ -3850,12 +4308,14 @@ impl Default for ProjectMetadata {
 mod tests {
     use super::{
         ArpMode, ArpeggiatorParams, AudioClip, AudioTrack, AutoParam, AutoPoint, CableDoc,
-        CableKind, ChannelParam, DEFAULT_AUDIO_TRACKS, DEFAULT_CONTROL_TRACKS, DEFAULT_MIDI_TRACKS,
-        EffectParams, GraphDoc, MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS,
-        MAX_AUDIO_TRACKS, MAX_BEND_RANGE, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES,
-        MIN_BEND_RANGE, MidiClip, MidiEnvelopeParams, MidiSource, MidiTrack, MixerChannel, NodeDoc,
-        NodeParam, PortRef, PortamentoParams, Project, SamplePlayMode, SynthParams, TICKS_PER_BAR,
-        TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec, default_audio_source_len, default_graph_doc,
+        CableKind, ChannelParam, ControlClip, ControlTrack, CurveMapParams, DEFAULT_AUDIO_TRACKS,
+        DEFAULT_CONTROL_TRACKS, DEFAULT_MIDI_TRACKS, DelayParams, EffectParams, GraphDoc,
+        MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS, MAX_AUDIO_TRACKS,
+        MAX_BEND_RANGE, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES, MAX_TEMPO_BPM,
+        MIN_BEND_RANGE, MIN_TEMPO_BPM, MapMode, MapSpec, MidiClip, MidiEnvelopeParams, MidiSource,
+        MidiTrack, MixerChannel, NodeDoc, NodeParam, PortRef, PortamentoParams, Project,
+        SamplePlayMode, SynthParams, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec,
+        default_audio_source_len, default_graph_doc,
     };
 
     fn effect_node(params: EffectParams) -> NodeDoc {
@@ -5298,6 +5758,7 @@ mod tests {
             to: PortRef::TimelineIn,
             param: AutoParam::default(),
             in_port: 0,
+            map: None,
         });
         assert!(
             doc.validate(2, 0).is_err(),
@@ -5325,6 +5786,7 @@ mod tests {
             to: PortRef::TimelineIn,
             param: AutoParam::TrackGain,
             in_port: 0,
+            map: None,
         });
         assert!(
             doc.validate(2, 1).is_err(),
@@ -5418,6 +5880,7 @@ mod tests {
             to: PortRef::TimelineIn,
             param: AutoParam::cc(74, 0),
             in_port: 0,
+            map: None,
         });
         assert!(
             doc.validate(2, 1).is_err(),
@@ -5518,6 +5981,14 @@ mod tests {
         }
     }
 
+    fn curve_map_node(id: u64) -> NodeDoc {
+        NodeDoc::CurveMap {
+            node_id: id,
+            track: 0,
+            params: CurveMapParams::default(),
+        }
+    }
+
     fn mixer_node(id: u64) -> NodeDoc {
         NodeDoc::Mixer {
             node_id: id,
@@ -5537,6 +6008,7 @@ mod tests {
             to: PortRef::Node(to),
             param: AutoParam::default(),
             in_port: 0,
+            map: None,
         }
     }
 
@@ -5548,6 +6020,7 @@ mod tests {
             to: PortRef::Node(to),
             param,
             in_port: 0,
+            map: None,
         }
     }
 
@@ -5680,6 +6153,7 @@ mod tests {
             to: PortRef::TimelineIn,
             param: AutoParam::Tempo,
             in_port: 0,
+            map: None,
         });
         assert!(
             doc.validate(1, 0).is_err(),
@@ -5717,6 +6191,140 @@ mod tests {
             },
         ));
         assert!(doc.validate(1, 0).is_err(), "two control cables");
+    }
+
+    // ---- C2: Curve Map node (spec `curve-map.md` D5/D6) ----
+
+    #[test]
+    fn curve_map_round_trips_and_defaults_to_the_identity() {
+        let node = curve_map_node(9);
+        let text = ron::to_string(&node).expect("serialize");
+        assert!(text.contains("type:\"curve_map\""), "tag missing: {text}");
+        let back: NodeDoc = ron::from_str(&text).expect("deserialize");
+        assert_eq!(node, back);
+        // The defaults are the identity map: inserting the node is a no-op
+        // until the user edits the range.
+        assert_eq!(CurveMapParams::default().map(), MapSpec::UNIT);
+        assert!(
+            !NodeDoc::CurveMap {
+                node_id: 9,
+                track: 0,
+                params: CurveMapParams::default(),
+            }
+            .has_audio_ports()
+        );
+    }
+
+    #[test]
+    fn curve_map_accepts_one_control_cable_from_any_source() {
+        // Envelope → map → instrument resonance: the D6 chain.
+        let mut doc = midi_node_doc();
+        doc.nodes.push(curve_map_node(9));
+        doc.cables.push(CableDoc::midi(0, 6));
+        doc.cables.push(control_cable(6, 9, AutoParam::CurveMap));
+        doc.cables
+            .push(control_cable(9, 2, AutoParam::Node(NodeParam::Resonance)));
+        assert!(doc.validate(1, 0).is_ok(), "one in, one out");
+
+        // A timeline curve may drive the map's input too (it is a curve, not
+        // a control source — D5 says either).
+        let mut doc = midi_node_doc();
+        doc.nodes.push(curve_map_node(9));
+        doc.cables.push(CableDoc {
+            kind: CableKind::Automation,
+            from: PortRef::AutoTrack(0),
+            to: PortRef::Node(9),
+            param: AutoParam::CurveMap,
+            in_port: 0,
+            map: None,
+        });
+        doc.cables
+            .push(control_cable(9, 2, AutoParam::Node(NodeParam::Resonance)));
+        assert!(doc.validate(1, 1).is_ok(), "timeline curve into a map");
+    }
+
+    #[test]
+    fn curve_map_rejects_a_second_input_and_foreign_ports() {
+        // Two sources into one map: there is one pass-through register, so a
+        // second writer would silently win.
+        let mut doc = midi_node_doc();
+        doc.nodes.push(curve_map_node(9));
+        doc.cables.push(control_cable(6, 9, AutoParam::CurveMap));
+        doc.cables.push(CableDoc {
+            kind: CableKind::Automation,
+            from: PortRef::AutoTrack(0),
+            to: PortRef::Node(9),
+            param: AutoParam::CurveMap,
+            in_port: 0,
+            map: None,
+        });
+        assert!(doc.validate(1, 1).is_err(), "one control input");
+
+        // A real parameter on the map's input is a category error: the port
+        // carries the signal, not a value the user picked.
+        let mut doc = midi_node_doc();
+        doc.nodes.push(curve_map_node(9));
+        doc.cables
+            .push(control_cable(6, 9, AutoParam::Node(NodeParam::Resonance)));
+        assert!(doc.validate(1, 0).is_err(), "map input is not a parameter");
+
+        // ... and the map port is meaningless on any other node.
+        let mut doc = midi_node_doc();
+        doc.cables.push(control_cable(6, 2, AutoParam::CurveMap));
+        assert!(doc.validate(1, 0).is_err(), "curve port only on a map node");
+
+        // No audio, no MIDI.
+        let mut doc = midi_node_doc();
+        doc.nodes.push(curve_map_node(9));
+        doc.cables
+            .push(CableDoc::audio(PortRef::Node(2), PortRef::Node(9)));
+        assert!(doc.validate(1, 0).is_err(), "map has no audio in");
+        let mut doc = midi_node_doc();
+        doc.nodes.push(curve_map_node(9));
+        doc.cables.push(node_midi(4, 9));
+        assert!(doc.validate(1, 0).is_err(), "map has no MIDI in");
+    }
+
+    #[test]
+    fn curve_map_params_repair_on_migrate() {
+        let graph = GraphDoc {
+            nodes: vec![
+                NodeDoc::CurveMap {
+                    node_id: 9,
+                    track: 0,
+                    params: CurveMapParams {
+                        min: 500.0,
+                        max: 20.0,
+                        mode: MapMode::Log,
+                    },
+                },
+                NodeDoc::CurveMap {
+                    node_id: 10,
+                    track: 0,
+                    params: CurveMapParams {
+                        min: f32::NAN,
+                        max: 1.0,
+                        mode: MapMode::Exp,
+                    },
+                },
+            ],
+            cables: Vec::new(),
+            layout: Default::default(),
+        };
+        let mut project = Project {
+            graph,
+            ..Project::default()
+        };
+        project.migrate();
+        let NodeDoc::CurveMap { params, .. } = &project.graph.nodes[0] else {
+            panic!("curve map must survive");
+        };
+        // Inverted bounds collapse to the identity rather than a backwards axis.
+        assert_eq!(*params, CurveMapParams::default());
+        let NodeDoc::CurveMap { params, .. } = &project.graph.nodes[1] else {
+            panic!("curve map must survive");
+        };
+        assert!(params.min.is_finite());
     }
 
     #[test]
@@ -5794,9 +6402,11 @@ mod tests {
 
     /// D11: the new node variants are purely additive — the version must not
     /// move (bumping it here means old files suddenly "need" a migration).
+    /// v9 is the one exception, and it *does* carry a migration: the curve
+    /// value domain changed (spec `curve-map.md` D7).
     #[test]
-    fn project_version_unchanged_by_midi_nodes() {
-        assert_eq!(super::PROJECT_VERSION, 8);
+    fn project_version_matches_the_curve_migration() {
+        assert_eq!(super::PROJECT_VERSION, 9);
     }
 
     // ---- SF2 bend range (spec `curve-map.md` D8/D9) ----
@@ -5856,5 +6466,231 @@ mod tests {
             };
             assert_eq!(*bend_range, expected, "stored {stored}");
         }
+    }
+
+    // ---- Curve normalization protocol (spec `curve-map.md` C1) ----
+
+    #[test]
+    fn map_spec_hits_both_ends_and_the_centre() {
+        let linear = MapSpec::linear(-24.0, 24.0);
+        assert_eq!(linear.map(-1.0), -24.0);
+        assert_eq!(linear.map(0.0), 0.0);
+        assert_eq!(linear.map(1.0), 24.0);
+        // Out-of-range input clamps to the ends instead of extrapolating.
+        assert_eq!(linear.map(-9.0), -24.0);
+        assert_eq!(linear.map(9.0), 24.0);
+
+        let log = MapSpec::log(20.0, 18_000.0);
+        assert!((log.map(-1.0) - 20.0).abs() < 1e-3);
+        assert!((log.map(1.0) - 18_000.0).abs() < 1e-1);
+        // Log means equal ratios per equal axis step: the centre is the
+        // geometric mean, not the arithmetic one.
+        assert!((log.map(0.0) - 600.0).abs() < 1.0);
+
+        let exp = MapSpec {
+            min: 0.0,
+            max: 1.0,
+            mode: MapMode::Exp,
+        };
+        assert!((exp.map(0.0) - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unmap_inverts_map() {
+        for spec in [
+            MapSpec::linear(0.0, 1.5),
+            MapSpec::linear(-1.0, 1.0),
+            MapSpec::log(20.0, 18_000.0),
+            MapSpec::log(0.2, 12.0),
+            MapSpec {
+                min: -18.0,
+                max: 18.0,
+                mode: MapMode::Exp,
+            },
+        ] {
+            for norm in [-1.0, -0.5, 0.0, 0.25, 1.0] {
+                let back = spec.unmap(spec.map(norm));
+                assert!((back - norm).abs() < 1e-4, "{spec:?} at {norm}: {back}");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_maps_fall_back_to_linear() {
+        // Log with a non-positive lower bound has no logarithm: linear.
+        let spec = MapSpec {
+            min: 0.0,
+            max: 100.0,
+            mode: MapMode::Log,
+        };
+        assert_eq!(spec.sanitized().mode, MapMode::Linear);
+        assert!((spec.map(0.0) - 50.0).abs() < 1e-6);
+        // Inverted / non-finite bounds collapse to the identity map.
+        assert_eq!(MapSpec::linear(10.0, 0.0).sanitized(), MapSpec::UNIT);
+        assert_eq!(
+            MapSpec {
+                min: f32::NAN,
+                max: 1.0,
+                mode: MapMode::Linear
+            }
+            .sanitized(),
+            MapSpec::UNIT
+        );
+    }
+
+    #[test]
+    fn default_map_follows_the_target_axis() {
+        let mut graph = GraphDoc::default();
+        let params = EffectParams::Delay(DelayParams::default());
+        graph.nodes.push(NodeDoc::Effect {
+            node_id: 7,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params,
+            delay: None,
+        });
+
+        // Context-free parameters.
+        assert_eq!(
+            AutoParam::Node(NodeParam::PitchOffset).default_map(&graph, &PortRef::Node(7)),
+            MapSpec::linear(-24.0, 24.0)
+        );
+        assert_eq!(
+            AutoParam::Tempo.default_map(&graph, &PortRef::TimelineIn),
+            MapSpec::log(MIN_TEMPO_BPM, MAX_TEMPO_BPM)
+        );
+        assert_eq!(
+            AutoParam::pitch_bend(0, 12.0).default_map(&graph, &PortRef::Node(7)),
+            MapSpec::linear(-12.0, 12.0)
+        );
+        // Effect slots resolve against the node payload (delay time is log).
+        assert_eq!(
+            AutoParam::Node(NodeParam::EffectSlot(0)).default_map(&graph, &PortRef::Node(7)),
+            MapSpec::log(0.005, 1.0)
+        );
+        // Unknown node: normalized pass-through.
+        assert_eq!(
+            AutoParam::Node(NodeParam::EffectSlot(0)).default_map(&graph, &PortRef::Node(99)),
+            MapSpec::linear(0.0, 1.0)
+        );
+    }
+
+    /// D7: an old project's curves keep their shape — every anchor is
+    /// inverse-mapped through the same axis the old value lived on, and the
+    /// cable records the map it now needs.
+    #[test]
+    fn migration_normalizes_curves_through_their_target_axis() {
+        // Start from an empty graph: the default document already ships a
+        // full patch, whose cables would sit in front of ours.
+        let mut project = Project {
+            graph: GraphDoc::default(),
+            ..Project::default()
+        };
+        project.graph.nodes.push(NodeDoc::Instrument {
+            node_id: 2,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            synth: SynthParams::default(),
+        });
+        project.graph.cables.push(CableDoc::automation(
+            0,
+            2,
+            AutoParam::Node(NodeParam::PitchOffset),
+        ));
+        project.graph.cables.push(CableDoc::tempo(1));
+        project.control_tracks.resize_with(3, ControlTrack::default);
+        // ±24 st axis: 0 st is the centre, +12 st is three quarters up.
+        project.control_tracks[0].clips = vec![ControlClip {
+            curve: vec![
+                AutoPoint {
+                    tick: 0,
+                    value: 0.0,
+                },
+                AutoPoint {
+                    tick: 100,
+                    value: 12.0,
+                },
+                AutoPoint {
+                    tick: 200,
+                    value: -24.0,
+                },
+            ],
+            ..ControlClip::default()
+        }];
+        // Tempo axis is log 20..300: 120 BPM is no longer the middle.
+        project.control_tracks[1].clips = vec![ControlClip {
+            curve: vec![AutoPoint {
+                tick: 0,
+                value: 120.0,
+            }],
+            ..ControlClip::default()
+        }];
+        // No cable: values are clamped into the normalized domain.
+        project.control_tracks[2].clips = vec![ControlClip {
+            curve: vec![
+                AutoPoint {
+                    tick: 0,
+                    value: 4.0,
+                },
+                AutoPoint {
+                    tick: 10,
+                    value: -3.0,
+                },
+            ],
+            ..ControlClip::default()
+        }];
+
+        project.migrate_v8_to_v9();
+
+        let pitch = &project.control_tracks[0].clips[0].curve;
+        assert_eq!(pitch[0].value, 0.0);
+        assert!((pitch[1].value - 0.5).abs() < 1e-5);
+        assert_eq!(pitch[2].value, -1.0);
+        assert_eq!(
+            project.graph.cables[0].map,
+            Some(MapSpec::linear(-24.0, 24.0))
+        );
+
+        let tempo = project.control_tracks[1].clips[0].curve[0].value;
+        let spec = MapSpec::log(MIN_TEMPO_BPM, MAX_TEMPO_BPM);
+        assert!((spec.map(tempo) - 120.0).abs() < 0.01, "tempo {tempo}");
+        assert_eq!(project.graph.cables[1].map, Some(spec));
+
+        let loose = &project.control_tracks[2].clips[0].curve;
+        assert_eq!((loose[0].value, loose[1].value), (1.0, -1.0));
+        assert!(project.graph.cables[0].map.is_some());
+    }
+
+    /// A v9 document round-trips: the map rides the cable, the anchors stay
+    /// normalized, and a legacy document without the field loads as `None`
+    /// (derived at compile time) instead of shifting values.
+    #[test]
+    fn v9_cables_round_trip_and_legacy_cables_stay_unmapped() {
+        let mut project = Project::default();
+        project.graph.cables.push(CableDoc::tempo(0));
+        project.graph.cables[0].map = Some(MapSpec::log(MIN_TEMPO_BPM, MAX_TEMPO_BPM));
+        project.control_tracks = vec![ControlTrack {
+            clips: vec![ControlClip {
+                curve: vec![AutoPoint {
+                    tick: 0,
+                    value: 0.25,
+                }],
+                ..ControlClip::default()
+            }],
+            ..ControlTrack::default()
+        }];
+        let text = ron::to_string(&project).expect("serialize");
+        let back: Project = ron::from_str(&text).expect("deserialize");
+        assert_eq!(back.graph.cables[0].map, project.graph.cables[0].map);
+        assert_eq!(back.control_tracks[0].clips[0].curve[0].value, 0.25);
+
+        // A cable written before v9 has no `map` key: it still parses, and the
+        // compiler derives the map from the target instead.
+        let legacy = CableDoc::tempo(0);
+        assert_eq!(legacy.map, None);
+        let legacy_text = ron::to_string(&legacy).expect("serialize legacy");
+        assert!(!legacy_text.contains("map"));
+        let parsed: CableDoc = ron::from_str(&legacy_text).expect("legacy cable");
+        assert_eq!(parsed, legacy);
     }
 }

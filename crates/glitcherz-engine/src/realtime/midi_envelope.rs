@@ -138,7 +138,25 @@ impl Processor for MidiEnvelopeProcessor {
     fn process_events(&mut self, ctx: &ProcessContext, out: &mut NodeEvents) {
         let dt = ctx.frames as f32 / ctx.sample_rate.max(1.0);
         self.update(dt);
-        out.control = Some(self.min + (self.max - self.min) * self.level);
+        // Normalized `[-1, 1]`: `Idle` = -1, full attack = +1. The node's own
+        // `min`/`max` scale is published through `map_spec` instead of being
+        // baked into the value (spec `curve-map.md` D1/D6), so the same
+        // envelope can drive any destination without re-scaling.
+        out.control = Some(self.level * 2.0 - 1.0);
+    }
+
+    /// D6: the envelope carries its own output scale, so it *is* the axis for
+    /// whatever it drives — `min..max` in the target's units (semitones for a
+    /// pitch port, 0..127 for a CC). An inverted range is normalized rather
+    /// than dropped: a map with `max < min` would degrade to the identity map
+    /// and lose the scale entirely.
+    fn map_spec(&self) -> Option<crate::realtime::map::MapSpec> {
+        let (min, max) = if self.max < self.min {
+            (self.max, self.min)
+        } else {
+            (self.min, self.max)
+        };
+        Some(crate::realtime::map::MapSpec::linear(min, max))
     }
 
     fn note_event(&mut self, event: NoteEvent) -> bool {
@@ -234,14 +252,19 @@ mod tests {
         }
     }
 
+    /// Runs `blocks` blocks and returns the output value **in the node's own
+    /// scale** — the control bus is normalized (`[-1, 1]`, spec
+    /// `curve-map.md` D1) and `map_spec` is what turns it into `min..max`, so
+    /// the assertions below stay in musical units.
     fn step(processor: &mut MidiEnvelopeProcessor, blocks: usize) -> f32 {
+        let map = processor.map_spec().expect("envelope declares its own map");
         let mut control = 0.0;
         for _ in 0..blocks {
             let mut out = NodeEvents::default();
             processor.process_events(&ctx(), &mut out);
             control = out.control.unwrap_or(0.0);
         }
-        control
+        map.map(control)
     }
 
     #[test]

@@ -101,6 +101,21 @@ pub trait Processor: Send {
         let _ = (_ctx, _out);
     }
 
+    /// The mapping this node declares for its own control output (spec
+    /// `curve-map.md` D5/D6).
+    ///
+    /// Control values on the bus are normalized (`[-1, 1]`); the destination
+    /// normally owns the axis. A node that *is* the axis — a Curve Map node, a
+    /// MIDI envelope with its own `min`/`max`, a portamento with a semitone
+    /// range — answers `Some` here and overrides the destination's default.
+    /// `None` (the default) means "let the target decide".
+    ///
+    /// Called once per outgoing control cable per block; RT-safe (no
+    /// allocation, no locks).
+    fn map_spec(&self) -> Option<crate::realtime::map::MapSpec> {
+        None
+    }
+
     /// Replaces this node's audio clip table (U6, spec
     /// `.agents/spec/audio-track.md` D4 — audio-track nodes only).
     ///

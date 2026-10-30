@@ -17,9 +17,9 @@ use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 use glitcherz_model::{
-    AutoParam, BuiltinEffectKind, CableDoc, CableKind, ChannelParam, GraphDoc, LayoutDoc,
-    MAX_AUDIO_TRACKS, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MIN_MIXER_CHANNELS,
-    MidiSource, NodeDoc, NodeParam, PortRef, VoiceSpec,
+    AutoParam, BuiltinEffectKind, CableDoc, CableKind, ChannelParam, CurveMapParams, GraphDoc,
+    LayoutDoc, MAX_AUDIO_TRACKS, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS,
+    MIN_MIXER_CHANNELS, MidiSource, NodeDoc, NodeParam, PortRef, VoiceSpec,
 };
 
 /// Inline parameter identity for built-in node kinds (G5, spec
@@ -542,6 +542,10 @@ pub enum NodeSource {
     Portamento,
     /// MIDI-triggered envelope control source (spec `midi-nodes.md` §5.3).
     MidiEnvelope,
+    /// Curve Map control node (spec `curve-map.md` D5): 1 control in, 1
+    /// control out, and a declared axis — a mapping card the user can put in
+    /// front of any destination.
+    CurveMap,
 }
 
 impl NodeSource {
@@ -719,6 +723,8 @@ fn opens_inspector(node: Option<&NodeDoc>) -> bool {
                 | NodeDoc::Arpeggiator { .. }
                 | NodeDoc::Portamento { .. }
                 | NodeDoc::MidiEnvelope { .. }
+                // The map's whole UI is its Inspector (§5: 双击进 Inspector).
+                | NodeDoc::CurveMap { .. }
         )
     )
 }
@@ -1400,6 +1406,9 @@ fn node_color(id: PatchId, doc: &GraphDoc) -> (Color32, Color32) {
             Some(NodeDoc::Arpeggiator { .. }) => Color32::from_rgb(90, 200, 110),
             Some(NodeDoc::Portamento { .. }) => Color32::from_rgb(80, 190, 100),
             Some(NodeDoc::MidiEnvelope { .. }) => Color32::from_rgb(70, 180, 90),
+            // A curve map is a control-stage node too, one shade cooler than
+            // the sources it sits behind (spec `curve-map.md` D5).
+            Some(NodeDoc::CurveMap { .. }) => Color32::from_rgb(85, 175, 150),
             Some(NodeDoc::ChannelStrip { .. }) => Color32::from_gray(140),
             None => Color32::from_gray(120),
         },
@@ -1565,11 +1574,44 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 format!("Portamento · {:.0} ms", params.time_ms)
             }
             Some(NodeDoc::MidiEnvelope { .. }) => "MIDI Env".to_string(),
+            // D5: the node body doubles as a "mapping card" — the range and
+            // mode are what the user needs to see without opening anything.
+            Some(NodeDoc::CurveMap { params, .. }) => {
+                format!("Map {}", curve_map_caption(*params))
+            }
             Some(NodeDoc::ChannelStrip { track, .. }) => {
                 format!("Strip (legacy) · Track {}", track + 1)
             }
             None => format!("Node {node_id}"),
         },
+    }
+}
+
+/// `-1..1 · Linear` — the axis a [`NodeDoc::CurveMap`] declares.
+///
+/// The node body doubles as the "mapping card" of spec `curve-map.md` D5: the
+/// two numbers and the mode are what the user needs to read off the patch
+/// without opening the Inspector, so the caption is kept as short as the
+/// numbers allow (18k rather than 18000.0000).
+pub(crate) fn curve_map_caption(params: CurveMapParams) -> String {
+    format!(
+        "{}..{} · {}",
+        axis_number(params.min),
+        axis_number(params.max),
+        params.mode.label()
+    )
+}
+
+pub(crate) fn axis_number(value: f32) -> String {
+    if !value.is_finite() {
+        return "?".to_string();
+    }
+    if value.abs() >= 10_000.0 {
+        format!("{:.0}k", value / 1000.0)
+    } else if value.abs() >= 100.0 || value.fract().abs() < 0.001 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
     }
 }
 
@@ -1589,6 +1631,9 @@ pub(crate) fn auto_param_label(param: &AutoParam) -> String {
         AutoParam::Cc { controller, .. } => format!("CC {controller}"),
         // P1: a bend is a controller too; the range lives in its editor.
         AutoParam::PitchBend { .. } => "Pitch Bend".to_string(),
+        // The curve map's pass-through port carries the signal, not a value
+        // the user picked (spec `curve-map.md` D5).
+        AutoParam::CurveMap => "Curve In".to_string(),
         AutoParam::Node(param) => match param {
             NodeParam::EffectSlot(slot) => format!("Param {slot}"),
             NodeParam::MixerChannel { channel, param } => match param {
@@ -1825,7 +1870,8 @@ impl PatchState {
                 // at the click position — this is the fallback).
                 NodeDoc::Arpeggiator { .. }
                 | NodeDoc::Portamento { .. }
-                | NodeDoc::MidiEnvelope { .. } => {
+                | NodeDoc::MidiEnvelope { .. }
+                | NodeDoc::CurveMap { .. } => {
                     let k = keyboard_slot;
                     keyboard_slot += 1;
                     (
@@ -2167,14 +2213,26 @@ enum AutoSource {
 /// Cable kind carried by one node's output port (spec `midi-nodes.md` §3).
 ///
 /// Port 0 is the MIDI out for MIDI effects / the keyboard; Portamento's
-/// port 1 is its control output. Every other node keeps the audio port.
+/// port 1 is its control output. Every other node keeps the audio port — the
+/// Curve Map has a single port and it is a control port (spec
+/// `curve-map.md` D5), so it is `Automation` on port 0.
 fn node_out_port_kind(node: &NodeDoc, port: usize) -> CableKind {
     match node {
         NodeDoc::Keyboard { .. } | NodeDoc::Arpeggiator { .. } => CableKind::Midi,
         NodeDoc::Portamento { .. } if port == 0 => CableKind::Midi,
         NodeDoc::Portamento { .. } => CableKind::Automation,
-        NodeDoc::MidiEnvelope { .. } => CableKind::Automation,
+        NodeDoc::MidiEnvelope { .. } | NodeDoc::CurveMap { .. } => CableKind::Automation,
         _ => CableKind::Audio,
+    }
+}
+
+/// The one parameter a node's single control port carries, when offering a
+/// menu would be noise (spec `curve-map.md` D5: the Curve Map has exactly one
+/// input and it is the signal itself).
+fn single_control_port(doc: &GraphDoc, node_id: u64) -> Option<AutoParam> {
+    match doc.node_by_id(node_id)? {
+        NodeDoc::CurveMap { .. } => Some(AutoParam::CurveMap),
+        _ => None,
     }
 }
 
@@ -2208,6 +2266,8 @@ fn accepts(kind: CableKind, target: PatchId, doc: &GraphDoc) -> bool {
                     | NodeDoc::Effect { .. }
                     | NodeDoc::Mixer { .. }
                     | NodeDoc::Feedback { .. }
+                    // D5: the map node's only input is a control input.
+                    | NodeDoc::CurveMap { .. }
             ),
         }
     } else {
@@ -2632,13 +2692,26 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                                             actions.push(PatchAction::ConnectTempoIn { index });
                                         }
                                         PatchId::Node(to_doc) => {
-                                            // The cable is committed after the
-                                            // parameter is picked in the popup menu.
-                                            state.pending_auto = Some((
-                                                AutoSource::Track(index),
-                                                to_doc,
-                                                sp + Vec2::new(4.0, 4.0),
-                                            ));
+                                            // A node with exactly one control
+                                            // port (the Curve Map) needs no
+                                            // menu: the pick is unambiguous
+                                            // (spec `curve-map.md` D5).
+                                            if let Some(param) = single_control_port(doc, to_doc) {
+                                                actions.push(PatchAction::ConnectAuto {
+                                                    index,
+                                                    to_doc,
+                                                    param,
+                                                });
+                                            } else {
+                                                // The cable is committed after
+                                                // the parameter is picked in the
+                                                // popup menu.
+                                                state.pending_auto = Some((
+                                                    AutoSource::Track(index),
+                                                    to_doc,
+                                                    sp + Vec2::new(4.0, 4.0),
+                                                ));
+                                            }
                                         }
                                         _ => {}
                                     }
@@ -2715,11 +2788,20 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                                         && drag.from != target
                                         && let PatchId::Node(to_doc) = target
                                     {
-                                        state.pending_auto = Some((
-                                            AutoSource::Node(from_doc),
-                                            to_doc,
-                                            sp + Vec2::new(4.0, 4.0),
-                                        ));
+                                        if let Some(param) = single_control_port(doc, to_doc) {
+                                            // One port, one answer (Curve Map).
+                                            actions.push(PatchAction::ConnectControl {
+                                                from_doc,
+                                                to_doc,
+                                                param,
+                                            });
+                                        } else {
+                                            state.pending_auto = Some((
+                                                AutoSource::Node(from_doc),
+                                                to_doc,
+                                                sp + Vec2::new(4.0, 4.0),
+                                            ));
+                                        }
                                     }
                                 }
                                 CableKind::Audio => {
@@ -3617,6 +3699,45 @@ mod tests {
     fn default_zoom_is_one_not_zero() {
         let state = PatchState::default();
         assert_eq!(state.zoom, 1.0);
+    }
+
+    /// Spec `curve-map.md` D5: the node body is the mapping card, so its
+    /// caption has to stay readable at patch zoom — `18k`, not `18000.0000`.
+    #[test]
+    fn curve_map_caption_stays_short() {
+        let params = CurveMapParams {
+            min: 20.0,
+            max: 18_000.0,
+            mode: glitcherz_model::MapMode::Log,
+        };
+        assert_eq!(curve_map_caption(params), "20..18k · Log");
+        assert_eq!(
+            curve_map_caption(CurveMapParams::default()),
+            "-1..1 · Linear",
+            "the identity default must read as an identity"
+        );
+    }
+
+    /// D5: the map's single control port commits without a parameter menu.
+    #[test]
+    fn only_the_curve_map_has_one_control_port() {
+        let mut project = Project::default();
+        let id = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::CurveMap {
+            node_id: id,
+            track: 0,
+            params: CurveMapParams::default(),
+        });
+        assert_eq!(
+            single_control_port(&project.graph, id),
+            Some(AutoParam::CurveMap)
+        );
+        // An instrument has many parameters, so it keeps the popup.
+        let instrument = project.graph.instrument_of_track(0).expect("synth");
+        assert_eq!(
+            single_control_port(&project.graph, instrument.node_id()),
+            None
+        );
     }
 
     #[test]

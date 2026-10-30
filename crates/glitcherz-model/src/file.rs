@@ -9,16 +9,17 @@
 //! when reading older files; unknown fields are ignored by serde. When a
 //! version needs a **destructive** migration (a field whose meaning changed
 //! rather than being added), [`parse_project`] branches on `version` and runs
-//! the chain — currently `migrate` (≤ v4), `migrate_v5_to_v6` (< 6) and
-//! `migrate_v6_to_v7` (< 7).
+//! the chain — `migrate` (≤ v4), `migrate_v5_to_v6` (< 6), `migrate_v6_to_v7`
+//! (< 7), `migrate_v7_to_v8` (< 8) and `migrate_v8_to_v9` (< 9).
 
 use std::path::Path;
 
 use crate::Project;
 
-/// Current version of the project file format (v8: built-in effect nodes
-/// carry a tagged `params` enum instead of a sibling `delay` field — spec
-/// `.agents/spec/effects.md` D3).
+/// Current version of the project file format (v9: curves and control values
+/// are normalized to `[-1, 1]` and each automation cable carries the
+/// [`crate::MapSpec`] that maps them onto its target — spec
+/// `.agents/spec/curve-map.md` D1/D7).
 ///
 /// Migration chain on load: v4 and older go through [`Project::migrate`]
 /// (ChannelStrip → mixer, master multi-input → synthetic mixer); `version < 6`
@@ -26,8 +27,9 @@ use crate::Project;
 /// into the sequence); `version < 7` goes through
 /// [`Project::migrate_v6_to_v7`] (audio `span_ticks` → seconds trim window);
 /// `version < 8` goes through [`Project::migrate_v7_to_v8`] (effect `delay`
-/// payload → `params`).
-pub const PROJECT_VERSION: u32 = 8;
+/// payload → `params`); `version < 9` goes through
+/// [`Project::migrate_v8_to_v9`] (curve anchors → normalized domain).
+pub const PROJECT_VERSION: u32 = 9;
 
 fn default_version() -> u32 {
     PROJECT_VERSION
@@ -108,6 +110,9 @@ pub fn parse_project(text: &str) -> Result<Project, ModelError> {
     }
     if version < 8 {
         project.migrate_v7_to_v8();
+    }
+    if version < 9 {
+        project.migrate_v8_to_v9();
     }
     project.validate().map_err(ModelError::InvalidGraph)?;
     Ok(project)

@@ -156,6 +156,20 @@ pub enum ParamId {
     EnvMin,
     /// MIDI envelope output scale, high end (driving a CC uses 0..127).
     EnvMax,
+    /// Curve Map: the normalized control value arriving on its input port
+    /// (**already normalized**, `-1..1`; spec `curve-map.md` D5/D6).
+    ///
+    /// Deliberately a parameter and not an event: the node has no MIDI input,
+    /// it holds the last value it was handed and re-emits it on its control
+    /// output. That is also why this write is *not* axis-mapped — the map
+    /// belongs to the hop after the node.
+    CurveMapIn,
+    /// Curve Map: output axis low end.
+    CurveMapMin,
+    /// Curve Map: output axis high end.
+    CurveMapMax,
+    /// Curve Map: mapping mode (0 = Linear, 1 = Log, 2 = Exp).
+    CurveMapMode,
 }
 
 /// Note event (MIDI semantics). `note` is the MIDI note number (69 = A4),

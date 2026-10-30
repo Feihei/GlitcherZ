@@ -20,6 +20,7 @@
 //! - [`buffer`]: pre-allocated flat buffers ([`AudioBuffer`]);
 //! - [`context`]: per-block context ([`ProcessContext`]);
 //! - [`processor`]: the [`Processor`] trait and [`ProcessorChain`];
+//! - [`map`]: normalized `[-1, 1]` control values → target axes ([`MapSpec`]);
 //! - [`graph`]: node graph core ([`RtGraph`](graph::RtGraph), [`ExecPlan`](graph::ExecPlan),
 //!   structure update protocol, and control-side compiler);
 //! - [`sine`] / [`gain`]: sine oscillator source and gain effect (`Processor` reference implementations);
@@ -48,6 +49,7 @@ pub mod chorus;
 pub mod commands;
 pub mod compressor;
 pub mod context;
+pub mod curve_map;
 pub mod delay;
 pub mod effect;
 pub mod envelope;
@@ -56,6 +58,7 @@ pub mod events;
 pub mod flanger;
 pub mod gain;
 pub mod graph;
+pub mod map;
 pub mod midi_envelope;
 pub mod mixer;
 pub mod mod_delay;
@@ -102,6 +105,7 @@ pub use commands::{
 };
 pub use compressor::CompressorProcessor;
 pub use context::ProcessContext;
+pub use curve_map::{CurveMapProcessor, mode_from_value, mode_value};
 pub use delay::DelayProcessor;
 pub use effect::{
     BuiltinEffectKind, Curve, EffectDescriptor, EffectMeters, EffectParamBank, MAX_EFFECT_PARAMS,
@@ -117,6 +121,7 @@ pub use graph::{
     FeedbackProcessor, GraphCompiler, GraphLevels, GraphUpdate, MASTER_NODE_ID, MAX_CABLES,
     MAX_MIDI_FANOUT, NodeKind, RtGraph, TIMELINE_IN, TopologyError,
 };
+pub use map::{MapMode, MapSpec};
 pub use midi_envelope::MidiEnvelopeProcessor;
 pub use mixer::{MixerChannel, MixerProcessor};
 pub use portamento::{MAX_PENDING_NOTES, PortamentoProcessor};

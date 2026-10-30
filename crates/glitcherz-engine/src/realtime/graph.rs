@@ -39,6 +39,7 @@ use crate::realtime::effect::Smoothed;
 use crate::realtime::effect::descriptor::{ParamSpec, Unit};
 use crate::realtime::events::{MAX_EVENT_CABLES, MAX_EVENT_FANOUT, NodeEvents, RtEvent};
 use crate::realtime::gain::GainProcessor;
+use crate::realtime::map::MapSpec;
 use crate::realtime::mixer::MixerProcessor;
 use crate::realtime::processor::{ChannelWeights, Processor};
 use crate::realtime::sequencer::{RtCtrl, RtCtrlKind};
@@ -172,6 +173,9 @@ pub struct AutoRoute {
     pub slot: u16,
     /// What the sampled value is delivered as.
     pub dest: AutoDest,
+    /// Mapping of the normalized curve value onto the destination's real axis
+    /// (spec `curve-map.md` D2/D4 — resolved with the target, once).
+    pub map: MapSpec,
 }
 
 impl Default for AutoRoute {
@@ -179,6 +183,7 @@ impl Default for AutoRoute {
         Self {
             slot: NO_EDGE,
             dest: AutoDest::default(),
+            map: MapSpec::UNIT,
         }
     }
 }
@@ -208,6 +213,11 @@ pub struct EventCable {
     pub kind: EventKind,
     /// Compiled control destination; ignored for [`EventKind::Midi`].
     pub dest: AutoDest,
+    /// Mapping of the normalized control value onto the destination's axis
+    /// (spec `curve-map.md` D2/D6). A source node that declares its own map
+    /// (`Processor::map_spec`, e.g. a Curve Map node or a MIDI envelope)
+    /// overrides this at delivery time — that is D6's "the map node wins".
+    pub map: MapSpec,
 }
 
 impl EventCable {
@@ -217,6 +227,7 @@ impl EventCable {
         to: NO_EDGE,
         kind: EventKind::Midi,
         dest: AutoDest::Param(ParamId::MasterGain),
+        map: MapSpec::UNIT,
     };
 }
 
@@ -285,6 +296,7 @@ impl ExecPlan {
         midi_targets: [[NO_EDGE; MAX_MIDI_FANOUT]; MAX_MIDI_TRACKS],
         midi_target_counts: [0; MAX_MIDI_TRACKS],
         auto_routes: [AutoRoute {
+            map: MapSpec::UNIT,
             slot: NO_EDGE,
             dest: AutoDest::Param(ParamId::MasterGain),
         }; MAX_AUTO_TRACKS],
@@ -623,9 +635,26 @@ impl RtGraph {
             // Control values need `&mut self` (de-duplication tables), so they
             // are delivered after the slot goes back.
             if let Some(value) = control {
+                // spec `curve-map.md` D6: a control source that declares its
+                // own map (MIDI envelope, portamento) overrides the
+                // destination's default — that is how "the axis travels with
+                // whoever knows it" works without a second resolution pass.
+                // `s` is a slot index taken from `plan.order`, in range by construction.
+                let source_map = self.slot_map_spec(s as u16);
                 for edge in &event_out[..event_count] {
                     if edge.kind == EventKind::Control {
-                        self.deliver_dest(edge.to, edge.dest, value, DedupKey::Slot(edge.to));
+                        // D5: a Curve Map's *input* is the signal, not a
+                        // value anybody scaled. The node stores what it is
+                        // handed and publishes its own axis for the next hop,
+                        // so this hop must stay identity — otherwise an
+                        // upstream envelope's scale would be applied twice
+                        // (once going in, once coming out through the map).
+                        let map = if is_curve_map_in(edge.dest) {
+                            MapSpec::UNIT
+                        } else {
+                            source_map.unwrap_or(edge.map)
+                        };
+                        self.deliver_dest(edge.to, edge.dest, map, value, DedupKey::Slot(edge.to));
                     }
                 }
             }
@@ -798,8 +827,8 @@ impl RtGraph {
     /// curve value to `(target node, destination)` (fixed at compile time, see
     /// [`AutoRoute`]). Silent when unconnected / out of range. RT-safe.
     ///
-    /// Parameter destinations write the value through; CC destinations
-    /// quantize to 7 bits and **only emit on change** (U4a D4).
+    /// The value arrives **normalized** (`-1..1`) and is mapped to the target's
+    /// real axis by the route's [`MapSpec`] (spec `curve-map.md` D4).
     pub fn auto_deliver(&mut self, auto_index: usize, value: f32) {
         let Some(&route) = self.plan.auto_routes.get(auto_index) else {
             return;
@@ -812,17 +841,38 @@ impl RtGraph {
         if route.slot == TIMELINE_IN {
             return;
         }
-        self.deliver_dest(route.slot, route.dest, value, DedupKey::Auto(auto_index));
+        // D5: a curve driving a Curve Map's input stays normalized; the node
+        // publishes the axis for the hop after it. (The document's map for
+        // that cable is the identity anyway — this keeps a hand-written file
+        // from scaling the signal twice.)
+        let map = if is_curve_map_in(route.dest) {
+            MapSpec::UNIT
+        } else {
+            route.map
+        };
+        self.deliver_dest(
+            route.slot,
+            route.dest,
+            map,
+            value,
+            DedupKey::Auto(auto_index),
+        );
     }
 
     /// Delivers one sampled control value to a node destination (U4a; shared
     /// with node-to-node control cables, spec `midi-nodes.md` D6).
     ///
-    /// Parameter destinations write the value through; CC and bend
-    /// destinations quantize to their wire grids and **only emit on change**
-    /// (U4a D4). `key` selects the de-duplication memory: one per automation
-    /// track, or one per destination slot for control cables.
-    fn deliver_dest(&mut self, slot: u16, dest: AutoDest, value: f32, key: DedupKey) {
+    /// `value` is normalized (`[-1, 1]`); `map` turns it into the destination's
+    /// real units (Hz, gain, semitones, CC...) before dispatch. Parameter
+    /// destinations write the value through; CC and bend destinations quantize
+    /// to their wire grids and **only emit on change** (U4a D4). `key` selects
+    /// the de-duplication memory: one per automation track, or one per
+    /// destination slot for control cables.
+    fn deliver_dest(&mut self, slot: u16, dest: AutoDest, map: MapSpec, value: f32, key: DedupKey) {
+        if !value.is_finite() {
+            return;
+        }
+        let value = map.map(value);
         match dest {
             AutoDest::Param(id) => {
                 let _ = self.slot_set_param(slot, id, value);
@@ -962,6 +1012,15 @@ impl RtGraph {
             .is_some_and(|n| n.processor.midi_cc(channel, controller, value))
     }
 
+    /// The map a slot's processor declares for its own control output, if any
+    /// (spec `curve-map.md` D5/D6). RT-safe (one virtual call, no allocation).
+    fn slot_map_spec(&self, slot: u16) -> Option<MapSpec> {
+        self.slots
+            .get(slot as usize)
+            .and_then(|s| s.as_ref())
+            .and_then(|n| n.processor.map_spec())
+    }
+
     /// Pitch bend into one slot (P1): same shape as [`Self::slot_midi_cc`].
     /// RT-safe.
     fn slot_midi_pitch_bend(&mut self, slot: u16, channel: u8, value: i16) -> bool {
@@ -988,6 +1047,13 @@ enum DedupKey {
     Auto(usize),
     /// Destination slot of a node-to-node control cable.
     Slot(u16),
+}
+
+/// Whether a control destination is a Curve Map's normalized input port
+/// (spec `curve-map.md` D5). That hop carries the signal itself, so it must
+/// never be axis-mapped. RT-safe (pattern match only).
+fn is_curve_map_in(dest: AutoDest) -> bool {
+    matches!(dest, AutoDest::Param(ParamId::CurveMapIn))
 }
 
 /// Dispatches one controller event into a processor (shared by the timeline
@@ -2181,6 +2247,7 @@ impl GraphCompiler {
         to_id: u64,
         kind: EventKind,
         dest: AutoDest,
+        map: MapSpec,
     ) -> Result<GraphUpdate, TopologyError> {
         let from = self.node_slot(from_id).ok_or(TopologyError::InvalidSlot)?;
         let to = self.node_slot(to_id).ok_or(TopologyError::InvalidSlot)?;
@@ -2213,6 +2280,7 @@ impl GraphCompiler {
             to,
             kind,
             dest,
+            map,
         };
         self.event_cable_count += 1;
         match self.compile() {
@@ -2250,6 +2318,7 @@ impl GraphCompiler {
         auto_index: usize,
         node_id: u64,
         param: ParamId,
+        map: MapSpec,
     ) -> Result<GraphUpdate, TopologyError> {
         if auto_index >= MAX_AUTO_TRACKS {
             return Err(TopologyError::InvalidIndex);
@@ -2258,6 +2327,7 @@ impl GraphCompiler {
         self.auto_routes[auto_index] = AutoRoute {
             slot,
             dest: AutoDest::Param(param),
+            map,
         };
         Ok(self.build_update(self.compile()?, Vec::new(), &[]))
     }
@@ -2272,6 +2342,7 @@ impl GraphCompiler {
         node_id: u64,
         channel: u8,
         controller: u8,
+        map: MapSpec,
     ) -> Result<GraphUpdate, TopologyError> {
         if auto_index >= MAX_AUTO_TRACKS {
             return Err(TopologyError::InvalidIndex);
@@ -2283,6 +2354,7 @@ impl GraphCompiler {
                 controller: controller.min(127),
                 channel: channel.min(15),
             },
+            map,
         };
         Ok(self.build_update(self.compile()?, Vec::new(), &[]))
     }
@@ -2297,6 +2369,7 @@ impl GraphCompiler {
         node_id: u64,
         channel: u8,
         range_semitones: f32,
+        map: MapSpec,
     ) -> Result<GraphUpdate, TopologyError> {
         if auto_index >= MAX_AUTO_TRACKS {
             return Err(TopologyError::InvalidIndex);
@@ -2313,6 +2386,7 @@ impl GraphCompiler {
                 channel: channel.min(15),
                 range_semitones: range,
             },
+            map,
         };
         Ok(self.build_update(self.compile()?, Vec::new(), &[]))
     }
@@ -2324,15 +2398,18 @@ impl GraphCompiler {
     pub fn set_timeline_in_route(
         &mut self,
         auto_index: usize,
+        map: MapSpec,
     ) -> Result<GraphUpdate, TopologyError> {
         if auto_index >= MAX_AUTO_TRACKS {
             return Err(TopologyError::InvalidIndex);
         }
         // `param` is unused for the conductor route (v1 has one port); keep
-        // the default so the table stays `Copy` and comparable.
+        // the default so the table stays `Copy` and comparable. The map is
+        // what turns the normalized curve into BPM.
         self.auto_routes[auto_index] = AutoRoute {
             slot: TIMELINE_IN,
             dest: AutoDest::Param(ParamId::MasterGain),
+            map,
         };
         Ok(self.build_update(self.compile()?, Vec::new(), &[]))
     }
@@ -2668,6 +2745,7 @@ mod tests {
     use crate::realtime::context::ProcessContext;
     use crate::realtime::events::NodeEvents;
     use crate::realtime::gain::GainProcessor;
+    use crate::realtime::map::MapSpec;
     use crate::realtime::mixer::MixerProcessor;
     use crate::realtime::processor::Processor;
     use crate::realtime::sequencer::{RtCtrl, RtCtrlKind};
@@ -3564,7 +3642,7 @@ mod tests {
         );
         let mixer_id = default_mixer_id(&compiler);
         let update = compiler
-            .set_auto_route(0, mixer_id, ParamId::MixerGain(0))
+            .set_auto_route(0, mixer_id, ParamId::MixerGain(0), MapSpec::UNIT)
             .expect("automation cable should succeed");
         graph.apply_update(update, &mut recycle_tx);
 
@@ -3596,7 +3674,7 @@ mod tests {
 
         // Unassigned node_id rejected for connection (original cable untouched).
         assert!(matches!(
-            compiler.set_auto_route(1, u64::MAX, ParamId::TrackGain),
+            compiler.set_auto_route(1, u64::MAX, ParamId::TrackGain, MapSpec::UNIT),
             Err(TopologyError::InvalidSlot)
         ));
     }
@@ -3707,22 +3785,24 @@ mod tests {
         let voice_id = compiler
             .track_voice_node_id(0)
             .expect("instrument should exist");
+        // The CC axis (spec `curve-map.md` D2): the curve is normalized, this
+        // is the mapping that turns it into a 7-bit value.
+        let cc_map = MapSpec::linear(0.0, 127.0);
         let update = compiler
-            .set_auto_cc_route(0, voice_id, 3, 74)
+            .set_auto_cc_route(0, voice_id, 3, 74, cc_map)
             .expect("CC route should succeed");
         graph.apply_update(update, &mut recycle_tx);
 
-        // The curve stores real CC units (spec D7): 50.8 rounds to 51 rather
-        // than truncating to 50.
-        graph.auto_deliver(0, 50.8);
+        // 50.8 → 51: rounds rather than truncates (the wire grid is integer).
+        graph.auto_deliver(0, cc_map.unmap(50.8));
         // Same quantized value: a CC is absolute, so it must not be resent.
-        graph.auto_deliver(0, 50.9);
-        // Out-of-range curve values clamp into 7 bits, and the second one is
-        // still a duplicate of the clamped result.
-        graph.auto_deliver(0, 900.0);
-        graph.auto_deliver(0, 127.0);
+        graph.auto_deliver(0, cc_map.unmap(50.9));
+        // Out-of-range input clamps into the axis ends (127), and the second
+        // one is still a duplicate of the clamped result.
+        graph.auto_deliver(0, cc_map.unmap(900.0));
+        graph.auto_deliver(0, cc_map.unmap(127.0));
         // A real move gets through.
-        graph.auto_deliver(0, 12.0);
+        graph.auto_deliver(0, cc_map.unmap(12.0));
 
         let events = seen.lock().expect("recorder lock").clone();
         assert_eq!(
@@ -3736,11 +3816,11 @@ mod tests {
     fn auto_cc_route_requires_a_live_node() {
         let (mut compiler, _graph) = GraphCompiler::default_graph(SR, BLOCK);
         assert!(matches!(
-            compiler.set_auto_cc_route(0, u64::MAX, 0, 74),
+            compiler.set_auto_cc_route(0, u64::MAX, 0, 74, MapSpec::UNIT),
             Err(TopologyError::InvalidSlot)
         ));
         assert!(matches!(
-            compiler.set_auto_cc_route(MAX_AUTO_TRACKS, 1, 0, 74),
+            compiler.set_auto_cc_route(MAX_AUTO_TRACKS, 1, 0, 74, MapSpec::UNIT),
             Err(TopologyError::InvalidIndex)
         ));
     }
@@ -3767,16 +3847,18 @@ mod tests {
         let voice_id = compiler
             .track_voice_node_id(0)
             .expect("instrument should exist");
+        // A ±2 st axis: `-1..1` spans two semitones each way.
+        let bend_map = MapSpec::linear(-2.0, 2.0);
         let update = compiler
-            .set_auto_pitch_bend_route(0, voice_id, 2, 2.0)
+            .set_auto_pitch_bend_route(0, voice_id, 2, 2.0, bend_map)
             .expect("bend route should succeed");
         graph.apply_update(update, &mut recycle_tx);
 
         graph.auto_deliver(0, 0.0); // centre
         graph.auto_deliver(0, 0.0); // unchanged → not resent
-        graph.auto_deliver(0, 1.0); // half of ±2 st
-        graph.auto_deliver(0, -1.0); // the other half
-        graph.auto_deliver(0, 2.0); // full up
+        graph.auto_deliver(0, bend_map.unmap(1.0)); // half of ±2 st
+        graph.auto_deliver(0, bend_map.unmap(-1.0)); // the other half
+        graph.auto_deliver(0, bend_map.unmap(2.0)); // full up
         graph.auto_deliver(0, 99.0); // saturates to the same full-up value
         graph.auto_deliver(0, f32::NAN); // ignored
 
@@ -3788,11 +3870,12 @@ mod tests {
         );
 
         // Re-ranging rescales the same curve without touching the anchors.
+        let wide = MapSpec::linear(-12.0, 12.0);
         let update = compiler
-            .set_auto_pitch_bend_route(0, voice_id, 2, 12.0)
+            .set_auto_pitch_bend_route(0, voice_id, 2, 12.0, wide)
             .expect("re-range should succeed");
         graph.apply_update(update, &mut recycle_tx);
-        graph.auto_deliver(0, 6.0);
+        graph.auto_deliver(0, wide.unmap(6.0));
         let seen = bends.lock().expect("recorder lock").clone();
         assert_eq!(
             seen.last(),
@@ -3840,13 +3923,14 @@ mod tests {
         let voice_id = compiler
             .track_voice_node_id(0)
             .expect("instrument should exist");
+        let bend_map = MapSpec::linear(-2.0, 2.0);
         let update = compiler
-            .set_auto_pitch_bend_route(0, voice_id, 0, 2.0)
+            .set_auto_pitch_bend_route(0, voice_id, 0, 2.0, bend_map)
             .expect("bend route should succeed");
         graph.apply_update(update, &mut recycle_tx);
 
-        graph.auto_deliver(0, 0.75);
-        graph.auto_deliver(0, -1.5);
+        graph.auto_deliver(0, bend_map.unmap(0.75));
+        graph.auto_deliver(0, bend_map.unmap(-1.5));
 
         let seen = seen.lock().expect("recorder lock").clone();
         assert_eq!(
@@ -3860,13 +3944,233 @@ mod tests {
     fn auto_pitch_bend_route_requires_a_live_node() {
         let (mut compiler, _graph) = GraphCompiler::default_graph(SR, BLOCK);
         assert!(matches!(
-            compiler.set_auto_pitch_bend_route(0, u64::MAX, 0, 2.0),
+            compiler.set_auto_pitch_bend_route(0, u64::MAX, 0, 2.0, MapSpec::UNIT),
             Err(TopologyError::InvalidSlot)
         ));
         assert!(matches!(
-            compiler.set_auto_pitch_bend_route(MAX_AUTO_TRACKS, 1, 0, 2.0),
+            compiler.set_auto_pitch_bend_route(MAX_AUTO_TRACKS, 1, 0, 2.0, MapSpec::UNIT),
             Err(TopologyError::InvalidIndex)
         ));
+    }
+
+    /// Spec `curve-map.md` D3/D4: the route's map is what turns the normalized
+    /// curve into real units, so the same `+0.5` means +12 st on a ±24 st axis
+    /// and 600 Hz on a log cutoff axis.
+    #[test]
+    fn route_map_turns_normalized_values_into_real_units() {
+        let (mut compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (update, _) = expect_swap(
+            compiler.set_voice(
+                0,
+                Box::new(OffsetRecorder {
+                    seen: std::sync::Arc::clone(&seen),
+                }),
+            ),
+            "swap in the offset recorder",
+        );
+        graph.apply_update(update, &mut recycle_tx);
+        let voice_id = compiler
+            .track_voice_node_id(0)
+            .expect("instrument should exist");
+        let update = compiler
+            .set_auto_route(
+                0,
+                voice_id,
+                ParamId::PitchOffset,
+                MapSpec::linear(-24.0, 24.0),
+            )
+            .expect("pitch route should succeed");
+        graph.apply_update(update, &mut recycle_tx);
+
+        graph.auto_deliver(0, 0.5); // three quarters up a ±24 st axis
+        graph.auto_deliver(0, -1.0); // the bottom
+        graph.auto_deliver(0, 4.0); // clamps to the top
+
+        let delivered = seen.lock().expect("recorder lock").clone();
+        assert_eq!(delivered, vec![12.0, -24.0, 24.0]);
+
+        // A log axis is geometric: the centre of 20..18000 Hz is 600 Hz.
+        let update = compiler
+            .set_auto_route(
+                0,
+                voice_id,
+                ParamId::PitchOffset,
+                MapSpec::log(20.0, 18_000.0),
+            )
+            .expect("log route should succeed");
+        graph.apply_update(update, &mut recycle_tx);
+        graph.auto_deliver(0, 0.0);
+        let latest = seen.lock().expect("recorder lock").last().copied();
+        let value = latest.expect("one delivery");
+        assert!((value - 600.0).abs() < 1.0, "log centre = {value}");
+    }
+
+    /// Spec `curve-map.md` D5/D6: a control source that declares its own map
+    /// wins over the destination's default — that is the whole point of the
+    /// Curve Map node, expressed through the `Processor::map_spec` hook.
+    #[test]
+    fn control_source_map_overrides_the_cable_map() {
+        use crate::realtime::midi_envelope::MidiEnvelopeProcessor;
+
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let params = Arc::new(AtomicUsize::new(0));
+        let value = Arc::new(AtomicU32::new(0));
+
+        let mut envelope = MidiEnvelopeProcessor::new();
+        // Instant attack, full sustain: the first block already outputs +1.
+        envelope.set_param(ParamId::EnvAttack, 0.0);
+        envelope.set_param(ParamId::EnvDecay, 0.0);
+        envelope.set_param(ParamId::EnvSustain, 1.0);
+        // The node's own scale (10..20) is the map it declares.
+        envelope.set_param(ParamId::EnvMin, 10.0);
+        envelope.set_param(ParamId::EnvMax, 20.0);
+
+        let update = compiler
+            .add_node(2, NodeKind::Plain, Box::new(envelope))
+            .expect("envelope node");
+        graph.apply_update(update, &mut recycle_tx);
+        let update = compiler
+            .add_node(
+                3,
+                NodeKind::Plain,
+                Box::new(EventSink {
+                    notes: Arc::new(AtomicUsize::new(0)),
+                    ccs: Arc::new(AtomicUsize::new(0)),
+                    params: Arc::clone(&params),
+                    last_param: Arc::clone(&value),
+                }),
+            )
+            .expect("param sink");
+        graph.apply_update(update, &mut recycle_tx);
+        // The cable's own map is 0..200 — the envelope's 10..20 must win.
+        let update = compiler
+            .connect_event(
+                2,
+                3,
+                EventKind::Control,
+                AutoDest::Param(ParamId::PitchOffset),
+                MapSpec::linear(0.0, 200.0),
+            )
+            .expect("control cable");
+        graph.apply_update(update, &mut recycle_tx);
+
+        assert!(graph.node_note(
+            2,
+            NoteEvent::On {
+                note: 60,
+                velocity: 1.0,
+            }
+        ));
+        graph.process_block(&ctx());
+        assert_eq!(params.load(Ordering::Relaxed), 1, "one delivery");
+        // 20 is the top of the envelope's own scale, i.e. normalized +1 — the
+        // cable's 0..200 map never got a say.
+        let seen = f32::from_bits(value.load(Ordering::Relaxed));
+        assert!((seen - 20.0).abs() < 1e-3, "delivered {seen}");
+    }
+
+    /// Spec `curve-map.md` D5/D6, end to end: envelope → Curve Map → target.
+    ///
+    /// Two things have to hold at once. The map node's *input* stays identity
+    /// (a scaled value must not be re-scaled), and its *output* axis overrides
+    /// both the cable's map and the destination's default — that is what makes
+    /// the node a mapping card rather than another scaler.
+    #[test]
+    fn a_curve_map_replaces_the_axis_of_the_hop_after_it() {
+        use crate::realtime::curve_map::CurveMapProcessor;
+        use crate::realtime::map::MapMode;
+        use crate::realtime::midi_envelope::MidiEnvelopeProcessor;
+
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let params = Arc::new(AtomicUsize::new(0));
+        let value = Arc::new(AtomicU32::new(0));
+
+        // Envelope parked at its top (+1 normalized) with a *wide* own scale;
+        // that scale must not survive the map node.
+        let mut envelope = MidiEnvelopeProcessor::new();
+        envelope.set_param(ParamId::EnvAttack, 0.0);
+        envelope.set_param(ParamId::EnvDecay, 0.0);
+        envelope.set_param(ParamId::EnvSustain, 1.0);
+        envelope.set_param(ParamId::EnvMin, -24.0);
+        envelope.set_param(ParamId::EnvMax, 24.0);
+
+        let update = compiler
+            .add_node(2, NodeKind::Plain, Box::new(envelope))
+            .expect("envelope node");
+        graph.apply_update(update, &mut recycle_tx);
+
+        let mut curve_map = CurveMapProcessor::new();
+        curve_map.apply_params(20.0, 18_000.0, MapMode::Log);
+        let update = compiler
+            .add_node(3, NodeKind::Plain, Box::new(curve_map))
+            .expect("curve map node");
+        graph.apply_update(update, &mut recycle_tx);
+
+        let update = compiler
+            .add_node(
+                4,
+                NodeKind::Plain,
+                Box::new(EventSink {
+                    notes: Arc::new(AtomicUsize::new(0)),
+                    ccs: Arc::new(AtomicUsize::new(0)),
+                    params: Arc::clone(&params),
+                    last_param: Arc::clone(&value),
+                }),
+            )
+            .expect("param sink");
+        graph.apply_update(update, &mut recycle_tx);
+
+        // Into the map: the normalized port. The graph keeps it identity even
+        // though the envelope declares -24..24 (D6 "the map node wins").
+        let update = compiler
+            .connect_event(
+                2,
+                3,
+                EventKind::Control,
+                AutoDest::Param(ParamId::CurveMapIn),
+                MapSpec::UNIT,
+            )
+            .expect("control cable into the map");
+        graph.apply_update(update, &mut recycle_tx);
+        // Out of the map: the cable says 0..200, the node's own axis wins.
+        let update = compiler
+            .connect_event(
+                3,
+                4,
+                EventKind::Control,
+                AutoDest::Param(ParamId::PitchOffset),
+                MapSpec::linear(0.0, 200.0),
+            )
+            .expect("control cable out of the map");
+        graph.apply_update(update, &mut recycle_tx);
+
+        assert!(graph.node_note(
+            2,
+            NoteEvent::On {
+                note: 60,
+                velocity: 1.0,
+            }
+        ));
+        graph.process_block(&ctx());
+        assert_eq!(params.load(Ordering::Relaxed), 1, "one delivery");
+        let seen = f32::from_bits(value.load(Ordering::Relaxed));
+        assert!(
+            (seen - 18_000.0).abs() < 1.0,
+            "the map's log axis must drive the target, got {seen}"
+        );
+
+        // Pulling the map's axis down to -1..1 makes the same +1 arrive as 1.0
+        // — the identity it defaults to.
+        assert!(graph.node_set_param(3, ParamId::CurveMapMin, -1.0));
+        assert!(graph.node_set_param(3, ParamId::CurveMapMax, 1.0));
+        assert!(graph.node_set_param(3, ParamId::CurveMapMode, 0.0));
+        graph.process_block(&ctx());
+        let seen = f32::from_bits(value.load(Ordering::Relaxed));
+        assert!((seen - 1.0).abs() < 1e-3, "identity axis, got {seen}");
     }
 
     // ---- P5b: node_id addressing / dynamic track count / multi-out fan-out ----
@@ -4232,7 +4536,7 @@ mod tests {
 
         // Automation routing table entries are cleaned up with the removed node.
         let update = compiler
-            .set_auto_route(0, 2, ParamId::TrackGain)
+            .set_auto_route(0, 2, ParamId::TrackGain, MapSpec::UNIT)
             .expect("cable");
         graph.apply_update(update, &mut recycle_tx);
         let update = compiler.remove_node(2).expect("remove instrument");
@@ -4352,7 +4656,13 @@ mod tests {
             .expect("sink node");
         graph.apply_update(update, &mut recycle_tx);
         let update = compiler
-            .connect_event(source, sink, EventKind::Midi, AutoDest::default())
+            .connect_event(
+                source,
+                sink,
+                EventKind::Midi,
+                AutoDest::default(),
+                MapSpec::UNIT,
+            )
             .expect("event cable");
         graph.apply_update(update, &mut recycle_tx);
 
@@ -4391,15 +4701,15 @@ mod tests {
         let (mut compiler, mut graph) = empty_with_nodes(&[(2, 60), (3, 62), (4, 64)]);
         let (mut recycle_tx, _recycle_rx) = recycle_channel();
         let update = compiler
-            .connect_event(2, 3, EventKind::Midi, AutoDest::default())
+            .connect_event(2, 3, EventKind::Midi, AutoDest::default(), MapSpec::UNIT)
             .expect("forward cable");
         graph.apply_update(update, &mut recycle_tx);
         assert!(matches!(
-            compiler.connect_event(3, 2, EventKind::Midi, AutoDest::default()),
+            compiler.connect_event(3, 2, EventKind::Midi, AutoDest::default(), MapSpec::UNIT),
             Err(TopologyError::Cycle)
         ));
         assert!(matches!(
-            compiler.connect_event(4, 3, EventKind::Midi, AutoDest::default()),
+            compiler.connect_event(4, 3, EventKind::Midi, AutoDest::default(), MapSpec::UNIT),
             Err(TopologyError::EventFanInOverflow)
         ));
         assert_eq!(
@@ -4417,12 +4727,12 @@ mod tests {
         let update = compiler.connect_midi(0, 2).expect("timeline feed");
         graph.apply_update(update, &mut recycle_tx);
         assert!(matches!(
-            compiler.connect_event(3, 2, EventKind::Midi, AutoDest::default()),
+            compiler.connect_event(3, 2, EventKind::Midi, AutoDest::default(), MapSpec::UNIT),
             Err(TopologyError::EventFanInOverflow)
         ));
         // Event cable first: a timeline feed into the same node is rejected.
         let update = compiler
-            .connect_event(4, 3, EventKind::Midi, AutoDest::default())
+            .connect_event(4, 3, EventKind::Midi, AutoDest::default(), MapSpec::UNIT)
             .expect("event cable");
         graph.apply_update(update, &mut recycle_tx);
         assert!(matches!(
@@ -4446,7 +4756,8 @@ mod tests {
                 Box::new(EventSource {
                     note: 60,
                     ctrl: None,
-                    control: Some(100.0),
+                    // Centre of the normalized domain (spec `curve-map.md` D1).
+                    control: Some(0.0),
                 }),
             )
             .expect("control source");
@@ -4473,6 +4784,7 @@ mod tests {
                     controller: 74,
                     channel: 0,
                 },
+                MapSpec::linear(0.0, 127.0),
             )
             .expect("cc cable");
         graph.apply_update(update, &mut recycle_tx);
@@ -4495,6 +4807,8 @@ mod tests {
                 4,
                 EventKind::Control,
                 AutoDest::Param(ParamId::PitchOffset),
+                // Centre of 0..200 is 100 — what the sink asserts.
+                MapSpec::linear(0.0, 200.0),
             )
             .expect("param cable");
         graph.apply_update(update, &mut recycle_tx);
@@ -4557,7 +4871,7 @@ mod tests {
         let update = compiler.connect_nodes(4, master, 0).expect("audio out");
         graph.apply_update(update, &mut recycle_tx);
         let update = compiler
-            .connect_event(3, 4, EventKind::Midi, AutoDest::default())
+            .connect_event(3, 4, EventKind::Midi, AutoDest::default(), MapSpec::UNIT)
             .expect("event cable");
         graph.apply_update(update, &mut recycle_tx);
         assert_eq!(compiler.event_cable_count, 1);

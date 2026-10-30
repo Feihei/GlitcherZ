@@ -187,7 +187,6 @@ impl Fixture {
             .map(|lane| OverlayLane {
                 clip: lane.clip,
                 data: &lane.data,
-                axis: lane.axis,
                 label: lane.label.clone(),
             })
             .collect();

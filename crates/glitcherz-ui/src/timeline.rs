@@ -512,12 +512,6 @@ pub struct TimelineParams<'a> {
     /// derive their tick footprint from their seconds window with this, and
     /// the modal geometry uses it for the same reason.
     pub sec_per_tick: f64,
-    /// Vertical axis `(min, max, log)` of the selected control track's
-    /// endpoint (U4b/U4c): the curve preview's value mapping. The app resolves
-    /// it from the cable's target node — effect slots get their real descriptor
-    /// range, not a placeholder. A track with no cable keeps the neutral 0..127
-    /// axis and says so on its header.
-    pub curve_axis: (f32, f32, bool),
     /// Waveform lookup for audio clip bodies (U6 D6): path → decoded sample
     /// (the app's session cache). `None` renders a flat placeholder body.
     pub waveform_of: &'a dyn Fn(&str) -> Option<std::sync::Arc<glitcherz_engine::SampleData>>,
@@ -1529,7 +1523,7 @@ pub fn show(
                         }
                     },
                     &|_| None,
-                    &|clip, painter, rect| draw_control_preview(painter, rect, clip, p.curve_axis),
+                    &|clip, painter, rect| draw_control_preview(painter, rect, clip),
                 );
             }
         }
@@ -2831,19 +2825,14 @@ pub(crate) fn track_permutation(len: usize, from: usize, to: usize) -> Vec<usize
 /// engine uses (`glitcherz_model::sample_curve`) and tiles it over the clip's
 /// span by `loop_ticks` — exactly what plays, mirrored on the block. There is
 /// no editing here: anchors are edited in the Edit tab (spec §8 D14).
-fn draw_control_preview(
-    painter: &egui::Painter,
-    rect: Rect,
-    clip: &ControlClip,
-    axis: (f32, f32, bool),
-) {
+fn draw_control_preview(painter: &egui::Painter, rect: Rect, clip: &ControlClip) {
     if clip.curve.is_empty() || clip.span_ticks == 0 || rect.width() < 6.0 || rect.height() < 6.0 {
         return;
     }
-    let (min, max, log) = axis;
     let height = rect.height() - 2.0;
-    let value_y =
-        |value: f32| rect.bottom() - 1.0 - crate::curve::to_norm(value, min, max, log) * height;
+    // Anchors are normalized (`curve-map.md` D1): the preview shows the stored
+    // shape, the same way the Edit tab does, with no target axis involved.
+    let value_y = |value: f32| rect.bottom() - 1.0 - crate::curve::y_of(value) * height;
     let color = Color32::from_rgb(150, 200, 250);
     let span = f64::from(clip.span_ticks.max(1));
     let span_px = rect.width();
@@ -2915,11 +2904,11 @@ mod tests {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(300.0, 60.0), egui::Sense::hover());
                 let painter = ui.painter_at(rect);
-                draw_control_preview(&painter, rect, &clip, (0.0, 1.5, false));
+                draw_control_preview(&painter, rect, &clip);
                 // Degenerate cases: empty curve, and a rect too small to draw.
-                draw_control_preview(&painter, rect, &ControlClip::default(), (0.0, 1.0, false));
+                draw_control_preview(&painter, rect, &ControlClip::default());
                 let tiny = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(3.0, 3.0));
-                draw_control_preview(&painter, tiny, &clip, (0.0, 1.0, false));
+                draw_control_preview(&painter, tiny, &clip);
             });
         });
         out.textures_delta.clear();

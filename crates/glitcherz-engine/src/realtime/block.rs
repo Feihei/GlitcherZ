@@ -338,7 +338,12 @@ impl BlockRunner {
             for clip in clips {
                 if let Some(value) = clip.value_at_absolute(position_ticks) {
                     match graph.auto_route(index) {
-                        Some(route) if route.slot == TIMELINE_IN => tempo = Some(value),
+                        // spec `curve-map.md` D4: the normalized curve becomes
+                        // BPM through the route's own map, so a tempo curve and
+                        // a cutoff curve are the same shape on different axes.
+                        Some(route) if route.slot == TIMELINE_IN => {
+                            tempo = Some(route.map.map(value));
+                        }
                         Some(route) if route.slot != NO_EDGE => {
                             node_values[node_count] = (index, value);
                             node_count += 1;
@@ -521,6 +526,7 @@ mod tests {
     };
     use crate::realtime::context::ProcessContext;
     use crate::realtime::graph::{GraphCompiler, GraphUpdate};
+    use crate::realtime::map::MapSpec;
     use crate::realtime::processor::Processor;
     use crate::realtime::sequencer::{
         MAX_TRACK_CLIPS, RtMidiClip, RtNote, Sequencer, TICKS_PER_BAR, TICKS_PER_QUARTER,
@@ -871,7 +877,7 @@ mod tests {
             .push(GraphUpdate::SetControlClips { index: 0, clips })
             .expect("structure queue not full");
         let update = compiler
-            .set_auto_route(0, mixer_id, ParamId::MixerGain(0))
+            .set_auto_route(0, mixer_id, ParamId::MixerGain(0), MapSpec::UNIT)
             .expect("automation routing should succeed");
         structure_tx.push(update).expect("structure queue not full");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
@@ -999,7 +1005,7 @@ mod tests {
             .push(GraphUpdate::SetControlClips { index: 0, clips })
             .expect("structure queue not full");
         let update = compiler
-            .set_auto_route(0, voice_id, ParamId::PluginParam(1))
+            .set_auto_route(0, voice_id, ParamId::PluginParam(1), MapSpec::UNIT)
             .expect("automation routing should succeed");
         structure_tx.push(update).expect("structure queue not full");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
@@ -1071,8 +1077,14 @@ mod tests {
         );
     }
 
-    /// Builds a flat tempo curve control clip for U3b tests.
+    /// The tempo axis the transport actually spans (spec `curve-map.md` D2);
+    /// curves store normalized values and this is what turns them into BPM.
+    const TEMPO: MapSpec = MapSpec::log(20.0, 300.0);
+
+    /// Builds a flat tempo curve control clip for U3b tests. `bpm` is the
+    /// audible tempo; the anchor itself is stored normalized.
     fn tempo_clip(start: u32, span: u32, bpm: f32) -> RtControlClip {
+        let bpm = TEMPO.unmap(bpm);
         let mut curve = RtAutomation {
             enabled: true,
             ..RtAutomation::default()
@@ -1105,7 +1117,7 @@ mod tests {
             .push(GraphUpdate::SetControlClips { index: 0, clips })
             .expect("structure queue not full");
         let update = compiler
-            .set_timeline_in_route(0)
+            .set_timeline_in_route(0, TEMPO)
             .expect("tempo routing should succeed");
         structure_tx.push(update).expect("structure queue not full");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
@@ -1149,7 +1161,7 @@ mod tests {
             .push(GraphUpdate::SetControlClips { index: 0, clips })
             .expect("structure queue not full");
         let update = compiler
-            .set_timeline_in_route(0)
+            .set_timeline_in_route(0, TEMPO)
             .expect("tempo routing should succeed");
         structure_tx.push(update).expect("structure queue not full");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
@@ -1196,7 +1208,7 @@ mod tests {
         // Cable the track to the conductor, then cut it: the override applies
         // while cabled and disappears on disconnect.
         let update = compiler
-            .set_timeline_in_route(0)
+            .set_timeline_in_route(0, TEMPO)
             .expect("tempo routing should succeed");
         structure_tx.push(update).expect("structure queue not full");
         runner.render_interleaved(&mut out);

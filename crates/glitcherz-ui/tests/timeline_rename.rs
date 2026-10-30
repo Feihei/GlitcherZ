@@ -100,7 +100,6 @@ impl Fixture {
                         markers: &[],
                         bar_ticks: TICKS_PER_BAR,
                         sec_per_tick: 60.0 / (120.0 * 960.0),
-                        curve_axis: (0.0, 127.0, false),
                         waveform_of: &|_| None,
                     },
                     router,

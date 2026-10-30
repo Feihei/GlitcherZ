@@ -100,7 +100,28 @@ impl Processor for PortamentoProcessor {
                 self.offset = 0.0;
             }
         }
-        out.control = Some(self.offset.clamp(self.min, self.max));
+        // Normalized `[-1, 1]` against the node's own semitone scale: the
+        // target's axis no longer has to be semitones (spec `curve-map.md`
+        // D1/D6). `min == max` has no scale to speak of — hold the centre.
+        let offset = self.offset.clamp(self.min, self.max);
+        let span = self.max - self.min;
+        out.control = Some(if span.abs() > f32::EPSILON {
+            ((offset - self.min) / span * 2.0 - 1.0).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        });
+    }
+
+    /// D6: the glide range is the axis — the offset is emitted normalized
+    /// against it, so the destination gets semitones back regardless of what
+    /// its own default axis says.
+    fn map_spec(&self) -> Option<crate::realtime::map::MapSpec> {
+        let (min, max) = if self.max < self.min {
+            (self.max, self.min)
+        } else {
+            (self.min, self.max)
+        };
+        Some(crate::realtime::map::MapSpec::linear(min, max))
     }
 
     fn note_event(&mut self, event: NoteEvent) -> bool {
@@ -202,14 +223,18 @@ mod tests {
     }
 
     /// Runs `blocks` blocks and returns the last emitted control value.
+    /// Runs `blocks` blocks and returns the glide offset in **semitones** —
+    /// the bus carries it normalized (`[-1, 1]`, spec `curve-map.md` D1) and
+    /// the node's own semitone range is the map that decodes it.
     fn run(processor: &mut PortamentoProcessor, blocks: usize) -> f32 {
+        let map = processor.map_spec().expect("portamento declares its map");
         let mut control = 0.0;
         for _ in 0..blocks {
             let mut out = NodeEvents::default();
             processor.process_events(&ctx(), &mut out);
             control = out.control.unwrap_or(0.0);
         }
-        control
+        map.map(control)
     }
 
     #[test]
