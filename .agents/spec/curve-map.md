@@ -1,6 +1,6 @@
 # 曲线归一化与 Curve Map 节点 Spec
 
-> 状态：草案（2026-10-30）。**D8/D9（pitch 输入口 + SF2 bend range）已实施**；D1–D7、D10–D11 待实施。
+> 状态：**已实施**（2026-10-30）。D1–D11 全部落地：C1 协议+迁移、C2 Curve Map 节点、C3 UI（C4 pitch 输入口同日先期交付）。`PROJECT_VERSION` 8 → 9。
 > 关联：`control-tracks.md`（曲线编辑 / `AutoDest`）、`midi-nodes.md`（D6 控制边、D13 滑音）、`effects.md`（参数轴）、`sf2-loader.md`。
 
 ## 1. 背景与问题
@@ -87,10 +87,15 @@ fn map_value(map: MapSpec, norm: f32) -> f32          // RT-safe，clamp 输入
 
 | 阶段 | 内容 | 验收 |
 | :--- | :--- | :--- |
-| **C1 协议 + 迁移** | `MapSpec`、`AutoRoute`/`EventCable` 携带 map、`deliver_dest` 换算、v8→v9 迁移 | 旧工程加载后曲线形状不变（轴正向换算一致）；CC/bend/Tempo 逐项 |
-| **C2 Curve Map 节点** | model + engine 节点（Control in/out，透传重映射）+ 校验 | 节点串联、范围/模式生效、Control 入 ≤1 |
-| **C3 UI** | 曲线轴换算、目标菜单范围显示、Add 菜单、节点体、Inspector | 手动：曲线换目标不变形；map 节点改范围即时生效 |
-| **C4 pitch 输入口** | 内置 `Pitch`、SF2 `bend_range` + RPN、插件 `±2` | SF2 设 12 st 后远距离滑音可到位；内置 ±24 内不受限 |
+| **C1 协议 + 迁移** ✅ | `MapSpec`、`AutoRoute`/`EventCable` 携带 map、`deliver_dest` 换算、v8→v9 迁移 | 旧工程加载后曲线形状不变（轴正向换算一致）；CC/bend/Tempo 逐项 |
+| **C2 Curve Map 节点** ✅ | model + engine 节点（Control in/out，透传重映射）+ 校验 | 节点串联、范围/模式生效、Control 入 ≤1 |
+| **C3 UI** ✅ | 曲线轴换算、目标菜单范围显示、Add 菜单、节点体、Inspector | 手动：曲线换目标不变形；map 节点改范围即时生效 |
+| **C4 pitch 输入口** ✅ | 内置 `Pitch`、SF2 `bend_range` + RPN、插件 `±2` | SF2 设 12 st 后远距离滑音可到位；内置 ±24 内不受限 |
+
+**实施备注（C2/C3 落地时的两处细化）**
+
+- 进入 Curve Map 的那一跳**强制恒等**（engine `is_curve_map_in` / 时间轴 `auto_deliver` 同规则）：上游控制源（包络/滑音）声明的轴只对「越过 map 之后」的目标生效，否则同一个刻度会被算两次。
+- `validate` 对 map 输入的限制**不分来源**（时间轴曲线与节点控制源共用一个直通寄存器），而普通节点的 `control in ≤ 1` 仍只约束节点源——这是两者唯一的差别。
 
 ## 7. 被否决的备选
 

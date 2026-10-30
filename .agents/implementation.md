@@ -125,6 +125,19 @@
   - **timeline 预览**：内联可编辑带退役（删 `curve_band` / `CurvePoint` / `CurveRemove` / `CurveDragEnd` / `timeline_curve_point` / `timeline_curve_remove` / `TimelineState::curve_drag`）；`lane_row` 加 `clip_body` 回调，控制行在 **clip 块内**用 `draw_control_preview()` 采样 `glitcherz_model::sample_curve` 画只读曲线（与引擎同数学），不再多一行。
   - **Edit tab 曲线编辑器**：`edit_clip: Option<EditTarget::{Midi{..}, Control{..}}>`；双击控制 clip → `TimelineAction::OpenControlEditor{track, clip}`（取代 `ShowControlCurve`）→ `control_editor_body()`。画布显示**一个 loop 周期**；三工具 `CurveTool::{Draw, Line, Curve}`（Draw/Line 写 `Linear`，Curve 写 `Smooth`，`set_clip_interp` 一步 undo）；交互沿用 `curve_upsert`（drag 合并 undo）/ `curve_remove_point`；`curve_tool`/`curve_drag` 为 app 瞬态字段（`set_control_edit_target` 按 clip 的 `interp` 同步工具）。
 
+### 曲线归一化与 Curve Map 节点（C1–C3，spec `curve-map.md`，2026-10-30）
+
+- **存储域整体搬迁**（D1）：`AutoPoint::value` 从「目标域」（cutoff Hz / gain / 秒 / CC / 半音 / BPM）改为**归一化 `[-1,1]`**，`0` = 轴中心。轴跟着**目标**走：`MapSpec { min, max, mode }` 由 `AutoParam::default_map` 解出，`CableDoc::map` 把解析结果写进文档（`skip_serializing_if`，老文件不带 → 回落到按目标重新解析，等价于迁移会写的值）。
+- **`PROJECT_VERSION` 8 → 9**，`migrate_v8_to_v9` 是**唯一带逆映射的迁移**：先按每条 `CableKind::Automation` 连线的目标轴求 `MapSpec`（含效果器槽位 → `effect_slot_map` → 目标节点 payload），写进 `cable.map`，再对每条控制轨的每个锚点 `map.unmap(value)`；**悬空曲线**（无连线 / 目标不存在）保留数值并 `clamp(-1,1)`（用户选择：静默，不加提示）。
+- **引擎只做一次算术**（D4/D10）：`AutoRoute.map` / `EventCable.map` 在编译期带上，`deliver_dest` 先 `if !value.is_finite() { return }` 再 `map.map(value)` 然后分派。`MapSpec` 是引擎自己的 `Copy` 类型（model 不依赖 engine），UI 的 `engine_map` / `engine_mode` 是唯一跨界点。
+- **控制源声明自己的轴**（D6）：`Processor::map_spec() -> Option<MapSpec>` 默认 `None`；`MidiEnvelope`（min..max，倒置范围自动交换）与 `Portamento`（半音范围）返回 `Some`，投递循环里 `slot_map_spec(source).unwrap_or(edge.map)` —— 不需要第二遍解析，也不需要节点种类表。两者的输出值同时改为归一化（`level*2-1` / 对 `min..max` 归一）。
+- **进入 Curve Map 的那一跳强制恒等**：`is_curve_map_in(dest)`（即 `AutoDest::Param(ParamId::CurveMapIn)`）在投递循环与 `auto_deliver` 里都跳过映射。否则「包络的 ±24 刻度」会先被算进 map 的输入、再从 map 输出算一次，等于缩放两次。
+- **Curve Map 节点**（D5）：`NodeDoc::CurveMap` + `CurveMapParams{min,max,mode}`（默认 `-1..1 Linear` = **恒等**，插入即无副作用）；engine `CurveMapProcessor` 只有「存住输入 + 原值吐出 + 声明轴」三件事，`ParamId::{CurveMapIn, CurveMapMin/Max/Mode}`。它和包络/滑音在同一块内生效：排在小节排序下游，上游投递后其 `process_events` 当块即吐出。
+- **校验上的两处不对称**（`GraphDoc::validate`）：map 输入 ≤1 **不分来源**（时间轴曲线与节点控制源共用一个直通寄存器），普通节点的控制入 ≤1 仍只约束节点源；`AutoParam::CurveMap` 只允许出现在 map 节点上，map 节点也只接受它。
+- **轴表两份、测试对齐**：model 的 `effect_slot_axis`（迁移与无 map 连线要读，但 model 不能依赖 engine 的 `EffectDescriptor`）镜像引擎描述符的 `min/max`；UI 的 `axis_table_matches_the_engine_descriptors` 遍历全部效果器全部槽位，任何一边改范围就红。
+- **UI**（C3）：`curve.rs` 只剩归一化 ↔ 屏幕映射（`y_of` / `norm_of_y`）、`axis_caption` 与 `map_in`；曲线编辑器/时间轴预览/piano-roll overlay 按归一化取高度，所以**换目标形状不变**。目标菜单每行追加轴摘要（`Cutoff · 20–18k Log`、`Pitch · ±24`）；map 节点体显示 `Map 20..18k · Log`，单控制端口拖线**直接连**（`single_control_port`），Inspector 有 Low/High/Mode 与 `−1 → x  0 → y  +1 → z` 读数。
+- **顺带修掉的 M5 遗留 bug**：`resolve_panel_target` 的可编辑集合只有 instrument/effect/mixer，选中 MIDI FX / 控制节点时会一路回退到本轨乐器，于是 `midi_fx_params()` **实际不可达**（M5 的三个参数面板一直是死代码）。C3 把 Arp/Portamento/MidiEnvelope/CurveMap 补进集合——否则 Curve Map 的范围没有任何入口可改。测试 `control_nodes_are_editable_targets` 钉住。
+
 ### CLAP 宿主（`glitcherz-clap-host`，路线图第 9 步）
 
 - `glitcherz-test-plugin`（cdylib）：clack-plugin 单音正弦乐器 fixture（`org.glitcherz.sine`，instrument+stereo 特性），供宿主端到端测试；
