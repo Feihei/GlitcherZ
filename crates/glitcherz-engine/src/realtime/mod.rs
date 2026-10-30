@@ -38,6 +38,7 @@
 //! - [`block`]: [`BlockRunner`] — splits the host's (cpal) arbitrarily long interleaved
 //!   buffer into fixed blocks, consumes commands at block boundaries, and reports state back.
 
+pub mod arpeggiator;
 pub mod atomic;
 pub mod audio_track;
 pub mod automation;
@@ -55,8 +56,10 @@ pub mod events;
 pub mod flanger;
 pub mod gain;
 pub mod graph;
+pub mod midi_envelope;
 pub mod mixer;
 pub mod mod_delay;
+pub mod portamento;
 pub mod processor;
 pub mod reverb;
 pub mod sample;
@@ -83,6 +86,7 @@ pub const DEFAULT_MIDI_TRACKS: usize = 4;
 
 pub use atomic::AtomicF32;
 
+pub use arpeggiator::{ARP_DIVISION_COUNT, ArpeggiatorProcessor, MAX_HELD_NOTES};
 pub use audio_track::{
     AUDIO_CLIP_TRASH_CAPACITY, AudioClipTable, AudioTrackProcessor, RtAudioClip,
     audio_clip_trash_channel, empty_clip_table,
@@ -113,7 +117,9 @@ pub use graph::{
     FeedbackProcessor, GraphCompiler, GraphLevels, GraphUpdate, MASTER_NODE_ID, MAX_CABLES,
     MAX_MIDI_FANOUT, NodeKind, RtGraph, TIMELINE_IN, TopologyError,
 };
+pub use midi_envelope::MidiEnvelopeProcessor;
 pub use mixer::{MixerChannel, MixerProcessor};
+pub use portamento::{MAX_PENDING_NOTES, PortamentoProcessor};
 pub use processor::{ChannelWeights, MAX_WEIGHT_CHANNELS, Processor, ProcessorChain};
 pub use reverb::ReverbProcessor;
 pub use sample::{SAMPLE_DEFAULT_ROOT, SAMPLE_POLYPHONY, SampleVoiceProcessor};

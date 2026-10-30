@@ -185,6 +185,18 @@ impl Processor for Sf2VoiceProcessor {
                     self.synth.set_master_volume(value.clamp(0.0, 2.0));
                 }
             }
+            ParamId::Sf2BendRange => {
+                // RPN 0 (pitch bend range): the instrument's real bend span.
+                // Sending the standard sequence keeps `midi_pitch_bend`'s
+                // 14-bit normalization meaningful (spec `curve-map.md` D9).
+                if value.is_finite() {
+                    let range = value.clamp(1.0, 24.0).round() as i32;
+                    self.synth.process_midi_message(CHANNEL, 0xB0, 101, 0);
+                    self.synth.process_midi_message(CHANNEL, 0xB0, 100, 0);
+                    self.synth.process_midi_message(CHANNEL, 0xB0, 6, range);
+                    self.synth.process_midi_message(CHANNEL, 0xB0, 38, 0);
+                }
+            }
             _ => return false,
         }
         true

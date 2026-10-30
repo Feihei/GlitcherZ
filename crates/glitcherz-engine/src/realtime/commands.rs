@@ -102,6 +102,10 @@ pub enum ParamId {
     /// the crate default is a hidden -6 dB that made every SoundFont node
     /// sound quiet.
     Sf2Gain,
+    /// SF2 voice: pitch-bend range in semitones (1..=24, rounded). Applied
+    /// with the standard RPN 0 sequence, so the instrument's 14-bit bend
+    /// events span the chosen range (spec `curve-map.md` D9).
+    Sf2BendRange,
     /// Sample voice: root MIDI note of the loaded sample (0..127, default
     /// 60 = C4). Affects the playback rate of **subsequent** note-ons;
     /// sounding voices keep their trigger-time rate (the sampler-standard
@@ -114,6 +118,44 @@ pub enum ParamId {
     /// fade), ≥ 0.5 = OneShot (pitch-matched note-offs are ignored; the
     /// blanket transport sweep still stops the voice).
     SamplePlayMode,
+    /// Arpeggiator step division index (0..7; spec `midi-nodes.md` §5.1).
+    ArpDivision,
+    /// Arpeggiator gate length as a fraction of one step (0.05..1).
+    ArpGate,
+    /// Arpeggiator step order: 0 = Up, 1 = Down, 2 = UpDown, 3 = DownUp,
+    /// 4 = Random.
+    ArpMode,
+    /// Arpeggiator octave layers (1..4).
+    ArpOctaves,
+    /// Arpeggiator latch (≥ 0.5 = keep running after all keys are released).
+    ArpLatch,
+    /// Arpeggiator harmony rule index (0 = off, 1 = octave, 2 = fifth,
+    /// 3 = major third, 4 = minor third, 5 = whole tone, 6 = chromatic).
+    ArpHarmony,
+    /// Probability (0..0.9) of skipping a step.
+    ArpSkip,
+    /// Portamento glide time constant (milliseconds, 0..2000; spec
+    /// `midi-nodes.md` §5.2).
+    PortTime,
+    /// Portamento output scale, low end (semitones, -24..24).
+    PortMin,
+    /// Portamento output scale, high end (semitones, -24..24).
+    PortMax,
+    /// Portamento legato-only glide (≥ 0.5 = glide only while the previous
+    /// note is still held).
+    PortLegato,
+    /// MIDI envelope attack time (seconds, 0..5; spec `midi-nodes.md` §5.3).
+    EnvAttack,
+    /// MIDI envelope decay time (seconds, 0..5).
+    EnvDecay,
+    /// MIDI envelope sustain level (0..1).
+    EnvSustain,
+    /// MIDI envelope release time (seconds, 0..10).
+    EnvRelease,
+    /// MIDI envelope output scale, low end.
+    EnvMin,
+    /// MIDI envelope output scale, high end (driving a CC uses 0..127).
+    EnvMax,
 }
 
 /// Note event (MIDI semantics). `note` is the MIDI note number (69 = A4),

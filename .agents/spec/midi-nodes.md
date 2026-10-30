@@ -1,6 +1,6 @@
 # MIDI 事件处理节点 Spec
 
-> 状态：草案（2026-10-29）。**M1 + M2 已实施（2026-10-29）**，M3–M5 待做。
+> 状态：**M1–M5 全部实施（2026-10-29）**；2026-10-30 增强：连线自动顶替、MIDI 线中点插入、MIDI FX picker、琶音 harmony/skip/DownUp/8 档 rate、滑音默认每音滑入。实现要点见 `.agents/plan.md` 同名条目。
 > 上游：`node-graph.md`（D3 连线三类型、D5 结构更新、D9 实施策略）、`control-tracks.md`（D3 `midi_cc` / D4 去重、`AutoDest::PitchBend`）、`roll-multiclip.md` D9–D11（`PitchOffset` 逐样本平滑）。
 
 ## 1. 背景与问题
@@ -67,16 +67,20 @@ MIDI 效果器与控制源没有音频端口：图仍会调用它们的 `process
 
 | 参数 | 类型 / 范围 | 默认 | 语义 |
 | :--- | :--- | :--- | :--- |
-| `division` | enum（1/4、1/8、1/8T、1/8.、1/16、1/16T、1/32） | 1/16 | step 长度（tick），表独立于 `delay::DIVISION_TICKS` |
+| `rate`（原 `division`） | enum（1/2、1/4、1/8、1/8T、1/16、1/16T、1/32、1/64） | 1/16 | step 长度（tick），表独立于 `delay::DIVISION_TICKS` |
 | `gate` | 0.05..1.0 | 0.5 | note on 持续占 step 的比例 |
-| `mode` | enum（Up、Down、UpDown、Random） | Up | 遍历顺序；`Random` 用节点内 seeded XorShift（种子 = `node_id`），可复现 |
+| `mode` | enum（Up、Down、UpDown、DownUp、Random） | Up | 遍历顺序；`Random` 用节点内 seeded XorShift（种子 = `node_id`），可复现 |
 | `octaves` | 1..4 | 1 | 音域扩展层数 |
 | `latch` | bool | false | 松开全部键后仍按最后一次和弦继续跑；新 note on 替换和弦 |
+| `harmony` | enum（Off、Octave、Fifth、Major 3rd、Minor 3rd、Whole Tone、Chromatic） | Off | 在每个 held 键上叠加的音程 / 音阶；作为外层与环境层叠加 |
+| `skip` | 0..0.9 | 0 | 每一步随机跳过的概率（跳过时无 note on，但 cursor 继续前进） |
 
 语义：
 
-- 输入 note on 累积到**定容 held 表**（16 键 + 插入序；满则忽略新键，保持确定行为）。输入 note off 从表移除；受 `latch` 影响。
+- 输入 note on 累积到**定容 held 表**（16 键、升序；满则忽略新键）。输入 note off 从表移除；受 `latch` 影响。
+- 序列 = held 键 × `harmony` 音程 × `octaves` 层；`harmony` 先展开、再叠八度（单音 + Fifth + 2 octaves → C, G, C+12, G+12）。
 - 每块检查是否跨过 step 边界：跨过 → 先发上一 step 的 note off（若 gate 未到点），再发新 step 的 note on；否则若 `gate` 到点 → 发 off。
+- `skip` 命中时不发 on（该步静音），但 `next_note` 已推进 cursor，模式不会卡在同一音。
 - 输出事件**只包含 arp 自己产生的音**；输入 note 不直接透传（否则原音与琶音同时响）。
 - 收到 blanket `Off { note: 0 }`（transport stop / panic 的既有语义）→ 清空 held、终止当前 step、向出边**透传同一个 blanket off**，保证下游乐器一定静音。这是本节唯一的 off 透传路径。
 - `transport_active == false` 时不产生新事件；若 step 在唱则补一个 off。
@@ -87,12 +91,12 @@ MIDI 效果器与控制源没有音频端口：图仍会调用它们的 `process
 | :--- | :--- | :--- | :--- |
 | `time` | 0..2000 ms | 120 | 偏移从初始值收敛到 0 的时间常数（指数逼近） |
 | `min` / `max` | -24..24 半音 | -24 / 24 | 输出刻度（D7） |
-| `legato_only` | bool | true | 仅在「上一个音仍按住」时滑音（v1 按最近 input 判定） |
+| `legato_only` | bool | false | 开启时仅在上一个音仍按住时滑音；默认关闭 = 每个音的起始都从上一个音高滑入（glissando 听感） |
 
 语义（D13）：
 
 - 透传所有输入 note（on/off 原样转发）到 MIDI 出。
-- 收到 note on 时记录 `delta = previous_note - new_note`（半音）。输出偏移从 `delta` 出发、按 `time` 指数收敛到 0；初始值钳到 `min..max`。
+- 收到 note on 时记录 `delta = previous_note - new_note`（半音）。输出偏移从 `delta` 出发、按 `time` 指数收敛到 0；初始值钳到 `min..max`。`previous_note` 在 note off 后**保留**，因此不重叠的连续音也会滑。
 - 首个 note（无 `previous_note`）偏移为 0。
 - 控制出口每块输出当前偏移（半音）。用户把 Control 线接到 `PitchOffset`（内置合成器，逐样本平滑，听感最好）或 `PitchBend{range}`（SF2 / CLAP / VST3 按节点自答分流，见 `roll-multiclip.md` D10）。
 - 复音输入取「最近一次 note on」作为 reference；不承诺逐 voice 独立滑音（见 §9 开放问题）。
@@ -196,18 +200,20 @@ pub enum NodeDoc {
 | :--- | :--- |
 | MIDI 线源 | `MidiTrack` / `Keyboard` / MIDI 效果器（`Arpeggiator`、`Portamento`） |
 | MIDI 线目标 | 乐器 / MIDI 效果器 |
-| MIDI 入边 ≤1 | 对同一目标节点：时间轴/键盘连接数 + 节点事件入边 ≤1（含 `Arpeggiator` 等），否则拒绝（多源事件流无合并语义） |
+| MIDI 入边 ≤1 | 对同一目标节点：时间轴/键盘连接数 + 节点事件入边 ≤1（含 `Arpeggiator` 等），否则拒绝（多源事件流无合并语义）。**UI 连线时自动顶替**目标已有的 MIDI 源，用户不必先断开（与音频单输入槽同规则） |
 | Control 线源 | `AutoTrack` / `Portamento` / `MidiEnvelope` |
 | Control 线目标 | 乐器 / 效果器 / Mixer / Feedback（控制源自身、MIDI 效果器、键盘、音频轨除外） |
-| Control 入边 ≤1 | 每目标节点至多一条（v1 不定义多源合并） |
+| Control 入边 ≤1 | 每目标节点至多一条节点控制线（v1 不定义多源合并）；UI 连线时自动顶替旧控制源 |
 | Control + Tempo | `param == Tempo` 只能落在 `TimelineIn`，源为节点时禁止 |
 | `in_port` | MIDI / Control 线必须为 0 |
 | 节点能力 | 三种新节点（`Arpeggiator` / `Portamento` / `MidiEnvelope`）没有音频端口；音频线不得以它们为源或目标 |
 
 ## 8. UI（`glitcherz-ui`）
 
-- `patch.rs`：三种节点的绘制盒与类型着色（MIDI FX 用与 MIDI 线一致的绿色；Control 出口沿用 automation 黄色）；Add 菜单新增 **MIDI FX** 分组。
-- `accepts()`：按 §7 规则放宽；拉线时只有 `kind` 匹配的端口可落。Control 线拉线仍弹 dest 菜单（复用现有 automation 菜单），但源为节点时隐藏 `Tempo`。
+- `patch.rs`：三种节点的绘制盒与类型着色（MIDI FX 用与 MIDI 线一致的绿色；Control 出口沿用 automation 黄色）；Add 菜单的 **MIDI FX…** 打开与 Instrument/Effect 相同的搜索 picker（仅 `BUILT-IN` 一个 tag 有内容）。
+- `accepts()`：按 §7 规则放宽；拉线时只有 `kind` 匹配的端口可落。Control 线拉线仍弹 dest 菜单（复用现有 automation 菜单），但源为节点时隐藏 `Tempo`，并追加 `Pitch Bend ±2 st`（滑音目标）。
+- **连线顶替**：MIDI / Control 新连线自动替换目标上的旧源（`clear_midi_sources` / `clear_control_sources`），文档与引擎同时更新，一次 undo。
+- **中点插入**：MIDI 线中点菜单提供 `Insert MIDI FX…`，`source → new → target` 整段替换，复用 picker（`NodeCategory::MidiFx`）。
 - Inspector / 节点卡：三个节点的参数面板（复用 `effect.rs` 的参数控件风格）。v1 不做节点内 inline 滑条。
 - 事件线删除、单源约束、撤销与现有 `CableKind` 逻辑同路。
 

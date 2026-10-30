@@ -71,6 +71,7 @@ fn node_param_axis(param: NodeParam) -> (f32, f32, bool) {
         NodeParam::MixerOutMute => (0.0, 1.0, false),
         NodeParam::FeedbackGain => (0.0, 1.0, false),
         NodeParam::Sf2Gain | NodeParam::SampleGain => (0.0, 2.0, false),
+        NodeParam::PitchOffset => (-24.0, 24.0, false),
         NodeParam::Resonance => (0.0, 0.98, false),
         NodeParam::Attack | NodeParam::Decay => (0.0, 2.0, false),
         NodeParam::Sustain => (0.0, 1.0, false),

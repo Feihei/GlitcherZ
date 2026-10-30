@@ -12,9 +12,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::convert;
 use crate::realtime::{
-    BlockRunner, COMMAND_QUEUE_CAPACITY, EngineCommand, FIXED_BLOCK_SIZE, Feedback, GraphCompiler,
-    GraphUpdate, ParamId, Sequencer, SequencerCommand, command_channel, recycle_channel,
-    structure_channel,
+    AutoDest, BlockRunner, COMMAND_QUEUE_CAPACITY, EngineCommand, EventKind, FIXED_BLOCK_SIZE,
+    Feedback, GraphCompiler, GraphUpdate, ParamId, Sequencer, SequencerCommand, command_channel,
+    recycle_channel, structure_channel,
 };
 
 /// Basic engine info (for UI display).
@@ -708,6 +708,27 @@ impl AudioEngine {
     /// connected).
     pub fn disconnect_nodes(&mut self, from_id: u64, to_id: u64) -> bool {
         self.apply_plan_update(|compiler| compiler.disconnect_nodes(from_id, to_id))
+    }
+
+    /// Connects a node-to-node event/control cable (spec `midi-nodes.md` D4;
+    /// node_id addressing). `kind` selects MIDI events or one control value
+    /// per block delivered as `dest`. Repeated connections are idempotent;
+    /// returns `false` on cycle / fan-in / fan-out / capacity errors or a
+    /// full structure queue.
+    pub fn connect_event(
+        &mut self,
+        from_id: u64,
+        to_id: u64,
+        kind: EventKind,
+        dest: AutoDest,
+    ) -> bool {
+        self.apply_plan_update(|compiler| compiler.connect_event(from_id, to_id, kind, dest))
+    }
+
+    /// Removes a node-to-node event/control cable (idempotent when not
+    /// connected).
+    pub fn disconnect_event(&mut self, from_id: u64, to_id: u64, kind: EventKind) -> bool {
+        self.apply_plan_update(|compiler| compiler.disconnect_event(from_id, to_id, kind))
     }
 
     /// Replaces a node's processor in place (**node_id preserved**, D11). The

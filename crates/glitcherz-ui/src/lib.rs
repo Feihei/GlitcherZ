@@ -37,21 +37,22 @@ use glitcherz_engine::SampleLibrary;
 use glitcherz_engine::Sf2Error;
 use glitcherz_engine::convert;
 use glitcherz_engine::realtime::{
-    AudioTrackProcessor, ChannelStripProcessor, Curve, EffectMeters, EngineCommand,
-    FeedbackProcessor, MAX_AUTO_POINTS, MAX_MIDI_FANOUT, MAX_TRACK_CLIPS, MidiClipTable,
-    MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent, ParamId, Processor,
-    RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCtrl, RtCtrlKind, RtCurveInterp,
-    RtMidiClip, RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand,
-    Sf2VoiceProcessor, SilentProcessor, SynthProcessor, Unit, empty_clip_table,
-    empty_midi_clip_table,
+    ArpeggiatorProcessor, AudioTrackProcessor, AutoDest, ChannelStripProcessor, Curve,
+    EffectMeters, EngineCommand, EventKind, FeedbackProcessor, MAX_AUTO_POINTS, MAX_MIDI_FANOUT,
+    MAX_TRACK_CLIPS, MidiClipTable, MidiEnvelopeProcessor, MixerChannel as EngineMixerChannel,
+    MixerProcessor, NodeKind, NoteEvent, ParamId, PortamentoProcessor, Processor, RtAudioClip,
+    RtAutoPoint, RtAutomation, RtControlClip, RtCtrl, RtCtrlKind, RtCurveInterp, RtMidiClip,
+    RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor,
+    SilentProcessor, SynthProcessor, Unit, empty_clip_table, empty_midi_clip_table,
 };
 use glitcherz_engine::{Sf2Library, Sf2Preset};
 use glitcherz_model::{
-    AutoParam, AutoPoint, CableKind, ChannelParam, ControlClip, ControlTrack, CtrlKind,
-    CurveInterp, EffectParams, GraphDoc, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS,
+    ArpeggiatorParams, AutoParam, AutoPoint, CableKind, ChannelParam, ControlClip, ControlTrack,
+    CtrlKind, CurveInterp, EffectParams, GraphDoc, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS,
     MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES,
-    MIN_MIXER_CHANNELS, Marker, MidiClip, MidiSource, MidiTrack, NodeDoc, NodeParam, PortRef,
-    Project, SamplePlayMode, SongLoop, SynthParams, VoiceSpec,
+    MIN_MIXER_CHANNELS, Marker, MidiClip, MidiEnvelopeParams, MidiSource, MidiTrack, NodeDoc,
+    NodeParam, PortRef, PortamentoParams, Project, SamplePlayMode, SongLoop, SynthParams,
+    VoiceSpec,
 };
 
 pub mod curve;
@@ -233,6 +234,27 @@ fn param_id_of(param: &AutoParam) -> Option<ParamId> {
     }
 }
 
+/// Node parameter address (model) → engine control destination for a
+/// node-to-node control cable (spec `midi-nodes.md` D6).
+///
+/// CC / bend keep their event-stream semantics (they are not parameters);
+/// everything else lands on the same `ParamId` the automation tables use.
+fn event_dest_of(param: &AutoParam) -> AutoDest {
+    if let Some((controller, channel)) = param.cc_of() {
+        return AutoDest::Cc {
+            controller,
+            channel,
+        };
+    }
+    if let Some((channel, range)) = param.pitch_bend_of() {
+        return AutoDest::PitchBend {
+            channel,
+            range_semitones: range,
+        };
+    }
+    AutoDest::Param(param_id_of(param).unwrap_or(ParamId::MasterGain))
+}
+
 /// Node parameter address (model) → engine parameter ID (U4c, spec
 /// `control-tracks.md` §9 D16).
 ///
@@ -253,6 +275,7 @@ fn node_param_id(param: NodeParam) -> ParamId {
         NodeParam::FeedbackGain => ParamId::FeedbackGain,
         NodeParam::Sf2Gain => ParamId::Sf2Gain,
         NodeParam::SampleGain => ParamId::SampleGain,
+        NodeParam::PitchOffset => ParamId::PitchOffset,
         NodeParam::Resonance => ParamId::FilterResonance,
         NodeParam::Attack => ParamId::Attack,
         NodeParam::Decay => ParamId::Decay,
@@ -1473,21 +1496,71 @@ impl GlitcherZApp {
                 CableKind::Midi => {
                     // G6: vk → instrument cables are document-only routing
                     // (the keyboard has no engine node; the app resolves the
-                    // route and addresses the instrument directly).
-                    let PortRef::MidiTrack(track) = &cable.from else {
-                        continue;
-                    };
-                    let Some(to) = to_node else {
-                        log::warn!("MIDI cable target node missing, skipping: {cable:?}");
-                        continue;
-                    };
-                    if !self.engine.connect_midi_node(*track, to) {
-                        log::warn!(
-                            "MIDI cable (track {track} → {to}) dispatch failed (fan-out limit exceeded / queue full)"
-                        );
+                    // route and addresses the instrument directly). MIDI
+                    // effects are real engine nodes (spec `midi-nodes.md`
+                    // D10), so their cables become event cables.
+                    match &cable.from {
+                        PortRef::MidiTrack(track) => {
+                            let Some(to) = to_node else {
+                                log::warn!("MIDI cable target node missing, skipping: {cable:?}");
+                                continue;
+                            };
+                            if !self.engine.connect_midi_node(*track, to) {
+                                log::warn!(
+                                    "MIDI cable (track {track} → {to}) dispatch failed (fan-out limit exceeded / queue full)"
+                                );
+                            }
+                        }
+                        PortRef::Node(id) => {
+                            let Some(from) = self.node_map.get(id).copied() else {
+                                // Virtual keyboards are document-only.
+                                continue;
+                            };
+                            let Some(to) = to_node else {
+                                log::warn!("MIDI cable target node missing, skipping: {cable:?}");
+                                continue;
+                            };
+                            if !self.engine.connect_event(
+                                from,
+                                to,
+                                EventKind::Midi,
+                                AutoDest::default(),
+                            ) {
+                                log::warn!(
+                                    "MIDI event cable ({from} → {to}) dispatch failed (cycle / limit exceeded / queue full)"
+                                );
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 CableKind::Automation => {
+                    // spec `midi-nodes.md` §7: node sources feed the event
+                    // bus (control cables); timeline sources keep the
+                    // automation-table route.
+                    if let PortRef::Node(id) = &cable.from {
+                        let Some(from) = self.node_map.get(id).copied() else {
+                            continue;
+                        };
+                        if cable.to == PortRef::TimelineIn {
+                            continue;
+                        }
+                        let Some(to) = to_node else {
+                            log::warn!("Control cable target node missing, skipping: {cable:?}");
+                            continue;
+                        };
+                        if !self.engine.connect_event(
+                            from,
+                            to,
+                            EventKind::Control,
+                            event_dest_of(&cable.param),
+                        ) {
+                            log::warn!(
+                                "Control cable ({from} → {to}) dispatch failed (cycle / queue full)"
+                            );
+                        }
+                        continue;
+                    }
                     let PortRef::AutoTrack(index) = &cable.from else {
                         continue;
                     };
@@ -1616,6 +1689,7 @@ impl GlitcherZApp {
                         bank,
                         program,
                         gain,
+                        bend_range,
                     } => {
                         if path.is_empty() {
                             // U13: born without a file — silent until the
@@ -1637,6 +1711,7 @@ impl GlitcherZApp {
                                     processor
                                         .set_param(ParamId::Sf2ProgramChange, f32::from(*program));
                                     processor.set_param(ParamId::Sf2Gain, *gain);
+                                    processor.set_param(ParamId::Sf2BendRange, *bend_range);
                                     (Box::new(processor), None, String::new())
                                 }
                                 Err(err) => {
@@ -1901,12 +1976,42 @@ impl GlitcherZApp {
                 NodeDoc::Keyboard { .. } => {
                     (Box::new(SynthProcessor::new(sr)), None, String::new())
                 }
-                // M2 placeholders: silent processors until M3/M4 land the
-                // arpeggiator / portamento / envelope DSP.
-                NodeDoc::Arpeggiator { .. }
-                | NodeDoc::Portamento { .. }
-                | NodeDoc::MidiEnvelope { .. } => {
-                    (Box::new(SilentProcessor::new()), None, String::new())
+                // M3/M4: MIDI effects and control sources are live; the keyboard
+                // stays a document-only node.
+                NodeDoc::Arpeggiator { params, .. } => {
+                    let mut processor = ArpeggiatorProcessor::new(doc_id as u32);
+                    processor.apply_params(
+                        params.division,
+                        params.gate,
+                        params.mode.index(),
+                        params.octaves,
+                        params.latch,
+                        params.harmony.index(),
+                        params.skip,
+                    );
+                    (Box::new(processor), None, String::new())
+                }
+                NodeDoc::Portamento { params, .. } => {
+                    let mut processor = PortamentoProcessor::new();
+                    processor.apply_params(
+                        params.time_ms,
+                        params.min,
+                        params.max,
+                        params.legato_only,
+                    );
+                    (Box::new(processor), None, String::new())
+                }
+                NodeDoc::MidiEnvelope { params, .. } => {
+                    let mut processor = MidiEnvelopeProcessor::new();
+                    processor.apply_params(
+                        params.attack,
+                        params.decay,
+                        params.sustain,
+                        params.release,
+                    );
+                    processor.set_param(ParamId::EnvMin, params.min);
+                    processor.set_param(ParamId::EnvMax, params.max);
+                    (Box::new(processor), None, String::new())
                 }
             };
         let engine_id = self.engine.fresh_node_id();
@@ -2491,8 +2596,22 @@ impl GlitcherZApp {
                     for (number, name) in CC_PRESETS {
                         v.push((format!("CC {number} {name}"), AutoParam::cc(number, 0)));
                     }
-                    // P1: pitch bend is the other event-stream destination.
-                    v.push(("Pitch Bend".to_string(), AutoParam::pitch_bend(0, 2.0)));
+                    // P1: pitch bend is the other event-stream destination. Built-in /
+                    // sample voices take the pitch offset directly; SF2 uses
+                    // its explicit bend range; plugins keep ±2 st.
+                    if let Some(NodeDoc::Instrument { voice, .. }) = doc.node_by_id(node_id) {
+                        match voice {
+                            VoiceSpec::Builtin | VoiceSpec::Sample { .. } => v.push((
+                                "Pitch ±24 st".to_string(),
+                                AutoParam::Node(NodeParam::PitchOffset),
+                            )),
+                            VoiceSpec::SoundFont { bend_range, .. } => v.push((
+                                format!("Pitch Bend ±{bend_range:.0} st"),
+                                AutoParam::pitch_bend(0, *bend_range),
+                            )),
+                            _ => v.push(("Pitch Bend".to_string(), AutoParam::pitch_bend(0, 2.0))),
+                        }
+                    }
                 }
                 v
             };
@@ -2623,29 +2742,25 @@ impl GlitcherZApp {
                     self.connect_audio(from_doc, to, in_port);
                 }
                 patch::PatchAction::ConnectMidi { track, to_doc } => {
-                    let dup = self.project().graph.cables.iter().any(|c| {
-                        c.kind == CableKind::Midi
-                            && c.from == PortRef::MidiTrack(track)
-                            && c.to == PortRef::Node(to_doc)
-                    });
-                    if !dup {
-                        let before = self.begin_edit();
-                        self.project_mut()
-                            .graph
-                            .cables
-                            .push(glitcherz_model::CableDoc::midi(track, to_doc));
-                        self.commit_edit("Connect MIDI", before);
-                    }
-                    if let Some(to_engine) = self.node_map.get(&to_doc).copied() {
-                        if !self.engine.connect_midi_node(track, to_engine) {
-                            self.set_message(
-                                "MIDI connect failed: fan-out limit / queue full".to_string(),
-                            );
-                        }
-                    }
+                    self.connect_midi_source(track, to_doc);
                 }
                 patch::PatchAction::ConnectKeyboardMidi { from_doc, to_doc } => {
                     self.connect_keyboard_midi(from_doc, to_doc);
+                }
+                patch::PatchAction::ConnectEventMidi { from_doc, to_doc } => {
+                    self.connect_event_cable(
+                        from_doc,
+                        to_doc,
+                        CableKind::Midi,
+                        AutoParam::default(),
+                    );
+                }
+                patch::PatchAction::ConnectControl {
+                    from_doc,
+                    to_doc,
+                    param,
+                } => {
+                    self.connect_event_cable(from_doc, to_doc, CableKind::Automation, param);
                 }
                 patch::PatchAction::ConnectAuto {
                     index,
@@ -2709,9 +2824,8 @@ impl GlitcherZApp {
         place: patch::PickerPlace,
     ) {
         self.picker_place = Some(place);
-        self.picker.open(plugin_picker::PickFilter::category(
-            category.map(patch::NodeCategory::is_instrument),
-        ));
+        self.picker
+            .open(plugin_picker::PickFilter::from_category(category));
     }
 
     /// Draw the plugin popup and create the picked node (U9 E3), or splice it
@@ -2834,6 +2948,7 @@ impl GlitcherZApp {
                     bank: 0,
                     program: 0,
                     gain: 1.0,
+                    bend_range: 2.0,
                 },
                 synth: SynthParams::default(),
             },
@@ -2911,6 +3026,22 @@ impl GlitcherZApp {
                 track,
                 gain: 0.5,
             },
+            // M5: MIDI FX / control-source nodes (spec `midi-nodes.md` §5).
+            patch::NodeSource::Arpeggiator => NodeDoc::Arpeggiator {
+                node_id,
+                track,
+                params: ArpeggiatorParams::default(),
+            },
+            patch::NodeSource::Portamento => NodeDoc::Portamento {
+                node_id,
+                track,
+                params: PortamentoParams::default(),
+            },
+            patch::NodeSource::MidiEnvelope => NodeDoc::MidiEnvelope {
+                node_id,
+                track,
+                params: MidiEnvelopeParams::default(),
+            },
         };
         if node.is_keyboard() {
             let before = self.begin_edit();
@@ -2982,6 +3113,12 @@ impl GlitcherZApp {
         let Some(cable) = self.project().graph.cables.get(cable_index).cloned() else {
             return;
         };
+        // Spec `midi-nodes.md` §8: a MIDI cable takes a MIDI effect, so the
+        // splice runs on the event path instead of the audio one.
+        if cable.kind == CableKind::Midi {
+            self.insert_midi_fx_in_cable(cable_index, &cable, source, at);
+            return;
+        }
         let (from_doc, to, in_port) = match splice_endpoints(&cable) {
             Ok(endpoints) => endpoints,
             Err(reason) => {
@@ -3016,6 +3153,62 @@ impl GlitcherZApp {
         self.connect_audio(new_id, to, in_port);
         self.session.resume_history();
         self.commit_edit("Insert Node", before);
+    }
+
+    /// Splice a MIDI effect into a MIDI cable: `source → new → target`
+    /// (spec `midi-nodes.md` §8). The upstream source may be the timeline, a
+    /// virtual keyboard or another MIDI effect.
+    fn insert_midi_fx_in_cable(
+        &mut self,
+        cable_index: usize,
+        cable: &glitcherz_model::CableDoc,
+        source: patch::NodeSource,
+        at: egui::Pos2,
+    ) {
+        if !source.fits_midi_insert() {
+            self.set_message("Insert failed: only MIDI FX nodes can be inserted".to_string());
+            return;
+        }
+        let PortRef::Node(to_doc) = cable.to else {
+            self.set_message("Insert failed: MIDI cable target is not a node".to_string());
+            return;
+        };
+        let track = self
+            .project()
+            .graph
+            .node_by_id(to_doc)
+            .map_or(self.selected_track, |node| node.track());
+        let before = self.begin_edit();
+        self.session.suspend_history();
+        let Some(new_id) = self.create_patch_node_on(source, at, track) else {
+            self.session.resume_history();
+            return;
+        };
+        self.delete_cable(cable_index);
+        match &cable.from {
+            PortRef::MidiTrack(track) => self.connect_midi_source(*track, new_id),
+            PortRef::Node(from_doc) => {
+                if self
+                    .project()
+                    .graph
+                    .node_by_id(*from_doc)
+                    .is_some_and(NodeDoc::is_keyboard)
+                {
+                    self.connect_keyboard_midi(*from_doc, new_id);
+                } else {
+                    self.connect_event_cable(
+                        *from_doc,
+                        new_id,
+                        CableKind::Midi,
+                        AutoParam::default(),
+                    );
+                }
+            }
+            _ => {}
+        }
+        self.connect_event_cable(new_id, to_doc, CableKind::Midi, AutoParam::default());
+        self.session.resume_history();
+        self.commit_edit("Insert MIDI FX", before);
     }
 
     /// Connect an audio cable (document deduplication + engine edge; both stay in sync).
@@ -3067,6 +3260,166 @@ impl GlitcherZApp {
         self.commit_edit("Connect Audio", before);
     }
 
+    /// Removes every MIDI in-edge of `to_doc` from the document and the engine
+    /// (one target = one source, spec `midi-nodes.md` §7). The caller owns the
+    /// undo step; this helper never commits.
+    fn clear_midi_sources(&mut self, to_doc: u64) {
+        let to_engine = self.node_map.get(&to_doc).copied();
+        let stale: Vec<glitcherz_model::CableDoc> = self
+            .project()
+            .graph
+            .cables
+            .iter()
+            .filter(|cable| cable.kind == CableKind::Midi && cable.to == PortRef::Node(to_doc))
+            .cloned()
+            .collect();
+        for cable in stale {
+            match (&cable.from, to_engine) {
+                (PortRef::MidiTrack(track), Some(to)) => {
+                    self.engine.disconnect_midi_node(*track, to);
+                }
+                (PortRef::Node(from_doc), Some(to)) => {
+                    if let Some(from) = self.node_map.get(from_doc).copied() {
+                        self.engine.disconnect_event(from, to, EventKind::Midi);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.project_mut()
+            .graph
+            .cables
+            .retain(|cable| !(cable.kind == CableKind::Midi && cable.to == PortRef::Node(to_doc)));
+    }
+
+    /// Removes node-to-node control in-edges of `to_doc` (timeline automation
+    /// cables are untouched — they keep their looser existing rules).
+    fn clear_control_sources(&mut self, to_doc: u64) {
+        let to_engine = self.node_map.get(&to_doc).copied();
+        let stale: Vec<glitcherz_model::CableDoc> = self
+            .project()
+            .graph
+            .cables
+            .iter()
+            .filter(|cable| {
+                cable.kind == CableKind::Automation
+                    && matches!(cable.from, PortRef::Node(_))
+                    && cable.to == PortRef::Node(to_doc)
+            })
+            .cloned()
+            .collect();
+        for cable in stale {
+            if let (PortRef::Node(from_doc), Some(to)) = (&cable.from, to_engine)
+                && let Some(from) = self.node_map.get(from_doc).copied()
+            {
+                self.engine.disconnect_event(from, to, EventKind::Control);
+            }
+        }
+        self.project_mut().graph.cables.retain(|cable| {
+            !(cable.kind == CableKind::Automation
+                && matches!(cable.from, PortRef::Node(_))
+                && cable.to == PortRef::Node(to_doc))
+        });
+    }
+
+    /// Timeline MIDI track → node with the same replace-the-old-source rule
+    /// as every other cable (spec `midi-nodes.md` §7).
+    fn connect_midi_source(&mut self, track: usize, to_doc: u64) {
+        let before = self.begin_edit();
+        self.session.suspend_history();
+        self.clear_midi_sources(to_doc);
+        self.project_mut()
+            .graph
+            .cables
+            .push(glitcherz_model::CableDoc::midi(track, to_doc));
+        let connected = self
+            .node_map
+            .get(&to_doc)
+            .copied()
+            .is_some_and(|to| self.engine.connect_midi_node(track, to));
+        if !connected {
+            self.set_message("MIDI connect failed: fan-out limit / queue full".to_string());
+        }
+        self.session.resume_history();
+        self.commit_edit("Connect MIDI", before);
+    }
+
+    /// Node-to-node event / control cable (spec `midi-nodes.md` D6/D10):
+    /// document cable + engine edge, deduplicated like every other connection.
+    /// The MIDI variant ignores `param` (a MIDI cable carries events, not a
+    /// destination).
+    fn connect_event_cable(
+        &mut self,
+        from_doc: u64,
+        to_doc: u64,
+        kind: CableKind,
+        param: AutoParam,
+    ) {
+        let duplicate = self.project().graph.cables.iter().any(|cable| {
+            cable.kind == kind
+                && cable.from == PortRef::Node(from_doc)
+                && cable.to == PortRef::Node(to_doc)
+                && (kind == CableKind::Midi || cable.param == param)
+        });
+        if duplicate {
+            self.set_message("Already connected".to_string());
+            return;
+        }
+        let before = self.begin_edit();
+        // Normal cable rule: a new connection replaces whatever occupied the
+        // destination. MIDI keeps one event source per node (§7) and control
+        // keeps one node source per destination.
+        match kind {
+            CableKind::Midi => self.clear_midi_sources(to_doc),
+            CableKind::Automation => self.clear_control_sources(to_doc),
+            CableKind::Audio => {}
+        }
+        self.project_mut()
+            .graph
+            .cables
+            .push(glitcherz_model::CableDoc {
+                kind,
+                from: PortRef::Node(from_doc),
+                to: PortRef::Node(to_doc),
+                param: if kind == CableKind::Midi {
+                    AutoParam::default()
+                } else {
+                    param.clone()
+                },
+                in_port: 0,
+            });
+        self.commit_edit(
+            if kind == CableKind::Midi {
+                "Connect MIDI FX"
+            } else {
+                "Connect Control"
+            },
+            before.clone(),
+        );
+        let event_kind = if kind == CableKind::Midi {
+            EventKind::Midi
+        } else {
+            EventKind::Control
+        };
+        if let (Some(from_engine), Some(to_engine)) = (
+            self.node_map.get(&from_doc).copied(),
+            self.node_map.get(&to_doc).copied(),
+        ) && !self.engine.connect_event(
+            from_engine,
+            to_engine,
+            event_kind,
+            event_dest_of(&param),
+        ) {
+            // The engine refused (cycle / second MIDI source / caps): roll the
+            // document back so it never claims a cable the audio thread does
+            // not have.
+            self.session.restore(before);
+            self.set_message(
+                "Connect failed: cycle / one MIDI source per node / queue full".to_string(),
+            );
+        }
+    }
+
     /// Connect a keyboard-input MIDI cable (G6, spec `plugin-gui.md` §8):
     /// **document-only** — the input node has no engine node, so there is no
     /// edge to dispatch; the live routes are resolved per frame from the
@@ -3109,6 +3462,7 @@ impl GlitcherZApp {
             return;
         }
         let before = self.begin_edit();
+        self.clear_midi_sources(to_doc);
         self.project_mut()
             .graph
             .cables
@@ -3211,19 +3565,41 @@ impl GlitcherZApp {
                     }
                 }
             }
-            CableKind::Midi => {
-                if let (PortRef::MidiTrack(track), PortRef::Node(to_doc)) = (&cable.from, &cable.to)
-                {
+            CableKind::Midi => match (&cable.from, &cable.to) {
+                (PortRef::MidiTrack(track), PortRef::Node(to_doc)) => {
                     if let Some(to_engine) = self.node_map.get(to_doc).copied() {
                         self.engine.disconnect_midi_node(*track, to_engine);
                     }
                 }
-            }
-            CableKind::Automation => {
-                if let PortRef::AutoTrack(index) = cable.from {
-                    self.engine.clear_auto_route(index);
+                // Node-to-node MIDI cable (MIDI effect / keyboard source).
+                // The keyboard is document-only, so its cable has no engine
+                // edge to drop.
+                (PortRef::Node(from_doc), PortRef::Node(to_doc)) => {
+                    if let (Some(from_engine), Some(to_engine)) = (
+                        self.node_map.get(from_doc).copied(),
+                        self.node_map.get(to_doc).copied(),
+                    ) {
+                        self.engine
+                            .disconnect_event(from_engine, to_engine, EventKind::Midi);
+                    }
                 }
-            }
+                _ => {}
+            },
+            CableKind::Automation => match (&cable.from, &cable.to) {
+                (PortRef::AutoTrack(index), _) => {
+                    self.engine.clear_auto_route(*index);
+                }
+                (PortRef::Node(from_doc), PortRef::Node(to_doc)) => {
+                    if let (Some(from_engine), Some(to_engine)) = (
+                        self.node_map.get(from_doc).copied(),
+                        self.node_map.get(to_doc).copied(),
+                    ) {
+                        self.engine
+                            .disconnect_event(from_engine, to_engine, EventKind::Control);
+                    }
+                }
+                _ => {}
+            },
         }
         let before = self.begin_edit();
         self.project_mut().graph.cables.remove(i);
@@ -4127,6 +4503,13 @@ impl GlitcherZApp {
             return;
         };
         let sample_rate = self.engine.info().sample_rate as f32;
+        let bend_range = match self.project().graph.node_by_id(doc_id) {
+            Some(NodeDoc::Instrument {
+                voice: VoiceSpec::SoundFont { bend_range, .. },
+                ..
+            }) => *bend_range,
+            _ => 2.0,
+        };
         let mut processor = match Sf2VoiceProcessor::new(library.font(), sample_rate) {
             Ok(processor) => processor,
             Err(err) => {
@@ -4137,6 +4520,7 @@ impl GlitcherZApp {
         processor.set_param(ParamId::Sf2BankSelect, f32::from(bank));
         processor.set_param(ParamId::Sf2ProgramChange, f32::from(program));
         processor.set_param(ParamId::Sf2Gain, gain);
+        processor.set_param(ParamId::Sf2BendRange, bend_range);
 
         let before = self.begin_edit();
         if let Some(NodeDoc::Instrument {
@@ -4333,6 +4717,7 @@ impl GlitcherZApp {
                     bank,
                     program,
                     gain,
+                    bend_range,
                 } => {
                     if path.is_empty() {
                         // U13: empty node renders silence on export too.
@@ -4343,6 +4728,7 @@ impl GlitcherZApp {
                                 processor.set_param(ParamId::Sf2BankSelect, f32::from(*bank));
                                 processor.set_param(ParamId::Sf2ProgramChange, f32::from(*program));
                                 processor.set_param(ParamId::Sf2Gain, *gain);
+                                processor.set_param(ParamId::Sf2BendRange, *bend_range);
                                 (Box::new(processor), None)
                             }
                             Err(err) => {
@@ -4496,10 +4882,32 @@ impl GlitcherZApp {
             }
             // Unreachable (returned above); kept for exhaustiveness.
             NodeDoc::Keyboard { .. } => (Box::new(SynthProcessor::new(sr)), None),
-            // M2 placeholders (silent until M3/M4 land).
-            NodeDoc::Arpeggiator { .. }
-            | NodeDoc::Portamento { .. }
-            | NodeDoc::MidiEnvelope { .. } => (Box::new(SilentProcessor::new()), None),
+            // M3/M4: arpeggiator / portamento / envelope are live.
+            NodeDoc::Arpeggiator { params, .. } => {
+                let mut processor = ArpeggiatorProcessor::new(node.node_id() as u32);
+                processor.apply_params(
+                    params.division,
+                    params.gate,
+                    params.mode.index(),
+                    params.octaves,
+                    params.latch,
+                    params.harmony.index(),
+                    params.skip,
+                );
+                (Box::new(processor), None)
+            }
+            NodeDoc::Portamento { params, .. } => {
+                let mut processor = PortamentoProcessor::new();
+                processor.apply_params(params.time_ms, params.min, params.max, params.legato_only);
+                (Box::new(processor), None)
+            }
+            NodeDoc::MidiEnvelope { params, .. } => {
+                let mut processor = MidiEnvelopeProcessor::new();
+                processor.apply_params(params.attack, params.decay, params.sustain, params.release);
+                processor.set_param(ParamId::EnvMin, params.min);
+                processor.set_param(ParamId::EnvMax, params.max);
+                (Box::new(processor), None)
+            }
         };
         let engine_id = engine.fresh_node_id();
         let kind = match node {
@@ -4578,12 +4986,39 @@ impl GlitcherZApp {
                         let _ = engine.connect_nodes(from, to, cable.in_port);
                     }
                 }
-                CableKind::Midi => {
-                    if let (PortRef::MidiTrack(track), Some(to)) = (&cable.from, to_node) {
-                        let _ = engine.connect_midi_node(*track, to);
+                CableKind::Midi => match &cable.from {
+                    PortRef::MidiTrack(track) => {
+                        if let Some(to) = to_node {
+                            let _ = engine.connect_midi_node(*track, to);
+                        }
                     }
-                }
+                    PortRef::Node(id) => {
+                        if let (Some(from), Some(to)) = (node_map.get(id).copied(), to_node) {
+                            let _ = engine.connect_event(
+                                from,
+                                to,
+                                EventKind::Midi,
+                                AutoDest::default(),
+                            );
+                        }
+                    }
+                    _ => {}
+                },
                 CableKind::Automation => {
+                    if let PortRef::Node(id) = &cable.from {
+                        if cable.to == PortRef::TimelineIn {
+                            continue;
+                        }
+                        if let (Some(from), Some(to)) = (node_map.get(id).copied(), to_node) {
+                            let _ = engine.connect_event(
+                                from,
+                                to,
+                                EventKind::Control,
+                                event_dest_of(&cable.param),
+                            );
+                        }
+                        continue;
+                    }
                     let PortRef::AutoTrack(index) = &cable.from else {
                         continue;
                     };
@@ -6885,6 +7320,11 @@ impl GlitcherZApp {
                 (Some(NodeDoc::Instrument { .. }), Some(id)) => {
                     format!("Instrument #{id} · Track {}", sel + 1)
                 }
+                (Some(NodeDoc::Arpeggiator { .. }), Some(id)) => format!("Arpeggiator #{id}"),
+                (Some(NodeDoc::Portamento { .. }), Some(id)) => format!("Portamento #{id}"),
+                (Some(NodeDoc::MidiEnvelope { .. }), Some(id)) => {
+                    format!("MIDI Envelope #{id}")
+                }
                 _ => {
                     if self.project().midi_tracks[sel].name.is_empty() {
                         format!("Track {}", sel + 1)
@@ -6894,6 +7334,22 @@ impl GlitcherZApp {
                 }
             };
             ui.heading(title);
+            // M5: MIDI FX / control-source parameter stack (spec
+            // `midi-nodes.md` §5). These nodes own no plugin editor, so the
+            // panel is just their parameters.
+            if let Some(id) = target
+                && matches!(
+                    target_doc,
+                    Some(
+                        NodeDoc::Arpeggiator { .. }
+                            | NodeDoc::Portamento { .. }
+                            | NodeDoc::MidiEnvelope { .. }
+                    )
+                )
+            {
+                self.midi_fx_params(ui, id);
+                return;
+            }
             // Embedded plugin editor (spec `plugin-gui.md` §4): CLAP
             // instruments only (v1). A collapsing header owns the toggle —
             // its triangle sits on a row of its own **above** the reserved
@@ -6975,14 +7431,26 @@ impl GlitcherZApp {
                                     bank,
                                     program,
                                     gain,
+                                    bend_range,
+                                    ..
                                 },
                             ..
-                        } => Some((path.clone(), *bank, *program, *gain)),
+                        } => Some((path.clone(), *bank, *program, *gain, *bend_range)),
                         _ => None,
                     }
                 });
-                if let Some((sf2_path, sf2_bank, sf2_program, sf2_gain)) = sf2_state {
-                    self.sf2_section(ui, instr_id, &sf2_path, sf2_bank, sf2_program, sf2_gain);
+                if let Some((sf2_path, sf2_bank, sf2_program, sf2_gain, sf2_bend_range)) =
+                    sf2_state
+                {
+                    self.sf2_section(
+                        ui,
+                        instr_id,
+                        &sf2_path,
+                        sf2_bank,
+                        sf2_program,
+                        sf2_gain,
+                        sf2_bend_range,
+                    );
                 }
                 // Sample instrument parameters (U5, spec `sample-player.md`
                 // D10): root note / play mode / gain. The root DragValue and
@@ -7544,6 +8012,234 @@ impl GlitcherZApp {
 
     /// ADSR four sliders (local copies + write-back, avoiding borrow
     /// conflicts), bound to the target instrument node (G4).
+    /// MIDI FX / control-source parameter stack (spec `midi-nodes.md` §5).
+    ///
+    /// Same live-delivery + merged-undo pattern as [`Self::adsr_sliders`]:
+    /// the engine hears every slider tick, the document records one step per
+    /// drag.
+    fn midi_fx_params(&mut self, ui: &mut egui::Ui, doc_id: u64) {
+        /// Arpeggiator division labels, in the engine's `ARP_DIVISION_TICKS`
+        /// order (spec `midi-nodes.md` §5.1).
+        const ARP_DIVISION_LABELS: [&str; 8] =
+            ["1/2", "1/4", "1/8", "1/8T", "1/16", "1/16T", "1/32", "1/64"];
+        let Some(node) = self.project().graph.node_by_id(doc_id).cloned() else {
+            return;
+        };
+        ui.weak("MIDI events only — this node has no audio output");
+        ui.add_space(4.0);
+        match node {
+            NodeDoc::Arpeggiator { params, .. } => {
+                let mut p = params;
+                let mut changed = false;
+                egui::Grid::new("arp_params")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Rate");
+                        egui::ComboBox::from_id_salt("arp_division")
+                            .selected_text(
+                                ARP_DIVISION_LABELS
+                                    [usize::from(p.division).min(ARP_DIVISION_LABELS.len() - 1)],
+                            )
+                            .show_ui(ui, |ui| {
+                                for (index, label) in ARP_DIVISION_LABELS.iter().enumerate() {
+                                    if ui
+                                        .selectable_label(usize::from(p.division) == index, *label)
+                                        .clicked()
+                                    {
+                                        p.division = index as u8;
+                                        changed = true;
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Gate");
+                        changed |= ui.add(egui::Slider::new(&mut p.gate, 0.05..=1.0)).changed();
+                        ui.end_row();
+                        ui.label("Mode");
+                        egui::ComboBox::from_id_salt("arp_mode")
+                            .selected_text(p.mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in glitcherz_model::ArpMode::ALL {
+                                    if ui.selectable_label(p.mode == mode, mode.label()).clicked() {
+                                        p.mode = mode;
+                                        changed = true;
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Harmony");
+                        egui::ComboBox::from_id_salt("arp_harmony")
+                            .selected_text(p.harmony.label())
+                            .show_ui(ui, |ui| {
+                                for harmony in glitcherz_model::ArpHarmony::ALL {
+                                    if ui
+                                        .selectable_label(p.harmony == harmony, harmony.label())
+                                        .clicked()
+                                    {
+                                        p.harmony = harmony;
+                                        changed = true;
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Skip");
+                        changed |= ui.add(egui::Slider::new(&mut p.skip, 0.0..=0.9)).changed();
+                        ui.end_row();
+                        ui.label("Octaves");
+                        changed |= ui.add(egui::Slider::new(&mut p.octaves, 1..=4)).changed();
+                        ui.end_row();
+                        ui.label("Latch");
+                        changed |= ui.checkbox(&mut p.latch, "").changed();
+                        ui.end_row();
+                    });
+                if changed {
+                    self.send_node_param(doc_id, ParamId::ArpDivision, f32::from(p.division));
+                    self.send_node_param(doc_id, ParamId::ArpGate, p.gate);
+                    self.send_node_param(doc_id, ParamId::ArpMode, f32::from(p.mode.index()));
+                    self.send_node_param(doc_id, ParamId::ArpOctaves, f32::from(p.octaves));
+                    self.send_node_param(
+                        doc_id,
+                        ParamId::ArpLatch,
+                        if p.latch { 1.0 } else { 0.0 },
+                    );
+                    self.send_node_param(doc_id, ParamId::ArpHarmony, f32::from(p.harmony.index()));
+                    self.send_node_param(doc_id, ParamId::ArpSkip, p.skip);
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Arpeggiator { params, .. }) =
+                        self.project_mut().graph.node_by_id_mut(doc_id)
+                    {
+                        *params = p;
+                    }
+                    self.commit_param_edit("Arpeggiator", before, "midi-fx-params");
+                }
+            }
+            NodeDoc::Portamento { params, .. } => {
+                let mut p = params;
+                let mut changed = false;
+                egui::Grid::new("portamento_params")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Glide Time");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut p.time_ms)
+                                    .range(0.0..=2000.0)
+                                    .suffix(" ms"),
+                            )
+                            .changed();
+                        ui.end_row();
+                        ui.label("Low End");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut p.min)
+                                    .range(-24.0..=24.0)
+                                    .suffix(" st"),
+                            )
+                            .changed();
+                        ui.end_row();
+                        ui.label("High End");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut p.max)
+                                    .range(-24.0..=24.0)
+                                    .suffix(" st"),
+                            )
+                            .changed();
+                        ui.end_row();
+                        ui.label("Legato Only");
+                        changed |= ui.checkbox(&mut p.legato_only, "").changed();
+                        ui.end_row();
+                    });
+                if changed {
+                    self.send_node_param(doc_id, ParamId::PortTime, p.time_ms);
+                    self.send_node_param(doc_id, ParamId::PortMin, p.min);
+                    self.send_node_param(doc_id, ParamId::PortMax, p.max);
+                    self.send_node_param(
+                        doc_id,
+                        ParamId::PortLegato,
+                        if p.legato_only { 1.0 } else { 0.0 },
+                    );
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Portamento { params, .. }) =
+                        self.project_mut().graph.node_by_id_mut(doc_id)
+                    {
+                        *params = p;
+                    }
+                    self.commit_param_edit("Portamento", before, "midi-fx-params");
+                }
+            }
+            NodeDoc::MidiEnvelope { params, .. } => {
+                let mut p = params;
+                let mut changed = false;
+                egui::Grid::new("midi_env_params")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Attack");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut p.attack)
+                                    .range(0.0..=5.0)
+                                    .suffix(" s"),
+                            )
+                            .changed();
+                        ui.end_row();
+                        ui.label("Decay");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut p.decay)
+                                    .range(0.0..=5.0)
+                                    .suffix(" s"),
+                            )
+                            .changed();
+                        ui.end_row();
+                        ui.label("Sustain");
+                        changed |= ui
+                            .add(egui::Slider::new(&mut p.sustain, 0.0..=1.0))
+                            .changed();
+                        ui.end_row();
+                        ui.label("Release");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut p.release)
+                                    .range(0.0..=10.0)
+                                    .suffix(" s"),
+                            )
+                            .changed();
+                        ui.end_row();
+                        ui.label("Low End");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut p.min).range(-127.0..=127.0))
+                            .changed();
+                        ui.end_row();
+                        ui.label("High End");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut p.max).range(-127.0..=127.0))
+                            .changed();
+                        ui.end_row();
+                    });
+                if changed {
+                    self.send_node_param(doc_id, ParamId::EnvAttack, p.attack);
+                    self.send_node_param(doc_id, ParamId::EnvDecay, p.decay);
+                    self.send_node_param(doc_id, ParamId::EnvSustain, p.sustain);
+                    self.send_node_param(doc_id, ParamId::EnvRelease, p.release);
+                    self.send_node_param(doc_id, ParamId::EnvMin, p.min);
+                    self.send_node_param(doc_id, ParamId::EnvMax, p.max);
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::MidiEnvelope { params, .. }) =
+                        self.project_mut().graph.node_by_id_mut(doc_id)
+                    {
+                        *params = p;
+                    }
+                    self.commit_param_edit("MIDI Envelope", before, "midi-fx-params");
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn adsr_sliders(&mut self, ui: &mut egui::Ui, doc_id: u64) {
         let synth = self.synth_of_node(doc_id).unwrap_or_default();
         let mut a = synth.attack_s;
@@ -7588,6 +8284,7 @@ impl GlitcherZApp {
     /// the node's own `Load File…` — a swap here and a swap on the canvas
     /// node run the same [`Self::pick_sound_font`], so both write the same
     /// document fields and record the same single undo step.
+    #[allow(clippy::too_many_arguments)]
     fn sf2_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -7596,6 +8293,7 @@ impl GlitcherZApp {
         bank: u8,
         program: u8,
         gain: f32,
+        bend_range: f32,
     ) {
         ui.separator();
         ui.add_space(4.0);
@@ -7750,6 +8448,33 @@ impl GlitcherZApp {
                     *gain = value.clamp(0.0, 2.0);
                 }
                 self.commit_param_edit("SoundFont Gain", before, "sf2-gain");
+            }
+        });
+
+        // Pitch-bend range (spec `curve-map.md` D8/D9): the instrument's
+        // 14-bit bend spans this many semitones. A control curve mapped to
+        // `Pitch Bend` therefore covers exactly this range.
+        ui.horizontal(|ui| {
+            ui.label("Bend Range");
+            let mut value = bend_range;
+            if ui
+                .add(
+                    egui::Slider::new(&mut value, 1.0..=24.0)
+                        .fixed_decimals(0)
+                        .suffix(" st"),
+                )
+                .changed()
+            {
+                self.send_node_param(doc_id, ParamId::Sf2BendRange, value);
+                let before = self.begin_param_edit();
+                if let Some(NodeDoc::Instrument {
+                    voice: VoiceSpec::SoundFont { bend_range, .. },
+                    ..
+                }) = self.project_mut().graph.node_by_id_mut(doc_id)
+                {
+                    *bend_range = value.clamp(1.0, 24.0);
+                }
+                self.commit_param_edit("SoundFont Bend Range", before, "sf2-bend-range");
             }
         });
     }

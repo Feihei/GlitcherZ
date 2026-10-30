@@ -1469,6 +1469,11 @@ pub enum VoiceSpec {
         /// belongs to the source instead of costing a graph node (U13).
         #[serde(default = "soundfont_default_gain")]
         gain: f32,
+        /// Pitch-bend range in semitones (1..=24, default 2 = GM). Applied to
+        /// the instrument with the standard RPN 0 sequence (spec
+        /// `curve-map.md` D8/D9).
+        #[serde(default = "soundfont_default_bend_range")]
+        bend_range: f32,
     },
     /// Wav sample player (spec `sample-player.md` D8): file path + root
     /// note + play mode + gain. Decoded sample data stays out of the
@@ -1545,6 +1550,11 @@ fn soundfont_default_gain() -> f32 {
     1.0
 }
 
+/// Serde default for [`VoiceSpec::SoundFont`]'s `bend_range`: the GM value.
+fn soundfont_default_bend_range() -> f32 {
+    2.0
+}
+
 /// The note plane of one MIDI track (D12 v3 / v4 timeline).
 ///
 /// Timbre/mix/effects are no longer track fields -- they are the
@@ -1595,6 +1605,10 @@ pub enum NodeParam {
     Sf2Gain,
     /// Sample-player node output gain (U5, 0..2).
     SampleGain,
+    /// Instrument pitch offset (semitones, -24..24). The built-in and sample
+    /// voices accept it directly; it is the pitch input for a control cable
+    /// (spec `curve-map.md` D8).
+    PitchOffset,
     /// Built-in synth filter resonance (0..0.98).
     Resonance,
     /// Built-in synth envelope attack (seconds, 0..2).
@@ -1871,13 +1885,110 @@ pub enum ArpMode {
     Down,
     /// Up then down, endpoints not repeated.
     UpDown,
+    /// Down then up, endpoints not repeated.
+    DownUp,
     /// Seeded random walk (reproducible per node).
     Random,
 }
 
+impl ArpMode {
+    /// Index transported to the engine (`ParamId::ArpMode`).
+    pub fn index(self) -> u8 {
+        match self {
+            ArpMode::Up => 0,
+            ArpMode::Down => 1,
+            ArpMode::UpDown => 2,
+            ArpMode::DownUp => 3,
+            ArpMode::Random => 4,
+        }
+    }
+
+    /// UI label (English, like every other node caption).
+    pub fn label(self) -> &'static str {
+        match self {
+            ArpMode::Up => "Up",
+            ArpMode::Down => "Down",
+            ArpMode::UpDown => "UpDown",
+            ArpMode::DownUp => "DownUp",
+            ArpMode::Random => "Random",
+        }
+    }
+
+    /// Every mode in menu order.
+    pub const ALL: [ArpMode; 5] = [
+        ArpMode::Up,
+        ArpMode::Down,
+        ArpMode::UpDown,
+        ArpMode::DownUp,
+        ArpMode::Random,
+    ];
+}
+
+/// Arpeggiator harmony rule (spec `midi-nodes.md` §5.1): extra notes stacked
+/// on every held key before the octave layers are applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArpHarmony {
+    /// Play the held keys only.
+    #[default]
+    Off,
+    /// Root + octave.
+    Octave,
+    /// Root + perfect fifth.
+    Fifth,
+    /// Root + major third.
+    MajorThird,
+    /// Root + minor third.
+    MinorThird,
+    /// Whole-tone ladder up to the octave.
+    WholeTone,
+    /// Chromatic ladder up to the octave.
+    Chromatic,
+}
+
+impl ArpHarmony {
+    /// Index transported to the engine (`ParamId::ArpHarmony`).
+    pub fn index(self) -> u8 {
+        match self {
+            ArpHarmony::Off => 0,
+            ArpHarmony::Octave => 1,
+            ArpHarmony::Fifth => 2,
+            ArpHarmony::MajorThird => 3,
+            ArpHarmony::MinorThird => 4,
+            ArpHarmony::WholeTone => 5,
+            ArpHarmony::Chromatic => 6,
+        }
+    }
+
+    /// UI label.
+    pub fn label(self) -> &'static str {
+        match self {
+            ArpHarmony::Off => "Off",
+            ArpHarmony::Octave => "Octave",
+            ArpHarmony::Fifth => "Fifth",
+            ArpHarmony::MajorThird => "Major 3rd",
+            ArpHarmony::MinorThird => "Minor 3rd",
+            ArpHarmony::WholeTone => "Whole Tone",
+            ArpHarmony::Chromatic => "Chromatic",
+        }
+    }
+
+    /// Every harmony in menu order.
+    pub const ALL: [ArpHarmony; 7] = [
+        ArpHarmony::Off,
+        ArpHarmony::Octave,
+        ArpHarmony::Fifth,
+        ArpHarmony::MajorThird,
+        ArpHarmony::MinorThird,
+        ArpHarmony::WholeTone,
+        ArpHarmony::Chromatic,
+    ];
+}
+
 /// Step division choices, in the order the engine's `ARP_DIVISION_TICKS` table
-/// uses (spec `midi-nodes.md` §5.1).
-pub const ARP_DIVISION_COUNT: usize = 7;
+/// uses (spec `midi-nodes.md` §5.1: 1/2, 1/4, 1/8, 1/8T, 1/16, 1/16T,
+/// 1/32, 1/64).
+pub const ARP_DIVISION_COUNT: usize = 8;
 /// Default division index: 1/16.
 pub const ARP_DEFAULT_DIVISION: u8 = 4;
 
@@ -1899,6 +2010,12 @@ pub struct ArpeggiatorParams {
     /// Keep running after all keys are released.
     #[serde(default)]
     pub latch: bool,
+    /// Harmony rule.
+    #[serde(default)]
+    pub harmony: ArpHarmony,
+    /// Probability (0..=0.9) of skipping a step.
+    #[serde(default)]
+    pub skip: f32,
 }
 
 fn default_arp_division() -> u8 {
@@ -1921,6 +2038,8 @@ impl Default for ArpeggiatorParams {
             mode: ArpMode::Up,
             octaves: 1,
             latch: false,
+            harmony: ArpHarmony::Off,
+            skip: 0.0,
         }
     }
 }
@@ -1943,6 +2062,12 @@ impl ArpeggiatorParams {
             mode: self.mode,
             octaves: self.octaves.clamp(1, 4),
             latch: self.latch,
+            harmony: self.harmony,
+            skip: if self.skip.is_finite() {
+                self.skip.clamp(0.0, 0.9)
+            } else {
+                0.0
+            },
         }
     }
 }
@@ -1959,8 +2084,9 @@ pub struct PortamentoParams {
     /// Output scale, high end (semitones).
     #[serde(default = "default_portamento_max")]
     pub max: f32,
-    /// Glide only while the previous note is still held.
-    #[serde(default = "default_true")]
+    /// Glide only while the previous note is still held (default off: every
+    /// note starts a short slide from the previous pitch, spec §5.2).
+    #[serde(default)]
     pub legato_only: bool,
 }
 
@@ -1982,7 +2108,7 @@ impl Default for PortamentoParams {
             time_ms: default_portamento_time(),
             min: default_portamento_min(),
             max: default_portamento_max(),
-            legato_only: true,
+            legato_only: false,
         }
     }
 }
@@ -3327,6 +3453,17 @@ impl Project {
                 NodeDoc::Arpeggiator { params, .. } => *params = params.sanitized(),
                 NodeDoc::Portamento { params, .. } => *params = params.sanitized(),
                 NodeDoc::MidiEnvelope { params, .. } => *params = params.sanitized(),
+                // SF2 bend range (spec `curve-map.md` D8): 1..=24 st, GM 2.
+                NodeDoc::Instrument {
+                    voice: VoiceSpec::SoundFont { bend_range, .. },
+                    ..
+                } => {
+                    *bend_range = if bend_range.is_finite() {
+                        bend_range.clamp(1.0, 24.0)
+                    } else {
+                        2.0
+                    };
+                }
                 _ => {}
             }
         }
@@ -4521,6 +4658,7 @@ mod tests {
                 bank: 0,
                 program: 40,
                 gain: 1.0,
+                bend_range: 2.0,
             },
             VoiceSpec::Sample {
                 path: "kick.wav".to_string(),
@@ -4592,6 +4730,7 @@ mod tests {
             bank: 0,
             program: 40,
             gain: 1.0,
+            bend_range: 2.0,
         };
         let text = ron::to_string(&soundfont).expect("serialization failed");
         assert!(
@@ -4609,6 +4748,7 @@ mod tests {
                 bank: 0,
                 program: 0,
                 gain: 1.0,
+                bend_range: 2.0,
             }
         );
     }
@@ -5463,6 +5603,7 @@ mod tests {
                 mode: ArpMode::UpDown,
                 octaves: 3,
                 latch: true,
+                ..ArpeggiatorParams::default()
             },
         };
         let back: NodeDoc = ron::from_str(&ron::to_string(&node).unwrap()).unwrap();
@@ -5591,6 +5732,7 @@ mod tests {
                         mode: ArpMode::Random,
                         octaves: 9,
                         latch: true,
+                        ..ArpeggiatorParams::default()
                     },
                 },
                 NodeDoc::Portamento {
@@ -5655,5 +5797,64 @@ mod tests {
     #[test]
     fn project_version_unchanged_by_midi_nodes() {
         assert_eq!(super::PROJECT_VERSION, 8);
+    }
+
+    // ---- SF2 bend range (spec `curve-map.md` D8/D9) ----
+
+    #[test]
+    fn sf2_bend_range_round_trips_and_defaults_to_gm() {
+        let voice = VoiceSpec::SoundFont {
+            path: "piano.sf2".to_string(),
+            bank: 1,
+            program: 2,
+            gain: 0.8,
+            bend_range: 7.0,
+        };
+        let text = ron::to_string(&voice).expect("serialize");
+        let back: VoiceSpec = ron::from_str(&text).expect("deserialize");
+        assert_eq!(voice, back);
+
+        // Files written before the field existed keep the GM ±2 default.
+        let legacy: VoiceSpec =
+            ron::from_str("(type:\"sound_font\",path:\"piano.sf2\",bank:0,program:0,gain:1.0)")
+                .expect("legacy deserialize");
+        assert_eq!(
+            legacy,
+            VoiceSpec::SoundFont {
+                path: "piano.sf2".to_string(),
+                bank: 0,
+                program: 0,
+                gain: 1.0,
+                bend_range: 2.0,
+            }
+        );
+    }
+
+    #[test]
+    fn sf2_bend_range_is_clamped_on_load() {
+        for (stored, expected) in [(0.1_f32, 1.0), (99.0, 24.0), (f32::NAN, 2.0)] {
+            let mut project = Project::default();
+            project.graph.nodes.push(NodeDoc::Instrument {
+                node_id: 99,
+                track: 0,
+                voice: VoiceSpec::SoundFont {
+                    path: String::new(),
+                    bank: 0,
+                    program: 0,
+                    gain: 1.0,
+                    bend_range: stored,
+                },
+                synth: SynthParams::default(),
+            });
+            project.migrate();
+            let Some(NodeDoc::Instrument {
+                voice: VoiceSpec::SoundFont { bend_range, .. },
+                ..
+            }) = project.graph.nodes.last()
+            else {
+                panic!("sf2 node must survive");
+            };
+            assert_eq!(*bend_range, expected, "stored {stored}");
+        }
     }
 }

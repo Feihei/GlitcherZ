@@ -430,6 +430,8 @@ pub enum NodeCategory {
     Instrument,
     /// Audio processor (built-in delay or an effect plugin).
     Effect,
+    /// MIDI effect / control source (built-in only, spec `midi-nodes.md`).
+    MidiFx,
 }
 
 impl NodeCategory {
@@ -534,6 +536,12 @@ pub enum NodeSource {
     /// Virtual keyboard node (G6, spec `plugin-gui.md` §8): document-only
     /// routing node.
     Keyboard,
+    /// Arpeggiator MIDI effect (spec `midi-nodes.md` §5.1).
+    Arpeggiator,
+    /// Portamento MIDI effect + control source (spec `midi-nodes.md` §5.2).
+    Portamento,
+    /// MIDI-triggered envelope control source (spec `midi-nodes.md` §5.3).
+    MidiEnvelope,
 }
 
 impl NodeSource {
@@ -549,6 +557,15 @@ impl NodeSource {
                 | NodeSource::ClapEffect { .. }
                 | NodeSource::Vst3Effect { .. }
                 | NodeSource::Mixer
+        )
+    }
+
+    /// Whether this source can be spliced into a MIDI cable
+    /// (`spec midi-nodes.md` §8).
+    pub fn fits_midi_insert(&self) -> bool {
+        matches!(
+            self,
+            NodeSource::Arpeggiator | NodeSource::Portamento | NodeSource::MidiEnvelope
         )
     }
 }
@@ -614,6 +631,20 @@ pub enum PatchAction {
     ConnectKeyboardMidi {
         from_doc: u64,
         to_doc: u64,
+    },
+    /// Node-to-node MIDI cable (spec `midi-nodes.md` D10): a MIDI effect's
+    /// output → instrument / MIDI-effect document node.
+    ConnectEventMidi {
+        from_doc: u64,
+        to_doc: u64,
+    },
+    /// Node-to-node control cable (spec `midi-nodes.md` D6): a control source
+    /// (Portamento / MidiEnvelope) → a node parameter. `param` is picked in
+    /// the same popup the timeline automation cable uses.
+    ConnectControl {
+        from_doc: u64,
+        to_doc: u64,
+        param: AutoParam,
     },
     /// Automation cable drag (parameter already picked by the user from the popup menu).
     ConnectAuto {
@@ -681,7 +712,14 @@ pub enum PatchAction {
 fn opens_inspector(node: Option<&NodeDoc>) -> bool {
     matches!(
         node,
-        Some(NodeDoc::Instrument { .. } | NodeDoc::Effect { .. } | NodeDoc::Mixer { .. })
+        Some(
+            NodeDoc::Instrument { .. }
+                | NodeDoc::Effect { .. }
+                | NodeDoc::Mixer { .. }
+                | NodeDoc::Arpeggiator { .. }
+                | NodeDoc::Portamento { .. }
+                | NodeDoc::MidiEnvelope { .. }
+        )
     )
 }
 
@@ -945,7 +983,7 @@ pub struct PatchState {
     drag: Option<DragKind>,
     /// Parameters awaiting selection after dropping an automation cable drag: `(track index,
     /// target document node, popup position)`.
-    pending_auto: Option<(usize, u64, Pos2)>,
+    pending_auto: Option<(AutoSource, u64, Pos2)>,
     /// Open add-node menu (right-click / `Shift+A`, spec D17).
     add_menu: Option<AddMenu>,
     /// Ctrl + right-drag cable cut in progress: screen-space pointer path.
@@ -1563,6 +1601,7 @@ pub(crate) fn auto_param_label(param: &AutoParam) -> String {
             NodeParam::MixerOutMute => "Out Mute".to_string(),
             NodeParam::FeedbackGain => "Feedback".to_string(),
             NodeParam::Sf2Gain | NodeParam::SampleGain => "Gain".to_string(),
+            NodeParam::PitchOffset => "Pitch".to_string(),
             NodeParam::Resonance => "Resonance".to_string(),
             NodeParam::Attack => "Attack".to_string(),
             NodeParam::Decay => "Decay".to_string(),
@@ -1661,7 +1700,22 @@ impl PatchState {
                     .map(|i| (i, Pos2::new(r.right(), top + (i as f32 + 0.5) * step)))
                     .collect()
             }
-            PatchId::Node(_) => vec![(0, Pos2::new(r.right(), r.center().y))],
+            PatchId::Node(node_id) => {
+                // Spec `midi-nodes.md` §3: a MIDI effect exposes a MIDI out;
+                // Portamento adds a second (control) port below it.
+                if deps
+                    .doc
+                    .node_by_id(node_id)
+                    .is_some_and(|node| matches!(node, NodeDoc::Portamento { .. }))
+                {
+                    vec![
+                        (0, Pos2::new(r.right(), r.center().y - 8.0)),
+                        (1, Pos2::new(r.right(), r.center().y + 8.0)),
+                    ]
+                } else {
+                    vec![(0, Pos2::new(r.right(), r.center().y))]
+                }
+            }
         }
     }
 
@@ -2099,6 +2153,31 @@ fn patch_port_to(port: &PortRef) -> Option<PatchId> {
     }
 }
 
+/// Where a pending automation / control cable originates (spec
+/// `midi-nodes.md` §7: timeline tracks and control-output nodes share the
+/// same destination picker).
+#[derive(Clone, Copy, Debug)]
+enum AutoSource {
+    /// Timeline automation track index.
+    Track(usize),
+    /// Control-output node (Portamento / MidiEnvelope).
+    Node(u64),
+}
+
+/// Cable kind carried by one node's output port (spec `midi-nodes.md` §3).
+///
+/// Port 0 is the MIDI out for MIDI effects / the keyboard; Portamento's
+/// port 1 is its control output. Every other node keeps the audio port.
+fn node_out_port_kind(node: &NodeDoc, port: usize) -> CableKind {
+    match node {
+        NodeDoc::Keyboard { .. } | NodeDoc::Arpeggiator { .. } => CableKind::Midi,
+        NodeDoc::Portamento { .. } if port == 0 => CableKind::Midi,
+        NodeDoc::Portamento { .. } => CableKind::Automation,
+        NodeDoc::MidiEnvelope { .. } => CableKind::Automation,
+        _ => CableKind::Audio,
+    }
+}
+
 /// Cable kind → whether the target entity accepts it (port type rules, spec §7/D3).
 fn accepts(kind: CableKind, target: PatchId, doc: &GraphDoc) -> bool {
     if let PatchId::Node(id) = target {
@@ -2112,7 +2191,13 @@ fn accepts(kind: CableKind, target: PatchId, doc: &GraphDoc) -> bool {
                     NodeDoc::Effect { .. } | NodeDoc::Mixer { .. } | NodeDoc::Feedback { .. }
                 )
             }
-            CableKind::Midi => matches!(node, NodeDoc::Instrument { .. }),
+            CableKind::Midi => matches!(
+                node,
+                NodeDoc::Instrument { .. }
+                    | NodeDoc::Arpeggiator { .. }
+                    | NodeDoc::Portamento { .. }
+                    | NodeDoc::MidiEnvelope { .. }
+            ),
             // U4c (spec `control-tracks.md` §9 D19): every node kind that owns
             // an automatable parameter accepts an automation cable. The
             // keyboard (MIDI source) and the audio-track node (no parameters)
@@ -2417,6 +2502,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 if ui.button("Effect…").clicked() {
                     return Some(AddPick::Picker(Some(NodeCategory::Effect)));
                 }
+                if ui.button("MIDI FX…").clicked() {
+                    return Some(AddPick::Picker(Some(NodeCategory::MidiFx)));
+                }
                 ui.separator();
                 // No source dimension: one level is enough.
                 if ui.button("Mixer").clicked() {
@@ -2428,6 +2516,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 if ui.button("Feedback Tap").clicked() {
                     return Some(AddPick::Add(NodeSource::Feedback));
                 }
+                ui.separator();
+
                 ui.separator();
                 // U9 E2: full plugin re-scan on demand (the startup scan is
                 // cached, so this is the escape hatch after installing or
@@ -2544,8 +2634,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                                         PatchId::Node(to_doc) => {
                                             // The cable is committed after the
                                             // parameter is picked in the popup menu.
-                                            state.pending_auto =
-                                                Some((index, to_doc, sp + Vec2::new(4.0, 4.0)));
+                                            state.pending_auto = Some((
+                                                AutoSource::Track(index),
+                                                to_doc,
+                                                sp + Vec2::new(4.0, 4.0),
+                                            ));
                                         }
                                         _ => {}
                                     }
@@ -2589,49 +2682,84 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                             }
                         }
                         PatchId::Node(from_doc) => {
-                            // G6: a virtual keyboard's out port is a MIDI
-                            // port; every other node out port is audio.
-                            if doc.node_by_id(from_doc).is_some_and(NodeDoc::is_keyboard) {
-                                if accepts(CableKind::Midi, target, doc)
-                                    && drag.from != target
-                                    && let PatchId::Node(to_doc) = target
-                                {
-                                    actions.push(PatchAction::ConnectKeyboardMidi {
-                                        from_doc,
-                                        to_doc,
-                                    });
-                                }
-                            } else if accepts(CableKind::Audio, target, doc) && drag.from != target
-                            {
-                                let to = match target {
-                                    PatchId::Node(id) => PortRef::Node(id),
-                                    PatchId::Master => PortRef::Master,
-                                    _ => PortRef::Master,
-                                };
-                                // D17: the cable binds to the target's input
-                                // port. Dropping on a mixer picks the exact
-                                // channel port when hit precisely, else the
-                                // first free channel; dropping anywhere else
-                                // is port 0. Slots are strictly single-input
-                                // (D14): the new cable replaces the old one
-                                // on the same slot; no free channel → reject.
-                                let in_port = match target {
-                                    PatchId::Node(to_doc)
-                                        if doc.node_by_id(to_doc).is_some_and(|n| n.is_mixer()) =>
+                            // The output port itself decides the cable kind
+                            // (spec `midi-nodes.md` §3): MIDI out → MIDI
+                            // cable, control out → automation, else audio.
+                            let kind = doc.node_by_id(from_doc).map_or(CableKind::Audio, |node| {
+                                node_out_port_kind(node, drag.port)
+                            });
+                            match kind {
+                                CableKind::Midi => {
+                                    if accepts(CableKind::Midi, target, doc)
+                                        && drag.from != target
+                                        && let PatchId::Node(to_doc) = target
                                     {
-                                        match state.hit_in_port(rect.min, sp, &deps) {
-                                            Some((PatchId::Node(_), port)) => Some(port),
-                                            _ => doc.first_free_channel(to_doc),
+                                        if doc
+                                            .node_by_id(from_doc)
+                                            .is_some_and(NodeDoc::is_keyboard)
+                                        {
+                                            actions.push(PatchAction::ConnectKeyboardMidi {
+                                                from_doc,
+                                                to_doc,
+                                            });
+                                        } else {
+                                            actions.push(PatchAction::ConnectEventMidi {
+                                                from_doc,
+                                                to_doc,
+                                            });
                                         }
                                     }
-                                    _ => Some(0),
-                                };
-                                if let Some(in_port) = in_port {
-                                    actions.push(PatchAction::ConnectAudio {
-                                        from_doc,
-                                        to,
-                                        in_port,
-                                    });
+                                }
+                                CableKind::Automation => {
+                                    if accepts(CableKind::Automation, target, doc)
+                                        && drag.from != target
+                                        && let PatchId::Node(to_doc) = target
+                                    {
+                                        state.pending_auto = Some((
+                                            AutoSource::Node(from_doc),
+                                            to_doc,
+                                            sp + Vec2::new(4.0, 4.0),
+                                        ));
+                                    }
+                                }
+                                CableKind::Audio => {
+                                    if accepts(CableKind::Audio, target, doc) && drag.from != target
+                                    {
+                                        let to = match target {
+                                            PatchId::Node(id) => PortRef::Node(id),
+                                            PatchId::Master => PortRef::Master,
+                                            _ => PortRef::Master,
+                                        };
+                                        // D17: the cable binds to the target's
+                                        // input port. Dropping on a mixer picks
+                                        // the exact channel port when hit
+                                        // precisely, else the first free
+                                        // channel; dropping anywhere else is
+                                        // port 0. Slots are strictly single-
+                                        // input (D14): the new cable replaces
+                                        // the old one on the same slot; no free
+                                        // channel → reject.
+                                        let in_port = match target {
+                                            PatchId::Node(to_doc)
+                                                if doc
+                                                    .node_by_id(to_doc)
+                                                    .is_some_and(|n| n.is_mixer()) =>
+                                            {
+                                                match state.hit_in_port(rect.min, sp, &deps) {
+                                                    Some((PatchId::Node(_), port)) => Some(port),
+                                                    _ => doc.first_free_channel(to_doc),
+                                                }
+                                            }
+                                            _ => Some(0),
+                                        };
+                                        if let Some(in_port) = in_port {
+                                            actions.push(PatchAction::ConnectAudio {
+                                                from_doc,
+                                                to,
+                                                in_port,
+                                            });
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2734,14 +2862,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 TimelinePort::Auto(_) => CableKind::Automation,
                 TimelinePort::Audio(_) => CableKind::Audio,
             },
-            PatchId::Node(node_id) => {
-                // G6: the vk node's out port carries MIDI, not audio.
-                if doc.node_by_id(node_id).is_some_and(NodeDoc::is_keyboard) {
-                    CableKind::Midi
-                } else {
-                    CableKind::Audio
-                }
-            }
+            PatchId::Node(node_id) => doc
+                .node_by_id(node_id)
+                .map_or(CableKind::Audio, |node| node_out_port_kind(node, drag.port)),
             PatchId::Master => CableKind::Audio,
             // Unreachable (no output ports); automation keeps the type
             // consistent with the terminal's port table.
@@ -2824,11 +2947,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     TimelinePort::Auto(_) => cable_color(CableKind::Automation),
                     TimelinePort::Audio(_) => cable_color(CableKind::Audio),
                 },
-                PatchId::Node(node_id)
-                    if doc.node_by_id(node_id).is_some_and(NodeDoc::is_keyboard) =>
-                {
-                    cable_color(CableKind::Midi)
-                }
+                PatchId::Node(node_id) => doc
+                    .node_by_id(node_id)
+                    .map_or(cable_color(CableKind::Audio), |node| {
+                        cable_color(node_out_port_kind(node, port))
+                    }),
                 _ => cable_color(CableKind::Audio),
             };
             painter.circle_filled(p, PORT_RADIUS, port_color);
@@ -3345,8 +3468,39 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     }
 
     // ---- Automation parameter popup menu ----
-    if let Some((index, to_doc, menu_pos)) = state.pending_auto {
-        let options = (deps.auto_options)(to_doc);
+    if let Some((source, to_doc, menu_pos)) = state.pending_auto {
+        let mut options = (deps.auto_options)(to_doc);
+        let from_node = matches!(source, AutoSource::Node(_));
+        // Pitch-family destination for control sources (spec `curve-map.md` D8):
+        // built-in / sample voices take `PitchOffset` directly, SF2 takes a
+        // bend spanning the node's explicit `bend_range`, and plugins keep
+        // their own ±2 st GM range.
+        if from_node && let Some(NodeDoc::Instrument { voice, .. }) = doc.node_by_id(to_doc) {
+            match voice {
+                glitcherz_model::VoiceSpec::Builtin | glitcherz_model::VoiceSpec::Sample { .. } => {
+                    options.push((
+                        "Pitch ±24 st".to_string(),
+                        AutoParam::Node(NodeParam::PitchOffset),
+                    ));
+                }
+                glitcherz_model::VoiceSpec::SoundFont { bend_range, .. } => {
+                    options.push((
+                        format!("Pitch Bend ±{bend_range:.0} st"),
+                        AutoParam::PitchBend {
+                            channel: 0,
+                            range_semitones: *bend_range,
+                        },
+                    ));
+                }
+                _ => options.push((
+                    "Pitch Bend ±2 st".to_string(),
+                    AutoParam::PitchBend {
+                        channel: 0,
+                        range_semitones: 2.0,
+                    },
+                )),
+            }
+        }
         let mut picked: Option<AutoParam> = None;
         egui::Area::new(egui::Id::new("glitcherz_patch_auto_menu"))
             .fixed_pos(menu_pos)
@@ -3354,8 +3508,17 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(140.0);
-                    ui.strong("Automation Target Param");
+                    ui.strong(if from_node {
+                        "Control Target Param"
+                    } else {
+                        "Automation Target Param"
+                    });
                     for (label, param) in &options {
+                        // Tempo is a timeline clock, never a node control
+                        // destination (spec `midi-nodes.md` §7).
+                        if from_node && matches!(param, AutoParam::Tempo) {
+                            continue;
+                        }
                         if ui.button(label).clicked() {
                             picked = Some(param.clone());
                         }
@@ -3363,11 +3526,18 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 });
             });
         if let Some(param) = picked {
-            actions.push(PatchAction::ConnectAuto {
-                index,
-                to_doc,
-                param,
-            });
+            match source {
+                AutoSource::Track(index) => actions.push(PatchAction::ConnectAuto {
+                    index,
+                    to_doc,
+                    param,
+                }),
+                AutoSource::Node(from_doc) => actions.push(PatchAction::ConnectControl {
+                    from_doc,
+                    to_doc,
+                    param,
+                }),
+            }
             state.pending_auto = None;
         } else if ui
             .ctx()
@@ -3387,6 +3557,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         #[derive(Clone)]
         enum CablePick {
             InsertPicker,
+            InsertPickerMidi,
             Insert(NodeSource),
             Delete,
         }
@@ -3396,10 +3567,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             None
         };
         // A cable can disappear between opening the menu and picking from it.
-        let is_audio = doc
-            .cables
-            .get(menu.cable)
-            .is_some_and(|c| c.kind == CableKind::Audio);
+        let kind = doc.cables.get(menu.cable).map(|c| c.kind);
         let pick = egui::Popup::from_response(&response)
             .id(cable_menu_id())
             .kind(egui::PopupKind::Menu)
@@ -3409,14 +3577,21 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             .show(|ui| {
                 ui.set_min_width(150.0);
                 ui.strong("Cable");
-                // MIDI / automation cables accept no processors at all.
-                if is_audio {
+                if kind == Some(CableKind::Audio) {
                     if ui.button("Insert Effect…").clicked() {
                         return Some(CablePick::InsertPicker);
                     }
                     // A mixer is not an "effect"; it gets its own leaf.
                     if ui.button("Insert Mixer").clicked() {
                         return Some(CablePick::Insert(NodeSource::Mixer));
+                    }
+                    ui.separator();
+                }
+                // Spec `midi-nodes.md` §8: a MIDI cable takes a MIDI effect
+                // (the chain `source → effect → instrument`).
+                if kind == Some(CableKind::Midi) {
+                    if ui.button("Insert MIDI FX…").clicked() {
+                        return Some(CablePick::InsertPickerMidi);
                     }
                     ui.separator();
                 }
@@ -3431,6 +3606,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 // Only effects can be spliced into an audio cable: an
                 // instrument would be born without a MIDI feed.
                 category: Some(NodeCategory::Effect),
+                place: PickerPlace::Insert {
+                    cable: menu.cable,
+                    at: menu.at,
+                },
+            }),
+            Some(CablePick::InsertPickerMidi) => actions.push(PatchAction::OpenPluginPicker {
+                category: Some(NodeCategory::MidiFx),
                 place: PickerPlace::Insert {
                     cable: menu.cable,
                     at: menu.at,
@@ -3795,6 +3977,7 @@ mod tests {
                 bank: 0,
                 program: 0,
                 gain: 1.0,
+                bend_range: 2.0,
             },
             synth: glitcherz_model::SynthParams::default(),
         };
@@ -4303,6 +4486,116 @@ mod tests {
         );
     }
 
+    /// M5 (spec `midi-nodes.md` §3): MIDI effect / control-source output
+    /// ports and their cable kinds, plus the accept matrix.
+    #[test]
+    fn midi_fx_node_ports_and_accept_rules() {
+        let mut doc = Project::default().graph;
+        let instrument = doc.instrument_of_track(0).unwrap().node_id();
+        let mixer = doc.first_mixer().unwrap().node_id();
+        let arp = 100;
+        doc.nodes.push(NodeDoc::Arpeggiator {
+            node_id: arp,
+            track: 0,
+            params: Default::default(),
+        });
+        let portamento = 101;
+        doc.nodes.push(NodeDoc::Portamento {
+            node_id: portamento,
+            track: 0,
+            params: Default::default(),
+        });
+        let envelope = 102;
+        doc.nodes.push(NodeDoc::MidiEnvelope {
+            node_id: envelope,
+            track: 0,
+            params: Default::default(),
+        });
+
+        // Port kinds: arp = MIDI, portamento = MIDI + control, envelope =
+        // control, ordinary nodes stay audio.
+        assert_eq!(
+            node_out_port_kind(doc.node_by_id(arp).unwrap(), 0),
+            CableKind::Midi
+        );
+        assert_eq!(
+            node_out_port_kind(doc.node_by_id(portamento).unwrap(), 0),
+            CableKind::Midi
+        );
+        assert_eq!(
+            node_out_port_kind(doc.node_by_id(portamento).unwrap(), 1),
+            CableKind::Automation
+        );
+        assert_eq!(
+            node_out_port_kind(doc.node_by_id(envelope).unwrap(), 0),
+            CableKind::Automation
+        );
+        assert_eq!(
+            node_out_port_kind(doc.node_by_id(instrument).unwrap(), 0),
+            CableKind::Audio
+        );
+
+        // MIDI goes into instruments / MIDI effects / envelopes; the mixer
+        // stays a mismatch.
+        for target in [instrument, arp, portamento, envelope] {
+            assert!(
+                accepts(CableKind::Midi, PatchId::Node(target), &doc),
+                "node {target} should take MIDI"
+            );
+        }
+        assert!(!accepts(CableKind::Midi, PatchId::Node(mixer), &doc));
+
+        // Control cables only reach parameter-bearing nodes.
+        assert!(accepts(
+            CableKind::Automation,
+            PatchId::Node(instrument),
+            &doc
+        ));
+        assert!(!accepts(CableKind::Automation, PatchId::Node(arp), &doc));
+        assert!(!accepts(
+            CableKind::Automation,
+            PatchId::Node(envelope),
+            &doc
+        ));
+
+        // Portamento exposes two output ports; the others one.
+        let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
+        let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
+        let deps = PatchDeps {
+            doc: &doc,
+            track_count: 1,
+            auto_count: 0,
+            audio_count: 0,
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
+        };
+        let mut state = PatchState::default();
+        state.ensure_positions(&doc, 1, 0, 0);
+        state.place_node(arp, Pos2::new(0.0, 0.0));
+        state.place_node(portamento, Pos2::new(300.0, 0.0));
+        state.place_node(envelope, Pos2::new(600.0, 0.0));
+        assert_eq!(
+            state
+                .out_ports_screen(Pos2::ZERO, PatchId::Node(arp), &deps)
+                .len(),
+            1
+        );
+        assert_eq!(
+            state
+                .out_ports_screen(Pos2::ZERO, PatchId::Node(portamento), &deps)
+                .len(),
+            2
+        );
+        assert_eq!(
+            state
+                .out_ports_screen(Pos2::ZERO, PatchId::Node(envelope), &deps)
+                .len(),
+            1
+        );
+    }
+
     /// U10: the timeline and mixer boxes reserve action rows for their own
     /// add / remove buttons, and their ports stay in the port area below;
     /// only those two entities carry buttons, and the virtual keyboard gates
@@ -4579,6 +4872,7 @@ mod tests {
                 bank: 0,
                 program: 0,
                 gain: 1.0,
+                bend_range: 2.0,
             },
             synth: glitcherz_model::SynthParams::default(),
         });
@@ -4630,6 +4924,7 @@ mod tests {
                 bank: 0,
                 program: 0,
                 gain: 1.0,
+                bend_range: 2.0,
             };
         }
         {

@@ -25,7 +25,7 @@ use eframe::egui;
 
 use glitcherz_model::BuiltinEffectKind;
 
-use crate::patch::NodeSource;
+use crate::patch::{NodeCategory, NodeSource};
 use crate::plugin_catalog::{PluginEntry, PluginFormat};
 
 /// How many entries each category keeps in the recent list (spec D10).
@@ -160,6 +160,13 @@ impl PickChoice {
                 "Wav sample player — the file is picked on the node".to_string()
             }
             NodeSource::Builtin(kind) => format!("Built-in effect: {}", kind.label()),
+            NodeSource::Arpeggiator => "MIDI effect: arpeggiator (MIDI in / out)".to_string(),
+            NodeSource::Portamento => {
+                "MIDI effect: portamento (MIDI in / out + control out)".to_string()
+            }
+            NodeSource::MidiEnvelope => {
+                "Control source: MIDI-triggered envelope (MIDI in / control out)".to_string()
+            }
             NodeSource::Mixer | NodeSource::Feedback | NodeSource::Keyboard => String::new(),
         }
     }
@@ -195,17 +202,41 @@ pub fn builtin_instruments() -> Vec<PickChoice> {
     ]
 }
 
+/// Node family the picker is currently filtered to (spec
+/// `plugin-browser.md` D1; MIDI effects are built-in only, spec
+/// `midi-nodes.md` §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickKind {
+    /// Instruments.
+    Instrument,
+    /// Audio effects.
+    Effect,
+    /// MIDI effects / control sources (built-in only).
+    MidiFx,
+}
+
+impl PickKind {
+    /// Converts the add menu's category filter.
+    fn of(is_instrument: bool) -> Self {
+        if is_instrument {
+            PickKind::Instrument
+        } else {
+            PickKind::Effect
+        }
+    }
+}
+
 /// What a picker instance may show (spec §6.1: opened from `Instrument…`,
-/// `Effect…`, or the global `Search Nodes…`).
+/// `Effect…`, `MIDI FX…` or the global `Search Nodes…`).
 ///
 /// Two independent axes: the **category** the menu leaf asked for, and the
 /// **sources** the user left switched on in the chip strip (D19). The query
 /// is the third, kept on [`PluginPicker`] because it is per-popup state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PickFilter {
-    /// `Some(true)` = instruments only, `Some(false)` = effects only,
-    /// `None` = the global `Search Nodes…` entry (both).
-    pub want_instrument: Option<bool>,
+    /// `Some(kind)` = that node family only, `None` = the global
+    /// `Search Nodes…` entry (all families).
+    pub kind: Option<PickKind>,
     /// Sources allowed to appear (`BUILT-IN` / `CLAP` / `VST3`).
     pub tags: PickTags,
 }
@@ -213,7 +244,7 @@ pub struct PickFilter {
 impl Default for PickFilter {
     fn default() -> Self {
         Self {
-            want_instrument: None,
+            kind: None,
             tags: PickTags::ALL,
         }
     }
@@ -224,21 +255,39 @@ impl PickFilter {
     /// (`None`), with every source switched on.
     pub fn category(want_instrument: Option<bool>) -> Self {
         Self {
-            want_instrument,
+            kind: want_instrument.map(PickKind::of),
             ..Self::default()
         }
     }
 
-    fn admits(&self, is_instrument: bool) -> bool {
-        self.want_instrument
-            .is_none_or(|wanted| wanted == is_instrument)
+    /// The `MIDI FX…` leaf: built-in MIDI effects / control sources only.
+    pub fn midi_fx() -> Self {
+        Self {
+            kind: Some(PickKind::MidiFx),
+            tags: PickTags::ALL,
+        }
+    }
+
+    /// The add menu's [`NodeCategory`] mapped to the filter.
+    pub fn from_category(category: Option<NodeCategory>) -> Self {
+        match category {
+            Some(NodeCategory::Instrument) => Self::category(Some(true)),
+            Some(NodeCategory::Effect) => Self::category(Some(false)),
+            Some(NodeCategory::MidiFx) => Self::midi_fx(),
+            None => Self::default(),
+        }
+    }
+
+    fn admits(&self, kind: PickKind) -> bool {
+        self.kind.is_none_or(|wanted| wanted == kind)
     }
 
     /// Heading shown above the filter field.
     fn heading(&self) -> &'static str {
-        match self.want_instrument {
-            Some(true) => "Instruments",
-            Some(false) => "Effects",
+        match self.kind {
+            Some(PickKind::Instrument) => "Instruments",
+            Some(PickKind::Effect) => "Effects",
+            Some(PickKind::MidiFx) => "MIDI FX",
             None => "All nodes",
         }
     }
@@ -386,6 +435,28 @@ pub fn matches_query(name: &str, path: &str, query: &str) -> bool {
     })
 }
 
+/// Built-in MIDI effects / control sources (spec `midi-nodes.md` §5): the
+/// `MIDI FX…` leaf lists these, and they have no plugin counterpart in v1.
+pub fn builtin_midi_fx() -> Vec<PickChoice> {
+    vec![
+        PickChoice {
+            name: "Arpeggiator".to_string(),
+            tag: PickTag::BuiltIn,
+            source: NodeSource::Arpeggiator,
+        },
+        PickChoice {
+            name: "Portamento".to_string(),
+            tag: PickTag::BuiltIn,
+            source: NodeSource::Portamento,
+        },
+        PickChoice {
+            name: "MIDI Envelope".to_string(),
+            tag: PickTag::BuiltIn,
+            source: NodeSource::MidiEnvelope,
+        },
+    ]
+}
+
 /// Built-in rows admitted by `filter` and matching `query`, in menu order.
 pub fn builtin_choices(filter: PickFilter, query: &str) -> Vec<PickChoice> {
     let mut rows = Vec::new();
@@ -394,15 +465,18 @@ pub fn builtin_choices(filter: PickFilter, query: &str) -> Vec<PickChoice> {
     if !filter.tags.has(PickTag::BuiltIn) {
         return rows;
     }
-    if filter.admits(true) {
+    if filter.admits(PickKind::Instrument) {
         rows.extend(builtin_instruments());
     }
-    if filter.admits(false) {
+    if filter.admits(PickKind::Effect) {
         rows.extend(BuiltinEffectKind::ALL.iter().map(|kind| PickChoice {
             name: kind.label().to_string(),
             tag: PickTag::BuiltIn,
             source: NodeSource::Builtin(*kind),
         }));
+    }
+    if filter.admits(PickKind::MidiFx) {
+        rows.extend(builtin_midi_fx());
     }
     rows.retain(|row| matches_query(&row.name, "", query));
     rows
@@ -413,7 +487,7 @@ pub fn builtin_choices(filter: PickFilter, query: &str) -> Vec<PickChoice> {
 pub fn plugin_choices(entries: &[PluginEntry], filter: PickFilter, query: &str) -> Vec<PickChoice> {
     let mut rows: Vec<PickChoice> = entries
         .iter()
-        .filter(|entry| filter.admits(entry.is_instrument))
+        .filter(|entry| filter.admits(PickKind::of(entry.is_instrument)))
         .filter(|entry| filter.tags.has(tag_of(entry.format)))
         .filter(|entry| matches_query(&entry.name, &entry.path, query))
         .map(PickChoice::from)
@@ -435,7 +509,7 @@ pub fn available_tags(entries: &[PluginEntry], filter: PickFilter) -> PickTags {
     tags.set(PickTag::BuiltIn, true);
     for entry in entries
         .iter()
-        .filter(|entry| filter.admits(entry.is_instrument))
+        .filter(|entry| filter.admits(PickKind::of(entry.is_instrument)))
     {
         tags.set(tag_of(entry.format), true);
     }
@@ -459,7 +533,7 @@ pub fn rows(
         rows.extend(
             recents
                 .iter()
-                .filter(|recent| filter.admits(recent.is_instrument))
+                .filter(|recent| filter.admits(PickKind::of(recent.is_instrument)))
                 .filter(|recent| filter.tags.has(tag_of(recent.format)))
                 .filter(|recent| matches_query(&recent.name, &recent.path, query))
                 .take(RECENT_MAX)
@@ -948,7 +1022,8 @@ mod tests {
         assert_eq!(recents, 0);
         // Built-in block, then CLAP, then VST3 — tags never interleave.
         let tags: Vec<PickTag> = rows.iter().map(|row| row.tag).collect();
-        let builtins = builtin_instruments().len() + BuiltinEffectKind::ALL.len();
+        let builtins =
+            builtin_instruments().len() + BuiltinEffectKind::ALL.len() + builtin_midi_fx().len();
         assert_eq!(&tags[..builtins], &vec![PickTag::BuiltIn; builtins][..]);
         assert!(tags[builtins..].windows(2).all(|pair| pair[0] <= pair[1]));
         // Names inside the CLAP group are ordered ignoring case.
@@ -1411,7 +1486,10 @@ mod tests {
         assert!(frame(&ctx, &mut picker, &entries, &recents, vec![], 0.0).is_none());
         assert_eq!(
             picker.row_count(),
-            1 + builtin_instruments().len() + BuiltinEffectKind::ALL.len() + entries.len()
+            1 + builtin_instruments().len()
+                + BuiltinEffectKind::ALL.len()
+                + builtin_midi_fx().len()
+                + entries.len()
         );
         // Enter on the initial highlight takes the most recent plugin.
         let outcome = frame(
@@ -1566,5 +1644,48 @@ mod tests {
         let outcome = frame(&ctx, &mut picker, &entries, &[], vec![press(false)], 0.2);
         assert_eq!(outcome, Some(PickOutcome::Cancelled));
         assert!(!picker.is_open());
+    }
+
+    /// M5+ (spec `midi-nodes.md` §8): the `MIDI FX…` leaf is a picker like
+    /// `Effect…`, but only the built-in chip has content.
+    #[test]
+    fn midi_fx_filter_lists_only_builtin_midi_effects() {
+        let rows = builtin_choices(PickFilter::midi_fx(), "");
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, vec!["Arpeggiator", "Portamento", "MIDI Envelope"]);
+        assert!(rows.iter().all(|row| row.tag == PickTag::BuiltIn));
+
+        // Instruments / effects filters never show them.
+        for filter in [
+            PickFilter::category(Some(true)),
+            PickFilter::category(Some(false)),
+        ] {
+            assert!(
+                !builtin_choices(filter, "")
+                    .iter()
+                    .any(|row| row.name == "Arpeggiator")
+            );
+        }
+        // The global search still does.
+        assert!(
+            builtin_choices(PickFilter::default(), "")
+                .iter()
+                .any(|row| row.name == "Arpeggiator")
+        );
+
+        // Plugin catalog entries are never MIDI effects (v1).
+        let entries = vec![entry(
+            PluginFormat::Clap,
+            "C:/clap/a.clap",
+            "a",
+            "Alpha",
+            false,
+        )];
+        assert!(plugin_choices(&entries, PickFilter::midi_fx(), "").is_empty());
+        // The chip strip for MIDI FX offers only the built-in chip.
+        let tags = available_tags(&entries, PickFilter::midi_fx());
+        assert!(tags.has(PickTag::BuiltIn));
+        assert!(!tags.has(PickTag::Clap));
+        assert!(!tags.has(PickTag::Vst3));
     }
 }
