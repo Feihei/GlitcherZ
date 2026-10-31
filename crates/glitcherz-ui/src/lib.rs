@@ -54,7 +54,7 @@ use glitcherz_model::{
     LfoWaveform, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS,
     MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip,
     MidiEnvelopeParams, MidiSource, MidiTrack, NodeDoc, NodeParam, PortRef, PortamentoParams,
-    Project, SamplePlayMode, SongLoop, SynthParams, VoiceSpec,
+    Project, SamplePlayMode, SongLoop, SynthParams, SynthWaveform, VoiceSpec,
 };
 
 pub mod curve;
@@ -260,6 +260,22 @@ enum AutoTarget {
     Node(u64),
     /// The fixed conductor terminal (`PortRef::TimelineIn`).
     TimelineIn,
+}
+
+/// Every engine parameter of a built-in synthesizer payload, in one place
+/// (spec `instrument.md`): the live document push and the offline export
+/// engine both walk this table, so they cannot drift apart.
+fn synth_param_values(synth: &SynthParams) -> [(ParamId, f32); 8] {
+    [
+        (ParamId::OscWaveform, f32::from(synth.waveform.index())),
+        (ParamId::FilterCutoff, synth.cutoff_hz),
+        (ParamId::FilterResonance, synth.resonance),
+        (ParamId::FilterMode, synth.filter_mode),
+        (ParamId::Attack, synth.attack_s),
+        (ParamId::Decay, synth.decay_s),
+        (ParamId::Sustain, synth.sustain),
+        (ParamId::Release, synth.release_s),
+    ]
 }
 
 /// Document automation parameter → engine parameter ID.
@@ -2422,15 +2438,7 @@ impl GlitcherZApp {
                 continue;
             };
             let params: Vec<(ParamId, f32)> = match node {
-                NodeDoc::Instrument { synth, .. } => vec![
-                    (ParamId::FilterCutoff, synth.cutoff_hz),
-                    (ParamId::FilterResonance, synth.resonance),
-                    (ParamId::FilterMode, synth.filter_mode),
-                    (ParamId::Attack, synth.attack_s),
-                    (ParamId::Decay, synth.decay_s),
-                    (ParamId::Sustain, synth.sustain),
-                    (ParamId::Release, synth.release_s),
-                ],
+                NodeDoc::Instrument { synth, .. } => synth_param_values(synth).to_vec(),
                 // Table-driven (spec `effects.md` D6): one entry per slot.
                 NodeDoc::Effect {
                     voice: VoiceSpec::Builtin | VoiceSpec::SoundFont { .. },
@@ -5121,8 +5129,16 @@ impl GlitcherZApp {
         let sr = convert::sample_rate_to_f32(self.engine.info().sample_rate);
         let sample_rate = self.engine.info().sample_rate;
         let (processor, guard): (Box<dyn Processor>, Option<PluginGuard>) = match node {
-            NodeDoc::Instrument { voice, .. } => match voice {
-                VoiceSpec::Builtin => (Box::new(SynthProcessor::new(sr)), None),
+            NodeDoc::Instrument { voice, synth, .. } => match voice {
+                VoiceSpec::Builtin => {
+                    // Spec `instrument.md`: the export engine must hear the
+                    // same timbre as the live one (waveform / filter / ADSR).
+                    let mut processor = SynthProcessor::new(sr);
+                    for (id, value) in synth_param_values(synth) {
+                        processor.set_param(id, value);
+                    }
+                    (Box::new(processor), None)
+                }
                 VoiceSpec::Sample {
                     path,
                     root_note,
@@ -8647,6 +8663,29 @@ impl GlitcherZApp {
                 .spacing([16.0, 8.0])
                 .show(ui, |ui| {
                     if let Some(instr_id) = instr_target {
+                    ui.label("Waveform");
+                    ui.horizontal(|ui| {
+                        let waveform = self.synth_of_node(instr_id).unwrap_or_default().waveform;
+                        for wave in SynthWaveform::ALL {
+                            if ui
+                                .selectable_label(waveform == wave, wave.label())
+                                .clicked()
+                            {
+                                let before = self.begin_edit();
+                                if let Some(s) = self.synth_mut_node(instr_id) {
+                                    s.waveform = wave;
+                                }
+                                self.commit_edit("Waveform", before);
+                                self.send_node_param(
+                                    instr_id,
+                                    ParamId::OscWaveform,
+                                    f32::from(wave.index()),
+                                );
+                            }
+                        }
+                    });
+                    ui.end_row();
+
                     ui.label("Cutoff Freq");
                     let mut cutoff = self.synth_of_node(instr_id).unwrap_or_default().cutoff_hz;
                     let r = ui.add(
@@ -12510,6 +12549,35 @@ mod panel_target_tests {
 #[cfg(test)]
 mod inline_param_tests {
     use super::*;
+
+    /// Spec `instrument.md`: the live push and the offline export engine walk
+    /// one table, and every timbre field of the document payload is on it.
+    #[test]
+    fn synth_param_table_covers_the_document_payload() {
+        let synth = SynthParams {
+            waveform: SynthWaveform::Square,
+            cutoff_hz: 3_000.0,
+            resonance: 0.6,
+            filter_mode: 2.0,
+            attack_s: 0.02,
+            decay_s: 0.3,
+            sustain: 0.4,
+            release_s: 0.7,
+        };
+        assert_eq!(
+            synth_param_values(&synth),
+            [
+                (ParamId::OscWaveform, 3.0),
+                (ParamId::FilterCutoff, 3_000.0),
+                (ParamId::FilterResonance, 0.6),
+                (ParamId::FilterMode, 2.0),
+                (ParamId::Attack, 0.02),
+                (ParamId::Decay, 0.3),
+                (ParamId::Sustain, 0.4),
+                (ParamId::Release, 0.7),
+            ]
+        );
+    }
 
     /// G5: every registry entry maps to the engine parameter the matching
     /// panel slider uses (inline and panel edits address the same

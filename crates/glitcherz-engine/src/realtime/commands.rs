@@ -14,10 +14,16 @@ pub const COMMAND_QUEUE_CAPACITY: usize = 1024;
 /// `NodeTarget`-directed routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamId {
-    /// Sine source frequency (Hz).
-    SineFrequency,
-    /// Sine source output gain (linear).
-    SineGain,
+    /// Oscillator source frequency (Hz).
+    OscFrequency,
+    /// Oscillator output gain (linear).
+    OscGain,
+    /// Oscillator waveform index (0 = Sine, 1 = Triangle, 2 = Saw,
+    /// 3 = Square; spec `instrument.md` D1).
+    ///
+    /// Discrete: switches take effect at the block boundary. The historical
+    /// `Sine*` names are gone with the single-waveform oscillator.
+    OscWaveform,
     /// Pitch offset in **semitones** (−24..24, `0` = no offset), P1 /
     /// spec `roll-multiclip.md` D10/D11.
     ///

@@ -263,7 +263,7 @@ fn param_routing() {
     assert!(proc.set_param(ParamId::Sf2BankSelect, 0.0));
     assert!(proc.set_param(ParamId::Sf2ProgramChange, 0.0));
     assert!(proc.set_param(ParamId::Sf2Gain, 0.5));
-    assert!(!proc.set_param(ParamId::SineFrequency, 440.0));
+    assert!(!proc.set_param(ParamId::OscFrequency, 440.0));
     assert!(!proc.set_param(ParamId::MasterGain, 1.0));
     assert!(!proc.set_param(ParamId::Attack, 0.1));
 }

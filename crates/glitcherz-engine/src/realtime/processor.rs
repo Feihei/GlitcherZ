@@ -230,7 +230,7 @@ mod tests {
         let mut chain = ProcessorChain::new();
         chain.push(Box::new(GainProcessor::new(1.0)));
         assert!(chain.set_param(ParamId::MasterGain, 0.5));
-        assert!(!chain.set_param(ParamId::SineFrequency, 100.0));
+        assert!(!chain.set_param(ParamId::OscFrequency, 100.0));
 
         let mut buf = AudioBuffer::new(1, 4);
         buf.set_len(4);

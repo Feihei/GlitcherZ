@@ -654,7 +654,7 @@ mod tests {
         runner.render_interleaved(&mut out[..half_frames * 2]);
         tx.push(EngineCommand::SetTrackParam {
             track: 0,
-            id: ParamId::SineFrequency,
+            id: ParamId::OscFrequency,
             value: 880.0,
         })
         .expect("queue not full");

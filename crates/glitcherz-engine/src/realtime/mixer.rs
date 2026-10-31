@@ -289,7 +289,7 @@ mod tests {
         assert!(mixer.input_weights().unwrap()[0][0].abs() < 1e-6);
         assert!(mixer.set_param(ParamId::MixerGain(1), 0.25));
         assert!((mixer.input_weights().unwrap()[1][0] - 0.25).abs() < 1e-6);
-        assert!(!mixer.set_param(ParamId::SineFrequency, 100.0));
+        assert!(!mixer.set_param(ParamId::OscFrequency, 100.0));
     }
 
     #[test]

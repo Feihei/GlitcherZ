@@ -216,7 +216,7 @@ fn params_clamp_and_reject_non_finite_values() {
     assert!(processor.set_param(ParamId::DrumSlotChoke(36), 3.0));
     assert!(processor.set_param(ParamId::PitchOffset, 12.0));
     assert!(!processor.set_param(ParamId::PitchOffset, f32::NAN));
-    assert!(!processor.set_param(ParamId::SineFrequency, 440.0));
+    assert!(!processor.set_param(ParamId::OscFrequency, 440.0));
     hit(&mut processor, 36, 1.0);
     let buffer = render(&mut processor, 1);
     assert!(buffer.channel(0).unwrap().iter().all(|v| v.is_finite()));

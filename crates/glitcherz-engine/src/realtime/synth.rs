@@ -1,12 +1,13 @@
-//! Full synthesizer: oscillator → ADSR envelope (single voice).
+//! Full synthesizer: oscillator → filter → ADSR envelope (single voice).
 
 use crate::convert;
 use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::{NoteEvent, ParamId};
 use crate::realtime::context::ProcessContext;
 use crate::realtime::envelope::AdsrProcessor;
+use crate::realtime::osc::OscProcessor;
 use crate::realtime::processor::Processor;
-use crate::realtime::sine::SineProcessor;
+use crate::realtime::svf::SvfProcessor;
 
 /// MIDI note number → frequency (Hz). A4 (69) = 440 Hz.
 /// Values are passed from the instrument / UI layer, not a per-sample hot
@@ -15,7 +16,7 @@ pub fn note_to_frequency(note: u8) -> f32 {
     convert::to_f32(440.0 * 2.0f64.powf((note as f64 - 69.0) / 12.0))
 }
 
-/// Single-voice synthesizer: sine oscillator + ADSR envelope.
+/// Single-voice synthesizer: oscillator → state-variable filter → ADSR.
 ///
 /// Note semantics (MIDI):
 /// - `On { note, velocity }`: the oscillator changes frequency immediately
@@ -24,10 +25,12 @@ pub fn note_to_frequency(note: u8) -> f32 {
 /// - `Off { .. }`: the envelope enters Release (the single-voice
 ///   implementation ignores the specific note).
 ///
-/// No built-in filter — the processing chain chains an
-/// [`SvfProcessor`](crate::realtime::SvfProcessor) after it.
+/// The filter sits **before** the amp envelope (VCF → VCA, spec
+/// `instrument.md` D3); its cutoff / resonance are smoothed inside
+/// [`SvfProcessor`].
 pub struct SynthProcessor {
-    osc: SineProcessor,
+    osc: OscProcessor,
+    filter: SvfProcessor,
     env: AdsrProcessor,
 }
 
@@ -36,13 +39,13 @@ impl SynthProcessor {
     /// (construction-time tolerance).
     ///
     /// The oscillator gain is normalized to 1: the voice amplitude is
-    /// entirely determined by the envelope (velocity → sustain); the
-    /// reverberant main gain / filter sit downstream in the chain.
+    /// entirely determined by the envelope (velocity → sustain).
     pub fn new(sample_rate: f32) -> Self {
-        let mut osc = SineProcessor::new(sample_rate);
-        osc.set_param(ParamId::SineGain, 1.0);
+        let mut osc = OscProcessor::new(sample_rate);
+        osc.set_param(ParamId::OscGain, 1.0);
         Self {
             osc,
+            filter: SvfProcessor::new(sample_rate),
             env: AdsrProcessor::new(sample_rate),
         }
     }
@@ -61,13 +64,18 @@ impl SynthProcessor {
 impl Processor for SynthProcessor {
     fn process(&mut self, ctx: &ProcessContext, buffer: &mut AudioBuffer) {
         self.osc.process(ctx, buffer);
+        self.filter.process(ctx, buffer);
         self.env.process(ctx, buffer);
     }
 
     fn set_param(&mut self, id: ParamId, value: f32) -> bool {
         match id {
-            ParamId::SineFrequency | ParamId::SineGain | ParamId::PitchOffset => {
-                self.osc.set_param(id, value)
+            ParamId::OscFrequency
+            | ParamId::OscGain
+            | ParamId::OscWaveform
+            | ParamId::PitchOffset => self.osc.set_param(id, value),
+            ParamId::FilterCutoff | ParamId::FilterResonance | ParamId::FilterMode => {
+                self.filter.set_param(id, value)
             }
             ParamId::Attack | ParamId::Decay | ParamId::Sustain | ParamId::Release => {
                 self.env.set_param(id, value)
@@ -197,7 +205,10 @@ mod tests {
     #[test]
     fn extreme_params_stay_finite() {
         let mut synth = SynthProcessor::new(SR);
-        synth.set_param(ParamId::SineFrequency, SR / 2.0);
+        synth.set_param(ParamId::OscFrequency, SR / 2.0);
+        synth.set_param(ParamId::OscWaveform, 3.0);
+        synth.set_param(ParamId::FilterCutoff, 20.0);
+        synth.set_param(ParamId::FilterResonance, 0.98);
         synth.note_event(NoteEvent::On {
             note: 127,
             velocity: f32::NAN,
@@ -207,19 +218,60 @@ mod tests {
     }
 
     #[test]
-    fn params_route_to_osc_and_envelope() {
+    fn params_route_to_osc_filter_and_envelope() {
         let mut synth = SynthProcessor::new(SR);
-        assert!(synth.set_param(ParamId::SineFrequency, 220.0));
+        assert!(synth.set_param(ParamId::OscFrequency, 220.0));
         assert!((synth.frequency() - 220.0).abs() < 1e-3);
+        assert!(synth.set_param(ParamId::OscWaveform, 2.0));
+        assert!(synth.set_param(ParamId::FilterCutoff, 1_000.0));
+        assert!(synth.set_param(ParamId::FilterResonance, 0.5));
+        assert!(synth.set_param(ParamId::FilterMode, 1.0));
         assert!(synth.set_param(ParamId::Attack, 0.5));
         assert!(synth.set_param(ParamId::Release, 0.5));
         assert!(
             !synth.set_param(ParamId::MasterGain, 1.0),
             "master gain is not the synthesizer's responsibility"
         );
+    }
+
+    /// Spec `instrument.md` D3: the filter is wired into the voice, so a low
+    /// cutoff audibly removes a high note (the old code dropped the parameter).
+    #[test]
+    fn filter_cutoff_reshapes_the_voice() {
+        let peak_of = |cutoff: f32| {
+            let mut synth = SynthProcessor::new(SR);
+            synth.set_param(ParamId::Attack, 0.0);
+            synth.set_param(ParamId::Decay, 0.0);
+            synth.set_param(ParamId::Sustain, 1.0);
+            synth.set_param(ParamId::FilterCutoff, cutoff);
+            synth.set_param(ParamId::FilterResonance, 0.1);
+            synth.note_event(note_on(108)); // C8 ≈ 4186 Hz
+            let out = render(&mut synth, 40);
+            out.iter().fold(0.0f32, |a, s| a.max(s.abs()))
+        };
+        let open = peak_of(12_000.0);
+        let closed = peak_of(200.0);
+        assert!(open > 0.8, "open filter should pass the note, peak {open}");
         assert!(
-            !synth.set_param(ParamId::FilterCutoff, 1000.0),
-            "the filter is not the synthesizer's responsibility"
+            closed < open * 0.3,
+            "200 Hz low-pass must attenuate a 4 kHz note ({closed} vs {open})"
+        );
+    }
+
+    /// The waveform parameter reaches the oscillator (spec D1).
+    #[test]
+    fn waveform_is_forwarded_to_the_oscillator() {
+        let mut synth = SynthProcessor::new(SR);
+        assert!(synth.set_param(ParamId::OscWaveform, 1.0));
+        synth.set_param(ParamId::Attack, 0.0);
+        synth.set_param(ParamId::Decay, 0.0);
+        synth.set_param(ParamId::Sustain, 1.0);
+        synth.note_event(note_on(69));
+        let out = render(&mut synth, SR as usize / BLOCK);
+        let crossings = count_positive_crossings(&out);
+        assert!(
+            (crossings as i64 - 440).abs() <= 4,
+            "triangle crossings = {crossings}"
         );
     }
 }

@@ -23,7 +23,7 @@
 //! - [`map`]: normalized `[-1, 1]` control values → target axes ([`MapSpec`]);
 //! - [`graph`]: node graph core ([`RtGraph`](graph::RtGraph), [`ExecPlan`](graph::ExecPlan),
 //!   structure update protocol, and control-side compiler);
-//! - [`sine`] / [`gain`]: sine oscillator source and gain effect (`Processor` reference implementations);
+//! - [`osc`] / [`gain`]: band-limited oscillator source and gain effect (`Processor` reference implementations);
 //! - [`effect`]: built-in effect framework — descriptors, [`Smoothed`](effect::Smoothed)
 //!   parameter smoothing and the [`EffectParamBank`](effect::EffectParamBank);
 //! - [`delay`] / [`eq`] / [`compressor`] / [`reverb`]: the built-in effects themselves (each
@@ -64,6 +64,7 @@ pub mod map;
 pub mod midi_envelope;
 pub mod mixer;
 pub mod mod_delay;
+pub mod osc;
 pub mod portamento;
 pub mod processor;
 pub mod reverb;
@@ -71,7 +72,7 @@ pub mod sample;
 pub mod sequencer;
 pub mod sf2;
 pub mod silent;
-pub mod sine;
+
 pub mod svf;
 pub mod synth;
 pub mod voice;
@@ -130,6 +131,7 @@ pub use lfo::{
 pub use map::{MapMode, MapSpec};
 pub use midi_envelope::MidiEnvelopeProcessor;
 pub use mixer::{MixerChannel, MixerProcessor};
+pub use osc::{OSC_WAVEFORM_COUNT, OscProcessor};
 pub use portamento::{MAX_PENDING_NOTES, PortamentoProcessor};
 pub use processor::{ChannelWeights, MAX_WEIGHT_CHANNELS, Processor, ProcessorChain};
 pub use reverb::ReverbProcessor;
@@ -142,7 +144,6 @@ pub use sequencer::{
 };
 pub use sf2::{SF2_POLYPHONY, Sf2VoiceProcessor};
 pub use silent::SilentProcessor;
-pub use sine::SineProcessor;
 pub use svf::{FilterMode, SvfProcessor};
 pub use synth::{SynthProcessor, note_to_frequency};
 pub use voice::{RecycledNode, STRUCTURE_QUEUE_CAPACITY, recycle_channel, structure_channel};

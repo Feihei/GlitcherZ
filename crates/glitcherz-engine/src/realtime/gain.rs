@@ -137,7 +137,7 @@ mod tests {
     fn master_gain_param_routes() {
         let mut gain = GainProcessor::new(1.0);
         assert!(gain.set_param(ParamId::MasterGain, 0.5));
-        assert!(!gain.set_param(ParamId::SineFrequency, 100.0));
+        assert!(!gain.set_param(ParamId::OscFrequency, 100.0));
 
         let mut buf = AudioBuffer::new(1, 8);
         buf.set_len(8);

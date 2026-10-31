@@ -1,4 +1,9 @@
-//! Sine wave generator.
+//! Band-limited oscillator (sine / triangle / saw / square).
+//!
+//! The oscillator is the demo instrument's source from roadmap step 1,
+//! generalized in spec `instrument.md`: the phase accumulator stays the same,
+//! the waveform is selected by index and saw / square are corrected with
+//! PolyBLEP so high notes do not alias.
 
 use std::f32::consts::TAU;
 
@@ -17,16 +22,23 @@ const PITCH_SMOOTHING_MS: f32 = 5.0;
 /// Pitch-offset span accepted by [`ParamId::PitchOffset`] (semitones).
 const PITCH_OFFSET_LIMIT: f32 = 24.0;
 
-/// Sine wave generator (the demo instrument from roadmap step 1).
+/// Number of waveforms the oscillator understands (`ParamId::OscWaveform`).
+pub const OSC_WAVEFORM_COUNT: u8 = 4;
+
+/// Sine / triangle / saw / square oscillator.
 ///
 /// Phase is accumulated normalized in 0..1 and wrapped after each sample,
 /// avoiding floating-point precision loss with large values; phase is
-/// continuous across blocks (see unit tests).
-pub struct SineProcessor {
+/// continuous across blocks and across waveform changes (see unit tests).
+/// The waveform index follows the document's `SynthWaveform` order:
+/// 0 = sine, 1 = triangle, 2 = saw, 3 = square.
+pub struct OscProcessor {
     sample_rate: f32,
     phase: f32,
     frequency_hz: f32,
     gain: f32,
+    /// 0 = sine, 1 = triangle, 2 = saw, 3 = square.
+    waveform: u8,
     /// Current pitch multiplier (`2^(offset/12)`), advanced **per sample**.
     pitch_ratio: f32,
     /// Where the multiplier is heading (set once per block by the curve).
@@ -35,7 +47,54 @@ pub struct SineProcessor {
     pitch_coeff: f32,
 }
 
-impl SineProcessor {
+/// PolyBLEP residual for one discontinuity at phase `0` (or `1`).
+///
+/// `t` is the normalized phase, `dt` the phase increment of the sample. The
+/// correction spans one sample on either side of the jump; `dt` is clamped and
+/// a zero/negative increment returns 0 so the division can never produce NaN.
+fn poly_blep(t: f32, dt: f32) -> f32 {
+    if !dt.is_finite() || dt <= 0.0 {
+        return 0.0;
+    }
+    let dt = dt.min(0.5);
+    if t < dt {
+        let x = t / dt;
+        x + x - x * x - 1.0
+    } else if t > 1.0 - dt {
+        let x = (t - 1.0) / dt;
+        x * x + x + x + 1.0
+    } else {
+        0.0
+    }
+}
+
+/// Waveform sample at `phase` in 0..1 (without gain).
+///
+/// Triangle / saw / square follow the LFO's phase convention
+/// (spec `lfo.md` §4): triangle starts at `-1`, saw is the rising ramp
+/// `2φ - 1`, square is `+1` for the first half cycle.
+fn wave_sample(waveform: u8, phase: f32, dt: f32) -> f32 {
+    match waveform {
+        1 => 1.0 - 4.0 * (phase - 0.5).abs(),
+        2 => {
+            let ramp = 2.0 * phase - 1.0;
+            ramp - poly_blep(phase, dt)
+        }
+        3 => {
+            let mut square = if phase < 0.5 { 1.0 } else { -1.0 };
+            let mut half = phase + 0.5;
+            if half >= 1.0 {
+                half -= 1.0;
+            }
+            square += poly_blep(phase, dt);
+            square -= poly_blep(half, dt);
+            square
+        }
+        _ => (TAU * phase).sin(),
+    }
+}
+
+impl OscProcessor {
     /// Falls back to 48 kHz when `sample_rate <= 0` (construction-time
     /// tolerance, not on the real-time path).
     pub fn new(sample_rate: f32) -> Self {
@@ -50,6 +109,7 @@ impl SineProcessor {
             phase: 0.0,
             frequency_hz: 440.0,
             gain: 0.25,
+            waveform: 0,
             pitch_ratio: 1.0,
             pitch_target: 1.0,
             pitch_coeff: coeff_for(PITCH_SMOOTHING_MS, sample_rate),
@@ -64,6 +124,19 @@ impl SineProcessor {
     /// Current gain (linear). RT-safe.
     pub fn gain(&self) -> f32 {
         self.gain
+    }
+
+    /// Current waveform index (0..3). RT-safe.
+    pub fn waveform(&self) -> u8 {
+        self.waveform
+    }
+
+    /// Sets the waveform index (clamped to `0..3`; non-finite values are
+    /// ignored). RT-safe.
+    fn set_waveform(&mut self, waveform: f32) {
+        if waveform.is_finite() {
+            self.waveform = (waveform.round().max(0.0) as u8).min(OSC_WAVEFORM_COUNT - 1);
+        }
     }
 
     /// Sets frequency: clamped to `[0, sample_rate/2]` (Nyquist),
@@ -101,7 +174,7 @@ impl SineProcessor {
     }
 }
 
-impl Processor for SineProcessor {
+impl Processor for OscProcessor {
     fn process(&mut self, _ctx: &ProcessContext, buffer: &mut AudioBuffer) {
         let frames = buffer.len();
         if frames == 0 || buffer.channels() == 0 {
@@ -109,21 +182,23 @@ impl Processor for SineProcessor {
         }
         let base_inc = self.frequency_hz / self.sample_rate;
         let gain = self.gain;
+        let waveform = self.waveform;
         let target = self.pitch_target;
         let coeff = self.pitch_coeff;
         let mut ratio = self.pitch_ratio;
         let mut phase = self.phase;
 
         // Generate into channel 0 first, then copy to the remaining channels,
-        // avoiding recomputing sin per channel.
+        // avoiding recomputing the waveform per channel.
         if let Some(ch0) = buffer.channel_mut(0) {
             for slot in ch0.iter_mut() {
-                *slot = (TAU * phase).sin() * gain;
+                let inc = (base_inc * ratio).clamp(0.0, 0.5);
+                *slot = wave_sample(waveform, phase, inc) * gain;
                 // P1/D11: the pitch multiplier moves **inside** the sample
                 // loop. Moving it per block is what makes a MIDI bend sound
                 // like a staircase; here a block-boundary step becomes a
                 // 5 ms glide and the spectrum stays clean.
-                phase += (base_inc * ratio).clamp(0.0, 0.5);
+                phase += inc;
                 if phase >= 1.0 {
                     phase -= 1.0;
                 }
@@ -148,12 +223,16 @@ impl Processor for SineProcessor {
 
     fn set_param(&mut self, id: ParamId, value: f32) -> bool {
         match id {
-            ParamId::SineFrequency => {
+            ParamId::OscFrequency => {
                 self.set_frequency(value);
                 true
             }
-            ParamId::SineGain => {
+            ParamId::OscGain => {
                 self.set_gain(value);
+                true
+            }
+            ParamId::OscWaveform => {
+                self.set_waveform(value);
                 true
             }
             ParamId::PitchOffset => {
@@ -167,7 +246,7 @@ impl Processor for SineProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::SineProcessor;
+    use super::{OSC_WAVEFORM_COUNT, OscProcessor};
     use crate::realtime::buffer::AudioBuffer;
     use crate::realtime::commands::ParamId;
     use crate::realtime::context::ProcessContext;
@@ -189,21 +268,27 @@ mod tests {
     }
 
     /// Renders `blocks` fixed-size blocks, returning the channel 0 output.
-    fn render(sine: &mut SineProcessor, blocks: usize) -> Vec<f32> {
+    fn render(osc: &mut OscProcessor, blocks: usize) -> Vec<f32> {
         let mut buf = AudioBuffer::new(1, 128);
         let mut collected = Vec::new();
         for _ in 0..blocks {
             buf.set_len(128);
             buf.clear();
-            sine.process(&ctx(128), &mut buf);
+            osc.process(&ctx(128), &mut buf);
             collected.extend_from_slice(buf.channel(0).unwrap());
         }
         collected
     }
 
+    fn oscillator(waveform: u8) -> OscProcessor {
+        let mut osc = OscProcessor::new(SR);
+        osc.set_param(ParamId::OscWaveform, waveform as f32);
+        osc
+    }
+
     #[test]
     fn frequency_matches_zero_crossings() {
-        let mut sine = SineProcessor::new(SR);
+        let mut sine = OscProcessor::new(SR);
         // 344 blocks ≈ 0.9985 s @ 440 Hz → about 439 positive zero crossings.
         let crossings = count_positive_crossings(&render(&mut sine, 344));
         assert!(
@@ -212,9 +297,76 @@ mod tests {
         );
     }
 
+    /// Every waveform must run at the requested pitch: one rising edge per
+    /// period, whatever the shape.
+    #[test]
+    fn all_waveforms_match_the_note_frequency() {
+        for index in 0..OSC_WAVEFORM_COUNT {
+            let mut osc = oscillator(index);
+            let crossings = count_positive_crossings(&render(&mut osc, 344));
+            assert!(
+                (crossings as i64 - 440).abs() <= 4,
+                "waveform {index}: crossings = {crossings}"
+            );
+        }
+    }
+
+    #[test]
+    fn waveform_index_is_clamped() {
+        let mut osc = OscProcessor::new(SR);
+        osc.set_param(ParamId::OscWaveform, 99.0);
+        assert_eq!(osc.waveform(), OSC_WAVEFORM_COUNT - 1);
+        osc.set_param(ParamId::OscWaveform, -5.0);
+        assert_eq!(osc.waveform(), 0);
+        osc.set_param(ParamId::OscWaveform, 2.6);
+        assert_eq!(osc.waveform(), 3, "rounds to the nearest waveform");
+        osc.set_param(ParamId::OscWaveform, f32::NAN);
+        assert_eq!(osc.waveform(), 3, "non-finite values are ignored");
+    }
+
+    #[test]
+    fn waveform_shapes_are_distinct() {
+        // Sine, triangle, saw and square all reach the same fundamental, so
+        // the check is on their shape: compare the first 64 samples pairwise.
+        // (RMS would not work — a triangle and a saw both measure 1/√3.)
+        let values: Vec<Vec<f32>> = (0..OSC_WAVEFORM_COUNT)
+            .map(|index| render(&mut oscillator(index), 1))
+            .collect();
+        for (i, a) in values.iter().enumerate() {
+            for (j, b) in values.iter().enumerate().skip(i + 1) {
+                let difference: f32 = a
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| (x - y).abs())
+                    .sum::<f32>()
+                    / a.len() as f32;
+                assert!(
+                    difference > 0.05,
+                    "waveforms {i} and {j} look alike (mean |diff| = {difference})"
+                );
+            }
+        }
+    }
+
+    /// The reason PolyBLEP exists: a naive square at a high note folds its
+    /// harmonics back down as inharmonic energy. Corrected, the waveform stays
+    /// close to ±1 (a naive one does too at the sample points, but its
+    /// interpolation shows ringing); the robust check here is that the
+    /// corrected square has no sample outside its range.
+    #[test]
+    fn corrected_square_stays_inside_its_range() {
+        let mut osc = oscillator(3);
+        osc.set_param(ParamId::OscGain, 1.0);
+        osc.set_param(ParamId::OscFrequency, 5_000.0);
+        let out = render(&mut osc, 20);
+        assert!(out.iter().all(|s| s.is_finite()));
+        let peak = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+        assert!(peak <= 1.05, "peak = {peak}");
+    }
+
     #[test]
     fn amplitude_matches_gain() {
-        let mut sine = SineProcessor::new(SR);
+        let mut sine = OscProcessor::new(SR);
         let mut buf = AudioBuffer::new(1, 256);
         buf.set_len(256);
         buf.clear();
@@ -229,9 +381,9 @@ mod tests {
 
     #[test]
     fn full_scale_output_is_finite() {
-        let mut sine = SineProcessor::new(SR);
-        sine.set_param(ParamId::SineGain, 4.0);
-        sine.set_param(ParamId::SineFrequency, SR / 2.0 - 1_000.0);
+        let mut sine = OscProcessor::new(SR);
+        sine.set_param(ParamId::OscGain, 4.0);
+        sine.set_param(ParamId::OscFrequency, SR / 2.0 - 1_000.0);
         let mut buf = AudioBuffer::new(2, 128);
         for _ in 0..1_000 {
             buf.set_len(128);
@@ -245,23 +397,23 @@ mod tests {
 
     #[test]
     fn params_are_clamped_and_nan_ignored() {
-        let mut sine = SineProcessor::new(SR);
-        sine.set_param(ParamId::SineFrequency, -50.0);
+        let mut sine = OscProcessor::new(SR);
+        sine.set_param(ParamId::OscFrequency, -50.0);
         assert!(sine.frequency().abs() < 1e-9);
 
-        sine.set_param(ParamId::SineFrequency, f32::NAN);
+        sine.set_param(ParamId::OscFrequency, f32::NAN);
         assert!(
             sine.frequency().abs() < 1e-9,
             "non-finite values should be ignored"
         );
 
-        sine.set_param(ParamId::SineFrequency, SR);
+        sine.set_param(ParamId::OscFrequency, SR);
         assert!(
             (sine.frequency() - SR / 2.0).abs() < 1e-3,
             "clamped to Nyquist"
         );
 
-        sine.set_param(ParamId::SineGain, f32::INFINITY);
+        sine.set_param(ParamId::OscGain, f32::INFINITY);
         assert!(
             (sine.gain() - 0.25).abs() < 1e-9,
             "non-finite gain should be ignored"
@@ -277,10 +429,10 @@ mod tests {
     fn phase_continuous_across_blocks() {
         // Zero-crossing counts of chunked vs whole-buffer rendering should
         // match (±1).
-        let mut sine = SineProcessor::new(SR);
+        let mut sine = OscProcessor::new(SR);
         let chunked = count_positive_crossings(&render(&mut sine, 50));
 
-        let mut sine = SineProcessor::new(SR);
+        let mut sine = OscProcessor::new(SR);
         let mut buf = AudioBuffer::new(1, 128 * 50);
         buf.set_len(128 * 50);
         buf.clear();
@@ -311,7 +463,7 @@ mod tests {
     /// half-cycle in the block the same length; per-sample smoothing cannot.
     #[test]
     fn pitch_offset_glides_within_one_block() {
-        let mut sine = SineProcessor::new(SR);
+        let mut sine = OscProcessor::new(SR);
         // Asked before the first sample: the smoother starts at 1.0 and has to
         // travel to 2.0 during the very block we measure.
         sine.set_pitch_offset(12.0);
@@ -338,7 +490,7 @@ mod tests {
 
     #[test]
     fn pitch_offset_clamps_and_ignores_non_finite() {
-        let mut sine = SineProcessor::new(SR);
+        let mut sine = OscProcessor::new(SR);
         sine.set_pitch_offset(1_000.0);
         assert!(
             (sine.pitch_ratio() - 1.0).abs() < 1e-6,

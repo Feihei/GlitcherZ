@@ -129,9 +129,62 @@ pub const DEFAULT_VELOCITY: u8 = 100;
 /// Lowest MIDI velocity (a note-off; silence).
 pub const MIN_VELOCITY: u8 = 1;
 
+/// Built-in oscillator waveform (spec `.agents/spec/instrument.md` D1).
+///
+/// The engine keeps its own index form (`ParamId::OscWaveform` takes a rounded
+/// `0..3`), exactly like the LFO's `LfoWaveform` and the effects'
+/// `Unit::Enum` parameters; this enum is the document-side vocabulary and the
+/// UI's label source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum SynthWaveform {
+    /// `sin(2πφ)`.
+    #[default]
+    Sine,
+    /// Piecewise triangle, starts at `-1`.
+    Triangle,
+    /// Rising ramp, `2φ - 1`.
+    Saw,
+    /// Half-period `+1` / `-1`.
+    Square,
+}
+
+impl SynthWaveform {
+    /// All waveforms, in engine index order (`ParamId::OscWaveform`).
+    pub const ALL: [Self; 4] = [Self::Sine, Self::Triangle, Self::Saw, Self::Square];
+
+    /// Short English label (UI combo).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sine => "Sine",
+            Self::Triangle => "Triangle",
+            Self::Saw => "Saw",
+            Self::Square => "Square",
+        }
+    }
+
+    /// Engine parameter index (0..=3).
+    pub fn index(self) -> u8 {
+        match self {
+            Self::Sine => 0,
+            Self::Triangle => 1,
+            Self::Saw => 2,
+            Self::Square => 3,
+        }
+    }
+
+    /// Index → waveform (unknown indices fall back to `Sine`).
+    pub fn from_index(index: u8) -> Self {
+        Self::ALL.get(index as usize).copied().unwrap_or(Self::Sine)
+    }
+}
+
 /// Per-track synthesizer timbre parameters.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SynthParams {
+    /// Oscillator waveform (spec `instrument.md`; default Sine keeps older
+    /// documents sounding the same).
+    #[serde(default)]
+    pub waveform: SynthWaveform,
     /// Filter cutoff frequency (Hz).
     #[serde(default = "default_cutoff")]
     pub cutoff_hz: f32,
@@ -182,6 +235,7 @@ fn default_release() -> f32 {
 impl Default for SynthParams {
     fn default() -> Self {
         Self {
+            waveform: SynthWaveform::Sine,
             cutoff_hz: default_cutoff(),
             resonance: default_resonance(),
             filter_mode: 0.0,
@@ -4712,8 +4766,8 @@ mod tests {
         MAX_BEND_RANGE, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES, MAX_TEMPO_BPM,
         MIN_BEND_RANGE, MIN_TEMPO_BPM, MapMode, MapSpec, MidiClip, MidiEnvelopeParams, MidiSource,
         MidiTrack, MixerChannel, NodeDoc, NodeParam, PortRef, PortamentoParams, Project,
-        SamplePlayMode, SynthParams, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, VoiceSpec,
-        default_audio_source_len, default_graph_doc,
+        SamplePlayMode, SynthParams, SynthWaveform, TICKS_PER_BAR, TICKS_PER_QUARTER,
+        TICKS_PER_STEP, VoiceSpec, default_audio_source_len, default_graph_doc,
     };
 
     fn effect_node(params: EffectParams) -> NodeDoc {
@@ -5682,6 +5736,33 @@ mod tests {
                 bend_range: 2.0,
             }
         );
+    }
+
+    /// Spec `instrument.md` D5: `waveform` is an additive `SynthParams`
+    /// field — older files load as Sine and `PROJECT_VERSION` does not move.
+    #[test]
+    fn synth_params_waveform_serde_compatibility() {
+        let synth = SynthParams {
+            waveform: SynthWaveform::Saw,
+            ..Default::default()
+        };
+        let text = ron::to_string(&synth).expect("serialization failed");
+        assert!(
+            text.contains("Saw"),
+            "the waveform must serialize by name: {text}"
+        );
+        let round: SynthParams = ron::from_str(&text).expect("roundtrip failed");
+        assert_eq!(round, synth);
+
+        // A payload written before the field existed: everything else keeps
+        // its documented default, the waveform falls back to Sine.
+        let legacy: SynthParams = ron::from_str(
+            "(cutoff_hz: 12000.0, resonance: 0.2, filter_mode: 0.0, \
+             attack_s: 0.01, decay_s: 0.1, sustain: 0.8, release_s: 0.2)",
+        )
+        .expect("legacy payload must load");
+        assert_eq!(legacy, SynthParams::default());
+        assert_eq!(legacy.waveform, SynthWaveform::Sine);
     }
 
     /// Sample voice (spec `sample-player.md` D8): internally tagged as

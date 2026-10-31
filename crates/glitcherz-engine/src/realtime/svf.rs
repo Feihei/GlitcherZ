@@ -5,7 +5,12 @@ use std::f32::consts::PI;
 use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::ParamId;
 use crate::realtime::context::ProcessContext;
+use crate::realtime::effect::smoothed::coeff_for;
 use crate::realtime::processor::Processor;
+
+/// Time constant of the cutoff / resonance smoothers (ms). Spec
+/// `instrument.md` D4: a dragged cutoff must not step at block boundaries.
+const SMOOTHING_MS: f32 = 10.0;
 
 /// Filter output mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -34,8 +39,19 @@ pub enum FilterMode {
 pub struct SvfProcessor {
     sample_rate: f32,
     mode: FilterMode,
+    /// Cutoff **target** (Hz).
     cutoff_hz: f32,
+    /// Resonance **target** (Simper `res`).
     resonance: f32,
+    /// Smoothed cutoff the coefficients actually use (Hz).
+    cutoff_now: f32,
+    /// Smoothed resonance the coefficients actually use.
+    res_now: f32,
+    /// Per-sample one-pole coefficient of both smoothers.
+    coeff: f32,
+    /// Set by the first render; `set_param` snaps while this is false
+    /// (same start semantics as `Smoothed`, spec `effects.md` D12).
+    started: bool,
     /// Per-channel state (up to 2).
     ic1: [f32; 2],
     ic2: [f32; 2],
@@ -54,15 +70,20 @@ const DENORMAL_EPS: f32 = 1e-18;
 impl SvfProcessor {
     /// Falls back to 48 kHz when `sample_rate <= 0` (construction-time tolerance).
     pub fn new(sample_rate: f32) -> Self {
+        let sample_rate = if sample_rate > 0.0 {
+            sample_rate
+        } else {
+            48_000.0
+        };
         let mut svf = Self {
-            sample_rate: if sample_rate > 0.0 {
-                sample_rate
-            } else {
-                48_000.0
-            },
+            sample_rate,
             mode: FilterMode::LowPass,
             cutoff_hz: 12_000.0,
             resonance: 0.2,
+            cutoff_now: 12_000.0,
+            res_now: 0.2,
+            coeff: coeff_for(SMOOTHING_MS, sample_rate),
+            started: false,
             ic1: [0.0; 2],
             ic2: [0.0; 2],
             a1: 0.0,
@@ -74,16 +95,66 @@ impl SvfProcessor {
         svf
     }
 
+    /// Smoothed cutoff the filter is currently running at (Hz). RT-safe.
+    pub fn current_cutoff(&self) -> f32 {
+        self.cutoff_now
+    }
+
+    /// Smoothed resonance the filter is currently running at. RT-safe.
+    pub fn current_resonance(&self) -> f32 {
+        self.res_now
+    }
+
+    /// Advances both smoothers by `frames` samples.
+    ///
+    /// The cutoff moves in the **log domain** (equal ratios take equal time,
+    /// the same rule `Smoothed` applies to frequency parameters); resonance is
+    /// linear. Before the first render the state snaps, so a restored project
+    /// starts at its saved values instead of sweeping from the defaults.
+    /// RT-safe: bounded loop, no allocation.
+    fn advance(&mut self, frames: usize) {
+        if !self.started {
+            self.started = true;
+            self.cutoff_now = self.cutoff_hz;
+            self.res_now = self.resonance;
+            return;
+        }
+        let coeff = self.coeff;
+        let cutoff_target = self.cutoff_hz.max(1.0).ln();
+        let mut cutoff = self.cutoff_now.max(1.0).ln();
+        for _ in 0..frames {
+            let delta = cutoff_target - cutoff;
+            if delta == 0.0 {
+                break;
+            }
+            let next = cutoff + delta * coeff;
+            cutoff = if next == cutoff { cutoff_target } else { next };
+        }
+        self.cutoff_now = cutoff.exp();
+
+        let res_target = self.resonance;
+        let mut res = self.res_now;
+        for _ in 0..frames {
+            let delta = res_target - res;
+            if delta == 0.0 {
+                break;
+            }
+            let next = res + delta * coeff;
+            res = if next == res { res_target } else { next };
+        }
+        self.res_now = res;
+    }
+
     /// Recomputes per-block coefficients from the current parameters. RT-safe (pure floating point, no pathological branching).
     fn update_coeffs(&mut self) {
         let nyquist = self.sample_rate * 0.5;
         let fc = self
-            .cutoff_hz
+            .cutoff_now
             .clamp(20.0, 20_000.0)
             .min(nyquist * 0.9)
             .max(1.0);
         let g = (PI * fc / self.sample_rate).tan();
-        self.k = (2.0 - 2.0 * self.resonance).max(0.0);
+        self.k = (2.0 - 2.0 * self.res_now).max(0.0);
         self.a1 = 1.0 / (1.0 + g * (g + self.k));
         self.a2 = g * self.a1;
         self.a3 = g * self.a2;
@@ -99,6 +170,7 @@ impl SvfProcessor {
 
 impl Processor for SvfProcessor {
     fn process(&mut self, _ctx: &ProcessContext, buffer: &mut AudioBuffer) {
+        self.advance(buffer.len());
         self.update_coeffs();
         let (a1, a2, a3, k) = (self.a1, self.a2, self.a3, self.k);
         let mode = self.mode;
@@ -141,10 +213,16 @@ impl Processor for SvfProcessor {
         match id {
             ParamId::FilterCutoff => {
                 self.cutoff_hz = value.clamp(20.0, 20_000.0);
+                if !self.started {
+                    self.cutoff_now = self.cutoff_hz;
+                }
                 true
             }
             ParamId::FilterResonance => {
                 self.resonance = value.clamp(0.0, MAX_RESONANCE);
+                if !self.started {
+                    self.res_now = self.resonance;
+                }
                 true
             }
             ParamId::FilterMode => {
@@ -337,6 +415,43 @@ mod tests {
             "high-pass DC gain should be 0, got {}",
             out[out.len() - 1]
         );
+    }
+
+    /// Spec `instrument.md` D4: a cutoff change must be a ramp, not a step at
+    /// the block boundary, and it must settle in the documented time.
+    #[test]
+    fn cutoff_changes_are_smoothed() {
+        let mut svf = SvfProcessor::new(SR);
+        // One block marks the filter as started (set_param snaps before that).
+        let _ = run_through(&mut svf, &vec![0.0; BLOCK]);
+        assert!((svf.current_cutoff() - 12_000.0).abs() < 1.0);
+
+        svf.set_param(ParamId::FilterCutoff, 200.0);
+        let _ = run_through(&mut svf, &vec![0.0; BLOCK]);
+        let after_one = svf.current_cutoff();
+        assert!(
+            after_one > 200.0 && after_one < 12_000.0,
+            "one 128-frame block must not jump to the target (got {after_one})"
+        );
+
+        // 10 time constants (100 ms at 48 kHz) settle within a fraction of a Hz.
+        let _ = run_through(&mut svf, &vec![0.0; SR as usize / 10]);
+        assert!(
+            (svf.current_cutoff() - 200.0).abs() < 1.0,
+            "settled at {}",
+            svf.current_cutoff()
+        );
+    }
+
+    /// D12 start semantics: values set before the first render are exact, so
+    /// a restored project never sweeps from the constructor defaults.
+    #[test]
+    fn params_set_before_the_first_render_snap() {
+        let mut svf = SvfProcessor::new(SR);
+        svf.set_param(ParamId::FilterCutoff, 500.0);
+        svf.set_param(ParamId::FilterResonance, 0.7);
+        assert!((svf.current_cutoff() - 500.0).abs() < 1e-3);
+        assert!((svf.current_resonance() - 0.7).abs() < 1e-6);
     }
 
     #[test]
