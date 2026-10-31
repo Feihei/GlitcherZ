@@ -42,6 +42,8 @@
 
 - [x] 内置合成器多波形 + 滤波器接线（2026-10-31，spec `spec/instrument.md`）：`SineProcessor` 更名 `OscProcessor`（`osc.rs`），新增 Sine/Triangle/Saw/Square 四种波形（锯齿/方波 PolyBLEP 抗锯齿，`SynthWaveform` + `ParamId::OscWaveform`，默认 Sine 保持旧工程音色）；`SvfProcessor` 真正接进 `SynthProcessor`（osc → SVF → ADSR），Inspector 的 Cutoff / Resonance / Filter Mode 从此生效，cutoff/res 加 10 ms 一阶平滑（cutoff 走 log 域）；离线导出改为走同一张 `synth_param_values` 表（顺带修掉导出时 ADSR/cutoff 未下发的不一致）。`ParamId::SineFrequency/SineGain` 更名 `OscFrequency/OscGain`。`SynthParams` 加 `waveform` 为 additive 字段，`PROJECT_VERSION` 不动
 
+- [x] 内置合成器复音化（2026-10-31，spec `spec/instrument.md` §8 D8–D12）：固定 16 声部，voice 池收在 `SynthProcessor` 内部（图/协议/文档零改动）。每声部独立 osc+SVF+ADSR；空闲槽优先、同音先 release、全忙偷最老；`Off{n}` 按音释放、`Off{0}` 保持全释放哨兵；`OscFrequency` 直控只改最新 voice；Idle voice 跳过渲染，预分配 mono scratch 逐 voice 累加。参数广播到全部声部；不设 limiter（交给 master / velocity）。测试：和弦可加性、Off 隔离、同音重触发、17 音 stealing、Off{0} 全释放
+
 ## 新方向：模块节点图架构（spec 已定稿）
 
 2026-10-07 评估可行并经两轮拷问式 Q&A 定稿，spec 见 `spec/node-graph.md`。核心决策：定容 64 节点/128 连线/每节点 ≤8 入边；端口剖面按节点类型；三连线类型（Audio/Midi/Automation）UI 层拒绝类型不匹配；拓扑变更 = 重建执行计划 + 差异化节点回收（复用现有结构队列/回收协议，调参永不重建）；悬空节点照常执行、主输出与时间轴节点固定存在；时间轴节点区分 MIDI 轨道与自动化轨道两类端口组，自动化曲线不再内嵌目标（目标 = 连线终点）；**不做 v1 兼容**，model v2 重构；P1+P2 连做不留并存中间态。

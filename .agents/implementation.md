@@ -91,7 +91,7 @@
 
 - `AudioBuffer`、`Processor`（`set_param` + `note_event`）、`ProcessorChain`、`BlockRunner`（固定 128 块拆分 + 块边界命令消费 + `Feedback` 原子回传：主电平/位置/步进/走带/**每轨电平**）；
 - **`Mixer`**：4 条 `TrackStrip`（`SynthProcessor → DelayProcessor`）并行处理 + 线性声像/增益/静音求和 → 主链（`MasterGain`）；`MixerLevels` 每块回传各轨 post-fader 峰值；
-- 内置合成器链（`SynthProcessor`）：带限振荡器（Sine / Triangle / Saw / Square，锯齿与方波走 PolyBLEP）→ TPT SVF（低通/高通/带通，cutoff 在 log 域、resonance 在线性域各 10 ms 一阶平滑）→ 线性 ADSR；振荡器可单独使用（`ParamId::OscFrequency / OscGain / OscWaveform`，spec `spec/instrument.md`）。旧描述"正弦振荡器 + ADSR → TPT SVF → 反馈延迟"是 TrackStrip 时代的状态，滤波器当时并未接线；
+- 内置合成器链（`SynthProcessor`）：**16 声部**，每声部带限振荡器（Sine / Triangle / Saw / Square，锯齿与方波走 PolyBLEP）→ 独立 TPT SVF（低通/高通/带通，cutoff 在 log 域、resonance 在线性域各 10 ms 一阶平滑）→ 独立线性 ADSR；振荡器可单独使用（`ParamId::OscFrequency / OscGain / OscWaveform`，spec `spec/instrument.md`）。声部分配：空闲槽 → 同音先 release → 最老 steal；`Off{n}` 只释放对应音、`Off{0}` 为全释放哨兵；`OscFrequency` 直控只作用于最新 voice；Idle voice 整段跳过渲染，各 voice 在预分配 mono scratch 内渲染后累加（相同时刻 N 音完全可加，已用"和弦 = 独奏之和"测试锁定）。`MAX_VOICES` 编译期断言与 `MAX_PENDING_OFFS_PER_TRACK` 对齐。旧描述"正弦振荡器 + ADSR → TPT SVF → 反馈延迟"是 TrackStrip 时代的状态，滤波器当时并未接线；
 - `Sequencer`（音频线程块边界采样时钟调度）：**纯窗口扫描**模型——只维护音乐位置（tick，1 四分音符 = 96），每块把 `[t0, t1)` 内到期事件一次性调度出来；BPM 变化只改未来速率（音乐位置不跳），循环回绕由窗口映射推导；**每轨双音源**（16 步步进模式 / 钢琴卷帘片段，`SetSource` 切换），卷帘音符按自身 start/length 触发；事件按 `(track, NoteEvent)` 送入对应轨道（≤1 块 ≈ 2.7 ms 抖动，逐样本偏移待后续）。
 
 ### 结构更新与节点回收（`realtime::voice`）

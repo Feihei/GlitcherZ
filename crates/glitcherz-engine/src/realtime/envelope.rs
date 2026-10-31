@@ -76,6 +76,15 @@ impl AdsrProcessor {
         self.level
     }
 
+    /// Whether the envelope is Idle — silent and ready for a new note.
+    ///
+    /// The polyphonic synthesizer allocates voices by this flag (spec
+    /// `instrument.md` D8): a slot stays reserved until its release tail has
+    /// fully decayed. RT-safe.
+    pub fn is_idle(&self) -> bool {
+        self.stage == Stage::Idle
+    }
+
     /// Triggers a note (enters Attack, resuming from the current level —
     /// retriggering during release re-attacks).
     /// RT-safe.

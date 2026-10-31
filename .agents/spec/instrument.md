@@ -63,3 +63,29 @@ MIDI note ──► OscProcessor (waveform, pitch offset, per-sample glide)
 - 引擎：四种波形各自过零率 ≈ 基频；满幅输入无 NaN/Inf；SVF 接线后 cutoff 200 Hz 低通可测衰减；cutoff 阶跃呈 ramp 而非整块跳变。
 - 模型：旧文档（无 `waveform` 字段）反序列化为 Sine。
 - UI：Inspector 切换波形/滤波模式写入文档并实时下发；导出路径下发全部 `SynthParams`。
+## 8. 复音（D8–D12）
+
+内置合成器从单声部升级为**固定 16 声部**，voice 池完全在 `SynthProcessor` 内部，
+图、节点协议、文档格式与序列化都不改动。
+
+| ID | 决策 |
+| :--- | :--- |
+| D8 | `MAX_VOICES = 16`，与 `MAX_PENDING_OFFS_PER_TRACK`（16）对齐：音序器每轨最多同时保留 16 个待释放长音，更大的池从编排路径永远触达不到。虚拟键盘同样受此上限约束。 |
+| D9 | 每个 voice 是完整链路 `OscProcessor → SvfProcessor → AdsrProcessor`，各自持有相位与滤波器状态；参数写入**广播**到所有 voice，`Attack/Decay/Sustain/Release/PitchOffset/Cutoff/Resonance/FilterMode/Waveform` 因此对整组声部一致。 |
+| D10 | 分配顺序：① 第一个 `env.is_idle()` 的槽；② 无空闲槽时偷**最老**（allocation stamp 最小）的 voice，并从其当前包络电平重新 Attack（`AdsrProcessor::trigger` 的既有语义），避免硬切。Release 尾音期间槽位仍被占用。 |
+| D11 | 同音先 release：`On{n}` 到达时先把所有 `note == n` 的 voice 送 Off，再分配新槽。这样重复触发是同音淡出 + 新音起音，不会让两条同音叠加成 +6 dB。 |
+| D12 | `Off{n}` 只释放 `note == n` 的 voice；**`Off{0}` 保持全释放哨兵**（`RtGraph::note_off_all` 依赖它）。代价：真实弹到 MIDI note 0 时它的 off 会释放全部声部——键盘最低音极少使用，接受。 |
+
+补充约定：
+
+- `ParamId::OscFrequency` 是单声部时代的"直接改频率"直控口，复音下**只作用于最新触发的 voice**（不动正在响的和弦），保留旧行为。
+- Idle 的 voice 在 `process` 里整段跳过（无音时 CPU 归零）；voice 在**预分配的单声道 scratch** 里渲染后累加到输出，全程零分配。
+- 没有 limiter / 自动增益：叠加超过 1.0 由 master 推子与 velocity 负责（与采样、插件声源一致）。
+
+验收：
+
+- 两个音符分别独奏的输出之和 ≈ 同时演奏的输出（可加性）；
+- `Off` 只让对应音消失，其余声部继续；
+- 同音重触发后旧 voice 进入 release、结束后 `active_voices()` 回到 1；
+- 连续 17 个 `On` 时 `active_voices() ≤ 16`，输出有限；
+- `Off{0}` 释放全部声部。
