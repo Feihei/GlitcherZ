@@ -4,9 +4,12 @@
 //! absolute-tick ruler (bars). Interactions:
 //!
 //! - drag a clip body → move (snapped to bars);
-//! - drag its right edge → resize (≥ 1 bar, snapped to bars);
+//! - drag its right edge → resize the container (growing tiles the content,
+//!   W2); Alt+drag the edge → set the content period (`loop_ticks`), which
+//!   restarts tiling right after it;
 //! - double-click an empty lane spot → insert a one-bar clip;
 //! - double-click a clip → jump to the Edit tab (piano roll / curve lane);
+//!   Alt+double-click renames it in place, `F2` renames the selected clip;
 //! - right-click a clip → delete;
 //! - header: click to select the track (mute lives on the mixer node);
 //! - ruler (U1): click/drag → seek; Ctrl+drag → set the song loop range;
@@ -24,8 +27,8 @@ use egui::{
     StrokeKind, Vec2, pos2,
 };
 use glitcherz_model::{
-    AudioClip, AudioTrack, AutoPoint, ControlClip, ControlTrack, CtrlEvent, MAX_ARRANGEMENT_TICKS,
-    MAX_CLIPS_PER_TRACK, Marker, MidiClip, MidiTrack, Note, SongLoop,
+    AudioClip, AudioTrack, AutoPoint, ClipGroup, ControlClip, ControlTrack, CtrlEvent,
+    MAX_ARRANGEMENT_TICKS, MAX_CLIPS_PER_TRACK, Marker, MidiClip, MidiTrack, Note, SongLoop,
 };
 
 /// Absolute arrangement ceiling in ticks (U3a). The bound is a **tick** count,
@@ -279,6 +282,16 @@ pub struct TimelineState {
     /// The right-click that opens the editor lands one frame before the text
     /// field exists, so the first frame that draws it asks for focus.
     rename_focus: bool,
+    /// Inline clip-rename editor (W3a: F2 on a selected clip, or Alt+double
+    /// click a clip block): which clip plus the draft text.
+    clip_rename: Option<(ClipSel, String)>,
+    /// Same one-frame focus hand-off as `rename_focus`.
+    clip_rename_focus: bool,
+    /// W3b: `Alt` + click picked a single clip out of its group. The next
+    /// plain click / marquee clears it, and group expansion is skipped while
+    /// it is set (otherwise the expanded selection would snap back every
+    /// frame).
+    break_group: bool,
 }
 
 impl Default for TimelineState {
@@ -303,6 +316,9 @@ impl Default for TimelineState {
             loop_drag: None,
             rename: None,
             rename_focus: false,
+            clip_rename: None,
+            clip_rename_focus: false,
+            break_group: false,
         }
     }
 }
@@ -375,6 +391,10 @@ pub enum TimelineAction {
         clip: usize,
         start_ticks: u32,
         span_ticks: u32,
+        /// W2: explicit content-period request (Alt+drag the right edge).
+        /// `None` = keep the current loop, only clamping it to the new span
+        /// (grow = tile, shrink = trim the tail).
+        loop_ticks: Option<u32>,
     },
     /// Delete the clip at `clip`.
     RemoveClip {
@@ -453,6 +473,25 @@ pub enum TimelineAction {
         track: usize,
         name: String,
     },
+    /// Rename one clip from the inline block editor (W3a): F2 on a selected
+    /// clip, or Alt+double-click a block. Empty clears back to the content
+    /// summary. One undo step.
+    RenameClip {
+        lane: TimelineLane,
+        track: usize,
+        clip: usize,
+        name: String,
+    },
+    /// W3b: put every selected clip into one new named group (auto-named
+    /// `Group N`, palette colour). Works across tracks and lane kinds.
+    GroupClips {
+        clips: Vec<ClipSel>,
+    },
+    /// W3b: dissolve every group touched by the selection — **all** members
+    /// lose the tag, even the ones outside the selection.
+    UngroupClips {
+        clips: Vec<ClipSel>,
+    },
     OpenMidiEditor {
         track: usize,
         clip: usize,
@@ -515,6 +554,9 @@ pub struct TimelineParams<'a> {
     /// Waveform lookup for audio clip bodies (U6 D6): path → decoded sample
     /// (the app's session cache). `None` renders a flat placeholder body.
     pub waveform_of: &'a dyn Fn(&str) -> Option<std::sync::Arc<glitcherz_engine::SampleData>>,
+    /// Clip-group table (W3b): member clips draw a colour stripe and a
+    /// click on one member selects the whole group.
+    pub clip_groups: &'a [ClipGroup],
 }
 
 /// Placement semantics shared by MIDI and control clips.
@@ -536,6 +578,26 @@ pub(crate) trait Placement {
     /// trims its head (start + offset, window offset += offset·sec_per_tick,
     /// window length −= offset·sec_per_tick).
     fn retain_from(&mut self, offset: u32, sec_per_tick: f64);
+    /// Optional user-facing clip name (W3a). Empty = unnamed.
+    fn name(&self) -> &str;
+    fn set_name(&mut self, name: String);
+    /// Content period (W2): the span repeats this every `loop_len` ticks.
+    /// Audio clips have no repeat semantics — they report their own span.
+    fn loop_len(&self, sec_per_tick: f64) -> u32;
+    /// Optional clip-group id (W3b). Ungrouped clips return `None`.
+    fn group(&self) -> Option<u32>;
+    fn set_group(&mut self, group: Option<u32>);
+}
+
+/// W2: the loop length after a span edit. Growing a clip tiles the content
+/// (loop stays put); shrinking it trims the tail (`loop = min(loop, span)`),
+/// so a single-period clip can still be shortened. An explicit loop request
+/// (Alt+drag on the right edge) wins but must fit the container.
+pub(crate) fn resolve_loop(current: u32, span: u32, requested: Option<u32>) -> u32 {
+    match requested {
+        Some(v) => v.clamp(1, span.max(1)),
+        None => current.clamp(1, span.max(1)),
+    }
 }
 
 impl Placement for MidiClip {
@@ -589,6 +651,21 @@ impl Placement for MidiClip {
             .collect();
         self.sort();
     }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+    fn loop_len(&self, _sec_per_tick: f64) -> u32 {
+        self.loop_ticks
+    }
+    fn group(&self) -> Option<u32> {
+        self.group
+    }
+    fn set_group(&mut self, group: Option<u32>) {
+        self.group = group;
+    }
 }
 
 impl Placement for ControlClip {
@@ -617,6 +694,21 @@ impl Placement for ControlClip {
                 ..*p
             })
             .collect();
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+    fn loop_len(&self, _sec_per_tick: f64) -> u32 {
+        self.loop_ticks
+    }
+    fn group(&self) -> Option<u32> {
+        self.group
+    }
+    fn set_group(&mut self, group: Option<u32>) {
+        self.group = group;
     }
 }
 
@@ -650,15 +742,31 @@ impl Placement for AudioClip {
         self.source_offset += secs;
         self.source_len = (self.source_len - secs).max(sec_per_tick);
     }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+    fn loop_len(&self, sec_per_tick: f64) -> u32 {
+        self.span(sec_per_tick)
+    }
+    fn group(&self) -> Option<u32> {
+        self.group
+    }
+    fn set_group(&mut self, group: Option<u32>) {
+        self.group = group;
+    }
 }
 
 /// Splits `clips[index]` at `at` in place (M4b.2): the left half keeps the
 /// start with a shortened span, the right half is inserted at `index + 1`
 /// with the content from the cut onward shifted to its origin (notes
-/// crossing the cut continue in both halves). Both halves are single-period
-/// clips (`loop == span`, D14), so neither half tiles. Returns false
-/// untouched when the index is out of bounds, the track is full, or `at` is
-/// not strictly inside the clip.
+/// crossing the cut continue in both halves). Only single-period clips
+/// (`loop == span`) are splittable: cutting a tiled clip would need a
+/// phase-relative loop origin, which the model does not carry (W2). Returns
+/// false untouched when the index is out of bounds, the track is full, `at`
+/// is not strictly inside the clip, or the clip is tiled.
 pub(crate) fn split_clip_in<T: Placement + Clone>(
     clips: &mut Vec<T>,
     at: u32,
@@ -669,7 +777,11 @@ pub(crate) fn split_clip_in<T: Placement + Clone>(
         return false;
     };
     let (start, end) = (c.start(), c.start() + c.span(sec_per_tick));
-    if at <= start || at >= end || clips.len() >= MAX_CLIPS_PER_TRACK {
+    if at <= start
+        || at >= end
+        || clips.len() >= MAX_CLIPS_PER_TRACK
+        || c.loop_len(sec_per_tick) < c.span(sec_per_tick)
+    {
         return false;
     }
     let left_span = at - start;
@@ -682,6 +794,20 @@ pub(crate) fn split_clip_in<T: Placement + Clone>(
     clips[index].set_loop(left_span, sec_per_tick);
     clips.insert(index + 1, right);
     true
+}
+
+/// W3a: which clip `F2` renames on a row — the first selection entry that
+/// belongs to this lane/track, provided the clip index still exists.
+fn clip_rename_target<T: Placement>(
+    selection: &[ClipSel],
+    lane: TimelineLane,
+    track: usize,
+    clips: &[T],
+) -> Option<(ClipSel, String)> {
+    let sel = selection
+        .iter()
+        .find(|s| s.lane == lane && s.track == track)?;
+    Some((*sel, clips.get(sel.clip)?.name().to_owned()))
 }
 
 /// Looks up a selected clip's (start, span) across both track kinds.
@@ -1225,7 +1351,7 @@ pub fn show(
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(
-                        "Drag move · edge resize · dbl-click insert/edit · right-click delete · marquee: select · Del: delete · K: knife · header dots: reorder track · ruler: click seek / Ctrl+drag loop / RMB marker · Ctrl+wheel: zoom time · Ctrl+Alt+wheel: row height · middle-drag: pan",
+                        "Drag move · edge resize (grow = tile) · Alt+edge: loop length · dbl-click edit · F2 / Alt+dbl-click: rename · Ctrl+G group · Ctrl+Shift+G ungroup · Alt+click: single · right-click delete · marquee select · Del · K knife · dots: reorder track · ruler: seek / Ctrl+loop / RMB marker · Ctrl+wheel zoom · Ctrl+Alt+wheel height · MMB pan",
                     )
                     .weak(),
                 )
@@ -1479,6 +1605,7 @@ pub fn show(
                 &|clip| format!("{} notes", clip.notes().len()),
                 &|_| None,
                 &|_, _, _| {},
+                p.clip_groups,
             );
         }
 
@@ -1528,6 +1655,7 @@ pub fn show(
                     },
                     &|_| None,
                     &|clip, painter, rect| draw_control_preview(painter, rect, clip),
+                    p.clip_groups,
                 );
             }
         }
@@ -1578,6 +1706,7 @@ pub fn show(
                     // clip-keyed parameter lane_row takes.
                     &|clip: &AudioClip| (p.waveform_of)(&clip.path),
                     &|_, _, _| {},
+                    p.clip_groups,
                 );
             }
         }
@@ -1901,7 +2030,82 @@ pub fn show(
             state.set_status(msg);
         }
     });
+    // W3b: expand the selection to every member of the groups it touches — a
+    // click on one grouped clip therefore moves / copies / deletes the whole
+    // group. `Alt`-picked selections opt out until the next plain pick, and
+    // the expansion is idempotent, so running it every frame is harmless.
+    if !state.break_group && !state.selection.is_empty() {
+        let expanded =
+            expand_group_selection(midi_tracks, control_tracks, audio_tracks, &state.selection);
+        if expanded != state.selection {
+            state.selection = expanded;
+        }
+    }
     actions
+}
+
+/// W3b: every clip that shares a group with any selected clip, in table
+/// order. Groups are cross-track and cross-lane by design, so the result can
+/// mix MIDI / control / audio entries. Selections without grouped clips are
+/// returned unchanged.
+pub(crate) fn expand_group_selection(
+    midi: &[MidiTrack],
+    control: &[ControlTrack],
+    audio: &[AudioTrack],
+    selection: &[ClipSel],
+) -> Vec<ClipSel> {
+    let group_of = |sel: &ClipSel| -> Option<u32> {
+        match sel.lane {
+            TimelineLane::Midi => midi
+                .get(sel.track)
+                .and_then(|track| track.clips.get(sel.clip))
+                .and_then(Placement::group),
+            TimelineLane::Control => control
+                .get(sel.track)
+                .and_then(|track| track.clips.get(sel.clip))
+                .and_then(Placement::group),
+            TimelineLane::Audio => audio
+                .get(sel.track)
+                .and_then(|track| track.clips.get(sel.clip))
+                .and_then(Placement::group),
+        }
+    };
+    let mut groups: Vec<u32> = Vec::new();
+    for sel in selection {
+        if let Some(id) = group_of(sel)
+            && !groups.contains(&id)
+        {
+            groups.push(id);
+        }
+    }
+    if groups.is_empty() {
+        return selection.to_vec();
+    }
+    let mut out = selection.to_vec();
+    let mut add = |lane: TimelineLane, track: usize, clip: usize, group: Option<u32>| {
+        if group.is_some_and(|id| groups.contains(&id)) {
+            let sel = ClipSel { lane, track, clip };
+            if !out.contains(&sel) {
+                out.push(sel);
+            }
+        }
+    };
+    for (ti, track) in midi.iter().enumerate() {
+        for (ci, clip) in track.clips.iter().enumerate() {
+            add(TimelineLane::Midi, ti, ci, clip.group());
+        }
+    }
+    for (ti, track) in control.iter().enumerate() {
+        for (ci, clip) in track.clips.iter().enumerate() {
+            add(TimelineLane::Control, ti, ci, clip.group());
+        }
+    }
+    for (ti, track) in audio.iter().enumerate() {
+        for (ci, clip) in track.clips.iter().enumerate() {
+            add(TimelineLane::Audio, ti, ci, clip.group());
+        }
+    }
+    out
 }
 
 /// Draws one audio clip's waveform body (U6 D6): min/max peak columns
@@ -2041,6 +2245,8 @@ fn lane_row<T: Placement>(
     // Optional per-clip body decoration drawn over the clip block (U12: the
     // read-only control curve preview). MIDI/audio rows pass a no-op.
     clip_body: &dyn Fn(&T, &egui::Painter, Rect),
+    // W3b: group table for the colour stripe + name tag.
+    clip_groups: &[ClipGroup],
 ) {
     // The row's widget ids must be STABLE. The lane is the keyboard focus
     // carrier, and egui auto ids are positional: anything above the rows
@@ -2247,6 +2453,35 @@ fn lane_row<T: Placement>(
             Stroke::new(1.0, colors.clip_stroke),
             StrokeKind::Inside,
         );
+        // W2: when the container is longer than one period, mark every
+        // repeat seam and tint the repeated periods — the same tiling the
+        // sequencer does (`start + k·loop`), so what is drawn is what plays.
+        let span_ticks = clip.span(sec_per_tick).max(1);
+        let loop_ticks = clip.loop_len(sec_per_tick).clamp(1, span_ticks);
+        if loop_ticks < span_ticks {
+            let loop_px = loop_ticks as f32 * px_per_tick;
+            let mut seam = rect.left() + loop_px;
+            let seam_color = colors.clip_stroke.gamma_multiply(0.55);
+            while seam < rect.right() - 0.5 {
+                let band = Rect::from_min_max(
+                    pos2(seam, rect.top()),
+                    pos2((seam + loop_px).min(rect.right()), rect.bottom()),
+                );
+                painter.rect_filled(
+                    band,
+                    0.0,
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+                );
+                painter.line_segment(
+                    [
+                        pos2(seam, rect.top() + 1.0),
+                        pos2(seam, rect.bottom() - 1.0),
+                    ],
+                    Stroke::new(1.0, seam_color),
+                );
+                seam += loop_px;
+            }
+        }
         // U6: a clip with waveform data draws min/max peak columns across
         // its body (stretched to the span, exactly like playback reads it).
         if let Some(data) = waveform_of(clip) {
@@ -2254,6 +2489,27 @@ fn lane_row<T: Placement>(
         }
         // U12: per-clip preview drawn over the block (control curve).
         clip_body(clip, &painter, rect);
+        // W3b: group stripe + name. Drawn after the content preview so the
+        // tag is never hidden by a waveform or curve.
+        if let Some(group_id) = clip.group()
+            && let Some(group) = clip_groups.iter().find(|group| group.id == group_id)
+        {
+            let color = Color32::from_rgb(group.color[0], group.color[1], group.color[2]);
+            let stripe = Rect::from_min_max(
+                pos2(rect.left() + 1.0, rect.top() + 2.0),
+                pos2(rect.left() + 4.0, rect.bottom() - 2.0),
+            );
+            painter.rect_filled(stripe, 1.0, color);
+            if rect.width() > 110.0 && !group.name.is_empty() {
+                painter.text(
+                    pos2(rect.right() - 4.0, rect.bottom() - 2.0),
+                    Align2::RIGHT_BOTTOM,
+                    &group.name,
+                    FontId::proportional(9.0),
+                    color,
+                );
+            }
+        }
         if state.selection.contains(&ClipSel {
             lane: lane_kind,
             track,
@@ -2269,13 +2525,85 @@ fn lane_row<T: Placement>(
                 StrokeKind::Inside,
             );
         }
+        // W3a: an inline rename field replaces the label while it is open.
+        // It is a real widget on top of the painted block, so typing and
+        // focus behave like the track-header editor.
+        let sel = ClipSel {
+            lane: lane_kind,
+            track,
+            clip: index,
+        };
+        if state
+            .clip_rename
+            .as_ref()
+            .is_some_and(|(clip_sel, _)| *clip_sel == sel)
+        {
+            let mut cancel = false;
+            let mut commit = false;
+            if let Some((_, draft)) = state.clip_rename.as_mut() {
+                let width = rect
+                    .width()
+                    .max(72.0)
+                    .min((lane.right() - rect.left() - 4.0).max(24.0));
+                let inner = Rect::from_min_size(
+                    rect.min + Vec2::new(2.0, 1.0),
+                    Vec2::new(width, (rect.height() - 2.0).max(14.0)),
+                );
+                let resp = ui.put(
+                    inner,
+                    egui::TextEdit::singleline(draft)
+                        .font(egui::TextStyle::Small)
+                        .hint_text("Clip name"),
+                );
+                if std::mem::take(&mut state.clip_rename_focus) {
+                    resp.request_focus();
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                } else if resp.lost_focus() {
+                    actions.push(TimelineAction::RenameClip {
+                        lane: lane_kind,
+                        track,
+                        clip: index,
+                        name: draft.trim().to_owned(),
+                    });
+                    commit = true;
+                }
+            }
+            if cancel || commit {
+                state.clip_rename = None;
+            }
+            continue;
+        }
+        // Empty name = unnamed: show the content summary instead (W3a).
+        let custom_name = clip.name();
+        let mut label = if custom_name.is_empty() {
+            clip_label(clip)
+        } else {
+            custom_name.to_owned()
+        };
+        // W2: `×N` tells how many content periods the container covers.
+        let repeats = span_ticks.div_ceil(loop_ticks);
+        if repeats > 1 {
+            label = format!("{label} ×{repeats}");
+        }
         painter.text(
             pos2(rect.left() + 4.0, rect.center().y),
             Align2::LEFT_CENTER,
-            clip_label(clip),
+            label,
             FontId::proportional(10.0),
             colors.clip_text,
         );
+    }
+
+    // Drop a rename editor whose clip disappeared (deleted, or the track's
+    // clip table was rebuilt).
+    if state
+        .clip_rename
+        .as_ref()
+        .is_some_and(|(s, _)| s.lane == lane_kind && s.track == track && s.clip >= clips.len())
+    {
+        state.clip_rename = None;
     }
 
     // Playhead.
@@ -2303,7 +2631,17 @@ fn lane_row<T: Placement>(
             if clips.len() >= MAX_CLIPS_PER_TRACK {
                 state.set_status("this track is full — cannot split");
             } else {
+                let tiled = hit_clip(clips, tick_at(pos.x), sec_per_tick).is_some_and(|index| {
+                    clips[index].loop_len(sec_per_tick) < clips[index].span(sec_per_tick)
+                });
                 match knife_target(clips, tick_at(pos.x), bar_ticks, sec_per_tick) {
+                    // W2: a cut would need a phase-relative loop origin,
+                    // which the model does not carry.
+                    Some(_) if tiled => {
+                        state.set_status(
+                            "a tiled clip must be trimmed to one period before cutting",
+                        );
+                    }
                     Some((index, at)) => {
                         actions.push(TimelineAction::SplitClip {
                             lane: lane_kind,
@@ -2345,21 +2683,35 @@ fn lane_row<T: Placement>(
         if let Some(pos) = response.interact_pointer_pos() {
             let tick = tick_at(pos.x);
             if let Some(index) = hit_clip(clips, tick, sec_per_tick) {
-                match row {
-                    RowKind::Midi(t) => actions.push(TimelineAction::OpenMidiEditor {
-                        track: t,
-                        clip: index,
-                    }),
-                    // U12: a control clip's curve is edited in the Edit tab (no
-                    // inline band anymore).
-                    RowKind::Control(t) => actions.push(TimelineAction::OpenControlEditor {
-                        track: t,
-                        clip: index,
-                    }),
-                    // U6 D2: audio clips have no editor — the double-click
-                    // selects the track (highlight + `- Audio` target).
-                    RowKind::Audio(t) => {
-                        actions.push(TimelineAction::SelectAudioTrack(t));
+                // W3a: Alt+double-click renames instead of opening the
+                // editor (same modifier family as the rest of the view).
+                if ui.input(|i| i.modifiers.alt) {
+                    state.clip_rename = Some((
+                        ClipSel {
+                            lane: lane_kind,
+                            track,
+                            clip: index,
+                        },
+                        clips[index].name().to_owned(),
+                    ));
+                    state.clip_rename_focus = true;
+                } else {
+                    match row {
+                        RowKind::Midi(t) => actions.push(TimelineAction::OpenMidiEditor {
+                            track: t,
+                            clip: index,
+                        }),
+                        // U12: a control clip's curve is edited in the Edit tab (no
+                        // inline band anymore).
+                        RowKind::Control(t) => actions.push(TimelineAction::OpenControlEditor {
+                            track: t,
+                            clip: index,
+                        }),
+                        // U6 D2: audio clips have no editor — the double-click
+                        // selects the track (highlight + `- Audio` target).
+                        RowKind::Audio(t) => {
+                            actions.push(TimelineAction::SelectAudioTrack(t));
+                        }
                     }
                 }
             } else if clips.len() < MAX_CLIPS_PER_TRACK {
@@ -2400,6 +2752,10 @@ fn lane_row<T: Placement>(
             let tick = tick_at(pos.x);
             if let Some(index) = hit_clip(clips, tick, sec_per_tick) {
                 let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                // W3b: `Alt` picks this one clip out of its group (the
+                // expansion at the end of show() is skipped while it holds).
+                let alt = ui.ctx().input(|i| i.modifiers.alt);
+                state.break_group = alt;
                 let sel = ClipSel {
                     lane: lane_kind,
                     track,
@@ -2428,6 +2784,8 @@ fn lane_row<T: Placement>(
                 }
             } else {
                 let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                // A fresh band starts from group-expanded semantics.
+                state.break_group = false;
                 state.marquee = Some(Marquee {
                     origin: pos,
                     current: pos,
@@ -2458,15 +2816,29 @@ fn lane_row<T: Placement>(
                                 clip,
                                 start_ticks: start,
                                 span_ticks: span,
+                                loop_ticks: None,
                             });
                         }
                     }
                     Some(Drag::Resize { clip, .. }) if clip < clips.len() => {
                         let start = clips[clip].start();
                         let limit = ARRANGEMENT_LIMIT_TICKS - start;
-                        let span = snap_bar(tick_at(pos.x) - start as f32, bar_ticks)
+                        let edge = snap_bar(tick_at(pos.x) - start as f32, bar_ticks)
                             .clamp(bar_ticks, limit.max(bar_ticks));
-                        if clips[clip].span(sec_per_tick) != span {
+                        // W2: the plain right edge edits the container (grow =
+                        // tile the content). Alt edits the content period; the
+                        // container grows to fit, so tiling starts right after
+                        // the period.
+                        let alt = ui.input(|i| i.modifiers.alt);
+                        let span = if alt {
+                            clips[clip].span(sec_per_tick).max(edge)
+                        } else {
+                            edge
+                        };
+                        let loop_ticks = alt.then_some(edge);
+                        let loop_changed =
+                            loop_ticks.is_some_and(|l| l != clips[clip].loop_len(sec_per_tick));
+                        if clips[clip].span(sec_per_tick) != span || loop_changed {
                             let lane = row.lane();
                             let track = row.track();
                             actions.push(TimelineAction::MoveResizeClip {
@@ -2475,6 +2847,7 @@ fn lane_row<T: Placement>(
                                 clip,
                                 start_ticks: start,
                                 span_ticks: span,
+                                loop_ticks,
                             });
                         }
                     }
@@ -2538,6 +2911,8 @@ fn lane_row<T: Placement>(
     if response.clicked() && !state.knife_armed && state.modal.is_none() {
         if let Some(pos) = response.interact_pointer_pos() {
             let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
+            // W3b: Alt keeps the selection on the clicked clip only.
+            state.break_group = ui.ctx().input(|i| i.modifiers.alt);
             match hit_clip(clips, tick_at(pos.x), sec_per_tick) {
                 Some(index) => {
                     let sel = ClipSel {
@@ -2629,6 +3004,39 @@ fn lane_row<T: Placement>(
         let y = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::NONE, Key::Y));
+        // W3a: F2 renames the first selected clip on this row (Windows /
+        // explorer convention; Alt+double-click is the pointer equivalent).
+        let f2 = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::NONE, Key::F2));
+        if f2 {
+            if let Some(target) = clip_rename_target(&state.selection, lane_kind, track, clips) {
+                state.clip_rename = Some(target);
+                state.clip_rename_focus = true;
+                state.modal = None;
+            }
+        }
+        // W3b: Ctrl+G groups the selection (cross-track / cross-lane),
+        // Ctrl+Shift+G dissolves every group it touches.
+        let shift_g = {
+            let mut mods = Modifiers::CTRL;
+            mods.shift = true;
+            ui.ctx().input_mut(|i| i.consume_key(mods, Key::G))
+        };
+        let ctrl_g = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::CTRL, Key::G));
+        if !state.selection.is_empty() {
+            if shift_g {
+                actions.push(TimelineAction::UngroupClips {
+                    clips: state.selection.clone(),
+                });
+            } else if ctrl_g {
+                actions.push(TimelineAction::GroupClips {
+                    clips: state.selection.clone(),
+                });
+            }
+        }
         if knife {
             // Single-shot, unified with the roll: K arms, one click
             // consumes; Esc / right-click cancel. Not a toggle.
@@ -2873,6 +3281,168 @@ mod tests {
     /// Seconds per tick at 120 BPM / 960 PPQ — the base-tempo conversion the
     /// placement helpers take (U11 D3); MIDI/control clips ignore it.
     const SPT: f64 = 60.0 / (120.0 * 960.0);
+
+    /// W3a: clip names are optional and the `Placement` helpers are the
+    /// single read/write path the timeline uses for all three clip kinds.
+    #[test]
+    fn clip_names_are_optional_and_writable() {
+        let mut midi = MidiClip::default();
+        assert!(Placement::name(&midi).is_empty());
+        Placement::set_name(&mut midi, "Verse".to_owned());
+        assert_eq!(Placement::name(&midi), "Verse");
+
+        let mut control = ControlClip::default();
+        Placement::set_name(&mut control, "Sweep".to_owned());
+        assert_eq!(Placement::name(&control), "Sweep");
+
+        let mut audio = AudioClip::default();
+        Placement::set_name(&mut audio, "Vox".to_owned());
+        assert_eq!(Placement::name(&audio), "Vox");
+    }
+
+    /// W3b: one grouped clip expands the selection to every member — across
+    /// tracks and lane kinds; ungrouped clips stay untouched.
+    #[test]
+    fn group_selection_expands_across_tracks_and_lanes() {
+        let mut midi = vec![MidiTrack::default(), MidiTrack::default()];
+        midi[0].clips.push(MidiClip {
+            group: Some(1),
+            ..MidiClip::default()
+        });
+        midi[1].clips.push(MidiClip {
+            group: Some(1),
+            ..MidiClip::default()
+        });
+        midi[1].clips.push(MidiClip::default());
+        let mut control = vec![ControlTrack::default()];
+        control[0].clips.push(ControlClip {
+            group: Some(1),
+            ..ControlClip::default()
+        });
+        let mut audio = vec![AudioTrack::default()];
+        audio[0].clips.push(AudioClip {
+            group: Some(2),
+            ..AudioClip::default()
+        });
+
+        let start = vec![ClipSel {
+            lane: TimelineLane::Midi,
+            track: 0,
+            clip: 0,
+        }];
+        let expanded = expand_group_selection(&midi, &control, &audio, &start);
+        assert_eq!(expanded.len(), 3, "two MIDI + one control member");
+        assert!(expanded.contains(&ClipSel {
+            lane: TimelineLane::Control,
+            track: 0,
+            clip: 0,
+        }));
+        assert!(
+            !expanded.iter().any(|sel| sel.lane == TimelineLane::Audio),
+            "another group's clips must stay out"
+        );
+
+        // An ungrouped selection is returned unchanged.
+        let lone = vec![ClipSel {
+            lane: TimelineLane::Midi,
+            track: 1,
+            clip: 1,
+        }];
+        assert_eq!(expand_group_selection(&midi, &control, &audio, &lone), lone);
+    }
+
+    /// W2: growing a clip keeps its content period (it tiles), shrinking trims
+    /// the tail; an explicit Alt request wins but must fit the container.
+    #[test]
+    fn resize_loop_tiles_when_growing_and_trims_when_shrinking() {
+        let bar = TICKS_PER_BAR;
+        assert_eq!(resolve_loop(bar, 4 * bar, None), bar);
+        assert_eq!(resolve_loop(2 * bar, bar, None), bar);
+        assert_eq!(resolve_loop(bar, 4 * bar, Some(2 * bar)), 2 * bar);
+        assert_eq!(resolve_loop(bar, bar, Some(8 * bar)), bar);
+        // Never zero: the loop always covers at least one tick.
+        assert_eq!(resolve_loop(bar, 1, None), 1);
+    }
+
+    /// W2: splitting a tiled clip is refused (it would need a phase-relative
+    /// loop origin the model does not carry).
+    #[test]
+    fn a_tiled_clip_cannot_be_split() {
+        let mut clips = vec![MidiClip {
+            start_ticks: 0,
+            span_ticks: 2 * TICKS_PER_BAR,
+            loop_ticks: TICKS_PER_BAR,
+            ..MidiClip::default()
+        }];
+        assert!(
+            !split_clip_in(&mut clips, TICKS_PER_BAR + TICKS_PER_BAR / 2, 0, SPT),
+            "tiled clip must refuse the cut"
+        );
+        assert_eq!(clips.len(), 1);
+    }
+
+    /// W3a: F2 targets the first selection entry on the focused row and
+    /// refuses stale indices / other lanes.
+    #[test]
+    fn f2_targets_the_selected_clip_on_its_own_row() {
+        let clips = vec![
+            MidiClip {
+                name: "Verse".to_owned(),
+                ..MidiClip::default()
+            },
+            MidiClip::default(),
+        ];
+        let sel = |lane, track, clip| ClipSel { lane, track, clip };
+
+        assert_eq!(
+            clip_rename_target(
+                &[sel(TimelineLane::Midi, 1, 0)],
+                TimelineLane::Midi,
+                1,
+                &clips
+            ),
+            Some((sel(TimelineLane::Midi, 1, 0), "Verse".to_owned()))
+        );
+        assert_eq!(
+            clip_rename_target(
+                &[sel(TimelineLane::Midi, 1, 1)],
+                TimelineLane::Midi,
+                1,
+                &clips
+            ),
+            Some((sel(TimelineLane::Midi, 1, 1), String::new()))
+        );
+        // Wrong track / wrong lane: not this row's business.
+        assert_eq!(
+            clip_rename_target(
+                &[sel(TimelineLane::Midi, 0, 0)],
+                TimelineLane::Midi,
+                1,
+                &clips
+            ),
+            None
+        );
+        assert_eq!(
+            clip_rename_target(
+                &[sel(TimelineLane::Audio, 1, 0)],
+                TimelineLane::Midi,
+                1,
+                &clips
+            ),
+            None
+        );
+        // Stale index.
+        assert_eq!(
+            clip_rename_target(
+                &[sel(TimelineLane::Midi, 1, 9)],
+                TimelineLane::Midi,
+                1,
+                &clips
+            ),
+            None
+        );
+        assert_eq!(clip_rename_target(&[], TimelineLane::Midi, 1, &clips), None);
+    }
 
     /// U12: the read-only curve preview on a control clip block draws a
     /// normal clip and is a silent no-op for degenerate inputs (empty curve,

@@ -101,6 +101,7 @@ impl Fixture {
                         bar_ticks: TICKS_PER_BAR,
                         sec_per_tick: 60.0 / (120.0 * 960.0),
                         waveform_of: &|_| None,
+                        clip_groups: &[],
                     },
                     router,
                 );

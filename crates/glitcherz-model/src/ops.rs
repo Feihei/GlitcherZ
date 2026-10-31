@@ -340,11 +340,228 @@ pub fn apply_duration(notes: &mut [Note], op: &DurationOp) {
     }
 }
 
+// ---- Randomize (W4) ----------------------------------------------------------------------
+
+/// Random perturbation half-ranges. Each field is "±N": `pitch: 2` means up
+/// to two semitones either way, `start: 40` up to 40 ticks either way. A zero
+/// range leaves that field untouched.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RandomizeOptions {
+    pub pitch: i32,
+    pub start: i64,
+    pub length: i64,
+    pub velocity: u8,
+    /// 0..=1 — the chance that a given note is perturbed at all. A skipped
+    /// note is **not** deleted (the slice-length contract).
+    pub probability: f32,
+}
+
+impl Default for RandomizeOptions {
+    fn default() -> Self {
+        Self {
+            pitch: 0,
+            start: 0,
+            length: 0,
+            velocity: 0,
+            probability: 1.0,
+        }
+    }
+}
+
+/// Symmetric draw in `-amplitude..=amplitude`.
+fn symmetric_f32(rng: &mut XorShift, amplitude: f32) -> f32 {
+    (rng.next_f32() * 2.0 - 1.0) * amplitude
+}
+
+/// Randomizes pitch / start / length / velocity in place (W4).
+///
+/// Clamps keep every note legal (pitch 0..=127, start ≥ 0, length ≥ 1,
+/// velocity 1..=127). The slice length never changes, so this is safe on a
+/// selection; the caller restores the sort invariant.
+pub fn randomize(notes: &mut [Note], options: &RandomizeOptions, seed: u64) {
+    let probability = if options.probability.is_finite() {
+        options.probability.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if probability <= 0.0 {
+        return;
+    }
+    let mut rng = XorShift(seed);
+    for note in notes {
+        if probability < 1.0 && rng.next_f32() >= probability {
+            continue;
+        }
+        if options.pitch > 0 {
+            let delta = round_i64(symmetric_f32(&mut rng, options.pitch as f32));
+            note.note = (i32::from(note.note) + delta as i32).clamp(0, 127) as u8;
+        }
+        if options.start > 0 {
+            let delta = round_i64(symmetric_f32(&mut rng, options.start as f32));
+            note.start = (note.start + delta).max(0);
+        }
+        if options.length > 0 {
+            let delta = round_i64(symmetric_f32(&mut rng, options.length as f32));
+            note.length = (note.length + delta).max(1);
+        }
+        if options.velocity > 0 {
+            let delta = symmetric_f32(&mut rng, f32::from(options.velocity));
+            note.velocity = (f32::from(note.velocity) + delta).round().clamp(1.0, 127.0) as u8;
+        }
+    }
+}
+
+// ---- Strum (W5) --------------------------------------------------------------------------
+
+/// Attack order within a chord group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrumDirection {
+    /// Low note first ("upstroke").
+    Up,
+    /// High note first ("downstroke").
+    Down,
+    /// Alternates per group, starting with [`StrumDirection::Up`].
+    Alternate,
+    /// Seeded shuffle per group.
+    Random,
+}
+
+/// Strum parameters (W5). Everything is measured in ticks, relative to each
+/// note's own start.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrumOptions {
+    /// Gap between consecutive attacks.
+    pub spread_ticks: i64,
+    /// Notes whose starts fall within this window of the group's first note
+    /// form one chord group.
+    pub group_window_ticks: i64,
+    /// Velocity delta from the first to the last attack (may be negative).
+    pub velocity_ramp: i32,
+    /// Extra ± tick jitter per note.
+    pub jitter_ticks: i64,
+    pub direction: StrumDirection,
+}
+
+impl Default for StrumOptions {
+    fn default() -> Self {
+        Self {
+            spread_ticks: 0,
+            group_window_ticks: 0,
+            velocity_ramp: 0,
+            jitter_ticks: 0,
+            direction: StrumDirection::Up,
+        }
+    }
+}
+
+/// Staggers chord attacks in place (W5): notes are grouped by start time
+/// (within `group_window_ticks`), ordered by pitch (or shuffled), and each
+/// attack moves by `position · spread_ticks`. `length` is **never** changed,
+/// so the notes keep their notated duration and their ends stagger with the
+/// starts. The slice length is unchanged and the caller re-sorts.
+pub fn strum(notes: &mut [Note], options: &StrumOptions, seed: u64) {
+    if notes.is_empty() {
+        return;
+    }
+    let spread = options.spread_ticks.max(0);
+    let window = options.group_window_ticks.max(0);
+    let jitter = options.jitter_ticks.max(0);
+    let mut rng = XorShift(seed);
+
+    // Time order, ties broken by pitch: a stable basis for chord grouping.
+    let mut order: Vec<usize> = (0..notes.len()).collect();
+    order.sort_by_key(|&i| (notes[i].start, notes[i].note, i));
+
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut anchor = 0i64;
+    for index in order {
+        if current.is_empty() {
+            anchor = notes[index].start;
+            current.push(index);
+        } else if notes[index].start - anchor <= window {
+            current.push(index);
+        } else {
+            groups.push(std::mem::take(&mut current));
+            anchor = notes[index].start;
+            current.push(index);
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+
+    for (group_index, mut group) in groups.into_iter().enumerate() {
+        group.sort_by_key(|&i| (notes[i].note, notes[i].start, i));
+        match options.direction {
+            StrumDirection::Up => {}
+            StrumDirection::Down => group.reverse(),
+            StrumDirection::Alternate => {
+                if group_index % 2 == 1 {
+                    group.reverse();
+                }
+            }
+            StrumDirection::Random => {
+                // Fisher–Yates, seeded.
+                for i in (1..group.len()).rev() {
+                    let j = (rng.next_f32() * (i as f32 + 1.0)) as usize;
+                    group.swap(i, j.min(i));
+                }
+            }
+        }
+        let count = group.len();
+        for (position, &index) in group.iter().enumerate() {
+            let offset = position as i64 * spread;
+            let wobble = if jitter > 0 {
+                round_i64(symmetric_f32(&mut rng, jitter as f32))
+            } else {
+                0
+            };
+            notes[index].start = (notes[index].start + offset + wobble).max(0);
+            if options.velocity_ramp != 0 && count > 1 {
+                let t = position as f32 / (count - 1) as f32;
+                let delta = options.velocity_ramp as f32 * t;
+                notes[index].velocity = (f32::from(notes[index].velocity) + delta)
+                    .round()
+                    .clamp(1.0, 127.0) as u8;
+            }
+        }
+    }
+}
+
+// ---- Drum kit key assignment (W1) --------------------------------------------------------
+
+/// Free MIDI keys for a multi-file drum-kit load (spec `drum-kit.md` K10).
+///
+/// Starts at [`crate::DRUM_DEFAULT_NOTE`] (36, GM kick), skips keys already
+/// used by `taken`, wraps around after 127, and returns at most `count` keys.
+/// The caller caps `count` by the remaining slot budget.
+pub fn assign_drum_notes(taken: &[u8], count: usize) -> Vec<u8> {
+    let mut used = [false; 128];
+    for &note in taken {
+        used[usize::from(note & 0x7F)] = true;
+    }
+    let mut out = Vec::with_capacity(count.min(128));
+    let mut key = crate::DRUM_DEFAULT_NOTE;
+    let mut scanned = 0;
+    while out.len() < count && scanned < 128 {
+        let index = usize::from(key);
+        if !used[index] {
+            used[index] = true;
+            out.push(key);
+        }
+        key = if key == 127 { 0 } else { key + 1 };
+        scanned += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SEED, DurationOp, QuantizeOptions, VelocityOp, apply_duration, apply_to_selected,
-        apply_velocity, quantize, round_i64, scale_notes, transpose,
+        DEFAULT_SEED, DurationOp, QuantizeOptions, RandomizeOptions, StrumDirection, StrumOptions,
+        VelocityOp, apply_duration, apply_to_selected, apply_velocity, quantize, randomize,
+        round_i64, scale_notes, strum, transpose,
     };
     use crate::Note;
 
@@ -661,5 +878,238 @@ mod tests {
             "the unselected note is untouched"
         );
         assert_eq!((notes[2].start, notes[2].length), (360, 48));
+    }
+
+    fn starts_by_pitch(notes: &[Note]) -> Vec<(u8, i64)> {
+        let mut pairs: Vec<(u8, i64)> = notes.iter().map(|n| (n.note, n.start)).collect();
+        pairs.sort_unstable();
+        pairs
+    }
+
+    fn chord() -> Vec<Note> {
+        vec![
+            note(0, 240, 60, 100),
+            note(0, 240, 64, 90),
+            note(0, 240, 67, 80),
+        ]
+    }
+
+    /// W4: the same seed replays identically and every field stays legal.
+    #[test]
+    fn randomize_is_bounded_and_seeded() {
+        let source = vec![
+            note(0, 240, 60, 100),
+            note(480, 240, 127, 1),
+            note(960, 1, 0, 127),
+        ];
+        let options = RandomizeOptions {
+            pitch: 12,
+            start: 120,
+            length: 240,
+            velocity: 40,
+            probability: 1.0,
+        };
+        let mut first = source.clone();
+        let mut second = source.clone();
+        randomize(&mut first, &options, 42);
+        randomize(&mut second, &options, 42);
+        assert_eq!(first, second, "seeded replay");
+        assert_ne!(first, source, "ranges are large enough to move something");
+        for note in &first {
+            assert!((0..=127).contains(&note.note));
+            assert!(note.start >= 0);
+            assert!(note.length >= 1);
+            assert!((1..=127).contains(&note.velocity));
+        }
+        assert_eq!(first.len(), source.len(), "no note may be dropped");
+    }
+
+    #[test]
+    fn randomize_with_zero_ranges_is_the_identity() {
+        let mut notes = vec![note(120, 240, 60, 100), note(480, 480, 64, 80)];
+        let before = notes.clone();
+        randomize(&mut notes, &RandomizeOptions::default(), DEFAULT_SEED);
+        assert_eq!(notes, before);
+    }
+
+    /// A low probability skips notes instead of deleting them: the slice
+    /// keeps its length, and probability 0 is a full no-op.
+    #[test]
+    fn randomize_probability_skips_without_deleting() {
+        let mut notes: Vec<Note> = (0..32).map(|i| note(i * 240, 240, 60, 100)).collect();
+        let before = notes.clone();
+        let options = RandomizeOptions {
+            pitch: 0,
+            start: 0,
+            length: 0,
+            velocity: 10,
+            probability: 0.0,
+        };
+        randomize(&mut notes, &options, 3);
+        assert_eq!(notes, before, "probability 0 is a no-op");
+
+        let options = RandomizeOptions {
+            probability: 0.5,
+            ..options
+        };
+        randomize(&mut notes, &options, 3);
+        assert_eq!(notes.len(), before.len());
+        let untouched = notes
+            .iter()
+            .zip(&before)
+            .filter(|(after, before)| *after == *before)
+            .count();
+        assert!(
+            untouched > 0 && untouched < notes.len(),
+            "a 0.5 chance must skip some and touch others (saw {untouched}/32)"
+        );
+    }
+
+    /// W5: Up strums from the lowest note, spreading starts by one gap.
+    #[test]
+    fn strum_up_spaces_from_the_lowest_note() {
+        let mut notes = chord();
+        strum(
+            &mut notes,
+            &StrumOptions {
+                spread_ticks: 120,
+                direction: StrumDirection::Up,
+                ..StrumOptions::default()
+            },
+            1,
+        );
+        assert_eq!(starts_by_pitch(&notes), vec![(60, 0), (64, 120), (67, 240)]);
+        assert!(
+            notes.iter().all(|n| n.length == 240),
+            "lengths never change"
+        );
+    }
+
+    #[test]
+    fn strum_down_reverses_the_attack_order() {
+        let mut notes = chord();
+        strum(
+            &mut notes,
+            &StrumOptions {
+                spread_ticks: 120,
+                direction: StrumDirection::Down,
+                ..StrumOptions::default()
+            },
+            1,
+        );
+        assert_eq!(starts_by_pitch(&notes), vec![(60, 240), (64, 120), (67, 0)]);
+    }
+
+    #[test]
+    fn strum_groups_only_notes_inside_the_window() {
+        let mut notes = vec![
+            note(0, 240, 60, 100),
+            note(30, 240, 64, 100),
+            note(960, 240, 67, 100),
+        ];
+        // Window 60: the first two group, the third starts a new group.
+        strum(
+            &mut notes,
+            &StrumOptions {
+                spread_ticks: 120,
+                group_window_ticks: 60,
+                direction: StrumDirection::Up,
+                ..StrumOptions::default()
+            },
+            1,
+        );
+        assert_eq!(
+            starts_by_pitch(&notes),
+            vec![(60, 0), (64, 150), (67, 960)],
+            "the lone note keeps its own start"
+        );
+    }
+
+    #[test]
+    fn strum_alternates_between_groups() {
+        let mut notes = vec![
+            note(0, 240, 60, 100),
+            note(0, 240, 67, 100),
+            note(960, 240, 62, 100),
+            note(960, 240, 69, 100),
+        ];
+        strum(
+            &mut notes,
+            &StrumOptions {
+                spread_ticks: 100,
+                group_window_ticks: 0,
+                direction: StrumDirection::Alternate,
+                ..StrumOptions::default()
+            },
+            1,
+        );
+        assert_eq!(
+            starts_by_pitch(&notes),
+            vec![(60, 0), (62, 1060), (67, 100), (69, 960)],
+            "group 1 is an upstroke, group 2 a downstroke"
+        );
+    }
+
+    #[test]
+    fn strum_random_is_seeded() {
+        let options = StrumOptions {
+            spread_ticks: 60,
+            group_window_ticks: 0,
+            direction: StrumDirection::Random,
+            ..StrumOptions::default()
+        };
+        let mut first = chord();
+        let mut second = chord();
+        strum(&mut first, &options, 99);
+        strum(&mut second, &options, 99);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn strum_ramp_and_jitter_stay_clamped() {
+        let mut notes = chord();
+        strum(
+            &mut notes,
+            &StrumOptions {
+                spread_ticks: 60,
+                group_window_ticks: 0,
+                velocity_ramp: 100,
+                jitter_ticks: 5,
+                direction: StrumDirection::Up,
+            },
+            5,
+        );
+        // Up order 60 → 64 → 67 gets 100% → ~150 → 180, clamped at 127.
+        let by_pitch = |pitch: u8| notes.iter().find(|n| n.note == pitch).unwrap().velocity;
+        assert_eq!(by_pitch(60), 100);
+        assert_eq!(by_pitch(64), 127);
+        assert_eq!(by_pitch(67), 127);
+        assert!(notes.iter().all(|n| n.start >= 0 && n.length == 240));
+    }
+
+    #[test]
+    fn strum_with_zero_spread_is_the_identity() {
+        let mut notes = chord();
+        let before = notes.clone();
+        strum(&mut notes, &StrumOptions::default(), 1);
+        assert_eq!(notes, before);
+    }
+
+    /// W1: new drum slots start at GM kick (36), skip used keys and wrap.
+    #[test]
+    fn drum_keys_start_at_36_and_skip_taken() {
+        assert_eq!(super::assign_drum_notes(&[], 3), vec![36, 37, 38]);
+        assert_eq!(super::assign_drum_notes(&[36, 38], 2), vec![37, 39]);
+        let taken: Vec<u8> = (36..=127).collect();
+        assert_eq!(
+            super::assign_drum_notes(&taken, 2),
+            vec![0, 1],
+            "after 127 the scan wraps to 0"
+        );
+        assert_eq!(
+            super::assign_drum_notes(&[], 200).len(),
+            128,
+            "there are only 128 MIDI keys"
+        );
     }
 }

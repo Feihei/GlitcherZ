@@ -51,6 +51,7 @@ pub mod compressor;
 pub mod context;
 pub mod curve_map;
 pub mod delay;
+pub mod drum_kit;
 pub mod effect;
 pub mod envelope;
 pub mod eq;
@@ -107,6 +108,7 @@ pub use compressor::CompressorProcessor;
 pub use context::ProcessContext;
 pub use curve_map::{CurveMapProcessor, mode_from_value, mode_value};
 pub use delay::DelayProcessor;
+pub use drum_kit::{DRUM_MAX_SLOTS, DRUM_POLYPHONY, DrumKitProcessor, DrumSlotSpec};
 pub use effect::{
     BuiltinEffectKind, Curve, EffectDescriptor, EffectMeters, EffectParamBank, MAX_EFFECT_PARAMS,
     MeterReading, ParamFlags, ParamSpec, Rate, Smoothed, StereoClass, Unit, validate_descriptor,

@@ -44,7 +44,10 @@
 use eframe::egui;
 
 use crate::grid::GridValue;
-use glitcherz_model::{ControlClip, MidiClip, MidiTrack, Note, TICKS_PER_QUARTER, TICKS_PER_STEP};
+use glitcherz_model::{
+    ControlClip, MidiClip, MidiTrack, Note, RandomizeOptions, StrumDirection, StrumOptions,
+    TICKS_PER_QUARTER, TICKS_PER_STEP,
+};
 
 pub use crate::grid::NoteValue;
 
@@ -224,6 +227,11 @@ pub enum RollIntent {
     },
     /// The lane drag ended: close the merged undo gesture.
     CurveDragEnd,
+    /// W4: randomize the selected notes (the whole clip when the selection
+    /// is empty; the command handles the fallback).
+    Randomize { options: RandomizeOptions },
+    /// W5: stagger chord attacks in the selection (whole clip when empty).
+    Strum { options: StrumOptions },
 }
 
 /// Which table a [`ClipRef`] points into (P3, spec `roll-multiclip.md` D4).
@@ -486,6 +494,13 @@ pub struct RollState {
     /// caption (P5). Sorted, view-state only — collapsing is not a document
     /// edit and never enters undo.
     pub collapsed_lanes: Vec<usize>,
+    /// W4: the inline randomize panel is open, plus its live parameters
+    /// (view state only — nothing enters the document until Apply).
+    pub randomize_open: bool,
+    pub randomize_options: RandomizeOptions,
+    /// W5: the inline strum panel is open, plus its live parameters.
+    pub strum_open: bool,
+    pub strum_options: StrumOptions,
 }
 
 /// Persistent mode: what a left-drag on the roll means (M4).
@@ -901,6 +916,10 @@ impl RollState {
             curve_drag: None,
             lane_rects: Vec::new(),
             collapsed_lanes: Vec::new(),
+            randomize_open: false,
+            randomize_options: RandomizeOptions::default(),
+            strum_open: false,
+            strum_options: StrumOptions::default(),
         }
     }
 
@@ -1331,6 +1350,26 @@ pub fn show(
         {
             state.knife_armed = false;
         }
+        // W4/W5: generator panels (view state + a one-shot command on
+        // Apply). Opening one closes the other: they share the parameter row.
+        if ui
+            .selectable_label(state.randomize_open, "Randomize")
+            .on_hover_text(
+                "Randomize pitch / timing / length / velocity over the selection",
+            )
+            .clicked()
+        {
+            state.randomize_open = !state.randomize_open;
+            state.strum_open = false;
+        }
+        if ui
+            .selectable_label(state.strum_open, "Strum")
+            .on_hover_text("Stagger chord attacks: direction, gap, ramp, jitter")
+            .clicked()
+        {
+            state.strum_open = !state.strum_open;
+            state.randomize_open = false;
+        }
         // The hint must never overflow the panel: an overflowing child
         // expands the ui's available rect (egui grows `max_rect` to include
         // every allocated frame), and the roll below would then be laid out
@@ -1355,6 +1394,107 @@ pub fn show(
             .truncate(),
         );
     });
+
+    // W4: randomize parameters (view state only — Apply runs the command
+    // once; Cancel closes without touching the document).
+    if state.randomize_open {
+        ui.horizontal(|ui| {
+            let bar = i64::from(bar_ticks);
+            ui.strong("Randomize ±");
+            ui.label("pitch");
+            ui.add(
+                egui::DragValue::new(&mut state.randomize_options.pitch)
+                    .range(0..=24)
+                    .suffix(" st"),
+            );
+            ui.label("start");
+            ui.add(
+                egui::DragValue::new(&mut state.randomize_options.start)
+                    .range(0..=4 * bar)
+                    .suffix(" t"),
+            );
+            ui.label("len");
+            ui.add(
+                egui::DragValue::new(&mut state.randomize_options.length)
+                    .range(0..=4 * bar)
+                    .suffix(" t"),
+            );
+            ui.label("vel");
+            ui.add(egui::DragValue::new(&mut state.randomize_options.velocity).range(0..=127));
+            ui.label("chance");
+            ui.add(
+                egui::DragValue::new(&mut state.randomize_options.probability)
+                    .range(0.0..=1.0)
+                    .speed(0.01),
+            );
+            if ui.button("Apply").clicked() {
+                intent = Some(RollIntent::Randomize {
+                    options: state.randomize_options,
+                });
+                state.randomize_open = false;
+            }
+            if ui.button("Cancel").clicked() {
+                state.randomize_open = false;
+            }
+        });
+    }
+    // W5: strum parameters.
+    if state.strum_open {
+        ui.horizontal(|ui| {
+            let bar = i64::from(bar_ticks);
+            ui.strong("Strum");
+            egui::ComboBox::from_id_salt("roll_strum_dir")
+                .selected_text(strum_direction_label(state.strum_options.direction))
+                .width(76.0)
+                .show_ui(ui, |ui| {
+                    for direction in [
+                        StrumDirection::Up,
+                        StrumDirection::Down,
+                        StrumDirection::Alternate,
+                        StrumDirection::Random,
+                    ] {
+                        if ui
+                            .selectable_label(
+                                state.strum_options.direction == direction,
+                                strum_direction_label(direction),
+                            )
+                            .clicked()
+                        {
+                            state.strum_options.direction = direction;
+                        }
+                    }
+                });
+            ui.label("spread");
+            ui.add(
+                egui::DragValue::new(&mut state.strum_options.spread_ticks)
+                    .range(0..=2 * bar)
+                    .suffix(" t"),
+            );
+            ui.label("window");
+            ui.add(
+                egui::DragValue::new(&mut state.strum_options.group_window_ticks)
+                    .range(0..=bar)
+                    .suffix(" t"),
+            );
+            ui.label("ramp");
+            ui.add(egui::DragValue::new(&mut state.strum_options.velocity_ramp).range(-64..=64));
+            ui.label("jitter");
+            ui.add(
+                egui::DragValue::new(&mut state.strum_options.jitter_ticks)
+                    .range(0..=(bar / 2).max(1))
+                    .suffix(" t"),
+            );
+            if ui.button("Apply").clicked() {
+                intent = Some(RollIntent::Strum {
+                    options: state.strum_options,
+                });
+                state.strum_open = false;
+            }
+            if ui.button("Cancel").clicked() {
+                state.strum_open = false;
+            }
+        });
+    }
 
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(
@@ -2877,6 +3017,16 @@ fn grid_label(grid: &GridValue) -> String {
         GridValue::Seconds(seconds) => format!("{seconds:.3}s"),
         GridValue::Frames(frames) => format!("{frames}f"),
         GridValue::Samples(samples) => format!("{samples}smp"),
+    }
+}
+
+/// W5: display label for a strum attack order.
+fn strum_direction_label(direction: StrumDirection) -> &'static str {
+    match direction {
+        StrumDirection::Up => "Up",
+        StrumDirection::Down => "Down",
+        StrumDirection::Alternate => "Alternate",
+        StrumDirection::Random => "Random",
     }
 }
 

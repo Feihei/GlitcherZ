@@ -500,6 +500,9 @@ pub enum NodeSource {
         /// `.wav` path, or empty for a node waiting for one.
         path: String,
     },
+    /// Multi-sample drum kit (W1, spec `drum-kit.md` K2): born with no
+    /// slots; the node's own `Load Samples…` button fills it.
+    DrumKit,
     /// CLAP instrument plugin.
     ClapInstrument {
         /// Module path.
@@ -611,6 +614,12 @@ pub enum PatchAction {
     /// cables, root note, play mode and gain, so a wrong file is one click to
     /// fix instead of delete + re-add.
     LoadSample {
+        node: u64,
+    },
+    /// Open a multi-select wav dialog for an existing drum-kit node (W1).
+    /// New files are appended as slots with free MIDI keys; the node keeps
+    /// its id and cables, and the engine processor is rebuilt in place.
+    LoadDrumSamples {
         node: u64,
     },
     /// Re-scan every plugin module, ignoring the cached stats (U9 E2, spec
@@ -831,6 +840,22 @@ fn node_action_buttons(id: PatchId, row: usize, deps: &PatchDeps) -> Vec<NodeAct
                         enabled: true,
                         hover: "Pick a .wav file for this node",
                         action: PatchAction::LoadSample { node: doc_id },
+                    }]
+                } else {
+                    Vec::new()
+                };
+            }
+            if let Some(NodeDoc::Instrument {
+                voice: VoiceSpec::DrumKit { .. },
+                ..
+            }) = deps.doc.node_by_id(doc_id)
+            {
+                return if row == 0 {
+                    vec![NodeAction {
+                        label: "Load Samples…",
+                        enabled: true,
+                        hover: "Pick wav files for this kit (one slot per file)",
+                        action: PatchAction::LoadDrumSamples { node: doc_id },
                     }]
                 } else {
                     Vec::new()
@@ -1536,6 +1561,13 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                         )
                     }
                 }
+                VoiceSpec::DrumKit { slots, .. } => {
+                    if slots.is_empty() {
+                        format!("DRUM (empty) · Track {}", track + 1)
+                    } else {
+                        format!("DRUM {} slots · Track {}", slots.len(), track + 1)
+                    }
+                }
                 VoiceSpec::Clap { plugin_id, .. } => {
                     format!("♪ {}", truncate(plugin_id, 16))
                 }
@@ -1550,7 +1582,10 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 // The built-in roster has six kinds since U10 — the caption
                 // takes the payload's own tag, so an EQ node never reads
                 // "Delay".
-                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {
+                VoiceSpec::Builtin
+                | VoiceSpec::SoundFont { .. }
+                | VoiceSpec::Sample { .. }
+                | VoiceSpec::DrumKit { .. } => {
                     format!("{} · Track {}", params.kind().label(), track + 1)
                 }
                 VoiceSpec::Clap { plugin_id, .. } => {

@@ -132,6 +132,24 @@ pub fn specs() -> Vec<crate::CommandSpec> {
             always,
             duration_op_cmd
         ),
+        crate::cmd!(
+            "midi.randomize",
+            "Randomize",
+            ["Midi", "Event"],
+            None,
+            "{track, clip, indices?, pitch? ±semitones, start? ±ticks, length? ±ticks, velocity? ±, probability? 0..1, seed?}",
+            always,
+            randomize_cmd
+        ),
+        crate::cmd!(
+            "midi.strum",
+            "Strum",
+            ["Midi", "Event"],
+            None,
+            "{track, clip, indices?, direction? up|down|alternate|random, spread_ticks?, group_window_ticks?, velocity_ramp?, jitter_ticks?, seed?}",
+            always,
+            strum_cmd
+        ),
         crate::cmd!(query "midi.query", "Query Notes", [], None, "{track, clip}", always, query),
     ]
 }
@@ -251,6 +269,89 @@ fn duration_op_cmd(session: &mut Session, params: &Value) -> crate::Result<Value
     });
     notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
     Ok(json!({ "changed": selected.len() }))
+}
+
+/// W4: random pitch / timing / duration / velocity perturbation over a
+/// selection (or the whole clip). Every field is a **half-range**; the
+/// probability skips notes instead of deleting them, preserving the ops
+/// contract and the caller's selection count.
+fn randomize_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let bar = i64::from(glitcherz_model::TICKS_PER_BAR);
+    let options = glitcherz_model::RandomizeOptions {
+        pitch: i64_or(params, "pitch", 0).clamp(0, 24) as i32,
+        start: i64_or(params, "start", 0).clamp(0, 4 * bar),
+        length: i64_or(params, "length", 0).clamp(0, 4 * bar),
+        velocity: i64_or(params, "velocity", 0).clamp(0, 127) as u8,
+        probability: crate::registry::f64_or(params, "probability", 1.0).clamp(0.0, 1.0) as f32,
+    };
+    let seed = params
+        .get("seed")
+        .and_then(Value::as_u64)
+        .unwrap_or(glitcherz_model::DEFAULT_SEED);
+    let notes = notes_mut(session, "midi.randomize", params)?;
+    let selected = indices_or_all(params, notes.len());
+    // Copy the selection, randomize it in one pass (the RNG stream must see
+    // the whole selection, not one note at a time), then write back.
+    let mut chosen: Vec<Note> = selected
+        .iter()
+        .filter_map(|&index| notes.get(index).copied())
+        .collect();
+    glitcherz_model::randomize(&mut chosen, &options, seed);
+    for (&index, updated) in selected.iter().zip(chosen.iter()) {
+        if let Some(slot) = notes.get_mut(index) {
+            *slot = *updated;
+        }
+    }
+    notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
+    Ok(json!({ "randomized": chosen.len(), "indices": locate(notes, &chosen) }))
+}
+
+/// W5: stagger chord attacks. `direction` picks the attack order, `spread`
+/// the gap, `group_window` the chord tolerance; lengths are untouched.
+fn strum_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    use glitcherz_model::StrumDirection;
+    let direction = match params
+        .get("direction")
+        .and_then(Value::as_str)
+        .unwrap_or("up")
+    {
+        "up" => StrumDirection::Up,
+        "down" => StrumDirection::Down,
+        "alternate" => StrumDirection::Alternate,
+        "random" => StrumDirection::Random,
+        other => {
+            return Err(bad_params(
+                "midi.strum",
+                format!("`direction` must be up|down|alternate|random, got {other:?}"),
+            ));
+        }
+    };
+    let bar = i64::from(glitcherz_model::TICKS_PER_BAR);
+    let options = glitcherz_model::StrumOptions {
+        spread_ticks: i64_or(params, "spread_ticks", 0).clamp(0, 4 * bar),
+        group_window_ticks: i64_or(params, "group_window_ticks", 0).clamp(0, 4 * bar),
+        velocity_ramp: i64_or(params, "velocity_ramp", 0).clamp(-127, 127) as i32,
+        jitter_ticks: i64_or(params, "jitter_ticks", 0).clamp(0, bar),
+        direction,
+    };
+    let seed = params
+        .get("seed")
+        .and_then(Value::as_u64)
+        .unwrap_or(glitcherz_model::DEFAULT_SEED);
+    let notes = notes_mut(session, "midi.strum", params)?;
+    let selected = indices_or_all(params, notes.len());
+    let mut chosen: Vec<Note> = selected
+        .iter()
+        .filter_map(|&index| notes.get(index).copied())
+        .collect();
+    glitcherz_model::strum(&mut chosen, &options, seed);
+    for (&index, updated) in selected.iter().zip(chosen.iter()) {
+        if let Some(slot) = notes.get_mut(index) {
+            *slot = *updated;
+        }
+    }
+    notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
+    Ok(json!({ "strummed": chosen.len(), "indices": locate(notes, &chosen) }))
 }
 
 /// Mutable clip at `track`/`clip` from the parameters.

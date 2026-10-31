@@ -391,6 +391,38 @@ A 阶段**只补这三处，不开参数端口**（每参数一个输入口 = �
 
 测试：model 134（+1 `a_bend_axis_follows_the_instruments_range`）、UI 174（+1 `a_cable_derives_its_axis_instead_of_storing_it`），全仓 814 项
 
+## W 系列：鼓机 + clip 编排 + MIDI 生成工具（2026-10-31 立项，spec 未写）
+
+用户提出五项（原话顺序）：① **鼓机乐器**（加载多个短采样对应 MIDI 位置）；② **clip 重复平铺**；③ **clip 命名和编组**；④ **MIDI clip editor 的随机化**；⑤ **strum**。五项彼此独立，但共享两处基建：`SampleLibrary`/`SampleData`（①）与 MIDI ops + 命令层（④⑤）。按既有约定**先写 spec 再实现**。
+
+| 项 | 里程碑 | 量级 | 现状缺口 | 主要依赖 |
+| :--- | :--- | :--- | :--- | :--- |
+| 鼓机 | W1 | 中 | 只有单文件单 root 采样器，无 note→sample 映射 | 新 RT processor + `VoiceSpec` 新变体 + 两处 UI 装配 |
+| clip 平铺 | W2 | 中 | 引擎已按 `loop_ticks` 平铺，UI 强制 `loop == span` | 拆 4 处单周期不变量 + timeline 平铺呈现 |
+| clip 命名 | W3a | 小 | clip 结构无 `name` 字段 | 三个 clip 结构 + timeline 行内 rename 骨架 |
+| clip 编组 | W3b | 中/大 | `Project` 无 clip 组，也无轨道文件夹 | 语义待拍板；文件夹方案应单独立项 |
+| 随机化 | W4 | 小–中 | ops 有 seeded 随机与 Humanize，UI 零接线 | 新 `randomize` op + 命令 + roll 工具栏 |
+| strum | W5 | 小–中 | 无任何和弦起音错位能力 | 新 `strum` op + 命令 + roll 工具栏 |
+
+- [x] **W1 鼓机乐器** ✅ 2026-10-31（spec `drum-kit.md` K1–K12）：`VoiceSpec::DrumKit { slots, gain }` + `DrumSlot { note, path, gain, pan, tune_semitones, choke }`（加法变体，`PROJECT_VERSION` 9 不动；空 slots = 静音）；`validate` 限 32 槽 + 触发键唯一。engine `realtime/drum_kit.rs`：128 项 note 直索引表 + 24 槽 voice 池 + 立体声 scratch 全在构造期预分配，热路径零分配（`drum_kit_rt_audit` 3 项通过）；1× 原生速率（`tune` 唯一音高系数）、全 OneShot、blanket 停音、choke group 10 ms fade；`ParamId::{DrumGain, DrumSlotGain/Pan/Tune/Choke(note)}` 节点寻址即时下发。UI：picker 内置乐器第 4 项 `Drum Kit`（node 出生空槽）；节点内 `Load Samples…`（rfd 多选，纯函数 `assign_drum_notes` 从 36 起分配空闲键，到 127 回绕）+ `N slots` 标签；Inspector `drum_section` 表格（key 显示 / 文件名 / gain / pan / tune / choke / × 移除），参数走 `begin_param_edit`/`commit_param_edit` 合并手势，加槽与移除走 `replace_node` 原位重建（一步 undo）。测试：engine `drum_kit` 8 项（静音/NaN 铁律、键映射、pan、choke、blanket、cap、参数）+ RT 审计 3 项、model 往返与 validate 2 项 + `assign_drum_notes` 1 项、UI 178 项全绿。**已知边界**：槽位键为只读显示（改键 = 移除后重新加载，避免拖动重建竞态）；choke 组是 0..127 数字（无命名）；鼓机参数未进 `AutoParam` 自动化词汇表。
+
+- [x] **W2 clip 重复平铺** ✅ 2026-10-31（spec `timeline.md` D14 回写 + D27）：引擎零改动（本就可按 `loop_ticks` 平铺）；UI 拆掉四处 `loop = span` 强制——`MoveResizeClip` 加 `loop_ticks: Option<u32>` 携带手势意图，`resolve_loop(current, span, requested)` 统一规则（拉长保留周期→平铺，缩短裁尾 `loop = min(loop, span)`，显式请求钳进容器），T 批量拉伸走同一规则；拖右缘 = 容器、`Alt+拖右缘` = 内容周期（容器不够时扩张）；块内画周期分隔缝 + 重复段淡色 + 标签 `×N`（与引擎 `start + k·loop` 同构）；`K` 刀切对平铺 clip 拒绝并提示（相位相对的 loop 原点模型不承载）；audio 不参与（U11 裁剪语义）。**顺带修 bug**：`timeline_move_resize_clip` 原先只对 audio 推 clip 表，拖动 MIDI/control clip 后引擎仍播旧位置，改为统一 `sync_clip_row`。测试 +3（`resolve_loop` 规则、平铺拒绝刀切），全仓 fmt/clippy/test 绿。
+
+- [x] **W3a clip 命名** ✅ 2026-10-31（spec `timeline.md` D26）：三类 clip 加 `name: String`（serde default + 空值不序列化，`PROJECT_VERSION` 9 不动），`Placement::{name,set_name}` 作唯一读写路径；块内 `F2`（选中 clip）/ `Alt+双击` 打开就地 `TextEdit`，`TimelineAction::RenameClip` → app 层一步 undo、不推引擎；空名回落现有内容摘要。测试：model 往返 + 旧文档空名、UI `clip_names_are_optional_and_writable` + `f2_targets_the_selected_clip_on_its_own_row`（跨轨/跨 lane/陈旧索引拒绝）。全仓 fmt/clippy/test 绿（model 134 / ui 176）。SMF 导出暂不写 clip 名。
+
+- [x] **W3b clip 编组** ✅ 2026-10-31（spec `timeline.md` D28）：按用户拍板做**跨轨、跨 lane 的组标签**（用户原话「不同轨道也可以编组，一起移动复制等」「MIDI+curve 编一组」）。model：`Project.clip_groups: Vec<ClipGroup { id, name, color }>`（上限 64、id 唯一非 0，`validate` 检查）+ 三类 clip 的 `group: Option<u32>`（serde default + 空值不序列化，`PROJECT_VERSION` 9 不动）；`Placement::{group,set_group}` 统一读写。UI：`Ctrl+G` 建组（自动 `Group N` + 8 色调色板）、`Ctrl+Shift+G` 解组（触及的组整体解散），均一步 undo；**选区扩组**在 `show()` 末尾幂等收敛——单击/框选任一成员即选中全组，`Alt+单击` 临时拆组（`break_group`）；移动 / `Shift+D` 复制 / Delete 复用现有三表批量路径（跨 lane 只做时间平移）。视觉：块左缘 3 px 组色竖条 + 右下角组名（宽 >110 px）。测试：model 组表往返 + validate（重复/0/超限）+ UI `group_selection_expands_across_tracks_and_lanes`。**后续项**：组名编辑 UI、组成员手动增删、组整体平铺。
+
+> 原备选 **轨道文件夹**（track group 层级，牵动行布局 / 轨重排 / 图 `track` 索引）**未采纳**——用户明确要 clip 级、跨类型编组，不是轨道层级。
+
+- [x] **W4 MIDI 随机化** ✅ 2026-10-31（spec `midi-generators.md` G1–G10）：`model::ops::RandomizeOptions { pitch, start, length, velocity, probability }` + `randomize(&mut [Note], &opts, seed)`——seeded、原地、不改 slice 长度，概率**跳过**而非删音，四字段 clamp（pitch 0..=127 / start ≥ 0 / length ≥ 1 / velocity 1..=127）；命令 `midi.randomize`（选区或整 clip，返回 `indices` 供 `reselect_from`）；roll 工具栏 `Randomize` toggle + 内联参数行（Apply 一次命令 / Cancel 不动文档，面板状态不落盘）。测试：model 3 项（seeded/clamp、零范围恒等、probability 只跳过）+ command 2 项（整 clip 与选区、空参数不 panic）。
+- [x] **W5 strum** ✅ 2026-10-31（spec `midi-generators.md` G5–G10）：`StrumOptions { direction, spread_ticks, group_window_ticks, velocity_ramp, jitter_ticks }` + `strum(&mut [Note], &opts, seed)`——按 start 窗口（相对组首音）分和弦组，Up=低音先 / Down=反向 / Alternate 每组交替（首组 Up）/ Random=seeded Fisher–Yates；第 k 个起音 `start += k·spread + jitter`，**length 不变**；命令 `midi.strum` + roll 工具栏 `Strum` 面板（方向下拉 + spread/window/ramp/jitter）。与实时 Arpeggiator 的边界写进 spec（一次性写文档 vs 实时重排）。测试：model 6 项 + command 3 项。
+
+**实施顺序建议**：W3a（小，先解锁 clip 标签与选择语义）→ W2（中，改 timeline 几何）→ W4 → W5（共用命令层与工具栏，建议同批）→ W1（独立乐器，可与 W4/W5 并行；落地后正好用来验证鼓 roll + strum 的配合）。
+
+**spec 计划**：`spec/drum-kit.md`（W1）；`spec/timeline.md` D14 修订 + loop 编辑交互（W2）；`spec/midi-generators.md`（W4/W5，或并入 `spec/editing-model.md`）；`spec/timeline.md` 增补 clip 命名与编组（W3a/W3b）。
+
+**本系列明确不做**：轨道文件夹 / 全局 mixer 视图（W3b 备选 B 单独立项）、audio clip 循环平铺（W2b 另议）、演奏期随机（W4 未来项）。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：

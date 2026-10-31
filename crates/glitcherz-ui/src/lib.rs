@@ -38,14 +38,14 @@ use glitcherz_engine::Sf2Error;
 use glitcherz_engine::convert;
 use glitcherz_engine::realtime::{
     ArpeggiatorProcessor, AudioTrackProcessor, AutoDest, ChannelStripProcessor, Curve,
-    CurveMapProcessor, EffectMeters, EngineCommand, EventKind, FeedbackProcessor, MAX_AUTO_POINTS,
-    MAX_MIDI_FANOUT, MAX_TRACK_CLIPS, MapMode as EngineMapMode, MapSpec as EngineMapSpec,
-    MidiClipTable, MidiEnvelopeProcessor, MixerChannel as EngineMixerChannel, MixerProcessor,
-    NodeKind, NoteEvent, ParamId, PortamentoProcessor, Processor, RtAudioClip, RtAutoPoint,
-    RtAutomation, RtControlClip, RtCtrl, RtCtrlKind, RtCurveInterp, RtMidiClip, RtNote,
-    SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor,
-    SilentProcessor, SynthProcessor, Unit, empty_clip_table, empty_midi_clip_table,
-    mode_value as curve_mode_value,
+    CurveMapProcessor, DrumKitProcessor, DrumSlotSpec, EffectMeters, EngineCommand, EventKind,
+    FeedbackProcessor, MAX_AUTO_POINTS, MAX_MIDI_FANOUT, MAX_TRACK_CLIPS, MapMode as EngineMapMode,
+    MapSpec as EngineMapSpec, MidiClipTable, MidiEnvelopeProcessor,
+    MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent, ParamId,
+    PortamentoProcessor, Processor, RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCtrl,
+    RtCtrlKind, RtCurveInterp, RtMidiClip, RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor,
+    SequencerCommand, Sf2VoiceProcessor, SilentProcessor, SynthProcessor, Unit, empty_clip_table,
+    empty_midi_clip_table, mode_value as curve_mode_value,
 };
 use glitcherz_engine::{Sf2Library, Sf2Preset};
 use glitcherz_model::{
@@ -1797,6 +1797,14 @@ impl GlitcherZApp {
                             }
                         }
                     }
+                    VoiceSpec::DrumKit { slots, gain } => {
+                        if slots.is_empty() {
+                            (Box::new(SilentProcessor::new()), None, String::new())
+                        } else {
+                            let processor = self.obtain_drum_kit_voice(slots, *gain, sr);
+                            (Box::new(processor), None, String::new())
+                        }
+                    }
                     VoiceSpec::SoundFont {
                         path,
                         bank,
@@ -1937,7 +1945,10 @@ impl GlitcherZApp {
                     }
                 },
                 NodeDoc::Effect { voice, params, .. } => match voice {
-                    VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {
+                    VoiceSpec::Builtin
+                    | VoiceSpec::SoundFont { .. }
+                    | VoiceSpec::Sample { .. }
+                    | VoiceSpec::DrumKit { .. } => {
                         // Kind-aware and seeded from the document (D15): a
                         // restored EQ/compressor starts at its saved values.
                         let built = crate::effect::processor(params, sr);
@@ -2897,6 +2908,10 @@ impl GlitcherZApp {
                     // cables and parameters.
                     self.pick_sample_file(node);
                 }
+                patch::PatchAction::LoadDrumSamples { node } => {
+                    // W1: append wav files as kit slots with free MIDI keys.
+                    self.pick_drum_samples(node);
+                }
                 patch::PatchAction::RescanPlugins => {
                     self.plugin_catalog.rescan();
                     self.set_message("Rescanning plug-ins…".to_string());
@@ -3129,6 +3144,15 @@ impl GlitcherZApp {
                     path,
                     root_note: SAMPLE_DEFAULT_ROOT,
                     play_mode: SamplePlayMode::Gate,
+                    gain: 1.0,
+                },
+                synth: SynthParams::default(),
+            },
+            patch::NodeSource::DrumKit => NodeDoc::Instrument {
+                node_id,
+                track,
+                voice: VoiceSpec::DrumKit {
+                    slots: Vec::new(),
                     gain: 1.0,
                 },
                 synth: SynthParams::default(),
@@ -4666,6 +4690,130 @@ impl GlitcherZApp {
         }
     }
 
+    // ---- Drum kit (W1, spec `drum-kit.md`) ----
+
+    /// Snapshot `(slots, gain)` of a drum-kit instrument node.
+    fn drum_kit_fields(&self, doc_id: u64) -> Option<(Vec<glitcherz_model::DrumSlot>, f32)> {
+        match self.project().graph.node_by_id(doc_id)? {
+            NodeDoc::Instrument {
+                voice: VoiceSpec::DrumKit { slots, gain },
+                ..
+            } => Some((slots.clone(), *gain)),
+            _ => None,
+        }
+    }
+
+    /// rfd multi-select behind the node's `Load Samples…` button.
+    fn pick_drum_samples(&mut self, doc_id: u64) {
+        if self.drum_kit_fields(doc_id).is_none() {
+            self.set_error("Load failed: node is not a drum kit".to_string());
+            return;
+        }
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter("Wave", &["wav"])
+            .pick_files()
+        else {
+            return;
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let label = format!("Loading {} drum samples…", paths.len());
+        self.queue_blocking_job(label, move |app| app.load_drum_samples(doc_id, paths));
+    }
+
+    /// Blocking half of [`Self::pick_drum_samples`]: decode through the
+    /// session cache, append slots with free MIDI keys, rebuild the processor
+    /// in place. One undo step.
+    fn load_drum_samples(&mut self, doc_id: u64, paths: Vec<PathBuf>) {
+        let Some((mut slots, gain)) = self.drum_kit_fields(doc_id) else {
+            self.set_error("Load failed: node is not a drum kit".to_string());
+            return;
+        };
+        let free = glitcherz_model::MAX_DRUM_SLOTS.saturating_sub(slots.len());
+        if free == 0 {
+            self.set_error("Drum kit is full (32 slots)".to_string());
+            return;
+        }
+        let taken: Vec<u8> = slots.iter().map(|slot| slot.note).collect();
+        let keys = glitcherz_model::assign_drum_notes(&taken, paths.len().min(free));
+        let sample_rate = self.engine.info().sample_rate as f32;
+        let mut loaded = 0;
+        for (path, key) in paths.iter().zip(keys) {
+            let path_text = path.display().to_string();
+            match self.sample_library.load(path) {
+                Ok(_) => {
+                    slots.push(glitcherz_model::DrumSlot {
+                        note: key,
+                        path: path_text,
+                        ..glitcherz_model::DrumSlot::default()
+                    });
+                    loaded += 1;
+                }
+                Err(err) => {
+                    log::error!("Drum sample '{}' failed to load: {err}", path.display());
+                }
+            }
+        }
+        if loaded == 0 {
+            self.set_error("No sample could be loaded".to_string());
+            return;
+        }
+        self.rebuild_drum_kit(doc_id, slots, gain, sample_rate, "Load Drum Samples");
+        self.set_message(format!("Loaded {loaded} drum samples"));
+    }
+
+    /// Writes `slots` back and swaps the engine processor in place (the node
+    /// id, cables and MIDI routing survive `replace_node`). One undo step.
+    fn rebuild_drum_kit(
+        &mut self,
+        doc_id: u64,
+        slots: Vec<glitcherz_model::DrumSlot>,
+        gain: f32,
+        sample_rate: f32,
+        label: &str,
+    ) {
+        let Some(engine_id) = self.engine_id(doc_id) else {
+            self.set_error("Drum kit rebuild failed: node is not installed".to_string());
+            return;
+        };
+        let before = self.begin_edit();
+        if let Some(NodeDoc::Instrument {
+            voice: VoiceSpec::DrumKit {
+                slots: doc_slots, ..
+            },
+            ..
+        }) = self.project_mut().graph.node_by_id_mut(doc_id)
+        {
+            *doc_slots = slots.clone();
+        }
+        let processor = self.obtain_drum_kit_voice(&slots, gain, sample_rate);
+        if self
+            .engine
+            .replace_node(engine_id, Box::new(processor))
+            .is_none()
+        {
+            self.session.restore(before);
+            self.set_error("Drum kit rebuild failed (engine busy) — try again".to_string());
+            return;
+        }
+        self.commit_edit(label, before);
+    }
+
+    /// Removes one slot by trigger key and rebuilds the kit (Inspector row ×).
+    fn remove_drum_slot(&mut self, doc_id: u64, note: u8) {
+        let Some((mut slots, gain)) = self.drum_kit_fields(doc_id) else {
+            return;
+        };
+        let before_len = slots.len();
+        slots.retain(|slot| slot.note != note);
+        if slots.len() == before_len {
+            return;
+        }
+        let sample_rate = self.engine.info().sample_rate as f32;
+        self.rebuild_drum_kit(doc_id, slots, gain, sample_rate, "Remove Drum Slot");
+    }
+
     /// The blocking half of [`Self::pick_sound_font_from`]: parse (cached),
     /// resolve a preset that exists in the new file, then swap the engine
     /// processor **in place** — `replace_node` keeps the node id, so cables,
@@ -4777,6 +4925,43 @@ impl GlitcherZApp {
     ) -> Result<SampleVoiceProcessor, SampleError> {
         let data = self.sample_library.load(std::path::Path::new(path))?;
         Ok(SampleVoiceProcessor::new(data, sample_rate))
+    }
+
+    /// Builds a drum kit processor from the document's slots (W1, spec
+    /// `drum-kit.md` K9): every slot decodes through the shared sample
+    /// cache; a broken file only silences that slot. An empty (or fully
+    /// failing) kit renders silence — never a synth patch.
+    /// **Control thread only.**
+    fn obtain_drum_kit_voice(
+        &mut self,
+        slots: &[glitcherz_model::DrumSlot],
+        gain: f32,
+        sample_rate: f32,
+    ) -> DrumKitProcessor {
+        let mut specs = Vec::with_capacity(slots.len());
+        for slot in slots.iter().take(glitcherz_model::MAX_DRUM_SLOTS) {
+            if slot.path.is_empty() {
+                continue;
+            }
+            match self.sample_library.load(std::path::Path::new(&slot.path)) {
+                Ok(data) => specs.push(DrumSlotSpec {
+                    note: slot.note,
+                    data,
+                    gain: slot.gain,
+                    pan: slot.pan,
+                    tune_semitones: slot.tune_semitones,
+                    choke: slot.choke,
+                }),
+                Err(err) => log::error!(
+                    "Drum slot {} failed to load '{}': {err}",
+                    slot.note,
+                    slot.path
+                ),
+            }
+        }
+        let mut processor = DrumKitProcessor::new(&specs, sample_rate);
+        processor.set_param(ParamId::DrumGain, gain);
+        processor
     }
 
     /// Builds the RT clip table of one audio track (U6 D4) from the
@@ -4900,6 +5085,14 @@ impl GlitcherZApp {
                         (Box::new(SynthProcessor::new(sr)), None)
                     }
                 },
+                VoiceSpec::DrumKit { slots, gain } => {
+                    if slots.is_empty() {
+                        (Box::new(SilentProcessor::new()), None)
+                    } else {
+                        let processor = self.obtain_drum_kit_voice(slots, *gain, sr);
+                        (Box::new(processor), None)
+                    }
+                }
                 VoiceSpec::SoundFont {
                     path,
                     bank,
@@ -4981,7 +5174,10 @@ impl GlitcherZApp {
                 },
             },
             NodeDoc::Effect { voice, params, .. } => match voice {
-                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {
+                VoiceSpec::Builtin
+                | VoiceSpec::SoundFont { .. }
+                | VoiceSpec::Sample { .. }
+                | VoiceSpec::DrumKit { .. } => {
                     (crate::effect::processor(params, sr).processor, None)
                 }
                 VoiceSpec::Clap {
@@ -5514,7 +5710,10 @@ impl GlitcherZApp {
                 VoiceSpec::Vst3 { path, class_id, .. } => {
                     Some(preset_plugin_key("vst3", path, class_id))
                 }
-                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => None,
+                VoiceSpec::Builtin
+                | VoiceSpec::SoundFont { .. }
+                | VoiceSpec::Sample { .. }
+                | VoiceSpec::DrumKit { .. } => None,
             },
             _ => None,
         }
@@ -5588,7 +5787,10 @@ impl GlitcherZApp {
         {
             match voice {
                 VoiceSpec::Clap { state, .. } | VoiceSpec::Vst3 { state, .. } => *state = blob,
-                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {}
+                VoiceSpec::Builtin
+                | VoiceSpec::SoundFont { .. }
+                | VoiceSpec::Sample { .. }
+                | VoiceSpec::DrumKit { .. } => {}
             }
         }
         self.commit_edit("Load Preset", before);
@@ -5655,7 +5857,10 @@ impl GlitcherZApp {
                 VoiceSpec::Clap { state, .. } | VoiceSpec::Vst3 { state, .. } => {
                     *state = Vec::new()
                 }
-                VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {}
+                VoiceSpec::Builtin
+                | VoiceSpec::SoundFont { .. }
+                | VoiceSpec::Sample { .. }
+                | VoiceSpec::DrumKit { .. } => {}
             }
         }
         self.commit_edit("Reset Preset", before);
@@ -5748,9 +5953,10 @@ impl GlitcherZApp {
                             .unwrap_or_else(|| "VST3".to_string()),
                         false,
                     )),
-                    VoiceSpec::Builtin | VoiceSpec::SoundFont { .. } | VoiceSpec::Sample { .. } => {
-                        None
-                    }
+                    VoiceSpec::Builtin
+                    | VoiceSpec::SoundFont { .. }
+                    | VoiceSpec::Sample { .. }
+                    | VoiceSpec::DrumKit { .. } => None,
                 },
                 _ => None,
             })
@@ -6383,6 +6589,7 @@ impl GlitcherZApp {
                     // U11 D3: audio clip spans are derived at the base tempo.
                     sec_per_tick: project.sec_per_tick(),
                     waveform_of: &waveform_of,
+                    clip_groups: &project.clip_groups,
                 },
                 router,
             )
@@ -6472,6 +6679,74 @@ impl GlitcherZApp {
                     self.commit_edit("Rename Track", before);
                 }
             }
+            // W3a: inline clip rename (F2 / Alt+double-click). Presentation
+            // only, so no engine push — one undo step.
+            timeline::TimelineAction::RenameClip {
+                lane,
+                track,
+                clip,
+                name,
+            } => {
+                let current = match lane {
+                    timeline::TimelineLane::Midi => self
+                        .project()
+                        .midi_tracks
+                        .get(track)
+                        .and_then(|t| t.clips.get(clip))
+                        .map(|c| c.name.clone()),
+                    timeline::TimelineLane::Control => self
+                        .project()
+                        .control_tracks
+                        .get(track)
+                        .and_then(|t| t.clips.get(clip))
+                        .map(|c| c.name.clone()),
+                    timeline::TimelineLane::Audio => self
+                        .project()
+                        .audio_tracks
+                        .get(track)
+                        .and_then(|t| t.clips.get(clip))
+                        .map(|c| c.name.clone()),
+                };
+                if current.is_some_and(|n| n != name) {
+                    let before = self.begin_edit();
+                    match lane {
+                        timeline::TimelineLane::Midi => {
+                            if let Some(c) = self
+                                .project_mut()
+                                .midi_tracks
+                                .get_mut(track)
+                                .and_then(|t| t.clips.get_mut(clip))
+                            {
+                                timeline::Placement::set_name(c, name.clone());
+                            }
+                        }
+                        timeline::TimelineLane::Control => {
+                            if let Some(c) = self
+                                .project_mut()
+                                .control_tracks
+                                .get_mut(track)
+                                .and_then(|t| t.clips.get_mut(clip))
+                            {
+                                timeline::Placement::set_name(c, name.clone());
+                            }
+                        }
+                        timeline::TimelineLane::Audio => {
+                            if let Some(c) = self
+                                .project_mut()
+                                .audio_tracks
+                                .get_mut(track)
+                                .and_then(|t| t.clips.get_mut(clip))
+                            {
+                                timeline::Placement::set_name(c, name.clone());
+                            }
+                        }
+                    }
+                    self.commit_edit("Rename Clip", before);
+                }
+            }
+            // W3b: create / dissolve a cross-track, cross-lane clip group.
+            timeline::TimelineAction::GroupClips { clips } => self.timeline_group_clips(clips),
+            timeline::TimelineAction::UngroupClips { clips } => self.timeline_ungroup_clips(clips),
             timeline::TimelineAction::AddClip {
                 lane,
                 track,
@@ -6486,7 +6761,15 @@ impl GlitcherZApp {
                 clip,
                 start_ticks,
                 span_ticks,
-            } => self.timeline_move_resize_clip(lane, track, clip, start_ticks, span_ticks),
+                loop_ticks,
+            } => self.timeline_move_resize_clip(
+                lane,
+                track,
+                clip,
+                start_ticks,
+                span_ticks,
+                loop_ticks,
+            ),
             timeline::TimelineAction::RemoveClip { lane, track, clip } => {
                 self.timeline_remove_clip(lane, track, clip)
             }
@@ -6743,6 +7026,7 @@ impl GlitcherZApp {
         clip: usize,
         start_ticks: u32,
         span_ticks: u32,
+        loop_ticks: Option<u32>,
     ) {
         let before = self.begin_edit();
         let sec_per_tick = self.project().sec_per_tick();
@@ -6753,14 +7037,15 @@ impl GlitcherZApp {
                 .get_mut(track)
                 .and_then(|t| t.clips.get_mut(clip))
                 .map(|c| {
+                    let new_loop = timeline::resolve_loop(c.loop_ticks, span_ticks, loop_ticks);
                     let changed = c.start_ticks != start_ticks
                         || c.span_ticks != span_ticks
-                        || c.loop_ticks != span_ticks;
+                        || c.loop_ticks != new_loop;
                     c.start_ticks = start_ticks;
-                    // Single-period clips (D14): the loop follows the span, so
-                    // resizing exposes fresh empty bars instead of tiling.
+                    // W2: growing the container tiles the content (the loop
+                    // stays), shrinking it trims the tail (`loop <= span`).
                     c.span_ticks = span_ticks;
-                    c.loop_ticks = span_ticks;
+                    c.loop_ticks = new_loop;
                     changed
                 })
                 .unwrap_or(false),
@@ -6795,12 +7080,13 @@ impl GlitcherZApp {
                 .get_mut(track)
                 .and_then(|t| t.clips.get_mut(clip))
                 .map(|c| {
+                    let new_loop = timeline::resolve_loop(c.loop_ticks, span_ticks, loop_ticks);
                     let changed = c.start_ticks != start_ticks
                         || c.span_ticks != span_ticks
-                        || c.loop_ticks != span_ticks;
+                        || c.loop_ticks != new_loop;
                     c.start_ticks = start_ticks;
                     c.span_ticks = span_ticks;
-                    c.loop_ticks = span_ticks;
+                    c.loop_ticks = new_loop;
                     changed
                 })
                 .unwrap_or(false),
@@ -6812,10 +7098,147 @@ impl GlitcherZApp {
                 before,
                 &format!("timeline:{}:{}:{}", lane as u8, track, clip),
             );
-            // Audio clip tables are not part of the sequencer's Copy table
-            // push — they ride the structure queue, so every edit re-sends.
-            if matches!(lane, timeline::TimelineLane::Audio) {
-                self.send_audio_clips_for_track(track);
+            // Every kind must reach the engine immediately. The old code
+            // pushed only audio: dragging a MIDI/control clip left the
+            // sequencer playing the previous placement until the next
+            // unrelated edit, and W2's "grow = tile" would never sound.
+            self.sync_clip_row(lane, track);
+        }
+    }
+
+    /// W3b: puts every selected clip into one new group (auto-named
+    /// `Group N`, palette colour). The selection may span MIDI / control /
+    /// audio lanes and several tracks. One undo step.
+    fn timeline_group_clips(&mut self, clips: Vec<timeline::ClipSel>) {
+        if clips.is_empty() {
+            self.set_message("Select clips to group".to_string());
+            return;
+        }
+        if self.project().clip_groups.len() >= glitcherz_model::MAX_CLIP_GROUPS {
+            self.set_error("Clip group limit reached (64)".to_string());
+            return;
+        }
+        let id = self
+            .project()
+            .clip_groups
+            .iter()
+            .map(|group| group.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let palette = glitcherz_model::CLIP_GROUP_COLORS;
+        let color = palette[(id as usize - 1) % palette.len()];
+        let before = self.begin_edit();
+        self.project_mut()
+            .clip_groups
+            .push(glitcherz_model::ClipGroup {
+                id,
+                name: format!("Group {id}"),
+                color,
+            });
+        let count = clips.len();
+        for sel in clips {
+            self.set_clip_group(sel, Some(id));
+        }
+        self.commit_edit("Group Clips", before);
+        self.set_message(format!("Grouped {count} clips as Group {id}"));
+    }
+
+    /// W3b: dissolves every group touched by the selection. Clearing the tag
+    /// walks the whole project, so members outside the selection dissolve
+    /// too — a group is one object, not a per-clip flag. One undo step.
+    fn timeline_ungroup_clips(&mut self, clips: Vec<timeline::ClipSel>) {
+        let project = self.project();
+        let mut ids: Vec<u32> = Vec::new();
+        for sel in &clips {
+            let group = match sel.lane {
+                timeline::TimelineLane::Midi => project
+                    .midi_tracks
+                    .get(sel.track)
+                    .and_then(|track| track.clips.get(sel.clip))
+                    .and_then(timeline::Placement::group),
+                timeline::TimelineLane::Control => project
+                    .control_tracks
+                    .get(sel.track)
+                    .and_then(|track| track.clips.get(sel.clip))
+                    .and_then(timeline::Placement::group),
+                timeline::TimelineLane::Audio => project
+                    .audio_tracks
+                    .get(sel.track)
+                    .and_then(|track| track.clips.get(sel.clip))
+                    .and_then(timeline::Placement::group),
+            };
+            if let Some(id) = group
+                && !ids.contains(&id)
+            {
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() {
+            self.set_message("Selection has no group".to_string());
+            return;
+        }
+        let before = self.begin_edit();
+        {
+            let project = self.project_mut();
+            for track in &mut project.midi_tracks {
+                for clip in &mut track.clips {
+                    if clip.group.is_some_and(|id| ids.contains(&id)) {
+                        clip.group = None;
+                    }
+                }
+            }
+            for track in &mut project.control_tracks {
+                for clip in &mut track.clips {
+                    if clip.group.is_some_and(|id| ids.contains(&id)) {
+                        clip.group = None;
+                    }
+                }
+            }
+            for track in &mut project.audio_tracks {
+                for clip in &mut track.clips {
+                    if clip.group.is_some_and(|id| ids.contains(&id)) {
+                        clip.group = None;
+                    }
+                }
+            }
+            project.clip_groups.retain(|group| !ids.contains(&group.id));
+        }
+        self.commit_edit("Ungroup Clips", before);
+    }
+
+    /// Sets one clip's group tag (all three lane tables share the shape).
+    fn set_clip_group(&mut self, sel: timeline::ClipSel, group: Option<u32>) {
+        match sel.lane {
+            timeline::TimelineLane::Midi => {
+                if let Some(clip) = self
+                    .project_mut()
+                    .midi_tracks
+                    .get_mut(sel.track)
+                    .and_then(|track| track.clips.get_mut(sel.clip))
+                {
+                    timeline::Placement::set_group(clip, group);
+                }
+            }
+            timeline::TimelineLane::Control => {
+                if let Some(clip) = self
+                    .project_mut()
+                    .control_tracks
+                    .get_mut(sel.track)
+                    .and_then(|track| track.clips.get_mut(sel.clip))
+                {
+                    timeline::Placement::set_group(clip, group);
+                }
+            }
+            timeline::TimelineLane::Audio => {
+                if let Some(clip) = self
+                    .project_mut()
+                    .audio_tracks
+                    .get_mut(sel.track)
+                    .and_then(|track| track.clips.get_mut(sel.clip))
+                {
+                    timeline::Placement::set_group(clip, group);
+                }
             }
         }
     }
@@ -7145,9 +7568,10 @@ impl GlitcherZApp {
                         .and_then(|t| t.clips.get_mut(e.sel.clip))
                         .map(|c| {
                             c.start_ticks = e.start_ticks;
-                            // Single-period clips (D14): the loop follows the span.
+                            // W2: stretching tiles the content (grow) or
+                            // trims its tail (shrink).
                             c.span_ticks = e.span_ticks;
-                            c.loop_ticks = e.span_ticks;
+                            c.loop_ticks = timeline::resolve_loop(c.loop_ticks, e.span_ticks, None);
                         })
                         .is_some(),
                     timeline::TimelineLane::Midi => project
@@ -7157,7 +7581,7 @@ impl GlitcherZApp {
                         .map(|c| {
                             c.start_ticks = e.start_ticks;
                             c.span_ticks = e.span_ticks;
-                            c.loop_ticks = e.span_ticks;
+                            c.loop_ticks = timeline::resolve_loop(c.loop_ticks, e.span_ticks, None);
                         })
                         .is_some(),
                     // U11: a stretch trims the seconds window (a left-edge
@@ -7690,6 +8114,11 @@ impl GlitcherZApp {
                     });
                 if let Some((sample_path, root_note, one_shot, gain)) = sample_state {
                     self.sample_section(ui, instr_id, &sample_path, root_note, one_shot, gain);
+                }
+                // W1: drum kit table (load / gain / per-slot trim).
+                let drum_state = self.drum_kit_fields(instr_id);
+                if let Some((slots, gain)) = drum_state {
+                    self.drum_section(ui, instr_id, &slots, gain);
                 }
                 // Effects are added from the graph only (Add ▸ Effect, or the
                 // cable-midpoint insert — spec `plugin-browser.md` D12); the
@@ -8850,6 +9279,165 @@ impl GlitcherZApp {
             *gain = gain_value.clamp(0.0, 2.0);
         }
         self.commit_param_edit("Sample Params", before, "sample-params");
+    }
+
+    /// Drum kit table (W1, spec `drum-kit.md` K11): timeline-style overall
+    /// trim, the multi-select load button and one row per slot. Gain / pan /
+    /// tune / choke are **live** `set_node_param` writes (no rebuild); the
+    /// trigger key is display-only — reassigning it means remove + reload,
+    /// which keeps the table free of drag-to-rebuild races.
+    fn drum_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc_id: u64,
+        slots: &[glitcherz_model::DrumSlot],
+        gain: f32,
+    ) {
+        ui.separator();
+        ui.add_space(4.0);
+        let mut gain_value = gain;
+        ui.horizontal(|ui| {
+            ui.strong(format!("Drum Kit · {} slots", slots.len()));
+            if ui
+                .button("Load Samples…")
+                .on_hover_text("Append wav files as slots with free MIDI keys")
+                .clicked()
+            {
+                self.pick_drum_samples(doc_id);
+            }
+            ui.label("Gain");
+            if ui
+                .add(egui::Slider::new(&mut gain_value, 0.0..=2.0))
+                .changed()
+            {
+                self.send_node_param(doc_id, ParamId::DrumGain, gain_value);
+            }
+        });
+        let before = self.begin_param_edit();
+        if let Some(NodeDoc::Instrument {
+            voice: VoiceSpec::DrumKit { gain, .. },
+            ..
+        }) = self.project_mut().graph.node_by_id_mut(doc_id)
+        {
+            *gain = gain_value.clamp(0.0, 2.0);
+        }
+        self.commit_param_edit("Drum Gain", before, "drum-gain");
+
+        if slots.is_empty() {
+            ui.weak("No samples loaded — pick wav files to build the kit.");
+            return;
+        }
+        let mut edits: Vec<(u8, u8, f32)> = Vec::new();
+        let mut remove: Option<u8> = None;
+        egui::Grid::new(format!("drum_grid_{doc_id}"))
+            .num_columns(7)
+            .spacing([8.0, 2.0])
+            .show(ui, |ui| {
+                ui.strong("Key");
+                ui.strong("File");
+                ui.strong("Gain");
+                ui.strong("Pan");
+                ui.strong("Tune");
+                ui.strong("Choke");
+                ui.label("");
+                ui.end_row();
+                for slot in slots {
+                    ui.label(format!("key {}", slot.note));
+                    let stem = std::path::Path::new(&slot.path)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "?".to_string());
+                    ui.label(stem).on_hover_text(&slot.path);
+                    let mut gain = slot.gain;
+                    if ui
+                        .add(egui::DragValue::new(&mut gain).range(0.0..=2.0).speed(0.01))
+                        .changed()
+                    {
+                        edits.push((slot.note, 0, gain));
+                    }
+                    let mut pan = slot.pan;
+                    if ui
+                        .add(egui::DragValue::new(&mut pan).range(-1.0..=1.0).speed(0.01))
+                        .changed()
+                    {
+                        edits.push((slot.note, 1, pan));
+                    }
+                    let mut tune = slot.tune_semitones;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut tune)
+                                .range(-24.0..=24.0)
+                                .speed(0.1)
+                                .suffix(" st"),
+                        )
+                        .changed()
+                    {
+                        edits.push((slot.note, 2, tune));
+                    }
+                    let mut choke = slot.choke.map_or(-1.0, f32::from);
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut choke)
+                                .range(-1.0..=127.0)
+                                .speed(0.2),
+                        )
+                        .on_hover_text(
+                            "-1 = no choke group; a new hit in the same group cuts the old one",
+                        )
+                        .changed()
+                    {
+                        edits.push((slot.note, 3, choke));
+                    }
+                    if ui
+                        .small_button("×")
+                        .on_hover_text("Remove this slot")
+                        .clicked()
+                    {
+                        remove = Some(slot.note);
+                    }
+                    ui.end_row();
+                }
+            });
+        for (note, field, value) in edits {
+            self.apply_drum_slot_edit(doc_id, note, field, value);
+        }
+        if let Some(note) = remove {
+            self.remove_drum_slot(doc_id, note);
+        }
+    }
+
+    /// Writes one slot parameter (0 gain / 1 pan / 2 tune / 3 choke) and
+    /// forwards it to the live processor. Undo merges per slot + field.
+    fn apply_drum_slot_edit(&mut self, doc_id: u64, note: u8, field: u8, value: f32) {
+        let before = self.begin_param_edit();
+        if let Some(NodeDoc::Instrument {
+            voice: VoiceSpec::DrumKit { slots, .. },
+            ..
+        }) = self.project_mut().graph.node_by_id_mut(doc_id)
+            && let Some(slot) = slots.iter_mut().find(|slot| slot.note == note)
+        {
+            match field {
+                0 => slot.gain = value.clamp(0.0, 2.0),
+                1 => slot.pan = value.clamp(-1.0, 1.0),
+                2 => slot.tune_semitones = value.clamp(-24.0, 24.0),
+                3 => {
+                    slot.choke = if value < 0.0 {
+                        None
+                    } else {
+                        Some(value.round().clamp(0.0, 127.0) as u8)
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (id, key) = match field {
+            0 => (ParamId::DrumSlotGain(note), "drum-slot-gain"),
+            1 => (ParamId::DrumSlotPan(note), "drum-slot-pan"),
+            2 => (ParamId::DrumSlotTune(note), "drum-slot-tune"),
+            _ => (ParamId::DrumSlotChoke(note), "drum-slot-choke"),
+        };
+        self.commit_param_edit("Drum Slot", before, &format!("{key}:{doc_id}:{note}"));
+        self.send_node_param(doc_id, id, value);
     }
 
     fn effect_sliders(&mut self, ui: &mut egui::Ui, doc_id: u64) {
@@ -10884,6 +11472,47 @@ impl GlitcherZApp {
             | RollIntent::CurveRemove { .. }
             | RollIntent::CurveDragEnd => {
                 unreachable!("curve intents never reach the note command table")
+            }
+            // W4: one-shot randomize over the selection (whole clip when the
+            // selection is empty — the command owns that fallback).
+            RollIntent::Randomize { options } => {
+                let outcome = self.execute(
+                    "midi.randomize",
+                    &json!({
+                        "track": track, "clip": clip,
+                        "indices": self.roll_state.selection.clone(),
+                        "pitch": options.pitch,
+                        "start": options.start,
+                        "length": options.length,
+                        "velocity": options.velocity,
+                        "probability": options.probability,
+                    }),
+                );
+                self.reselect_from(&outcome);
+                outcome
+            }
+            // W5: one-shot strum over the selection.
+            RollIntent::Strum { options } => {
+                let direction = match options.direction {
+                    glitcherz_model::StrumDirection::Up => "up",
+                    glitcherz_model::StrumDirection::Down => "down",
+                    glitcherz_model::StrumDirection::Alternate => "alternate",
+                    glitcherz_model::StrumDirection::Random => "random",
+                };
+                let outcome = self.execute(
+                    "midi.strum",
+                    &json!({
+                        "track": track, "clip": clip,
+                        "indices": self.roll_state.selection.clone(),
+                        "direction": direction,
+                        "spread_ticks": options.spread_ticks,
+                        "group_window_ticks": options.group_window_ticks,
+                        "velocity_ramp": options.velocity_ramp,
+                        "jitter_ticks": options.jitter_ticks,
+                    }),
+                );
+                self.reselect_from(&outcome);
+                outcome
             }
         };
         if let Some((index, start, length)) = created {

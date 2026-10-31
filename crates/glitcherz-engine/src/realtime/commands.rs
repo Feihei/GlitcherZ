@@ -118,6 +118,21 @@ pub enum ParamId {
     /// fade), ≥ 0.5 = OneShot (pitch-matched note-offs are ignored; the
     /// blanket transport sweep still stops the voice).
     SamplePlayMode,
+    /// Drum kit: node output trim (linear, clamped 0..2; spec
+    /// `drum-kit.md` K8). Applies immediately to every sounding voice.
+    DrumGain,
+    /// Drum kit: per-slot trim (payload = trigger MIDI key, 0..127).
+    DrumSlotGain(u8),
+    /// Drum kit: per-slot pan (-1..1, payload = trigger key).
+    DrumSlotPan(u8),
+    /// Drum kit: per-slot pitch trim in semitones (-24..24, payload =
+    /// trigger key). Affects the rate of **subsequent** hits; sounding
+    /// voices keep their trigger-time rate (K8).
+    DrumSlotTune(u8),
+    /// Drum kit: per-slot choke group (payload = trigger key; value is the
+    /// group number, negative = no choke). New hits in the same group fade
+    /// older ones out (K7).
+    DrumSlotChoke(u8),
     /// Arpeggiator step division index (0..7; spec `midi-nodes.md` §5.1).
     ArpDivision,
     /// Arpeggiator gate length as a fraction of one step (0.05..1).

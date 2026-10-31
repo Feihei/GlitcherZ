@@ -52,8 +52,9 @@ pub use file::{
     ModelError, PROJECT_VERSION, ProjectFile, load_project, parse_project, save_project,
 };
 pub use ops::{
-    DEFAULT_SEED, DurationOp, QuantizeOptions, VelocityOp, apply_duration, apply_to_selected,
-    apply_velocity, quantize, scale_notes, transpose,
+    DEFAULT_SEED, DurationOp, QuantizeOptions, RandomizeOptions, StrumDirection, StrumOptions,
+    VelocityOp, apply_duration, apply_to_selected, apply_velocity, assign_drum_notes, quantize,
+    randomize, scale_notes, strum, transpose,
 };
 
 /// MIDI track capacity limit (D12; the engine side uses the same value).
@@ -1020,6 +1021,57 @@ impl Sequence {
     }
 }
 
+/// Upper bound of named clip groups (W3b).
+pub const MAX_CLIP_GROUPS: usize = 64;
+
+/// Label palette for clip groups (W3b): eight repeating RGB colours. The
+/// model stores plain bytes so it never depends on a UI colour type.
+pub const CLIP_GROUP_COLORS: [[u8; 3]; 8] = [
+    [90, 150, 220],
+    [220, 160, 90],
+    [110, 190, 140],
+    [200, 110, 180],
+    [230, 200, 90],
+    [120, 190, 210],
+    [200, 120, 110],
+    [160, 140, 220],
+];
+
+/// A named, coloured clip group (W3b, spec `timeline.md` D28).
+///
+/// Membership lives on the clips themselves (`group: Option<u32>`), so one
+/// group can span MIDI / control / audio lanes and different tracks: moving
+/// or copying one member moves/copies them all.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ClipGroup {
+    /// Group id (1..; unique per project).
+    #[serde(default = "clip_group_default_id")]
+    pub id: u32,
+    #[serde(default)]
+    pub name: String,
+    /// Label colour (RGB) for the timeline stripe.
+    #[serde(default = "clip_group_default_color")]
+    pub color: [u8; 3],
+}
+
+impl Default for ClipGroup {
+    fn default() -> Self {
+        Self {
+            id: clip_group_default_id(),
+            name: String::new(),
+            color: clip_group_default_color(),
+        }
+    }
+}
+
+fn clip_group_default_id() -> u32 {
+    1
+}
+
+fn clip_group_default_color() -> [u8; 3] {
+    CLIP_GROUP_COLORS[0]
+}
+
 /// A MIDI clip placed on the arrangement timeline (D14/D15).
 ///
 /// `start_ticks` is the absolute position on the arrangement; the clip is
@@ -1029,6 +1081,14 @@ impl Sequence {
 /// relative to the clip start.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MidiClip {
+    /// Optional user-facing clip name (W3a). Empty means unnamed: the
+    /// timeline falls back to a content summary ("N notes").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Optional clip-group id (W3b): members move / copy / delete together,
+    /// across tracks and lane kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u32>,
     /// Absolute start position on the arrangement (tick).
     #[serde(default)]
     pub start_ticks: u32,
@@ -1112,6 +1172,8 @@ fn default_clip_loop() -> u32 {
 impl Default for MidiClip {
     fn default() -> Self {
         Self {
+            name: String::new(),
+            group: None,
             start_ticks: 0,
             span_ticks: default_clip_span(),
             loop_ticks: default_clip_loop(),
@@ -1167,6 +1229,13 @@ impl MidiClip {
 /// (D2): the base tempo is the single conversion source.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AudioClip {
+    /// Optional user-facing clip name (W3a). Empty means unnamed: the
+    /// timeline falls back to the wav file stem.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Optional clip-group id (W3b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u32>,
     /// Path to the .wav file (decoded via the session sample cache; a
     /// missing file makes the clip silent, not invalid).
     #[serde(default)]
@@ -1195,6 +1264,8 @@ pub struct AudioClip {
 impl Default for AudioClip {
     fn default() -> Self {
         Self {
+            name: String::new(),
+            group: None,
             path: String::new(),
             start_ticks: 0,
             source_offset: 0.0,
@@ -1253,6 +1324,13 @@ pub enum CurveInterp {
 /// decided by the node graph's automation cable, not by the clip.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ControlClip {
+    /// Optional user-facing clip name (W3a). Empty means unnamed: the
+    /// timeline falls back to a content summary ("N anchors").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Optional clip-group id (W3b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u32>,
     /// Absolute start position on the arrangement (tick).
     #[serde(default)]
     pub start_ticks: u32,
@@ -1274,6 +1352,8 @@ pub struct ControlClip {
 impl Default for ControlClip {
     fn default() -> Self {
         Self {
+            name: String::new(),
+            group: None,
             start_ticks: 0,
             span_ticks: default_clip_span(),
             loop_ticks: default_clip_loop(),
@@ -1496,6 +1576,17 @@ pub enum VoiceSpec {
         #[serde(default = "sample_default_gain")]
         gain: f32,
     },
+    /// Multi-sample drum kit (W1, spec `drum-kit.md`): each slot maps one
+    /// MIDI key to a short wav. Sample data stays out of the document (the
+    /// session `SampleLibrary` cache holds the decoded `Arc`s); an empty
+    /// slot list is silent (U13's empty-node rule).
+    DrumKit {
+        #[serde(default)]
+        slots: Vec<DrumSlot>,
+        /// Node output trim (linear, 0..=2, default 1.0).
+        #[serde(default = "sample_default_gain")]
+        gain: f32,
+    },
     /// CLAP plugin: dynamic library path + plugin ID (instantiated on the
     /// non-real-time thread).
     Clap {
@@ -1536,6 +1627,57 @@ pub enum SamplePlayMode {
 /// Serde default for [`VoiceSpec::Sample`]'s `root_note` (60 = C4).
 fn sample_default_root() -> u8 {
     60
+}
+
+/// Capacity of one drum kit (W1, spec `drum-kit.md` K3). 32 overlapping
+/// one-shot voices already exceed what a 24-voice engine pool can sustain,
+/// so the document limit stays modest.
+pub const MAX_DRUM_SLOTS: usize = 32;
+
+/// Default trigger key of a new drum slot (GM kick, 36).
+pub const DRUM_DEFAULT_NOTE: u8 = 36;
+
+/// One key of a drum kit (W1, spec `drum-kit.md` K2): a short wav plus the
+/// per-slot trim, placement and choke group. Sample data stays out of the
+/// document — `path` is the only identity.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DrumSlot {
+    /// MIDI key that triggers this slot (0..=127, unique per kit).
+    #[serde(default = "drum_default_note")]
+    pub note: u8,
+    /// Path to the .wav file (decoded through the session sample cache).
+    #[serde(default)]
+    pub path: String,
+    /// Slot trim (linear, 0..=2, default 1.0).
+    #[serde(default = "sample_default_gain")]
+    pub gain: f32,
+    /// Stereo placement (-1..=1, default 0 = centre).
+    #[serde(default)]
+    pub pan: f32,
+    /// Pitch trim in semitones (-24..=24, default 0 = native rate).
+    #[serde(default)]
+    pub tune_semitones: f32,
+    /// Choke group: a new hit in the same group fades the old one out
+    /// (closed vs open hi-hat, K7). `None` = no choke.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choke: Option<u8>,
+}
+
+impl Default for DrumSlot {
+    fn default() -> Self {
+        Self {
+            note: DRUM_DEFAULT_NOTE,
+            path: String::new(),
+            gain: 1.0,
+            pan: 0.0,
+            tune_semitones: 0.0,
+            choke: None,
+        }
+    }
+}
+
+fn drum_default_note() -> u8 {
+    DRUM_DEFAULT_NOTE
 }
 
 /// Serde default for [`VoiceSpec::Sample`]'s `gain`.
@@ -3366,6 +3508,30 @@ impl GraphDoc {
                 }
             }
         }
+        // Drum kit integrity (W1, spec `drum-kit.md` K3): bounded slots and
+        // unique trigger keys — a duplicate key would make "which sample
+        // plays" depend on table order.
+        for node in &self.nodes {
+            if let NodeDoc::Instrument { node_id, voice, .. } = node
+                && let VoiceSpec::DrumKit { slots, .. } = voice
+            {
+                if slots.len() > MAX_DRUM_SLOTS {
+                    return Err(format!(
+                        "drum kit node {node_id} has {} slots (limit {MAX_DRUM_SLOTS})",
+                        slots.len()
+                    ));
+                }
+                let mut keys = std::collections::HashSet::new();
+                for slot in slots {
+                    if !keys.insert(slot.note) {
+                        return Err(format!(
+                            "drum kit node {node_id} maps key {} twice",
+                            slot.note
+                        ));
+                    }
+                }
+            }
+        }
         // Input-source ownership (spec `plugin-gui.md` §8): one source, one
         // keyboard node. Two nodes listening to the same device would route
         // the same key press into two unrelated fan-outs — unpredictable and
@@ -3832,6 +3998,10 @@ pub struct Project {
     /// Audio tracks (U6, capped at [`MAX_AUDIO_TRACKS`]).
     #[serde(default)]
     pub audio_tracks: Vec<AudioTrack>,
+    /// Named clip groups (W3b, spec `timeline.md` D28). Membership lives on
+    /// the clips (`group: Option<u32>`); an empty table means no groups.
+    #[serde(default)]
+    pub clip_groups: Vec<ClipGroup>,
     /// Node graph document (D13 fully explicit).
     #[serde(default)]
     pub graph: GraphDoc,
@@ -3849,6 +4019,7 @@ impl Default for Project {
             midi_tracks: vec![MidiTrack::default(); DEFAULT_MIDI_TRACKS],
             control_tracks: vec![ControlTrack::default(); DEFAULT_CONTROL_TRACKS],
             audio_tracks: vec![AudioTrack::default(); DEFAULT_AUDIO_TRACKS],
+            clip_groups: Vec::new(),
             graph: default_graph_doc(DEFAULT_MIDI_TRACKS, DEFAULT_AUDIO_TRACKS),
         }
     }
@@ -4126,6 +4297,26 @@ impl Project {
                 "control track count {} exceeds the limit {MAX_AUTO_TRACKS}",
                 self.control_tracks.len()
             ));
+        }
+        // W3b: clip groups are a flat, bounded table with unique ids. A clip's
+        // dangling `group` reference is harmless (it renders as ungrouped) and
+        // is cleaned when a group is dissolved, so it is not a file error.
+        if self.clip_groups.len() > MAX_CLIP_GROUPS {
+            return Err(format!(
+                "clip group count {} exceeds the limit {MAX_CLIP_GROUPS}",
+                self.clip_groups.len()
+            ));
+        }
+        for (i, group) in self.clip_groups.iter().enumerate() {
+            if group.id == 0 {
+                return Err("clip group id 0 is reserved".to_string());
+            }
+            if self.clip_groups[i + 1..]
+                .iter()
+                .any(|other| other.id == group.id)
+            {
+                return Err(format!("duplicate clip group id {}", group.id));
+            }
         }
         for (ti, track) in self.midi_tracks.iter().enumerate() {
             if track.clips.len() > MAX_CLIPS_PER_TRACK {
@@ -4468,6 +4659,7 @@ mod tests {
     #[test]
     fn midi_clip_ron_roundtrip() {
         let mut clip = MidiClip {
+            name: "Intro".to_string(),
             start_ticks: 2 * TICKS_PER_BAR,
             span_ticks: 4 * TICKS_PER_BAR,
             ..MidiClip::default()
@@ -4499,6 +4691,51 @@ mod tests {
         assert_eq!(back.span_ticks, TICKS_PER_BAR);
         assert_eq!(back.loop_ticks, TICKS_PER_BAR);
         assert!(back.notes().is_empty());
+        // W3a: clips written before the name field read back as unnamed.
+        assert!(back.name.is_empty());
+    }
+
+    /// W3b: clip groups are a flat table + a per-clip tag; both round-trip,
+    /// and the validator rejects id 0, duplicates and an oversized table.
+    #[test]
+    fn clip_groups_roundtrip_and_validate() {
+        let mut project = Project::default();
+        project.clip_groups.push(super::ClipGroup {
+            id: 1,
+            name: "Verse".to_string(),
+            color: [10, 20, 30],
+        });
+        project.midi_tracks[0].clips.push(MidiClip {
+            group: Some(1),
+            ..MidiClip::default()
+        });
+        let text = ron::to_string(&project).expect("serialize");
+        let back: Project = ron::from_str(&text).expect("deserialize");
+        assert_eq!(back.clip_groups, project.clip_groups);
+        assert_eq!(back.midi_tracks[0].clips[0].group, Some(1));
+        assert!(back.validate().is_ok());
+
+        let duplicate = Project {
+            clip_groups: vec![super::ClipGroup::default(), super::ClipGroup::default()],
+            ..Project::default()
+        };
+        assert!(
+            duplicate.validate().is_err(),
+            "duplicate ids must be rejected"
+        );
+        let zero = Project {
+            clip_groups: vec![super::ClipGroup {
+                id: 0,
+                ..super::ClipGroup::default()
+            }],
+            ..Project::default()
+        };
+        assert!(zero.validate().is_err(), "id 0 is reserved");
+        let oversized = Project {
+            clip_groups: vec![super::ClipGroup::default(); super::MAX_CLIP_GROUPS + 1],
+            ..Project::default()
+        };
+        assert!(oversized.validate().is_err(), "the table is capped");
     }
 
     /// U6/U11: audio track round-trip + partial defaults + old-file loading.
@@ -4589,6 +4826,8 @@ mod tests {
             audio_tracks: vec![AudioTrack {
                 name: String::new(),
                 clips: vec![AudioClip {
+                    name: String::new(),
+                    group: None,
                     path: "a.wav".to_string(),
                     start_ticks: 0,
                     source_offset: 1.0,
@@ -5151,6 +5390,31 @@ mod tests {
                 play_mode: SamplePlayMode::OneShot,
                 gain: 0.5,
             },
+            VoiceSpec::DrumKit {
+                slots: Vec::new(),
+                gain: 1.0,
+            },
+            VoiceSpec::DrumKit {
+                slots: vec![
+                    super::DrumSlot {
+                        note: 36,
+                        path: "kick.wav".to_string(),
+                        gain: 1.0,
+                        pan: 0.0,
+                        tune_semitones: 0.0,
+                        choke: None,
+                    },
+                    super::DrumSlot {
+                        note: 42,
+                        path: "hat.wav".to_string(),
+                        gain: 0.8,
+                        pan: -0.3,
+                        tune_semitones: 2.0,
+                        choke: Some(1),
+                    },
+                ],
+                gain: 0.9,
+            },
             VoiceSpec::Clap {
                 path: "a.clap".to_string(),
                 plugin_id: "x".to_string(),
@@ -5668,6 +5932,45 @@ mod tests {
     /// Spec `plugin-gui.md` §8: one source, one node. Two nodes listening to
     /// the same device would double-trigger every key into two unrelated
     /// fan-outs, so the binding is a document-level error.
+    /// W1: drum-kit integrity — duplicate trigger keys and the slot cap.
+    #[test]
+    fn validate_rejects_duplicate_or_oversized_drum_kits() {
+        fn set_drum_voice(doc: &mut GraphDoc, node_id: u64, slots: Vec<super::DrumSlot>) {
+            if let Some(NodeDoc::Instrument { voice, .. }) =
+                doc.nodes.iter_mut().find(|node| node.node_id() == node_id)
+            {
+                *voice = VoiceSpec::DrumKit { slots, gain: 1.0 };
+            }
+        }
+        fn drum_slot(note: u8) -> super::DrumSlot {
+            super::DrumSlot {
+                note,
+                ..super::DrumSlot::default()
+            }
+        }
+
+        let mut doc = vk_doc();
+        set_drum_voice(&mut doc, 2, vec![drum_slot(36), drum_slot(36)]);
+        let err = doc
+            .validate(2, 0)
+            .expect_err("duplicate trigger keys must be rejected");
+        assert!(err.contains("twice"), "unexpected error: {err}");
+
+        let mut doc = vk_doc();
+        let slots: Vec<super::DrumSlot> = (0..super::MAX_DRUM_SLOTS as u8 + 1)
+            .map(drum_slot)
+            .collect();
+        set_drum_voice(&mut doc, 2, slots);
+        let err = doc
+            .validate(2, 0)
+            .expect_err("an oversized kit must be rejected");
+        assert!(err.contains("slots"), "unexpected error: {err}");
+
+        let mut doc = vk_doc();
+        set_drum_voice(&mut doc, 2, vec![drum_slot(36), drum_slot(38)]);
+        assert!(doc.validate(2, 0).is_ok(), "two distinct keys are legal");
+    }
+
     #[test]
     fn validate_rejects_two_nodes_bound_to_the_same_source() {
         let mut doc = vk_doc();
