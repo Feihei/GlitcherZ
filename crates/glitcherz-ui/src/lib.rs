@@ -948,19 +948,30 @@ struct GuiParamBatch {
 
 /// Resolves the Inspector's editing target (spec `plugin-gui.md` §6):
 /// the first **editable** document node in the patch selection, in document
-/// order; with nothing selected the panel falls back to the selected track's
-/// first-match instrument (the pre-G4 track-driven behavior). Stale selection
-/// ids (deleted nodes) are filtered by the document walk.
+/// order. Only a genuinely empty selection falls back to the selected track's
+/// first-match instrument (the pre-G4 track-driven behavior).
 ///
 /// "Editable" includes the built-in MIDI FX / control nodes (M5) and the Curve
 /// Map (spec `curve-map.md` §5): their Inspector panel *is* their only UI, so
 /// leaving them out made `midi_fx_params` unreachable — selecting one fell
 /// back to the track's instrument instead.
-fn resolve_panel_target(doc: &GraphDoc, selected: &[u64], track: usize) -> Option<u64> {
-    if !selected.is_empty() {
+///
+/// Selecting a node that has no editable parameters (the timeline, the master
+/// output, a keyboard / sample / audio-track node) must **not** resurrect the
+/// instrument panel: the panel belongs to the selection. Stale ids (a node
+/// deleted while still selected) are the one exception and still fall back,
+/// so deleting a node does not blank the panel.
+fn resolve_panel_target(
+    doc: &GraphDoc,
+    selected: &[u64],
+    has_any_selection: bool,
+    track: usize,
+) -> Option<u64> {
+    if has_any_selection {
+        let mut matched_uneditable = false;
         for node in &doc.nodes {
-            if selected.contains(&node.node_id())
-                && matches!(
+            if selected.contains(&node.node_id()) {
+                if matches!(
                     node,
                     NodeDoc::Instrument { .. }
                         | NodeDoc::Effect { .. }
@@ -970,13 +981,35 @@ fn resolve_panel_target(doc: &GraphDoc, selected: &[u64], track: usize) -> Optio
                         | NodeDoc::MidiEnvelope { .. }
                         | NodeDoc::Lfo { .. }
                         | NodeDoc::CurveMap { .. }
-                )
-            {
-                return Some(node.node_id());
+                ) {
+                    return Some(node.node_id());
+                }
+                matched_uneditable = true;
             }
         }
+        if matched_uneditable || selected.is_empty() {
+            // A non-editable node, or only the timeline / master entry, is
+            // selected: the Inspector shows that node's (empty) panel.
+            return None;
+        }
+        // Only stale ids are left: deleted nodes keep the track fallback.
     }
     doc.instrument_of_track(track).map(NodeDoc::node_id)
+}
+
+/// Whether the Inspector follows the **track** (built-in delay + external
+/// effect list) instead of a single node.
+///
+/// True when nothing is selected, or when the panel target is the track's
+/// instrument (the pre-G4 "instrument + its delay" view). Any other selection
+/// — timeline, mixer, a MIDI FX / control node, an effect — owns the panel and
+/// must not show another node's parameters.
+fn panel_shows_track_extras(target_doc: &Option<NodeDoc>, has_any_selection: bool) -> bool {
+    match target_doc {
+        Some(NodeDoc::Instrument { .. }) => true,
+        Some(_) => false,
+        None => !has_any_selection,
+    }
 }
 
 /// Peak level meter: the peak holds for 600 ms before falling back, which is easier to read visually.
@@ -2401,7 +2434,12 @@ impl GlitcherZApp {
         let track = self
             .selected_track
             .min(self.project().midi_tracks.len().saturating_sub(1));
-        resolve_panel_target(&self.project().graph, &selected, track)
+        resolve_panel_target(
+            &self.project().graph,
+            &selected,
+            self.patch_state.has_any_selection(),
+            track,
+        )
     }
 
     /// Push the full set of project document parameters (commands dropped on queue full are safe
@@ -8031,6 +8069,7 @@ impl GlitcherZApp {
             // selection's first editable document node, falling back to the
             // selected track's first-match instrument (pre-G4 behavior).
             let target = self.panel_target_node();
+            let has_any_selection = self.patch_state.has_any_selection();
             let target_doc = target.and_then(|id| self.project().graph.node_by_id(id).cloned());
             let title = match (&target_doc, target) {
                 (Some(NodeDoc::Effect { .. }), Some(id)) => {
@@ -8047,6 +8086,7 @@ impl GlitcherZApp {
                 }
                 (Some(NodeDoc::Lfo { .. }), Some(id)) => format!("LFO #{id}"),
                 (Some(NodeDoc::CurveMap { .. }), Some(id)) => format!("Curve Map #{id}"),
+                (None, None) if has_any_selection => "Selection".to_string(),
                 _ => {
                     if self.project().midi_tracks[sel].name.is_empty() {
                         format!("Track {}", sel + 1)
@@ -8056,6 +8096,9 @@ impl GlitcherZApp {
                 }
             };
             ui.heading(title);
+            if target.is_none() && has_any_selection {
+                ui.weak("This node has no editable parameters.");
+            }
             // M5: MIDI FX / control-source parameter stack (spec
             // `midi-nodes.md` §5). These nodes own no plugin editor, so the
             // panel is just their parameters.
@@ -8239,7 +8282,10 @@ impl GlitcherZApp {
                     )],
                     _ => Vec::new(),
                 },
-                _ => self.track_external_fx(sel),
+                _ if panel_shows_track_extras(&target_doc, has_any_selection) => {
+                    self.track_external_fx(sel)
+                }
+                _ => Vec::new(),
             };
             // Track-level "clear" shortcut at the head of the effect list
             // (spec `plugin-browser.md` §8.1): the batch removal of a track's
@@ -8642,11 +8688,12 @@ impl GlitcherZApp {
             let effect_target: Option<u64> = match (&target_doc, target) {
                 (Some(NodeDoc::Effect { .. }), Some(id)) => Some(id),
                 (Some(NodeDoc::Mixer { .. }), _) => None,
-                _ => self
+                _ if panel_shows_track_extras(&target_doc, has_any_selection) => self
                     .project()
                     .graph
                     .builtin_delay_of_track(sel)
                     .map(NodeDoc::node_id),
+                _ => None,
             };
             // Everything below belongs to the panel's **node** — the
             // instrument's filter / amp envelope, the effect's delay. Master
@@ -12458,7 +12505,7 @@ mod panel_target_tests {
         let doc = &project.graph;
         let t0 = doc.instrument_of_track(0).unwrap().node_id();
         // Pre-G4 behavior: nothing selected → the selected track's instrument.
-        assert_eq!(resolve_panel_target(doc, &[], 0), Some(t0));
+        assert_eq!(resolve_panel_target(doc, &[], false, 0), Some(t0));
     }
 
     #[test]
@@ -12473,7 +12520,7 @@ mod panel_target_tests {
         });
         let doc = &project.graph;
         // Cross-track patch target: the selection addresses the panel.
-        assert_eq!(resolve_panel_target(doc, &[t1], 0), Some(t1));
+        assert_eq!(resolve_panel_target(doc, &[t1], true, 0), Some(t1));
     }
 
     #[test]
@@ -12489,8 +12536,8 @@ mod panel_target_tests {
         });
         let doc = &project.graph;
         let mixer = doc.first_mixer().unwrap().node_id();
-        assert_eq!(resolve_panel_target(doc, &[delay], 0), Some(delay));
-        assert_eq!(resolve_panel_target(doc, &[mixer], 0), Some(mixer));
+        assert_eq!(resolve_panel_target(doc, &[delay], true, 0), Some(delay));
+        assert_eq!(resolve_panel_target(doc, &[mixer], true, 0), Some(mixer));
     }
 
     #[test]
@@ -12499,9 +12546,9 @@ mod panel_target_tests {
         let doc = &project.graph;
         let t0 = doc.instrument_of_track(0).unwrap().node_id();
         // Deleted node ids never resolve; the walk falls back to the track.
-        assert_eq!(resolve_panel_target(doc, &[9999], 0), Some(t0));
+        assert_eq!(resolve_panel_target(doc, &[9999], true, 0), Some(t0));
         // No editable node on a nonexistent track → no target.
-        assert_eq!(resolve_panel_target(doc, &[], 99), None);
+        assert_eq!(resolve_panel_target(doc, &[], false, 99), None);
     }
 
     /// C3 regression: the built-in MIDI FX / control panels (and the Curve
@@ -12524,8 +12571,8 @@ mod panel_target_tests {
             params: MidiEnvelopeParams::default(),
         });
         let doc = &project.graph;
-        assert_eq!(resolve_panel_target(doc, &[map], 0), Some(map));
-        assert_eq!(resolve_panel_target(doc, &[env], 0), Some(env));
+        assert_eq!(resolve_panel_target(doc, &[map], true, 0), Some(map));
+        assert_eq!(resolve_panel_target(doc, &[env], true, 0), Some(env));
     }
 
     #[test]
@@ -12542,8 +12589,54 @@ mod panel_target_tests {
         });
         let doc = &project.graph;
         // Selection order is irrelevant: document order decides.
-        assert_eq!(resolve_panel_target(doc, &[t1, t0], 0), Some(t0));
-        assert_eq!(resolve_panel_target(doc, &[t0, t1], 0), Some(t0));
+        assert_eq!(resolve_panel_target(doc, &[t1, t0], true, 0), Some(t0));
+        assert_eq!(resolve_panel_target(doc, &[t0, t1], true, 0), Some(t0));
+    }
+
+    /// The timeline / master entries are not document nodes at all
+    /// (`selected_doc_nodes` filters them out). Selecting one must show that
+    /// node's empty panel, not the track instrument.
+    #[test]
+    fn timeline_selection_does_not_fall_back() {
+        let project = Project::default();
+        let doc = &project.graph;
+        assert_eq!(resolve_panel_target(doc, &[], true, 0), None);
+    }
+
+    /// A real but non-editable node owns the panel too: the instrument
+    /// parameters belong to the instrument node, not to the track.
+    #[test]
+    fn non_editable_node_does_not_fall_back() {
+        let mut project = Project::default();
+        let keyboard = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::Keyboard {
+            node_id: keyboard,
+            track: 0,
+            source: glitcherz_model::MidiSource::default(),
+        });
+        let doc = &project.graph;
+        assert_eq!(resolve_panel_target(doc, &[keyboard], true, 0), None);
+    }
+
+    /// Track-level extras follow the same rule: only an empty selection or
+    /// the track instrument shows the built-in delay / external effects.
+    #[test]
+    fn extra_panels_follow_the_selection() {
+        let instrument = Some(NodeDoc::Instrument {
+            node_id: 2,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            synth: SynthParams::default(),
+        });
+        let lfo = Some(NodeDoc::Lfo {
+            node_id: 5,
+            track: 0,
+            params: LfoParams::default(),
+        });
+        assert!(panel_shows_track_extras(&instrument, false));
+        assert!(!panel_shows_track_extras(&lfo, true));
+        assert!(!panel_shows_track_extras(&None, true), "timeline selected");
+        assert!(panel_shows_track_extras(&None, false), "nothing selected");
     }
 }
 #[cfg(test)]

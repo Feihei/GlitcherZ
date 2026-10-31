@@ -1753,6 +1753,16 @@ impl PatchState {
             .collect()
     }
 
+    /// Whether anything at all is selected — including the special timeline /
+    /// master entries that [`Self::selected_doc_nodes`] filters out.
+    ///
+    /// The Inspector needs this to tell "nothing selected" (fall back to the
+    /// track's instrument) from "the timeline is selected" (that node owns the
+    /// panel, so the instrument parameters must stay hidden).
+    pub fn has_any_selection(&self) -> bool {
+        !self.selection.nodes.is_empty() || !self.selection.cables.is_empty()
+    }
+
     /// Graph space → screen space.
     fn to_screen(&self, rect_min: Pos2, p: Pos2) -> Pos2 {
         Pos2::new(
