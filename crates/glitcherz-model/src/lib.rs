@@ -2677,6 +2677,167 @@ impl MidiEnvelopeParams {
     }
 }
 
+/// LFO waveform (spec `.agents/spec/lfo.md` §4).
+///
+/// The engine keeps its own index form (`ParamId::LfoWaveform` takes a
+/// rounded `0..4`), exactly like the effects' `Unit::Enum` parameters; this
+/// enum is the document-side vocabulary and the UI's label source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum LfoWaveform {
+    /// `sin(2πφ)`.
+    #[default]
+    Sine,
+    /// Piecewise triangle, starts at `-1`.
+    Triangle,
+    /// Rising ramp, `2φ - 1`.
+    Saw,
+    /// Half-period `+1` / `-1`.
+    Square,
+    /// One random value per cycle, held until the next cycle boundary.
+    SampleHold,
+}
+
+impl LfoWaveform {
+    /// All waveforms, in engine index order (`ParamId::LfoWaveform`).
+    pub const ALL: [Self; 5] = [
+        Self::Sine,
+        Self::Triangle,
+        Self::Saw,
+        Self::Square,
+        Self::SampleHold,
+    ];
+
+    /// Short English label (UI combo + patch node caption).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sine => "Sine",
+            Self::Triangle => "Triangle",
+            Self::Saw => "Saw",
+            Self::Square => "Square",
+            Self::SampleHold => "S&H",
+        }
+    }
+
+    /// Engine parameter index (0..=4).
+    pub fn index(self) -> u8 {
+        match self {
+            Self::Sine => 0,
+            Self::Triangle => 1,
+            Self::Saw => 2,
+            Self::Square => 3,
+            Self::SampleHold => 4,
+        }
+    }
+}
+
+/// LFO sync division choices, in the engine's `LFO_DIVISION_TICKS` table
+/// order (spec `lfo.md` §3).
+pub const LFO_DIVISION_COUNT: usize = 6;
+/// Default sync division index: 1/4 note.
+pub const LFO_DEFAULT_DIVISION: u8 = 2;
+/// Division labels, parallel to the engine's tick table.
+pub const LFO_DIVISION_LABELS: [&str; LFO_DIVISION_COUNT] =
+    ["1/1", "1/2", "1/4", "1/8", "1/16", "1/32"];
+
+/// LFO parameters (spec `.agents/spec/lfo.md` §3).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LfoParams {
+    /// Waveform shape.
+    #[serde(default)]
+    pub waveform: LfoWaveform,
+    /// Free-running rate in Hz when `sync` is off (0.01..=40).
+    #[serde(default = "default_lfo_rate")]
+    pub rate_hz: f32,
+    /// Use the musical division instead of Hz.
+    #[serde(default)]
+    pub sync: bool,
+    /// Division index into [`LFO_DIVISION_COUNT`] when `sync` is on.
+    #[serde(default = "default_lfo_division")]
+    pub division: u8,
+    /// Output depth (0..=1): the waveform is scaled into `[-1, 1] × depth`.
+    #[serde(default = "default_lfo_depth")]
+    pub depth: f32,
+}
+
+fn default_lfo_rate() -> f32 {
+    1.0
+}
+
+fn default_lfo_division() -> u8 {
+    LFO_DEFAULT_DIVISION
+}
+
+fn default_lfo_depth() -> f32 {
+    0.5
+}
+
+impl Default for LfoParams {
+    fn default() -> Self {
+        Self {
+            waveform: LfoWaveform::Sine,
+            rate_hz: default_lfo_rate(),
+            sync: false,
+            division: default_lfo_division(),
+            depth: default_lfo_depth(),
+        }
+    }
+}
+
+impl LfoParams {
+    /// Load-time clamp (same rule as the other control sources): a
+    /// hand-written file must never reach the audio thread with a non-finite
+    /// rate, a negative depth or a division index outside the table.
+    pub fn sanitized(self) -> Self {
+        Self {
+            waveform: self.waveform,
+            rate_hz: if self.rate_hz.is_finite() {
+                self.rate_hz.clamp(0.01, 40.0)
+            } else {
+                default_lfo_rate()
+            },
+            sync: self.sync,
+            division: if (self.division as usize) < LFO_DIVISION_COUNT {
+                self.division
+            } else {
+                LFO_DEFAULT_DIVISION
+            },
+            depth: if self.depth.is_finite() {
+                self.depth.clamp(0.0, 1.0)
+            } else {
+                default_lfo_depth()
+            },
+        }
+    }
+
+    /// One-cycle preview value in `[-1, 1]` for the Inspector's waveform
+    /// drawing (`hold` is the current S&H value; ignored by the others).
+    ///
+    /// Kept next to the parameters so the UI preview cannot drift from the
+    /// engine's formula (spec `lfo.md` §4).
+    pub fn preview_value(self, phase: f32, hold: f32) -> f32 {
+        let p = phase.clamp(0.0, 1.0);
+        match self.waveform {
+            LfoWaveform::Sine => (std::f32::consts::TAU * p).sin(),
+            LfoWaveform::Triangle => {
+                if p < 0.5 {
+                    4.0 * p - 1.0
+                } else {
+                    3.0 - 4.0 * p
+                }
+            }
+            LfoWaveform::Saw => 2.0 * p - 1.0,
+            LfoWaveform::Square => {
+                if p < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+            LfoWaveform::SampleHold => hold,
+        }
+    }
+}
+
 /// Curve Map node parameters (spec `.agents/spec/curve-map.md` D5).
 ///
 /// The node is a **pure pass-through with an opinion**: it takes the
@@ -2873,6 +3034,24 @@ pub enum NodeDoc {
         #[serde(default)]
         params: MidiEnvelopeParams,
     },
+    /// Control source: free-running LFO (1 control out, no audio / MIDI
+    /// ports; spec `lfo.md`).
+    ///
+    /// Runs off the transport clock: Hz mode accumulates playing seconds,
+    /// sync mode derives its phase from `song_ticks`. Output is normalized
+    /// `[-1, 1]`, so it drives a parameter, a CC or a bend through the same
+    /// target-derived axis as a curve (D5 of `curve-map.md`).
+    Lfo {
+        /// Persisted node ID.
+        #[serde(default)]
+        node_id: u64,
+        /// Owning track (grouping only).
+        #[serde(default)]
+        track: usize,
+        /// Waveform / rate / depth.
+        #[serde(default)]
+        params: LfoParams,
+    },
     /// Control map: 1 control in, 1 control out, no audio / MIDI ports
     /// (spec `curve-map.md` D5).
     ///
@@ -2969,6 +3148,7 @@ impl NodeDoc {
             | NodeDoc::Arpeggiator { node_id, .. }
             | NodeDoc::Portamento { node_id, .. }
             | NodeDoc::MidiEnvelope { node_id, .. }
+            | NodeDoc::Lfo { node_id, .. }
             | NodeDoc::CurveMap { node_id, .. }
             | NodeDoc::ChannelStrip { node_id, .. } => *node_id,
         }
@@ -2986,6 +3166,7 @@ impl NodeDoc {
             | NodeDoc::Arpeggiator { track, .. }
             | NodeDoc::Portamento { track, .. }
             | NodeDoc::MidiEnvelope { track, .. }
+            | NodeDoc::Lfo { track, .. }
             | NodeDoc::CurveMap { track, .. }
             | NodeDoc::ChannelStrip { track, .. } => *track,
         }
@@ -3026,7 +3207,10 @@ impl NodeDoc {
     pub fn has_control_out(&self) -> bool {
         matches!(
             self,
-            NodeDoc::Portamento { .. } | NodeDoc::MidiEnvelope { .. } | NodeDoc::CurveMap { .. }
+            NodeDoc::Portamento { .. }
+                | NodeDoc::MidiEnvelope { .. }
+                | NodeDoc::Lfo { .. }
+                | NodeDoc::CurveMap { .. }
         )
     }
 
@@ -3051,6 +3235,7 @@ impl NodeDoc {
                 | NodeDoc::Arpeggiator { .. }
                 | NodeDoc::Portamento { .. }
                 | NodeDoc::MidiEnvelope { .. }
+                | NodeDoc::Lfo { .. }
                 | NodeDoc::CurveMap { .. }
         )
     }
@@ -3722,7 +3907,7 @@ impl GraphDoc {
                             })?;
                             if !source.has_control_out() {
                                 return Err(format!(
-                                    "automation cable source node {id} has no control output (Portamento / MidiEnvelope only)"
+                                    "automation cable source node {id} has no control output (Portamento / MIDI Envelope / LFO / Curve Map only)"
                                 ));
                             }
                             Some(id)
@@ -4051,6 +4236,8 @@ impl Project {
                 NodeDoc::Arpeggiator { params, .. } => *params = params.sanitized(),
                 NodeDoc::Portamento { params, .. } => *params = params.sanitized(),
                 NodeDoc::MidiEnvelope { params, .. } => *params = params.sanitized(),
+                // LFO rate / depth / division (spec `lfo.md` D8).
+                NodeDoc::Lfo { params, .. } => *params = params.sanitized(),
                 // Curve Map axis (spec `curve-map.md` D5): a hand-written
                 // file must not reach the audio thread with a backwards or
                 // non-finite range.
@@ -4520,6 +4707,7 @@ mod tests {
         ArpMode, ArpeggiatorParams, AudioClip, AudioTrack, AutoParam, AutoPoint, CableDoc,
         CableKind, ChannelParam, ControlClip, ControlTrack, CurveMapParams, DEFAULT_AUDIO_TRACKS,
         DEFAULT_CONTROL_TRACKS, DEFAULT_MIDI_TRACKS, DelayParams, EffectParams, GraphDoc,
+        LFO_DEFAULT_DIVISION, LFO_DIVISION_COUNT, LFO_DIVISION_LABELS, LfoParams, LfoWaveform,
         MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS, MAX_AUDIO_TRACKS,
         MAX_BEND_RANGE, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES, MAX_TEMPO_BPM,
         MIN_BEND_RANGE, MIN_TEMPO_BPM, MapMode, MapSpec, MidiClip, MidiEnvelopeParams, MidiSource,
@@ -6835,6 +7023,96 @@ mod tests {
                 assert!((back - norm).abs() < 1e-4, "{spec:?} at {norm}: {back}");
             }
         }
+    }
+
+    #[test]
+    fn lfo_params_default_round_trip_and_clamp() {
+        let p = LfoParams::default();
+        assert_eq!(p.waveform, LfoWaveform::Sine);
+        assert!((p.rate_hz - 1.0).abs() < 1e-6);
+        assert_eq!(p.division, LFO_DEFAULT_DIVISION);
+        assert!((p.depth - 0.5).abs() < 1e-6);
+        assert_eq!(LFO_DIVISION_LABELS.len(), LFO_DIVISION_COUNT);
+
+        let bad = LfoParams {
+            rate_hz: f32::NAN,
+            depth: 9.0,
+            division: 99,
+            ..p
+        }
+        .sanitized();
+        assert!((bad.rate_hz - 1.0).abs() < 1e-6);
+        assert_eq!(bad.depth, 1.0);
+        assert_eq!(bad.division, LFO_DEFAULT_DIVISION);
+
+        let slow = LfoParams { rate_hz: 0.0, ..p }.sanitized();
+        assert_eq!(slow.rate_hz, 0.01);
+        let fast = LfoParams {
+            rate_hz: 500.0,
+            ..p
+        }
+        .sanitized();
+        assert_eq!(fast.rate_hz, 40.0);
+    }
+
+    #[test]
+    fn lfo_preview_values_match_the_waveform_table() {
+        let p = LfoParams::default();
+        let hold = 0.42;
+        for (wave, expected) in [
+            (LfoWaveform::Sine, [0.0, 1.0, 0.0, -1.0]),
+            (LfoWaveform::Triangle, [-1.0, 0.0, 1.0, 0.0]),
+            (LfoWaveform::Saw, [-1.0, -0.5, 0.0, 0.5]),
+            (LfoWaveform::Square, [1.0, 1.0, -1.0, -1.0]),
+            (LfoWaveform::SampleHold, [hold, hold, hold, hold]),
+        ] {
+            let params = LfoParams {
+                waveform: wave,
+                ..p
+            };
+            for (phase, want) in [0.0, 0.25, 0.5, 0.75].into_iter().zip(expected) {
+                let got = params.preview_value(phase, hold);
+                assert!(
+                    (got - want).abs() < 1e-5,
+                    "{} at {phase}: {got} != {want}",
+                    wave.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lfo_node_is_a_control_source_without_audio_ports() {
+        let node = NodeDoc::Lfo {
+            node_id: 9,
+            track: 0,
+            params: LfoParams::default(),
+        };
+        assert!(node.has_control_out());
+        assert!(!node.has_audio_ports());
+        assert!(!node.has_midi_in());
+        assert!(!node.has_midi_out());
+        assert!(!node.accepts_control());
+        assert_eq!(node.node_id(), 9);
+    }
+
+    #[test]
+    fn lfo_node_round_trips_through_ron() {
+        let node = NodeDoc::Lfo {
+            node_id: 9,
+            track: 1,
+            params: LfoParams {
+                waveform: LfoWaveform::SampleHold,
+                rate_hz: 2.5,
+                sync: true,
+                division: 3,
+                depth: 0.75,
+            },
+        };
+        let text = ron::to_string(&node).expect("serialize");
+        assert!(text.contains("type:\"lfo\""), "tag missing: {text}");
+        let back: NodeDoc = ron::from_str(&text).expect("deserialize");
+        assert_eq!(node, back);
     }
 
     #[test]

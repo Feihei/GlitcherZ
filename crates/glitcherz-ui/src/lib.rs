@@ -39,8 +39,8 @@ use glitcherz_engine::convert;
 use glitcherz_engine::realtime::{
     ArpeggiatorProcessor, AudioTrackProcessor, AutoDest, ChannelStripProcessor, Curve,
     CurveMapProcessor, DrumKitProcessor, DrumSlotSpec, EffectMeters, EngineCommand, EventKind,
-    FeedbackProcessor, MAX_AUTO_POINTS, MAX_MIDI_FANOUT, MAX_TRACK_CLIPS, MapMode as EngineMapMode,
-    MapSpec as EngineMapSpec, MidiClipTable, MidiEnvelopeProcessor,
+    FeedbackProcessor, LfoProcessor, MAX_AUTO_POINTS, MAX_MIDI_FANOUT, MAX_TRACK_CLIPS,
+    MapMode as EngineMapMode, MapSpec as EngineMapSpec, MidiClipTable, MidiEnvelopeProcessor,
     MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent, ParamId,
     PortamentoProcessor, Processor, RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCtrl,
     RtCtrlKind, RtCurveInterp, RtMidiClip, RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor,
@@ -50,11 +50,11 @@ use glitcherz_engine::realtime::{
 use glitcherz_engine::{Sf2Library, Sf2Preset};
 use glitcherz_model::{
     ArpeggiatorParams, AutoParam, AutoPoint, CableKind, ChannelParam, ControlClip, ControlTrack,
-    CtrlKind, CurveInterp, CurveMapParams, EffectParams, GraphDoc, MAX_ARRANGEMENT_TICKS,
-    MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS,
-    MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip, MidiEnvelopeParams, MidiSource, MidiTrack,
-    NodeDoc, NodeParam, PortRef, PortamentoParams, Project, SamplePlayMode, SongLoop, SynthParams,
-    VoiceSpec,
+    CtrlKind, CurveInterp, CurveMapParams, EffectParams, GraphDoc, LFO_DIVISION_LABELS, LfoParams,
+    LfoWaveform, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS,
+    MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip,
+    MidiEnvelopeParams, MidiSource, MidiTrack, NodeDoc, NodeParam, PortRef, PortamentoParams,
+    Project, SamplePlayMode, SongLoop, SynthParams, VoiceSpec,
 };
 
 pub mod curve;
@@ -199,6 +199,49 @@ const NOTE_NAMES: [&str; 12] = [
 fn note_name(note: u8) -> String {
     let octave = note as i32 / 12 - 1;
     format!("{}{octave}", NOTE_NAMES[(note % 12) as usize])
+}
+
+/// Two-cycle LFO shape preview for the Inspector (spec `lfo.md` §6).
+///
+/// UI-thread only: the point list is allocated here, outside the audio
+/// callback. Sample & Hold alternates two fixed demo values (its real sequence
+/// depends on the node seed and is only audible while playing).
+fn lfo_wave_preview(ui: &mut egui::Ui, params: LfoParams) {
+    let width = ui.available_width().clamp(80.0, 260.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 56.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, egui::Color32::from_gray(22));
+    painter.rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+        egui::StrokeKind::Inside,
+    );
+    let mid = rect.center().y;
+    painter.line_segment(
+        [egui::pos2(rect.left(), mid), egui::pos2(rect.right(), mid)],
+        egui::Stroke::new(1.0, egui::Color32::from_gray(55)),
+    );
+    const STEPS: usize = 128;
+    let mut points = Vec::with_capacity(STEPS + 1);
+    for i in 0..=STEPS {
+        let t = i as f32 / STEPS as f32;
+        let cycles = t * 2.0;
+        let hold = if (cycles.floor() as i32) % 2 == 0 {
+            0.55
+        } else {
+            -0.6
+        };
+        let value = params.preview_value(cycles.fract(), hold) * params.depth;
+        points.push(egui::pos2(
+            rect.left() + rect.width() * t,
+            mid - value * rect.height() * 0.42,
+        ));
+    }
+    painter.add(egui::Shape::line(
+        points,
+        egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 195, 100)),
+    ));
 }
 
 /// Path → display name (file name; full path on failure).
@@ -909,6 +952,7 @@ fn resolve_panel_target(doc: &GraphDoc, selected: &[u64], track: usize) -> Optio
                         | NodeDoc::Arpeggiator { .. }
                         | NodeDoc::Portamento { .. }
                         | NodeDoc::MidiEnvelope { .. }
+                        | NodeDoc::Lfo { .. }
                         | NodeDoc::CurveMap { .. }
                 )
             {
@@ -2143,6 +2187,18 @@ impl GlitcherZApp {
                     processor.apply_params(params.min, params.max, engine_mode(params.mode));
                     (Box::new(processor), None, String::new())
                 }
+                // Spec `lfo.md`: free-running control source.
+                NodeDoc::Lfo { params, .. } => {
+                    let mut processor = LfoProcessor::new(doc_id as u32);
+                    processor.apply_params(
+                        params.waveform.index(),
+                        params.rate_hz,
+                        params.sync,
+                        params.division,
+                        params.depth,
+                    );
+                    (Box::new(processor), None, String::new())
+                }
             };
         let engine_id = self.engine.fresh_node_id();
         // D15: the mixer is the only multi-input node; the engine compiler
@@ -3241,6 +3297,12 @@ impl GlitcherZApp {
                 node_id,
                 track,
                 params: CurveMapParams::default(),
+            },
+            // Spec `lfo.md`: free-running control source.
+            patch::NodeSource::Lfo => NodeDoc::Lfo {
+                node_id,
+                track,
+                params: LfoParams::default(),
             },
         };
         if node.is_keyboard() {
@@ -5295,6 +5357,17 @@ impl GlitcherZApp {
             NodeDoc::CurveMap { params, .. } => {
                 let mut processor = CurveMapProcessor::new();
                 processor.apply_params(params.min, params.max, engine_mode(params.mode));
+                (Box::new(processor), None)
+            }
+            NodeDoc::Lfo { params, .. } => {
+                let mut processor = LfoProcessor::new(node.node_id() as u32);
+                processor.apply_params(
+                    params.waveform.index(),
+                    params.rate_hz,
+                    params.sync,
+                    params.division,
+                    params.depth,
+                );
                 (Box::new(processor), None)
             }
         };
@@ -7956,6 +8029,7 @@ impl GlitcherZApp {
                 (Some(NodeDoc::MidiEnvelope { .. }), Some(id)) => {
                     format!("MIDI Envelope #{id}")
                 }
+                (Some(NodeDoc::Lfo { .. }), Some(id)) => format!("LFO #{id}"),
                 (Some(NodeDoc::CurveMap { .. }), Some(id)) => format!("Curve Map #{id}"),
                 _ => {
                     if self.project().midi_tracks[sel].name.is_empty() {
@@ -7976,6 +8050,7 @@ impl GlitcherZApp {
                         NodeDoc::Arpeggiator { .. }
                             | NodeDoc::Portamento { .. }
                             | NodeDoc::MidiEnvelope { .. }
+                            | NodeDoc::Lfo { .. }
                             | NodeDoc::CurveMap { .. }
                     )
                 )
@@ -8663,7 +8738,7 @@ impl GlitcherZApp {
         let Some(node) = self.project().graph.node_by_id(doc_id).cloned() else {
             return;
         };
-        ui.weak("MIDI events only — this node has no audio output");
+        ui.weak("MIDI / control only — this node has no audio output");
         ui.add_space(4.0);
         match node {
             NodeDoc::Arpeggiator { params, .. } => {
@@ -8872,6 +8947,85 @@ impl GlitcherZApp {
                         *params = p;
                     }
                     self.commit_param_edit("MIDI Envelope", before, "midi-fx-params");
+                }
+            }
+            // Spec `lfo.md` §6: waveform + time base + depth, with a
+            // two-cycle preview so the shape is visible before wiring it up.
+            NodeDoc::Lfo { params, .. } => {
+                let mut p = params;
+                let mut changed = false;
+                egui::Grid::new("lfo_params")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Waveform");
+                        egui::ComboBox::from_id_salt("lfo_waveform")
+                            .selected_text(p.waveform.label())
+                            .show_ui(ui, |ui| {
+                                for wave in LfoWaveform::ALL {
+                                    changed |= ui
+                                        .selectable_value(&mut p.waveform, wave, wave.label())
+                                        .changed();
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Sync");
+                        changed |= ui.checkbox(&mut p.sync, "Follow tempo").changed();
+                        ui.end_row();
+                        ui.label("Rate");
+                        if p.sync {
+                            egui::ComboBox::from_id_salt("lfo_division")
+                                .selected_text(
+                                    LFO_DIVISION_LABELS[usize::from(p.division)
+                                        .min(LFO_DIVISION_LABELS.len() - 1)],
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (index, label) in LFO_DIVISION_LABELS.iter().enumerate() {
+                                        if ui
+                                            .selectable_label(
+                                                usize::from(p.division) == index,
+                                                *label,
+                                            )
+                                            .clicked()
+                                        {
+                                            p.division = index as u8;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                        } else {
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut p.rate_hz)
+                                        .range(0.01..=40.0)
+                                        .speed(0.01)
+                                        .suffix(" Hz"),
+                                )
+                                .changed();
+                        }
+                        ui.end_row();
+                        ui.label("Depth");
+                        changed |= ui.add(egui::Slider::new(&mut p.depth, 0.0..=1.0)).changed();
+                        ui.end_row();
+                    });
+                lfo_wave_preview(ui, p);
+                if changed {
+                    self.send_node_param(
+                        doc_id,
+                        ParamId::LfoWaveform,
+                        f32::from(p.waveform.index()),
+                    );
+                    self.send_node_param(doc_id, ParamId::LfoSync, if p.sync { 1.0 } else { 0.0 });
+                    self.send_node_param(doc_id, ParamId::LfoRate, p.rate_hz);
+                    self.send_node_param(doc_id, ParamId::LfoDivision, f32::from(p.division));
+                    self.send_node_param(doc_id, ParamId::LfoDepth, p.depth);
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Lfo { params, .. }) =
+                        self.project_mut().graph.node_by_id_mut(doc_id)
+                    {
+                        *params = p;
+                    }
+                    self.commit_param_edit("LFO", before, "lfo-params");
                 }
             }
             // C3: the mapping card (spec `curve-map.md` §5). Three controls,

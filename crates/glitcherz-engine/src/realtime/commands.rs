@@ -171,6 +171,17 @@ pub enum ParamId {
     EnvMin,
     /// MIDI envelope output scale, high end (driving a CC uses 0..127).
     EnvMax,
+    /// LFO free-running rate in Hz (0.01..40; spec `.agents/spec/lfo.md` §3).
+    LfoRate,
+    /// LFO waveform index (0 = Sine, 1 = Triangle, 2 = Saw, 3 = Square,
+    /// 4 = Sample & Hold).
+    LfoWaveform,
+    /// LFO output depth (0..1).
+    LfoDepth,
+    /// LFO musical sync (≥ 0.5 = use the division instead of Hz).
+    LfoSync,
+    /// LFO sync division index (0..5, parallel to `LFO_DIVISION_TICKS`).
+    LfoDivision,
     /// Curve Map: the normalized control value arriving on its input port
     /// (**already normalized**, `-1..1`; spec `curve-map.md` D5/D6).
     ///

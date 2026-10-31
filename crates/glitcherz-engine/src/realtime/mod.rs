@@ -59,6 +59,7 @@ pub mod events;
 pub mod flanger;
 pub mod gain;
 pub mod graph;
+pub mod lfo;
 pub mod map;
 pub mod midi_envelope;
 pub mod mixer;
@@ -122,6 +123,9 @@ pub use graph::{
     AutoDest, AutoRoute, Cable, ChannelStripProcessor, EventCable, EventKind, ExecPlan,
     FeedbackProcessor, GraphCompiler, GraphLevels, GraphUpdate, MASTER_NODE_ID, MAX_CABLES,
     MAX_MIDI_FANOUT, NodeKind, RtGraph, TIMELINE_IN, TopologyError,
+};
+pub use lfo::{
+    LFO_DIVISION_TICKS, LFO_MAX_RATE_HZ, LFO_MIN_RATE_HZ, LFO_WAVEFORM_COUNT, LfoProcessor,
 };
 pub use map::{MapMode, MapSpec};
 pub use midi_envelope::MidiEnvelopeProcessor;

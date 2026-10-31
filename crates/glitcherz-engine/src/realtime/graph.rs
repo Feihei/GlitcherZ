@@ -4173,6 +4173,82 @@ mod tests {
         assert!((seen - 1.0).abs() < 1e-3, "identity axis, got {seen}");
     }
 
+    /// Spec `lfo.md` M4: a free-running LFO reaches a parameter destination
+    /// through the same control bus as a curve / envelope, and stops
+    /// delivering while the transport is inactive.
+    #[test]
+    fn lfo_drives_a_parameter_destination_and_stops_when_parked() {
+        use crate::realtime::lfo::LfoProcessor;
+
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let params = Arc::new(AtomicUsize::new(0));
+        let value = Arc::new(AtomicU32::new(0));
+
+        let mut lfo = LfoProcessor::new(1);
+        // 40 Hz sine at 48 kHz / 128 frames: the phase moves visibly block to
+        // block, so two consecutive deliveries must differ.
+        lfo.apply_params(0, 40.0, false, 2, 1.0);
+        let update = compiler
+            .add_node(2, NodeKind::Plain, Box::new(lfo))
+            .expect("lfo node");
+        graph.apply_update(update, &mut recycle_tx);
+
+        let update = compiler
+            .add_node(
+                4,
+                NodeKind::Plain,
+                Box::new(EventSink {
+                    notes: Arc::new(AtomicUsize::new(0)),
+                    ccs: Arc::new(AtomicUsize::new(0)),
+                    params: Arc::clone(&params),
+                    last_param: Arc::clone(&value),
+                }),
+            )
+            .expect("param sink");
+        graph.apply_update(update, &mut recycle_tx);
+
+        let update = compiler
+            .connect_event(
+                2,
+                4,
+                EventKind::Control,
+                AutoDest::Param(ParamId::PitchOffset),
+                MapSpec::linear(-24.0, 24.0),
+            )
+            .expect("control cable");
+        graph.apply_update(update, &mut recycle_tx);
+
+        graph.process_block(&ctx());
+        let first = f32::from_bits(value.load(Ordering::Relaxed));
+        assert_eq!(params.load(Ordering::Relaxed), 1, "one delivery");
+        assert!(
+            first.is_finite() && first.abs() <= 24.0,
+            "axis mapped: {first}"
+        );
+
+        for _ in 0..8 {
+            graph.process_block(&ctx());
+        }
+        let later = f32::from_bits(value.load(Ordering::Relaxed));
+        assert!(
+            (later - first).abs() > 1e-4,
+            "the LFO must move the target ({first} -> {later})"
+        );
+
+        let stopped = ProcessContext {
+            transport_active: false,
+            ..ctx()
+        };
+        let before = params.load(Ordering::Relaxed);
+        graph.process_block(&stopped);
+        assert_eq!(
+            params.load(Ordering::Relaxed),
+            before,
+            "a parked LFO must not overwrite the parameter"
+        );
+    }
+
     // ---- P5b: node_id addressing / dynamic track count / multi-out fan-out ----
 
     #[test]

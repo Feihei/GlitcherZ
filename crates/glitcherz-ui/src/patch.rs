@@ -18,8 +18,8 @@ use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 use glitcherz_model::{
     AutoParam, BuiltinEffectKind, CableDoc, CableKind, ChannelParam, CurveMapParams, GraphDoc,
-    LayoutDoc, MAX_AUDIO_TRACKS, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS,
-    MIN_MIXER_CHANNELS, MidiSource, NodeDoc, NodeParam, PortRef, VoiceSpec,
+    LFO_DIVISION_LABELS, LayoutDoc, MAX_AUDIO_TRACKS, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS,
+    MAX_MIXER_CHANNELS, MIN_MIXER_CHANNELS, MidiSource, NodeDoc, NodeParam, PortRef, VoiceSpec,
 };
 
 /// Inline parameter identity for built-in node kinds (G5, spec
@@ -545,6 +545,9 @@ pub enum NodeSource {
     Portamento,
     /// MIDI-triggered envelope control source (spec `midi-nodes.md` §5.3).
     MidiEnvelope,
+    /// Free-running LFO control source (spec `lfo.md`): 1 control out, no
+    /// audio / MIDI ports.
+    Lfo,
     /// Curve Map control node (spec `curve-map.md` D5): 1 control in, 1
     /// control out, and a declared axis — a mapping card the user can put in
     /// front of any destination.
@@ -732,6 +735,8 @@ fn opens_inspector(node: Option<&NodeDoc>) -> bool {
                 | NodeDoc::Arpeggiator { .. }
                 | NodeDoc::Portamento { .. }
                 | NodeDoc::MidiEnvelope { .. }
+                // The LFO's whole UI is its Inspector too (spec `lfo.md` §6).
+                | NodeDoc::Lfo { .. }
                 // The map's whole UI is its Inspector (§5: 双击进 Inspector).
                 | NodeDoc::CurveMap { .. }
         )
@@ -1431,6 +1436,9 @@ fn node_color(id: PatchId, doc: &GraphDoc) -> (Color32, Color32) {
             Some(NodeDoc::Arpeggiator { .. }) => Color32::from_rgb(90, 200, 110),
             Some(NodeDoc::Portamento { .. }) => Color32::from_rgb(80, 190, 100),
             Some(NodeDoc::MidiEnvelope { .. }) => Color32::from_rgb(70, 180, 90),
+            // A free-running LFO is a control *generator*: same family, one
+            // shade warmer than the note-triggered envelope.
+            Some(NodeDoc::Lfo { .. }) => Color32::from_rgb(120, 195, 100),
             // A curve map is a control-stage node too, one shade cooler than
             // the sources it sits behind (spec `curve-map.md` D5).
             Some(NodeDoc::CurveMap { .. }) => Color32::from_rgb(85, 175, 150),
@@ -1609,6 +1617,23 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 format!("Portamento · {:.0} ms", params.time_ms)
             }
             Some(NodeDoc::MidiEnvelope { .. }) => "MIDI Env".to_string(),
+            // Spec `lfo.md` §6: waveform + time base + depth, readable off the
+            // box without opening the Inspector.
+            Some(NodeDoc::Lfo { params, .. }) => {
+                let rate = if params.sync {
+                    LFO_DIVISION_LABELS
+                        [usize::from(params.division).min(LFO_DIVISION_LABELS.len() - 1)]
+                    .to_string()
+                } else {
+                    format!("{:.2} Hz", params.rate_hz)
+                };
+                format!(
+                    "LFO · {} {} · {:.0}%",
+                    params.waveform.label(),
+                    rate,
+                    params.depth * 100.0
+                )
+            }
             // D5: the node body doubles as a "mapping card" — the range and
             // mode are what the user needs to see without opening anything.
             Some(NodeDoc::CurveMap { params, .. }) => {
@@ -1820,8 +1845,9 @@ impl PatchState {
                         1
                     }
                 }
-                // G6: the virtual keyboard has no audio input.
-                Some(node) if node.is_keyboard() => 0,
+                // G6: the virtual keyboard has no audio input; the LFO is a pure
+                // control source with no input port at all (spec `lfo.md` D1).
+                Some(node) if node.is_keyboard() || matches!(node, NodeDoc::Lfo { .. }) => 0,
                 _ => 1,
             },
         };
@@ -1906,6 +1932,7 @@ impl PatchState {
                 NodeDoc::Arpeggiator { .. }
                 | NodeDoc::Portamento { .. }
                 | NodeDoc::MidiEnvelope { .. }
+                | NodeDoc::Lfo { .. }
                 | NodeDoc::CurveMap { .. } => {
                     let k = keyboard_slot;
                     keyboard_slot += 1;
@@ -2256,7 +2283,9 @@ fn node_out_port_kind(node: &NodeDoc, port: usize) -> CableKind {
         NodeDoc::Keyboard { .. } | NodeDoc::Arpeggiator { .. } => CableKind::Midi,
         NodeDoc::Portamento { .. } if port == 0 => CableKind::Midi,
         NodeDoc::Portamento { .. } => CableKind::Automation,
-        NodeDoc::MidiEnvelope { .. } | NodeDoc::CurveMap { .. } => CableKind::Automation,
+        NodeDoc::MidiEnvelope { .. } | NodeDoc::Lfo { .. } | NodeDoc::CurveMap { .. } => {
+            CableKind::Automation
+        }
         _ => CableKind::Audio,
     }
 }

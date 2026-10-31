@@ -423,6 +423,17 @@ A 阶段**只补这三处，不开参数端口**（每参数一个输入口 = �
 
 **本系列明确不做**：轨道文件夹 / 全局 mixer 视图（W3b 备选 B 单独立项）、audio clip 循环平铺（W2b 另议）、演奏期随机（W4 未来项）。
 
+## LFO 控制源节点（2026-10-31 立项，已交付）
+
+用户提出「可以输出 LFO 信号的模块，有参数可控制」。按现有控制源体系做成 1 control out 节点（输出归一化 `[-1,1]`，可直连参数 / CC / pitch bend，或先过 Curve Map）。
+
+- 参数：Waveform（Sine / Triangle / Saw / Square / SampleHold）、Rate（0.01–40 Hz）、Sync + 分频（1/1…1/32）、Depth（0–1）。
+- 时间基准：Hz 模式累计播放秒数；sync 模式由 `song_ticks` 派生（跟随 tempo 曲线 / seek / loop）。停止时冻结相位**且不投递**；Stop→Play 从 0 重启，Pause→Play 继续。
+- 实施：model `LfoWaveform` / `LfoParams` + `NodeDoc::Lfo`；engine `realtime/lfo.rs` + `ParamId::{LfoRate, LfoWaveform, LfoDepth, LfoSync, LfoDivision}`；UI `MIDI FX…` 选择器 / 节点标签 / Inspector 参数 + 两周期波形预览 / 两处装配。
+- 测试：波形表、depth、sync、停止 / 恢复、S&H 可复现、RT 零分配、graph 串联（`lfo_drives_a_parameter_destination_and_stops_when_parked`）、picker 列表。
+- 已知边界：输出是**绝对覆盖**（非相对调制，见 spec Q1）；无 MIDI key-sync、Phase / Offset、Reverse Saw。
+- spec：`.agents/spec/lfo.md`。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：
