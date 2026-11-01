@@ -438,6 +438,45 @@ A 阶段**只补这三处，不开参数端口**（每参数一个输入口 = �
 - 已知边界：输出是**绝对覆盖**（非相对调制，见 spec Q1）；无 MIDI key-sync、Phase / Offset、Reverse Saw。
 - spec：`.agents/spec/lfo.md`。
 
+## 全仓 review + S 系列稳定性修复（2026-11-01 立项）
+
+完整报告见 **`.agents/review-2026-11-01.md`**（问题清单带 `文件:行` 证据、功能缺口表、
+结构债、S1–S3 计划）。本节只留进度。
+
+已交付（全仓 fmt / clippy / test 绿）：
+
+- [x] **S1-1** 启动默认不发声（`--autoplay` 显式开启，`--no-autoplay` 保留兼容）
+- [x] **S1-2** 原子保存（tmp → sync → rename）+ `<name>.glz.bak` + 拒绝 `version > PROJECT_VERSION`
+- [x] **S1-3a** undo/redo 按字节预算裁剪（`DEFAULT_HISTORY_BYTES = 256 MiB`，最少保留 1 步）
+
+## 录音与节拍器（2026-11-01 立项，spec `.agents/spec/recording.md`）
+
+用户裁定：**节拍器与录音同一闭环交付**；音频输入做成**图内 `NodeDoc::Input` 节点**；
+录音素材落 `<stem>.media/` + **相对路径**；顺序**先 MIDI 闭环后音频录音**。
+
+- [x] **R1 节拍器（引擎内）** ✅ 2026-11-01：`realtime/metronome.rs`（构造期预生成
+  重拍/弱拍 click 表 + voice 播放）；`Sequencer` 增 `numerator`/`denominator` +
+  `beat_ticks()`（与 `ticks_per_bar_of` 同源换算）；`SequencerCommand::SetMetronome{enabled, gain}`；
+  `BlockRunner` 在 `process_block` **之后**混入 click（不进节点图、不进主电平表），
+  Play/Stop/Pause/Seek 时 `resync`（准时起拍才响，seek 不响）；`AudioEngine::set_metronome`；
+  transport 区 `Click` 开关 + 电平滑条；离线导出引擎恒关闭。
+  测试：6 单元（拍长/静音/每拍一次/停走带静音/seek 不响/重拍加重）+ 4 集成审计
+  （空图可听 / 未开静音 / 停走带静音 / **渲染 1 秒零堆分配**）
+- [ ] **R2 录音骨架**：`SetCapture(bool)` + `CapturedMidi` 回传 ring + 溢出计数；
+  UI 录音状态机（Idle/PreRoll/Recording）+ armed track + pre-roll；电脑键盘经引擎打戳；
+  停止落 clip、undo 一步
+- [ ] **R3 midir 硬件 MIDI 输入**（`Arc<Mutex<Producer>>` 直推命令队列）
+- [ ] **R4 音频录音**：`NodeDoc::Input` + `InputProcessor` + cpal 输入双 ring +
+  `.media/` 相对路径 + 手动延迟 offset
+- [ ] **R5 收尾**：录音后选中新 clip、输入电平表、溢出告警、PDC 自动对齐
+
+接下来（按 review 文档的优先级）：
+
+- [ ] **S1-4** undo 历史面板（`Session::undo_history()` / `undo_label()` 已有，缺 `undo_to(n)` + 面板）
+- [ ] **S1-5** Preferences：音频设备 / 采样率 / 缓冲区 + 掉线提示（需 `AudioEngine::start_with`）
+- [ ] **S2-3** PDC（`Processor::latency_samples()` 接进图编译期）
+- [ ] **S3** 自动保存、相对路径与缺失媒体重定位、导出规格化、CJK 字体、`ui/lib.rs` 拆分
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：

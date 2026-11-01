@@ -95,6 +95,10 @@
 | :--- | :--- | :--- |
 | 走带 | transport | 播放/停止控制整体 |
 | 播放头 | playhead | 当前播放位置指示 |
+| 节拍器 | metronome | 走带时钟驱动的参考拍；click 是它的声音，图外混音（spec `recording.md` D1） |
+| 预备拍 | pre-roll | 录音前先播放、但不采集的若干小节（D14）；不是 count-in（不从负数起拍） |
+| 采集抽头 | capture tap | 引擎在 block 边界给输入事件打 `position_ticks` 后回传 UI 的通道（D6） |
+| 录音素材目录 | media directory | 工程旁的 `<stem>.media/`，clip 存相对路径（D11） |
 | 片段 | clip | 钢琴卷帘编辑的音符集合 |
 | 音符 | note | MIDI 音符；音名如 `A4` |
 | 延音尾 | gate tail | 音符 off 事件前的延续播放（pending off 机制）；项目级"音长 gate"已随 Steps 退役，音符收尾用自身 length |
@@ -123,7 +127,7 @@
 | :--- | :--- | :--- |
 | 项目文件 | project file | `.glz`（RON 格式） |
 | 持久化 | persisted | eframe storage / 文档序列化语境 |
-| 冒烟测试 | smoke test | `--seconds` 自动关窗跑通 |
+| 冒烟测试 | smoke test | `--seconds` 自动关窗跑通；需要验声时加 `--autoplay` |
 | 节点画布 | node patch | P5d 的 patch 图视图编辑器（Pure Data 语境，连线图叫 patch） |
 | 钢琴卷帘 | piano roll | 音符片段编辑器 |
 | 混音器 | mixer | 多轨电平/推子区 |
