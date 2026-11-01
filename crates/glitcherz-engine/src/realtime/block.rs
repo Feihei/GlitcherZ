@@ -7,6 +7,7 @@ use rtrb::Consumer;
 
 use crate::realtime::atomic::AtomicF32;
 use crate::realtime::automation::MAX_AUTO_TRACKS;
+use crate::realtime::capture::CaptureTap;
 use crate::realtime::commands::{EngineCommand, NoteEvent, SequencerCommand};
 use crate::realtime::context::ProcessContext;
 use crate::realtime::graph::{GraphLevels, GraphUpdate, NO_EDGE, RtGraph, TIMELINE_IN};
@@ -145,6 +146,11 @@ pub struct BlockRunner {
     /// Pre-allocated mono click buffer, one block long: `run_next_block` fills
     /// it and [`BlockRunner::sample_at`] adds it to both output channels.
     click: Vec<f32>,
+    /// Capture tap (spec `recording.md` D6/D7): while enabled, live input
+    /// events are stamped with the transport position and queued back to the
+    /// control thread. Off by default; the offline export engine never turns
+    /// it on.
+    capture: CaptureTap,
     feedback: Feedback,
     played_samples: u64,
 }
@@ -166,6 +172,7 @@ impl BlockRunner {
         recycle: rtrb::Producer<RecycledNode>,
         audio_trash: rtrb::Producer<crate::realtime::audio_track::AudioClipTable>,
         midi_trash: rtrb::Producer<crate::realtime::sequencer::MidiClipTable>,
+        capture: CaptureTap,
         feedback: Feedback,
     ) -> Self {
         Self {
@@ -188,6 +195,7 @@ impl BlockRunner {
             midi_trash_pending: None,
             metronome: Metronome::new(sample_rate),
             click: vec![0.0; fixed_block.max(1)],
+            capture,
             feedback,
             played_samples: 0,
         }
@@ -445,12 +453,22 @@ impl BlockRunner {
                 self.graph.node_set_param(node_id, id, value);
             }
             EngineCommand::Note { track, event } => {
+                // Capture first: the transport position is read *before* the
+                // event is delivered, so a recording and playback of the same
+                // event share one block-quantized timestamp.
+                let ticks = self.sequencer.position_ticks();
                 self.graph.track_note(track, event);
+                self.capture.note(ticks, event);
             }
             EngineCommand::NoteAtNode { node_id, event } => {
                 // G6: virtual-keyboard route — the addressed instrument only.
+                // Captured like `Note`: the tap records *what was played*, and
+                // the UI decides which track the take lands on.
+                let ticks = self.sequencer.position_ticks();
                 let _ = self.graph.node_note(node_id, event);
+                self.capture.note(ticks, event);
             }
+            EngineCommand::SetCapture(enabled) => self.capture.configure(enabled),
             EngineCommand::Sequencer(cmd) => self.apply_sequencer_command(cmd),
             EngineCommand::Panic => {
                 // Panic = silence, not stop: the transport keeps running and
@@ -618,6 +636,7 @@ mod tests {
             _recycle_tx,
             audio_trash_tx,
             midi_trash_tx,
+            crate::realtime::capture::CaptureTap::detached(),
             feedback.clone(),
         );
         (runner, tx, graph_tx, feedback, compiler)

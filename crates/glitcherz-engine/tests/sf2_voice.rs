@@ -465,6 +465,7 @@ fn real_soundfont_full_graph_paths() {
         recycle_tx,
         audio_trash_tx,
         midi_trash_tx,
+        glitcherz_engine::realtime::CaptureTap::detached(),
         feedback,
     );
     let mut runner = runner;

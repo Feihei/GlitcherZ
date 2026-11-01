@@ -302,6 +302,14 @@ pub enum EngineCommand {
     NoteAtNode { node_id: u64, event: NoteEvent },
     /// Sequencer transport / configuration.
     Sequencer(SequencerCommand),
+    /// Enables / disables the capture tap (spec `.agents/spec/recording.md`
+    /// D6/D7).
+    ///
+    /// While enabled, every live event arriving through [`EngineCommand::Note`]
+    /// or [`EngineCommand::NoteAtNode`] is copied into the capture ring with
+    /// the block-boundary transport position. Sequencer-scheduled events are
+    /// never captured — a recording must not re-record the arrangement.
+    SetCapture(bool),
     /// Set a node parameter addressed by node_id (P5b: node-addressed path;
     /// both automation routing and the patch treat this as authoritative).
     SetNodeParam {
@@ -347,6 +355,7 @@ mod tests {
             EngineCommand::NoteAtNode { .. } => f32::NAN,
             EngineCommand::Sequencer(SequencerCommand::SetBpm(value)) => value,
             EngineCommand::Sequencer(_) => f32::NAN,
+            EngineCommand::SetCapture(_) => f32::NAN,
             EngineCommand::Panic => f32::NAN,
         }
     }

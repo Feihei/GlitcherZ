@@ -20,8 +20,8 @@
 //! only into this test binary; the engine crate stays `#![forbid(unsafe_code)]`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use glitcherz_engine::realtime::block::{BlockRunner, Feedback};
 use glitcherz_engine::realtime::commands::{EngineCommand, SequencerCommand, command_channel};
@@ -121,6 +121,7 @@ fn make_runner() -> (BlockRunner, Producer<EngineCommand>) {
         recycle_tx,
         audio_trash_tx,
         midi_trash_tx,
+        glitcherz_engine::realtime::CaptureTap::detached(),
         feedback,
     );
     (runner, tx)
@@ -129,12 +130,10 @@ fn make_runner() -> (BlockRunner, Producer<EngineCommand>) {
 /// Enables the click and starts the transport (commands land at the next
 /// block boundary).
 fn start_clicking(tx: &mut Producer<EngineCommand>) {
-    tx.push(EngineCommand::Sequencer(
-        SequencerCommand::SetMetronome {
-            enabled: true,
-            gain: 0.8,
-        },
-    ))
+    tx.push(EngineCommand::Sequencer(SequencerCommand::SetMetronome {
+        enabled: true,
+        gain: 0.8,
+    }))
     .expect("command queue not full");
     tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
         .expect("command queue not full");
@@ -184,12 +183,10 @@ fn click_stays_off_until_enabled() {
 fn stopped_transport_renders_no_click() {
     let _guard = AUDIT_LOCK.lock().expect("audit lock");
     let (mut runner, mut tx) = make_runner();
-    tx.push(EngineCommand::Sequencer(
-        SequencerCommand::SetMetronome {
-            enabled: true,
-            gain: 1.0,
-        },
-    ))
+    tx.push(EngineCommand::Sequencer(SequencerCommand::SetMetronome {
+        enabled: true,
+        gain: 1.0,
+    }))
     .expect("command queue not full");
     let mut buffer = vec![0.0f32; SR as usize * 2];
     let peak = render_peak(&mut runner, &mut buffer, SR as usize);

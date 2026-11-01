@@ -61,6 +61,14 @@ pub struct AudioEngine {
     /// [`AudioEngine::reclaim_midi_clips`]. The tables own `Vec`s, so the
     /// audio thread must never drop them.
     midi_trash: rtrb::Consumer<crate::realtime::MidiClipTable>,
+    /// Capture ring consumer end (spec `recording.md` D6): live input events
+    /// stamped with the transport position, drained by
+    /// [`AudioEngine::drain_captured`] on the control thread.
+    capture: rtrb::Consumer<crate::realtime::CapturedNote>,
+    /// Cumulative count of captured events the ring could not hold. Read by
+    /// [`AudioEngine::capture_overflow`] so the UI can warn instead of
+    /// silently losing notes.
+    capture_overflow: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Control-side graph state (non-real-time): authoritative topology copy +
     /// execution plan compiler. Entirely `Copy`, so the whole snapshot can be
     /// rolled back when a queue push fails.
@@ -114,6 +122,12 @@ impl AudioEngine {
         let (audio_trash_tx, audio_trash_rx) =
             crate::realtime::audio_track::audio_clip_trash_channel();
         let (midi_trash_tx, midi_trash_rx) = crate::realtime::midi_clip_trash_channel();
+        // Capture tap (spec `recording.md` D6): the audio thread holds the
+        // producer, the control side keeps the consumer for `drain_captured`.
+        let (capture_tx, capture_rx) =
+            crate::realtime::capture_channel(crate::realtime::CAPTURE_QUEUE_CAPACITY);
+        let capture_overflow = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let capture = crate::realtime::CaptureTap::new(capture_tx, capture_overflow.clone());
         // Boxed on purpose: `BlockRunner` is ~50 KB (the graph carries a fixed
         // per-node event buffer table), and cpal's `build_output_stream` passes
         // the callback closure by value through a stack of generic
@@ -133,6 +147,7 @@ impl AudioEngine {
             recycle_tx,
             audio_trash_tx,
             midi_trash_tx,
+            capture,
             feedback.clone(),
         ));
 
@@ -159,6 +174,8 @@ impl AudioEngine {
             recycle: recycle_rx,
             audio_trash: audio_trash_rx,
             midi_trash: midi_trash_rx,
+            capture: capture_rx,
+            capture_overflow,
             compiler,
             offline_runner: None,
             feedback,
@@ -191,6 +208,12 @@ impl AudioEngine {
         let (audio_trash_tx, audio_trash_rx) =
             crate::realtime::audio_track::audio_clip_trash_channel();
         let (midi_trash_tx, midi_trash_rx) = crate::realtime::midi_clip_trash_channel();
+        // Same capture plumbing as the live engine, permanently disabled: the
+        // offline engine exists to render a mix, and nothing in the export
+        // path ever sends `SetCapture`.
+        let (capture_tx, capture_rx) =
+            crate::realtime::capture_channel(crate::realtime::CAPTURE_QUEUE_CAPACITY);
+        let capture_overflow = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let runner = Box::new(BlockRunner::new(
             FIXED_BLOCK_SIZE,
             2,
@@ -202,6 +225,7 @@ impl AudioEngine {
             recycle_tx,
             audio_trash_tx,
             midi_trash_tx,
+            crate::realtime::CaptureTap::new(capture_tx, capture_overflow.clone()),
             feedback.clone(),
         ));
         Ok(Self {
@@ -211,6 +235,8 @@ impl AudioEngine {
             recycle: recycle_rx,
             audio_trash: audio_trash_rx,
             midi_trash: midi_trash_rx,
+            capture: capture_rx,
+            capture_overflow,
             compiler,
             offline_runner: Some(runner),
             feedback,
@@ -666,6 +692,35 @@ impl AudioEngine {
             enabled,
             gain,
         }))
+    }
+
+    /// Enables / disables the capture tap (spec `.agents/spec/recording.md`
+    /// D6/D7).
+    ///
+    /// While enabled, every live note event that reaches the audio thread is
+    /// stamped with the block-boundary transport position and queued for
+    /// [`AudioEngine::drain_captured`]. Sequencer-scheduled events are never
+    /// captured, so a recording does not re-record the arrangement. Returns
+    /// `false` if the command queue is full (retry next frame).
+    pub fn set_capture(&mut self, enabled: bool) -> bool {
+        self.send(EngineCommand::SetCapture(enabled))
+    }
+
+    /// Appends everything the audio thread captured since the last call to
+    /// `out` (**never clears it** — callers reuse one buffer per frame and
+    /// clear it themselves). **Control thread only**: it is the single
+    /// consumer of the ring.
+    pub fn drain_captured(&mut self, out: &mut Vec<crate::realtime::CapturedNote>) {
+        while let Ok(captured) = self.capture.pop() {
+            out.push(captured);
+        }
+    }
+
+    /// Cumulative number of captured events the ring dropped because it was
+    /// full (0 = nothing lost). Cumulative on purpose: the UI compares it
+    /// against the previous read to report "N events dropped".
+    pub fn capture_overflow(&self) -> u64 {
+        self.capture_overflow.load(Ordering::Relaxed)
     }
 
     // ---- Document-driven graph building API (P5c, D13: the loader rebuilds

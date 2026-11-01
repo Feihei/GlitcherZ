@@ -35,6 +35,8 @@
 //!   RT rendering of a pre-decoded wav with a fixed voice pool (decoding stays in
 //!   [`crate::sample`]);
 //! - [`commands`]: `rtrb` command queue and [`EngineCommand`] / [`NoteEvent`] / [`ParamId`];
+//! - [`capture`]: capture tap — stamps live input events with the transport position and
+//!   hands them back to the control thread (recording, spec `recording.md` D6);
 //! - [`atomic`]: [`AtomicF32`] (audio thread → UI scalar feedback);
 //! - [`block`]: [`BlockRunner`] — splits the host's (cpal) arbitrarily long interleaved
 //!   buffer into fixed blocks, consumes commands at block boundaries, and reports state back.
@@ -45,6 +47,7 @@ pub mod audio_track;
 pub mod automation;
 pub mod block;
 pub mod buffer;
+pub mod capture;
 pub mod chorus;
 pub mod commands;
 pub mod compressor;
@@ -103,6 +106,7 @@ pub use automation::{
 };
 pub use block::{BlockRunner, Feedback};
 pub use buffer::AudioBuffer;
+pub use capture::{CAPTURE_QUEUE_CAPACITY, CaptureTap, CapturedNote, capture_channel};
 pub use chorus::ChorusProcessor;
 pub use commands::{
     COMMAND_QUEUE_CAPACITY, EngineCommand, NoteEvent, ParamId, SequencerCommand, command_channel,

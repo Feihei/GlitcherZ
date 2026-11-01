@@ -2546,6 +2546,7 @@ mod tests {
             recycle_tx,
             audio_trash_tx,
             midi_trash_tx,
+            glitcherz_engine::realtime::CaptureTap::detached(),
             feedback.clone(),
         );
 
