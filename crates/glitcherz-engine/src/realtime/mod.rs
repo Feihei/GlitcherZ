@@ -107,7 +107,10 @@ pub use automation::{
 };
 pub use block::{BlockRunner, Feedback};
 pub use buffer::AudioBuffer;
-pub use capture::{CAPTURE_QUEUE_CAPACITY, CaptureTap, CapturedNote, capture_channel};
+pub use capture::{
+    CAPTURE_QUEUE_CAPACITY, CaptureTap, CapturedControl, CapturedNote, capture_channel,
+    control_capture_channel,
+};
 pub use chorus::ChorusProcessor;
 pub use commands::{
     COMMAND_QUEUE_CAPACITY, EngineCommand, NoteEvent, ParamId, SequencerCommand, command_channel,

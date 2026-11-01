@@ -1576,6 +1576,10 @@ pub struct GlitcherZApp {
     /// Capture-overflow count at the last warning, so a loss is reported once
     /// per burst instead of every frame.
     capture_overflow_seen: u64,
+    /// Curve-track baking state (R8).
+    control_recorder: recorder::ControlRecorder,
+    /// One frame's control samples, reused.
+    control_scratch: Vec<glitcherz_engine::realtime::CapturedControl>,
     /// In-flight audio take (R4). `None` = not recording audio.
     audio_take: Option<AudioTake>,
     /// Scratch buffer for one frame's recorded samples (reused).
@@ -1743,6 +1747,8 @@ impl GlitcherZApp {
             record_mute_other: false,
             capture_pending: None,
             capture_overflow_seen: 0,
+            control_recorder: recorder::ControlRecorder::new(),
+            control_scratch: Vec::new(),
             audio_take: None,
             audio_scratch: Vec::new(),
             record_latency_samples: 0,
@@ -6443,6 +6449,14 @@ impl GlitcherZApp {
             self.capture_pending = None;
         }
         self.drain_capture();
+        // R8: the control ring is separate; drain it every frame so a curve
+        // take never starts with stale samples.
+        let mut control_batch = std::mem::take(&mut self.control_scratch);
+        self.engine.drain_captured_controls(&mut control_batch);
+        for captured in control_batch.drain(..) {
+            self.control_recorder.push(captured);
+        }
+        self.control_scratch = control_batch;
         // R4: move the take ring's samples into the in-flight take every frame
         // (a bounded queue must be drained continuously or it drops).
         if self.audio_take.is_some() {
@@ -6472,6 +6486,7 @@ impl GlitcherZApp {
         if self.engine.is_playing() {
             let position = f64::from(self.engine.musical_ticks().max(0.0));
             self.recorder.observe_position(position);
+            self.control_recorder.observe_position(position);
         }
         self.reconcile_take_tracks();
     }
@@ -6527,10 +6542,11 @@ impl GlitcherZApp {
     /// actually capture today (R6 D26). Returns `(armed, unsupported)` in
     /// track order; `unsupported` carries one human-readable reason per wired
     /// port, so a rejected Rec press can say exactly what is missing.
-    fn armed_recording_tracks(&self) -> (Vec<usize>, Vec<usize>, Vec<String>) {
+    fn armed_recording_tracks(&self) -> (Vec<usize>, Vec<usize>, Vec<usize>, Vec<String>) {
         let doc = &self.project().graph;
         let mut midi = Vec::new();
         let mut audio = Vec::new();
+        let mut curve = Vec::new();
         let mut unsupported = Vec::new();
         for (kind, tracks) in [
             (TrackKind::Midi, doc.track_input_tracks(TrackKind::Midi)),
@@ -6540,24 +6556,38 @@ impl GlitcherZApp {
             for track in tracks {
                 let source = doc.track_input_source(kind, track);
                 match (kind, source.map(|c| &c.from)) {
-                    // R6: the only implemented MIDI source is a device /
-                    // computer keyboard (command-level tap). MIDI-effect
-                    // output baking is R7.
+                    // R6: a device / computer keyboard records through the
+                    // command tap; R7 bakes a MIDI effect's *output* at the
+                    // event-dispatch tap.
                     (TrackKind::Midi, Some(PortRef::Node(id)))
-                        if doc.node_by_id(*id).is_some_and(NodeDoc::is_keyboard) =>
+                        if doc
+                            .node_by_id(*id)
+                            .is_some_and(|node| node.is_keyboard() || node.has_midi_out()) =>
                     {
                         midi.push(track);
                     }
                     (TrackKind::Midi, Some(PortRef::Node(_))) => unsupported.push(format!(
-                        "Track {}: MIDI-effect recording is not implemented yet (R7)",
+                        "Track {}: the MIDI input needs a keyboard or MIDI-effect source",
                         track + 1
                     )),
                     (TrackKind::Midi, _) => unsupported.push(format!(
                         "Track {}: the MIDI input needs a keyboard source",
                         track + 1
                     )),
+                    // R8: a control-output node's block value is baked into
+                    // the curve track. Timeline-curve outlets are not sampled
+                    // yet (their evaluation happens outside the node bus).
+                    (TrackKind::Curve, Some(PortRef::Node(id)))
+                        if doc.node_by_id(*id).is_some_and(NodeDoc::has_control_out) =>
+                    {
+                        curve.push(track);
+                    }
+                    (TrackKind::Curve, Some(PortRef::AutoTrack(_))) => unsupported.push(format!(
+                        "Track {}: curve-to-curve baking is not implemented yet",
+                        track + 1
+                    )),
                     (TrackKind::Curve, _) => unsupported.push(format!(
-                        "Track {}: curve recording is not implemented yet (R8)",
+                        "Track {}: the curve input needs a control source (LFO / envelope / portamento / map)",
                         track + 1
                     )),
                     // R4: a live input node is the only audio capture source.
@@ -6581,12 +6611,14 @@ impl GlitcherZApp {
         midi.dedup();
         audio.sort_unstable();
         audio.dedup();
-        (midi, audio, unsupported)
+        curve.sort_unstable();
+        curve.dedup();
+        (midi, audio, curve, unsupported)
     }
 
-    /// Whether any take (MIDI or audio) is running.
+    /// Whether any take (MIDI, audio or curve) is running.
     fn is_recording(&self) -> bool {
-        self.recorder.is_active() || self.audio_take.is_some()
+        self.recorder.is_active() || self.audio_take.is_some() || self.control_recorder.is_active()
     }
 
     /// Moves everything the capture tap has queued into the recorder.
@@ -6621,9 +6653,9 @@ impl GlitcherZApp {
         if self.is_recording() {
             return;
         }
-        let (midi_armed, audio_armed, unsupported) = self.armed_recording_tracks();
+        let (midi_armed, audio_armed, curve_armed, unsupported) = self.armed_recording_tracks();
 
-        if midi_armed.is_empty() && audio_armed.is_empty() {
+        if midi_armed.is_empty() && audio_armed.is_empty() && curve_armed.is_empty() {
             if unsupported.is_empty() {
                 self.set_message(
                     "No recording input is wired: drag a source into Timeline In · T1 (a track input port) first"
@@ -6706,6 +6738,43 @@ impl GlitcherZApp {
                 self.capture_pending = Some(true);
             }
         }
+        if !curve_armed.is_empty() {
+            self.control_recorder
+                .begin(curve_armed.clone(), record_start, from);
+            if !self.engine.set_capture(true) {
+                self.capture_pending = Some(true);
+            }
+        }
+        // R7/R8: arm the in-graph taps. Keyboard MIDI tracks already go
+        // through the command-level tap, so only MIDI-effect sources need a
+        // bake entry.
+        let (midi_bakes, ctrl_bakes) = {
+            let doc = &self.project().graph;
+            let mut midi_bakes: std::collections::BTreeMap<u64, u16> = Default::default();
+            let mut ctrl_bakes: std::collections::BTreeMap<u64, u16> = Default::default();
+            for &track in &midi_armed {
+                if let Some(cable) = doc.track_input_source(TrackKind::Midi, track)
+                    && let PortRef::Node(id) = cable.from
+                    && !doc.node_by_id(id).is_some_and(NodeDoc::is_keyboard)
+                {
+                    *midi_bakes.entry(id).or_default() |= 1 << track;
+                }
+            }
+            for &track in &curve_armed {
+                if let Some(cable) = doc.track_input_source(TrackKind::Curve, track)
+                    && let PortRef::Node(id) = cable.from
+                {
+                    *ctrl_bakes.entry(id).or_default() |= 1 << track;
+                }
+            }
+            (midi_bakes, ctrl_bakes)
+        };
+        for (node_id, tracks) in midi_bakes {
+            self.engine.set_midi_bake(node_id, tracks);
+        }
+        for (node_id, tracks) in ctrl_bakes {
+            self.engine.set_ctrl_bake(node_id, tracks);
+        }
         if !audio_armed.is_empty() {
             let info = self
                 .engine
@@ -6738,6 +6807,7 @@ impl GlitcherZApp {
         let mut names = Vec::new();
         names.extend(midi_armed.iter().map(|&track| format!("T{}", track + 1)));
         names.extend(audio_armed.iter().map(|&track| format!("A{}", track + 1)));
+        names.extend(curve_armed.iter().map(|&track| format!("C{}", track + 1)));
         let list = names.join(", ");
         // D30: the track outlet is the only audible path once the device is
         // taken over, so a missing instrument is a real "you hear nothing"
@@ -6916,6 +6986,13 @@ impl GlitcherZApp {
             take.samples.append(&mut scratch);
             self.audio_scratch = scratch;
         }
+        // R8: drain the last controls before closing the curve takes.
+        let mut control_batch = std::mem::take(&mut self.control_scratch);
+        self.engine.drain_captured_controls(&mut control_batch);
+        for captured in control_batch.drain(..) {
+            self.control_recorder.push(captured);
+        }
+        self.control_scratch = control_batch;
         // After a rewind the live position is 0, so the last observed playing
         // position is the fallback (that is the real end of the take).
         let end =
@@ -6925,7 +7002,13 @@ impl GlitcherZApp {
         } else {
             Vec::new()
         };
+        let control_takes = if self.control_recorder.is_active() {
+            self.control_recorder.finish(0.0)
+        } else {
+            Vec::new()
+        };
         self.engine.set_capture(false);
+        self.engine.clear_bakes();
         self.capture_pending = None;
         self.engine.set_record_mute(0);
         self.engine.set_audio_capture(false);
@@ -6946,7 +7029,21 @@ impl GlitcherZApp {
             })
             .collect();
         let audio_clips = audio_take.map_or_else(Vec::new, |take| self.finish_audio_take(take));
-        if midi_clips.is_empty() && audio_clips.is_empty() {
+        let control_start = self.control_recorder.start_ticks;
+        let control_clips: Vec<(usize, ControlClip)> = control_takes
+            .iter()
+            .filter_map(|(track, points)| {
+                recorder::control_take_clip(control_start, points, bar).map(|mut clip| {
+                    clip.name = format!(
+                        "Bake {} · bar {}",
+                        track + 1,
+                        clip.start_ticks / bar.max(1) + 1
+                    );
+                    (*track, clip)
+                })
+            })
+            .collect();
+        if midi_clips.is_empty() && audio_clips.is_empty() && control_clips.is_empty() {
             self.set_message("Nothing recorded".to_string());
             return;
         }
@@ -6989,7 +7086,25 @@ impl GlitcherZApp {
                 audio_written.push(track);
             }
         }
-        if midi_written.is_empty() && audio_written.is_empty() {
+        let mut control_written = Vec::new();
+        for (track, clip) in control_clips {
+            let pushed = self
+                .project_mut()
+                .control_tracks
+                .get_mut(track)
+                .map(|t| {
+                    if t.clips.len() >= MAX_CLIPS_PER_TRACK {
+                        return false;
+                    }
+                    t.clips.push(clip);
+                    true
+                })
+                .unwrap_or(false);
+            if pushed {
+                control_written.push(track);
+            }
+        }
+        if midi_written.is_empty() && audio_written.is_empty() && control_written.is_empty() {
             self.session.restore(before);
             self.set_message("Recording discarded: the target track has no room".to_string());
             return;
@@ -7001,6 +7116,10 @@ impl GlitcherZApp {
         for &track in &audio_written {
             self.send_audio_clips_for_track(track);
             self.sync_clip_row(timeline::TimelineLane::Audio, track);
+        }
+        for &track in &control_written {
+            self.send_control_clips(track);
+            self.sync_clip_row(timeline::TimelineLane::Control, track);
         }
         // R5: land the user on the take they just recorded.
         let mut new_selection = Vec::new();
@@ -7034,6 +7153,21 @@ impl GlitcherZApp {
                 });
             }
         }
+        for &track in &control_written {
+            if let Some(len) = self
+                .project()
+                .control_tracks
+                .get(track)
+                .map(|track| track.clips.len())
+                .filter(|len| *len > 0)
+            {
+                new_selection.push(timeline::ClipSel {
+                    lane: timeline::TimelineLane::Control,
+                    track,
+                    clip: len - 1,
+                });
+            }
+        }
         if !new_selection.is_empty() {
             self.timeline_state.selection = new_selection;
             self.view = MainView::Timeline;
@@ -7057,6 +7191,13 @@ impl GlitcherZApp {
                 if audio_written.len() == 1 { "" } else { "s" }
             ));
         }
+        if !control_written.is_empty() {
+            parts.push(format!(
+                "curves into {} track{}",
+                control_written.len(),
+                if control_written.len() == 1 { "" } else { "s" }
+            ));
+        }
         self.set_message(format!("Recorded {}", parts.join(" and ")));
     }
 
@@ -7066,12 +7207,15 @@ impl GlitcherZApp {
             return;
         }
         self.recorder.reset();
+        self.control_recorder.reset();
         self.audio_take = None;
         self.engine.set_capture(false);
+        self.engine.clear_bakes();
         self.engine.set_audio_capture(false);
         self.engine.set_record_mute(0);
         self.capture_pending = None;
         self.capture_scratch.clear();
+        self.control_scratch.clear();
         self.audio_scratch.clear();
     }
 

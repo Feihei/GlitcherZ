@@ -507,7 +507,13 @@ curve→曲线轨，即"烘培"）；**一个输入只允许一个源，一个�
 - [x] **R5 收尾** ✅ 2026-11-01：录音后自动选中新 clip 并切到 Timeline、take 命名
   （`Take N · bar M`）、transport 实时输入电平条、输入 ring 溢出状态栏告警
   （每 burst 一次）。PDC 自动对齐依赖 S2-3，落地后再接；立体声对 / 多设备输入留作后续。
-- [ ] **R7 MIDI 烘培 / R8 控制烘培**：事件派发级 / 块边界采样级 tap，模型已允许连线（D26）
+- [x] **R7 MIDI 烘培 / R8 控制烘培** ✅ 2026-11-01：引擎 `RtGraph` 烘培表 +
+  块末 `baked_notes` / `baked_controls`，`EngineCommand::{SetMidiBake,SetCtrlBake,ClearBakes}`；
+  MIDI 在事件派发处抓取（Arp / Portamento 输出 → MIDI 轨），控制源在块边界抓值
+  （LFO / Envelope / Portamento / Curve Map → 曲线轨）；`CaptureTap` 增控制 ring，
+  UI `ControlRecorder` + `control_take_clip`（≤64 锚点、整小节 span）。
+  MIDI / 音频 / 曲线 take 同一次 undo。限制：Timeline 曲线出口 → 曲线输入仍未采样，
+  见 spec R8 备注
 
 接下来（按 review 文档的优先级）：
 

@@ -38,6 +38,13 @@ use crate::realtime::delay::DelayProcessor;
 use crate::realtime::effect::Smoothed;
 use crate::realtime::effect::descriptor::{ParamSpec, Unit};
 use crate::realtime::events::{MAX_EVENT_CABLES, MAX_EVENT_FANOUT, NodeEvents, RtEvent};
+
+/// Bake sources (R7/R8) a graph can watch at once. One per MIDI-effect /
+/// control node wired into a recording input; the take matrix is small.
+pub const MAX_BAKE_SOURCES: usize = 8;
+/// Baked MIDI events a block can carry. Two sources of 32 events already fill
+/// it; the UI drains every block, so overflow only loses a pathological burst.
+pub const MAX_BAKED_EVENTS: usize = 64;
 use crate::realtime::gain::GainProcessor;
 use crate::realtime::map::MapSpec;
 use crate::realtime::mixer::MixerProcessor;
@@ -353,6 +360,17 @@ pub struct RtGraph {
     /// is unambiguous.
     last_edge_cc: [i16; MAX_NODES],
     last_edge_bend: [i32; MAX_NODES],
+    /// Bake sources (R7/R8): node id + MIDI-track bitmask it records into.
+    bake_midi: [(u64, u16); MAX_BAKE_SOURCES],
+    bake_midi_len: u8,
+    /// Bake sources for curve tracks.
+    bake_ctrl: [(u64, u16); MAX_BAKE_SOURCES],
+    bake_ctrl_len: u8,
+    /// This block's baked events, drained by the block runner.
+    baked_notes: [(RtEvent, u16); MAX_BAKED_EVENTS],
+    baked_notes_len: u8,
+    baked_controls: [(f32, u16); MAX_BAKE_SOURCES],
+    baked_controls_len: u8,
 }
 
 /// Pitches released per block by a panic sweep. Kept below the plugin hosts'
@@ -461,13 +479,78 @@ impl RtGraph {
             last_bend: [i32::MIN; MAX_AUTO_TRACKS],
             last_edge_cc: [-1; MAX_NODES],
             last_edge_bend: [i32::MIN; MAX_NODES],
+            bake_midi: [(0, 0); MAX_BAKE_SOURCES],
+            bake_midi_len: 0,
+            bake_ctrl: [(0, 0); MAX_BAKE_SOURCES],
+            bake_ctrl_len: 0,
+            baked_notes: [(RtEvent::Note(NoteEvent::Off { note: 0 }), 0); MAX_BAKED_EVENTS],
+            baked_notes_len: 0,
+            baked_controls: [(0.0, 0); MAX_BAKE_SOURCES],
+            baked_controls_len: 0,
         }
+    }
+
+    /// Arms / updates one MIDI bake source (R7): every event this node emits is
+    /// copied to the bake buffer for the track bitmask. RT-safe.
+    pub fn set_midi_bake(&mut self, node_id: u64, tracks: u16) {
+        set_bake(
+            &mut self.bake_midi,
+            &mut self.bake_midi_len,
+            node_id,
+            tracks,
+        );
+    }
+
+    /// Arms / updates one control bake source (R8). RT-safe.
+    pub fn set_ctrl_bake(&mut self, node_id: u64, tracks: u16) {
+        set_bake(
+            &mut self.bake_ctrl,
+            &mut self.bake_ctrl_len,
+            node_id,
+            tracks,
+        );
+    }
+
+    /// Clears every bake source (end of a take). RT-safe.
+    pub fn clear_bakes(&mut self) {
+        self.bake_midi_len = 0;
+        self.bake_ctrl_len = 0;
+        self.baked_notes_len = 0;
+        self.baked_controls_len = 0;
+    }
+
+    /// Number of baked MIDI events in the last block. RT-safe.
+    pub fn baked_note_len(&self) -> usize {
+        usize::from(self.baked_notes_len)
+    }
+
+    /// One baked MIDI event + its track bitmask. RT-safe.
+    pub fn baked_note(&self, index: usize) -> Option<(RtEvent, u16)> {
+        self.baked_notes.get(index).copied()
+    }
+
+    /// Number of baked control values in the last block. RT-safe.
+    pub fn baked_control_len(&self) -> usize {
+        usize::from(self.baked_controls_len)
+    }
+
+    /// One baked control value + its track bitmask. RT-safe.
+    pub fn baked_control(&self, index: usize) -> Option<(f32, u16)> {
+        self.baked_controls.get(index).copied()
+    }
+
+    /// Drops the last block's baked events after the caller consumed them.
+    /// RT-safe.
+    pub fn clear_baked(&mut self) {
+        self.baked_notes_len = 0;
+        self.baked_controls_len = 0;
     }
 
     /// Installs a node directly (used only by default-graph construction
     /// before stream start). **Not RT-safe**.
     fn install(
         &mut self,
+
         slot: usize,
         node_id: u64,
         processor: Box<dyn Processor>,
@@ -629,6 +712,29 @@ impl RtGraph {
                             let _ = dispatch_ctrl(&mut *target.processor, ctrl);
                         }
                     }
+                }
+            }
+            // R7/R8: bake the events this node produced before they reach their
+            // targets. The buffer is fixed; a pathological burst is truncated.
+            let bake_midi = bake_bits(&self.bake_midi, self.bake_midi_len, node.node_id);
+            if bake_midi != 0 {
+                for event in node.events.iter() {
+                    let index = usize::from(self.baked_notes_len);
+                    if index >= MAX_BAKED_EVENTS {
+                        break;
+                    }
+                    self.baked_notes[index] = (event, bake_midi);
+                    self.baked_notes_len += 1;
+                }
+            }
+            let bake_ctrl = bake_bits(&self.bake_ctrl, self.bake_ctrl_len, node.node_id);
+            if bake_ctrl != 0
+                && let Some(value) = control
+            {
+                let index = usize::from(self.baked_controls_len);
+                if index < MAX_BAKE_SOURCES {
+                    self.baked_controls[index] = (value, bake_ctrl);
+                    self.baked_controls_len += 1;
                 }
             }
             self.slots[s] = Some(node);
@@ -2745,6 +2851,43 @@ fn chain_processor(kind: usize, sample_rate: f32) -> Box<dyn Processor> {
         1 => Box::new(DelayProcessor::new(sample_rate)),
         _ => Box::new(ChannelStripProcessor::new_at(sample_rate)),
     }
+}
+
+/// Inserts or updates one bake source; a full table drops the newest. RT-safe.
+fn set_bake(table: &mut [(u64, u16); MAX_BAKE_SOURCES], len: &mut u8, node_id: u64, tracks: u16) {
+    if tracks == 0 {
+        // Clearing one source: compact the table.
+        let count = usize::from(*len);
+        let mut write = 0;
+        for read in 0..count {
+            if table[read].0 != node_id {
+                table[write] = table[read];
+                write += 1;
+            }
+        }
+        *len = write as u8;
+        return;
+    }
+    let count = usize::from(*len);
+    for entry in table.iter_mut().take(count) {
+        if entry.0 == node_id {
+            entry.1 = tracks;
+            return;
+        }
+    }
+    if count < MAX_BAKE_SOURCES {
+        table[count] = (node_id, tracks);
+        *len += 1;
+    }
+}
+
+/// Track bitmask for one node in a bake table. RT-safe.
+fn bake_bits(table: &[(u64, u16); MAX_BAKE_SOURCES], len: u8, node_id: u64) -> u16 {
+    table
+        .iter()
+        .take(usize::from(len))
+        .find_map(|(id, tracks)| (*id == node_id).then_some(*tracks))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -5027,5 +5170,29 @@ mod tests {
             compiler.has_cable(s2, s_master),
             "audio bypass still rejoins the chain"
         );
+    }
+
+    #[test]
+    fn bake_tables_upsert_clear_and_share_a_source() {
+        use super::{MAX_BAKE_SOURCES, bake_bits, set_bake};
+        let mut table = [(0u64, 0u16); MAX_BAKE_SOURCES];
+        let mut len = 0u8;
+        set_bake(&mut table, &mut len, 7, 0b011);
+        assert_eq!(bake_bits(&table, len, 7), 0b011);
+        // A second call for the same source updates the bitmask in place.
+        set_bake(&mut table, &mut len, 7, 0b101);
+        assert_eq!(len, 1);
+        assert_eq!(bake_bits(&table, len, 7), 0b101);
+        // A zero bitmask removes the entry.
+        set_bake(&mut table, &mut len, 7, 0);
+        assert_eq!(len, 0);
+        assert_eq!(bake_bits(&table, len, 7), 0);
+
+        let mut graph = RtGraph::new(128);
+        graph.set_midi_bake(9, 0b001);
+        graph.set_ctrl_bake(9, 0b010);
+        graph.clear_bakes();
+        assert_eq!(graph.baked_note_len(), 0);
+        assert_eq!(graph.baked_control_len(), 0);
     }
 }

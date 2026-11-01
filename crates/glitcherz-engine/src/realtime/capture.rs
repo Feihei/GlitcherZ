@@ -43,9 +43,28 @@ pub struct CapturedNote {
     pub track: Option<usize>,
 }
 
+/// One captured control value (R8) with the transport position it was sampled
+/// at and the curve track it is baked into.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CapturedControl {
+    /// Transport position in ticks.
+    pub ticks: f64,
+    /// Normalized control value (`-1..1`), as published by the control node.
+    pub value: f32,
+    /// Curve track addressed by the recording input.
+    pub track: usize,
+}
+
 /// Creates the capture ring. **Not RT-safe** (allocates); call before starting
 /// the stream.
 pub fn capture_channel(capacity: usize) -> (Producer<CapturedNote>, Consumer<CapturedNote>) {
+    RingBuffer::new(capacity)
+}
+
+/// Creates the control-capture ring (R8). **Not RT-safe**.
+pub fn control_capture_channel(
+    capacity: usize,
+) -> (Producer<CapturedControl>, Consumer<CapturedControl>) {
     RingBuffer::new(capacity)
 }
 
@@ -56,6 +75,7 @@ pub fn capture_channel(capacity: usize) -> (Producer<CapturedNote>, Consumer<Cap
 /// that never records pays one branch per live event and nothing else.
 pub struct CaptureTap {
     tx: Producer<CapturedNote>,
+    control_tx: Producer<CapturedControl>,
     enabled: bool,
     /// Published drop count (shared with the control thread). Written only by
     /// this thread, read with `Relaxed` — a torn read is impossible for a
@@ -69,8 +89,26 @@ pub struct CaptureTap {
 impl CaptureTap {
     /// Constructs. **Not RT-safe** (takes ownership of a pre-built producer).
     pub fn new(tx: Producer<CapturedNote>, overflow: Arc<AtomicU64>) -> Self {
+        let (control_tx, control_rx) = control_capture_channel(CAPTURE_QUEUE_CAPACITY);
+        drop(control_rx);
         Self {
             tx,
+            control_tx,
+            enabled: false,
+            overflow,
+            dropped: 0,
+        }
+    }
+
+    /// Constructs with a live control ring (R8). **Not RT-safe**.
+    pub fn with_control(
+        tx: Producer<CapturedNote>,
+        control_tx: Producer<CapturedControl>,
+        overflow: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            tx,
+            control_tx,
             enabled: false,
             overflow,
             dropped: 0,
@@ -113,6 +151,25 @@ impl CaptureTap {
             .push(CapturedNote {
                 ticks,
                 event,
+                track,
+            })
+            .is_err()
+        {
+            self.dropped = self.dropped.saturating_add(1);
+            self.overflow.store(self.dropped, Ordering::Relaxed);
+        }
+    }
+
+    /// Stamps and queues one block-sampled control value (R8). **RT-safe**.
+    pub fn control(&mut self, ticks: f64, value: f32, track: usize) {
+        if !self.enabled {
+            return;
+        }
+        if self
+            .control_tx
+            .push(CapturedControl {
+                ticks,
+                value,
                 track,
             })
             .is_err()

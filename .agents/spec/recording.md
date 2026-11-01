@@ -1,7 +1,8 @@
 # Spec: 节拍器与录音（Metronome & Recording）
 
 > 状态：实施中（2026-11-01）。R1 节拍器、R2 录音骨架、R3 硬件 MIDI 输入、**R6 轨输入口**、
-> **R4 音频录音**、**R5 收尾**已交付；R7/R8 多类型采集待实施（PDC 自动对齐并入 S2-3）。
+> **R4 音频录音**、**R5 收尾**、**R7 MIDI 烘培 / R8 控制烘培**已交付；
+> PDC 自动对齐并入 S2-3，Timeline 曲线出口再采样留作后续。
 > 关联：`plan.md`「S2 补最短的板」、`review-2026-11-01.md`、
 > `spec/audio-track.md`（音频轨播放与 trim）、`spec/tempo-meter.md`（tick 时钟 / 拍号）。
 > 前置事实：引擎已有完整的 tick 时钟（`Sequencer::position_ticks` + `base_bpm` +
@@ -169,10 +170,16 @@ LFO/curve ──automation──► Curve 1 输入口  （R8：块边界采样 t
   录音后自动选中新 clip（MIDI 与音频都选中，并切到 Timeline）、take 命名
   （`Take N · bar M`）、transport 输入电平条、输入 ring 溢出告警。
   PDC 自动对齐待 S2-3；立体声对 / 多设备输入留作后续。
-- [ ] **R7 MIDI 烘培**（D26 第二类 tap）：`RtGraph` 事件派发处按目标 slot 采集，
-  把"过完 Arp / Portamento 的音符"写进 MIDI 轨；需与 R6 的会话结构共用。
-- [ ] **R8 控制烘培**（D26 第四类 tap）：块边界采样 LFO / curve 输出，
-  写进曲线轨（`ControlClip`）；曲线轨输入口到这时才真正 armed。
+- [x] **R7 MIDI 烘培**（D26 第二类 tap）✅ 2026-11-01：`RtGraph` 在事件派发处按
+  node_id + 轨位图抓取本块事件（`baked_notes`），`BlockRunner` 用块末 transport tick
+  写入 capture ring；`EngineCommand::SetMidiBake{node_id, tracks}` / `ClearBakes`。
+  UI 把 Arp / Portamento → MIDI 轨输入识别为可录，Rec 时下发位图、Stop 时清空。
+- [x] **R8 控制烘培**（D26 第四类 tap）✅ 2026-11-01：块边界抓取控制节点的
+  `NodeEvents.control`（`baked_controls`），经独立 `CapturedControl` ring 回到 UI；
+  `ControlRecorder` 分组 + 循环覆盖，`control_take_clip` 生成 `ControlClip`
+  （≤64 锚点，与引擎固定表一致；整小节 span）。MIDI / 音频 / 曲线 take 同一次 undo。
+  **限制**：源仅支持**控制输出节点**（LFO / Envelope / Portamento / Curve Map）；
+  Timeline 曲线出口 → 曲线输入的再采样尚未实现，按 Rec 会明确拒绝。
 
 ## 5. 轨输入口与录音归属（R6，2026-11-01 用户裁定）
 

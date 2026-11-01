@@ -326,6 +326,16 @@ pub enum EngineCommand {
     /// the timeline's routing table exactly like [`EngineCommand::Note`], so a
     /// controller follows the same path as the notes it shapes.
     Ctrl { track: usize, ctrl: RtCtrl },
+    /// Arm / update a MIDI bake source (R7): the node's event output is copied
+    /// into the capture ring for the tracks in the bitmask (bit `n` = track
+    /// `n`). `tracks == 0` clears that source.
+    SetMidiBake { node_id: u64, tracks: u16 },
+    /// Arm / update a control bake source (R8): the node's block control value
+    /// is copied into the control capture ring for the curve tracks in the
+    /// bitmask. `tracks == 0` clears that source.
+    SetCtrlBake { node_id: u64, tracks: u16 },
+    /// Clear every bake source (take ended). RT-safe.
+    ClearBakes,
     /// Sequencer transport / configuration.
     Sequencer(SequencerCommand),
     /// Enables / disables the capture tap (spec `.agents/spec/recording.md`
@@ -381,6 +391,9 @@ mod tests {
             EngineCommand::NoteAtNode { .. } => f32::NAN,
             EngineCommand::CtrlAtNode { .. } => f32::NAN,
             EngineCommand::Ctrl { .. } => f32::NAN,
+            EngineCommand::SetMidiBake { .. } => f32::NAN,
+            EngineCommand::SetCtrlBake { .. } => f32::NAN,
+            EngineCommand::ClearBakes => f32::NAN,
             EngineCommand::Sequencer(SequencerCommand::SetBpm(value)) => value,
             EngineCommand::Sequencer(_) => f32::NAN,
             EngineCommand::SetCapture(_) => f32::NAN,

@@ -27,9 +27,13 @@
 
 use std::collections::BTreeMap;
 
+use glitcherz_engine::realtime::CapturedControl;
 use glitcherz_engine::realtime::CapturedNote;
 use glitcherz_engine::realtime::commands::NoteEvent;
-use glitcherz_model::{MAX_ARRANGEMENT_TICKS, MAX_CLIP_NOTES, MidiClip, Note};
+use glitcherz_model::{
+    AutoPoint, ControlClip, CurveInterp, MAX_ARRANGEMENT_TICKS, MAX_CLIP_NOTES, MAX_CURVE_POINTS,
+    MidiClip, Note,
+};
 
 /// Where the recorder is in its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +288,177 @@ impl MidiRecorder {
         notes.sort_by_key(|n| (n.start, n.note, n.length, n.velocity));
         Some(notes)
     }
+}
+
+/// Curve-track baking recorder (R8): block-sampled control values grouped by
+/// track. Ownership mirrors [`MidiRecorder`] (the engine only samples), and a
+/// loop pass overwrites the previous one like a MIDI take.
+pub struct ControlRecorder {
+    phase: RecordPhase,
+    tracks: Vec<usize>,
+    pub start_ticks: f64,
+    points: BTreeMap<usize, Vec<(f64, f32)>>,
+    last_position: f64,
+    passes: u32,
+}
+
+impl Default for ControlRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ControlRecorder {
+    /// Idle recorder.
+    pub fn new() -> Self {
+        Self {
+            phase: RecordPhase::Idle,
+            tracks: Vec::new(),
+            start_ticks: 0.0,
+            points: BTreeMap::new(),
+            last_position: 0.0,
+            passes: 0,
+        }
+    }
+
+    /// Whether a take is running.
+    pub fn is_active(&self) -> bool {
+        self.phase != RecordPhase::Idle
+    }
+
+    /// Armed curve tracks.
+    pub fn tracks(&self) -> &[usize] {
+        &self.tracks
+    }
+
+    /// Starts a take. `tracks` = curve tracks armed by `Timeline In` wiring.
+    pub fn begin(&mut self, mut tracks: Vec<usize>, start_ticks: f64, position: f64) {
+        tracks.sort_unstable();
+        tracks.dedup();
+        self.phase = RecordPhase::PreRoll;
+        self.tracks = tracks;
+        self.start_ticks = start_ticks;
+        self.points = self.tracks.iter().map(|&t| (t, Vec::new())).collect();
+        self.last_position = position;
+        self.passes = 0;
+    }
+
+    /// Drops everything and returns to idle.
+    pub fn reset(&mut self) {
+        self.phase = RecordPhase::Idle;
+        self.tracks.clear();
+        self.points.clear();
+        self.passes = 0;
+    }
+
+    /// Promotes pre-roll and clears every take on a backwards jump (loop wrap
+    /// / seek), matching the MIDI recorder's last-pass-wins rule.
+    pub fn observe_position(&mut self, position: f64) {
+        if self.phase == RecordPhase::PreRoll && position >= self.start_ticks {
+            self.phase = RecordPhase::Recording;
+        }
+        if self.phase == RecordPhase::Recording && position + 0.5 < self.last_position {
+            for points in self.points.values_mut() {
+                points.clear();
+            }
+            self.passes = self.passes.saturating_add(1);
+        }
+        self.last_position = position;
+    }
+
+    /// Feeds one block-sampled value. Events before the start tick (pre-roll)
+    /// are discarded by timestamp.
+    pub fn push(&mut self, captured: CapturedControl) {
+        if self.phase == RecordPhase::Idle || captured.ticks < self.start_ticks {
+            return;
+        }
+        let Some(points) = self.points.get_mut(&captured.track) else {
+            return;
+        };
+        self.phase = RecordPhase::Recording;
+        // The engine already clamps the control axis; keep a corrupted value
+        // from reaching the document.
+        let value = if captured.value.is_finite() {
+            captured.value.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        points.push((captured.ticks, value));
+    }
+
+    /// Ends the take: `(track, absolute tick/control samples)`, sorted.
+    pub fn finish(&mut self, _position: f64) -> Vec<(usize, Vec<(f64, f32)>)> {
+        let tracks: Vec<usize> = self.tracks.clone();
+        let mut out = Vec::new();
+        for track in tracks {
+            if let Some(points) = self.points.remove(&track)
+                && !points.is_empty()
+            {
+                out.push((track, points));
+            }
+        }
+        self.phase = RecordPhase::Idle;
+        self.tracks.clear();
+        self.points.clear();
+        self.passes = 0;
+        out
+    }
+}
+
+/// Wraps one curve take into a `ControlClip`: bounded to
+/// [`MAX_CURVE_POINTS`] anchors (the engine's fixed table), uniformly thinned
+/// when the take is longer, and spanning whole bars like a MIDI take.
+pub fn control_take_clip(
+    start_ticks: f64,
+    samples: &[(f64, f32)],
+    bar_ticks: u32,
+) -> Option<ControlClip> {
+    if samples.is_empty() {
+        return None;
+    }
+    let bar = u64::from(bar_ticks.max(1));
+    let start =
+        (start_ticks.round().max(0.0) as u64).min(MAX_ARRANGEMENT_TICKS.saturating_sub(bar));
+    let mut relative: Vec<(u64, f32)> = samples
+        .iter()
+        .map(|(tick, value)| {
+            let rel = (tick - start_ticks).round().max(0.0) as u64;
+            (rel, *value)
+        })
+        .collect();
+    relative.sort_by_key(|(tick, _)| *tick);
+    relative.dedup_by_key(|(tick, _)| *tick);
+    let end_rel = relative.last().map(|(tick, _)| *tick).unwrap_or(0);
+    let span = (end_rel.div_ceil(bar) * bar).max(bar);
+    let limit = MAX_ARRANGEMENT_TICKS.saturating_sub(start).max(1);
+    let span = span.min(limit) as u32;
+    let target = MAX_CURVE_POINTS.max(2);
+    let curve: Vec<AutoPoint> = if relative.len() <= target {
+        relative
+            .iter()
+            .map(|(tick, value)| AutoPoint {
+                tick: (*tick).min(u64::from(span).saturating_sub(1)) as u32,
+                value: *value,
+            })
+            .collect()
+    } else {
+        (0..target)
+            .map(|i| {
+                let index = i * (relative.len() - 1) / (target - 1);
+                let (tick, value) = relative[index];
+                AutoPoint {
+                    tick: tick.min(u64::from(span).saturating_sub(1)) as u32,
+                    value,
+                }
+            })
+            .collect()
+    };
+    let mut clip = ControlClip::new(start as u32);
+    clip.span_ticks = span;
+    clip.loop_ticks = span;
+    clip.interp = CurveInterp::Linear;
+    clip.curve = curve;
+    Some(clip)
 }
 
 /// Closes one open note into `take` (bounds-checked by [`MAX_CLIP_NOTES`]).
@@ -629,6 +804,43 @@ mod tests {
             u64::from(clip.start_ticks) + u64::from(clip.span_ticks),
             MAX_ARRANGEMENT_TICKS
         );
+    }
+
+    #[test]
+    fn control_baking_filters_pre_roll_and_thins_to_the_point_cap() {
+        use glitcherz_engine::realtime::CapturedControl;
+        let mut recorder = super::ControlRecorder::new();
+        recorder.begin(vec![2], 960.0, 0.0);
+        recorder.observe_position(960.0);
+        recorder.push(CapturedControl {
+            ticks: 500.0,
+            value: 0.5,
+            track: 2,
+        });
+        assert_eq!(recorder.finish(0.0).len(), 0, "pre-roll is discarded");
+
+        let mut recorder = super::ControlRecorder::new();
+        recorder.begin(vec![2], 0.0, 0.0);
+        for i in 0..200 {
+            recorder.push(CapturedControl {
+                ticks: f64::from(i * 10),
+                value: (i as f32 / 200.0) * 2.0 - 1.0,
+                track: 2,
+            });
+        }
+        let takes = recorder.finish(2000.0);
+        assert_eq!(takes.len(), 1);
+        assert_eq!(takes[0].0, 2);
+        let clip = super::control_take_clip(0.0, &takes[0].1, 960).expect("clip");
+        assert!(
+            clip.curve.len() <= glitcherz_model::MAX_CURVE_POINTS,
+            "bounded by the engine's fixed table"
+        );
+        assert_eq!(
+            clip.span_ticks, 2880,
+            "the last sample rounds to three bars"
+        );
+        assert!(clip.curve.iter().all(|p| p.value >= -1.0 && p.value <= 1.0));
     }
 
     #[test]

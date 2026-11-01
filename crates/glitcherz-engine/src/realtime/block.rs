@@ -10,6 +10,7 @@ use crate::realtime::automation::MAX_AUTO_TRACKS;
 use crate::realtime::capture::CaptureTap;
 use crate::realtime::commands::{EngineCommand, NoteEvent, SequencerCommand};
 use crate::realtime::context::ProcessContext;
+use crate::realtime::events::RtEvent;
 use crate::realtime::graph::{GraphLevels, GraphUpdate, NO_EDGE, RtGraph, TIMELINE_IN};
 use crate::realtime::metronome::Metronome;
 use crate::realtime::sequencer::{RtCtrl, Sequencer, SequencerSink};
@@ -308,6 +309,34 @@ impl BlockRunner {
         // 5. The node graph processes one block (topological order: sum inputs → process in place → master output).
         let levels: GraphLevels = self.graph.process_block(&ctx);
 
+        // 5a. Bake taps (R7/R8): events / control values produced *inside* the
+        // graph carry the block's transport position. Notes only for R7 —
+        // controllers shape a performance but are not part of the take.
+        let bake_ticks = self.sequencer.position_ticks();
+        for index in 0..self.graph.baked_note_len() {
+            let Some((event, tracks)) = self.graph.baked_note(index) else {
+                continue;
+            };
+            if let RtEvent::Note(note) = event {
+                for track in 0..MAX_AUTO_TRACKS.min(16) {
+                    if tracks & (1 << track) != 0 {
+                        self.capture.note(bake_ticks, note, Some(track));
+                    }
+                }
+            }
+        }
+        for index in 0..self.graph.baked_control_len() {
+            let Some((value, tracks)) = self.graph.baked_control(index) else {
+                continue;
+            };
+            for track in 0..MAX_AUTO_TRACKS.min(16) {
+                if tracks & (1 << track) != 0 {
+                    self.capture.control(bake_ticks, value, track);
+                }
+            }
+        }
+        self.graph.clear_baked();
+
         // 5b. Metronome (spec `recording.md` D1): beat tracking and the click
         // buffer, filled **after** the graph so the click stays outside it.
         // `tick` also owns the beat tracker, which is why it must see the
@@ -480,6 +509,13 @@ impl BlockRunner {
                 // Not captured (R6 records notes; curve baking is R8).
                 let _ = self.graph.track_ctrl(track, ctrl);
             }
+            EngineCommand::SetMidiBake { node_id, tracks } => {
+                self.graph.set_midi_bake(node_id, tracks);
+            }
+            EngineCommand::SetCtrlBake { node_id, tracks } => {
+                self.graph.set_ctrl_bake(node_id, tracks);
+            }
+            EngineCommand::ClearBakes => self.graph.clear_bakes(),
             EngineCommand::SetCapture(enabled) => self.capture.configure(enabled),
             EngineCommand::Sequencer(cmd) => self.apply_sequencer_command(cmd),
             EngineCommand::Panic => {

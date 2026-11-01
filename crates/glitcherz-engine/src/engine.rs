@@ -110,6 +110,9 @@ pub struct AudioEngine {
     /// stamped with the transport position, drained by
     /// [`AudioEngine::drain_captured`] on the control thread.
     capture: rtrb::Consumer<crate::realtime::CapturedNote>,
+    /// Control capture ring (R8): block-sampled control values baked into a
+    /// curve track, drained by [`AudioEngine::drain_captured_controls`].
+    capture_control: rtrb::Consumer<crate::realtime::CapturedControl>,
     /// Cumulative count of captured events the ring could not hold. Read by
     /// [`AudioEngine::capture_overflow`] so the UI can warn instead of
     /// silently losing notes.
@@ -175,8 +178,14 @@ impl AudioEngine {
         // producer, the control side keeps the consumer for `drain_captured`.
         let (capture_tx, capture_rx) =
             crate::realtime::capture_channel(crate::realtime::CAPTURE_QUEUE_CAPACITY);
+        let (control_tx, control_rx) =
+            crate::realtime::control_capture_channel(crate::realtime::CAPTURE_QUEUE_CAPACITY);
         let capture_overflow = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let capture = crate::realtime::CaptureTap::new(capture_tx, capture_overflow.clone());
+        let capture = crate::realtime::CaptureTap::with_control(
+            capture_tx,
+            control_tx,
+            capture_overflow.clone(),
+        );
         // Boxed on purpose: `BlockRunner` is ~50 KB (the graph carries a fixed
         // per-node event buffer table), and cpal's `build_output_stream` passes
         // the callback closure by value through a stack of generic
@@ -242,6 +251,7 @@ impl AudioEngine {
             audio_trash: audio_trash_rx,
             midi_trash: midi_trash_rx,
             capture: capture_rx,
+            capture_control: control_rx,
             capture_overflow,
             compiler,
             offline_runner: None,
@@ -282,6 +292,8 @@ impl AudioEngine {
         // path ever sends `SetCapture`.
         let (capture_tx, capture_rx) =
             crate::realtime::capture_channel(crate::realtime::CAPTURE_QUEUE_CAPACITY);
+        let (control_tx, control_rx) =
+            crate::realtime::control_capture_channel(crate::realtime::CAPTURE_QUEUE_CAPACITY);
         let capture_overflow = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let runner = Box::new(BlockRunner::new(
             FIXED_BLOCK_SIZE,
@@ -294,7 +306,11 @@ impl AudioEngine {
             recycle_tx,
             audio_trash_tx,
             midi_trash_tx,
-            crate::realtime::CaptureTap::new(capture_tx, capture_overflow.clone()),
+            crate::realtime::CaptureTap::with_control(
+                capture_tx,
+                control_tx,
+                capture_overflow.clone(),
+            ),
             feedback.clone(),
         ));
         Ok(Self {
@@ -305,6 +321,7 @@ impl AudioEngine {
             audio_trash: audio_trash_rx,
             midi_trash: midi_trash_rx,
             capture: capture_rx,
+            capture_control: control_rx,
             capture_overflow,
             compiler,
             offline_runner: Some(runner),
@@ -844,6 +861,30 @@ impl AudioEngine {
         while let Ok(captured) = self.capture.pop() {
             out.push(captured);
         }
+    }
+
+    /// R8: appends every block-sampled control value captured since the last
+    /// call. **Control thread only.**
+    pub fn drain_captured_controls(&mut self, out: &mut Vec<crate::realtime::CapturedControl>) {
+        while let Ok(captured) = self.capture_control.pop() {
+            out.push(captured);
+        }
+    }
+
+    /// R7: arms / updates a MIDI bake source for a track bitmask (`0` clears
+    /// that source). Returns `false` when the command queue is full.
+    pub fn set_midi_bake(&mut self, node_id: u64, tracks: u16) -> bool {
+        self.send(EngineCommand::SetMidiBake { node_id, tracks })
+    }
+
+    /// R8: arms / updates a control bake source for a track bitmask.
+    pub fn set_ctrl_bake(&mut self, node_id: u64, tracks: u16) -> bool {
+        self.send(EngineCommand::SetCtrlBake { node_id, tracks })
+    }
+
+    /// Clears every bake source. Returns `false` when the queue is full.
+    pub fn clear_bakes(&mut self) -> bool {
+        self.send(EngineCommand::ClearBakes)
     }
 
     /// Cumulative number of captured events the ring dropped because it was
