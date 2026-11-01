@@ -453,6 +453,9 @@ A 阶段**只补这三处，不开参数端口**（每参数一个输入口 = �
 
 用户裁定：**节拍器与录音同一闭环交付**；音频输入做成**图内 `NodeDoc::Input` 节点**；
 录音素材落 `<stem>.media/` + **相对路径**；顺序**先 MIDI 闭环后音频录音**。
+追加裁定（同日晚）：**patch 是显式基准**——录音归属由 `Timeline In` 的轨输入口连线决定，
+默认工程不预接、必须先手动连线；端口**类型匹配即可连**（乐器→音频轨、FX 后 MIDI→MIDI 轨、
+curve→曲线轨，即"烘培"）；**一个输入只允许一个源，一个源可扇出多个输入**。
 
 - [x] **R1 节拍器（引擎内）** ✅ 2026-11-01：`realtime/metronome.rs`（构造期预生成
   重拍/弱拍 click 表 + voice 播放）；`Sequencer` 增 `numerator`/`denominator` +
@@ -479,9 +482,15 @@ A 阶段**只补这三处，不开参数端口**（每参数一个输入口 = �
   该节点连到的乐器」快照（未接线且录音中回落 armed track）；Inspector 选中键盘节点时显示
   输入源面板、连接状态与目标乐器。设备绑定是文档编辑（一次 undo），不是应用配置。
   测试：`midi_input` 8 单元 + `node_ctrl_reaches_only_the_addressed_slot`。
-- [ ] **R4 音频录音**：`NodeDoc::Input` + `InputProcessor` + cpal 输入双 ring +
-  `.media/` 相对路径 + 手动延迟 offset
+- [ ] **R6 轨输入口（录音归属，R4 前置）**：`Timeline In` 增每轨输入口
+  （`PortRef::TrackIn{kind,track}` + 版本 v10），录音归属 = 接线（D16 选中轨回落退役），
+  单一源 + 类型匹配即可连；`CapturedNote` 加 track 戳 → 多轨同录；干区冲突校验；
+  **轨输入接管**（设备接了轨输入口后直连 cable 休眠，纯派生、无 mute 状态，D33）；
+  `SetRecordMute` 其他轨静音选项；punch out（D21–D33，spec §5）
+- [ ] **R4 音频录音**（改用轨输入口，`Input` 不带 `track` 字段）：`NodeDoc::Input` +
+  `InputProcessor` + cpal 输入双 ring + `.media/` 相对路径 + 手动延迟 offset
 - [ ] **R5 收尾**：录音后选中新 clip、输入电平表、溢出告警、PDC 自动对齐
+- [ ] **R7 MIDI 烘培 / R8 控制烘培**：事件派发级 / 块边界采样级 tap，模型已允许连线（D26）
 
 接下来（按 review 文档的优先级）：
 

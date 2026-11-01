@@ -101,7 +101,12 @@
 | 采集环 | capture ring | 采集抽头的 SPSC 队列；满则丢弃并累计溢出计数（D7） |
 | 输入源 | input source | 键盘节点监听的来源：电脑键盘或某个硬件 MIDI 端口（`MidiSource`，D18） |
 | 节点寻址 | node-addressed | 命令直接送到某个引擎节点，不经 track 扇出表（`NoteAtNode` / `CtrlAtNode`） |
-| 待录轨 | armed track | 录音落点 = 录制开始时的当前选中 MIDI 轨（D16） |
+| 轨输入口 | track input jack | `Timeline In` 上的每轨录音入口；语义是磁带机输入，只进数据、不改信号流（D21/D24） |
+| 录音归属 | record target | 由「哪条线的终点是这个轨输入口」决定，不再是选中状态（D22，取代 D16 的 armed track） |
+| 轨输入接管 | track takeover | 设备一旦接入某轨输入口，该设备的出口就只有那些轨；直连 cable **休眠**但不删除（D33）。永久语义，不做录音期临时静音 |
+| 休眠 | dormant | 保留在文档里、画成灰态、不产生派发的 cable（D33 接管后的直连线） |
+| 烘培 | bake | 把某处的实时信号/事件采下来写成该类型轨道的 clip（音频 → 音频轨、FX 后 MIDI → MIDI 轨、控制值 → 曲线轨，D24/D26） |
+| 待录轨 | armed track | **已退役**（D22 取代 D16）；旧语义 = 录制开始时的当前选中 MIDI 轨。新代码不要再造这个词 |
 | 录音片段 | take | 一次录音产出的 clip；一次 take = 一个 undo 步（D15） |
 | 录音素材目录 | media directory | 工程旁的 `<stem>.media/`，clip 存相对路径（D11） |
 | 片段 | clip | 钢琴卷帘编辑的音符集合 |
