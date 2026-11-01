@@ -11,8 +11,13 @@
 //! rather than being added), [`parse_project`] branches on `version` and runs
 //! the chain — `migrate` (≤ v4), `migrate_v5_to_v6` (< 6), `migrate_v6_to_v7`
 //! (< 7), `migrate_v7_to_v8` (< 8) and `migrate_v8_to_v9` (< 9).
+//!
+//! A file **newer** than this build is rejected outright: serde ignores unknown
+//! fields, so loading it would silently drop whatever the newer build added and
+//! the next save would persist that loss.
 
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use crate::Project;
 
@@ -58,18 +63,70 @@ pub enum ModelError {
     Serialize(#[from] ron::error::Error),
     #[error("invalid project file graph structure: {0}")]
     InvalidGraph(String),
+    #[error(
+        "project file is format v{file}, but this build only understands up to v{supported} \
+         -- open it with a newer GlitcherZ (saving it here would drop data)"
+    )]
+    NewerVersion { file: u32, supported: u32 },
+}
+
+/// Suffix of the in-progress file written by [`save_project`]. Left behind only
+/// if the process dies mid-save; the real file is then still intact.
+pub const TEMP_SUFFIX: &str = "tmp";
+
+/// Suffix of the previous revision kept by [`save_project`].
+pub const BACKUP_SUFFIX: &str = "bak";
+
+/// `path` with `.<suffix>` appended (not replacing the existing extension, so
+/// `song.glz` becomes `song.glz.tmp`).
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(".");
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+/// Serialized form used by [`save_project`]: borrows the document instead of
+/// cloning it (a save must not pay for a full deep copy of the project).
+#[derive(serde::Serialize)]
+struct ProjectFileRef<'a> {
+    version: u32,
+    project: &'a Project,
 }
 
 /// Saves the project as a `.glz` file (RON pretty format). **Not real-time**
 /// (disk IO).
+///
+/// The write is crash-safe: the text goes to `<name>.glz.tmp`, is flushed to
+/// disk, and only then replaces the real file with a rename (atomic on the
+/// same volume, on both NTFS and POSIX filesystems). If the process dies
+/// mid-save the previous project file is still complete on disk.
+///
+/// The replaced revision is kept as `<name>.glz.bak`. That copy is best
+/// effort: a locked or full `.bak` must never turn a good save into an error,
+/// because the new file is already durable by then.
 pub fn save_project(project: &Project, path: &Path) -> Result<(), ModelError> {
     project.validate().map_err(ModelError::InvalidGraph)?;
-    let file = ProjectFile {
-        version: PROJECT_VERSION,
-        project: project.clone(),
-    };
-    let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::new())?;
-    std::fs::write(path, text)?;
+    let text = ron::ser::to_string_pretty(
+        &ProjectFileRef {
+            version: PROJECT_VERSION,
+            project,
+        },
+        ron::ser::PrettyConfig::new(),
+    )?;
+
+    let temp = with_suffix(path, TEMP_SUFFIX);
+    {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(text.as_bytes())?;
+        // Without this the rename could publish a file whose bytes never
+        // reached the platter.
+        file.sync_all()?;
+    }
+    if path.exists() {
+        let _ = std::fs::copy(path, with_suffix(path, BACKUP_SUFFIX));
+    }
+    std::fs::rename(&temp, path)?;
     Ok(())
 }
 
@@ -101,6 +158,15 @@ pub fn parse_project(text: &str) -> Result<Project, ModelError> {
         }
         _ => (ron::from_str(text)?, PROJECT_VERSION),
     };
+    if version > PROJECT_VERSION {
+        // Serde silently ignores unknown fields, so "parsing fine" is not
+        // evidence of a lossless read: a newer file would lose whatever its
+        // own build added, and the next save would make that permanent.
+        return Err(ModelError::NewerVersion {
+            file: version,
+            supported: PROJECT_VERSION,
+        });
+    }
     project.migrate();
     if version < 6 {
         project.migrate_v5_to_v6();
@@ -345,6 +411,63 @@ mod tests {
         let text = ron::ser::to_string(&project).expect("serialization failed");
         let parsed = parse_project(&text).expect("parse failed");
         assert_eq!(project, parsed);
+    }
+
+    #[test]
+    fn a_save_is_atomic_and_keeps_the_previous_revision() {
+        let dir = std::env::temp_dir().join(format!("glitcherz_save_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("song.glz");
+
+        let mut project = demo_project();
+        save_project(&project, &path).expect("first save");
+        assert!(path.exists());
+        assert!(
+            !dir.join("song.glz.tmp").exists(),
+            "the temp file must be renamed onto the real file"
+        );
+        assert!(
+            !dir.join("song.glz.bak").exists(),
+            "there is nothing to back up before the first save"
+        );
+
+        project.metadata.tempo_bpm = 96.0;
+        save_project(&project, &path).expect("second save");
+        assert!(
+            !dir.join("song.glz.tmp").exists(),
+            "no temp file left behind"
+        );
+        // The backup is the revision the second save replaced.
+        let backup = load_project(&dir.join("song.glz.bak")).expect("backup loads");
+        assert!(
+            (backup.metadata.tempo_bpm - 140.0).abs() < 1e-9,
+            "the backup must hold the previous revision"
+        );
+        let current = load_project(&path).expect("current loads");
+        assert!((current.metadata.tempo_bpm - 96.0).abs() < 1e-9);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_from_a_newer_build_is_rejected() {
+        let newer = ProjectFile {
+            version: PROJECT_VERSION + 1,
+            project: demo_project(),
+        };
+        let text = ron::ser::to_string(&newer).expect("serialization failed");
+        assert!(
+            matches!(parse_project(&text), Err(ModelError::NewerVersion { .. })),
+            "a newer file must be refused instead of silently losing fields"
+        );
+
+        // The current version still round-trips.
+        let current = ProjectFile {
+            version: PROJECT_VERSION,
+            project: demo_project(),
+        };
+        let text = ron::ser::to_string(&current).expect("serialization failed");
+        assert!(parse_project(&text).is_ok());
     }
 
     #[test]
