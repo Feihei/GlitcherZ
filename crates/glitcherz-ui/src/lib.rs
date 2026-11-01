@@ -69,6 +69,7 @@ pub mod plugin_catalog;
 pub mod plugin_picker;
 pub mod plugin_window;
 pub mod project_files;
+pub mod recorder;
 pub mod timeline;
 
 /// Filter cutoff frequency slider range (logarithmic scale).
@@ -1444,6 +1445,21 @@ pub struct GlitcherZApp {
     /// Set when the click was turned on but the command queue was full, so
     /// the next frame retries instead of silently dropping the state change.
     metronome_pending: bool,
+    /// MIDI recording state machine (spec `recording.md` R2): pre-roll,
+    /// capture filtering, note pairing and the take → clip conversion.
+    recorder: recorder::MidiRecorder,
+    /// One frame's worth of captured events, drained into the recorder and
+    /// reused (the drain appends, the recorder consumes).
+    capture_scratch: Vec<glitcherz_engine::realtime::CapturedNote>,
+    /// Pre-roll length in bars (`0..=2`, spec D14; default one bar so a take
+    /// starts without the user having to count the click in).
+    record_pre_roll_bars: u8,
+    /// Desired capture-tap state that a full command queue refused; retried
+    /// every frame until it lands.
+    capture_pending: Option<bool>,
+    /// Capture-overflow count at the last warning, so a loss is reported once
+    /// per burst instead of every frame.
+    capture_overflow_seen: u64,
     /// The range-selection modal for a pending export (U7 D2).
     export_dialog_open: bool,
     /// Selected range inside the export dialog.
@@ -1591,6 +1607,11 @@ impl GlitcherZApp {
             metronome_on: false,
             metronome_gain: 0.6,
             metronome_pending: false,
+            recorder: recorder::MidiRecorder::new(),
+            capture_scratch: Vec::new(),
+            record_pre_roll_bars: 1,
+            capture_pending: None,
+            capture_overflow_seen: 0,
             export_dialog_open: false,
             export_range_choice: export_audio::ExportRange::FullSong,
             first_frame_logged: false,
@@ -4224,6 +4245,8 @@ impl GlitcherZApp {
     fn do_new(&mut self) {
         self.close_plugin_editor();
         self.editor_user_open = false;
+        // A take belongs to the document that is about to be replaced.
+        self.cancel_recording();
         self.send_sequencer(SequencerCommand::Stop);
         self.session.replace(Project::default());
         self.project_path = None;
@@ -4530,6 +4553,9 @@ impl GlitcherZApp {
 
     /// The blocking half of [`Self::do_open`].
     fn do_open_now(&mut self, path: PathBuf) {
+        // A take belongs to the document being replaced (the session is about
+        // to be swapped and the engine graph rebuilt).
+        self.cancel_recording();
         match glitcherz_model::load_project(&path) {
             Ok(project) => {
                 self.session.replace(project);
@@ -6107,6 +6133,185 @@ impl GlitcherZApp {
         self.engine.send(EngineCommand::Sequencer(cmd));
     }
 
+    // ---- MIDI recording (spec `recording.md` R2) ----
+
+    /// Per-frame recording housekeeping: takes whatever the capture tap
+    /// produced, feeds the state machine, and retries a capture toggle the
+    /// command queue refused.
+    fn poll_recording(&mut self) {
+        if let Some(desired) = self.capture_pending
+            && self.engine.set_capture(desired)
+        {
+            self.capture_pending = None;
+        }
+        self.drain_capture();
+        // The transport position only makes sense as a clock while it runs:
+        // a stopped (or auto-stopped) transport reads 0, which would look like
+        // a loop wrap and wipe the take.
+        if self.engine.is_playing() {
+            let position = f64::from(self.engine.musical_ticks().max(0.0));
+            self.recorder.observe_position(position);
+        }
+    }
+
+    /// Moves everything the capture tap has queued into the recorder.
+    fn drain_capture(&mut self) {
+        // The scratch buffer is taken out so the engine drain (which needs
+        // `&mut self.engine`) and the recorder (which needs `&mut self`) never
+        // borrow `self` at the same time.
+        let mut batch = std::mem::take(&mut self.capture_scratch);
+        self.engine.drain_captured(&mut batch);
+        let overflow = self.engine.capture_overflow();
+        if overflow > self.capture_overflow_seen {
+            let lost = overflow - self.capture_overflow_seen;
+            self.capture_overflow_seen = overflow;
+            self.set_message(format!(
+                "Recording dropped {lost} input events (UI fell behind)"
+            ));
+        }
+        for captured in batch.drain(..) {
+            self.recorder.push(captured);
+        }
+        self.capture_scratch = batch;
+    }
+
+    /// Starts a take into the selected track (spec D16: the selection is the
+    /// armed track in this version).
+    ///
+    /// Recording starts on a bar line: the transport jumps back by the
+    /// pre-roll, plays that many bars as a count-in (material and click are
+    /// audible, nothing is captured), then capture begins at the bar line
+    /// itself. At the very start of the song the pre-roll cannot go before
+    /// tick 0, so the take simply begins after the first bar of pre-roll.
+    fn start_recording(&mut self) {
+        if self.recorder.is_active() {
+            return;
+        }
+        let bar = f64::from(self.project().ticks_per_bar().max(1));
+        let now = f64::from(self.engine.musical_ticks().max(0.0));
+        // Forward to the next bar line (a position already on one stays).
+        let start = (now / bar).ceil() * bar;
+        let pre_roll = f64::from(self.record_pre_roll_bars) * bar;
+        let from = (start - pre_roll).max(0.0);
+        let record_start = from + pre_roll;
+        self.recorder.begin(self.selected_track, record_start, from);
+        if !self.engine.set_capture(true) {
+            self.capture_pending = Some(true);
+        }
+        self.engine.seek_ticks(from);
+        self.send_sequencer(SequencerCommand::Play);
+        let track = self.selected_track + 1;
+        if record_start > from {
+            let bars = self.record_pre_roll_bars;
+            self.set_message(format!("Recording track {track} after {bars} bar pre-roll"));
+        } else {
+            self.set_message(format!("Recording track {track}"));
+        }
+    }
+
+    /// Ends the take and writes it as a clip (one undo step, spec D15).
+    ///
+    /// Called by the record button and by every transport stop / pause path —
+    /// the take must be closed while the transport position still means
+    /// something, which is why `Stop` is sent only after this returns.
+    fn finish_recording(&mut self) {
+        if !self.recorder.is_active() {
+            return;
+        }
+        // Pull the last frames' events out of the ring before closing notes.
+        self.drain_capture();
+        let track = self.recorder.track;
+        // After a rewind the live position is 0, so the last observed playing
+        // position is the fallback (that is the real end of the take).
+        let end =
+            f64::from(self.engine.musical_ticks().max(0.0)).max(self.recorder.last_position());
+        let notes = self.recorder.finish(end);
+        self.engine.set_capture(false);
+        self.capture_pending = None;
+        if notes.is_empty() {
+            self.set_message("Nothing recorded".to_string());
+            return;
+        }
+        let note_count = notes.len();
+        // Start on the bar line the take was armed for; the span covers whole
+        // bars of material (a take must not loop).
+        let Some(clip) = recorder::take_clip(
+            self.recorder.start_ticks,
+            &notes,
+            self.project().ticks_per_bar(),
+        ) else {
+            self.set_message("Nothing recorded".to_string());
+            return;
+        };
+
+        let before = self.begin_edit();
+        let written = self
+            .project_mut()
+            .midi_tracks
+            .get_mut(track)
+            .map(|t| {
+                if t.clips.len() >= MAX_CLIPS_PER_TRACK {
+                    return false;
+                }
+                t.clips.push(clip);
+                true
+            })
+            .unwrap_or(false);
+        if !written {
+            self.set_message(format!(
+                "Recording discarded: track {} has no room for another clip",
+                track + 1
+            ));
+            return;
+        }
+        self.commit_edit("Record MIDI", before);
+        self.sync_clip_row(timeline::TimelineLane::Midi, track);
+        self.selected_track = track;
+        self.set_message(format!(
+            "Recorded {note_count} notes into track {}",
+            track + 1
+        ));
+    }
+
+    /// Drops the take in flight without writing a clip (new / open project).
+    fn cancel_recording(&mut self) {
+        if !self.recorder.is_active() {
+            return;
+        }
+        self.recorder.reset();
+        self.engine.set_capture(false);
+        self.capture_pending = None;
+        self.capture_scratch.clear();
+    }
+
+    /// Record button: start a take, or end the one in flight.
+    fn toggle_recording(&mut self) {
+        if self.recorder.is_active() {
+            self.finish_recording();
+        } else {
+            self.start_recording();
+        }
+    }
+
+    /// Transport stop, with the recording edge: the take is closed **before**
+    /// the transport rewinds (its end position would otherwise read 0).
+    fn stop_transport(&mut self) {
+        if self.recorder.is_active() {
+            self.finish_recording();
+        }
+        self.send_sequencer(SequencerCommand::Stop);
+    }
+
+    /// Transport pause, with the same recording edge: a take cannot survive a
+    /// pause (the gap would become one endless note), so it is closed here and
+    /// the position is kept for the next Play.
+    fn pause_transport(&mut self) {
+        if self.recorder.is_active() {
+            self.finish_recording();
+        }
+        self.engine.pause();
+    }
+
     fn send_note_on(&mut self, note: u8, velocity: f32) {
         self.send_to_vk_targets(NoteEvent::On { note, velocity });
         self.held_notes.insert(note);
@@ -6126,6 +6331,16 @@ impl GlitcherZApp {
     /// `&mut self`; the list is at most `MAX_MIDI_FANOUT` long.
     fn send_to_vk_targets(&mut self, event: NoteEvent) {
         if self.vk_targets.is_empty() {
+            // R2: an uncabled keyboard is silent in normal use, but a take
+            // must still work — while recording, the armed track takes the
+            // note directly (so what is heard is also what is captured).
+            if self.recorder.is_active() {
+                self.engine.send(EngineCommand::Note {
+                    track: self.recorder.track,
+                    event,
+                });
+                return;
+            }
             if matches!(event, NoteEvent::On { .. }) {
                 self.set_message(
                     "Keyboard has no destination: cable the input node to an instrument (Ctrl+L)"
@@ -6221,7 +6436,7 @@ impl GlitcherZApp {
                         ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::Space));
                         if !repeat {
                             if self.engine.is_playing() {
-                                self.engine.pause();
+                                self.pause_transport();
                             } else {
                                 self.send_sequencer(SequencerCommand::Play);
                             }
@@ -6323,6 +6538,14 @@ impl GlitcherZApp {
                 }
                 (egui::Key::X, true) => {
                     self.octave_base = (self.octave_base + 12).min(84);
+                }
+                (egui::Key::R, true) => {
+                    // Record (spec `recording.md` R2). While the piano roll owns
+                    // the keyboard (its modal command keys) `R` belongs to it,
+                    // and a live text edit keeps its own letters.
+                    if !roll_owns_focus && !text_edit_owns_keys {
+                        self.toggle_recording();
+                    }
                 }
                 _ => {
                     if let Some((_, semi)) = KEYMAP.iter().find(|(k, _)| *k == key) {
@@ -6431,7 +6654,7 @@ impl GlitcherZApp {
                 }
                 if ui.add(play_btn).on_hover_text("Space").clicked() {
                     if playing {
-                        self.engine.pause();
+                        self.pause_transport();
                     } else {
                         self.send_sequencer(SequencerCommand::Play);
                     }
@@ -6441,7 +6664,38 @@ impl GlitcherZApp {
                     .on_hover_text("Stop and rewind")
                     .clicked()
                 {
-                    self.send_sequencer(SequencerCommand::Stop);
+                    self.stop_transport();
+                }
+                // Record (spec `recording.md` R2): one take into the selected
+                // track, starting on the next bar line after the pre-roll.
+                let rec_active = self.recorder.is_active();
+                let mut rec_btn =
+                    egui::Button::new(if rec_active { "● Rec…" } else { "● Rec" });
+                if rec_active {
+                    rec_btn = rec_btn.fill(egui::Color32::from_rgb(150, 40, 40));
+                }
+                let rec_tip = if rec_active {
+                    format!(
+                        "Recording into track {} — click to end the take",
+                        self.recorder.track + 1
+                    )
+                } else {
+                    format!(
+                        "Record MIDI into the selected track ({}) — R",
+                        self.selected_track + 1
+                    )
+                };
+                if ui.add(rec_btn).on_hover_text(rec_tip).clicked() {
+                    self.toggle_recording();
+                }
+                if !rec_active {
+                    let pre = ui.add(
+                        egui::DragValue::new(&mut self.record_pre_roll_bars)
+                            .range(0..=2)
+                            .speed(0.1)
+                            .suffix(" bar"),
+                    );
+                    pre.on_hover_text("Pre-roll before recording starts (no capture)");
                 }
                 if ui.button("⏭").on_hover_text("Skip to end (End)").clicked() {
                     self.engine
@@ -12232,10 +12486,20 @@ impl eframe::App for GlitcherZApp {
         // `Vec`s must be released on the control thread).
         self.engine.reclaim_midi_clips();
 
+        // R2: recording housekeeping (spec `recording.md`) — drain the capture
+        // tap and advance pre-roll → recording. Runs before the transport
+        // edges below, which may close the take.
+        self.poll_recording();
+
         // Transport stop edge: automation no longer overrides; restore manual parameter values
         // per node.
         let playing = self.engine.is_playing();
         if self.was_playing && !playing {
+            // The transport can stop on its own (arrangement end); a take must
+            // still be written, using the last position it observed.
+            if self.recorder.is_active() {
+                self.finish_recording();
+            }
             self.push_node_params();
         }
         self.was_playing = playing;

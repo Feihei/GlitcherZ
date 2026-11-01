@@ -462,9 +462,15 @@ A 阶段**只补这三处，不开参数端口**（每参数一个输入口 = �
   transport 区 `Click` 开关 + 电平滑条；离线导出引擎恒关闭。
   测试：6 单元（拍长/静音/每拍一次/停走带静音/seek 不响/重拍加重）+ 4 集成审计
   （空图可听 / 未开静音 / 停走带静音 / **渲染 1 秒零堆分配**）
-- [ ] **R2 录音骨架**：`SetCapture(bool)` + `CapturedMidi` 回传 ring + 溢出计数；
-  UI 录音状态机（Idle/PreRoll/Recording）+ armed track + pre-roll；电脑键盘经引擎打戳；
-  停止落 clip、undo 一步
+- [x] **R2 录音骨架（MIDI，无硬件可验收）** ✅ 2026-11-01：引擎侧 `realtime/capture.rs`
+  （`CaptureTap` + `CapturedNote{ticks, event}` + 8192 ring + 溢出计数）、
+  `EngineCommand::SetCapture(bool)`、`AudioEngine::{set_capture, drain_captured, capture_overflow}`；
+  `BlockRunner` 在 `Note` / `NoteAtNode` 入口先取 `position_ticks()` 再入库（sequencer 排的音符
+  不经命令队列，天然不入 ring）。UI 侧 `recorder.rs`（`Idle/PreRoll/Recording` + on/off 配对 +
+  循环回卷清空 + `take_clip`）、`poll_recording` 每帧 drain、transport 区 `● Rec` 与 pre-roll
+  选择（0–2 小节）、`R` 快捷键；Stop / Pause / 自动停止都在倒回前落 clip，一次 take = 一个 undo 步。
+  测试：capture 5 单元 + `capture_rt_audit` 4 集成（含零堆分配与"sequencer 音符不入 ring"）+
+  recorder 13 单元。
 - [ ] **R3 midir 硬件 MIDI 输入**（`Arc<Mutex<Producer>>` 直推命令队列）
 - [ ] **R4 音频录音**：`NodeDoc::Input` + `InputProcessor` + cpal 输入双 ring +
   `.media/` 相对路径 + 手动延迟 offset

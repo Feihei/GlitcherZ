@@ -1,6 +1,6 @@
 # Spec: 节拍器与录音（Metronome & Recording）
 
-> 状态：规划中（2026-11-01）。R1 已交付，R2–R5 待实施。
+> 状态：实施中（2026-11-01）。R1 节拍器、R2 录音骨架已交付，R3–R5 待实施。
 > 关联：`plan.md`「S2 补最短的板」、`review-2026-11-01.md`、
 > `spec/audio-track.md`（音频轨播放与 trim）、`spec/tempo-meter.md`（tick 时钟 / 拍号）。
 > 前置事实：引擎已有完整的 tick 时钟（`Sequencer::position_ticks` + `base_bpm` +
@@ -40,6 +40,8 @@
 | D13 | 录音对齐 | 先做**手动 offset**（采样数，UI 可调，默认 0）；PDC（`latency_samples` 接进图编译期）落地后再自动算 | 自动对齐依赖 PDC 基础设施，S2-3 尚未实施；手动 offset 能立刻可用 |
 | D14 | pre-roll | 录音前 `pre_roll_bars`（0–2，默认 1）内**正常播放素材与 click，但不采集**；UI 丢弃 `ticks < record_start_ticks` 的事件 | 这是 pre-roll 而非 count-in（不从负数起拍），实现只需一次比较，引擎零改动 |
 | D15 | 一个 take = 一个 undo 步 | 录音停止时一次性写入 clip 的 notes，走一次 `begin_edit` / `commit_edit` | 逐音符入栈会让 undo 栈被一次录音灌满 200 步 |
+| D16 | armed track 的确定 | **当前选中的 MIDI 轨**，不再单独做 arming UI；录制期间若键盘节点没有任何连线，按键直接发给 armed track（否则"没接线就录不了"） | 第一版把 arming 做进选择，零额外 UI；有连线时行为完全不变（仍走 vk 路由），只是把"没连线也能录"补上 |
+| D17 | take 的结束时机 | Stop / Pause / 走带自动停止 / 再按一次 Rec **都结束 take**，且**先落 clip 再发 Stop**（Stop 会把位置倒回 0） | Pause 后继续会产生一个跨暂停的长音；自动停止（到编排末尾）也必须落盘，否则 take 丢失 |
 
 ## 3. 数据流
 
@@ -60,12 +62,13 @@ UI 开关 → EngineCommand::Sequencer(SetMetronome{enabled, gain})
 
 ```
 来源：电脑键盘（UI 按键） / midir 线程（Arc<Mutex<Producer>> 直推命令队列）
-     → EngineCommand::Note{trace: 用户输入}
+     → EngineCommand::Note / NoteAtNode{trace: 用户输入}
      → BlockRunner 消费命令时：先发声音（监听，零额外延迟），
-       若 capture 开启则 push CapturedMidi{ticks: position_ticks(), event}
+       若 capture 开启则 push CapturedNote{ticks: position_ticks(), event}
      → capture ring（容量 8192，满则丢弃 + 溢出计数）
-UI 每帧：drain → 过滤 ticks < record_start_ticks → on/off 配对成 Note
-停止：一次性写入 armed track 的新 clip（开始位置吸附到小节）
+UI 每帧：drain → 丢弃 ticks < record_start_ticks（pre-roll）→ on/off 配对成 Note；
+         走带从后往前跳 = 循环回卷 → 清空上一 pass（D12）
+停止：一次性写入 armed track 的新 clip（开始位置吸附到小节，span 向上取整到整小节）
 ```
 
 ### 3.3 音频录音（R4）
@@ -86,10 +89,19 @@ cpal 输入流回调（输入设备线程）
   `SequencerCommand::SetMetronome{enabled, gain}`；`BlockRunner` 在 `process_block`
   之后混入 click；`AudioEngine::set_metronome`；transport 区一个开关按钮；
   测试：按拍触发 / 关闭静音 / 拍号变化 / 导出隔离 / RT 零分配审计。✅ 2026-11-01
-- [ ] **R2 录音骨架（MIDI，无硬件可验收）**
-  `EngineCommand::SetCapture(bool)` + `CapturedMidi` ring + 溢出计数；
-  UI 录音状态机（Idle / PreRoll / Recording）、armed track、pre-roll；
-  电脑键盘经引擎打戳；停止时落 clip；undo 一步。
+- [x] **R2 录音骨架（MIDI，无硬件可验收）** ✅ 2026-11-01
+  引擎侧：`realtime/capture.rs`（`CaptureTap` + `CapturedNote{ticks, event}` + 8192 容量 ring +
+  溢出计数）、`EngineCommand::SetCapture(bool)`、`AudioEngine::{set_capture, drain_captured,
+  capture_overflow}`；`BlockRunner::apply_command` 在 `Note` / `NoteAtNode` 两个入口先取
+  `position_ticks()` 再入库（sequencer 自己排的音符不经过命令队列，因此天然不入 ring）。
+  UI 侧：`recorder.rs`（`RecordPhase::{Idle, PreRoll, Recording}` + on/off 配对 + 循环回卷
+  清空 + `take_clip`）+ `start/finish/cancel/toggle_recording` + `poll_recording` 每帧 drain
+  + transport 区 `● Rec` 按钮与 pre-roll 选择（0–2 小节）+ `R` 快捷键；Stop / Pause / 自动停止
+  / 再按 Rec 都在倒回之前落 clip（D17），一次 take = 一个 undo 步。
+  测试：capture 单元 5 项（关闭不入队 / 打戳 / 满环计数 / 关闭不丢已采集）、
+  `tests/capture_rt_audit.rs` 4 项（带位置戳 / 默认关闭 / **sequencer 音符不入 ring** /
+  捕获期间零堆分配）、recorder 单元 13 项（pre-roll 丢弃 / 相对位置 / 按停结束 / 重触发 /
+  循环回卷 / 空 take / 边界取整 / 不 loop / 力度映射）。
 - [ ] **R3 硬件 MIDI 输入**
   `midir` 依赖 + 设备枚举（启动时选 + 落配置）；MIDI 线程经
   `Arc<Mutex<Producer>>` 直推命令队列；CC / pitch bend 按现有 `RtCtrl` 通道进。

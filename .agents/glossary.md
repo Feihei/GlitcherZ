@@ -98,6 +98,9 @@
 | 节拍器 | metronome | 走带时钟驱动的参考拍；click 是它的声音，图外混音（spec `recording.md` D1） |
 | 预备拍 | pre-roll | 录音前先播放、但不采集的若干小节（D14）；不是 count-in（不从负数起拍） |
 | 采集抽头 | capture tap | 引擎在 block 边界给输入事件打 `position_ticks` 后回传 UI 的通道（D6） |
+| 采集环 | capture ring | 采集抽头的 SPSC 队列；满则丢弃并累计溢出计数（D7） |
+| 待录轨 | armed track | 录音落点 = 录制开始时的当前选中 MIDI 轨（D16） |
+| 录音片段 | take | 一次录音产出的 clip；一次 take = 一个 undo 步（D15） |
 | 录音素材目录 | media directory | 工程旁的 `<stem>.media/`，clip 存相对路径（D11） |
 | 片段 | clip | 钢琴卷帘编辑的音符集合 |
 | 音符 | note | MIDI 音符；音名如 `A4` |
