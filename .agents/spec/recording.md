@@ -1,7 +1,7 @@
 # Spec: 节拍器与录音（Metronome & Recording）
 
 > 状态：实施中（2026-11-01）。R1 节拍器、R2 录音骨架、R3 硬件 MIDI 输入、**R6 轨输入口**、
-> **R4 音频录音**已交付；R5 收尾、R7/R8 多类型采集待实施。
+> **R4 音频录音**、**R5 收尾**已交付；R7/R8 多类型采集待实施（PDC 自动对齐并入 S2-3）。
 > 关联：`plan.md`「S2 补最短的板」、`review-2026-11-01.md`、
 > `spec/audio-track.md`（音频轨播放与 trim）、`spec/tempo-meter.md`（tick 时钟 / 拍号）。
 > 前置事实：引擎已有完整的 tick 时钟（`Sequencer::position_ticks` + `base_bpm` +
@@ -165,9 +165,10 @@ LFO/curve ──automation──► Curve 1 输入口  （R8：块边界采样 t
   `.media/` + 相对路径（`Project::base_dir` / `resolve_media_path` / `media_path_string`）；
   Input 节点 audio out → 音频轨输入口 = 录音归属；take 写 32-bit float mono wav，
   手动延迟 offset 平移 clip 起点。音频 + MIDI take 同一次 undo；无设备 / 未保存工程拒绝开录。
-- [ ] **R5 收尾**
-  录音后自动选中新 clip、take 命名、输入电平表、状态栏溢出告警；
-  PDC 落地后自动对齐；多输入通道（立体声对 / 多设备）。
+- [x] **R5 收尾** ✅ 2026-11-01
+  录音后自动选中新 clip（MIDI 与音频都选中，并切到 Timeline）、take 命名
+  （`Take N · bar M`）、transport 输入电平条、输入 ring 溢出告警。
+  PDC 自动对齐待 S2-3；立体声对 / 多设备输入留作后续。
 - [ ] **R7 MIDI 烘培**（D26 第二类 tap）：`RtGraph` 事件派发处按目标 slot 采集，
   把"过完 Arp / Portamento 的音符"写进 MIDI 轨；需与 R6 的会话结构共用。
 - [ ] **R8 控制烘培**（D26 第四类 tap）：块边界采样 LFO / curve 输出，

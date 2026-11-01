@@ -1583,6 +1583,8 @@ pub struct GlitcherZApp {
     /// Manual input-latency offset in samples (D13): positive values move the
     /// clip earlier on the timeline. Session-only until PDC exists.
     record_latency_samples: i64,
+    /// Input drop count at the last warning (R5: report once per burst).
+    input_dropped_seen: u64,
     /// The range-selection modal for a pending export (U7 D2).
     export_dialog_open: bool,
     /// Selected range inside the export dialog.
@@ -1744,6 +1746,7 @@ impl GlitcherZApp {
             audio_take: None,
             audio_scratch: Vec::new(),
             record_latency_samples: 0,
+            input_dropped_seen: 0,
             export_dialog_open: false,
             export_range_choice: export_audio::ExportRange::FullSong,
             first_frame_logged: false,
@@ -6451,6 +6454,18 @@ impl GlitcherZApp {
             scratch.clear();
             self.audio_scratch = scratch;
         }
+        // R5: an input overflow is user-visible (the take is missing samples),
+        // not a silent loss. Report once per burst like the capture counter.
+        if let Some(stats) = self.engine.input_stats() {
+            let dropped = stats.dropped();
+            if dropped > self.input_dropped_seen {
+                let lost = dropped - self.input_dropped_seen;
+                self.input_dropped_seen = dropped;
+                self.set_message(format!(
+                    "Audio input dropped {lost} samples (monitor/record ring full)"
+                ));
+            }
+        }
         // The transport position only makes sense as a clock while it runs:
         // a stopped (or auto-stopped) transport reads 0, which would look like
         // a loop wrap and wipe the take.
@@ -6864,7 +6879,11 @@ impl GlitcherZApp {
             clips.push((
                 track,
                 glitcherz_model::AudioClip {
-                    name: format!("Take {}", track + 1),
+                    name: format!(
+                        "Take {} · bar {}",
+                        track + 1,
+                        start_ticks / self.project().ticks_per_bar() + 1
+                    ),
                     group: None,
                     path: stored,
                     start_ticks,
@@ -6916,7 +6935,14 @@ impl GlitcherZApp {
         let midi_clips: Vec<(usize, MidiClip, usize)> = midi_takes
             .iter()
             .filter_map(|(track, notes)| {
-                recorder::take_clip(midi_start, notes, bar).map(|clip| (*track, clip, notes.len()))
+                recorder::take_clip(midi_start, notes, bar).map(|mut clip| {
+                    clip.name = format!(
+                        "Take {} · bar {}",
+                        track + 1,
+                        clip.start_ticks / bar.max(1) + 1
+                    );
+                    (*track, clip, notes.len())
+                })
             })
             .collect();
         let audio_clips = audio_take.map_or_else(Vec::new, |take| self.finish_audio_take(take));
@@ -6976,10 +7002,43 @@ impl GlitcherZApp {
             self.send_audio_clips_for_track(track);
             self.sync_clip_row(timeline::TimelineLane::Audio, track);
         }
-        let first_track = midi_written
-            .first()
-            .copied()
-            .or_else(|| audio_written.first().copied());
+        // R5: land the user on the take they just recorded.
+        let mut new_selection = Vec::new();
+        for &track in &midi_written {
+            if let Some(len) = self
+                .project()
+                .midi_tracks
+                .get(track)
+                .map(|track| track.clips.len())
+                .filter(|len| *len > 0)
+            {
+                new_selection.push(timeline::ClipSel {
+                    lane: timeline::TimelineLane::Midi,
+                    track,
+                    clip: len - 1,
+                });
+            }
+        }
+        for &track in &audio_written {
+            if let Some(len) = self
+                .project()
+                .audio_tracks
+                .get(track)
+                .map(|track| track.clips.len())
+                .filter(|len| *len > 0)
+            {
+                new_selection.push(timeline::ClipSel {
+                    lane: timeline::TimelineLane::Audio,
+                    track,
+                    clip: len - 1,
+                });
+            }
+        }
+        if !new_selection.is_empty() {
+            self.timeline_state.selection = new_selection;
+            self.view = MainView::Timeline;
+        }
+        let first_track = midi_written.first().copied();
         if let Some(track) = first_track {
             self.selected_track = track;
         }
@@ -7658,6 +7717,19 @@ impl GlitcherZApp {
                 .on_hover_text(
                     "Manual input latency offset: positive moves audio takes earlier on the timeline",
                 );
+                // R5: live input level (monitor path), so a silent microphone
+                // is visible before the take is over.
+                if let Some(stats) = self.engine.input_stats() {
+                    let peak = stats.peak().min(1.0);
+                    ui.separator();
+                    ui.label("In");
+                    ui.add(
+                        egui::ProgressBar::new(peak)
+                            .desired_width(48.0)
+                            .text(format!("{:.0}%", peak * 100.0)),
+                    )
+                    .on_hover_text("Live input peak (pre-take)");
+                }
                 if ui.button("⏭").on_hover_text("Skip to end (End)").clicked() {
                     self.engine
                         .seek_ticks(f64::from(self.arrangement_end_ticks()));
