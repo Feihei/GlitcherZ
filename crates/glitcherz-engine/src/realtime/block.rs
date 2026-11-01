@@ -468,6 +468,12 @@ impl BlockRunner {
                 let _ = self.graph.node_note(node_id, event);
                 self.capture.note(ticks, event);
             }
+            EngineCommand::CtrlAtNode { node_id, ctrl } => {
+                // R3: hardware CC / pitch bend reaches the addressed instrument
+                // only. Controllers are not captured — a take records notes;
+                // automation recording is a separate feature.
+                let _ = self.graph.node_ctrl(node_id, ctrl);
+            }
             EngineCommand::SetCapture(enabled) => self.capture.configure(enabled),
             EngineCommand::Sequencer(cmd) => self.apply_sequencer_command(cmd),
             EngineCommand::Panic => {

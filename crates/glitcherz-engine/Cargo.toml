@@ -8,6 +8,9 @@ description = "GlitcherZ audio engine: processing graph, scheduling, synthesizer
 
 [dependencies]
 cpal = { workspace = true }
+# Hardware MIDI input (R3): port enumeration and the driver-thread callback.
+# Non-real-time (the callback runs on the OS MIDI thread, never the audio one).
+midir = { workspace = true }
 rtrb = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }

@@ -24,6 +24,8 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 # 音频设备
 cpal = "0.18"
+# 硬件 MIDI 输入（R3：端口枚举 + 输入回调，spec recording.md §3.2）
+midir = "0.11"
 # 原生文件对话框（保存/打开项目）
 rfd = "0.17"
 # GUI（egui 框架）。默认关闭全部 feature；渲染后端由 glitcherz-ui 选择 glow。

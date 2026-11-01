@@ -40,6 +40,9 @@
 pub mod convert;
 pub mod engine;
 pub mod host_gate;
+/// Hardware MIDI input (R3): port enumeration, connections and the
+/// driver-thread callbacks. Control-side only — never on the audio path.
+pub mod midi_input;
 pub mod realtime;
 pub mod sample;
 pub mod sf2;
@@ -47,6 +50,7 @@ pub mod sf2;
 #[cfg(test)]
 pub(crate) mod testing;
 
-pub use engine::{AudioEngine, AudioEngineInfo, EngineError, available_outputs};
+pub use engine::{AudioEngine, AudioEngineInfo, CommandSender, EngineError, available_outputs};
+pub use midi_input::{MidiInputError, MidiInputHub, MidiInputStats, MidiTarget};
 pub use sample::{SampleData, SampleError, SampleLibrary, StereoFrame};
 pub use sf2::{Sf2Error, Sf2Library, Sf2Preset};

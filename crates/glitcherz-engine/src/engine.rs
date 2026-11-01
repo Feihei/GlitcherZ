@@ -7,6 +7,7 @@
 //! directly.
 
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -16,6 +17,43 @@ use crate::realtime::{
     Feedback, GraphCompiler, GraphUpdate, MapSpec, ParamId, Sequencer, SequencerCommand,
     command_channel, recycle_channel, structure_channel,
 };
+
+/// Shareable producer end of the command queue.
+///
+/// The UI thread alone used to own the producer, which made live MIDI input
+/// impossible: a hardware input callback runs on the driver's thread and has no
+/// way back to the UI except a one-frame hop (16-50 ms of latency before the
+/// note even reaches the engine). Wrapping the producer in a mutex lets any
+/// control-side thread push straight into the queue, so a played note reaches
+/// the audio callback at the next block boundary however it arrived.
+///
+/// This is **not** on the real-time path — the audio thread only holds the
+/// consumer half — so a blocking lock is acceptable here. Uncontended it costs
+/// tens of nanoseconds, and the only other contender is the UI thread pushing
+/// parameters.
+#[derive(Clone)]
+pub struct CommandSender(Arc<Mutex<rtrb::Producer<EngineCommand>>>);
+
+impl CommandSender {
+    /// Wraps a raw producer. Crate-internal and test-only: production code
+    /// always gets its handle from [`AudioEngine::command_sender`].
+    #[cfg(test)]
+    pub(crate) fn from_producer(producer: rtrb::Producer<EngineCommand>) -> Self {
+        Self(Arc::new(Mutex::new(producer)))
+    }
+
+    /// Pushes a command; `false` when the queue is full and it was dropped.
+    pub fn send(&self, command: EngineCommand) -> bool {
+        // A poisoned lock only means some other control-side thread panicked
+        // while holding it; the producer itself is still consistent (it is a
+        // plain index pair), so recover rather than losing the whole queue.
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(command)
+            .is_ok()
+    }
+}
 
 /// Basic engine info (for UI display).
 #[derive(Debug, Clone)]
@@ -45,7 +83,7 @@ pub enum EngineError {
 pub struct AudioEngine {
     /// Output stream (live engines only; offline engines have `None`).
     _stream: Option<cpal::Stream>,
-    commands: rtrb::Producer<EngineCommand>,
+    commands: CommandSender,
     /// Structure update queue: producer end for graph topology changes
     /// (plan swaps / installing or removing nodes).
     structure: rtrb::Producer<GraphUpdate>,
@@ -108,7 +146,8 @@ impl AudioEngine {
         let sample_rate_f32 = convert::sample_rate_to_f32(stream_config.sample_rate);
         let device_name = device.to_string();
 
-        let (commands, command_rx) = command_channel(COMMAND_QUEUE_CAPACITY);
+        let (command_tx, command_rx) = command_channel(COMMAND_QUEUE_CAPACITY);
+        let commands = CommandSender(Arc::new(Mutex::new(command_tx)));
 
         // Initial processing graph: main output only (P5c, D13 fully
         // explicit). The project document builds the graph step by step via
@@ -199,7 +238,8 @@ impl AudioEngine {
     /// non-real-time thread** (allocation during construction).
     pub fn start_offline(sample_rate: u32) -> Result<Self, EngineError> {
         let sample_rate_f32 = convert::sample_rate_to_f32(sample_rate);
-        let (commands, command_rx) = command_channel(COMMAND_QUEUE_CAPACITY);
+        let (command_tx, command_rx) = command_channel(COMMAND_QUEUE_CAPACITY);
+        let commands = CommandSender(Arc::new(Mutex::new(command_tx)));
         let (compiler, graph) = GraphCompiler::empty_graph(sample_rate_f32, FIXED_BLOCK_SIZE);
         let feedback = Feedback::new();
         let sequencer = Sequencer::new(sample_rate_f32);
@@ -272,7 +312,17 @@ impl AudioEngine {
     /// Returns `false` when the queue is full and the command was dropped
     /// (non-critical path, safe to ignore).
     pub fn send(&mut self, command: EngineCommand) -> bool {
-        self.commands.push(command).is_ok()
+        self.commands.send(command)
+    }
+
+    /// Clone of the shareable command producer, for control-side threads other
+    /// than the UI (hardware MIDI input, R3).
+    ///
+    /// Commands sent this way are indistinguishable from the UI's: they take
+    /// effect at the next block boundary and are captured by the tap when it is
+    /// enabled.
+    pub fn command_sender(&self) -> CommandSender {
+        self.commands.clone()
     }
 
     /// Peak level of the most recent audio block (max of both channels,

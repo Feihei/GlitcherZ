@@ -2,6 +2,8 @@
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use crate::realtime::sequencer::RtCtrl;
+
 /// Default capacity of the control command queue. When full, new commands are
 /// dropped by the sender (see
 /// [`crate::engine::AudioEngine::send`]); no thread is ever blocked.
@@ -300,6 +302,15 @@ pub enum EngineCommand {
     /// graph; only its document cable decides the target). Unknown ids are
     /// silently dropped (RT-safe, no panic).
     NoteAtNode { node_id: u64, event: NoteEvent },
+    /// Send a controller event to **one instrument node** addressed by
+    /// `node_id` (R3: hardware MIDI CC and pitch bend, spec
+    /// `.agents/spec/recording.md` §3.2).
+    ///
+    /// The node-addressed twin of [`EngineCommand::NoteAtNode`]: hardware input
+    /// is a live performance source, so it reaches the instrument the input
+    /// node is cabled to rather than fanning out through the timeline's track
+    /// table. Unknown ids are dropped without panicking.
+    CtrlAtNode { node_id: u64, ctrl: RtCtrl },
     /// Sequencer transport / configuration.
     Sequencer(SequencerCommand),
     /// Enables / disables the capture tap (spec `.agents/spec/recording.md`
@@ -353,6 +364,7 @@ mod tests {
             EngineCommand::SetNodeParam { value, .. } => value,
             EngineCommand::Note { .. } => f32::NAN,
             EngineCommand::NoteAtNode { .. } => f32::NAN,
+            EngineCommand::CtrlAtNode { .. } => f32::NAN,
             EngineCommand::Sequencer(SequencerCommand::SetBpm(value)) => value,
             EngineCommand::Sequencer(_) => f32::NAN,
             EngineCommand::SetCapture(_) => f32::NAN,

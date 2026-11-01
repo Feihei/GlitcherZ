@@ -823,6 +823,20 @@ impl RtGraph {
         self.slot_note(index as u16, event)
     }
 
+    /// Controller twin of [`Self::node_note`] (R3: hardware MIDI CC / pitch
+    /// bend). Reaches exactly the addressed node; unknown ids and controller
+    /// kinds with no consumer are dropped (see [`dispatch_ctrl`]). RT-safe.
+    pub fn node_ctrl(&mut self, node_id: u64, ctrl: RtCtrl) -> bool {
+        let Some(index) = self
+            .slots
+            .iter()
+            .position(|s| s.as_ref().is_some_and(|n| n.node_id == node_id))
+        else {
+            return false;
+        };
+        self.slot_ctrl(index as u16, ctrl)
+    }
+
     /// Automation track delivery: looks up the routing table and hands the
     /// curve value to `(target node, destination)` (fixed at compile time, see
     /// [`AutoRoute`]). Silent when unconnected / out of range. RT-safe.
@@ -2859,6 +2873,50 @@ mod tests {
         assert!(
             !graph.node_note(u64::MAX, note_on(69)),
             "unknown node ids are dropped"
+        );
+    }
+
+    /// R3 (spec `recording.md` §3.2): hardware CC / pitch bend reach the
+    /// addressed node only — the controller twin of
+    /// [`RtGraph::node_note`], with no track fan-out involved.
+    #[test]
+    fn node_ctrl_reaches_only_the_addressed_slot() {
+        let (mut compiler, mut graph) = GraphCompiler::default_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let ccs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bends = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (update, _) = expect_swap(
+            compiler.set_voice(
+                1,
+                Box::new(CtrlRecorder {
+                    ccs: std::sync::Arc::clone(&ccs),
+                    bends: std::sync::Arc::clone(&bends),
+                }),
+            ),
+            "swap in the controller recorder",
+        );
+        graph.apply_update(update, &mut recycle_tx);
+        // Read the id **after** the swap: `set_voice` re-addresses the slot.
+        let node = compiler
+            .track_voice_node_id(1)
+            .expect("track 1 should carry an instrument node");
+
+        assert!(graph.node_ctrl(node, RtCtrl::new(0, 5, RtCtrlKind::Cc(7), 64)));
+        assert!(graph.node_ctrl(node, RtCtrl::new(0, 5, RtCtrlKind::PitchBend, 4096)));
+        assert!(
+            !graph.node_ctrl(u64::MAX, RtCtrl::new(0, 5, RtCtrlKind::Cc(7), 64)),
+            "unknown node ids are dropped"
+        );
+
+        assert_eq!(
+            *ccs.lock().expect("recorder lock"),
+            vec![(5, 7, 64)],
+            "the CC reached the addressed instrument once"
+        );
+        assert_eq!(
+            *bends.lock().expect("recorder lock"),
+            vec![(5, 4096)],
+            "pitch bend reached the same instrument"
         );
     }
 
