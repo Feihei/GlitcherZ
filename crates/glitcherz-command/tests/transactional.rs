@@ -230,6 +230,53 @@ fn history_is_bounded() {
 }
 
 #[test]
+fn history_is_bounded_by_memory_not_just_step_count() {
+    // Snapshots are whole documents, so the step limit alone does not bound
+    // memory: a big project at 200 steps can hold gigabytes.
+    let mut session = session_with_notes();
+    let snapshot = session.project().approx_bytes();
+    assert!(snapshot > 0, "a document must report a non-zero size");
+
+    // Room for two snapshots, not three.
+    session.set_history_byte_limit(snapshot * 2 + snapshot / 2);
+    for velocity in [10, 20, 30, 40, 50] {
+        session
+            .execute(
+                "midi.note_edit",
+                &json!({ "index": 0, "velocity": velocity }),
+            )
+            .unwrap();
+    }
+
+    assert!(
+        session.history_bytes() <= session.history_byte_limit(),
+        "the byte budget must hold ({} > {})",
+        session.history_bytes(),
+        session.history_byte_limit()
+    );
+    assert_eq!(
+        session.undo_history().len(),
+        2,
+        "the oldest steps are dropped until the budget fits"
+    );
+}
+
+#[test]
+fn one_oversized_step_still_leaves_undo_usable() {
+    // A single snapshot larger than the whole budget must survive: refusing to
+    // record it would silently disable undo for heavy projects.
+    let mut session = session_with_notes();
+    session.set_history_byte_limit(1);
+    session
+        .execute("midi.note_edit", &json!({ "index": 0, "velocity": 40 }))
+        .unwrap();
+
+    assert_eq!(session.undo_history().len(), 1);
+    assert!(session.undo(), "the one retained step is still undoable");
+    assert_eq!(notes(&session)[0].velocity, 100);
+}
+
+#[test]
 fn every_command_survives_empty_params() {
     // No command may panic when handed no parameters on a default document.
     for command in command_specs() {

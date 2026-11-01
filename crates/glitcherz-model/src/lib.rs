@@ -3189,7 +3189,45 @@ fn default_feedback_gain() -> f32 {
     0.5
 }
 
+impl VoiceSpec {
+    /// Heap bytes held by the voice payload (paths, plugin state, drum slots).
+    /// Part of [`Project::approx_bytes`].
+    fn payload_bytes(&self) -> usize {
+        match self {
+            VoiceSpec::Builtin => 0,
+            VoiceSpec::SoundFont { path, .. } => path.len(),
+            VoiceSpec::Sample { path, .. } => path.len(),
+            VoiceSpec::DrumKit { slots, .. } => {
+                slots.len() * std::mem::size_of::<DrumSlot>()
+                    + slots.iter().map(|slot| slot.path.len()).sum::<usize>()
+            }
+            VoiceSpec::Clap {
+                path,
+                plugin_id,
+                state,
+            } => path.len() + plugin_id.len() + state.len(),
+            VoiceSpec::Vst3 {
+                path,
+                class_id,
+                state,
+            } => path.len() + class_id.len() + state.len(),
+        }
+    }
+}
+
 impl NodeDoc {
+    /// Bytes the node owns *behind* the enum slot: voice paths, plugin state
+    /// blobs, drum slot tables. Part of [`Project::approx_bytes`]; nodes that
+    /// only carry scalars report 0.
+    fn payload_bytes(&self) -> usize {
+        match self {
+            NodeDoc::Instrument { voice, .. } | NodeDoc::Effect { voice, .. } => {
+                voice.payload_bytes()
+            }
+            _ => 0,
+        }
+    }
+
     /// Node ID.
     pub fn node_id(&self) -> u64 {
         match self {
@@ -4515,6 +4553,61 @@ impl Project {
         let ticks = (clip.source_len / self.sec_per_tick()).round();
         // `max` swallows NaN (returns 1.0); `as` saturates huge values.
         ticks.max(1.0) as u32
+    }
+
+    /// Approximate heap footprint of the document, in bytes.
+    ///
+    /// The undo history keeps whole-document snapshots, so it needs a size
+    /// signal to bound its own memory (see
+    /// `glitcherz_command::Session::history_byte_limit`). Exactness is not
+    /// required — the job is to notice a project built from millions of notes
+    /// or holding a tens-of-megabytes plugin state — so vectors are priced as
+    /// `len * size_of::<T>()` rather than by walking every element, and node
+    /// payloads that never grow large (mixer channel tables, arpeggiator
+    /// steps) are ignored.
+    pub fn approx_bytes(&self) -> usize {
+        let mut total = std::mem::size_of::<Self>();
+
+        total += self.metadata.name.len();
+        total += self.metadata.markers.len() * std::mem::size_of::<Marker>();
+        total += self.clip_groups.len() * std::mem::size_of::<ClipGroup>();
+        for group in &self.clip_groups {
+            total += group.name.len();
+        }
+
+        for track in &self.midi_tracks {
+            total += std::mem::size_of::<MidiTrack>() + track.name.len();
+            total += track.clips.len() * std::mem::size_of::<MidiClip>();
+            for clip in &track.clips {
+                total += clip.name.len();
+                total += clip.sequence.notes.len() * std::mem::size_of::<Note>();
+                total += clip.sequence.ctrls.len() * std::mem::size_of::<CtrlEvent>();
+            }
+        }
+
+        for track in &self.control_tracks {
+            total += std::mem::size_of::<ControlTrack>() + track.name.len();
+            total += track.clips.len() * std::mem::size_of::<ControlClip>();
+            for clip in &track.clips {
+                total += clip.name.len();
+                total += clip.curve.len() * std::mem::size_of::<AutoPoint>();
+            }
+        }
+
+        for track in &self.audio_tracks {
+            total += std::mem::size_of::<AudioTrack>() + track.name.len();
+            total += track.clips.len() * std::mem::size_of::<AudioClip>();
+            for clip in &track.clips {
+                total += clip.name.len() + clip.path.len();
+            }
+        }
+
+        total += self.graph.cables.len() * std::mem::size_of::<CableDoc>();
+        for node in &self.graph.nodes {
+            total += std::mem::size_of::<NodeDoc>() + node.payload_bytes();
+        }
+
+        total
     }
 
     /// Project-level validation: track counts, clip capacities/placement and

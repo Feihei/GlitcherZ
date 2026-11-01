@@ -49,6 +49,13 @@ pub use registry::{
 /// Default number of undo steps retained.
 pub const DEFAULT_HISTORY_LIMIT: usize = 200;
 
+/// Default memory budget for retained undo/redo snapshots (256 MiB).
+///
+/// The step limit alone does not bound memory: every entry is a whole-document
+/// snapshot, so a project with millions of notes or a few large plugin state
+/// blobs would hold gigabytes at 200 steps. Whichever limit bites first wins.
+pub const DEFAULT_HISTORY_BYTES: usize = 256 * 1024 * 1024;
+
 /// Default number of retained journal entries.
 ///
 /// Merged gestures (fader drags, velocity painting) journal one entry per
@@ -97,6 +104,10 @@ pub fn bad_params(command: &str, message: impl Into<String>) -> CommandError {
 struct HistoryEntry {
     label: String,
     doc: Arc<Project>,
+    /// `doc.approx_bytes()` at push time, cached so trimming does not have to
+    /// re-walk the document (and so the accounting stays consistent even if a
+    /// snapshot is later edited in place through a unique `Arc`).
+    bytes: usize,
 }
 
 /// The project document plus its undo history and gesture state.
@@ -115,6 +126,10 @@ pub struct Session {
     /// Whether there are unsaved changes.
     dirty: bool,
     history_limit: usize,
+    /// Memory budget for `undo` + `redo` (see [`DEFAULT_HISTORY_BYTES`]).
+    history_byte_limit: usize,
+    /// Estimated bytes currently retained by `undo` + `redo`.
+    history_bytes: usize,
     /// Nesting counter for [`Session::suspend_history`].
     suspend_depth: u32,
     /// Parameterized log of executed commands (macro recording / agent replay).
@@ -138,6 +153,8 @@ impl Session {
             revision: 1,
             dirty: false,
             history_limit: DEFAULT_HISTORY_LIMIT,
+            history_byte_limit: DEFAULT_HISTORY_BYTES,
+            history_bytes: 0,
             suspend_depth: 0,
             journal: Vec::new(),
         }
@@ -168,6 +185,7 @@ impl Session {
         self.doc = Arc::new(project);
         self.undo.clear();
         self.redo.clear();
+        self.history_bytes = 0;
         self.merge_key = None;
         self.journal.clear();
         self.revision = self.revision.wrapping_add(1);
@@ -225,9 +243,76 @@ impl Session {
         self.trim_history();
     }
 
+    /// Memory budget for undo/redo snapshots, in bytes.
+    pub fn history_byte_limit(&self) -> usize {
+        self.history_byte_limit
+    }
+
+    /// Estimated bytes currently retained by the undo/redo stacks.
+    pub fn history_bytes(&self) -> usize {
+        self.history_bytes
+    }
+
+    /// Sets the snapshot memory budget, trimming if it shrank.
+    pub fn set_history_byte_limit(&mut self, limit: usize) {
+        self.history_byte_limit = limit;
+        self.trim_history();
+    }
+
+    /// Pushes one snapshot and enforces both limits.
+    fn record_history(&mut self, label: &str, doc: Arc<Project>) {
+        let bytes = doc.approx_bytes();
+        self.history_bytes = self.history_bytes.saturating_add(bytes);
+        self.undo.push(HistoryEntry {
+            label: label.to_string(),
+            doc,
+            bytes,
+        });
+        self.clear_redo();
+        self.trim_history();
+    }
+
+    /// Drops the redo stack, keeping the memory accounting honest.
+    fn clear_redo(&mut self) {
+        for entry in self.redo.drain(..) {
+            self.history_bytes = self.history_bytes.saturating_sub(entry.bytes);
+        }
+    }
+
+    /// Drops the oldest undo snapshot, returning it (and its byte count).
+    ///
+    /// `None` on an empty stack — `drain(..1)` alone would panic there, which
+    /// is exactly the case the memory-budget loop hits on the first trim.
+    fn take_oldest_undo(&mut self) -> Option<HistoryEntry> {
+        self.undo.drain(..self.undo.len().min(1)).next()
+    }
+
+    fn take_oldest_redo(&mut self) -> Option<HistoryEntry> {
+        self.redo.drain(..self.redo.len().min(1)).next()
+    }
+
     fn trim_history(&mut self) {
         if let Some(excess) = self.undo.len().checked_sub(self.history_limit) {
-            self.undo.drain(..excess);
+            let dropped: Vec<HistoryEntry> = self.undo.drain(..excess).collect();
+            for entry in dropped {
+                self.history_bytes = self.history_bytes.saturating_sub(entry.bytes);
+            }
+        }
+        // Memory budget: drop redo steps first (the furthest-future states are
+        // the cheapest thing to lose), then the oldest undo steps. One undo
+        // step always survives, even if a single snapshot exceeds the whole
+        // budget — an unusable undo stack is worse than an over-budget one.
+        while self.history_bytes > self.history_byte_limit {
+            let Some(entry) = self.take_oldest_redo() else {
+                break;
+            };
+            self.history_bytes = self.history_bytes.saturating_sub(entry.bytes);
+        }
+        while self.history_bytes > self.history_byte_limit && self.undo.len() > 1 {
+            let Some(entry) = self.take_oldest_undo() else {
+                break;
+            };
+            self.history_bytes = self.history_bytes.saturating_sub(entry.bytes);
         }
     }
 
@@ -248,12 +333,7 @@ impl Session {
         if Arc::ptr_eq(&before, &self.doc) {
             return;
         }
-        self.undo.push(HistoryEntry {
-            label: label.to_string(),
-            doc: before,
-        });
-        self.redo.clear();
-        self.trim_history();
+        self.record_history(label, before);
     }
 
     /// Like [`Session::push_undo`], but consecutive calls sharing `key`
@@ -342,13 +422,20 @@ impl Session {
         let Some(entry) = self.undo.pop() else {
             return false;
         };
+        // The popped snapshot becomes the live document (no longer counted);
+        // the previous live document becomes a redo snapshot (counted).
+        self.history_bytes = self.history_bytes.saturating_sub(entry.bytes);
         let current = std::mem::replace(&mut self.doc, entry.doc);
+        let bytes = current.approx_bytes();
+        self.history_bytes = self.history_bytes.saturating_add(bytes);
         self.redo.push(HistoryEntry {
             label: entry.label,
             doc: current,
+            bytes,
         });
         self.revision = self.revision.wrapping_add(1);
         self.dirty = true;
+        self.trim_history();
         true
     }
 
@@ -358,13 +445,18 @@ impl Session {
         let Some(entry) = self.redo.pop() else {
             return false;
         };
+        self.history_bytes = self.history_bytes.saturating_sub(entry.bytes);
         let current = std::mem::replace(&mut self.doc, entry.doc);
+        let bytes = current.approx_bytes();
+        self.history_bytes = self.history_bytes.saturating_add(bytes);
         self.undo.push(HistoryEntry {
             label: entry.label,
             doc: current,
+            bytes,
         });
         self.revision = self.revision.wrapping_add(1);
         self.dirty = true;
+        self.trim_history();
         true
     }
 
@@ -394,12 +486,7 @@ impl Session {
         match attempt {
             Ok(Ok(value)) => {
                 if spec.undoable && !self.history_suspended() && !Arc::ptr_eq(&before, &self.doc) {
-                    self.undo.push(HistoryEntry {
-                        label: spec.label.to_string(),
-                        doc: before,
-                    });
-                    self.redo.clear();
-                    self.trim_history();
+                    self.record_history(spec.label, before);
                 }
                 if spec.journal {
                     self.record_journal(id, &params);
