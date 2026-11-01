@@ -471,7 +471,14 @@ A 阶段**只补这三处，不开参数端口**（每参数一个输入口 = �
   选择（0–2 小节）、`R` 快捷键；Stop / Pause / 自动停止都在倒回前落 clip，一次 take = 一个 undo 步。
   测试：capture 5 单元 + `capture_rt_audit` 4 集成（含零堆分配与"sequencer 音符不入 ring"）+
   recorder 13 单元。
-- [ ] **R3 midir 硬件 MIDI 输入**（`Arc<Mutex<Producer>>` 直推命令队列）
+- [x] **R3 midir 硬件 MIDI 输入** ✅ 2026-11-01
+  `midir 0.11`；`CommandSender`（`Arc<Mutex<Producer>>`）让驱动回调直推命令队列，
+  `AudioEngine::command_sender()` 暴露克隆；`midi_input` 模块（`MidiInputHub` + 端口枚举
+  + 差量开合 + 回调内零分配的路由快照）；`EngineCommand::CtrlAtNode` + `RtGraph::node_ctrl`
+  把 CC / pitch bend 接进既有 `dispatch_ctrl`。UI：`sync_midi_bindings` 每帧推「设备 →
+  该节点连到的乐器」快照（未接线且录音中回落 armed track）；Inspector 选中键盘节点时显示
+  输入源面板、连接状态与目标乐器。设备绑定是文档编辑（一次 undo），不是应用配置。
+  测试：`midi_input` 8 单元 + `node_ctrl_reaches_only_the_addressed_slot`。
 - [ ] **R4 音频录音**：`NodeDoc::Input` + `InputProcessor` + cpal 输入双 ring +
   `.media/` 相对路径 + 手动延迟 offset
 - [ ] **R5 收尾**：录音后选中新 clip、输入电平表、溢出告警、PDC 自动对齐

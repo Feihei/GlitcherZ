@@ -47,7 +47,7 @@ use glitcherz_engine::realtime::{
     SequencerCommand, Sf2VoiceProcessor, SilentProcessor, SynthProcessor, Unit, empty_clip_table,
     empty_midi_clip_table, mode_value as curve_mode_value,
 };
-use glitcherz_engine::{Sf2Library, Sf2Preset};
+use glitcherz_engine::{MidiTarget, Sf2Library, Sf2Preset};
 use glitcherz_model::{
     ArpeggiatorParams, AutoParam, AutoPoint, CableKind, ChannelParam, ControlClip, ControlTrack,
     CtrlKind, CurveInterp, CurveMapParams, EffectParams, GraphDoc, LFO_DIVISION_LABELS, LfoParams,
@@ -1301,6 +1301,19 @@ pub struct GlitcherZApp {
     /// MIDI multi-out / single-in rule), so a key press reaches all of them —
     /// cheap synth layering without a mixer.
     vk_targets: Vec<u64>,
+    /// Hardware MIDI input (R3, spec `recording.md` §3.2): open ports and the
+    /// routing snapshots their callbacks read. Control-side only — the
+    /// callbacks push into the command queue directly, never through the UI.
+    midi_hub: glitcherz_engine::MidiInputHub,
+    /// Port names from the last enumeration, kept next to the hub so the
+    /// Inspector can render its menu without a second backend query.
+    midi_ports: Vec<String>,
+    /// Bindings last pushed to the hub, so an unchanged document does not
+    /// rebuild the connections every frame.
+    midi_bindings: Vec<(String, Vec<glitcherz_engine::MidiTarget>)>,
+    /// Ports the last binding pass could not find (bound but unplugged). Shown
+    /// once in the status bar, not every frame.
+    midi_missing: Vec<String>,
     /// Currently held notes (shared by on-screen keys and computer keys, for highlighting and
     /// de-duplication).
     held_notes: HashSet<u8>,
@@ -1561,6 +1574,10 @@ impl GlitcherZApp {
             view: MainView::default(),
             octave_base: 60,
             vk_targets: Vec::new(),
+            midi_hub: glitcherz_engine::MidiInputHub::new(),
+            midi_ports: Vec::new(),
+            midi_bindings: Vec::new(),
+            midi_missing: Vec::new(),
             held_notes: HashSet::new(),
             current_note: None,
             meter_l: PeakMeter::new(),
@@ -1636,7 +1653,26 @@ impl GlitcherZApp {
             // here keeps the first painted frame the real project.
             app.do_open_now(path);
         }
+        // R3: one backend enumeration at startup so a project that already
+        // binds a device reconnects before the first frame. A failure here is
+        // not fatal — a machine without MIDI support just has no ports.
+        if let Err(err) = app.refresh_midi_ports() {
+            log::warn!("MIDI input unavailable: {err}");
+        }
         app
+    }
+
+    /// Re-enumerates hardware MIDI input ports (startup, and the Inspector's
+    /// refresh button). Errors are reported in the status bar rather than
+    /// propagated: no MIDI backend is a degraded, not a broken, app.
+    fn refresh_midi_ports(&mut self) -> Result<(), glitcherz_engine::MidiInputError> {
+        let result = self.midi_hub.refresh_ports();
+        self.midi_ports = self.midi_hub.ports().to_vec();
+        log::info!("MIDI input ports: {:?}", self.midi_ports);
+        // Force the next sync to re-evaluate: a port that just appeared may
+        // satisfy a binding that was reported missing.
+        self.midi_bindings.clear();
+        result
     }
 
     // ---- Document → engine (D13 fully explicit: the loader rebuilds purely from the document) ----
@@ -6398,6 +6434,187 @@ impl GlitcherZApp {
         self.vk_targets = targets;
     }
 
+    /// The keyboard node in the current patch selection, if any (R3).
+    ///
+    /// A keyboard node has no parameters, so [`resolve_panel_target`] never
+    /// returns one — the input-source panel looks the selection up directly.
+    fn selected_keyboard_node(&self) -> Option<u64> {
+        let doc = &self.project().graph;
+        self.patch_state
+            .selected_doc_nodes()
+            .into_iter()
+            .find(|id| matches!(doc.node_by_id(*id), Some(NodeDoc::Keyboard { .. })))
+    }
+
+    /// Input-source picker for one keyboard node (R3, spec `recording.md`
+    /// §3.2): the computer keyboard or a hardware port.
+    ///
+    /// Binding is a document edit, so it is one undo step. A source already
+    /// bound elsewhere is offered as disabled — [`GraphDoc::validate`] rejects
+    /// duplicate bindings, and refusing the click up front is cheaper than
+    /// failing on save.
+    fn keyboard_source_panel(&mut self, ui: &mut egui::Ui, node: u64) {
+        ui.heading(format!("Keyboard #{node}"));
+        ui.weak("Live input source and its destination instrument(s).");
+        ui.add_space(6.0);
+
+        let Some(current) = self.project().graph.node_by_id(node).and_then(|n| match n {
+            NodeDoc::Keyboard { source, .. } => Some(source.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+
+        // Where the node's commands land, so the panel can say whether playing
+        // will be audible at all.
+        let routed: Vec<u64> = self.project().graph.keyboard_routes_from(node);
+
+        let mut choice: Option<MidiSource> = None;
+        let computer_selected = matches!(current, MidiSource::Computer);
+        if ui.radio(computer_selected, "Computer keyboard").clicked() && !computer_selected {
+            choice = Some(MidiSource::Computer);
+        }
+
+        ui.separator();
+        if self.midi_ports.is_empty() {
+            ui.weak("No MIDI input devices found.");
+        } else {
+            ui.label("MIDI devices");
+            for port in &self.midi_ports {
+                let selected = matches!(&current, MidiSource::Device(name) if name == port);
+                // Another node already owns this port (the document allows one
+                // binding per source).
+                let taken = !selected
+                    && self.project().graph.nodes.iter().any(|n| {
+                        n.node_id() != node
+                            && matches!(
+                                n,
+                                NodeDoc::Keyboard {
+                                    source: MidiSource::Device(other),
+                                    ..
+                                } if other == port
+                            )
+                    });
+                let label = if taken {
+                    format!("{port}  (in use)")
+                } else {
+                    port.clone()
+                };
+                let response = ui.add_enabled(!taken, egui::RadioButton::new(selected, label));
+                if response.clicked() && !selected {
+                    choice = Some(MidiSource::Device(port.clone()));
+                }
+            }
+        }
+
+        ui.add_space(6.0);
+        if ui.button("Refresh devices").clicked() {
+            match self.refresh_midi_ports() {
+                Ok(()) => self.set_message("MIDI devices refreshed".to_string()),
+                Err(err) => self.set_message(format!("MIDI input: {err}")),
+            }
+        }
+
+        // Reported state: a bound port that is not open is exactly what the
+        // user needs to see when nothing responds.
+        ui.add_space(6.0);
+        if let MidiSource::Device(port) = &current {
+            if self.midi_hub.is_open(port) {
+                ui.colored_label(
+                    egui::Color32::from_rgb(95, 205, 190),
+                    format!("Connected: {port}"),
+                );
+            } else {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 160, 80),
+                    format!("Not connected: {port}"),
+                );
+            }
+        }
+        if routed.is_empty() {
+            ui.weak("No destination: cable this node's MIDI out to an instrument.");
+        } else {
+            let list: Vec<String> = routed.iter().map(|id| format!("#{id}")).collect();
+            ui.weak(format!("Plays: {}", list.join(", ")));
+        }
+
+        if let Some(source) = choice {
+            let before = self.begin_edit();
+            if let Some(NodeDoc::Keyboard { source: slot, .. }) = self
+                .project_mut()
+                .graph
+                .nodes
+                .iter_mut()
+                .find(|n| n.node_id() == node)
+            {
+                *slot = source;
+            }
+            self.commit_edit("Change MIDI input", before);
+            // Re-open on the next frame: a new binding means a new connection.
+            self.midi_bindings.clear();
+        }
+    }
+
+    /// Recomputes the hardware MIDI routing snapshots and hands them to the hub
+    /// (R3, spec `recording.md` §3.2).
+    ///
+    /// The routing rule is the computer keyboard's, one level down: a device
+    /// keyboard node plays the instruments **its cables** reach, and while
+    /// recording with nothing cabled the armed track takes the notes instead.
+    /// The snapshot is compared before being pushed, so an idle frame does not
+    /// touch the connections — midir reconnecting a port costs a driver call.
+    fn sync_midi_bindings(&mut self) {
+        let bindings = {
+            let doc = &self.project().graph;
+            let recording_track = self.recorder.is_active().then_some(self.recorder.track);
+            let mut out: Vec<(String, Vec<MidiTarget>)> = Vec::new();
+            for node in &doc.nodes {
+                let NodeDoc::Keyboard {
+                    node_id,
+                    source: MidiSource::Device(port),
+                    ..
+                } = node
+                else {
+                    continue;
+                };
+                let mut targets: Vec<MidiTarget> = doc
+                    .keyboard_routes_from(*node_id)
+                    .into_iter()
+                    .filter_map(|doc_id| self.node_map.get(&doc_id).copied())
+                    .map(MidiTarget::Node)
+                    .collect();
+                if targets.is_empty()
+                    && let Some(track) = recording_track
+                {
+                    targets.push(MidiTarget::Track(track));
+                }
+                out.push((port.clone(), targets));
+            }
+            out
+        };
+        if bindings == self.midi_bindings {
+            return;
+        }
+        self.midi_bindings = bindings.clone();
+        let sender = self.engine.command_sender();
+        match self.midi_hub.set_bindings(&bindings, &sender) {
+            Ok(missing) => {
+                // Report a change of state only: an unplugged controller is
+                // not worth a status line every frame.
+                if missing != self.midi_missing {
+                    if !missing.is_empty() {
+                        self.set_message(format!("MIDI input not found: {}", missing.join(", ")));
+                    }
+                    self.midi_missing = missing;
+                }
+            }
+            Err(err) => {
+                self.set_message(format!("MIDI input: {err}"));
+                self.midi_missing.clear();
+            }
+        }
+    }
+
     /// Handle computer keyboard playing (FL Studio-style layout; Z/X shift octaves).
     ///
     /// While the piano roll owns keyboard focus, the computer keyboard
@@ -8365,6 +8582,13 @@ impl GlitcherZApp {
             }
             let sel = self.selected_track.min(self.project().midi_tracks.len() - 1);
             self.selected_track = sel;
+            // R3 (spec `recording.md` §3.2): a keyboard input node has exactly
+            // one property — which source it listens to — so the Inspector is
+            // its binding panel rather than a "no parameters" placeholder.
+            if let Some(node) = self.selected_keyboard_node() {
+                self.keyboard_source_panel(ui, node);
+                return;
+            }
             // Panel editing target (spec `plugin-gui.md` §6): the patch
             // selection's first editable document node, falling back to the
             // selected track's first-match instrument (pre-G4 behavior).
@@ -12423,6 +12647,9 @@ impl eframe::App for GlitcherZApp {
         // G6: the vk route decides where live notes go — recomputed before
         // the keyboard handling below reads it.
         self.refresh_vk_targets();
+        // R3: hardware input ports follow the same rule — their callbacks read
+        // a routing snapshot rebuilt from the document.
+        self.sync_midi_bindings();
 
         // U2: an open unsaved-changes modal owns the keyboard (its Escape
         // cancels); the transport / note shortcuts stay out of the way. The

@@ -1,6 +1,6 @@
 # Spec: 节拍器与录音（Metronome & Recording）
 
-> 状态：实施中（2026-11-01）。R1 节拍器、R2 录音骨架已交付，R3–R5 待实施。
+> 状态：实施中（2026-11-01）。R1 节拍器、R2 录音骨架、R3 硬件 MIDI 输入已交付，R4–R5 待实施。
 > 关联：`plan.md`「S2 补最短的板」、`review-2026-11-01.md`、
 > `spec/audio-track.md`（音频轨播放与 trim）、`spec/tempo-meter.md`（tick 时钟 / 拍号）。
 > 前置事实：引擎已有完整的 tick 时钟（`Sequencer::position_ticks` + `base_bpm` +
@@ -42,6 +42,9 @@
 | D15 | 一个 take = 一个 undo 步 | 录音停止时一次性写入 clip 的 notes，走一次 `begin_edit` / `commit_edit` | 逐音符入栈会让 undo 栈被一次录音灌满 200 步 |
 | D16 | armed track 的确定 | **当前选中的 MIDI 轨**，不再单独做 arming UI；录制期间若键盘节点没有任何连线，按键直接发给 armed track（否则"没接线就录不了"） | 第一版把 arming 做进选择，零额外 UI；有连线时行为完全不变（仍走 vk 路由），只是把"没连线也能录"补上 |
 | D17 | take 的结束时机 | Stop / Pause / 走带自动停止 / 再按一次 Rec **都结束 take**，且**先落 clip 再发 Stop**（Stop 会把位置倒回 0） | Pause 后继续会产生一个跨暂停的长音；自动停止（到编排末尾）也必须落盘，否则 take 丢失 |
+| D18 | 设备绑定落在哪 | 写进**文档**（`NodeDoc::Keyboard.source = MidiSource::Device(端口名)`），不做应用配置 | 绑定是"这条输入走哪个乐器"的一部分，跟着工程走才可分享/可撤销；模型早已有该字段与"两个节点不得绑同一源"的校验，R3 只是把它接上 |
+| D19 | 硬件事件的送达路径 | 输入回调直接把 `EngineCommand` 推入命令队列（`CommandSender` = `Arc<Mutex<Producer>>`），**不经 UI 中转** | 经 UI 会多一帧 16–50 ms 延迟，弹奏直接不可用；回调在驱动线程（非 RT），持锁成本可忽略 |
+| D20 | 硬件控制器（CC / bend） | 只发**节点寻址**（`EngineCommand::CtrlAtNode`），不进 capture tap、不走 track 扇出 | 控制器是演奏表情，必须跟随输入节点的连线；自动化录制是另一个功能，顺手捕获会造成"录一次音多出一堆 CC" |
 
 ## 3. 数据流
 
@@ -61,11 +64,14 @@ UI 开关 → EngineCommand::Sequencer(SetMetronome{enabled, gain})
 ### 3.2 MIDI 录音（R2 + R3）
 
 ```
-来源：电脑键盘（UI 按键） / midir 线程（Arc<Mutex<Producer>> 直推命令队列）
-     → EngineCommand::Note / NoteAtNode{trace: 用户输入}
+来源：电脑键盘（UI 按键） / midir 驱动线程回调（D19：经 CommandSender 直推命令队列）
+     → EngineCommand::Note / NoteAtNode / CtrlAtNode{node_id, ctrl}
+       （D20：硬件 CC 与 pitch bend 只走节点寻址，不进 tap、不走 track 扇出）
      → BlockRunner 消费命令时：先发声音（监听，零额外延迟），
        若 capture 开启则 push CapturedNote{ticks: position_ticks(), event}
      → capture ring（容量 8192，满则丢弃 + 溢出计数）
+绑定：Keyboard 节点的 source（D18）；UI 每帧把「设备 → 该节点连到的乐器」快照推给 hub，
+     未接线且正在录音时回落 armed track（与电脑键盘同规则）
 UI 每帧：drain → 丢弃 ticks < record_start_ticks（pre-roll）→ on/off 配对成 Note；
          走带从后往前跳 = 循环回卷 → 清空上一 pass（D12）
 停止：一次性写入 armed track 的新 clip（开始位置吸附到小节，span 向上取整到整小节）
@@ -102,9 +108,20 @@ cpal 输入流回调（输入设备线程）
   `tests/capture_rt_audit.rs` 4 项（带位置戳 / 默认关闭 / **sequencer 音符不入 ring** /
   捕获期间零堆分配）、recorder 单元 13 项（pre-roll 丢弃 / 相对位置 / 按停结束 / 重触发 /
   循环回卷 / 空 take / 边界取整 / 不 loop / 力度映射）。
-- [ ] **R3 硬件 MIDI 输入**
-  `midir` 依赖 + 设备枚举（启动时选 + 落配置）；MIDI 线程经
-  `Arc<Mutex<Producer>>` 直推命令队列；CC / pitch bend 按现有 `RtCtrl` 通道进。
+- [x] **R3 硬件 MIDI 输入** ✅ 2026-11-01
+  引擎：`midir 0.11` 依赖；`engine::CommandSender`（= `Arc<Mutex<Producer<EngineCommand>>>`）
+  让非 UI 线程也能推命令，`AudioEngine::command_sender()` 暴露克隆；`midi_input` 模块
+  （`MidiInputHub` / `MidiTarget::{Node, Track}` / `MidiInputStats`，端口枚举 + 差量开合 +
+  回调内固定数组复制路由快照，零分配）；`EngineCommand::CtrlAtNode` + `RtGraph::node_ctrl`
+  把 CC / pitch bend 送进既有 `dispatch_ctrl`。原始消息解析为纯函数：note on/off、
+  note-on-vel-0、CC、14-bit pitch bend；系统消息、aftertouch、program change 一律丢弃
+  （没有消费者，且不能让 active sensing 灌满命令队列）。
+  UI：`sync_midi_bindings` 每帧把「设备 → 该节点连到的乐器」快照推给 hub（未接线且正在录音
+  时回落到 armed track，与电脑键盘同规则）；Inspector 在选中键盘节点时显示输入源面板
+  （电脑键盘 / 各端口，已被别的节点占用的端口禁用）、连接状态、目标乐器与"刷新设备"。
+  设备绑定是**文档编辑**（一次 undo），不是应用配置（D18）。
+  测试：`midi_input` 单元 8 项（note on/off、vel-0、CC、bend 居中/上下限、系统消息丢弃、
+  node 目标、track 目标拒收 CC、满队列报告丢弃）+ `node_ctrl_reaches_only_the_addressed_slot`。
 - [ ] **R4 音频录音**
   `NodeDoc::Input{node_id, track, channel, gain}` + `InputProcessor`；
   `AudioInput`（cpal 输入流 + 双 ring + `Arc<InputStats>` 原子量）；
