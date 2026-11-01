@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
-//! GlitcherZ desktop app entry point: starts the audio engine (glitcherz-engine) and
-//! opens the main window (glitcherz-ui). Currently roadmap step 3 -- full
-//! synthesizer (ADSR envelope + SVF filter) and virtual keyboard.
+//! GlitcherZ desktop app entry point: starts the audio engine (glitcherz-engine)
+//! and opens the main window (glitcherz-ui).
+//!
+//! The engine starts silent. `--autoplay` deliberately holds one note so a
+//! smoke run can prove the audio path end to end without touching the UI.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -14,8 +16,8 @@ use glitcherz_engine::AudioEngine;
 struct Args {
     /// MIDI note auto-triggered at startup (69 = A4).
     note: u8,
-    /// Start silent (do not auto-trigger a note).
-    no_autoplay: bool,
+    /// Hold a note at startup (diagnostic; the default is silent).
+    autoplay: bool,
     /// Project file loaded at startup.
     open: Option<PathBuf>,
     gain: f64,
@@ -55,7 +57,7 @@ fn main() -> ExitCode {
 
     let ui_config = glitcherz_ui::UiConfig {
         gain: args.gain,
-        auto_play_note: (!args.no_autoplay).then_some(args.note),
+        auto_play_note: args.autoplay.then_some(args.note),
         auto_close_after: args.seconds.map(|s| Duration::from_secs_f64(s.max(0.0))),
         open_path: args.open,
     };
@@ -69,9 +71,11 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     println!(
-        "Usage: glitcherz [--note <0-127>] [--no-autoplay] [--gain <0.0-1.0>] [--seconds <secs>] [--list-devices]\n\
-         Defaults: opens the main window and auto-triggers an A4 note (sustained tone).\n\
+        "Usage: glitcherz [--open <project>] [--autoplay [--note <0-127>]] [--gain <0.0-1.0>] \
+         [--seconds <secs>] [--list-devices]\n\
+         Defaults: opens the main window and stays silent.\n\
          Play with the on-screen keyboard or the computer keyboard (A W S E D ..., Z/X to shift octaves); close the window to quit.\n\
+         --autoplay holds one note from startup (diagnostic: proves the audio path);\n\
          --seconds auto-closes the window after N seconds (for smoke tests)."
     );
 }
@@ -79,7 +83,7 @@ fn print_usage() {
 fn parse_args(raw: impl Iterator<Item = String>) -> Args {
     let mut args = Args {
         note: 69,
-        no_autoplay: false,
+        autoplay: false,
         open: None,
         gain: 0.8,
         seconds: None,
@@ -92,6 +96,8 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Args {
             "--note" => {
                 if let Some(v) = it.next().and_then(|s| s.parse::<i32>().ok()) {
                     args.note = v.clamp(0, 127) as u8;
+                    // Naming a note is an explicit request to hear it.
+                    args.autoplay = true;
                 }
             }
             "--freq" => {
@@ -101,10 +107,13 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Args {
                     if f.is_finite() && f > 0.0 {
                         let note = (69.0 + 12.0 * (f / 440.0).log2()).round() as i32;
                         args.note = note.clamp(0, 127) as u8;
+                        args.autoplay = true;
                     }
                 }
             }
-            "--no-autoplay" => args.no_autoplay = true,
+            "--autoplay" => args.autoplay = true,
+            // Compatibility alias from the days when autoplay was the default.
+            "--no-autoplay" => args.autoplay = false,
             "--open" => {
                 if let Some(v) = it.next() {
                     args.open = Some(PathBuf::from(v));
