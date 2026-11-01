@@ -1434,6 +1434,16 @@ pub struct GlitcherZApp {
     /// blocks per frame at the end of `ui()`. Dropping it releases the
     /// offline engine and its plugin guards.
     export_job: Option<export_audio::ExportJob>,
+    /// Transport metronome state (spec `recording.md` R1). UI-side only: the
+    /// engine holds the authoritative click, this drives the button and is
+    /// re-sent on toggle. Never persisted in the document.
+    metronome_on: bool,
+    /// Linear click level, `0..=1` (default `0.6` — audible under a mix
+    /// without dominating it).
+    metronome_gain: f32,
+    /// Set when the click was turned on but the command queue was full, so
+    /// the next frame retries instead of silently dropping the state change.
+    metronome_pending: bool,
     /// The range-selection modal for a pending export (U7 D2).
     export_dialog_open: bool,
     /// Selected range inside the export dialog.
@@ -1578,6 +1588,9 @@ impl GlitcherZApp {
             plugin_editor_wants_open: false,
             editor_user_open: false,
             export_job: None,
+            metronome_on: false,
+            metronome_gain: 0.6,
+            metronome_pending: false,
             export_dialog_open: false,
             export_range_choice: export_audio::ExportRange::FullSong,
             first_frame_logged: false,
@@ -6443,6 +6456,39 @@ impl GlitcherZApp {
                 {
                     let enable = !loop_on;
                     self.timeline_toggle_loop(enable);
+                }
+                // Metronome (spec `recording.md` R1): the click is generated
+                // inside the engine after the graph, so it keeps sounding with
+                // every track muted and never reaches the exported file.
+                let metro_btn = egui::Button::new("Click").selected(self.metronome_on);
+                if ui
+                    .add(metro_btn)
+                    .on_hover_text("Metronome (audible while the transport plays, not exported)")
+                    .clicked()
+                {
+                    self.metronome_on = !self.metronome_on;
+                    self.metronome_pending = true;
+                }
+                if self.metronome_on {
+                    let level = ui
+                        .add(
+                            egui::Slider::new(&mut self.metronome_gain, 0.0..=1.0)
+                                .show_value(false)
+                                .max_decimals(2),
+                        )
+                        .on_hover_text("Click level");
+                    if level.changed() {
+                        self.metronome_pending = true;
+                    }
+                }
+                // Retry a toggle that hit a full command queue (the queue
+                // drains every block, so one frame is usually enough).
+                if self.metronome_pending
+                    && self
+                        .engine
+                        .set_metronome(self.metronome_on, self.metronome_gain)
+                {
+                    self.metronome_pending = false;
                 }
                 if ui
                     .button("‹")

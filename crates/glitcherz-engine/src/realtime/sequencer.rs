@@ -70,6 +70,17 @@ pub fn ticks_per_bar_of(numerator: u8, denominator: u8) -> u32 {
     TICKS_PER_QUARTER * 4 / denominator * numerator
 }
 
+/// Ticks per beat (one denominator note) for `denominator`: 4/4 → 960,
+/// 6/8 → 480, 12/16 → 240.
+///
+/// Kept beside [`ticks_per_bar_of`] so both derive from the same denominator
+/// clamp — the metronome (`spec/recording.md` D5) must not invent a second
+/// rounding rule.
+pub fn ticks_per_beat_of(denominator: u8) -> u32 {
+    let denominator = u32::from(denominator.clamp(1, 32).next_power_of_two().min(32));
+    (TICKS_PER_QUARTER * 4 / denominator).max(1)
+}
+
 /// Lowest note-on velocity (a note-off; silence).
 pub const MIN_VELOCITY: u8 = 1;
 
@@ -334,6 +345,11 @@ pub struct Sequencer {
     /// reads this instead of the 4/4 [`TICKS_PER_BAR`] constant. Set by
     /// `SetTimeSignature`; changing it never moves the transport.
     bar_ticks: u32,
+    /// Meter numerator (beats per bar), mirrored so the metronome can mark the
+    /// downbeat (`spec/recording.md` D5). Clamped like `bar_ticks`.
+    numerator: u8,
+    /// Meter denominator; [`ticks_per_beat_of`] turns it into the beat length.
+    denominator: u8,
     position_ticks: f64,
     /// Active MIDI track count (D12 dynamic tracks: sent from the control side
     /// via `SetMidiTrackCount`, scheduling only scans `0..track_count`;
@@ -388,6 +404,8 @@ impl Sequencer {
             base_bpm: 120.0,
             bpm_override: None,
             bar_ticks: TICKS_PER_BAR,
+            numerator: 4,
+            denominator: 4,
             position_ticks: 0.0,
             track_count: crate::realtime::DEFAULT_MIDI_TRACKS,
             clips: std::array::from_fn(|_| empty_midi_clip_table()),
@@ -597,11 +615,24 @@ impl Sequencer {
     ///
     /// RT-safe: arithmetic only, no allocation.
     pub fn set_time_signature(&mut self, numerator: u8, denominator: u8) {
-        let bar_ticks = ticks_per_bar_of(numerator, denominator);
+        self.numerator = numerator.clamp(1, MAX_TIME_SIGNATURE_NUMERATOR);
+        self.denominator = denominator.clamp(1, 32).next_power_of_two().min(32);
+        let bar_ticks = ticks_per_bar_of(self.numerator, self.denominator);
         if bar_ticks != self.bar_ticks {
             self.bar_ticks = bar_ticks;
             self.refresh_arrangement_end();
         }
+    }
+
+    /// Meter numerator (beats per bar). RT-safe.
+    pub fn numerator(&self) -> u8 {
+        self.numerator
+    }
+
+    /// Length of one beat in ticks, derived from the meter denominator
+    /// (`spec/recording.md` D5). Always `>= 1`, so callers may divide. RT-safe.
+    pub fn beat_ticks(&self) -> u32 {
+        ticks_per_beat_of(self.denominator)
     }
 
     /// The live bar length in ticks (U3a). RT-safe.

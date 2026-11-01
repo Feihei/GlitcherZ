@@ -656,6 +656,18 @@ impl AudioEngine {
         ))
     }
 
+    /// Enables / configures the transport metronome (`spec/recording.md`).
+    ///
+    /// The click is mixed after the graph, so it survives muting the master
+    /// chain and never enters automation or the exported audio. Returns
+    /// `false` if the command queue is full.
+    pub fn set_metronome(&mut self, enabled: bool, gain: f32) -> bool {
+        self.send(EngineCommand::Sequencer(SequencerCommand::SetMetronome {
+            enabled,
+            gain,
+        }))
+    }
+
     // ---- Document-driven graph building API (P5c, D13: the loader rebuilds
     // the engine graph from the document) ----
 

@@ -10,6 +10,7 @@ use crate::realtime::automation::MAX_AUTO_TRACKS;
 use crate::realtime::commands::{EngineCommand, NoteEvent, SequencerCommand};
 use crate::realtime::context::ProcessContext;
 use crate::realtime::graph::{GraphLevels, GraphUpdate, NO_EDGE, RtGraph, TIMELINE_IN};
+use crate::realtime::metronome::Metronome;
 use crate::realtime::sequencer::{RtCtrl, Sequencer, SequencerSink};
 use crate::realtime::voice::RecycledNode;
 
@@ -136,6 +137,14 @@ pub struct BlockRunner {
     midi_trash: rtrb::Producer<crate::realtime::sequencer::MidiClipTable>,
     /// Parked MIDI table that did not fit the trash queue last block.
     midi_trash_pending: Option<crate::realtime::sequencer::MidiClipTable>,
+    /// Transport metronome (spec `recording.md` D1–D5): synthesized after the
+    /// graph has run, so it never becomes a node, never enters automation and
+    /// never shows up in the master peak meter. Disabled until the UI sends
+    /// `SetMetronome`; the offline export engine never does (D2).
+    metronome: Metronome,
+    /// Pre-allocated mono click buffer, one block long: `run_next_block` fills
+    /// it and [`BlockRunner::sample_at`] adds it to both output channels.
+    click: Vec<f32>,
     feedback: Feedback,
     played_samples: u64,
 }
@@ -177,6 +186,8 @@ impl BlockRunner {
             audio_trash_pending: None,
             midi_trash,
             midi_trash_pending: None,
+            metronome: Metronome::new(sample_rate),
+            click: vec![0.0; fixed_block.max(1)],
             feedback,
             played_samples: 0,
         }
@@ -288,6 +299,20 @@ impl BlockRunner {
 
         // 5. The node graph processes one block (topological order: sum inputs → process in place → master output).
         let levels: GraphLevels = self.graph.process_block(&ctx);
+
+        // 5b. Metronome (spec `recording.md` D1): beat tracking and the click
+        // buffer, filled **after** the graph so the click stays outside it.
+        // `tick` also owns the beat tracker, which is why it must see the
+        // post-advance position.
+        {
+            let Self {
+                metronome,
+                sequencer,
+                click,
+                ..
+            } = self;
+            metronome.tick(sequencer, click);
+        }
 
         // 6. State feedback.
         self.feedback.level.store(levels.master);
@@ -451,6 +476,11 @@ impl BlockRunner {
         match cmd {
             SequencerCommand::Play => {
                 self.sequencer.play();
+                // The click re-anchors to the play position: starting exactly
+                // on a beat fires that beat (the bar-one downbeat), a resume
+                // mid-beat waits for the next one.
+                self.metronome
+                    .resync(self.sequencer.position_ticks(), self.sequencer.beat_ticks());
                 // Release the previous run's still-pending notes **by pitch**
                 // (see `take_pending_offs`), then a blanket off for the
                 // built-in chain — clearing manual notes that may still be
@@ -460,6 +490,8 @@ impl BlockRunner {
             }
             SequencerCommand::Stop => {
                 self.sequencer.stop();
+                self.metronome
+                    .resync(self.sequencer.position_ticks(), self.sequencer.beat_ticks());
                 // Same pitch-matched release: a blanket `Off { note: 0 }`
                 // alone never reaches a pitch-matching plugin (Dexed), whose
                 // sounding notes then hang forever.
@@ -470,6 +502,8 @@ impl BlockRunner {
                 // U1: the position stays (resume via Play); sounding notes
                 // still fall silent — same release semantics as Stop.
                 self.sequencer.pause();
+                self.metronome
+                    .resync(self.sequencer.position_ticks(), self.sequencer.beat_ticks());
                 self.release_pending_notes();
                 self.graph.note_off_all();
             }
@@ -478,6 +512,10 @@ impl BlockRunner {
                 // fire at the new one (the sequencer clears its pending
                 // offs); sounding notes release like a transport jump.
                 self.sequencer.seek(ticks);
+                // A seek silently lands wherever the user clicked: the beat
+                // it happened to cross must not click.
+                self.metronome
+                    .resync(self.sequencer.position_ticks(), self.sequencer.beat_ticks());
                 self.release_pending_notes();
                 self.graph.note_off_all();
             }
@@ -495,6 +533,9 @@ impl BlockRunner {
             SequencerCommand::SetMidiTrackCount(count) => {
                 self.sequencer.set_track_count(count);
             }
+            SequencerCommand::SetMetronome { enabled, gain } => {
+                self.metronome.configure(enabled, gain);
+            }
             SequencerCommand::SetArrangementFloor(floor) => {
                 self.sequencer.set_arrangement_floor(floor);
             }
@@ -503,12 +544,19 @@ impl BlockRunner {
 
     /// Reads the sample at `(channel, position)` from the master buffer;
     /// out-of-range is always silent (no panic).
+    ///
+    /// The metronome click is added here, on top of the graph output and
+    /// outside the master bus (`spec/recording.md` D1): muting, effects and
+    /// automation cannot silence it, and the peak meter (computed inside the
+    /// graph) does not include it.
     fn sample_at(&self, ch: usize, pos: usize) -> f32 {
-        self.graph
+        let program = self
+            .graph
             .master_channel(ch)
             .and_then(|c| c.get(pos))
             .copied()
-            .unwrap_or(0.0)
+            .unwrap_or(0.0);
+        program + self.click.get(pos).copied().unwrap_or(0.0)
     }
 }
 

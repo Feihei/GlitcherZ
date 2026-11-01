@@ -61,6 +61,7 @@ pub mod gain;
 pub mod graph;
 pub mod lfo;
 pub mod map;
+pub mod metronome;
 pub mod midi_envelope;
 pub mod mixer;
 pub mod mod_delay;

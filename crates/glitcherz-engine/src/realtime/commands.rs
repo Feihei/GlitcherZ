@@ -249,6 +249,20 @@ pub enum SequencerCommand {
     /// position is kept — a meter is notation plus a bar length, not a data
     /// transform. Invalid fields are clamped on the real-time side.
     SetTimeSignature { numerator: u8, denominator: u8 },
+    /// Enable / configure the transport metronome (`spec/recording.md` D1–D5).
+    ///
+    /// The click is synthesized inside [`crate::realtime::block::BlockRunner`]
+    /// and mixed **after** the node graph: it is not a node, not automation,
+    /// not part of the master peak meter, and the offline export engine never
+    /// receives this command, so a rendered file can never contain a click
+    /// (D2). `gain` is linear `0..=1`; out-of-range values are clamped
+    /// real-time-side.
+    SetMetronome {
+        /// Whether the click sounds while the transport plays.
+        enabled: bool,
+        /// Linear click level, `0..=1`.
+        gain: f32,
+    },
     /// Set the active MIDI track count (D12 dynamic tracks; values beyond
     /// capacity are clamped on the real-time side).
     SetMidiTrackCount(usize),
