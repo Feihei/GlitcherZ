@@ -32,6 +32,8 @@ rfd = "0.17"
 eframe = { version = "0.36", default-features = false, features = ["default_fonts"] }
 # 实时无锁队列（UI → 音频线程）
 rtrb = "0.4"
+# 实时无锁 MPMC 队列（R4：输入回调 → 图内 InputProcessor；图重建后句柄仍可共享）
+crossbeam-queue = "0.3"
 # 错误处理
 thiserror = "2"
 # 日志

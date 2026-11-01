@@ -189,7 +189,10 @@ pub fn parse_project(text: &str) -> Result<Project, ModelError> {
 /// Loads the project from disk. **Not real-time** (disk IO).
 pub fn load_project(path: &Path) -> Result<Project, ModelError> {
     let text = std::fs::read_to_string(path)?;
-    parse_project(&text)
+    let mut project = parse_project(&text)?;
+    // R4 D11: relative media paths resolve against the project's directory.
+    project.base_dir = path.parent().map(Path::to_path_buf);
+    Ok(project)
 }
 
 #[cfg(test)]
@@ -260,9 +263,17 @@ mod tests {
             std::env::temp_dir().join(format!("glitcherz_roundtrip_{}.glz", std::process::id()));
 
         save_project(&project, &path).expect("save failed");
-        let loaded = load_project(&path).expect("load failed");
+        let mut loaded = load_project(&path).expect("load failed");
         let _ = std::fs::remove_file(&path);
 
+        // R4 D11: loading roots relative media at the project directory. That
+        // is session state, not a serialized field, so the document comparison
+        // below runs without it.
+        assert_eq!(
+            loaded.base_dir,
+            path.parent().map(std::path::Path::to_path_buf)
+        );
+        loaded.base_dir = None;
         assert_eq!(
             project, loaded,
             "save→load should fully restore the project"
@@ -285,7 +296,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("glitcherz_tempo_{}.glz", std::process::id()));
 
         save_project(&project, &path).expect("save failed");
-        let loaded = load_project(&path).expect("load failed");
+        let mut loaded = load_project(&path).expect("load failed");
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(
@@ -293,6 +304,7 @@ mod tests {
             Some((crate::PortRef::TimelineIn, AutoParam::Tempo))
         );
         assert_eq!(loaded.graph.layout.timeline_in, Some([930.0, 320.0]));
+        loaded.base_dir = None;
         assert_eq!(loaded, project, "the whole document must roundtrip");
     }
 

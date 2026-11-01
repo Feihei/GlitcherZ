@@ -43,6 +43,7 @@
 //!   start from 2.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 pub mod file;
 pub mod ops;
@@ -3142,6 +3143,24 @@ pub enum NodeDoc {
         #[serde(default = "default_feedback_gain")]
         gain: f32,
     },
+    /// Live audio input node (R4, spec `recording.md` D9): 1 audio out, no
+    /// input, no engine-side MIDI. It is the graph's door for a microphone /
+    /// instrument, and the source that arms an audio track's recording input.
+    ///
+    /// Deliberately has **no `track` field**: recording ownership is the
+    /// `Timeline In` wiring (D22), so one input can feed several audio tracks.
+    Input {
+        /// Persisted node ID.
+        #[serde(default)]
+        node_id: u64,
+        /// Which interleaved channel of the device the node exposes (0-based;
+        /// v1 supports the first two channels).
+        #[serde(default)]
+        channel: u8,
+        /// Output gain (linear, 0..2; 1.0 = unity).
+        #[serde(default = "default_input_gain")]
+        gain: f32,
+    },
     /// Audio track node (U6, spec `.agents/spec/audio-track.md` D3): the
     /// generator that plays the owning [`AudioTrack`]'s clips off the
     /// transport clock. The clip table itself lives in
@@ -3187,6 +3206,12 @@ fn default_track_gain() -> f32 {
 
 fn default_feedback_gain() -> f32 {
     0.5
+}
+
+/// Unity gain for a live input node (D10: born silent downstream because it is
+/// unconnected, not because its gain is turned down).
+fn default_input_gain() -> f32 {
+    1.0
 }
 
 impl VoiceSpec {
@@ -3242,7 +3267,8 @@ impl NodeDoc {
             | NodeDoc::MidiEnvelope { node_id, .. }
             | NodeDoc::Lfo { node_id, .. }
             | NodeDoc::CurveMap { node_id, .. }
-            | NodeDoc::ChannelStrip { node_id, .. } => *node_id,
+            | NodeDoc::ChannelStrip { node_id, .. }
+            | NodeDoc::Input { node_id, .. } => *node_id,
         }
     }
 
@@ -3261,6 +3287,9 @@ impl NodeDoc {
             | NodeDoc::Lfo { track, .. }
             | NodeDoc::CurveMap { track, .. }
             | NodeDoc::ChannelStrip { track, .. } => *track,
+            // R4: the live input node has no owning track (recording ownership
+            // is the `Timeline In` wiring, D22).
+            NodeDoc::Input { .. } => 0,
         }
     }
 
@@ -3912,6 +3941,26 @@ impl GraphDoc {
                 }
             }
         }
+        // Live input node range (R4): v1 is mono/stereo, unity gain 0..2.
+        for node in &self.nodes {
+            if let NodeDoc::Input {
+                node_id,
+                channel,
+                gain,
+            } = node
+            {
+                if *channel > 1 {
+                    return Err(format!(
+                        "input node {node_id} selects channel {channel} (v1 supports 0..1)"
+                    ));
+                }
+                if !gain.is_finite() || !(0.0..=2.0).contains(gain) {
+                    return Err(format!(
+                        "input node {node_id} has an out-of-range gain ({gain})"
+                    ));
+                }
+            }
+        }
         // Drum kit integrity (W1, spec `drum-kit.md` K3): bounded slots and
         // unique trigger keys — a duplicate key would make "which sample
         // plays" depend on table order.
@@ -4494,6 +4543,11 @@ pub struct Project {
     /// Node graph document (D13 fully explicit).
     #[serde(default)]
     pub graph: GraphDoc,
+    /// Directory the project file lives in (R4 D11): session-only, **never
+    /// serialized**. Relative clip paths resolve against it, so a project
+    /// copied together with its `<stem>.media/` folder plays anywhere.
+    #[serde(skip)]
+    pub base_dir: Option<PathBuf>,
 }
 
 fn default_master_gain() -> f32 {
@@ -4510,6 +4564,7 @@ impl Default for Project {
             audio_tracks: vec![AudioTrack::default(); DEFAULT_AUDIO_TRACKS],
             clip_groups: Vec::new(),
             graph: default_graph_doc(DEFAULT_MIDI_TRACKS, DEFAULT_AUDIO_TRACKS),
+            base_dir: None,
         }
     }
 }
@@ -4741,6 +4796,34 @@ impl Project {
                     };
                 }
             }
+        }
+    }
+
+    /// Resolves a document media path (R4 D11): an absolute path is used as-is;
+    /// a relative one is joined to the project directory. With no `base_dir`
+    /// (unsaved project / bare document) the relative path is returned
+    /// unchanged, which keeps tests and headless tools working against the cwd.
+    pub fn resolve_media_path(&self, path: &str) -> PathBuf {
+        let candidate = Path::new(path);
+        if candidate.is_absolute() {
+            return candidate.to_path_buf();
+        }
+        match &self.base_dir {
+            Some(dir) => dir.join(candidate),
+            None => candidate.to_path_buf(),
+        }
+    }
+
+    /// The string to store in a clip for `path`: relative to the project
+    /// directory when the file lives under it, absolute otherwise.
+    pub fn media_path_string(&self, path: &Path) -> String {
+        match &self.base_dir {
+            Some(dir) => path
+                .strip_prefix(dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string(),
+            None => path.to_string_lossy().to_string(),
         }
     }
 
@@ -6771,6 +6854,60 @@ mod tests {
             0,
         ));
         assert!(doc.validate(2, 1).is_err(), "keyboard has no control out");
+    }
+
+    /// R4: the live input node is mono/stereo and its gain stays 0..2.
+    #[test]
+    fn input_node_validation_bounds_channel_and_gain() {
+        let mut doc = vk_doc();
+        doc.nodes.push(NodeDoc::Input {
+            node_id: 8,
+            channel: 0,
+            gain: 1.0,
+        });
+        assert!(doc.validate(2, 0).is_ok());
+        doc.nodes.pop();
+        doc.nodes.push(NodeDoc::Input {
+            node_id: 8,
+            channel: 2,
+            gain: 1.0,
+        });
+        assert!(doc.validate(2, 0).is_err(), "channel 2 is out of range");
+        doc.nodes.pop();
+        doc.nodes.push(NodeDoc::Input {
+            node_id: 8,
+            channel: 0,
+            gain: 3.0,
+        });
+        assert!(doc.validate(2, 0).is_err(), "gain above 2 is rejected");
+    }
+
+    /// R4 D11: relative media paths resolve against the project directory and
+    /// are stored relative to it.
+    #[test]
+    fn relative_media_paths_resolve_against_the_project_directory() {
+        let mut project = Project {
+            base_dir: Some(std::path::PathBuf::from("songs")),
+            ..Project::default()
+        };
+        assert_eq!(
+            project.resolve_media_path("demo.media/rec-1.wav"),
+            std::path::PathBuf::from("songs").join("demo.media/rec-1.wav")
+        );
+        assert_eq!(
+            project.resolve_media_path("C:/elsewhere/take.wav"),
+            std::path::PathBuf::from("C:/elsewhere/take.wav"),
+            "absolute paths are untouched"
+        );
+        assert_eq!(
+            project.media_path_string(std::path::Path::new("songs/demo.media/rec-1.wav")),
+            "demo.media/rec-1.wav"
+        );
+        project.base_dir = None;
+        assert_eq!(
+            project.resolve_media_path("demo.media/x.wav"),
+            std::path::PathBuf::from("demo.media/x.wav")
+        );
     }
 
     /// U3b (spec `tempo-meter.md` D1/D2/D7): the Timeline In terminal accepts

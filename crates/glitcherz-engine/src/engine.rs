@@ -74,6 +74,13 @@ pub struct AudioEngineInfo {
 pub enum EngineError {
     #[error("no audio output device available")]
     NoOutputDevice,
+    /// R4: the input stream could not be opened; the engine still runs (the
+    /// Input node is silent and the UI reports the reason).
+    #[error("no audio input device available")]
+    NoInputDevice,
+    /// R4: the device cannot deliver the engine's sample rate in f32.
+    #[error("unsupported audio input config: {0}")]
+    InputUnsupported(String),
     #[error("audio device error: {0}")]
     Device(#[from] cpal::Error),
 }
@@ -123,6 +130,9 @@ pub struct AudioEngine {
     offline_runner: Option<Box<BlockRunner>>,
     feedback: Feedback,
     info: AudioEngineInfo,
+    /// Live audio input (R4): `None` when no input device / unsupported rate.
+    /// Dropping the engine closes the stream.
+    input: Option<crate::audio_input::AudioInput>,
 }
 
 impl AudioEngine {
@@ -206,6 +216,24 @@ impl AudioEngine {
         )?;
         stream.play()?;
 
+        // R4: open the input side best-effort. A machine without a microphone
+        // must still run the DAW; the Input node then reports the failure.
+        let input = match crate::audio_input::AudioInput::open(stream_config.sample_rate) {
+            Ok(input) => {
+                log::info!(
+                    "audio input: {} ({} ch @ {} Hz)",
+                    input.info().device_name,
+                    input.info().channels,
+                    input.info().sample_rate
+                );
+                Some(input)
+            }
+            Err(err) => {
+                log::warn!("audio input unavailable: {err}");
+                None
+            }
+        };
+
         Ok(Self {
             _stream: Some(stream),
             commands,
@@ -223,6 +251,7 @@ impl AudioEngine {
                 sample_rate: stream_config.sample_rate,
                 out_channels: stream_config.channels,
             },
+            input,
         })
     }
 
@@ -285,6 +314,7 @@ impl AudioEngine {
                 sample_rate,
                 out_channels: 2,
             },
+            input: None,
         })
     }
 
@@ -764,6 +794,46 @@ impl AudioEngine {
     /// `false` if the command queue is full (retry next frame).
     pub fn set_capture(&mut self, enabled: bool) -> bool {
         self.send(EngineCommand::SetCapture(enabled))
+    }
+
+    /// R4: description of the live input device (device name, channels, rate),
+    /// or `None` when no input stream could be opened.
+    pub fn input_info(&self) -> Option<&crate::audio_input::AudioInputInfo> {
+        self.input.as_ref().map(|input| input.info())
+    }
+
+    /// R4: monitor ring handle for the graph's `InputProcessor` (a new clone
+    /// each call; all clones address the same queue). `None` = no input.
+    pub fn input_ring(&self) -> Option<crate::audio_input::InputRing> {
+        self.input.as_ref().map(|input| input.monitor_ring())
+    }
+
+    /// R4: shared input counters (peak / drops / underruns), if live.
+    pub fn input_stats(&self) -> Option<std::sync::Arc<crate::audio_input::InputStats>> {
+        self.input.as_ref().map(|input| input.stats())
+    }
+
+    /// R4: feed / stop feeding the monitor ring. Disabling clears what was
+    /// queued so a later node never starts on stale samples.
+    pub fn set_input_monitor(&mut self, enabled: bool) {
+        if let Some(input) = &self.input {
+            input.set_monitor_enabled(enabled);
+        }
+    }
+
+    /// R4: arms the take ring. Enabling clears stale samples first.
+    pub fn set_audio_capture(&mut self, enabled: bool) {
+        if let Some(input) = &self.input {
+            input.set_record_enabled(enabled);
+        }
+    }
+
+    /// R4: drains the take ring into `out` (never clears `out`); returns the
+    /// number of samples moved. **Control thread only.**
+    pub fn drain_recorded_audio(&mut self, out: &mut Vec<f32>) -> usize {
+        self.input
+            .as_ref()
+            .map_or(0, |input| input.drain_recorded(out))
     }
 
     /// Appends everything the audio thread captured since the last call to

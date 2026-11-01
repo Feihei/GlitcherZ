@@ -540,6 +540,10 @@ pub enum NodeSource {
     /// Virtual keyboard node (G6, spec `plugin-gui.md` §8): document-only
     /// routing node.
     Keyboard,
+    /// Live audio input node (R4, spec `recording.md` D9): 1 audio out, no
+    /// MIDI. Routes a microphone / instrument into the graph and arms audio
+    /// track recording inputs.
+    AudioInput,
     /// Arpeggiator MIDI effect (spec `midi-nodes.md` §5.1).
     Arpeggiator,
     /// Portamento MIDI effect + control source (spec `midi-nodes.md` §5.2).
@@ -1484,6 +1488,9 @@ fn node_color(id: PatchId, doc: &GraphDoc) -> (Color32, Color32) {
             Some(NodeDoc::Effect { .. }) => Color32::from_rgb(220, 150, 70),
             Some(NodeDoc::Mixer { .. }) => Color32::from_rgb(110, 190, 120),
             Some(NodeDoc::Keyboard { .. }) => Color32::from_rgb(95, 205, 190),
+            // R4: a live input is an audio source, one shade warmer than the
+            // keyboard's routing colour.
+            Some(NodeDoc::Input { .. }) => Color32::from_rgb(80, 185, 205),
             Some(NodeDoc::Feedback { .. }) => Color32::from_rgb(215, 105, 160),
             // U6: audio tracks share the sample-player family's warm tone.
             Some(NodeDoc::AudioTrack { .. }) => Color32::from_rgb(205, 165, 90),
@@ -1601,6 +1608,7 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
         PatchId::Timeline => "Timeline".to_string(),
         PatchId::TimelineIn => "Timeline In".to_string(),
         PatchId::Node(node_id) => match doc.node_by_id(node_id) {
+            Some(NodeDoc::Input { .. }) => "Audio In".to_string(),
             Some(NodeDoc::Instrument { voice, track, .. }) => match voice {
                 VoiceSpec::Builtin => format!("Synth · Track {}", track + 1),
                 // U13: the file is the node's identity now (the preset is
@@ -1917,7 +1925,12 @@ impl PatchState {
                 }
                 // G6: the virtual keyboard has no audio input; the LFO is a pure
                 // control source with no input port at all (spec `lfo.md` D1).
-                Some(node) if node.is_keyboard() || matches!(node, NodeDoc::Lfo { .. }) => 0,
+                Some(node)
+                    if node.is_keyboard()
+                        || matches!(node, NodeDoc::Lfo { .. } | NodeDoc::Input { .. }) =>
+                {
+                    0
+                }
                 _ => 1,
             },
         };
@@ -1989,6 +2002,15 @@ impl PatchState {
                 // timeline box (only a fallback — the menu places them at the
                 // click position).
                 NodeDoc::Keyboard { .. } => {
+                    let k = keyboard_slot;
+                    keyboard_slot += 1;
+                    (
+                        PatchId::Node(node.node_id()),
+                        Pos2::new(16.0, keyboard_top + k as f32 * 68.0),
+                    )
+                }
+                // R4: the live input is a source node like the keyboard.
+                NodeDoc::Input { .. } => {
                     let k = keyboard_slot;
                     keyboard_slot += 1;
                     (
@@ -2776,6 +2798,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 }
                 if ui.button("Keyboard In (computer)").clicked() {
                     return Some(AddPick::Add(NodeSource::Keyboard));
+                }
+                if ui
+                    .button("Audio Input (microphone)")
+                    .on_hover_text("Live input node: 1 audio out, no connections by default")
+                    .clicked()
+                {
+                    return Some(AddPick::Add(NodeSource::AudioInput));
                 }
                 if ui.button("Feedback Tap").clicked() {
                     return Some(AddPick::Add(NodeSource::Feedback));

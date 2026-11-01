@@ -37,6 +37,9 @@
 //! AudioEngine::position_seconds ◄─ AtomicU64 ◄─ playback position
 //! ```
 
+/// Live audio input capture (R4): the cpal input stream + two lock-free
+/// rings (monitor / take). Control-side handle; callbacks are allocation-free.
+pub mod audio_input;
 pub mod convert;
 pub mod engine;
 pub mod host_gate;
@@ -50,6 +53,7 @@ pub mod sf2;
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub use audio_input::{AudioInput, AudioInputInfo, InputRing, InputStats};
 pub use engine::{AudioEngine, AudioEngineInfo, CommandSender, EngineError, available_outputs};
 pub use midi_input::{MidiInputError, MidiInputHub, MidiInputStats, MidiTarget};
 pub use sample::{SampleData, SampleError, SampleLibrary, StereoFrame};

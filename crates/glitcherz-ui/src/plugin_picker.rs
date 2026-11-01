@@ -153,6 +153,9 @@ impl PickChoice {
             | NodeSource::ClapEffect { path, .. }
             | NodeSource::Vst3Effect { path, .. } => path.clone(),
             NodeSource::BuiltinSynth => "Built-in synth (sine + filter + ADSR)".to_string(),
+            NodeSource::AudioInput => {
+                "Live audio input (microphone / instrument) — 1 audio out".to_string()
+            }
             NodeSource::SoundFont { .. } => {
                 "SoundFont (.sf2 / .sf3) — the file is picked on the node".to_string()
             }

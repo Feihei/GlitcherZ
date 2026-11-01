@@ -493,8 +493,17 @@ curve→曲线轨，即"烘培"）；**一个输入只允许一个源，一个�
   中途拔线只结束该轨 take；transport 增 `Mute others`。
   测试：model 轨输入规则 + 项目音频范围、sequencer record mute、capture 轨戳、
   patch 端口表 / 休眠判定、recorder 多轨；全仓 fmt/clippy/test 绿
-- [ ] **R4 音频录音**（改用轨输入口，`Input` 不带 `track` 字段）：`NodeDoc::Input` +
-  `InputProcessor` + cpal 输入双 ring + `.media/` 相对路径 + 手动延迟 offset
+- [x] **R4 音频录音** ✅ 2026-11-01：model `NodeDoc::Input{node_id,channel,gain}`
+  （无 `track` 字段，录音归属仍由轨输入口接线决定）+ `Project::base_dir` /
+  `resolve_media_path` / `media_path_string`；`crossbeam-queue` 双无锁 ring
+  （monitor + take，Arc 句柄跨图重建存活）；engine `audio_input`（cpal 输入流，
+  按引擎采样率打开、f32、无重采样）+ `realtime::input::InputProcessor`（通道选择 /
+  gain / 欠采样计数）+ `ParamId::{InputGain,InputChannel}`；UI Input 节点（Add 菜单）、
+  装配 / 离线静音、monitor 开关、每帧 drain、`.media/` 写 32-bit float mono wav
+  （相对路径）、手动延迟 offset、音频 take 与 MIDI take 同一 undo 步；
+  干区校验覆盖音频轨，无输入设备 / 未保存工程明确拒绝。
+  测试：InputProcessor 通道 / gain / 空环静音 / 区间钳制、InputRing FIFO、
+  Input 节点字段校验、相对/绝对媒体路径；全仓 fmt/clippy/test 绿
 - [ ] **R5 收尾**：录音后选中新 clip、输入电平表、溢出告警、PDC 自动对齐
 - [ ] **R7 MIDI 烘培 / R8 控制烘培**：事件派发级 / 块边界采样级 tap，模型已允许连线（D26）
 

@@ -1,7 +1,7 @@
 # Spec: 节拍器与录音（Metronome & Recording）
 
-> 状态：实施中（2026-11-01）。R1 节拍器、R2 录音骨架、R3 硬件 MIDI 输入、**R6 轨输入口**已交付；
-> R4 音频录音据此复用轨输入口；R5 收尾、R7/R8 多类型采集待实施。
+> 状态：实施中（2026-11-01）。R1 节拍器、R2 录音骨架、R3 硬件 MIDI 输入、**R6 轨输入口**、
+> **R4 音频录音**已交付；R5 收尾、R7/R8 多类型采集待实施。
 > 关联：`plan.md`「S2 补最短的板」、`review-2026-11-01.md`、
 > `spec/audio-track.md`（音频轨播放与 trim）、`spec/tempo-meter.md`（tick 时钟 / 拍号）。
 > 前置事实：引擎已有完整的 tick 时钟（`Sequencer::position_ticks` + `base_bpm` +
@@ -158,11 +158,13 @@ LFO/curve ──automation──► Curve 1 输入口  （R8：块边界采样 t
   （派发纯派生 + 中途改接线结束该轨 take，无 mute 状态）。
   测试：validate（单源 / 类型不匹配 / 轨号越界 / 项目音频范围）、patch 端口表与休眠判定、
   sequencer `SetRecordMute`、capture 打轨戳、recorder 多轨同录；全仓 fmt/clippy/test 绿。
-- [ ] **R4 音频录音**（改用轨输入口，`Input` 不再带 `track` 字段）
-  `NodeDoc::Input{node_id, channel, gain}` + `InputProcessor`；
-  `AudioInput`（cpal 输入流 + 双 ring + `Arc<InputStats>` 原子量）；
-  `.media/` + 相对路径解析（`Project::base_dir` / `resolve_path`）；
-  Input 节点 audio out → 音频轨输入口 = 录音归属；落盘与 clip 创建；手动延迟 offset。
+- [x] **R4 音频录音**（改用轨输入口，`Input` 不再带 `track` 字段）✅ 2026-11-01
+  `NodeDoc::Input{node_id, channel, gain}` + `InputProcessor`（`realtime/input.rs`）；
+  `AudioInput`（cpal 输入流 + monitor/take 两条 `crossbeam_queue::ArrayQueue` +
+  `Arc<InputStats>` 原子量），按引擎采样率打开、只接受 f32、不重采样；
+  `.media/` + 相对路径（`Project::base_dir` / `resolve_media_path` / `media_path_string`）；
+  Input 节点 audio out → 音频轨输入口 = 录音归属；take 写 32-bit float mono wav，
+  手动延迟 offset 平移 clip 起点。音频 + MIDI take 同一次 undo；无设备 / 未保存工程拒绝开录。
 - [ ] **R5 收尾**
   录音后自动选中新 clip、take 命名、输入电平表、状态栏溢出告警；
   PDC 落地后自动对齐；多输入通道（立体声对 / 多设备）。

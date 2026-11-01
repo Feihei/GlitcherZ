@@ -77,6 +77,11 @@ pub enum ParamId {
     /// Feedback tap gain (P6; 0..1). Applied to the one-block-delayed sum
     /// of the feedback node's in-edges.
     FeedbackGain,
+    /// Audio-input node gain (R4; linear 0..2).
+    InputGain,
+    /// Audio-input node source channel (R4; 0-based index into the device's
+    /// interleaved stream).
+    InputChannel,
     /// Mixer channel gain (payload = channel index 0..32, linear 0..1.5; D15).
     MixerGain(u8),
     /// Mixer channel pan (payload = channel index; -1..1, linear law).
