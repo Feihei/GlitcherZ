@@ -34,7 +34,9 @@ use crate::Project;
 /// `version < 8` goes through [`Project::migrate_v7_to_v8`] (effect `delay`
 /// payload → `params`); `version < 9` goes through
 /// [`Project::migrate_v8_to_v9`] (curve anchors → normalized domain).
-pub const PROJECT_VERSION: u32 = 9;
+/// v10 (R6) only adds the [`crate::PortRef::TrackIn`] enum branch — no
+/// migration function: v9 files simply contain none.
+pub const PROJECT_VERSION: u32 = 10;
 
 fn default_version() -> u32 {
     PROJECT_VERSION

@@ -36,6 +36,11 @@ pub struct CapturedNote {
     pub ticks: f64,
     /// The event itself.
     pub event: NoteEvent,
+    /// MIDI track the event was addressed to (R6 D25/D31), or `None` for a
+    /// node-addressed performance event. The UI records track-addressed events
+    /// into the track's take and **discards** node-addressed ones: recording
+    /// ownership is the track-input wiring, not the direct node cable.
+    pub track: Option<usize>,
 }
 
 /// Creates the capture ring. **Not RT-safe** (allocates); call before starting
@@ -99,11 +104,19 @@ impl CaptureTap {
 
     /// Stamps and queues one live event. **RT-safe**: no allocation, no
     /// logging, no panic — a full ring drops the event and counts it.
-    pub fn note(&mut self, ticks: f64, event: NoteEvent) {
+    pub fn note(&mut self, ticks: f64, event: NoteEvent, track: Option<usize>) {
         if !self.enabled {
             return;
         }
-        if self.tx.push(CapturedNote { ticks, event }).is_err() {
+        if self
+            .tx
+            .push(CapturedNote {
+                ticks,
+                event,
+                track,
+            })
+            .is_err()
+        {
             self.dropped = self.dropped.saturating_add(1);
             self.overflow.store(self.dropped, Ordering::Relaxed);
         }
@@ -139,7 +152,7 @@ mod tests {
     #[test]
     fn disabled_tap_drops_everything_without_counting() {
         let (mut tap, mut rx, overflow) = tap(8);
-        tap.note(0.0, on(60));
+        tap.note(0.0, on(60), Some(0));
         assert!(rx.pop().is_err());
         assert_eq!(overflow.load(Ordering::Relaxed), 0);
     }
@@ -148,10 +161,11 @@ mod tests {
     fn enabled_tap_stamps_the_position() {
         let (mut tap, mut rx, _) = tap(8);
         tap.configure(true);
-        tap.note(960.0, on(64));
+        tap.note(960.0, on(64), Some(0));
         let captured = rx.pop().expect("event should be queued");
         assert_eq!(captured.ticks, 960.0);
         assert_eq!(captured.event, on(64));
+        assert_eq!(captured.track, Some(0), "R6: the track stamp survives");
     }
 
     #[test]
@@ -159,13 +173,13 @@ mod tests {
         // One usable slot: the second event must not block or panic.
         let (mut tap, mut rx, overflow) = tap(1);
         tap.configure(true);
-        tap.note(0.0, on(60));
-        tap.note(1.0, on(61));
-        tap.note(2.0, on(62));
+        tap.note(0.0, on(60), Some(0));
+        tap.note(1.0, on(61), Some(1));
+        tap.note(2.0, on(62), Some(2));
         assert_eq!(overflow.load(Ordering::Relaxed), 2);
         assert_eq!(rx.pop().map(|c| c.ticks), Ok(0.0));
         // The counter is cumulative, so draining does not reset it.
-        tap.note(3.0, on(63));
+        tap.note(3.0, on(63), Some(3));
         assert_eq!(overflow.load(Ordering::Relaxed), 2);
     }
 
@@ -173,9 +187,9 @@ mod tests {
     fn disabling_keeps_what_was_already_captured() {
         let (mut tap, mut rx, _) = tap(8);
         tap.configure(true);
-        tap.note(0.0, on(60));
+        tap.note(0.0, on(60), Some(0));
         tap.configure(false);
-        tap.note(1.0, on(61));
+        tap.note(1.0, on(61), Some(1));
         assert_eq!(rx.pop().map(|c| c.event), Ok(on(60)));
         assert!(rx.pop().is_err());
     }

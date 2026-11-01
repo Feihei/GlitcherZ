@@ -389,6 +389,10 @@ pub struct Sequencer {
     /// ends + note), several slots per track so a chord's notes each keep
     /// their own off (a single slot orphans all but the last note).
     pending_offs: [[Option<(u64, u8)>; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS],
+    /// Recording monitor mute (R6 D29): bit `n` set = track `n`'s sequenced
+    /// note-ons are dropped. Note-offs still fire (they were scheduled before
+    /// the mask changed), so flipping the mask never leaves a hanging voice.
+    record_mute: u32,
 }
 
 impl Sequencer {
@@ -419,7 +423,19 @@ impl Sequencer {
             loop_start_ticks: 0,
             loop_end_ticks: 0,
             pending_offs: [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS],
+            record_mute: 0,
         }
+    }
+
+    /// Sets the recording monitor mute bitmap (R6 D29). Bit `n` drops track
+    /// `n`'s sequenced note-ons. RT-safe.
+    pub fn set_record_mute(&mut self, bits: u32) {
+        self.record_mute = bits;
+    }
+
+    /// Whether track `n` is muted for recording monitoring (R6 D29). RT-safe.
+    pub fn track_record_muted(&self, track: usize) -> bool {
+        track < 32 && (self.record_mute & (1 << track)) != 0
     }
 
     /// Whether playing. RT-safe.
@@ -831,6 +847,7 @@ impl Sequencer {
     ) {
         // Disjoint field borrows: the clip table is read-only while scheduling,
         // the pending-offs table is written as notes are triggered.
+        let muted = self.track_record_muted(track);
         let clips = &self.clips[track];
         let pending = &mut self.pending_offs[track];
         for clip in clips {
@@ -877,7 +894,7 @@ impl Sequencer {
                     if on_tick >= t1 || on_tick >= clip_end {
                         break; // past the window or past the clip span
                     }
-                    if on_tick >= t0 {
+                    if on_tick >= t0 && !muted {
                         let velocity = note.velocity_f32();
                         // Retrigger guard: a previous occurrence of this note
                         // may still be sounding (its off was scheduled past
@@ -1146,6 +1163,28 @@ mod tests {
 
         let ctrls = run_ctrls(&mut seq, 400);
         assert_eq!(ctrls.len(), 2, "one per loop period: {ctrls:?}");
+    }
+
+    /// R6 D29: the recording monitor mute drops sequenced note-ons on the muted
+    /// tracks while the armed track keeps playing.
+    #[test]
+    fn record_mute_drops_note_ons_only_on_the_muted_track() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        place(&mut seq, 0, 0, 384, 384, &[clip_note(0, 100, 60)]);
+        place(&mut seq, 1, 0, 384, 384, &[clip_note(0, 100, 61)]);
+        seq.set_record_mute(1 << 1);
+        seq.play();
+
+        let events = run(&mut seq, 400);
+        let notes = ons(&events);
+        assert!(
+            notes.iter().all(|(track, _)| *track == 0),
+            "the muted track must not start notes: {notes:?}"
+        );
+        assert_eq!(notes.len(), 1, "the armed track still plays: {notes:?}");
+        // The mute is a scheduling mask, not a transport change.
+        assert!(seq.position_ticks() > 0.0);
     }
 
     /// P0: within one block, controllers are delivered before notes — a pitch

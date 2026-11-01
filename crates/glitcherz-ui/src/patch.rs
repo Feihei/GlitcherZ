@@ -19,7 +19,8 @@ use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use glitcherz_model::{
     AutoParam, BuiltinEffectKind, CableDoc, CableKind, ChannelParam, CurveMapParams, GraphDoc,
     LFO_DIVISION_LABELS, LayoutDoc, MAX_AUDIO_TRACKS, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS,
-    MAX_MIXER_CHANNELS, MIN_MIXER_CHANNELS, MidiSource, NodeDoc, NodeParam, PortRef, VoiceSpec,
+    MAX_MIXER_CHANNELS, MIN_MIXER_CHANNELS, MidiSource, NodeDoc, NodeParam, PortRef, TrackKind,
+    VoiceSpec, timeline_in_port, timeline_in_port_kind,
 };
 
 /// Inline parameter identity for built-in node kinds (G5, spec
@@ -674,6 +675,16 @@ pub enum PatchAction {
     ConnectTempoIn {
         index: usize,
     },
+    /// R6: connect a source into one track's **recording input** on the fixed
+    /// `Timeline In` terminal. `from` is the drag's source port (a node, a
+    /// timeline MIDI outlet or a timeline automation outlet); `kind` + `track`
+    /// identify the destination port. Document-only: a recording input is a
+    /// terminal, not an engine edge.
+    ConnectTrackIn {
+        from: PortRef,
+        kind: TrackKind,
+        track: usize,
+    },
     /// Delete a cable (index into the document cable table).
     DeleteCable(usize),
     /// Delete a node (document node_id; any instrument / effect / channel strip is
@@ -1180,9 +1191,10 @@ const TIMELINE_ROW_HEIGHT: f32 = 26.0;
 const TIMELINE_ACTION_ROWS: usize = 3;
 /// Timeline header height: title band + the three action rows.
 const TIMELINE_HEADER: f32 = NODE_TITLE_BAND + TIMELINE_ACTION_ROWS as f32 * ACTION_ROW_HEIGHT;
-/// Timeline In terminal size (U3b): one port row, same width as the timeline
-/// box it mirrors.
-const TIMELINE_IN_SIZE: Vec2 = Vec2::new(TIMELINE_WIDTH, 52.0);
+/// Timeline In terminal size (U3b/R6): one tempo port plus one recording input
+/// per track, same width as the timeline box it mirrors. Height scales with the
+/// port count; [`timeline_in_size`] is the single measure.
+const TIMELINE_IN_WIDTH: f32 = TIMELINE_WIDTH;
 /// Fixed patch height.
 const CANVAS_HEIGHT: f32 = 300.0;
 /// Output port circle radius / hit radius (generous so port drags are easy to start).
@@ -1229,6 +1241,50 @@ fn timeline_port_kind(port: usize, midi_count: usize, auto_count: usize) -> Time
     } else {
         TimelinePort::Audio(port - midi_count - auto_count)
     }
+}
+
+/// `Timeline In` port count (R6 D21): the tempo port plus one recording input
+/// per track, in MIDI → curve → audio order.
+fn timeline_in_port_count(midi_count: usize, auto_count: usize, audio_count: usize) -> usize {
+    1 + midi_count + auto_count + audio_count
+}
+
+/// `Timeline In` terminal size: one row per port below the title band.
+fn timeline_in_size(midi_count: usize, auto_count: usize, audio_count: usize) -> Vec2 {
+    Vec2::new(
+        TIMELINE_IN_WIDTH,
+        NODE_TITLE_BAND
+            + (TIMELINE_ROW_HEIGHT
+                * timeline_in_port_count(midi_count, auto_count, audio_count) as f32)
+                .max(TIMELINE_ROW_HEIGHT),
+    )
+}
+
+/// A `Timeline In` port index → its track family and index (`None` = the
+/// tempo port). Thin wrapper over the model helper so layout and wiring share
+/// one port table.
+fn timeline_in_port_track(port: u8, deps: &PatchDeps) -> Option<(TrackKind, usize)> {
+    timeline_in_port_kind(port, deps.track_count, deps.auto_count, deps.audio_count)
+}
+
+/// The cable kind one recording input accepts (D24).
+fn track_kind_cable(kind: TrackKind) -> CableKind {
+    match kind {
+        TrackKind::Midi => CableKind::Midi,
+        TrackKind::Curve => CableKind::Automation,
+        TrackKind::Audio => CableKind::Audio,
+    }
+}
+
+/// The port index of one recording input, or `None` when it is out of range.
+fn track_input_port(kind: TrackKind, track: usize, deps: &PatchDeps) -> Option<u8> {
+    timeline_in_port(
+        kind,
+        track,
+        deps.track_count,
+        deps.auto_count,
+        deps.audio_count,
+    )
 }
 
 /// Timeline box size (height scales with the port count).
@@ -1493,7 +1549,9 @@ fn inline_row_count(id: PatchId, deps: &PatchDeps) -> usize {
 fn size_of(id: PatchId, deps: &PatchDeps) -> Vec2 {
     let base = match id {
         PatchId::Timeline => timeline_size(deps.track_count, deps.auto_count, deps.audio_count),
-        PatchId::TimelineIn => TIMELINE_IN_SIZE,
+        PatchId::TimelineIn => {
+            timeline_in_size(deps.track_count, deps.auto_count, deps.audio_count)
+        }
         PatchId::Node(node_id) => match deps.doc.node_by_id(node_id) {
             // Title + slot action row, then one port per channel.
             Some(NodeDoc::Mixer { inputs, .. }) => Vec2::new(
@@ -1844,8 +1902,10 @@ impl PatchState {
         };
         let n = match id {
             PatchId::Timeline => return Vec::new(),
-            // v1 port table: `Tempo` only (spec §4.2 lists future slots).
-            PatchId::TimelineIn => 1,
+            // R6 port table: tempo (0) plus one recording input per track.
+            PatchId::TimelineIn => {
+                timeline_in_port_count(deps.track_count, deps.auto_count, deps.audio_count)
+            }
             PatchId::Master => 1,
             PatchId::Node(node_id) => match deps.doc.node_by_id(node_id) {
                 Some(node) if node.is_mixer() => {
@@ -2088,7 +2148,16 @@ impl PatchState {
         deps: &PatchDeps,
     ) -> Option<[Pos2; 4]> {
         let (from, from_port) = patch_port_from(&cable.from, deps)?;
-        let to = patch_port_to(&cable.to)?;
+        let (to, to_port) = match &cable.to {
+            // R6: a recording input is a port on the fixed terminal; its
+            // index is derived from the track identity, so it stays correct
+            // when tracks are added or removed.
+            PortRef::TrackIn { kind, track } => {
+                (PatchId::TimelineIn, track_input_port(*kind, *track, deps)?)
+            }
+            PortRef::TimelineIn => (PatchId::TimelineIn, cable.in_port),
+            _ => (patch_port_to(&cable.to)?, cable.in_port),
+        };
         let p0 = self
             .out_ports_screen(rect_min, from, deps)
             .into_iter()
@@ -2097,7 +2166,7 @@ impl PatchState {
         let p3 = self
             .in_ports_screen(rect_min, to, deps)
             .into_iter()
-            .find(|(k, _)| *k == cable.in_port)?
+            .find(|(k, _)| *k == to_port)?
             .1;
         Some(bezier_controls(p0, p3))
     }
@@ -2258,6 +2327,8 @@ fn patch_port_from(port: &PortRef, deps: &PatchDeps) -> Option<(PatchId, usize)>
         PortRef::AutoTrack(i) => Some((PatchId::Timeline, deps.track_count + i)),
         PortRef::Master => None, // The master output is not a valid audio source.
         PortRef::TimelineIn => None, // Pure sink: no output ports.
+        // R6: a recording input is a sink, never a source.
+        PortRef::TrackIn { .. } => None,
     }
 }
 
@@ -2267,6 +2338,8 @@ fn patch_port_to(port: &PortRef) -> Option<PatchId> {
         PortRef::Node(id) => Some(PatchId::Node(*id)),
         PortRef::Master => Some(PatchId::Master),
         PortRef::TimelineIn => Some(PatchId::TimelineIn),
+        // R6: recording inputs live on the fixed terminal.
+        PortRef::TrackIn { .. } => Some(PatchId::TimelineIn),
         _ => None,
     }
 }
@@ -2310,6 +2383,62 @@ fn single_control_port(doc: &GraphDoc, node_id: u64) -> Option<AutoParam> {
     }
 }
 
+/// The track a dormant direct cable is superseded by (R6 D33), if any.
+///
+/// A keyboard node wired into a MIDI recording input dispatches through that
+/// track instead of its direct instrument cables; the direct ones stay in the
+/// document and render faded. Pure derivation from the cable table — there is
+/// no stored mute state to restore.
+fn dormant_cable_track(doc: &GraphDoc, cable: &CableDoc) -> Option<usize> {
+    if cable.kind != CableKind::Midi || !matches!(cable.to, PortRef::Node(_)) {
+        return None;
+    }
+    let PortRef::Node(from) = cable.from else {
+        return None;
+    };
+    if !doc.node_by_id(from).is_some_and(NodeDoc::is_keyboard) {
+        return None;
+    }
+    doc.node_track_inputs(from)
+        .into_iter()
+        .find_map(|(kind, track)| (kind == TrackKind::Midi).then_some(track))
+}
+
+/// The document port a cable drag starts from (R6): a node's output, a
+/// timeline MIDI/curve outlet, or an audio track's folded node.
+fn drag_source_port(drag: &CableDrag, doc: &GraphDoc, deps: &PatchDeps) -> Option<PortRef> {
+    match drag.from {
+        PatchId::Node(id) => Some(PortRef::Node(id)),
+        PatchId::Timeline => match timeline_port_kind(drag.port, deps.track_count, deps.auto_count)
+        {
+            TimelinePort::Midi(track) => Some(PortRef::MidiTrack(track)),
+            TimelinePort::Auto(index) => Some(PortRef::AutoTrack(index)),
+            TimelinePort::Audio(track) => audio_node_id(doc, track).map(PortRef::Node),
+        },
+        PatchId::Master | PatchId::TimelineIn => None,
+    }
+}
+
+/// Cable kind carried by a drag's source port (the same rule `accepts` and the
+/// drop branches use).
+fn drag_cable_kind(drag: &CableDrag, doc: &GraphDoc, deps: &PatchDeps) -> CableKind {
+    match drag.from {
+        PatchId::Timeline => match timeline_port_kind(drag.port, deps.track_count, deps.auto_count)
+        {
+            TimelinePort::Midi(_) => CableKind::Midi,
+            TimelinePort::Auto(_) => CableKind::Automation,
+            TimelinePort::Audio(_) => CableKind::Audio,
+        },
+        PatchId::Node(node_id) => doc
+            .node_by_id(node_id)
+            .map_or(CableKind::Audio, |node| node_out_port_kind(node, drag.port)),
+        PatchId::Master => CableKind::Audio,
+        // Unreachable (no output ports); automation keeps the terminal's
+        // historical port table.
+        PatchId::TimelineIn => CableKind::Automation,
+    }
+}
+
 /// Cable kind → whether the target entity accepts it (port type rules, spec §7/D3).
 fn accepts(kind: CableKind, target: PatchId, doc: &GraphDoc) -> bool {
     if let PatchId::Node(id) = target {
@@ -2347,10 +2476,11 @@ fn accepts(kind: CableKind, target: PatchId, doc: &GraphDoc) -> bool {
     } else {
         match target {
             PatchId::Master => kind == CableKind::Audio,
-            // U3b D7: the conductor terminal only takes automation (its sole
-            // port is `Tempo`); audio / MIDI cables are rejected like any
-            // other port-type mismatch.
-            PatchId::TimelineIn => kind == CableKind::Automation,
+            // R6: the terminal hosts a tempo port plus per-track recording inputs;
+            // which one a cable may land on is decided by the port it is
+            // dropped on (`timeline_in_port_track`), so the box itself accepts
+            // every cable type.
+            PatchId::TimelineIn => true,
             PatchId::Timeline => false,
             // Handled by the `if let` above (unreachable here).
             PatchId::Node(_) => false,
@@ -2743,186 +2873,210 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 if let Some(sp) = pointer
                     && let Some(target) = state.hit_node(rect.min, sp, &deps)
                 {
-                    match drag.from {
-                        // Timeline port: MIDI tracks, then control tracks, then
-                        // audio tracks (mapping lives in `timeline_port_kind`).
-                        PatchId::Timeline => {
-                            match timeline_port_kind(drag.port, midi_count, auto_count) {
-                                TimelinePort::Midi(track) => {
-                                    if accepts(CableKind::Midi, target, doc)
-                                        && let PatchId::Node(to_doc) = target
+                    if target == PatchId::TimelineIn {
+                        // R6 D24: a recording input accepts one source whose data
+                        // kind matches the track family. The drop has to land on a
+                        // specific port — dropping anywhere on the box would make
+                        // "which track did I mean" ambiguous.
+                        if let (Some(from), Some((PatchId::TimelineIn, port))) = (
+                            drag_source_port(&drag, doc, &deps),
+                            state.hit_in_port(rect.min, sp, &deps),
+                        ) && let Some((kind, track)) = timeline_in_port_track(port, &deps)
+                            && drag_cable_kind(&drag, doc, &deps) == track_kind_cable(kind)
+                        {
+                            actions.push(PatchAction::ConnectTrackIn { from, kind, track });
+                        }
+                    } else {
+                        match drag.from {
+                            // Timeline port: MIDI tracks, then control tracks, then
+                            // audio tracks (mapping lives in `timeline_port_kind`).
+                            PatchId::Timeline => {
+                                match timeline_port_kind(drag.port, midi_count, auto_count) {
+                                    TimelinePort::Midi(track) => {
+                                        if accepts(CableKind::Midi, target, doc)
+                                            && let PatchId::Node(to_doc) = target
+                                        {
+                                            actions
+                                                .push(PatchAction::ConnectMidi { track, to_doc });
+                                        }
+                                    }
+                                    TimelinePort::Auto(index)
+                                        if accepts(CableKind::Automation, target, doc) =>
                                     {
-                                        actions.push(PatchAction::ConnectMidi { track, to_doc });
+                                        match target {
+                                            // The conductor terminal has a single
+                                            // port, so the cable commits straight
+                                            // away — no parameter popup (U3b D7).
+                                            PatchId::TimelineIn => {
+                                                actions.push(PatchAction::ConnectTempoIn { index });
+                                            }
+                                            PatchId::Node(to_doc) => {
+                                                // A node with exactly one control
+                                                // port (the Curve Map) needs no
+                                                // menu: the pick is unambiguous
+                                                // (spec `curve-map.md` D5).
+                                                if let Some(param) =
+                                                    single_control_port(doc, to_doc)
+                                                {
+                                                    actions.push(PatchAction::ConnectAuto {
+                                                        index,
+                                                        to_doc,
+                                                        param,
+                                                    });
+                                                } else {
+                                                    // The cable is committed after
+                                                    // the parameter is picked in the
+                                                    // popup menu.
+                                                    state.pending_auto = Some((
+                                                        AutoSource::Track(index),
+                                                        to_doc,
+                                                        sp + Vec2::new(4.0, 4.0),
+                                                    ));
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    TimelinePort::Auto(_) => {}
+                                    // U6: the audio-track node is folded into the
+                                    // timeline box, so its audio cable is dragged
+                                    // from this port (target / channel math mirrors
+                                    // the ordinary node-out-port branch below).
+                                    TimelinePort::Audio(track) => {
+                                        if accepts(CableKind::Audio, target, doc)
+                                            && let Some(from_doc) = audio_node_id(doc, track)
+                                        {
+                                            let to = match target {
+                                                PatchId::Node(id) => PortRef::Node(id),
+                                                PatchId::Master => PortRef::Master,
+                                                _ => PortRef::Master,
+                                            };
+                                            let in_port = match target {
+                                                PatchId::Node(to_doc)
+                                                    if doc
+                                                        .node_by_id(to_doc)
+                                                        .is_some_and(|n| n.is_mixer()) =>
+                                                {
+                                                    match state.hit_in_port(rect.min, sp, &deps) {
+                                                        Some((PatchId::Node(_), port)) => {
+                                                            Some(port)
+                                                        }
+                                                        _ => doc.first_free_channel(to_doc),
+                                                    }
+                                                }
+                                                _ => Some(0),
+                                            };
+                                            if let Some(in_port) = in_port {
+                                                actions.push(PatchAction::ConnectAudio {
+                                                    from_doc,
+                                                    to,
+                                                    in_port,
+                                                });
+                                            }
+                                        }
                                     }
                                 }
-                                TimelinePort::Auto(index)
-                                    if accepts(CableKind::Automation, target, doc) =>
-                                {
-                                    match target {
-                                        // The conductor terminal has a single
-                                        // port, so the cable commits straight
-                                        // away — no parameter popup (U3b D7).
-                                        PatchId::TimelineIn => {
-                                            actions.push(PatchAction::ConnectTempoIn { index });
+                            }
+                            PatchId::Node(from_doc) => {
+                                // The output port itself decides the cable kind
+                                // (spec `midi-nodes.md` §3): MIDI out → MIDI
+                                // cable, control out → automation, else audio.
+                                let kind =
+                                    doc.node_by_id(from_doc).map_or(CableKind::Audio, |node| {
+                                        node_out_port_kind(node, drag.port)
+                                    });
+                                match kind {
+                                    CableKind::Midi => {
+                                        if accepts(CableKind::Midi, target, doc)
+                                            && drag.from != target
+                                            && let PatchId::Node(to_doc) = target
+                                        {
+                                            if doc
+                                                .node_by_id(from_doc)
+                                                .is_some_and(NodeDoc::is_keyboard)
+                                            {
+                                                actions.push(PatchAction::ConnectKeyboardMidi {
+                                                    from_doc,
+                                                    to_doc,
+                                                });
+                                            } else {
+                                                actions.push(PatchAction::ConnectEventMidi {
+                                                    from_doc,
+                                                    to_doc,
+                                                });
+                                            }
                                         }
-                                        PatchId::Node(to_doc) => {
-                                            // A node with exactly one control
-                                            // port (the Curve Map) needs no
-                                            // menu: the pick is unambiguous
-                                            // (spec `curve-map.md` D5).
+                                    }
+                                    CableKind::Automation => {
+                                        if accepts(CableKind::Automation, target, doc)
+                                            && drag.from != target
+                                            && let PatchId::Node(to_doc) = target
+                                        {
                                             if let Some(param) = single_control_port(doc, to_doc) {
-                                                actions.push(PatchAction::ConnectAuto {
-                                                    index,
+                                                // One port, one answer (Curve Map).
+                                                actions.push(PatchAction::ConnectControl {
+                                                    from_doc,
                                                     to_doc,
                                                     param,
                                                 });
                                             } else {
-                                                // The cable is committed after
-                                                // the parameter is picked in the
-                                                // popup menu.
                                                 state.pending_auto = Some((
-                                                    AutoSource::Track(index),
+                                                    AutoSource::Node(from_doc),
                                                     to_doc,
                                                     sp + Vec2::new(4.0, 4.0),
                                                 ));
                                             }
                                         }
-                                        _ => {}
                                     }
-                                }
-                                TimelinePort::Auto(_) => {}
-                                // U6: the audio-track node is folded into the
-                                // timeline box, so its audio cable is dragged
-                                // from this port (target / channel math mirrors
-                                // the ordinary node-out-port branch below).
-                                TimelinePort::Audio(track) => {
-                                    if accepts(CableKind::Audio, target, doc)
-                                        && let Some(from_doc) = audio_node_id(doc, track)
-                                    {
-                                        let to = match target {
-                                            PatchId::Node(id) => PortRef::Node(id),
-                                            PatchId::Master => PortRef::Master,
-                                            _ => PortRef::Master,
-                                        };
-                                        let in_port = match target {
-                                            PatchId::Node(to_doc)
-                                                if doc
-                                                    .node_by_id(to_doc)
-                                                    .is_some_and(|n| n.is_mixer()) =>
-                                            {
-                                                match state.hit_in_port(rect.min, sp, &deps) {
-                                                    Some((PatchId::Node(_), port)) => Some(port),
-                                                    _ => doc.first_free_channel(to_doc),
-                                                }
-                                            }
-                                            _ => Some(0),
-                                        };
-                                        if let Some(in_port) = in_port {
-                                            actions.push(PatchAction::ConnectAudio {
-                                                from_doc,
-                                                to,
-                                                in_port,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        PatchId::Node(from_doc) => {
-                            // The output port itself decides the cable kind
-                            // (spec `midi-nodes.md` §3): MIDI out → MIDI
-                            // cable, control out → automation, else audio.
-                            let kind = doc.node_by_id(from_doc).map_or(CableKind::Audio, |node| {
-                                node_out_port_kind(node, drag.port)
-                            });
-                            match kind {
-                                CableKind::Midi => {
-                                    if accepts(CableKind::Midi, target, doc)
-                                        && drag.from != target
-                                        && let PatchId::Node(to_doc) = target
-                                    {
-                                        if doc
-                                            .node_by_id(from_doc)
-                                            .is_some_and(NodeDoc::is_keyboard)
+                                    CableKind::Audio => {
+                                        if accepts(CableKind::Audio, target, doc)
+                                            && drag.from != target
                                         {
-                                            actions.push(PatchAction::ConnectKeyboardMidi {
-                                                from_doc,
-                                                to_doc,
-                                            });
-                                        } else {
-                                            actions.push(PatchAction::ConnectEventMidi {
-                                                from_doc,
-                                                to_doc,
-                                            });
-                                        }
-                                    }
-                                }
-                                CableKind::Automation => {
-                                    if accepts(CableKind::Automation, target, doc)
-                                        && drag.from != target
-                                        && let PatchId::Node(to_doc) = target
-                                    {
-                                        if let Some(param) = single_control_port(doc, to_doc) {
-                                            // One port, one answer (Curve Map).
-                                            actions.push(PatchAction::ConnectControl {
-                                                from_doc,
-                                                to_doc,
-                                                param,
-                                            });
-                                        } else {
-                                            state.pending_auto = Some((
-                                                AutoSource::Node(from_doc),
-                                                to_doc,
-                                                sp + Vec2::new(4.0, 4.0),
-                                            ));
-                                        }
-                                    }
-                                }
-                                CableKind::Audio => {
-                                    if accepts(CableKind::Audio, target, doc) && drag.from != target
-                                    {
-                                        let to = match target {
-                                            PatchId::Node(id) => PortRef::Node(id),
-                                            PatchId::Master => PortRef::Master,
-                                            _ => PortRef::Master,
-                                        };
-                                        // D17: the cable binds to the target's
-                                        // input port. Dropping on a mixer picks
-                                        // the exact channel port when hit
-                                        // precisely, else the first free
-                                        // channel; dropping anywhere else is
-                                        // port 0. Slots are strictly single-
-                                        // input (D14): the new cable replaces
-                                        // the old one on the same slot; no free
-                                        // channel → reject.
-                                        let in_port = match target {
-                                            PatchId::Node(to_doc)
-                                                if doc
-                                                    .node_by_id(to_doc)
-                                                    .is_some_and(|n| n.is_mixer()) =>
-                                            {
-                                                match state.hit_in_port(rect.min, sp, &deps) {
-                                                    Some((PatchId::Node(_), port)) => Some(port),
-                                                    _ => doc.first_free_channel(to_doc),
+                                            let to = match target {
+                                                PatchId::Node(id) => PortRef::Node(id),
+                                                PatchId::Master => PortRef::Master,
+                                                _ => PortRef::Master,
+                                            };
+                                            // D17: the cable binds to the target's
+                                            // input port. Dropping on a mixer picks
+                                            // the exact channel port when hit
+                                            // precisely, else the first free
+                                            // channel; dropping anywhere else is
+                                            // port 0. Slots are strictly single-
+                                            // input (D14): the new cable replaces
+                                            // the old one on the same slot; no free
+                                            // channel → reject.
+                                            let in_port = match target {
+                                                PatchId::Node(to_doc)
+                                                    if doc
+                                                        .node_by_id(to_doc)
+                                                        .is_some_and(|n| n.is_mixer()) =>
+                                                {
+                                                    match state.hit_in_port(rect.min, sp, &deps) {
+                                                        Some((PatchId::Node(_), port)) => {
+                                                            Some(port)
+                                                        }
+                                                        _ => doc.first_free_channel(to_doc),
+                                                    }
                                                 }
+                                                _ => Some(0),
+                                            };
+                                            if let Some(in_port) = in_port {
+                                                actions.push(PatchAction::ConnectAudio {
+                                                    from_doc,
+                                                    to,
+                                                    in_port,
+                                                });
                                             }
-                                            _ => Some(0),
-                                        };
-                                        if let Some(in_port) = in_port {
-                                            actions.push(PatchAction::ConnectAudio {
-                                                from_doc,
-                                                to,
-                                                in_port,
-                                            });
                                         }
                                     }
                                 }
                             }
+                            PatchId::Master => {}
+                            // A pure sink has no output port, so no drag can start
+                            // here (U3b).
+                            PatchId::TimelineIn => {}
                         }
-                        PatchId::Master => {}
-                        // A pure sink has no output port, so no drag can start
-                        // here (U3b).
-                        PatchId::TimelineIn => {}
                     }
                 }
             }
@@ -2949,18 +3103,29 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     }
 
     // ---- Draw cables (beneath nodes) ----
+    // R6 D33: a keyboard node wired into a track input takes over its own
+    // output, so its direct MIDI cables no longer dispatch. They stay in the
+    // document (nothing is deleted automatically) but render dormant.
     for (i, cable) in doc.cables.iter().enumerate() {
         let Some(bez) = state.cable_controls(rect.min, cable, &deps) else {
             continue;
         };
+        let dormant = dormant_cable_track(doc, cable);
         let selected = state.selection.cables.contains(&i);
+        let color = if selected {
+            Color32::WHITE
+        } else {
+            cable_color(cable.kind).gamma_multiply(if dormant.is_some() { 0.3 } else { 1.0 })
+        };
         let stroke = egui::Stroke::new(
-            if selected { 3.5 } else { 2.0 },
             if selected {
-                Color32::WHITE
+                3.5
+            } else if dormant.is_some() {
+                1.2
             } else {
-                cable_color(cable.kind)
+                2.0
             },
+            color,
         );
         painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
             bez,
@@ -2986,8 +3151,26 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         } else {
             MIDPOINT_RADIUS
         };
-        painter.circle_filled(mid, r, cable_color(cable.kind));
+        painter.circle_filled(
+            mid,
+            r,
+            color.gamma_multiply(if dormant.is_some() { 0.6 } else { 1.0 }),
+        );
         painter.circle_stroke(mid, r, egui::Stroke::new(1.0, Color32::BLACK));
+        if let Some(track) = dormant
+            && hovered
+        {
+            painter.text(
+                mid + Vec2::new(0.0, 14.0),
+                egui::Align2::CENTER_TOP,
+                format!(
+                    "Device is routed into Track {}; direct cables are dormant",
+                    track + 1
+                ),
+                FontId::proportional(10.0),
+                Color32::from_rgb(220, 190, 120),
+            );
+        }
     }
 
     // ---- Cable-cut visuals: pointer path + cables about to be severed ----
@@ -3131,18 +3314,27 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         // master the single port 0. The Timeline In terminal names its port
         // (U3b: v1 has the `Tempo` port only).
         for (port, p) in state.in_ports_screen(rect.min, id, &deps) {
-            let inbound = if matches!(id, PatchId::TimelineIn) {
-                cable_color(CableKind::Automation)
-            } else {
-                Color32::from_gray(90)
+            let (inbound, label) = match id {
+                PatchId::TimelineIn => match timeline_in_port_track(port, &deps) {
+                    None => (cable_color(CableKind::Automation), "Tempo".to_string()),
+                    Some((kind, track)) => {
+                        let label = match kind {
+                            TrackKind::Midi => format!("T{}", track + 1),
+                            TrackKind::Curve => format!("C{}", track + 1),
+                            TrackKind::Audio => format!("A{}", track + 1),
+                        };
+                        (cable_color(track_kind_cable(kind)), label)
+                    }
+                },
+                _ => (Color32::from_gray(90), String::new()),
             };
             painter.circle_filled(p, PORT_RADIUS, inbound);
             painter.circle_stroke(p, PORT_RADIUS, egui::Stroke::new(1.0, Color32::BLACK));
-            if matches!(id, PatchId::TimelineIn) && port == 0 {
+            if matches!(id, PatchId::TimelineIn) {
                 painter.text(
                     Pos2::new(p.x + 10.0, p.y),
                     egui::Align2::LEFT_CENTER,
-                    "Tempo",
+                    label,
                     FontId::proportional(10.0),
                     Color32::from_gray(170),
                 );
@@ -3984,13 +4176,14 @@ mod tests {
         );
         assert_eq!(
             state.in_ports_screen(min, PatchId::TimelineIn, &deps).len(),
-            1,
-            "v1 exposes exactly the Tempo port"
+            timeline_in_port_count(deps.track_count, deps.auto_count, deps.audio_count),
+            "the terminal hosts the Tempo port plus one recording input per track"
         );
 
+        // R6: the box accepts every cable type; the drop port decides.
         assert!(accepts(CableKind::Automation, PatchId::TimelineIn, doc));
-        assert!(!accepts(CableKind::Audio, PatchId::TimelineIn, doc));
-        assert!(!accepts(CableKind::Midi, PatchId::TimelineIn, doc));
+        assert!(accepts(CableKind::Audio, PatchId::TimelineIn, doc));
+        assert!(accepts(CableKind::Midi, PatchId::TimelineIn, doc));
 
         // Cable endpoint resolution: the sink is a valid target, never a
         // source; the timeline itself accepts nothing.
@@ -4000,9 +4193,93 @@ mod tests {
         );
         assert_eq!(patch_port_from(&PortRef::TimelineIn, &deps), None);
         assert!(!accepts(CableKind::Automation, PatchId::Timeline, doc));
+        assert_eq!(
+            patch_port_to(&PortRef::TrackIn {
+                kind: TrackKind::Midi,
+                track: 0
+            }),
+            Some(PatchId::TimelineIn)
+        );
+        assert_eq!(
+            patch_port_from(
+                &PortRef::TrackIn {
+                    kind: TrackKind::Midi,
+                    track: 0
+                },
+                &deps
+            ),
+            None,
+            "a recording input is a pure sink"
+        );
+        assert_eq!(
+            timeline_in_port(
+                TrackKind::Midi,
+                0,
+                deps.track_count,
+                deps.auto_count,
+                deps.audio_count
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            timeline_in_port(
+                TrackKind::Audio,
+                0,
+                deps.track_count,
+                deps.auto_count,
+                deps.audio_count
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            timeline_in_port_kind(0, deps.track_count, deps.auto_count, deps.audio_count),
+            None,
+            "port 0 is the tempo port"
+        );
 
         // The layout round-trips the sink's position like master / timeline.
         assert!(state.export_layout(doc).timeline_in.is_some());
+    }
+
+    /// R6 D33: a keyboard's direct instrument cable renders dormant once the
+    /// keyboard feeds a track recording input.
+    #[test]
+    fn a_taken_over_keyboard_cable_is_dormant() {
+        let mut doc = GraphDoc {
+            nodes: vec![
+                NodeDoc::Instrument {
+                    node_id: 2,
+                    track: 0,
+                    voice: VoiceSpec::Builtin,
+                    synth: Default::default(),
+                },
+                NodeDoc::Keyboard {
+                    node_id: 6,
+                    track: 0,
+                    source: MidiSource::Computer,
+                },
+            ],
+            cables: vec![CableDoc::keyboard_midi(6, 2)],
+            layout: Default::default(),
+        };
+        let direct = doc.cables[0].clone();
+        assert_eq!(dormant_cable_track(&doc, &direct), None);
+        doc.cables.push(CableDoc {
+            kind: CableKind::Midi,
+            from: PortRef::Node(6),
+            to: PortRef::TrackIn {
+                kind: TrackKind::Midi,
+                track: 3,
+            },
+            param: AutoParam::default(),
+            in_port: 0,
+            map: None,
+        });
+        assert_eq!(
+            dormant_cable_track(&doc, &direct),
+            Some(3),
+            "the direct cable is superseded by the track route"
+        );
     }
 
     /// A freshly added node's placed position must survive `ensure_positions`

@@ -24,15 +24,16 @@ use crate::realtime::sequencer::{RtCtrl, RtCtrlKind};
 
 /// Where one hardware input port delivers its events.
 ///
-/// A live performance source plays the instruments its node is cabled to; while
-/// recording with nothing cabled, the UI adds the armed track instead, so the
-/// input is never silently dead.
+/// A live performance source plays the instruments its node is cabled to. A
+/// node wired into timeline recording inputs (R6) is taken over: its events go
+/// to those tracks instead (D33), so the device plays and records through the
+/// same path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MidiTarget {
     /// One instrument node, addressed by engine node ID.
     Node(u64),
-    /// A track's sound source (recording fallback, mirrors the computer
-    /// keyboard's behaviour). Notes only — controllers always follow cables.
+    /// A timeline MIDI track and its routed instruments (R6 D31). Notes and
+    /// controllers both take this path.
     Track(usize),
 }
 
@@ -247,11 +248,10 @@ fn deliver(sender: &CommandSender, target: MidiTarget, parsed: ParsedEvent) -> b
             Some(track) => sender.send(EngineCommand::Note { track, event }),
             None => sender.send(EngineCommand::NoteAtNode { node_id, event }),
         },
-        // Controllers follow cables only: a recording fallback track has no
-        // documented controller destination (and capturing CC would need the
-        // automation path, not the note one).
+        // R6 D31: a track target now takes controllers too — they follow the
+        // same recorded route as the notes (the track's routed instruments).
         ParsedEvent::Ctrl(ctrl) => match track {
-            Some(_) => false,
+            Some(track) => sender.send(EngineCommand::Ctrl { track, ctrl }),
             None => sender.send(EngineCommand::CtrlAtNode { node_id, ctrl }),
         },
     }
@@ -429,9 +429,9 @@ mod tests {
     }
 
     #[test]
-    fn a_track_target_takes_notes_but_not_controllers() {
-        // The recording fallback routes notes to a track; controllers have no
-        // track-addressed path, so they are refused rather than misdelivered.
+    fn a_track_target_takes_notes_and_controllers() {
+        // R6 D31: a track-addressed device routes both notes and controllers
+        // through the track (the recorded path), not through the node.
         let (tx, mut rx) = sender();
         assert!(deliver(
             &tx,
@@ -439,12 +439,12 @@ mod tests {
             ParsedEvent::Note(NoteEvent::Off { note: 60 })
         ));
         assert!(matches!(rx.pop(), Ok(EngineCommand::Note { track: 2, .. })));
-        assert!(!deliver(
+        assert!(deliver(
             &tx,
             MidiTarget::Track(2),
             ParsedEvent::Ctrl(RtCtrl::new(0, 0, RtCtrlKind::Cc(7), 100))
         ));
-        assert!(rx.pop().is_err(), "nothing may be queued for the track");
+        assert!(matches!(rx.pop(), Ok(EngineCommand::Ctrl { track: 2, .. })));
     }
 
     #[test]

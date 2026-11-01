@@ -458,7 +458,7 @@ impl BlockRunner {
                 // event share one block-quantized timestamp.
                 let ticks = self.sequencer.position_ticks();
                 self.graph.track_note(track, event);
-                self.capture.note(ticks, event);
+                self.capture.note(ticks, event, Some(track));
             }
             EngineCommand::NoteAtNode { node_id, event } => {
                 // G6: virtual-keyboard route — the addressed instrument only.
@@ -466,13 +466,19 @@ impl BlockRunner {
                 // the UI decides which track the take lands on.
                 let ticks = self.sequencer.position_ticks();
                 let _ = self.graph.node_note(node_id, event);
-                self.capture.note(ticks, event);
+                self.capture.note(ticks, event, None);
             }
             EngineCommand::CtrlAtNode { node_id, ctrl } => {
                 // R3: hardware CC / pitch bend reaches the addressed instrument
                 // only. Controllers are not captured — a take records notes;
                 // automation recording is a separate feature.
                 let _ = self.graph.node_ctrl(node_id, ctrl);
+            }
+            EngineCommand::Ctrl { track, ctrl } => {
+                // R6 D31: a device wired into a track input drives the track's
+                // routed instruments, so its controllers follow the same path.
+                // Not captured (R6 records notes; curve baking is R8).
+                let _ = self.graph.track_ctrl(track, ctrl);
             }
             EngineCommand::SetCapture(enabled) => self.capture.configure(enabled),
             EngineCommand::Sequencer(cmd) => self.apply_sequencer_command(cmd),
@@ -556,6 +562,9 @@ impl BlockRunner {
             } => self.sequencer.set_time_signature(numerator, denominator),
             SequencerCommand::SetMidiTrackCount(count) => {
                 self.sequencer.set_track_count(count);
+            }
+            SequencerCommand::SetRecordMute(bits) => {
+                self.sequencer.set_record_mute(bits);
             }
             SequencerCommand::SetMetronome { enabled, gain } => {
                 self.metronome.configure(enabled, gain);

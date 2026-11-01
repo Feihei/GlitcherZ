@@ -1,8 +1,7 @@
 # Spec: 节拍器与录音（Metronome & Recording）
 
-> 状态：实施中（2026-11-01）。R1 节拍器、R2 录音骨架、R3 硬件 MIDI 输入已交付；
-> **R6 轨输入口已定案**（§5，用户裁定：patch 是显式基准、默认工程不预接、类型匹配即可连、
-> 单一源），R4 音频录音据此改为复用轨输入口；R5 收尾、R7/R8 多类型采集待实施。
+> 状态：实施中（2026-11-01）。R1 节拍器、R2 录音骨架、R3 硬件 MIDI 输入、**R6 轨输入口**已交付；
+> R4 音频录音据此复用轨输入口；R5 收尾、R7/R8 多类型采集待实施。
 > 关联：`plan.md`「S2 补最短的板」、`review-2026-11-01.md`、
 > `spec/audio-track.md`（音频轨播放与 trim）、`spec/tempo-meter.md`（tick 时钟 / 拍号）。
 > 前置事实：引擎已有完整的 tick 时钟（`Sequencer::position_ticks` + `base_bpm` +
@@ -146,17 +145,19 @@ LFO/curve ──automation──► Curve 1 输入口  （R8：块边界采样 t
   设备绑定是**文档编辑**（一次 undo），不是应用配置（D18）。
   测试：`midi_input` 单元 8 项（note on/off、vel-0、CC、bend 居中/上下限、系统消息丢弃、
   node 目标、track 目标拒收 CC、满队列报告丢弃）+ `node_ctrl_reaches_only_the_addressed_slot`。
-- [ ] **R6 轨输入口（录音归属，R4 的前置）**
+- [x] **R6 轨输入口（录音归属，R4 的前置）** ✅ 2026-11-01
   模型：`PortRef::TrackIn { kind, track }` + `TrackKind::{Midi, Audio, Curve}`、版本 v10、
-  validate（单源 / 类型匹配 / 轨号范围）；删除 D16 的"选中轨回落"。
-  `Timeline In` 端口表扩展（tempo 口保持 0 号），patch 左边缘每轨一口 + 命中 / 连线 / 剪线。
+  validate（单源 / 类型匹配 / 轨号范围，音频轨由 `Project::validate` 复核）；删除 D16 的
+  "选中轨回落"（实现已无该分支）。
+  `Timeline In` 端口表扩展（tempo 口保持 0 号）：patch 左边缘每轨一口 + 命中 / 连线 / 剪线；
+  被接管的设备直连 cable 画成休眠样式 + tooltip。
   派发：设备的 cable 按终点分流（轨输入口 → `Note{track}`，乐器 → `NoteAtNode`），
-  新增 `EngineCommand::Ctrl{track}`；`midi_input` 的绑定快照改为"节点目标 + 轨目标"两组。
-  录音：`CapturedNote` 加 `track: Option<usize>`（`NoteAtNode` 记 `None` → 丢弃）、
-  recorder 按 track 分组多 take、D27 干区校验、D29 `SetRecordMute`、D30 警告、D32 punch out、
-  D33 轨输入接管（派发纯派生 + 休眠 cable 样式 + 中途改接线结束 take，无 mute 状态）。
-  测试：validate（单源 / 类型不匹配 / 轨号越界）、dispatch 分流、capture 打轨戳、
-  多轨同录一次 undo、干区冲突拒绝、`set_record_mute` 只丢 On。
+  `EngineCommand::Ctrl{track}`；`midi_input` 绑定快照改为"节点目标 + 轨目标"（纯派生）。
+  录音：`CapturedNote.track`（`NoteAtNode` 记 `None` → 丢弃）、recorder 按 track 分组多 take、
+  D27 干区校验、D29 `SetRecordMute`、D30 警告、D32 punch out、D33 轨输入接管
+  （派发纯派生 + 中途改接线结束该轨 take，无 mute 状态）。
+  测试：validate（单源 / 类型不匹配 / 轨号越界 / 项目音频范围）、patch 端口表与休眠判定、
+  sequencer `SetRecordMute`、capture 打轨戳、recorder 多轨同录；全仓 fmt/clippy/test 绿。
 - [ ] **R4 音频录音**（改用轨输入口，`Input` 不再带 `track` 字段）
   `NodeDoc::Input{node_id, channel, gain}` + `InputProcessor`；
   `AudioInput`（cpal 输入流 + 双 ring + `Arc<InputStats>` 原子量）；

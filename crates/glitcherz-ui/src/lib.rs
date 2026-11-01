@@ -53,8 +53,8 @@ use glitcherz_model::{
     CtrlKind, CurveInterp, CurveMapParams, EffectParams, GraphDoc, LFO_DIVISION_LABELS, LfoParams,
     LfoWaveform, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS,
     MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip,
-    MidiEnvelopeParams, MidiSource, MidiTrack, NodeDoc, NodeParam, PortRef, PortamentoParams,
-    Project, SamplePlayMode, SongLoop, SynthParams, SynthWaveform, VoiceSpec,
+    MidiEnvelopeParams, MidiSource, MidiTrack, NodeDoc, NodeParam, Note, PortRef, PortamentoParams,
+    Project, SamplePlayMode, SongLoop, SynthParams, SynthWaveform, TrackKind, VoiceSpec,
 };
 
 pub mod curve;
@@ -327,6 +327,61 @@ fn event_dest_of(param: &AutoParam, graph: &GraphDoc, target: &PortRef) -> AutoD
 /// New documents carry it explicitly on the cable (written whenever the UI
 /// routes it); a cable from an older file derives it from the target, which is
 /// exactly what the v8 → v9 migration would have written.
+/// Live destinations of one keyboard node (R6 D31/D33): `(tracks, nodes)`.
+///
+/// A node wired into one or more MIDI **recording inputs** dispatches into
+/// those tracks — the track outlet then reaches the instruments, so listening
+/// and recording share one path — and its direct instrument cables are
+/// dormant. Without a recording-input cable the direct cable list is used.
+fn keyboard_live_routes(doc: &GraphDoc, node: u64) -> (Vec<usize>, Vec<u64>) {
+    let tracks: Vec<usize> = doc
+        .node_track_inputs(node)
+        .into_iter()
+        .filter_map(|(kind, track)| (kind == TrackKind::Midi).then_some(track))
+        .collect();
+    let nodes = if tracks.is_empty() {
+        doc.keyboard_routes_from(node)
+    } else {
+        Vec::new()
+    };
+    (tracks, nodes)
+}
+
+/// Whether a timeline MIDI outlet reaches an instrument through the MIDI
+/// node graph (R6 D30 warning: recording works but nothing is audible).
+fn midi_outlet_has_instrument(doc: &GraphDoc, track: usize) -> bool {
+    let mut reached: std::collections::BTreeSet<u64> = Default::default();
+    let mut queue: std::collections::VecDeque<u64> = Default::default();
+    for cable in &doc.cables {
+        if cable.kind == CableKind::Midi
+            && cable.from == PortRef::MidiTrack(track)
+            && let PortRef::Node(id) = cable.to
+        {
+            queue.push_back(id);
+        }
+    }
+    while let Some(id) = queue.pop_front() {
+        if !reached.insert(id) {
+            continue;
+        }
+        if doc
+            .node_by_id(id)
+            .is_some_and(|node| matches!(node, NodeDoc::Instrument { .. }))
+        {
+            return true;
+        }
+        for cable in &doc.cables {
+            if cable.kind == CableKind::Midi
+                && cable.from == PortRef::Node(id)
+                && let PortRef::Node(next) = cable.to
+            {
+                queue.push_back(next);
+            }
+        }
+    }
+    false
+}
+
 fn cable_map(cable: &glitcherz_model::CableDoc, graph: &GraphDoc) -> glitcherz_model::MapSpec {
     // A Curve Map source owns the axis of the hop after it (spec `curve-map.md`
     // D6), and it is read from the node rather than from a copy: editing Low /
@@ -1301,6 +1356,10 @@ pub struct GlitcherZApp {
     /// MIDI multi-out / single-in rule), so a key press reaches all of them —
     /// cheap synth layering without a mixer.
     vk_targets: Vec<u64>,
+    /// Timeline recording tracks the computer-keyboard node feeds (R6 D33):
+    /// when the node has a cable into a track's recording input, those tracks
+    /// are its destinations and the direct instrument cables go dormant.
+    vk_track_targets: Vec<usize>,
     /// Hardware MIDI input (R3, spec `recording.md` §3.2): open ports and the
     /// routing snapshots their callbacks read. Control-side only — the
     /// callbacks push into the command queue directly, never through the UI.
@@ -1467,6 +1526,9 @@ pub struct GlitcherZApp {
     /// Pre-roll length in bars (`0..=2`, spec D14; default one bar so a take
     /// starts without the user having to count the click in).
     record_pre_roll_bars: u8,
+    /// R6 D29: while recording, silence the sequenced notes of every other
+    /// MIDI track, so only the take is heard. UI-session state, not persisted.
+    record_mute_other: bool,
     /// Desired capture-tap state that a full command queue refused; retried
     /// every frame until it lands.
     capture_pending: Option<bool>,
@@ -1574,6 +1636,7 @@ impl GlitcherZApp {
             view: MainView::default(),
             octave_base: 60,
             vk_targets: Vec::new(),
+            vk_track_targets: Vec::new(),
             midi_hub: glitcherz_engine::MidiInputHub::new(),
             midi_ports: Vec::new(),
             midi_bindings: Vec::new(),
@@ -1627,6 +1690,7 @@ impl GlitcherZApp {
             recorder: recorder::MidiRecorder::new(),
             capture_scratch: Vec::new(),
             record_pre_roll_bars: 1,
+            record_mute_other: false,
             capture_pending: None,
             capture_overflow_seen: 0,
             export_dialog_open: false,
@@ -3129,6 +3193,9 @@ impl GlitcherZApp {
                 patch::PatchAction::ConnectTempoIn { index } => {
                     self.set_auto_endpoint(index, AutoTarget::TimelineIn, AutoParam::Tempo);
                 }
+                patch::PatchAction::ConnectTrackIn { from, kind, track } => {
+                    self.connect_track_input(from, kind, track);
+                }
                 patch::PatchAction::DeleteCable(i) => {
                     self.delete_cable(i);
                 }
@@ -3858,6 +3925,82 @@ impl GlitcherZApp {
             .cables
             .push(glitcherz_model::CableDoc::keyboard_midi(from_doc, to_doc));
         self.commit_edit("Connect Keyboard", before);
+    }
+
+    /// Connects one source into a timeline track's **recording input** (R6 D21-D24).
+    ///
+    /// A recording input is a **pure sink** on the fixed `Timeline In`
+    /// terminal: the cable is a document fact (it arms the track, D22) and adds
+    /// no engine edge. The model's `validate` is the single authority for type
+    /// matching, track ranges and the single-source rule, so the edit is pushed
+    /// first and rolled back with its own message when the graph refuses it —
+    /// the same pattern as an engine-refused event cable.
+    fn connect_track_input(&mut self, from: PortRef, kind: TrackKind, track: usize) {
+        if matches!(
+            from,
+            PortRef::TrackIn { .. } | PortRef::TimelineIn | PortRef::Master
+        ) {
+            self.set_message(
+                "Connect failed: the source port carries no recording signal".to_string(),
+            );
+            return;
+        }
+        let cable_kind = match kind {
+            TrackKind::Midi => CableKind::Midi,
+            TrackKind::Curve => CableKind::Automation,
+            TrackKind::Audio => CableKind::Audio,
+        };
+        // A recording input is single-source: reconnect replaces the previous
+        // cable, except when the very same source is already there.
+        let duplicate = self
+            .project()
+            .graph
+            .cables
+            .iter()
+            .any(|cable| cable.to == (PortRef::TrackIn { kind, track }) && cable.from == from);
+        if duplicate {
+            self.set_message("Already connected".to_string());
+            return;
+        }
+        let in_port = glitcherz_model::timeline_in_port(
+            kind,
+            track,
+            self.project().midi_tracks.len(),
+            self.project().control_tracks.len(),
+            self.project().audio_tracks.len(),
+        )
+        .unwrap_or(0);
+        let before = self.begin_edit();
+        self.project_mut()
+            .graph
+            .cables
+            .retain(|cable| cable.to != (PortRef::TrackIn { kind, track }));
+        self.project_mut()
+            .graph
+            .cables
+            .push(glitcherz_model::CableDoc {
+                kind: cable_kind,
+                from,
+                to: PortRef::TrackIn { kind, track },
+                param: AutoParam::default(),
+                in_port,
+                map: None,
+            });
+        if let Err(err) = self.project().validate() {
+            self.session.restore(before);
+            self.set_message(format!("Connect failed: {err}"));
+            return;
+        }
+        self.commit_edit("Connect Recording Input", before);
+        let label = match kind {
+            TrackKind::Midi => "MIDI",
+            TrackKind::Curve => "curve",
+            TrackKind::Audio => "audio",
+        };
+        self.set_message(format!(
+            "Recording input: track {} {label} armed by wiring",
+            track + 1
+        ));
     }
 
     /// Ctrl+L (G6 quick audition): toggle MIDI cables from the
@@ -6188,6 +6331,102 @@ impl GlitcherZApp {
             let position = f64::from(self.engine.musical_ticks().max(0.0));
             self.recorder.observe_position(position);
         }
+        self.reconcile_take_tracks();
+    }
+
+    /// R6 D33: removing a track's recording-input cable mid-take ends **that**
+    /// take on this frame (no half-take left behind); the other armed tracks
+    /// keep recording. Adding a cable mid-take does not arm it — a take's set
+    /// of tracks is fixed at Rec.
+    fn reconcile_take_tracks(&mut self) {
+        if !self.recorder.is_active() {
+            return;
+        }
+        let current: std::collections::BTreeSet<usize> = self
+            .project()
+            .graph
+            .track_input_tracks(TrackKind::Midi)
+            .into_iter()
+            .collect();
+        let removed: Vec<usize> = self
+            .recorder
+            .tracks()
+            .iter()
+            .copied()
+            .filter(|track| !current.contains(track))
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+        let end =
+            f64::from(self.engine.musical_ticks().max(0.0)).max(self.recorder.last_position());
+        let mut takes = Vec::new();
+        for track in removed {
+            if let Some(notes) = self.recorder.finish_track(track, end) {
+                takes.push((track, notes));
+            }
+        }
+        let label = format!("Record MIDI (input removed: {} track(s))", takes.len());
+        let written = self.commit_take_clips(&label, &takes);
+        if !self.recorder.is_active() {
+            self.engine.set_capture(false);
+            self.capture_pending = None;
+            self.engine.set_record_mute(0);
+        }
+        match written {
+            Some((tracks, _)) => self.set_message(format!(
+                "Recording input removed: take closed on {tracks} track(s)"
+            )),
+            None => self.set_message("Recording input removed: closed an empty take".to_string()),
+        }
+    }
+
+    /// Tracks whose recording-input cable names a source type the engine can
+    /// actually capture today (R6 D26). Returns `(armed, unsupported)` in
+    /// track order; `unsupported` carries one human-readable reason per wired
+    /// port, so a rejected Rec press can say exactly what is missing.
+    fn armed_recording_tracks(&self) -> (Vec<usize>, Vec<String>) {
+        let doc = &self.project().graph;
+        let mut armed = Vec::new();
+        let mut unsupported = Vec::new();
+        for (kind, tracks) in [
+            (TrackKind::Midi, doc.track_input_tracks(TrackKind::Midi)),
+            (TrackKind::Curve, doc.track_input_tracks(TrackKind::Curve)),
+            (TrackKind::Audio, doc.track_input_tracks(TrackKind::Audio)),
+        ] {
+            for track in tracks {
+                let source = doc.track_input_source(kind, track);
+                match (kind, source.map(|c| &c.from)) {
+                    // R6: the only implemented MIDI source is a device /
+                    // computer keyboard (command-level tap). MIDI-effect
+                    // output baking is R7.
+                    (TrackKind::Midi, Some(PortRef::Node(id)))
+                        if doc.node_by_id(*id).is_some_and(NodeDoc::is_keyboard) =>
+                    {
+                        armed.push(track);
+                    }
+                    (TrackKind::Midi, Some(PortRef::Node(_))) => unsupported.push(format!(
+                        "Track {}: MIDI-effect recording is not implemented yet (R7)",
+                        track + 1
+                    )),
+                    (TrackKind::Midi, _) => unsupported.push(format!(
+                        "Track {}: the MIDI input needs a keyboard source",
+                        track + 1
+                    )),
+                    (TrackKind::Curve, _) => unsupported.push(format!(
+                        "Track {}: curve recording is not implemented yet (R8)",
+                        track + 1
+                    )),
+                    (TrackKind::Audio, _) => unsupported.push(format!(
+                        "Track {}: audio recording is not implemented yet (R4)",
+                        track + 1
+                    )),
+                }
+            }
+        }
+        armed.sort_unstable();
+        armed.dedup();
+        (armed, unsupported)
     }
 
     /// Moves everything the capture tap has queued into the recorder.
@@ -6211,8 +6450,7 @@ impl GlitcherZApp {
         self.capture_scratch = batch;
     }
 
-    /// Starts a take into the selected track (spec D16: the selection is the
-    /// armed track in this version).
+    /// Starts a take into every track armed by the `Timeline In` wiring (R6 D22).
     ///
     /// Recording starts on a bar line: the transport jumps back by the
     /// pre-roll, plays that many bars as a count-in (material and click are
@@ -6223,6 +6461,21 @@ impl GlitcherZApp {
         if self.recorder.is_active() {
             return;
         }
+        let (armed, unsupported) = self.armed_recording_tracks();
+        if armed.is_empty() {
+            if unsupported.is_empty() {
+                self.set_message(
+                    "No recording input is wired: drag a source into Timeline In · T1 (a track input port) first"
+                        .to_string(),
+                );
+            } else {
+                self.set_message(format!(
+                    "Cannot record: {}",
+                    unsupported.first().cloned().unwrap_or_default()
+                ));
+            }
+            return;
+        }
         let bar = f64::from(self.project().ticks_per_bar().max(1));
         let now = f64::from(self.engine.musical_ticks().max(0.0));
         // Forward to the next bar line (a position already on one stays).
@@ -6230,22 +6483,134 @@ impl GlitcherZApp {
         let pre_roll = f64::from(self.record_pre_roll_bars) * bar;
         let from = (start - pre_roll).max(0.0);
         let record_start = from + pre_roll;
-        self.recorder.begin(self.selected_track, record_start, from);
+        // R6 D27 (dry region): nothing may already occupy the take's span on
+        // any armed track. The check is an interval overlap, not "track is
+        // empty", so recording after existing material keeps working.
+        let bar_ticks = self.project().ticks_per_bar().max(1);
+        let record_start_tick = record_start.round().max(0.0) as u64;
+        for &track in &armed {
+            let Some(existing) = self.project().midi_tracks.get(track) else {
+                continue;
+            };
+            if let Some(clip) = existing.clips.iter().find(|clip| {
+                u64::from(clip.start_ticks) + u64::from(clip.span_ticks) > record_start_tick
+            }) {
+                let bar_no = clip.start_ticks / bar_ticks + 1;
+                self.set_message(format!(
+                    "Track {} bar {bar_no} already has a clip — delete or move it first",
+                    track + 1
+                ));
+                return;
+            }
+        }
+        self.recorder.begin(armed.clone(), record_start, from);
         if !self.engine.set_capture(true) {
             self.capture_pending = Some(true);
         }
+        // R6 D29: optionally silence every other MIDI track while recording.
+        let mut mute_bits = 0u32;
+        if self.record_mute_other {
+            for track in 0..self.project().midi_tracks.len().min(32) {
+                if !armed.contains(&track) {
+                    mute_bits |= 1 << track;
+                }
+            }
+        }
+        self.engine.set_record_mute(mute_bits);
         self.engine.seek_ticks(from);
         self.send_sequencer(SequencerCommand::Play);
-        let track = self.selected_track + 1;
-        if record_start > from {
-            let bars = self.record_pre_roll_bars;
-            self.set_message(format!("Recording track {track} after {bars} bar pre-roll"));
+        let list = armed
+            .iter()
+            .map(|&track| format!("T{}", track + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // D30: the track outlet is the only audible path once the device is
+        // taken over, so a missing instrument is a real "you hear nothing"
+        // warning, not a hint.
+        let silent: Vec<String> = armed
+            .iter()
+            .filter(|&&track| !midi_outlet_has_instrument(&self.project().graph, track))
+            .map(|&track| format!("T{}", track + 1))
+            .collect();
+        let mut message = if record_start > from {
+            format!(
+                "Recording {list} after {} bar pre-roll",
+                self.record_pre_roll_bars
+            )
         } else {
-            self.set_message(format!("Recording track {track}"));
+            format!("Recording {list}")
+        };
+        if !silent.is_empty() {
+            message.push_str(&format!(
+                " — {} has no instrument on its track outlet (you will hear nothing)",
+                silent.join(", ")
+            ));
         }
+        self.set_message(message);
     }
 
-    /// Ends the take and writes it as a clip (one undo step, spec D15).
+    /// Writes finished takes as clips, one undo step for the whole session.
+    /// Returns `(tracks written, notes written)`, or `None` when nothing was
+    /// played (no undo step, no clip).
+    fn commit_take_clips(
+        &mut self,
+        label: &str,
+        takes: &[(usize, Vec<Note>)],
+    ) -> Option<(usize, usize)> {
+        let bar = self.project().ticks_per_bar();
+        let start = self.recorder.start_ticks;
+        let clips: Vec<(usize, MidiClip, usize)> = takes
+            .iter()
+            .filter_map(|(track, notes)| {
+                recorder::take_clip(start, notes, bar).map(|clip| (*track, clip, notes.len()))
+            })
+            .collect();
+        if clips.is_empty() {
+            return None;
+        }
+        let before = self.begin_edit();
+        let mut written_tracks = Vec::new();
+        let mut written_notes = 0usize;
+        let mut full = Vec::new();
+        for (track, clip, note_count) in clips {
+            let pushed = self
+                .project_mut()
+                .midi_tracks
+                .get_mut(track)
+                .map(|t| {
+                    if t.clips.len() >= MAX_CLIPS_PER_TRACK {
+                        return false;
+                    }
+                    t.clips.push(clip);
+                    true
+                })
+                .unwrap_or(false);
+            if pushed {
+                written_tracks.push(track);
+                written_notes += note_count;
+            } else {
+                full.push(track);
+            }
+        }
+        if written_tracks.is_empty() {
+            self.session.restore(before);
+            self.set_message("Recording discarded: the target track has no room".to_string());
+            return None;
+        }
+        self.commit_edit(label, before);
+        for &track in &written_tracks {
+            self.sync_clip_row(timeline::TimelineLane::Midi, track);
+        }
+        if !full.is_empty() {
+            self.set_message(format!(
+                "Recording discarded for track {} (no room)",
+                full[0] + 1
+            ));
+        }
+        Some((written_tracks.len(), written_notes))
+    }
+
+    /// Ends the take and writes it as clips (one undo step, spec D15/R6).
     ///
     /// Called by the record button and by every transport stop / pause path —
     /// the take must be closed while the transport position still means
@@ -6256,56 +6621,24 @@ impl GlitcherZApp {
         }
         // Pull the last frames' events out of the ring before closing notes.
         self.drain_capture();
-        let track = self.recorder.track;
         // After a rewind the live position is 0, so the last observed playing
         // position is the fallback (that is the real end of the take).
         let end =
             f64::from(self.engine.musical_ticks().max(0.0)).max(self.recorder.last_position());
-        let notes = self.recorder.finish(end);
+        let takes = self.recorder.finish(end);
         self.engine.set_capture(false);
         self.capture_pending = None;
-        if notes.is_empty() {
-            self.set_message("Nothing recorded".to_string());
-            return;
-        }
-        let note_count = notes.len();
-        // Start on the bar line the take was armed for; the span covers whole
-        // bars of material (a take must not loop).
-        let Some(clip) = recorder::take_clip(
-            self.recorder.start_ticks,
-            &notes,
-            self.project().ticks_per_bar(),
-        ) else {
+        self.engine.set_record_mute(0);
+        let Some((tracks, notes)) = self.commit_take_clips("Record MIDI", &takes) else {
             self.set_message("Nothing recorded".to_string());
             return;
         };
-
-        let before = self.begin_edit();
-        let written = self
-            .project_mut()
-            .midi_tracks
-            .get_mut(track)
-            .map(|t| {
-                if t.clips.len() >= MAX_CLIPS_PER_TRACK {
-                    return false;
-                }
-                t.clips.push(clip);
-                true
-            })
-            .unwrap_or(false);
-        if !written {
-            self.set_message(format!(
-                "Recording discarded: track {} has no room for another clip",
-                track + 1
-            ));
-            return;
+        if let Some(&(first, _)) = takes.first() {
+            self.selected_track = first;
         }
-        self.commit_edit("Record MIDI", before);
-        self.sync_clip_row(timeline::TimelineLane::Midi, track);
-        self.selected_track = track;
         self.set_message(format!(
-            "Recorded {note_count} notes into track {}",
-            track + 1
+            "Recorded {notes} notes into {tracks} track{}",
+            if tracks == 1 { "" } else { "s" }
         ));
     }
 
@@ -6316,6 +6649,7 @@ impl GlitcherZApp {
         }
         self.recorder.reset();
         self.engine.set_capture(false);
+        self.engine.set_record_mute(0);
         self.capture_pending = None;
         self.capture_scratch.clear();
     }
@@ -6360,30 +6694,27 @@ impl GlitcherZApp {
     }
 
     /// Delivers one live event to every destination of the keyboard input
-    /// node (G6 — node-addressed, skips the track table). **No fallback**: an
-    /// unbound or unconnected input is silent, and the status bar says so on
-    /// the first key press rather than quietly playing the selected track.
-    /// Index loop rather than an iterator so the per-target helper may take
-    /// `&mut self`; the list is at most `MAX_MIDI_FANOUT` long.
+    /// node (G6 + R6 D31). Track destinations take the timeline fan-out path
+    /// (so the same routing that plays the take records it); node destinations
+    /// are addressed directly. **No fallback**: an unbound or unconnected input
+    /// is silent, and the status bar says so on the first key press rather than
+    /// quietly playing the selected track.
     fn send_to_vk_targets(&mut self, event: NoteEvent) {
-        if self.vk_targets.is_empty() {
-            // R2: an uncabled keyboard is silent in normal use, but a take
-            // must still work — while recording, the armed track takes the
-            // note directly (so what is heard is also what is captured).
-            if self.recorder.is_active() {
-                self.engine.send(EngineCommand::Note {
-                    track: self.recorder.track,
-                    event,
-                });
-                return;
-            }
+        if self.vk_targets.is_empty() && self.vk_track_targets.is_empty() {
             if matches!(event, NoteEvent::On { .. }) {
                 self.set_message(
-                    "Keyboard has no destination: cable the input node to an instrument (Ctrl+L)"
+                    "Keyboard is not wired: cable the input node to an instrument or a track recording input"
                         .to_string(),
                 );
             }
             return;
+        }
+        // Track targets first: the note is recorded there, so the listener
+        // should hear the same path. The lists are tiny and copied out to keep
+        // the mutable borrow free for the send.
+        let tracks = self.vk_track_targets.clone();
+        for track in tracks {
+            self.engine.send(EngineCommand::Note { track, event });
         }
         for i in 0..self.vk_targets.len() {
             let doc = self.vk_targets[i];
@@ -6411,17 +6742,18 @@ impl GlitcherZApp {
     /// starts on the next key press), while deleting the input node or its
     /// cables releases whatever was sounding.
     fn refresh_vk_targets(&mut self) {
-        let targets = {
+        let (tracks, targets) = {
             let doc = &self.project().graph;
             match doc.computer_keyboard() {
-                Some(vk) => doc.keyboard_routes_from(vk),
-                None => Vec::new(),
+                Some(vk) => keyboard_live_routes(doc, vk),
+                None => (Vec::new(), Vec::new()),
             }
         };
-        if targets == self.vk_targets {
+        if targets == self.vk_targets && tracks == self.vk_track_targets {
             return;
         }
         let old = std::mem::take(&mut self.vk_targets);
+        let old_tracks = std::mem::take(&mut self.vk_track_targets);
         let held: Vec<u8> = self.held_notes.iter().copied().collect();
         for doc in old {
             if targets.contains(&doc) {
@@ -6431,7 +6763,19 @@ impl GlitcherZApp {
                 self.send_note_event_at(doc, NoteEvent::Off { note });
             }
         }
+        for track in old_tracks {
+            if tracks.contains(&track) {
+                continue;
+            }
+            for note in held.iter().copied() {
+                self.engine.send(EngineCommand::Note {
+                    track,
+                    event: NoteEvent::Off { note },
+                });
+            }
+        }
         self.vk_targets = targets;
+        self.vk_track_targets = tracks;
     }
 
     /// The keyboard node in the current patch selection, if any (R3).
@@ -6466,8 +6810,8 @@ impl GlitcherZApp {
         };
 
         // Where the node's commands land, so the panel can say whether playing
-        // will be audible at all.
-        let routed: Vec<u64> = self.project().graph.keyboard_routes_from(node);
+        // will be audible at all (R6: track takeover wins over direct cables).
+        let (track_routes, node_routes) = keyboard_live_routes(&self.project().graph, node);
 
         let mut choice: Option<MidiSource> = None;
         let computer_selected = matches!(current, MidiSource::Computer);
@@ -6531,10 +6875,19 @@ impl GlitcherZApp {
                 );
             }
         }
-        if routed.is_empty() {
-            ui.weak("No destination: cable this node's MIDI out to an instrument.");
+        if !track_routes.is_empty() {
+            let list: Vec<String> = track_routes
+                .iter()
+                .map(|track| format!("Track {}", track + 1))
+                .collect();
+            ui.weak(format!(
+                "Plays and records: {} (direct cables are dormant)",
+                list.join(", ")
+            ));
+        } else if node_routes.is_empty() {
+            ui.weak("No destination: cable this node's MIDI out to an instrument or a track recording input.");
         } else {
-            let list: Vec<String> = routed.iter().map(|id| format!("#{id}")).collect();
+            let list: Vec<String> = node_routes.iter().map(|id| format!("#{id}")).collect();
             ui.weak(format!("Plays: {}", list.join(", ")));
         }
 
@@ -6556,17 +6909,17 @@ impl GlitcherZApp {
     }
 
     /// Recomputes the hardware MIDI routing snapshots and hands them to the hub
-    /// (R3, spec `recording.md` §3.2).
+    /// (R3/R6, spec `recording.md` §3.2 §5).
     ///
     /// The routing rule is the computer keyboard's, one level down: a device
-    /// keyboard node plays the instruments **its cables** reach, and while
-    /// recording with nothing cabled the armed track takes the notes instead.
-    /// The snapshot is compared before being pushed, so an idle frame does not
-    /// touch the connections — midir reconnecting a port costs a driver call.
+    /// keyboard node plays the **tracks its recording input cables arm** (D33
+    /// takeover), or — with no recording cable — the instruments its direct
+    /// cables reach. Recording is not a modifier: the track route is permanent
+    /// while the cable exists, so idle playing, recording and playback all use
+    /// the same path.
     fn sync_midi_bindings(&mut self) {
         let bindings = {
             let doc = &self.project().graph;
-            let recording_track = self.recorder.is_active().then_some(self.recorder.track);
             let mut out: Vec<(String, Vec<MidiTarget>)> = Vec::new();
             for node in &doc.nodes {
                 let NodeDoc::Keyboard {
@@ -6577,17 +6930,13 @@ impl GlitcherZApp {
                 else {
                     continue;
                 };
-                let mut targets: Vec<MidiTarget> = doc
-                    .keyboard_routes_from(*node_id)
+                let (tracks, nodes) = keyboard_live_routes(doc, *node_id);
+                let mut targets: Vec<MidiTarget> = nodes
                     .into_iter()
                     .filter_map(|doc_id| self.node_map.get(&doc_id).copied())
                     .map(MidiTarget::Node)
                     .collect();
-                if targets.is_empty()
-                    && let Some(track) = recording_track
-                {
-                    targets.push(MidiTarget::Track(track));
-                }
+                targets.extend(tracks.into_iter().map(MidiTarget::Track));
                 out.push((port.clone(), targets));
             }
             out
@@ -6653,7 +7002,13 @@ impl GlitcherZApp {
                         ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::Space));
                         if !repeat {
                             if self.engine.is_playing() {
-                                self.pause_transport();
+                                // R6 D32: Play while recording punches out —
+                                // the take closes, the transport keeps rolling.
+                                if self.recorder.is_active() {
+                                    self.finish_recording();
+                                } else {
+                                    self.pause_transport();
+                                }
                             } else {
                                 self.send_sequencer(SequencerCommand::Play);
                             }
@@ -6869,9 +7224,22 @@ impl GlitcherZApp {
                 if playing {
                     play_btn = play_btn.fill(egui::Color32::DARK_GREEN);
                 }
-                if ui.add(play_btn).on_hover_text("Space").clicked() {
+                if ui
+                    .add(play_btn)
+                    .on_hover_text(if self.recorder.is_active() {
+                        "Punch out: end the take and keep playing (Space)"
+                    } else {
+                        "Space"
+                    })
+                    .clicked()
+                {
                     if playing {
-                        self.pause_transport();
+                        // R6 D32: punch out instead of pausing while a take runs.
+                        if self.recorder.is_active() {
+                            self.finish_recording();
+                        } else {
+                            self.pause_transport();
+                        }
                     } else {
                         self.send_sequencer(SequencerCommand::Play);
                     }
@@ -6892,15 +7260,16 @@ impl GlitcherZApp {
                     rec_btn = rec_btn.fill(egui::Color32::from_rgb(150, 40, 40));
                 }
                 let rec_tip = if rec_active {
-                    format!(
-                        "Recording into track {} — click to end the take",
-                        self.recorder.track + 1
-                    )
+                    let list = self
+                        .recorder
+                        .tracks()
+                        .iter()
+                        .map(|&track| format!("T{}", track + 1))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("Recording {list} — click to end the take")
                 } else {
-                    format!(
-                        "Record MIDI into the selected track ({}) — R",
-                        self.selected_track + 1
-                    )
+                    "Record into every track wired to a Timeline In recording port — R".to_string()
                 };
                 if ui.add(rec_btn).on_hover_text(rec_tip).clicked() {
                     self.toggle_recording();
@@ -6914,6 +7283,10 @@ impl GlitcherZApp {
                     );
                     pre.on_hover_text("Pre-roll before recording starts (no capture)");
                 }
+                ui.checkbox(&mut self.record_mute_other, "Mute others")
+                    .on_hover_text(
+                        "While recording, silence the sequenced notes of every other MIDI track",
+                    );
                 if ui.button("⏭").on_hover_text("Skip to end (End)").clicked() {
                     self.engine
                         .seek_ticks(f64::from(self.arrangement_end_ticks()));
@@ -8479,23 +8852,39 @@ impl GlitcherZApp {
             .unwrap_or_else(|| "—".to_string());
         // G6: where the computer keyboard goes (the on-screen keyboard panel
         // is gone — the patch decides, so the status bar says where).
-        let keys_text = if self.vk_targets.is_empty() {
+        let keys_text = if self.vk_targets.is_empty() && self.vk_track_targets.is_empty() {
             "none".to_string()
         } else {
-            let mut tracks: Vec<usize> = self
-                .vk_targets
-                .iter()
-                .filter_map(|doc| self.project().graph.node_by_id(*doc).map(NodeDoc::track))
-                .map(|track| track + 1)
-                .collect();
-            tracks.sort_unstable();
-            tracks.dedup();
-            let list = tracks
-                .iter()
-                .map(|t| format!("T{t}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("{} synth(s) {list}", self.vk_targets.len())
+            let mut parts = Vec::new();
+            if !self.vk_track_targets.is_empty() {
+                let list = self
+                    .vk_track_targets
+                    .iter()
+                    .map(|t| format!("T{}", t + 1))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                parts.push(format!(
+                    "{} rec track(s) {list}",
+                    self.vk_track_targets.len()
+                ));
+            }
+            if !self.vk_targets.is_empty() {
+                let mut tracks: Vec<usize> = self
+                    .vk_targets
+                    .iter()
+                    .filter_map(|doc| self.project().graph.node_by_id(*doc).map(NodeDoc::track))
+                    .map(|track| track + 1)
+                    .collect();
+                tracks.sort_unstable();
+                tracks.dedup();
+                let list = tracks
+                    .iter()
+                    .map(|t| format!("T{t}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                parts.push(format!("{} synth(s) {list}", self.vk_targets.len()));
+            }
+            parts.join(" · ")
         };
         // Status message (disappears automatically after the timeout). This
         // used to be `take_if(.. elapsed() < TTL)`, which *consumed* the

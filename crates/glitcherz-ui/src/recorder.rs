@@ -1,4 +1,4 @@
-//! MIDI recording state machine (spec `.agents/spec/recording.md` R2).
+//! MIDI recording state machine (spec `.agents/spec/recording.md` R2/R6).
 //!
 //! The engine only stamps live events and hands them back (see the capture tap
 //! in `glitcherz-engine`); **all** recording semantics live here: pre-roll
@@ -6,6 +6,11 @@
 //! conversion. That split is deliberate (spec D6) — the engine never learns
 //! what "record" means, and this module is testable without audio hardware or
 //! a running engine.
+//!
+//! R6 moved ownership from a selected track to the document: every track whose
+//! `Timeline In` recording input is cabled is armed, and one playback can feed
+//! several of them at once (D22/D23). Each armed track keeps its own take; the
+//! UI writes one clip per non-empty take inside a single undo step (D15).
 //!
 //! Phases:
 //!
@@ -19,6 +24,8 @@
 //! and the arrangement) and captured events are **dropped by timestamp** — the
 //! filter is `ticks >= start_ticks`, not a frame-order guess, so it is exact
 //! even when a block's worth of events arrives late.
+
+use std::collections::BTreeMap;
 
 use glitcherz_engine::realtime::CapturedNote;
 use glitcherz_engine::realtime::commands::NoteEvent;
@@ -44,21 +51,42 @@ struct TakenNote {
     velocity: u8,
 }
 
-/// MIDI recording state (one take at a time).
-pub struct MidiRecorder {
-    phase: RecordPhase,
-    /// Track the take lands on: the selected track when recording started
-    /// (spec D16 — the selection *is* the armed track in this version).
-    pub track: usize,
-    /// Absolute tick where capture starts; the clip's start position.
-    pub start_ticks: f64,
+/// Per-track open-note table and closed material.
+struct TrackTake {
     /// Open note-ons by pitch: `(start_ticks, velocity)`.
     open: [Option<(f64, u8)>; 128],
     /// Closed notes, absolute ticks.
     taken: Vec<TakenNote>,
+}
+
+impl TrackTake {
+    fn new() -> Self {
+        Self {
+            open: [None; 128],
+            taken: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.open = [None; 128];
+        self.taken.clear();
+    }
+}
+
+/// MIDI recording state (one take session, one take per armed track).
+pub struct MidiRecorder {
+    phase: RecordPhase,
+    /// Tracks armed by the `Timeline In` wiring when the take started. Sorted
+    /// and deduplicated; the recorder never adds to it mid-take (a cable added
+    /// while recording starts capturing on the next take).
+    tracks: Vec<usize>,
+    /// Absolute tick where capture starts; the clip's start position.
+    pub start_ticks: f64,
+    /// Per-armed-track material.
+    takes: BTreeMap<usize, TrackTake>,
     /// Last observed transport position (loop-wrap detection).
     last_position: f64,
-    /// Completed loop passes. Each wrap **clears** the take (D12: the last
+    /// Completed loop passes. Each wrap **clears** every take (D12: the last
     /// pass wins, no comping).
     pub passes: u32,
 }
@@ -74,10 +102,9 @@ impl MidiRecorder {
     pub fn new() -> Self {
         Self {
             phase: RecordPhase::Idle,
-            track: 0,
+            tracks: Vec::new(),
             start_ticks: 0.0,
-            open: [None; 128],
-            taken: Vec::new(),
+            takes: BTreeMap::new(),
             last_position: 0.0,
             passes: 0,
         }
@@ -99,9 +126,14 @@ impl MidiRecorder {
         self.phase == RecordPhase::Recording
     }
 
+    /// Tracks armed when the take started, in track order.
+    pub fn tracks(&self) -> &[usize] {
+        &self.tracks
+    }
+
     /// Number of notes closed so far (what the status line reports).
     pub fn note_count(&self) -> usize {
-        self.taken.len()
+        self.takes.values().map(|t| t.taken.len()).sum()
     }
 
     /// Last transport position observed by [`Self::observe_position`]. Used as
@@ -111,15 +143,16 @@ impl MidiRecorder {
         self.last_position
     }
 
-    /// Enters pre-roll for `track`, capturing from `start_ticks` on. The
+    /// Enters pre-roll for `tracks`, capturing from `start_ticks` on. The
     /// transport position is recorded too, so the first wrap is detected even
     /// if the loop turns before the first note arrives.
-    pub fn begin(&mut self, track: usize, start_ticks: f64, position: f64) {
+    pub fn begin(&mut self, mut tracks: Vec<usize>, start_ticks: f64, position: f64) {
+        tracks.sort_unstable();
+        tracks.dedup();
         self.phase = RecordPhase::PreRoll;
-        self.track = track;
+        self.tracks = tracks;
         self.start_ticks = start_ticks;
-        self.open = [None; 128];
-        self.taken.clear();
+        self.takes = self.tracks.iter().map(|&t| (t, TrackTake::new())).collect();
         self.last_position = position;
         self.passes = 0;
     }
@@ -127,13 +160,13 @@ impl MidiRecorder {
     /// Drops everything and returns to idle (cancel, project new/open).
     pub fn reset(&mut self) {
         self.phase = RecordPhase::Idle;
-        self.open = [None; 128];
-        self.taken.clear();
+        self.tracks.clear();
+        self.takes.clear();
         self.passes = 0;
     }
 
     /// Feeds one frame's transport position through the state machine:
-    /// promotes pre-roll to recording and clears the take when the transport
+    /// promotes pre-roll to recording and clears every take when the transport
     /// jumps backwards (a loop wrap, or a seek — either way the material
     /// collected so far belongs to a position we left).
     pub fn observe_position(&mut self, position: f64) {
@@ -141,8 +174,9 @@ impl MidiRecorder {
             self.phase = RecordPhase::Recording;
         }
         if self.is_capturing() && position + 0.5 < self.last_position {
-            self.taken.clear();
-            self.open = [None; 128];
+            for take in self.takes.values_mut() {
+                take.clear();
+            }
             self.passes = self.passes.saturating_add(1);
         }
         self.last_position = position;
@@ -150,15 +184,22 @@ impl MidiRecorder {
 
     /// Feeds one captured event.
     ///
-    /// An event stamped at or after `start_ticks` is itself proof that the
-    /// pre-roll is over, so the phase is promoted here as well as in
+    /// Only **track-addressed** events are recorded (R6 D22): a device wired to
+    /// an instrument directly is a live performance path, not a take. An event
+    /// stamped at or after `start_ticks` is itself proof that the pre-roll is
+    /// over, so the phase is promoted here as well as in
     /// [`Self::observe_position`]: the frame order (drain vs. observe) then
-    /// cannot drop the first notes of a take. Anything stamped earlier is
-    /// pre-roll material and is discarded (D14).
+    /// cannot drop the first notes of a take.
     pub fn push(&mut self, captured: CapturedNote) {
         if self.phase == RecordPhase::Idle || captured.ticks < self.start_ticks {
             return;
         }
+        let Some(track) = captured.track else {
+            return;
+        };
+        let Some(take) = self.takes.get_mut(&track) else {
+            return;
+        };
         self.phase = RecordPhase::Recording;
         match captured.event {
             NoteEvent::On { note, velocity } => {
@@ -166,47 +207,66 @@ impl MidiRecorder {
                 // A retrigger without an off (a lost event, or the previous
                 // note's off landing after a wrap) closes the old one here
                 // rather than leaking it until stop.
-                if let Some((start, vel)) = self.open[pitch].take() {
-                    self.close(start, captured.ticks, note, vel);
+                if let Some((start, vel)) = take.open[pitch].take() {
+                    close(take, start, captured.ticks, note, vel);
                 }
-                self.open[pitch] = Some((captured.ticks, velocity_to_u8(velocity)));
+                take.open[pitch] = Some((captured.ticks, velocity_to_u8(velocity)));
             }
             NoteEvent::Off { note } => {
                 let pitch = usize::from(note & 0x7f);
-                if let Some((start, velocity)) = self.open[pitch].take() {
-                    self.close(start, captured.ticks, note, velocity);
+                if let Some((start, velocity)) = take.open[pitch].take() {
+                    close(take, start, captured.ticks, note, velocity);
                 }
             }
         }
     }
 
-    fn close(&mut self, start: f64, end: f64, note: u8, velocity: u8) {
-        if self.taken.len() >= MAX_CLIP_NOTES {
-            return;
+    /// Ends one track's take early (R6 D33: its input cable was removed
+    /// mid-recording). Returns the track's clip-relative notes; `None` when the
+    /// track was not armed or nothing was played. When the last armed track
+    /// leaves, the session returns to idle.
+    pub fn finish_track(&mut self, track: usize, position: f64) -> Option<Vec<Note>> {
+        let end = position.max(self.start_ticks + 1.0);
+        let notes = self.close_take(track, end)?;
+        self.tracks.retain(|&t| t != track);
+        if self.tracks.is_empty() {
+            self.reset();
         }
-        // A zero-length note is legal MIDI but useless in a roll; one tick is
-        // the model's minimum and keeps it visible/editable.
-        self.taken.push(TakenNote {
-            start,
-            end: end.max(start + 1.0),
-            note,
-            velocity,
-        });
+        Some(notes)
     }
 
-    /// Ends the take: closes whatever is still held and converts the result to
-    /// clip-relative [`Note`]s, sorted. Returns an empty vector when nothing
-    /// was played (the caller then writes no clip and records no undo step).
-    pub fn finish(&mut self, position: f64) -> Vec<Note> {
+    /// Ends the take: closes whatever is still held and converts every track's
+    /// result to clip-relative [`Note`]s, sorted by track. Empty tracks are
+    /// omitted; the caller writes no clip and records no undo step for them.
+    pub fn finish(&mut self, position: f64) -> Vec<(usize, Vec<Note>)> {
         let end = position.max(self.start_ticks + 1.0);
-        // Index loop: `close` needs `&mut self`, which an `iter_mut` borrow of
-        // `self.open` would keep alive.
-        for pitch in 0..self.open.len() {
-            if let Some((start, velocity)) = self.open[pitch].take() {
-                self.close(start, end, pitch as u8, velocity);
+        let tracks: Vec<usize> = self.tracks.clone();
+        let mut out = Vec::new();
+        for track in tracks {
+            if let Some(notes) = self.close_take(track, end) {
+                out.push((track, notes));
             }
         }
-        let mut notes: Vec<Note> = self
+        self.phase = RecordPhase::Idle;
+        self.tracks.clear();
+        self.takes.clear();
+        self.passes = 0;
+        out
+    }
+
+    /// Closes and removes one track's material, mapping it to clip-relative
+    /// notes. `None` when nothing was played.
+    fn close_take(&mut self, track: usize, end: f64) -> Option<Vec<Note>> {
+        let mut take = self.takes.remove(&track)?;
+        for pitch in 0..take.open.len() {
+            if let Some((start, velocity)) = take.open[pitch].take() {
+                close(&mut take, start, end, pitch as u8, velocity);
+            }
+        }
+        if take.taken.is_empty() {
+            return None;
+        }
+        let mut notes: Vec<Note> = take
             .taken
             .drain(..)
             .map(|taken| {
@@ -222,11 +282,23 @@ impl MidiRecorder {
             })
             .collect();
         notes.sort_by_key(|n| (n.start, n.note, n.length, n.velocity));
-        self.phase = RecordPhase::Idle;
-        self.open = [None; 128];
-        self.passes = 0;
-        notes
+        Some(notes)
     }
+}
+
+/// Closes one open note into `take` (bounds-checked by [`MAX_CLIP_NOTES`]).
+fn close(take: &mut TrackTake, start: f64, end: f64, note: u8, velocity: u8) {
+    if take.taken.len() >= MAX_CLIP_NOTES {
+        return;
+    }
+    // A zero-length note is legal MIDI but useless in a roll; one tick is
+    // the model's minimum and keeps it visible/editable.
+    take.taken.push(TakenNote {
+        start,
+        end: end.max(start + 1.0),
+        note,
+        velocity,
+    });
 }
 
 /// Velocity `0.0..=1.0` → MIDI wire range `1..=127` (never 0: a note with
@@ -270,45 +342,85 @@ mod tests {
     use glitcherz_engine::realtime::commands::NoteEvent;
     use glitcherz_model::{MAX_ARRANGEMENT_TICKS, Note};
 
-    fn on(ticks: f64, note: u8) -> CapturedNote {
+    fn captured(ticks: f64, event: NoteEvent, track: Option<usize>) -> CapturedNote {
         CapturedNote {
             ticks,
-            event: NoteEvent::On {
+            event,
+            track,
+        }
+    }
+
+    fn on(ticks: f64, note: u8) -> CapturedNote {
+        captured(
+            ticks,
+            NoteEvent::On {
                 note,
                 velocity: 1.0,
             },
-        }
+            Some(3),
+        )
     }
 
     fn off(ticks: f64, note: u8) -> CapturedNote {
-        CapturedNote {
-            ticks,
-            event: NoteEvent::Off { note },
-        }
+        captured(ticks, NoteEvent::Off { note }, Some(3))
     }
 
-    /// A recorder that already left pre-roll at tick 960.
+    fn on_track(ticks: f64, note: u8, track: usize) -> CapturedNote {
+        captured(
+            ticks,
+            NoteEvent::On {
+                note,
+                velocity: 1.0,
+            },
+            Some(track),
+        )
+    }
+
+    fn off_track(ticks: f64, note: u8, track: usize) -> CapturedNote {
+        captured(ticks, NoteEvent::Off { note }, Some(track))
+    }
+
+    /// A recorder already out of pre-roll at tick 960, armed for track 3.
     fn recording() -> MidiRecorder {
         let mut recorder = MidiRecorder::new();
-        recorder.begin(3, 960.0, 0.0);
+        recorder.begin(vec![3], 960.0, 0.0);
         recorder.observe_position(960.0);
         assert_eq!(recorder.phase(), RecordPhase::Recording);
         recorder
     }
 
+    fn only_notes(finished: Vec<(usize, Vec<Note>)>) -> Vec<Note> {
+        assert_eq!(finished.len(), 1, "one non-empty take expected");
+        finished.into_iter().next().expect("take").1
+    }
+
     #[test]
     fn pre_roll_discards_events_until_the_start_tick() {
         let mut recorder = MidiRecorder::new();
-        recorder.begin(0, 1920.0, 0.0);
+        recorder.begin(vec![0], 1920.0, 0.0);
         recorder.observe_position(500.0);
         assert_eq!(recorder.phase(), RecordPhase::PreRoll);
-        recorder.push(on(500.0, 60));
+        recorder.push(captured(
+            500.0,
+            NoteEvent::On {
+                note: 60,
+                velocity: 1.0,
+            },
+            Some(0),
+        ));
         assert_eq!(recorder.note_count(), 0, "pre-roll material is dropped");
 
         recorder.observe_position(1920.0);
         assert_eq!(recorder.phase(), RecordPhase::Recording);
-        recorder.push(on(1920.0, 60));
-        recorder.push(off(2400.0, 60));
+        recorder.push(captured(
+            1920.0,
+            NoteEvent::On {
+                note: 60,
+                velocity: 1.0,
+            },
+            Some(0),
+        ));
+        recorder.push(captured(2400.0, NoteEvent::Off { note: 60 }, Some(0)));
         assert_eq!(recorder.note_count(), 1);
     }
 
@@ -317,11 +429,35 @@ mod tests {
         // The drain/observe order within a frame must not matter: an event at
         // or past the start tick proves the pre-roll is over.
         let mut recorder = MidiRecorder::new();
-        recorder.begin(0, 960.0, 0.0);
-        recorder.push(on(960.0, 60));
+        recorder.begin(vec![0], 960.0, 0.0);
+        recorder.push(captured(
+            960.0,
+            NoteEvent::On {
+                note: 60,
+                velocity: 1.0,
+            },
+            Some(0),
+        ));
         assert_eq!(recorder.phase(), RecordPhase::Recording);
-        recorder.push(off(1200.0, 60));
+        recorder.push(captured(1200.0, NoteEvent::Off { note: 60 }, Some(0)));
         assert_eq!(recorder.finish(1200.0).len(), 1);
+    }
+
+    #[test]
+    fn node_addressed_events_are_not_recorded() {
+        // R6: a device wired straight to an instrument is a performance path;
+        // only a cable into a track recording input arms a take.
+        let mut recorder = recording();
+        recorder.push(captured(
+            1000.0,
+            NoteEvent::On {
+                note: 60,
+                velocity: 1.0,
+            },
+            None,
+        ));
+        recorder.push(captured(1100.0, NoteEvent::Off { note: 60 }, None));
+        assert_eq!(recorder.note_count(), 0);
     }
 
     #[test]
@@ -329,7 +465,7 @@ mod tests {
         let mut recorder = recording();
         recorder.push(on(1200.0, 64));
         recorder.push(off(1440.0, 64));
-        let notes = recorder.finish(1500.0);
+        let notes = only_notes(recorder.finish(1500.0));
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].start, 240, "1200 - 960");
         assert_eq!(notes[0].length, 240);
@@ -340,7 +476,7 @@ mod tests {
     fn a_held_note_is_closed_at_stop() {
         let mut recorder = recording();
         recorder.push(on(1000.0, 67));
-        let notes = recorder.finish(1400.0);
+        let notes = only_notes(recorder.finish(1400.0));
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].start, 40);
         assert_eq!(notes[0].length, 400);
@@ -352,7 +488,7 @@ mod tests {
         recorder.push(on(1000.0, 60));
         recorder.push(on(1200.0, 60));
         recorder.push(off(1400.0, 60));
-        let notes = recorder.finish(1400.0);
+        let notes = only_notes(recorder.finish(1400.0));
         assert_eq!(notes.len(), 2, "the second note-on closes the first");
         assert_eq!(notes[0].start, 40);
         assert_eq!(notes[0].length, 200);
@@ -360,10 +496,55 @@ mod tests {
     }
 
     #[test]
-    fn a_loop_wrap_keeps_only_the_last_pass() {
+    fn two_armed_tracks_get_independent_takes() {
+        let mut recorder = MidiRecorder::new();
+        recorder.begin(vec![1, 4], 960.0, 0.0);
+        recorder.observe_position(960.0);
+        recorder.push(on_track(1000.0, 60, 1));
+        recorder.push(on_track(1000.0, 67, 4));
+        recorder.push(off_track(1200.0, 60, 1));
+        // Track 4's note is left held; stop closes it.
+        let finished = recorder.finish(1300.0);
+        assert_eq!(finished.len(), 2);
+        assert_eq!(finished[0].0, 1);
+        assert_eq!(finished[0].1.len(), 1);
+        assert_eq!(finished[1].0, 4);
+        assert_eq!(finished[1].1[0].note, 67);
+    }
+
+    #[test]
+    fn an_unarmed_track_is_ignored() {
         let mut recorder = recording();
+        recorder.push(on_track(1000.0, 62, 7));
+        assert_eq!(recorder.note_count(), 0);
+    }
+
+    #[test]
+    fn finishing_one_track_leaves_the_others_recording() {
+        let mut recorder = MidiRecorder::new();
+        recorder.begin(vec![1, 4], 960.0, 0.0);
+        recorder.observe_position(960.0);
+        recorder.push(on_track(1000.0, 60, 1));
+        recorder.push(on_track(1000.0, 67, 4));
+        let notes = recorder
+            .finish_track(1, 1200.0)
+            .expect("track 1 has material");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(recorder.tracks(), &[4]);
+        assert_eq!(recorder.note_count(), 0, "track 4 still holds its note");
+        let rest = recorder.finish(1300.0);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].0, 4);
+    }
+
+    #[test]
+    fn a_loop_wrap_keeps_only_the_last_pass() {
+        let mut recorder = MidiRecorder::new();
+        recorder.begin(vec![3, 4], 960.0, 0.0);
+        recorder.observe_position(960.0);
         recorder.push(on(1000.0, 60));
         recorder.push(off(1100.0, 60));
+        recorder.push(on_track(1000.0, 70, 4));
         assert_eq!(recorder.note_count(), 1);
         // Transport jumped back to the loop start: the first pass is dropped.
         recorder.observe_position(0.0);
@@ -371,7 +552,7 @@ mod tests {
         assert_eq!(recorder.passes, 1);
         recorder.push(on(1000.0, 62));
         recorder.push(off(1100.0, 62));
-        let notes = recorder.finish(1200.0);
+        let notes = only_notes(recorder.finish(1200.0));
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].note, 62);
     }

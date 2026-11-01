@@ -482,11 +482,17 @@ curve→曲线轨，即"烘培"）；**一个输入只允许一个源，一个�
   该节点连到的乐器」快照（未接线且录音中回落 armed track）；Inspector 选中键盘节点时显示
   输入源面板、连接状态与目标乐器。设备绑定是文档编辑（一次 undo），不是应用配置。
   测试：`midi_input` 8 单元 + `node_ctrl_reaches_only_the_addressed_slot`。
-- [ ] **R6 轨输入口（录音归属，R4 前置）**：`Timeline In` 增每轨输入口
-  （`PortRef::TrackIn{kind,track}` + 版本 v10），录音归属 = 接线（D16 选中轨回落退役），
-  单一源 + 类型匹配即可连；`CapturedNote` 加 track 戳 → 多轨同录；干区冲突校验；
-  **轨输入接管**（设备接了轨输入口后直连 cable 休眠，纯派生、无 mute 状态，D33）；
-  `SetRecordMute` 其他轨静音选项；punch out（D21–D33，spec §5）
+- [x] **R6 轨输入口（录音归属，R4 前置）** ✅ 2026-11-01：model `TrackKind` +
+  `PortRef::TrackIn{kind,track}`（v10，无迁移）+ `GraphDoc::{track_input_source,
+  track_input_tracks, node_track_inputs}`；`validate` 单源 / 类型匹配 / 轨号范围
+  （音频轨由 `Project::validate` 复核）。patch `Timeline In` 扩成 tempo + 每轨一口
+  （MIDI → Curve → Audio），命中 / 剪线 / 休眠直连样式（tooltip）。
+  引擎 `CapturedNote.track`、`EngineCommand::Ctrl{track}`、`SequencerCommand::SetRecordMute`
+  （只丢 On）。UI 派发按 `Timeline In` 接线派生（`keyboard_live_routes`），
+  midi hub 快照含轨目标；recorder 多轨 take、干区校验、punch out、D30 无乐器告警、
+  中途拔线只结束该轨 take；transport 增 `Mute others`。
+  测试：model 轨输入规则 + 项目音频范围、sequencer record mute、capture 轨戳、
+  patch 端口表 / 休眠判定、recorder 多轨；全仓 fmt/clippy/test 绿
 - [ ] **R4 音频录音**（改用轨输入口，`Input` 不带 `track` 字段）：`NodeDoc::Input` +
   `InputProcessor` + cpal 输入双 ring + `.media/` 相对路径 + 手动延迟 offset
 - [ ] **R5 收尾**：录音后选中新 clip、输入电平表、溢出告警、PDC 自动对齐

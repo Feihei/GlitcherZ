@@ -3335,9 +3335,9 @@ impl NodeDoc {
 
 /// Cable port reference (spec §7 `PortRef`).
 ///
-/// `Master` / `TimelineIn` / `MidiTrack` / `AutoTrack` are reserved identities
-/// of fixed entities (not listed in the node table; the loader/engine fills
-/// them in implicitly); `Node` references a document node.
+/// `Master` / `TimelineIn` / `MidiTrack` / `AutoTrack` / `TrackIn` are reserved
+/// identities of fixed entities (not listed in the node table; the loader /
+/// engine fills them in implicitly); `Node` references a document node.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PortRef {
@@ -3354,8 +3354,90 @@ pub enum PortRef {
     /// **pure sink** mirroring the `Timeline` source. It has no node_id, no
     /// engine processor and no user-creatable instance — identity alone makes
     /// it a singleton (D2), so `validate` only constrains the cables, not the
-    /// entity. v1 has a single port ([`AutoParam::Tempo`]).
+    /// entity. Port 0 is the tempo port ([`AutoParam::Tempo`]); R6 adds one
+    /// recording input per track (see [`PortRef::TrackIn`]).
     TimelineIn,
+    /// One timeline track's **recording input** (R6, spec `recording.md` §5):
+    /// a port on the fixed `Timeline In` terminal. A cable landing here says
+    /// "this source records into that track"; the destination is a document
+    /// fact, not UI state (D22). Type-matched only (D24), at most one source
+    /// per port (D23).
+    TrackIn {
+        /// Which track family the input belongs to.
+        kind: TrackKind,
+        /// Track index inside that family.
+        track: usize,
+    },
+}
+
+/// Timeline track family addressed by a [`PortRef::TrackIn`] port (R6,
+/// spec `recording.md` §5 D21).
+///
+/// The order is the one the `Timeline In` port table uses (MIDI → curve →
+/// audio), matching the `Timeline` outlet order.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackKind {
+    /// MIDI track (note plane).
+    #[default]
+    Midi,
+    /// Control (curve) track.
+    Curve,
+    /// Audio track.
+    Audio,
+}
+
+/// The `Timeline In` port index of `kind`/`track` (R6 D21), or `None` when the
+/// track is out of range.
+///
+/// Port 0 is the pre-existing tempo port; the recording inputs follow in
+/// **MIDI → curve → audio** order, one per track, so the terminal and the
+/// `Timeline` outlet expose the same sequence.
+pub fn timeline_in_port(
+    kind: TrackKind,
+    track: usize,
+    midi_count: usize,
+    auto_count: usize,
+    audio_count: usize,
+) -> Option<u8> {
+    let offset = match kind {
+        TrackKind::Midi if track < midi_count => track,
+        TrackKind::Curve if track < auto_count => midi_count + track,
+        TrackKind::Audio if track < audio_count => midi_count + auto_count + track,
+        _ => return None,
+    };
+    u8::try_from(offset + 1).ok()
+}
+
+/// Inverse of [`timeline_in_port`]: a `Timeline In` port index → its track
+/// family and index. Port 0 (tempo) returns `None`.
+pub fn timeline_in_port_kind(
+    port: u8,
+    midi_count: usize,
+    auto_count: usize,
+    audio_count: usize,
+) -> Option<(TrackKind, usize)> {
+    let index = usize::from(port).checked_sub(1)?;
+    if index < midi_count {
+        Some((TrackKind::Midi, index))
+    } else if index < midi_count + auto_count {
+        Some((TrackKind::Curve, index - midi_count))
+    } else if index < midi_count + auto_count + audio_count {
+        Some((TrackKind::Audio, index - midi_count - auto_count))
+    } else {
+        None
+    }
 }
 
 /// Cable type (D3): bound to the port type; type mismatches are rejected at
@@ -3626,6 +3708,51 @@ impl GraphDoc {
             .collect()
     }
 
+    /// The cable feeding one timeline track's recording input (R6 D22), if the
+    /// track is armed by wiring.
+    pub fn track_input_source(&self, kind: TrackKind, track: usize) -> Option<&CableDoc> {
+        self.cables.iter().find(|cable| {
+            matches!(
+                cable.to,
+                PortRef::TrackIn { kind: k, track: t } if k == kind && t == track
+            )
+        })
+    }
+
+    /// Every track of `kind` whose recording input has a cable (the armed set,
+    /// R6 D22), in track order.
+    pub fn track_input_tracks(&self, kind: TrackKind) -> Vec<usize> {
+        let mut tracks: Vec<usize> = self
+            .cables
+            .iter()
+            .filter_map(|cable| match cable.to {
+                PortRef::TrackIn { kind: k, track } if k == kind => Some(track),
+                _ => None,
+            })
+            .collect();
+        tracks.sort_unstable();
+        tracks.dedup();
+        tracks
+    }
+
+    /// Every timeline recording input fed by one source node (R6 D23/D33):
+    /// the track family and index pairs, in document cable order.
+    ///
+    /// A node with at least one entry here is **taken over**: its direct MIDI
+    /// cables are dormant and its events are dispatched through these tracks
+    /// instead (D33 — pure derivation, no stored mute flag).
+    pub fn node_track_inputs(&self, node_id: u64) -> Vec<(TrackKind, usize)> {
+        self.cables
+            .iter()
+            .filter_map(|cable| match (&cable.from, &cable.to) {
+                (PortRef::Node(id), PortRef::TrackIn { kind, track }) if *id == node_id => {
+                    Some((*kind, *track))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The first effect node of a track.
     pub fn effect_of_track(&self, track: usize) -> Option<&NodeDoc> {
         self.nodes
@@ -3843,9 +3970,80 @@ impl GraphDoc {
         // Curve Map inputs are single-source for **every** source kind (spec
         // `curve-map.md` D5), so they get their own counter.
         let mut curve_map_in: std::collections::BTreeMap<u64, usize> = Default::default();
+        // R6 D23: one recording source per timeline track input, whatever the
+        // cable kind (a second cable is rejected, not silently replaced).
+        let mut track_in_count: std::collections::BTreeMap<(TrackKind, usize), usize> =
+            Default::default();
         for cable in &self.cables {
             self.check_port(&cable.from, &node_ids, midi_count, auto_count)?;
             self.check_port(&cable.to, &node_ids, midi_count, auto_count)?;
+            if let PortRef::TrackIn { kind, track } = &cable.to {
+                let expected = match kind {
+                    TrackKind::Midi => CableKind::Midi,
+                    TrackKind::Curve => CableKind::Automation,
+                    TrackKind::Audio => CableKind::Audio,
+                };
+                if cable.kind != expected {
+                    return Err(format!(
+                        "cable kind {:?} does not match the {:?} recording input (track {track}, D24)",
+                        cable.kind, kind
+                    ));
+                }
+                let count = track_in_count.entry((*kind, *track)).or_insert(0);
+                *count += 1;
+                if *count > 1 {
+                    return Err(format!(
+                        "the {:?} recording input of track {track} receives multiple cables (one source per input, D23)",
+                        kind
+                    ));
+                }
+                // D24: the source has to be the kind of data the input records.
+                // Timeline track outlets are sources too, but a timeline outlet
+                // feeding its own input family would re-record the arrangement
+                // and is not part of the R6 matrix (D26).
+                match (kind, &cable.from) {
+                    (TrackKind::Midi, PortRef::Node(id)) => {
+                        let source = self.node_by_id(*id).ok_or_else(|| {
+                            format!("MIDI recording input source node {id} does not exist")
+                        })?;
+                        if !source.has_midi_out() {
+                            return Err(format!(
+                                "MIDI recording input source node {id} has no MIDI output (keyboard / MIDI-effect nodes only)"
+                            ));
+                        }
+                    }
+                    (TrackKind::Audio, PortRef::Node(id)) => {
+                        let source = self.node_by_id(*id).ok_or_else(|| {
+                            format!("audio recording input source node {id} does not exist")
+                        })?;
+                        if matches!(source, NodeDoc::AudioTrack { .. }) || !source.has_audio_ports()
+                        {
+                            return Err(format!(
+                                "audio recording input source node {id} has no audio output (instrument / mixer / input nodes only)"
+                            ));
+                        }
+                    }
+                    (TrackKind::Curve, PortRef::AutoTrack(_)) => {}
+                    (TrackKind::Curve, PortRef::Node(id)) => {
+                        let source = self.node_by_id(*id).ok_or_else(|| {
+                            format!("control recording input source node {id} does not exist")
+                        })?;
+                        if !source.has_control_out() {
+                            return Err(format!(
+                                "control recording input source node {id} has no control output (Portamento / MIDI Envelope / LFO / Curve Map only)"
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(format!(
+                            "the {:?} recording input of track {track} does not accept this source port (D24)",
+                            kind
+                        ));
+                    }
+                }
+                // The input port itself is a sink: nothing else to check.
+                continue;
+            }
             match cable.kind {
                 CableKind::Audio => {
                     if !matches!(cable.from, PortRef::Node(_)) {
@@ -4129,6 +4327,20 @@ impl GraphDoc {
                 if *index >= auto_count {
                     return Err(format!(
                         "automation track port {index} out of range (track count = {auto_count})"
+                    ));
+                }
+            }
+            PortRef::TrackIn { kind, track } => {
+                let count = match kind {
+                    TrackKind::Midi => midi_count,
+                    TrackKind::Curve => auto_count,
+                    // The graph document does not know the project's audio
+                    // track count; `Project::validate` re-checks the real one.
+                    TrackKind::Audio => MAX_AUDIO_TRACKS,
+                };
+                if *track >= count {
+                    return Err(format!(
+                        "{kind:?} recording input {track} out of range (track count = {count})"
                     ));
                 }
             }
@@ -4746,7 +4958,24 @@ impl Project {
             }
         }
         self.graph
-            .validate(self.midi_tracks.len(), self.control_tracks.len())
+            .validate(self.midi_tracks.len(), self.control_tracks.len())?;
+        // R6 D21: an audio recording input must reference a real audio track.
+        // The graph document only knows the universal cap; the project owns the
+        // actual count.
+        for cable in &self.graph.cables {
+            if let PortRef::TrackIn {
+                kind: TrackKind::Audio,
+                track,
+            } = cable.to
+                && track >= self.audio_tracks.len()
+            {
+                return Err(format!(
+                    "audio recording input {track} out of range (track count = {})",
+                    self.audio_tracks.len()
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -4860,7 +5089,7 @@ mod tests {
         MIN_BEND_RANGE, MIN_TEMPO_BPM, MapMode, MapSpec, MidiClip, MidiEnvelopeParams, MidiSource,
         MidiTrack, MixerChannel, NodeDoc, NodeParam, PortRef, PortamentoParams, Project,
         SamplePlayMode, SynthParams, SynthWaveform, TICKS_PER_BAR, TICKS_PER_QUARTER,
-        TICKS_PER_STEP, VoiceSpec, default_audio_source_len, default_graph_doc,
+        TICKS_PER_STEP, TrackKind, VoiceSpec, default_audio_source_len, default_graph_doc,
     };
 
     fn effect_node(params: EffectParams) -> NodeDoc {
@@ -5114,6 +5343,33 @@ mod tests {
         let parsed: Project = ron::from_str(&legacy).expect("legacy file must parse");
         assert!(parsed.audio_tracks.is_empty());
         parsed.validate().expect("legacy shape is valid");
+    }
+
+    /// R6: the graph only knows the universal audio cap; the project rejects a
+    /// recording input that no actual audio track backs.
+    #[test]
+    fn an_audio_recording_input_must_name_a_real_track() {
+        let mut project = Project::default();
+        let from = project.graph.nodes.first().map(NodeDoc::node_id).unwrap();
+        project.graph.cables.push(CableDoc {
+            kind: CableKind::Audio,
+            from: PortRef::Node(from),
+            to: PortRef::TrackIn {
+                kind: TrackKind::Audio,
+                track: 0,
+            },
+            param: AutoParam::default(),
+            in_port: 0,
+            map: None,
+        });
+        project
+            .validate()
+            .expect("one audio track exists by default");
+        project.audio_tracks.clear();
+        assert!(
+            project.validate().is_err(),
+            "no audio track may be armed by a stale recording input"
+        );
     }
 
     /// U6: the audio-track validate section enforces the caps.
@@ -6407,6 +6663,116 @@ mod tests {
         );
     }
 
+    /// R6 (spec `recording.md` §5 D21-D24): one recording source per track
+    /// input, type matched, track in range.
+    #[test]
+    fn track_input_cables_follow_the_recording_rules() {
+        fn track_in(
+            kind: CableKind,
+            from: PortRef,
+            track_kind: TrackKind,
+            track: usize,
+        ) -> CableDoc {
+            CableDoc {
+                kind,
+                from,
+                to: PortRef::TrackIn {
+                    kind: track_kind,
+                    track,
+                },
+                param: AutoParam::default(),
+                in_port: 0,
+                map: None,
+            }
+        }
+
+        // Keyboard → MIDI track input is the R6 path.
+        let mut doc = vk_doc();
+        doc.cables.push(track_in(
+            CableKind::Midi,
+            PortRef::Node(6),
+            TrackKind::Midi,
+            1,
+        ));
+        assert!(
+            doc.validate(2, 0).is_ok(),
+            "keyboard → MIDI recording input"
+        );
+
+        // One input, one source (D23): the same cable twice is still two
+        // cables into the port.
+        let mut doc = vk_doc();
+        doc.cables.push(track_in(
+            CableKind::Midi,
+            PortRef::Node(6),
+            TrackKind::Midi,
+            1,
+        ));
+        doc.cables.push(track_in(
+            CableKind::Midi,
+            PortRef::Node(6),
+            TrackKind::Midi,
+            1,
+        ));
+        assert!(doc.validate(2, 0).is_err(), "one source per input");
+
+        // Port type must match the track family (D24).
+        let mut doc = vk_doc();
+        doc.cables.push(track_in(
+            CableKind::Audio,
+            PortRef::Node(2),
+            TrackKind::Midi,
+            1,
+        ));
+        assert!(doc.validate(2, 0).is_err(), "audio data on a MIDI input");
+
+        // Track range follows the family count.
+        let mut doc = vk_doc();
+        doc.cables.push(track_in(
+            CableKind::Midi,
+            PortRef::Node(6),
+            TrackKind::Midi,
+            5,
+        ));
+        assert!(doc.validate(2, 0).is_err(), "MIDI track out of range");
+
+        // An instrument's audio output can arm an audio input.
+        let mut doc = vk_doc();
+        doc.cables.push(track_in(
+            CableKind::Audio,
+            PortRef::Node(2),
+            TrackKind::Audio,
+            0,
+        ));
+        assert!(
+            doc.validate(2, 0).is_ok(),
+            "instrument → audio recording input"
+        );
+
+        // A curve input takes the timeline curve outlet.
+        let mut doc = vk_doc();
+        doc.cables.push(track_in(
+            CableKind::Automation,
+            PortRef::AutoTrack(0),
+            TrackKind::Curve,
+            0,
+        ));
+        assert!(
+            doc.validate(2, 1).is_ok(),
+            "curve outlet → curve recording input"
+        );
+
+        // A keyboard is not a control source.
+        let mut doc = vk_doc();
+        doc.cables.push(track_in(
+            CableKind::Automation,
+            PortRef::Node(6),
+            TrackKind::Curve,
+            0,
+        ));
+        assert!(doc.validate(2, 1).is_err(), "keyboard has no control out");
+    }
+
     /// U3b (spec `tempo-meter.md` D1/D2/D7): the Timeline In terminal accepts
     /// exactly one thing — an automation cable carrying `Tempo`. Everything
     /// else is rejected by `validate`, and no extra singleton rule is needed
@@ -7090,7 +7456,7 @@ mod tests {
     /// value domain changed (spec `curve-map.md` D7).
     #[test]
     fn project_version_matches_the_curve_migration() {
-        assert_eq!(super::PROJECT_VERSION, 9);
+        assert_eq!(super::PROJECT_VERSION, 10);
     }
 
     // ---- SF2 bend range (spec `curve-map.md` D8/D9) ----

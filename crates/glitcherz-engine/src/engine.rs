@@ -744,6 +744,16 @@ impl AudioEngine {
         }))
     }
 
+    /// Records while monitoring: mute the sequenced notes of every MIDI track
+    /// whose bit is set (R6 D29). Bit `n` = track `n`; `0` restores normal
+    /// playback. Returns `false` if the command queue is full (retry next
+    /// frame).
+    pub fn set_record_mute(&mut self, bits: u32) -> bool {
+        self.send(EngineCommand::Sequencer(SequencerCommand::SetRecordMute(
+            bits,
+        )))
+    }
+
     /// Enables / disables the capture tap (spec `.agents/spec/recording.md`
     /// D6/D7).
     ///

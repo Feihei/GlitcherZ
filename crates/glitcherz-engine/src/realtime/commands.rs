@@ -274,6 +274,10 @@ pub enum SequencerCommand {
     /// the D16 end alone would cut audio ending past the MIDI arrangement).
     /// `0` clears it — the live engine never sets anything else.
     SetArrangementFloor(u32),
+    /// Mute other tracks during a recording (R6 D29): bit `n` set = MIDI track
+    /// `n` drops its sequenced **note-ons** (offs still fire, so nothing hangs
+    /// on the mute edge). `0` = every track plays normally.
+    SetRecordMute(u32),
 }
 
 /// Control commands from the UI / control thread to the audio thread.
@@ -311,6 +315,12 @@ pub enum EngineCommand {
     /// node is cabled to rather than fanning out through the timeline's track
     /// table. Unknown ids are dropped without panicking.
     CtrlAtNode { node_id: u64, ctrl: RtCtrl },
+    /// Send a controller event to a **timeline MIDI track** (R6 D31): the
+    /// track-addressed twin of [`EngineCommand::CtrlAtNode`], used when a
+    /// hardware input is wired into a track's recording input. Fans out through
+    /// the timeline's routing table exactly like [`EngineCommand::Note`], so a
+    /// controller follows the same path as the notes it shapes.
+    Ctrl { track: usize, ctrl: RtCtrl },
     /// Sequencer transport / configuration.
     Sequencer(SequencerCommand),
     /// Enables / disables the capture tap (spec `.agents/spec/recording.md`
@@ -365,6 +375,7 @@ mod tests {
             EngineCommand::Note { .. } => f32::NAN,
             EngineCommand::NoteAtNode { .. } => f32::NAN,
             EngineCommand::CtrlAtNode { .. } => f32::NAN,
+            EngineCommand::Ctrl { .. } => f32::NAN,
             EngineCommand::Sequencer(SequencerCommand::SetBpm(value)) => value,
             EngineCommand::Sequencer(_) => f32::NAN,
             EngineCommand::SetCapture(_) => f32::NAN,
