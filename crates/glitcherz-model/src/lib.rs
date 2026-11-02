@@ -6894,9 +6894,14 @@ mod tests {
             project.resolve_media_path("demo.media/rec-1.wav"),
             std::path::PathBuf::from("songs").join("demo.media/rec-1.wav")
         );
+        // The absolute sample has to be absolute *for the host platform*: a
+        // `C:/...` drive path is an ordinary relative path on unix, so a
+        // hardcoded one only proves the rule on Windows. The temp directory is
+        // absolute everywhere.
+        let outside = std::env::temp_dir().join("glitcherz-take.wav");
         assert_eq!(
-            project.resolve_media_path("C:/elsewhere/take.wav"),
-            std::path::PathBuf::from("C:/elsewhere/take.wav"),
+            project.resolve_media_path(&outside.to_string_lossy()),
+            outside,
             "absolute paths are untouched"
         );
         assert_eq!(
