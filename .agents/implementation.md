@@ -741,3 +741,14 @@ let _ = self.slot_set_param(route.slot, ParamId::PitchOffset, value); // synth /
 - **电平按通道**：`InputStats` 的 `peaks: [AtomicU32; 2]` 由 cpal 回调按 `i % channels` 分通道写入（栈数组 + relaxed 原子，仍满足实时铁律），`peak_of(ch)` 供节点/Inspector 读；`peak()` 返回两通道最大值。
 
 **为什么 latency 留在走带条**：它是 take 的对齐偏移（正数把音频 clip 起点提前），依赖当前设备与缓冲大小，会话级、不随工程保存；放在走带条与 pre-roll / `Mute others` 同属"本次录音怎么采"，挂到工程节点上会被误读成节点参数。控件已加 `Latency` 标签与完整 hover 说明。
+## 音频输出 Preferences（S1-5，2026-11-03）
+
+**引擎侧只加一个入口**：`AudioEngine::start_with(OutputConfig { device, sample_rate, buffer_size })`，`start()` 就是 `OutputConfig::default()`。`device = None` 用系统默认；指定名字找不到时是 `UnknownOutputDevice`（启动路径回落默认并提示）；指定采样率只在设备的 f32 配置里找，找不优先挑与默认配置相同声道数的，其次 2 声道，最后最窄的（引擎只渲染立体声，8 声道端点只会多出 6 条静音轨）；`buffer_size` 直接映射 `cpal::BufferSize::Fixed`。
+
+**运行时切换 = 换引擎，不是换流**：`AudioEngine` 的 `BlockRunner` 已经 move 进 cpal 回调闭包，拿不回来。`apply_output_config` 先构造新引擎，成功后才 `mem::replace` 并 `drop` 旧引擎（旧 stream 停止、旧图随之销毁），随后清掉 `voice_guards` / `retiring_guards`（旧引擎不会回回收执，留着会泄漏插件库），再 `apply_document()` 按新采样率重建整张图并重开输入流。失败时旧引擎继续跑，错误留在 Preferences 窗口里，不弹全局对话框。
+
+**配置存在 `UiState`**（`output_device` / `output_sample_rate` / `output_buffer_size`，全部 `#[serde(default)]`）：`save()` 写回，启动时 `GlitcherZApp::new` 读出来——只有显式设置过且与当前引擎不符才重建，普通启动不会重复打开默认设备；保存的设备不可用时用默认引擎启动并在状态栏说明原因。
+
+**掉线提示**：cpal error 回调（不在数据路径）把错误文本写进 `Arc<Mutex<Option<String>>>`，UI 每帧 `take_stream_error()` 并显示红色状态栏（"Audio output stopped: … Open Edit ▸ Preferences…"），同一个字符串覆盖写，不会堆积。Preferences 窗口也显示最近一次流错误。
+
+**测试**：`output_config_matches` 四态（默认任意匹配 / 设备 / 采样率 / 缓冲的不匹配）、`UiState` RON 往返；`cargo run -p glitcherz-app -- --seconds 5` 冒烟覆盖默认启动路径。真实设备/采样率切换需要人工点 Apply（headless 无法验证）。

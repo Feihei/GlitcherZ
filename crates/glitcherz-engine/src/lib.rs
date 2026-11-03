@@ -54,7 +54,9 @@ pub mod sf2;
 pub(crate) mod testing;
 
 pub use audio_input::{AudioInput, AudioInputInfo, InputRing, InputStats, RecordSource};
-pub use engine::{AudioEngine, AudioEngineInfo, CommandSender, EngineError, available_outputs};
+pub use engine::{
+    AudioEngine, AudioEngineInfo, CommandSender, EngineError, OutputConfig, available_outputs,
+};
 pub use midi_input::{MidiInputError, MidiInputHub, MidiInputStats, MidiTarget};
 pub use sample::{SampleData, SampleError, SampleLibrary, StereoFrame};
 pub use sf2::{Sf2Error, Sf2Library, Sf2Preset};

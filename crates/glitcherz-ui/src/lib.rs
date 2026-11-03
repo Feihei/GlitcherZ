@@ -32,6 +32,7 @@ use eframe::egui;
 
 use glitcherz_clap_host::{ClapInstance, ClapInstanceConfig};
 use glitcherz_engine::AudioEngine;
+use glitcherz_engine::OutputConfig;
 use glitcherz_engine::RecordSource;
 use glitcherz_engine::SampleError;
 use glitcherz_engine::SampleLibrary;
@@ -958,10 +959,46 @@ struct UiState {
     /// the stored name stays a plain device name.
     #[serde(default)]
     input_loopback: bool,
+    /// Persisted output endpoint (`None` = system default). S1-5: a deliberate
+    /// device choice must survive restarts, or every launch silently reverts.
+    #[serde(default)]
+    output_device: Option<String>,
+    /// Persisted output sample rate (`None` = the device default).
+    #[serde(default)]
+    output_sample_rate: Option<u32>,
+    /// Persisted fixed buffer size in frames (`None` = the device default).
+    #[serde(default)]
+    output_buffer_size: Option<u32>,
 }
 
 /// Capacity limit of the recent files list.
 const RECENT_FILES_MAX: usize = 8;
+
+impl UiState {
+    /// The persisted output setup as an engine request (S1-5).
+    fn output_config(&self) -> OutputConfig {
+        OutputConfig {
+            device: self.output_device.clone(),
+            sample_rate: self.output_sample_rate,
+            buffer_size: self.output_buffer_size,
+        }
+    }
+}
+
+/// Whether the live engine already satisfies `config` (S1-5). Used at startup
+/// to avoid reopening the default device just because a preference exists.
+fn output_config_matches(info: &glitcherz_engine::AudioEngineInfo, config: &OutputConfig) -> bool {
+    config
+        .device
+        .as_deref()
+        .is_none_or(|device| device == info.device_name)
+        && config
+            .sample_rate
+            .is_none_or(|rate| rate == info.sample_rate)
+        && config
+            .buffer_size
+            .is_none_or(|frames| info.buffer_frames == Some(frames))
+}
 
 /// Key for [`UiState`] in eframe storage.
 const UI_STATE_KEY: &str = "glitcherz_ui_state";
@@ -1674,6 +1711,22 @@ pub struct GlitcherZApp {
     export_range_choice: export_audio::ExportRange,
     /// Whether the Undo History panel is open (S1-4). View state only.
     undo_history_open: bool,
+    /// Live output setup (S1-5): persisted to `UiState` and re-applied by
+    /// rebuilding the engine when the user changes it.
+    output_config: OutputConfig,
+    /// Whether the Preferences window is open.
+    preferences_open: bool,
+    /// Pending edits inside Preferences; only Apply commits them.
+    preferences_draft: OutputConfig,
+    /// Output-device names shown by Preferences (enumerated when the window
+    /// opens — enumeration opens the driver, so never per frame).
+    preferences_devices: Vec<String>,
+    /// Why the last Apply failed (shown in the Preferences window so a bad
+    /// pick does not silently keep the old device).
+    preferences_error: Option<String>,
+    /// Last output-stream error already reported, to avoid re-showing the same
+    /// dead-stream message every frame.
+    last_stream_error: Option<String>,
     /// Diagnostic flag: whether `ui()` has been entered (logging only).
     first_frame_logged: bool,
     /// Diagnostic flag: whether the close command has been sent (logging only).
@@ -1750,6 +1803,31 @@ impl GlitcherZApp {
         let cached_plugins = cc
             .storage
             .and_then(|storage| storage.get_string(PLUGIN_CACHE_KEY));
+        // S1-5: a persisted output choice is applied before the window shows.
+        // Only an explicit preference triggers a reopen; the plain default
+        // launch keeps the engine handed in by `main`.
+        let output_config = ui_state.output_config();
+        let wants_explicit_output = output_config.device.is_some()
+            || output_config.sample_rate.is_some()
+            || output_config.buffer_size.is_some();
+        let (engine, startup_audio_error) = if wants_explicit_output
+            && !output_config_matches(engine.info(), &output_config)
+        {
+            match AudioEngine::start_with(output_config.clone()) {
+                Ok(started) => {
+                    drop(engine);
+                    (started, None)
+                }
+                Err(err) => (
+                    engine,
+                    Some(format!(
+                        "Saved audio settings unavailable ({err}); using the default output device."
+                    )),
+                ),
+            }
+        } else {
+            (engine, None)
+        };
         let mut app = Self {
             engine,
             session: glitcherz_command::Session::new(Project {
@@ -1848,6 +1926,12 @@ impl GlitcherZApp {
             export_dialog_open: false,
             export_range_choice: export_audio::ExportRange::FullSong,
             undo_history_open: false,
+            output_config,
+            preferences_open: false,
+            preferences_draft: OutputConfig::default(),
+            preferences_devices: Vec::new(),
+            preferences_error: None,
+            last_stream_error: None,
             first_frame_logged: false,
             close_sent: false,
         };
@@ -1869,6 +1953,9 @@ impl GlitcherZApp {
             }
         }
         app.audio_sources = AudioEngine::record_sources();
+        if let Some(err) = startup_audio_error {
+            app.set_error(err);
+        }
         app.push_all_params();
         if let Some(note) = config.auto_play_note {
             // Diagnostic path (smoke runs): bypass the patch route on purpose —
@@ -6840,6 +6927,207 @@ impl GlitcherZApp {
         Some(names.join(" "))
     }
 
+    /// Applies a new output setup (S1-5): builds the replacement engine first,
+    /// then swaps it in and rebuilds the document at the new sample rate. On
+    /// failure the old engine keeps running and the reason stays in the window.
+    fn apply_output_config(&mut self, config: OutputConfig) {
+        if output_config_matches(self.engine.info(), &config) {
+            self.output_config = config;
+            self.preferences_error = None;
+            self.preferences_open = false;
+            return;
+        }
+        self.close_plugin_editor();
+        match AudioEngine::start_with(config.clone()) {
+            Ok(engine) => {
+                let old = std::mem::replace(&mut self.engine, engine);
+                // Stop the old stream before releasing its plugin guards: the
+                // old graph (and every node in it) dies with the stream.
+                drop(old);
+                self.voice_guards.clear();
+                self.retiring_guards.clear();
+                self.node_map.clear();
+                self.output_config = config;
+                self.preferences_error = None;
+                self.preferences_open = false;
+                self.last_stream_error = None;
+                // The document is sample-rate agnostic (tick domain); the
+                // rebuild re-instantiates every processor at the new rate.
+                self.apply_document();
+                if self.audio_device.is_some() {
+                    let source = self.record_source();
+                    if let Err(err) = self.engine.reopen_input(&source) {
+                        self.set_error(format!(
+                            "Audio output applied, but the input device failed: {err}"
+                        ));
+                    }
+                }
+                self.set_message(format!(
+                    "Audio output: {} ({} Hz)",
+                    self.engine.info().device_name,
+                    self.engine.info().sample_rate
+                ));
+            }
+            Err(err) => {
+                self.preferences_error = Some(err.to_string());
+            }
+        }
+    }
+
+    /// Preferences window (S1-5): output device / sample rate / buffer size.
+    /// Edits live in a draft; Apply is the only commit point.
+    fn preferences_panel(&mut self, ctx: &egui::Context) {
+        if !self.preferences_open {
+            return;
+        }
+        if self.preferences_devices.is_empty() {
+            self.preferences_devices = glitcherz_engine::available_outputs();
+        }
+        let mut open = self.preferences_open;
+        let mut apply = false;
+        let devices = self.preferences_devices.clone();
+        egui::Window::new("Preferences")
+            .id(egui::Id::new("glitcherz_preferences"))
+            .open(&mut open)
+            .default_width(380.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.heading("Audio output");
+                if let Some(err) = &self.last_stream_error {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 140, 120),
+                        format!("Last output error: {err}"),
+                    );
+                }
+                ui.add_space(4.0);
+                egui::Grid::new("audio_output_grid")
+                    .num_columns(2)
+                    .spacing([14.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Device");
+                        let device_label = self
+                            .preferences_draft
+                            .device
+                            .clone()
+                            .unwrap_or_else(|| "System default".to_string());
+                        egui::ComboBox::from_id_salt("output_device")
+                            .selected_text(device_label)
+                            .width(240.0)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(
+                                        self.preferences_draft.device.is_none(),
+                                        "System default",
+                                    )
+                                    .clicked()
+                                {
+                                    self.preferences_draft.device = None;
+                                }
+                                for device in &devices {
+                                    let selected = self.preferences_draft.device.as_deref()
+                                        == Some(device.as_str());
+                                    if ui.selectable_label(selected, device).clicked() {
+                                        self.preferences_draft.device = Some(device.clone());
+                                    }
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Sample rate");
+                        let rate_label = self.preferences_draft.sample_rate.map_or_else(
+                            || "Device default".to_string(),
+                            |rate| format!("{rate} Hz"),
+                        );
+                        egui::ComboBox::from_id_salt("output_rate")
+                            .selected_text(rate_label)
+                            .width(240.0)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(
+                                        self.preferences_draft.sample_rate.is_none(),
+                                        "Device default",
+                                    )
+                                    .clicked()
+                                {
+                                    self.preferences_draft.sample_rate = None;
+                                }
+                                for rate in [44_100u32, 48_000, 88_200, 96_000, 176_400, 192_000] {
+                                    let selected = self.preferences_draft.sample_rate == Some(rate);
+                                    if ui
+                                        .selectable_label(selected, format!("{rate} Hz"))
+                                        .clicked()
+                                    {
+                                        self.preferences_draft.sample_rate = Some(rate);
+                                    }
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Buffer size");
+                        let buffer_label = self.preferences_draft.buffer_size.map_or_else(
+                            || "Device default".to_string(),
+                            |frames| format!("{frames} frames"),
+                        );
+                        egui::ComboBox::from_id_salt("output_buffer")
+                            .selected_text(buffer_label)
+                            .width(240.0)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(
+                                        self.preferences_draft.buffer_size.is_none(),
+                                        "Device default",
+                                    )
+                                    .clicked()
+                                {
+                                    self.preferences_draft.buffer_size = None;
+                                }
+                                for frames in [64u32, 128, 256, 512, 1024] {
+                                    let selected =
+                                        self.preferences_draft.buffer_size == Some(frames);
+                                    if ui
+                                        .selectable_label(selected, format!("{frames} frames"))
+                                        .clicked()
+                                    {
+                                        self.preferences_draft.buffer_size = Some(frames);
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                    });
+                ui.add_space(6.0);
+                ui.weak(
+                    "Applying rebuilds the audio graph and re-instantiates plug-ins. \
+                     A device that cannot run the chosen rate keeps the previous output.",
+                );
+                if let Some(err) = &self.preferences_error {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 140, 120),
+                        egui::RichText::new(err).strong(),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Close").clicked() {
+                        self.preferences_open = false;
+                    }
+                    if ui.button("Refresh devices").clicked() {
+                        self.preferences_devices = glitcherz_engine::available_outputs();
+                    }
+                });
+            });
+        if !open {
+            self.preferences_open = false;
+        }
+        if apply {
+            let config = self.preferences_draft.clone();
+            self.apply_output_config(config);
+        }
+    }
+
     /// Undo History panel (S1-4): every retained step plus the redo tail, newest
     /// first. Clicking a row restores the document state after that step.
     fn undo_history_panel(&mut self, ctx: &egui::Context) {
@@ -8499,6 +8787,14 @@ impl GlitcherZApp {
                     if ui.button("Undo History…").clicked() {
                         ui.close();
                         self.undo_history_open = true;
+                    }
+                    ui.separator();
+                    if ui.button("Preferences…").clicked() {
+                        ui.close();
+                        self.preferences_draft = self.output_config.clone();
+                        self.preferences_error = None;
+                        self.preferences_devices.clear();
+                        self.preferences_open = true;
                     }
                 });
                 ui.separator();
@@ -14167,6 +14463,9 @@ impl eframe::App for GlitcherZApp {
                 recent_plugins: self.recent_plugins.clone(),
                 input_device: self.audio_device.clone(),
                 input_loopback: self.audio_loopback,
+                output_device: self.output_config.device.clone(),
+                output_sample_rate: self.output_config.sample_rate,
+                output_buffer_size: self.output_config.buffer_size,
             },
         );
         // U9 E2: the plugin catalog (spec `plugin-browser.md` D11). A partial
@@ -14308,6 +14607,14 @@ impl eframe::App for GlitcherZApp {
         self.transport_panel(ui);
         self.recording_refusal_card(ui);
         self.undo_history_panel(ui.ctx());
+        // S1-5: a dead output stream would otherwise look exactly like silence.
+        if let Some(err) = self.engine.take_stream_error() {
+            self.set_error(format!(
+                "Audio output stopped: {err}. Open Edit ▸ Preferences to pick another device."
+            ));
+            self.last_stream_error = Some(err);
+        }
+        self.preferences_panel(ui.ctx());
         self.status_panel(ui);
         self.view_tabs(ui);
         // The Edit tab follows the timeline's clip selection (no target of its
@@ -14537,6 +14844,75 @@ pub fn run(engine: AudioEngine, config: UiConfig) -> eframe::Result<()> {
         native_options,
         Box::new(move |cc| Ok(Box::new(GlitcherZApp::new(cc, engine, config)))),
     )
+}
+
+#[cfg(test)]
+mod audio_preferences_tests {
+    use super::*;
+
+    fn info(device: &str, rate: u32, buffer: Option<u32>) -> glitcherz_engine::AudioEngineInfo {
+        glitcherz_engine::AudioEngineInfo {
+            device_name: device.to_string(),
+            sample_rate: rate,
+            out_channels: 2,
+            buffer_frames: buffer,
+        }
+    }
+
+    #[test]
+    fn an_empty_config_matches_the_default_engine() {
+        assert!(output_config_matches(
+            &info("Speakers", 48_000, None),
+            &OutputConfig::default()
+        ));
+    }
+
+    #[test]
+    fn explicit_fields_must_match_the_live_engine() {
+        let live = info("Speakers", 48_000, Some(256));
+        assert!(output_config_matches(
+            &live,
+            &OutputConfig {
+                device: Some("Speakers".into()),
+                sample_rate: Some(48_000),
+                buffer_size: Some(256),
+            }
+        ));
+        assert!(!output_config_matches(
+            &live,
+            &OutputConfig {
+                device: Some("Headphones".into()),
+                ..Default::default()
+            }
+        ));
+        assert!(!output_config_matches(
+            &live,
+            &OutputConfig {
+                sample_rate: Some(44_100),
+                ..Default::default()
+            }
+        ));
+        assert!(!output_config_matches(
+            &live,
+            &OutputConfig {
+                buffer_size: Some(512),
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn ui_state_roundtrips_the_output_settings() {
+        let state = UiState {
+            output_device: Some("Speakers".into()),
+            output_sample_rate: Some(96_000),
+            output_buffer_size: Some(256),
+            ..Default::default()
+        };
+        let text = ron::ser::to_string(&state).expect("serialize UiState");
+        let back: UiState = ron::from_str(&text).expect("deserialize UiState");
+        assert_eq!(back.output_config(), state.output_config());
+    }
 }
 
 #[cfg(test)]

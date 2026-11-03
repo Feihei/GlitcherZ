@@ -64,6 +64,23 @@ pub struct AudioEngineInfo {
     pub sample_rate: u32,
     /// Number of output channels.
     pub out_channels: u16,
+    /// Requested fixed buffer size in frames; `None` = the device default.
+    pub buffer_frames: Option<u32>,
+}
+
+/// Requested output stream setup (S1-5).
+///
+/// Every field is optional: `None` keeps the device's default, which is the
+/// historical [`AudioEngine::start`] behaviour. Stored in `UiState` so a
+/// deliberate device / sample-rate / buffer choice survives restarts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutputConfig {
+    /// Output endpoint name; `None` = the system default device.
+    pub device: Option<String>,
+    /// Requested sample rate; `None` = the device's default.
+    pub sample_rate: Option<u32>,
+    /// Requested fixed buffer size in frames; `None` = the device default.
+    pub buffer_size: Option<u32>,
 }
 
 /// Engine error. The application layer can just `Display` it; no fine-grained
@@ -74,6 +91,14 @@ pub struct AudioEngineInfo {
 pub enum EngineError {
     #[error("no audio output device available")]
     NoOutputDevice,
+    /// S1-5: a persisted device name is no longer present (unplugged / driver
+    /// removed). The caller falls back to the default engine and reports it.
+    #[error("output device not found: {0}")]
+    UnknownOutputDevice(String),
+    /// S1-5: the device exists but cannot deliver the requested sample rate in
+    /// f32. The old stream must keep running until the user picks another value.
+    #[error("unsupported output configuration: {0}")]
+    UnsupportedOutputConfig(String),
     /// R4: the input stream could not be opened; the engine still runs (the
     /// Input node is silent and the UI reports the reason).
     #[error("no audio input device available")]
@@ -139,6 +164,10 @@ pub struct AudioEngine {
     /// Why the last input open failed, for the device picker (the picker must
     /// be able to say "this device cannot do 48 kHz f32", not just "no input").
     input_error: Option<String>,
+    /// Last cpal output-stream error (S1-5): device unplugged, driver failure,
+    /// backend lost. Written from the stream's error callback (never the data
+    /// callback) and drained by the UI via [`AudioEngine::take_stream_error`].
+    stream_error: Arc<Mutex<Option<String>>>,
 }
 
 impl AudioEngine {
@@ -146,21 +175,20 @@ impl AudioEngine {
     /// called on a non-real-time thread** (allocation is allowed during
     /// construction).
     pub fn start() -> Result<Self, EngineError> {
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or(EngineError::NoOutputDevice)?;
-        let supported = device.default_output_config()?;
+        Self::start_with(OutputConfig::default())
+    }
+
+    /// Starts the engine with an explicit output device / sample rate /
+    /// buffer size (S1-5). `None` fields keep the device defaults, so
+    /// [`AudioEngine::start`] is exactly `start_with(OutputConfig::default())`.
+    ///
+    /// **Must be called on a non-real-time thread**.
+    pub fn start_with(config: OutputConfig) -> Result<Self, EngineError> {
+        let (device, stream_config, device_name) = open_output(&config)?;
 
         // The data callback always works with f32; if the device's native
         // format differs, cpal converts at the callback boundary.
-        log::info!(
-            "device default format {:?}, building output stream as f32",
-            supported.sample_format()
-        );
-        let stream_config = supported.config();
         let sample_rate_f32 = convert::sample_rate_to_f32(stream_config.sample_rate);
-        let device_name = device.to_string();
 
         let (command_tx, command_rx) = command_channel(COMMAND_QUEUE_CAPACITY);
         let commands = CommandSender(Arc::new(Mutex::new(command_tx)));
@@ -214,6 +242,8 @@ impl AudioEngine {
 
         // Data callback: all code constrained by the real-time iron rules is
         // concentrated inside BlockRunner.
+        let stream_error = Arc::new(Mutex::new(None));
+        let stream_error_callback = Arc::clone(&stream_error);
         let stream = device.build_output_stream(
             stream_config,
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
@@ -221,8 +251,13 @@ impl AudioEngine {
             },
             move |err| {
                 // The error callback is not on the data path (device hotplug
-                // etc.), so logging is allowed.
+                // etc.), so logging is allowed. Keep the last reason for the
+                // UI (S1-5): a dead stream is otherwise indistinguishable from
+                // silence.
                 log::error!("audio stream error: {err}");
+                if let Ok(mut slot) = stream_error_callback.lock() {
+                    *slot = Some(err.to_string());
+                }
             },
             None,
         )?;
@@ -273,9 +308,11 @@ impl AudioEngine {
                 device_name,
                 sample_rate: stream_config.sample_rate,
                 out_channels: stream_config.channels,
+                buffer_frames: config.buffer_size,
             },
             input,
             input_error,
+            stream_error,
         })
     }
 
@@ -344,9 +381,11 @@ impl AudioEngine {
                 device_name: "offline".to_string(),
                 sample_rate,
                 out_channels: 2,
+                buffer_frames: None,
             },
             input: None,
             input_error: None,
+            stream_error: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1149,6 +1188,77 @@ impl AudioEngine {
     pub fn info(&self) -> &AudioEngineInfo {
         &self.info
     }
+
+    /// Takes the last output-stream error, if any (S1-5).
+    ///
+    /// The error callback runs off the data path, so the slot is a plain
+    /// `Mutex`; the UI polls this once per frame and reports a dead stream
+    /// instead of letting it look like silence.
+    pub fn take_stream_error(&self) -> Option<String> {
+        self.stream_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// Resolves the requested output device and stream config (S1-5).
+///
+/// `config.device = None` keeps the system default; a missing named device is
+/// a hard error so the caller can fall back and say why. A requested sample
+/// rate must be offered by the device in f32, otherwise the stream cannot be
+/// built with the engine's f32 callback.
+fn open_output(
+    config: &OutputConfig,
+) -> Result<(cpal::Device, cpal::StreamConfig, String), EngineError> {
+    let host = cpal::default_host();
+    let device = match &config.device {
+        None => host
+            .default_output_device()
+            .ok_or(EngineError::NoOutputDevice)?,
+        Some(name) => host
+            .output_devices()?
+            .find(|device| &device.to_string() == name)
+            .ok_or_else(|| EngineError::UnknownOutputDevice(name.clone()))?,
+    };
+    let default = device.default_output_config()?;
+    log::info!(
+        "device default format {:?}, building output stream as f32",
+        default.sample_format()
+    );
+    let preferred_channels = default.channels();
+    let mut stream_config = match config.sample_rate {
+        None => default.config(),
+        Some(rate) => device
+            .supported_output_configs()?
+            .filter(|range| {
+                range.sample_format() == cpal::SampleFormat::F32
+                    && rate >= range.min_sample_rate()
+                    && rate <= range.max_sample_rate()
+            })
+            // Prefer the default config's channel count, then stereo, then the
+            // narrowest: the engine renders stereo, so an 8-channel endpoint
+            // would just pad six silent channels.
+            .max_by_key(|range| {
+                let channels = range.channels();
+                (
+                    channels == preferred_channels,
+                    channels == 2,
+                    std::cmp::Reverse(channels),
+                )
+            })
+            .map(|range| range.with_sample_rate(rate).config())
+            .ok_or_else(|| {
+                EngineError::UnsupportedOutputConfig(format!(
+                    "{device} has no {rate} Hz f32 output configuration"
+                ))
+            })?,
+    };
+    if let Some(frames) = config.buffer_size {
+        stream_config.buffer_size = cpal::BufferSize::Fixed(frames.max(16));
+    }
+    let device_name = device.to_string();
+    Ok((device, stream_config, device_name))
 }
 
 /// Enumerates the host's output device names (for diagnostics,
