@@ -365,6 +365,31 @@ fn keyboard_live_routes(doc: &GraphDoc, node: u64) -> (Vec<usize>, Vec<u64>) {
     (tracks, nodes)
 }
 
+/// Frames of audio the take ring holds before capture starts: a span in
+/// **ticks** converted through `sec_per_tick` (960 ticks per quarter, not
+/// seconds) at the device rate.
+///
+/// Multiplying ticks by the sample rate directly turns a one-bar pre-roll
+/// into hundreds of millions of samples, which skips the entire take and
+/// reads as "audio records nothing".
+fn pre_roll_skip_frames(span_ticks: f64, sec_per_tick: f64, sample_rate: u32) -> usize {
+    (span_ticks.max(0.0) * sec_per_tick.max(0.0) * f64::from(sample_rate))
+        .round()
+        .max(0.0) as usize
+}
+
+/// Short form of a cpal device name for the transport chip: "麦克风 (Realtek
+/// High Definition Audio)" would otherwise push the whole transport row wide.
+fn short_device_name(name: &str) -> String {
+    const LIMIT: usize = 24;
+    if name.chars().count() <= LIMIT {
+        return name.to_string();
+    }
+    let mut out: String = name.chars().take(LIMIT).collect();
+    out.push('…');
+    out
+}
+
 /// Writes the selected channel of an interleaved take as a mono f32 wav
 /// (R4 D11). Float PCM keeps the take lossless; the sample cache decodes it
 /// like any other wav.
@@ -417,6 +442,37 @@ fn midi_outlet_has_instrument(doc: &GraphDoc, track: usize) -> bool {
                 && let PortRef::Node(next) = cable.to
             {
                 queue.push_back(next);
+            }
+        }
+    }
+    false
+}
+
+/// Whether an audio track's generator reaches the master through audio
+/// cables. The default graph leaves every `AudioTrack` node unwired, so a
+/// recorded take can be perfect and still produce no sound — worth saying
+/// out loud at take start (same spirit as the MIDI outlet warning).
+fn audio_outlet_reaches_master(doc: &GraphDoc, track: usize) -> bool {
+    let Some(start) = doc.nodes.iter().find_map(|node| match node {
+        NodeDoc::AudioTrack { node_id, track: t } if *t == track => Some(*node_id),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let mut reached: std::collections::BTreeSet<u64> = Default::default();
+    let mut queue: std::collections::VecDeque<u64> = std::collections::VecDeque::from([start]);
+    while let Some(id) = queue.pop_front() {
+        if !reached.insert(id) {
+            continue;
+        }
+        for cable in &doc.cables {
+            if cable.kind != CableKind::Audio || cable.from != PortRef::Node(id) {
+                continue;
+            }
+            match cable.to {
+                PortRef::Master => return true,
+                PortRef::Node(next) => queue.push_back(next),
+                _ => {}
             }
         }
     }
@@ -907,6 +963,10 @@ struct UiState {
     /// newest first. Persisted so the picker's `Recent` group survives restarts.
     #[serde(default)]
     recent_plugins: Vec<plugin_picker::RecentPlugin>,
+    /// Recording input device (`None` = system default). App-level, not
+    /// document-level: one input stream serves every project.
+    #[serde(default)]
+    input_device: Option<String>,
 }
 
 /// Capacity limit of the recent files list.
@@ -923,6 +983,10 @@ const PLUGIN_CACHE_KEY: &str = "plugin_cache";
 /// failed SoundFont load is worth reading, not glimpsing).
 const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(8);
 const STATUS_ERROR_TTL: Duration = Duration::from_secs(16);
+
+/// How long the `● Rec` refusal card stays up (it has its own close button,
+/// so this only clears a card the user walked away from).
+const RECORD_REFUSAL_TTL: Duration = Duration::from_secs(20);
 
 /// How severe a status-bar message is. Failures are painted red and stay up
 /// longer; everything else is the neutral info blue.
@@ -1431,6 +1495,19 @@ pub struct GlitcherZApp {
     /// Status bar message (text + time shown + severity; disappears
     /// automatically after a timeout).
     status_message: Option<(String, Instant, MessageKind)>,
+    /// Why the last `● Rec` press was refused (text + time shown). Drawn as a
+    /// floating card above the transport: a status-line-only refusal is too
+    /// easy to miss, and "Rec did nothing" reads as a dead button.
+    record_refusal: Option<(String, Instant)>,
+    /// When the last take started. A take whose transport never starts rolling
+    /// is a dead button, not a recording — checked a second later.
+    record_started_at: Option<Instant>,
+    /// Recording input device name (`None` = the system default). Persisted:
+    /// a picker that forgets the pick every launch is worse than no picker.
+    audio_device: Option<String>,
+    /// Device list shown by the transport's input-device menu (refreshed on
+    /// demand — enumeration opens the driver).
+    audio_devices: Vec<String>,
     /// Desired window title.
     window_title: String,
     /// Title already sent to the windowing system (avoids resending the command every frame).
@@ -1576,6 +1653,12 @@ pub struct GlitcherZApp {
     /// Capture-overflow count at the last warning, so a loss is reported once
     /// per burst instead of every frame.
     capture_overflow_seen: u64,
+    /// What the current take actually pulled out of the engine: MIDI events,
+    /// interleaved audio samples and control points. Reported when a take ends
+    /// empty, so "nothing recorded" says *where* the signal stopped.
+    take_events: u64,
+    take_samples: u64,
+    take_points: u64,
     /// Curve-track baking state (R8).
     control_recorder: recorder::ControlRecorder,
     /// One frame's control samples, reused.
@@ -1704,6 +1787,10 @@ impl GlitcherZApp {
             project_path: None,
             recent: ui_state.recent_files,
             status_message: None,
+            record_refusal: None,
+            record_started_at: None,
+            audio_device: ui_state.input_device.clone(),
+            audio_devices: Vec::new(),
             window_title: "GlitcherZ".to_string(),
             title_sent: String::new(),
             pending_file_action: None,
@@ -1747,6 +1834,9 @@ impl GlitcherZApp {
             record_mute_other: false,
             capture_pending: None,
             capture_overflow_seen: 0,
+            take_events: 0,
+            take_samples: 0,
+            take_points: 0,
             control_recorder: recorder::ControlRecorder::new(),
             control_scratch: Vec::new(),
             audio_take: None,
@@ -1758,6 +1848,21 @@ impl GlitcherZApp {
             first_frame_logged: false,
             close_sent: false,
         };
+        // R4: honour the persisted recording device. A picker that forgets the
+        // pick every launch is worse than none; a missing device falls back to
+        // the system default instead of leaving the user without an input.
+        if let Some(device) = app.audio_device.clone()
+            && let Err(err) = app.engine.reopen_input(Some(&device))
+        {
+            log::warn!(
+                "Saved audio input device unavailable, falling back to the system default: {err}"
+            );
+            app.audio_device = None;
+            if let Err(err) = app.engine.reopen_input(None) {
+                log::warn!("audio input unavailable: {err}");
+            }
+        }
+        app.audio_devices = AudioEngine::input_devices();
         app.push_all_params();
         if let Some(note) = config.auto_play_note {
             // Diagnostic path (smoke runs): bypass the patch route on purpose —
@@ -6453,6 +6558,7 @@ impl GlitcherZApp {
         // take never starts with stale samples.
         let mut control_batch = std::mem::take(&mut self.control_scratch);
         self.engine.drain_captured_controls(&mut control_batch);
+        self.take_points = self.take_points.saturating_add(control_batch.len() as u64);
         for captured in control_batch.drain(..) {
             self.control_recorder.push(captured);
         }
@@ -6461,7 +6567,8 @@ impl GlitcherZApp {
         // (a bounded queue must be drained continuously or it drops).
         if self.audio_take.is_some() {
             let mut scratch = std::mem::take(&mut self.audio_scratch);
-            self.engine.drain_recorded_audio(&mut scratch);
+            let moved = self.engine.drain_recorded_audio(&mut scratch);
+            self.take_samples = self.take_samples.saturating_add(moved as u64);
             if let Some(take) = &mut self.audio_take {
                 take.samples.append(&mut scratch);
             }
@@ -6628,6 +6735,7 @@ impl GlitcherZApp {
         // borrow `self` at the same time.
         let mut batch = std::mem::take(&mut self.capture_scratch);
         self.engine.drain_captured(&mut batch);
+        self.take_events = self.take_events.saturating_add(batch.len() as u64);
         let overflow = self.engine.capture_overflow();
         if overflow > self.capture_overflow_seen {
             let lost = overflow - self.capture_overflow_seen;
@@ -6642,6 +6750,176 @@ impl GlitcherZApp {
         self.capture_scratch = batch;
     }
 
+    /// Reports a `● Rec` problem **loudly**: a refused press (D22 wiring, R4
+    /// device, D27 dry region) and a take that captured nothing both leave the
+    /// user staring at a button that "did nothing". A status-line notice alone
+    /// is too easy to miss, so the reason also becomes a card. Logged too — the
+    /// log outlives the card.
+    fn recording_problem(&mut self, reason: String) {
+        log::warn!("Recording: {reason}");
+        self.status_message = Some((reason.clone(), Instant::now(), MessageKind::Error));
+        self.record_refusal = Some((reason, Instant::now()));
+    }
+
+    /// One-line summary of the armed recording inputs (`T1 A2`), or `None`
+    /// when nothing is wired into any `Timeline In` port.
+    fn armed_recording_chip(&self) -> Option<String> {
+        let (midi, audio, curve, _) = self.armed_recording_tracks();
+        if midi.is_empty() && audio.is_empty() && curve.is_empty() {
+            return None;
+        }
+        let mut names = Vec::new();
+        names.extend(midi.iter().map(|&track| format!("T{}", track + 1)));
+        names.extend(audio.iter().map(|&track| format!("A{}", track + 1)));
+        names.extend(curve.iter().map(|&track| format!("C{}", track + 1)));
+        Some(names.join(" "))
+    }
+
+    /// Floating card with the last refusal reason, dismissed by its close
+    /// button or after [`RECORD_REFUSAL_TTL`].
+    fn recording_refusal_card(&mut self, ui: &mut egui::Ui) {
+        let expired = self
+            .record_refusal
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= RECORD_REFUSAL_TTL);
+        if expired {
+            self.record_refusal = None;
+        }
+        let Some((reason, _)) = self.record_refusal.clone() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Recording problem")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 72.0])
+            .show(ui.ctx(), |ui| {
+                ui.set_max_width(420.0);
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 140, 120),
+                    egui::RichText::new(&reason).strong(),
+                );
+                ui.add_space(4.0);
+                if reason.to_lowercase().contains("timeline in") {
+                    ui.weak(
+                        "Timeline In is the recording input: open the Patch tab and drag a source \
+                         into it.",
+                    );
+                } else {
+                    ui.weak("Fix the cause above, then press ● Rec again.");
+                }
+            });
+        if !open {
+            self.record_refusal = None;
+        }
+        ui.ctx().request_repaint();
+    }
+
+    /// Recording-device picker (`In` in the transport). One input stream means
+    /// one device for every audio take — the label always shows what the
+    /// stream is actually bound to, not just what was picked, so a fallback
+    /// (unplugged device) is impossible to miss.
+    fn audio_device_menu(&mut self, ui: &mut egui::Ui) {
+        if self.audio_devices.is_empty() {
+            self.audio_devices = AudioEngine::input_devices();
+        }
+        let live = self
+            .engine
+            .input_info()
+            .map(|info| info.device_name.clone());
+        let label = match &live {
+            Some(name) => format!("🎙 {}", short_device_name(name)),
+            None => "🎙 no input".to_string(),
+        };
+        let mut pick: Option<Option<String>> = None;
+        let live_name = live.clone();
+        ui.menu_button(label, |ui| {
+            ui.set_min_width(280.0);
+            // R4: the picker lists devices, but the *stream* is the truth:
+            // show what is open right now above the choices.
+            match &live_name {
+                Some(name) => {
+                    ui.label(egui::RichText::new(name).strong());
+                    if let Some(info) = self.engine.input_info() {
+                        ui.weak(format!("{} ch @ {} Hz", info.channels, info.sample_rate));
+                    }
+                }
+                None => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 120, 110),
+                        "No input stream is open",
+                    );
+                    if let Some(err) = self.engine.input_error() {
+                        ui.weak(err);
+                    }
+                }
+            }
+            ui.separator();
+            if ui
+                .selectable_label(self.audio_device.is_none(), "System default")
+                .clicked()
+            {
+                pick = Some(None);
+            }
+            if self.audio_devices.is_empty() {
+                ui.weak("(no input devices found)");
+            }
+            let devices = self.audio_devices.clone();
+            for name in devices {
+                let selected = self.audio_device.as_deref() == Some(name.as_str());
+                if ui.selectable_label(selected, &name).clicked() {
+                    pick = Some(Some(name.clone()));
+                }
+            }
+            ui.separator();
+            if ui.button("Refresh devices").clicked() {
+                self.audio_devices = AudioEngine::input_devices();
+            }
+        })
+        .response
+        .on_hover_text(
+            "Audio input device for recording (one stream: applies to every audio take)",
+        );
+
+        if let Some(device) = pick {
+            self.pick_audio_device(device);
+        }
+    }
+
+    /// Opens `device` (`None` = system default) and rebuilds the graph so the
+    /// `Input` node latches onto the new stream's ring.
+    fn pick_audio_device(&mut self, device: Option<String>) {
+        if self.is_recording() {
+            self.recording_problem(
+                "End the take before switching the audio input device".to_string(),
+            );
+            return;
+        }
+        match self.engine.reopen_input(device.as_deref()) {
+            Ok(()) => {
+                self.audio_device = device;
+                self.audio_devices = AudioEngine::input_devices();
+                // The Input node holds a clone of the *old* ring; a rebuild is
+                // what makes the monitor path follow the new stream.
+                self.apply_document();
+                let described = self.engine.input_info().map(|info| {
+                    format!(
+                        "{} ({} ch @ {} Hz)",
+                        info.device_name, info.channels, info.sample_rate
+                    )
+                });
+                self.set_message(format!(
+                    "Audio input: {}",
+                    described.unwrap_or_else(|| "system default".to_string())
+                ));
+            }
+            Err(err) => {
+                self.recording_problem(format!("Cannot open the audio input device: {err}"));
+            }
+        }
+    }
+
     /// Starts a take into every track armed by the `Timeline In` wiring (R6 D22).
     ///
     /// Recording starts on a bar line: the transport jumps back by the
@@ -6654,32 +6932,39 @@ impl GlitcherZApp {
             return;
         }
         let (midi_armed, audio_armed, curve_armed, unsupported) = self.armed_recording_tracks();
+        log::info!(
+            "Record pressed: midi={midi_armed:?} audio={audio_armed:?} curve={curve_armed:?} \
+             unsupported={} position={:.1}",
+            unsupported.len(),
+            self.engine.musical_ticks()
+        );
 
         if midi_armed.is_empty() && audio_armed.is_empty() && curve_armed.is_empty() {
-            if unsupported.is_empty() {
-                self.set_message(
-                    "No recording input is wired: drag a source into Timeline In · T1 (a track input port) first"
+            if let Some(reason) = unsupported.first() {
+                self.recording_problem(format!("Rec refused: {reason}"));
+            } else {
+                self.recording_problem(
+                    "No recording input is armed. Open the Patch tab and drag a source into \
+                     Timeline In (MIDI out → T1, Input node → A1)."
                         .to_string(),
                 );
-            } else {
-                self.set_message(format!(
-                    "Cannot record: {}",
-                    unsupported.first().cloned().unwrap_or_default()
-                ));
             }
             return;
         }
         // R4: audio needs a live input stream; refuse up front rather than
         // writing an empty take.
         if !audio_armed.is_empty() && self.engine.input_info().is_none() {
-            self.set_message(
-                "Cannot record audio: no input device (check the microphone / audio interface)"
-                    .to_string(),
+            // The engine knows *why* (missing device / unsupported rate); a
+            // generic "no input device" sends the user hunting in the OS.
+            let detail = self.engine.input_error().map_or_else(
+                || ": pick a device next to In, or check the microphone".to_string(),
+                |err| format!(": {err}"),
             );
+            self.recording_problem(format!("Cannot record audio{detail}"));
             return;
         }
         if !audio_armed.is_empty() && self.project().base_dir.is_none() {
-            self.set_message(
+            self.recording_problem(
                 "Cannot record audio: save the project first (takes live in <stem>.media/)"
                     .to_string(),
             );
@@ -6705,8 +6990,9 @@ impl GlitcherZApp {
                 u64::from(clip.start_ticks) + u64::from(clip.span_ticks) > record_start_tick
             }) {
                 let bar_no = clip.start_ticks / bar_ticks + 1;
-                self.set_message(format!(
-                    "Track {} bar {bar_no} already has a clip — delete or move it first",
+                self.recording_problem(format!(
+                    "Track {} already has a clip at bar {bar_no}. Move the transport past it \
+                     (or delete that clip), then press Rec again.",
                     track + 1
                 ));
                 return;
@@ -6724,14 +7010,20 @@ impl GlitcherZApp {
                 });
                 if let Some(clip) = clash {
                     let bar_no = clip.start_ticks / bar_ticks + 1;
-                    self.set_message(format!(
-                        "Audio track {} bar {bar_no} already has a clip — delete or move it first",
+                    self.recording_problem(format!(
+                        "Audio track {} already has a clip at bar {bar_no}. Move the transport \
+                         past it (or delete that clip), then press Rec again.",
                         track + 1
                     ));
                     return;
                 }
             }
         }
+        // Fresh take counters (see `take_events`): the empty-take report says
+        // which stage of the pipeline actually saw data.
+        self.take_events = 0;
+        self.take_samples = 0;
+        self.take_points = 0;
         if !midi_armed.is_empty() {
             self.recorder.begin(midi_armed.clone(), record_start, from);
             if !self.engine.set_capture(true) {
@@ -6781,11 +7073,17 @@ impl GlitcherZApp {
                 .input_info()
                 .cloned()
                 .expect("guarded by input_info above");
-            let skip_seconds = (record_start - from).max(0.0) * f64::from(info.sample_rate);
+            // The take ring starts filling at `from` (pre-roll included), so
+            // the pre-roll has to be skipped when the take is closed.
+            let skip_frames = pre_roll_skip_frames(
+                record_start - from,
+                self.project().sec_per_tick(),
+                info.sample_rate,
+            );
             self.audio_take = Some(AudioTake {
                 tracks: audio_armed.clone(),
                 start_ticks: record_start,
-                skip_interleaved: (skip_seconds.round().max(0.0) as usize) * info.channels.max(1),
+                skip_interleaved: skip_frames * info.channels.max(1),
                 channels: info.channels.max(1),
                 sample_rate: info.sample_rate,
                 samples: Vec::new(),
@@ -6804,6 +7102,11 @@ impl GlitcherZApp {
         self.engine.set_record_mute(mute_bits);
         self.engine.seek_ticks(from);
         self.send_sequencer(SequencerCommand::Play);
+        self.record_started_at = Some(Instant::now());
+        log::info!(
+            "Recording started on midi={midi_armed:?} audio={audio_armed:?} curve={curve_armed:?} \
+             from={from:.1} capture={record_start:.1}"
+        );
         let mut names = Vec::new();
         names.extend(midi_armed.iter().map(|&track| format!("T{}", track + 1)));
         names.extend(audio_armed.iter().map(|&track| format!("A{}", track + 1)));
@@ -6817,6 +7120,14 @@ impl GlitcherZApp {
             .filter(|&&track| !midi_outlet_has_instrument(&self.project().graph, track))
             .map(|&track| format!("T{}", track + 1))
             .collect();
+        // Same warning for audio: the `AudioTrack` generator ships unwired
+        // (the default graph leaves the routing to the user), so a take can be
+        // recorded perfectly and stay inaudible forever.
+        let silent_audio: Vec<String> = audio_armed
+            .iter()
+            .filter(|&&track| !audio_outlet_reaches_master(&self.project().graph, track))
+            .map(|&track| format!("A{}", track + 1))
+            .collect();
         let mut message = if record_start > from {
             format!(
                 "Recording {list} after {} bar pre-roll",
@@ -6829,6 +7140,13 @@ impl GlitcherZApp {
             message.push_str(&format!(
                 " — {} has no instrument on its track outlet (you will hear nothing)",
                 silent.join(", ")
+            ));
+        }
+        if !silent_audio.is_empty() {
+            message.push_str(&format!(
+                " — {} is not wired to the master: connect its AudioTrack node to a mixer \
+                 channel in Patch or playback stays silent",
+                silent_audio.join(", ")
             ));
         }
         self.set_message(message);
@@ -6898,20 +7216,48 @@ impl GlitcherZApp {
     /// Cuts a finished audio take into per-track wav files (R4 D11) and returns
     /// the clips to insert. Empty when nothing was captured or the project has no
     /// directory to write into.
-    fn finish_audio_take(&mut self, take: AudioTake) -> Vec<(usize, glitcherz_model::AudioClip)> {
+    ///
+    /// Returns `(clips, reason)`; `reason` explains a discarded take (the
+    /// caller shows it, because it also knows why the other take kinds were
+    /// empty). Samples that fall inside the pre-roll are dropped, never
+    /// placed at a wrong position.
+    fn finish_audio_take(
+        &mut self,
+        take: AudioTake,
+    ) -> (Vec<(usize, glitcherz_model::AudioClip)>, Option<String>) {
         let channels = take.channels.max(1);
         let skip = take.skip_interleaved.min(take.samples.len());
         let data = &take.samples[skip..];
         let frames = data.len() / channels;
         if frames == 0 {
-            return Vec::new();
+            return if take.samples.is_empty() {
+                (
+                    Vec::new(),
+                    Some(
+                        "Audio take discarded: the input device delivered no samples. Check \
+                         the microphone / interface and that the In meter moves."
+                            .to_string(),
+                    ),
+                )
+            } else {
+                (
+                    Vec::new(),
+                    Some(format!(
+                        "Audio take discarded: all {} sample(s) fall inside the pre-roll. \
+                         Record past the pre-roll, or set it to 0 bar next to Rec.",
+                        take.samples.len()
+                    )),
+                )
+            };
         }
         let Some(base) = self.project().base_dir.clone() else {
-            self.set_message(
-                "Audio take discarded: save the project first (takes live in <stem>.media/)"
-                    .to_string(),
+            return (
+                Vec::new(),
+                Some(
+                    "Audio take discarded: save the project first (takes live in <stem>.media/)"
+                        .to_string(),
+                ),
             );
-            return Vec::new();
         };
         let stem = self
             .project_path
@@ -6921,10 +7267,12 @@ impl GlitcherZApp {
             .unwrap_or_else(|| "untitled".to_string());
         let dir = base.join(format!("{stem}.media"));
         if let Err(err) = std::fs::create_dir_all(&dir) {
-            self.set_message(format!(
-                "Audio take discarded: cannot create media folder ({err})"
-            ));
-            return Vec::new();
+            return (
+                Vec::new(),
+                Some(format!(
+                    "Audio take discarded: cannot create media folder ({err})"
+                )),
+            );
         }
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6942,8 +7290,10 @@ impl GlitcherZApp {
         for &track in &take.tracks {
             let path = dir.join(format!("rec-{stamp}-a{}.wav", track + 1));
             if let Err(err) = write_mono_wav(&path, data, channels, sample_rate) {
-                self.set_message(format!("Audio take discarded: wav write failed ({err})"));
-                return Vec::new();
+                return (
+                    Vec::new(),
+                    Some(format!("Audio take discarded: wav write failed ({err})")),
+                );
             }
             let stored = self.project().media_path_string(&path);
             clips.push((
@@ -6964,7 +7314,7 @@ impl GlitcherZApp {
                 },
             ));
         }
-        clips
+        (clips, None)
     }
 
     /// Ends the take and writes it as clips (one undo step, spec D15/R4/R6).
@@ -6982,13 +7332,15 @@ impl GlitcherZApp {
         let mut audio_take = self.audio_take.take();
         if let Some(take) = &mut audio_take {
             let mut scratch = std::mem::take(&mut self.audio_scratch);
-            self.engine.drain_recorded_audio(&mut scratch);
+            let moved = self.engine.drain_recorded_audio(&mut scratch);
+            self.take_samples = self.take_samples.saturating_add(moved as u64);
             take.samples.append(&mut scratch);
             self.audio_scratch = scratch;
         }
         // R8: drain the last controls before closing the curve takes.
         let mut control_batch = std::mem::take(&mut self.control_scratch);
         self.engine.drain_captured_controls(&mut control_batch);
+        self.take_points = self.take_points.saturating_add(control_batch.len() as u64);
         for captured in control_batch.drain(..) {
             self.control_recorder.push(captured);
         }
@@ -6997,6 +7349,9 @@ impl GlitcherZApp {
         // position is the fallback (that is the real end of the take).
         let end =
             f64::from(self.engine.musical_ticks().max(0.0)).max(self.recorder.last_position());
+        // A take that never left pre-roll captured by design — the report has
+        // to say that, or the user blames the wiring.
+        let never_captured = self.recorder.is_active() && !self.recorder.is_capturing();
         let midi_takes = if self.recorder.is_active() {
             self.recorder.finish(end)
         } else {
@@ -7028,7 +7383,8 @@ impl GlitcherZApp {
                 })
             })
             .collect();
-        let audio_clips = audio_take.map_or_else(Vec::new, |take| self.finish_audio_take(take));
+        let (audio_clips, audio_problem) =
+            audio_take.map_or_else(|| (Vec::new(), None), |take| self.finish_audio_take(take));
         let control_start = self.control_recorder.start_ticks;
         let control_clips: Vec<(usize, ControlClip)> = control_takes
             .iter()
@@ -7044,7 +7400,30 @@ impl GlitcherZApp {
             })
             .collect();
         if midi_clips.is_empty() && audio_clips.is_empty() && control_clips.is_empty() {
-            self.set_message("Nothing recorded".to_string());
+            let events = self.take_events;
+            let samples = self.take_samples;
+            let points = self.take_points;
+            log::warn!(
+                "Take ended empty: {events} MIDI event(s), {samples} audio sample(s), \
+                 {points} control point(s)"
+            );
+            let hint = if let Some(reason) = audio_problem.clone() {
+                // The audio path knows exactly what went wrong — prefer it.
+                self.recording_problem(reason);
+                return;
+            } else if never_captured {
+                "the take ended during the pre-roll, so nothing was ever captured. Set the \
+                 pre-roll to 0 bar next to Rec, or record past it."
+            } else if events == 0 && samples == 0 && points == 0 {
+                "the engine's capture taps returned nothing. Check the source is cabled into \
+                 the track's Timeline In input (for audio, the In meter must move)."
+            } else if samples == 0 && points == 0 {
+                "events arrived but none became a note — they were either before the take \
+                 start or addressed to an instrument instead of a track."
+            } else {
+                "material arrived but no take could be closed — try a longer take."
+            };
+            self.recording_problem(format!("Nothing recorded: {hint}"));
             return;
         }
         let before = self.begin_edit();
@@ -7198,7 +7577,12 @@ impl GlitcherZApp {
                 if control_written.len() == 1 { "" } else { "s" }
             ));
         }
-        self.set_message(format!("Recorded {}", parts.join(" and ")));
+        // A take that recorded but dropped its audio still has to say why.
+        let mut summary = format!("Recorded {}", parts.join(" and "));
+        if let Some(reason) = audio_problem {
+            summary.push_str(&format!(" — {reason}"));
+        }
+        self.set_message(summary);
     }
 
     /// Drops the take in flight without writing a clip (new / open project).
@@ -7214,6 +7598,7 @@ impl GlitcherZApp {
         self.engine.set_audio_capture(false);
         self.engine.set_record_mute(0);
         self.capture_pending = None;
+        self.record_started_at = None;
         self.capture_scratch.clear();
         self.control_scratch.clear();
         self.audio_scratch.clear();
@@ -7811,7 +8196,11 @@ impl GlitcherZApp {
                 }
                 if ui
                     .button("■ Stop")
-                    .on_hover_text("Stop and rewind")
+                    .on_hover_text(if self.is_recording() {
+                        "End the take and rewind (a take stopped during the pre-roll has nothing to keep)"
+                    } else {
+                        "Stop and rewind"
+                    })
                     .clicked()
                 {
                     self.stop_transport();
@@ -7819,12 +8208,26 @@ impl GlitcherZApp {
                 // Record (spec `recording.md` R2): one take into the selected
                 // track, starting on the next bar line after the pre-roll.
                 let rec_active = self.is_recording();
-                let mut rec_btn =
-                    egui::Button::new(if rec_active { "● Rec…" } else { "● Rec" });
+                // Pre-roll is dead time for capture — label it, or the user
+                // plays through the count-in and concludes nothing records.
+                let rec_pre_roll = rec_active && !self.recorder.is_capturing();
+                let mut rec_btn = egui::Button::new(if rec_pre_roll {
+                    "● Pre-roll…"
+                } else if rec_active {
+                    "● Rec…"
+                } else {
+                    "● Rec"
+                });
                 if rec_active {
                     rec_btn = rec_btn.fill(egui::Color32::from_rgb(150, 40, 40));
                 }
-                let rec_tip = if rec_active {
+                let rec_tip = if rec_pre_roll {
+                    format!(
+                        "Counting in — capture starts after {} bar(s) of pre-roll. \
+                         Anything played now is not recorded.",
+                        self.record_pre_roll_bars
+                    )
+                } else if rec_active {
                     let list = self
                         .recorder
                         .tracks()
@@ -7840,6 +8243,26 @@ impl GlitcherZApp {
                     self.toggle_recording();
                 }
                 if !rec_active {
+                    // Arm indicator: the app's own answer to "will Rec do
+                    // anything?" — read *before* the press, not from a refusal
+                    // card after it.
+                    match self.armed_recording_chip() {
+                        Some(armed) => {
+                            ui.weak(armed)
+                                .on_hover_text("Armed recording inputs (Timeline In)");
+                        }
+                        None => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(235, 125, 115),
+                                egui::RichText::new("no input").small(),
+                            )
+                            .on_hover_text(
+                                "No track has a source wired into its Timeline In recording \
+                                 input — open the Patch tab and drag one in (MIDI out → T1, \
+                                 Input node → A1).",
+                            );
+                        }
+                    }
                     let pre = ui.add(
                         egui::DragValue::new(&mut self.record_pre_roll_bars)
                             .range(0..=2)
@@ -7861,19 +8284,25 @@ impl GlitcherZApp {
                 .on_hover_text(
                     "Manual input latency offset: positive moves audio takes earlier on the timeline",
                 );
-                // R5: live input level (monitor path), so a silent microphone
-                // is visible before the take is over.
+                // R5/R4: live input level + the recording-device picker. Both
+                // sit next to Rec because "which microphone is this take
+                // using" is a recording decision, and an unplugged or silent
+                // device has to be visible *before* the take, not after it.
+                ui.separator();
+                ui.label("In");
                 if let Some(stats) = self.engine.input_stats() {
                     let peak = stats.peak().min(1.0);
-                    ui.separator();
-                    ui.label("In");
                     ui.add(
                         egui::ProgressBar::new(peak)
-                            .desired_width(48.0)
+                            .desired_width(44.0)
                             .text(format!("{:.0}%", peak * 100.0)),
                     )
                     .on_hover_text("Live input peak (pre-take)");
+                } else {
+                    ui.label(egui::RichText::new("—").weak())
+                        .on_hover_text("No input stream is open");
                 }
+                self.audio_device_menu(ui);
                 if ui.button("⏭").on_hover_text("Skip to end (End)").clicked() {
                     self.engine
                         .seek_ticks(f64::from(self.arrangement_end_ticks()));
@@ -8154,9 +8583,23 @@ impl GlitcherZApp {
         });
         // U6: audio clip bodies read peaks from the session sample cache
         // (read-only lookup — decoding happens on the edit paths).
+        //
+        // The cache is keyed by the **resolved** path: the playback table
+        // looks clips up through `resolve_media_path` (project directory +
+        // relative path), and a recorded take stores exactly that relative
+        // form. Looking it up raw missed every clip under a saved project —
+        // the clip drew as an empty box while playback still had sound.
+        let media_base = self.project().base_dir.clone();
         let waveform_of = {
             let library = &self.sample_library;
-            move |path: &str| library.get(std::path::Path::new(path))
+            move |path: &str| {
+                let raw = std::path::Path::new(path);
+                let resolved = match (&media_base, raw.is_absolute()) {
+                    (Some(dir), false) => dir.join(raw),
+                    _ => raw.to_path_buf(),
+                };
+                library.get(&resolved)
+            }
         };
         let actions = {
             let Self {
@@ -13601,6 +14044,7 @@ impl eframe::App for GlitcherZApp {
             &UiState {
                 recent_files: self.recent.clone(),
                 recent_plugins: self.recent_plugins.clone(),
+                input_device: self.audio_device.clone(),
             },
         );
         // U9 E2: the plugin catalog (spec `plugin-browser.md` D11). A partial
@@ -13712,6 +14156,24 @@ impl eframe::App for GlitcherZApp {
         }
         self.was_playing = playing;
 
+        // A take whose transport never rolled must not sit silently in
+        // pre-roll (the user reads that as "Rec did nothing"). Give the engine
+        // a second to pick the Play up, then say so.
+        if self
+            .record_started_at
+            .is_some_and(|at| at.elapsed() >= Duration::from_secs(1))
+        {
+            let stalled = self.recorder.is_active() && !playing;
+            self.record_started_at = None;
+            if stalled {
+                self.recording_problem(
+                    "Recording is armed, but the transport did not start playing — the audio \
+                     engine is not running (check the output device)."
+                        .to_string(),
+                );
+            }
+        }
+
         // U9 E2: the plugin-scan banner sits above the transport while the
         // startup scan has modules left (it names the module the frame's tail
         // will block on, spec D14). The U7 export banner shares the slot.
@@ -13722,6 +14184,7 @@ impl eframe::App for GlitcherZApp {
         // after `ui()` returns already shows what the window is busy with.
         self.blocking_banner(ui);
         self.transport_panel(ui);
+        self.recording_refusal_card(ui);
         self.status_panel(ui);
         self.view_tabs(ui);
         // The Edit tab follows the timeline's clip selection (no target of its
@@ -14596,5 +15059,18 @@ mod sf2_tests {
         assert_eq!(human_bytes(900 * 1024), "900 KB");
         assert_eq!(human_bytes(240 * 1024 * 1024), "240 MB");
         assert_eq!(human_bytes(2 * 1024 * 1024 * 1024), "2.0 GB");
+    }
+
+    /// The audio take's pre-roll skip is a tick span, not a sample count:
+    /// one 4/4 bar at 120 bpm is 3840 ticks = 2 s = 96 000 frames at 48 kHz.
+    /// Getting this wrong (ticks × rate) swallowed every take whole.
+    #[test]
+    fn pre_roll_skip_converts_ticks_to_frames() {
+        let sec_per_tick = 60.0 / (120.0 * f64::from(glitcherz_model::TICKS_PER_QUARTER));
+        assert_eq!(pre_roll_skip_frames(3840.0, sec_per_tick, 48_000), 96_000);
+        assert_eq!(pre_roll_skip_frames(1920.0, sec_per_tick, 48_000), 48_000);
+        assert_eq!(pre_roll_skip_frames(0.0, sec_per_tick, 48_000), 0);
+        // A half-bar pre-roll is a quarter of a bar's frames, not a million.
+        assert!(pre_roll_skip_frames(3840.0, sec_per_tick, 48_000) < 200_000);
     }
 }
