@@ -741,6 +741,19 @@ let _ = self.slot_set_param(route.slot, ParamId::PitchOffset, value); // synth /
 - **电平按通道**：`InputStats` 的 `peaks: [AtomicU32; 2]` 由 cpal 回调按 `i % channels` 分通道写入（栈数组 + relaxed 原子，仍满足实时铁律），`peak_of(ch)` 供节点/Inspector 读；`peak()` 返回两通道最大值。
 
 **为什么 latency 留在走带条**：它是 take 的对齐偏移（正数把音频 clip 起点提前），依赖当前设备与缓冲大小，会话级、不随工程保存；放在走带条与 pre-roll / `Mute others` 同属"本次录音怎么采"，挂到工程节点上会被误读成节点参数。控件已加 `Latency` 标签与完整 hover 说明。
+
+## 增量引擎同步 S2-5a（2026-11-03）
+
+**问题**：undo / redo 无条件走 `apply_document()`，即使只改了一个音符也会删掉全部节点再重装 —— 插件要重新 spawn + `load_state`，一次撤销的代价可能上百毫秒。
+
+**判据**：`Project::topology_eq(other)` 比较 `graph.nodes`（含节点参数）、`graph.cables` 与三类轨道列表长度。名称、颜色、clip 内容等视图字段不进比较。等价 ⇒ 引擎图与路由表本来就不该变。
+
+**分派**：`GlitcherZApp::sync_engine(before)` 在 `undo` / `redo` / `jump_history_to` / `execute` 前后调用。等价走 `refresh_clips_and_transport()`：master gain、BPM、拍号、MIDI / control / audio clip 表、track count、loop range；不等价才 `apply_document()`。`push_all_clips` 因此退役（`execute` 也改走 `sync_engine`）。
+
+**边界（S2-5b 留待）**：节点参数仍在 `graph.nodes` 的相等比较里，所以改 cutoff / 推子 / LFO 的 undo 仍会全量重建。下一步要把"节点身份"（voice 的 path/plugin id、mixer inputs、track 等）与"可重放参数"拆开，并给 `push_node_params` 补齐 Sample / SF2 / Arp / Portamento / Env / LFO / CurveMap 的重放。
+
+**验证**：`topology_eq` 三项（改名不影响、节点/电缆变化、轨道数量变化）在 model crate；全仓 fmt/clippy/test 绿 + `--seconds 5` 冒烟。
+
 ## 音频输出 Preferences（S1-5，2026-11-03）
 
 **引擎侧只加一个入口**：`AudioEngine::start_with(OutputConfig { device, sample_rate, buffer_size })`，`start()` 就是 `OutputConfig::default()`。`device = None` 用系统默认；指定名字找不到时是 `UnknownOutputDevice`（启动路径回落默认并提示）；指定采样率只在设备的 f32 配置里找，找不优先挑与默认配置相同声道数的，其次 2 声道，最后最窄的（引擎只渲染立体声，8 声道端点只会多出 6 条静音轨）；`buffer_size` 直接映射 `cpal::BufferSize::Fixed`。

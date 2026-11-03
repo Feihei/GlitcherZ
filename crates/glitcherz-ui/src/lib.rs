@@ -3052,8 +3052,9 @@ impl GlitcherZApp {
         id: &str,
         params: &serde_json::Value,
     ) -> glitcherz_command::Result<serde_json::Value> {
+        let before = self.session.project_arc();
         let outcome = self.session.execute(id, params)?;
-        self.push_all_clips();
+        self.sync_engine(&before);
         Ok(outcome)
     }
 
@@ -4677,15 +4678,45 @@ impl GlitcherZApp {
         }
     }
 
-    /// Re-push every track's clip table to the sequencer.
+    /// Pushes the document to the engine after an undo/redo, a history jump or a
+    /// command (S2-5).
     ///
-    /// Called after a command edits the document; the audio thread holds its
-    /// own copy of the clip tables, so they must be refreshed even when the
-    /// edit was a single note.
-    fn push_all_clips(&mut self) {
+    /// Only a graph-changing edit (node payload, cable, track count) needs the
+    /// full rebuild. When the topology is identical, clips / loop / transport
+    /// fields are pushed directly, leaving every instantiated plug-in alive —
+    /// a note or curve edit no longer re-spawns the world.
+    fn sync_engine(&mut self, before: &Project) {
+        if before.topology_eq(self.project()) {
+            self.refresh_clips_and_transport();
+        } else {
+            self.apply_document();
+        }
+    }
+
+    /// The cheap half of [`Self::sync_engine`]: everything that is not the
+    /// graph itself. Must stay aligned with `apply_document`'s non-topology
+    /// pushes (master gain / tempo / meter / clip tables / loop / track count).
+    fn refresh_clips_and_transport(&mut self) {
+        self.engine.send(EngineCommand::SetParam {
+            id: ParamId::MasterGain,
+            value: self.project().master_gain,
+        });
+        self.send_sequencer(SequencerCommand::SetBpm(convert::to_f32(
+            self.project().metadata.tempo_bpm,
+        )));
+        self.push_time_signature();
         for track in 0..self.project().midi_tracks.len() {
             self.send_track_clips(track);
         }
+        for index in 0..self.project().control_tracks.len() {
+            self.send_control_clips(index);
+        }
+        for track in 0..self.project().audio_tracks.len() {
+            self.send_audio_clips_for_track(track);
+        }
+        self.engine
+            .set_midi_track_count(self.project().midi_tracks.len());
+        self.push_loop_range();
     }
 
     /// Reverts the last document edit (Ctrl+Z).
@@ -4696,11 +4727,9 @@ impl GlitcherZApp {
         // Undo/redo invalidates every held index: drag, selection, marquee.
         self.roll_state.clear_gesture();
 
+        let before = self.session.project_arc();
         if self.session.undo() {
-            // Undo can restore any kind of edit (a deleted node, a rerouted
-            // cable), so the engine gets the full rebuild, not just clip
-            // tables.
-            self.apply_document();
+            self.sync_engine(&before);
         } else {
             self.set_message("Nothing to undo".to_string());
         }
@@ -4711,8 +4740,9 @@ impl GlitcherZApp {
         // Undo/redo invalidates every held index: drag, selection, marquee.
         self.roll_state.clear_gesture();
 
+        let before = self.session.project_arc();
         if self.session.redo() {
-            self.apply_document();
+            self.sync_engine(&before);
         } else {
             self.set_message("Nothing to redo".to_string());
         }
@@ -4720,13 +4750,14 @@ impl GlitcherZApp {
 
     /// Jumps to a state picked in the Undo History panel (S1-4).
     ///
-    /// Same contract as [`Self::undo`]: every held index is invalidated and the
-    /// engine is rebuilt from the restored document (a jump can cross any kind
-    /// of edit, including node and cable changes).
+    /// Same contract as [`Self::undo`]: held indices are invalidated and the
+    /// engine follows the restored document (incremental when the graph did
+    /// not change).
     fn jump_history_to(&mut self, depth: usize) {
         self.roll_state.clear_gesture();
+        let before = self.session.project_arc();
         if self.session.jump_to(depth) {
-            self.apply_document();
+            self.sync_engine(&before);
         }
     }
 

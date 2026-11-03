@@ -4573,6 +4573,21 @@ impl Default for Project {
 pub const MAX_ARRANGEMENT_TICKS: u64 = (MAX_ARRANGEMENT_BARS as u64) * (TICKS_PER_BAR as u64);
 
 impl Project {
+    /// Whether the real-time graph would be identical for both documents:
+    /// node payloads, cables, and the three track-list lengths.
+    ///
+    /// Clip contents, clip names/colours, marker text and other view-only
+    /// fields are deliberately excluded — they are pushed to the engine
+    /// separately (S2-5). The UI uses this to skip a full graph rebuild when
+    /// undo/redo only touched clips.
+    pub fn topology_eq(&self, other: &Project) -> bool {
+        self.graph.nodes == other.graph.nodes
+            && self.graph.cables == other.graph.cables
+            && self.midi_tracks.len() == other.midi_tracks.len()
+            && self.control_tracks.len() == other.control_tracks.len()
+            && self.audio_tracks.len() == other.audio_tracks.len()
+    }
+
     /// Migrates older document shapes to the current one (v4 → v5, P5f):
     ///
     /// 1. Every legacy [`NodeDoc::ChannelStrip`] becomes a 2-channel
@@ -5819,6 +5834,46 @@ mod tests {
     /// minimal template — one playable MIDI track (instrument → mixer.ch0),
     /// one global mixer with a single channel → master, the keyboard input,
     /// and one unwired generator node for the audio lane.
+    #[test]
+    fn topology_eq_ignores_view_only_changes() {
+        let base = Project::default();
+        let mut renamed = base.clone();
+        renamed.midi_tracks[0].name = "Renamed".to_string();
+        renamed.control_tracks[0].name = "Curve".to_string();
+        assert!(
+            base.topology_eq(&renamed),
+            "names do not change the real-time graph"
+        );
+    }
+
+    #[test]
+    fn topology_eq_rejects_node_and_cable_changes() {
+        let base = Project::default();
+
+        let mut node_changed = base.clone();
+        for node in &mut node_changed.graph.nodes {
+            if let NodeDoc::Instrument { track, .. } = node {
+                *track += 1;
+                break;
+            }
+        }
+        assert!(!base.topology_eq(&node_changed), "node payloads matter");
+
+        let mut cable_changed = base.clone();
+        cable_changed.graph.cables[0].in_port =
+            cable_changed.graph.cables[0].in_port.wrapping_add(1);
+        assert!(!base.topology_eq(&cable_changed), "cable ports matter");
+    }
+
+    #[test]
+    fn topology_eq_rejects_track_count_changes() {
+        let base = Project::default();
+        let mut extra = base.clone();
+        let track = extra.control_tracks[0].clone();
+        extra.control_tracks.push(track);
+        assert!(!base.topology_eq(&extra), "track lists bound the engine");
+    }
+
     #[test]
     fn default_project_graph_is_fully_explicit() {
         let project = Project::default();
