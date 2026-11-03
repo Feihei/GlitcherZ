@@ -519,7 +519,7 @@ curve→曲线轨，即"烘培"）；**一个输入只允许一个源，一个�
 
 接下来（按 review 文档的优先级；2026-11-03 已回填 review 的滞后勾选——S2-1b / S2-2 由 R2–R4 覆盖、S2-4 随 S1-3b 落地）：
 
-- [ ] **S1-4** undo 历史面板（`Session::undo_history()` / `undo_label()` 已有，缺 `undo_to(n)` + 面板）
+- [x] **S1-4** undo 历史面板 ✅ 2026-11-03：`Session::jump_to(depth)`（按 undo 深度前跳/后跳，历史保留，跳转不是编辑）+ `Session::history_rows()`（初始状态 + undo + redo 尾部，带 `current` / `future` 标记）；UI `Edit` 菜单（Undo / Redo / Undo History…）+ 浮窗（最新在上、当前行高亮、灰行 = 可 redo、点击跳到该步之后），跳转走 `jump_history_to` → `clear_gesture` + `apply_document`
 - [ ] **S1-5** Preferences：音频设备 / 采样率 / 缓冲区 + 掉线提示（需 `AudioEngine::start_with`）
 - [ ] **S2-3** PDC（`Processor::latency_samples()` 接进图编译期）
 - [x] **S2-4** 手势 API 重构 ✅ 2026-11-03（`begin_param_edit` / `commit_param_edit` / `end_param_edit`，26 处调用点）

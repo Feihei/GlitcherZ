@@ -110,6 +110,20 @@ struct HistoryEntry {
     bytes: usize,
 }
 
+/// One row of [`Session::history_rows`], oldest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryRow {
+    /// The undo depth this row jumps to (`0` = initial state).
+    pub depth: usize,
+    /// Label of the step that produced this state; `None` for the initial
+    /// state.
+    pub label: Option<String>,
+    /// Whether this row is the live document.
+    pub current: bool,
+    /// Whether this row is ahead of the cursor (a redo step).
+    pub future: bool,
+}
+
 /// The project document plus its undo history and gesture state.
 ///
 /// Cloning a `Session` is cheap and shares the document; editing either copy
@@ -230,6 +244,58 @@ impl Session {
     /// Undo labels, oldest first (for a history panel).
     pub fn undo_history(&self) -> Vec<String> {
         self.undo.iter().map(|h| h.label.clone()).collect()
+    }
+
+    /// The full undo history as jump targets, oldest first.
+    ///
+    /// Row `depth` is the document state after `depth` recorded steps: row 0
+    /// is the initial state, and rows past [`Session::undo_history`] length are
+    /// the redo steps still ahead of the cursor. The UI renders the rows in
+    /// reverse and calls [`Session::jump_to`] with the row's depth.
+    pub fn history_rows(&self) -> Vec<HistoryRow> {
+        let current = self.undo.len();
+        let mut rows = Vec::with_capacity(self.undo.len() + self.redo.len() + 1);
+        rows.push(HistoryRow {
+            depth: 0,
+            label: None,
+            current: current == 0,
+            future: false,
+        });
+        let steps = self
+            .undo
+            .iter()
+            .map(|h| h.label.as_str())
+            .chain(self.redo.iter().rev().map(|h| h.label.as_str()));
+        for (index, label) in steps.enumerate() {
+            let depth = index + 1;
+            rows.push(HistoryRow {
+                depth,
+                label: Some(label.to_string()),
+                current: depth == current,
+                future: depth > current,
+            });
+        }
+        rows
+    }
+
+    /// Jumps the document to a given undo depth.
+    ///
+    /// `0` is the state before the oldest retained step, `undo_history().len()`
+    /// is the current document, and larger values reapply redo steps. Returns
+    /// whether the document changed. The history is preserved (jumping is not
+    /// an edit): steps after the target become redo entries.
+    pub fn jump_to(&mut self, depth: usize) -> bool {
+        self.end_merge();
+        let target = depth.min(self.undo.len() + self.redo.len());
+        if target == self.undo.len() {
+            return false;
+        }
+        while self.undo.len() > target && self.step_back() {}
+        while self.undo.len() < target && self.step_forward() {}
+        self.revision = self.revision.wrapping_add(1);
+        self.dirty = true;
+        self.trim_history();
+        true
     }
 
     /// Maximum number of retained undo steps.
@@ -419,6 +485,32 @@ impl Session {
     /// Reverts the most recent step. Returns `false` when there is none.
     pub fn undo(&mut self) -> bool {
         self.end_merge();
+        if self.step_back() {
+            self.revision = self.revision.wrapping_add(1);
+            self.dirty = true;
+            self.trim_history();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reapplies the most recently undone step.
+    pub fn redo(&mut self) -> bool {
+        self.end_merge();
+        if self.step_forward() {
+            self.revision = self.revision.wrapping_add(1);
+            self.dirty = true;
+            self.trim_history();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Moves one step back without the per-call bookkeeping
+    /// ([`Session::undo`] and [`Session::jump_to`] share this).
+    fn step_back(&mut self) -> bool {
         let Some(entry) = self.undo.pop() else {
             return false;
         };
@@ -433,15 +525,11 @@ impl Session {
             doc: current,
             bytes,
         });
-        self.revision = self.revision.wrapping_add(1);
-        self.dirty = true;
-        self.trim_history();
         true
     }
 
-    /// Reapplies the most recently undone step.
-    pub fn redo(&mut self) -> bool {
-        self.end_merge();
+    /// Reapplies one redo step, mirroring [`Session::step_back`].
+    fn step_forward(&mut self) -> bool {
         let Some(entry) = self.redo.pop() else {
             return false;
         };
@@ -454,9 +542,6 @@ impl Session {
             doc: current,
             bytes,
         });
-        self.revision = self.revision.wrapping_add(1);
-        self.dirty = true;
-        self.trim_history();
         true
     }
 

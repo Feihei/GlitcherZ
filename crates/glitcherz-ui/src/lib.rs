@@ -1667,6 +1667,8 @@ pub struct GlitcherZApp {
     export_dialog_open: bool,
     /// Selected range inside the export dialog.
     export_range_choice: export_audio::ExportRange,
+    /// Whether the Undo History panel is open (S1-4). View state only.
+    undo_history_open: bool,
     /// Diagnostic flag: whether `ui()` has been entered (logging only).
     first_frame_logged: bool,
     /// Diagnostic flag: whether the close command has been sent (logging only).
@@ -1840,6 +1842,7 @@ impl GlitcherZApp {
             input_dropped_seen: 0,
             export_dialog_open: false,
             export_range_choice: export_audio::ExportRange::FullSong,
+            undo_history_open: false,
             first_frame_logged: false,
             close_sent: false,
         };
@@ -4575,6 +4578,18 @@ impl GlitcherZApp {
         }
     }
 
+    /// Jumps to a state picked in the Undo History panel (S1-4).
+    ///
+    /// Same contract as [`Self::undo`]: every held index is invalidated and the
+    /// engine is rebuilt from the restored document (a jump can cross any kind
+    /// of edit, including node and cable changes).
+    fn jump_history_to(&mut self, depth: usize) {
+        self.roll_state.clear_gesture();
+        if self.session.jump_to(depth) {
+            self.apply_document();
+        }
+    }
+
     /// Save to the current path; if never saved, pop up the "Save As" dialog.
     /// Returns whether the document reached the disk — the unsaved-changes
     /// modal (U2) only proceeds when it did.
@@ -6772,6 +6787,51 @@ impl GlitcherZApp {
         Some(names.join(" "))
     }
 
+    /// Undo History panel (S1-4): every retained step plus the redo tail, newest
+    /// first. Clicking a row restores the document state after that step.
+    fn undo_history_panel(&mut self, ctx: &egui::Context) {
+        if !self.undo_history_open {
+            return;
+        }
+        let rows = self.session.history_rows();
+        let mut open = self.undo_history_open;
+        let mut jump = None;
+        egui::Window::new("Undo History")
+            .id(egui::Id::new("glitcherz_undo_history"))
+            .open(&mut open)
+            .default_width(320.0)
+            .min_width(240.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.weak("Click a step to jump to the state after it.");
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        for row in rows.iter().rev() {
+                            let text = match &row.label {
+                                Some(label) => format!("{}. {label}", row.depth),
+                                None => "0. Initial state".to_string(),
+                            };
+                            let text = if row.future {
+                                // Undone steps stay reachable: grey, not gone.
+                                egui::RichText::new(text).weak()
+                            } else {
+                                egui::RichText::new(text)
+                            };
+                            let response = ui.selectable_label(row.current, text);
+                            if response.clicked() && !row.current {
+                                jump = Some(row.depth);
+                            }
+                        }
+                    });
+            });
+        self.undo_history_open = open;
+        if let Some(depth) = jump {
+            self.jump_history_to(depth);
+        }
+    }
+
     /// Floating card with the last refusal reason, dismissed by its close
     /// button or after [`RECORD_REFUSAL_TTL`].
     fn recording_refusal_card(&mut self, ui: &mut egui::Ui) {
@@ -8231,6 +8291,41 @@ impl GlitcherZApp {
                         } else {
                             self.set_message("An export is already running".to_string());
                         }
+                    }
+                });
+                ui.menu_button("Edit", |ui| {
+                    let undo_text = match self.session.undo_label() {
+                        Some(label) => format!("Undo {label}"),
+                        None => "Undo".to_string(),
+                    };
+                    let redo_text = match self.session.redo_label() {
+                        Some(label) => format!("Redo {label}"),
+                        None => "Redo".to_string(),
+                    };
+                    if ui
+                        .add_enabled(
+                            self.session.can_undo(),
+                            egui::Button::new(undo_text).shortcut_text("Ctrl+Z"),
+                        )
+                        .clicked()
+                    {
+                        ui.close();
+                        self.undo();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.session.can_redo(),
+                            egui::Button::new(redo_text).shortcut_text("Ctrl+Y"),
+                        )
+                        .clicked()
+                    {
+                        ui.close();
+                        self.redo();
+                    }
+                    ui.separator();
+                    if ui.button("Undo History…").clicked() {
+                        ui.close();
+                        self.undo_history_open = true;
                     }
                 });
                 ui.separator();
@@ -14018,6 +14113,7 @@ impl eframe::App for GlitcherZApp {
         self.blocking_banner(ui);
         self.transport_panel(ui);
         self.recording_refusal_card(ui);
+        self.undo_history_panel(ui.ctx());
         self.status_panel(ui);
         self.view_tabs(ui);
         // The Edit tab follows the timeline's clip selection (no target of its

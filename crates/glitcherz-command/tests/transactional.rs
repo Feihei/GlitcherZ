@@ -203,6 +203,88 @@ fn a_new_edit_discards_the_redo_stack() {
 }
 
 #[test]
+fn jump_to_restores_any_recorded_state() {
+    let mut session = session_with_notes();
+    let initial = notes(&session);
+    session
+        .execute("midi.note_edit", &json!({ "index": 0, "velocity": 40 }))
+        .unwrap();
+    let after_first = notes(&session);
+    session
+        .execute("midi.note_edit", &json!({ "index": 0, "velocity": 60 }))
+        .unwrap();
+    let after_second = notes(&session);
+
+    assert!(session.jump_to(1), "one step back");
+    assert_eq!(notes(&session), after_first);
+    assert!(session.can_redo());
+
+    assert!(session.jump_to(0), "back to the initial state");
+    assert_eq!(notes(&session), initial);
+
+    assert!(session.jump_to(2), "two steps forward");
+    assert_eq!(notes(&session), after_second);
+    assert!(
+        !session.jump_to(2),
+        "jumping to the current state changes nothing"
+    );
+}
+
+#[test]
+fn jump_to_clamps_and_keeps_the_history() {
+    let mut session = session_with_notes();
+    session
+        .execute("midi.note_edit", &json!({ "index": 0, "velocity": 40 }))
+        .unwrap();
+    session
+        .execute("midi.note_edit", &json!({ "index": 0, "velocity": 60 }))
+        .unwrap();
+
+    assert!(session.jump_to(0));
+    assert!(session.jump_to(usize::MAX), "clamps to the newest state");
+    assert_eq!(session.undo_history().len(), 2, "jumping is not an edit");
+    assert!(session.jump_to(0));
+    assert_eq!(session.undo_history().len(), 0, "all steps undone");
+    assert_eq!(
+        session
+            .history_rows()
+            .iter()
+            .filter(|row| row.future)
+            .count(),
+        2,
+        "the undone steps stay available for redo"
+    );
+}
+
+#[test]
+fn history_rows_describe_every_jump_target() {
+    let mut session = session_with_notes();
+    session
+        .execute("midi.note_edit", &json!({ "index": 0, "velocity": 40 }))
+        .unwrap();
+    session
+        .execute("midi.note_edit", &json!({ "index": 0, "velocity": 60 }))
+        .unwrap();
+    assert!(session.undo());
+
+    let rows = session.history_rows();
+    assert_eq!(rows.len(), 3, "initial state plus both steps");
+    assert_eq!(rows[0].depth, 0);
+    assert_eq!(rows[0].label, None);
+    assert!(!rows[0].current && !rows[0].future);
+    assert_eq!(rows[1].depth, 1);
+    assert_eq!(rows[1].label.as_deref(), Some("Edit Note"));
+    assert!(rows[1].current);
+    assert_eq!(rows[2].depth, 2);
+    assert!(rows[2].future);
+
+    session.jump_to(2);
+    let rows = session.history_rows();
+    assert!(rows[2].current && !rows[2].future);
+    assert!(!rows[0].current && !rows[0].future);
+}
+
+#[test]
 fn history_is_bounded() {
     let mut session = session_with_notes();
     session.set_history_limit(3);
