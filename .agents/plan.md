@@ -524,7 +524,33 @@ curve→曲线轨，即"烘培"）；**一个输入只允许一个源，一个�
 - [x] **S2-3** PDC ✅ 2026-11-03（spec `node-graph.md` §11 D23–D26）：`Processor::latency_samples()` 在**节点安装时**由控制线程读入 `GraphCompiler::slot_latency`（CLAP `clap_plugin_latency.get` / VST3 `getLatencySamples`，实例化后各一次）；`RtGraph::compute_pdc` 按拓扑序累积 `out_latency`，每条入边补偿 `max_in - out_latency[src]`，Feedback tap 边不参与；补偿表留在 `RtGraph`（不进 `ExecPlan`，保持结构更新载荷）；每槽预分配 `MAX_PDC_SAMPLES`（16384 帧 ≈ 341 ms）立体声 ring，`pdc_active` 为假时走原快路径；ring 随 `NodeDeployment` / `RecycledNode` 在控制线程分配释放。测试 +5（脉冲对齐 / 默认图零开销 / 上限钳制 / CLAP·VST3 latency 读取），全仓 fmt/clippy/test 绿
 - [x] **S2-4** 手势 API 重构 ✅ 2026-11-03（`begin_param_edit` / `commit_param_edit` / `end_param_edit`，26 处调用点）
 - [x] **S2-5** 增量引擎同步 ✅ 2026-11-03：① `Project::topology_eq`（nodes 载荷 + cables + 三类轨道数量）判严格等价；② **S2-5b** 再加 `Project::engine_topology_eq`（只比节点身份：node_id / track / voice 的 path·plugin id·state / effect kind / mixer inputs / drum slot key·path），可重放参数不再触发重建。undo / redo / Undo History 跳转 / `execute` 统一走 `sync_engine(before)`：身份等价时只推 clip 表 / loop / 速度拍号 / master gain / track count / **全节点参数**（`push_node_params` 已补齐 Sample / SF2 / DrumKit / Arp / Portamento / Env / LFO / CurveMap / Feedback / Input，外加 `push_mixer_params`），插件不再重实例化；身份变化仍 `apply_document()` 全量重建。测试 +5（`topology_eq` 3 项 + `engine_topology_eq` 参数跳过 / voice·mixer 身份），全仓 fmt/clippy/test 绿 + 冒烟
-- [ ] **S3** 自动保存、相对路径与缺失媒体重定位、导出规格化、`ui/lib.rs` 拆分、`implementation.md` 拆分、补 `docs/`（CJK 字体已完成）
+- [ ] **S3** 自动保存 ✅、导出规格化 ✅、媒体相对路径/收集/重定位 ✅、`ui/lib.rs` 拆分、`implementation.md` 拆分、补 `docs/`
+  - [x] **S3a 自动保存 + 崩溃恢复** ✅ 2026-11-03（spec `spec/autosave.md`，用户拍板：落工程目录 + app data 兜底、静默 30 s / 最短 60 s）：
+    模型 `save_autosave`（原子写、不写 `.bak`、不 validate）+ `autosave_path`；UI `autosave.rs`
+    （`Clock` 纯时间算术 / `candidates` 只按"文件存在"判定 / `age_label`）；`GlitcherZApp`
+    在 `ui()` 末尾 `tick_autosave`（克隆文档 + 现场插件 blob 后写克隆，避免自触发写盘循环）、
+    `adopt_document` 抽出 open/recover 共用路径（恢复后标 dirty、`project_path` 回指原工程）、
+    启动 `recovery_dialog`（Recover / Discard all / Later）+ 手存 / 退出 / clean 关闭时删快照。
+    测试 +6（自动保存文件往返无 `.bak`、静默 30 s、连续编辑 60 s、clean 不写、候选发现、年龄文案），全仓 fmt/clippy/972 项 test 绿
+  - [x] **S3c 导出规格化** ✅ 2026-11-03（spec `spec/export-audio.md` D7/D9–D13，用户拍板：默认 24-bit 可选 16/32f、采样率下拉默认当前、stems = 每轨一文件 + 混音）：
+    `Bits` / `WavFormat` / `sample_rate_choices` / `sanitize_file_part` / `stem_path` / `ExportPass`；
+    `ExportJob` 改**多 pass**（`pump(blocks, setup)`：pass 结束 → finalize → 2 s flush 丢弃 →
+    `begin_pass` 开新 writer + setup 重推 clip 表 + seek/Play，`outputs` 收集已完成文件）；
+    `spawn_offline_node` 收 `export_rate`（此前读活引擎 rate，等于把导出钉死在设备上）；
+    `start_export` 收 `format + passes`，新增 `export_passes`（有内容的轨才出 stem，重名追加序号）与
+    `set_export_pass_tables`（目标轨留内容、其它轨空表，control 轨保留）；对话框加位深 / 采样率 / stems，
+    banner 显示 `n/total — 轨名 — 文件`，取消删当前半成品。测试 +4（WavSpec 三档、采样率去重、
+    轨名消毒 + stem 路径、3-pass 真实渲染写出 3 个 24-bit@22050 文件且 setup 只对 stem 触发），全仓 fmt/clippy/976 项 test 绿 + 冒烟
+  - [x] **S3b 媒体相对路径 + 收集 + 重定位** ✅ 2026-11-03（spec `spec/media.md` M1–M9）：
+    model 新增 `media_paths` / `rewrite_media_paths` / `missing_media`，`resolve_media_path` 把 `\` 折回 `/`
+    并把 `media_path_string` 统一写成 `/` 分隔（老 Windows 工程的 `\` 仍可读）；采样 / SoundFont / 鼓机 slot
+    三处 picker 改存相对路径，`obtain_*` 与 `build_audio_clip_table` 统一解析（缓存键 = 解析后绝对路径，
+    Inspector 的 SF2 preset 表同步按解析路径查）；新模块 `ui/media.rs`（`collect_target` 同名不同大小加 ` (2)`、
+    同大小视为已收集；`find_by_name` 深度 ≤4 / 预算 20000 / 大小写不敏感）；File 菜单
+    `Collect Media Files…`（复制进 `<stem>.media/` + 重写，一步 undo）与 `Relocate Missing Media…`
+    （选目录按名匹配 + `apply_document`），打开/恢复工程后按 `missing_media()` 弹缺失提示
+    （Locate Folder… / Continue without them）。测试 +4（媒体引用枚举·重写·缺失判定、路径分隔符规范化、
+    收集落点三条规则、按名搜索深度）。全仓 fmt/clippy/980 项 test 绿 + 冒烟
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 

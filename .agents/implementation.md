@@ -767,3 +767,63 @@ let _ = self.slot_set_param(route.slot, ParamId::PitchOffset, value); // synth /
 **掉线提示**：cpal error 回调（不在数据路径）把错误文本写进 `Arc<Mutex<Option<String>>>`，UI 每帧 `take_stream_error()` 并显示红色状态栏（"Audio output stopped: … Open Edit ▸ Preferences…"），同一个字符串覆盖写，不会堆积。Preferences 窗口也显示最近一次流错误。
 
 **测试**：`output_config_matches` 四态（默认任意匹配 / 设备 / 采样率 / 缓冲的不匹配）、`UiState` RON 往返；`cargo run -p glitcherz-app -- --seconds 5` 冒烟覆盖默认启动路径。真实设备/采样率切换需要人工点 Apply（headless 无法验证）。
+
+## 自动保存与崩溃恢复（S3a，2026-11-03）
+
+**信号用"文件存在"，不用时间戳比较**：快照在手存成功、明确丢弃（`FileAction::Exit`）、以及窗口关闭时文档为 clean（`Drop`）三条路径上都会被删除，所以启动时发现文件就等于"上一轮没干净退出"。`autosave::candidates` 因此只做 `metadata().is_file()`，不需要 mtime 判断谁更新 —— 规则可穷举，测试也不需要伪造修改时间。
+
+**落点两套**：已存盘工程 → `<name>.glz.autosave`（同目录，跟着工程走）；从未存盘 → `<eframe::storage_dir("GlitcherZ")>/autosave/Untitled.glz`。`storage_dir` 返回 `None` 的平台只快照已存盘工程，不猜路径。
+
+**写入**：`glitcherz_model::save_autosave` 复用抽出来的 `write_atomic`（`.tmp` → `sync_all` → rename），但**不写 `.bak`、不 `validate`** —— 快照不是用户要的版本，而"文档瞬时非法"不能成为丢工作的理由（加载路径仍 validate，坏快照在恢复时报错）。
+
+**节奏**：`autosave::Clock` 只做时间算术（不 IO、不读时钟，`Instant` 由调用方给），`observe(revision, dirty, now)` 在 revision 变化时记 `last_edit`，`due(now)` = 脏 && revision ≠ 已写 revision && (静默 ≥30 s || 距上次写 ≥60 s)。`mark_written` 在成功**和失败**后都调用：满盘时不会每帧刷错误，而是下一分钟再试。
+
+**为什么快照是克隆**：`capture_plugin_states` 走 `project_mut()`，会 bump revision 并置 dirty —— 在 tick 里直接调用等于每 30 s 自触发一次写盘（死循环）。所以 tick 里 `project().clone()` + `plugin_state_blobs()` + 自由函数 `apply_plugin_state(&mut snapshot, blobs)`，只写克隆；手存路径反过来把 blobs 应用到活文档（`capture_plugin_states` = 两者组合）。
+
+**恢复**：`adopt_document(project, path, dirty)` 是 open / recover 共用的一段（`session.replace` → layout 导入 → `project_path` / recent → 清选区与卷帘状态 → `autosave_clock.reset` → `push_all_params` + `push_loop_range`）。恢复时先按快照所在目录清掉 `base_dir`（`load_project` 会把相对媒体根指向快照目录），再设为原工程目录，并 `Session::mark_dirty()` —— 快照从未以该工程保存过，标题必须带 `*`。走 `queue_blocking_job` 的 banner 三相位（安装插件与 SoundFont 与普通打开同样慢）。
+
+**提示**：启动 `recovery_dialog` 是 modal，每项 `Recover` + 年龄 + 大小，底部 `Discard all` / `Later`。`Later` 只清列表不删文件（下次启动仍会问）；恢复一个不动其它（其它属于别的工程）。打开提示期间 `handle_keyboard_input` 让路。
+
+**测试**（+6）：`an_autosave_reloads_without_leaving_a_backup`（两次写无 `.bak` / 无残留 `.tmp` / 可重载为同一文档）、`a_quiet_pause_arms_the_snapshot`、`continuous_editing_still_snapshots_on_the_spacing`、`a_clean_document_is_never_snapshotted`、`snapshots_are_found_beside_recent_projects_and_in_app_data`、`age_labels_stay_readable`。
+
+## 导出规格化（S3c，2026-11-03）
+
+**格式由 `WavFormat { sample_rate, bits }` 决定，唯一的换算点在 `Bits::wav_spec`**：16/24 走 `SampleFormat::Int`（24-bit 用 i32 载值、hound 写 3 字节），32f 走 `SampleFormat::Float`。16/24 先 `clamp(-1,1)` 并拦 NaN（`finite_or_silence`）；32f 只拦 NaN/Inf，保留引擎自己的 overshoot —— 这正是选 float 交付的意义。
+
+**采样率必须跟着离线引擎走**：`spawn_offline_node` 以前读 `self.engine.info().sample_rate`，于是"导出采样率"这件事根本不存在。现在它显式收 `export_rate`，`start_export` 用它开 `start_offline(rate)` —— 96 kHz 导出不再需要 96 kHz 设备。音频 clip 是时间制播放（`elapsed × wav_sr`），换 rate 不会变调。
+
+**stems = 同一张图、多个 pass**：`ExportPass { path, label, target }`，`target: Option<TrackSel>`（`None` = 整混音）。`pump` 里 pass 的生命周期是显式的：
+
+```
+pass 写完尾音 → finishing → close_pass（finalize + 记 outputs）
+             → 还有 pass？index+1，flush_left = 2 s 的块数
+flush 阶段：渲染但丢弃（上一 pass 的 reverb/delay 尾巴）
+flush 归零 → writer 为 None → begin_pass：开新 writer → setup(engine, node_map, target)
+           → seek(window.0) → Play → tail_left 复位
+```
+
+`setup` 由 app 提供（`set_export_pass_tables`）：目标轨 `rt_clips` / `build_audio_clip_table`，其它轨推 `empty_midi_clip_table()` / `empty_clip_table()`。**不重装图**——重装等于每轨一次 CLAP/VST3 实例化 + state 回灌；改址只是几次结构队列推送。control 轨（automation / tempo）全程保留：它们属于"这个 stem 听起来的样子"。
+
+**`pass_finished` 必须要求 writer 存在**：初版只判 `!is_playing() && tail_left == 0`，flush 结束后这个条件立刻成立，于是 pass 被"关闭"而从未开始 —— 三个 pass 只写一个文件。是 3-pass 渲染测试抓到的（`setup_calls` 为空）。
+
+**取消**：删掉 `job.path()` 对应的未完成文件（不在 `outputs` 里即是半成品），已完成 pass 保留并在状态栏报数量。半成品 wav 看起来像成品，比没有更糟。
+
+**命名**：`sanitize_file_part` 把 `/ \ : * ? " < > |` 与控制码换成 `_`、折叠连续空格、去掉尾部点与空格（Windows 会静默裁掉，导致写出的路径和记录的不一致），空名回落 `track`；重名追加 ` 2`、` 3`。stem 文件固定落在用户选的那个目录（`mix.with_file_name`）。
+
+**测试**（+4）：`bit_depths_match_the_wav_spec`、`the_device_rate_leads_the_sample_rate_choices`、`stem_names_survive_hostile_track_names`、`a_multi_pass_job_writes_every_pass_in_the_requested_format`（真离线引擎跑完 3 个 pass，读回三个 24-bit @22050 文件，并断言 setup 只对两个 stem 触发）。
+
+## 媒体路径、收集与重定位（S3b，2026-11-03）
+
+**一条规则，两个函数**：`Project::media_path_string` 决定存什么（在工程目录下 → 相对；否则绝对；分隔符一律 `/`），`Project::resolve_media_path` 决定怎么读（`\` 折回 `/`，相对则 join `base_dir`）。所有加载点（`obtain_sample_voice` / `obtain_sf2_voice` / `obtain_drum_kit_voice` / `build_audio_clip_table`）都只调 resolve，缓存键是**解析后的绝对路径** —— 否则两个工程的同名媒体会共用一条缓存。
+
+**为什么存 `/`**：`strip_prefix` + `to_string_lossy` 在 Windows 上产出 `demo.media\kick.wav`，这个字符串在 macOS 上是一个**文件名**而不是路径。反过来老 Windows 工程里的 `\` 由 resolve 折回 `/`，所以两个方向都能开。
+
+**收集（`Collect Media Files…`）**：遍历 `media_paths()`，跳过已在 `<stem>.media/` 里的，`media::collect_target` 给出落点——同名不同大小加 ` (2)`，同名同大小视为已收集（跳过复制，所以重复执行是幂等的，也不会把 300 MB 的 SF2 复制两份）。一步 undo（`Collect Media`）。**不 `apply_document`**：引擎里解码好的数据就是这些字节的副本。
+
+**重定位（`Relocate Missing Media…`）**：`missing_media()` 给出**存储形式**的路径（这样才能按 key 重写），选一个目录后 `media::find_by_name` 在其下 BFS（深度 ≤4、预算 20000、大小写不敏感）按文件名匹配，重写后**必须** `apply_document()` —— 节点里装的是旧路径的源。仍缺的文件留在列表里，提示框不关。
+
+**缺失提示**：`adopt_document` 末尾 `refresh_missing_media()`，所以打开 / 恢复工程都会算一次；非空弹 modal（路径列表 + `Locate Folder…` / `Continue without them`）。不做播放中转圈轮询——用户正在编辑时弹窗比不弹更烦。
+
+**顺手修的一处**：Inspector 的 SF2 preset 表按**存储路径**查 `sf2_preset_names`，改成相对路径存盘后就查不到了（下拉空白）。现在按 `base_dir + stored` 解析后查（`graph_patch` 里 destructure 出 `session`，用 `session.project().base_dir` 而不是 `self.project()`，否则和 `patch_state` 的可变借用打架）。
+
+**测试**（+4）：`media_references_are_enumerated_rewritten_and_checked`（去重 / 空路径跳过 / 重写 / 缺失判定）、`relative_media_paths_resolve_against_the_project_directory`（新增 `/` 存储与 `\` 兼容读两条断言）、`a_free_name_is_used_as_is` / `name_clashes_get_a_suffix_but_the_same_file_does_not`、`relocation_finds_a_file_by_name_inside_a_picked_folder`。
