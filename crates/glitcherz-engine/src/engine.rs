@@ -510,9 +510,11 @@ impl AudioEngine {
                 node_id,
                 node,
                 output,
+                history,
             } = recycled;
             drop(node); // Released on the control thread: the real-time iron rule only constrains the audio callback
             drop(output);
+            drop(history);
             ids.push(node_id);
         }
         ids

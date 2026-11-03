@@ -68,7 +68,7 @@ BuiltinParam(u8),
 | D13 | 立体声联动 | descriptor 标 `StereoClass::{Mono, Linkable { default }}`；`Linkable` 的效果器参数结构体带 `stereo_link: bool`（serde default = true），并有 `STEREO_LINK` 标记的槽位（`ms = 0` 吸附） | 联动开关走参数路径而非重建节点：切开时要保住压缩包络/混响尾音 |
 | D14 | 联动数学 | 联动时检测器取 `max(|L|, |R|)`，两侧共用同一增益衰减；非联动时逐声道独立检测。**两侧检测器状态永远预分配**（构造期），切换只在块边界改选择位 | 切换零分配零重建；`max` 而非功率和，保持峰值检测语义可断言 |
 | D15 | 元数据真源 | 文档字段 `stereo_link` 是持久化真源；UI 编辑沿用 delay 滑条的既有模式（改文档 + 下发参数），引擎构造期以文档值初始化 | 与 `send_node_param` 现有双写模式一致，undo 一步 |
-| D16 | 延迟补偿口子 | `Processor` 新增默认方法 `fn latency_samples(&self) -> usize { 0 }`，v1 全部返回 0 | 为后续过采样饱和/限幅器预留，避免届时改 trait 全仓编译 |
+| D16 | 延迟补偿口子 | `Processor` 新增默认方法 `fn latency_samples(&self) -> usize { 0 }`；内置效果器目前全部返回 0，插件节点返回插件自报值。**PDC 已于 S2-3 落地**（图编译期对齐，见 `node-graph.md` §11） | 为过采样饱和/限幅器预留；插件 latency 现在会实际参与混音对齐 |
 | D17 | 不做节点化 | **Echo 不新建节点**（现有 Delay 即回声，升级为 ping-pong + tempo-sync 模式）；**Gain 不新建节点**（通道条已是增益级，缺的只是链路中 trim） | 两个都能表意会造成用户困惑与重复维护 |
 
 ## 5. 数据结构

@@ -30,6 +30,9 @@ pub struct RecycledNode {
     /// The node's dedicated output buffer, returned to the control thread
     /// for release along with the node.
     pub output: AudioBuffer,
+    /// PDC history ring (S2-3), returned for the same reason: dropping it on
+    /// the audio thread would allocate.
+    pub history: Box<[f32]>,
 }
 
 /// Default capacity of the structure update queue.

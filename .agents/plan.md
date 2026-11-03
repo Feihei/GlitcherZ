@@ -521,7 +521,7 @@ curve→曲线轨，即"烘培"）；**一个输入只允许一个源，一个�
 
 - [x] **S1-4** undo 历史面板 ✅ 2026-11-03：`Session::jump_to(depth)`（按 undo 深度前跳/后跳，历史保留，跳转不是编辑）+ `Session::history_rows()`（初始状态 + undo + redo 尾部，带 `current` / `future` 标记）；UI `Edit` 菜单（Undo / Redo / Undo History…）+ 浮窗（最新在上、当前行高亮、灰行 = 可 redo、点击跳到该步之后），跳转走 `jump_history_to` → `clear_gesture` + `apply_document`
 - [ ] **S1-5** Preferences：音频设备 / 采样率 / 缓冲区 + 掉线提示（需 `AudioEngine::start_with`）
-- [ ] **S2-3** PDC（`Processor::latency_samples()` 接进图编译期）
+- [x] **S2-3** PDC ✅ 2026-11-03（spec `node-graph.md` §11 D23–D26）：`Processor::latency_samples()` 在**节点安装时**由控制线程读入 `GraphCompiler::slot_latency`（CLAP `clap_plugin_latency.get` / VST3 `getLatencySamples`，实例化后各一次）；`RtGraph::compute_pdc` 按拓扑序累积 `out_latency`，每条入边补偿 `max_in - out_latency[src]`，Feedback tap 边不参与；补偿表留在 `RtGraph`（不进 `ExecPlan`，保持结构更新载荷）；每槽预分配 `MAX_PDC_SAMPLES`（16384 帧 ≈ 341 ms）立体声 ring，`pdc_active` 为假时走原快路径；ring 随 `NodeDeployment` / `RecycledNode` 在控制线程分配释放。测试 +5（脉冲对齐 / 默认图零开销 / 上限钳制 / CLAP·VST3 latency 读取），全仓 fmt/clippy/test 绿
 - [x] **S2-4** 手势 API 重构 ✅ 2026-11-03（`begin_param_edit` / `commit_param_edit` / `end_param_edit`，26 处调用点）
 - [ ] **S2-5** 增量引擎同步（`sync_document(prev, next)` 取代 undo/redo 全量重建）
 - [ ] **S3** 自动保存、相对路径与缺失媒体重定位、导出规格化、`ui/lib.rs` 拆分、`implementation.md` 拆分、补 `docs/`（CJK 字体已完成）

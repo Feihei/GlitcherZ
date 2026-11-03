@@ -78,6 +78,12 @@ pub const MAX_DEPLOYMENTS: usize = 4;
 pub const MAX_REMOVALS: usize = 8;
 /// Maximum instrument nodes a single MIDI track can fan out to simultaneously (D7).
 pub const MAX_MIDI_FANOUT: usize = 4;
+/// Per-node PDC history depth, in frames (S2-3). Every installed node keeps a
+/// stereo ring of this length; compensation delays are clamped below it so a
+/// pathological plugin latency cannot index out of bounds. 16384 frames is
+/// ~341 ms at 48 kHz — comfortably above common lookahead/linear-phase
+/// latencies while costing 128 KiB per node.
+pub const MAX_PDC_SAMPLES: usize = 16_384;
 
 /// Reserved node_id of the master output (D6: always present, cannot be removed or retyped).
 /// Document nodes (glitcherz-model) are allocated from 2; 0 is always the invalid sentinel.
@@ -285,6 +291,16 @@ pub struct ExecPlan {
     pub event_out: [[EventCable; MAX_EVENT_FANOUT]; MAX_NODES],
     /// Valid out-edge count of each slot.
     pub event_out_counts: [u8; MAX_NODES],
+    /// Intrinsic latency of each slot in frames (S2-3), captured when the
+    /// node was installed. The runtime derives per-edge compensation from
+    /// this and [`RtGraph::pdc_delay`] on every topology swap.
+    pub slot_latency: [u32; MAX_NODES],
+    /// Node kind of each slot: the runtime needs it to leave feedback taps
+    /// out of latency alignment.
+    pub kinds: [NodeKind; MAX_NODES],
+    /// Whether any edge carries a non-zero compensation. `false` keeps the
+    /// pre-S2-3 fast path (sum straight from the source output buffer).
+    pub pdc_active: bool,
 }
 
 impl ExecPlan {
@@ -309,6 +325,9 @@ impl ExecPlan {
         }; MAX_AUTO_TRACKS],
         event_out: [[EventCable::EMPTY; MAX_EVENT_FANOUT]; MAX_NODES],
         event_out_counts: [0; MAX_NODES],
+        slot_latency: [0; MAX_NODES],
+        kinds: [NodeKind::Plain; MAX_NODES],
+        pdc_active: false,
     };
 }
 
@@ -333,7 +352,41 @@ struct NodeSlot {
     node_id: u64,
     processor: Box<dyn Processor>,
     output: AudioBuffer,
+    /// PDC history ring (S2-3): `MAX_PDC_SAMPLES` stereo frames,
+    /// interleaved `[L0, R0, L1, R1, …]`. Written every block while
+    /// [`ExecPlan::pdc_active`]; downstream edges read it at their
+    /// compensation offset.
+    history: Box<[f32]>,
+    /// Next frame index to write in `history` (`0..MAX_PDC_SAMPLES`).
+    history_write: usize,
     events: NodeEvents,
+}
+
+impl NodeSlot {
+    /// Appends this block's stereo output to the PDC history ring (S2-3).
+    /// RT-safe: a fixed-length copy, no allocation.
+    fn push_history(&mut self, frames: usize) {
+        let capacity = self.history.len() / 2;
+        if capacity == 0 {
+            return;
+        }
+        let frames = frames.min(capacity);
+        let write = self.history_write;
+        for channel in 0..2 {
+            if let Some(source) = self.output.channel(channel) {
+                for (index, &sample) in source.iter().take(frames).enumerate() {
+                    let frame = (write + index) % capacity;
+                    self.history[frame * 2 + channel] = sample;
+                }
+            } else {
+                for index in 0..frames {
+                    let frame = (write + index) % capacity;
+                    self.history[frame * 2 + channel] = 0.0;
+                }
+            }
+        }
+        self.history_write = (write + frames) % capacity;
+    }
 }
 
 /// Runtime graph: fixed-capacity slots + the current execution plan.
@@ -342,6 +395,10 @@ struct NodeSlot {
 pub struct RtGraph {
     slots: [Option<NodeSlot>; MAX_NODES],
     plan: ExecPlan,
+    /// Per-in-edge latency compensation in frames (S2-3), derived from the
+    /// plan on every topology swap. Kept out of [`ExecPlan`] so the structural
+    /// update payload stays small.
+    pdc_delay: [[u16; MAX_IN_EDGES]; MAX_NODES],
     block_size: usize,
     /// Panic sweep cursor (see [`RtGraph::panic`]): `Some(start)` = the next
     /// block must release pitches `start..` and advance; `None` = idle.
@@ -450,20 +507,25 @@ pub enum GraphUpdate {
     },
 }
 
+/// A node ready to install: processor + dedicated output buffer + PDC
+/// history ring. All three are control-side allocations (S2-3).
+pub type PendingNode = (Box<dyn Processor>, AudioBuffer, Box<[f32]>);
+
 /// One node install: control-side-constructed processor + dedicated output
-/// buffer.
+/// buffer (+ PDC history ring, S2-3).
 ///
-/// The buffer must be preallocated on the control side (the real-time thread
-/// must not allocate) and moves into the graph together with the node; when a
-/// node is removed, its buffer is returned to the control thread for
+/// Everything here must be preallocated on the control side (the real-time
+/// thread must not allocate) and moves into the graph together with the node;
+/// when a node is removed, its buffer is returned to the control thread for
 /// deallocation via [`RecycledNode`].
 pub struct NodeDeployment {
     /// Destination slot.
     pub slot: u16,
     /// Node ID monotonically allocated on the control side (used for recycle pairing).
     pub node_id: u64,
-    /// `Some` = pending install (processor + output buffer); set to `None` after consumption.
-    pub node: Option<(Box<dyn Processor>, AudioBuffer)>,
+    /// `Some` = pending install (processor + output buffer + history); set to
+    /// `None` after consumption.
+    pub node: Option<PendingNode>,
 }
 
 impl RtGraph {
@@ -473,6 +535,7 @@ impl RtGraph {
         Self {
             slots: std::array::from_fn(|_| None),
             plan: ExecPlan::EMPTY,
+            pdc_delay: [[0; MAX_IN_EDGES]; MAX_NODES],
             block_size: block_size.max(1),
             panic_sweep: None,
             last_cc: [-1; MAX_AUTO_TRACKS],
@@ -560,6 +623,8 @@ impl RtGraph {
             node_id,
             processor,
             output,
+            history: vec![0.0; MAX_PDC_SAMPLES * 2].into_boxed_slice(),
+            history_write: 0,
             events: NodeEvents::default(),
         });
     }
@@ -590,11 +655,12 @@ impl RtGraph {
                     node_id: node.node_id,
                     node: node.processor,
                     output: node.output,
+                    history: node.history,
                 });
             }
         }
         for dep in deployments.iter_mut().take(deployment_count) {
-            let Some((processor, output)) = dep.node.take() else {
+            let Some((processor, output, history)) = dep.node.take() else {
                 continue;
             };
             let s = dep.slot as usize;
@@ -605,6 +671,7 @@ impl RtGraph {
                     node_id: dep.node_id,
                     node: processor,
                     output,
+                    history,
                 });
                 continue;
             }
@@ -612,10 +679,13 @@ impl RtGraph {
                 node_id: dep.node_id,
                 processor,
                 output,
+                history,
+                history_write: 0,
                 events: NodeEvents::default(),
             });
         }
         self.plan = plan;
+        self.compute_pdc();
         // A new plan may point a curve at a different node: forget the last
         // emitted value so the next sampled block always delivers one (the
         // new target would otherwise wait for the curve to move).
@@ -643,6 +713,54 @@ impl RtGraph {
         None
     }
 
+    /// Derives per-edge compensation (S2-3) from the plan.
+    ///
+    /// `out_latency[slot]` is the accumulated latency at a slot's output. Each
+    /// in-edge of a node is delayed by `max_in - out_latency[src]`, aligning
+    /// every input to the slowest branch. Feedback taps are excluded: their
+    /// one-block lag is the effect itself, not a misalignment.
+    ///
+    /// RT-safe: fixed-capacity arithmetic, no allocation. Runs once per
+    /// topology swap (never per block).
+    fn compute_pdc(&mut self) {
+        self.pdc_delay = [[0; MAX_IN_EDGES]; MAX_NODES];
+        let max_delay = MAX_PDC_SAMPLES.saturating_sub(self.block_size);
+        let mut out_latency = [0u32; MAX_NODES];
+        let mut active = false;
+        for index in 0..self.plan.order_len {
+            let slot = self.plan.order[index] as usize;
+            let count = self.plan.in_counts[slot] as usize;
+            if self.plan.kinds[slot] == NodeKind::Feedback {
+                // A feedback node runs before its tap sources; its input lag
+                // is intentional, so it contributes no alignment delay.
+                out_latency[slot] = self.plan.slot_latency[slot];
+                continue;
+            }
+            let mut max_in = 0u32;
+            for edge in 0..count {
+                let src = self.plan.in_edges[slot][edge] as usize;
+                if self.plan.kinds[src] == NodeKind::Feedback {
+                    continue;
+                }
+                max_in = max_in.max(out_latency[src]);
+            }
+            for edge in 0..count {
+                let src = self.plan.in_edges[slot][edge] as usize;
+                let latency = if self.plan.kinds[src] == NodeKind::Feedback {
+                    0
+                } else {
+                    out_latency[src]
+                };
+                let delay = max_in.saturating_sub(latency);
+                let clamped = (delay as usize).min(max_delay) as u16;
+                self.pdc_delay[slot][edge] = clamped;
+                active |= clamped > 0;
+            }
+            out_latency[slot] = self.plan.slot_latency[slot].saturating_add(max_in);
+        }
+        self.plan.pdc_active = active;
+    }
+
     /// Processes one block: in topological order, sum in-edges → consume
     /// events → process in place; returns levels.
     /// RT-safe.
@@ -665,6 +783,8 @@ impl RtGraph {
             // borrow `self` while `self.slots` is being mutated.
             let edges = self.plan.in_edges[s];
             let ports = self.plan.in_ports[s];
+            let pdc_delays = self.pdc_delay[s];
+            let pdc_active = self.plan.pdc_active;
             // D20: per-channel weights come from the destination processor
             // (mixer nodes); `None` = unit weights. Split borrow: `processor`
             // is read while `output` is written — disjoint fields of the
@@ -672,17 +792,34 @@ impl RtGraph {
             let weights: Option<&ChannelWeights> = node.processor.input_weights();
             for (i, &src) in edges[..count].iter().enumerate() {
                 if let Some(src_node) = self.slots[src as usize].as_ref() {
-                    match weights {
-                        Some(w) => sum_into_weighted(
+                    let delay = if pdc_active {
+                        usize::from(pdc_delays[i])
+                    } else {
+                        0
+                    };
+                    let weight = weights.map(|w| w[ports[i] as usize]);
+                    if delay == 0 {
+                        match weight {
+                            Some(w) => sum_into_weighted(&mut node.output, &src_node.output, w),
+                            None => sum_into(&mut node.output, &src_node.output),
+                        }
+                    } else {
+                        sum_into_delayed(
                             &mut node.output,
-                            &src_node.output,
-                            w[ports[i] as usize],
-                        ),
-                        None => sum_into(&mut node.output, &src_node.output),
+                            &src_node.history,
+                            src_node.history_write,
+                            delay,
+                            weight,
+                        );
                     }
                 }
             }
             node.processor.process(ctx, &mut node.output);
+            // S2-3: publish this block into the PDC history. Downstream edges
+            // (which run later in topology order) read it at their offset.
+            if pdc_active {
+                node.push_history(frames);
+            }
             // Event/control bus (spec `midi-nodes.md` D4/D5): produce this
             // block's output, then hand it to the already-sorted downstream
             // slots. The topology guarantees they have not run yet, so
@@ -1216,6 +1353,37 @@ fn sum_into_weighted(dst: &mut AudioBuffer, src: &AudioBuffer, weight: [f32; 2])
     }
 }
 
+/// Latency-compensated variant of [`sum_into`] (S2-3): reads the source's
+/// history ring `delay` frames behind its newest sample. `history` is
+/// interleaved stereo; `write` is the ring's next write frame. RT-safe.
+fn sum_into_delayed(
+    dst: &mut AudioBuffer,
+    history: &[f32],
+    write: usize,
+    delay: usize,
+    weight: Option<[f32; 2]>,
+) {
+    let capacity = history.len() / 2;
+    if capacity == 0 {
+        return;
+    }
+    let delay = delay.min(capacity.saturating_sub(1));
+    for channel in 0..dst.channels().min(2) {
+        let Some(destination) = dst.channel_mut(channel) else {
+            continue;
+        };
+        let frames = destination.len().min(capacity);
+        let gain = weight.map_or(1.0, |w| w[channel]);
+        // `write` points past this block's last frame; step back one block
+        // (`frames`) and then by the compensation delay.
+        let start = (write + capacity * 2 - frames - delay) % capacity;
+        for (index, sample) in destination.iter_mut().enumerate() {
+            let frame = (start + index) % capacity;
+            *sample += history[frame * 2 + channel] * gain;
+        }
+    }
+}
+
 /// Resolves the destination slot within a track by parameter kind: the mixer
 /// trio → channel strip; the delay trio → delay; master gain has no track
 /// home; the rest (timbre/envelope/filter/plugin) → instrument.
@@ -1410,6 +1578,10 @@ pub struct GraphCompiler {
     slot_ids: [u64; MAX_NODES],
     /// Slot → node kind (P5f D14/D16: compile-time in-edge discipline).
     kinds: [NodeKind; MAX_NODES],
+    /// Slot → intrinsic processing latency in frames (S2-3), captured from
+    /// [`Processor::latency_samples`] when the node is installed (the
+    /// compiler never owns the processors, so it cannot ask them later).
+    slot_latency: [u32; MAX_NODES],
     /// Audio cable list (`from → to`, deduplicated; P5b replaces the
     /// single-out-edge `out_edge`).
     cables: [Cable; MAX_CABLES],
@@ -1449,6 +1621,7 @@ impl GraphCompiler {
             occupied: [false; MAX_NODES],
             slot_ids: [0; MAX_NODES],
             kinds: [NodeKind::Plain; MAX_NODES],
+            slot_latency: [0; MAX_NODES],
             cables: [Cable {
                 from: 0,
                 to: 0,
@@ -1583,6 +1756,7 @@ impl GraphCompiler {
                 self.occupied[slot as usize] = false;
                 self.slot_ids[slot as usize] = 0;
                 self.kinds[slot as usize] = NodeKind::Plain;
+                self.slot_latency[slot as usize] = 0;
             }
         }
         self.track_voice[track] = NO_EDGE;
@@ -1859,7 +2033,14 @@ impl GraphCompiler {
             batch[batch_slot] = NodeDeployment {
                 slot,
                 node_id,
-                node: Some((node, AudioBuffer::new(2, self.block_size))),
+                node: Some((
+                    node,
+                    AudioBuffer::new(2, self.block_size),
+                    // S2-3: every node carries a PDC ring. Allocating lazily
+                    // is not an option (a plan can activate compensation
+                    // later without reinstalling the upstream nodes).
+                    vec![0.0; MAX_PDC_SAMPLES * 2].into_boxed_slice(),
+                )),
             };
         }
         let mut removed_arr = [0u16; MAX_REMOVALS];
@@ -2041,6 +2222,8 @@ impl GraphCompiler {
             plan.event_out[source][count] = *cable;
             plan.event_out_counts[source] += 1;
         }
+        plan.slot_latency = self.slot_latency;
+        plan.kinds = self.kinds;
         Ok(plan)
     }
 
@@ -2058,6 +2241,7 @@ impl GraphCompiler {
         let slot = self.track_voice[track];
         let node_id = self.fresh_id();
         self.slot_ids[slot as usize] = node_id;
+        self.slot_latency[slot as usize] = node.latency_samples().min(u32::MAX as usize) as u32;
         let Ok(plan) = self.compile() else {
             return Err(node);
         };
@@ -2081,6 +2265,7 @@ impl GraphCompiler {
         let node_id = self.fresh_id();
         let node = Box::new(SynthProcessor::new(self.sample_rate));
         self.slot_ids[slot as usize] = node_id;
+        self.slot_latency[slot as usize] = 0;
         let plan = self.compile()?;
         Ok(self.build_update(plan, vec![(slot, node_id, node)], &[slot]))
     }
@@ -2111,6 +2296,7 @@ impl GraphCompiler {
         let free = free_idx as u16;
         self.occupied[free as usize] = true;
         self.kinds[free as usize] = NodeKind::Plain;
+        self.slot_latency[free as usize] = node.latency_samples().min(u32::MAX as usize) as u32;
         if let Some((to, port)) = downstream {
             self.remove_cable(delay, to);
             if self
@@ -2120,6 +2306,7 @@ impl GraphCompiler {
             {
                 self.occupied[free as usize] = false;
                 self.kinds[free as usize] = NodeKind::Plain;
+                self.slot_latency[free as usize] = 0;
                 let _ = self.remove_cable(delay, free);
                 let _ = self.remove_cable(free, to);
                 let _ = self.add_cable(delay, to, port);
@@ -2128,6 +2315,7 @@ impl GraphCompiler {
         } else if self.add_cable(delay, free, 0).is_err() {
             self.occupied[free as usize] = false;
             self.kinds[free as usize] = NodeKind::Plain;
+            self.slot_latency[free as usize] = 0;
             return Err(node);
         }
         if let Some(e) = self.track_effects[track]
@@ -2144,6 +2332,7 @@ impl GraphCompiler {
                 self.occupied[free as usize] = false;
                 self.slot_ids[free as usize] = 0;
                 self.kinds[free as usize] = NodeKind::Plain;
+                self.slot_latency[free as usize] = 0;
                 if let Some((to, port)) = downstream {
                     let _ = self.add_cable(delay, to, port);
                 } else {
@@ -2200,6 +2389,7 @@ impl GraphCompiler {
                 self.occupied[effect as usize] = false;
                 self.slot_ids[effect as usize] = 0;
                 self.kinds[effect as usize] = NodeKind::Plain;
+                self.slot_latency[effect as usize] = 0;
                 removed[removed_count] = effect;
                 removed_count += 1;
             }
@@ -2284,6 +2474,7 @@ impl GraphCompiler {
         for &slot in &slots[..count] {
             self.occupied[slot as usize] = false;
             self.slot_ids[slot as usize] = 0;
+            self.slot_latency[slot as usize] = 0;
         }
         self.track_voice[track] = NO_EDGE;
         self.track_delay[track] = NO_EDGE;
@@ -2575,12 +2766,16 @@ impl GraphCompiler {
         self.occupied[free as usize] = true;
         self.slot_ids[free as usize] = node_id;
         self.kinds[free as usize] = kind;
+        // S2-3: capture the intrinsic latency while the processor is still
+        // here (the compiler only keeps slot metadata, not the nodes).
+        self.slot_latency[free as usize] = node.latency_samples().min(u32::MAX as usize) as u32;
         let plan = match self.compile() {
             Ok(plan) => plan,
             Err(_) => {
                 self.occupied[free as usize] = false;
                 self.slot_ids[free as usize] = 0;
                 self.kinds[free as usize] = NodeKind::Plain;
+                self.slot_latency[free as usize] = 0;
                 return Err(TopologyError::Cycle);
             }
         };
@@ -2666,7 +2861,12 @@ impl GraphCompiler {
         let Some(slot) = self.node_slot(node_id) else {
             return Err(node);
         };
+        // S2-3: the swap keeps the slot, so the latency table must follow the
+        // new processor — and roll back if the plan refuses it.
+        let old_latency = self.slot_latency[slot as usize];
+        self.slot_latency[slot as usize] = node.latency_samples().min(u32::MAX as usize) as u32;
         let Ok(plan) = self.compile() else {
+            self.slot_latency[slot as usize] = old_latency;
             return Err(node);
         };
         // apply_update removes first, installs second: the old node in the
@@ -2707,6 +2907,7 @@ impl GraphCompiler {
         self.occupied[free as usize] = true;
         self.slot_ids[free as usize] = new_id;
         self.kinds[free as usize] = NodeKind::Plain;
+        self.slot_latency[free as usize] = node.latency_samples().min(u32::MAX as usize) as u32;
         // Preserve the original cable's destination channel when splicing:
         // `from → (mixer, ch)` becomes `from → new → (mixer, ch)`.
         let old_port = self.cables[..self.cable_count]
@@ -2739,6 +2940,7 @@ impl GraphCompiler {
         self.occupied[free as usize] = false;
         self.slot_ids[free as usize] = 0;
         self.kinds[free as usize] = NodeKind::Plain;
+        self.slot_latency[free as usize] = 0;
         let _ = self.add_cable(from, to, old_port);
     }
 
@@ -2838,6 +3040,7 @@ impl GraphCompiler {
         self.occupied[slot as usize] = false;
         self.slot_ids[slot as usize] = 0;
         self.kinds[slot as usize] = NodeKind::Plain;
+        self.slot_latency[slot as usize] = 0;
         let plan = self.compile()?;
         Ok(self.build_update(plan, Vec::new(), &[slot]))
     }
@@ -3287,6 +3490,170 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Emits a single one-frame pulse at `pulse_at` and reports the same
+    /// value as its intrinsic latency, so the PDC can align it.
+    struct PulseSource {
+        position: usize,
+        pulse_at: usize,
+    }
+
+    impl Processor for PulseSource {
+        fn process(&mut self, _ctx: &ProcessContext, buffer: &mut AudioBuffer) {
+            let frames = buffer.channel(0).map_or(0, |channel| channel.len());
+            for ch in 0..buffer.channels() {
+                if let Some(channel) = buffer.channel_mut(ch) {
+                    for (index, sample) in channel.iter_mut().enumerate() {
+                        *sample = if self.position + index == self.pulse_at {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                    }
+                }
+            }
+            self.position += frames;
+        }
+
+        fn latency_samples(&self) -> usize {
+            self.pulse_at
+        }
+    }
+
+    /// Builds a two-branch graph: `fast → delayed → mixer.ch0` and
+    /// `fast2 → mixer.ch1`, mixer → master.
+    fn pdc_compiler(
+        delayed_pulse_at: usize,
+    ) -> (GraphCompiler, RtGraph, rtrb::Producer<RecycledNode>) {
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let mut apply =
+            |graph: &mut RtGraph, update: GraphUpdate| graph.apply_update(update, &mut recycle_tx);
+
+        apply(
+            &mut graph,
+            compiler
+                .add_node(2, NodeKind::Mixer, Box::new(MixerProcessor::new(2)))
+                .expect("add mixer"),
+        );
+        apply(
+            &mut graph,
+            compiler
+                .add_node(
+                    3,
+                    NodeKind::Plain,
+                    Box::new(PulseSource {
+                        position: 0,
+                        pulse_at: 0,
+                    }),
+                )
+                .expect("add fast source"),
+        );
+        apply(
+            &mut graph,
+            compiler
+                .add_node(
+                    4,
+                    NodeKind::Plain,
+                    Box::new(PulseSource {
+                        position: 0,
+                        pulse_at: delayed_pulse_at,
+                    }),
+                )
+                .expect("add delayed node"),
+        );
+        apply(
+            &mut graph,
+            compiler
+                .add_node(
+                    5,
+                    NodeKind::Plain,
+                    Box::new(PulseSource {
+                        position: 0,
+                        pulse_at: 0,
+                    }),
+                )
+                .expect("add second source"),
+        );
+        apply(&mut graph, compiler.connect_nodes(3, 4, 0).expect("3 → 4"));
+        apply(
+            &mut graph,
+            compiler.connect_nodes(4, 2, 0).expect("4 → mixer ch0"),
+        );
+        apply(
+            &mut graph,
+            compiler.connect_nodes(5, 2, 1).expect("5 → mixer ch1"),
+        );
+        apply(
+            &mut graph,
+            compiler
+                .connect_nodes(2, super::MASTER_NODE_ID, 0)
+                .expect("mixer → master"),
+        );
+        (compiler, graph, recycle_tx)
+    }
+
+    #[test]
+    fn pdc_aligns_a_fast_branch_to_a_latency_node() {
+        const DELAY: usize = 10;
+        let (compiler, mut graph, _tx) = pdc_compiler(DELAY);
+
+        assert!(graph.plan.pdc_active, "a latency node must activate PDC");
+        let mixer = compiler.node_slot(2).expect("mixer slot");
+        assert_eq!(
+            &graph.pdc_delay[mixer as usize][..2],
+            &[0, DELAY as u16],
+            "the delayed branch is untouched, the fast one is shifted"
+        );
+
+        graph.process_block(&ctx());
+        let master = graph.plan.master_slot as usize;
+        let output = graph.slots[master]
+            .as_ref()
+            .expect("master installed")
+            .output
+            .channel(0)
+            .expect("master left channel");
+        assert!(
+            output[..DELAY].iter().all(|sample| sample.abs() < 1e-9),
+            "both branches must be silent before the delayed pulse"
+        );
+        assert!(
+            output[DELAY] > 0.1,
+            "both pulses should land together at frame {DELAY}, got {}",
+            output[DELAY]
+        );
+        assert!(
+            output[DELAY + 1..].iter().all(|sample| sample.abs() < 1e-9),
+            "nothing may follow the aligned pulse"
+        );
+    }
+
+    #[test]
+    fn graph_without_latency_keeps_the_fast_path() {
+        let graph = default_graph();
+        assert!(!graph.plan.pdc_active, "no latency node → no PDC work");
+        assert!(
+            graph
+                .pdc_delay
+                .iter()
+                .all(|delays| delays.iter().all(|&delay| delay == 0)),
+            "no edge may carry a compensation delay"
+        );
+    }
+
+    #[test]
+    fn pdc_clamps_to_the_history_ring() {
+        let huge = super::MAX_PDC_SAMPLES * 2;
+        let (compiler, graph, _tx) = pdc_compiler(huge);
+        let mixer = compiler.node_slot(2).expect("mixer slot");
+        let max_delay = super::MAX_PDC_SAMPLES - BLOCK;
+        assert_eq!(
+            usize::from(graph.pdc_delay[mixer as usize][1]),
+            max_delay,
+            "a latency beyond the ring is clamped to the usable depth"
+        );
     }
 
     #[test]

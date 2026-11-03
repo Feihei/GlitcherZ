@@ -39,7 +39,7 @@
 | D10 | 输入节点默认接线 | 新建时**不连任何输出**，gain 默认 0 dB；UI 明示"未连接 = 无声" | 自动连到 master 会在用户插上麦克风的瞬间啸叫。宁可多一步拖线 |
 | D11 | 录音素材落盘 | 工程旁 `<stem>.media/`，clip 存**相对路径**；`Project::base_dir`（不序列化）在加载时设为工程目录 | 顺手解决 review 里「换机器全变静音」。绝对路径继续按绝对处理，插件路径不受影响 |
 | D12 | 循环录音 | loop 打开时**每个 pass 覆盖上一 pass**（只留最后一遍），不做 comping / take lanes | 第一版价值最高的是"练到满意为止"，comping 是另一个量级的功能；覆盖语义可预测 |
-| D13 | 录音对齐 | 先做**手动 offset**（采样数，UI 可调，默认 0）；PDC（`latency_samples` 接进图编译期）落地后再自动算 | 自动对齐依赖 PDC 基础设施，S2-3 尚未实施；手动 offset 能立刻可用 |
+| D13 | 录音对齐 | 先做**手动 offset**（采样数，transport 的 `Latency` 控件可调，默认 0，会话级不随工程保存）；**PDC 已于 S2-3 落地**（`latency_samples` 接进图编译期，见 `node-graph.md` §11），但录音链路自动对齐仍属后续项 | 手动 offset 已可用；自动对齐需要汇总输入设备 → 轨道链的往返延迟，PDC 只覆盖图内部分 |
 | D14 | pre-roll | 录音前 `pre_roll_bars`（0–2，默认 1）内**正常播放素材与 click，但不采集**；UI 丢弃 `ticks < record_start_ticks` 的事件 | 这是 pre-roll 而非 count-in（不从负数起拍），实现只需一次比较，引擎零改动 |
 | D15 | 一个 take = 一个 undo 步 | 录音停止时一次性写入 clip 的 notes，走一次 `begin_edit` / `commit_edit` | 逐音符入栈会让 undo 栈被一次录音灌满 200 步 |
 | D16 | armed track 的确定 | ~~**当前选中的 MIDI 轨**……~~ **已被 D22 取代**（选中轨不再参与录音，归属由轨输入口的连线决定） | 原方案把 arming 做进选择，零额外 UI；但"选中轨"与"实际演奏路径"是两条互不相干的线，录完回放往往不是同一个乐器。R6 用显式接线取代 |
@@ -171,7 +171,8 @@ LFO/curve ──automation──► Curve 1 输入口  （R8：块边界采样 t
   手动延迟 offset 平移 clip 起点。音频 + MIDI take 同一次 undo；无设备 / 未保存工程拒绝开录。
 - [x] **R5 收尾** ✅ 2026-11-01
   录音后自动选中新 clip（MIDI 与音频都选中，并切到 Timeline）、take 命名
-  （`Take N · bar M`）、transport 输入电平条、输入 ring 溢出告警。
+  （`Take N · bar M`）、Audio In 节点与 Inspector 的输入电平条（按节点 channel）、
+  输入 ring 溢出告警。
   PDC 自动对齐待 S2-3；立体声对 / 多设备输入留作后续。
 - [x] **R7 MIDI 烘培**（D26 第二类 tap）✅ 2026-11-01：`RtGraph` 在事件派发处按
   node_id + 轨位图抓取本块事件（`baked_notes`），`BlockRunner` 用块末 transport tick
@@ -187,7 +188,7 @@ LFO/curve ──automation──► Curve 1 输入口  （R8：块边界采样 t
 - [x] **R9 系统声音内录**（WASAPI loopback）✅ 2026-11-03
   `RecordSource`（Default / Capture / Loopback）+ `record_sources()` 枚举；
   loopback 走 render 端点的 `supported_output_configs()`，按端点原生采样率开流（无重采样）；
-  transport 设备菜单分「Inputs / System playback (loopback)」两组，选择持久化到
+  Audio In 节点与 Inspector 的设备菜单分「Inputs / System playback (loopback)」两组，选择持久化到
   `UiState.{input_device, input_loopback}`；按 Rec 时若源为 loopback 明确提示
   "本工程回放也会进 take"。
 
@@ -250,6 +251,6 @@ audio 轨上，现在好像还不支持"*。
 | D37 | 内录会把**本工程自己的回放**录进 take | 引擎输出与该端点同一个设备时这是物理必然。按 Rec 的启动消息里明说，不自动静音、不临时改路由——用户可能就是想内录整机混音（含本工程）。想只录外部声音就把引擎输出换到另一个设备，或先停走带 |
 | D38 | 同一时刻只有一条录音流 | 内录 + 麦克风同时录需要第二条 stream 与混音归属规则，属 R4 既有"单一输入设备"限制的延伸，本轮不做 |
 
-**连接方式**：transport 的 `In` → 菜单里 `System playback (loopback)` 分组（`↩ 设备名`），
-选中即换流并重建图（`Input` 节点重新 latch 新 ring）。选择持久化到
+**连接方式**：Audio In 节点的设备 chip（或 Inspector 的录音源菜单）→
+`System playback (loopback)` 分组（`↩ 设备名`），选中即换流并重建图（`Input` 节点重新 latch 新 ring）。选择持久化到
 `UiState.{input_device, input_loopback}`；设备拔掉时回落系统默认并在日志/状态栏说明。

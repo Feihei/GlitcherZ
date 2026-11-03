@@ -820,6 +820,10 @@ pub struct Vst3Node {
     /// Handoff gate shared with the control-side guard (the CLAP mirror; see
     /// `glitcherz_engine::host_gate::StateGate`).
     state_gate: Arc<StateGate>,
+    /// Intrinsic latency reported by `IAudioProcessor::getLatencySamples` at
+    /// instantiation (S2-3 PDC), in frames. A later component restart that
+    /// changes it is not tracked yet.
+    latency: u32,
 }
 
 // SAFETY: The node is moved wholesale between threads (constructed on the
@@ -985,6 +989,13 @@ impl Vst3Instance {
             .expect("HostParamChanges always implements IParameterChanges")
             .as_ptr();
 
+        // S2-3: query the intrinsic latency once, on the control thread, while the
+        // processor is still exclusively ours. `getLatencySamples` is a
+        // constant query (no processing state), safe on an initialized
+        // component.
+        // SAFETY: `audio_processor` is an initialized COM interface held by
+        // this function; the call has no out-parameters.
+        let latency = unsafe { audio_processor.getLatencySamples() };
         let node = Vst3Node {
             event_list,
             param_changes,
@@ -1000,6 +1011,7 @@ impl Vst3Instance {
             pending: [PendingVst3Event::NoteOff { note: 0 }; MAX_PENDING_EVENTS],
             pending_count: 0,
             state_gate: Arc::clone(&state_gate),
+            latency,
         };
 
         // Instantiation success path: objects are handed to the guard; the
@@ -1291,6 +1303,10 @@ impl Processor for Vst3Node {
         }
         true
     }
+
+    fn latency_samples(&self) -> usize {
+        self.latency as usize
+    }
 }
 
 // This crate does not export GetPluginFactory (that is a plugin-side
@@ -1352,9 +1368,21 @@ mod tests {
         Some((instance, ctx))
     }
 
+    /// S2-3: the node reports the latency captured from
+    /// `IAudioProcessor::getLatencySamples` at instantiation. The fixture
+    /// returns 0; this locks the read path (no panic, no stale value).
+    #[test]
+    fn node_reports_the_plugins_latency() {
+        let Some((instance, _ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        assert_eq!(instance.node.latency_samples(), 0);
+    }
+
     #[test]
     fn parse_cid_round_trip() {
         let text = "52455a4f5a53494e4500000000000001";
+
         let cid = parse_cid(text).expect("valid CID");
         assert_eq!(super::format_cid(&cid), text);
         assert!(parse_cid("nothex").is_none());

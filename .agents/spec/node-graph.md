@@ -211,3 +211,17 @@ pub struct CableDoc {
 - mixer 通道的自动化轨道支持（`MixerGain(u8)` 等载荷参数 + 自动化参数菜单动态枚举所选 mixer 的各通道）——后续版本；
 - mixer 逐通道电平表（v1 电平点 = 轨道末端节点；通道表后续按需求议）；
 - `MixerLevels` → 节点电平的 UI 呈现（画布上节点发光 vs 保留电平条）。
+## 11. PDC — 插件延迟补偿（S2-3，2026-11-03 落地）
+
+**目标**：有 latency 的插件与其他分支并联时不产生相位/时间错位。内置效果器目前全部报告 0 延迟，因此默认工程行为零变化。
+
+**决策**：
+
+- **D23 延迟来源**：`Processor::latency_samples()` 是唯一来源。编译器不持有处理器，所以由控制线程在**安装节点时**读取并写入 `GraphCompiler::slot_latency`；CLAP 读 `clap_plugin_latency.get()`、VST3 读 `IAudioProcessor::getLatencySamples()`（均在实例化后读取一次）。动态延迟变化（CLAP `rescan` / VST3 `restartComponent`）暂不跟踪，重装节点才刷新。
+- **D24 对齐算法**：按拓扑序累积 `out_latency[slot] = own + max(入边源 out_latency)`，每条入边补偿 `max_in - out_latency[src]`。**Feedback 的 tap 边不参与**：那 1 块延迟是反馈语义本身，不是待纠正的错位。延迟表由 `RtGraph::compute_pdc` 在每次拓扑交换时从 `ExecPlan`（`slot_latency` + `kinds` + 拓扑序）推导，**不放进 `ExecPlan`**：结构更新载荷保持不变，避免 `GraphUpdate` 因多出 4 KiB 而放大栈占用。
+- **D25 运行时**：每个 `NodeSlot` 预分配 `MAX_PDC_SAMPLES`（16384 帧，48 kHz 下 ≈ 341 ms）的立体声 interleaved ring。plan 有非零延迟时（`pdc_active`）每块把 output 写入 ring，下游边按偏移读取（`sum_into_delayed`）；零延迟图继续走原来的直接求和快路径。ring 由控制线程分配、随 `NodeDeployment` 安装，移除时随 `RecycledNode` 回控制线程释放（音频线程零分配/零释放）。
+- **D26 上限**：补偿超过 `MAX_PDC_SAMPLES - block_size` 时钳制（音频继续播放，只是未完全对齐）。
+
+**验证**：`pdc_aligns_a_fast_branch_to_a_latency_node`（两路脉冲汇合对齐）、`graph_without_latency_keeps_the_fast_path`（默认图零 PDC 开销）、`pdc_clamps_to_the_history_ring`；CLAP/VST3 宿主各有一项 `node_reports_the_plugins_latency`（fixture 无延迟扩展时回落 0）。
+
+**仍待做**：录音 PDC 自动对齐（R5 目前用手动 `Latency` offset）、插件动态延迟更新、外部输入/输出的整体 round-trip 对齐。

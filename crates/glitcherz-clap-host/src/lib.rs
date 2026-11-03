@@ -49,6 +49,7 @@ pub use clack_extensions::gui::GuiSize;
 use clack_extensions::gui::{
     GuiApiType, GuiConfiguration, GuiError, HostGui, HostGuiImpl, PluginGui,
 };
+use clack_extensions::latency::PluginLatency;
 use clack_extensions::log::{HostLog, HostLogImpl};
 use clack_extensions::params::{
     HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamRescanFlags,
@@ -299,6 +300,10 @@ struct GlitcherZHostShared {
     /// Captured during plugin initialization: the plugin's gui extension,
     /// when implemented (read back after instantiation for open/close).
     gui_ext: OnceLock<Option<PluginGui>>,
+    /// Captured during plugin initialization: the plugin's latency extension
+    /// (S2-3 PDC). Read once at instantiation; a dynamic latency change
+    /// (`clap_host_latency.rescan`) is not tracked yet.
+    latency_ext: OnceLock<Option<PluginLatency>>,
     /// Gui callback facts shared with the guard (polled via
     /// [`ClapInstanceGuard::editor_events`]).
     gui: Arc<GuiHostState>,
@@ -315,6 +320,9 @@ impl SharedHandler<'_> for GlitcherZHostShared {
     fn initializing(&self, instance: InitializingPluginHandle<'_>) {
         let _ = self.state_ext.set(instance.get_extension::<PluginState>());
         let _ = self.gui_ext.set(instance.get_extension::<PluginGui>());
+        let _ = self
+            .latency_ext
+            .set(instance.get_extension::<PluginLatency>());
     }
 }
 
@@ -435,6 +443,9 @@ pub struct ClapNode {
     pending_count: usize,
     /// Handoff gate shared with the control-side guard (see [`StateGate`]).
     state_gate: Arc<StateGate>,
+    /// Intrinsic latency reported by the plugin's latency extension at
+    /// instantiation (S2-3 PDC), in frames.
+    latency: u32,
 }
 
 /// Guard holding the plugin dynamic library and instance. **Must live as
@@ -737,6 +748,7 @@ impl ClapInstance {
             move |_| GlitcherZHostShared {
                 state_ext: OnceLock::new(),
                 gui_ext: OnceLock::new(),
+                latency_ext: OnceLock::new(),
                 gui: Arc::clone(&shared_gui_state),
                 params: Arc::clone(&shared_params_state),
             },
@@ -772,6 +784,14 @@ impl ClapInstance {
         // processing must be started via as_started_mut before process.
         let processor: PluginAudioProcessor<GlitcherZHostHandlers> = stopped.into();
 
+        // S2-3: report the plugin's intrinsic latency to the graph compiler. Read
+        // once after activation (the extension is [main-thread]); a plugin that
+        // changes latency later only takes effect on the next instantiation.
+        let latency = instance
+            .access_shared_handler(|shared| shared.latency_ext.get().copied())
+            .flatten()
+            .map(|latency| latency.get(&instance.plugin_handle()))
+            .unwrap_or(0);
         let state_gate = Arc::new(StateGate::default());
 
         Ok(Self {
@@ -785,7 +805,7 @@ impl ClapInstance {
                 params: params_state,
                 gui_open: false,
             },
-            node: ClapNode::new(processor, config, state_gate),
+            node: ClapNode::new(processor, config, state_gate, latency),
         })
     }
 
@@ -819,6 +839,7 @@ impl ClapNode {
         processor: impl Into<PluginAudioProcessor<GlitcherZHostHandlers>>,
         config: ClapInstanceConfig,
         state_gate: Arc<StateGate>,
+        latency: u32,
     ) -> Self {
         let frames = config.max_frames.max(FIXED_BLOCK_SIZE as u32) as usize;
         Self {
@@ -832,6 +853,7 @@ impl ClapNode {
             pending: [PendingClapEvent::NoteOff { note: 0 }; MAX_PENDING_EVENTS],
             pending_count: 0,
             state_gate,
+            latency,
         }
     }
 
@@ -1012,6 +1034,10 @@ impl Processor for ClapNode {
             data: [status, (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8],
         })
     }
+
+    fn latency_samples(&self) -> usize {
+        self.latency as usize
+    }
 }
 
 #[cfg(test)]
@@ -1065,6 +1091,17 @@ mod tests {
             sec_per_tick: 60.0 / (120.0 * 960.0),
         };
         Some((instance, ctx))
+    }
+
+    /// S2-3: the node reports the latency captured from the plugin extension.
+    /// The fixture implements no latency extension, so the value is 0 — this
+    /// exercises the "extension missing" path (no panic, no stale value).
+    #[test]
+    fn node_reports_the_plugins_latency() {
+        let Some((instance, _ctx)) = spawn_test_plugin() else {
+            return;
+        };
+        assert_eq!(instance.node.latency_samples(), 0);
     }
 
     #[test]
