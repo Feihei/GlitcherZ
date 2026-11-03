@@ -216,6 +216,13 @@ impl Session {
         self.dirty = false;
     }
 
+    /// Marks the document dirty without touching it (crash recovery: the
+    /// snapshot came from disk but has never been saved as this project, so
+    /// the title must show the unsaved marker and closing must ask first).
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     /// Change counter; bumped on every mutation.
     pub fn revision(&self) -> u64 {
         self.revision

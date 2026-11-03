@@ -42,7 +42,7 @@
 //!   id 1 = master output reserved ([`MASTER_NODE_ID`]), document nodes
 //!   start from 2.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 pub mod file;
@@ -50,7 +50,8 @@ pub mod ops;
 pub mod smf;
 
 pub use file::{
-    ModelError, PROJECT_VERSION, ProjectFile, load_project, parse_project, save_project,
+    AUTOSAVE_SUFFIX, ModelError, PROJECT_VERSION, ProjectFile, autosave_path, load_project,
+    parse_project, save_autosave, save_project,
 };
 pub use ops::{
     DEFAULT_SEED, DurationOp, QuantizeOptions, RandomizeOptions, StrumDirection, StrumOptions,
@@ -4925,8 +4926,13 @@ impl Project {
     /// a relative one is joined to the project directory. With no `base_dir`
     /// (unsaved project / bare document) the relative path is returned
     /// unchanged, which keeps tests and headless tools working against the cwd.
+    ///
+    /// Stored paths use `/` (S3b): a project written on Windows has to open on
+    /// macOS and the other way round, so a `\` from an older file is folded back
+    /// to `/` here instead of being read as a file name character on unix.
     pub fn resolve_media_path(&self, path: &str) -> PathBuf {
-        let candidate = Path::new(path);
+        let stored = path.replace('\\', "/");
+        let candidate = Path::new(&stored);
         if candidate.is_absolute() {
             return candidate.to_path_buf();
         }
@@ -4937,16 +4943,98 @@ impl Project {
     }
 
     /// The string to store in a clip for `path`: relative to the project
-    /// directory when the file lives under it, absolute otherwise.
+    /// directory when the file lives under it, absolute otherwise. Separators
+    /// are written as `/` so the project file stays portable (S3b).
     pub fn media_path_string(&self, path: &Path) -> String {
-        match &self.base_dir {
+        let text = match &self.base_dir {
             Some(dir) => path
                 .strip_prefix(dir)
                 .unwrap_or(path)
                 .to_string_lossy()
                 .to_string(),
             None => path.to_string_lossy().to_string(),
+        };
+        text.replace('\\', "/")
+    }
+
+    /// Every media file the document references (S3b): sample instruments,
+    /// SoundFonts, drum-kit slots and audio clips, as the strings stored in the
+    /// document. Unloaded nodes / clips (empty path) are skipped, duplicates
+    /// appear once.
+    ///
+    /// Plugin binaries (`VoiceSpec::Clap` / `Vst3`) are deliberately **not**
+    /// media: they are installed software, not project assets.
+    pub fn media_paths(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for node in &self.graph.nodes {
+            let voice = match node {
+                NodeDoc::Instrument { voice, .. } | NodeDoc::Effect { voice, .. } => voice,
+                _ => continue,
+            };
+            match voice {
+                VoiceSpec::Sample { path, .. } | VoiceSpec::SoundFont { path, .. } => {
+                    push_media_path(&mut out, path);
+                }
+                VoiceSpec::DrumKit { slots, .. } => {
+                    for slot in slots {
+                        push_media_path(&mut out, &slot.path);
+                    }
+                }
+                _ => {}
+            }
         }
+        for track in &self.audio_tracks {
+            for clip in &track.clips {
+                push_media_path(&mut out, &clip.path);
+            }
+        }
+        out
+    }
+
+    /// Rewrites stored media paths through `map` (old string → new string);
+    /// anything not in the map is left alone. The building block of "collect
+    /// media files" and "relocate missing media" (S3b) — both are one edit.
+    pub fn rewrite_media_paths(&mut self, map: &HashMap<String, String>) {
+        if map.is_empty() {
+            return;
+        }
+        for node in &mut self.graph.nodes {
+            let voice = match node {
+                NodeDoc::Instrument { voice, .. } | NodeDoc::Effect { voice, .. } => voice,
+                _ => continue,
+            };
+            match voice {
+                VoiceSpec::Sample { path, .. } | VoiceSpec::SoundFont { path, .. } => {
+                    if let Some(new) = map.get(path.as_str()) {
+                        *path = new.clone();
+                    }
+                }
+                VoiceSpec::DrumKit { slots, .. } => {
+                    for slot in slots.iter_mut() {
+                        if let Some(new) = map.get(slot.path.as_str()) {
+                            slot.path = new.clone();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for track in &mut self.audio_tracks {
+            for clip in &mut track.clips {
+                if let Some(new) = map.get(clip.path.as_str()) {
+                    clip.path = new.clone();
+                }
+            }
+        }
+    }
+
+    /// Referenced media paths that do not resolve to an existing file, as the
+    /// **stored** strings (so the caller can rewrite them by key).
+    pub fn missing_media(&self) -> Vec<String> {
+        self.media_paths()
+            .into_iter()
+            .filter(|stored| !self.resolve_media_path(stored).is_file())
+            .collect()
     }
 
     /// The document's bar length in ticks (U3a): every bar-based measure
@@ -5279,6 +5367,14 @@ impl Default for ProjectMetadata {
             markers: Vec::new(),
             time_signature: TimeSignature::COMMON,
         }
+    }
+}
+
+/// Appends `path` to `out` unless it is empty or already listed (S3b: one
+/// media file can be shared by several clips / nodes).
+fn push_media_path(out: &mut Vec<String>, path: &str) {
+    if !path.is_empty() && !out.iter().any(|existing| existing == path) {
+        out.push(path.to_string());
     }
 }
 
@@ -7135,11 +7231,102 @@ mod tests {
             project.media_path_string(std::path::Path::new("songs/demo.media/rec-1.wav")),
             "demo.media/rec-1.wav"
         );
+        // S3b: separators are stored as `/` whatever the host uses, and a `\`
+        // written by an older Windows build still resolves.
+        assert_eq!(
+            project.media_path_string(
+                &std::path::Path::new("songs")
+                    .join("demo.media")
+                    .join("x.wav")
+            ),
+            "demo.media/x.wav"
+        );
+        assert_eq!(
+            project.resolve_media_path("demo.media\\x.wav"),
+            std::path::PathBuf::from("songs")
+                .join("demo.media")
+                .join("x.wav")
+        );
         project.base_dir = None;
         assert_eq!(
             project.resolve_media_path("demo.media/x.wav"),
             std::path::PathBuf::from("demo.media/x.wav")
         );
+    }
+
+    /// S3b: every media reference is enumerated once, rewritten by map, and a
+    /// path that does not resolve to a file is reported as missing.
+    #[test]
+    fn media_references_are_enumerated_rewritten_and_checked() {
+        let dir = std::env::temp_dir().join(format!("glitcherz_media_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("demo.media")).expect("temp dir");
+        let present = dir.join("demo.media").join("kick.wav");
+        std::fs::write(&present, b"not really a wav").expect("write");
+
+        let mut project = Project {
+            base_dir: Some(dir.clone()),
+            ..Project::default()
+        };
+        // One audio clip with media, one without (an empty clip is not a
+        // reference), plus a missing sample and a drum slot sharing the
+        // present file.
+        project.audio_tracks = vec![crate::AudioTrack {
+            clips: vec![
+                crate::AudioClip {
+                    path: "demo.media/kick.wav".to_string(),
+                    source_len: 1.0,
+                    ..crate::AudioClip::default()
+                },
+                crate::AudioClip::default(),
+            ],
+            ..crate::AudioTrack::default()
+        }];
+        let sample_id = project.graph.first_mixer().unwrap().node_id() + 1;
+        for (node_id, path) in [
+            (sample_id, "demo.media/kick.wav"),
+            (sample_id + 1, "gone/snare.wav"),
+        ] {
+            project.graph.nodes.push(NodeDoc::Instrument {
+                node_id,
+                track: 0,
+                voice: VoiceSpec::Sample {
+                    path: path.to_string(),
+                    root_note: 60,
+                    play_mode: SamplePlayMode::Gate,
+                    gain: 1.0,
+                },
+                synth: SynthParams::default(),
+            });
+        }
+
+        let mut paths = project.media_paths();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "demo.media/kick.wav".to_string(),
+                "gone/snare.wav".to_string()
+            ],
+            "duplicates collapse, empty paths are skipped"
+        );
+        assert_eq!(project.missing_media(), vec!["gone/snare.wav".to_string()]);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "gone/snare.wav".to_string(),
+            "demo.media/snare.wav".to_string(),
+        );
+        project.rewrite_media_paths(&map);
+        assert_eq!(project.media_paths().len(), 2);
+        assert_eq!(project.media_paths()[1], "demo.media/snare.wav");
+        assert_eq!(
+            project.missing_media(),
+            vec!["demo.media/snare.wav".to_string()],
+            "the rewritten path is missing until the file is copied"
+        );
+
+        project.base_dir = None;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// U3b (spec `tempo-meter.md` D1/D2/D7): the Timeline In terminal accepts

@@ -59,6 +59,7 @@ use glitcherz_model::{
     Project, SamplePlayMode, SongLoop, SynthParams, SynthWaveform, TrackKind, VoiceSpec,
 };
 
+pub mod autosave;
 pub mod curve;
 pub mod effect;
 pub mod event_list;
@@ -66,6 +67,7 @@ pub mod export_audio;
 pub mod focus;
 pub mod fonts;
 pub mod grid;
+pub mod media;
 pub mod patch;
 pub mod piano_roll;
 pub mod plugin_catalog;
@@ -1523,6 +1525,19 @@ pub struct GlitcherZApp {
     project_path: Option<PathBuf>,
     /// Recently opened project files (persisted).
     recent: Vec<PathBuf>,
+    /// Crash-recovery snapshots found at startup (S3a). Emptied once the user
+    /// has answered the prompt; a non-empty list draws the recovery modal.
+    recovery: Vec<autosave::Candidate>,
+    /// The app's storage directory (the untitled document's snapshot lives
+    /// there). `None` on a platform without one — then only saved projects are
+    /// snapshotted.
+    autosave_app_dir: Option<PathBuf>,
+    /// When the next snapshot is due (S3a).
+    autosave_clock: autosave::Clock,
+    /// Media the document references but cannot find (S3b). Non-empty draws
+    /// the missing-media prompt; every path is a **stored** string so it can be
+    /// rewritten by key. Recomputed on open, collect and relocate.
+    missing_media: Vec<String>,
     /// Status bar message (text + time shown + severity; disappears
     /// automatically after a timeout).
     status_message: Option<(String, Instant, MessageKind)>,
@@ -1709,6 +1724,13 @@ pub struct GlitcherZApp {
     export_dialog_open: bool,
     /// Selected range inside the export dialog.
     export_range_choice: export_audio::ExportRange,
+    /// Selected bit depth (S3c). Sticky across exports: a delivery format is
+    /// a session preference, not a per-file question.
+    export_bits: export_audio::Bits,
+    /// Selected export sample rate (S3c); starts at the device rate.
+    export_sample_rate: u32,
+    /// Whether the export also writes one file per track (S3c).
+    export_stems: bool,
     /// Whether the Undo History panel is open (S1-4). View state only.
     undo_history_open: bool,
     /// Live output setup (S1-5): persisted to `UiState` and re-applied by
@@ -1786,6 +1808,36 @@ fn relocate_in<T: timeline::Placement>(
     touched
 }
 
+/// Writes captured plugin state blobs into `project` (S3a: the manual save
+/// applies them to the live document, the auto-save snapshot to a throwaway
+/// clone — a snapshot must not dirty the document it copies).
+fn apply_plugin_state(project: &mut Project, blobs: Vec<(u64, Vec<u8>)>) {
+    for (doc_id, blob) in blobs {
+        let Some(node) = project.graph.node_by_id_mut(doc_id) else {
+            continue;
+        };
+        match node {
+            NodeDoc::Instrument {
+                voice: VoiceSpec::Clap { state, .. },
+                ..
+            }
+            | NodeDoc::Effect {
+                voice: VoiceSpec::Clap { state, .. },
+                ..
+            }
+            | NodeDoc::Instrument {
+                voice: VoiceSpec::Vst3 { state, .. },
+                ..
+            }
+            | NodeDoc::Effect {
+                voice: VoiceSpec::Vst3 { state, .. },
+                ..
+            } => *state = blob,
+            _ => {}
+        }
+    }
+}
+
 impl GlitcherZApp {
     /// Build the window app, restore persisted recent files, and push the whole project document
     /// down via incremental graph building + the command queue (takes effect at the next audio
@@ -1798,6 +1850,11 @@ impl GlitcherZApp {
             .storage
             .and_then(|storage| eframe::get_value(storage, UI_STATE_KEY))
             .unwrap_or_default();
+        // S3a: a snapshot left on disk means the previous run died with
+        // unsaved work (a clean save or exit removes it). Collect the
+        // candidates before `ui_state` is taken apart below.
+        let autosave_app_dir = eframe::storage_dir("GlitcherZ");
+        let recovery = autosave::candidates(&ui_state.recent_files, autosave_app_dir.as_deref());
         // U9 E2: the plugin catalog restores from storage and plans the
         // startup scan (a warm cache usually leaves nothing to do).
         let cached_plugins = cc
@@ -1828,6 +1885,9 @@ impl GlitcherZApp {
         } else {
             (engine, None)
         };
+        // S3c: the export dialog starts at the device rate; the engine moves
+        // into the app below, so read it here.
+        let device_sample_rate = engine.info().sample_rate;
         let mut app = Self {
             engine,
             session: glitcherz_command::Session::new(Project {
@@ -1865,6 +1925,10 @@ impl GlitcherZApp {
             auto_close_after: config.auto_close_after,
             project_path: None,
             recent: ui_state.recent_files,
+            recovery,
+            autosave_app_dir,
+            autosave_clock: autosave::Clock::new(Instant::now()),
+            missing_media: Vec::new(),
             status_message: None,
             record_refusal: None,
             record_started_at: None,
@@ -1925,6 +1989,9 @@ impl GlitcherZApp {
             input_dropped_seen: 0,
             export_dialog_open: false,
             export_range_choice: export_audio::ExportRange::FullSong,
+            export_bits: export_audio::Bits::Int24,
+            export_sample_rate: device_sample_rate,
+            export_stems: false,
             undo_history_open: false,
             output_config,
             preferences_open: false,
@@ -3381,6 +3448,9 @@ impl GlitcherZApp {
             // Immutable reborrow aliases: two closures (auto_options /
             // plugin_inline) capture the same tables simultaneously.
             let doc = &session.project().graph;
+            // S3b: media paths are resolved against the project directory; the
+            // readers below only get the graph, so root them here.
+            let sf2_media_base = session.project().base_dir.clone();
             let clap = &*clap;
             let vst3 = &*vst3;
             let clap_fx = &*clap_fx;
@@ -3473,6 +3543,9 @@ impl GlitcherZApp {
             // so the patch and the Inspector list exactly the same entries.
             // Empty = not resident (or no file yet) → the combos stay
             // disabled instead of showing a lie.
+            //
+            // S3b: the table is keyed by the **resolved** path (that is what
+            // the loader caches), so a project-relative library is rooted here.
             let sf2_presets = move |node_id: u64| -> Vec<(u8, u8, String)> {
                 let Some(NodeDoc::Instrument {
                     voice: VoiceSpec::SoundFont { path, .. },
@@ -3484,10 +3557,13 @@ impl GlitcherZApp {
                 if path.is_empty() {
                     return Vec::new();
                 }
-                sf2_preset_names
-                    .get(std::path::Path::new(path))
-                    .cloned()
-                    .unwrap_or_default()
+                let stored = path.replace('\\', "/");
+                let resolved = match (&sf2_media_base, std::path::Path::new(&stored).is_absolute())
+                {
+                    (Some(dir), false) => dir.join(&stored),
+                    _ => std::path::PathBuf::from(&stored),
+                };
+                sf2_preset_names.get(&resolved).cloned().unwrap_or_default()
             };
             // R4: live input snapshot for the Audio In node's device chip and
             // per-channel meter. The cloned handles/strings outlive the
@@ -4910,7 +4986,13 @@ impl GlitcherZApp {
             FileAction::Open(path) => self.do_open(path),
             // `ui()` sends the viewport close once `allow_close` is up, so
             // this needs no egui context.
-            FileAction::Exit => self.allow_close = true,
+            FileAction::Exit => {
+                // S3a: reaching Exit means the user answered the unsaved
+                // prompt — saved (snapshot already gone) or discarded. Either
+                // way there is nothing left to recover.
+                self.clear_autosave();
+                self.allow_close = true;
+            }
         }
     }
 
@@ -4925,6 +5007,10 @@ impl GlitcherZApp {
         self.send_sequencer(SequencerCommand::Stop);
         self.session.replace(Project::default());
         self.project_path = None;
+        // S3a: the snapshot clock belongs to the document that just went away.
+        self.autosave_clock.reset(Instant::now());
+        // S3b: a fresh document references no media.
+        self.missing_media.clear();
         self.selected_track = 0;
         self.selected_auto = 0;
         self.edit_clip = None;
@@ -4985,6 +5071,81 @@ impl GlitcherZApp {
             }
             Some(ConfirmChoice::Cancel) => self.pending_file_action = None,
             None => {}
+        }
+    }
+
+    /// Startup prompt for crash snapshots (S3a). A modal, not a status line:
+    /// losing work silently is the failure this feature exists to prevent, so
+    /// the decision has to be in front of the user.
+    ///
+    /// The snapshots stay on disk until the answer says otherwise — "Later"
+    /// just closes the prompt (they are offered again next launch), and
+    /// recovering one leaves the others alone.
+    fn recovery_dialog(&mut self, ctx: &egui::Context) {
+        if self.recovery.is_empty() {
+            return;
+        }
+        let mut recover: Option<usize> = None;
+        let mut discard_all = false;
+        let mut later = false;
+        let now = std::time::SystemTime::now();
+        let modal = egui::Modal::new(egui::Id::new("glitcherz_recovery")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("Recover unsaved work");
+            ui.label(
+                "GlitcherZ did not shut down cleanly. These snapshots still hold edits that \
+                 were never saved:",
+            );
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .show(ui, |ui| {
+                    for (index, candidate) in self.recovery.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.button("Recover").clicked() {
+                                recover = Some(index);
+                            }
+                            ui.label(candidate.display_name());
+                            ui.weak(format!(
+                                "{} · {}",
+                                autosave::age_label(candidate.saved_at, now),
+                                human_bytes(candidate.bytes)
+                            ));
+                        });
+                    }
+                });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Discard all").clicked() {
+                    discard_all = true;
+                }
+                if ui.button("Later").clicked() {
+                    later = true;
+                }
+            });
+            ui.add_space(4.0);
+            ui.weak("Recovering replaces the current document. Discarding deletes the files.");
+        });
+        if modal.should_close() {
+            later = true;
+        }
+        if discard_all {
+            for candidate in std::mem::take(&mut self.recovery) {
+                autosave::discard(&candidate.autosave);
+            }
+            self.set_message("Discarded unsaved snapshots".to_string());
+            return;
+        }
+        if let Some(index) = recover {
+            let candidate = self.recovery.remove(index);
+            // The other snapshots belong to other projects; leaving them alone
+            // keeps them available on the next launch.
+            self.recovery.clear();
+            self.recover_snapshot(candidate);
+            return;
+        }
+        if later {
+            self.recovery.clear();
         }
     }
 
@@ -5126,6 +5287,13 @@ impl GlitcherZApp {
     /// layout, spec/plugin-state.md D3). Individual failures are logged and
     /// skipped: a broken plugin must not block the whole save (D7).
     fn capture_plugin_states(&mut self) {
+        let blobs = self.plugin_state_blobs();
+        apply_plugin_state(self.project_mut(), blobs);
+    }
+
+    /// Live plugin state blobs, one per installed plugin node (S3a: shared by
+    /// the manual save and the auto-save snapshot).
+    fn plugin_state_blobs(&mut self) -> Vec<(u64, Vec<u8>)> {
         let doc_by_engine: std::collections::HashMap<u64, u64> = self
             .node_map
             .iter()
@@ -5159,36 +5327,15 @@ impl GlitcherZApp {
                 blobs.push((doc_id, blob));
             }
         }
-        for (doc_id, blob) in blobs {
-            let Some(node) = self.project_mut().graph.node_by_id_mut(doc_id) else {
-                continue;
-            };
-            match node {
-                NodeDoc::Instrument {
-                    voice: VoiceSpec::Clap { state, .. },
-                    ..
-                }
-                | NodeDoc::Effect {
-                    voice: VoiceSpec::Clap { state, .. },
-                    ..
-                }
-                | NodeDoc::Instrument {
-                    voice: VoiceSpec::Vst3 { state, .. },
-                    ..
-                }
-                | NodeDoc::Effect {
-                    voice: VoiceSpec::Vst3 { state, .. },
-                    ..
-                } => *state = blob,
-                _ => {}
-            }
-        }
+        blobs
     }
 
     /// Write to disk and update recent files / status message. Returns
     /// whether the write succeeded (U2: the title's dirty marker and the
     /// unsaved-changes modal depend on it).
     fn do_save(&mut self, path: PathBuf) -> bool {
+        // S3a: a "Save As" retires the previous path's snapshot as well.
+        let previous = self.project_path.clone();
         // Persist the patch canvas layout (view data) with the project.
         let layout = self.patch_state.export_layout(&self.project().graph);
         self.project_mut().graph.layout = layout;
@@ -5200,6 +5347,14 @@ impl GlitcherZApp {
                 self.session.mark_clean();
                 self.project_path = Some(path.clone());
                 self.push_recent(path.clone());
+                // S3a: the document is on disk, so the crash snapshot has
+                // nothing left to recover (it also covers the untitled one a
+                // "Save As" just retired).
+                self.clear_autosave();
+                if let Some(previous) = previous.filter(|p| p != &path) {
+                    autosave::discard(&glitcherz_model::autosave_path(&previous));
+                }
+                self.autosave_clock.reset(Instant::now());
                 self.set_message(format!("Saved {}", path.display()));
                 log::info!("Project saved: {}", path.display());
                 true
@@ -5210,6 +5365,57 @@ impl GlitcherZApp {
                 false
             }
         }
+    }
+
+    /// Where the current document's crash snapshot belongs (S3a).
+    fn autosave_target(&self) -> Option<PathBuf> {
+        autosave::target(
+            self.project_path.as_deref(),
+            self.autosave_app_dir.as_deref(),
+        )
+    }
+
+    /// Deletes the crash snapshot of the current document — plus the untitled
+    /// one, which a "Save As" just made obsolete.
+    fn clear_autosave(&mut self) {
+        if let Some(path) = self.autosave_target() {
+            autosave::discard(&path);
+        }
+        if let Some(path) = autosave::untitled_path(self.autosave_app_dir.as_deref()) {
+            autosave::discard(&path);
+        }
+    }
+
+    /// End-of-frame snapshot tick (S3a). The clock decides; the write happens
+    /// here on the UI thread (disk IO, never inside the audio callback).
+    fn tick_autosave(&mut self, now: Instant) {
+        self.autosave_clock
+            .observe(self.session.revision(), self.session.is_dirty(), now);
+        if !self.autosave_clock.due(now) {
+            return;
+        }
+        let Some(path) = self.autosave_target() else {
+            return;
+        };
+        // Snapshot a clone with the live plugin state folded in: capturing into
+        // the live document would bump the revision and dirty flag on every
+        // tick, which turns recovery into a write loop.
+        let mut snapshot = self.project().clone();
+        let blobs = self.plugin_state_blobs();
+        apply_plugin_state(&mut snapshot, blobs);
+        match autosave::write(&snapshot, &path) {
+            Ok(()) => {
+                log::info!("Auto-saved to {}", path.display());
+            }
+            Err(err) => {
+                // Report once per interval, not per frame: `mark_written`
+                // below is what keeps a full disk from spamming the bar. The
+                // rest of the session works, so this is a warning, not a stop.
+                log::warn!("Auto-save failed: {err}");
+                self.set_error(format!("Auto-save failed: {err}"));
+            }
+        }
+        self.autosave_clock.mark_written(now);
     }
 
     /// Load from disk, replace the document, rebuild the engine graph per the document, and
@@ -5235,30 +5441,264 @@ impl GlitcherZApp {
         self.cancel_recording();
         match glitcherz_model::load_project(&path) {
             Ok(project) => {
-                self.session.replace(project);
-                // Seed the patch view from the persisted layout (session positions of
-                // the previous document are dropped). Snapshot first: `project()`
-                // borrows all of `self`, which would clash with `patch_state`.
-                let layout = self.project().graph.layout.clone();
-                self.patch_state.import_layout(&layout);
-                self.project_path = Some(path.clone());
-                self.push_recent(path.clone());
-                self.selected_track = 0;
-                self.selected_auto = 0;
-                self.edit_clip = None;
-                // The selection indexes the *previous* document.
-                self.edit_selection.clear();
-                self.timeline_state.selection.clear();
-                self.roll_state = piano_roll::RollState::new();
-                self.push_all_params();
-                // U1: the opened document's song loop reaches the engine.
-                self.push_loop_range();
+                self.adopt_document(project, Some(path.clone()), false);
                 self.set_message(format!("Opened {}", path.display()));
                 log::info!("Project opened: {}", path.display());
             }
             Err(err) => {
                 self.set_message(format!("Open failed: {err}"));
                 log::error!("Failed to open project: {err}");
+            }
+        }
+    }
+
+    /// Replaces the live document with `project` and points the view, the
+    /// engine and the snapshot clock at it (open / crash recovery).
+    ///
+    /// `path` is the project the document belongs to (`None` = untitled);
+    /// `dirty` marks it as unsaved work — a recovered snapshot has never been
+    /// written as this project, so the title must show `*` and closing must ask.
+    /// `base_dir` is the caller's business: it depends on where the bytes came
+    /// from, not on where they are going.
+    fn adopt_document(&mut self, project: Project, path: Option<PathBuf>, dirty: bool) {
+        self.session.replace(project);
+        if dirty {
+            self.session.mark_dirty();
+        }
+        // Seed the patch view from the persisted layout (session positions of
+        // the previous document are dropped). Snapshot first: `project()`
+        // borrows all of `self`, which would clash with `patch_state`.
+        let layout = self.project().graph.layout.clone();
+        self.patch_state.import_layout(&layout);
+        self.project_path = path.clone();
+        if let Some(path) = path {
+            self.push_recent(path);
+        }
+        self.selected_track = 0;
+        self.selected_auto = 0;
+        self.edit_clip = None;
+        // The selection indexes the *previous* document.
+        self.edit_selection.clear();
+        self.timeline_state.selection.clear();
+        self.roll_state = piano_roll::RollState::new();
+        self.autosave_clock.reset(Instant::now());
+        self.push_all_params();
+        // U1: the opened document's song loop reaches the engine.
+        self.push_loop_range();
+        // S3b: a project that travelled without its media says so right away
+        // instead of playing silence with no explanation.
+        self.refresh_missing_media();
+    }
+
+    /// Recomputes which referenced media files cannot be found (S3b).
+    fn refresh_missing_media(&mut self) {
+        self.missing_media = self.project().missing_media();
+        if !self.missing_media.is_empty() {
+            log::warn!("Missing media: {:?}", self.missing_media);
+        }
+    }
+
+    /// Copies every referenced media file that lives outside
+    /// `<stem>.media/` into it and rewrites the document paths — one undo step.
+    /// The project must be on disk first: the folder is defined beside it.
+    fn collect_media_files(&mut self) {
+        let Some(project_path) = self.project_path.clone() else {
+            self.set_error("Save the project first — the media folder lives beside it".to_string());
+            return;
+        };
+        let Some(base) = project_path.parent().map(Path::to_path_buf) else {
+            self.set_error("The project path has no folder".to_string());
+            return;
+        };
+        let stem = project_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or_else(|| "Untitled".to_string());
+        let media_dir = base.join(format!("{stem}.media"));
+
+        let mut map: HashMap<String, String> = HashMap::new();
+        let mut copied = 0usize;
+        let mut failed = 0usize;
+        for stored in self.project().media_paths() {
+            let source = self.project().resolve_media_path(&stored);
+            if !source.is_file() {
+                // Missing files are the relocation dialog's business; copying
+                // cannot help.
+                failed += 1;
+                continue;
+            }
+            if source.starts_with(&media_dir) {
+                continue; // already collected
+            }
+            let target = media::collect_target(&media_dir, &source);
+            let target_len = std::fs::metadata(&target).map(|meta| meta.len()).ok();
+            let source_len = std::fs::metadata(&source).map(|meta| meta.len()).ok();
+            if target_len.is_none() || target_len != source_len {
+                let result = std::fs::create_dir_all(&media_dir)
+                    .and_then(|()| std::fs::copy(&source, &target).map(|_| ()));
+                if let Err(err) = result {
+                    log::error!("Collect media: copying {} failed: {err}", source.display());
+                    failed += 1;
+                    continue;
+                }
+                copied += 1;
+            }
+            let new_stored = self.project().media_path_string(&target);
+            if new_stored != stored {
+                map.insert(stored, new_stored);
+            }
+        }
+
+        if map.is_empty() {
+            self.set_message(
+                "Nothing to collect — the media already lives in the project folder".to_string(),
+            );
+        } else {
+            let moved = map.len();
+            let before = self.begin_edit();
+            self.project_mut().rewrite_media_paths(&map);
+            self.commit_edit("Collect Media", before);
+            self.set_message(format!(
+                "Collected {copied} file(s) ({moved} path(s) rewritten) into {}",
+                media_dir.display()
+            ));
+            log::info!("Collected media into {}", media_dir.display());
+        }
+        if failed > 0 {
+            self.set_error(format!("{failed} media file(s) could not be copied"));
+        }
+        self.refresh_missing_media();
+    }
+
+    /// Points missing files at a folder the user picks: every missing path is
+    /// matched by file name anywhere under that folder and rewritten — one undo
+    /// step. The engine graph is rebuilt, because the nodes hold the old
+    /// (unloadable) sources.
+    fn relocate_missing_media(&mut self) {
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title("Folder containing the missing media")
+            .pick_folder()
+        else {
+            return;
+        };
+        let mut map: HashMap<String, String> = HashMap::new();
+        for stored in self.missing_media.clone() {
+            let Some(name) = Path::new(&stored)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            let Some(found) = media::find_by_name(&dir, &name, media::SEARCH_DEPTH) else {
+                continue;
+            };
+            let new_stored = self.project().media_path_string(&found);
+            if new_stored != stored {
+                map.insert(stored, new_stored);
+            }
+        }
+        if map.is_empty() {
+            self.set_error("No file with a matching name in that folder".to_string());
+            return;
+        }
+        let relocated = map.len();
+        let before = self.begin_edit();
+        self.project_mut().rewrite_media_paths(&map);
+        self.commit_edit("Relocate Media", before);
+        // Every installed sample / audio table still points at the old path.
+        self.apply_document();
+        self.refresh_missing_media();
+        if self.missing_media.is_empty() {
+            self.set_message(format!("Relocated {relocated} media file(s)"));
+            log::info!("Relocated {relocated} media file(s) into the project");
+        } else {
+            self.set_error(format!(
+                "Relocated {relocated} file(s); {} still missing",
+                self.missing_media.len()
+            ));
+        }
+    }
+
+    /// S3b: prompt for media the project references but cannot find. Two ways
+    /// out — point at a folder, or carry on without the files.
+    fn missing_media_dialog(&mut self, ctx: &egui::Context) {
+        if self.missing_media.is_empty() {
+            return;
+        }
+        let mut continue_without = false;
+        let mut locate = false;
+        let modal = egui::Modal::new(egui::Id::new("glitcherz_missing_media")).show(ctx, |ui| {
+            ui.set_width(480.0);
+            ui.heading(format!("Missing media ({})", self.missing_media.len()));
+            ui.label("The project refers to these files, but they are not where it expects them:");
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    for path in &self.missing_media {
+                        ui.weak(path);
+                    }
+                });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Locate Folder…")
+                    .on_hover_text("Pick the folder they moved to — files are matched by name")
+                    .clicked()
+                {
+                    locate = true;
+                }
+                if ui.button("Continue without them").clicked() {
+                    continue_without = true;
+                }
+            });
+        });
+        if modal.should_close() {
+            continue_without = true;
+        }
+        if locate {
+            // Keeps the dialog alive: `relocate` refreshes the list, so any
+            // file it could not find stays visible.
+            self.relocate_missing_media();
+        }
+        if continue_without {
+            self.missing_media.clear();
+        }
+    }
+
+    /// S3a: loads a crash snapshot through the same blocking banner a normal
+    /// open uses (plugins and SoundFonts are just as slow to install).
+    fn recover_snapshot(&mut self, candidate: autosave::Candidate) {
+        let name = candidate.display_name();
+        self.queue_blocking_job(format!("Recovering {name}…"), move |app| {
+            app.do_recover_now(candidate)
+        });
+    }
+
+    /// The blocking half of [`Self::recover_snapshot`].
+    fn do_recover_now(&mut self, candidate: autosave::Candidate) {
+        self.cancel_recording();
+        match glitcherz_model::load_project(&candidate.autosave) {
+            Ok(mut project) => {
+                // `load_project` rooted relative media at the snapshot's own
+                // folder; the document belongs to the project it came from.
+                project.base_dir = candidate
+                    .project
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf);
+                let name = candidate.display_name();
+                self.adopt_document(project, candidate.project, true);
+                self.set_message(format!("Recovered unsaved work from {name}"));
+                log::info!("Recovered snapshot {}", candidate.autosave.display());
+            }
+            Err(err) => {
+                self.set_error(format!("Recovery failed: {err}"));
+                log::error!(
+                    "Failed to read snapshot {}: {err}",
+                    candidate.autosave.display()
+                );
             }
         }
     }
@@ -5290,7 +5730,10 @@ impl GlitcherZApp {
         path: &str,
         sample_rate: f32,
     ) -> Result<Sf2VoiceProcessor, Sf2Error> {
-        let library = self.sf2_library_for(Path::new(path))?;
+        // S3b: same rule as samples — a relative library path is rooted at the
+        // project directory.
+        let resolved = self.project().resolve_media_path(path);
+        let library = self.sf2_library_for(&resolved)?;
         Sf2VoiceProcessor::new(library.font(), sample_rate)
     }
 
@@ -5451,8 +5894,11 @@ impl GlitcherZApp {
             return;
         };
         let sample_rate = self.engine.info().sample_rate as f32;
-        let path_text = path.display().to_string();
-        let mut processor = match self.obtain_sample_voice(&path_text, sample_rate) {
+        // S3b: load from the absolute path the dialog returned, but store it
+        // relative to the project folder so the project survives a move.
+        let path_text = self.project().media_path_string(&path);
+        let mut processor = match self.obtain_sample_voice(&path.display().to_string(), sample_rate)
+        {
             Ok(processor) => processor,
             Err(err) => {
                 // The document keeps its old path: a broken pick is not a
@@ -5564,7 +6010,8 @@ impl GlitcherZApp {
         let sample_rate = self.engine.info().sample_rate as f32;
         let mut loaded = 0;
         for (path, key) in paths.iter().zip(keys) {
-            let path_text = path.display().to_string();
+            // S3b: store relative to the project folder (see `media_path_string`).
+            let path_text = self.project().media_path_string(path);
             match self.sample_library.load(path) {
                 Ok(_) => {
                     slots.push(glitcherz_model::DrumSlot {
@@ -5682,6 +6129,9 @@ impl GlitcherZApp {
         processor.set_param(ParamId::Sf2Gain, gain);
         processor.set_param(ParamId::Sf2BendRange, bend_range);
 
+        // S3b: store the library relative to the project folder when it lives
+        // under it (the absolute path keeps working for shared libraries).
+        let stored_path = self.project().media_path_string(&path);
         let before = self.begin_edit();
         if let Some(NodeDoc::Instrument {
             voice:
@@ -5694,7 +6144,7 @@ impl GlitcherZApp {
             ..
         }) = self.project_mut().graph.node_by_id_mut(doc_id)
         {
-            *doc_path = path.display().to_string();
+            *doc_path = stored_path.clone();
             *doc_bank = bank;
             *doc_program = program;
         }
@@ -5747,7 +6197,10 @@ impl GlitcherZApp {
         path: &str,
         sample_rate: f32,
     ) -> Result<SampleVoiceProcessor, SampleError> {
-        let data = self.sample_library.load(std::path::Path::new(path))?;
+        // S3b: the document may store a project-relative path (that is what
+        // makes a project folder portable); resolve it before touching disk.
+        let resolved = self.project().resolve_media_path(path);
+        let data = self.sample_library.load(&resolved)?;
         Ok(SampleVoiceProcessor::new(data, sample_rate))
     }
 
@@ -5767,7 +6220,9 @@ impl GlitcherZApp {
             if slot.path.is_empty() {
                 continue;
             }
-            match self.sample_library.load(std::path::Path::new(&slot.path)) {
+            // S3b: drum slots store project-relative paths too.
+            let resolved = self.project().resolve_media_path(&slot.path);
+            match self.sample_library.load(&resolved) {
                 Ok(data) => specs.push(DrumSlotSpec {
                     note: slot.note,
                     data,
@@ -5883,12 +6338,16 @@ impl GlitcherZApp {
         node_map: &mut HashMap<u64, u64>,
         guards: &mut Vec<PluginGuard>,
         node: &NodeDoc,
+        export_rate: u32,
     ) {
         if node.is_keyboard() {
             return; // document-only routing node, no engine counterpart
         }
-        let sr = convert::sample_rate_to_f32(self.engine.info().sample_rate);
-        let sample_rate = self.engine.info().sample_rate;
+        // S3c: the export can run at a rate the device is not on, so every
+        // processor must be built for the **offline engine's** rate — reading
+        // the live engine here is what kept the export glued to the device.
+        let sr = convert::sample_rate_to_f32(export_rate);
+        let sample_rate = export_rate;
         let (processor, guard): (Box<dyn Processor>, Option<PluginGuard>) = match node {
             NodeDoc::Instrument { voice, synth, .. } => match voice {
                 VoiceSpec::Builtin => {
@@ -6170,23 +6629,28 @@ impl GlitcherZApp {
     /// D4: the mirror of `apply_document` — nodes, track addressing,
     /// cables, the three clip-table pushes, the arrangement floor — minus
     /// every session-cache side effect) and returns the started job.
+    ///
+    /// S3c: `format` decides sample rate + bit depth (the engine is built at
+    /// `format.sample_rate`, not the device's), and `passes` is the file list —
+    /// the mix first, then optionally one file per audible track.
     fn start_export(
         &mut self,
-        path: &std::path::Path,
         range: export_audio::ExportRange,
+        format: export_audio::WavFormat,
+        passes: Vec<export_audio::ExportPass>,
     ) -> Option<export_audio::ExportJob> {
         let Some(window) = range.window(self.project()) else {
             self.set_message("No song loop set — draw one on the ruler first".to_string());
             return None;
         };
-        let sample_rate = self.engine.info().sample_rate;
+        let sample_rate = format.sample_rate;
         let mut engine = glitcherz_engine::AudioEngine::start_offline(sample_rate)
             .expect("the offline engine needs no audio device");
         let mut node_map: HashMap<u64, u64> = HashMap::new();
         let mut guards: Vec<PluginGuard> = Vec::new();
         let nodes = self.project().graph.nodes.clone();
         for node in &nodes {
-            self.spawn_offline_node(&mut engine, &mut node_map, &mut guards, node);
+            self.spawn_offline_node(&mut engine, &mut node_map, &mut guards, node, sample_rate);
         }
         // Track addressing (the mirror of register_track_chain).
         for track in 0..self.project().midi_tracks.len() {
@@ -6357,12 +6821,115 @@ impl GlitcherZApp {
         // No loop range is pushed — the offline render never wraps.
         engine.seek_ticks(window.0);
         let _ = engine.send(EngineCommand::Sequencer(SequencerCommand::Play));
-        match export_audio::ExportJob::new(engine, guards, path, sample_rate, window) {
+        match export_audio::ExportJob::new(engine, guards, node_map, format, window, passes) {
             Ok(job) => Some(job),
             Err(err) => {
                 self.set_message(format!("Export failed to create the wav: {err}"));
                 None
             }
+        }
+    }
+
+    /// S3c: the pass list for one export. The mix is always first; with stems
+    /// the job then renders one file per track that actually has content, in
+    /// document order (MIDI tracks, then audio tracks).
+    fn export_passes(&self, mix: &std::path::Path, stems: bool) -> Vec<export_audio::ExportPass> {
+        let mut passes = vec![export_audio::ExportPass::mix(mix.to_path_buf())];
+        if !stems {
+            return passes;
+        }
+        let mut used: Vec<String> = Vec::new();
+        let mut push = |name: String, target: export_audio::TrackSel, passes: &mut Vec<_>| {
+            let base = export_audio::sanitize_file_part(&name);
+            let mut unique = base.clone();
+            let mut n = 2;
+            while used.contains(&unique) {
+                unique = format!("{base} {n}");
+                n += 1;
+            }
+            used.push(unique.clone());
+            passes.push(export_audio::ExportPass::stem(
+                export_audio::stem_path(mix, &unique),
+                name,
+                target,
+            ));
+        };
+        for (index, track) in self.project().midi_tracks.iter().enumerate() {
+            let audible = track
+                .clips
+                .iter()
+                .any(|clip| !clip.sequence.notes.is_empty() || !clip.sequence.ctrls.is_empty());
+            if !audible {
+                continue;
+            }
+            let name = if track.name.trim().is_empty() {
+                format!("MIDI {}", index + 1)
+            } else {
+                track.name.clone()
+            };
+            push(name, export_audio::TrackSel::Midi(index), &mut passes);
+        }
+        for (index, track) in self.project().audio_tracks.iter().enumerate() {
+            if !track.clips.iter().any(|clip| !clip.path.is_empty()) {
+                continue;
+            }
+            let name = if track.name.trim().is_empty() {
+                format!("Audio {}", index + 1)
+            } else {
+                track.name.clone()
+            };
+            push(name, export_audio::TrackSel::Audio(index), &mut passes);
+        }
+        passes
+    }
+
+    /// S3c: re-addresses the offline engine's clip tables for one pass — the
+    /// target track keeps its content, every other audible track goes empty.
+    /// The graph (instruments, effects, mixer) and the control tracks stay:
+    /// automation and tempo rides are part of what a stem sounds like.
+    fn set_export_pass_tables(
+        &mut self,
+        engine: &mut AudioEngine,
+        node_map: &HashMap<u64, u64>,
+        target: Option<export_audio::TrackSel>,
+    ) {
+        use export_audio::TrackSel;
+        for track in 0..self.project().midi_tracks.len() {
+            let keep = match target {
+                None => true,
+                Some(TrackSel::Midi(t)) => t == track,
+                Some(TrackSel::Audio(_)) => false,
+            };
+            let table = if keep {
+                self.rt_clips(track)
+            } else {
+                empty_midi_clip_table()
+            };
+            let _ = engine.send_midi_clips(track, table);
+        }
+        for track in 0..self.project().audio_tracks.len() {
+            let keep = match target {
+                None => true,
+                Some(TrackSel::Audio(t)) => t == track,
+                Some(TrackSel::Midi(_)) => false,
+            };
+            let Some(&engine_id) = self
+                .project()
+                .graph
+                .nodes
+                .iter()
+                .find(|n| matches!(n, NodeDoc::AudioTrack { track: t, .. } if *t == track))
+                .map(NodeDoc::node_id)
+                .and_then(|doc_id| node_map.get(&doc_id))
+            else {
+                continue;
+            };
+            let table = if keep {
+                self.build_audio_clip_table(track)
+            } else {
+                empty_clip_table()
+            };
+            let _ = engine.send_audio_clips(engine_id, table);
         }
     }
 
@@ -6372,23 +6939,54 @@ impl GlitcherZApp {
         let Some(mut job) = self.export_job.take() else {
             return;
         };
-        let done = job.pump(export_audio::BLOCKS_PER_FRAME);
+        let done = {
+            let mut setup = |engine: &mut AudioEngine,
+                             map: &HashMap<u64, u64>,
+                             target: Option<export_audio::TrackSel>| {
+                self.set_export_pass_tables(engine, map, target);
+            };
+            job.pump(export_audio::BLOCKS_PER_FRAME, &mut setup)
+        };
         if !done {
             self.export_job = Some(job);
             return;
         }
-        let path_label = job.path().display().to_string();
         if job.cancelled {
-            self.set_message("Export cancelled".to_string());
-        } else {
-            match job.finalize() {
-                Ok(path) => {
-                    self.set_message(format!("Exported to {}", path.display()));
-                    log::info!("Audio export written to {path_label}");
-                }
-                Err(err) => {
-                    self.set_message(format!("Export finalize failed: {err}"));
-                }
+            // The unfinished file is a partial wav — deleting it is kinder
+            // than leaving a file that looks like a render.
+            let partial = job.path().to_path_buf();
+            if !job.outputs().contains(&partial) {
+                let _ = std::fs::remove_file(&partial);
+            }
+            self.set_message(format!(
+                "Export cancelled ({} file(s) kept)",
+                job.outputs().len()
+            ));
+            log::info!("Audio export cancelled");
+            return;
+        }
+        let outputs: Vec<PathBuf> = job.outputs().to_vec();
+        match outputs.as_slice() {
+            [] => self.set_message("Export finished with no output".to_string()),
+            [single] => {
+                self.set_message(format!("Exported to {}", single.display()));
+                log::info!("Audio export written to {}", single.display());
+            }
+            [mix, stems @ ..] => {
+                self.set_message(format!(
+                    "Exported {} + {} stem(s) to {}",
+                    display_name(mix),
+                    stems.len(),
+                    mix.parent().map_or_else(
+                        || mix.display().to_string(),
+                        |dir| dir.display().to_string()
+                    )
+                ));
+                log::info!(
+                    "Audio export written to {} (+{} stems)",
+                    mix.display(),
+                    stems.len()
+                );
             }
         }
     }
@@ -6401,6 +6999,18 @@ impl GlitcherZApp {
         };
         let progress = job.progress();
         let mut cancel = false;
+        let (index, total) = job.pass_number();
+        // A single pass is just "Exporting"; stems name the file being
+        // rendered so a long run does not look stuck on one file.
+        let label = if total > 1 {
+            format!(
+                "Exporting {index}/{total} — {} — {}",
+                job.label(),
+                job.path().display()
+            )
+        } else {
+            format!("Exporting — {}", job.path().display())
+        };
         egui::Panel::top("glitcherz_export").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.add(
@@ -6408,7 +7018,7 @@ impl GlitcherZApp {
                         .desired_width(160.0)
                         .text(format!("{}%", (progress * 100.0) as u32)),
                 );
-                ui.weak(format!("Exporting — {}", job.path().display()));
+                ui.weak(label);
                 if ui.button("Cancel").clicked() {
                     cancel = true;
                 }
@@ -6431,9 +7041,13 @@ impl GlitcherZApp {
                 > self.project().metadata.loop_range.start_ticks
             && self.project().metadata.loop_range.end_ticks > 0;
         let modal = egui::Modal::new(egui::Id::new("glitcherz_export_range")).show(ctx, |ui| {
-            ui.set_width(320.0);
+            ui.set_width(360.0);
             ui.heading("Export Audio");
-            ui.label("Render the arrangement to a 16-bit stereo wav.");
+            ui.label(format!(
+                "{} · {} kHz · stereo wav",
+                self.export_bits.label(),
+                f64::from(self.export_sample_rate) / 1000.0
+            ));
             ui.add_space(8.0);
             ui.radio_value(
                 &mut self.export_range_choice,
@@ -6451,6 +7065,40 @@ impl GlitcherZApp {
                 "No song loop set — Ctrl+drag on the ruler to draw one"
             })
             .on_hover_text("The enabled loop range on the ruler");
+            ui.add_space(10.0);
+            // S3c: format controls. 24-bit is the delivery default; the rate
+            // list leads with the device rate (the offline engine is built at
+            // whatever is chosen, so a 96 kHz bounce does not need a 96 kHz
+            // device).
+            let rates = export_audio::sample_rate_choices(self.engine.info().sample_rate);
+            ui.horizontal(|ui| {
+                ui.label("Depth");
+                for bits in export_audio::Bits::ALL {
+                    ui.radio_value(&mut self.export_bits, bits, bits.label());
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Rate");
+                egui::ComboBox::from_id_salt("glitcherz_export_rate")
+                    .selected_text(format!(
+                        "{} kHz",
+                        f64::from(self.export_sample_rate) / 1000.0
+                    ))
+                    .show_ui(ui, |ui| {
+                        for rate in rates {
+                            ui.selectable_value(
+                                &mut self.export_sample_rate,
+                                rate,
+                                format!("{} kHz", f64::from(rate) / 1000.0),
+                            );
+                        }
+                    });
+            });
+            ui.checkbox(
+                &mut self.export_stems,
+                "Also write stems (one file per track)",
+            )
+            .on_hover_text("Renders the mix, then every track that has content on its own");
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.button("Cancel").clicked() {
@@ -6474,6 +7122,11 @@ impl GlitcherZApp {
         }
         if start {
             let range = self.export_range_choice;
+            let format = export_audio::WavFormat {
+                sample_rate: self.export_sample_rate,
+                bits: self.export_bits,
+            };
+            let stems = self.export_stems;
             let stem = self
                 .project_path
                 .as_ref()
@@ -6484,10 +7137,18 @@ impl GlitcherZApp {
                 .set_file_name(format!("{stem}.wav"))
                 .add_filter("Wave", &["wav"])
                 .save_file()
-                && let Some(job) = self.start_export(&path, range)
             {
-                self.export_job = Some(job);
-                log::info!("Audio export started: {}", path.display());
+                let passes = self.export_passes(&path, stems);
+                let pass_count = passes.len();
+                if let Some(job) = self.start_export(range, format, passes) {
+                    self.export_job = Some(job);
+                    log::info!(
+                        "Audio export started: {} ({pass_count} pass(es), {} · {} Hz)",
+                        path.display(),
+                        format.bits.label(),
+                        format.sample_rate
+                    );
+                }
             }
         }
     }
@@ -8877,6 +9538,29 @@ impl GlitcherZApp {
                         } else {
                             self.set_message("An export is already running".to_string());
                         }
+                    }
+                    ui.separator();
+                    // S3b: make the project folder self-contained, and fix up
+                    // paths after a move.
+                    if ui
+                        .button("Collect Media Files…")
+                        .on_hover_text(
+                            "Copy every referenced sample / SoundFont / wav into <project>.media/",
+                        )
+                        .clicked()
+                    {
+                        ui.close();
+                        self.collect_media_files();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.missing_media.is_empty(),
+                            egui::Button::new("Relocate Missing Media…"),
+                        )
+                        .clicked()
+                    {
+                        ui.close();
+                        self.relocate_missing_media();
                     }
                 });
                 ui.menu_button("Edit", |ui| {
@@ -14624,8 +15308,10 @@ impl eframe::App for GlitcherZApp {
 
         // U2: an open unsaved-changes modal owns the keyboard (its Escape
         // cancels); the transport / note shortcuts stay out of the way. The
-        // same holds for the plugin popup (U9 E3): it owns ↑↓/Enter/Esc.
-        if self.pending_file_action.is_none() && !self.picker.is_open() {
+        // same holds for the plugin popup (U9 E3): it owns ↑↓/Enter/Esc, and
+        // for the startup recovery prompt (S3a), which must be answered first.
+        if self.pending_file_action.is_none() && !self.picker.is_open() && self.recovery.is_empty()
+        {
             self.handle_keyboard_input(ui.ctx());
         }
 
@@ -14904,6 +15590,12 @@ impl eframe::App for GlitcherZApp {
         // (it creates the node with its final source, spec D1).
         self.plugin_picker_frame(ui.ctx());
 
+        // S3a: the crash-recovery prompt. Drawn first so a snapshot left by the
+        // previous run is the first thing the user answers.
+        self.recovery_dialog(ui.ctx());
+        // S3b: media the opened project cannot find.
+        self.missing_media_dialog(ui.ctx());
+
         // U7: the export range modal rides above every panel (the
         // unsaved-changes precedent).
         self.export_dialog(ui.ctx());
@@ -14939,6 +15631,10 @@ impl eframe::App for GlitcherZApp {
             ui.ctx().request_repaint();
         }
 
+        // S3a: crash snapshot last — after every panel, so a long write lands
+        // in the quiet part of the frame. Disk IO on the UI thread only.
+        self.tick_autosave(Instant::now());
+
         // Audio-driven displays (level meter, playback position, envelope) need periodic
         // repaints; without this, egui sleeps when idle and auto-close (smoke test) never fires.
         ui.ctx().request_repaint_after(Duration::from_millis(50));
@@ -14952,6 +15648,15 @@ impl Drop for GlitcherZApp {
         // the plugin library would unload while its editor window is
         // still attached (spec `plugin-gui.md` §4.3).
         self.close_plugin_editor();
+        // S3a: a clean document leaves nothing to recover, so a plain window
+        // close (which never goes through the unsaved-changes modal) must not
+        // leave a stale snapshot behind. A **dirty** document keeps its
+        // snapshot on purpose: reaching Drop with unsaved edits means the run
+        // is ending without the user's answer, which is exactly the case the
+        // snapshot exists for.
+        if !self.session.is_dirty() {
+            self.clear_autosave();
+        }
     }
 }
 

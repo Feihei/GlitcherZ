@@ -79,6 +79,16 @@ pub const TEMP_SUFFIX: &str = "tmp";
 /// Suffix of the previous revision kept by [`save_project`].
 pub const BACKUP_SUFFIX: &str = "bak";
 
+/// Suffix of the crash-recovery snapshot ([`save_autosave`]): `song.glz` is
+/// snapshotted to `song.glz.autosave`. Deliberately *not* `.bak` — that name
+/// already means "the revision before the last manual save".
+pub const AUTOSAVE_SUFFIX: &str = "autosave";
+
+/// `<path>.autosave` — where the auto-save snapshot of `path` lives.
+pub fn autosave_path(path: &Path) -> PathBuf {
+    with_suffix(path, AUTOSAVE_SUFFIX)
+}
+
 /// `path` with `.<suffix>` appended (not replacing the existing extension, so
 /// `song.glz` becomes `song.glz.tmp`).
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -94,6 +104,22 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 struct ProjectFileRef<'a> {
     version: u32,
     project: &'a Project,
+}
+
+/// Writes text to `path` through a flushed `<path>.tmp` and a rename, so a
+/// crash mid-write leaves the previous file intact (atomic on the same
+/// volume, NTFS and POSIX alike).
+fn write_atomic(path: &Path, text: &str) -> Result<(), ModelError> {
+    let temp = with_suffix(path, TEMP_SUFFIX);
+    {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(text.as_bytes())?;
+        // Without this the rename could publish a file whose bytes never
+        // reached the platter.
+        file.sync_all()?;
+    }
+    std::fs::rename(&temp, path)?;
+    Ok(())
 }
 
 /// Saves the project as a `.glz` file (RON pretty format). **Not real-time**
@@ -116,20 +142,29 @@ pub fn save_project(project: &Project, path: &Path) -> Result<(), ModelError> {
         },
         ron::ser::PrettyConfig::new(),
     )?;
-
-    let temp = with_suffix(path, TEMP_SUFFIX);
-    {
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(text.as_bytes())?;
-        // Without this the rename could publish a file whose bytes never
-        // reached the platter.
-        file.sync_all()?;
-    }
     if path.exists() {
         let _ = std::fs::copy(path, with_suffix(path, BACKUP_SUFFIX));
     }
-    std::fs::rename(&temp, path)?;
-    Ok(())
+    write_atomic(path, &text)
+}
+
+/// Writes a crash-recovery snapshot ([`autosave_path`]). **Not real-time**.
+///
+/// Two deliberate differences from [`save_project`]: no `<name>.bak` copy (the
+/// snapshot is not a revision the user asked for, and a `.bak` beside it would
+/// grow the project directory for nothing), and **no `validate`** — a snapshot
+/// must be written even if the document happens to be transiently invalid,
+/// because losing the user's work is the worse failure. The recovery path
+/// still validates on load, so an unreadable snapshot fails loudly there.
+pub fn save_autosave(project: &Project, path: &Path) -> Result<(), ModelError> {
+    let text = ron::ser::to_string_pretty(
+        &ProjectFileRef {
+            version: PROJECT_VERSION,
+            project,
+        },
+        ron::ser::PrettyConfig::new(),
+    )?;
+    write_atomic(path, &text)
 }
 
 /// Parses project file text.
@@ -197,7 +232,9 @@ pub fn load_project(path: &Path) -> Result<Project, ModelError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PROJECT_VERSION, ProjectFile, load_project, parse_project, save_project};
+    use super::{
+        PROJECT_VERSION, ProjectFile, load_project, parse_project, save_autosave, save_project,
+    };
     use crate::{
         AutoParam, AutoPoint, CableDoc, MASTER_NODE_ID, MidiClip, ModelError, NodeDoc, Note,
         Project, TICKS_PER_BAR,
@@ -306,6 +343,40 @@ mod tests {
         assert_eq!(loaded.graph.layout.timeline_in, Some([930.0, 320.0]));
         loaded.base_dir = None;
         assert_eq!(loaded, project, "the whole document must roundtrip");
+    }
+
+    /// S3a: a recovery snapshot reloads as the same document and never leaves
+    /// a `.bak` (the snapshot is not a revision the user asked for) or a stale
+    /// `.tmp` behind.
+    #[test]
+    fn an_autosave_reloads_without_leaving_a_backup() {
+        let project = demo_project();
+        let path = std::env::temp_dir().join(format!("glitcherz_snap_{}.glz", std::process::id()));
+        let snap = super::autosave_path(&path);
+        assert_eq!(
+            snap.file_name().map(|n| n.to_string_lossy().into_owned()),
+            Some(format!(
+                "glitcherz_snap_{}.glz.autosave",
+                std::process::id()
+            ))
+        );
+
+        save_autosave(&project, &snap).expect("first snapshot");
+        save_autosave(&project, &snap).expect("second snapshot");
+
+        assert!(
+            !super::with_suffix(&snap, super::BACKUP_SUFFIX).exists(),
+            "a snapshot must not grow a .bak beside it"
+        );
+        assert!(
+            !super::with_suffix(&snap, super::TEMP_SUFFIX).exists(),
+            "the atomic write must clean up its .tmp"
+        );
+
+        let mut loaded = load_project(&snap).expect("the snapshot must reload");
+        let _ = std::fs::remove_file(&snap);
+        loaded.base_dir = None;
+        assert_eq!(loaded, project, "a snapshot is a full document");
     }
 
     // U1: the song loop range and markers live on the metadata and survive
