@@ -4572,6 +4572,90 @@ impl Default for Project {
 /// Maximum arrangement length in ticks (D16 safety bound).
 pub const MAX_ARRANGEMENT_TICKS: u64 = (MAX_ARRANGEMENT_BARS as u64) * (TICKS_PER_BAR as u64);
 
+/// S2-5b: whether two nodes would construct the same processor. Values that
+/// a live processor accepts through `ParamId` are excluded.
+fn node_engine_identity_eq(a: &NodeDoc, b: &NodeDoc) -> bool {
+    if a.node_id() != b.node_id() || a.track() != b.track() {
+        return false;
+    }
+    match (a, b) {
+        (NodeDoc::Instrument { voice: va, .. }, NodeDoc::Instrument { voice: vb, .. }) => {
+            voice_engine_identity_eq(va, vb)
+        }
+        (
+            NodeDoc::Effect {
+                voice: va,
+                params: pa,
+                ..
+            },
+            NodeDoc::Effect {
+                voice: vb,
+                params: pb,
+                ..
+            },
+        ) => voice_engine_identity_eq(va, vb) && pa.kind() == pb.kind(),
+        // A mixer's channel count decides its ports; faders are replayed.
+        (NodeDoc::Mixer { inputs: ia, .. }, NodeDoc::Mixer { inputs: ib, .. }) => ia == ib,
+        // UI-only node: no engine counterpart, but a changed node id / track is
+        // still an identity change for the graph document.
+        (NodeDoc::Keyboard { .. }, NodeDoc::Keyboard { .. }) => true,
+        // Parameter-only engine nodes (all values replay through ParamId).
+        (NodeDoc::Arpeggiator { .. }, NodeDoc::Arpeggiator { .. })
+        | (NodeDoc::Portamento { .. }, NodeDoc::Portamento { .. })
+        | (NodeDoc::MidiEnvelope { .. }, NodeDoc::MidiEnvelope { .. })
+        | (NodeDoc::Lfo { .. }, NodeDoc::Lfo { .. })
+        | (NodeDoc::CurveMap { .. }, NodeDoc::CurveMap { .. })
+        | (NodeDoc::Feedback { .. }, NodeDoc::Feedback { .. })
+        | (NodeDoc::Input { .. }, NodeDoc::Input { .. })
+        | (NodeDoc::AudioTrack { .. }, NodeDoc::AudioTrack { .. }) => true,
+        // Legacy load-only node: never worth a fast path.
+        (NodeDoc::ChannelStrip { .. }, NodeDoc::ChannelStrip { .. }) => a == b,
+        _ => false,
+    }
+}
+
+/// S2-5b: whether two voices load the same source. Preset / root / gain /
+/// bend / drum trim values are parameters; paths and plugin state are not.
+fn voice_engine_identity_eq(a: &VoiceSpec, b: &VoiceSpec) -> bool {
+    match (a, b) {
+        (VoiceSpec::Builtin, VoiceSpec::Builtin) => true,
+        (VoiceSpec::SoundFont { path: pa, .. }, VoiceSpec::SoundFont { path: pb, .. }) => pa == pb,
+        (VoiceSpec::Sample { path: pa, .. }, VoiceSpec::Sample { path: pb, .. }) => pa == pb,
+        (VoiceSpec::DrumKit { slots: sa, .. }, VoiceSpec::DrumKit { slots: sb, .. }) => {
+            sa.len() == sb.len()
+                && sa
+                    .iter()
+                    .zip(sb)
+                    .all(|(x, y)| x.note == y.note && x.path == y.path)
+        }
+        (
+            VoiceSpec::Clap {
+                path: pa,
+                plugin_id: ia,
+                state: sa,
+            },
+            VoiceSpec::Clap {
+                path: pb,
+                plugin_id: ib,
+                state: sb,
+            },
+        ) => pa == pb && ia == ib && sa == sb,
+        (
+            VoiceSpec::Vst3 {
+                path: pa,
+                class_id: ca,
+                state: sa,
+            },
+            VoiceSpec::Vst3 {
+                path: pb,
+                class_id: cb,
+                state: sb,
+            },
+        ) => pa == pb && ca == cb && sa == sb,
+        _ => false,
+    }
+}
+
 impl Project {
     /// Whether the real-time graph would be identical for both documents:
     /// node payloads, cables, and the three track-list lengths.
@@ -4582,6 +4666,29 @@ impl Project {
     /// undo/redo only touched clips.
     pub fn topology_eq(&self, other: &Project) -> bool {
         self.graph.nodes == other.graph.nodes
+            && self.graph.cables == other.graph.cables
+            && self.midi_tracks.len() == other.midi_tracks.len()
+            && self.control_tracks.len() == other.control_tracks.len()
+            && self.audio_tracks.len() == other.audio_tracks.len()
+    }
+
+    /// Whether the engine would keep the same **processors and wiring**,
+    /// ignoring values that can be replayed through `ParamId` (synth/effect
+    /// faders, mixer faders, LFO rate, …).
+    ///
+    /// This is the S2-5b predicate: parameter-only edits can push values to
+    /// the live processors instead of re-instantiating them. Anything that
+    /// changes which processor would be constructed — a voice path / plugin
+    /// ID / plugin state, the built-in effect kind, a mixer's channel count, a
+    /// drum slot's key or sample — still counts as a new topology.
+    pub fn engine_topology_eq(&self, other: &Project) -> bool {
+        self.graph.nodes.len() == other.graph.nodes.len()
+            && self
+                .graph
+                .nodes
+                .iter()
+                .zip(&other.graph.nodes)
+                .all(|(a, b)| node_engine_identity_eq(a, b))
             && self.graph.cables == other.graph.cables
             && self.midi_tracks.len() == other.midi_tracks.len()
             && self.control_tracks.len() == other.control_tracks.len()
@@ -5872,6 +5979,71 @@ mod tests {
         let track = extra.control_tracks[0].clone();
         extra.control_tracks.push(track);
         assert!(!base.topology_eq(&extra), "track lists bound the engine");
+    }
+
+    #[test]
+    fn engine_topology_eq_ignores_replayable_parameters() {
+        let base = Project::default();
+        let mut changed = base.clone();
+        for node in &mut changed.graph.nodes {
+            if let NodeDoc::Instrument { synth, .. } = node {
+                synth.cutoff_hz += 100.0;
+                break;
+            }
+        }
+        assert!(
+            base.engine_topology_eq(&changed),
+            "synth values replay through ParamId"
+        );
+        assert!(
+            !base.topology_eq(&changed),
+            "the strict predicate still sees the payload"
+        );
+    }
+
+    #[test]
+    fn engine_topology_eq_rejects_voice_and_mixer_shape_changes() {
+        let base = Project::default();
+        let mut voice = base.clone();
+        for node in &mut voice.graph.nodes {
+            if let NodeDoc::Instrument { voice, .. } = node {
+                *voice = VoiceSpec::SoundFont {
+                    path: "a.sf2".to_string(),
+                    bank: 0,
+                    program: 0,
+                    gain: 1.0,
+                    bend_range: 2.0,
+                };
+                break;
+            }
+        }
+        assert!(voice.engine_topology_eq(&voice));
+
+        let mut other_voice = voice.clone();
+        for node in &mut other_voice.graph.nodes {
+            if let NodeDoc::Instrument { voice, .. } = node {
+                if let VoiceSpec::SoundFont { path, .. } = voice {
+                    *path = "b.sf2".to_string();
+                }
+                break;
+            }
+        }
+        assert!(
+            !voice.engine_topology_eq(&other_voice),
+            "another font needs a new processor"
+        );
+
+        let mut wider_mixer = base.clone();
+        for node in &mut wider_mixer.graph.nodes {
+            if let NodeDoc::Mixer { inputs, .. } = node {
+                *inputs += 1;
+                break;
+            }
+        }
+        assert!(
+            !base.engine_topology_eq(&wider_mixer),
+            "channel count decides the ports"
+        );
     }
 
     #[test]

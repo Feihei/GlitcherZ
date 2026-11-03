@@ -742,17 +742,19 @@ let _ = self.slot_set_param(route.slot, ParamId::PitchOffset, value); // synth /
 
 **为什么 latency 留在走带条**：它是 take 的对齐偏移（正数把音频 clip 起点提前），依赖当前设备与缓冲大小，会话级、不随工程保存；放在走带条与 pre-roll / `Mute others` 同属"本次录音怎么采"，挂到工程节点上会被误读成节点参数。控件已加 `Latency` 标签与完整 hover 说明。
 
-## 增量引擎同步 S2-5a（2026-11-03）
+## 增量引擎同步（S2-5，2026-11-03）
 
 **问题**：undo / redo 无条件走 `apply_document()`，即使只改了一个音符也会删掉全部节点再重装 —— 插件要重新 spawn + `load_state`，一次撤销的代价可能上百毫秒。
 
-**判据**：`Project::topology_eq(other)` 比较 `graph.nodes`（含节点参数）、`graph.cables` 与三类轨道列表长度。名称、颜色、clip 内容等视图字段不进比较。等价 ⇒ 引擎图与路由表本来就不该变。
+**两层判据**：
+- `Project::topology_eq`：`graph.nodes`（含参数）、`graph.cables`、三类轨道数量全等 —— 严格版本，视图字段（名称 / 颜色 / clip 内容）不进比较。
+- `Project::engine_topology_eq`（S2-5b）：只比**节点身份**。`node_id` / `track` 必比；`VoiceSpec` 只比 `path`（Clap/Vst3 再加 plugin id / class id 与 state）；内置效果器只比 `EffectParams::kind()`；mixer 只比 `inputs`；drum kit 只比每个 slot 的 `note` + `path`。synth / effect 数值、mixer 推子、SF2 bank/program/gain/bend、Sample root/mode/gain、Arp/Portamento/Env/LFO/CurveMap/Feedback/Input 参数全部视为可重放。
 
-**分派**：`GlitcherZApp::sync_engine(before)` 在 `undo` / `redo` / `jump_history_to` / `execute` 前后调用。等价走 `refresh_clips_and_transport()`：master gain、BPM、拍号、MIDI / control / audio clip 表、track count、loop range；不等价才 `apply_document()`。`push_all_clips` 因此退役（`execute` 也改走 `sync_engine`）。
+**分派**：`GlitcherZApp::sync_engine(before)` 在 `undo` / `redo` / `jump_history_to` / `execute` 前后调用。身份等价走 `refresh_clips_and_transport()`：master gain、BPM、拍号、**`push_node_params` + `push_mixer_params`**、MIDI / control / audio clip 表、track count、loop range；身份变化才 `apply_document()`。`push_all_clips` 因此退役。
 
-**边界（S2-5b 留待）**：节点参数仍在 `graph.nodes` 的相等比较里，所以改 cutoff / 推子 / LFO 的 undo 仍会全量重建。下一步要把"节点身份"（voice 的 path/plugin id、mixer inputs、track 等）与"可重放参数"拆开，并给 `push_node_params` 补齐 Sample / SF2 / Arp / Portamento / Env / LFO / CurveMap 的重放。
+**`push_node_params` 的重放面**（S2-5b 补齐）：Instrument 按 voice 分流（Builtin → `synth_param_values`；SoundFont → bank/program/gain/bend；Sample → root/play mode/gain；DrumKit → `DrumGain` + 每槽 gain/pan/tune/choke；Clap/Vst3 跳过，参数由宿主面板即时推送）；Effect Builtin → `BuiltinParam` 槽；Arp / Portamento / Env / LFO / CurveMap / Feedback / Input 逐 `ParamId` 推。这些 `set_param` 路径与构造期 `apply_params` 等价（engine crate 内两个入口共用同一套 clamp）。
 
-**验证**：`topology_eq` 三项（改名不影响、节点/电缆变化、轨道数量变化）在 model crate；全仓 fmt/clippy/test 绿 + `--seconds 5` 冒烟。
+**验证**：model crate 5 项（`topology_eq` 3 + `engine_topology_eq` 参数跳过 / voice·mixer 身份）；全仓 fmt/clippy/test 绿 + `--seconds 5` 冒烟。App 级"undo 不重建"无法在无窗口环境断言，以判据单测 + 结构（单一 `sync_engine` 入口）兜底。
 
 ## 音频输出 Preferences（S1-5，2026-11-03）
 

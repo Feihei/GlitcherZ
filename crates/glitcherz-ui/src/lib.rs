@@ -2899,7 +2899,55 @@ impl GlitcherZApp {
                 continue;
             };
             let params: Vec<(ParamId, f32)> = match node {
-                NodeDoc::Instrument { synth, .. } => synth_param_values(synth).to_vec(),
+                NodeDoc::Instrument { voice, synth, .. } => match voice {
+                    VoiceSpec::Builtin => synth_param_values(synth).to_vec(),
+                    // U13: SoundFont preset / trim / bend range are parameters.
+                    VoiceSpec::SoundFont {
+                        bank,
+                        program,
+                        gain,
+                        bend_range,
+                        ..
+                    } => vec![
+                        (ParamId::Sf2BankSelect, f32::from(*bank)),
+                        (ParamId::Sf2ProgramChange, f32::from(*program)),
+                        (ParamId::Sf2Gain, *gain),
+                        (ParamId::Sf2BendRange, *bend_range),
+                    ],
+                    VoiceSpec::Sample {
+                        root_note,
+                        play_mode,
+                        gain,
+                        ..
+                    } => vec![
+                        (ParamId::SampleRootNote, f32::from(*root_note)),
+                        (
+                            ParamId::SamplePlayMode,
+                            if matches!(play_mode, SamplePlayMode::OneShot) {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                        ),
+                        (ParamId::SampleGain, *gain),
+                    ],
+                    VoiceSpec::DrumKit { slots, gain } => {
+                        let mut values = vec![(ParamId::DrumGain, *gain)];
+                        for slot in slots {
+                            values.push((ParamId::DrumSlotGain(slot.note), slot.gain));
+                            values.push((ParamId::DrumSlotPan(slot.note), slot.pan));
+                            values.push((ParamId::DrumSlotTune(slot.note), slot.tune_semitones));
+                            values.push((
+                                ParamId::DrumSlotChoke(slot.note),
+                                slot.choke.map_or(-1.0, f32::from),
+                            ));
+                        }
+                        values
+                    }
+                    // Plugin parameters live in the host cache and are pushed
+                    // by the parameter UI itself; undo never changes them.
+                    VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. } => Vec::new(),
+                },
                 // Table-driven (spec `effects.md` D6): one entry per slot.
                 NodeDoc::Effect {
                     voice: VoiceSpec::Builtin | VoiceSpec::SoundFont { .. },
@@ -2916,6 +2964,48 @@ impl GlitcherZApp {
                         )
                     })
                     .collect::<Vec<_>>(),
+                NodeDoc::Arpeggiator { params, .. } => vec![
+                    (ParamId::ArpDivision, f32::from(params.division)),
+                    (ParamId::ArpGate, params.gate),
+                    (ParamId::ArpMode, params.mode.index() as f32),
+                    (ParamId::ArpOctaves, f32::from(params.octaves)),
+                    (ParamId::ArpLatch, if params.latch { 1.0 } else { 0.0 }),
+                    (ParamId::ArpHarmony, params.harmony.index() as f32),
+                    (ParamId::ArpSkip, params.skip),
+                ],
+                NodeDoc::Portamento { params, .. } => vec![
+                    (ParamId::PortTime, params.time_ms),
+                    (ParamId::PortMin, params.min),
+                    (ParamId::PortMax, params.max),
+                    (
+                        ParamId::PortLegato,
+                        if params.legato_only { 1.0 } else { 0.0 },
+                    ),
+                ],
+                NodeDoc::MidiEnvelope { params, .. } => vec![
+                    (ParamId::EnvAttack, params.attack),
+                    (ParamId::EnvDecay, params.decay),
+                    (ParamId::EnvSustain, params.sustain),
+                    (ParamId::EnvRelease, params.release),
+                    (ParamId::EnvMin, params.min),
+                    (ParamId::EnvMax, params.max),
+                ],
+                NodeDoc::Lfo { params, .. } => vec![
+                    (ParamId::LfoWaveform, params.waveform.index() as f32),
+                    (ParamId::LfoRate, params.rate_hz),
+                    (ParamId::LfoSync, if params.sync { 1.0 } else { 0.0 }),
+                    (ParamId::LfoDivision, f32::from(params.division)),
+                    (ParamId::LfoDepth, params.depth),
+                ],
+                NodeDoc::CurveMap { params, .. } => vec![
+                    (ParamId::CurveMapMin, params.min),
+                    (ParamId::CurveMapMax, params.max),
+                    (
+                        ParamId::CurveMapMode,
+                        curve_mode_value(engine_mode(params.mode)),
+                    ),
+                ],
+                NodeDoc::Feedback { gain, .. } => vec![(ParamId::FeedbackGain, *gain)],
                 // R4: the live input node's channel + trim.
                 NodeDoc::Input { channel, gain, .. } => vec![
                     (ParamId::InputChannel, f32::from(*channel)),
@@ -4686,7 +4776,7 @@ impl GlitcherZApp {
     /// fields are pushed directly, leaving every instantiated plug-in alive —
     /// a note or curve edit no longer re-spawns the world.
     fn sync_engine(&mut self, before: &Project) {
-        if before.topology_eq(self.project()) {
+        if before.engine_topology_eq(self.project()) {
             self.refresh_clips_and_transport();
         } else {
             self.apply_document();
@@ -4705,6 +4795,10 @@ impl GlitcherZApp {
             self.project().metadata.tempo_bpm,
         )));
         self.push_time_signature();
+        // S2-5b: parameter-only edits keep the processors, so every value the
+        // rebuild would have set at construction must be replayed here.
+        self.push_node_params();
+        self.push_mixer_params();
         for track in 0..self.project().midi_tracks.len() {
             self.send_track_clips(track);
         }
