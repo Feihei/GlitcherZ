@@ -18,7 +18,7 @@
 | :--- | :--- |
 | 语言 | Rust（edition 2024，stable toolchain） |
 | 音频设备 | `cpal` |
-| 信号处理/合成 | `fundsp`、`dasp` |
+| 信号处理/合成 | 自研 DSP（`glitcherz-engine/src/realtime/`）；算法参考 `fundsp`（**非依赖**，取其思路不引 crate） |
 | GUI | `egui`（`eframe`） |
 | 线程通信 | `crossbeam-channel` / `rtrb`（实时无锁队列） |
 | 序列化 | `serde` + `ron` |
