@@ -16,6 +16,13 @@ Make music entirely on your computer: compose melodies, arrange beats, mix track
 - **Automation** — draw curves to bring your mix to life over time
 - **Cross-platform & project files** — works on all three major desktop systems, and your projects are saved in an open, readable format
 
+## Documentation
+
+The user manual lives in [`docs/`](docs/README.md): the
+[manual](docs/manual.md), a [shortcut cheat sheet](docs/shortcuts.md) and
+[project files & disk layout](docs/project-files.md). Developer notes are in
+`.agents/`.
+
 ---
 
 ## 中文
@@ -35,6 +42,12 @@ Make music entirely on your computer: compose melodies, arrange beats, mix track
 - **插件支持** — 加载你喜欢的 CLAP / VST3 乐器与效果器插件
 - **自动化** — 绘制曲线，让参数随时间自动变化，让音乐动起来
 - **跨平台 + 开放的项目文件格式** — 三大桌面系统通用，项目文件开放可读
+
+## 文档
+
+用户手册在 [`docs/`](docs/README.md)：[主手册](docs/manual.md)、
+[快捷键速查](docs/shortcuts.md)、[工程文件与磁盘布局](docs/project-files.md)。
+开发向文档在 `.agents/`。
 
 ---
 
