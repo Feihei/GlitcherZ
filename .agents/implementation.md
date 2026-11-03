@@ -4,6 +4,17 @@
 
 ## 已落地
 
+### 内嵌 CJK 字体兜底（2026-11-03）
+
+- **症状与根因**：轨名/片段名开放用户命名后，中文输入落到 epaint 的替换字形（U+FFFD）显示成豆腐块——`default_fonts` 只含 Latin/Cyrillic，全仓此前没有任何 `FontDefinitions`。
+- **方案**：`glitcherz-ui/src/fonts.rs` 用 `include_bytes!` 内嵌 **Noto Sans SC Regular 子集**（23,187 字形 / 4.97 MB），`GlitcherZApp::new` 开头 `fonts::install(&cc.egui_ctx)`，内部 `Context::add_font(FontInsert::new(..), FontPriority::Lowest)` 同时挂到 `Proportional` 与 `Monospace` 两族末尾。
+- **为什么 `Lowest` 而不是替换默认族**：Latin 仍走 egui 自带 Ubuntu-Light / Hack，行高与所有按现有度量调过的布局一分不变；CJK 只在前面几族都没有该字形时才被取用。测试 `latin_row_height_stays_with_the_bundled_face` 卡这条——Noto 面高 1.448 em vs Ubuntu-Light 1.149 em，插到最前会让拉丁行高 +26%。
+- **为什么 Noto Sans SC 而不是思源黑体 CN**：同一设计、同一度量（同一 Adobe/Google 项目，CN/SC 是同一批字形），差别只在许可——Source Han 家族名带 OFL 保留字体名 "Source"，子集属于 Modified Version，再分发必须先改名；"Noto Sans SC" 不含保留名，可原样发布。OFL 全文随包 `assets/fonts/OFL.txt`。
+- **子集口径**（可复现命令见 `assets/fonts/README.md`）：ASCII / Latin-1 / 常用标点 / 箭头 / 数学符号 / CJK 标点 / 假名 / CJK 基本区 U+4E00–9FFF **全部 20,976 个码位** / 兼容表意 / 全角半角 / 罗马数字 / 圈括号数字 ①⑴㈠ / 制表符与块元素 / 注音 ㄅ–ㄩ / 兼容单位 ㎎㎜㊣。`--no-hinting` 白省 1.3 MB（epaint 经 `skrifa` 光栅化，CFF hint 本来就不用）。原始 8.3 MB → 带 hint 子集 6.3 MB → 4.97 MB。
+- **覆盖结论（实测）**：GBK 的 21,791 个字符，子集自身命中 21,654，其余由 egui 自带的 Ubuntu-Light / NotoEmoji 兜住（希腊、西里尔、拼音声调、★☆），只剩 `≒`(U+2252) 与 `⌒`(U+2312) 无字形——这两个上游字体本身就没有。汉字侧：GBK 的 21,003 个汉字 100% 覆盖，且额外多出基本区里 GBK 缺的约 5,000 个（玥、喆、堃、龘）；CJK 扩展 A/B 与韩文不收。
+- **不做**：运行时读系统字体（三平台字形不一致，Linux 可能压根没有）、CJK 扩展 A/B（生僻字，不值 1 MB+ 的代价）。
+- **验证**：`fonts::tests` 两项——`embedded_font_renders_cjk_without_replacement_glyphs`（"鼓组 Bass 01" 逐字无 U+FFFD、advance 非零、CJK 字形拿到 atlas 槽位）与上行行高测试。
+
 ### mixer 通道条上画布（U14，spec `node-graph.md` D22，2026-10-28）
 
 - **一行一个通道，压在端口上**：绘制段在 inline 参数循环之后（后注册 → 指针优先于节点拖拽），位置**由 `in_ports_screen` 的端口坐标推导**（`channel_strip_rect(port_pos, box, zoom)`），而不是另起一套均分——端口位置一改，条自动跟随，不会出现"推子飘在两根线中间"。条高 22 < `PORT_SPACING` 30，所以 2 通道（`port_area` 只有 48 图空间、step 24）时上下仍各留 1 px。

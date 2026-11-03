@@ -124,6 +124,8 @@ jobs:
           mkdir -p "$stage"
           cp "${{ matrix.bin }}" "$stage/"
           cp README.md "$stage/"
+          # Font licence: OFL 1.1 requires the notice to travel with the binary.
+          cp THIRD-PARTY-NOTICES.md "$stage/"
           tar -czf "$stage.tar.gz" -C dist "$(basename "$stage")"
           # Only the archive is uploaded; drop the staging tree.
           rm -rf "$stage"
@@ -137,6 +139,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "${{ matrix.bin }}" $stage
           Copy-Item "README.md" $stage
+          # Font licence: OFL 1.1 requires the notice to travel with the binary.
+          Copy-Item "THIRD-PARTY-NOTICES.md" $stage
           Compress-Archive -Path $stage -DestinationPath "$stage.zip" -Force
           # Only the archive is uploaded; drop the staging tree.
           Remove-Item -Recurse -Force $stage
@@ -214,6 +218,10 @@ jobs:
             echo "- **Linux**: needs ALSA, OpenGL and an X11 or Wayland session, e.g. on Debian/Ubuntu:"
             echo "  \`sudo apt install libasound2 libgl1 libxkbcommon0 libwayland-client0\`."
             echo "- CLAP / VST3 plugins are optional; point GlitcherZ at your plugin folders in the app."
+            echo
+            echo "## License"
+            echo
+            echo "GlitcherZ is MIT OR Apache-2.0. The bundled Noto Sans SC font subset is under the SIL Open Font License 1.1; both notices ship in \`THIRD-PARTY-NOTICES.md\` inside each archive."
           } > NOTES.md
           cat NOTES.md
 

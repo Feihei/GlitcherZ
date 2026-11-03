@@ -35,3 +35,16 @@ Make music entirely on your computer: compose melodies, arrange beats, mix track
 - **插件支持** — 加载你喜欢的 CLAP / VST3 乐器与效果器插件
 - **自动化** — 绘制曲线，让参数随时间自动变化，让音乐动起来
 - **跨平台 + 开放的项目文件格式** — 三大桌面系统通用，项目文件开放可读
+
+---
+
+## License / 许可证
+
+GlitcherZ is licensed under **MIT OR Apache-2.0**. The executable embeds a
+subset of **Noto Sans SC** (SIL Open Font License 1.1, © 2014-2021 Adobe);
+the notice and full OFL text ship with every release archive in
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
+
+GlitcherZ 本体按 **MIT OR Apache-2.0** 授权；可执行文件内嵌的 **思源黑体同源
+Noto Sans SC** 子集按 SIL Open Font License 1.1 使用，声明与许可证全文见
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)，并随每个发布归档一同分发。

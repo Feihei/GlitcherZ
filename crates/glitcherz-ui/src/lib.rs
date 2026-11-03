@@ -63,6 +63,7 @@ pub mod effect;
 pub mod event_list;
 pub mod export_audio;
 pub mod focus;
+pub mod fonts;
 pub mod grid;
 pub mod patch;
 pub mod piano_roll;
@@ -1730,6 +1731,9 @@ impl GlitcherZApp {
     /// down via incremental graph building + the command queue (takes effect at the next audio
     /// block boundary).
     pub fn new(cc: &eframe::CreationContext<'_>, engine: AudioEngine, config: UiConfig) -> Self {
+        // CJK glyphs come from the embedded fallback face; without it every
+        // non-Latin track/clip name renders as tofu (module `fonts`).
+        fonts::install(&cc.egui_ctx);
         let ui_state: UiState = cc
             .storage
             .and_then(|storage| eframe::get_value(storage, UI_STATE_KEY))

@@ -293,6 +293,8 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 
 依赖：P2 必须先于 P3/P4；P1 与 P2 并行；P0 独立可先做。
 
+- [x] 内嵌 CJK 字体兜底（2026-11-03，实测「轨名能命名但中文显示豆腐块」）：`ui/src/fonts.rs` 内嵌 Noto Sans SC Regular 子集（23,187 字形 / 4.97 MB，GBK 字符除 `≒`⌒ 外全覆盖），`add_font` + `FontPriority::Lowest` 挂 Proportional/Monospace 末尾——Latin 度量零变化；选 Noto 而非思源黑体是因为 Source Han 家族名带 OFL 保留字体名，子集（Modified Version）再分发须改名。子集命令与许可见 `crates/glitcherz-ui/assets/fonts/README.md`
+
 ## U13：SoundFont 节点自足化（2026-10-28 立项，spec `sf2-loader.md` D10–D17）
 
 用户提出：SF2 节点现在"添加时选文件、之后锁死"，希望加完节点就能直接出现，节点上有 `Load File…` 按钮，加载后显示字体名，还能反复换；bank/patch 下拉也要放到节点上，与 Inspector 同等效力；并问 SF2 一贯音量偏小该不该加节点级 gain。
