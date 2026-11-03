@@ -517,12 +517,14 @@ curve→曲线轨，即"烘培"）；**一个输入只允许一个源，一个�
   MIDI / 音频 / 曲线 take 同一次 undo。限制：Timeline 曲线出口 → 曲线输入仍未采样，
   见 spec R8 备注
 
-接下来（按 review 文档的优先级）：
+接下来（按 review 文档的优先级；2026-11-03 已回填 review 的滞后勾选——S2-1b / S2-2 由 R2–R4 覆盖、S2-4 随 S1-3b 落地）：
 
 - [ ] **S1-4** undo 历史面板（`Session::undo_history()` / `undo_label()` 已有，缺 `undo_to(n)` + 面板）
 - [ ] **S1-5** Preferences：音频设备 / 采样率 / 缓冲区 + 掉线提示（需 `AudioEngine::start_with`）
 - [ ] **S2-3** PDC（`Processor::latency_samples()` 接进图编译期）
-- [ ] **S3** 自动保存、相对路径与缺失媒体重定位、导出规格化、CJK 字体、`ui/lib.rs` 拆分
+- [x] **S2-4** 手势 API 重构 ✅ 2026-11-03（`begin_param_edit` / `commit_param_edit` / `end_param_edit`，26 处调用点）
+- [ ] **S2-5** 增量引擎同步（`sync_document(prev, next)` 取代 undo/redo 全量重建）
+- [ ] **S3** 自动保存、相对路径与缺失媒体重定位、导出规格化、`ui/lib.rs` 拆分、`implementation.md` 拆分、补 `docs/`（CJK 字体已完成）
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
