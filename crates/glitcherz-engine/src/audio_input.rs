@@ -135,19 +135,66 @@ pub struct AudioInput {
     _stream: cpal::Stream,
 }
 
+/// Names of the host's input devices, sorted, de-duplicated.
+///
+/// **Control thread only** (device enumeration opens the driver). A host
+/// that cannot enumerate returns an empty list; `open` then still falls back
+/// to the system default, so a picker failure never kills recording.
+pub fn input_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    let Ok(devices) = host.input_devices() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = devices.map(|device| device.to_string()).collect();
+    names.sort_by_key(|name| name.to_lowercase());
+    names.dedup();
+    names
+}
+
+/// Finds `wanted` among the host's input devices (exact name first, then a
+/// case-insensitive match), or explains why it is gone.
+fn device_by_name(host: &cpal::Host, wanted: &str) -> Result<cpal::Device, EngineError> {
+    let devices: Vec<cpal::Device> = host.input_devices()?.collect();
+    if let Some(device) = devices.iter().find(|device| device.to_string() == wanted) {
+        return Ok(device.clone());
+    }
+    let lowered = wanted.to_lowercase();
+    if let Some(device) = devices
+        .iter()
+        .find(|device| device.to_string().to_lowercase() == lowered)
+    {
+        return Ok(device.clone());
+    }
+    Err(EngineError::InputUnsupported(format!(
+        "input device \"{wanted}\" is not available (unplugged?). Available: {}",
+        if devices.is_empty() {
+            "none".to_string()
+        } else {
+            devices
+                .iter()
+                .map(|device| device.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    )))
+}
+
 impl AudioInput {
-    /// Opens the default input device at `sample_rate`.
+    /// Opens `device_name`, or the system default when it is `None`.
     ///
     /// No resampling (spec "不做的事"): a device that cannot deliver the
     /// engine's rate is a hard error, so what is recorded is byte-for-byte
     /// what the timeline expects.
-    pub fn open(sample_rate: u32) -> Result<Self, EngineError> {
+    pub fn open(sample_rate: u32, device_name: Option<&str>) -> Result<Self, EngineError> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or(EngineError::NoInputDevice)?;
+        let device = match device_name {
+            Some(name) => device_by_name(&host, name)?,
+            None => host
+                .default_input_device()
+                .ok_or(EngineError::NoInputDevice)?,
+        };
         let device_name = device.to_string();
-        let chosen = choose_config(&device, sample_rate)?;
+        let chosen = choose_config(&device, sample_rate, &device_name)?;
         let channels = chosen.channels() as usize;
         let monitor = InputRing::new(INPUT_RING_CAPACITY);
         let record = InputRing::new(RECORD_RING_CAPACITY);
@@ -259,13 +306,26 @@ impl AudioInput {
 
 /// Picks an f32 input config at `sample_rate`, preferring mono, then stereo,
 /// then whatever the device offers.
+///
+/// The failure text lists what the device *does* offer: "no f32 at 48 kHz"
+/// alone leaves the user with no next step, and a picker needs to explain
+/// why the device they chose cannot be used.
 fn choose_config(
     device: &cpal::Device,
     sample_rate: u32,
+    device_name: &str,
 ) -> Result<cpal::SupportedStreamConfig, EngineError> {
     let mut chosen: Option<cpal::SupportedStreamConfigRange> = None;
+    let mut offered: Vec<String> = Vec::new();
     if let Ok(ranges) = device.supported_input_configs() {
         for range in ranges {
+            offered.push(format!(
+                "{:?} {}ch {}..{} Hz",
+                range.sample_format(),
+                range.channels(),
+                range.min_sample_rate(),
+                range.max_sample_rate()
+            ));
             if range.sample_format() != cpal::SampleFormat::F32 {
                 continue;
             }
@@ -283,7 +343,13 @@ fn choose_config(
     }
     let range = chosen.ok_or_else(|| {
         EngineError::InputUnsupported(format!(
-            "no f32 input config at {sample_rate} Hz (no resampling is performed)"
+            "{device_name}: no f32 input config at {sample_rate} Hz (no resampling is \
+             performed); device offers [{}]",
+            if offered.is_empty() {
+                "nothing".to_string()
+            } else {
+                offered.join(", ")
+            }
         ))
     })?;
     Ok(range.with_sample_rate(sample_rate))

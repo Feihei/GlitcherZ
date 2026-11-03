@@ -136,6 +136,9 @@ pub struct AudioEngine {
     /// Live audio input (R4): `None` when no input device / unsupported rate.
     /// Dropping the engine closes the stream.
     input: Option<crate::audio_input::AudioInput>,
+    /// Why the last input open failed, for the device picker (the picker must
+    /// be able to say "this device cannot do 48 kHz f32", not just "no input").
+    input_error: Option<String>,
 }
 
 impl AudioEngine {
@@ -227,7 +230,8 @@ impl AudioEngine {
 
         // R4: open the input side best-effort. A machine without a microphone
         // must still run the DAW; the Input node then reports the failure.
-        let input = match crate::audio_input::AudioInput::open(stream_config.sample_rate) {
+        let mut input_error = None;
+        let input = match crate::audio_input::AudioInput::open(stream_config.sample_rate, None) {
             Ok(input) => {
                 log::info!(
                     "audio input: {} ({} ch @ {} Hz)",
@@ -239,6 +243,7 @@ impl AudioEngine {
             }
             Err(err) => {
                 log::warn!("audio input unavailable: {err}");
+                input_error = Some(err.to_string());
                 None
             }
         };
@@ -262,6 +267,7 @@ impl AudioEngine {
                 out_channels: stream_config.channels,
             },
             input,
+            input_error,
         })
     }
 
@@ -332,6 +338,7 @@ impl AudioEngine {
                 out_channels: 2,
             },
             input: None,
+            input_error: None,
         })
     }
 
@@ -817,6 +824,47 @@ impl AudioEngine {
     /// or `None` when no input stream could be opened.
     pub fn input_info(&self) -> Option<&crate::audio_input::AudioInputInfo> {
         self.input.as_ref().map(|input| input.info())
+    }
+
+    /// Names of the host's input devices (the picker's list). **Control
+    /// thread only.**
+    pub fn input_devices() -> Vec<String> {
+        crate::audio_input::input_devices()
+    }
+
+    /// Why the current input stream is not open (`None` while it is).
+    pub fn input_error(&self) -> Option<&str> {
+        self.input_error.as_deref()
+    }
+
+    /// Swaps the live input stream for `device` (`None` = system default).
+    ///
+    /// The old stream is dropped first: two open streams on one device is
+    /// what makes a microphone unusable on Windows, and the graph's
+    /// `InputProcessor` keeps its ring clone either way — the caller rebuilds
+    /// the graph so the node latches onto the new ring.
+    pub fn reopen_input(&mut self, device: Option<&str>) -> Result<(), String> {
+        self.input = None;
+        let rate = self.info.sample_rate;
+        match crate::audio_input::AudioInput::open(rate, device) {
+            Ok(input) => {
+                log::info!(
+                    "audio input: {} ({} ch @ {} Hz)",
+                    input.info().device_name,
+                    input.info().channels,
+                    input.info().sample_rate
+                );
+                self.input = Some(input);
+                self.input_error = None;
+                Ok(())
+            }
+            Err(err) => {
+                let message = err.to_string();
+                log::warn!("audio input unavailable: {message}");
+                self.input_error = Some(message.clone());
+                Err(message)
+            }
+        }
     }
 
     /// R4: monitor ring handle for the graph's `InputProcessor` (a new clone
