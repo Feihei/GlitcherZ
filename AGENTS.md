@@ -67,6 +67,7 @@ glitcherz/
   复合操作（内部会触发其他可撤销编辑）先 `session.suspend_history()`，收尾 `resume_history()` 再 commit——只记外层一步。
   组件层（钢琴卷帘/timeline）**只读文档 + 返回意图**（`RollIntent`/`TimelineAction`），由 app 层翻译成命令或守卫编辑；组件不得持有 `&mut` 文档。U4b 之后曲线编辑并入 timeline 的 inline 带（`TimelineAction::CurvePoint` / `CurveRemove`），独立的 automation lane 组件（`lane::show` + `LaneIntent`）已退休，模块改名 `curve.rs`，只剩轴映射（`axis`/`to_norm`/`from_norm`/`SNAP_TICKS`）。
 - **MIDI ops 纯函数化**：签名一律 `fn(&mut [Note], Options)`，原地修改、**不改变 slice 长度**（故可作用于选区），不碰 clip/track/context；随机部分走 seeded XorShift 保可测可复现。
+- **`glitcherz-ui` 面板方法分模块**：`impl GlitcherZApp` 的方法分布在 14 个同级模块（`transport` / `inspector_panel` / `mixer_panel` / `timeline_ops` / `patch_ops` / `file_ops` / `voices` / `recording` / `editing` / `engine_sync` / `settings` / `status_bar` / `keyboard` / `export_ops`），`lib.rs` 只留结构体、`new`、编辑守卫与 `ui()`。新方法写进对应模块，且必须 `pub(crate)` 才能被父模块与兄弟模块调用（私有方法对父模块不可见）。
 
 ## 测试
 

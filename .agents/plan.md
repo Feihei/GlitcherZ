@@ -524,7 +524,10 @@ curve→曲线轨，即"烘培"）；**一个输入只允许一个源，一个�
 - [x] **S2-3** PDC ✅ 2026-11-03（spec `node-graph.md` §11 D23–D26）：`Processor::latency_samples()` 在**节点安装时**由控制线程读入 `GraphCompiler::slot_latency`（CLAP `clap_plugin_latency.get` / VST3 `getLatencySamples`，实例化后各一次）；`RtGraph::compute_pdc` 按拓扑序累积 `out_latency`，每条入边补偿 `max_in - out_latency[src]`，Feedback tap 边不参与；补偿表留在 `RtGraph`（不进 `ExecPlan`，保持结构更新载荷）；每槽预分配 `MAX_PDC_SAMPLES`（16384 帧 ≈ 341 ms）立体声 ring，`pdc_active` 为假时走原快路径；ring 随 `NodeDeployment` / `RecycledNode` 在控制线程分配释放。测试 +5（脉冲对齐 / 默认图零开销 / 上限钳制 / CLAP·VST3 latency 读取），全仓 fmt/clippy/test 绿
 - [x] **S2-4** 手势 API 重构 ✅ 2026-11-03（`begin_param_edit` / `commit_param_edit` / `end_param_edit`，26 处调用点）
 - [x] **S2-5** 增量引擎同步 ✅ 2026-11-03：① `Project::topology_eq`（nodes 载荷 + cables + 三类轨道数量）判严格等价；② **S2-5b** 再加 `Project::engine_topology_eq`（只比节点身份：node_id / track / voice 的 path·plugin id·state / effect kind / mixer inputs / drum slot key·path），可重放参数不再触发重建。undo / redo / Undo History 跳转 / `execute` 统一走 `sync_engine(before)`：身份等价时只推 clip 表 / loop / 速度拍号 / master gain / track count / **全节点参数**（`push_node_params` 已补齐 Sample / SF2 / DrumKit / Arp / Portamento / Env / LFO / CurveMap / Feedback / Input，外加 `push_mixer_params`），插件不再重实例化；身份变化仍 `apply_document()` 全量重建。测试 +5（`topology_eq` 3 项 + `engine_topology_eq` 参数跳过 / voice·mixer 身份），全仓 fmt/clippy/test 绿 + 冒烟
-- [ ] **S3** 自动保存 ✅、导出规格化 ✅、媒体相对路径/收集/重定位 ✅、`ui/lib.rs` 拆分、`implementation.md` 拆分、补 `docs/`
+- [ ] **S3** 自动保存 ✅、导出规格化 ✅、媒体相对路径/收集/重定位 ✅、`ui/lib.rs` 拆分 ✅、补 `docs/`
+  只剩 `docs/`。**`implementation.md` 拆分已撤销**（2026-11-04）：该文件 829 行 / 13 个 `##` 节、`grep '^## '`
+  即得索引，逐节 1–2 KB，拆成目录只把同样的文字挪位置，还要在每次追加时先决定"归哪个系列"；
+  按特性查设计的职责已由 `.agents/spec/` 承担。只补了顶部目录，不动正文。
   - [x] **S3a 自动保存 + 崩溃恢复** ✅ 2026-11-03（spec `spec/autosave.md`，用户拍板：落工程目录 + app data 兜底、静默 30 s / 最短 60 s）：
     模型 `save_autosave`（原子写、不写 `.bak`、不 validate）+ `autosave_path`；UI `autosave.rs`
     （`Clock` 纯时间算术 / `candidates` 只按"文件存在"判定 / `age_label`）；`GlitcherZApp`
@@ -551,6 +554,13 @@ curve→曲线轨，即"烘培"）；**一个输入只允许一个源，一个�
     （选目录按名匹配 + `apply_document`），打开/恢复工程后按 `missing_media()` 弹缺失提示
     （Locate Folder… / Continue without them）。测试 +4（媒体引用枚举·重写·缺失判定、路径分隔符规范化、
     收集落点三条规则、按名搜索深度）。全仓 fmt/clippy/980 项 test 绿 + 冒烟
+
+  - [x] **S3d `ui/lib.rs` 拆分** ✅ 2026-11-04：16,421 → **3,383 行**，`impl GlitcherZApp` 的 229 个方法
+    按面板搬到 14 个同级模块（`engine_sync` / `patch_ops` / `file_ops` / `export_ops` / `voices` /
+    `recording` / `timeline_ops` / `inspector_panel` / `mixer_panel` / `editing` / `transport` /
+    `keyboard` / `settings` / `status_bar`），`lib.rs` 只留结构体与常量、`new`、编辑守卫 / undo、
+    `ui()`、自由函数与测试。子模块方法一律 `pub(crate)`（私有方法对父模块不可见）+ 顶部
+    `use super::*;`；纯位移，980 项测试前后一致，fmt / clippy 零 diff + 冒烟
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 

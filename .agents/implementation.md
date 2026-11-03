@@ -2,6 +2,25 @@
 
 > 记录已落地模块的实现要点、协议细节与版本 gotchas。新增模块落地后在此追加条目。
 
+## 目录
+
+按落地时间倒序；详细内容按标题往下找。
+
+- UI 模块拆分（S3，2026-11-04）
+- 媒体路径、收集与重定位（S3b，2026-11-03）
+- 导出规格化（S3c，2026-11-03）
+- 自动保存与崩溃恢复（S3a，2026-11-03）
+- 音频输出 Preferences（S1-5，2026-11-03）
+- 增量引擎同步（S2-5，2026-11-03）
+- 录音输入 UI 归位（R4/R5/R9，2026-11-03）
+- 节点参数自动化词汇表（U4c / A，2026-10-28）
+- 曲线泳道（P4）与折叠（P5）
+- 音高通路（P1）：一个目标，两种投递
+- Edit tab 跟随 timeline 选区（2026-10-28）
+- 多 clip 卷帘（P3）：subject / ghost / 焦点
+- 版本注意（gotchas）
+- 已落地（更早的模块，`###` 子节按主题排列）
+
 ## 已落地
 
 ### 内嵌 CJK 字体兜底（2026-11-03）
@@ -811,6 +830,34 @@ flush 归零 → writer 为 None → begin_pass：开新 writer → setup(engine
 **命名**：`sanitize_file_part` 把 `/ \ : * ? " < > |` 与控制码换成 `_`、折叠连续空格、去掉尾部点与空格（Windows 会静默裁掉，导致写出的路径和记录的不一致），空名回落 `track`；重名追加 ` 2`、` 3`。stem 文件固定落在用户选的那个目录（`mix.with_file_name`）。
 
 **测试**（+4）：`bit_depths_match_the_wav_spec`、`the_device_rate_leads_the_sample_rate_choices`、`stem_names_survive_hostile_track_names`、`a_multi_pass_job_writes_every_pass_in_the_requested_format`（真离线引擎跑完 3 个 pass，读回三个 24-bit @22050 文件，并断言 setup 只对两个 stem 触发）。
+
+## UI 模块拆分（S3，2026-11-04）
+
+`ui/src/lib.rs` 从 **16,421 行降到 3,383 行**：`impl GlitcherZApp` 的 229 个方法按面板搬到 14 个同级模块，`lib.rs` 只留结构体/常量、`new`、编辑守卫与 undo、`ui()`、自由函数和测试。
+
+| 模块 | 行数 | 内容 |
+| :--- | ---: | :--- |
+| `engine_sync.rs` | 1282 | `apply_document` / `install_node` / 参数下发 / `sync_engine` / clip 表 |
+| `patch_ops.rs` | 1384 | patch 画布交互、建节点、连线接线、删除 |
+| `file_ops.rs` | 781 | 存/开/新建、MIDI 导入导出、自动保存、媒体收集与重定位、崩溃恢复 |
+| `export_ops.rs` | 835 | 离线引擎装配、多 pass 导出、导出对话框 |
+| `voices.rs` | 1032 | SoundFont / 采样 / 鼓机加载、音色预设、外部 FX、插件编辑器窗口 |
+| `recording.rs` | 1035 | 录音取音与 take 收尾 |
+| `timeline_ops.rs` | 1240 | 时间轴动作、clip 增删改、曲线点 |
+| `inspector_panel.rs` | 1978 | Inspector 及各 voice / effect 子面板 |
+| `mixer_panel.rs` | 897 | 混音台通道条与轨道增删 |
+| `editing.rs` | 960 | 编辑目标、卷帘与曲线编辑器 |
+| `transport.rs` | 580 | 走带条、master 段、跳转、视图 tab |
+| `keyboard.rs` | 585 | 电脑键盘 / MIDI 输入、键盘节点面板 |
+| `settings.rs` | 379 | Preferences、设备菜单、undo 历史窗口 |
+| `status_bar.rs` | 211 | 状态栏、编辑工具栏、插件扫描条 |
+
+**两条硬规则**：
+
+1. 子模块里的方法一律 `pub(crate)`。私有方法在子模块里**对父模块不可见**（`E0624`：`method is private`），搬迁时第一版就是被这个拦下来的。
+2. 模块顶部 `use super::*;` 拿结构体字段与 `lib.rs` 的自由函数（私有项对后代模块可见，反之不行）。新方法直接写进对应模块，不要再往 `lib.rs` 追加。
+
+**做法**：一次性脚本按 `impl` 花括号配平（剥掉字符串与注释再计数）切条目、按名字抽取、保持原顺序，每批搬完 `cargo check`。纯位移：前后 980 项测试一致，`fmt` / `clippy -D warnings` 零 diff。
 
 ## 媒体路径、收集与重定位（S3b，2026-11-03）
 
