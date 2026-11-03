@@ -231,13 +231,21 @@ impl AudioEngine {
         // R4: open the input side best-effort. A machine without a microphone
         // must still run the DAW; the Input node then reports the failure.
         let mut input_error = None;
-        let input = match crate::audio_input::AudioInput::open(stream_config.sample_rate, None) {
+        let input = match crate::audio_input::AudioInput::open(
+            stream_config.sample_rate,
+            &crate::audio_input::RecordSource::Default,
+        ) {
             Ok(input) => {
                 log::info!(
-                    "audio input: {} ({} ch @ {} Hz)",
+                    "audio input: {} ({} ch @ {} Hz){}",
                     input.info().device_name,
                     input.info().channels,
-                    input.info().sample_rate
+                    input.info().sample_rate,
+                    if input.info().loopback {
+                        " [WASAPI loopback]"
+                    } else {
+                        ""
+                    }
                 );
                 Some(input)
             }
@@ -826,10 +834,10 @@ impl AudioEngine {
         self.input.as_ref().map(|input| input.info())
     }
 
-    /// Names of the host's input devices (the picker's list). **Control
-    /// thread only.**
-    pub fn input_devices() -> Vec<String> {
-        crate::audio_input::input_devices()
+    /// Every recording source the picker offers (R9): capture endpoints, then
+    /// render endpoints as WASAPI loopback. **Control thread only.**
+    pub fn record_sources() -> Vec<crate::audio_input::RecordSource> {
+        crate::audio_input::record_sources()
     }
 
     /// Why the current input stream is not open (`None` while it is).
@@ -837,22 +845,30 @@ impl AudioEngine {
         self.input_error.as_deref()
     }
 
-    /// Swaps the live input stream for `device` (`None` = system default).
+    /// Swaps the live input stream for `source`.
     ///
     /// The old stream is dropped first: two open streams on one device is
     /// what makes a microphone unusable on Windows, and the graph's
     /// `InputProcessor` keeps its ring clone either way — the caller rebuilds
     /// the graph so the node latches onto the new ring.
-    pub fn reopen_input(&mut self, device: Option<&str>) -> Result<(), String> {
+    pub fn reopen_input(
+        &mut self,
+        source: &crate::audio_input::RecordSource,
+    ) -> Result<(), String> {
         self.input = None;
         let rate = self.info.sample_rate;
-        match crate::audio_input::AudioInput::open(rate, device) {
+        match crate::audio_input::AudioInput::open(rate, source) {
             Ok(input) => {
                 log::info!(
-                    "audio input: {} ({} ch @ {} Hz)",
+                    "audio input: {} ({} ch @ {} Hz){}",
                     input.info().device_name,
                     input.info().channels,
-                    input.info().sample_rate
+                    input.info().sample_rate,
+                    if input.info().loopback {
+                        " [WASAPI loopback]"
+                    } else {
+                        ""
+                    }
                 );
                 self.input = Some(input);
                 self.input_error = None;

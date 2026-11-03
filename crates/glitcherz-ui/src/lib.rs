@@ -32,6 +32,7 @@ use eframe::egui;
 
 use glitcherz_clap_host::{ClapInstance, ClapInstanceConfig};
 use glitcherz_engine::AudioEngine;
+use glitcherz_engine::RecordSource;
 use glitcherz_engine::SampleError;
 use glitcherz_engine::SampleLibrary;
 use glitcherz_engine::Sf2Error;
@@ -963,10 +964,15 @@ struct UiState {
     /// newest first. Persisted so the picker's `Recent` group survives restarts.
     #[serde(default)]
     recent_plugins: Vec<plugin_picker::RecentPlugin>,
-    /// Recording input device (`None` = system default). App-level, not
-    /// document-level: one input stream serves every project.
+    /// Recording source endpoint name (`None` = system default). App-level,
+    /// not document-level: one input stream serves every project.
     #[serde(default)]
     input_device: Option<String>,
+    /// Whether `input_device` names an **output** endpoint captured through
+    /// WASAPI loopback (R9) rather than a capture endpoint. Separate field so
+    /// the stored name stays a plain device name.
+    #[serde(default)]
+    input_loopback: bool,
 }
 
 /// Capacity limit of the recent files list.
@@ -1502,12 +1508,15 @@ pub struct GlitcherZApp {
     /// When the last take started. A take whose transport never starts rolling
     /// is a dead button, not a recording — checked a second later.
     record_started_at: Option<Instant>,
-    /// Recording input device name (`None` = the system default). Persisted:
+    /// Recording source endpoint name (`None` = the system default). Persisted:
     /// a picker that forgets the pick every launch is worse than no picker.
     audio_device: Option<String>,
-    /// Device list shown by the transport's input-device menu (refreshed on
-    /// demand — enumeration opens the driver).
-    audio_devices: Vec<String>,
+    /// Whether `audio_device` is an output endpoint captured through WASAPI
+    /// loopback (`audio_device` + this = `RecordSource::Loopback`).
+    audio_loopback: bool,
+    /// Sources shown by the transport's recording menu (refreshed on demand —
+    /// enumeration opens the driver).
+    audio_sources: Vec<RecordSource>,
     /// Desired window title.
     window_title: String,
     /// Title already sent to the windowing system (avoids resending the command every frame).
@@ -1790,7 +1799,8 @@ impl GlitcherZApp {
             record_refusal: None,
             record_started_at: None,
             audio_device: ui_state.input_device.clone(),
-            audio_devices: Vec::new(),
+            audio_loopback: ui_state.input_loopback,
+            audio_sources: Vec::new(),
             window_title: "GlitcherZ".to_string(),
             title_sent: String::new(),
             pending_file_action: None,
@@ -1848,21 +1858,24 @@ impl GlitcherZApp {
             first_frame_logged: false,
             close_sent: false,
         };
-        // R4: honour the persisted recording device. A picker that forgets the
-        // pick every launch is worse than none; a missing device falls back to
-        // the system default instead of leaving the user without an input.
-        if let Some(device) = app.audio_device.clone()
-            && let Err(err) = app.engine.reopen_input(Some(&device))
-        {
-            log::warn!(
-                "Saved audio input device unavailable, falling back to the system default: {err}"
-            );
-            app.audio_device = None;
-            if let Err(err) = app.engine.reopen_input(None) {
-                log::warn!("audio input unavailable: {err}");
+        // R4/R9: honour the persisted recording source. A picker that forgets
+        // the pick every launch is worse than none; a missing device (or an
+        // output endpoint that got unplugged) falls back to the system default
+        // instead of leaving the user without an input.
+        if app.audio_device.is_some() {
+            let source = app.record_source();
+            if let Err(err) = app.engine.reopen_input(&source) {
+                log::warn!(
+                    "Saved recording source unavailable, falling back to the system default: {err}"
+                );
+                app.audio_device = None;
+                app.audio_loopback = false;
+                if let Err(err) = app.engine.reopen_input(&RecordSource::Default) {
+                    log::warn!("audio input unavailable: {err}");
+                }
             }
         }
-        app.audio_devices = AudioEngine::input_devices();
+        app.audio_sources = AudioEngine::record_sources();
         app.push_all_params();
         if let Some(note) = config.auto_play_note {
             // Diagnostic path (smoke runs): bypass the patch route on purpose —
@@ -6816,34 +6829,43 @@ impl GlitcherZApp {
         ui.ctx().request_repaint();
     }
 
-    /// Recording-device picker (`In` in the transport). One input stream means
-    /// one device for every audio take — the label always shows what the
-    /// stream is actually bound to, not just what was picked, so a fallback
-    /// (unplugged device) is impossible to miss.
+    /// Recording-source picker (`In` in the transport). One input stream means
+    /// one source for every audio take — the label always shows what the stream
+    /// is actually bound to, not just what was picked, so a fallback (unplugged
+    /// device) is impossible to miss.
+    ///
+    /// R9: the list carries the host's render endpoints too, marked `↩`. Those
+    /// are WASAPI loopback sources: they record what the machine plays.
     fn audio_device_menu(&mut self, ui: &mut egui::Ui) {
-        if self.audio_devices.is_empty() {
-            self.audio_devices = AudioEngine::input_devices();
+        if self.audio_sources.is_empty() {
+            self.audio_sources = AudioEngine::record_sources();
         }
-        let live = self
-            .engine
-            .input_info()
-            .map(|info| info.device_name.clone());
+        let live = self.engine.input_info().cloned();
         let label = match &live {
-            Some(name) => format!("🎙 {}", short_device_name(name)),
+            Some(info) if info.loopback => {
+                format!("🔊 ↩ {}", short_device_name(&info.device_name))
+            }
+            Some(info) => format!("🎙 {}", short_device_name(&info.device_name)),
             None => "🎙 no input".to_string(),
         };
-        let mut pick: Option<Option<String>> = None;
-        let live_name = live.clone();
+        let current = self.record_source();
+        let mut pick: Option<RecordSource> = None;
         ui.menu_button(label, |ui| {
-            ui.set_min_width(280.0);
+            ui.set_min_width(320.0);
             // R4: the picker lists devices, but the *stream* is the truth:
             // show what is open right now above the choices.
-            match &live_name {
-                Some(name) => {
-                    ui.label(egui::RichText::new(name).strong());
-                    if let Some(info) = self.engine.input_info() {
-                        ui.weak(format!("{} ch @ {} Hz", info.channels, info.sample_rate));
-                    }
+            match &live {
+                Some(info) => {
+                    ui.label(egui::RichText::new(&info.device_name).strong());
+                    let kind = if info.loopback {
+                        "WASAPI loopback (what this output plays)"
+                    } else {
+                        "capture input"
+                    };
+                    ui.weak(format!(
+                        "{} · {} ch @ {} Hz",
+                        kind, info.channels, info.sample_rate
+                    ));
                 }
                 None => {
                     ui.colored_label(
@@ -6857,65 +6879,120 @@ impl GlitcherZApp {
             }
             ui.separator();
             if ui
-                .selectable_label(self.audio_device.is_none(), "System default")
+                .selectable_label(
+                    current == RecordSource::Default,
+                    "System default (microphone)",
+                )
                 .clicked()
             {
-                pick = Some(None);
+                pick = Some(RecordSource::Default);
             }
-            if self.audio_devices.is_empty() {
-                ui.weak("(no input devices found)");
+
+            let sources = self.audio_sources.clone();
+            let captures: Vec<&String> = sources
+                .iter()
+                .filter_map(|source| match source {
+                    RecordSource::Capture(name) => Some(name),
+                    _ => None,
+                })
+                .collect();
+            let loopbacks: Vec<&String> = sources
+                .iter()
+                .filter_map(|source| match source {
+                    RecordSource::Loopback(name) => Some(name),
+                    _ => None,
+                })
+                .collect();
+
+            ui.add_space(2.0);
+            ui.weak("Inputs");
+            if captures.is_empty() {
+                ui.weak("(none found)");
             }
-            let devices = self.audio_devices.clone();
-            for name in devices {
-                let selected = self.audio_device.as_deref() == Some(name.as_str());
-                if ui.selectable_label(selected, &name).clicked() {
-                    pick = Some(Some(name.clone()));
+            for name in captures {
+                let source = RecordSource::Capture(name.clone());
+                if ui.selectable_label(current == source, name).clicked() {
+                    pick = Some(source);
                 }
             }
+
+            ui.add_space(2.0);
+            ui.weak("System playback (loopback)");
+            if loopbacks.is_empty() {
+                ui.weak("(none found)");
+            }
+            for name in loopbacks {
+                let source = RecordSource::Loopback(name.clone());
+                let hint = "WASAPI loopback: records everything this output device plays — \
+                            other apps, and this project's own playback if the engine outputs \
+                            to it.";
+                if ui
+                    .selectable_label(current == source, format!("↩ {name}"))
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    pick = Some(source);
+                }
+            }
+
             ui.separator();
             if ui.button("Refresh devices").clicked() {
-                self.audio_devices = AudioEngine::input_devices();
+                self.audio_sources = AudioEngine::record_sources();
             }
         })
         .response
         .on_hover_text(
-            "Audio input device for recording (one stream: applies to every audio take)",
+            "Recording source (one stream: applies to every audio take). ↩ entries record what \
+             the machine plays.",
         );
 
-        if let Some(device) = pick {
-            self.pick_audio_device(device);
+        if let Some(source) = pick {
+            self.pick_audio_source(source);
         }
     }
 
-    /// Opens `device` (`None` = system default) and rebuilds the graph so the
-    /// `Input` node latches onto the new stream's ring.
-    fn pick_audio_device(&mut self, device: Option<String>) {
+    /// The picker state as an engine source.
+    fn record_source(&self) -> RecordSource {
+        match (&self.audio_device, self.audio_loopback) {
+            (Some(name), true) => RecordSource::Loopback(name.clone()),
+            (Some(name), false) => RecordSource::Capture(name.clone()),
+            (None, _) => RecordSource::Default,
+        }
+    }
+
+    /// Opens `source` and rebuilds the graph so the `Input` node latches onto
+    /// the new stream's ring.
+    fn pick_audio_source(&mut self, source: RecordSource) {
         if self.is_recording() {
             self.recording_problem(
-                "End the take before switching the audio input device".to_string(),
+                "End the take before switching the recording source".to_string(),
             );
             return;
         }
-        match self.engine.reopen_input(device.as_deref()) {
+        match self.engine.reopen_input(&source) {
             Ok(()) => {
-                self.audio_device = device;
-                self.audio_devices = AudioEngine::input_devices();
+                self.audio_device = source.name().map(str::to_string);
+                self.audio_loopback = source.is_loopback();
+                self.audio_sources = AudioEngine::record_sources();
                 // The Input node holds a clone of the *old* ring; a rebuild is
                 // what makes the monitor path follow the new stream.
                 self.apply_document();
                 let described = self.engine.input_info().map(|info| {
                     format!(
-                        "{} ({} ch @ {} Hz)",
-                        info.device_name, info.channels, info.sample_rate
+                        "{}{} ({} ch @ {} Hz)",
+                        if info.loopback { "↩ " } else { "" },
+                        info.device_name,
+                        info.channels,
+                        info.sample_rate
                     )
                 });
                 self.set_message(format!(
-                    "Audio input: {}",
+                    "Recording source: {}",
                     described.unwrap_or_else(|| "system default".to_string())
                 ));
             }
             Err(err) => {
-                self.recording_problem(format!("Cannot open the audio input device: {err}"));
+                self.recording_problem(format!("Cannot open the recording source: {err}"));
             }
         }
     }
@@ -7147,6 +7224,19 @@ impl GlitcherZApp {
                 " — {} is not wired to the master: connect its AudioTrack node to a mixer \
                  channel in Patch or playback stays silent",
                 silent_audio.join(", ")
+            ));
+        }
+        // R9: a loopback source hears the machine, including this project when
+        // the engine outputs to that same endpoint — the one failure mode a
+        // user cannot guess from the meters moving.
+        if !audio_armed.is_empty()
+            && let Some(info) = self.engine.input_info()
+            && info.loopback
+        {
+            message.push_str(&format!(
+                " — recording WASAPI loopback of {}: this project's own playback is part of \
+                 the take if the engine outputs there",
+                info.device_name
             ));
         }
         self.set_message(message);
@@ -14045,6 +14135,7 @@ impl eframe::App for GlitcherZApp {
                 recent_files: self.recent.clone(),
                 recent_plugins: self.recent_plugins.clone(),
                 input_device: self.audio_device.clone(),
+                input_loopback: self.audio_loopback,
             },
         );
         // U9 E2: the plugin catalog (spec `plugin-browser.md` D11). A partial

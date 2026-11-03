@@ -1,6 +1,8 @@
 //! Audio input capture (R4, spec `.agents/spec/recording.md` §3.3).
 //!
-//! One cpal input stream feeds two lock-free queues:
+//! One cpal stream feeds two lock-free queues. The stream is a capture
+//! endpoint by default, or a **render** endpoint captured through WASAPI
+//! loopback (R9) — "record what this machine plays" without a virtual cable.
 //!
 //! * **monitor**: consumed by the graph's `InputProcessor`, so the input can
 //!   be routed into effects / a mixer like any other source (D9);
@@ -113,6 +115,40 @@ impl InputStats {
     }
 }
 
+/// Where a recording stream takes its samples from (R9).
+///
+/// WASAPI captures a **render** endpoint as easily as a capture one: cpal sees
+/// the endpoint's data flow and sets `AUDCLNT_STREAMFLAGS_LOOPBACK` itself
+/// (`host/wasapi/device.rs`), so "record what this machine plays" needs no
+/// extra crate and no virtual cable — just a separate source kind, because the
+/// two paths differ in config probing (see [`choose_config`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RecordSource {
+    /// The system default input device.
+    #[default]
+    Default,
+    /// A named capture endpoint (microphone, interface, virtual cable input).
+    Capture(String),
+    /// A named render endpoint, captured through WASAPI loopback: everything
+    /// this output device plays, including other applications.
+    Loopback(String),
+}
+
+impl RecordSource {
+    /// Endpoint name, `None` for the system default.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Default => None,
+            Self::Capture(name) | Self::Loopback(name) => Some(name),
+        }
+    }
+
+    /// Whether this source listens to an output endpoint.
+    pub fn is_loopback(&self) -> bool {
+        matches!(self, Self::Loopback(_))
+    }
+}
+
 /// Input stream description for the UI / take writer.
 #[derive(Debug, Clone)]
 pub struct AudioInputInfo {
@@ -122,6 +158,8 @@ pub struct AudioInputInfo {
     pub channels: usize,
     /// Sample rate (Hz). Always the engine's output rate (no resampling, D4).
     pub sample_rate: u32,
+    /// Whether the samples are this machine's playback (WASAPI loopback).
+    pub loopback: bool,
 }
 
 /// The live input stream plus the handles its callback and consumers share.
@@ -135,26 +173,43 @@ pub struct AudioInput {
     _stream: cpal::Stream,
 }
 
-/// Names of the host's input devices, sorted, de-duplicated.
+/// Every source a take can record from: the host's capture endpoints, then its
+/// render endpoints (WASAPI loopback), each group sorted by name.
 ///
-/// **Control thread only** (device enumeration opens the driver). A host
-/// that cannot enumerate returns an empty list; `open` then still falls back
-/// to the system default, so a picker failure never kills recording.
-pub fn input_devices() -> Vec<String> {
+/// **Control thread only** (enumeration opens the driver). A host that cannot
+/// enumerate returns an empty list; `open` still falls back to the system
+/// default, so a picker failure never kills recording.
+pub fn record_sources() -> Vec<RecordSource> {
     let host = cpal::default_host();
-    let Ok(devices) = host.input_devices() else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = devices.map(|device| device.to_string()).collect();
-    names.sort_by_key(|name| name.to_lowercase());
-    names.dedup();
-    names
+    let mut sources = Vec::new();
+    if let Ok(devices) = host.input_devices() {
+        sources.extend(devices.map(|device| RecordSource::Capture(device.to_string())));
+    }
+    if let Ok(devices) = host.output_devices() {
+        sources.extend(devices.map(|device| RecordSource::Loopback(device.to_string())));
+    }
+    sources.sort_by_key(RecordSource::sort_key);
+    sources.dedup();
+    sources
 }
 
-/// Finds `wanted` among the host's input devices (exact name first, then a
-/// case-insensitive match), or explains why it is gone.
-fn device_by_name(host: &cpal::Host, wanted: &str) -> Result<cpal::Device, EngineError> {
-    let devices: Vec<cpal::Device> = host.input_devices()?.collect();
+impl RecordSource {
+    /// Capture endpoints before render endpoints, then by lowercased name.
+    fn sort_key(&self) -> (bool, String) {
+        (
+            self.is_loopback(),
+            self.name().unwrap_or_default().to_lowercase(),
+        )
+    }
+}
+
+/// Finds `wanted` in `devices` (exact name first, then case-insensitive), or
+/// explains why it is gone.
+fn device_by_name(
+    devices: Vec<cpal::Device>,
+    wanted: &str,
+    role: &str,
+) -> Result<cpal::Device, EngineError> {
     if let Some(device) = devices.iter().find(|device| device.to_string() == wanted) {
         return Ok(device.clone());
     }
@@ -166,7 +221,7 @@ fn device_by_name(host: &cpal::Host, wanted: &str) -> Result<cpal::Device, Engin
         return Ok(device.clone());
     }
     Err(EngineError::InputUnsupported(format!(
-        "input device \"{wanted}\" is not available (unplugged?). Available: {}",
+        "{role} device \"{wanted}\" is not available (unplugged?). Available: {}",
         if devices.is_empty() {
             "none".to_string()
         } else {
@@ -179,22 +234,43 @@ fn device_by_name(host: &cpal::Host, wanted: &str) -> Result<cpal::Device, Engin
     )))
 }
 
+/// Resolves a source to its endpoint and says whether it is a render endpoint
+/// (loopback) — checked from the endpoint itself, not from the source kind, so
+/// a stale pick cannot quietly turn into the wrong direction.
+fn resolve_source(
+    host: &cpal::Host,
+    source: &RecordSource,
+) -> Result<(cpal::Device, bool), EngineError> {
+    match source {
+        RecordSource::Default => Ok((
+            host.default_input_device()
+                .ok_or(EngineError::NoInputDevice)?,
+            false,
+        )),
+        RecordSource::Capture(name) => {
+            let devices: Vec<cpal::Device> = host.input_devices()?.collect();
+            Ok((device_by_name(devices, name, "input")?, false))
+        }
+        RecordSource::Loopback(name) => {
+            let devices: Vec<cpal::Device> = host.output_devices()?.collect();
+            Ok((device_by_name(devices, name, "output")?, true))
+        }
+    }
+}
+
 impl AudioInput {
-    /// Opens `device_name`, or the system default when it is `None`.
+    /// Opens `source` at the engine's rate.
     ///
     /// No resampling (spec "不做的事"): a device that cannot deliver the
     /// engine's rate is a hard error, so what is recorded is byte-for-byte
-    /// what the timeline expects.
-    pub fn open(sample_rate: u32, device_name: Option<&str>) -> Result<Self, EngineError> {
+    /// what the timeline expects. That bites loopback harder than capture —
+    /// shared-mode loopback is never converted by the OS — so the error names
+    /// the rates the endpoint does run.
+    pub fn open(sample_rate: u32, source: &RecordSource) -> Result<Self, EngineError> {
         let host = cpal::default_host();
-        let device = match device_name {
-            Some(name) => device_by_name(&host, name)?,
-            None => host
-                .default_input_device()
-                .ok_or(EngineError::NoInputDevice)?,
-        };
+        let (device, loopback) = resolve_source(&host, source)?;
         let device_name = device.to_string();
-        let chosen = choose_config(&device, sample_rate, &device_name)?;
+        let chosen = choose_config(&device, sample_rate, &device_name, loopback)?;
         let channels = chosen.channels() as usize;
         let monitor = InputRing::new(INPUT_RING_CAPACITY);
         let record = InputRing::new(RECORD_RING_CAPACITY);
@@ -254,6 +330,7 @@ impl AudioInput {
                 device_name,
                 channels,
                 sample_rate,
+                loopback,
             },
             _stream: stream,
         })
@@ -304,55 +381,106 @@ impl AudioInput {
     }
 }
 
-/// Picks an f32 input config at `sample_rate`, preferring mono, then stereo,
-/// then whatever the device offers.
+/// Picks an f32 config at `sample_rate` for a capture or loopback stream.
+///
+/// The two directions answer different questions. cpal reports an output
+/// device's formats through `supported_output_configs` and returns **empty**
+/// from `supported_input_configs` ("assume no input formats"), so a loopback
+/// stream has to probe the render side; and because shared-mode loopback never
+/// gets the output path's automatic format conversion, only natively supported
+/// rates work.
 ///
 /// The failure text lists what the device *does* offer: "no f32 at 48 kHz"
-/// alone leaves the user with no next step, and a picker needs to explain
-/// why the device they chose cannot be used.
+/// alone leaves the user with no next step, and a picker needs to explain why
+/// the device they chose cannot be used.
 fn choose_config(
     device: &cpal::Device,
     sample_rate: u32,
     device_name: &str,
+    loopback: bool,
 ) -> Result<cpal::SupportedStreamConfig, EngineError> {
     let mut chosen: Option<cpal::SupportedStreamConfigRange> = None;
     let mut offered: Vec<String> = Vec::new();
-    if let Ok(ranges) = device.supported_input_configs() {
-        for range in ranges {
-            offered.push(format!(
-                "{:?} {}ch {}..{} Hz",
-                range.sample_format(),
-                range.channels(),
-                range.min_sample_rate(),
-                range.max_sample_rate()
-            ));
-            if range.sample_format() != cpal::SampleFormat::F32 {
-                continue;
-            }
-            if sample_rate < range.min_sample_rate() || sample_rate > range.max_sample_rate() {
-                continue;
-            }
-            let better = match &chosen {
-                None => true,
-                Some(current) => preference(range.channels(), current.channels()),
-            };
-            if better {
-                chosen = Some(range);
+    // The two directions return distinct iterator types, so normalise to a
+    // Vec before the shared selection loop.
+    let probe: Result<Vec<cpal::SupportedStreamConfigRange>, cpal::Error> = if loopback {
+        device
+            .supported_output_configs()
+            .map(std::iter::Iterator::collect)
+    } else {
+        device
+            .supported_input_configs()
+            .map(std::iter::Iterator::collect)
+    };
+    let mut probe_error = None;
+    match probe {
+        Ok(ranges) => {
+            for range in ranges {
+                offered.push(format!(
+                    "{:?} {}ch {}..{} Hz",
+                    range.sample_format(),
+                    range.channels(),
+                    range.min_sample_rate(),
+                    range.max_sample_rate()
+                ));
+                if range.sample_format() != cpal::SampleFormat::F32 {
+                    continue;
+                }
+                if sample_rate < range.min_sample_rate() || sample_rate > range.max_sample_rate() {
+                    continue;
+                }
+                let better = match &chosen {
+                    None => true,
+                    // A system mix is inherently multichannel: taking mono
+                    // first would drop half of what the machine plays.
+                    Some(current) if loopback => {
+                        stereo_preference(range.channels(), current.channels())
+                    }
+                    Some(current) => preference(range.channels(), current.channels()),
+                };
+                if better {
+                    chosen = Some(range);
+                }
             }
         }
+        Err(err) => probe_error = Some(err.to_string()),
     }
     let range = chosen.ok_or_else(|| {
+        let reason = if loopback {
+            format!(
+                "{device_name}: WASAPI loopback is not resampled by the OS, so {sample_rate} Hz \
+                 must be a rate this output endpoint runs natively — it is not"
+            )
+        } else {
+            format!("{device_name}: no f32 input config at {sample_rate} Hz (no resampling)")
+        };
         EngineError::InputUnsupported(format!(
-            "{device_name}: no f32 input config at {sample_rate} Hz (no resampling is \
-             performed); device offers [{}]",
+            "{reason}; device offers [{}{}]{}",
             if offered.is_empty() {
                 "nothing".to_string()
             } else {
                 offered.join(", ")
-            }
+            },
+            if loopback {
+                " — set the endpoint to the engine rate in Windows sound settings, or pick \
+                  another device"
+            } else {
+                ""
+            },
+            probe_error.map_or_else(String::new, |err| format!(" ({err})")),
         ))
     })?;
     Ok(range.with_sample_rate(sample_rate))
+}
+
+/// Channel preference for loopback: stereo, then mono, then the smallest.
+fn stereo_preference(candidate: u16, current: u16) -> bool {
+    let rank = |channels: u16| match channels {
+        2 => 0,
+        1 => 1,
+        n => 2 + n,
+    };
+    rank(candidate) < rank(current)
 }
 
 /// Channel preference: mono first (one channel is all a take needs), then
@@ -364,4 +492,42 @@ fn preference(candidate: u16, current: u16) -> bool {
         n => 2 + n,
     };
     rank(candidate) < rank(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The picker groups by kind, so the sort key must put every capture
+    /// endpoint before every loopback one (and keep names case-insensitive
+    /// alphabetical within a group).
+    #[test]
+    fn capture_sources_sort_before_loopback() {
+        let mut sources = vec![
+            RecordSource::Loopback("USB DAC".to_string()),
+            RecordSource::Capture("mic B".to_string()),
+            RecordSource::Loopback("Realtek".to_string()),
+            RecordSource::Capture("Mic A".to_string()),
+        ];
+        sources.sort_by_key(RecordSource::sort_key);
+        assert_eq!(
+            sources,
+            vec![
+                RecordSource::Capture("Mic A".to_string()),
+                RecordSource::Capture("mic B".to_string()),
+                RecordSource::Loopback("Realtek".to_string()),
+                RecordSource::Loopback("USB DAC".to_string()),
+            ]
+        );
+    }
+
+    /// `Default` is an input device: it must never be treated as loopback, or
+    /// the engine would look for a render endpoint it was never given.
+    #[test]
+    fn default_source_is_a_capture_source() {
+        assert_eq!(RecordSource::default(), RecordSource::Default);
+        assert!(!RecordSource::default().is_loopback());
+        assert_eq!(RecordSource::default().name(), None);
+        assert!(RecordSource::Loopback("x".to_string()).is_loopback());
+    }
 }

@@ -84,12 +84,15 @@ UI 每帧：drain → 丢弃 ticks < record_start_ticks（pre-roll）→ on/off 
 ### 3.3 音频录音（R4）
 
 ```
-cpal 输入流回调（输入设备线程）
+cpal 流回调（capture 端点，或 render 端点的 WASAPI loopback —— R9）
   ├─→ ring A（监听）→ InputProcessor（图内节点）→ 用户接的任意下游
   └─→ ring B（录音）→ UI 每帧 drain → 内存 Vec<f32>
 停止 → 写 <stem>.media/rec-<时间戳>-<track>.wav → 建 AudioClip（相对路径）
      → SetAudioClips（既有结构队列路径，RT 侧零改动）
 ```
+
+**录音源**（R9 D34）：`RecordSource::{Default, Capture(name), Loopback(name)}`。
+三条路都进同一个 `AudioInput`，所以监听、take 写入、干区校验、undo 全都不分叉。
 
 ### 3.4 轨输入口（R6）
 
@@ -181,6 +184,13 @@ LFO/curve ──automation──► Curve 1 输入口  （R8：块边界采样 t
   **限制**：源仅支持**控制输出节点**（LFO / Envelope / Portamento / Curve Map）；
   Timeline 曲线出口 → 曲线输入的再采样尚未实现，按 Rec 会明确拒绝。
 
+- [x] **R9 系统声音内录**（WASAPI loopback）✅ 2026-11-03
+  `RecordSource`（Default / Capture / Loopback）+ `record_sources()` 枚举；
+  loopback 走 render 端点的 `supported_output_configs()`，按端点原生采样率开流（无重采样）；
+  transport 设备菜单分「Inputs / System playback (loopback)」两组，选择持久化到
+  `UiState.{input_device, input_loopback}`；按 Rec 时若源为 loopback 明确提示
+  "本工程回放也会进 take"。
+
 ## 5. 轨输入口与录音归属（R6，2026-11-01 用户裁定）
 
 用户裁定（原话要点）：**patch 是显式基准，也是现实舞台设备连接的虚拟化表示**，所以录音前
@@ -222,3 +232,24 @@ LFO/curve ──automation──► Curve 1 输入口  （R8：块边界采样 t
 - **音频输入的采样率转换**：输入设备按引擎采样率打开，失败则报错不回退。
 - **输入节点的多设备混音**：第一版只支持单一输入设备（一个 stream）。
 - **节拍器音色自定义**：不做采样替换，合成表够用。
+
+## 7. 系统声音内录（R9，2026-11-03）
+
+需求原话：*"wasapi 是不是支持 loopback 录音，也就是目前 usb audio 播放的声音可以内录到
+audio 轨上，现在好像还不支持"*。
+
+**真机验证**（`Wasapi` host，默认输出 `扬声器 (USB AUDIO DAC)`，mix `F32 2 ch @ 48 kHz`）：
+在 render 端点上开一条"输入流"，回采 1.2 s 的 440 Hz 测试音 → 58560 帧，
+`ch0 = ch1 = 0.2000`，与源幅度一致。结论：**能力一直在 cpal 里，只是 UI 只枚举了输入设备。**
+
+| # | 决策 | 理由 |
+| :-- | :-- | :-- |
+| D34 | 内录是**录音源的一种**，不是新节点、不是虚拟设备 | `RecordSource::{Default, Capture(name), Loopback(name)}` 只描述"这条流从哪来"。图里的 `Input` 节点、monitor/take 双 ring、dry-region 校验、clip 落盘与 undo 全部分叉不变 |
+| D35 | 用 cpal 自带的 loopback，**不引 `wasapi` crate** | cpal 0.18 的 WASAPI 后端在 `data_flow == eRender` 时自己加 `AUDCLNT_STREAMFLAGS_LOOPBACK`（`host/wasapi/device.rs`）。零新依赖，跨平台分支也不用写 |
+| D36 | loopback 的配置从 `supported_output_configs()` 取，**必须端点原生采样率** | cpal 对输出设备的 `supported_input_configs()` 返回空、`default_input_config()` 直接 `UnsupportedOperation`；且共享模式 loopback 不走输出路径的 `AUTOCONVERTPCM`，引擎采样率不被支持时 `Initialize` 会失败。失败文案列出端点实际支持的格式，并提示在 Windows 声音设置里改端点采样率 |
+| D37 | 内录会把**本工程自己的回放**录进 take | 引擎输出与该端点同一个设备时这是物理必然。按 Rec 的启动消息里明说，不自动静音、不临时改路由——用户可能就是想内录整机混音（含本工程）。想只录外部声音就把引擎输出换到另一个设备，或先停走带 |
+| D38 | 同一时刻只有一条录音流 | 内录 + 麦克风同时录需要第二条 stream 与混音归属规则，属 R4 既有"单一输入设备"限制的延伸，本轮不做 |
+
+**连接方式**：transport 的 `In` → 菜单里 `System playback (loopback)` 分组（`↩ 设备名`），
+选中即换流并重建图（`Input` 节点重新 latch 新 ring）。选择持久化到
+`UiState.{input_device, input_loopback}`；设备拔掉时回落系统默认并在日志/状态栏说明。
