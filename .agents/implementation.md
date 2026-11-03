@@ -730,3 +730,14 @@ let _ = self.slot_set_param(route.slot, ParamId::PitchOffset, value); // synth /
 - **删通道要在同一步收尾**：`mixer_remove_channel` 除了 `inputs -= 1` + `channels.pop()`，还要 `retain` 掉指向该通道的 automation 电缆并 `clear_auto_route(index)`，否则下次保存被校验拒绝、引擎也会继续往闲置通道写值。
 
 **已知边界**：参数仍是块边界写入（≤2.7 ms）。内置效果器有自己的 `Smoothed`，但 **mixer 通道权重是块内常量**（`input_weights()` 每块读一次，`sum_into_weighted` 逐样本乘同一权重），所以 LFO 形态的 gain 曲线会有 375 Hz 台阶；推子慢推听不出来。块内线性斜坡是 A2 的后续项：`Processor` 增加"上一块权重"接口 + 求和循环在 `from`/`to` 之间插值，代价是 mixer 求和数学测试的期望值要跟着改成"块内均值"。
+
+## 录音输入 UI 归位（R4/R5/R9，2026-11-03）
+
+**设备与电平不再挂在走带条。** 走带条只保留"这次怎么录"的会话设置（pre-roll、`Mute others`、手动 `Latency`）；录音源与电平归到它们描述的实体上：
+
+- `Audio In` 节点（`NodeDoc::Input`）底部新增两行信息区：设备 chip（点击弹出录音源菜单，含系统默认 / Inputs / System playback 两组 + Refresh）和该节点所选 channel 的实时峰值条。节点高度由 `size_of` 的 `INPUT_INFO_ROWS` 预留；菜单打开时用 `PatchState.input_sources` 缓存一次枚举结果（枚举会打开驱动，不能每帧调用）。
+- Inspector 选中 `Audio In` 时显示 `input_section`：设备菜单、流状态（设备名 / 通道数 / 采样率 / loopback / 错误）、该 channel 的 peak、Ch 1/Ch 2 选择、输出 gain。`resolve_panel_target` / `opens_inspector` 已把 `NodeDoc::Input` 加入可编辑白名单。
+- `NodeDoc::Input.channel/gain` 之前只有模型字段、没有 UI 入口；现在节点内联（`InlineParam::InputChannel/InputGain`）和 Inspector 都会写文档并经 `ParamId::InputChannel/InputGain` 下发引擎。channel 行是 combo（Ch 1 / Ch 2），与 SF2 bank/patch 共用 `pending_choice` 弹窗。
+- **电平按通道**：`InputStats` 的 `peaks: [AtomicU32; 2]` 由 cpal 回调按 `i % channels` 分通道写入（栈数组 + relaxed 原子，仍满足实时铁律），`peak_of(ch)` 供节点/Inspector 读；`peak()` 返回两通道最大值。
+
+**为什么 latency 留在走带条**：它是 take 的对齐偏移（正数把音频 clip 起点提前），依赖当前设备与缓冲大小，会话级、不随工程保存；放在走带条与 pre-roll / `Mute others` 同属"本次录音怎么采"，挂到工程节点上会被误读成节点参数。控件已加 `Latency` 标签与完整 hover 说明。

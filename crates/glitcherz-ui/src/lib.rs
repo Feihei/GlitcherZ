@@ -783,6 +783,8 @@ fn inline_param_id(p: patch::InlineParam) -> ParamId {
         // preset list to keep a valid address), never straight to a param.
         patch::InlineParam::Sf2Bank => ParamId::Sf2BankSelect,
         patch::InlineParam::Sf2Program => ParamId::Sf2ProgramChange,
+        patch::InlineParam::InputGain => ParamId::InputGain,
+        patch::InlineParam::InputChannel => ParamId::InputChannel,
     }
 }
 
@@ -1131,6 +1133,9 @@ fn resolve_panel_target(
                         | NodeDoc::MidiEnvelope { .. }
                         | NodeDoc::Lfo { .. }
                         | NodeDoc::CurveMap { .. }
+                        // R4: the live input node's device picker, meter and
+                        // channel/gain are its Inspector panel.
+                        | NodeDoc::Input { .. }
                 ) {
                     return Some(node.node_id());
                 }
@@ -2824,6 +2829,11 @@ impl GlitcherZApp {
                         )
                     })
                     .collect::<Vec<_>>(),
+                // R4: the live input node's channel + trim.
+                NodeDoc::Input { channel, gain, .. } => vec![
+                    (ParamId::InputChannel, f32::from(*channel)),
+                    (ParamId::InputGain, *gain),
+                ],
                 _ => continue,
             };
             for (id, value) in params {
@@ -3301,6 +3311,29 @@ impl GlitcherZApp {
                     .cloned()
                     .unwrap_or_default()
             };
+            // R4: live input snapshot for the Audio In node's device chip and
+            // per-channel meter. The cloned handles/strings outlive the
+            // `&dyn Fn` readers stored in `PatchDeps`.
+            let input_info = self.engine.input_info().cloned();
+            let input_error = self.engine.input_error().map(str::to_string);
+            let input_stats = self.engine.input_stats();
+            let input_peak = move |channel: u8| {
+                input_stats
+                    .as_ref()
+                    .map_or(0.0, |stats| stats.peak_of(usize::from(channel)))
+            };
+            // Read the app's cached device list: the patch captures it once per
+            // menu open, so this closure must never enumerate devices itself.
+            let input_source_cache = self.audio_sources.clone();
+            let input_sources = move || {
+                input_source_cache
+                    .iter()
+                    .map(|source| patch::InputSourceItem {
+                        name: source.name().map(str::to_string),
+                        loopback: source.is_loopback(),
+                    })
+                    .collect::<Vec<_>>()
+            };
             patch::show(
                 ui,
                 patch_state,
@@ -3312,6 +3345,15 @@ impl GlitcherZApp {
                     auto_options: &options,
                     plugin_inline: &plugin_inline,
                     sf2_presets: &sf2_presets,
+                    input: patch::InputDeps {
+                        open: input_info.is_some(),
+                        device: input_info.as_ref().map(|info| info.device_name.as_str()),
+                        loopback: input_info.as_ref().is_some_and(|info| info.loopback),
+                        channels: input_info.as_ref().map_or(0, |info| info.channels),
+                        error: input_error.as_deref(),
+                        peak: Some(&input_peak),
+                        sources: Some(&input_sources),
+                    },
                 },
             )
         };
@@ -3428,6 +3470,17 @@ impl GlitcherZApp {
                 }
                 patch::PatchAction::SetInlineParam { node, param, value } => {
                     self.apply_inline_param(node, param, value);
+                }
+                patch::PatchAction::PickInputSource(item) => {
+                    let source = match item.name {
+                        None => RecordSource::Default,
+                        Some(name) if item.loopback => RecordSource::Loopback(name),
+                        Some(name) => RecordSource::Capture(name),
+                    };
+                    self.pick_audio_source(source);
+                }
+                patch::PatchAction::RefreshInputSources => {
+                    self.audio_sources = AudioEngine::record_sources();
                 }
             }
         }
@@ -6873,10 +6926,10 @@ impl GlitcherZApp {
         ui.ctx().request_repaint();
     }
 
-    /// Recording-source picker (`In` in the transport). One input stream means
-    /// one source for every audio take — the label always shows what the stream
-    /// is actually bound to, not just what was picked, so a fallback (unplugged
-    /// device) is impossible to miss.
+    /// Recording-source picker (Audio In node + its Inspector panel). One input
+    /// stream means one source for every audio take — the label always shows
+    /// what the stream is actually bound to, not just what was picked, so a
+    /// fallback (unplugged device) is impossible to miss.
     ///
     /// R9: the list carries the host's render endpoints too, marked `↩`. Those
     /// are WASAPI loopback sources: they record what the machine plays.
@@ -6885,12 +6938,14 @@ impl GlitcherZApp {
             self.audio_sources = AudioEngine::record_sources();
         }
         let live = self.engine.input_info().cloned();
+        // `🎙` / `🔊` (U+1F399 / U+1F50A) are not in egui's default font
+        // set and paint as tofu boxes; `↩` (U+21A9) and plain text are.
         let label = match &live {
             Some(info) if info.loopback => {
-                format!("🔊 ↩ {}", short_device_name(&info.device_name))
+                format!("↩ {}", short_device_name(&info.device_name))
             }
-            Some(info) => format!("🎙 {}", short_device_name(&info.device_name)),
-            None => "🎙 no input".to_string(),
+            Some(info) => format!("In · {}", short_device_name(&info.device_name)),
+            None => "In · no input".to_string(),
         };
         let current = self.record_source();
         let mut pick: Option<RecordSource> = None;
@@ -7992,6 +8047,124 @@ impl GlitcherZApp {
         }
     }
 
+    /// Inspector panel for a live `Audio In` node (R4): the recording source
+    /// (one global stream), its status, the selected channel's meter, and the
+    /// node's own channel / output trim.
+    fn input_section(&mut self, ui: &mut egui::Ui, node: u64, channel: u8, gain: f32) {
+        ui.weak(
+            "Live input: one recording stream feeds every audio take. The channel and gain \
+             below belong to this node.",
+        );
+        ui.add_space(6.0);
+        self.audio_device_menu(ui);
+
+        let info = self.engine.input_info().cloned();
+        match &info {
+            Some(info) => {
+                ui.weak(format!(
+                    "{} ch @ {} Hz · {}",
+                    info.channels,
+                    info.sample_rate,
+                    if info.loopback { "loopback" } else { "capture" }
+                ));
+            }
+            None => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 120, 110),
+                    "No input stream is open",
+                );
+                if let Some(err) = self.engine.input_error() {
+                    ui.weak(err);
+                }
+            }
+        }
+
+        ui.add_space(6.0);
+        ui.label("Input level");
+        if let Some(stats) = self.engine.input_stats() {
+            let peak = stats.peak_of(usize::from(channel)).min(1.0);
+            ui.add(
+                egui::ProgressBar::new(peak)
+                    .desired_width(180.0)
+                    .text(format!("Ch {} · {:.0}%", channel + 1, peak * 100.0)),
+            )
+            .on_hover_text("Live peak of the channel this node takes (pre-take)");
+        } else {
+            ui.weak("—").on_hover_text("No input stream is open");
+        }
+        if let Some(info) = &info
+            && usize::from(channel) >= info.channels
+        {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 160, 80),
+                format!(
+                    "The stream carries {} channel(s); this node selects a channel it does not \
+                     have and will be silent.",
+                    info.channels
+                ),
+            );
+        }
+
+        ui.add_space(6.0);
+        ui.label("Channel");
+        let mut picked: Option<u8> = None;
+        ui.horizontal(|ui| {
+            for ch in 0..2u8 {
+                let available = info
+                    .as_ref()
+                    .is_none_or(|info| usize::from(ch) < info.channels);
+                let selected = ch == channel;
+                if ui
+                    .add_enabled(
+                        available || selected,
+                        egui::Button::new(format!("Ch {}", ch + 1)).selected(selected),
+                    )
+                    .clicked()
+                    && !selected
+                {
+                    picked = Some(ch);
+                }
+            }
+        });
+        if let Some(ch) = picked {
+            let before = self.begin_edit();
+            if let Some(NodeDoc::Input { channel, .. }) =
+                self.project_mut().graph.node_by_id_mut(node)
+            {
+                *channel = ch;
+            }
+            self.commit_edit("Input Channel", before);
+            self.send_node_param(node, ParamId::InputChannel, f32::from(ch));
+        }
+
+        ui.add_space(6.0);
+        ui.label("Gain");
+        let mut value = gain;
+        let response = ui.add(
+            egui::Slider::new(&mut value, 0.0..=2.0)
+                .fixed_decimals(2)
+                .text("output"),
+        );
+        if response.changed() {
+            let before = self.begin_param_edit();
+            if let Some(NodeDoc::Input { gain, .. }) = self.project_mut().graph.node_by_id_mut(node)
+            {
+                *gain = value;
+            }
+            self.commit_param_edit("Input Gain", before, "input-gain");
+            self.send_node_param(node, ParamId::InputGain, value);
+        }
+        if response.drag_stopped() {
+            self.end_param_edit();
+        }
+
+        ui.add_space(6.0);
+        ui.weak(
+            "The recording source is shared: changing it here reopens the stream for every \
+             audio take, not just this node.",
+        );
+    }
+
     /// Recomputes the hardware MIDI routing snapshots and hands them to the hub
     /// (R3/R6, spec `recording.md` §3.2 §5).
     ///
@@ -8475,6 +8648,14 @@ impl GlitcherZApp {
                     .on_hover_text(
                         "While recording, silence the sequenced notes of every other MIDI track",
                     );
+                // R4/R5: the device picker and the input meter live on the Audio In
+                // node and its Inspector panel — the transport keeps only the
+                // take settings (pre-roll, mute others, manual alignment).
+                ui.label("Latency").on_hover_text(
+                    "Manual input latency offset in samples: positive moves audio takes \
+                     earlier on the timeline. Session-only — it depends on this device and \
+                     buffer size, so it is not saved with the project.",
+                );
                 ui.add(
                     egui::DragValue::new(&mut self.record_latency_samples)
                         .range(-48_000..=48_000)
@@ -8484,25 +8665,6 @@ impl GlitcherZApp {
                 .on_hover_text(
                     "Manual input latency offset: positive moves audio takes earlier on the timeline",
                 );
-                // R5/R4: live input level + the recording-device picker. Both
-                // sit next to Rec because "which microphone is this take
-                // using" is a recording decision, and an unplugged or silent
-                // device has to be visible *before* the take, not after it.
-                ui.separator();
-                ui.label("In");
-                if let Some(stats) = self.engine.input_stats() {
-                    let peak = stats.peak().min(1.0);
-                    ui.add(
-                        egui::ProgressBar::new(peak)
-                            .desired_width(44.0)
-                            .text(format!("{:.0}%", peak * 100.0)),
-                    )
-                    .on_hover_text("Live input peak (pre-take)");
-                } else {
-                    ui.label(egui::RichText::new("—").weak())
-                        .on_hover_text("No input stream is open");
-                }
-                self.audio_device_menu(ui);
                 if ui.button("⏭").on_hover_text("Skip to end (End)").clicked() {
                     self.engine
                         .seek_ticks(f64::from(self.arrangement_end_ticks()));
@@ -10228,6 +10390,7 @@ impl GlitcherZApp {
                 }
                 (Some(NodeDoc::Lfo { .. }), Some(id)) => format!("LFO #{id}"),
                 (Some(NodeDoc::CurveMap { .. }), Some(id)) => format!("Curve Map #{id}"),
+                (Some(NodeDoc::Input { .. }), Some(id)) => format!("Audio In #{id}"),
                 (None, None) if has_any_selection => "Selection".to_string(),
                 _ => {
                     if self.project().midi_tracks[sel].name.is_empty() {
@@ -10240,6 +10403,14 @@ impl GlitcherZApp {
             ui.heading(title);
             if target.is_none() && has_any_selection {
                 ui.weak("This node has no editable parameters.");
+            }
+            // R4: the live input node's panel — device picker, stream status,
+            // per-channel meter, channel and output trim. The transport no
+            // longer carries the device/meter.
+            if let (Some(NodeDoc::Input { channel, gain, .. }), Some(id)) = (&target_doc, target)
+            {
+                self.input_section(ui, id, *channel, *gain);
+                return;
             }
             // M5: MIDI FX / control-source parameter stack (spec
             // `midi-nodes.md` §5). These nodes own no plugin editor, so the
@@ -12013,6 +12184,29 @@ impl GlitcherZApp {
                     }
                     self.commit_param_edit("Feedback Gain", before, "feedback-gain");
                     self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::InputGain => {
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Input { gain, .. }) =
+                        self.project_mut().graph.node_by_id_mut(node)
+                    {
+                        *gain = value.clamp(0.0, 2.0);
+                    }
+                    self.commit_param_edit("Input Gain", before, "input-gain");
+                    self.send_node_param(node, ParamId::InputGain, value);
+                }
+                // One discrete edit: the engine's `InputProcessor` clamps the
+                // channel to the device's count, so no graph rebuild is needed.
+                patch::InlineParam::InputChannel => {
+                    let channel = value.round().clamp(0.0, 1.0);
+                    let before = self.begin_edit();
+                    if let Some(NodeDoc::Input { channel: slot, .. }) =
+                        self.project_mut().graph.node_by_id_mut(node)
+                    {
+                        *slot = channel as u8;
+                    }
+                    self.commit_edit("Input Channel", before);
+                    self.send_node_param(node, ParamId::InputChannel, channel);
                 }
                 patch::InlineParam::SampleRoot => {
                     let before = self.begin_param_edit();
@@ -14431,6 +14625,22 @@ mod panel_target_tests {
         let doc = &project.graph;
         // Cross-track patch target: the selection addresses the panel.
         assert_eq!(resolve_panel_target(doc, &[t1], true, 0), Some(t1));
+    }
+
+    /// R4: the live input node owns a panel (device picker + channel meter),
+    /// so selecting it resolves to the node, and a double-click opens it.
+    #[test]
+    fn input_node_is_an_editable_target() {
+        let mut project = Project::default();
+        let input = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::Input {
+            node_id: input,
+            channel: 1,
+            gain: 0.5,
+        });
+        let doc = &project.graph;
+        assert_eq!(resolve_panel_target(doc, &[input], true, 0), Some(input));
+        assert!(patch::opens_inspector(doc.node_by_id(input)));
     }
 
     #[test]

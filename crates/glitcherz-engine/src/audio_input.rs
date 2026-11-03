@@ -84,8 +84,9 @@ pub struct InputStats {
     dropped: AtomicU64,
     /// Samples the monitor processor had to fill with silence (underrun).
     underruns: AtomicU64,
-    /// Peak absolute input level, f32 bits (relaxed, one read per frame).
-    peak_bits: AtomicU32,
+    /// Per-channel peak absolute input level, f32 bits (relaxed, one read
+    /// per frame). Two slots: the `Input` node exposes channels 0/1.
+    peaks: [AtomicU32; 2],
 }
 
 impl InputStats {
@@ -104,9 +105,24 @@ impl InputStats {
         self.underruns.load(Ordering::Relaxed)
     }
 
-    /// Peak input level, `0..` (linear).
+    /// Peak input level, `0..` (linear), across every published channel.
     pub fn peak(&self) -> f32 {
-        f32::from_bits(self.peak_bits.load(Ordering::Relaxed))
+        self.peak_of(0).max(self.peak_of(1))
+    }
+
+    /// Peak input level of one device channel, `0..` (linear). Unknown
+    /// channels read 0.
+    pub fn peak_of(&self, channel: usize) -> f32 {
+        self.peaks
+            .get(channel)
+            .map_or(0.0, |slot| f32::from_bits(slot.load(Ordering::Relaxed)))
+    }
+
+    /// Publishes one channel's peak (audio thread / tests).
+    pub(crate) fn publish_peak(&self, channel: usize, value: f32) {
+        if let Some(slot) = self.peaks.get(channel) {
+            slot.store(value.abs().to_bits(), Ordering::Relaxed);
+        }
     }
 
     /// Publishes an underrun count (audio thread, absolute value).
@@ -291,14 +307,22 @@ impl AudioInput {
                 cb_stats
                     .received
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
-                let mut peak = 0.0f32;
-                for &sample in data {
-                    let abs = sample.abs();
-                    if abs > peak {
-                        peak = abs;
+                // Per-channel peaks, so an `Input` node can meter the exact
+                // channel it takes. Stack array + relaxed atomics: no
+                // allocation and no lock in the callback.
+                let mut peaks = [0.0f32; 2];
+                for (i, &sample) in data.iter().enumerate() {
+                    let channel = i % channels.max(1);
+                    if channel < peaks.len() {
+                        let abs = sample.abs();
+                        if abs > peaks[channel] {
+                            peaks[channel] = abs;
+                        }
                     }
                 }
-                cb_stats.peak_bits.store(peak.to_bits(), Ordering::Relaxed);
+                for (channel, peak) in peaks.into_iter().enumerate() {
+                    cb_stats.publish_peak(channel, peak);
+                }
                 if cb_monitor_on.load(Ordering::Relaxed) {
                     for &sample in data {
                         if !cb_monitor.push(sample) {
@@ -519,6 +543,19 @@ mod tests {
                 RecordSource::Loopback("USB DAC".to_string()),
             ]
         );
+    }
+
+    /// The two channels report independently; the aggregate `peak()` is the
+    /// louder one, and an out-of-range channel reads silence.
+    #[test]
+    fn peaks_are_published_per_channel() {
+        let stats = InputStats::default();
+        stats.publish_peak(0, 0.25);
+        stats.publish_peak(1, -0.75);
+        assert_eq!(stats.peak_of(0), 0.25);
+        assert_eq!(stats.peak_of(1), 0.75);
+        assert_eq!(stats.peak(), 0.75);
+        assert_eq!(stats.peak_of(7), 0.0);
     }
 
     /// `Default` is an input device: it must never be treated as loopback, or

@@ -58,6 +58,10 @@ pub enum InlineParam {
     MixerMute(u8),
     /// Mixer channel solo toggle (U14): a discrete chip, value 0 / 1.
     MixerSolo(u8),
+    /// Live input node output gain (R4): document field, 0..2.
+    InputGain,
+    /// Live input node channel selector (R4): a combo row, 0 / 1.
+    InputChannel,
 }
 
 /// How an inline row is presented (U13). Discrete selectors such as a
@@ -73,7 +77,9 @@ impl InlineParam {
     /// Presentation of this parameter's row.
     fn row_kind(self) -> RowKind {
         match self {
-            InlineParam::Sf2Bank | InlineParam::Sf2Program => RowKind::Combo,
+            InlineParam::Sf2Bank | InlineParam::Sf2Program | InlineParam::InputChannel => {
+                RowKind::Combo
+            }
             _ => RowKind::Slider,
         }
     }
@@ -118,6 +124,19 @@ const FEEDBACK_INLINE: [InlineParamSpec; 1] = [InlineParamSpec {
     param: InlineParam::FeedbackGain,
     label: "fb",
 }];
+
+/// Live input inline rows (R4): which device channel is taken, and its
+/// output trim. Row order matches the Inspector panel (channel, then gain).
+const INPUT_INLINE: [InlineParamSpec; 2] = [
+    InlineParamSpec {
+        param: InlineParam::InputChannel,
+        label: "ch",
+    },
+    InlineParamSpec {
+        param: InlineParam::InputGain,
+        label: "gain",
+    },
+];
 
 /// Sample player inline rows (U5): root note + gain (spec
 /// `sample-player.md` D10 — the two parameters that shape the sound most).
@@ -188,6 +207,7 @@ fn inline_params_of(node: &NodeDoc) -> Vec<InlineParamSpec> {
         }
         NodeDoc::Mixer { .. } => MIXER_INLINE.to_vec(),
         NodeDoc::Feedback { .. } => FEEDBACK_INLINE.to_vec(),
+        NodeDoc::Input { .. } => INPUT_INLINE.to_vec(),
         _ => Vec::new(),
     }
 }
@@ -311,6 +331,11 @@ fn inline_doc_value(node: &NodeDoc, param: InlineParam) -> (f64, f64, f64) {
             1.0,
         ),
         (NodeDoc::Feedback { gain, .. }, InlineParam::FeedbackGain) => (*gain as f64, 0.0, 1.0),
+        // R4: the live input node owns a device channel and an output trim.
+        (NodeDoc::Input { channel, .. }, InlineParam::InputChannel) => {
+            (f64::from(*channel), 0.0, 1.0)
+        }
+        (NodeDoc::Input { gain, .. }, InlineParam::InputGain) => (f64::from(*gain), 0.0, 2.0),
         (
             NodeDoc::Instrument {
                 voice: VoiceSpec::Sample { root_note, .. },
@@ -373,6 +398,13 @@ struct InlineRow {
 /// **current bank**, sorted by program number so the list reads in GM order
 /// instead of file order. Captions are truncated to the node's width — the
 /// popup is 220 px wide, a MuseScore-General patch name is not.
+/// Channel list of a live input node (R4): the document exposes the first
+/// two device channels, whatever the stream actually carries. The engine
+/// clamps an unavailable channel, and the Inspector says so.
+fn input_channel_choices() -> Vec<(u8, String)> {
+    vec![(0, "Ch 1".to_string()), (1, "Ch 2".to_string())]
+}
+
 fn sf2_choices(presets: &[(u8, u8, String)], param: InlineParam, bank: u8) -> Vec<(u8, String)> {
     match param {
         InlineParam::Sf2Bank => {
@@ -733,14 +765,20 @@ pub enum PatchAction {
         param: InlineParamId,
         value: f32,
     },
+    /// `Audio In` node: bind the recording stream to another device. One
+    /// stream feeds every audio take, so this is global, not per-node.
+    PickInputSource(InputSourceItem),
+    /// Re-enumerate recording devices after a hot-plug.
+    RefreshInputSources,
 }
 
 /// Double-click gate: whether the Inspector has anything to show for a node.
 /// Instruments and effects carry parameters; the mixer carries the channel
-/// console. The virtual keyboard, the legacy strip and feedback taps do not,
-/// so double-clicking them stays inert instead of switching to a panel that
-/// would fall back to some unrelated track's instrument.
-fn opens_inspector(node: Option<&NodeDoc>) -> bool {
+/// console; the live input node carries its device picker and channel meter.
+/// The virtual keyboard, the legacy strip and feedback taps do not, so
+/// double-clicking them stays inert instead of switching to a panel that would
+/// fall back to some unrelated track's instrument.
+pub(crate) fn opens_inspector(node: Option<&NodeDoc>) -> bool {
     matches!(
         node,
         Some(
@@ -754,6 +792,9 @@ fn opens_inspector(node: Option<&NodeDoc>) -> bool {
                 | NodeDoc::Lfo { .. }
                 // The map's whole UI is its Inspector (§5: 双击进 Inspector).
                 | NodeDoc::CurveMap { .. }
+                // R4: the live input node's panel owns the device picker and
+                // the channel meter.
+                | NodeDoc::Input { .. }
         )
     )
 }
@@ -979,6 +1020,43 @@ fn action_button(ui: &mut egui::Ui, rect: Rect, z: f32, action: &NodeAction) -> 
     action.enabled && resp.clicked()
 }
 
+/// One row of the recording-source list carried into the patch (R4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputSourceItem {
+    /// Endpoint name; `None` is the system default input.
+    pub name: Option<String>,
+    /// Whether the endpoint is a WASAPI loopback (system playback).
+    pub loopback: bool,
+}
+
+/// Live recording-input snapshot for the patch (R4): the same stream data the
+/// Inspector reads. `Default` (no stream, no sources) keeps headless tests and
+/// panels that never draw an `Audio In` node free of plumbing.
+#[derive(Clone, Copy, Default)]
+pub struct InputDeps<'a> {
+    /// Whether an input stream is currently open.
+    pub open: bool,
+    /// Live device name, if open.
+    pub device: Option<&'a str>,
+    /// Whether the live stream is a loopback capture.
+    pub loopback: bool,
+    /// Channel count of the live stream (0 when closed).
+    pub channels: usize,
+    /// Stream error, if it failed to open.
+    pub error: Option<&'a str>,
+    /// Per-channel peak reader (`0..1`); `None` in headless/test contexts.
+    pub peak: Option<&'a dyn Fn(u8) -> f32>,
+    /// Enumerated recording sources; `None` where devices cannot be probed.
+    pub sources: Option<&'a dyn Fn() -> Vec<InputSourceItem>>,
+}
+
+impl InputDeps<'_> {
+    /// Peak of one channel, or 0 when no stream / reader is wired.
+    fn peak_of(&self, channel: u8) -> f32 {
+        self.peak.map_or(0.0, |read| read(channel))
+    }
+}
+
 /// Snapshot of external data the patch depends on (immutable borrows to avoid borrow conflicts).
 ///
 /// `Copy` on purpose: every field is a reference or a `usize`, so a per-frame
@@ -1006,6 +1084,9 @@ pub struct PatchDeps<'a> {
     /// library is not resident this session — the node's bank / patch combos
     /// then stay inert instead of offering a list the engine cannot play.
     pub sf2_presets: &'a dyn Fn(u64) -> Vec<(u8, u8, String)>,
+    /// Live recording-input snapshot (R4): device picker + per-channel meter
+    /// on the `Audio In` node.
+    pub input: InputDeps<'a>,
 }
 
 /// Cable being dragged (source = the entity + output port owning the drag).
@@ -1041,10 +1122,17 @@ pub struct PatchState {
     cut_path: Option<Vec<Pos2>>,
     /// Cable-midpoint menu awaiting a pick (D18: one flat level).
     pending_cable_menu: Option<CableMenu>,
-    /// SoundFont combo row awaiting a pick (U13): `(node, parameter, popup
-    /// screen position, frame it was opened)` — same frame-stamp trick as
-    /// the cable menu, because a click opens it.
-    pending_sf2_choice: Option<(u64, InlineParam, Pos2, u64)>,
+    /// Combo row awaiting a pick (U13 SoundFont bank/patch, R4 input channel):
+    /// `(node, parameter, popup screen position, frame it was opened)` — same
+    /// frame-stamp trick as the cable menu, because a click opens it.
+    pending_choice: Option<(u64, InlineParam, Pos2, u64)>,
+    /// Recording-source popup (R4) opened from an `Audio In` node's device
+    /// chip: `(node, popup position, frame opened)`.
+    pending_input_menu: Option<(u64, Pos2, u64)>,
+    /// Recording sources captured when `pending_input_menu` opened (R4).
+    /// Enumerating devices opens the driver, so it happens once per open,
+    /// never per frame.
+    input_sources: Vec<InputSourceItem>,
 }
 
 impl Default for PatchState {
@@ -1059,7 +1147,9 @@ impl Default for PatchState {
             add_menu: None,
             cut_path: None,
             pending_cable_menu: None,
-            pending_sf2_choice: None,
+            pending_choice: None,
+            pending_input_menu: None,
+            input_sources: Vec::new(),
         }
     }
 }
@@ -1164,6 +1254,9 @@ const ACTION_MIN_ZOOM: f32 = 0.6;
 /// Inline parameter row height (graph space; G5 — the node body grows
 /// downward by `rows * INLINE_ROW_HEIGHT`).
 const INLINE_ROW_HEIGHT: f32 = 16.0;
+/// `Audio In` info area (R4): device chip + per-channel meter, drawn above
+/// the inline rows. Two rows, same height as a slider row.
+const INPUT_INFO_ROWS: f32 = 2.0;
 /// Left/right inset of the inline slider rows inside the node box.
 const INLINE_INSET: f32 = 8.0;
 /// Width reserved for the inline row label (graph space).
@@ -1566,6 +1659,12 @@ fn size_of(id: PatchId, deps: &PatchDeps) -> Vec2 {
                 header_band(id, deps) + (*inputs as f32 * PORT_SPACING).max(NODE_HEIGHT_MIN),
             ),
             Some(NodeDoc::Keyboard { .. }) => KEYBOARD_SIZE,
+            // R4: the live input box carries the device chip + meter above
+            // its inline rows.
+            Some(NodeDoc::Input { .. }) => Vec2::new(
+                NODE_SIZE.x,
+                NODE_SIZE.y + INPUT_INFO_ROWS * INLINE_ROW_HEIGHT,
+            ),
             // U13: a node that owns an action row (the SoundFont file
             // button) reserves it on top of the title band.
             _ => Vec2::new(
@@ -3371,6 +3470,101 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         }
     }
 
+    // ---- Live input node: device chip + per-channel meter (R4) ----
+    // One input stream feeds every audio take, so every `Audio In` node shows
+    // the same device; the meter is that node's own channel.
+    for &id in state.positions.keys() {
+        let PatchId::Node(doc_id) = id else {
+            continue;
+        };
+        let Some(NodeDoc::Input { channel, .. }) = doc.node_by_id(doc_id) else {
+            continue;
+        };
+        if state.zoom < INLINE_MIN_ZOOM {
+            continue;
+        }
+        let Some(r) = state.screen_rect(rect.min, id, &deps) else {
+            continue;
+        };
+        if !r.intersects(rect) {
+            continue;
+        }
+        let z = state.zoom;
+        let row_h = INLINE_ROW_HEIGHT * z;
+        let inline_h = inline_row_count(id, &deps) as f32 * row_h;
+        let info_top = r.bottom() - inline_h - INPUT_INFO_ROWS * row_h;
+        let inset = INLINE_INSET * z;
+
+        let chip = Rect::from_min_max(
+            Pos2::new(r.left() + inset, info_top + 1.0 * z),
+            Pos2::new(r.right() - inset, info_top + row_h - 1.0 * z),
+        );
+        painter.rect_filled(chip, 2.0 * z, Color32::from_gray(46));
+        painter.rect_stroke(
+            chip,
+            2.0 * z,
+            Stroke::new(1.0, Color32::from_gray(88)),
+            egui::StrokeKind::Inside,
+        );
+        let caption = match deps.input.device {
+            Some(name) if deps.input.loopback => format!("↩ {}", truncate(name, 13)),
+            Some(name) => truncate(name, 14),
+            None => "no input".to_string(),
+        };
+        painter.text(
+            Pos2::new(chip.left() + 4.0 * z, chip.center().y),
+            egui::Align2::LEFT_CENTER,
+            &caption,
+            FontId::proportional(9.0 * z),
+            Color32::from_gray(if deps.input.open { 220 } else { 140 }),
+        );
+        let resp = ui
+            .allocate_rect(chip, Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let tip = match deps.input.error {
+            Some(err) => format!("Recording source (one stream for every take)\n{err}"),
+            None => "Recording source (one stream for every take)".to_string(),
+        };
+        let resp = resp.on_hover_text(tip);
+        if resp.clicked()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            state.pending_input_menu = Some((doc_id, pos + Vec2::new(4.0, 4.0), u64::MAX));
+        }
+
+        let meter = Rect::from_min_max(
+            Pos2::new(r.left() + inset, info_top + row_h + 1.0 * z),
+            Pos2::new(r.right() - inset, info_top + 2.0 * row_h - 1.0 * z),
+        );
+        let peak = deps.input.peak_of(*channel).clamp(0.0, 1.0);
+        painter.rect_filled(meter, 2.0 * z, Color32::from_gray(28));
+        let fill = Rect::from_min_max(
+            meter.min,
+            Pos2::new(meter.left() + meter.width() * peak, meter.bottom()),
+        );
+        let bar = if peak > 0.95 {
+            Color32::from_rgb(220, 80, 70)
+        } else if peak > 0.7 {
+            Color32::from_rgb(220, 180, 70)
+        } else {
+            Color32::from_rgb(80, 185, 205)
+        };
+        painter.rect_filled(fill, 2.0 * z, bar);
+        painter.rect_stroke(
+            meter,
+            2.0 * z,
+            Stroke::new(1.0, Color32::from_gray(70)),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            Pos2::new(meter.right() - 3.0 * z, meter.center().y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{:.0}%", peak * 100.0),
+            FontId::proportional(9.0 * z),
+            Color32::from_gray(210),
+        );
+    }
+
     // ---- Inline parameter sliders (G5 spec §7) ----
     // Real widgets placed over the bottom row strip of each node box (the
     // height formula in `size_of` reserves it). Being later in the layer,
@@ -3435,6 +3629,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     && param.row_kind() == RowKind::Combo
                 {
                     row.choices = sf2_choices(&presets, param, *bank);
+                }
+            }
+        }
+        // R4: the input node's channel row is the other combo.
+        if matches!(node, NodeDoc::Input { .. }) {
+            for row in &mut rows {
+                if let InlineParamId::BuiltIn(InlineParam::InputChannel) = row.param {
+                    row.choices = input_channel_choices();
                 }
             }
         }
@@ -3548,7 +3750,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 };
                 if enabled && resp.clicked() {
                     if let Some(sp) = resp.interact_pointer_pos() {
-                        state.pending_sf2_choice = Some((
+                        state.pending_choice = Some((
                             doc_id,
                             match param {
                                 InlineParamId::BuiltIn(p) => p,
@@ -3700,19 +3902,19 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     // stay readable while the patch itself is zoomed out.
     // Stamp the opening frame first — the click that opened this menu is an
     // `any_click` in the same frame.
-    if let Some((_, _, _, frame)) = &mut state.pending_sf2_choice
+    if let Some((_, _, _, frame)) = &mut state.pending_choice
         && *frame == u64::MAX
     {
         *frame = ui.ctx().cumulative_frame_nr();
     }
     // The node can disappear while the list is open (delete / undo).
     if state
-        .pending_sf2_choice
+        .pending_choice
         .is_some_and(|(node, ..)| doc.node_by_id(node).is_none())
     {
-        state.pending_sf2_choice = None;
+        state.pending_choice = None;
     }
-    if let Some((doc_id, param, menu_pos, opened)) = state.pending_sf2_choice {
+    if let Some((doc_id, param, menu_pos, opened)) = state.pending_choice {
         let bank = match doc.node_by_id(doc_id) {
             Some(NodeDoc::Instrument {
                 voice: VoiceSpec::SoundFont { bank, .. },
@@ -3721,13 +3923,18 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             _ => 0,
         };
         let presets = (deps.sf2_presets)(doc_id);
-        let choices = sf2_choices(&presets, param, bank);
+        let choices = match param {
+            InlineParam::InputChannel => input_channel_choices(),
+            _ => sf2_choices(&presets, param, bank),
+        };
         let current = doc
             .node_by_id(doc_id)
             .map_or(0.0, |node| inline_doc_value(node, param).0);
         let title = match param {
             InlineParam::Sf2Bank => "SoundFont Bank",
-            _ => "SoundFont Patch",
+            InlineParam::Sf2Program => "SoundFont Patch",
+            InlineParam::InputChannel => "Input Channel",
+            _ => "Parameter",
         };
         let mut picked: Option<u8> = None;
         egui::Area::new(egui::Id::new("glitcherz_patch_sf2_choice"))
@@ -3761,7 +3968,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     param: InlineParamId::BuiltIn(param),
                     value: f32::from(value),
                 });
-                state.pending_sf2_choice = None;
+                state.pending_choice = None;
             }
             None => {
                 // Ignore the click that opened the menu (same frame).
@@ -3770,9 +3977,123 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                         .ctx()
                         .input(|i| i.pointer.any_click() || i.key_pressed(egui::Key::Escape))
                 {
-                    state.pending_sf2_choice = None;
+                    state.pending_choice = None;
                 }
             }
+        }
+    }
+
+    // ---- Recording source list (R4) ----
+    // Opened by the device chip on an `Audio In` box. Same list as the
+    // Inspector picker; the stream is global, so this edits it for every take.
+    let opening = state
+        .pending_input_menu
+        .is_some_and(|(_, _, frame)| frame == u64::MAX);
+    if opening {
+        state.pending_input_menu = state
+            .pending_input_menu
+            .map(|(node, pos, _)| (node, pos, ui.ctx().cumulative_frame_nr()));
+        // Enumerating devices opens the driver: do it once per open, never
+        // per frame.
+        state.input_sources = deps.input.sources.map_or_else(Vec::new, |list| list());
+    }
+    if state
+        .pending_input_menu
+        .is_some_and(|(node, ..)| doc.node_by_id(node).is_none())
+    {
+        state.pending_input_menu = None;
+    }
+    if let Some((_, menu_pos, opened)) = state.pending_input_menu {
+        let sources = state.input_sources.clone();
+        let current = InputSourceItem {
+            name: deps.input.device.map(str::to_string),
+            loopback: deps.input.loopback,
+        };
+        let mut pick: Option<InputSourceItem> = None;
+        let mut refresh = false;
+        egui::Area::new(egui::Id::new("glitcherz_patch_input_source"))
+            .fixed_pos(menu_pos)
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(320.0);
+                    match (deps.input.open, deps.input.device) {
+                        (true, Some(name)) => {
+                            ui.label(egui::RichText::new(name).strong());
+                            ui.weak(format!(
+                                "{} ch · {}",
+                                deps.input.channels,
+                                if deps.input.loopback {
+                                    "WASAPI loopback (what this output plays)"
+                                } else {
+                                    "capture input"
+                                }
+                            ));
+                        }
+                        _ => {
+                            ui.colored_label(
+                                Color32::from_rgb(230, 120, 110),
+                                "No input stream is open",
+                            );
+                            if let Some(err) = deps.input.error {
+                                ui.weak(err);
+                            }
+                        }
+                    }
+                    ui.separator();
+                    if ui
+                        .selectable_label(current.name.is_none(), "System default (microphone)")
+                        .clicked()
+                    {
+                        pick = Some(InputSourceItem {
+                            name: None,
+                            loopback: false,
+                        });
+                    }
+                    let (captures, loopbacks): (Vec<_>, Vec<_>) =
+                        sources.into_iter().partition(|item| !item.loopback);
+                    ui.add_space(2.0);
+                    ui.weak("Inputs");
+                    if captures.is_empty() {
+                        ui.weak("(none found)");
+                    }
+                    for item in captures {
+                        let selected = current.name == item.name && !current.loopback;
+                        let caption = item.name.clone().unwrap_or_default();
+                        if ui.selectable_label(selected, caption).clicked() {
+                            pick = Some(item);
+                        }
+                    }
+                    ui.add_space(2.0);
+                    ui.weak("System playback (loopback)");
+                    if loopbacks.is_empty() {
+                        ui.weak("(none found)");
+                    }
+                    for item in loopbacks {
+                        let selected = current.name == item.name && current.loopback;
+                        let caption = format!("↩ {}", item.name.clone().unwrap_or_default());
+                        if ui.selectable_label(selected, caption).clicked() {
+                            pick = Some(item);
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Refresh devices").clicked() {
+                        refresh = true;
+                    }
+                });
+            });
+        if let Some(item) = pick {
+            actions.push(PatchAction::PickInputSource(item));
+            state.pending_input_menu = None;
+        } else if refresh {
+            actions.push(PatchAction::RefreshInputSources);
+            state.pending_input_menu = None;
+        } else if opened != ui.ctx().cumulative_frame_nr()
+            && ui
+                .ctx()
+                .input(|i| i.pointer.any_click() || i.key_pressed(egui::Key::Escape))
+        {
+            state.pending_input_menu = None;
         }
     }
 
@@ -4114,6 +4435,7 @@ mod tests {
     fn cable_midpoint_menu_opens_and_survives_its_opening_frame() {
         let project = Project::default();
         let deps = PatchDeps {
+            input: Default::default(),
             doc: &project.graph,
             track_count: project.midi_tracks.len(),
             auto_count: project.control_tracks.len(),
@@ -4185,6 +4507,7 @@ mod tests {
         let project = Project::default();
         let doc = &project.graph;
         let deps = PatchDeps {
+            input: Default::default(),
             doc,
             track_count: project.midi_tracks.len(),
             auto_count: project.control_tracks.len(),
@@ -4403,6 +4726,7 @@ mod tests {
         let idx = project.graph.cables.len() - 1;
         let doc = &project.graph;
         let deps = PatchDeps {
+            input: Default::default(),
             doc,
             track_count: project.midi_tracks.len(),
             auto_count: project.control_tracks.len(),
@@ -4582,6 +4906,7 @@ mod tests {
         });
         let doc = &project.graph;
         let deps = PatchDeps {
+            input: Default::default(),
             doc,
             track_count: project.midi_tracks.len(),
             auto_count: project.control_tracks.len(),
@@ -4740,6 +5065,22 @@ mod tests {
         assert_eq!((v, min, max), (48.0, 0.0, 127.0));
         let (v, min, max) = inline_doc_value(&sample, InlineParam::SampleGain);
         assert_eq!((v, min, max), (0.5, 0.0, 2.0));
+
+        // R4: the live input rows read the node's channel and trim.
+        let input = NodeDoc::Input {
+            node_id: 6,
+            channel: 1,
+            gain: 0.5,
+        };
+        assert_eq!(
+            inline_doc_value(&input, InlineParam::InputChannel),
+            (1.0, 0.0, 1.0)
+        );
+        assert_eq!(
+            inline_doc_value(&input, InlineParam::InputGain),
+            (0.5, 0.0, 2.0)
+        );
+        assert!(!input_channel_choices().is_empty());
     }
 
     #[test]
@@ -4836,6 +5177,7 @@ mod tests {
         let doc = &project.graph;
         let node_id = audio_node_id(doc, 0).expect("default audio-track node");
         let deps = PatchDeps {
+            input: Default::default(),
             doc,
             track_count: project.midi_tracks.len(),
             auto_count: project.control_tracks.len(),
@@ -4927,6 +5269,7 @@ mod tests {
         let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
         let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
         let deps = PatchDeps {
+            input: Default::default(),
             doc: &doc,
             track_count: 1,
             auto_count: 0,
@@ -5036,6 +5379,7 @@ mod tests {
         let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
         let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
         let deps = PatchDeps {
+            input: Default::default(),
             doc: &doc,
             track_count: 1,
             auto_count: 0,
@@ -5084,6 +5428,7 @@ mod tests {
         let auto_count = 1;
         let audio_count = 1;
         let deps = PatchDeps {
+            input: Default::default(),
             doc,
             track_count,
             auto_count,
@@ -5164,6 +5509,7 @@ mod tests {
             channels.push(Default::default());
         }
         let fdeps = PatchDeps {
+            input: Default::default(),
             doc: &free.graph,
             track_count,
             auto_count,
@@ -5182,6 +5528,7 @@ mod tests {
             .cables
             .push(CableDoc::audio_to_channel(from, fm, inputs));
         let fdeps = PatchDeps {
+            input: Default::default(),
             doc: &free.graph,
             track_count,
             auto_count,
@@ -5361,6 +5708,7 @@ mod tests {
                 }
             };
             let deps = PatchDeps {
+                input: Default::default(),
                 doc: &project.graph,
                 track_count: 1,
                 auto_count: 0,
@@ -5409,6 +5757,7 @@ mod tests {
                 }
             };
             let deps = PatchDeps {
+                input: Default::default(),
                 doc: &project.graph,
                 track_count: 1,
                 auto_count: 0,
@@ -5466,6 +5815,7 @@ mod tests {
         // Born empty: silent, one file button, the caption says so.
         {
             let deps = PatchDeps {
+                input: Default::default(),
                 doc: &project.graph,
                 track_count: project.midi_tracks.len(),
                 auto_count: 0,
@@ -5505,6 +5855,7 @@ mod tests {
             };
         }
         let deps = PatchDeps {
+            input: Default::default(),
             doc: &project.graph,
             track_count: project.midi_tracks.len(),
             auto_count: 0,
