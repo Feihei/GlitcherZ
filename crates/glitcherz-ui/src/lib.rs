@@ -724,12 +724,11 @@ fn axis_hint(map: &glitcherz_model::MapSpec) -> String {
     }
 }
 
-/// Control-change destinations offered by the automation target menus (U4a).
+/// Control-change destinations offered by the node-graph curve menus (U4a).
 ///
 /// A short preset list instead of all 128 controllers: these are the ones that
-/// carry meaning in practice, and the automation strip lets the picked CC be
-/// re-numbered afterwards (so an uncommon controller costs one drag, not a
-/// 128-row menu).
+/// carry meaning in practice. They are offered as cable destinations when a
+/// curve is wired into an instrument's MIDI input.
 const CC_PRESETS: [(u8, &str); 8] = [
     (1, "Mod Wheel"),
     (2, "Breath"),
@@ -740,23 +739,6 @@ const CC_PRESETS: [(u8, &str); 8] = [
     (71, "Resonance"),
     (74, "Cutoff"),
 ];
-
-/// Human-readable CC destination label (`CC 74 Cutoff · ch 1`).
-fn cc_label(controller: u8, channel: u8) -> String {
-    let name = CC_PRESETS
-        .iter()
-        .find(|(number, _)| *number == controller)
-        .map(|(_, name)| *name);
-    match name {
-        Some(name) => format!("CC {controller} {name} · ch {}", channel + 1),
-        None => format!("CC {controller} · ch {}", channel + 1),
-    }
-}
-
-/// Human-readable bend destination label (`Pitch Bend ±2 st · ch 1`).
-fn bend_label(range_semitones: f32, channel: u8) -> String {
-    format!("Pitch Bend ±{range_semitones:.1} st · ch {}", channel + 1)
-}
 
 /// Document curve interpolation → engine mirror (U12). The two enums are
 /// structurally identical; this is the one conversion point.
@@ -990,7 +972,7 @@ const PLUGIN_CACHE_KEY: &str = "plugin_cache";
 const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(8);
 const STATUS_ERROR_TTL: Duration = Duration::from_secs(16);
 
-/// How long the `● Rec` refusal card stays up (it has its own close button,
+/// How long the `⏺ Rec` refusal card stays up (it has its own close button,
 /// so this only clears a card the user walked away from).
 const RECORD_REFUSAL_TTL: Duration = Duration::from_secs(20);
 
@@ -1501,7 +1483,7 @@ pub struct GlitcherZApp {
     /// Status bar message (text + time shown + severity; disappears
     /// automatically after a timeout).
     status_message: Option<(String, Instant, MessageKind)>,
-    /// Why the last `● Rec` press was refused (text + time shown). Drawn as a
+    /// Why the last `⏺ Rec` press was refused (text + time shown). Drawn as a
     /// floating card above the transport: a status-line-only refusal is too
     /// easy to miss, and "Rec did nothing" reads as a dead button.
     record_refusal: Option<(String, Instant)>,
@@ -1586,8 +1568,7 @@ pub struct GlitcherZApp {
     clap_param_filter: String,
     /// Instrument param panel filter (VST3; matched against title).
     vst3_param_filter: String,
-    /// Automation target picker filter (matched against the option label).
-    auto_param_filter: String,
+
     /// Captured factory-default state blobs (document node_id → blob),
     /// taken at spawn time before any document state restore — the preset
     /// "Reset" target.
@@ -1823,7 +1804,7 @@ impl GlitcherZApp {
             vst3_effect_values: HashMap::new(),
             clap_param_filter: String::new(),
             vst3_param_filter: String::new(),
-            auto_param_filter: String::new(),
+
             voice_default_state: HashMap::new(),
             voice_preset_selected: HashMap::new(),
             preset_name_input: String::new(),
@@ -3216,9 +3197,8 @@ impl GlitcherZApp {
                     plugin_params_of(doc, node_id, clap, clap_fx, vst3, vst3_fx);
                 let mut v = node_auto_options(doc, node_id, clap_params, vst3_params);
                 if matches!(doc.node_by_id(node_id), Some(NodeDoc::Instrument { .. })) {
-                    // U4a: CC is a separate destination family for the same
-                    // instrument; the presets mirror the automation strip's
-                    // menu so both entry points offer the same list.
+                    // U4a: CC is a separate destination family for the
+                    // instrument; list the presets alongside its parameters.
                     for (number, name) in CC_PRESETS {
                         v.push((format!("CC {number} {name}"), AutoParam::cc(number, 0)));
                     }
@@ -6763,7 +6743,7 @@ impl GlitcherZApp {
         self.capture_scratch = batch;
     }
 
-    /// Reports a `● Rec` problem **loudly**: a refused press (D22 wiring, R4
+    /// Reports a `⏺ Rec` problem **loudly**: a refused press (D22 wiring, R4
     /// device, D27 dry region) and a take that captured nothing both leave the
     /// user staring at a button that "did nothing". A status-line notice alone
     /// is too easy to miss, so the reason also becomes a card. Logged too — the
@@ -6820,7 +6800,7 @@ impl GlitcherZApp {
                          into it.",
                     );
                 } else {
-                    ui.weak("Fix the cause above, then press ● Rec again.");
+                    ui.weak("Fix the cause above, then press ⏺ Rec again.");
                 }
             });
         if !open {
@@ -8301,13 +8281,44 @@ impl GlitcherZApp {
                 // Pre-roll is dead time for capture — label it, or the user
                 // plays through the count-in and concludes nothing records.
                 let rec_pre_roll = rec_active && !self.recorder.is_capturing();
-                let mut rec_btn = egui::Button::new(if rec_pre_roll {
-                    "● Pre-roll…"
+                // `⏺` (U+23FA) ships in egui's icon font; `●` (U+25CF) only
+                // exists in the monospace face, so it renders as a tofu box in
+                // the proportional (button) font. Colour the dot separately:
+                // the icon font is monochrome and follows the text format.
+                let rec_label = if rec_pre_roll {
+                    " Pre-roll…"
                 } else if rec_active {
-                    "● Rec…"
+                    " Rec…"
                 } else {
-                    "● Rec"
-                });
+                    " Rec"
+                };
+                let rec_font = egui::TextStyle::Button.resolve(ui.style());
+                let dot_color = if rec_active {
+                    egui::Color32::from_rgb(255, 120, 120)
+                } else {
+                    egui::Color32::from_rgb(220, 60, 60)
+                };
+                let mut rec_text = egui::text::LayoutJob::default();
+                rec_text.append(
+                    "⏺",
+                    0.0,
+                    egui::TextFormat {
+                        font_id: rec_font.clone(),
+                        color: dot_color,
+                        valign: egui::Align::Center,
+                        ..Default::default()
+                    },
+                );
+                rec_text.append(
+                    rec_label,
+                    0.0,
+                    egui::TextFormat {
+                        font_id: rec_font,
+                        color: egui::Color32::PLACEHOLDER,
+                        ..Default::default()
+                    },
+                );
+                let mut rec_btn = egui::Button::new(rec_text);
                 if rec_active {
                     rec_btn = rec_btn.fill(egui::Color32::from_rgb(150, 40, 40));
                 }
@@ -8646,13 +8657,7 @@ impl GlitcherZApp {
         if self.project().midi_tracks.is_empty() && self.project().control_tracks.is_empty() {
             return;
         }
-        // Automation strip (add / remove a curve + its target parameter).
-        // Track-level state belongs to the timeline, not to the inspector
-        // panel; a `Panel::bottom` keeps it pinned while the arrangement
-        // scrolls.
-        egui::Panel::bottom("glitcherz_automation").show(ui, |ui| {
-            self.automation_strip(ui);
-        });
+
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
         let selected_track = self.selected_track;
@@ -13823,45 +13828,6 @@ impl GlitcherZApp {
         }
     }
 
-    /// Automation strip under the arrangement (D12 top-level entities; each
-    /// curve's delivery endpoint is decided by node-graph cables).
-    ///
-    /// Lives in the **timeline**, not the Inspector: adding a curve creates a
-    /// track, and picking which parameter a curve drives is track-level state.
-    /// The curves themselves are edited in the timeline's inline band (U4b):
-    /// select a control track, or double-click one of its clips.
-    fn automation_strip(&mut self, ui: &mut egui::Ui) {
-        let auto_count = self.project().control_tracks.len();
-        ui.horizontal(|ui| {
-            ui.strong("Curve");
-            if ui
-                .add_enabled(auto_count < MAX_AUTO_TRACKS, egui::Button::new("+ Curve"))
-                .on_hover_text("Add an automation (control) track")
-                .clicked()
-            {
-                self.add_control_track();
-            }
-            if ui
-                .add_enabled(auto_count > 0, egui::Button::new("- Curve"))
-                .on_hover_text("Remove the selected automation track")
-                .clicked()
-            {
-                self.remove_control_track();
-            }
-            ui.separator();
-            if auto_count == 0 {
-                ui.weak("(no curve yet — '+ Curve' adds a control track)");
-                return;
-            }
-            let index = self.selected_auto.min(auto_count - 1);
-            ui.weak(format!("Track {}", index + 1));
-            self.auto_target_row(ui, index);
-            ui.weak(
-                "Band under the row: click to add an anchor · drag to move · right-click to delete",
-            );
-        });
-    }
-
     /// Append a control track and select it (one undo step).
     fn add_control_track(&mut self) {
         let auto_count = self.project().control_tracks.len();
@@ -13894,234 +13860,6 @@ impl GlitcherZApp {
             .engine
             .set_control_clips(index, [RtControlClip::default(); MAX_TRACK_CLIPS]);
         self.selected_auto = index.min(self.project().control_tracks.len().saturating_sub(1));
-    }
-
-    /// Endpoint picker for one control track: this track's instrument
-    /// (cutoff / plugin parameters) plus the global song tempo. Mixer-fader
-    /// automation is deferred (P5f decision). Options carry the **document**
-    /// node_id (the cable's persisted identity), mapped when dispatching.
-    fn auto_target_row(&mut self, ui: &mut egui::Ui, index: usize) {
-        let sel = self.selected_track;
-        let mut options: Vec<(String, AutoTarget, AutoParam)> = Vec::new();
-        // U3b: song tempo is always offered — the conductor terminal is a
-        // fixed entity, so it needs no ownership check.
-        options.push((
-            "Song Tempo (BPM)".to_string(),
-            AutoTarget::TimelineIn,
-            AutoParam::Tempo,
-        ));
-        // U4c: the track's whole chain — instrument, its effects (built-in
-        // ones included) and the mixer channel it feeds — through the same
-        // enumeration the patch popup uses.
-        let graph = &self.project().graph;
-        let voice_doc = graph.instrument_of_track(sel).map(NodeDoc::node_id);
-        {
-            let mut push_node_options = |doc_id: u64, prefix: &str| {
-                let (clap, vst3) = plugin_params_of(
-                    graph,
-                    doc_id,
-                    &self.clap_voice_params,
-                    &self.clap_effect_params,
-                    &self.voice_params,
-                    &self.vst3_effect_params,
-                );
-                for (label, param) in node_auto_options(graph, doc_id, clap, vst3) {
-                    options.push((format!("{prefix}{label}"), AutoTarget::Node(doc_id), param));
-                }
-            };
-            if let Some(voice_doc) = voice_doc {
-                push_node_options(voice_doc, "");
-            }
-            for node in graph.nodes.iter().filter(|n| n.track() == sel) {
-                if let NodeDoc::Effect { node_id, .. } = node {
-                    push_node_options(*node_id, "FX ");
-                }
-            }
-        }
-        if let Some((mixer_doc, channel)) = self.track_channel_target(sel) {
-            for (label, param) in [
-                ("Gain", ChannelParam::Gain),
-                ("Pan", ChannelParam::Pan),
-                ("Mute", ChannelParam::Mute),
-                ("Solo", ChannelParam::Solo),
-            ] {
-                options.push((
-                    format!("Mixer Ch {} {label}", channel + 1),
-                    AutoTarget::Node(mixer_doc),
-                    AutoParam::Node(NodeParam::MixerChannel { channel, param }),
-                ));
-            }
-        }
-        // The endpoint label resolves against the target node too (an effect
-        // slot reads `mix` rather than `param 2`); snapshot it now, before the
-        // widget closures start borrowing `self` mutably.
-        let endpoint = self.project().graph.auto_target(index);
-        let current = {
-            let graph = &self.project().graph;
-            endpoint
-                .as_ref()
-                .map(|(port, param)| match param {
-                    AutoParam::Tempo => "Song Tempo".to_string(),
-                    AutoParam::Cc {
-                        controller,
-                        channel,
-                    } => cc_label(*controller, *channel),
-                    AutoParam::PitchBend {
-                        channel,
-                        range_semitones,
-                    } => bend_label(*range_semitones, *channel),
-                    other => crate::patch::auto_param_label_at(other, graph, port),
-                })
-                .unwrap_or_else(|| "Not connected".to_string())
-        };
-
-        let mut picked: Option<(AutoTarget, AutoParam)> = None;
-        ui.horizontal(|ui| {
-            ui.label("Target");
-            ui.menu_button("Pick Parameter…", |ui| {
-                // 2000+ parameter plugins make an unfiltered menu unusable:
-                // a filter box + virtualized rows keep it responsive.
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.auto_param_filter)
-                        .hint_text("Filter parameters…"),
-                );
-                let needle = self.auto_param_filter.to_lowercase();
-                let visible: Vec<usize> = options
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (label, _, _))| {
-                        needle.is_empty() || label.to_lowercase().contains(&needle)
-                    })
-                    .map(|(i, _)| i)
-                    .collect();
-                let row_h = ui.text_style_height(&egui::TextStyle::Body);
-                if visible.is_empty() {
-                    ui.weak("(no match)");
-                }
-                egui::ScrollArea::vertical().max_height(320.0).show_rows(
-                    ui,
-                    row_h,
-                    visible.len(),
-                    |ui, range| {
-                        for row in range {
-                            let (label, target, param) = &options[visible[row]];
-                            if ui.button(label).clicked() {
-                                picked = Some((*target, param.clone()));
-                                ui.close();
-                            }
-                        }
-                    },
-                );
-            });
-            // U4a: MIDI CC is a second destination family, not a plugin
-            // parameter — it gets its own menu instead of hiding among 2000
-            // parameter rows.
-            if let Some(doc) = voice_doc {
-                ui.menu_button("MIDI CC…", |ui| {
-                    ui.weak("Into the track instrument's MIDI input");
-                    for (number, name) in CC_PRESETS {
-                        if ui.button(format!("{number} · {name}")).clicked() {
-                            picked = Some((AutoTarget::Node(doc), AutoParam::cc(number, 0)));
-                            ui.close();
-                        }
-                    }
-                })
-                .response
-                .on_hover_text("CLAP / SoundFont. VST3 cannot receive host CC.");
-                // P1: pitch bend is a sibling destination, not a CC number.
-                // The hover text is the honest part of D10: the VST3 binding
-                // in use has no event type for bend, so a bend cable on a
-                // VST3 node is silent by construction.
-                ui.menu_button("Pitch Bend…", |ui| {
-                    ui.weak("Into the track instrument's MIDI input");
-                    if ui.button("±2 st · ch 1").clicked() {
-                        picked = Some((AutoTarget::Node(doc), AutoParam::pitch_bend(0, 2.0)));
-                        ui.close();
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "CLAP / SoundFont receive a MIDI bend. Built-in instruments take the same \
-                     curve as a per-sample smoothed pitch offset (finer than any MIDI bend). \
-                     VST3 cannot receive host pitch bend, so the curve is silent there.",
-                );
-            }
-            if let Some((target, param)) = picked {
-                self.set_auto_endpoint(index, target, param);
-            }
-            // Current endpoint display (computed before this closure — it
-            // needs an immutable document borrow that the menu widgets above
-            // would conflict with).
-            ui.weak(format!("-> {current}"));
-        });
-        // The preset list is a shortcut, not a limit: a picked CC can be
-        // renumbered (0..127) and re-channelled in place. Applied on release
-        // so a drag is one undo step, not one per frame.
-        if let Some((
-            PortRef::Node(doc),
-            AutoParam::Cc {
-                controller,
-                channel,
-            },
-        )) = endpoint
-        {
-            let (mut cc, mut ch) = (controller, channel);
-            let mut commit = false;
-            ui.horizontal(|ui| {
-                ui.label("CC");
-                let number = ui.add(egui::DragValue::new(&mut cc).range(0..=127));
-                ui.label("ch");
-                let mut shown = u16::from(ch) + 1;
-                let channel_response = ui.add(egui::DragValue::new(&mut shown).range(1..=16));
-                commit = number.drag_stopped()
-                    || number.lost_focus()
-                    || channel_response.drag_stopped()
-                    || channel_response.lost_focus();
-                ch = (shown.saturating_sub(1).min(15)) as u8;
-            });
-            if commit && (cc, ch) != (controller, channel) {
-                self.set_auto_endpoint(index, AutoTarget::Node(doc), AutoParam::cc(cc, ch));
-            }
-        }
-        // P1: the bend range is a **document field** (D9), so it is editable
-        // here rather than probed from the receiver. Changing it rescales the
-        // axis, not the anchors: the curve stores semitones, so re-ranging
-        // leaves every point musically where it was.
-        if let Some((
-            PortRef::Node(doc),
-            AutoParam::PitchBend {
-                channel,
-                range_semitones,
-            },
-        )) = endpoint
-        {
-            let (mut range, mut ch) = (range_semitones, channel);
-            let mut commit = false;
-            ui.horizontal(|ui| {
-                ui.label("±");
-                let range_response = ui.add(
-                    egui::DragValue::new(&mut range)
-                        .range(glitcherz_model::MIN_BEND_RANGE..=glitcherz_model::MAX_BEND_RANGE)
-                        .speed(0.1)
-                        .suffix(" st"),
-                );
-                ui.label("ch");
-                let mut shown = u16::from(ch) + 1;
-                let channel_response = ui.add(egui::DragValue::new(&mut shown).range(1..=16));
-                commit = range_response.drag_stopped()
-                    || range_response.lost_focus()
-                    || channel_response.drag_stopped()
-                    || channel_response.lost_focus();
-                ch = shown.saturating_sub(1).min(15) as u8;
-            });
-            if commit && (range != range_semitones || ch != channel) {
-                self.set_auto_endpoint(
-                    index,
-                    AutoTarget::Node(doc),
-                    AutoParam::pitch_bend(ch, range),
-                );
-            }
-        }
     }
 }
 

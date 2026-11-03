@@ -509,6 +509,8 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 
 **面板只剩"选中节点的参数"**：三处结构管理搬走——① mixer 控制台改 `mixer_section(ui, mixer_doc)`，只有 `target_doc` 是 `NodeDoc::Mixer` 时才画（原先无论选什么都会画一遍"first mixer"）；② 混音台头部的 `+ Track` / `- Track` 删除（timeline 工具栏本来就有同名按钮，且那是轨道管理不是混音参数）；③ `automation_section` 拆解：`automation_strip`（新增，timeline 底部 `egui::Panel::bottom("glitcherz_automation")`）+ `add_control_track` / `remove_control_track` + `auto_target_row`（端点选择器，原样搬过来，`index` 改成入参）+ 删除 `clip_section` 死文案。曲线管理是轨道级状态，跟轨道放一起。
 
+**2026-11-03 更新**：`automation_strip` / `auto_target_row` 已删除——`+/- Curve` 由 timeline 工具栏与 patch Timeline 节点承担，端点由节点图连线选择。随之移除的还有 CC 通道号与 Pitch Bend range 的内联微调；后续若要恢复，应加到节点图的连线弹窗里，而不是再加一条底部条。`Panel::bottom` 的声明顺序说明（见下段）随 strip 删除失效。
+
 **`Panel::bottom` 的声明顺序**：必须写在 `timeline::show` **之前**（面板先占位，再让内容吃剩余高度）；`timeline::show` 内部的 ScrollArea 是 `auto_shrink(false)`，放后面会把 strip 挤出屏幕。
 
 **插件编辑器改折叠头**（原来 `Show Editor` / `Close Editor` 按钮，展开后原生子窗口会盖住按钮）：
