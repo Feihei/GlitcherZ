@@ -13,8 +13,8 @@ use std::sync::Arc;
 use glitcherz_engine::realtime::{
     BitcrusherProcessor, BuiltinEffectKind, ChorusProcessor, CompressorProcessor, DelayProcessor,
     EffectDescriptor, EffectMeters, EqProcessor, FlangerProcessor, ParamId, ParamSpec,
-    PhaserProcessor, Processor, ReverbProcessor, Unit, bitcrusher, chorus, compressor, delay, eq,
-    flanger, phaser, reverb,
+    PhaserProcessor, Processor, ReverbProcessor, SaturationProcessor, Unit, bitcrusher, chorus,
+    compressor, delay, eq, flanger, phaser, reverb, saturation,
 };
 use glitcherz_model::{BuiltinEffectKind as DocEffectKind, EffectParams};
 
@@ -38,6 +38,7 @@ pub fn engine_kind(params: &EffectParams) -> BuiltinEffectKind {
         DocEffectKind::Flanger => BuiltinEffectKind::Flanger,
         DocEffectKind::Bitcrusher => BuiltinEffectKind::Bitcrusher,
         DocEffectKind::Phaser => BuiltinEffectKind::Phaser,
+        DocEffectKind::Saturation => BuiltinEffectKind::Saturation,
     }
 }
 
@@ -57,6 +58,7 @@ pub fn default_params(kind: DocEffectKind) -> EffectParams {
         DocEffectKind::Flanger => EffectParams::Flanger(Box::default()),
         DocEffectKind::Bitcrusher => EffectParams::Bitcrusher(Box::default()),
         DocEffectKind::Phaser => EffectParams::Phaser(Box::default()),
+        DocEffectKind::Saturation => EffectParams::Saturation(Box::default()),
     }
 }
 
@@ -82,6 +84,7 @@ pub fn processor(params: &EffectParams, sample_rate: f32) -> BuiltinProcessor {
         BuiltinEffectKind::Flanger => Box::new(FlangerProcessor::new(sample_rate)),
         BuiltinEffectKind::Bitcrusher => Box::new(BitcrusherProcessor::new(sample_rate)),
         BuiltinEffectKind::Phaser => Box::new(PhaserProcessor::new(sample_rate)),
+        BuiltinEffectKind::Saturation => Box::new(SaturationProcessor::new(sample_rate)),
     };
     let descriptor = descriptor(params);
     for slot in 0..descriptor.params.len() {
@@ -165,6 +168,14 @@ pub fn value(params: &EffectParams, slot: u8) -> f32 {
             phaser::SLOT_MIX => ph.mix,
             _ => 0.0,
         },
+        EffectParams::Saturation(sat) => match slot {
+            saturation::SLOT_MODE => sat.mode as f32,
+            saturation::SLOT_DRIVE => sat.drive,
+            saturation::SLOT_TONE => sat.tone,
+            saturation::SLOT_TRIM => sat.trim,
+            saturation::SLOT_MIX => sat.mix,
+            _ => 0.0,
+        },
     }
 }
 
@@ -240,6 +251,14 @@ pub fn set_value(params: &mut EffectParams, slot: u8, value: f32) {
             phaser::SLOT_SPREAD => ph.spread = value,
             phaser::SLOT_STAGES => ph.stages = value.round().clamp(0.0, 3.0) as u8,
             phaser::SLOT_MIX => ph.mix = value,
+            _ => {}
+        },
+        EffectParams::Saturation(sat) => match slot {
+            saturation::SLOT_MODE => sat.mode = value.round().clamp(0.0, 2.0) as u8,
+            saturation::SLOT_DRIVE => sat.drive = value,
+            saturation::SLOT_TONE => sat.tone = value,
+            saturation::SLOT_TRIM => sat.trim = value,
+            saturation::SLOT_MIX => sat.mix = value,
             _ => {}
         },
     }

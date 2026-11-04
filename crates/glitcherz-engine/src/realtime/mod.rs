@@ -76,6 +76,7 @@ pub mod portamento;
 pub mod processor;
 pub mod reverb;
 pub mod sample;
+pub mod saturation;
 pub mod sequencer;
 pub mod sf2;
 pub mod silent;
@@ -150,6 +151,7 @@ pub use portamento::{MAX_PENDING_NOTES, PortamentoProcessor};
 pub use processor::{ChannelWeights, MAX_WEIGHT_CHANNELS, Processor, ProcessorChain};
 pub use reverb::ReverbProcessor;
 pub use sample::{SAMPLE_DEFAULT_ROOT, SAMPLE_POLYPHONY, SampleVoiceProcessor};
+pub use saturation::SaturationProcessor;
 pub use sequencer::{
     ControlClipTable, MAX_TIME_SIGNATURE_NUMERATOR, MAX_TRACK_CLIPS, MIDI_CLIP_TRASH_CAPACITY,
     MIN_VELOCITY, MidiClipTable, RtCtrl, RtCtrlKind, RtMidiClip, RtNote, Sequencer, SequencerSink,

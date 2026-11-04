@@ -680,6 +680,47 @@ impl Default for PhaserParams {
     }
 }
 
+fn default_saturation_drive() -> f32 {
+    2.0
+}
+
+fn default_saturation_tone() -> f32 {
+    20_000.0
+}
+
+/// Saturation parameters (spec `effects.md` E5; slot order matches the engine
+/// descriptor).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SaturationParams {
+    /// Shaper mode as the enum index (0 = Soft, 1 = Hard, 2 = Fold).
+    #[serde(default)]
+    pub mode: u8,
+    /// Input drive (1..16).
+    #[serde(default = "default_saturation_drive")]
+    pub drive: f32,
+    /// Trailing tone low pass (Hz; the 20 kHz default is near-off).
+    #[serde(default = "default_saturation_tone")]
+    pub tone: f32,
+    /// Output trim in dB.
+    #[serde(default)]
+    pub trim: f32,
+    /// Dry/wet mix (`0` = fully dry).
+    #[serde(default = "default_mix_one")]
+    pub mix: f32,
+}
+
+impl Default for SaturationParams {
+    fn default() -> Self {
+        Self {
+            mode: 0,
+            drive: default_saturation_drive(),
+            tone: default_saturation_tone(),
+            trim: 0.0,
+            mix: default_mix_one(),
+        }
+    }
+}
+
 /// Built-in effect kind (spec `.agents/spec/effects.md` D1).
 ///
 /// The wire format is the `kind` tag of [`EffectParams`]; this enum lets UI and
@@ -706,6 +747,8 @@ pub enum BuiltinEffectKind {
     Bitcrusher,
     /// All-pass cascade with an LFO-swept corner frequency.
     Phaser,
+    /// 2× oversampled waveshaper.
+    Saturation,
 }
 
 impl BuiltinEffectKind {
@@ -720,6 +763,7 @@ impl BuiltinEffectKind {
             Self::Flanger => "Flanger",
             Self::Bitcrusher => "Bitcrusher",
             Self::Phaser => "Phaser",
+            Self::Saturation => "Saturation",
         }
     }
 
@@ -733,6 +777,7 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Flanger,
         BuiltinEffectKind::Bitcrusher,
         BuiltinEffectKind::Phaser,
+        BuiltinEffectKind::Saturation,
     ];
 }
 
@@ -761,6 +806,8 @@ pub enum EffectParams {
     Bitcrusher(Box<BitcrusherParams>),
     /// All-pass cascade with an LFO-swept corner frequency.
     Phaser(Box<PhaserParams>),
+    /// 2× oversampled waveshaper.
+    Saturation(Box<SaturationParams>),
 }
 
 impl Default for EffectParams {
@@ -781,6 +828,7 @@ impl EffectParams {
             Self::Flanger(_) => BuiltinEffectKind::Flanger,
             Self::Bitcrusher(_) => BuiltinEffectKind::Bitcrusher,
             Self::Phaser(_) => BuiltinEffectKind::Phaser,
+            Self::Saturation(_) => BuiltinEffectKind::Saturation,
         }
     }
 
@@ -908,6 +956,22 @@ impl EffectParams {
     pub fn as_phaser_mut(&mut self) -> Option<&mut PhaserParams> {
         match self {
             Self::Phaser(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Saturation parameters, when this is a saturation node.
+    pub fn as_saturation(&self) -> Option<&SaturationParams> {
+        match self {
+            Self::Saturation(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Mutable saturation parameters, when this is a saturation node.
+    pub fn as_saturation_mut(&mut self) -> Option<&mut SaturationParams> {
+        match self {
+            Self::Saturation(params) => Some(params),
             _ => None,
         }
     }
@@ -2296,6 +2360,12 @@ pub fn effect_slot_axis(params: &EffectParams, slot: u8) -> MapSpec {
         (EffectParams::Phaser(_), 3) => M::log(1.1, 2.6),
         (EffectParams::Phaser(_), 4) => M::linear(0.0, 3.0),
         (EffectParams::Phaser(_), 5) => M::linear(0.0, 1.0),
+        // mode (enum), drive, tone, trim, mix.
+        (EffectParams::Saturation(_), 0) => M::linear(0.0, 2.0),
+        (EffectParams::Saturation(_), 1) => M::log(1.0, 16.0),
+        (EffectParams::Saturation(_), 2) => M::log(1_000.0, 20_000.0),
+        (EffectParams::Saturation(_), 3) => M::linear(-24.0, 24.0),
+        (EffectParams::Saturation(_), 4) => M::linear(0.0, 1.0),
         // Out-of-range slot (a plugin payload, or a document that kept a
         // stale slot after the effect changed kind): normalized pass-through.
         _ => M::linear(0.0, 1.0),

@@ -53,6 +53,8 @@ pub enum BuiltinEffectKind {
     Bitcrusher,
     /// All-pass cascade with an LFO-swept corner frequency.
     Phaser,
+    /// 2× oversampled waveshaper.
+    Saturation,
 }
 
 impl BuiltinEffectKind {
@@ -66,6 +68,7 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Flanger,
         BuiltinEffectKind::Bitcrusher,
         BuiltinEffectKind::Phaser,
+        BuiltinEffectKind::Saturation,
     ];
 
     /// Static descriptor of this kind.
@@ -79,6 +82,7 @@ impl BuiltinEffectKind {
             BuiltinEffectKind::Flanger => &crate::realtime::flanger::DESCRIPTOR,
             BuiltinEffectKind::Bitcrusher => &crate::realtime::bitcrusher::DESCRIPTOR,
             BuiltinEffectKind::Phaser => &crate::realtime::phaser::DESCRIPTOR,
+            BuiltinEffectKind::Saturation => &crate::realtime::saturation::DESCRIPTOR,
         }
     }
 }
