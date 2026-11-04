@@ -1,6 +1,6 @@
 # 扩展音频解码：symphonia 接入 Spec
 
-> 状态：X1 草案（2026-11-04），X1–X3 待实施。
+> 状态：X1–X3 已交付（2026-11-04，文档 `a75655e` / 实现 `f1d4feb`）。
 > 上游：`sample-player.md`（U5 采样播放器）、`audio-track.md`（U6 音频轨 / 波形）、
 > `media.md`（S3b 媒体相对路径与收集）、`AGENTS.md`「实时音频铁律」。
 > 决策来源：2026-11-02 外部 DSP crate 选型讨论；`fundsp` 不引依赖（只作算法参考），
@@ -89,11 +89,11 @@ File → MediaSourceStream → Hint(extension) → get_probe().format(...)
 
 ## 6. 实现拆分
 
-- [ ] **X1 文档 + 依赖**：本 spec、`plan.md` 新节、`AGENTS.md` 索引、
+- [x] **X1 文档 + 依赖**：本 spec、`plan.md` 新节、`AGENTS.md` 索引、
       `Cargo.toml` 依赖、`THIRD-PARTY-NOTICES.md` MPL 条目（文档与依赖分开提交）
-- [ ] **X2 解码分路**：`engine/src/sample.rs` 拆 `decode_wav` / `decode_symphonia`，
+- [x] **X2 解码分路**：`engine/src/sample.rs` 拆 `decode_wav` / `decode_symphonia`，
       `SampleError` 按 D9 调整，`AUDIO_FILE_EXTENSIONS` 导出，单测按 §7
-- [ ] **X3 UI 与用户文档**：三处对话框过滤器读同一常量、Inspector/patch 的
+- [x] **X3 UI 与用户文档**：三处对话框过滤器读同一常量、Inspector/patch 的
       「.wav」hover 文案改通用措辞、`docs/manual.md` / `docs/project-files.md`
       同步「支持的音频格式」
 
@@ -132,3 +132,15 @@ File → MediaSourceStream → Hint(extension) → get_probe().format(...)
 | 整文件解码 | 一首 5 分钟立体声 48 kHz ≈ 115 MB | 用户开始加载长采样 / 出现内存压力 → 改为磁盘流式 + 分块缓存 |
 | 0.6 core API 较新 | 上游 0.6 仍可能微调，CI 需锁版本 | 有稳定 0.6.x 后再放宽版本约束 |
 | `Decode(String)` 丢掉结构化错误 | UI 只能显示文本，无法按错误种类分流 | 需要「格式不支持时弹重定位对话框」时再拆枚举 |
+
+## 10. 实施勘误（X1–X3）
+
+| # | 规格原样 | 实际做法 | 原因 |
+| :-- | :-- | :-- | :-- |
+| 1 | §5 写 `get_probe().format(...)` | `get_probe().probe(&hint, mss, FormatOptions, MetadataOptions)` 返回 `Box<dyn FormatReader>` | 0.6 重写了 probe API，0.5 示例里的 `format()` / `ProbeResult` 已不存在 |
+| 2 | §5 写 `get_codecs().make(...)` | `make_audio_decoder(&AudioCodecParameters, &AudioDecoderOptions)` | 同上；`Track.codec_params` 是 `Option<CodecParameters>`，需 `.audio()` 取出再 clone，避免 borrow 与 `next_packet()` 冲突 |
+| 3 | `Hint` 路径 | `symphonia::core::formats::probe::Hint` | 0.6 没有 `core::probe` 模块 |
+| 4 | §7.2 逐帧 `assert_eq!` | 真的逐帧相等，无容差 | 两条路径的 i16→f32 都除以 32768（`symphonia-core/audio/conv.rs`），算出来是同一个 f32 |
+| 5 | D6 每包一个临时 Vec | 复用单个 `scratch: Vec<f32>` | `copy_to_vec_interleaved` 内部 `dst.resize(...)` 覆盖目标，不 append；复用后每包零额外分配 |
+| 6 | 错误分流 | probe / 建解码器失败 → `UnsupportedFormat`，解包失败 → `Decode`，单包 decode error 跳过继续 | 坏包可恢复、坏格式不可恢复；与 `symphonia-play` 的处理一致 |
+| 7 | 采样率变更 | 首块记录 rate，后续块不同直接 `Decode`（channel 数同理） | RT 播放步进只认单一源采样率，静默拼接会产生变速 |

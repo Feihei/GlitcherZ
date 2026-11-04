@@ -580,22 +580,34 @@ curve→曲线轨，即"烘培"）；**一个输入只允许一个源，一个�
 > 类型级 `AudioNode` 管线，源码不可照抄）；**`symphonia` 整体引入**（MPL-2.0，纯解码）。
 > 另：`midly` 不引入（已有自研 `smf.rs`），`dasp` 已从 `AGENTS.md` 技术栈移除。
 
-- [ ] **X1 文档 + 依赖**：spec `audio-decoding.md` ✅ 已写；`AGENTS.md` 索引、
+- [x] **X1 文档 + 依赖** ✅ 2026-11-04（`a75655e` 文档、`f1d4feb` 实现）：spec
+      `audio-decoding.md` ✅ 已写；`AGENTS.md` 索引、
       workspace `Cargo.toml` 加 `symphonia 0.6.1`（`default-features = false`，
       显式 `flac / mp3 / mpa / ogg / vorbis / aac / isomp4 / aiff / pcm / wav`）、
       `THIRD-PARTY-NOTICES.md` 登记 MPL-2.0
-- [ ] **X2 解码分路**：`engine/src/sample.rs` 拆 `decode_wav`（hound 原逻辑零改动）与
+- [x] **X2 解码分路** ✅ 2026-11-04：`engine/src/sample.rs` 拆 `decode_wav`（hound 原逻辑零改动）与
       `decode_symphonia`；`.wav` 走前者、其余按扩展名 hint + 内容探测走后者；
       `GenericAudioBufferRef::copy_to_vec_interleaved::<f32>()` 转交错，mono 复制、
       >2 声道拒绝；`SampleError` 改为 `Decode(String)` + `UnsupportedFormat(String)`；
       导出 `AUDIO_FILE_EXTENSIONS` 作为格式清单唯一真源。RT 侧 / `SampleData` 字段 /
       `SampleLibrary` / 文档版本全部不动
-- [ ] **X3 UI 与用户文档**：三处 `add_filter("Wave", &["wav"])` 改读同一常量；
+- [x] **X3 UI 与用户文档** ✅ 2026-11-04：三处 `add_filter("Wave", &["wav"])` 改读同一常量；
       Inspector / patch 的 `.wav` hover 文案改通用；`docs/manual.md`、
       `docs/project-files.md` 同步支持格式
 
 验收：现有 WAV 测试逐条不改断言通过；新增「同一 fixture 两条分路逐帧相等」、
 symphonia 分路的 mono/stereo/>2ch/垃圾文件；全仓 fmt / clippy -D warnings / test 绿。
+
+**交付记录（2026-11-04）**：文档 `a75655e`、实现 `f1d4feb`。5 个新解码测试
+（hound/symphonia 逐帧 `assert_eq!` 通过——两边 i16 都除以 32768）、全仓
+1009 项测试绿、2 秒窗口冒烟通过。**0.6 API gotcha**：`Probe::probe()`（不是
+`format()`）、`CodecRegistry::make_audio_decoder()`（不是 `make()`）、
+`next_packet() -> Result<Option<Packet>>`、`Track.codec_params` 是
+`Option<CodecParameters>` 要 `.audio()` 取出、`Hint` 在
+`core::formats::probe` 而非 `core::probe`、`decode()` 返回
+`GenericAudioBufferRef`（0.5 的 `AudioBufferRef` / `SampleBuffer` 示例全部不适用）。
+`copy_to_vec_interleaved` 会 `resize` 目标 Vec（覆盖，不是 append），故每包复用一个
+scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 symphonia 分路验证）。
 
 明确不做：编码器（导出/录音仍 hound 写 WAV）、Opus / ALAC、元数据展示、
 流式解码、采样率重采样（`rubato` 未引入）、`PROJECT_VERSION` bump。
