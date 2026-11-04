@@ -4,9 +4,11 @@
 //! absolute-tick ruler (bars). Interactions:
 //!
 //! - drag a clip body → move (snapped to bars);
-//! - drag its right edge → resize the container (growing tiles the content,
-//!   W2); Alt+drag the edge → set the content period (`loop_ticks`), which
-//!   restarts tiling right after it;
+//! - drag its right edge → extend/trim the clip time; a single-period clip
+//!   grows its content with the container, a tiled clip keeps its repeat
+//!   count and scales the period;
+//! - Alt+T → tile the selection: drag to set the content period
+//!   (`loop_ticks`), bar-aligned; one drop = one undo step;
 //! - double-click an empty lane spot → insert a one-bar clip;
 //! - double-click a clip → jump to the Edit tab (piano roll / curve lane);
 //!   Alt+double-click renames it in place, `F2` renames the selected clip;
@@ -121,6 +123,16 @@ pub struct ClipSpanEdit {
     pub span_ticks: u32,
 }
 
+/// One tile edit of the tile modal (Shift+T / Alt+T): the container grows to
+/// `span_ticks` while the content period stays `loop_ticks` — the clip's
+/// full length at arm time, so the WHOLE clip repeats as one unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipTileEdit {
+    pub sel: ClipSel,
+    pub span_ticks: u32,
+    pub loop_ticks: u32,
+}
+
 /// Which axis a Grab / Duplicate is constrained to (Blender convention,
 /// unified with the roll: X = time only, Y = rows only). Pressing the
 /// same key again releases the lock; the other axis takes over.
@@ -144,6 +156,9 @@ enum ModalKind {
     /// T: stretch the end edge of every selected clip; S mid-modal flips
     /// to the start edge (unified with the roll's t+s). Bar delta only.
     Stretch { start_edge: bool },
+    /// Alt+T: set the content period of every selected clip, bar-aligned.
+    /// The container length is unchanged, so this changes the repeat count.
+    Tile,
 }
 
 /// Live modal state. `origin` snapshots the selection at arm time; since
@@ -198,6 +213,10 @@ enum Drag {
     Resize {
         row: RowKind,
         clip: usize,
+        /// Snapshot at drag start so per-frame stretching scales from the
+        /// original period (not from the previous frame's result).
+        origin_span: u32,
+        origin_loop: u32,
     },
 }
 
@@ -349,6 +368,12 @@ impl TimelineState {
         self.modal.is_some()
     }
 
+    /// Whether the live modal is the Alt+T tile modal (integration
+    /// observability — the kind itself stays private).
+    pub fn tiling_active(&self) -> bool {
+        matches!(self.modal.as_ref().map(|m| m.kind), Some(ModalKind::Tile))
+    }
+
     /// Shows a transient status message in the toolbar for a few seconds
     /// (or until another status replaces it).
     fn set_status(&mut self, msg: impl Into<String>) {
@@ -393,9 +418,8 @@ pub enum TimelineAction {
         clip: usize,
         start_ticks: u32,
         span_ticks: u32,
-        /// W2: explicit content-period request (Alt+drag the right edge).
-        /// `None` = keep the current loop, only clamping it to the new span
-        /// (grow = tile, shrink = trim the tail).
+        /// Explicit content period from the resize gesture, computed from the
+        /// drag-start snapshot. `None` = keep the current loop (a move).
         loop_ticks: Option<u32>,
     },
     /// Delete the clip at `clip`.
@@ -427,6 +451,12 @@ pub enum TimelineAction {
     /// Stretch every clip in the list (T modal finalize). One undo step.
     StretchClipsBatch {
         spans: Vec<ClipSpanEdit>,
+    },
+    /// Tile every clip in the list (tile modal finalize): each container
+    /// grows to `span_ticks` while the content period stays `loop_ticks`
+    /// (the clip's armed length). One undo step.
+    TileClipsBatch {
+        tiles: Vec<ClipTileEdit>,
     },
     /// Clone every clip in the list onto its target (Shift+D finalize;
     /// originals untouched). One undo step.
@@ -592,14 +622,34 @@ pub(crate) trait Placement {
     fn set_group(&mut self, group: Option<u32>);
 }
 
-/// W2: the loop length after a span edit. Growing a clip tiles the content
-/// (loop stays put); shrinking it trims the tail (`loop = min(loop, span)`),
-/// so a single-period clip can still be shortened. An explicit loop request
-/// (Alt+drag on the right edge) wins but must fit the container.
+/// W2: the loop length after a span edit that does NOT explicitly ask for a
+/// period (currently only moves, where the span is unchanged). Kept for the
+/// move path: a moved clip must not change its content period.
 pub(crate) fn resolve_loop(current: u32, span: u32, requested: Option<u32>) -> u32 {
     match requested {
         Some(v) => v.clamp(1, span.max(1)),
         None => current.clamp(1, span.max(1)),
+    }
+}
+
+/// T semantics (2026-11-04): the content period after a **stretch/resize**.
+///
+/// - Single-period clip (`loop == span`): the content grows with the
+///   container, so `T` genuinely extends the clip's editable time — the
+///   piano roll's range is `loop_ticks`.
+/// - Tiled clip (`loop < span`): keep the repeat count, scale the period
+///   with the container.
+pub(crate) fn resolve_stretch_loop(current_loop: u32, old_span: u32, new_span: u32) -> u32 {
+    let old_span = old_span.max(1);
+    let new_span = new_span.max(1);
+    let current_loop = current_loop.max(1);
+    if current_loop >= old_span {
+        new_span
+    } else {
+        let repeats = f64::from(old_span) / f64::from(current_loop);
+        ((f64::from(new_span) / repeats).round() as u32)
+            .max(1)
+            .min(new_span)
     }
 }
 
@@ -984,6 +1034,103 @@ fn stretch_targets(
     )
 }
 
+/// Looks up a selected clip's content period. Audio clips have no repeat
+/// semantics, so they report `None`.
+fn clip_loop_len(
+    midi_tracks: &[MidiTrack],
+    control_tracks: &[ControlTrack],
+    sec_per_tick: f64,
+    sel: ClipSel,
+) -> Option<u32> {
+    match sel.lane {
+        TimelineLane::Control => Some(
+            control_tracks
+                .get(sel.track)?
+                .clips
+                .get(sel.clip)?
+                .loop_len(sec_per_tick),
+        ),
+        TimelineLane::Midi => Some(
+            midi_tracks
+                .get(sel.track)?
+                .clips
+                .get(sel.clip)?
+                .loop_len(sec_per_tick),
+        ),
+        TimelineLane::Audio => None,
+    }
+}
+
+/// The tile modal's per-clip edits (Shift+T / Alt+T). The pointer adds or
+/// removes whole repeats, one per period-width of travel:
+/// - a single-period clip tiles as a whole (period = its full length);
+/// - an ALREADY-TILED clip keeps its content period and the pointer just
+///   adjusts the repeat count — no nested tiling (2026-11-04).
+///   Until the pointer moves the clip keeps its exact armed span. `None`
+///   when the pointer is unavailable or the modal is not a Tile.
+#[allow(clippy::too_many_arguments)]
+fn tile_targets(
+    modal: &Modal,
+    ptr: Option<Pos2>,
+    px_per_bar: f32,
+    bar_ticks: u32,
+    midi_tracks: &[MidiTrack],
+    control_tracks: &[ControlTrack],
+    sec_per_tick: f64,
+) -> Option<Vec<ClipTileEdit>> {
+    if !matches!(modal.kind, ModalKind::Tile) {
+        return None;
+    }
+    let ptr = ptr?;
+    let bar = f64::from(bar_ticks.max(1));
+    let delta_bars = if modal.grab.x.is_finite() {
+        f64::from(ptr.x - modal.grab.x) / f64::from(px_per_bar.max(0.001))
+    } else {
+        0.0
+    };
+    Some(
+        modal
+            .origin
+            .iter()
+            .filter_map(|sel| {
+                let (start, span) =
+                    clip_geometry(midi_tracks, control_tracks, &[], sec_per_tick, *sel)?;
+                let span = span.max(1);
+                let period = clip_loop_len(midi_tracks, control_tracks, sec_per_tick, *sel)
+                    .unwrap_or(span)
+                    .clamp(1, span);
+                // The pointer adds/removes whole repeats, one per period-width
+                // of travel: a single-period clip tiles as a whole, an
+                // already-tiled clip just adjusts its repeat count (2026-11-04,
+                // no nested tiling). Until the pointer moves the clip keeps
+                // its exact armed span.
+                let span_ticks = if delta_bars == 0.0 {
+                    span
+                } else {
+                    let period_bars = (f64::from(period) / bar).max(f64::EPSILON);
+                    let base = (f64::from(span) / f64::from(period)).round().max(1.0);
+                    let step = (delta_bars.abs() / period_bars).floor();
+                    let repeats = if delta_bars > 0.0 {
+                        base + step
+                    } else {
+                        (base - step).max(1.0)
+                    };
+                    period.saturating_mul(repeats as u32)
+                };
+                let room = f64::from(ARRANGEMENT_LIMIT_TICKS.saturating_sub(start).max(1))
+                    / f64::from(period.max(1));
+                let span_ticks =
+                    span_ticks.min((room.floor().max(1.0) as u32).saturating_mul(period));
+                Some(ClipTileEdit {
+                    sel: *sel,
+                    span_ticks,
+                    loop_ticks: period,
+                })
+            })
+            .collect(),
+    )
+}
+
 /// One modal target awaiting overlap validation: the clip at `sel` wants
 /// the (start, span) rectangle on row `to_track` of track kind `lane`.
 type ModalTarget = (ClipSel, (u32, u32), usize, TimelineLane);
@@ -1123,6 +1270,15 @@ pub fn show(
     router: &mut crate::focus::FocusRouter,
 ) -> Vec<TimelineAction> {
     let mut actions = Vec::new();
+    // 2026-11-04: the tile shortcut (Shift+T, Alt+T as a fallback) is a
+    // view-level command, not a focus-gated lane key — losing lane focus
+    // while a modifier is pressed would otherwise swallow it; run it before
+    // the rows. Any MIDI/curve clip can tile: periods go down to a quarter
+    // bar, so even a single-bar clip halves into two repeats.
+    if state.modal.is_none() && !state.knife_armed && take_tile_shortcut(ui.ctx()) {
+        state.knife_armed = false;
+        arm_modal(state, ui.ctx(), Arm::Tile);
+    }
     // While a modal transform (G/T/Shift+D) or the armed knife owns the
     // pointer, the keyboard stays with the lane that armed it — the pointer
     // may travel across neutral chrome (or past the content edge) without
@@ -1325,6 +1481,17 @@ pub fn show(
                         .color(Color32::from_rgb(140, 200, 250)),
                     );
                 }
+                Some(Modal {
+                    kind: ModalKind::Tile,
+                    ..
+                }) => {
+                    ui.weak(
+                        egui::RichText::new(
+                            "Tile: drag right to repeat the whole clip · LMB drop · RMB / Esc cancel",
+                        )
+                        .color(Color32::from_rgb(140, 200, 250)),
+                    );
+                }
                 None => {}
             }
             // Selection feedback: a persistent count so "did my click
@@ -1354,7 +1521,7 @@ pub fn show(
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(
-                        "Drag move · edge resize (grow = tile) · Alt+edge: loop length · dbl-click edit · F2 / Alt+dbl-click: rename · Ctrl+G group · Ctrl+Shift+G ungroup · Alt+click: single · right-click delete · marquee select · Del · K knife · dots: reorder track · ruler: seek / Ctrl+loop / RMB marker · Ctrl+wheel zoom · Ctrl+Alt+wheel height · MMB pan",
+                        "Drag move · edge resize (T: extend time) · Shift+T / Alt+T: tile · dbl-click edit · F2 / Alt+dbl-click: rename · Ctrl+G group · Ctrl+Shift+G ungroup · Alt+click: single · right-click delete · marquee select · Del · K knife · dots: reorder track · ruler: seek / Ctrl+loop / RMB marker · Ctrl+wheel zoom · Ctrl+Alt+wheel height · MMB pan",
                     )
                     .weak(),
                 )
@@ -1607,7 +1774,7 @@ pub fn show(
                 highlight,
                 &|clip| format!("{} notes", clip.notes().len()),
                 &|_| None,
-                &|_, _, _| {},
+                &|clip, painter, rect| draw_midi_preview(painter, rect, clip),
                 p.clip_groups,
             );
         }
@@ -1807,6 +1974,15 @@ pub fn show(
         // the block — `state.modal` is still borrowed inside it.
         let mut refused_msg: Option<String> = None;
         if state.modal.is_some() {
+            // Tile may have been armed without a pointer (holding Alt drops
+            // the cursor on Windows); latch the grab on the first valid one
+            // so the period starts moving from where the user actually is.
+            if let (Some(m), Some(hover)) =
+                (state.modal.as_mut(), ui.ctx().pointer_hover_pos())
+                && !m.grab.x.is_finite()
+            {
+                m.grab = hover;
+            }
             // The modal owns the whole input while it runs: the confirming
             // / cancelling click lands ANYWHERE (Blender semantics — the
             // pointer has usually travelled past the lane, e.g. past the
@@ -1949,6 +2125,20 @@ pub fn show(
                                     }
                                 }
                             }
+                            ModalKind::Tile => {
+                                if let Some(tiles) = tile_targets(
+                                    m,
+                                    ptr,
+                                    px_per_bar,
+                                    bar_ticks,
+                                    midi_tracks,
+                                    control_tracks,
+                                    p.sec_per_tick,
+                                ) && !tiles.is_empty()
+                                {
+                                    actions.push(TimelineAction::TileClipsBatch { tiles });
+                                }
+                            }
                         }
                     }
                 }
@@ -1983,7 +2173,7 @@ pub fn show(
                                     p.sec_per_tick,
                                     mv.from,
                                 )?;
-                                Some((mv.from.lane, mv.to_track, mv.start_ticks, span))
+                                Some((mv.from.lane, mv.to_track, mv.start_ticks, span, None))
                             })
                             .collect::<Vec<_>>()
                     }),
@@ -1999,12 +2189,44 @@ pub fn show(
                     )
                     .map(|es| {
                         es.into_iter()
-                            .map(|e| (e.sel.lane, e.sel.track, e.start_ticks, e.span_ticks))
+                            .map(|e| {
+                                (e.sel.lane, e.sel.track, e.start_ticks, e.span_ticks, None)
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                    ModalKind::Tile => tile_targets(
+                        m,
+                        ptr,
+                        px_per_bar,
+                        bar_ticks,
+                        midi_tracks,
+                        control_tracks,
+                        p.sec_per_tick,
+                    )
+                    .map(|tiles| {
+                        tiles
+                            .into_iter()
+                            .filter_map(|t| {
+                                let (start, _) = clip_geometry(
+                                    midi_tracks,
+                                    control_tracks,
+                                    audio_tracks,
+                                    p.sec_per_tick,
+                                    t.sel,
+                                )?;
+                                Some((
+                                    t.sel.lane,
+                                    t.sel.track,
+                                    start,
+                                    t.span_ticks,
+                                    Some(t.loop_ticks),
+                                ))
+                            })
                             .collect::<Vec<_>>()
                     }),
                 };
                 if let Some(targets) = targets {
-                    for (lane_kind, track, start, span) in targets {
+                    for (lane_kind, track, start, span, period) in targets {
                         let Some((_, lane_rect)) = geom
                             .iter()
                             .find(|(row, _)| row.key() == (lane_kind.row_code(), track))
@@ -2030,6 +2252,24 @@ pub fn show(
                         };
                         let painter = ui.painter_at(*lane_rect);
                         painter.rect_filled(rect, 3.0, ghost);
+                        if let Some(period) = period {
+                            if period < span {
+                                let seam_color = ghost.gamma_multiply(0.8);
+                                draw_tile_seams(&painter, rect, period, px_per_tick, seam_color);
+                            }
+                            // Always show the target repeat count: opening the modal must
+                            // give immediate feedback even before the pointer
+                            // moves. Sub-bar periods make a "N bar" label
+                            // misleading, so only ×M shows.
+                            let repeats = span.div_ceil(period.max(1));
+                            painter.text(
+                                rect.center(),
+                                Align2::CENTER_CENTER,
+                                format!("×{repeats}"),
+                                FontId::proportional(11.0),
+                                Color32::WHITE,
+                            );
+                        }
                     }
                 }
             }
@@ -2457,34 +2697,15 @@ fn lane_row<T: Placement>(
             Stroke::new(1.0, colors.clip_stroke),
             StrokeKind::Inside,
         );
-        // W2: when the container is longer than one period, mark every
-        // repeat seam and tint the repeated periods — the same tiling the
-        // sequencer does (`start + k·loop`), so what is drawn is what plays.
+        // W2 / 2026-11-04: when the container is longer than one period, mark
+        // every repeat seam and tint the repeated periods — the same tiling
+        // the sequencer does (`start + k·loop`), so what is drawn is what
+        // plays. Single-period clips stay a plain solid block.
         let span_ticks = clip.span(sec_per_tick).max(1);
         let loop_ticks = clip.loop_len(sec_per_tick).clamp(1, span_ticks);
         if loop_ticks < span_ticks {
-            let loop_px = loop_ticks as f32 * px_per_tick;
-            let mut seam = rect.left() + loop_px;
             let seam_color = colors.clip_stroke.gamma_multiply(0.55);
-            while seam < rect.right() - 0.5 {
-                let band = Rect::from_min_max(
-                    pos2(seam, rect.top()),
-                    pos2((seam + loop_px).min(rect.right()), rect.bottom()),
-                );
-                painter.rect_filled(
-                    band,
-                    0.0,
-                    Color32::from_rgba_unmultiplied(255, 255, 255, 10),
-                );
-                painter.line_segment(
-                    [
-                        pos2(seam, rect.top() + 1.0),
-                        pos2(seam, rect.bottom() - 1.0),
-                    ],
-                    Stroke::new(1.0, seam_color),
-                );
-                seam += loop_px;
-            }
+            draw_tile_seams(&painter, rect, loop_ticks, px_per_tick, seam_color);
         }
         // U6: a clip with waveform data draws min/max peak columns across
         // its body (stretched to the span, exactly like playback reads it).
@@ -2777,7 +2998,12 @@ fn lane_row<T: Placement>(
                 let edge_x = lane.left()
                     + (clips[index].start() + clips[index].span(sec_per_tick)) as f32 * px_per_tick;
                 if (pos.x - edge_x).abs() <= EDGE_GRAB {
-                    state.drag = Some(Drag::Resize { row, clip: index });
+                    state.drag = Some(Drag::Resize {
+                        row,
+                        clip: index,
+                        origin_span: clips[index].span(sec_per_tick),
+                        origin_loop: clips[index].loop_len(sec_per_tick),
+                    });
                 } else {
                     let grab = tick - clips[index].start() as f32;
                     state.drag = Some(Drag::Move {
@@ -2824,22 +3050,23 @@ fn lane_row<T: Placement>(
                             });
                         }
                     }
-                    Some(Drag::Resize { clip, .. }) if clip < clips.len() => {
+                    Some(Drag::Resize {
+                        clip,
+                        origin_span,
+                        origin_loop,
+                        ..
+                    }) if clip < clips.len() => {
                         let start = clips[clip].start();
                         let limit = ARRANGEMENT_LIMIT_TICKS - start;
                         let edge = snap_bar(tick_at(pos.x) - start as f32, bar_ticks)
                             .clamp(bar_ticks, limit.max(bar_ticks));
-                        // W2: the plain right edge edits the container (grow =
-                        // tile the content). Alt edits the content period; the
-                        // container grows to fit, so tiling starts right after
-                        // the period.
-                        let alt = ui.input(|i| i.modifiers.alt);
-                        let span = if alt {
-                            clips[clip].span(sec_per_tick).max(edge)
-                        } else {
-                            edge
-                        };
-                        let loop_ticks = alt.then_some(edge);
+                        // 2026-11-04: the plain right edge extends/trims the
+                        // clip time. A single-period clip grows its content
+                        // with the container; a tiled clip keeps its repeat
+                        // count and scales its period. The origin snapshot
+                        // avoids drift across the per-frame updates.
+                        let span = edge;
+                        let loop_ticks = Some(resolve_stretch_loop(origin_loop, origin_span, span));
                         let loop_changed =
                             loop_ticks.is_some_and(|l| l != clips[clip].loop_len(sec_per_tick));
                         if clips[clip].span(sec_per_tick) != span || loop_changed {
@@ -2986,9 +3213,35 @@ fn lane_row<T: Placement>(
         let knife = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::NONE, Key::K));
-        let t = ui
-            .ctx()
-            .input_mut(|i| i.consume_key(Modifiers::NONE, Key::T));
+        // Alt+T must be distinguished from plain T. Scan the raw key event
+        // and also accept a plain T while Alt is held: winit can deliver the
+        // modifier state one frame late, and `consume_key` only matches the
+        // event's own modifier snapshot.
+        let (alt_t, t) = ui.ctx().input_mut(|i| {
+            let alt_held = i.modifiers.alt;
+            let mut alt_t = false;
+            let mut plain_t = false;
+            i.events.retain(|event| {
+                if let egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = event
+                    && (*key == Key::T || physical_key.as_ref() == Some(&Key::T))
+                {
+                    if modifiers.alt || alt_held {
+                        alt_t = true;
+                    } else {
+                        plain_t = true;
+                    }
+                    return false;
+                }
+                true
+            });
+            (alt_t, plain_t)
+        });
         // S is a mid-modal qualifier (flips a Stretch to its start edge,
         // unified with the roll's t+s) — never an arming key here.
         let s = ui
@@ -3061,7 +3314,7 @@ fn lane_row<T: Placement>(
                             Some(axis)
                         };
                     }
-                    ModalKind::Stretch { .. } => {}
+                    ModalKind::Stretch { .. } | ModalKind::Tile => {}
                 }
             }
         }
@@ -3072,11 +3325,13 @@ fn lane_row<T: Placement>(
                 modal.kind = ModalKind::Stretch { start_edge: true };
             }
         }
-        // Arm G / Shift+D / T (Blender-style modal; arming one tool
-        // clears the other).
-        if (g || shift_d || t) && state.modal.is_none() {
+        // Arm G / Shift+D / T / Alt+T (Blender-style modal; arming one
+        // tool clears the other).
+        if (g || shift_d || t || alt_t) && state.modal.is_none() {
             state.knife_armed = false;
-            let arm = if g {
+            let arm = if alt_t {
+                Arm::Tile
+            } else if g {
                 Arm::Grab
             } else if shift_d {
                 Arm::Duplicate
@@ -3109,11 +3364,47 @@ fn lane_row<T: Placement>(
     parent.advance_cursor_after_rect(row_ui.min_rect());
 }
 
-/// Which modal G / Shift+D / T arms (M4b.3/4).
+/// Consumes a tile-shortcut press (Shift+T, with Alt+T as a fallback) and
+/// reports whether it was one. Accepts the event's modifier snapshot and the
+/// current held state (winit can deliver the modifier state one frame late,
+/// and `consume_key` only checks the event's own snapshot), plus the
+/// physical key for non-Latin layouts. Shift is the PRIMARY qualifier: on
+/// Windows Alt+letter is `WM_SYSKEYDOWN`, and releasing Alt raises
+/// `SC_KEYMENU`, whose menu mode swallows the following mouse events until
+/// Esc — the reported "hint shows Tile but nothing responds" symptom (D29).
+fn take_tile_shortcut(ctx: &egui::Context) -> bool {
+    ctx.input_mut(|i| {
+        let shift_held = i.modifiers.shift;
+        let alt_held = i.modifiers.alt;
+        let mut found = false;
+        i.events.retain(|event| {
+            if let egui::Event::Key {
+                key,
+                physical_key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+                && (*key == Key::T || physical_key.as_ref() == Some(&Key::T))
+                && !modifiers.ctrl
+                && !modifiers.command
+                && (modifiers.shift || shift_held || modifiers.alt || alt_held)
+            {
+                found = true;
+                return false;
+            }
+            true
+        });
+        found
+    })
+}
+
+/// Which modal G / Shift+D / T / Alt+T arms (M4b.3/4).
 enum Arm {
     Grab,
     Duplicate,
     Stretch,
+    Tile,
 }
 
 /// The X/Y axis-lock suffix for the Move / Duplicate hints.
@@ -3136,9 +3427,15 @@ fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
     // U11: the modal family is three-table now — audio clips arm G / T /
     // Shift+D just like MIDI/control (the geometry layer derives audio spans
     // from the seconds window at the base tempo).
-    let Some(ptr) = ctx.pointer_hover_pos() else {
+    // Holding Alt can drop the egui cursor on Windows (CursorLeft →
+    // PointerGone), so a missing pointer must be VISIBLE — it used to fail
+    // silently here. Tile is the one arm that can proceed without it: it
+    // latches its grab on the first valid pointer instead.
+    let ptr = ctx.pointer_hover_pos();
+    if ptr.is_none() && !matches!(arm, Arm::Tile) {
+        state.set_status("move the pointer over the timeline first");
         return;
-    };
+    }
     let kind = match arm {
         Arm::Grab => {
             let first = state.selection[0].lane;
@@ -3157,11 +3454,24 @@ fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
             ModalKind::Duplicate { locked: None }
         }
         Arm::Stretch => ModalKind::Stretch { start_edge: false },
+        Arm::Tile => {
+            if state
+                .selection
+                .iter()
+                .any(|s| s.lane == TimelineLane::Audio)
+            {
+                state.set_status("audio clips have no content period \u{2014} cannot tile");
+                return;
+            }
+            ModalKind::Tile
+        }
     };
     state.modal = Some(Modal {
         kind,
         origin: state.selection.clone(),
-        grab: ptr,
+        // Tile arms without a pointer on purpose; the sentinel is latched to
+        // the first real pointer position while the modal runs.
+        grab: ptr.unwrap_or(pos2(f32::INFINITY, f32::INFINITY)),
     });
 }
 
@@ -3239,6 +3549,112 @@ pub(crate) fn track_permutation(len: usize, from: usize, to: usize) -> Vec<usize
             }
         })
         .collect()
+}
+
+/// Marks repeat seams inside a clip block: the first period stays plain, each
+/// following period gets a faint tint and a dashed seam. Matches the
+/// sequencer's `start + k·loop` tiling, so a single-period clip looks clearly
+/// different from a tiled one.
+fn draw_tile_seams(
+    painter: &egui::Painter,
+    rect: Rect,
+    loop_ticks: u32,
+    px_per_tick: f32,
+    seam_color: Color32,
+) {
+    if loop_ticks == 0 || px_per_tick <= 0.0 {
+        return;
+    }
+    let loop_px = loop_ticks as f32 * px_per_tick;
+    if loop_px < 1.0 {
+        return;
+    }
+    let mut seam = rect.left() + loop_px;
+    let mut guard = 0;
+    while seam < rect.right() - 0.5 && guard < 1024 {
+        let band = Rect::from_min_max(
+            pos2(seam, rect.top()),
+            pos2((seam + loop_px).min(rect.right()), rect.bottom()),
+        );
+        painter.rect_filled(
+            band,
+            0.0,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+        );
+        let mut y = rect.top() + 1.0;
+        while y < rect.bottom() - 1.0 {
+            let y1 = (y + 2.5).min(rect.bottom() - 1.0);
+            painter.line_segment(
+                [pos2(seam, y), pos2(seam, y1)],
+                Stroke::new(1.0, seam_color),
+            );
+            y += 5.0;
+        }
+        seam += loop_px;
+        guard += 1;
+    }
+}
+
+/// Draws a read-only note preview inside one MIDI clip block (2026-11-04,
+/// same role as [`draw_control_preview`] for curve clips).
+///
+/// Notes are laid out at their tick positions (x) and pitch (y, adaptive
+/// range) and clipped to the block. The content tiles by `loop_ticks` exactly
+/// like playback. There is no editing here: notes are edited in the piano
+/// roll.
+fn draw_midi_preview(painter: &egui::Painter, rect: Rect, clip: &MidiClip) {
+    if clip.sequence.notes.is_empty()
+        || clip.span_ticks == 0
+        || rect.width() < 6.0
+        || rect.height() < 6.0
+    {
+        return;
+    }
+    let notes = &clip.sequence.notes;
+    let mut lo = u8::MAX;
+    let mut hi = 0u8;
+    for n in notes {
+        lo = lo.min(n.note);
+        hi = hi.max(n.note);
+    }
+    let lo = i32::from(lo).saturating_sub(2).max(0);
+    let hi = (i32::from(hi) + 2).min(127);
+    let pitch_span = (hi - lo).max(11) as f32;
+    let usable = (rect.height() - 2.0).max(1.0);
+    let row_h = (usable / (pitch_span + 1.0)).max(1.0);
+    let note_h = (row_h - 0.5).max(1.0);
+    let span = clip.span_ticks.max(1);
+    let period_ticks = clip.loop_ticks.max(1).min(span);
+    let px_per_tick = rect.width() / span as f32;
+    if px_per_tick <= 0.0 {
+        return;
+    }
+    let color = Color32::from_rgba_unmultiplied(215, 232, 255, 220);
+    let mut period = 0u32;
+    let mut guard = 0;
+    while period < span && guard < 1024 {
+        let period_end = period.saturating_add(period_ticks).min(span);
+        for n in notes {
+            let start = i64::from(period) + n.start;
+            if start >= i64::from(period_end) {
+                continue;
+            }
+            let end = (start + n.length.max(1)).min(i64::from(period_end));
+            let x0 = (rect.left() + start as f32 * px_per_tick).max(rect.left());
+            let x1 = (rect.left() + end as f32 * px_per_tick)
+                .max(x0 + 1.0)
+                .min(rect.right());
+            if x1 <= rect.left() || x0 >= rect.right() {
+                continue;
+            }
+            let pitch = i32::from(n.note).clamp(lo, hi);
+            let y = rect.top() + 1.0 + (hi - pitch) as f32 * row_h;
+            let y1 = (y + note_h).min(rect.bottom() - 1.0);
+            painter.rect_filled(Rect::from_min_max(pos2(x0, y), pos2(x1, y1)), 0.5, color);
+        }
+        period = period.saturating_add(period_ticks);
+        guard += 1;
+    }
 }
 
 /// Draws a read-only curve preview inside one control clip block (U12).
@@ -3368,6 +3784,99 @@ mod tests {
         assert_eq!(resolve_loop(bar, 1, None), 1);
     }
 
+    /// 2026-11-04: T extends a single-period clip's editable time; a tiled
+    /// clip keeps its repeat count and scales its period with the container.
+    #[test]
+    fn stretch_loop_extends_time_and_scales_tiled_periods() {
+        let bar = TICKS_PER_BAR;
+        // Single period: 1 bar -> 4 bars, still one period.
+        assert_eq!(resolve_stretch_loop(bar, bar, 4 * bar), 4 * bar);
+        // 4 bars in 2 periods: grow to 8 bars -> 4-bar period (2 repeats).
+        assert_eq!(resolve_stretch_loop(2 * bar, 4 * bar, 8 * bar), 4 * bar);
+        // Shrinking likewise keeps the repeat count.
+        assert_eq!(resolve_stretch_loop(2 * bar, 4 * bar, 2 * bar), bar);
+        // Never zero / never beyond the container.
+        assert_eq!(resolve_stretch_loop(bar, bar, 1), 1);
+        assert_eq!(resolve_stretch_loop(8 * bar, 8 * bar, 2), 2);
+    }
+
+    /// 2026-11-04: the tile modal adds/removes whole repeats, one per
+    /// period-width of travel. A single-period clip tiles as a whole; an
+    /// already-tiled clip keeps its period and just adjusts the count.
+    #[test]
+    fn tile_targets_adjusts_repeats() {
+        let mut clip = MidiClip::new(0);
+        clip.span_ticks = 4 * TICKS_PER_BAR;
+        clip.loop_ticks = 4 * TICKS_PER_BAR;
+        let midi = vec![MidiTrack {
+            clips: vec![clip],
+            ..MidiTrack::default()
+        }];
+        let modal = Modal {
+            kind: ModalKind::Tile,
+            origin: vec![ClipSel {
+                lane: TimelineLane::Midi,
+                track: 0,
+                clip: 0,
+            }],
+            grab: pos2(100.0, 100.0),
+        };
+        let target = |dx_bars: f32, tracks: &[MidiTrack]| {
+            tile_targets(
+                &modal,
+                Some(pos2(100.0 + dx_bars * 56.0, 100.0)),
+                56.0,
+                TICKS_PER_BAR,
+                tracks,
+                &[],
+                SPT,
+            )
+            .unwrap()
+        };
+        // No movement: the ghost is the clip itself (×1).
+        let tiles = target(0.0, &midi);
+        assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
+        assert_eq!(tiles[0].loop_ticks, 4 * TICKS_PER_BAR);
+        // Partial travel does not count until a full clip-width.
+        let tiles = target(2.0, &midi);
+        assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
+        // One clip-width right: the whole clip repeats once (×2).
+        let tiles = target(4.0, &midi);
+        assert_eq!(tiles[0].span_ticks, 8 * TICKS_PER_BAR);
+        assert_eq!(tiles[0].loop_ticks, 4 * TICKS_PER_BAR);
+        // Two clip-widths: ×3.
+        let tiles = target(8.0, &midi);
+        assert_eq!(tiles[0].span_ticks, 12 * TICKS_PER_BAR);
+        // Left of the grab point never shrinks the clip.
+        let tiles = target(-3.0, &midi);
+        assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
+
+        // A single-bar clip tiles into two repeats after one bar of travel.
+        let mut one_bar = midi.clone();
+        one_bar[0].clips[0].span_ticks = TICKS_PER_BAR;
+        one_bar[0].clips[0].loop_ticks = TICKS_PER_BAR;
+        let tiles = target(1.0, &one_bar);
+        assert_eq!(tiles[0].span_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(tiles[0].loop_ticks, TICKS_PER_BAR);
+
+        // An already-tiled clip adjusts its repeat count and keeps its
+        // period — no nested tiling.
+        let mut tiled = midi.clone();
+        tiled[0].clips[0].loop_ticks = 2 * TICKS_PER_BAR;
+        // No movement: unchanged (×2).
+        let tiles = target(0.0, &tiled);
+        assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
+        assert_eq!(tiles[0].loop_ticks, 2 * TICKS_PER_BAR);
+        // Right by two periods: ×4.
+        let tiles = target(4.0, &tiled);
+        assert_eq!(tiles[0].span_ticks, 8 * TICKS_PER_BAR);
+        assert_eq!(tiles[0].loop_ticks, 2 * TICKS_PER_BAR);
+        // Left by one period: back to a single period (×1).
+        let tiles = target(-2.0, &tiled);
+        assert_eq!(tiles[0].span_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(tiles[0].loop_ticks, 2 * TICKS_PER_BAR);
+    }
+
     /// W2: splitting a tiled clip is refused (it would need a phase-relative
     /// loop origin the model does not carry).
     #[test]
@@ -3493,6 +4002,56 @@ mod tests {
                 draw_control_preview(&painter, rect, &ControlClip::default());
                 let tiny = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(3.0, 3.0));
                 draw_control_preview(&painter, tiny, &clip);
+            });
+        });
+        out.textures_delta.clear();
+    }
+
+    /// 2026-11-04: the MIDI note preview is a silent no-op for degenerate
+    /// inputs (empty notes, zero span, tiny rect) and tiles a tiled clip.
+    #[test]
+    fn midi_preview_handles_degenerate_inputs() {
+        let mut clip = MidiClip::new(0);
+        clip.span_ticks = 2 * TICKS_PER_BAR;
+        clip.loop_ticks = TICKS_PER_BAR;
+        clip.sequence.notes = vec![
+            Note {
+                start: 0,
+                length: 240,
+                note: 60,
+                ..Note::default()
+            },
+            Note {
+                start: i64::from(TICKS_PER_BAR) / 2,
+                length: 480,
+                note: 67,
+                ..Note::default()
+            },
+        ];
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 120.0));
+        let mut viewports = egui::ViewportIdMap::default();
+        viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                inner_rect: Some(screen),
+                ..Default::default()
+            },
+        );
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            viewports,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |root| {
+            egui::CentralPanel::default().show(root, |ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(300.0, 60.0), egui::Sense::hover());
+                let painter = ui.painter_at(rect);
+                draw_midi_preview(&painter, rect, &clip);
+                draw_midi_preview(&painter, rect, &MidiClip::default());
+                let tiny = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(3.0, 3.0));
+                draw_midi_preview(&painter, tiny, &clip);
             });
         });
         out.textures_delta.clear();

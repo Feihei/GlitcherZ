@@ -92,7 +92,7 @@ impl Fixture {
     /// pinning as the roll harness: a whole click (4 steps = 0.4s) stays
     /// under egui's 0.8s click ceiling and exceeds its 0.3s double-click
     /// window.
-    fn frame(&mut self, events: Vec<egui::Event>) {
+    fn frame(&mut self, events: Vec<egui::Event>) -> Vec<glitcherz_ui::timeline::TimelineAction> {
         self.time += 0.1;
         let raw = self.raw(events);
         let Self {
@@ -106,6 +106,7 @@ impl Fixture {
             ..
         } = self;
         let loop_range = glitcherz_model::SongLoop::default();
+        let mut actions = Vec::new();
         let mut out = ctx.run_ui(raw, |root| {
             // Same order as the app: the router resolves hover focus before
             // the panels run; the transport + tab bar are neutral chrome.
@@ -139,7 +140,7 @@ impl Fixture {
                 if *churn {
                     ui.weak("churn");
                 }
-                let _ = timeline::show(
+                actions = timeline::show(
                     ui,
                     state,
                     &*tracks,
@@ -166,6 +167,7 @@ impl Fixture {
             router.register_neutral(transport.response.rect);
         });
         out.textures_delta.clear();
+        actions
     }
 
     /// A click (press + release, no movement). Four frames, matching what
@@ -327,6 +329,201 @@ fn clicking_a_clip_then_g_arms_the_move_modal() {
     assert!(f.owns_focus());
 }
 
+/// 2026-11-04: Alt+T must arm the tile modal (not the plain-T stretch).
+#[test]
+fn alt_t_arms_the_tile_modal() {
+    let mut f = Fixture::new();
+    f.frame(vec![]);
+    f.frame(vec![]);
+    let row = f
+        .ctx
+        .read_response(egui::Id::new("glitcherz_timeline_row").with((false, 0usize)))
+        .expect("row 0 is missing from the widget stack")
+        .rect;
+    let pos = egui::pos2(row.left() + 130.0, row.center().y);
+    f.click(pos);
+    f.frame(vec![hover(pos)]);
+    f.frame(vec![
+        hover(pos),
+        key_with(egui::Key::T, egui::Modifiers::ALT),
+    ]);
+    assert!(
+        f.state.tiling_active(),
+        "Alt+T on a selected clip must arm the tile modal"
+    );
+    assert!(f.owns_focus());
+}
+
+/// 2026-11-04: holding Alt can drop the egui cursor on Windows
+/// (CursorLeft → PointerGone), so arming the tile modal must NOT require a
+/// live pointer — it latches its grab on the first valid one instead. The
+/// first user report was exactly this: the 1-bar refusal message proved the
+/// key arrived, but the follow-up press on a 2-bar clip silently failed.
+#[test]
+fn alt_t_arms_tile_without_a_pointer() {
+    let mut f = Fixture::new();
+    f.frame(vec![]);
+    f.frame(vec![]);
+    let row = f
+        .ctx
+        .read_response(egui::Id::new("glitcherz_timeline_row").with((false, 0usize)))
+        .expect("row 0 is missing from the widget stack")
+        .rect;
+    let pos = egui::pos2(row.left() + 130.0, row.center().y);
+    f.click(pos);
+    f.frame(vec![hover(pos)]);
+    // The key press arrives on a frame where the cursor is gone.
+    f.frame(vec![
+        egui::Event::PointerGone,
+        key_with(egui::Key::T, egui::Modifiers::ALT),
+    ]);
+    assert!(
+        f.state.tiling_active(),
+        "Alt+T must arm the tile modal even when the pointer is unavailable"
+    );
+}
+
+/// 2026-11-04 follow-up: after arming without a pointer (Alt drops the
+/// cursor), the pointer must come back, latch the grab, and the confirming
+/// click must land the tile as ONE action. Regression for "the hint bar
+/// shows Tile but moving the mouse shows no ghost and the click does
+/// nothing".
+#[test]
+fn alt_t_click_confirms_tile_after_pointer_returns() {
+    let mut f = Fixture::new();
+    f.frame(vec![]);
+    f.frame(vec![]);
+    let row = f
+        .ctx
+        .read_response(egui::Id::new("glitcherz_timeline_row").with((false, 0usize)))
+        .expect("row 0 is missing from the widget stack")
+        .rect;
+    let pos = egui::pos2(row.left() + 130.0, row.center().y);
+    f.click(pos);
+    // Arm with the cursor gone (Alt drops it on Windows).
+    f.frame(vec![
+        egui::Event::PointerGone,
+        key_with(egui::Key::T, egui::Modifiers::ALT),
+    ]);
+    assert!(f.state.tiling_active(), "tile modal must be armed");
+    // Pointer returns; the grab latches and the preview follows.
+    f.frame(vec![hover(pos)]);
+    assert!(
+        f.state.tiling_active(),
+        "modal must survive the pointer returning"
+    );
+    // Confirming click lands the tile.
+    let mut actions = Vec::new();
+    actions.extend(f.frame(vec![hover(pos), press(pos, true)]));
+    actions.extend(f.frame(vec![hover(pos)]));
+    actions.extend(f.frame(vec![hover(pos), press(pos, false)]));
+    let tiled: Vec<_> = actions
+        .iter()
+        .filter_map(|a| match a {
+            glitcherz_ui::timeline::TimelineAction::TileClipsBatch { tiles } => {
+                Some((tiles[0].span_ticks, tiles[0].loop_ticks))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tiled,
+        vec![(
+            2 * glitcherz_model::TICKS_PER_BAR,
+            glitcherz_model::TICKS_PER_BAR
+        )],
+        "confirming click at the grab point keeps the already-tiled \
+         clip unchanged (2-bar container, 1-bar period) — no nesting"
+    );
+}
+
+/// 2026-11-04: the user's exact flow — confirm a T stretch, then Alt+T in
+/// the very next instants. If the tile arm/ghost/confirm chain breaks after
+/// a just-confirmed Stretch, this reproduces it.
+#[test]
+fn alt_t_works_right_after_a_confirmed_stretch() {
+    let mut f = Fixture::new();
+    f.frame(vec![]);
+    f.frame(vec![]);
+    let row = f
+        .ctx
+        .read_response(egui::Id::new("glitcherz_timeline_row").with((false, 0usize)))
+        .expect("row 0 is missing from the widget stack")
+        .rect;
+    let pos = egui::pos2(row.left() + 130.0, row.center().y);
+    f.click(pos);
+    // T stretch: arm, move, confirm (one-bar clip grows to two bars here in
+    // the app; the action lands through the app layer, so the clip stays
+    // 2 bars in the fixture — what matters is the modal handoff).
+    f.frame(vec![hover(pos), key(egui::Key::T)]);
+    assert!(f.state.modal_active(), "T must arm the stretch modal");
+    // Confirming the stretch at the same spot still emits a (no-op) batch —
+    // stretch_targets reports every selection clip unconditionally. What
+    // matters here is the modal handoff below.
+    let mut actions = Vec::new();
+    actions.extend(f.frame(vec![hover(pos)]));
+    actions.extend(f.frame(vec![hover(pos), press(pos, true)]));
+    actions.extend(f.frame(vec![hover(pos)]));
+    actions.extend(f.frame(vec![hover(pos), press(pos, false)]));
+    assert!(actions.iter().all(|a| matches!(
+        a,
+        glitcherz_ui::timeline::TimelineAction::StretchClipsBatch { .. }
+    )));
+    // Immediately Alt+T with the cursor dropped by Alt.
+    f.frame(vec![
+        egui::Event::PointerGone,
+        key_with(egui::Key::T, egui::Modifiers::ALT),
+    ]);
+    assert!(
+        f.state.tiling_active(),
+        "tile modal must arm after a stretch"
+    );
+    // Pointer returns and the user confirms.
+    f.frame(vec![hover(pos)]);
+    let mut actions = Vec::new();
+    actions.extend(f.frame(vec![hover(pos), press(pos, true)]));
+    actions.extend(f.frame(vec![hover(pos)]));
+    actions.extend(f.frame(vec![hover(pos), press(pos, false)]));
+    let tiled: Vec<_> = actions
+        .iter()
+        .filter_map(|a| match a {
+            glitcherz_ui::timeline::TimelineAction::TileClipsBatch { tiles } => {
+                Some((tiles[0].span_ticks, tiles[0].loop_ticks))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !tiled.is_empty(),
+        "confirming click after a stretch must land the tile"
+    );
+}
+
+/// 2026-11-04: Shift+T is the primary tile qualifier — on Windows Alt+letter
+/// raises SC_KEYMENU whose menu mode swallows the following mouse events
+/// (D29). The modal must arm even with the cursor gone, mirroring Alt+T.
+#[test]
+fn shift_t_arms_the_tile_modal() {
+    let mut f = Fixture::new();
+    f.frame(vec![]);
+    f.frame(vec![]);
+    let row = f
+        .ctx
+        .read_response(egui::Id::new("glitcherz_timeline_row").with((false, 0usize)))
+        .expect("row 0 is missing from the widget stack")
+        .rect;
+    let pos = egui::pos2(row.left() + 130.0, row.center().y);
+    f.click(pos);
+    f.frame(vec![
+        egui::Event::PointerGone,
+        key_with(egui::Key::T, egui::Modifiers::SHIFT),
+    ]);
+    assert!(
+        f.state.tiling_active(),
+        "Shift+T on a selected clip must arm the tile modal"
+    );
+}
+
 /// Hover-follow focus (Blender-style context): merely hovering a lane
 /// grants it the keyboard — no click needed.
 #[test]
@@ -399,11 +596,15 @@ fn press(pos: egui::Pos2, pressed: bool) -> egui::Event {
 }
 
 fn key(k: egui::Key) -> egui::Event {
+    key_with(k, egui::Modifiers::default())
+}
+
+fn key_with(k: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
     egui::Event::Key {
         key: k,
         physical_key: None,
         pressed: true,
         repeat: false,
-        modifiers: egui::Modifiers::default(),
+        modifiers,
     }
 }

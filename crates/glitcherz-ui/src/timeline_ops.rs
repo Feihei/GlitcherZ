@@ -283,6 +283,9 @@ impl GlitcherZApp {
             timeline::TimelineAction::StretchClipsBatch { spans } => {
                 self.timeline_stretch_clips_batch(spans)
             }
+            timeline::TimelineAction::TileClipsBatch { tiles } => {
+                self.timeline_tile_clips_batch(tiles)
+            }
             timeline::TimelineAction::DuplicateClipsBatch { dups } => {
                 self.timeline_duplicate_clips_batch(dups)
             }
@@ -606,7 +609,7 @@ impl GlitcherZApp {
             // Every kind must reach the engine immediately. The old code
             // pushed only audio: dragging a MIDI/control clip left the
             // sequencer playing the previous placement until the next
-            // unrelated edit, and W2's "grow = tile" would never sound.
+            // unrelated edit, so the new span never sounded.
             self.sync_clip_row(lane, track);
         }
     }
@@ -1077,11 +1080,17 @@ impl GlitcherZApp {
                         .get_mut(e.sel.track)
                         .and_then(|t| t.clips.get_mut(e.sel.clip))
                         .map(|c| {
+                            let old_span = c.span_ticks;
                             c.start_ticks = e.start_ticks;
-                            // W2: stretching tiles the content (grow) or
-                            // trims its tail (shrink).
                             c.span_ticks = e.span_ticks;
-                            c.loop_ticks = timeline::resolve_loop(c.loop_ticks, e.span_ticks, None);
+                            // 2026-11-04: T extends the clip's time for a
+                            // single-period clip, and scales a tiled clip's
+                            // period while keeping its repeat count.
+                            c.loop_ticks = timeline::resolve_stretch_loop(
+                                c.loop_ticks,
+                                old_span,
+                                e.span_ticks,
+                            );
                         })
                         .is_some(),
                     timeline::TimelineLane::Midi => project
@@ -1089,9 +1098,17 @@ impl GlitcherZApp {
                         .get_mut(e.sel.track)
                         .and_then(|t| t.clips.get_mut(e.sel.clip))
                         .map(|c| {
+                            let old_span = c.span_ticks;
                             c.start_ticks = e.start_ticks;
                             c.span_ticks = e.span_ticks;
-                            c.loop_ticks = timeline::resolve_loop(c.loop_ticks, e.span_ticks, None);
+                            // 2026-11-04: T extends the clip's time for a
+                            // single-period clip, and scales a tiled clip's
+                            // period while keeping its repeat count.
+                            c.loop_ticks = timeline::resolve_stretch_loop(
+                                c.loop_ticks,
+                                old_span,
+                                e.span_ticks,
+                            );
                         })
                         .is_some(),
                     // U11: a stretch trims the seconds window (a left-edge
@@ -1122,6 +1139,59 @@ impl GlitcherZApp {
         }
         if !touched.is_empty() {
             self.commit_edit("Stretch Clips", before);
+            for (lane, track) in touched {
+                self.sync_clip_row(lane, track);
+            }
+        }
+    }
+
+    /// Tile-modal finalize: grows every clip's container to `span_ticks`
+    /// while the content period stays `loop_ticks` (the clip's armed
+    /// length), in ONE undo step. MIDI and control clips only; audio clips
+    /// have no repeat semantics.
+    pub(crate) fn timeline_tile_clips_batch(&mut self, tiles: Vec<timeline::ClipTileEdit>) {
+        if tiles.is_empty() {
+            return;
+        }
+        let before = self.begin_edit();
+        let mut touched = Vec::new();
+        {
+            let project = self.project_mut();
+            for e in &tiles {
+                let changed = match e.sel.lane {
+                    timeline::TimelineLane::Control => project
+                        .control_tracks
+                        .get_mut(e.sel.track)
+                        .and_then(|t| t.clips.get_mut(e.sel.clip))
+                        .map(|c| {
+                            let new_span = e.span_ticks.max(e.loop_ticks.max(1));
+                            let changed = c.span_ticks != new_span || c.loop_ticks != e.loop_ticks;
+                            c.span_ticks = new_span;
+                            c.loop_ticks = e.loop_ticks.max(1).min(new_span);
+                            changed
+                        })
+                        .unwrap_or(false),
+                    timeline::TimelineLane::Midi => project
+                        .midi_tracks
+                        .get_mut(e.sel.track)
+                        .and_then(|t| t.clips.get_mut(e.sel.clip))
+                        .map(|c| {
+                            let new_span = e.span_ticks.max(e.loop_ticks.max(1));
+                            let changed = c.span_ticks != new_span || c.loop_ticks != e.loop_ticks;
+                            c.span_ticks = new_span;
+                            c.loop_ticks = e.loop_ticks.max(1).min(new_span);
+                            changed
+                        })
+                        .unwrap_or(false),
+                    timeline::TimelineLane::Audio => false,
+                };
+                if changed && !touched.contains(&(e.sel.lane, e.sel.track)) {
+                    touched.push((e.sel.lane, e.sel.track));
+                }
+            }
+        }
+        if !touched.is_empty() {
+            self.commit_edit("Tile Clips", before);
             for (lane, track) in touched {
                 self.sync_clip_row(lane, track);
             }

@@ -1132,9 +1132,9 @@ fn clip_group_default_color() -> [u8; 3] {
 ///
 /// `start_ticks` is the absolute position on the arrangement; the clip is
 /// audible for `span_ticks` from there, and its note content repeats every
-/// `loop_ticks` within the span (D14 future tiling semantics: the scheduler
-/// already tiles, the UI presents one period for now). Sequence positions are
-/// relative to the clip start.
+/// `loop_ticks` within the span (D14). A single-period clip has
+/// `loop_ticks == span_ticks`; the timeline's Alt+T tool lowers `loop_ticks`
+/// to tile the content. Sequence positions are relative to the clip start.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MidiClip {
     /// Optional user-facing clip name (W3a). Empty means unnamed: the
