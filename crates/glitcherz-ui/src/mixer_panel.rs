@@ -885,6 +885,123 @@ impl GlitcherZApp {
         self.commit_edit("Reorder Tracks", before);
     }
 
+    /// Reorders one track family by the lane that owns the grabbed header.
+    pub(crate) fn reorder_track(&mut self, lane: timeline::TimelineLane, from: usize, to: usize) {
+        match lane {
+            timeline::TimelineLane::Midi => self.reorder_midi_track(from, to),
+            timeline::TimelineLane::Control => self.reorder_control_track(from, to),
+            timeline::TimelineLane::Audio => self.reorder_audio_track(from, to),
+        }
+    }
+
+    /// Reorders the control (curve) tracks: the track table moves together
+    /// with every `PortRef::AutoTrack` cable outlet and every curve recording
+    /// input (`Timeline In`), then the engine is rebuilt from the document.
+    pub(crate) fn reorder_control_track(&mut self, from: usize, to: usize) {
+        let len = self.project().control_tracks.len();
+        if from >= len || to > len || to == from || to == from + 1 {
+            return;
+        }
+        let perm = crate::timeline::track_permutation(len, from, to);
+        let before = self.begin_edit();
+        {
+            let project = self.project_mut();
+            let old_tracks = std::mem::take(&mut project.control_tracks);
+            let mut new_tracks = vec![ControlTrack::default(); len];
+            for (old, track) in old_tracks.into_iter().enumerate() {
+                new_tracks[perm[old]] = track;
+            }
+            project.control_tracks = new_tracks;
+            for cable in &mut project.graph.cables {
+                if let PortRef::AutoTrack(t) = &mut cable.from
+                    && *t < len
+                {
+                    *t = perm[*t];
+                }
+                if let PortRef::TrackIn {
+                    kind: TrackKind::Curve,
+                    track,
+                } = &mut cable.to
+                    && *track < len
+                {
+                    *track = perm[*track];
+                }
+            }
+        }
+        if self.selected_auto < len {
+            self.selected_auto = perm[self.selected_auto];
+        }
+        if let Some(EditTarget::Control { track, .. }) = &mut self.edit_clip
+            && *track < len
+        {
+            *track = perm[*track];
+        }
+        for sel in &mut self.timeline_state.selection {
+            if matches!(sel.lane, timeline::TimelineLane::Control) && sel.track < len {
+                sel.track = perm[sel.track];
+            }
+        }
+        self.edit_selection
+            .clone_from(&self.timeline_state.selection);
+        self.apply_document();
+        // The sequencer holds the control clip tables by track index; the
+        // graph rebuild does not re-push them, so re-send their new slots.
+        for index in 0..self.project().control_tracks.len() {
+            self.send_control_clips(index);
+        }
+        self.commit_edit("Reorder Curve Tracks", before);
+    }
+
+    /// Reorders the audio tracks: the track table moves together with every
+    /// `NodeDoc::AudioTrack` generator and every audio recording input
+    /// (`Timeline In`), then the engine is rebuilt from the document.
+    pub(crate) fn reorder_audio_track(&mut self, from: usize, to: usize) {
+        let len = self.project().audio_tracks.len();
+        if from >= len || to > len || to == from || to == from + 1 {
+            return;
+        }
+        let perm = crate::timeline::track_permutation(len, from, to);
+        let before = self.begin_edit();
+        {
+            let project = self.project_mut();
+            let old_tracks = std::mem::take(&mut project.audio_tracks);
+            let mut new_tracks = vec![glitcherz_model::AudioTrack::default(); len];
+            for (old, track) in old_tracks.into_iter().enumerate() {
+                new_tracks[perm[old]] = track;
+            }
+            project.audio_tracks = new_tracks;
+            for node in &mut project.graph.nodes {
+                if let NodeDoc::AudioTrack { track, .. } = node
+                    && *track < len
+                {
+                    *track = perm[*track];
+                }
+            }
+            for cable in &mut project.graph.cables {
+                if let PortRef::TrackIn {
+                    kind: TrackKind::Audio,
+                    track,
+                } = &mut cable.to
+                    && *track < len
+                {
+                    *track = perm[*track];
+                }
+            }
+        }
+        if self.selected_audio < len {
+            self.selected_audio = perm[self.selected_audio];
+        }
+        for sel in &mut self.timeline_state.selection {
+            if matches!(sel.lane, timeline::TimelineLane::Audio) && sel.track < len {
+                sel.track = perm[sel.track];
+            }
+        }
+        self.edit_selection
+            .clone_from(&self.timeline_state.selection);
+        self.apply_document();
+        self.commit_edit("Reorder Audio Tracks", before);
+    }
+
     /// `Track N` or the track's own name — the label every clip reference
     /// shows (edit header, roll focus chips).
     pub(crate) fn track_label(&self, track: usize) -> String {

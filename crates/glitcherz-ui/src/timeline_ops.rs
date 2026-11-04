@@ -129,8 +129,8 @@ impl GlitcherZApp {
             timeline::TimelineAction::RemoveControlTrack => self.remove_control_track(),
             timeline::TimelineAction::AddAudioTrack => self.add_audio_track(),
             timeline::TimelineAction::RemoveLastAudioTrack => self.remove_last_audio_track(),
-            timeline::TimelineAction::ReorderMidiTrack { from, to } => {
-                self.reorder_midi_track(from, to)
+            timeline::TimelineAction::ReorderTrack { lane, from, to } => {
+                self.reorder_track(lane, from, to)
             }
             // Inline header rename (right-click → type → Enter). Presentation
             // only: no engine push, no node retarget — one undo step.

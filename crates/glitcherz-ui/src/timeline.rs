@@ -38,6 +38,8 @@ const ARRANGEMENT_LIMIT_TICKS: u32 = MAX_ARRANGEMENT_TICKS as u32;
 
 /// Fixed width of the row-header column.
 pub const HEADER_WIDTH: f32 = 108.0;
+/// Width of the reorder grab handle at the left of every row header.
+const REORDER_GRIP_WIDTH: f32 = 12.0;
 /// Height of one track row at `row_zoom` = 1.
 pub const ROW_HEIGHT: f32 = 28.0;
 /// Row-height zoom bounds (multiplier over [`ROW_HEIGHT`]).
@@ -270,9 +272,9 @@ pub struct TimelineState {
     /// anchor math for pointer-anchored horizontal zoom.
     rows_viewport_min: Pos2,
 
-    /// Track-reorder drag (header grab handle): the MIDI track index the
+    /// Track-reorder drag (header grab handle): the lane and track index the
     /// grab started on.
-    reorder: Option<usize>,
+    reorder: Option<RowKind>,
     /// Song-loop drag on the ruler (U1): `None` means an in-progress ruler
     /// drag is a plain seek scrub instead.
     loop_drag: Option<LoopDrag>,
@@ -455,13 +457,14 @@ pub enum TimelineAction {
     RemoveMarker {
         index: usize,
     },
-    /// Reorder the MIDI tracks: the track at `from` is re-inserted so it
-    /// ends up just before original index `to` (an insertion index,
-    /// 0..=len; `to == from` / `to == from + 1` are identity drops the
-    /// caller skips). One undo step — the document track table, the
-    /// per-track node `track` fields and the `MidiTrack` cable indices all
-    /// move together.
-    ReorderMidiTrack {
+    /// Reorder one track family (MIDI / curve / audio): the track at `from`
+    /// is re-inserted so it ends up just before original index `to` (an
+    /// insertion index, 0..=len; `to == from` / `to == from + 1` are identity
+    /// drops the caller skips). One undo step — the document track table, the
+    /// per-track node `track` fields and the lane's cable indices all move
+    /// together.
+    ReorderTrack {
+        lane: TimelineLane,
         from: usize,
         to: usize,
     },
@@ -1729,21 +1732,22 @@ pub fn show(
         }
 
         // ---- Track reorder (header grab handle). The target is the
-        // insertion row the pointer hovers among the MIDI rows; the drop
-        // (primary release anywhere — the drag follows the pointer across
-        // rows) lands as one action. The insert indicator is drawn over
-        // the rows so the target is visible while dragging. ----
+        // insertion row the pointer hovers among the dragged lane's rows; the
+        // drop (primary release anywhere — the drag follows the pointer across
+        // rows) lands as one action. The insert indicator is drawn over the
+        // rows so the target is visible while dragging. ----
         if let Some(from) = state.reorder
             && let Some(frame) = rows_frame
         {
-            let midi_rows: Vec<Rect> = geom
+            let lane = from.lane();
+            let lane_rows: Vec<Rect> = geom
                 .iter()
-                .filter_map(|(r, rect)| matches!(r, RowKind::Midi(_)).then_some(*rect))
+                .filter_map(|(r, rect)| (r.lane() == lane).then_some(*rect))
                 .collect();
             let ptr = ui.ctx().pointer_hover_pos();
             let mut drop: Option<usize> = None;
             if let Some(ptr) = ptr
-                && let Some((to, y)) = reorder_target(ptr.y, &midi_rows)
+                && let Some((to, y)) = reorder_target(ptr.y, &lane_rows)
             {
                 drop = Some(to);
                 ui.painter().line_segment(
@@ -1754,10 +1758,14 @@ pub fn show(
             if ui.ctx().input(|i| i.pointer.primary_released()) {
                 state.reorder = None;
                 if let Some(to) = drop
-                    && to != from
-                    && to != from + 1
+                    && to != from.track()
+                    && to != from.track() + 1
                 {
-                    actions.push(TimelineAction::ReorderMidiTrack { from, to });
+                    actions.push(TimelineAction::ReorderTrack {
+                        lane,
+                        from: from.track(),
+                        to,
+                    });
                 }
             }
         }
@@ -2280,10 +2288,33 @@ fn lane_row<T: Placement>(
     let ui = &mut row_ui;
     // Every header must occupy the same horizontal footprint as the ruler's
     // left spacer (HEADER_WIDTH plus one item gap), otherwise each lane —
-    // and the playhead drawn from it — starts at a different x. MIDI rows
-    // carry an extra reorder grip, so their name cell is narrowed by that
-    // grip plus the gap instead of letting the header grow past the column.
+    // and the playhead drawn from it — starts at a different x. Every row
+    // carries a reorder grip, so the name cell is narrowed by that grip plus
+    // the gap instead of letting the header grow past the column.
     let header_gap = ui.spacing().item_spacing.x;
+    // Reorder grab handle: a drag on the dots moves the track. Sense::drag
+    // only — a plain click on it does nothing (selecting stays with the name
+    // button).
+    let (grip_rect, grip_response) =
+        ui.allocate_exact_size(Vec2::new(REORDER_GRIP_WIDTH, row_h - 4.0), Sense::drag());
+    let grip_color = if state.reorder == Some(row) {
+        SELECTED
+    } else {
+        Color32::from_gray(110)
+    };
+    let grip_painter = ui.painter_at(grip_rect);
+    let mid = grip_rect.center().y;
+    for dy in [-3.0, 0.0, 3.0] {
+        for dx in [-3.0, 0.0] {
+            grip_painter.circle_filled(pos2(grip_rect.center().x + dx, mid + dy), 1.2, grip_color);
+        }
+    }
+    if grip_response.drag_started_by(egui::PointerButton::Primary) {
+        state.reorder = Some(row);
+    }
+    if grip_response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
     // Header cell.
     match header {
         HeaderKind::Midi {
@@ -2292,33 +2323,6 @@ fn lane_row<T: Placement>(
             raw_name,
             selected,
         } => {
-            // Reorder grab handle (MIDI rows only): a drag on the dots
-            // moves the track. Sense::drag only — a plain click on it does
-            // nothing (selecting stays with the name button).
-            let (grip_rect, grip_response) =
-                ui.allocate_exact_size(Vec2::new(12.0, row_h - 4.0), Sense::drag());
-            let grip_color = if state.reorder == Some(index) {
-                SELECTED
-            } else {
-                Color32::from_gray(110)
-            };
-            let grip_painter = ui.painter_at(grip_rect);
-            let mid = grip_rect.center().y;
-            for dy in [-3.0, 0.0, 3.0] {
-                for dx in [-3.0, 0.0] {
-                    grip_painter.circle_filled(
-                        pos2(grip_rect.center().x + dx, mid + dy),
-                        1.2,
-                        grip_color,
-                    );
-                }
-            }
-            if grip_response.drag_started_by(egui::PointerButton::Primary) {
-                state.reorder = Some(index);
-            }
-            if grip_response.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
-            }
             track_header_cell(
                 ui,
                 state,
@@ -2327,7 +2331,7 @@ fn lane_row<T: Placement>(
                 index,
                 &name,
                 raw_name,
-                HEADER_WIDTH - 12.0 - header_gap,
+                HEADER_WIDTH - REORDER_GRIP_WIDTH - header_gap,
                 row_h - 4.0,
                 selected.then_some(Color32::from_rgb(60, 90, 140)),
                 TimelineAction::SelectTrack(index),
@@ -2348,7 +2352,7 @@ fn lane_row<T: Placement>(
                 index,
                 &name,
                 raw_name,
-                HEADER_WIDTH,
+                HEADER_WIDTH - REORDER_GRIP_WIDTH - header_gap,
                 row_h - 4.0,
                 selected.then_some(Color32::from_rgb(120, 90, 40)),
                 TimelineAction::SelectControlTrack(index),
@@ -2369,7 +2373,7 @@ fn lane_row<T: Placement>(
                 index,
                 &name,
                 raw_name,
-                HEADER_WIDTH,
+                HEADER_WIDTH - REORDER_GRIP_WIDTH - header_gap,
                 row_h - 4.0,
                 selected.then_some(Color32::from_rgb(60, 52, 34)),
                 TimelineAction::SelectAudioTrack(index),
