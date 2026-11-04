@@ -110,6 +110,19 @@ FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
 OTHER DEALINGS IN THE FONT SOFTWARE.
 ```
 
+## Symphonia (audio decoding)
+
+- Linked into `glitcherz-engine` from crates.io (`symphonia 0.6.1`); used to
+  decode FLAC / MP3 / Ogg Vorbis / AAC-LC (ISO/MP4) / AIFF on the control
+  thread only (spec `.agents/spec/audio-decoding.md`).
+- Copyright (c) 2019-2022 The Project Symphonia Developers.
+- Upstream source: <https://github.com/pdeljanov/Symphonia>
+- Licensed under the Mozilla Public License, Version 2.0 (MPL-2.0):
+  <https://mozilla.org/MPL/2.0/>. GlitcherZ links the unmodified upstream
+  crates; the complete corresponding source is available from the upstream
+  repository at the exact versions recorded in `Cargo.lock`. No Symphonia
+  source is copied into this repository.
+
 ---
 
 GlitcherZ 本体按 MIT OR Apache-2.0 授权；上面列出的第三方资源随二进制一同分发，

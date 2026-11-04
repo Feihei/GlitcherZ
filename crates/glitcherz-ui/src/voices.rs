@@ -234,12 +234,12 @@ impl GlitcherZApp {
         self.queue_blocking_job(label, move |app| app.load_sound_font(doc_id, path));
     }
 
-    /// `Load File…` / `Replace…` on a sample node (v3): pick a `.wav`, then
-    /// swap the node's voice in place. Mirrors [`Self::pick_sound_font`] —
+    /// `Load File…` / `Replace…` on a sample node (v3): pick an audio file,
+    /// then swap the node's voice in place. Mirrors [`Self::pick_sound_font`] —
     /// the node's button and the Inspector run this one function.
     pub(crate) fn pick_sample_file(&mut self, doc_id: u64) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Wave", &["wav"])
+            .add_filter("Audio", AUDIO_FILE_EXTENSIONS)
             .pick_file()
         else {
             return;
@@ -362,7 +362,7 @@ impl GlitcherZApp {
             return;
         }
         let Some(paths) = rfd::FileDialog::new()
-            .add_filter("Wave", &["wav"])
+            .add_filter("Audio", AUDIO_FILE_EXTENSIONS)
             .pick_files()
         else {
             return;

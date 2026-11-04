@@ -17,10 +17,10 @@
 //! - [`sf2`]: non-real-time SoundFont loading (S2) — file IO, parsing and
 //!   preset enumeration; the parsed [`Arc<rustysynth_ext::SoundFont>`] is
 //!   handed to the audio-side processor without any further parsing.
-//! - [`sample`]: non-real-time wav decoding (U5) — hound decode to f32
-//!   stereo frames plus the session-level [`sample::SampleLibrary`] cache;
-//!   the audio-side processor receives the already-decoded
-//!   [`Arc<sample::SampleData>`].
+//! - [`sample`]: non-real-time audio decoding (U5 / X series) — WAV via hound,
+//!   other containers via symphonia, both into f32 stereo frames plus the
+//!   session-level [`sample::SampleLibrary`] cache; the audio-side processor
+//!   receives the already-decoded [`Arc<sample::SampleData>`].
 //! - [`convert`]: the central point for f32 (audio path) / f64 (UI, time)
 //!   conversions.
 //! - [`host_gate`]: plugin-host infrastructure — the atomic handoff gate
@@ -58,5 +58,5 @@ pub use engine::{
     AudioEngine, AudioEngineInfo, CommandSender, EngineError, OutputConfig, available_outputs,
 };
 pub use midi_input::{MidiInputError, MidiInputHub, MidiInputStats, MidiTarget};
-pub use sample::{SampleData, SampleError, SampleLibrary, StereoFrame};
+pub use sample::{AUDIO_FILE_EXTENSIONS, SampleData, SampleError, SampleLibrary, StereoFrame};
 pub use sf2::{Sf2Error, Sf2Library, Sf2Preset};

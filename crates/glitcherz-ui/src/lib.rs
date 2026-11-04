@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use glitcherz_clap_host::{ClapInstance, ClapInstanceConfig};
+use glitcherz_engine::AUDIO_FILE_EXTENSIONS;
 use glitcherz_engine::AudioEngine;
 use glitcherz_engine::OutputConfig;
 use glitcherz_engine::RecordSource;

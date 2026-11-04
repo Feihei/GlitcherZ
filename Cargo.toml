@@ -74,6 +74,14 @@ rustysynth-ext = { path = ".vendor/rustysynth-ext", features = ["sf3"] }
 # wav 解码（U5 采样播放器 / U6 audio track 共用；纯 Rust 零 unsafe，
 # 解码只在控制线程 sample 模块，RT 路径不 touch）
 hound = "3.5"
+# Compressed audio decoding (X series, spec .agents/spec/audio-decoding.md).
+# Pure Rust, decode-only, MPL-2.0. Default features pull SIMD/rustfft and
+# metadata readers we do not need, so codecs and containers are explicit.
+# WAV keeps using hound for byte-for-byte zero regression; "wav"/"pcm" are
+# enabled here for the symphonia-side parity test and exotic-WAV fallback.
+symphonia = { version = "0.6.1", default-features = false, features = [
+    "flac", "mp3", "mpa", "ogg", "vorbis", "aac", "isomp4", "aiff", "pcm", "wav",
+] }
 glitcherz-model = { path = "crates/glitcherz-model" }
 glitcherz-command = { path = "crates/glitcherz-command" }
 glitcherz-clap-host = { path = "crates/glitcherz-clap-host" }

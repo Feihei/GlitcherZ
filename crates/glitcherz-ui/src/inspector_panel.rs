@@ -1430,7 +1430,7 @@ impl GlitcherZApp {
             };
             if ui
                 .button(caption)
-                .on_hover_text("Pick a .wav file for this node")
+                .on_hover_text("Pick an audio file for this node")
                 .clicked()
             {
                 self.pick_sample_file(doc_id);

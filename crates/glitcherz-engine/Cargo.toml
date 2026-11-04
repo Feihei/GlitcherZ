@@ -21,4 +21,7 @@ rustysynth-ext = { workspace = true }
 # wav decoding (U5 sample player / U6 audio track): control-thread only
 # (sample module); the RT processor receives already-decoded f32 frames.
 hound = { workspace = true }
+# Non-wav decoding (X series): FLAC / MP3 / Ogg Vorbis / AAC-LC / AIFF.
+# Control-thread only; the RT processor never sees symphonia types.
+symphonia = { workspace = true }
 crossbeam-queue = { workspace = true }

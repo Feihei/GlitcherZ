@@ -525,12 +525,13 @@ pub enum NodeSource {
         /// `.sf2` / `.sf3` path, or empty for a node waiting for one.
         path: String,
     },
-    /// Wav sample player (U5, spec `sample-player.md`). Like [`Self::SoundFont`]
-    /// the path may be **empty**: that is the normal "born empty" node, silent
+    /// Audio file sample player (U5, spec `sample-player.md`; formats in
+    /// `audio-decoding.md`). Like [`Self::SoundFont`] the path may be
+    /// **empty**: that is the normal "born empty" node, silent
     /// until its own `Load File…` button swaps a real voice in (v3) — adding
     /// one never blocks on a dialog, and a wrong pick is one click to replace.
     Sample {
-        /// `.wav` path, or empty for a node waiting for one.
+        /// Audio file path, or empty for a node waiting for one.
         path: String,
     },
     /// Multi-sample drum kit (W1, spec `drum-kit.md` K2): born with no
@@ -899,7 +900,7 @@ fn node_action_buttons(id: PatchId, row: usize, deps: &PatchDeps) -> Vec<NodeAct
                             "Replace…"
                         },
                         enabled: true,
-                        hover: "Pick a .wav file for this node",
+                        hover: "Pick an audio file for this node",
                         action: PatchAction::LoadSample { node: doc_id },
                     }]
                 } else {

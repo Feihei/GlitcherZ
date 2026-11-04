@@ -467,20 +467,20 @@ impl GlitcherZApp {
         }
     }
 
-    /// U6 D2: double-click on empty audio-track space asked for a wav. The
-    /// modal dialog runs here (the timeline is a view); the clip is born at
-    /// the clicked tick with the span derived from the file's duration at
+    /// U6 D2: double-click on empty audio-track space asks for an audio file.
+    /// The modal dialog runs here (the timeline is a view); the clip is born
+    /// at the clicked tick with the span derived from the file's duration at
     /// the current tempo (D1: stretched across the span on playback).
     pub(crate) fn timeline_add_audio_clip(&mut self, track: usize, start_ticks: u32) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Wave", &["wav"])
+            .add_filter("Audio", AUDIO_FILE_EXTENSIONS)
             .pick_file()
         else {
             return;
         };
         let path = path.display().to_string();
         let Ok(data) = self.sample_library.load(std::path::Path::new(&path)) else {
-            self.set_message("Audio clip unreadable: not a supported wav".to_string());
+            self.set_message("Audio clip unreadable: not a supported audio file".to_string());
             return;
         };
         // R4 D11: store the path relative to the project when it lives under
