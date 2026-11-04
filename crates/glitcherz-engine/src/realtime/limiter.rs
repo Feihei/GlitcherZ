@@ -17,7 +17,6 @@
 
 use std::sync::Arc;
 
-use crate::realtime::atomic::AtomicF32;
 use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::ParamId;
 use crate::realtime::context::ProcessContext;
@@ -211,14 +210,14 @@ impl Processor for LimiterProcessor {
                 if linked { joined } else { right.abs() },
             ];
 
-            for ch in 0..2 {
+            for (ch, &level) in det.iter().enumerate() {
                 // Each delay line takes its own channel's input; with a mono
                 // buffer `right` already mirrors `left`, so both chains stay
                 // fed and no state ever goes stale. Only the live channels
                 // are written back.
                 let input = if ch == 0 { left } else { right };
                 let delayed = self.delay[ch].push(input);
-                self.detector[ch].push(det[ch], self.cursor);
+                self.detector[ch].push(level, self.cursor);
                 let window_peak = self.detector[ch].max(self.cursor + 1);
                 let target = (ceiling / window_peak.max(1e-9)).min(1.0);
                 let gain = &mut self.gain[ch];

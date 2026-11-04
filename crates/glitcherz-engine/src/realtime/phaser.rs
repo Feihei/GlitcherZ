@@ -201,7 +201,7 @@ mod tests {
 
     use super::{
         DESCRIPTOR, MAX_STAGES, PhaserProcessor, SLOT_DEPTH, SLOT_FEEDBACK, SLOT_MIX, SLOT_RATE,
-        SLOT_SPREAD, SLOT_STAGES,
+        SLOT_STAGES,
     };
     use crate::realtime::buffer::AudioBuffer;
     use crate::realtime::commands::ParamId;
