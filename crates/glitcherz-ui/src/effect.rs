@@ -11,9 +11,9 @@
 use std::sync::Arc;
 
 use glitcherz_engine::realtime::{
-    BuiltinEffectKind, ChorusProcessor, CompressorProcessor, DelayProcessor, EffectDescriptor,
-    EffectMeters, EqProcessor, FlangerProcessor, ParamId, ParamSpec, Processor, ReverbProcessor,
-    Unit, chorus, compressor, delay, eq, flanger, reverb,
+    BitcrusherProcessor, BuiltinEffectKind, ChorusProcessor, CompressorProcessor, DelayProcessor,
+    EffectDescriptor, EffectMeters, EqProcessor, FlangerProcessor, ParamId, ParamSpec, Processor,
+    ReverbProcessor, Unit, bitcrusher, chorus, compressor, delay, eq, flanger, reverb,
 };
 use glitcherz_model::{BuiltinEffectKind as DocEffectKind, EffectParams};
 
@@ -35,6 +35,7 @@ pub fn engine_kind(params: &EffectParams) -> BuiltinEffectKind {
         DocEffectKind::Reverb => BuiltinEffectKind::Reverb,
         DocEffectKind::Chorus => BuiltinEffectKind::Chorus,
         DocEffectKind::Flanger => BuiltinEffectKind::Flanger,
+        DocEffectKind::Bitcrusher => BuiltinEffectKind::Bitcrusher,
     }
 }
 
@@ -52,6 +53,7 @@ pub fn default_params(kind: DocEffectKind) -> EffectParams {
         DocEffectKind::Reverb => EffectParams::Reverb(Box::default()),
         DocEffectKind::Chorus => EffectParams::Chorus(Box::default()),
         DocEffectKind::Flanger => EffectParams::Flanger(Box::default()),
+        DocEffectKind::Bitcrusher => EffectParams::Bitcrusher(Box::default()),
     }
 }
 
@@ -75,6 +77,7 @@ pub fn processor(params: &EffectParams, sample_rate: f32) -> BuiltinProcessor {
         BuiltinEffectKind::Reverb => Box::new(ReverbProcessor::new(sample_rate)),
         BuiltinEffectKind::Chorus => Box::new(ChorusProcessor::new(sample_rate)),
         BuiltinEffectKind::Flanger => Box::new(FlangerProcessor::new(sample_rate)),
+        BuiltinEffectKind::Bitcrusher => Box::new(BitcrusherProcessor::new(sample_rate)),
     };
     let descriptor = descriptor(params);
     for slot in 0..descriptor.params.len() {
@@ -142,6 +145,13 @@ pub fn value(params: &EffectParams, slot: u8) -> f32 {
             flanger::SLOT_MIX => fl.mix,
             _ => 0.0,
         },
+        EffectParams::Bitcrusher(cr) => match slot {
+            bitcrusher::SLOT_DRIVE => cr.drive,
+            bitcrusher::SLOT_BITS => cr.bits,
+            bitcrusher::SLOT_DOWNSAMPLE => cr.downsample,
+            bitcrusher::SLOT_MIX => cr.mix,
+            _ => 0.0,
+        },
     }
 }
 
@@ -201,6 +211,13 @@ pub fn set_value(params: &mut EffectParams, slot: u8, value: f32) {
             flanger::SLOT_FEEDBACK => fl.feedback = value,
             flanger::SLOT_WIDTH => fl.width = value,
             flanger::SLOT_MIX => fl.mix = value,
+            _ => {}
+        },
+        EffectParams::Bitcrusher(cr) => match slot {
+            bitcrusher::SLOT_DRIVE => cr.drive = value,
+            bitcrusher::SLOT_BITS => cr.bits = value,
+            bitcrusher::SLOT_DOWNSAMPLE => cr.downsample = value,
+            bitcrusher::SLOT_MIX => cr.mix = value,
             _ => {}
         },
     }

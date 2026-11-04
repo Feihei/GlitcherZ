@@ -27,8 +27,8 @@ use glitcherz_engine::realtime::commands::ParamId;
 use glitcherz_engine::realtime::context::ProcessContext;
 use glitcherz_engine::realtime::processor::Processor;
 use glitcherz_engine::realtime::{
-    ChorusProcessor, CompressorProcessor, DelayProcessor, EffectMeters, EqProcessor,
-    FlangerProcessor, ReverbProcessor,
+    BitcrusherProcessor, ChorusProcessor, CompressorProcessor, DelayProcessor, EffectMeters,
+    EqProcessor, FlangerProcessor, ReverbProcessor,
 };
 
 // ---------------------------------------------------------------------------
@@ -209,6 +209,15 @@ fn built_in_effects_are_allocation_free() {
     let scope = AuditScope::begin();
     exercise(&mut flanger, &mut flanger_buffer, 64);
     assert_zero_alloc(&scope, "FlangerProcessor process/set_param");
+
+    // Bitcrusher (E5): per-block quantizer state and a per-sample hold; the
+    // powf for the bit depth must stay at block rate.
+    let mut crusher = BitcrusherProcessor::new(SR);
+    let mut crusher_buffer = fixture();
+    exercise(&mut crusher, &mut crusher_buffer, 2);
+    let scope = AuditScope::begin();
+    exercise(&mut crusher, &mut crusher_buffer, 64);
+    assert_zero_alloc(&scope, "BitcrusherProcessor process/set_param");
 
     // The meter handle itself is written from the audio thread.
     let meters = EffectMeters::new();

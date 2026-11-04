@@ -49,6 +49,8 @@ pub enum BuiltinEffectKind {
     Chorus,
     /// Stereo flanger.
     Flanger,
+    /// Quantization + sample & hold lo-fi.
+    Bitcrusher,
 }
 
 impl BuiltinEffectKind {
@@ -60,6 +62,7 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Reverb,
         BuiltinEffectKind::Chorus,
         BuiltinEffectKind::Flanger,
+        BuiltinEffectKind::Bitcrusher,
     ];
 
     /// Static descriptor of this kind.
@@ -71,6 +74,7 @@ impl BuiltinEffectKind {
             BuiltinEffectKind::Reverb => &crate::realtime::reverb::DESCRIPTOR,
             BuiltinEffectKind::Chorus => &crate::realtime::chorus::DESCRIPTOR,
             BuiltinEffectKind::Flanger => &crate::realtime::flanger::DESCRIPTOR,
+            BuiltinEffectKind::Bitcrusher => &crate::realtime::bitcrusher::DESCRIPTOR,
         }
     }
 }

@@ -581,6 +581,48 @@ impl Default for FlangerParams {
     }
 }
 
+fn default_bitcrusher_drive() -> f32 {
+    1.0
+}
+
+fn default_bitcrusher_bits() -> f32 {
+    8.0
+}
+
+fn default_bitcrusher_downsample() -> f32 {
+    2.0
+}
+
+/// Bitcrusher parameters (spec `effects.md` E5; slot order matches the engine
+/// descriptor).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BitcrusherParams {
+    /// Input gain before quantization.
+    #[serde(default = "default_bitcrusher_drive")]
+    pub drive: f32,
+    /// Quantization depth in bits (2..16; fractional values give a continuous
+    /// step size).
+    #[serde(default = "default_bitcrusher_bits")]
+    pub bits: f32,
+    /// Sample & hold ratio (1 = off).
+    #[serde(default = "default_bitcrusher_downsample")]
+    pub downsample: f32,
+    /// Dry/wet mix (`0` = fully dry).
+    #[serde(default = "default_mix_one")]
+    pub mix: f32,
+}
+
+impl Default for BitcrusherParams {
+    fn default() -> Self {
+        Self {
+            drive: default_bitcrusher_drive(),
+            bits: default_bitcrusher_bits(),
+            downsample: default_bitcrusher_downsample(),
+            mix: default_mix_one(),
+        }
+    }
+}
+
 /// Built-in effect kind (spec `.agents/spec/effects.md` D1).
 ///
 /// The wire format is the `kind` tag of [`EffectParams`]; this enum lets UI and
@@ -603,6 +645,8 @@ pub enum BuiltinEffectKind {
     Chorus,
     /// Stereo flanger.
     Flanger,
+    /// Quantization + sample & hold lo-fi.
+    Bitcrusher,
 }
 
 impl BuiltinEffectKind {
@@ -615,6 +659,7 @@ impl BuiltinEffectKind {
             Self::Reverb => "Reverb",
             Self::Chorus => "Chorus",
             Self::Flanger => "Flanger",
+            Self::Bitcrusher => "Bitcrusher",
         }
     }
 
@@ -626,6 +671,7 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Reverb,
         BuiltinEffectKind::Chorus,
         BuiltinEffectKind::Flanger,
+        BuiltinEffectKind::Bitcrusher,
     ];
 }
 
@@ -650,6 +696,8 @@ pub enum EffectParams {
     Chorus(Box<ChorusParams>),
     /// Stereo flanger.
     Flanger(Box<FlangerParams>),
+    /// Quantization + sample & hold lo-fi.
+    Bitcrusher(Box<BitcrusherParams>),
 }
 
 impl Default for EffectParams {
@@ -668,6 +716,7 @@ impl EffectParams {
             Self::Reverb(_) => BuiltinEffectKind::Reverb,
             Self::Chorus(_) => BuiltinEffectKind::Chorus,
             Self::Flanger(_) => BuiltinEffectKind::Flanger,
+            Self::Bitcrusher(_) => BuiltinEffectKind::Bitcrusher,
         }
     }
 
@@ -763,6 +812,22 @@ impl EffectParams {
     pub fn as_flanger_mut(&mut self) -> Option<&mut FlangerParams> {
         match self {
             Self::Flanger(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Bitcrusher parameters, when this is a bitcrusher node.
+    pub fn as_bitcrusher(&self) -> Option<&BitcrusherParams> {
+        match self {
+            Self::Bitcrusher(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Mutable bitcrusher parameters, when this is a bitcrusher node.
+    pub fn as_bitcrusher_mut(&mut self) -> Option<&mut BitcrusherParams> {
+        match self {
+            Self::Bitcrusher(params) => Some(params),
             _ => None,
         }
     }
@@ -2139,6 +2204,11 @@ pub fn effect_slot_axis(params: &EffectParams, slot: u8) -> MapSpec {
         (EffectParams::Flanger(_), 2) => M::linear(-0.95, 0.95),
         (EffectParams::Flanger(_), 3) => M::linear(0.0, 1.0),
         (EffectParams::Flanger(_), 4) => M::linear(0.0, 1.0),
+        // drive, bits, downsample, mix.
+        (EffectParams::Bitcrusher(_), 0) => M::log(1.0, 16.0),
+        (EffectParams::Bitcrusher(_), 1) => M::linear(2.0, 16.0),
+        (EffectParams::Bitcrusher(_), 2) => M::linear(1.0, 32.0),
+        (EffectParams::Bitcrusher(_), 3) => M::linear(0.0, 1.0),
         // Out-of-range slot (a plugin payload, or a document that kept a
         // stale slot after the effect changed kind): normalized pass-through.
         _ => M::linear(0.0, 1.0),

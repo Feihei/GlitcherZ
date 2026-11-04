@@ -45,6 +45,7 @@ pub mod arpeggiator;
 pub mod atomic;
 pub mod audio_track;
 pub mod automation;
+pub mod bitcrusher;
 pub mod block;
 pub mod buffer;
 pub mod capture;
@@ -105,6 +106,7 @@ pub use audio_track::{
 pub use automation::{
     MAX_AUTO_POINTS, MAX_AUTO_TRACKS, RtAutoPoint, RtAutomation, RtControlClip, RtCurveInterp,
 };
+pub use bitcrusher::BitcrusherProcessor;
 pub use block::{BlockRunner, Feedback};
 pub use buffer::AudioBuffer;
 pub use capture::{
