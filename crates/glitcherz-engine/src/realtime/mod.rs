@@ -65,6 +65,7 @@ pub mod gain;
 pub mod graph;
 pub mod input;
 pub mod lfo;
+pub mod limiter;
 pub mod map;
 pub mod metronome;
 pub mod midi_envelope;
@@ -142,6 +143,7 @@ pub use input::InputProcessor;
 pub use lfo::{
     LFO_DIVISION_TICKS, LFO_MAX_RATE_HZ, LFO_MIN_RATE_HZ, LFO_WAVEFORM_COUNT, LfoProcessor,
 };
+pub use limiter::LimiterProcessor;
 pub use map::{MapMode, MapSpec};
 pub use midi_envelope::MidiEnvelopeProcessor;
 pub use mixer::{MixerChannel, MixerProcessor};

@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use glitcherz_engine::realtime::{
     BitcrusherProcessor, BuiltinEffectKind, ChorusProcessor, CompressorProcessor, DelayProcessor,
-    EffectDescriptor, EffectMeters, EqProcessor, FlangerProcessor, ParamId, ParamSpec,
-    PhaserProcessor, Processor, ReverbProcessor, SaturationProcessor, Unit, bitcrusher, chorus,
-    compressor, delay, eq, flanger, phaser, reverb, saturation,
+    EffectDescriptor, EffectMeters, EqProcessor, FlangerProcessor, LimiterProcessor, ParamId,
+    ParamSpec, PhaserProcessor, Processor, ReverbProcessor, SaturationProcessor, Unit, bitcrusher,
+    chorus, compressor, delay, eq, flanger, limiter, phaser, reverb, saturation,
 };
 use glitcherz_model::{BuiltinEffectKind as DocEffectKind, EffectParams};
 
@@ -39,6 +39,7 @@ pub fn engine_kind(params: &EffectParams) -> BuiltinEffectKind {
         DocEffectKind::Bitcrusher => BuiltinEffectKind::Bitcrusher,
         DocEffectKind::Phaser => BuiltinEffectKind::Phaser,
         DocEffectKind::Saturation => BuiltinEffectKind::Saturation,
+        DocEffectKind::Limiter => BuiltinEffectKind::Limiter,
     }
 }
 
@@ -59,6 +60,7 @@ pub fn default_params(kind: DocEffectKind) -> EffectParams {
         DocEffectKind::Bitcrusher => EffectParams::Bitcrusher(Box::default()),
         DocEffectKind::Phaser => EffectParams::Phaser(Box::default()),
         DocEffectKind::Saturation => EffectParams::Saturation(Box::default()),
+        DocEffectKind::Limiter => EffectParams::Limiter(Box::default()),
     }
 }
 
@@ -85,6 +87,11 @@ pub fn processor(params: &EffectParams, sample_rate: f32) -> BuiltinProcessor {
         BuiltinEffectKind::Bitcrusher => Box::new(BitcrusherProcessor::new(sample_rate)),
         BuiltinEffectKind::Phaser => Box::new(PhaserProcessor::new(sample_rate)),
         BuiltinEffectKind::Saturation => Box::new(SaturationProcessor::new(sample_rate)),
+        BuiltinEffectKind::Limiter => {
+            let handle = Arc::new(EffectMeters::new());
+            meters = Some(handle.clone());
+            Box::new(LimiterProcessor::with_meters(sample_rate, Some(handle)))
+        }
     };
     let descriptor = descriptor(params);
     for slot in 0..descriptor.params.len() {
@@ -176,6 +183,13 @@ pub fn value(params: &EffectParams, slot: u8) -> f32 {
             saturation::SLOT_MIX => sat.mix,
             _ => 0.0,
         },
+        EffectParams::Limiter(lim) => match slot {
+            limiter::SLOT_THRESHOLD => lim.threshold,
+            limiter::SLOT_RELEASE => lim.release,
+            limiter::SLOT_LINK => bool_value(lim.stereo_link),
+            limiter::SLOT_OUTPUT => lim.output,
+            _ => 0.0,
+        },
     }
 }
 
@@ -259,6 +273,13 @@ pub fn set_value(params: &mut EffectParams, slot: u8, value: f32) {
             saturation::SLOT_TONE => sat.tone = value,
             saturation::SLOT_TRIM => sat.trim = value,
             saturation::SLOT_MIX => sat.mix = value,
+            _ => {}
+        },
+        EffectParams::Limiter(lim) => match slot {
+            limiter::SLOT_THRESHOLD => lim.threshold = value,
+            limiter::SLOT_RELEASE => lim.release = value,
+            limiter::SLOT_LINK => lim.stereo_link = value >= 0.5,
+            limiter::SLOT_OUTPUT => lim.output = value,
             _ => {}
         },
     }
@@ -491,7 +512,7 @@ mod tests {
             let built = processor(&params, 48_000.0);
             assert_eq!(
                 built.meters.is_some(),
-                *kind == DocEffectKind::Compressor,
+                matches!(kind, DocEffectKind::Compressor | DocEffectKind::Limiter),
                 "{kind:?} meter handle"
             );
         }

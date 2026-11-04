@@ -55,6 +55,8 @@ pub enum BuiltinEffectKind {
     Phaser,
     /// 2× oversampled waveshaper.
     Saturation,
+    /// Lookahead ceiling keeper.
+    Limiter,
 }
 
 impl BuiltinEffectKind {
@@ -69,6 +71,7 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Bitcrusher,
         BuiltinEffectKind::Phaser,
         BuiltinEffectKind::Saturation,
+        BuiltinEffectKind::Limiter,
     ];
 
     /// Static descriptor of this kind.
@@ -83,6 +86,7 @@ impl BuiltinEffectKind {
             BuiltinEffectKind::Bitcrusher => &crate::realtime::bitcrusher::DESCRIPTOR,
             BuiltinEffectKind::Phaser => &crate::realtime::phaser::DESCRIPTOR,
             BuiltinEffectKind::Saturation => &crate::realtime::saturation::DESCRIPTOR,
+            BuiltinEffectKind::Limiter => &crate::realtime::limiter::DESCRIPTOR,
         }
     }
 }

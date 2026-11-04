@@ -721,6 +721,39 @@ impl Default for SaturationParams {
     }
 }
 
+fn default_limiter_release() -> f32 {
+    120.0
+}
+
+/// Lookahead limiter parameters (spec `effects.md` E5; slot order matches the
+/// engine descriptor).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LimiterParams {
+    /// Output ceiling in dB.
+    #[serde(default)]
+    pub threshold: f32,
+    /// Gain release time in ms.
+    #[serde(default = "default_limiter_release")]
+    pub release: f32,
+    /// Whether both channels share one detector (`max(|L|, |R|)`).
+    #[serde(default = "default_true")]
+    pub stereo_link: bool,
+    /// Output trim in dB.
+    #[serde(default)]
+    pub output: f32,
+}
+
+impl Default for LimiterParams {
+    fn default() -> Self {
+        Self {
+            threshold: 0.0,
+            release: default_limiter_release(),
+            stereo_link: true,
+            output: 0.0,
+        }
+    }
+}
+
 /// Built-in effect kind (spec `.agents/spec/effects.md` D1).
 ///
 /// The wire format is the `kind` tag of [`EffectParams`]; this enum lets UI and
@@ -749,6 +782,8 @@ pub enum BuiltinEffectKind {
     Phaser,
     /// 2× oversampled waveshaper.
     Saturation,
+    /// Lookahead ceiling keeper.
+    Limiter,
 }
 
 impl BuiltinEffectKind {
@@ -764,6 +799,7 @@ impl BuiltinEffectKind {
             Self::Bitcrusher => "Bitcrusher",
             Self::Phaser => "Phaser",
             Self::Saturation => "Saturation",
+            Self::Limiter => "Limiter",
         }
     }
 
@@ -778,6 +814,7 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Bitcrusher,
         BuiltinEffectKind::Phaser,
         BuiltinEffectKind::Saturation,
+        BuiltinEffectKind::Limiter,
     ];
 }
 
@@ -808,6 +845,8 @@ pub enum EffectParams {
     Phaser(Box<PhaserParams>),
     /// 2× oversampled waveshaper.
     Saturation(Box<SaturationParams>),
+    /// Lookahead ceiling keeper.
+    Limiter(Box<LimiterParams>),
 }
 
 impl Default for EffectParams {
@@ -829,6 +868,7 @@ impl EffectParams {
             Self::Bitcrusher(_) => BuiltinEffectKind::Bitcrusher,
             Self::Phaser(_) => BuiltinEffectKind::Phaser,
             Self::Saturation(_) => BuiltinEffectKind::Saturation,
+            Self::Limiter(_) => BuiltinEffectKind::Limiter,
         }
     }
 
@@ -972,6 +1012,22 @@ impl EffectParams {
     pub fn as_saturation_mut(&mut self) -> Option<&mut SaturationParams> {
         match self {
             Self::Saturation(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Limiter parameters, when this is a limiter node.
+    pub fn as_limiter(&self) -> Option<&LimiterParams> {
+        match self {
+            Self::Limiter(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Mutable limiter parameters, when this is a limiter node.
+    pub fn as_limiter_mut(&mut self) -> Option<&mut LimiterParams> {
+        match self {
+            Self::Limiter(params) => Some(params),
             _ => None,
         }
     }
@@ -2366,6 +2422,11 @@ pub fn effect_slot_axis(params: &EffectParams, slot: u8) -> MapSpec {
         (EffectParams::Saturation(_), 2) => M::log(1_000.0, 20_000.0),
         (EffectParams::Saturation(_), 3) => M::linear(-24.0, 24.0),
         (EffectParams::Saturation(_), 4) => M::linear(0.0, 1.0),
+        // threshold (dB), release (ms), stereo link, output (dB).
+        (EffectParams::Limiter(_), 0) => M::linear(-24.0, 0.0),
+        (EffectParams::Limiter(_), 1) => M::log(5.0, 1_000.0),
+        (EffectParams::Limiter(_), 2) => M::linear(0.0, 1.0),
+        (EffectParams::Limiter(_), 3) => M::linear(-12.0, 12.0),
         // Out-of-range slot (a plugin payload, or a document that kept a
         // stale slot after the effect changed kind): normalized pass-through.
         _ => M::linear(0.0, 1.0),

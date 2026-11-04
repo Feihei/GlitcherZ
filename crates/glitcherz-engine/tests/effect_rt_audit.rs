@@ -28,7 +28,8 @@ use glitcherz_engine::realtime::context::ProcessContext;
 use glitcherz_engine::realtime::processor::Processor;
 use glitcherz_engine::realtime::{
     BitcrusherProcessor, ChorusProcessor, CompressorProcessor, DelayProcessor, EffectMeters,
-    EqProcessor, FlangerProcessor, PhaserProcessor, ReverbProcessor, SaturationProcessor,
+    EqProcessor, FlangerProcessor, LimiterProcessor, PhaserProcessor, ReverbProcessor,
+    SaturationProcessor,
 };
 
 // ---------------------------------------------------------------------------
@@ -236,6 +237,15 @@ fn built_in_effects_are_allocation_free() {
     let scope = AuditScope::begin();
     exercise(&mut saturation, &mut saturation_buffer, 64);
     assert_zero_alloc(&scope, "SaturationProcessor process/set_param");
+
+    // Limiter (E5): the monotone window deque and the delay ring are fixed
+    // capacity; the gain envelope is plain arithmetic.
+    let mut limiter = LimiterProcessor::new(SR);
+    let mut limiter_buffer = fixture();
+    exercise(&mut limiter, &mut limiter_buffer, 2);
+    let scope = AuditScope::begin();
+    exercise(&mut limiter, &mut limiter_buffer, 64);
+    assert_zero_alloc(&scope, "LimiterProcessor process/set_param");
 
     // The meter handle itself is written from the audio thread.
     let meters = EffectMeters::new();
