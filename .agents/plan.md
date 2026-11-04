@@ -573,6 +573,33 @@ curve→曲线轨，即"烘培"）；**一个输入只允许一个源，一个�
     `sample_rate_choices`、stem 命名与消毒规则），不写未实现的行为；根 `README.md` 加「文档」段指向该目录，
     `AGENTS.md` 文档索引加一行
 
+## X 系列：扩展音频解码（2026-11-04 立项，spec `spec/audio-decoding.md`）
+
+> 来源：2026-11-02 外部 DSP crate 选型讨论 + 2026-11-03 文档修正（commit `321f47b`）。
+> 结论：**`fundsp` 不引依赖**（只作算法参考，读公式写标量版；它是 `f32x8` SIMD +
+> 类型级 `AudioNode` 管线，源码不可照抄）；**`symphonia` 整体引入**（MPL-2.0，纯解码）。
+> 另：`midly` 不引入（已有自研 `smf.rs`），`dasp` 已从 `AGENTS.md` 技术栈移除。
+
+- [ ] **X1 文档 + 依赖**：spec `audio-decoding.md` ✅ 已写；`AGENTS.md` 索引、
+      workspace `Cargo.toml` 加 `symphonia 0.6.1`（`default-features = false`，
+      显式 `flac / mp3 / mpa / ogg / vorbis / aac / isomp4 / aiff / pcm / wav`）、
+      `THIRD-PARTY-NOTICES.md` 登记 MPL-2.0
+- [ ] **X2 解码分路**：`engine/src/sample.rs` 拆 `decode_wav`（hound 原逻辑零改动）与
+      `decode_symphonia`；`.wav` 走前者、其余按扩展名 hint + 内容探测走后者；
+      `GenericAudioBufferRef::copy_to_vec_interleaved::<f32>()` 转交错，mono 复制、
+      >2 声道拒绝；`SampleError` 改为 `Decode(String)` + `UnsupportedFormat(String)`；
+      导出 `AUDIO_FILE_EXTENSIONS` 作为格式清单唯一真源。RT 侧 / `SampleData` 字段 /
+      `SampleLibrary` / 文档版本全部不动
+- [ ] **X3 UI 与用户文档**：三处 `add_filter("Wave", &["wav"])` 改读同一常量；
+      Inspector / patch 的 `.wav` hover 文案改通用；`docs/manual.md`、
+      `docs/project-files.md` 同步支持格式
+
+验收：现有 WAV 测试逐条不改断言通过；新增「同一 fixture 两条分路逐帧相等」、
+symphonia 分路的 mono/stereo/>2ch/垃圾文件；全仓 fmt / clippy -D warnings / test 绿。
+
+明确不做：编码器（导出/录音仍 hound 写 WAV）、Opus / ALAC、元数据展示、
+流式解码、采样率重采样（`rubato` 未引入）、`PROJECT_VERSION` bump。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：
