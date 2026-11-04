@@ -524,6 +524,39 @@ fn shift_t_arms_the_tile_modal() {
     );
 }
 
+/// 2026-11-04: double-clicking empty lane space inserts a clip AND selects
+/// it, so G / T / Shift+D work right away without an extra pick.
+#[test]
+fn double_click_insert_selects() {
+    let mut f = Fixture::new();
+    f.frame(vec![]);
+    f.frame(vec![]);
+    let row = f
+        .ctx
+        .read_response(egui::Id::new("glitcherz_timeline_row").with((false, 0usize)))
+        .expect("row 0 is missing from the widget stack")
+        .rect;
+    let empty = egui::pos2(row.left() + 400.0, row.center().y);
+    // A fast double click: two press/release pairs one frame apart, inside
+    // egui's 0.3s multi-click window.
+    let mut actions = Vec::new();
+    actions.extend(f.frame(vec![hover(empty), press(empty, true)]));
+    actions.extend(f.frame(vec![hover(empty), press(empty, false)]));
+    actions.extend(f.frame(vec![hover(empty), press(empty, true)]));
+    actions.extend(f.frame(vec![hover(empty), press(empty, false)]));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, glitcherz_ui::timeline::TimelineAction::AddClip { .. })),
+        "double-click on empty lane space must insert a clip"
+    );
+    let sel = f.state.selected();
+    assert_eq!(sel.len(), 1, "the inserted clip must be the only selection");
+    assert_eq!(sel[0].lane, glitcherz_ui::timeline::TimelineLane::Midi);
+    assert_eq!(sel[0].track, 0);
+    assert_eq!(sel[0].clip, 1);
+}
+
 /// Hover-follow focus (Blender-style context): merely hovering a lane
 /// grants it the keyboard — no click needed.
 #[test]

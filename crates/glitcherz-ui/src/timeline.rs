@@ -374,6 +374,12 @@ impl TimelineState {
         matches!(self.modal.as_ref().map(|m| m.kind), Some(ModalKind::Tile))
     }
 
+    /// The current selection (integration observability — used by the
+    /// focus tests to assert auto-selection after a double-click insert).
+    pub fn selected(&self) -> &[ClipSel] {
+        &self.selection
+    }
+
     /// Shows a transient status message in the toolbar for a few seconds
     /// (or until another status replaces it).
     fn set_status(&mut self, msg: impl Into<String>) {
@@ -887,16 +893,42 @@ fn clip_geometry(
     }
 }
 
-/// Clamps a row delta so the whole selection stays inside its kind's rows
-/// (rigid move: one delta for everyone, clamped globally, not per clip).
-fn clamp_row_delta(row_delta: i32, sel: &[ClipSel], rows: usize) -> i32 {
-    if sel.is_empty() || rows == 0 {
+/// Clamps a row delta so EVERY kind's selection group stays inside its own
+/// rows (rigid move: one delta for everyone; each kind clamps against its
+/// own row count and the delta must satisfy all of them at once).
+fn clamp_row_delta(
+    row_delta: i32,
+    sel: &[ClipSel],
+    rows_midi: usize,
+    rows_control: usize,
+    rows_audio: usize,
+) -> i32 {
+    if sel.is_empty() {
         return 0;
     }
-    let min_t = sel.iter().map(|s| s.track).min().unwrap_or(0);
-    let max_t = sel.iter().map(|s| s.track).max().unwrap_or(0);
-    let lo = -(min_t as i32);
-    let hi = (rows - 1) as i32 - max_t as i32;
+    let mut lo = i32::MIN;
+    let mut hi = i32::MAX;
+    for (lane, rows) in [
+        (TimelineLane::Midi, rows_midi),
+        (TimelineLane::Control, rows_control),
+        (TimelineLane::Audio, rows_audio),
+    ] {
+        let tracks: Vec<i32> = sel
+            .iter()
+            .filter(|s| s.lane == lane)
+            .map(|s| s.track as i32)
+            .collect();
+        if tracks.is_empty() || rows == 0 {
+            continue;
+        }
+        let min_t = *tracks.iter().min().unwrap();
+        let max_t = *tracks.iter().max().unwrap();
+        lo = lo.max(-min_t);
+        hi = hi.min((rows as i32 - 1) - max_t);
+    }
+    if lo > hi {
+        return 0;
+    }
     row_delta.clamp(lo.min(0), hi.max(0))
 }
 
@@ -945,14 +977,15 @@ fn grab_targets(
     let ptr = ptr?;
     let mut bar_delta = ((ptr.x - modal.grab.x) / px_per_bar).round() as i64;
     let mut row_delta = ((ptr.y - modal.grab.y) / row_h).round() as i32;
-    // The modal moves within one track kind (arm_modal enforces a single
-    // kind): MIDI / control / audio all clamp against their own row count.
-    let rows = match modal.origin.first()?.lane {
-        TimelineLane::Midi => rows_midi,
-        TimelineLane::Control => rows_control,
-        TimelineLane::Audio => rows_audio,
-    };
-    row_delta = clamp_row_delta(row_delta, &modal.origin, rows);
+    // A mixed selection moves as one rigid group: each kind clamps the
+    // delta against its own row count and all limits must hold at once.
+    row_delta = clamp_row_delta(
+        row_delta,
+        &modal.origin,
+        rows_midi,
+        rows_control,
+        rows_audio,
+    );
     // An axis lock zeroes the OTHER axis' delta (Blender convention: the
     // named axis is the one that still moves).
     match locked {
@@ -2952,11 +2985,20 @@ fn lane_row<T: Placement>(
                 } else {
                     let lane = row.lane();
                     let track = row.track();
+                    // 2026-11-04: the inserted clip is selected right away so
+                    // G / T / Shift+D work on it without an extra pick. The
+                    // op pushes the clip, so its index is the current length.
+                    let clip = clips.len();
                     actions.push(TimelineAction::AddClip {
                         lane,
                         track,
                         start_ticks: start,
                     });
+                    state.selection = vec![ClipSel { lane, track, clip }];
+                    // The second press may have started a rubber band; the
+                    // inserted clip's selection must survive the release.
+                    state.marquee = None;
+                    state.marquee_ending = false;
                 }
             }
         }
@@ -3138,8 +3180,14 @@ fn lane_row<T: Placement>(
     // selects nothing and every command key (G / T / Shift+D) just
     // flashes "nothing selected" — the roll hit the same trap. Clicking
     // empty space deselects; a modifier click on empty space leaves the
-    // selection alone.
-    if response.clicked() && !state.knife_armed && state.modal.is_none() {
+    // selection alone. The SECOND click of a double-click is skipped: it
+    // would clear the selection the double-click handler just set on an
+    // inserted clip (2026-11-04).
+    if response.clicked()
+        && !response.double_clicked()
+        && !state.knife_armed
+        && state.modal.is_none()
+    {
         if let Some(pos) = response.interact_pointer_pos() {
             let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
             // W3b: Alt keeps the selection on the clicked clip only.
@@ -3437,22 +3485,8 @@ fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
         return;
     }
     let kind = match arm {
-        Arm::Grab => {
-            let first = state.selection[0].lane;
-            if state.selection.iter().any(|s| s.lane != first) {
-                state.set_status("mixed selection: G moves one track kind at a time");
-                return;
-            }
-            ModalKind::Grab { locked: None }
-        }
-        Arm::Duplicate => {
-            let first = state.selection[0].lane;
-            if state.selection.iter().any(|s| s.lane != first) {
-                state.set_status("mixed selection: Shift+D copies one track kind at a time");
-                return;
-            }
-            ModalKind::Duplicate { locked: None }
-        }
+        Arm::Grab => ModalKind::Grab { locked: None },
+        Arm::Duplicate => ModalKind::Duplicate { locked: None },
         Arm::Stretch => ModalKind::Stretch { start_edge: false },
         Arm::Tile => {
             if state
@@ -3769,6 +3803,43 @@ mod tests {
             clip: 1,
         }];
         assert_eq!(expand_group_selection(&midi, &control, &audio, &lone), lone);
+    }
+
+    /// 2026-11-04: a mixed-kind selection clamps the shared row delta
+    /// against EACH kind's own row count (intersection of all limits).
+    #[test]
+    fn clamp_row_delta_respects_each_kind() {
+        let midi_top = ClipSel {
+            lane: TimelineLane::Midi,
+            track: 0,
+            clip: 0,
+        };
+        let ctrl_top = ClipSel {
+            lane: TimelineLane::Control,
+            track: 0,
+            clip: 0,
+        };
+        // Two MIDI rows, one control row, both groups at track 0: the
+        // control group (single row) forbids moving in either direction.
+        let mixed = vec![
+            ClipSel {
+                lane: TimelineLane::Midi,
+                track: 0,
+                clip: 0,
+            },
+            ClipSel {
+                lane: TimelineLane::Control,
+                track: 0,
+                clip: 0,
+            },
+        ];
+        assert_eq!(clamp_row_delta(1, &mixed, 2, 1, 0), 0);
+        assert_eq!(clamp_row_delta(-1, &mixed, 2, 1, 0), 0);
+        // MIDI-only selection: one row up is free, one row down is free.
+        assert_eq!(clamp_row_delta(1, &[midi_top], 2, 1, 0), 1);
+        assert_eq!(clamp_row_delta(-1, &[midi_top], 2, 1, 0), 0);
+        // Control-only selection stays within its single row.
+        assert_eq!(clamp_row_delta(1, &[ctrl_top], 2, 1, 0), 0);
     }
 
     /// W2: growing a clip keeps its content period (it tiles), shrinking trims
@@ -4277,9 +4348,9 @@ mod tests {
                 clip: 0,
             },
         ];
-        assert_eq!(clamp_row_delta(2, &sel, 3), 1);
+        assert_eq!(clamp_row_delta(2, &sel, 3, 0, 0), 1);
         // Track 0 anchors the group: no downward move at all.
-        assert_eq!(clamp_row_delta(-5, &sel, 3), 0);
+        assert_eq!(clamp_row_delta(-5, &sel, 3, 0, 0), 0);
         // Selection on rows 1 and 2 can move down by one, not further.
         let low = vec![
             ClipSel {
@@ -4293,8 +4364,8 @@ mod tests {
                 clip: 0,
             },
         ];
-        assert_eq!(clamp_row_delta(-1, &low, 3), -1);
-        assert_eq!(clamp_row_delta(-5, &low, 3), -1);
+        assert_eq!(clamp_row_delta(-1, &low, 3, 0, 0), -1);
+        assert_eq!(clamp_row_delta(-5, &low, 3, 0, 0), -1);
     }
 
     #[test]
