@@ -337,7 +337,10 @@ D16 的 `latency_samples()` 口子接入 S2-3 落地的图级 PDC。实施细节
   - [x] `tests/effect_rt_audit.rs`：Eq / Compressor / Delay / meters 的 `set_param`+`process` 零分配
 - [x] **E3** Reverb（FDN-8）
 - [x] **E4** `ModDelay` 核心 → Chorus / Flanger；`DelayProcessor` 升级 ping-pong + tempo-sync
-- [ ] **E5（可选）** Saturation（过采样）/ Bitcrusher / Phaser / Limiter + PDC
+- [x] **E5** Saturation（过采样）/ Bitcrusher / Phaser / Limiter + PDC ✅ 2026-11-04：
+        四个效果器全部经 E1 框架表驱动交付（见 §8「E5 收官」与 §18 实施勘误）；PDC 本体随
+        S2-3 落地，Saturation 的 16 样本 wet 延迟与 Limiter 的 5 ms lookahead 均经
+        `latency_samples()` 参与图级对齐
 
 ### 落地时必须核对的 UI 触点
 
