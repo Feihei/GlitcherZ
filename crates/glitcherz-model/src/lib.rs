@@ -623,6 +623,63 @@ impl Default for BitcrusherParams {
     }
 }
 
+fn default_phaser_rate() -> f32 {
+    0.5
+}
+
+fn default_phaser_depth() -> f32 {
+    0.7
+}
+
+fn default_phaser_feedback() -> f32 {
+    0.3
+}
+
+fn default_phaser_spread() -> f32 {
+    1.4
+}
+
+fn default_phaser_stages() -> u8 {
+    1
+}
+
+/// Phaser parameters (spec `effects.md` E5; slot order matches the engine
+/// descriptor).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PhaserParams {
+    /// LFO rate (Hz).
+    #[serde(default = "default_phaser_rate")]
+    pub rate: f32,
+    /// Sweep depth (0..1, ±3.5 octaves around 120 Hz at 1).
+    #[serde(default = "default_phaser_depth")]
+    pub depth: f32,
+    /// Chain feedback (−0.9..0.9).
+    #[serde(default = "default_phaser_feedback")]
+    pub feedback: f32,
+    /// Geometric frequency ratio between stages.
+    #[serde(default = "default_phaser_spread")]
+    pub spread: f32,
+    /// All-pass stage count as the enum index (0 = 2, 1 = 4, 2 = 6, 3 = 8).
+    #[serde(default = "default_phaser_stages")]
+    pub stages: u8,
+    /// Dry/wet mix (`0` = fully dry).
+    #[serde(default = "default_half")]
+    pub mix: f32,
+}
+
+impl Default for PhaserParams {
+    fn default() -> Self {
+        Self {
+            rate: default_phaser_rate(),
+            depth: default_phaser_depth(),
+            feedback: default_phaser_feedback(),
+            spread: default_phaser_spread(),
+            stages: default_phaser_stages(),
+            mix: default_half(),
+        }
+    }
+}
+
 /// Built-in effect kind (spec `.agents/spec/effects.md` D1).
 ///
 /// The wire format is the `kind` tag of [`EffectParams`]; this enum lets UI and
@@ -647,6 +704,8 @@ pub enum BuiltinEffectKind {
     Flanger,
     /// Quantization + sample & hold lo-fi.
     Bitcrusher,
+    /// All-pass cascade with an LFO-swept corner frequency.
+    Phaser,
 }
 
 impl BuiltinEffectKind {
@@ -660,6 +719,7 @@ impl BuiltinEffectKind {
             Self::Chorus => "Chorus",
             Self::Flanger => "Flanger",
             Self::Bitcrusher => "Bitcrusher",
+            Self::Phaser => "Phaser",
         }
     }
 
@@ -672,6 +732,7 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Chorus,
         BuiltinEffectKind::Flanger,
         BuiltinEffectKind::Bitcrusher,
+        BuiltinEffectKind::Phaser,
     ];
 }
 
@@ -698,6 +759,8 @@ pub enum EffectParams {
     Flanger(Box<FlangerParams>),
     /// Quantization + sample & hold lo-fi.
     Bitcrusher(Box<BitcrusherParams>),
+    /// All-pass cascade with an LFO-swept corner frequency.
+    Phaser(Box<PhaserParams>),
 }
 
 impl Default for EffectParams {
@@ -717,6 +780,7 @@ impl EffectParams {
             Self::Chorus(_) => BuiltinEffectKind::Chorus,
             Self::Flanger(_) => BuiltinEffectKind::Flanger,
             Self::Bitcrusher(_) => BuiltinEffectKind::Bitcrusher,
+            Self::Phaser(_) => BuiltinEffectKind::Phaser,
         }
     }
 
@@ -828,6 +892,22 @@ impl EffectParams {
     pub fn as_bitcrusher_mut(&mut self) -> Option<&mut BitcrusherParams> {
         match self {
             Self::Bitcrusher(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Phaser parameters, when this is a phaser node.
+    pub fn as_phaser(&self) -> Option<&PhaserParams> {
+        match self {
+            Self::Phaser(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Mutable phaser parameters, when this is a phaser node.
+    pub fn as_phaser_mut(&mut self) -> Option<&mut PhaserParams> {
+        match self {
+            Self::Phaser(params) => Some(params),
             _ => None,
         }
     }
@@ -2209,6 +2289,13 @@ pub fn effect_slot_axis(params: &EffectParams, slot: u8) -> MapSpec {
         (EffectParams::Bitcrusher(_), 1) => M::linear(2.0, 16.0),
         (EffectParams::Bitcrusher(_), 2) => M::linear(1.0, 32.0),
         (EffectParams::Bitcrusher(_), 3) => M::linear(0.0, 1.0),
+        // rate, depth, feedback, spread, stages (enum), mix.
+        (EffectParams::Phaser(_), 0) => M::log(0.02, 8.0),
+        (EffectParams::Phaser(_), 1) => M::linear(0.0, 1.0),
+        (EffectParams::Phaser(_), 2) => M::linear(-0.9, 0.9),
+        (EffectParams::Phaser(_), 3) => M::log(1.1, 2.6),
+        (EffectParams::Phaser(_), 4) => M::linear(0.0, 3.0),
+        (EffectParams::Phaser(_), 5) => M::linear(0.0, 1.0),
         // Out-of-range slot (a plugin payload, or a document that kept a
         // stale slot after the effect changed kind): normalized pass-through.
         _ => M::linear(0.0, 1.0),

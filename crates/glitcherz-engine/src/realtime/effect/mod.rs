@@ -51,6 +51,8 @@ pub enum BuiltinEffectKind {
     Flanger,
     /// Quantization + sample & hold lo-fi.
     Bitcrusher,
+    /// All-pass cascade with an LFO-swept corner frequency.
+    Phaser,
 }
 
 impl BuiltinEffectKind {
@@ -63,6 +65,7 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Chorus,
         BuiltinEffectKind::Flanger,
         BuiltinEffectKind::Bitcrusher,
+        BuiltinEffectKind::Phaser,
     ];
 
     /// Static descriptor of this kind.
@@ -75,6 +78,7 @@ impl BuiltinEffectKind {
             BuiltinEffectKind::Chorus => &crate::realtime::chorus::DESCRIPTOR,
             BuiltinEffectKind::Flanger => &crate::realtime::flanger::DESCRIPTOR,
             BuiltinEffectKind::Bitcrusher => &crate::realtime::bitcrusher::DESCRIPTOR,
+            BuiltinEffectKind::Phaser => &crate::realtime::phaser::DESCRIPTOR,
         }
     }
 }

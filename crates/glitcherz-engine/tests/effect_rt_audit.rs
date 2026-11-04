@@ -28,7 +28,7 @@ use glitcherz_engine::realtime::context::ProcessContext;
 use glitcherz_engine::realtime::processor::Processor;
 use glitcherz_engine::realtime::{
     BitcrusherProcessor, ChorusProcessor, CompressorProcessor, DelayProcessor, EffectMeters,
-    EqProcessor, FlangerProcessor, ReverbProcessor,
+    EqProcessor, FlangerProcessor, PhaserProcessor, ReverbProcessor,
 };
 
 // ---------------------------------------------------------------------------
@@ -218,6 +218,15 @@ fn built_in_effects_are_allocation_free() {
     let scope = AuditScope::begin();
     exercise(&mut crusher, &mut crusher_buffer, 64);
     assert_zero_alloc(&scope, "BitcrusherProcessor process/set_param");
+
+    // Phaser (E5): block-boundary coefficient planning (tan at block rate)
+    // plus a per-sample TPT cascade.
+    let mut phaser = PhaserProcessor::new(SR);
+    let mut phaser_buffer = fixture();
+    exercise(&mut phaser, &mut phaser_buffer, 2);
+    let scope = AuditScope::begin();
+    exercise(&mut phaser, &mut phaser_buffer, 64);
+    assert_zero_alloc(&scope, "PhaserProcessor process/set_param");
 
     // The meter handle itself is written from the audio thread.
     let meters = EffectMeters::new();
