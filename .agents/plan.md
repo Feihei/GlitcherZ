@@ -272,7 +272,7 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
   - 落地细节见 spec `effects.md` §15 实施勘误（`ParamFlags::INLINE`、低切旁通恒积分、一阶架式斜率、rt_audit 合成单测试）
 - [x] **E3** Reverb（FDN-8 + 阻尼 + pre-delay，不用 Freeverb）✅ 2026-10-27：`realtime/reverb.rs`（8 条非谐和延迟线 + 快速 Hadamard 蝶形反馈 + 环内逐线 one-pole 阻尼 / 一阶 TPT 低切 + 左右两条 200 ms pre-delay + `width` 立体声重组；反馈增益由 RT60 反解，构造期一次分配）；engine `BuiltinEffectKind::Reverb` + descriptor；model `ReverbParams` + `EffectParams::Reverb`（无版本变更，纯 tag 增量）；UI `effect.rs` 桥接；12 项单测 + `effect_rt_audit` 追加零分配。落地细节见 spec `effects.md` §16 实施勘误。全仓 fmt/clippy/test 绿
 - [x] **E4** `ModDelay` 核心 → Chorus / Flanger；Delay 升级 ping-pong + tempo-sync ✅ 2026-10-27：`realtime/mod_delay.rs`（分数延迟线 + 线性插值 + 正弦 LFO + `sampler` 参数助手）；`realtime/chorus.rs`（21 ms 中心双抽头，±9 ms 扫 12–30 ms，无反馈）+ `realtime/flanger.rs`（2.75 ms 中心单抽头，±2.25 ms 扫 0.5–5 ms，feedback ±0.95）；`DelayProcessor` 加 `ping_pong`（交叉馈送，首回声落对侧）+ `sync`/`division`（8 档音符时值 × `sec_per_tick`，缓冲扩到 4 s）；框架新增 `Unit::Enum` + `ParamSpec::choices`/`enumeration`（离散多档，UI 走 ComboBox）。model `ChorusParams`/`FlangerParams` + `EffectParams::{Chorus,Flanger}`；`DelayParams` 加 3 字段（serde default，无版本变更）。落地细节见 spec `effects.md` §17。全仓 fmt/clippy/test 绿
-- [ ] **E5（可选）** Saturation（过采样）/ Bitcrusher / Phaser / Limiter + PDC
+- [x] **E5** Bitcrusher / Phaser / Saturation（2× 过采样）/ Limiter（lookahead）✅ 2026-11-04：四个效果器经 E1 框架表驱动落地（engine processor + model payload + UI 桥接 + `effect_slot_axis` 轴表，纯 tag 增量、`PROJECT_VERSION` 不变）；Saturation 的 16 样本 wet 延迟与 Limiter 的 5 ms lookahead 均经 `latency_samples()` 参与 S2-3 的图级 PDC 对齐；Limiter 复用 compressor 的 GR 表模式（UI GR 条自动出现）。落地细节见 spec `effects.md` §18 实施勘误。四个 commit：`048c3a6` / `7110d29` / `7bcb668` / `a11bd7e`，全仓 fmt/clippy/test 绿
 
 明确不做：Echo 节点（Delay 即回声）、Gain 节点（通道条已是增益级）、每效果 sidechain。
 

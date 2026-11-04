@@ -286,10 +286,11 @@ GR 表（E2b 收尾项）：`Arc<EffectMeters> { gr_db: AtomicF32, out_peak_l/r:
 Chorus 中心延迟 12–30 ms 双抽头、无反馈；Flanger 中心延迟 0.5–5 ms、单抽头 + 反馈。
 `feedback` 上限 ±0.95 而非 ±1：环内还有插值读数，留 5 % 余量防自激发散。
 
-### 后续候选（未立项）
+### E5 收官 ✅ 2026-11-04
 
-Saturation（需 2×/4× 过采样，裸 `tanh` 会糊）、Bitcrusher、Phaser（全通链）、
-Master Limiter（前视，要吃 D16 的 `latency_samples`，并需要 PDC）。
+本节曾列为「后续候选」的 Saturation（2× 过采样）/ Bitcrusher / Phaser（全通链）/
+Limiter（前视）已全部交付；Limiter 的前视延迟与 Saturation 的过采样延迟都经
+D16 的 `latency_samples()` 口子接入 S2-3 落地的图级 PDC。实施细节与规格偏差见 §18。
 
 ## 9. 数据流
 
@@ -448,5 +449,35 @@ E4 分两批落地：**E4a** Chorus / Flanger（ModDelay 核心），**E4b** Del
 | 9 | 版本号 | —— | **不变**（`PROJECT_VERSION` 仍 8） | `Chorus`/`Flanger` 是纯 tag 增量；`DelayParams` 新增的 `ping_pong`/`sync`/`sync_division` 用 `serde(default)`（default 与 descriptor 一致：division 索引 2 = 1/4），旧文件无感加载 |
 | 10 | 默认值 | §8 E4 表未列默认 | Chorus：rate 1.0、depth 0.5、width 0.5、mix 0.5；Flanger：rate 0.5、depth 0.7、feedback 0.5、width 0.5、mix 0.5；Delay `sync_division` 默认 2（1/4） | 与 E3 同 `model_defaults_match_the_engine_descriptors` 锁定 |
 | 11 | `rt_audit` | §11 要求零分配 | 追加 `ChorusProcessor` / `FlangerProcessor` 到既有单测试 | 同 §15/§16 第 10 条：计数分配器全局，必须合成单测试 |
+
+## 18. 实施勘误（E5）
+
+E5 分四个 commit 交付：**E5a** Bitcrusher（`048c3a6`）、**E5b** Phaser（`7110d29`）、
+**E5c** Saturation（`7bcb668`）、**E5d** Limiter（`a11bd7e`）。PDC 本体已随 S2-3 落地，
+本批只补四个效果器；全部经 E1 框架表驱动（roster / `EffectParams` 变体 / `effect.rs`
+桥接五处 / `effect_slot_axis` 轴表），**`PROJECT_VERSION` 不变**（纯 tag 增量，与 E2–E4 同）。
+
+| # | 位置 | 规格原样 | 实际做法 | 原因 |
+| :-- | :-- | :-- | :-- | :-- |
+| 1 | Bitcrusher 参数速率 | 未规定 | `drive`/`bits`/`downsample` 全部块率消费（仅 `mix` 逐样本） | 量化深度与 hold 比例的 10 ms 平滑以块率台阶出现完全不可闻；`2^bits` 的 powf 与 ratio 取整留在块边界 |
+| 2 | Bitcrusher 位深 | 整数位深 | 分数值允许（`levels = 2^(bits−1)` 连续） | 量化步长连续变化听不出阶梯，且免去 round 抖动 |
+| 3 | Bitcrusher hold 相位 | 未规定 | `phase` 跨块连续，ratio 变化时 clamp 复位 | 否则每次块边界都重置 hold，ratio 失去意义 |
+| 4 | Phaser 全通结构 | 「全通链」未定式 | TPT 一阶 LP + `AP = 2·LP − x`（精确双线性全通），每级一个状态 | DF-I 全通在 `a → ±1` 有 f32 极限环风险；TPT 无环内延迟 |
+| 5 | Phaser 系数更新 | 未规定 | 块首/块尾各算一组 `G = t/(1+t)`，块内线性插值；LFO 相位跨块连续 | 无逐样本 `tan`（≤8 级 × 2 端点 = 每块 ≤16 次）；插值作用于 G 而非 a，压缩域更线性 |
+| 6 | Phaser 扫频范围 | 未规定 | `f_k = 120 Hz · 2^(depth·lfo·3.5) · spread^k`，spread 1.1..2.6、stages 2/4/6/8（enum 槽） | 每级几何分布是 phaser notch 间距的通行做法；f 钳到 0.45·sr 防 tan 发散 |
+| 7 | Phaser stages 切换 | 未规定 | 保留未用级的状态，重新启用时延续 | 全通是有状态的；清零反而引入不连续，延续状态自然收敛 |
+| 8 | Saturation halfband 归一化 | 未规定 | **全体系数和**归一化 Σh = 1 | 首版误用 even 臂和（理想 halfband = 0.5）→ 全链增益 ×2（tanh 饱和 1.0 × 2 = peak 2.0，测试直接暴露）。上下采样级联要求各自 DC = 1 |
+| 9 | Saturation 上采样增益 | 未规定 | 上采样求和 ×2（zero-stuff 能量稀释补偿，Σh_up = 2 / Σh_down = 1） | 不补偿则恒等信号衰减 ½（wet_path 测试 worst 0.25 = 输入幅度一半，同批暴露） |
+| 10 | Saturation 下采样 odd 臂 | 未规定 | `out[n] = Σ h[2k]·z_even[n−k] + h[2k+1]·z_odd[n−k−1]`——odd 臂多读一格（容量 17） | `z[2n−(2k+1)]` 落在 odd 子带的 `n−k−1` 槽；首版相位错位使湿路径失真 |
+| 11 | Saturation 延迟 | D16 预留 | wet 路径恒定延迟 **16 样本**（两个 halfband 群延迟 8+8），`latency_samples()` 报告，与采样率无关 | 脉冲峰值恰落 index 16 的测试锁定；PDC 在图编译期对齐 |
+| 12 | Saturation dry 对齐 | 未规定 | dry 不做 16 样本延迟对齐 | 对齐则 `mix = 0` 违反逐样本直通不变量；不对齐的低 mix comb 是并联失真设计的通行取舍 |
+| 13 | Saturation shape | 「裸 tanh 会糊」 | Soft `tanh` / Hard clip / Fold `asin(sin(π/2·x))·(2/π)`（\|x\|≤1 恒等折叠）+ 后置 one-pole tone（1k..20k）+ trim | 三种塑形覆盖软饱和/硬削/倍频折叠；tone 让高频谐波可收 |
+| 14 | Limiter 检测窗口 | 「前视」未定式 | 固定 5 ms 滑动窗最大值（单调 deque，定容 1026，O(1) 均摊） | lookahead 做成参数会改变 `latency_samples()`，而 PDC 表只在节点安装时读取（S2-3）；固定窗口恒定延迟是唯一安全解 |
+| 15 | Limiter 立体声联动 | D13/D14 | 两个检测器**恒运行**；联动时都吃 `max(|L|,|R|)`（状态天然同步），独立时各吃各；mono buffer 把输入镜像喂进第二链 | 切换零重同步（D14 的「选择位」语义）；mono 镜像防止切到立体声时第二链从 stale 状态起步 |
+| 16 | Limiter gain 包络 | 未规定 | 下降瞬时、上升走 release 一阶（与 compressor 的 GR 平滑同系数语义） | limiter 的 attack 必须为 0 才能咬住瞬态 |
+| 17 | Limiter meters | 未规定 | `with_meters` 发布 `EffectMeters`（compressor 同款）；UI GR 条按 meters map 存在性自动出现 | 上限器的 GR 是最值得看的表头；UI 零新增代码 |
+| 18 | Limiter 输入路由 | 未规定 | 每条延迟线吃各自声道输入（mono 时 `right` fallback 到 `left` 天然镜像） | 首版两条延迟线都吃 `left`，右声道输出左声道的延迟副本（bit-exact delay 测试暴露） |
+| 19 | 菜单顺序 | —— | Bitcrusher → Phaser → Saturation → Limiter 追加在 Flanger 之后 | 追加式交付保每个 commit 自洽（ALL 数组每步合法），不做最终重排 |
+| 20 | `rt_audit` | §11 要求零分配 | 四个 processor 追加进合成单测试 | 同 §15 第 10 条：计数分配器全局，必须单线程窗口 |
 
 
