@@ -15,6 +15,8 @@
 | `Ctrl+S` / `Ctrl+Shift+S` | 保存 / 另存为 |
 | `Ctrl+Z` / `Ctrl+Y` | undo / redo |
 | `Ctrl+L` | 把选中乐器接到 / 摘下电脑键盘 |
+| `Tab` / `Shift+Tab` | 按 `Patch → Timeline → Edit → Inspector` 循环切换视图 |
+| `Alt+1` .. `Alt+4` | 直接跳到第 N 个视图（顺序同上） |
 | `R` | 开始录音（卷帘持有焦点时除外） |
 | `Z` / `X` | 降 / 升八度（24–84 之间） |
 
@@ -57,6 +59,7 @@
 | `↑` / `↓` | 上下一律 |
 | `Shift` + `↑` / `↓` | 上下八度 |
 | `←` / `→` | 左右一格（跟随当前网格） |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | 在多个 clip 之间切换编辑焦点（光标在卷帘上时；其余情况下和 `Tab` 一样切视图） |
 | `Esc` | 退出模态 / 退出 `Draw` |
 
 ## 鼠标

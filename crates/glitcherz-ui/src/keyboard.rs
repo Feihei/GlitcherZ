@@ -422,6 +422,10 @@ impl GlitcherZApp {
         // is too broad here: it is true whenever ANY widget is focused, which
         // includes our hover-follow roll / timeline surfaces.
         let text_edit_owns_keys = ctx.text_edit_focused();
+        // The piano roll's clip chip strip owns `Ctrl+Tab` while the roll
+        // itself holds the keyboard (spec `roll-multiclip.md` D7); the view
+        // cycle leaves that combo to the roll there, and keeps bare `Tab`.
+        let roll_has_keys = self.roll_state.owns_keyboard_focus(ctx);
         let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
         for event in events {
             let egui::Event::Key {
@@ -502,6 +506,38 @@ impl GlitcherZApp {
                     }
                     _ => {}
                 }
+            }
+            // View switching. Plain `Tab` / `Shift+Tab` cycle the four tabs and
+            // `Alt+1..4` jumps straight to one. The piano roll's clip chip
+            // strip used to own plain `Tab` for clip focus (spec
+            // `roll-multiclip.md` D7); it now lives on `Ctrl+Tab`, so the view
+            // cycle keeps Tab everywhere. While the roll holds the keyboard,
+            // `Ctrl+Tab` is left to it; elsewhere it cycles views as well.
+            let view_target = if !pressed || text_edit_owns_keys {
+                None
+            } else if modifiers.alt {
+                match key {
+                    egui::Key::Num1 => MainView::from_index(0),
+                    egui::Key::Num2 => MainView::from_index(1),
+                    egui::Key::Num3 => MainView::from_index(2),
+                    egui::Key::Num4 => MainView::from_index(3),
+                    _ => None,
+                }
+            } else if key == egui::Key::Tab {
+                if modifiers.ctrl && roll_has_keys {
+                    None
+                } else {
+                    Some(self.view.cycle(!modifiers.shift))
+                }
+            } else {
+                None
+            };
+            if let Some(target) = view_target {
+                if !repeat {
+                    ctx.input_mut(|i| i.consume_key(modifiers, key));
+                    self.view = target;
+                }
+                continue;
             }
             if repeat {
                 continue;

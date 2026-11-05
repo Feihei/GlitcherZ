@@ -563,14 +563,15 @@ impl GlitcherZApp {
 
     /// Arrangement timeline panel (timeline spec T3): rows = tracks, clip
     /// blocks with move/resize/insert/delete, double-click opens the editor.
-    /// Main view tab bar (stacks under the transport panel).
+    /// Main view tab bar (stacks under the transport panel). The order and the
+    /// captions come from [`MainView::ORDER`], so the bar, the `Tab` cycle and
+    /// `Alt+1..4` can never disagree.
     pub(crate) fn view_tabs(&mut self, ui: &mut egui::Ui) {
         let response = egui::Panel::top("glitcherz_views").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.view, MainView::Timeline, "Timeline");
-                ui.selectable_value(&mut self.view, MainView::Edit, "Edit");
-                ui.selectable_value(&mut self.view, MainView::Patch, "Patch");
-                ui.selectable_value(&mut self.view, MainView::Inspector, "Inspector");
+                for view in MainView::ORDER {
+                    ui.selectable_value(&mut self.view, view, view.label());
+                }
             });
         });
         // Chrome: switching tabs releases the previous view's focus.

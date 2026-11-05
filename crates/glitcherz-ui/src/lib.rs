@@ -1339,6 +1339,86 @@ enum MainView {
     Inspector,
 }
 
+impl MainView {
+    /// Left-to-right tab order, which is also the `Tab` / `Ctrl`-free cycle
+    /// order and the `Alt+1..4` index. The graph comes first because that is
+    /// where the project is actually built, but the arrangement stays the
+    /// view the app *opens* on (see `default` above): a DAW's home screen is
+    /// still the timeline, it is just no longer the leftmost tab.
+    const ORDER: [Self; 4] = [Self::Patch, Self::Timeline, Self::Edit, Self::Inspector];
+
+    /// Tab caption.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Patch => "Patch",
+            Self::Timeline => "Timeline",
+            Self::Edit => "Edit",
+            Self::Inspector => "Inspector",
+        }
+    }
+
+    /// Next / previous view in [`Self::ORDER`], wrapping at both ends.
+    fn cycle(self, forward: bool) -> Self {
+        let i = Self::ORDER
+            .iter()
+            .position(|v| *v == self)
+            .unwrap_or_default();
+        let n = Self::ORDER.len();
+        Self::ORDER[if forward {
+            (i + 1) % n
+        } else {
+            (i + n - 1) % n
+        }]
+    }
+
+    /// `Alt+1..4` target: the n-th tab (1-based), if it exists.
+    fn from_index(index: usize) -> Option<Self> {
+        Self::ORDER.get(index).copied()
+    }
+}
+
+#[cfg(test)]
+mod main_view_tests {
+    use super::MainView;
+
+    /// The tab bar, the `Tab` cycle and `Alt+1..4` all read `ORDER`, so this
+    /// pins the one order the user asked for: patch first, arrangement second.
+    #[test]
+    fn the_tab_order_puts_patch_first_and_timeline_second() {
+        assert_eq!(
+            MainView::ORDER,
+            [
+                MainView::Patch,
+                MainView::Timeline,
+                MainView::Edit,
+                MainView::Inspector
+            ]
+        );
+        assert_eq!(
+            MainView::default(),
+            MainView::Timeline,
+            "a new session still opens on the arrangement, not on the graph"
+        );
+    }
+
+    #[test]
+    fn cycling_wraps_in_both_directions() {
+        assert_eq!(MainView::Inspector.cycle(true), MainView::Patch);
+        assert_eq!(MainView::Patch.cycle(false), MainView::Inspector);
+        assert_eq!(MainView::Patch.cycle(true), MainView::Timeline);
+        assert_eq!(MainView::Timeline.cycle(false), MainView::Patch);
+    }
+
+    #[test]
+    fn alt_digits_index_the_same_order() {
+        assert_eq!(MainView::from_index(0), Some(MainView::Patch));
+        assert_eq!(MainView::from_index(1), Some(MainView::Timeline));
+        assert_eq!(MainView::from_index(2), Some(MainView::Edit));
+        assert_eq!(MainView::from_index(3), Some(MainView::Inspector));
+        assert_eq!(MainView::from_index(4), None, "only four tabs");
+    }
+}
+
 /// A destructive file action that must ask about unsaved changes first (U2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FileAction {

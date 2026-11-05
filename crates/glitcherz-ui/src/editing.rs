@@ -504,7 +504,7 @@ impl GlitcherZApp {
                         .on_hover_text(if focused {
                             "Editing this clip (writable)"
                         } else {
-                            "Click (or Tab) to edit this clip · its notes are ghosts until then"
+                            "Click (or Ctrl+Tab) to edit this clip · its notes are ghosts until then"
                         })
                         .clicked()
                         && !focused
@@ -516,11 +516,22 @@ impl GlitcherZApp {
             if let Some(clip) = switch {
                 self.set_roll_focus(clip);
             }
-            // Tab / Shift+Tab cycle the focus (D7). Consumed here so egui's
-            // focus traversal never steals it; the roll itself never reads Tab.
-            let backward = ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+            // Ctrl+Tab / Ctrl+Shift+Tab cycle the focus (D7). Consumed here so
+            // egui's focus traversal never steals it, and so the app-wide view
+            // cycle — which owns the bare Tab — leaves this alone. The roll
+            // itself never reads a bare Tab.
+            let backward = ui.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers {
+                        ctrl: true,
+                        shift: true,
+                        ..egui::Modifiers::NONE
+                    },
+                    egui::Key::Tab,
+                )
+            });
             let forward =
-                !backward && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+                !backward && ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab));
             if backward || forward {
                 let next = match &mut self.edit_clip {
                     Some(EditTarget::Midi(subject)) => Some(subject.cycle_focus(backward)),
