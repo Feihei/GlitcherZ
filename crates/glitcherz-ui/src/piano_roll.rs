@@ -2630,6 +2630,18 @@ pub fn show(
         }
     }
 
+    // A release the widget never saw (pointer released over another window,
+    // `PointerGone` from a remote-desktop session, or the app losing focus
+    // mid-drag) must still end the gesture. A surviving drag re-applies its
+    // delta every frame — which silently overwrites whatever Ctrl+Z just
+    // restored, the "undo does nothing after dragging a note out" report.
+    if state.drag.is_some() && !ui.ctx().input(|i| i.pointer.any_down()) {
+        state.drag = None;
+    }
+    if state.marquee.is_some() && !ui.ctx().input(|i| i.pointer.any_down()) {
+        state.marquee = None;
+    }
+
     // Velocity lane: drag sets absolute velocities. With a selection, every
     // selected note follows the pointer; without one, the notes under the
     // pointer do (a sweep across the lane "paints" velocities).
@@ -3151,10 +3163,18 @@ fn clamped_move_deltas(
             }
         }
     }
-    // A clip-relative move cannot push a note past the loop either.
+    // A clip-relative move cannot push a note past the loop either — tail
+    // included. The old cap was `loop_ticks - 1` (start only), which let a
+    // note hang up to its own length outside the clip: the clip table then
+    // schedules it past the clip end and the roll draws it half-clipped, so
+    // the state after the drag is one no undo/redo round-trip can present
+    // back — it reads as "Ctrl+Z does nothing". A note already longer than
+    // the loop keeps its position (room clamped at 0) instead of being
+    // shoved left by a rightward drag.
     for index in indices {
         if let Some(note) = notes.get(*index) {
-            delta_start = delta_start.min(loop_ticks - 1 - note.start);
+            let room = (loop_ticks - note.length - note.start).max(0);
+            delta_start = delta_start.min(room);
         }
     }
     (
@@ -3310,12 +3330,25 @@ mod tests {
         };
         assert_eq!(delta_start, 0, "the note at 0 blocks the whole move");
 
-        // ...or right past the loop end.
+        // ...or right past the loop end. The cap is the note's **tail**, not
+        // its start: every note stays fully inside the clip.
         let intent = clamped_move(&clip, &[0, 1, 2], 480, 0, loop_ticks, None);
         let RollIntent::MoveNotes { delta_start, .. } = intent else {
             panic!("expected a move");
         };
-        assert_eq!(delta_start, 960 - 1 - 480, "limited by the latest note");
+        assert_eq!(
+            delta_start,
+            960 - 240 - 480,
+            "limited by the latest note's tail"
+        );
+        for note in &clip.sequence.notes {
+            assert!(
+                note.start + delta_start + note.length <= loop_ticks,
+                "note at {} (len {}) ends outside the clip after the move",
+                note.start,
+                note.length
+            );
+        }
 
         // Pitch: the 0-note blocks downward, the 127-note blocks upward.
         let intent = clamped_move(&clip, &[0, 1, 2], 0, -5, loop_ticks, None);
@@ -3867,11 +3900,12 @@ mod tests {
         assert_eq!(modal.finalize(&clip, &[0], frame, 3840), None);
 
         // The move clamps against the loop end (snap(4000) = 4080 → a
-        // want of 3840 ticks, clamped to 3839).
+        // want of 3840 ticks, clamped so the 240-tick note's **tail** lands
+        // on the clip end: 3840 - 240 = 3600).
         let frame = modal.frame(&clip, &[0], 4000.0, 60, 240, 3840);
         let intent = modal.finalize(&clip, &[0], frame, 3840).expect("clamps");
         match intent {
-            RollIntent::MoveNotes { delta_start, .. } => assert_eq!(delta_start, 3839),
+            RollIntent::MoveNotes { delta_start, .. } => assert_eq!(delta_start, 3600),
             other => panic!("expected a move, got {other:?}"),
         }
     }

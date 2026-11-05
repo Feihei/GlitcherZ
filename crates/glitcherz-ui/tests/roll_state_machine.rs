@@ -1307,3 +1307,83 @@ fn ctrl_a_selects_every_note_and_ctrl_shift_a_clears() {
     assert!(f.state.selection.is_empty(), "Ctrl+Shift+A clears");
 }
 
+/// Regression (user report, 2026-11-05): dragging a note past the clip edge
+/// used to leave its **tail** outside the clip — a state the engine cannot
+/// schedule and the roll draws half-clipped, so Ctrl+Z appeared to do
+/// nothing. The drag must stop at the clip's tail, and the intents it emits
+/// must replay into exactly one undo step.
+#[test]
+fn a_drag_out_of_the_clip_stops_at_the_tail_and_undoes_in_one_step() {
+    use glitcherz_command::Session;
+    use glitcherz_model::Project;
+
+    let mut f = Fixture::new();
+    let _ = f.click(f.pos(120.0, 60));
+    // Far beyond the clip: the release even lands outside the window.
+    let intents = f.drag(f.pos(120.0, 60), f.pos(8000.0, 60));
+    assert!(!f.state.is_dragging(), "the release ends the gesture");
+
+    let moves: Vec<(i64, u64)> = intents
+        .iter()
+        .filter_map(|intent| match intent {
+            RollIntent::MoveNotes {
+                delta_start,
+                gesture,
+                ..
+            } => Some((
+                *delta_start,
+                gesture.expect("a drag always carries a gesture"),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert!(!moves.is_empty(), "the drag emitted at least one move");
+    assert!(
+        moves.windows(2).all(|pair| pair[0].1 == pair[1].1),
+        "every frame of one drag shares the same undo key"
+    );
+
+    // Replay the drag the way the app does: same command, same merged key.
+    let mut project = Project::default();
+    project.midi_tracks[0]
+        .clips
+        .push(f.tracks[0].clips[0].clone());
+    let mut session = Session::new(project);
+    for (delta_start, gesture) in &moves {
+        session
+            .execute_merged(
+                "midi.notes_move",
+                &serde_json::json!({
+                    "track": 0, "clip": 0, "indices": [0],
+                    "ticks": delta_start, "semitones": 0,
+                }),
+                &format!("roll-move:0:0:{gesture}"),
+            )
+            .unwrap();
+    }
+    let dragged = session.project().midi_tracks[0].clips[0].clone();
+    let note = dragged
+        .notes()
+        .iter()
+        .find(|note| note.note == 60)
+        .expect("note A");
+    assert!(
+        note.start + note.length <= i64::from(TICKS_PER_BAR),
+        "the tail stays inside the clip: {}..{}",
+        note.start,
+        note.end()
+    );
+
+    session.undo();
+    let restored = session.project().midi_tracks[0].clips[0].clone();
+    assert_eq!(
+        restored
+            .notes()
+            .iter()
+            .find(|note| note.note == 60)
+            .expect("note A")
+            .start,
+        0,
+        "one Ctrl+Z restores the whole drag"
+    );
+}
