@@ -3533,3 +3533,23 @@ mod sf2_tests {
         assert!(pre_roll_skip_frames(3840.0, sec_per_tick, 48_000) < 200_000);
     }
 }
+
+#[cfg(test)]
+mod gain_label_tests {
+    use super::*;
+
+    /// The master fader and the drum-slot trim share one label, so a value
+    /// means the same thing everywhere: unity is `+0.0 dB`, half is `-6.0 dB`,
+    /// and both ends of the linear range stay readable instead of printing a
+    /// bare multiplier.
+    #[test]
+    fn linear_gain_reads_in_db() {
+        assert_eq!(gain_db_text(1.0), "+0.0 dB");
+        assert_eq!(gain_db_text(2.0), "+6.0 dB");
+        assert_eq!(gain_db_text(0.5), "-6.0 dB");
+        assert_eq!(gain_db_text(0.0), "-∞ dB");
+        // Silence has no finite dB value; the floor must stay a label, not a
+        // `-inf` that a DragValue would try to format.
+        assert_eq!(gain_db_text(1e-9), "-∞ dB");
+    }
+}

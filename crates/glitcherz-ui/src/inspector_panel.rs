@@ -1531,10 +1531,16 @@ impl GlitcherZApp {
                 self.pick_drum_samples(doc_id);
             }
             ui.label("Gain");
-            if ui
-                .add(egui::Slider::new(&mut gain_value, 0.0..=2.0))
-                .changed()
-            {
+            let gain_response = ui
+                .add(
+                    egui::Slider::new(&mut gain_value, 0.0..=2.0)
+                        .custom_formatter(|value, _| gain_db_text(value as f32)),
+                )
+                .on_hover_text("Kit output trim · double-click the rail for 0 dB");
+            if gain_response.double_clicked() {
+                gain_value = 1.0;
+                self.send_node_param(doc_id, ParamId::DrumGain, gain_value);
+            } else if gain_response.changed() {
                 self.send_node_param(doc_id, ParamId::DrumGain, gain_value);
             }
         });
@@ -1608,11 +1614,19 @@ impl GlitcherZApp {
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "?".to_string());
                     ui.label(stem).on_hover_text(&slot.path);
+                    // Gain is stored linear but reads in dB: "0.63" tells
+                    // nobody anything, "-4.0 dB" does. Same formatter as the
+                    // master fader, so the two speak one language. A
+                    // double-click on the rail returns the slot to unity —
+                    // the one value everybody resets to.
                     let mut gain = slot.gain;
-                    if ui
-                        .add(egui::DragValue::new(&mut gain).range(0.0..=2.0).speed(0.01))
-                        .changed()
-                    {
+                    let gain_response = ui.add(
+                        egui::Slider::new(&mut gain, 0.0..=2.0)
+                            .custom_formatter(|value, _| gain_db_text(value as f32)),
+                    );
+                    if gain_response.double_clicked() {
+                        edits.push((slot.note, 0, 1.0));
+                    } else if gain_response.changed() {
                         edits.push((slot.note, 0, gain));
                     }
                     let mut pan = slot.pan;

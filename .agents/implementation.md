@@ -906,3 +906,13 @@ flush 归零 → writer 为 None → begin_pass：开新 writer → setup(engine
 **测试**：`panel_target_tests::synth_params_belong_to_the_builtin_voice_only`（`Builtin` 为真；Sample / DrumKit / SoundFont / Clap / Vst3 逐一为假）。
 
 **未改动**：引擎侧 `SynthParams` 字段保留（工程文件向前兼容，切换 voice 时旧字段仍在文档里），只是 UI 不再假装它们起作用。
+
+## 鼓组增益改读 dB，双击回 unity（2026-11-05）
+
+**改动只在 UI 层**：`DrumSlot.gain` 仍是线性 0..=2（引擎与工程文件不动），面板把它当 dB 用。
+
+- 每个槽位的 Gain 从 `DragValue`（裸乘数 0.63）换成 `Slider` + `custom_formatter(|v| gain_db_text(v))`，与主输出推子同一个格式化器——因此两处的"0 dB""−∞ dB"字面一致，不会各说各话。
+- **双击推子轨道复位到 0 dB**（`gain_response.double_clicked()` → `1.0`）。为什么不是双击数值框：egui 的 `DragValue` 在 `clicked()` 里就 `request_focus`，下一帧变成 `TextEdit`，双击的第二下落在文本框上，`double_clicked()` 永远等不到；`Slider` 的轨道本身不抢点击，双击可靠。写入仍走 `apply_drum_slot_edit`（每槽位+字段一个合并 undo）。
+- 套件级输出 Gain 也套上同一格式化器（同样是线性值，别处一致）。
+
+**测试**：`gain_label_tests::linear_gain_reads_in_db`（1.0 → `+0.0 dB`、2.0 → `+6.0 dB`、0.5 → `-6.0 dB`、0 与 1e-9 → `-∞ dB`）。
