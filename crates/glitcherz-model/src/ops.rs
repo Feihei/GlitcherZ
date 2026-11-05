@@ -10,7 +10,7 @@
 //! - randomness is a seeded XorShift, so every operation is reproducible and
 //!   unit-testable.
 
-use crate::Note;
+use crate::{DrumSlot, Note};
 
 /// Default seed for the deterministic RNG (`0x5EED_50DC_4AF7_0001`).
 pub const DEFAULT_SEED: u64 = 0x5EED_50DC_4AF7_0001;
@@ -531,6 +531,52 @@ pub fn strum(notes: &mut [Note], options: &StrumOptions, seed: u64) {
 
 // ---- Drum kit key assignment (W1) --------------------------------------------------------
 
+/// MIDI note name in scientific pitch notation (`60` → `C4`, `36` → `C2`).
+///
+/// One implementation for the whole app: the status bar, the event list, the
+/// patch caption and the drum table must never disagree on the octave base.
+pub fn note_name(note: u8) -> String {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    let octave = i32::from(note) / 12 - 1;
+    format!("{}{octave}", NAMES[usize::from(note) % 12])
+}
+
+/// Nearest key to `want` that `taken` does not occupy (spec `drum-kit.md`
+/// K3: trigger keys stay unique).
+///
+/// Searches outward from `want` — upward first, so a kick dragged onto its
+/// own octave lands on the next free key above rather than below — and
+/// clamps to the MIDI range. `None` only when all 128 keys are taken, which a
+/// 32-slot kit cannot reach, but the caller must not assume it.
+pub fn nearest_free_note(taken: &[u8], want: u8) -> Option<u8> {
+    let mut used = [false; 128];
+    for &note in taken {
+        used[usize::from(note & 0x7F)] = true;
+    }
+    if !used[usize::from(want)] {
+        return Some(want);
+    }
+    for delta in 1..=127u8 {
+        // `checked_add` guards the `u8` wrap, not the MIDI range: 1 + 127 is a
+        // valid byte and would index past the end of the table.
+        if let Some(note) = want
+            .checked_add(delta)
+            .filter(|note| usize::from(*note) < used.len() && !used[usize::from(*note)])
+        {
+            return Some(note);
+        }
+        if let Some(note) = want
+            .checked_sub(delta)
+            .filter(|note| !used[usize::from(*note)])
+        {
+            return Some(note);
+        }
+    }
+    None
+}
+
 /// Free MIDI keys for a multi-file drum-kit load (spec `drum-kit.md` K10).
 ///
 /// Starts at [`crate::DRUM_DEFAULT_NOTE`] (36, GM kick), skips keys already
@@ -556,6 +602,31 @@ pub fn assign_drum_notes(taken: &[u8], count: usize) -> Vec<u8> {
     out
 }
 
+/// Moves one drum slot to `to`, snapping to the nearest free key when `to` is
+/// already taken (spec `drum-kit.md` K13).
+///
+/// Returns the key the slot landed on, or `None` when nothing moved (unknown
+/// `from`, every key taken, or the slot already sits on the resolved key).
+/// The slot keeps its position in `slots`, so the Inspector table never
+/// reshuffles rows under a drag; only the trigger key changes.
+pub fn reassign_drum_slot(slots: &mut [DrumSlot], from: u8, to: u8) -> Option<u8> {
+    if !slots.iter().any(|slot| slot.note == from) {
+        return None;
+    }
+    let taken: Vec<u8> = slots
+        .iter()
+        .map(|slot| slot.note)
+        .filter(|note| *note != from)
+        .collect();
+    let target = nearest_free_note(&taken, to)?;
+    if target == from {
+        return None;
+    }
+    let slot = slots.iter_mut().find(|slot| slot.note == from)?;
+    slot.note = target;
+    Some(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -563,7 +634,7 @@ mod tests {
         VelocityOp, apply_duration, apply_to_selected, apply_velocity, quantize, randomize,
         round_i64, scale_notes, strum, transpose,
     };
-    use crate::Note;
+    use crate::{DrumSlot, Note};
 
     fn note(start: i64, length: i64, pitch: u8, velocity: u8) -> Note {
         Note {
@@ -1111,5 +1182,74 @@ mod tests {
             128,
             "there are only 128 MIDI keys"
         );
+    }
+
+    /// One octave convention for the whole app: middle C is C4 (60).
+    #[test]
+    fn note_names_are_scientific_pitch() {
+        assert_eq!(super::note_name(60), "C4", "middle C");
+        assert_eq!(super::note_name(61), "C#4");
+        assert_eq!(super::note_name(36), "C2", "GM kick");
+        assert_eq!(super::note_name(42), "F#2", "GM closed hi-hat");
+        assert_eq!(super::note_name(0), "C-1");
+        assert_eq!(super::note_name(127), "G9");
+    }
+
+    /// A moved slot snaps to the closest free key, preferring upward.
+    #[test]
+    fn nearest_free_note_searches_outward() {
+        assert_eq!(super::nearest_free_note(&[], 36), Some(36), "free target");
+        assert_eq!(
+            super::nearest_free_note(&[35, 36], 36),
+            Some(37),
+            "equidistant: upward wins"
+        );
+        assert_eq!(
+            super::nearest_free_note(&[36, 37], 36),
+            Some(35),
+            "35 is closer than 38"
+        );
+        assert_eq!(super::nearest_free_note(&[126, 127], 127), Some(125));
+        assert_eq!(super::nearest_free_note(&[0], 0), Some(1), "clamped at 0");
+        assert_eq!(
+            super::nearest_free_note(&(0..=127).collect::<Vec<_>>(), 60),
+            None
+        );
+    }
+
+    /// Moving a slot keeps the table order and never duplicates a key.
+    #[test]
+    fn reassigning_a_slot_snaps_and_keeps_order() {
+        let mut slots = vec![
+            DrumSlot {
+                note: 36,
+                ..DrumSlot::default()
+            },
+            DrumSlot {
+                note: 38,
+                ..DrumSlot::default()
+            },
+            DrumSlot {
+                note: 42,
+                ..DrumSlot::default()
+            },
+        ];
+        assert_eq!(super::reassign_drum_slot(&mut slots, 36, 40), Some(40));
+        assert_eq!(
+            slots.iter().map(|slot| slot.note).collect::<Vec<_>>(),
+            vec![40, 38, 42],
+            "order is stable; only the moved key changed"
+        );
+        // 38 is taken → snap to the nearest free key, never overwrite.
+        assert_eq!(super::reassign_drum_slot(&mut slots, 40, 38), Some(39));
+        let keys: Vec<u8> = slots.iter().map(|slot| slot.note).collect();
+        assert_eq!(keys, vec![39, 38, 42]);
+        let mut unique = keys.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), keys.len(), "keys stay unique");
+        // No-op and unknown source.
+        assert_eq!(super::reassign_drum_slot(&mut slots, 39, 39), None);
+        assert_eq!(super::reassign_drum_slot(&mut slots, 60, 61), None);
     }
 }

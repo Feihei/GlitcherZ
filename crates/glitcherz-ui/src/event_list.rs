@@ -12,7 +12,7 @@
 
 use eframe::egui;
 
-use glitcherz_model::MidiClip;
+use glitcherz_model::{MidiClip, note_name};
 
 /// Absolute field changes for one note (unset fields keep their value).
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -150,29 +150,4 @@ fn drag_u8_note(
         .range(0..=127)
         .custom_formatter(|v, _| note_name(v.round().clamp(0.0, 127.0) as u8)),
     );
-}
-
-/// MIDI note number → "C4" style name (middle C = C4).
-fn note_name(note: u8) -> String {
-    const NAMES: [&str; 12] = [
-        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-    ];
-    format!(
-        "{}{}",
-        NAMES[usize::from(note) % 12],
-        i32::from(note) / 12 - 1
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::note_name;
-
-    #[test]
-    fn note_names_are_scientific_pitch() {
-        assert_eq!(note_name(60), "C4", "middle C");
-        assert_eq!(note_name(61), "C#4");
-        assert_eq!(note_name(0), "C-1");
-        assert_eq!(note_name(127), "G9");
-    }
 }

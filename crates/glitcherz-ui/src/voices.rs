@@ -467,6 +467,32 @@ impl GlitcherZApp {
         self.rebuild_drum_kit(doc_id, slots, gain, sample_rate, "Remove Drum Slot");
     }
 
+    /// Reassigns one slot's trigger key and rebuilds the kit in place (the
+    /// Inspector key drag, W1b / spec K13).
+    ///
+    /// `reassign_drum_slot` snaps a taken key to the nearest free one instead
+    /// of overwriting a neighbour (`validate` rejects duplicate notes). The
+    /// rebuild preserves the node id, cables and MIDI routing — the RT table
+    /// is indexed by key at construction, so a moved slot needs a fresh
+    /// processor, and the clip already triggering the old key simply goes
+    /// silent while the new key sounds.
+    pub(crate) fn move_drum_slot(&mut self, doc_id: u64, from: u8, to: u8) {
+        let Some((mut slots, gain)) = self.drum_kit_fields(doc_id) else {
+            return;
+        };
+        // Snap-to-free, order-preserving: the model owns the rule so the
+        // uniqueness invariant is testable without an engine.
+        let Some(target) = glitcherz_model::reassign_drum_slot(&mut slots, from, to) else {
+            return;
+        };
+        let sample_rate = self.engine.info().sample_rate as f32;
+        self.rebuild_drum_kit(doc_id, slots, gain, sample_rate, "Move Drum Slot");
+        self.set_message(format!(
+            "Slot moved to {} ({target})",
+            glitcherz_model::note_name(target)
+        ));
+    }
+
     /// The blocking half of [`Self::pick_sound_font_from`]: parse (cached),
     /// resolve a preset that exists in the new file, then swap the engine
     /// processor **in place** — `replace_node` keeps the node id, so cables,

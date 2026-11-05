@@ -1496,8 +1496,9 @@ impl GlitcherZApp {
     /// Drum kit table (W1, spec `drum-kit.md` K11): timeline-style overall
     /// trim, the multi-select load button and one row per slot. Gain / pan /
     /// tune / choke are **live** `set_node_param` writes (no rebuild); the
-    /// trigger key is display-only — reassigning it means remove + reload,
-    /// which keeps the table free of drag-to-rebuild races.
+    /// trigger key is a note-name drag that rebuilds the kit once per drop —
+    /// the RT table is indexed by key at construction, so a moved slot needs
+    /// a new processor, and `rebuild_drum_kit` swaps it in place.
     pub(crate) fn drum_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -1541,6 +1542,7 @@ impl GlitcherZApp {
         }
         let mut edits: Vec<(u8, u8, f32)> = Vec::new();
         let mut remove: Option<u8> = None;
+        let mut move_key: Option<(u8, u8)> = None;
         egui::Grid::new(format!("drum_grid_{doc_id}"))
             .num_columns(7)
             .spacing([8.0, 2.0])
@@ -1554,7 +1556,41 @@ impl GlitcherZApp {
                 ui.label("");
                 ui.end_row();
                 for slot in slots {
-                    ui.label(format!("key {}", slot.note));
+                    // The key reads as a note name (`C2 · 36`) and drags like a
+                    // number: a drum slot is identified by where it sounds, and
+                    // a bare 36 has no visible row in the roll. The rebuild is
+                    // deferred to the drop so one drag is one rebuild and one
+                    // undo step.
+                    let mut key = u16::from(slot.note);
+                    let key_response = ui
+                        .add_sized(
+                            [64.0, ui.spacing().interact_size.y],
+                            egui::DragValue::new(&mut key)
+                                .range(0..=127)
+                                .speed(1.0)
+                                .custom_formatter(|value, _| {
+                                    let note = value.round().clamp(0.0, 127.0) as u8;
+                                    format!("{} · {note}", glitcherz_model::note_name(note))
+                                }),
+                        )
+                        .on_hover_text(
+                            "Trigger key — drag to move this slot. Keys already in \
+                             use snap to the nearest free one.",
+                        );
+                    // The drop frame carries no value change (egui clears its
+                    // drag accumulator on release), so the last dragged key is
+                    // remembered per widget id until the button comes up.
+                    if key_response.drag_stopped() {
+                        let target = ui
+                            .data(|data| data.get_temp::<u8>(key_response.id))
+                            .unwrap_or(slot.note);
+                        ui.data_mut(|data| data.remove::<u8>(key_response.id));
+                        move_key = Some((slot.note, target));
+                    } else if key_response.changed() && !key_response.dragged() {
+                        move_key = Some((slot.note, key.min(127) as u8));
+                    } else if key_response.dragged() && key_response.changed() {
+                        ui.data_mut(|data| data.insert_temp(key_response.id, key.min(127) as u8));
+                    }
                     let stem = std::path::Path::new(&slot.path)
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
@@ -1612,6 +1648,9 @@ impl GlitcherZApp {
             });
         for (note, field, value) in edits {
             self.apply_drum_slot_edit(doc_id, note, field, value);
+        }
+        if let Some((from, to)) = move_key {
+            self.move_drum_slot(doc_id, from, to);
         }
         if let Some(note) = remove {
             self.remove_drum_slot(doc_id, note);

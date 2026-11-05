@@ -17,8 +17,8 @@
 use eframe::egui;
 use glitcherz_model::{AutoPoint, ControlClip, MidiClip, MidiTrack, Note, Sequence, TICKS_PER_BAR};
 use glitcherz_ui::piano_roll::{
-    CURVE_LANE_COLLAPSED_HEIGHT, ClipRef, OverlayLane, ROW_HEIGHT, RollIntent, RollMode, RollState,
-    RollSubject,
+    CURVE_LANE_COLLAPSED_HEIGHT, ClipRef, KEYS_WIDTH, OverlayLane, ROW_HEIGHT, RollIntent,
+    RollMode, RollState, RollSubject,
 };
 
 /// 1600 px wide on purpose: the default view shows two bars, so this keeps
@@ -44,7 +44,7 @@ struct Fixture {
     state: RollState,
     /// Hover-follow focus arbiter, mirroring the app's per-frame flow.
     router: glitcherz_ui::focus::FocusRouter,
-    /// Roll rect left edge (the roll spans the panel's full width).
+    /// Roll rect left edge (the note area starts after the keyboard column).
     left: f32,
     ticks_to_x: f32,
     /// Screen y of pitch 60's row (calibrated, not derived).
@@ -107,8 +107,8 @@ impl Fixture {
         fixture
     }
 
-    /// Learns the panel geometry: the roll is allocated at the panel's
-    /// full width, so its left edge is the panel's left edge.
+    /// Learns the panel geometry: the roll fills the panel minus the keyboard
+    /// column on its left edge, so its note area starts `KEYS_WIDTH` in.
     ///
     /// The horizontal scale is the **default view**: the fit basis is the
     /// context span, with a floor of two bars (a one-bar clip alone used to
@@ -123,8 +123,11 @@ impl Fixture {
             });
         });
         out.textures_delta.clear();
-        self.left = rect.left();
-        self.ticks_to_x = rect.width() / (2.0 * TICKS_PER_BAR as f32);
+        // The roll's note area starts after the keyboard column, and the fit
+        // scale divides the *remaining* width — the column is chrome, not
+        // timeline.
+        self.left = rect.left() + KEYS_WIDTH;
+        self.ticks_to_x = (rect.width() - KEYS_WIDTH) / (2.0 * TICKS_PER_BAR as f32);
     }
 
     /// Probes clicks down a vertical line until one lands on note A,
@@ -133,8 +136,9 @@ impl Fixture {
     /// combo or the mode chip.
     fn calibrate(&mut self) {
         let mut y = 60.0;
+        let probes = [self.left + 30.0, self.left + 45.0];
         while y < 520.0 {
-            for x in [30.0, 45.0] {
+            for x in probes {
                 if self.click_hits_note_a(egui::pos2(x, y)) {
                     self.y60 = y;
                     return;

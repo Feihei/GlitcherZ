@@ -20,7 +20,7 @@ use glitcherz_model::{
     AutoParam, BuiltinEffectKind, CableDoc, CableKind, ChannelParam, CurveMapParams, GraphDoc,
     LFO_DIVISION_LABELS, LayoutDoc, MAX_AUDIO_TRACKS, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS,
     MAX_MIXER_CHANNELS, MIN_MIXER_CHANNELS, MidiSource, NodeDoc, NodeParam, PortRef, TrackKind,
-    VoiceSpec, timeline_in_port, timeline_in_port_kind,
+    VoiceSpec, note_name, timeline_in_port, timeline_in_port_kind,
 };
 
 /// Inline parameter identity for built-in node kinds (G5, spec
@@ -1765,16 +1765,6 @@ fn file_stem_of(path: &str) -> String {
         .map(|s| s.to_string_lossy().into_owned())
         .map(|s| truncate(&s, 10))
         .unwrap_or_default()
-}
-
-/// MIDI note number → scientific pitch name (`60` → `C4`).
-fn note_name(note: u8) -> String {
-    const NAMES: [&str; 12] = [
-        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-    ];
-    let name = NAMES[(note % 12) as usize];
-    let octave = (note / 12) as i32 - 1;
-    format!("{name}{octave}")
 }
 
 /// Entity label.

@@ -242,15 +242,10 @@ const KEYMAP: &[(egui::Key, u8)] = &[
     (egui::Key::Semicolon, 16),
 ];
 
-const NOTE_NAMES: [&str; 12] = [
-    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-];
-
-/// MIDI note number → note name (e.g. 69 → "A4").
-fn note_name(note: u8) -> String {
-    let octave = note as i32 / 12 - 1;
-    format!("{}{octave}", NOTE_NAMES[(note % 12) as usize])
-}
+/// MIDI note number → note name (e.g. 69 → "A4"). Re-exported so the panels
+/// that reach helpers through `super::*` share the model's single octave
+/// convention instead of keeping a private copy.
+pub(crate) use glitcherz_model::note_name;
 
 /// Two-cycle LFO shape preview for the Inspector (spec `lfo.md` §6).
 ///

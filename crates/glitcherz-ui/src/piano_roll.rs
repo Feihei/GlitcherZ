@@ -59,6 +59,14 @@ pub const MAX_ROLL_CONTEXT: usize = 8;
 /// Height of each semitone row (pixels).
 pub const ROW_HEIGHT: f32 = 9.0;
 
+/// Width of the keyboard column on the left edge of the roll (pixels).
+///
+/// The column is what makes a MIDI number findable: without it a lane, a drum
+/// slot or a status-bar "C2" has no row to point at. Every strip that shares
+/// the roll's time axis (velocity lane, curve lanes) is shifted by the same
+/// amount, so notes and lanes stay aligned.
+pub const KEYS_WIDTH: f32 = 64.0;
+
 /// Fallback roll-area height (pixels, 32 semitone rows).
 ///
 /// [`show`] normally fills whatever height the caller leaves (the Edit tab
@@ -1530,9 +1538,25 @@ pub fn show(
     } else {
         ROLL_HEIGHT
     };
-    let width = ui.available_width();
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, roll_h), egui::Sense::click_and_drag());
+    let full_width = ui.available_width();
+    // The keyboard column is chrome, not note area: every note / tick / hit
+    // test derives from `roll_rect`, so clicking a key name can never draw a
+    // note on the row it labels. `allocate_space` reserves the row without
+    // registering a widget — the interaction lives on `roll_rect` alone.
+    let (_, outer) = ui.allocate_space(egui::vec2(full_width, roll_h));
+    let keys_rect = egui::Rect::from_min_max(
+        outer.left_top(),
+        egui::pos2(outer.left() + KEYS_WIDTH, outer.bottom()),
+    );
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(outer.left() + KEYS_WIDTH, outer.top()),
+        outer.right_bottom(),
+    );
+    let response = ui.interact(
+        rect,
+        ui.id().with("roll-notes"),
+        egui::Sense::click_and_drag(),
+    );
     // The roll owns keyboard focus while hovered (the app-level FocusRouter
     // assigns it before layout); the click itself is handled in the
     // interaction section below (it needs the pointer→tick/pitch helpers
@@ -1545,6 +1569,7 @@ pub fn show(
     }
     state.had_focus = response.has_focus();
     state.focus_id = Some(response.id);
+    let width = rect.width();
 
     // ---- View navigation: Ctrl+wheel zooms the time axis, Ctrl+Alt+wheel
     // zooms the pitch axis (egui's vertical-only zoom), Shift+wheel scrolls
@@ -1676,6 +1701,49 @@ pub fn show(
             loop_ticks,
         )
     });
+
+    // 0. Keyboard column: white/black key blocks with the C of every octave
+    //    labelled. Without it a MIDI number has no visible anchor — the row
+    //    shading says "black key" but not *which* octave, which is exactly
+    //    what the drum table, the event list and the status bar name.
+    let keys_painter = ui.painter_at(keys_rect);
+    keys_painter.rect_filled(keys_rect, 0.0, egui::Color32::from_gray(20));
+    for note in min_note..=top_note {
+        if !(0..=127).contains(&note) {
+            continue;
+        }
+        let y = rect.top() + (top_note - note) as f32 * row_h;
+        let black = is_black_key(note);
+        // Real-keyboard silhouette: white keys span the row edge to edge,
+        // black keys are the shorter, darker block sitting on a row boundary.
+        // At 9 px per row the outline still reads as a keyboard.
+        let block = egui::Rect::from_min_size(
+            egui::pos2(keys_rect.left(), y),
+            egui::vec2(if black { KEYS_WIDTH * 0.62 } else { KEYS_WIDTH }, row_h),
+        );
+        keys_painter.rect_filled(
+            block,
+            0.0,
+            if black {
+                egui::Color32::from_gray(46)
+            } else {
+                egui::Color32::from_gray(92)
+            },
+        );
+        if note % 12 == 0 {
+            keys_painter.text(
+                egui::pos2(keys_rect.right() - 4.0, y + row_h * 0.5),
+                egui::Align2::RIGHT_CENTER,
+                glitcherz_model::note_name(note as u8),
+                egui::FontId::monospace((row_h * 0.95).clamp(8.0, 11.0)),
+                egui::Color32::from_gray(28),
+            );
+        }
+    }
+    keys_painter.line_segment(
+        [keys_rect.right_top(), keys_rect.right_bottom()],
+        egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+    );
 
     // 1. Row background (black keys darker).
     for note in min_note..=top_note {
@@ -1846,8 +1914,7 @@ pub fn show(
     }
 
     // ---- Velocity lane (M2.4): bars under the roll, drag to set. ----
-    let (lane_rect, lane_response) =
-        ui.allocate_exact_size(egui::vec2(width, LANE_HEIGHT), egui::Sense::drag());
+    let (lane_rect, lane_response) = allocate_roll_strip(ui, LANE_HEIGHT, egui::Sense::drag());
     // Same time axis, its own strip: `over` moves only the left edge and the
     // vertical anchor, so the bars line up with the notes above them.
     let lane_geom = geom.over(lane_rect);
@@ -1887,7 +1954,18 @@ pub fn show(
     // ---- Overlay curve lanes (P4, D8/D16): one strip per control clip in
     // the context, sharing the roll's time axis and carrying its own value
     // axis. They are writable and write **their own** clip, never the focus.
-    let lane_intent = curve_lanes(ui, width, &geom, lanes, state);
+    let lane_intent = curve_lanes(ui, &geom, lanes, state);
+
+    // The keyboard column ends with the notes, but the strips below keep the
+    // same left inset — fill that gutter so it reads as chrome instead of a
+    // hole in the layout.
+    let gutter_bottom = ui.cursor().top() - ui.spacing().item_spacing.y;
+    let gutter = egui::Rect::from_min_max(
+        egui::pos2(keys_rect.left(), lane_rect.top()),
+        egui::pos2(keys_rect.right(), gutter_bottom.max(lane_rect.bottom())),
+    );
+    ui.painter_at(gutter)
+        .rect_filled(gutter, 0.0, egui::Color32::from_gray(14));
 
     // ---- Keyboard: mode + the modal command family (M4a). ----
     // Gated on focus so the keys never leak into text fields elsewhere.
@@ -2594,13 +2672,28 @@ pub fn show(
 
 /// Draws the overlay curve lanes and returns their edit for this frame.
 ///
+/// Allocates a strip under the roll that shares its time axis: same left edge
+/// as the note area (the keyboard column is skipped) and the same width, so
+/// `RollGeom::over` maps ticks onto the same pixels as the notes above.
+fn allocate_roll_strip(
+    ui: &mut egui::Ui,
+    height: f32,
+    sense: egui::Sense,
+) -> (egui::Rect, egui::Response) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(KEYS_WIDTH);
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), sense)
+    })
+    .inner
+}
+
 /// Layout: one strip per lane, stacked directly under the velocity lane, all
 /// using the roll's time axis (`geom.over`) and the lane's clip origin
 /// (`at_origin`). Nothing here touches the note machinery — a lane edit is a
 /// curve command on its own control clip (D16).
 fn curve_lanes(
     ui: &mut egui::Ui,
-    width: f32,
     geom: &RollGeom,
     lanes: &[OverlayLane<'_>],
     state: &mut RollState,
@@ -2619,8 +2712,7 @@ fn curve_lanes(
         } else {
             CURVE_LANE_HEIGHT
         };
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+        let (rect, response) = allocate_roll_strip(ui, height, egui::Sense::click_and_drag());
         // Time axis of *this* clip: same pixels per tick, own origin.
         state.lane_rects.push(rect);
         let lane_geom = geom.at_origin(i64::from(lane.data.start_ticks)).over(rect);
