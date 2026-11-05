@@ -131,6 +131,25 @@ pub enum ParamId {
     /// fade), ≥ 0.5 = OneShot (pitch-matched note-offs are ignored; the
     /// blanket transport sweep still stops the voice).
     SamplePlayMode,
+    /// Sample voice: first frame of the head (source frames, rounded;
+    /// spec `sample-player.md` D12). Frozen into voices at trigger time,
+    /// like [`ParamId::SampleRootNote`].
+    ///
+    /// Frames ride the `f32` parameter channel, which is exact up to
+    /// 2^24 frames (~5.8 min at 48 kHz) — far beyond any playable sample.
+    SampleStart,
+    /// Sample voice: loop window start (source frames). `0` = file start.
+    SampleLoopStart,
+    /// Sample voice: loop window end / start of the tail (source frames).
+    /// `0` = [`ParamId::SampleEnd`].
+    SampleLoopEnd,
+    /// Sample voice: exclusive end of the window (source frames). `0` = the
+    /// file's last frame, so an unset region is the whole sample.
+    SampleEnd,
+    /// Sample voice: loop mode — 0 = Off, 1 = Forward, 2 = Ping-pong.
+    /// OneShot voices ignore the loop (they play head → loop → tail once;
+    /// spec D14).
+    SampleLoopMode,
     /// Drum kit: node output trim (linear, clamped 0..2; spec
     /// `drum-kit.md` K8). Applies immediately to every sounding voice.
     DrumGain,

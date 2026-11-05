@@ -532,6 +532,7 @@ impl GlitcherZApp {
                     root_note: SAMPLE_DEFAULT_ROOT,
                     play_mode: SamplePlayMode::Gate,
                     gain: 1.0,
+                    region: glitcherz_model::SampleRegion::default(),
                 },
                 synth: SynthParams::default(),
             },

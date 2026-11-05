@@ -208,6 +208,7 @@ impl GlitcherZApp {
                                     root_note,
                                     play_mode,
                                     gain,
+                                    ..
                                 },
                             ..
                         } => Some((

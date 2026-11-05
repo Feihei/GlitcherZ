@@ -268,6 +268,7 @@ impl GlitcherZApp {
                         root_note,
                         play_mode,
                         gain,
+                        ..
                     } => {
                         if path.is_empty() {
                             // v3: born without a file — silent until the
@@ -832,6 +833,7 @@ impl GlitcherZApp {
                         root_note,
                         play_mode,
                         gain,
+                        region,
                         ..
                     } => vec![
                         (ParamId::SampleRootNote, f32::from(*root_note)),
@@ -844,6 +846,14 @@ impl GlitcherZApp {
                             },
                         ),
                         (ParamId::SampleGain, *gain),
+                        // D12: the play window rides the same push, so a
+                        // trim edit, an undo and a fresh node all land on the
+                        // processor through one path.
+                        (ParamId::SampleStart, region.start as f32),
+                        (ParamId::SampleLoopStart, region.loop_start as f32),
+                        (ParamId::SampleLoopEnd, region.loop_end as f32),
+                        (ParamId::SampleEnd, region.end as f32),
+                        (ParamId::SampleLoopMode, f32::from(region.loop_mode.index())),
                     ],
                     VoiceSpec::DrumKit { slots, gain } => {
                         let mut values = vec![(ParamId::DrumGain, *gain)];

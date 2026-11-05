@@ -43,6 +43,8 @@ impl GlitcherZApp {
                     root_note,
                     play_mode,
                     gain,
+                    region,
+                    ..
                 } => match self.obtain_sample_voice(path, sr) {
                     Ok(mut processor) => {
                         processor.set_param(ParamId::SampleRootNote, f32::from(*root_note));
@@ -55,6 +57,17 @@ impl GlitcherZApp {
                             },
                         );
                         processor.set_param(ParamId::SampleGain, *gain);
+                        // D12: the offline render must hear the same window as
+                        // the live graph, or an export of a trimmed loop would
+                        // play material the user never hears.
+                        processor.set_param(ParamId::SampleStart, region.start as f32);
+                        processor.set_param(ParamId::SampleLoopStart, region.loop_start as f32);
+                        processor.set_param(ParamId::SampleLoopEnd, region.loop_end as f32);
+                        processor.set_param(ParamId::SampleEnd, region.end as f32);
+                        processor.set_param(
+                            ParamId::SampleLoopMode,
+                            f32::from(region.loop_mode.index()),
+                        );
                         (Box::new(processor), None)
                     }
                     Err(err) => {

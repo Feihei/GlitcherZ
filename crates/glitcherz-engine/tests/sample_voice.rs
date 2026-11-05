@@ -505,3 +505,147 @@ fn pitch_offset_moves_a_voice_that_is_already_playing() {
         "an octave down halves the rate without a retrigger, got {slowed}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// D12–D15: head / loop / tail split
+// ---------------------------------------------------------------------------
+
+/// Renders `blocks` blocks and returns the whole left-channel stream.
+fn render_stream(proc: &mut SampleVoiceProcessor, blocks: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(blocks * BLOCK);
+    let mut buffer = AudioBuffer::new(2, BLOCK);
+    for _ in 0..blocks {
+        buffer.set_len(BLOCK);
+        buffer.clear();
+        proc.process(&ctx(BLOCK), &mut buffer);
+        out.extend_from_slice(buffer.channel(0).expect("stereo"));
+    }
+    out
+}
+
+/// Sets the four window points plus the loop mode in one go.
+fn set_region(
+    proc: &mut SampleVoiceProcessor,
+    start: f32,
+    loop_start: f32,
+    loop_end: f32,
+    end: f32,
+    mode: f32,
+) {
+    proc.set_param(ParamId::SampleStart, start);
+    proc.set_param(ParamId::SampleLoopStart, loop_start);
+    proc.set_param(ParamId::SampleLoopEnd, loop_end);
+    proc.set_param(ParamId::SampleEnd, end);
+    proc.set_param(ParamId::SampleLoopMode, mode);
+}
+
+/// A forward loop keeps the cursor inside the loop window forever: a ramp
+/// sample proves it by staying inside the ramp's own band (a cursor that
+/// escaped would read a value outside it), and the voice is still sounding
+/// after five loop lengths.
+#[test]
+fn a_forward_loop_repeats_the_window() {
+    let fixture = ramp_fixture("loop-fwd", 1000, 48_000, 1.0 / 1000.0);
+    let mut proc = make_processor(&fixture);
+    set_region(&mut proc, 100.0, 200.0, 300.0, 1000.0, 1.0);
+    proc.note_event(note_on(ROOT));
+
+    let stream = render_stream(&mut proc, 40); // 5120 frames = 51 loop lengths
+    // The head (frames 100..200 of the source) plays first, then the loop.
+    for (i, sample) in stream.iter().enumerate().skip(100) {
+        assert!(
+            (0.19..=0.31).contains(sample),
+            "frame {i} = {sample} left the loop band"
+        );
+    }
+    assert!(
+        stream[stream.len() - 1].abs() > 0.15,
+        "a held loop must still be sounding"
+    );
+}
+
+/// Ping-pong reflects at both loop edges instead of jumping: on a ramp the
+/// seam is invisible (no sample-to-sample step larger than the ramp slope),
+/// while a forward loop jumps by the whole loop's height at the wrap.
+#[test]
+fn a_pingpong_loop_has_no_seam() {
+    let slope = 1.0 / 1000.0;
+    let fixture = ramp_fixture("loop-pingpong", 1000, 48_000, slope);
+    let mut proc = make_processor(&fixture);
+    set_region(&mut proc, 100.0, 200.0, 300.0, 1000.0, 2.0);
+    proc.note_event(note_on(ROOT));
+
+    let stream = render_stream(&mut proc, 20);
+    let looped = &stream[100..];
+    let biggest_step = looped
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).abs())
+        .fold(0.0f32, f32::max);
+    // Two interpolation steps of the ramp, plus 16-bit fixture quantisation.
+    assert!(
+        biggest_step < 8.0 * slope,
+        "ping-pong seam: step of {biggest_step} vs slope {slope}"
+    );
+    assert!(
+        looped.iter().all(|s| (0.19..=0.31).contains(s)),
+        "the cursor must stay inside the loop window"
+    );
+}
+
+/// Releasing a Gate voice that is inside its loop plays the **tail** first
+/// and only fades over its last ~10 ms, so the tail is audible — the whole
+/// point of the split. The same release on an unlooped voice keeps the old
+/// immediate fade.
+#[test]
+fn a_gate_release_plays_the_tail_before_fading() {
+    let fixture = flat_fixture("tail", 1000, 48_000, 0.5);
+
+    let mut looped = make_processor(&fixture);
+    set_region(&mut looped, 100.0, 200.0, 400.0, 1000.0, 1.0);
+    looped.note_event(note_on(ROOT));
+    let _ = render_stream(&mut looped, 3); // 384 frames: inside the loop
+    looped.note_event(NoteEvent::Off { note: ROOT });
+    let tail = render_stream(&mut looped, 10);
+    let audible = tail.iter().filter(|s| s.abs() > 0.1).count();
+    // Tail = frames 400..1000 = 600 engine frames at root rate; its last 480
+    // fade, so everything above 0.1 ends ~504 frames in (600 - 480 + 80 % of
+    // the fade). Anything near 384 would mean the tail never played.
+    assert!(
+        audible >= 480,
+        "the tail was cut short: {audible} audible frames"
+    );
+
+    let mut plain = make_processor(&fixture);
+    plain.note_event(note_on(ROOT));
+    let _ = render_stream(&mut plain, 3);
+    plain.note_event(NoteEvent::Off { note: ROOT });
+    let faded = render_stream(&mut plain, 10);
+    let plain_audible = faded.iter().filter(|s| s.abs() > 0.1).count();
+    assert!(
+        audible > plain_audible + 80,
+        "the looped tail ({audible} frames) must outlast the bare fade \
+         ({plain_audible} frames)"
+    );
+}
+
+/// OneShot never loops: with a loop configured the window plays once
+/// (head → loop → tail) and stops at `end`, so a drum hit cannot run
+/// forever.
+#[test]
+fn a_one_shot_plays_the_window_once() {
+    let fixture = flat_fixture("oneshot-window", 1000, 48_000, 0.5);
+    let mut proc = make_processor(&fixture);
+    set_region(&mut proc, 0.0, 100.0, 200.0, 400.0, 1.0);
+    proc.set_param(ParamId::SamplePlayMode, 1.0);
+    proc.note_event(note_on(ROOT));
+
+    let stream = render_stream(&mut proc, 10); // 1280 frames > the 400-frame window
+    assert!(
+        stream[..300].iter().any(|s| s.abs() > 0.1),
+        "the window must sound"
+    );
+    assert!(
+        stream[420..].iter().all(|s| s.abs() < 1e-6),
+        "a one-shot must stop at the window end"
+    );
+}

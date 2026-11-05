@@ -1897,6 +1897,11 @@ pub enum VoiceSpec {
         /// Output gain (linear, 0..=2, default 1.0).
         #[serde(default = "sample_default_gain")]
         gain: f32,
+        /// Play window and loop points inside the file (spec
+        /// `sample-player.md` D12: head / loop / tail split). `default`
+        /// keeps every pre-D12 project on the whole sample.
+        #[serde(default)]
+        region: SampleRegion,
     },
     /// Multi-sample drum kit (W1, spec `drum-kit.md`): each slot maps one
     /// MIDI key to a short wav. Sample data stays out of the document (the
@@ -1949,6 +1954,135 @@ pub enum SamplePlayMode {
 /// Serde default for [`VoiceSpec::Sample`]'s `root_note` (60 = C4).
 fn sample_default_root() -> u8 {
     60
+}
+
+/// How a looped sample repeats (spec `sample-player.md` D12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum SampleLoopMode {
+    /// No loop: the sample plays straight through (pre-D12 behavior).
+    #[default]
+    Off,
+    /// Jump back to `loop_start` at `loop_end` (the usual sustain loop).
+    Forward,
+    /// Bounce: play forward to `loop_end`, then backwards to `loop_start`
+    /// without a seam (LMMS / hardware sampler ping-pong).
+    PingPong,
+}
+
+impl SampleLoopMode {
+    /// Every mode, in the engine's parameter order (0 = Off).
+    pub const ALL: [Self; 3] = [Self::Off, Self::Forward, Self::PingPong];
+
+    /// Numeric index used by `ParamId::SampleLoopMode` and the UI radios.
+    pub fn index(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Forward => 1,
+            Self::PingPong => 2,
+        }
+    }
+
+    /// UI label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Forward => "Forward",
+            Self::PingPong => "Ping-pong",
+        }
+    }
+}
+
+/// Play window and loop points of a sample voice, in **source frames**
+/// (spec `sample-player.md` D12/D13).
+///
+/// Frames, not seconds: the document must not care about the file's sample
+/// rate, and trimming is a waveform gesture. `0` on `loop_end` / `end` means
+/// "the end of the file": the document does not carry the length, and a
+/// sample that is later replaced by a longer one should not keep an
+/// accidental cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct SampleRegion {
+    /// First frame of the head.
+    #[serde(default)]
+    pub start: u32,
+    /// Loop window start (used while a Gate note is held).
+    #[serde(default)]
+    pub loop_start: u32,
+    /// Loop window end / start of the tail. `0` = `end`.
+    #[serde(default)]
+    pub loop_end: u32,
+    /// Exclusive end of the window. `0` = the last frame of the file.
+    #[serde(default)]
+    pub end: u32,
+    /// Whether and how the loop window repeats.
+    #[serde(default)]
+    pub loop_mode: SampleLoopMode,
+}
+
+impl SampleRegion {
+    /// Whether this region is the whole, unlooped sample (the pre-D12
+    /// shape) — callers skip the trim UI's reset affordance on it.
+    pub fn is_full_sample(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Resolves the window against a concrete sample length (`frames` =
+    /// number of frame pairs in the file). Returns exclusive bounds plus
+    /// the loop window, all clamped into the file.
+    ///
+    /// Shared by the engine-side trigger path and the UI's waveform view so
+    /// a handle can never promise a frame the renderer will not reach.
+    pub fn resolve(&self, frames: u32) -> ResolvedSampleRegion {
+        // The last interpolatable frame pair (`i + 1` must exist).
+        let last = frames.saturating_sub(1);
+        let end = if self.end == 0 {
+            last
+        } else {
+            self.end.min(last)
+        };
+        let start = self.start.min(end);
+        let loop_end = if self.loop_end == 0 {
+            end
+        } else {
+            self.loop_end.min(end)
+        };
+        let loop_start = self.loop_start.min(loop_end);
+        ResolvedSampleRegion {
+            start,
+            loop_start,
+            loop_end,
+            end,
+            loop_mode: self.loop_mode,
+            // A zero-width window is not a loop: refusing here keeps every
+            // renderer from having to re-check.
+            loops: self.loop_mode != SampleLoopMode::Off && loop_end.saturating_sub(loop_start) > 1,
+        }
+    }
+}
+
+/// [`SampleRegion`] with every position resolved against the file length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedSampleRegion {
+    pub start: u32,
+    pub loop_start: u32,
+    pub loop_end: u32,
+    pub end: u32,
+    pub loop_mode: SampleLoopMode,
+    /// `loop_mode != Off` **and** the loop window is wider than one frame.
+    pub loops: bool,
+}
+
+impl Default for ResolvedSampleRegion {
+    fn default() -> Self {
+        Self {
+            start: 0,
+            loop_start: 0,
+            loop_end: 0,
+            end: 0,
+            loop_mode: SampleLoopMode::Off,
+            loops: false,
+        }
+    }
 }
 
 /// Capacity of one drum kit (W1, spec `drum-kit.md` K3). 32 overlapping
@@ -5678,7 +5812,7 @@ mod tests {
         MAX_BEND_RANGE, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES, MAX_TEMPO_BPM,
         MIN_BEND_RANGE, MIN_TEMPO_BPM, MapMode, MapSpec, MidiClip, MidiEnvelopeParams, MidiSource,
         MidiTrack, MixerChannel, NodeDoc, NodeParam, PortRef, PortamentoParams, Project,
-        SamplePlayMode, SynthParams, SynthWaveform, TICKS_PER_BAR, TICKS_PER_QUARTER,
+        SamplePlayMode, SampleRegion, SynthParams, SynthWaveform, TICKS_PER_BAR, TICKS_PER_QUARTER,
         TICKS_PER_STEP, TrackKind, VoiceSpec, default_audio_source_len, default_graph_doc,
     };
 
@@ -6669,12 +6803,14 @@ mod tests {
                 root_note: 60,
                 play_mode: SamplePlayMode::Gate,
                 gain: 1.0,
+                region: SampleRegion::default(),
             },
             VoiceSpec::Sample {
                 path: "hat.wav".to_string(),
                 root_note: 48,
                 play_mode: SamplePlayMode::OneShot,
                 gain: 0.5,
+                region: SampleRegion::default(),
             },
             VoiceSpec::DrumKit {
                 slots: Vec::new(),
@@ -6820,6 +6956,7 @@ mod tests {
             root_note: 48,
             play_mode: SamplePlayMode::OneShot,
             gain: 0.5,
+            region: SampleRegion::default(),
         };
         let text = ron::to_string(&sample).expect("serialization failed");
         assert!(
@@ -6836,7 +6973,8 @@ mod tests {
                 path: "kick.wav".to_string(),
                 root_note: 60,
                 play_mode: SamplePlayMode::Gate,
-                gain: 1.0
+                gain: 1.0,
+                region: SampleRegion::default()
             }
         );
         // Serialized names of the play mode variants are snake_case.
@@ -7583,6 +7721,7 @@ mod tests {
                     root_note: 60,
                     play_mode: SamplePlayMode::Gate,
                     gain: 1.0,
+                    region: SampleRegion::default(),
                 },
                 synth: SynthParams::default(),
             });
@@ -8713,5 +8852,96 @@ mod tests {
         assert!(!legacy_text.contains("map"));
         let parsed: CableDoc = ron::from_str(&legacy_text).expect("legacy cable");
         assert_eq!(parsed, legacy);
+    }
+}
+
+#[cfg(test)]
+mod sample_region_tests {
+    use super::{SampleLoopMode, SampleRegion};
+
+    /// A sample of `frames` frame pairs has `frames - 1` as the last
+    /// interpolatable position; `end == 0` means "the whole file", and every
+    /// handle is clamped inside it so the UI can never point past the data.
+    #[test]
+    fn zero_bounds_mean_the_whole_sample() {
+        let whole = SampleRegion::default().resolve(48_000);
+        assert_eq!(whole.start, 0);
+        assert_eq!(whole.loop_start, 0);
+        assert_eq!(whole.loop_end, 47_999);
+        assert_eq!(whole.end, 47_999);
+        assert!(!whole.loops, "Off never loops");
+        assert!(SampleRegion::default().is_full_sample());
+    }
+
+    #[test]
+    fn explicit_bounds_are_kept_and_clamped() {
+        let region = SampleRegion {
+            start: 100,
+            loop_start: 500,
+            loop_end: 1_500,
+            end: 2_000,
+            loop_mode: SampleLoopMode::Forward,
+        }
+        .resolve(48_000);
+        assert_eq!(
+            (region.start, region.loop_start, region.loop_end, region.end),
+            (100, 500, 1_500, 2_000)
+        );
+        assert!(region.loops);
+
+        // Bounds past the end clamp to the last frame, and a start past the
+        // window collapses onto `end` instead of inverting it.
+        let clipped = SampleRegion {
+            start: 90_000,
+            loop_start: 80_000,
+            loop_end: 90_000,
+            end: 90_000,
+            loop_mode: SampleLoopMode::PingPong,
+        }
+        .resolve(1_000);
+        assert_eq!(clipped.end, 999);
+        assert_eq!(clipped.start, 999);
+        assert_eq!(clipped.loop_end, 999);
+        assert_eq!(clipped.loop_start, 999);
+        assert!(!clipped.loops, "a zero-width window is not a loop");
+    }
+
+    /// One frame of loop is a click generator, not a loop: refuse it here so
+    /// every renderer inherits the same guard.
+    #[test]
+    fn a_one_frame_loop_does_not_loop() {
+        for mode in [SampleLoopMode::Forward, SampleLoopMode::PingPong] {
+            let region = SampleRegion {
+                loop_start: 100,
+                loop_end: 101,
+                end: 0,
+                loop_mode: mode,
+                ..SampleRegion::default()
+            }
+            .resolve(1_000);
+            assert!(!region.loops, "{mode:?} with one frame must not loop");
+        }
+        let two = SampleRegion {
+            loop_start: 100,
+            loop_end: 102,
+            loop_mode: SampleLoopMode::Forward,
+            ..SampleRegion::default()
+        }
+        .resolve(1_000);
+        assert!(two.loops);
+    }
+
+    /// Old projects carry no `region` key at all: the whole-sample default
+    /// must load, and the mode index must match the engine's parameter order.
+    #[test]
+    fn region_defaults_and_mode_indices() {
+        let partial: super::VoiceSpec =
+            ron::from_str("(type: \"sample\", path: \"kick.wav\")").expect("legacy file loads");
+        let super::VoiceSpec::Sample { region, .. } = partial else {
+            panic!("expected a sample voice");
+        };
+        assert!(region.is_full_sample(), "legacy file = whole sample");
+        assert_eq!(SampleLoopMode::ALL.map(SampleLoopMode::index), [0, 1, 2]);
+        assert_eq!(SampleLoopMode::default(), SampleLoopMode::Off);
     }
 }

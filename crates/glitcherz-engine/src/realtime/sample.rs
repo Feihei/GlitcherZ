@@ -51,7 +51,9 @@ const PITCH_OFFSET_LIMIT: f32 = 24.0;
 ///
 /// `rate` and `one_shot` are **frozen at trigger time** (D4): changing the
 /// node's root note or play mode mid-flight only affects voices spawned
-/// afterwards, which is the sampler-standard behaviour.
+/// afterwards, which is the sampler-standard behaviour. The play window
+/// (D12) is frozen the same way — a loop point that moved under a sounding
+/// voice would jump its cursor.
 #[derive(Debug, Clone, Copy)]
 struct Voice {
     /// Slot is occupied by a playing (or releasing) voice.
@@ -70,8 +72,23 @@ struct Voice {
     releasing: bool,
     /// Fade progress in frames (0..release_frames).
     fade_pos: f32,
+    /// Engine frames still to render before the fade starts (D15: the tail
+    /// plays out first, and only its last ~10 ms fade).
+    fade_wait: f32,
     /// Play mode frozen at trigger (D1).
     one_shot: bool,
+    /// Exclusive end of the window, in source frames.
+    end: f64,
+    /// Loop window, in source frames (`loop_end` = start of the tail).
+    loop_start: f64,
+    loop_end: f64,
+    /// The loop is live for this voice: mode != Off and not OneShot. Cleared
+    /// when a release jumps to the tail, so the tail never wraps.
+    wrapping: bool,
+    /// `PingPong` instead of `Forward` (frozen with the rest of the window).
+    pingpong: bool,
+    /// Cursor direction: `1.0` forward, `-1.0` reversed (ping-pong only).
+    dir: f64,
 }
 
 impl Voice {
@@ -85,9 +102,54 @@ impl Voice {
             vel_gain: 0.0,
             releasing: false,
             fade_pos: 0.0,
+            fade_wait: 0.0,
             one_shot: false,
+            end: 0.0,
+            loop_start: 0.0,
+            loop_end: 0.0,
+            wrapping: false,
+            pingpong: false,
+            dir: 1.0,
         }
     }
+}
+
+/// Loop mode values carried by [`ParamId::SampleLoopMode`]: `0` = off,
+/// `1` = forward (the renderer's default when a loop exists and is not
+/// ping-pong), `2` = ping-pong.
+const LOOP_OFF: u8 = 0;
+const LOOP_PINGPONG: u8 = 2;
+
+/// Play window resolved against the loaded sample, in source frames (D12).
+///
+/// The document-side twin is `glitcherz_model::SampleRegion::resolve`; the
+/// engine crate stays document-free, so the clamping rule lives in both
+/// places — the model's copy drives the waveform handles, this one drives the
+/// renderer, and both must agree on "0 means the end".
+#[derive(Debug, Clone, Copy)]
+struct Region {
+    start: f64,
+    loop_start: f64,
+    loop_end: f64,
+    end: f64,
+    mode: u8,
+}
+
+impl Region {
+    /// A loop needs a mode **and** a window wider than one frame.
+    fn loops(&self) -> bool {
+        self.mode != LOOP_OFF && self.loop_end - self.loop_start > 1.0
+    }
+}
+
+/// The raw parameter values, kept as integers so a re-resolve never drifts.
+#[derive(Debug, Clone, Copy, Default)]
+struct RawRegion {
+    start: u32,
+    loop_start: u32,
+    loop_end: u32,
+    end: u32,
+    mode: u8,
 }
 
 /// Polyphonic sample player: fixed voice pool + interpolated reads.
@@ -113,6 +175,11 @@ pub struct SampleVoiceProcessor {
     gain: f32,
     engine_rate: f64,
     release_frames: f32,
+    /// Document values of the play window (D12), and their resolution
+    /// against the loaded sample (recomputed on every region write, never
+    /// per block).
+    raw_region: RawRegion,
+    region: Region,
     left: Box<[f32]>,
     right: Box<[f32]>,
     /// Current pitch multiplier (`2^(offset/12)`), advanced **per frame**
@@ -139,6 +206,8 @@ impl SampleVoiceProcessor {
         } else {
             48_000.0
         };
+        let raw_region = RawRegion::default();
+        let region = resolve_region(raw_region, data.frames().len());
         Self {
             data,
             voices: vec![Voice::idle(); SAMPLE_POLYPHONY],
@@ -149,6 +218,8 @@ impl SampleVoiceProcessor {
             gain: 1.0,
             engine_rate: f64::from(rate),
             release_frames: (RELEASE_SECONDS * rate).max(1.0),
+            raw_region,
+            region,
             left: vec![0.0; FIXED_BLOCK_SIZE].into_boxed_slice(),
             right: vec![0.0; FIXED_BLOCK_SIZE].into_boxed_slice(),
             pitch_ratio: 1.0,
@@ -171,16 +242,27 @@ impl SampleVoiceProcessor {
 
     /// Spawns a voice; a full pool steals the oldest active slot (D4).
     fn spawn(&mut self, note: u8, vel_gain: f32) {
+        let region = self.region;
         let voice = Voice {
             active: true,
             note,
             age: 0,
-            pos: 0.0,
+            pos: region.start,
             rate: self.rate_for(note),
             vel_gain,
             releasing: false,
             fade_pos: 0.0,
+            fade_wait: 0.0,
             one_shot: self.one_shot,
+            end: region.end,
+            loop_start: region.loop_start,
+            loop_end: region.loop_end,
+            // D14: one-shot voices run the window once (head → loop → tail),
+            // so a drum hit cannot start cycling forever; only a held Gate
+            // note keeps the loop alive.
+            wrapping: region.loops() && !self.one_shot,
+            pingpong: region.mode == LOOP_PINGPONG,
+            dir: 1.0,
         };
         if self.active_count < SAMPLE_POLYPHONY {
             self.voices[self.active_count] = voice;
@@ -201,13 +283,33 @@ impl SampleVoiceProcessor {
     }
 
     /// Pitch-matched release (D1): enters Gate voices into the fade and
-    /// leaves OneShot voices running.
+    /// leaves OneShot voices running. A voice that was looping leaves the
+    /// loop for the **tail** first (D15) and only fades over the tail's last
+    /// ~10 ms, so the tail is actually heard.
     fn release_matching(&mut self, note: u8) {
+        let release_frames = self.release_frames;
+        let pitch = self.pitch_ratio.max(0.01);
         for i in 0..self.active_count {
             let voice = &mut self.voices[i];
             if voice.active && voice.note == note && !voice.one_shot && !voice.releasing {
                 voice.releasing = true;
                 voice.fade_pos = 0.0;
+                voice.fade_wait = 0.0;
+                let tail = voice.end - voice.loop_end;
+                // Only a voice that has actually reached the loop gets the
+                // tail treatment; a release inside the head keeps its
+                // ordinary 10 ms fade (jumping forward would cut the attack).
+                if voice.wrapping && tail > 1.0 && voice.pos >= voice.loop_start {
+                    // Jump to the tail start and stop wrapping. The fade is
+                    // deferred by however long the tail runs (in engine
+                    // frames) minus its own length: a tail shorter than the
+                    // fade just starts fading at once.
+                    voice.pos = voice.loop_end;
+                    voice.wrapping = false;
+                    let rate = (voice.rate * f64::from(pitch)).max(1e-9);
+                    let engine_frames = (tail / rate).min(f64::from(f32::MAX)) as f32;
+                    voice.fade_wait = (engine_frames - release_frames).max(0.0);
+                }
             }
         }
     }
@@ -348,6 +450,25 @@ impl Processor for SampleVoiceProcessor {
             ParamId::SamplePlayMode => {
                 self.one_shot = value >= 0.5;
             }
+            // D12: the play window. Positions are frozen into voices at
+            // trigger (D4's freeze rule), so a write here only changes what
+            // the *next* note-on plays — no cursor jumps under a sounding
+            // voice.
+            ParamId::SampleStart
+            | ParamId::SampleLoopStart
+            | ParamId::SampleLoopEnd
+            | ParamId::SampleEnd
+            | ParamId::SampleLoopMode => {
+                let frame = param_to_u32(value);
+                match id {
+                    ParamId::SampleStart => self.raw_region.start = frame,
+                    ParamId::SampleLoopStart => self.raw_region.loop_start = frame,
+                    ParamId::SampleLoopEnd => self.raw_region.loop_end = frame,
+                    ParamId::SampleEnd => self.raw_region.end = frame,
+                    _ => self.raw_region.mode = frame.min(2) as u8,
+                }
+                self.region = resolve_region(self.raw_region, self.data.frames().len());
+            }
             // P1/D11: unlike `SampleRootNote`, the offset applies to
             // **sounding** voices too — a bend that only affected new notes
             // could not slide.
@@ -368,8 +489,14 @@ impl Processor for SampleVoiceProcessor {
 /// interpolation over pre-decoded frames, no allocation.
 ///
 /// The fade (D2) is linear over `release_frames`; a voice ends when it
-/// either plays past the last frame pair (natural end, no fade — the
-/// sample itself is the timbre) or completes its fade.
+/// either plays past its window's end (natural end, no fade — the sample
+/// itself is the timbre) or completes its fade.
+///
+/// Looping (D12/D13): the cursor wraps at `loop_end` back to `loop_start`,
+/// or bounces between them for ping-pong. The wrap uses `rem_euclid` over
+/// the loop period instead of a `while` subtraction, so a huge pitch ratio
+/// (a sample played four octaves down still steps a fraction of a frame, but
+/// a rate of 10× would step ten frames) can never spin the loop.
 // The voice owns its cursor/gain state, the processor its sample/gain/pitch
 // ramp, and the two output slices are the destination — bundling them into a
 // context struct would allocate or borrow-split what is a hot inner loop.
@@ -385,19 +512,23 @@ fn render_voice(
     out_r: &mut [f32],
 ) {
     let src = data.frames();
-    // Last interpolatable start index (needs i + 1 to exist).
-    let last = src.len().saturating_sub(1);
     for f in 0..frames {
-        if !voice.active || voice.pos >= last as f64 {
+        if !voice.active || voice.pos >= voice.end {
             voice.active = false;
             break;
         }
         let mut g = voice.vel_gain * master_gain;
         if voice.releasing {
-            g *= 1.0 - voice.fade_pos / release_frames;
-            voice.fade_pos += 1.0;
-            if voice.fade_pos >= release_frames {
-                voice.active = false;
+            if voice.fade_wait > 0.0 {
+                // D15: the tail is still playing; the fade starts when only
+                // one fade-length of it is left.
+                voice.fade_wait -= 1.0;
+            } else {
+                g *= 1.0 - voice.fade_pos / release_frames;
+                voice.fade_pos += 1.0;
+                if voice.fade_pos >= release_frames {
+                    voice.active = false;
+                }
             }
         }
         let i = voice.pos as usize;
@@ -406,12 +537,47 @@ fn render_voice(
         let b = src[i + 1];
         out_l[f] += (a[0] + (b[0] - a[0]) * frac) * g;
         out_r[f] += (a[1] + (b[1] - a[1]) * frac) * g;
-        voice.pos += voice.rate * f64::from(pitch_ramp.get(f).copied().unwrap_or(1.0));
+        voice.pos += voice.dir * voice.rate * f64::from(pitch_ramp.get(f).copied().unwrap_or(1.0));
+        if voice.wrapping {
+            wrap_into_loop(voice);
+        }
     }
     // Natural end inside the block: only clamp when the cursor has run
-    // past the final pair (checked again on the next block's first frame).
-    if voice.pos >= last as f64 {
+    // past the final frame pair (checked again on the next block's first
+    // frame).
+    if voice.pos >= voice.end {
         voice.active = false;
+    }
+}
+
+/// Folds the cursor back into `[loop_start, loop_end]` (D13).
+///
+/// Forward mode mirrors the overshoot back to the loop start; ping-pong
+/// reflects it and flips [`Voice::dir`]. Both use the loop's period so any
+/// step size lands in one arithmetic step.
+fn wrap_into_loop(voice: &mut Voice) {
+    let span = voice.loop_end - voice.loop_start;
+    if span <= 0.0 {
+        voice.wrapping = false;
+        return;
+    }
+    if !voice.pingpong {
+        if voice.pos >= voice.loop_end {
+            voice.pos = voice.loop_start + (voice.pos - voice.loop_start).rem_euclid(span);
+        }
+        return;
+    }
+    // Ping-pong: one full cycle is forward then backward (2 × span). A
+    // cursor exactly at a boundary keeps moving in the direction it was
+    // heading, which is what makes the turnaround seamless.
+    let period = 2.0 * span;
+    let t = (voice.pos - voice.loop_start).rem_euclid(period);
+    if t <= span {
+        voice.pos = voice.loop_start + t;
+        voice.dir = 1.0;
+    } else {
+        voice.pos = voice.loop_start + (period - t);
+        voice.dir = -1.0;
     }
 }
 
@@ -429,6 +595,45 @@ fn copy_channel(buffer: &mut AudioBuffer, ch: usize, src: &[f32]) {
 /// 0 via saturating cast; out-of-range values clamp.
 fn param_to_u8(value: f32, max: u8) -> u8 {
     value.round().clamp(0.0, f32::from(max)) as u8
+}
+
+/// Reads a frame position from a parameter value. Non-finite and negative
+/// values degrade to 0 (file start / "unset"), and the f32 channel is exact
+/// up to 2^24 frames (~5.8 min at 48 kHz).
+fn param_to_u32(value: f32) -> u32 {
+    if !value.is_finite() {
+        return 0;
+    }
+    value.clamp(0.0, u32::MAX as f32) as u32
+}
+
+/// Resolves the document window against the loaded sample (D12).
+///
+/// `last` is the last **interpolatable** frame (`len - 1`, since the reader
+/// needs `i + 1`); `0` on `loop_end`/`end` means "the end of the file", and a
+/// loop narrower than two frames is not a loop. Same rule as the model's
+/// `SampleRegion::resolve`.
+fn resolve_region(raw: RawRegion, frames: usize) -> Region {
+    let last = frames.saturating_sub(1) as u32;
+    let end = if raw.end == 0 {
+        last
+    } else {
+        raw.end.min(last)
+    };
+    let start = raw.start.min(end);
+    let loop_end = if raw.loop_end == 0 {
+        end
+    } else {
+        raw.loop_end.min(end)
+    };
+    let loop_start = raw.loop_start.min(loop_end);
+    Region {
+        start: f64::from(start),
+        loop_start: f64::from(loop_start),
+        loop_end: f64::from(loop_end),
+        end: f64::from(end),
+        mode: raw.mode,
+    }
 }
 
 #[cfg(test)]

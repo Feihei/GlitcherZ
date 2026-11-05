@@ -1,6 +1,7 @@
 # Spec: 采样播放器乐器（Sample Player Instrument）
 
-> 状态：已收官（2026-10-24，SP1–SP5 全部落地）。对应 `plan.md`「U5 采样播放器 instrument」。
+> 状态：SP1–SP5 收官（2026-10-24）；D12–D15 头/腹/尾切分（2026-11-05，SP6）落地。
+> 对应 `plan.md`「U5 采样播放器 instrument」。
 > 前置：U4 已交付；U8/E 系列后 Inspector 已收敛，添加节点统一走 patch
 > `Add ▸ Instrument`（spec `plugin-browser.md`）。
 
@@ -35,6 +36,10 @@ hound。
 | D9 | 文件丢失 | 重开工程 wav 缺失 → 回落内置 synth + log，文档字段保留（重试机会） | 同 plugin-state / SF2 D8 先例，宁缺勿炸 |
 | D10 | 参数 | `ParamId::{SampleRootNote, SampleGain, SamplePlayMode}`（0 = Gate，≥ 0.5 = OneShot），`set_node_param` 非重建下发；velocity → voice 增益线性 `vel/127` | 镜像 `Sf2BankSelect` 家族；Inspector 与 patch inline（G5 注册表 `SAMPLE_INLINE` = root + gain）双入口同源 |
 | D11 | 测试 | 单测自生成 wav fixture（hound `WavWriter` 写毫秒级正弦/满幅），无外部文件、常规 CI 可跑；静音/NaN 两组铁律测试 + 分配计数审计（同 S1 流程，自证零分配） | AGENTS.md 强制；fixture 生成比 SF2 手建 RIFF 字节流简单 |
+| D12 | 播放窗口 | `region: SampleRegion { start, loop_start, loop_end, end, loop_mode }`，单位**源帧**、`u32`、serde default 加法（PROJECT_VERSION 不动）。`end`/`loop_end` 的 `0` = 文件末尾 | 文档不携带文件长度（解码数据在会话缓存里），用 `0` 表示"到末尾"让旧工程与"换一个更长的文件"都不产生意外裁切；帧而非秒：文档不该关心文件采样率，而裁切是个波形手势 |
+| D13 | 循环模式 | `SampleLoopMode::{Off, Forward, PingPong}`。Forward 到 `loop_end` 回卷到 `loop_start`；PingPong 两端反射。**loop 宽度 ≤ 1 帧不算循环** | 对标 LMMS 内置 sample loader；`rem_euclid` 折返让任意步长（高音高比率）一次算完，不会 while 自旋；一帧循环只会变成咔嗒，直接在解析层拒掉 |
+| D14 | OneShot 与循环 | OneShot **忽略循环**：窗口只走一遍（头 → 循环段 → 尾），停在 `end`；只有 Gate 按住才真正循环 | 否则 OneShot + loop 会无限循环，只能靠 Stop 停——鼓/镲一条就废了 |
+| D15 | 松键与音尾 | Gate 松键时，若声部**已进入循环段**，光标跳到 `loop_end` 播尾，fade 延后到尾部最后 ~10ms；在头段内松键仍走原来的即时 10ms fade。`release_all`（Stop/Panic/切轨）不做尾部处理 | 用户确认（2026-11-05）："松键跳 loop_end 播完尾巴再收"。头段内跳尾会切掉起音，所以按"是否已进循环"分岔；停止必须快，不给尾巴 |
 
 ## 4. 数据流
 
@@ -46,7 +51,15 @@ hound。
 播放：轨声源 = VoiceSpec::Sample → 图节点（MIDI 入边）
       → note_on：池取 voice，rate = 2^((note−root)/12)·wav_sr/engine_sr，
         gain = velocity·文档 gain → 线性插值逐帧读 → 求和进 buffer
-      → Gate off / 偷音 / 采样越界 → 10ms fade → swap 回收
+      → 光标在 [loop_start, loop_end) 内回卷（Forward）/ 两端反射（PingPong）
+      → Gate off：已进循环 → 跳 loop_end 播尾，fade 延后到尾末；
+                    仍在头段 → 即时 10ms fade
+      → 偷音 / 越过 end → swap 回收
+
+窗口参数：`ParamId::{SampleStart, SampleLoopStart, SampleLoopEnd,
+SampleEnd, SampleLoopMode}`，与 root/play_mode/gain 同一条
+`push_node_params` / 离线导出的参数推送路径；**触发时定格**（D4 语义），
+改窗口只影响后续 note-on，不会把正在响的游标拽走。
 ```
 
 ## 5. 实现拆分
@@ -72,6 +85,12 @@ hound。
   release 长度、OneShot 全长）；全仓 fmt/clippy/test 绿
   ✅ 2026-10-24（543 项全绿 + 5 秒冒烟）
 
+- [x] **SP6** 采样切分（D12–D15，2026-11-05）：model `SampleRegion` +
+  `SampleLoopMode` + `resolve()`；engine 五个 `ParamId` + 循环渲染
+  （Forward / PingPong）+ 松键进尾；UI Inspector 波形与四条标记
+  ✅ 2026-11-05（`sample_voice.rs` 新增 4 项：循环带内不掉出、pingpong
+  无接缝、松键播尾、OneShot 只走一遍）
+
 ### 实施勘误（写代码时推翻的两处预想）
 
 - **审计 scope 边界**：`AudioBuffer::new`（构造期分配）必须建在
@@ -82,8 +101,9 @@ hound。
 
 ## 6. 边界与明确不做
 
-- **不做** loop 循环点（wav smpl/cue chunk 解析留给实测需求；长 pad
-  靠 Gate + 样本长度）。
+- **不做** wav `smpl` / `cue` chunk 解析：loop 点由用户给，不从文件元数据
+  猜（要了再单独立项）。
+- **不做** 交叉淡化循环（crossfade loop）与循环内的自动增益匹配。
 - **不做** 采样内切片（slicing / beat chop）、Round-Robin、交叉淡化。
 - **不做** 音频格式扩展（mp3/flac/ogg → 若有需求走 symphonia 另立项）。
 - **不做** 高质量重采样（sinc 多相滤波）——线性插值 v1 够用，实测劣化

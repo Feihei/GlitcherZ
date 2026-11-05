@@ -3048,6 +3048,7 @@ mod panel_target_tests {
                 root_note: 60,
                 play_mode: SamplePlayMode::default(),
                 gain: 1.0,
+                region: glitcherz_model::SampleRegion::default(),
             },
             VoiceSpec::DrumKit {
                 slots: Vec::new(),

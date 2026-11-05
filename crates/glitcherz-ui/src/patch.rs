@@ -5436,6 +5436,7 @@ mod tests {
                 root_note: 60,
                 play_mode: glitcherz_model::SamplePlayMode::Gate,
                 gain: 1.0,
+                region: glitcherz_model::SampleRegion::default(),
             },
             synth: glitcherz_model::SynthParams::default(),
         };
@@ -5679,6 +5680,7 @@ mod tests {
                 root_note: 48,
                 play_mode: glitcherz_model::SamplePlayMode::OneShot,
                 gain: 0.5,
+                region: glitcherz_model::SampleRegion::default(),
             },
             synth: glitcherz_model::SynthParams::default(),
         };
@@ -6437,6 +6439,7 @@ mod tests {
                 root_note: 60,
                 play_mode: glitcherz_model::SamplePlayMode::Gate,
                 gain: 1.0,
+                region: glitcherz_model::SampleRegion::default(),
             },
             synth: glitcherz_model::SynthParams::default(),
         });
@@ -6482,6 +6485,7 @@ mod tests {
                 root_note: 60,
                 play_mode: glitcherz_model::SamplePlayMode::Gate,
                 gain: 1.0,
+                region: glitcherz_model::SampleRegion::default(),
             };
         }
         let deps = PatchDeps {

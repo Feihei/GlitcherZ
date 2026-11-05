@@ -916,3 +916,20 @@ flush 归零 → writer 为 None → begin_pass：开新 writer → setup(engine
 - 套件级输出 Gain 也套上同一格式化器（同样是线性值，别处一致）。
 
 **测试**：`gain_label_tests::linear_gain_reads_in_db`（1.0 → `+0.0 dB`、2.0 → `+6.0 dB`、0.5 → `-6.0 dB`、0 与 1e-9 → `-∞ dB`）。
+
+## 采样切分：头 / 腹 / 尾 + ping-pong（SP6，2026-11-05）
+
+spec `sample-player.md` D12–D15 落地。**文档层**（`SampleRegion`：`start` / `loop_start` / `loop_end` / `end` 四个**源帧** + `loop_mode`）→ **参数通道**（五个 `ParamId`）→ **RT 渲染**（回卷 / 反射 / 松键进尾）三段。
+
+几个当初容易踩的点：
+
+- **`0` 是"到文件末尾"的哨兵**。文档不携带文件长度（解码数据在会话 `SampleLibrary` 里），所以 `end == 0` / `loop_end == 0` 必须解释成"文件的最后一帧"，否则旧工程一打开就被裁成 0 帧。解析规则写了两份：model 的 `SampleRegion::resolve()`（喂 UI 波形把手）和 engine 的 `resolve_region()`（喂渲染器）——engine crate 不依赖 model，两份必须对同一件事说同一个答案，改一处记得改另一处。
+- **`end` 是"最后一个可插值帧"（`len - 1`），不是 `len`**。渲染器读 `src[i]` 和 `src[i+1]` 做线性插值，游标必须停在 `len-2` 以内；沿用旧实现的 `last = len - 1` 语义，旧工程的输出才能逐样本不变。
+- **回卷用 `rem_euclid`，不用 while 减**。音高比率可以很大（同一个采样降 4 个八度或升 4 个八度），`while pos >= loop_end { pos -= span }` 在高比率下会自旋；`loop_start + (pos - loop_start).rem_euclid(span)` 一次算完。ping-pong 用一个周期 `2 * span` 折返：`t = rem_euclid(period)`，`t <= span` 正向、否则反向并翻转 `dir`，接缝处没有跳变（`a_pingpong_loop_has_no_seam` 用 ramp 样本的最大帧间步长钉住这点，Forward 在回卷处会跳整段高度）。
+- **松键进尾分岔**：只有"声部已经进到循环段"（`pos >= loop_start`）时才跳到 `loop_end` 播尾；在**头段**里松键仍然走原来的即时 10ms fade——否则一次短促按键会把起音切掉直接跳到尾巴。尾部 fade 用 `fade_wait` 预存"还要等多少引擎帧"：`(tail / (rate · pitch)) - release_frames`，负数归零（尾巴比 fade 还短就立刻淡出）。`release_all`（Stop / Panic / 切轨）**不做**尾部处理，停止必须快。
+- **OneShot 忽略循环**（D14）：`wrapping = region.loops() && !one_shot`。否则 OneShot + loop 会无限循环，只能靠 Stop 停。OneShot 于是等价于"头 → 循环段 → 尾走一遍"。
+- **窗口在触发时定格**（沿用 D4 的 rate 冻结语义）：改窗口只影响后续 note-on，不会把正在响的游标拽走。因此 `SampleStart/...` 的 `set_param` 只写 `raw_region` 再重解析，不 touch 任何 voice。
+
+**参数路线**：`push_node_params`（实时）与 `export_ops`（离线渲染）各推一遍同样的五个参数——离线导出漏推就会导出用户听不到的素材（导出的是整条文件而不是裁好的窗口）。
+
+**测试**：`sample_voice.rs` +4（`a_forward_loop_repeats_the_window`、`a_pingpong_loop_has_no_seam`、`a_gate_release_plays_the_tail_before_fading`、`a_one_shot_plays_the_window_once`）；model +4（`sample_region_tests`：0 哨兵、越界钳制、一帧循环拒绝、旧文件 default）。旧的采样用例一个没改，全部照过——"旧工程逐样本不变"这条由它们守。
