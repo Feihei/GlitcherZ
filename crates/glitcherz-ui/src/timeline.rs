@@ -1316,6 +1316,39 @@ pub fn show(
         state.knife_armed = false;
         arm_modal(state, ui.ctx(), Arm::Tile);
     }
+    // Ctrl+A / Ctrl+Shift+A (W3c): select every clip in the arrangement, or
+    // drop the selection. A view-level command like the tile shortcut — the
+    // lane rows only ever see their own track, and "all" is by definition
+    // cross-lane. The inline rename editor (a live text edit) keeps the combo
+    // for itself.
+    if state.modal.is_none() && !ui.ctx().text_edit_focused() {
+        let (deselect, select_all) = ui.ctx().input_mut(|i| {
+            let mut ctrl_shift = Modifiers::CTRL;
+            ctrl_shift.shift = true;
+            // Shift first: `consume_key` matches modifiers logically, so the
+            // plain Ctrl+A pattern would eat Ctrl+Shift+A as well.
+            let clear = i.consume_key(ctrl_shift, Key::A);
+            let all = i.consume_key(Modifiers::CTRL, Key::A);
+            (clear, all)
+        });
+        if deselect {
+            state.selection.clear();
+            state.marquee = None;
+            state.knife_armed = false;
+            state.set_status("Selection cleared");
+        } else if select_all {
+            state.selection = all_clips(midi_tracks, control_tracks, audio_tracks);
+            state.marquee = None;
+            state.knife_armed = false;
+            state.break_group = false;
+            let count = state.selection.len();
+            if count == 0 {
+                state.set_status("Select all: the arrangement is empty");
+            } else {
+                state.set_status(format!("{count} clips selected"));
+            }
+        }
+    }
     // While a modal transform (G/T/Shift+D) or the armed knife owns the
     // pointer, the keyboard stays with the lane that armed it — the pointer
     // may travel across neutral chrome (or past the content edge) without
@@ -2327,6 +2360,45 @@ pub fn show(
         }
     }
     actions
+}
+
+/// W3c: every clip in the arrangement, in table order (MIDI → control →
+/// audio, by track then clip). Empty tracks contribute nothing, so the
+/// result doubles as the "did anything get selected?" count.
+pub(crate) fn all_clips(
+    midi: &[MidiTrack],
+    control: &[ControlTrack],
+    audio: &[AudioTrack],
+) -> Vec<ClipSel> {
+    let mut out = Vec::new();
+    for (track, data) in midi.iter().enumerate() {
+        for clip in 0..data.clips.len() {
+            out.push(ClipSel {
+                lane: TimelineLane::Midi,
+                track,
+                clip,
+            });
+        }
+    }
+    for (track, data) in control.iter().enumerate() {
+        for clip in 0..data.clips.len() {
+            out.push(ClipSel {
+                lane: TimelineLane::Control,
+                track,
+                clip,
+            });
+        }
+    }
+    for (track, data) in audio.iter().enumerate() {
+        for clip in 0..data.clips.len() {
+            out.push(ClipSel {
+                lane: TimelineLane::Audio,
+                track,
+                clip,
+            });
+        }
+    }
+    out
 }
 
 /// W3b: every clip that shares a group with any selected clip, in table
@@ -3807,6 +3879,58 @@ mod tests {
             clip: 1,
         }];
         assert_eq!(expand_group_selection(&midi, &control, &audio, &lone), lone);
+    }
+
+    /// W3c: Ctrl+A takes every clip of every lane, in table order; empty
+    /// tracks and empty tables contribute nothing.
+    #[test]
+    fn all_clips_covers_every_lane_in_table_order() {
+        let mut midi = vec![MidiTrack::default(), MidiTrack::default()];
+        midi[0].clips.push(MidiClip::default());
+        midi[0].clips.push(MidiClip::default());
+        midi[1].clips.push(MidiClip::default());
+        let mut control = vec![ControlTrack::default()];
+        control[0].clips.push(ControlClip::default());
+        let mut audio = vec![AudioTrack::default()];
+        audio[0].clips.push(AudioClip::default());
+
+        let all = all_clips(&midi, &control, &audio);
+        assert_eq!(all.len(), 5, "three MIDI + one control + one audio");
+        assert_eq!(
+            all[0],
+            ClipSel {
+                lane: TimelineLane::Midi,
+                track: 0,
+                clip: 0
+            }
+        );
+        assert_eq!(
+            all[2],
+            ClipSel {
+                lane: TimelineLane::Midi,
+                track: 1,
+                clip: 0
+            }
+        );
+        assert_eq!(
+            all[3],
+            ClipSel {
+                lane: TimelineLane::Control,
+                track: 0,
+                clip: 0
+            }
+        );
+        assert_eq!(
+            all[4],
+            ClipSel {
+                lane: TimelineLane::Audio,
+                track: 0,
+                clip: 0
+            }
+        );
+        // Nothing loaded: nothing to select (the caller reports it).
+        assert!(all_clips(&[], &[], &[]).is_empty());
+        assert!(all_clips(&[MidiTrack::default()], &[], &[]).is_empty());
     }
 
     /// 2026-11-04: a mixed-kind selection clamps the shared row delta

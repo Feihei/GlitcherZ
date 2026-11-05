@@ -158,6 +158,10 @@ struct Keys {
     x: bool,
     y: bool,
     delete: bool,
+    /// `Ctrl+A`: select every note of the focus clip.
+    select_all: bool,
+    /// `Ctrl+Shift+A`: drop the selection.
+    deselect_all: bool,
 }
 
 /// An edit the roll wants performed.
@@ -2006,6 +2010,14 @@ pub fn show(
             x: i.consume_key(egui::Modifiers::NONE, egui::Key::X),
             y: i.consume_key(egui::Modifiers::NONE, egui::Key::Y),
             delete: i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
+            // The Shift variant is consumed first: `consume_key` matches
+            // logically, so the plain Ctrl+A pattern would swallow it too.
+            deselect_all: {
+                let mut mods = egui::Modifiers::CTRL;
+                mods.shift = true;
+                i.consume_key(mods, egui::Key::A)
+            },
+            select_all: i.consume_key(egui::Modifiers::CTRL, egui::Key::A),
         });
         if keys.x {
             state.apply_axis(Axis::Time);
@@ -2038,6 +2050,21 @@ pub fn show(
             // A knife stroke or a tweak drag owns the pointer; the family
             // never chains.
         } else {
+            // Ctrl+A / Ctrl+Shift+A (W3c): the selection is the focus clip's
+            // note list, so "all" means every index of that one clip — the
+            // ghosts around it are not editable and stay out.
+            if keys.deselect_all {
+                state.selection.clear();
+                state.note_status("Selection cleared");
+            } else if keys.select_all {
+                state.selection = (0..clip.notes().len()).collect();
+                let count = state.selection.len();
+                if count == 0 {
+                    state.note_status("Select all: the clip is empty");
+                } else {
+                    state.note_status(format!("{count} notes selected"));
+                }
+            }
             if keys.shift_d {
                 if state.selection.is_empty() {
                     state.note_status("Duplicate: nothing selected");

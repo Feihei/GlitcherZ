@@ -380,6 +380,14 @@ fn shift() -> egui::Modifiers {
     }
 }
 
+fn ctrl_shift() -> egui::Modifiers {
+    egui::Modifiers {
+        ctrl: true,
+        shift: true,
+        ..Default::default()
+    }
+}
+
 fn ctrl() -> egui::Modifiers {
     egui::Modifiers {
         ctrl: true,
@@ -1280,3 +1288,22 @@ fn the_lane_toggle_collapses_the_lane() {
         f.state.lane_rects[0].height()
     );
 }
+
+// ---- W3c: Ctrl+A / Ctrl+Shift+A ----
+
+#[test]
+fn ctrl_a_selects_every_note_and_ctrl_shift_a_clears() {
+    let mut f = Fixture::new();
+    // Hover first: the roll's command keys are focus-gated.
+    let _ = f.frame(vec![hover(f.pos(120.0, 60))]);
+    let _ = f.tap_key_with(egui::Key::A, ctrl());
+    assert_eq!(
+        f.state.selection,
+        vec![0, 1],
+        "every note of the focus clip, in order"
+    );
+
+    let _ = f.tap_key_with(egui::Key::A, ctrl_shift());
+    assert!(f.state.selection.is_empty(), "Ctrl+Shift+A clears");
+}
+

@@ -15,7 +15,7 @@
 | `Ctrl+S` / `Ctrl+Shift+S` | 保存 / 另存为 |
 | `Ctrl+Z` / `Ctrl+Y` | undo / redo |
 | `Ctrl+L` | 把选中乐器接到 / 摘下电脑键盘 |
-| `Tab` / `Shift+Tab` | 按 `Patch → Timeline → Edit → Inspector` 循环切换视图 |
+| `Tab` / `Shift+Tab` | 按 `Timeline → Edit → Patch → Inspector` 循环切换视图 |
 | `Alt+1` .. `Alt+4` | 直接跳到第 N 个视图（顺序同上） |
 | `R` | 开始录音（卷帘持有焦点时除外） |
 | `Z` / `X` | 降 / 升八度（24–84 之间） |
@@ -45,6 +45,7 @@
 | `K` | 刀片，一次点击切一刀 |
 | `Delete` | 删除选中片段 |
 | `Ctrl+G` / `Ctrl+Shift+G` | 编组 / 解组 |
+| `Ctrl+A` / `Ctrl+Shift+A` | 全选所有轨道的片段 / 取消选择 |
 | `F2` | 重命名选中片段 |
 | `Esc` | 取消模态 / 取消刀片 |
 
@@ -64,6 +65,7 @@
 | `Shift` + `↑` / `↓` | 上下八度 |
 | `←` / `→` | 左右一格（跟随当前网格） |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | 在多个 clip 之间切换编辑焦点（光标在卷帘上时；其余情况下和 `Tab` 一样切视图） |
+| `Ctrl+A` / `Ctrl+Shift+A` | 全选当前 clip 的音符 / 取消选择 |
 | `Esc` | 退出模态 / 退出 `Draw` |
 
 ## 鼠标
