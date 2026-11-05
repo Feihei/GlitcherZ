@@ -9,6 +9,12 @@ runs:
     - name: apt-get install
       shell: bash
       run: |
+        # The ubuntu-24.04 GitHub runner image ships a Microsoft apt repo
+        # (packages.microsoft.com) that intermittently returns HTTP 403 on
+        # `apt-get update`. We depend only on packages from the standard Ubuntu
+        # archive, so drop that third-party source before updating to keep CI
+        # from failing on a repo we never use.
+        sudo rm -f /etc/apt/sources.list.d/*microsoft*.list
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
           pkg-config \
