@@ -758,11 +758,23 @@ impl GlitcherZApp {
                     ui.end_row();
 
                     ui.label("Filter Mode");
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         let mode = self.synth_of_node(instr_id).unwrap_or_default().filter_mode;
-                        for (name, value) in [("Low-pass", 0.0), ("High-pass", 1.0), ("Band-pass", 2.0)] {
+                        // Four buttons: wrapped so a narrow Inspector pushes
+                        // "Moog" to a second line instead of clipping it.
+                        for (name, value, hint) in [
+                            ("Low-pass", 0.0, "12 dB/oct state-variable low pass"),
+                            ("High-pass", 1.0, "12 dB/oct state-variable high pass"),
+                            ("Band-pass", 2.0, "12 dB/oct state-variable band pass"),
+                            (
+                                "Moog",
+                                3.0,
+                                "24 dB/oct 4-pole ladder low pass, saturation in the resonance path",
+                            ),
+                        ] {
                             if ui
                                 .selectable_label((mode - value).abs() < 0.5, name)
+                                .on_hover_text(hint)
                                 .clicked()
                             {
                                 let before = self.begin_edit();

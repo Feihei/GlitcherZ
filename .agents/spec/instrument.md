@@ -1,6 +1,6 @@
 # 内置合成器：多波形 + 滤波器接线
 
-> 状态：M1–M4 已实施（2026-10-31）；D13 波形跨淡已实施（2026-11-05）
+> 状态：M1–M4 已实施（2026-10-31）；D13 波形跨淡、D14 Moog ladder 已实施（2026-11-05）
 > 相关：`.agents/spec/effects.md`（`Unit::Enum` / `Smoothed`）、`.agents/spec/midi-nodes.md`（内置 ADSR 与 MidiEnvelope 的区别）
 
 ## 1. 背景
@@ -32,6 +32,7 @@
 | D6 | `ParamId::SineFrequency / SineGain` 更名 `OscFrequency / OscGain`，DSP 类型 `SineProcessor` → `OscProcessor`（文件 `sine.rs` → `osc.rs`）。名字必须与"它现在产生四种波形"一致。 |
 | D7 | 波形是离散参数，**不进自动化**（`NodeParam` 不加变体）；cutoff 沿用既有 `AutoParam::FilterCutoff`，接线后曲线/LFO 自动对其生效。 |
 | D13 | 运行中切换波形做 **5 ms 线性 crossfade**（E5 `declick()` 的落地）：两个波形在**同一相位**上求值再混合，因此不需要第二个相位累加器、也不会跑调；首个 block 渲染之前的切换不着色（尚未发声，没有 click 可遮，构造期选中的波形从第 0 个采样起就是纯净的）。 |
+| D14 | `FilterMode` 增加第四个取值 `Moog`（索引 3）：**四级 ladder 低通**，与 SVF 共享平滑后的 cutoff / resonance，状态相互独立；共振映射 `k = 4.3·(res/0.98)²`，反馈路径饱和（`tanh`），输出补一半的 `1/(1+k)` 通带损失。 |
 
 ## 4. 处理链
 
@@ -57,12 +58,14 @@ MIDI note ──► OscProcessor (waveform, pitch offset, per-sample glide)
 
 - 波形跨淡（D13）只覆盖切换那一刻：淡入过程中再次切换，从当前听感**主导**的那个波形重新起淡，单步不超过半个波形落差；比 5 ms 更密的连续切换不是音乐手势，只保证有界、不保证无阶跃。
 - `FilterMode` 仍是离散参数，不可自动化。
+- Moog 模式（D14）只做**低通**：ladder 的 hi/band 抽头不暴露；共振到顶时低音会比 SVF 低通薄（这是 ladder 的本音，补了一半而已）。
 - 频率极高（接近 Nyquist）时 PolyBLEP 的 dt 接近 0.5，修正项退化，但不会产生 NaN/Inf。
 
 ## 7. 验收
 
 - 引擎：四种波形各自过零率 ≈ 基频；满幅输入无 NaN/Inf；SVF 接线后 cutoff 200 Hz 低通可测衰减；cutoff 阶跃呈 ramp 而非整块跳变；运行中切换波形不产生阶跃（测试锁输出一阶差分上界，见 `osc::tests::a_waveform_switch_is_crossfaded`）。
-- 模型：旧文档（无 `waveform` 字段）反序列化为 Sine。
+- 引擎（Moog）：同 cutoff 下 4× cutoff 处衰减 **显著深于** 2 极低通（成对比较，见 `svf::tests::the_ladder_mode_is_darker_than_the_two_pole_low_pass`）；通带 RMS 不低于 0.6；共振拉满时自激有界（限幅环而非发散）；cutoff 全量扫频无 NaN/Inf；模式来回切换后 2 极输出**逐比特不变**。
+- 模型：旧文档（无 `waveform` 字段）反序列化为 Sine；`filter_mode` 仍是 f32，旧值 0..2 语义不变。
 - UI：Inspector 切换波形/滤波模式写入文档并实时下发；导出路径下发全部 `SynthParams`。
 ## 8. 复音（D8–D12）
 
@@ -90,3 +93,27 @@ MIDI note ──► OscProcessor (waveform, pitch offset, per-sample glide)
 - 同音重触发后旧 voice 进入 release、结束后 `active_voices()` 回到 1；
 - 连续 17 个 `On` 时 `active_voices() ≤ 16`，输出有限；
 - `Off{0}` 释放全部声部。
+## 9. Moog 四级 ladder（D14）
+
+```
+x ──►(u = x − k·tanh(y4))──► 一级 TPT ──► 二级 ──► 三级 ──► 四级 ──► y4 (× makeup)
+         ▲                                                              │
+         └──────────────────────── k ───────────────────────────────────┘
+```
+
+- **零延迟反馈**。四级都是线性 TPT 单极点，级联输出可写成输入的闭式函数
+  `y4 = G⁴·u + σ`（`G = g/(1+g)`，`g = tan(πfc/sr)`，`σ = Σ G^(3-i)·sh_i`，
+  `sh_i = s_i·(1−G)`）。代入 `u = x − k·y4` 直接解出 `y4`，**没有一采样延迟**：
+  延迟反馈会在高 cutoff 处失谐并在高共振时发散，而离线/实时两条路径都要能跑到 20 kHz。
+- **饱和只在反馈路径**（`u = x − k·tanh(y4)`）。级联保持线性，上述闭式解继续成立；
+  `|tanh(y)| ≤ |y|` 保证反馈只会**减少**环路增益，所以大信号有界、共振到顶时收敛到
+  极限环（自激）而不是发散。这一步是"一次牛顿步"而非隐式求解——精度足够，成本为零。
+- **共振映射是二次的**：`k = 4.3·(res/0.98)²`。线性映射会让滑块刚过中点就把通带压掉
+  6 dB（`1/(1+k)`），听感上"一推就闷"。四级在 cutoff 处每级贡献 `1/√2` 与 −45°，
+  环路增益 `k/4`，所以 `k = 4` 是自激门限；`4.3` 让滑块顶端刚好越过门限。
+- **补一半通带**：ladder 的通带损失 `1/(1+k)` 就是 Moog 的"低音变薄"，全补会把共振峰
+  一起抬起来，所以输出乘 `1 + k/2`——模式切换不再是音量跳变，高端共振仍然会变薄。
+- **状态独立**：`SvfProcessor` 里 ladder 与 SVF 各自持有状态，Moog 模式不进入 2 极的
+  积分器循环（`a_detour_through_the_ladder_leaves_the_two_pole_modes_bit_exact` 用
+  `assert_eq!` 锁死这一点）。两者共用**同一份**平滑后的 cutoff / resonance，
+  所以切模式不会先扫一段。

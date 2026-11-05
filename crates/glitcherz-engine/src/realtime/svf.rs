@@ -6,6 +6,7 @@ use crate::realtime::buffer::AudioBuffer;
 use crate::realtime::commands::ParamId;
 use crate::realtime::context::ProcessContext;
 use crate::realtime::effect::smoothed::coeff_for;
+use crate::realtime::moog::Ladder;
 use crate::realtime::processor::Processor;
 
 /// Time constant of the cutoff / resonance smoothers (ms). Spec
@@ -15,13 +16,15 @@ const SMOOTHING_MS: f32 = 10.0;
 /// Filter output mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterMode {
-    /// Low-pass (default).
+    /// Low-pass (default), 12 dB/oct.
     #[default]
     LowPass,
     /// High-pass.
     HighPass,
     /// Band-pass.
     BandPass,
+    /// Moog-style 4-pole ladder low-pass, 24 dB/oct, saturating resonance.
+    Moog,
 }
 
 /// State-variable filter (zero-delay feedback / TPT topology, Simper SVF).
@@ -29,6 +32,10 @@ pub enum FilterMode {
 /// Second order (12 dB/oct), providing low-pass/high-pass/band-pass outputs
 /// simultaneously; resonance is parameterized with Simper's `res` (0..1,
 /// k = 2 - 2·res), approaching self-oscillation as `res → 1`.
+///
+/// [`FilterMode::Moog`] swaps the topology for a 4-pole ladder
+/// ([`crate::realtime::moog::Ladder`]) fed by the same smoothed cutoff and
+/// resonance; the rest of the pipeline cannot tell the two apart.
 ///
 /// The cutoff frequency is clamped at process time to `[20, min(20000, 0.45·sr)]`;
 /// state is flushed of denormals when silent to avoid CPU spikes. All paths RT-safe.
@@ -60,6 +67,10 @@ pub struct SvfProcessor {
     a2: f32,
     a3: f32,
     k: f32,
+    /// Ladder state, advanced only while the mode is [`FilterMode::Moog`]. It
+    /// shares the smoothed cutoff / resonance, so the mode switch is seamless:
+    /// both algorithms are already running at the same `fc`.
+    ladder: Ladder,
 }
 
 /// Upper bound preventing resonance from reaching self-oscillation.
@@ -90,6 +101,7 @@ impl SvfProcessor {
             a2: 0.0,
             a3: 0.0,
             k: 2.0,
+            ladder: Ladder::new(),
         };
         svf.update_coeffs();
         svf
@@ -174,6 +186,19 @@ impl Processor for SvfProcessor {
         self.update_coeffs();
         let (a1, a2, a3, k) = (self.a1, self.a2, self.a3, self.k);
         let mode = self.mode;
+        if mode == FilterMode::Moog {
+            // Same smoothing, same Nyquist clamp, different topology. The SVF
+            // integrators are left untouched so returning to a 2-pole mode
+            // resumes from the state it had (see the round-trip test).
+            self.ladder
+                .set_coeffs(self.cutoff_now, self.res_now, self.sample_rate);
+            for ch in 0..buffer.channels().min(2) {
+                if let Some(channel) = buffer.channel_mut(ch) {
+                    self.ladder.process(ch, channel);
+                }
+            }
+            return;
+        }
         for ch in 0..buffer.channels().min(2) {
             let (Some(mut ic1), Some(mut ic2)) = (Some(self.ic1[ch]), Some(self.ic2[ch])) else {
                 continue;
@@ -193,6 +218,10 @@ impl Processor for SvfProcessor {
                         // raw band-pass gain of 1/k, which varies with Q).
                         FilterMode::BandPass => v1 * k,
                         FilterMode::HighPass => input - k * v1 - v2,
+                        // Unreachable: the ladder returns before this loop.
+                        // Degrading to the 2-pole low pass (rather than a
+                        // passthrough) keeps a future reordering audible-safe.
+                        FilterMode::Moog => v2,
                     };
                     Self::flush(&mut ic1);
                     Self::flush(&mut ic2);
@@ -230,8 +259,10 @@ impl Processor for SvfProcessor {
                     FilterMode::LowPass
                 } else if value < 1.5 {
                     FilterMode::HighPass
-                } else {
+                } else if value < 2.5 {
                     FilterMode::BandPass
+                } else {
+                    FilterMode::Moog
                 };
                 true
             }
@@ -452,6 +483,97 @@ mod tests {
         svf.set_param(ParamId::FilterResonance, 0.7);
         assert!((svf.current_cutoff() - 500.0).abs() < 1e-3);
         assert!((svf.current_resonance() - 0.7).abs() < 1e-6);
+    }
+
+    /// D14: `FilterMode::Moog` is index 3 on the wire, and it has to sound
+    /// like a 4-pole next to the 2-pole low pass: same passband, far darker
+    /// stopband. This is the pairwise comparison that keeps the two modes from
+    /// silently collapsing into one another.
+    #[test]
+    fn the_ladder_mode_is_darker_than_the_two_pole_low_pass() {
+        fn mode(mode: f32) -> SvfProcessor {
+            let mut svf = SvfProcessor::new(SR);
+            svf.set_param(ParamId::FilterMode, mode);
+            svf.set_param(ParamId::FilterCutoff, 1_000.0);
+            svf.set_param(ParamId::FilterResonance, 0.1);
+            svf
+        }
+
+        let mut ladder = mode(3.0);
+        assert_eq!(ladder.mode, FilterMode::Moog);
+        let mut two_pole = mode(0.0);
+
+        // Passband: both stay close to the 0.707 sine RMS.
+        let below_ladder = run_through(&mut ladder, &sine(200.0, 0.5));
+        let below_two_pole = run_through(&mut two_pole, &sine(200.0, 0.5));
+        let (a, b) = (
+            rms(&below_ladder[below_ladder.len() - BLOCK..]),
+            rms(&below_two_pole[below_two_pole.len() - BLOCK..]),
+        );
+        assert!(a > 0.6 && b > 0.6, "passband: ladder {a}, 2-pole {b}");
+        assert!(
+            (a - b).abs() < 0.1,
+            "the passband must stay comparable: ladder {a}, 2-pole {b}"
+        );
+
+        // Stopband at 4× cutoff: 24 dB/oct against 12 dB/oct.
+        let mut ladder = mode(3.0);
+        let mut two_pole = mode(0.0);
+        let above_ladder = run_through(&mut ladder, &sine(4_000.0, 0.5));
+        let above_two_pole = run_through(&mut two_pole, &sine(4_000.0, 0.5));
+        let (a, b) = (
+            rms(&above_ladder[above_ladder.len() - BLOCK..]),
+            rms(&above_two_pole[above_two_pole.len() - BLOCK..]),
+        );
+        assert!(
+            a < b * 0.5,
+            "the ladder must roll off faster: ladder {a}, 2-pole {b}"
+        );
+    }
+
+    /// Switching to Moog and back must not disturb the SVF integrators — the
+    /// two topologies keep separate state, so a mode detour is bit-exact in
+    /// the 2-pole modes.
+    #[test]
+    fn a_detour_through_the_ladder_leaves_the_two_pole_modes_bit_exact() {
+        let probe = sine(440.0, 0.2);
+        let silence = vec![0.0; BLOCK * 8];
+
+        let mut plain = SvfProcessor::new(SR);
+        plain.set_param(ParamId::FilterCutoff, 700.0);
+        let mut detoured = SvfProcessor::new(SR);
+        detoured.set_param(ParamId::FilterCutoff, 700.0);
+
+        let _ = run_through(&mut plain, &silence);
+        detoured.set_param(ParamId::FilterMode, 3.0);
+        let _ = run_through(&mut detoured, &silence);
+        detoured.set_param(ParamId::FilterMode, 0.0);
+
+        assert_eq!(
+            run_through(&mut plain, &probe),
+            run_through(&mut detoured, &probe)
+        );
+    }
+
+    /// The resonance slider keeps meaning "more" in the ladder mode: driving
+    /// it at the top must ring, and the output has to stay finite.
+    #[test]
+    fn the_ladder_resonance_is_bounded_at_the_top_of_the_slider() {
+        let mut svf = SvfProcessor::new(SR);
+        svf.set_param(ParamId::FilterMode, 3.0);
+        svf.set_param(ParamId::FilterCutoff, 400.0);
+        svf.set_param(ParamId::FilterResonance, 0.98);
+        let mut signal = sine(400.0, 1.0);
+        for s in signal.iter_mut() {
+            *s *= 2.0;
+        }
+        let out = run_through(&mut svf, &signal);
+        assert!(out.iter().all(|s| s.is_finite()));
+        let peak = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+        assert!(
+            peak < 16.0,
+            "resonant ladder must stay bounded, peak {peak}"
+        );
     }
 
     #[test]

@@ -958,3 +958,17 @@ spec `instrument.md` D13 落地：`OscProcessor` 在运行中换波形时不再�
 - 顺带发现：锯齿在相位 0 的值经 PolyBLEP 修正后是 0 而不是 -1（`-1 - poly_blep(0) = -1 - (-1)`），所以"起手第一采样"的断言用三角波而不是锯齿。
 
 **测试**：`osc.rs` +2（`a_waveform_switch_is_crossfaded`、`a_waveform_change_before_playback_does_not_fade`），既有 13 个振荡器用例全部照过。
+
+## Moog 四级 ladder（FilterMode::Moog，2026-11-05）
+
+spec `instrument.md` D14 落地。新文件 `realtime/moog.rs` 放 DSP，`SvfProcessor` 只是多一个 `ladder` 字段和 process 开头的一个分支——2 极的三条通路（LP/HP/BP）一个字节都没动。
+
+- **反馈必须零延迟**。四级 TPT 单极点级联的输出可以写成输入的闭式：`y4 = G⁴·u + σ`，把 `u = x − k·y4` 代进去就解出来了。用一采样延迟的反馈（很多教学实现）在 fc 接近 Nyquist 时相位多转一点就失谐，k 大时直接发散；ZDF 版本在 20 kHz 也稳。
+- **饱和放反馈路径而不是每一级**。级联保持线性 → 闭式解继续成立，不用迭代；`|tanh| ≤ |x|` 保证环路增益只减不增，所以"自激"是有界的极限环而不是指数增长。这一条正好就是验收里的"有界自激"。
+- **共振映射从线性改成二次**（`k = 4.3·(res/0.98)²`）。第一版是线性的，测试直接抓到通带 RMS 只有 0.51（SVF 是 0.68）：ladder 的直流增益是 `1/(1+k)`，线性映射在 res=0.1 时就给出 k=0.43，掉了 3 dB；res=0.2（默认值）会掉 5 dB，用户一换模式就以为音量被吃了。二次映射 + 输出补 `1 + k/2` 之后，res=0.1 时通带 0.64、res=0.2 时 0.62，切模式基本听不出音量差。
+- **只补一半**：全补 `1+k` 会把共振峰也一起抬上去（顶端 k=4.3 就是 5.3 倍增益，直接削顶），而且"高共振时低音变薄"本来就是 Moog 的音色特征。留一半是有意的折中，写进了 §6 已知边界。
+- **状态隔离靠 assert_eq 锁**：`a_detour_through_the_ladder_leaves_the_two_pole_modes_bit_exact` 让一个滤波器在 Moog 模式跑 8 个 block 再切回 LP，然后把输出与从没切过的那个逐样本比较——相等才说明 ladder 分支没碰 `ic1/ic2`。这比"看起来没坏"可靠。
+- `FilterMode` 多了个变体，`svf.rs` 里那个 `match mode` 必须补一支：写成 `Moog => v2`（退化成 2 极低通）并注明不可达，而不是 `=> input`——万一将来有人把 ladder 分支挪走，宁可音色不对也不要静默直通。
+- UI 的 Filter Mode 行从 3 个按钮变 4 个，改成 `horizontal_wrapped` 并给每个按钮加了 hover 说明（12 dB/oct vs 24 dB/oct）——窄一点的窗口会把 Moog 折到第二行，而不是被裁掉。
+
+**测试**：`moog.rs` +5（直流增益、4 极衰减对比、自激有界、全量扫频、双声道状态独立）；`svf.rs` +3（与 2 极的通带/阻带成对比较、Moog 往返逐比特不变、滑块顶端的共振有界）。
