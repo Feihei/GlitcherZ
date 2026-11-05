@@ -649,8 +649,20 @@ impl GlitcherZApp {
             // Filter / envelope: instrument-targeted (G4 — the panel
             // target's node fields; the no-selection fallback resolves to
             // the selected track's instrument node anyway).
-            let instr_target = match (&target_doc, target) {
-                (Some(NodeDoc::Instrument { .. }), Some(id)) => Some(id),
+            //
+            // Only the **built-in synth** reads `SynthParams`: the sample
+            // player, drum kit, SoundFont and plugin voices each own their
+            // sound and their own panel below, and the engine never consumes
+            // the timbre fields for them. Offering waveform / cutoff / ADSR
+            // there was a panel of knobs wired to nothing. `patch.rs`
+            // `inline_params_of` splits the canvas rows the same way, so the
+            // two surfaces stay in step.
+            let synth_target = match (&target_doc, target) {
+                (Some(NodeDoc::Instrument { voice, .. }), Some(id))
+                    if voice_has_synth_params(voice) =>
+                {
+                    Some(id)
+                }
                 _ => None,
             };
             // Effect sliders: an Effect panel target edits that node; the
@@ -671,7 +683,7 @@ impl GlitcherZApp {
             // instrument's filter / amp envelope, the effect's delay. Master
             // gain and the output meter live on the transport bar (always
             // visible), so they must not look like part of this node.
-            if instr_target.is_some() || effect_target.is_some() {
+            if synth_target.is_some() || effect_target.is_some() {
                 ui.horizontal(|ui| {
                     ui.strong("Node Parameters");
                     ui.weak("— filter / envelope / effect of the node above, not the master bus");
@@ -681,7 +693,7 @@ impl GlitcherZApp {
                 .num_columns(2)
                 .spacing([16.0, 8.0])
                 .show(ui, |ui| {
-                    if let Some(instr_id) = instr_target {
+                    if let Some(instr_id) = synth_target {
                     ui.label("Waveform");
                     ui.horizontal(|ui| {
                         let waveform = self.synth_of_node(instr_id).unwrap_or_default().waveform;

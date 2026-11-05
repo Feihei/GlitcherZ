@@ -1228,6 +1228,19 @@ fn panel_shows_track_extras(target_doc: &Option<NodeDoc>, has_any_selection: boo
     }
 }
 
+/// Whether this voice reads the built-in synth's timbre fields — waveform,
+/// filter cutoff / resonance / mode, amp envelope.
+///
+/// Only `VoiceSpec::Builtin` does. The sample player, drum kit, SoundFont and
+/// plugin voices are rendered by their own processors and `engine_sync` never
+/// pushes `SynthParams` for them, so a panel that showed those knobs was a row
+/// of controls wired to nothing (user report, 2026-11-05). The Inspector's
+/// `Node Parameters` grid and `patch::inline_params_of` both ask this one
+/// question, so the two surfaces cannot drift apart.
+fn voice_has_synth_params(voice: &VoiceSpec) -> bool {
+    matches!(voice, VoiceSpec::Builtin)
+}
+
 /// Peak level meter: the peak holds for 600 ms before falling back, which is easier to read visually.
 #[derive(Debug)]
 struct PeakMeter {
@@ -3020,6 +3033,50 @@ mod panel_target_tests {
         assert!(!panel_shows_track_extras(&lfo, true));
         assert!(!panel_shows_track_extras(&None, true), "timeline selected");
         assert!(panel_shows_track_extras(&None, false), "nothing selected");
+    }
+
+    /// Only the built-in voice owns the synth timbre grid. Every other voice
+    /// renders itself, so the Inspector must not show waveform / cutoff /
+    /// ADSR for it — the panel used to, and those knobs changed the document
+    /// fields without changing a single sample of sound.
+    #[test]
+    fn synth_params_belong_to_the_builtin_voice_only() {
+        assert!(voice_has_synth_params(&VoiceSpec::Builtin));
+        let others = [
+            VoiceSpec::Sample {
+                path: String::new(),
+                root_note: 60,
+                play_mode: SamplePlayMode::default(),
+                gain: 1.0,
+            },
+            VoiceSpec::DrumKit {
+                slots: Vec::new(),
+                gain: 1.0,
+            },
+            VoiceSpec::SoundFont {
+                path: String::new(),
+                bank: 0,
+                program: 0,
+                gain: 1.0,
+                bend_range: 2.0,
+            },
+            VoiceSpec::Clap {
+                path: String::new(),
+                plugin_id: String::new(),
+                state: Vec::new(),
+            },
+            VoiceSpec::Vst3 {
+                path: String::new(),
+                class_id: String::new(),
+                state: Vec::new(),
+            },
+        ];
+        for voice in others {
+            assert!(
+                !voice_has_synth_params(&voice),
+                "{voice:?} has no synth grid"
+            );
+        }
     }
 }
 #[cfg(test)]

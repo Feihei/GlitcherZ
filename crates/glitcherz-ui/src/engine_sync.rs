@@ -991,17 +991,30 @@ impl GlitcherZApp {
     }
 
     /// Built-in synth timbre parameters of an instrument node.
+    ///
+    /// `None` for every other voice: the timbre fields exist on the document
+    /// for forward compatibility, but nothing renders them (see
+    /// [`voice_has_synth_params`]), so reading them out would hand callers a
+    /// struct that has no effect on the sound.
     pub(crate) fn synth_of_node(&self, doc_id: u64) -> Option<SynthParams> {
         match self.project().graph.node_by_id(doc_id)? {
-            NodeDoc::Instrument { synth, .. } => Some(*synth),
+            NodeDoc::Instrument { voice, synth, .. } if voice_has_synth_params(voice) => {
+                Some(*synth)
+            }
             _ => None,
         }
     }
 
     /// Built-in synth timbre parameters of an instrument node (mutable).
+    ///
+    /// Same rule as [`Self::synth_of_node`]: writing these fields on a sample
+    /// player / drum kit / SoundFont / plugin node would be a silent no-op, so
+    /// the accessor refuses the write instead.
     pub(crate) fn synth_mut_node(&mut self, doc_id: u64) -> Option<&mut SynthParams> {
         match self.project_mut().graph.node_by_id_mut(doc_id)? {
-            NodeDoc::Instrument { synth, .. } => Some(synth),
+            NodeDoc::Instrument { voice, synth, .. } if voice_has_synth_params(voice) => {
+                Some(synth)
+            }
             _ => None,
         }
     }

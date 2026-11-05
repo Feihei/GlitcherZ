@@ -890,3 +890,19 @@ flush 归零 → writer 为 None → begin_pass：开新 writer → setup(engine
 **测试**：`ctrl_a_selects_every_note_and_ctrl_shift_a_clears`（卷帘，走真实 egui 帧）、`all_clips_covers_every_lane_in_table_order`（表序 + 空表）、`a_drag_out_of_the_clip_stops_at_the_tail_and_undoes_in_one_step`（拖到窗口外 → 尾巴仍在 clip 内 → 同一 gesture key → 一次 undo 回到 0）、`clamped_move_keeps_notes_inside_the_clip_and_pitch_range` 与模态 clamp 用例的期望值从 `loop-1` 改为 `loop-length`。
 
 **标签顺序**回退成 `Timeline → Edit → Patch → Inspector`（`MainView::ORDER` 仍是唯一来源，标签栏 / `Tab` 循环 / `Alt+1..4` 自动跟随）；默认视图不变。`docs/manual.md`、`docs/shortcuts.md` 同步。
+
+## Inspector 面板分家：合成器参数只属于内置合成器（2026-11-05）
+
+**症状**：选中鼓组 / 采样 / SoundFont / 插件乐器节点时，Inspector 下半部照样画出 `Waveform` / `Cutoff Freq` / `Resonance` / `Filter Mode` / `Volume Envelope` 一整块 `Node Parameters`，拖动滑块文档字段会变、undo 也记，但**一个采样都不变**（用户报障）。
+
+**根因**：那块网格用的是 `match (&target_doc, target) { (Some(NodeDoc::Instrument { .. }), ..) }`——只判断"这是个乐器节点"，没判断"这个乐器是不是内置合成器"。而 `engine_sync` 建图时是按 voice 分派的（`VoiceSpec::Builtin => SynthProcessor`，其余走采样播放器 / 鼓机 / SF2 / 插件），`synth_param_values(synth)` 也只在 `Builtin` 分支被推送。所以非内置 voice 的 `SynthParams` 是**只写不读**的死字段。画布上的内联行（`patch.rs::inline_params_of`）早就按 voice 分了家，缺的只有 Inspector。
+
+**修法三层**：
+
+1. `lib.rs` 新增 `voice_has_synth_params(&VoiceSpec) -> bool`（`matches!(voice, VoiceSpec::Builtin)`），与 `panel_shows_track_extras` 并列，成为"There be synths"的唯一判据。
+2. Inspector 用 `synth_target` 取代原来的 `instr_target`：voice 不是 `Builtin` 就是 `None`。`Node Parameters` 标题与整个网格都跟着它——鼓组的 Inspector 现在只剩鼓槽表 + 输出 gain，采样只有路径/根音/播放模式/gain，SF2 只有文件/预设/gain。
+3. `engine_sync::synth_of_node` / `synth_mut_node` 也加同一道守卫，非内置 voice 返回 `None`。原来它们对任何 `NodeDoc::Instrument` 都返回 `Some`，等于给调用方一个"写了也不生效"的引用；`adsr_sliders` 与 `apply_inline_param` 都走这条路，守卫让语义从"能写但没用"变成"没有这个概念"。
+
+**测试**：`panel_target_tests::synth_params_belong_to_the_builtin_voice_only`（`Builtin` 为真；Sample / DrumKit / SoundFont / Clap / Vst3 逐一为假）。
+
+**未改动**：引擎侧 `SynthParams` 字段保留（工程文件向前兼容，切换 voice 时旧字段仍在文档里），只是 UI 不再假装它们起作用。
