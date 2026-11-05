@@ -972,3 +972,25 @@ spec `instrument.md` D14 落地。新文件 `realtime/moog.rs` 放 DSP，`SvfPro
 - UI 的 Filter Mode 行从 3 个按钮变 4 个，改成 `horizontal_wrapped` 并给每个按钮加了 hover 说明（12 dB/oct vs 24 dB/oct）——窄一点的窗口会把 Moog 折到第二行，而不是被裁掉。
 
 **测试**：`moog.rs` +5（直流增益、4 极衰减对比、自激有界、全量扫频、双声道状态独立）；`svf.rs` +3（与 2 极的通带/阻带成对比较、Moog 往返逐比特不变、滑块顶端的共振有界）。
+
+## egui 0.36 → 0.37（2026-11-05）
+
+`eframe` 从 0.36.2 升到 0.37.0（egui / epaint / ecolor / emath 跟着走）。`default-features = false` 保持不变，只把 0.37 新变成"可选"的 `clipboard` 显式打开。
+
+**0.36 → 0.37 实际撞到的五个契约**（升级前评估里点了四个，最后一个只有编译器会告诉你）：
+
+| 变化 | 影响面 | 处理 |
+| :--- | :--- | :--- |
+| `clipboard` 变成 eframe 的**可选 feature**（默认 feature 里有，但我们关掉了默认） | 所有文本框的 Ctrl+C/V | `glitcherz-ui` 的 eframe features 加 `clipboard`。不加上去**不会编译失败**——只是复制粘贴静默失效，属于最难自查的一类 |
+| `Id::new` 弃用，拆成 `Id::unique`（全局唯一）与 `IdSalt::new`（局部盐） | 30 处、11 个文件 | 全部换 `Id::unique`：签名相同、语义相同（`Id::new` 在 0.37 里就是 `Id::unique` 的薄封装） |
+| `Ui::id()` → `Ui::scope_id()`，`UiBuilder::id()` → `UiBuilder::scope_id()` | 2 处 | 直接改名。注意这**不是** `unique_id()`：`scope_id` 是布局作用域的稳定 id，`ui.interact` / `UiBuilder` 要的正是它 |
+| `ScrollArea::State.offset` 变成**私有字段**，只留 `clamped_offset()` / `unclamped_offset()` 读 | 时间轴 Ctrl+滚轮锚点缩放、时间轴中键平移、混音器中键平移，外加 `mixer_strip_scroll` 测试脚手架 | 0.37 没有 setter，**改用 builder 的 `scroll_offset` / `horizontal_scroll_offset`**：手势算出目标偏移 → 传给 ScrollArea；不再"读 state → 改 → store"。只在手势发生的那一帧传，否则每帧都传会把视图钉死、滚轮失效 |
+| `Event::MouseWheel` 多了一个 `source: MouseWheelSource` 字段（Wheel / Trackpad / Momentum / Unknown） | `tests/egui_event_semantics.rs` 的合成滚轮事件 | 补 `source: Wheel` |
+
+**刻意没做的**：`system_fonts` 仍然关闭（工程自带 Noto Sans SC，见 `fonts.rs`）；`wgpu` 不启用，继续用 glow；`links` 不启用。这也说明为什么 `epaint_default_fonts` 的字体集（Ubuntu-Light / NotoEmoji / emoji-icon-font / Hack）与 0.36 完全一致 —— `.agents/glossary.md` 里那张"哪些字形能显示"的表不用改。
+
+**ScrollArea 那一条是唯一有行为风险的**。旧写法是"改存储里的 offset"，相当于在 ScrollArea 布局**之前**把状态改掉，同一帧生效；新写法 `scroll_offset()` 在 `ScrollArea::show` 里 `state.offset.x = offset_x.unwrap_or(state.offset.x)`，恰好也是布局前赋值，所以缩放锚点的数学（`tick → new_ppt → anchored`）一个字没改。差别只在"谁拥有这次赋值"：手势帧由 builder 覆盖，其余帧照旧由滚轮/拖动驱动。
+
+**门槛**：`cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace`（39 个测试二进制）全绿，**第一次跑就过**，没有需要改断言的用例——包括最依赖像素几何的 `timeline_focus`(9)、`mixer_strip_scroll`(2)、`egui_event_semantics`(1)、`roll_state_machine`。`cargo build -p glitcherz-app` 也能链接出可执行文件。
+
+**视觉**：0.37 把默认间距、按钮内边距、圆角调大了（"roomier buttons / larger corner radius"），工程没有覆盖全局 `Style`，所以整套界面会比 0.36 略微松一点、圆一点；滚动条命中区和橡胶带滚动也换成了新实现。这是升级的预期代价，需要实际开窗口看一眼再决定要不要用 `Style` 补偿。

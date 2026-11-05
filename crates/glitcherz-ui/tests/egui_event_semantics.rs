@@ -91,6 +91,8 @@ fn wheel(delta: egui::Vec2, modifiers: egui::Modifiers) -> egui::Event {
         delta,
         modifiers,
         phase: egui::TouchPhase::Move,
+        // 0.37 split the event by input device; a test drag is a plain wheel.
+        source: egui::MouseWheelSource::Wheel,
     }
 }
 
@@ -339,7 +341,7 @@ fn space_reaches_the_app_while_a_click_surface_has_focus() {
     }
 
     fn run(ctx: &egui::Context, t: f64, consume: bool) -> Obs {
-        let id = egui::Id::new("focused_click_surface");
+        let id = egui::Id::unique("focused_click_surface");
         let mut viewports = egui::ViewportIdMap::default();
         viewports.insert(
             egui::ViewportId::ROOT,

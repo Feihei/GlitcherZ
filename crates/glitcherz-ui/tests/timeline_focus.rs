@@ -289,7 +289,7 @@ fn rows_stack_vertically_instead_of_overlapping() {
     f.frame(vec![]);
     let rect = |track: usize| {
         f.ctx
-            .read_response(egui::Id::new("glitcherz_timeline_row").with((false, track)))
+            .read_response(egui::Id::unique("glitcherz_timeline_row").with((false, track)))
             .unwrap_or_else(|| panic!("row {track} is missing from the widget stack"))
             .rect
     };
@@ -311,7 +311,7 @@ fn clicking_a_clip_then_g_arms_the_move_modal() {
     f.frame(vec![]);
     let row = f
         .ctx
-        .read_response(egui::Id::new("glitcherz_timeline_row").with((false, 0usize)))
+        .read_response(egui::Id::unique("glitcherz_timeline_row").with((false, 0usize)))
         .expect("row 0 is missing from the widget stack")
         .rect;
     // The fixture clip covers bars 0-2 from the lane start; the lane
@@ -337,7 +337,7 @@ fn alt_t_arms_the_tile_modal() {
     f.frame(vec![]);
     let row = f
         .ctx
-        .read_response(egui::Id::new("glitcherz_timeline_row").with((false, 0usize)))
+        .read_response(egui::Id::unique("glitcherz_timeline_row").with((false, 0usize)))
         .expect("row 0 is missing from the widget stack")
         .rect;
     let pos = egui::pos2(row.left() + 130.0, row.center().y);
@@ -366,7 +366,7 @@ fn alt_t_arms_tile_without_a_pointer() {
     f.frame(vec![]);
     let row = f
         .ctx
-        .read_response(egui::Id::new("glitcherz_timeline_row").with((false, 0usize)))
+        .read_response(egui::Id::unique("glitcherz_timeline_row").with((false, 0usize)))
         .expect("row 0 is missing from the widget stack")
         .rect;
     let pos = egui::pos2(row.left() + 130.0, row.center().y);
@@ -395,7 +395,7 @@ fn alt_t_click_confirms_tile_after_pointer_returns() {
     f.frame(vec![]);
     let row = f
         .ctx
-        .read_response(egui::Id::new("glitcherz_timeline_row").with((false, 0usize)))
+        .read_response(egui::Id::unique("glitcherz_timeline_row").with((false, 0usize)))
         .expect("row 0 is missing from the widget stack")
         .rect;
     let pos = egui::pos2(row.left() + 130.0, row.center().y);
@@ -447,7 +447,7 @@ fn alt_t_works_right_after_a_confirmed_stretch() {
     f.frame(vec![]);
     let row = f
         .ctx
-        .read_response(egui::Id::new("glitcherz_timeline_row").with((false, 0usize)))
+        .read_response(egui::Id::unique("glitcherz_timeline_row").with((false, 0usize)))
         .expect("row 0 is missing from the widget stack")
         .rect;
     let pos = egui::pos2(row.left() + 130.0, row.center().y);
@@ -509,7 +509,7 @@ fn shift_t_arms_the_tile_modal() {
     f.frame(vec![]);
     let row = f
         .ctx
-        .read_response(egui::Id::new("glitcherz_timeline_row").with((false, 0usize)))
+        .read_response(egui::Id::unique("glitcherz_timeline_row").with((false, 0usize)))
         .expect("row 0 is missing from the widget stack")
         .rect;
     let pos = egui::pos2(row.left() + 130.0, row.center().y);
@@ -533,7 +533,7 @@ fn double_click_insert_selects() {
     f.frame(vec![]);
     let row = f
         .ctx
-        .read_response(egui::Id::new("glitcherz_timeline_row").with((false, 0usize)))
+        .read_response(egui::Id::unique("glitcherz_timeline_row").with((false, 0usize)))
         .expect("row 0 is missing from the widget stack")
         .rect;
     let empty = egui::pos2(row.left() + 400.0, row.center().y);
@@ -568,7 +568,7 @@ fn hovering_a_lane_grants_focus_without_a_click() {
     // y — the toolbar / ruler heights are egui's business.
     let row = f
         .ctx
-        .read_response(egui::Id::new("glitcherz_timeline_row").with((false, 0usize)))
+        .read_response(egui::Id::unique("glitcherz_timeline_row").with((false, 0usize)))
         .expect("row 0 is missing from the widget stack")
         .rect;
     f.frame(vec![hover(egui::pos2(LANE_X, row.center().y))]);

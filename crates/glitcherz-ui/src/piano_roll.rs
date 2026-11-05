@@ -1558,7 +1558,7 @@ pub fn show(
     );
     let response = ui.interact(
         rect,
-        ui.id().with("roll-notes"),
+        ui.scope_id().with("roll-notes"),
         egui::Sense::click_and_drag(),
     );
     // The roll owns keyboard focus while hovered (the app-level FocusRouter

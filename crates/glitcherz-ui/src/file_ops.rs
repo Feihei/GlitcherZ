@@ -108,26 +108,27 @@ impl GlitcherZApp {
             return;
         };
         let mut choice = None;
-        let modal = egui::Modal::new(egui::Id::new("glitcherz_unsaved_changes")).show(ctx, |ui| {
-            ui.set_width(360.0);
-            ui.heading("Unsaved changes");
-            ui.label(format!(
-                "The project has unsaved changes. Save them before you {}?",
-                action.verb()
-            ));
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    choice = Some(ConfirmChoice::Save);
-                }
-                if ui.button("Discard changes").clicked() {
-                    choice = Some(ConfirmChoice::Discard);
-                }
-                if ui.button("Cancel").clicked() {
-                    choice = Some(ConfirmChoice::Cancel);
-                }
+        let modal =
+            egui::Modal::new(egui::Id::unique("glitcherz_unsaved_changes")).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.heading("Unsaved changes");
+                ui.label(format!(
+                    "The project has unsaved changes. Save them before you {}?",
+                    action.verb()
+                ));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        choice = Some(ConfirmChoice::Save);
+                    }
+                    if ui.button("Discard changes").clicked() {
+                        choice = Some(ConfirmChoice::Discard);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(ConfirmChoice::Cancel);
+                    }
+                });
             });
-        });
         if modal.should_close() {
             choice = Some(ConfirmChoice::Cancel);
         }
@@ -164,7 +165,7 @@ impl GlitcherZApp {
         let mut discard_all = false;
         let mut later = false;
         let now = std::time::SystemTime::now();
-        let modal = egui::Modal::new(egui::Id::new("glitcherz_recovery")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("glitcherz_recovery")).show(ctx, |ui| {
             ui.set_width(460.0);
             ui.heading("Recover unsaved work");
             ui.label(
@@ -703,7 +704,7 @@ impl GlitcherZApp {
         }
         let mut continue_without = false;
         let mut locate = false;
-        let modal = egui::Modal::new(egui::Id::new("glitcherz_missing_media")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("glitcherz_missing_media")).show(ctx, |ui| {
             ui.set_width(480.0);
             ui.heading(format!("Missing media ({})", self.missing_media.len()));
             ui.label("The project refers to these files, but they are not where it expects them:");

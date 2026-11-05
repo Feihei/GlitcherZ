@@ -736,7 +736,7 @@ impl GlitcherZApp {
             && self.project().metadata.loop_range.end_ticks
                 > self.project().metadata.loop_range.start_ticks
             && self.project().metadata.loop_range.end_ticks > 0;
-        let modal = egui::Modal::new(egui::Id::new("glitcherz_export_range")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("glitcherz_export_range")).show(ctx, |ui| {
             ui.set_width(360.0);
             ui.heading("Export Audio");
             ui.label(format!(

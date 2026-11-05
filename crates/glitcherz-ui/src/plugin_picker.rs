@@ -40,7 +40,7 @@ const TAG_WIDTH: f32 = 58.0;
 /// Stable id for the query field (an auto-generated id would move with the
 /// popup and drop focus on open).
 fn query_id() -> egui::Id {
-    egui::Id::new("glitcherz_plugin_picker_query")
+    egui::Id::unique("glitcherz_plugin_picker_query")
 }
 
 /// Where a row comes from (spec D15): the right-aligned tag, and the key the
@@ -711,7 +711,7 @@ impl PluginPicker {
         // (spec D19).
         let available = available_tags(entries, self.filter);
         let mut picked: Option<PickChoice> = None;
-        let area = egui::Area::new(egui::Id::new("glitcherz_plugin_picker"))
+        let area = egui::Area::new(egui::Id::unique("glitcherz_plugin_picker"))
             .order(egui::Order::Foreground)
             .fixed_pos(anchor)
             .constrain_to(ctx.content_rect())
@@ -905,7 +905,7 @@ fn tag_chip(ui: &mut egui::Ui, tag: PickTag, on: bool) -> bool {
     }
     let response = ui.interact(
         rect,
-        egui::Id::new(("plugin_picker_tag", tag.label())),
+        egui::Id::unique(("plugin_picker_tag", tag.label())),
         egui::Sense::click(),
     );
     let visuals = ui.visuals();
@@ -985,7 +985,7 @@ fn row(ui: &mut egui::Ui, choice: &PickChoice, selected: bool, reveal: bool, ind
     // Enter path always worked because keys bypass hit-testing).
     let response = ui.interact(
         rect,
-        egui::Id::new(("plugin_picker_row", index)),
+        egui::Id::unique(("plugin_picker_row", index)),
         egui::Sense::click(),
     );
     response.on_hover_text(choice.tooltip()).clicked()
@@ -1469,7 +1469,7 @@ mod tests {
         // click its centre — the same gesture as clicking the name with the
         // mouse. Index 4 is the first plugin: the four built-ins lead.
         let row_rect = ctx
-            .read_response(egui::Id::new(("plugin_picker_row", 4)))
+            .read_response(egui::Id::unique(("plugin_picker_row", 4)))
             .expect("row 4 drew once the popup settled")
             .rect;
         let pos = row_rect.center();
@@ -1572,7 +1572,7 @@ mod tests {
         // Chips carry explicit ids, so the test can click one like the mouse
         // would: BUILT-IN / CLAP / VST3 all exist under "instruments" here.
         let chip = ctx
-            .read_response(egui::Id::new(("plugin_picker_tag", "VST3")))
+            .read_response(egui::Id::unique(("plugin_picker_tag", "VST3")))
             .expect("the VST3 chip drew once the popup settled")
             .rect;
         let pos = chip.center();

@@ -1245,11 +1245,11 @@ struct CableMenu {
 /// Popup ids — one per menu, so egui remembers each open state independently
 /// and `Popup::is_id_open` can report that a menu closed itself.
 fn add_menu_id() -> egui::Id {
-    egui::Id::new("glitcherz_patch_add_menu")
+    egui::Id::unique("glitcherz_patch_add_menu")
 }
 
 fn cable_menu_id() -> egui::Id {
-    egui::Id::new("glitcherz_patch_cable_menu")
+    egui::Id::unique("glitcherz_patch_cable_menu")
 }
 
 /// Current selection (multi-select: marquee box selection can select several nodes).
@@ -4246,7 +4246,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             _ => "Parameter",
         };
         let mut picked: Option<u8> = None;
-        egui::Area::new(egui::Id::new("glitcherz_patch_sf2_choice"))
+        egui::Area::new(egui::Id::unique("glitcherz_patch_sf2_choice"))
             .fixed_pos(menu_pos)
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
@@ -4320,7 +4320,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         };
         let mut pick: Option<InputSourceItem> = None;
         let mut refresh = false;
-        egui::Area::new(egui::Id::new("glitcherz_patch_input_source"))
+        egui::Area::new(egui::Id::unique("glitcherz_patch_input_source"))
             .fixed_pos(menu_pos)
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
@@ -4481,7 +4481,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         // Pitch targets come from `auto_options` (the app's shared table with
         // the timeline menu), so adding them here would duplicate every row.
         let mut picked: Option<AutoParam> = None;
-        egui::Area::new(egui::Id::new("glitcherz_patch_auto_menu"))
+        egui::Area::new(egui::Id::unique("glitcherz_patch_auto_menu"))
             .fixed_pos(menu_pos)
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {

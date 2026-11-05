@@ -66,7 +66,7 @@ impl GlitcherZApp {
         let mut apply = false;
         let devices = self.preferences_devices.clone();
         egui::Window::new("Preferences")
-            .id(egui::Id::new("glitcherz_preferences"))
+            .id(egui::Id::unique("glitcherz_preferences"))
             .open(&mut open)
             .default_width(380.0)
             .resizable(false)
@@ -217,7 +217,7 @@ impl GlitcherZApp {
         let mut open = self.undo_history_open;
         let mut jump = None;
         egui::Window::new("Undo History")
-            .id(egui::Id::new("glitcherz_undo_history"))
+            .id(egui::Id::unique("glitcherz_undo_history"))
             .open(&mut open)
             .default_width(320.0)
             .min_width(240.0)

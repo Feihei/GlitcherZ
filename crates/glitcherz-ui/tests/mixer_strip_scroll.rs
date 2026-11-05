@@ -100,7 +100,11 @@ fn frame(
                     let strip_width = (ui.available_width() - CONTROLS_W).max(160.0);
 
                     // ---- pan (same shape as `mixer_section`) ----
+                    // eframe 0.37 keeps `ScrollArea::State`'s offset private,
+                    // so the pan is handed to the builder instead of written
+                    // into the stored state (see `mixer_section`).
                     let c = ui.ctx();
+                    let mut pan_offset: Option<f32> = None;
                     if let Some((scroll_id, band)) = *view
                         && c.pointer_hover_pos().is_some_and(|pos| band.contains(pos))
                     {
@@ -110,13 +114,9 @@ fn frame(
                                 i.pointer.delta(),
                             )
                         });
-                        if down
-                            && delta != egui::Vec2::ZERO
-                            && let Some(mut s) =
-                                egui::containers::scroll_area::State::load(c, scroll_id)
-                        {
-                            s.offset.x = (s.offset.x - delta.x).max(0.0);
-                            s.store(c, scroll_id);
+                        if down && delta != egui::Vec2::ZERO {
+                            pan_offset = egui::containers::scroll_area::State::load(c, scroll_id)
+                                .map(|s| (s.clamped_offset().x - delta.x).max(0.0));
                         }
                     }
 
@@ -131,61 +131,60 @@ fn frame(
                             .id_salt(STRIP_ROW),
                     );
                     let (scroll_id, band) = {
-                        let strips = egui::ScrollArea::horizontal()
+                        let mut strips = egui::ScrollArea::horizontal()
                             .id_salt(STRIP_SCROLL)
                             .max_width(strip_width)
-                            .auto_shrink([true, true])
-                            .show(&mut row, |ui| {
-                                ui.horizontal(|ui| {
-                                    for i in 0..CHANNELS {
-                                        ui.vertical(|ui| {
-                                            // Same title cell as `mixer_section`:
-                                            // a fixed-size rect with a
-                                            // truncating label inside, so it can
-                                            // never wrap no matter how little
-                                            // width the column has left.
-                                            let (cell, resp) = ui.allocate_exact_size(
-                                                egui::vec2(STRIP_W, TITLE_H),
-                                                egui::Sense::click(),
-                                            );
-                                            let mut cell_ui = ui.new_child(
-                                                egui::UiBuilder::new().max_rect(cell).layout(
-                                                    egui::Layout::left_to_right(
-                                                        egui::Align::Center,
-                                                    ),
-                                                ),
-                                            );
-                                            let title = cell_ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(format!("Ch {}", i + 1))
-                                                        .weak(),
-                                                )
-                                                .truncate(),
-                                            );
-                                            let _ = resp.on_hover_text(format!("Ch {}", i + 1));
-                                            title_h.push(title.rect.height());
-                                            let _ =
-                                                ui.add_sized([96.0, 20.0], egui::Button::new("S"));
-                                            let _ = ui.allocate_exact_size(
-                                                egui::vec2(96.0, 10.0),
-                                                egui::Sense::hover(),
-                                            );
-                                            let mut f = 0.5_f32;
-                                            let _ = ui.add_sized(
-                                                [96.0, 110.0],
-                                                egui::Slider::new(&mut f, 0.0..=1.5).vertical(),
-                                            );
-                                            let mut p = 0.0_f32;
-                                            let _ = ui.add_sized(
-                                                [96.0, 20.0],
-                                                egui::Slider::new(&mut p, -1.0..=1.0).text("Pan"),
-                                            );
-                                        });
-                                    }
-                                });
+                            .auto_shrink([true, true]);
+                        if let Some(offset) = pan_offset {
+                            strips = strips.horizontal_scroll_offset(offset);
+                        }
+                        let strips = strips.show(&mut row, |ui| {
+                            ui.horizontal(|ui| {
+                                for i in 0..CHANNELS {
+                                    ui.vertical(|ui| {
+                                        // Same title cell as `mixer_section`:
+                                        // a fixed-size rect with a
+                                        // truncating label inside, so it can
+                                        // never wrap no matter how little
+                                        // width the column has left.
+                                        let (cell, resp) = ui.allocate_exact_size(
+                                            egui::vec2(STRIP_W, TITLE_H),
+                                            egui::Sense::click(),
+                                        );
+                                        let mut cell_ui = ui.new_child(
+                                            egui::UiBuilder::new().max_rect(cell).layout(
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                            ),
+                                        );
+                                        let title = cell_ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!("Ch {}", i + 1)).weak(),
+                                            )
+                                            .truncate(),
+                                        );
+                                        let _ = resp.on_hover_text(format!("Ch {}", i + 1));
+                                        title_h.push(title.rect.height());
+                                        let _ = ui.add_sized([96.0, 20.0], egui::Button::new("S"));
+                                        let _ = ui.allocate_exact_size(
+                                            egui::vec2(96.0, 10.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        let mut f = 0.5_f32;
+                                        let _ = ui.add_sized(
+                                            [96.0, 110.0],
+                                            egui::Slider::new(&mut f, 0.0..=1.5).vertical(),
+                                        );
+                                        let mut p = 0.0_f32;
+                                        let _ = ui.add_sized(
+                                            [96.0, 20.0],
+                                            egui::Slider::new(&mut p, -1.0..=1.0).text("Pan"),
+                                        );
+                                    });
+                                }
                             });
+                        });
                         p.content = strips.content_size;
-                        p.offset = strips.state.offset.x;
+                        p.offset = strips.state.clamped_offset().x;
                         (
                             strips.id,
                             egui::Rect::from_min_size(

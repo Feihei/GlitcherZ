@@ -171,7 +171,7 @@ mod tests {
         let mut ran = false;
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             router.register_keyboard(
-                egui::Id::new("a"),
+                egui::Id::unique("a"),
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(10.0, 10.0)),
             );
             router.register_neutral(egui::Rect::from_min_size(
@@ -205,7 +205,7 @@ mod tests {
     fn focus_hold_pins_the_owner_through_neutral_hover() {
         let ctx = egui::Context::default();
         let mut router = FocusRouter::new();
-        let id = egui::Id::new("roll");
+        let id = egui::Id::unique("roll");
         let kb = kb_rect();
         let neutral = neutral_rect();
 

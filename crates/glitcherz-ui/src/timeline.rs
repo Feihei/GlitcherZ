@@ -1377,7 +1377,13 @@ pub fn show(
     // Ctrl+Alt+wheel zooms the row height, middle-drag pans both axes. Plain
     // / Shift wheel stay with the ScrollArea (vertical / horizontal
     // scrolling).
+    //
+    // eframe 0.37 made `ScrollArea::State`'s offset private: it can be *read*
+    // (`clamped_offset`) but only changed by handing the value to the
+    // ScrollArea, so both gestures below produce an offset that is passed to
+    // the builder instead of being written into the stored state.
     let scroll_id = ui.make_persistent_id("glitcherz_timeline_scroll");
+    let mut scroll_target: Option<Vec2> = None;
     {
         let (zoom2, mods) = ui.ctx().input(|i| (i.zoom_delta_2d(), i.modifiers));
         let ctrl = mods.ctrl || mods.command;
@@ -1390,8 +1396,8 @@ pub fn show(
                 unreachable!("in_rows implies ptr")
             };
             let vmin = state.rows_viewport_min;
-            let mut scroll_state = egui::containers::scroll_area::State::load(ui.ctx(), scroll_id);
-            let offset = scroll_state.as_ref().map_or(Vec2::ZERO, |s| s.offset);
+            let offset = egui::containers::scroll_area::State::load(ui.ctx(), scroll_id)
+                .map_or(Vec2::ZERO, |s| s.clamped_offset());
             // Time axis: uniform zoom (pure Ctrl) or horizontal-only (the
             // touch pinch case). Anchor the tick under the pointer.
             if zoom2.x != 1.0 {
@@ -1403,18 +1409,13 @@ pub fn show(
                     let new_ppt = new / bar_ticks as f32;
                     let anchored = (tick * new_ppt - (ptr.x - vmin.x)).max(0.0);
                     state.px_per_bar = new;
-                    if let Some(s) = scroll_state.as_mut() {
-                        s.offset.x = anchored;
-                    }
+                    scroll_target = Some(Vec2::new(anchored, offset.y));
                 }
             }
             // Row height: only a vertical-only factor (Ctrl+Alt) resizes
             // the rows — a uniform zoom belongs to the time axis above.
             if zoom2.y != 1.0 && (zoom2.x - zoom2.y).abs() > 1e-4 {
                 state.row_zoom = (state.row_zoom * zoom2.y).clamp(ROW_ZOOM_MIN, ROW_ZOOM_MAX);
-            }
-            if let Some(s) = scroll_state {
-                s.store(ui.ctx(), scroll_id);
             }
             ui.ctx().request_repaint();
         }
@@ -1427,11 +1428,13 @@ pub fn show(
         {
             let d = ui.ctx().input(|i| i.pointer.delta());
             if d != Vec2::ZERO
-                && let Some(mut s) = egui::containers::scroll_area::State::load(ui.ctx(), scroll_id)
+                && let Some(s) = egui::containers::scroll_area::State::load(ui.ctx(), scroll_id)
             {
-                s.offset.x = (s.offset.x - d.x).max(0.0);
-                s.offset.y = (s.offset.y - d.y).max(0.0);
-                s.store(ui.ctx(), scroll_id);
+                let offset = s.clamped_offset();
+                scroll_target = Some(Vec2::new(
+                    (offset.x - d.x).max(0.0),
+                    (offset.y - d.y).max(0.0),
+                ));
             }
         }
     }
@@ -1442,10 +1445,15 @@ pub fn show(
     // ID, the focused lane turns into a phantom (no row reports focus
     // again, every focus-gated key dies, and the "no keyboard focus" chip
     // stays lit no matter how often you click).
-    egui::ScrollArea::both()
+    let mut view = egui::ScrollArea::both()
         .auto_shrink(false)
-        .id_salt("glitcherz_timeline_scroll")
-        .show(ui, |ui| {
+        .id_salt("glitcherz_timeline_scroll");
+    if let Some(target) = scroll_target {
+        // Only on the frames a gesture produced one: passing it every frame
+        // would pin the view and the wheel would stop scrolling.
+        view = view.scroll_offset(target);
+    }
+    view.show(ui, |ui| {
         // Toolbar: zoom + track add/remove + hints.
         ui.horizontal(|ui| {
             ui.strong("Arrangement");
@@ -2631,7 +2639,7 @@ fn lane_row<T: Placement>(
         egui::UiBuilder::new()
             // Same layout as `ui.horizontal`, but with an explicit id.
             .layout(egui::Layout::left_to_right(egui::Align::Center))
-            .id(egui::Id::new("glitcherz_timeline_row").with(row.key()))
+            .scope_id(egui::Id::unique("glitcherz_timeline_row").with(row.key()))
             .max_rect(row_rect),
     );
     let ui = &mut row_ui;
