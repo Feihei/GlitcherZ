@@ -26,8 +26,10 @@
 | K8 | 参数下发 | `ParamId::{DrumGain, DrumSlotGain(note), DrumSlotPan(note), DrumSlotTune(note), DrumSlotChoke(note)}`；`DrumSlotTune` 只影响后续触发的 voice（触发时冻结 rate），其余实时作用。非有限值丢弃。 |
 | K9 | 音色池 | UI 侧复用会话 `sample_library`（U5 的 `SampleLibrary`）；同一路径的槽位共享同一 `Arc<SampleData>`。单槽解码失败只让该槽静默并 `set_error`，不拖垮整个节点。 |
 | K10 | 多选加载的 note 分配 | 纯函数 `assign_drum_notes(taken, count)`：从 **36** 起顺序找空闲键（跳过已占用，到 127 回绕），保证一次多选立即得到可用映射；文件名里的数字**不**参与推断（文档表格可改）。 |
-| K11 | UI 版图 | patch 节点：`Load Samples…` 按钮 + `N slots` 标签（与 SF2 的 `Load File…` 同族）；Inspector：`drum_section` 表格（note / file stem / gain / pan / tune / choke + 移除）。节点内不铺 32 行表格（空间不够，缩放后不可点）。 |
+| K11 | UI 版图 | patch 节点：`Load Samples…` 按钮 + `N slots` 标签（与 SF2 的 `Load File…` 同族）；Inspector：`drum_section` 表格（key / file stem / gain / pan / tune / choke + 移除）。节点内不铺 32 行表格（空间不够，缩放后不可点）。 |
 | K12 | 一步 undo | 加槽/删槽/改参数都走既有 `begin_edit`/`commit_param_edit` 守卫；`Load Samples…` 整次加载 = 一步 undo。 |
+| K13 | 键位可读可改（2026-11-05） | 触发键在表格里显示为 **`C2 · 36`**（`note_name` 唯一实现，C4 = 60 科学音高），可拖动改键；落到已占用键时用 `nearest_free_note`（`ops.rs`，等距上优先）吸附到最近空闲键，不覆盖邻居。改键走 `move_drum_slot` + `rebuild_drum_kit`（RT 表按 key 索引，必须换 processor；`replace_node` 保留 node id / 连线 / MIDI 路由），**一次拖放 = 一次重建 = 一步 undo**（拖动中不提交，松手才落）。手册/术语沿用 K11 的表格语义。 |
+| K14 | 卷帘键名列（2026-11-05） | `piano_roll::show` 左侧固定 `KEYS_WIDTH = 64 px` 键盘列：白/黑键块 + 每个八度的 C 行标 `C2` 等键名。卷帘的 `rect` 收窄为音符区，所有 tick/命中/框选仍由 `geom` 派生；velocity lane 与 curve lane 用 `allocate_roll_strip` 同样右移，保持时间轴对齐。键名列下方（lane 高度段）填深色 gutter，不读作空洞。 |
 
 ## 3. 引擎接口
 
@@ -54,7 +56,9 @@ impl DrumKitProcessor {
 - engine：静音输入 → 静音、满幅 → 无 NaN/Inf、note 映射与未映射键、pan 左右声道、choke 互斥、blanket 停音、24 复音上限、gain/tune 参数。
 - RT 审计：`drum_kit_rt_audit`（复用 `sample_rt_audit` 的计数分配器）触发/压测/控制面零分配。
 - model：`DrumSlot` / `VoiceSpec::DrumKit` RON 往返；旧文档读出空槽位；validate（上限 32、note 唯一）。
-- UI：`assign_drum_notes` 分配纯函数（跳过占用、回绕、上限）。
+- model：`note_name` 八度基准（60 → `C4`、36 → `C2`）、`nearest_free_note`（空闲直取、等距上优先、0/127 边界、全满 → None）。
+- UI：`assign_drum_notes` 分配纯函数（跳过占用、回绕、上限）；`move_drum_slot` 改键后槽位数与顺序不变、`validate` 通过。
+- UI：卷帘 `roll_state_machine` 集成测试按 `KEYS_WIDTH` 校准（键名列占位后音符区起点右移、fit 比例按剩余宽度算）。
 - 全仓 `fmt` / `clippy -D warnings` / `test` 绿。
 
 ## 5. 明确不做

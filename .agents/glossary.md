@@ -140,6 +140,8 @@
 | 冒烟测试 | smoke test | `--seconds` 自动关窗跑通；需要验声时加 `--autoplay` |
 | 节点画布 | node patch | P5d 的 patch 图视图编辑器（Pure Data 语境，连线图叫 patch） |
 | 钢琴卷帘 | piano roll | 音符片段编辑器 |
+| 键名列 | keyboard column | 卷帘左缘固定宽度的键位条（`KEYS_WIDTH`），C 行标音名；不写 key lane / keyboard strip |
+| 音名 | note name | 科学音高记法，C4 = 60；唯一实现 `model::ops::note_name`，不写 pitch name |
 | 混音器 | mixer | 多轨电平/推子区 |
 | 走带控制 | transport bar | 顶部播放/速度/文件工具条 |
 
