@@ -16,7 +16,8 @@
 标签顺序按搭建工程的顺序排：`Patch`（节点图）→ `Timeline`（编曲）→ `Edit`（卷帘 / 曲线）
 → `Inspector`（选中节点的参数）。启动时默认仍停在 `Timeline`——那是 DAW 的主视图。
 切换可以点标签，也可以按 `Tab` / `Shift+Tab` 循环，或用 `Alt+1` .. `Alt+4` 直接跳
-（编号就是上面的顺序）。
+（编号就是上面的顺序）。`Tab` 被视图切换独占，代价是 egui 的控件焦点遍历不再生效——
+`File` / `Edit` 菜单只能用鼠标点。
 
 `Edit` 菜单只有四项：`Undo`（`Ctrl+Z`）、`Redo`（`Ctrl+Y`）、`Undo History…`、
 `Preferences…`。`Undo History…` 是浮窗，最新在上，当前行高亮，灰行可以 redo，点一行就跳到那一步之后。

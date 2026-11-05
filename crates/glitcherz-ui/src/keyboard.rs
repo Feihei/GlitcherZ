@@ -535,6 +535,9 @@ impl GlitcherZApp {
             if let Some(target) = view_target {
                 if !repeat {
                     ctx.input_mut(|i| i.consume_key(modifiers, key));
+                    // An open menu (File / Edit) would otherwise float over
+                    // the view we are switching to.
+                    egui::Popup::close_all(ctx);
                     self.view = target;
                 }
                 continue;
