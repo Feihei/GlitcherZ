@@ -1347,12 +1347,13 @@ enum MainView {
 }
 
 impl MainView {
-    /// Left-to-right tab order, which is also the `Tab` / `Ctrl`-free cycle
-    /// order and the `Alt+1..4` index. The graph comes first because that is
-    /// where the project is actually built, but the arrangement stays the
-    /// view the app *opens* on (see `default` above): a DAW's home screen is
-    /// still the timeline, it is just no longer the leftmost tab.
-    const ORDER: [Self; 4] = [Self::Patch, Self::Timeline, Self::Edit, Self::Inspector];
+    /// Left-to-right tab order, which is also the `Tab` / `Shift+Tab` cycle
+    /// order and the `Alt+1..4` index: **Timeline → Edit → Patch →
+    /// Inspector**. The arrangement comes first because that is where a
+    /// session actually starts, the piano roll sits next to it (the two views
+    /// you edit clips in), and the graph — where the patch is *built* rather
+    /// than performed — follows the editing pair.
+    const ORDER: [Self; 4] = [Self::Timeline, Self::Edit, Self::Patch, Self::Inspector];
 
     /// Tab caption.
     fn label(self) -> &'static str {
@@ -1389,38 +1390,40 @@ mod main_view_tests {
     use super::MainView;
 
     /// The tab bar, the `Tab` cycle and `Alt+1..4` all read `ORDER`, so this
-    /// pins the one order the user asked for: patch first, arrangement second.
+    /// pins the one order the user asked for: arrangement, editor, patch.
     #[test]
-    fn the_tab_order_puts_patch_first_and_timeline_second() {
+    fn the_tab_order_starts_on_the_arrangement_and_ends_on_the_patch() {
         assert_eq!(
             MainView::ORDER,
             [
-                MainView::Patch,
                 MainView::Timeline,
                 MainView::Edit,
+                MainView::Patch,
                 MainView::Inspector
             ]
         );
         assert_eq!(
             MainView::default(),
             MainView::Timeline,
-            "a new session still opens on the arrangement, not on the graph"
+            "the default view is also the leftmost tab"
         );
     }
 
     #[test]
     fn cycling_wraps_in_both_directions() {
-        assert_eq!(MainView::Inspector.cycle(true), MainView::Patch);
-        assert_eq!(MainView::Patch.cycle(false), MainView::Inspector);
-        assert_eq!(MainView::Patch.cycle(true), MainView::Timeline);
-        assert_eq!(MainView::Timeline.cycle(false), MainView::Patch);
+        assert_eq!(MainView::Inspector.cycle(true), MainView::Timeline);
+        assert_eq!(MainView::Timeline.cycle(false), MainView::Inspector);
+        assert_eq!(MainView::Timeline.cycle(true), MainView::Edit);
+        assert_eq!(MainView::Edit.cycle(false), MainView::Timeline);
+        assert_eq!(MainView::Edit.cycle(true), MainView::Patch);
+        assert_eq!(MainView::Patch.cycle(true), MainView::Inspector);
     }
 
     #[test]
     fn alt_digits_index_the_same_order() {
-        assert_eq!(MainView::from_index(0), Some(MainView::Patch));
-        assert_eq!(MainView::from_index(1), Some(MainView::Timeline));
-        assert_eq!(MainView::from_index(2), Some(MainView::Edit));
+        assert_eq!(MainView::from_index(0), Some(MainView::Timeline));
+        assert_eq!(MainView::from_index(1), Some(MainView::Edit));
+        assert_eq!(MainView::from_index(2), Some(MainView::Patch));
         assert_eq!(MainView::from_index(3), Some(MainView::Inspector));
         assert_eq!(MainView::from_index(4), None, "only four tabs");
     }

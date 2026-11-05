@@ -9,12 +9,12 @@
 | 区域 | 内容 |
 | :--- | :--- |
 | 走带栏 | `File` / `Edit` 菜单；`⏮` `▶ Play` `■ Stop` `⏺ Rec` `⏭`；`Loop`、`Click`、上/下一个标记；`Tempo`、`Meter`；右侧 `Master` 推子、立体声电平表和 panic 按钮 |
-| 标签栏 | `Patch` / `Timeline` / `Edit` / `Inspector` |
+| 标签栏 | `Timeline` / `Edit` / `Patch` / `Inspector` |
 | 主区域 | 当前标签的内容 |
 | 状态栏 | 当前编辑目标、音符名、键盘映射、`Pos 小节.拍`、最近一条消息（失败是红色） |
 
-标签顺序按搭建工程的顺序排：`Patch`（节点图）→ `Timeline`（编曲）→ `Edit`（卷帘 / 曲线）
-→ `Inspector`（选中节点的参数）。启动时默认仍停在 `Timeline`——那是 DAW 的主视图。
+标签顺序按动手的顺序排：`Timeline`（编曲）→ `Edit`（卷帘 / 曲线）→ `Patch`（节点图）
+→ `Inspector`（选中节点的参数）。启动时默认停在 `Timeline`——那是 DAW 的主视图，也是第一个标签。
 切换可以点标签，也可以按 `Tab` / `Shift+Tab` 循环，或用 `Alt+1` .. `Alt+4` 直接跳
 （编号就是上面的顺序）。`Tab` 被视图切换独占，代价是 egui 的控件焦点遍历不再生效——
 `File` / `Edit` 菜单只能用鼠标点。
