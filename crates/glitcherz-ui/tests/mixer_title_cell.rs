@@ -2,12 +2,13 @@
 //! a **right**-click, because that is what opens the inline rename field.
 //!
 //! The console lives inside `GlitcherZApp::mixer_section`, which needs an audio
-//! engine to run, so this mirrors just the cell: an `allocate_exact_size` rect
-//! with `Sense::click()` and a truncating `Label` drawn into it by a child Ui.
-//! Two things are easy to get wrong and both are pinned here:
+//! engine to run, so this mirrors just the cell: an `add_sized` frameless
+//! `Button` (the same widget the timeline track header uses). Two things are
+//! easy to get wrong and both are pinned here:
 //!
-//! - a bare `Label` only senses hover, so `secondary_clicked()` never fires —
-//!   the hit test has to live on the allocated rect, not the glyph run;
+//! - a bare `Label` is selectable text by default, so its glyph run shows the
+//!   I-beam cursor and swallows right-clicks — only the blank tail of the strip
+//!   used to answer. A Button owns the entire rect instead;
 //! - the rect, not the label's own rect, is the target: the title is truncated
 //!   and short names leave empty space on the right that must still be clickable.
 
@@ -47,20 +48,18 @@ fn frame(
     let mut out = ctx.run_ui(raw, |root| {
         egui::CentralPanel::default().show(root, |ui| {
             for i in 0..4 {
-                let (cell, resp) =
-                    ui.allocate_exact_size(egui::vec2(STRIP_W, TITLE_H), egui::Sense::click());
+                let resp = ui
+                    .add_sized(
+                        [STRIP_W, TITLE_H],
+                        egui::Button::new(egui::RichText::new(format!("Ch {}", i + 1)).size(11.0))
+                            .frame(false)
+                            .fill(egui::Color32::TRANSPARENT)
+                            .truncate(),
+                    )
+                    .on_hover_text("Right-click to rename this channel");
                 if i == TARGET {
-                    *rect = Some(cell);
+                    *rect = Some(resp.rect);
                 }
-                let mut cell_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(cell)
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                );
-                cell_ui.add(
-                    egui::Label::new(egui::RichText::new(format!("Ch {}", i + 1)).weak())
-                        .truncate(),
-                );
                 if i == TARGET && resp.secondary_clicked() {
                     *hits += 1;
                 }
@@ -70,8 +69,9 @@ fn frame(
     out.textures_delta.clear();
 }
 
-#[test]
-fn a_right_click_on_the_title_cell_is_reported() {
+/// Runs a right-click at `offset_x` inside the target cell and reports whether
+/// it reached the cell widget.
+fn right_click_at(offset_x: f32) -> usize {
     let ctx = egui::Context::default();
     let mut hits = 0;
     let mut rect = None;
@@ -80,9 +80,7 @@ fn a_right_click_on_the_title_cell_is_reported() {
         frame(&ctx, vec![], k as f64 * 0.1, &mut hits, &mut rect);
     }
     let cell = rect.expect("the target cell must be laid out");
-    // Aim at the right edge of the cell, past the glyphs: a short name leaves
-    // empty space there, and that space must still open the editor.
-    let pos = egui::pos2(cell.right() - 4.0, cell.center().y);
+    let pos = egui::pos2(cell.left() + offset_x, cell.center().y);
 
     let mut t = 0.2;
     let mut step = |events: Vec<egui::Event>, hits: &mut usize, rect: &mut Option<egui::Rect>| {
@@ -107,9 +105,27 @@ fn a_right_click_on_the_title_cell_is_reported() {
         );
     }
     step(vec![], &mut hits, &mut rect);
+    hits
+}
 
+#[test]
+fn a_right_click_on_the_glyph_run_is_reported() {
+    // The regression: with a selectable `Label` this click went to the text
+    // selection interaction instead of the cell.
     assert_eq!(
-        hits, 1,
-        "a right-click on the strip title cell must be reported (it opens the rename editor)"
+        right_click_at(6.0),
+        1,
+        "right-clicking the channel name itself must open the rename editor"
+    );
+}
+
+#[test]
+fn a_right_click_on_the_blank_tail_is_reported() {
+    // A short name leaves empty space on the right; that space must still
+    // belong to the cell.
+    assert_eq!(
+        right_click_at(STRIP_W - 4.0),
+        1,
+        "right-clicking the empty tail of the title cell must open the editor"
     );
 }

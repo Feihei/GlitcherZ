@@ -38,6 +38,37 @@ impl GlitcherZApp {
             // S3b: media paths are resolved against the project directory; the
             // readers below only get the graph, so root them here.
             let sf2_media_base = session.project().base_dir.clone();
+            // Live track names for the patch's timeline / mixer port captions.
+            // The patch only borrows the graph document, so the names ride a
+            // reader; a rename in the arrangement is visible on the next frame.
+            let midi_names: Vec<String> = session
+                .project()
+                .midi_tracks
+                .iter()
+                .map(|t| t.name.clone())
+                .collect();
+            let auto_names: Vec<String> = session
+                .project()
+                .control_tracks
+                .iter()
+                .map(|t| t.name.clone())
+                .collect();
+            let audio_names: Vec<String> = session
+                .project()
+                .audio_tracks
+                .iter()
+                .map(|t| t.name.clone())
+                .collect();
+            let track_name = move |kind: TrackKind, index: usize| -> String {
+                match kind {
+                    TrackKind::Midi => &midi_names,
+                    TrackKind::Curve => &auto_names,
+                    TrackKind::Audio => &audio_names,
+                }
+                .get(index)
+                .cloned()
+                .unwrap_or_default()
+            };
             let clap = &*clap;
             let vst3 = &*vst3;
             let clap_fx = &*clap_fx;
@@ -183,6 +214,7 @@ impl GlitcherZApp {
                     track_count,
                     auto_count,
                     audio_count,
+                    track_name: &track_name,
                     auto_options: &options,
                     plugin_inline: &plugin_inline,
                     sf2_presets: &sf2_presets,
@@ -322,6 +354,24 @@ impl GlitcherZApp {
                 }
                 patch::PatchAction::RefreshInputSources => {
                     self.audio_sources = AudioEngine::record_sources();
+                }
+                // Inline rename on a timeline outlet / mixer inlet. Both go
+                // through the same undoable document edits as the arrangement
+                // header and the Inspector console.
+                patch::PatchAction::RenameTrack { kind, track, name } => {
+                    let lane = match kind {
+                        TrackKind::Midi => timeline::TimelineLane::Midi,
+                        TrackKind::Curve => timeline::TimelineLane::Control,
+                        TrackKind::Audio => timeline::TimelineLane::Audio,
+                    };
+                    self.rename_track(lane, track, name);
+                }
+                patch::PatchAction::RenameChannel {
+                    node,
+                    channel,
+                    name,
+                } => {
+                    self.rename_mixer_channel(node, channel, name);
                 }
             }
         }

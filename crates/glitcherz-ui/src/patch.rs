@@ -771,6 +771,21 @@ pub enum PatchAction {
     PickInputSource(InputSourceItem),
     /// Re-enumerate recording devices after a hot-plug.
     RefreshInputSources,
+    /// Inline rename of a track name, opened by right-clicking a timeline
+    /// outlet caption. Presentation only: one undo step, no engine push.
+    RenameTrack {
+        kind: TrackKind,
+        track: usize,
+        name: String,
+    },
+    /// Inline rename of a mixer channel's custom name, opened by right-clicking
+    /// a mixer inlet caption. An empty name clears it back to the derived
+    /// track / `Ch N` label.
+    RenameChannel {
+        node: u64,
+        channel: u8,
+        name: String,
+    },
 }
 
 /// Double-click gate: whether the Inspector has anything to show for a node.
@@ -1074,6 +1089,11 @@ pub struct PatchDeps<'a> {
     /// Audio track count (U6): drives the timeline node's third action row
     /// and its audio output ports.
     pub audio_count: usize,
+    /// Live track name by `(kind, index)`, read every frame. The patch view
+    /// has no `Project` borrow (only the graph document), so the timeline and
+    /// mixer port captions are supplied by this reader — a rename in the
+    /// arrangement shows up here on the very next frame.
+    pub track_name: &'a dyn Fn(TrackKind, usize) -> String,
     /// Given a document node id, return automatable parameter options `(label, parameter)`.
     pub auto_options: &'a dyn Fn(u64) -> Vec<(String, AutoParam)>,
     /// Given a document node id, return its external-plugin inline
@@ -1096,6 +1116,40 @@ struct CableDrag {
     from: PatchId,
     /// Output port index (only [`PatchId::Timeline`] has more than one).
     port: usize,
+}
+
+/// A name the patch can rename in place: a track (timeline outlet) or a mixer
+/// channel (mixer inlet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortNameTarget {
+    Track { kind: TrackKind, track: usize },
+    Channel { node: u64, channel: u8 },
+}
+
+/// One open inline rename editor in the patch view.
+#[derive(Debug)]
+struct PortRename {
+    target: PortNameTarget,
+    draft: String,
+    /// The right-click that opened the editor lands one frame before the text
+    /// field exists — request focus on the first frame that draws it.
+    needs_focus: bool,
+}
+
+/// One painted port caption plus the rect that answers a right-click.
+#[derive(Debug, Clone)]
+struct PortNameLabel {
+    target: PortNameTarget,
+    /// Screen-space hit/draw rect.
+    rect: Rect,
+    /// Truncated caption actually painted.
+    display: String,
+    /// Untruncated value used for the tooltip.
+    full: String,
+    /// Initial draft (`""` for an unset custom channel name).
+    raw: String,
+    /// Placeholder shown while editing.
+    hint: String,
 }
 
 /// Patch cross-frame state.
@@ -1134,6 +1188,8 @@ pub struct PatchState {
     /// Enumerating devices opens the driver, so it happens once per open,
     /// never per frame.
     input_sources: Vec<InputSourceItem>,
+    /// Open inline rename on a track / channel name, if any.
+    rename: Option<PortRename>,
 }
 
 impl Default for PatchState {
@@ -1151,6 +1207,7 @@ impl Default for PatchState {
             pending_choice: None,
             pending_input_menu: None,
             input_sources: Vec::new(),
+            rename: None,
         }
     }
 }
@@ -1238,6 +1295,23 @@ enum DragKind {
 
 /// Audio node box size.
 const NODE_SIZE: Vec2 = Vec2::new(150.0, 64.0);
+/// Mixer box width. Wider than a plain node: the input-port name column gets
+/// its own space between the port dot and the fader strip.
+const MIXER_WIDTH: f32 = 220.0;
+/// Graph-space gap from a port dot to its name column. At the minimum
+/// interactive zoom this clears `PORT_HIT_RADIUS` (18 screen px), so a press
+/// on the name never starts a cable drag.
+const PORT_NAME_GAP: f32 = 30.0;
+/// Graph-space width of one port name column: six full-width (CJK) glyphs at
+/// 10 pt fit, longer names are cut with an ellipsis.
+const PORT_NAME_WIDTH: f32 = 72.0;
+/// Max caption length in full-width cells (six CJK glyphs / twelve latin
+/// letters); longer names are cut with an ellipsis.
+const PORT_NAME_FULLWIDTH: usize = 6;
+/// Zoom below which the painted port names (and their right-click editor) are
+/// dropped — the glyphs would be too small to read or hit, mirroring the
+/// in-node action buttons and inline sliders.
+const PORT_NAME_MIN_ZOOM: f32 = ACTION_MIN_ZOOM;
 /// Virtual keyboard box (G6): a compact box with a mini key strip.
 const KEYBOARD_SIZE: Vec2 = Vec2::new(150.0, 56.0);
 /// Mixer port-area minimum height (scales with the channel/input count).
@@ -1274,9 +1348,10 @@ const INLINE_MIN_ZOOM: f32 = ACTION_MIN_ZOOM;
 /// so two neighbouring strips never touch, and tall enough for the `M` / `S`
 /// chips to stay clickable at [`ACTION_MIN_ZOOM`].
 const CHANNEL_STRIP_HEIGHT: f32 = 22.0;
-/// Left edge of a channel strip, clear of the port dot and of
-/// `PORT_HIT_RADIUS` — a press inside the dot must still start a cable drag.
-const CHANNEL_STRIP_LEFT: f32 = 22.0;
+/// Left edge of a channel strip, clear of the port dot, of `PORT_HIT_RADIUS`
+/// — a press inside the dot must still start a cable drag — and of the whole
+/// port-name column, so the fader never paints over the channel name.
+const CHANNEL_STRIP_LEFT: f32 = PORT_NAME_GAP + PORT_NAME_WIDTH + 6.0;
 /// Width of one `M` / `S` toggle chip.
 const CHANNEL_TOGGLE_W: f32 = 18.0;
 /// Gap between the two toggles and between the fader and the mute chip.
@@ -1654,9 +1729,10 @@ fn size_of(id: PatchId, deps: &PatchDeps) -> Vec2 {
             timeline_in_size(deps.track_count, deps.auto_count, deps.audio_count)
         }
         PatchId::Node(node_id) => match deps.doc.node_by_id(node_id) {
-            // Title + slot action row, then one port per channel.
+            // Title + slot action row, then one port per channel. The box is
+            // wider than a plain node so each port has a name column.
             Some(NodeDoc::Mixer { inputs, .. }) => Vec2::new(
-                NODE_SIZE.x,
+                MIXER_WIDTH,
                 header_band(id, deps) + (*inputs as f32 * PORT_SPACING).max(NODE_HEIGHT_MIN),
             ),
             Some(NodeDoc::Keyboard { .. }) => KEYBOARD_SIZE,
@@ -1904,6 +1980,139 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Truncate a user-facing name to `max_fullwidth` full-width cells: ASCII
+/// counts as one cell, non-ASCII (CJK, …) as two. A cut name ends with an
+/// ellipsis. Six cells = six Chinese glyphs / twelve latin letters, which is
+/// what the port-name column is sized for — a long track name must never
+/// widen (or overflow) a node box.
+fn truncate_fullwidth(s: &str, max_fullwidth: usize) -> String {
+    let budget = max_fullwidth * 2;
+    let mut width = 0usize;
+    let mut out = String::new();
+    let mut cut = false;
+    for ch in s.chars() {
+        let cells = if ch.is_ascii() { 1 } else { 2 };
+        if width + cells > budget {
+            cut = true;
+            break;
+        }
+        width += cells;
+        out.push(ch);
+    }
+    if cut {
+        out.push('…');
+    }
+    out
+}
+
+/// The track whose audio chain lands on one mixer channel, derived from the
+/// cable that terminates there. The last node of that chain owns the track
+/// (`NodeDoc::track()`), so this is the inverse of the app's forward
+/// `track_channel_target` walk without needing the project.
+fn mixer_feeding_track(doc: &GraphDoc, mixer: u64, channel: u8) -> Option<(TrackKind, usize)> {
+    let cable = doc.cables.iter().find(|c| {
+        c.kind == CableKind::Audio && c.to == PortRef::Node(mixer) && c.in_port == channel
+    })?;
+    let PortRef::Node(id) = &cable.from else {
+        return None;
+    };
+    let node = doc.node_by_id(*id)?;
+    if let NodeDoc::AudioTrack { track, .. } = node {
+        Some((TrackKind::Audio, *track))
+    } else {
+        Some((TrackKind::Midi, node.track()))
+    }
+}
+
+/// Captions for the two kinds of named ports: every timeline outlet (the
+/// track's live name) and every mixer inlet (the channel's custom name, or
+/// the feeding track's name, or `Ch N`). Computed once per frame so the
+/// right-click hit test and the painting agree on exactly the same rects.
+///
+/// Nothing here allocates a widget: the canvas keeps its own click/drag
+/// sense, so selecting or dragging a node by its title still works.
+fn port_name_labels(
+    rect_min: Pos2,
+    state: &PatchState,
+    deps: &PatchDeps<'_>,
+) -> Vec<PortNameLabel> {
+    let z = state.zoom;
+    if z < PORT_NAME_MIN_ZOOM {
+        return Vec::new();
+    }
+    let name_w = PORT_NAME_WIDTH * z;
+    let gap = PORT_NAME_GAP * z;
+    let h = 18.0 * z;
+    let mut out = Vec::new();
+
+    // Timeline outlets: the caption sits to the left of the dot, inside the
+    // box — the same place the old `T1` / `C1` / `A1` tags lived.
+    for (port, p) in state.out_ports_screen(rect_min, PatchId::Timeline, deps) {
+        let (kind, track, tag) = match timeline_port_kind(port, deps.track_count, deps.auto_count) {
+            TimelinePort::Midi(t) => (TrackKind::Midi, t, format!("T{}", t + 1)),
+            TimelinePort::Auto(i) => (TrackKind::Curve, i, format!("C{}", i + 1)),
+            TimelinePort::Audio(i) => (TrackKind::Audio, i, format!("A{}", i + 1)),
+        };
+        let raw = (deps.track_name)(kind, track);
+        let full = if raw.is_empty() {
+            tag.clone()
+        } else {
+            raw.clone()
+        };
+        out.push(PortNameLabel {
+            target: PortNameTarget::Track { kind, track },
+            rect: Rect::from_min_size(
+                Pos2::new(p.x - gap - name_w, p.y - h * 0.5),
+                Vec2::new(name_w, h),
+            ),
+            display: truncate_fullwidth(&full, PORT_NAME_FULLWIDTH),
+            full,
+            raw,
+            hint: tag,
+        });
+    }
+
+    // Mixer inlets: the caption sits to the right of the dot, in the column
+    // the wider mixer box reserves in front of the fader strip.
+    for &id in state.positions.keys() {
+        let PatchId::Node(node_id) = id else {
+            continue;
+        };
+        let Some(NodeDoc::Mixer { channels, .. }) = deps.doc.node_by_id(node_id) else {
+            continue;
+        };
+        for (port, p) in state.in_ports_screen(rect_min, id, deps) {
+            let Some(ch) = channels.get(port as usize) else {
+                continue;
+            };
+            let fallback = format!("Ch {}", port + 1);
+            let track_name = mixer_feeding_track(deps.doc, node_id, port)
+                .map(|(kind, track)| (deps.track_name)(kind, track))
+                .filter(|name| !name.is_empty());
+            let full = if !ch.name.is_empty() {
+                ch.name.clone()
+            } else {
+                track_name.unwrap_or_else(|| fallback.clone())
+            };
+            out.push(PortNameLabel {
+                target: PortNameTarget::Channel {
+                    node: node_id,
+                    channel: port,
+                },
+                rect: Rect::from_min_size(
+                    Pos2::new(p.x + gap, p.y - h * 0.5),
+                    Vec2::new(name_w, h),
+                ),
+                display: truncate_fullwidth(&full, PORT_NAME_FULLWIDTH),
+                full,
+                raw: ch.name.clone(),
+                hint: fallback,
+            });
+        }
+    }
+    out
+}
+
 impl PatchState {
     /// Document node ids currently selected (fixed entities — timeline /
     /// master — excluded). Read by the app to resolve the Synth panel's
@@ -2092,7 +2301,9 @@ impl PatchState {
                         Pos2::new(480.0, y + k as f32 * 64.0),
                     )
                 }
-                NodeDoc::Mixer { .. } => (PatchId::Node(node.node_id()), Pos2::new(700.0, y)),
+                // Wider box (port-name column): start a little further left so
+                // its right edge still clears the master column at x = 930.
+                NodeDoc::Mixer { .. } => (PatchId::Node(node.node_id()), Pos2::new(680.0, y)),
                 // P6: feedback taps sit just left of the mixer column.
                 NodeDoc::Feedback { .. } => (PatchId::Node(node.node_id()), Pos2::new(600.0, y)),
                 // U6: audio-track nodes are folded into the timeline box (see
@@ -2704,7 +2915,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             state.pan = Vec2::ZERO;
             state.zoom = 1.0;
         }
-        ui.weak("Shift+A / right-click to add node · Ctrl+right-drag to cut cables · click a cable dot to insert/delete · click to select · drag bg to box-select · middle-drag to pan · scroll to zoom · drag ports to connect · Delete to remove");
+        ui.weak("Shift+A / right-click to add node · right-click a port name to rename · Ctrl+right-drag to cut cables · click a cable dot to insert/delete · click to select · drag bg to box-select · middle-drag to pan · scroll to zoom · drag ports to connect · Delete to remove");
     });
 
     // ---- Patch ----
@@ -2816,18 +3027,58 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         }
     }
 
+    // ---- Named-port captions (timeline outlets / mixer inlets) ----
+    // One snapshot per frame: the same rects drive the right-click rename
+    // below and the painting later, so a caption can never be clicked where
+    // it is not drawn (or vice versa). The captions are *painted*, not
+    // widgets, so the canvas keeps its own click / drag / marquee behaviour —
+    // pressing a title still selects and drags its node.
+    let name_labels = port_name_labels(rect.min, state, &deps);
+    // The node / channel the editor pointed at may have been removed (or the
+    // view zoomed below the caption threshold) — drop a stale editor.
+    let stale_rename = state
+        .rename
+        .as_ref()
+        .is_some_and(|r| !name_labels.iter().any(|l| l.target == r.target));
+    if stale_rename {
+        state.rename = None;
+    }
+    if let Some(sp) = ui.ctx().pointer_hover_pos()
+        && let Some(label) = name_labels.iter().find(|l| l.rect.contains(sp))
+    {
+        let _ = response
+            .clone()
+            .on_hover_text(format!("{}\nRight-click to rename", label.full));
+    }
+
     // ---- Add-node menu: right-click, or `Shift+A` (spec D17) ----
     // Right-click anywhere on the canvas; with Ctrl held the right button
     // belongs to the cable-cut interaction instead (Blender-style knife), so
     // the menu is suppressed. `Shift+A` opens the same popup at the cursor,
     // which is why the menu is a `Popup` with an explicit open command rather
     // than `Response::context_menu` (that one only opens on a click).
+    // A right-click ON a port caption belongs to the inline rename instead.
     let shift_a = !ctrl
         && !ui.ctx().egui_wants_keyboard_input()
         && ui
             .ctx()
             .input(|i| i.modifiers.shift && !i.modifiers.command && i.key_pressed(egui::Key::A));
-    let open_at = if response.secondary_clicked() && !ctrl {
+    // While an editor is open, the right-click belongs to "click elsewhere
+    // to commit" — do not also open a menu / start a second rename.
+    let right_click = response.secondary_clicked() && !ctrl && state.rename.is_none();
+    let rename_at = if right_click {
+        pointer.and_then(|sp| name_labels.iter().find(|l| l.rect.contains(sp)))
+    } else {
+        None
+    };
+    if let Some(label) = rename_at {
+        state.rename = Some(PortRename {
+            target: label.target,
+            draft: label.raw.clone(),
+            needs_focus: true,
+        });
+    }
+    let open_at = if right_click && rename_at.is_none() {
         pointer
     } else if shift_a {
         Some(
@@ -3424,20 +3675,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             };
             painter.circle_filled(p, PORT_RADIUS, port_color);
             painter.circle_stroke(p, PORT_RADIUS, egui::Stroke::new(1.0, Color32::BLACK));
-            if let PatchId::Timeline = id {
-                let label = match timeline_port_kind(port, midi_count, auto_count) {
-                    TimelinePort::Midi(t) => format!("T{}", t + 1),
-                    TimelinePort::Auto(i) => format!("C{}", i + 1),
-                    TimelinePort::Audio(i) => format!("A{}", i + 1),
-                };
-                painter.text(
-                    Pos2::new(p.x - 10.0, p.y),
-                    egui::Align2::RIGHT_CENTER,
-                    label,
-                    FontId::proportional(10.0),
-                    Color32::from_gray(170),
-                );
-            }
+            // Timeline outlet captions (the live track names) are painted in
+            // the port-name section below, together with the mixer captions —
+            // the old static `T1` / `C1` / `A1` tags went stale on a rename.
         }
         // Input ports: mixers draw one per channel (P5f D17), other nodes /
         // master the single port 0. The Timeline In terminal names its port
@@ -3893,6 +4133,84 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     value: if ch.solo { 0.0 } else { 1.0 },
                 });
             }
+        }
+    }
+
+    // ---- Port names + inline rename (timeline outlets / mixer inlets) ----
+    // Painted last among the node overlays, so an open editor sits above the
+    // channel strip. Captions are plain text, not widgets: the right-click
+    // that opens the editor is handled on the canvas above using the very
+    // same rects, which keeps node select / drag / marquee intact.
+    let z = state.zoom;
+    let mut rename_commit: Option<(PortNameTarget, String)> = None;
+    for label in &name_labels {
+        let editing = state
+            .rename
+            .as_ref()
+            .is_some_and(|r| r.target == label.target);
+        if editing {
+            // A transient editor is wider than the name column (room to type);
+            // it overlays the fader strip for the few frames it is open.
+            let editor = Rect::from_min_size(
+                label.rect.min,
+                Vec2::new(label.rect.width().max(140.0 * z), label.rect.height()),
+            );
+            let mut cancel = false;
+            let mut finish = false;
+            if let Some(r) = state.rename.as_mut() {
+                let resp = ui.put(
+                    editor,
+                    egui::TextEdit::singleline(&mut r.draft)
+                        .font(egui::TextStyle::Small)
+                        .hint_text(label.hint.clone()),
+                );
+                if std::mem::take(&mut r.needs_focus) {
+                    resp.request_focus();
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                } else if resp.lost_focus() {
+                    // Enter, Tab and a click elsewhere all end the edit.
+                    // Empty clears the custom name back to the derived label.
+                    rename_commit = Some((r.target, r.draft.trim().to_owned()));
+                    finish = true;
+                }
+            }
+            if cancel || finish {
+                state.rename = None;
+            }
+        } else {
+            // Timeline outlets read right-to-left into the box; mixer inlets
+            // read left-to-right from the port dot.
+            let (pos, align) = match label.target {
+                PortNameTarget::Track { .. } => (
+                    Pos2::new(label.rect.right(), label.rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                ),
+                PortNameTarget::Channel { .. } => (
+                    Pos2::new(label.rect.left(), label.rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                ),
+            };
+            painter.text(
+                pos,
+                align,
+                &label.display,
+                FontId::proportional(10.0 * z),
+                Color32::from_rgb(225, 225, 228),
+            );
+        }
+    }
+    if let Some((target, name)) = rename_commit {
+        match target {
+            PortNameTarget::Track { kind, track } => {
+                actions.push(PatchAction::RenameTrack { kind, track, name })
+            }
+            PortNameTarget::Channel { node, channel } => actions.push(PatchAction::RenameChannel {
+                node,
+                channel,
+                name,
+            }),
         }
     }
 
@@ -4426,6 +4744,314 @@ mod tests {
         actions
     }
 
+    /// Drive a secondary (right) click at a screen position: hover, press,
+    /// release. egui reports `secondary_clicked()` on the release frame.
+    fn right_click(
+        ctx: &egui::Context,
+        state: &mut PatchState,
+        deps: PatchDeps<'_>,
+        pos: Pos2,
+        t: f64,
+    ) {
+        let hover = egui::Event::PointerMoved(pos);
+        let _ = drive(ctx, state, deps, vec![hover.clone()], t);
+        for (k, pressed) in [true, false].into_iter().enumerate() {
+            let _ = drive(
+                ctx,
+                state,
+                deps,
+                vec![
+                    hover.clone(),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+                t + 0.1 * (k as f64 + 1.0),
+            );
+        }
+    }
+
+    /// Where the canvas starts in screen space. A background right-click opens
+    /// the add-node menu with `at = pointer - canvas_origin` (pan 0 / zoom 1),
+    /// so the menu placement tells us the exact origin the captions use.
+    fn canvas_origin(deps: PatchDeps<'_>) -> Pos2 {
+        let ctx = egui::Context::default();
+        let mut state = PatchState::default();
+        state.ensure_positions(
+            deps.doc,
+            deps.track_count,
+            deps.auto_count,
+            deps.audio_count,
+        );
+        for k in 0..3 {
+            let _ = drive(&ctx, &mut state, deps, vec![], k as f64 * 0.1);
+        }
+        let probe = Pos2::new(400.0, 520.0);
+        right_click(&ctx, &mut state, deps, probe, 1.0);
+        let at = state
+            .add_menu
+            .expect("a background right-click opens the add-node menu")
+            .at;
+        Pos2::new(probe.x - at.x, probe.y - at.y)
+    }
+
+    /// The six-full-width-cell cap: CJK counts double, ASCII single, and a cut
+    /// always ends with an ellipsis — a long name must never widen a node box.
+    #[test]
+    fn port_names_truncate_at_six_fullwidth_cells() {
+        assert_eq!(truncate_fullwidth("Bass", 6), "Bass");
+        assert_eq!(truncate_fullwidth("ABCDEFGHIJKL", 6), "ABCDEFGHIJKL");
+        assert_eq!(truncate_fullwidth("ABCDEFGHIJKLM", 6), "ABCDEFGHIJKL…");
+        assert_eq!(truncate_fullwidth("一二三四五六", 6), "一二三四五六");
+        assert_eq!(truncate_fullwidth("一二三四五六七", 6), "一二三四五六…");
+        assert_eq!(truncate_fullwidth("一二三ABCDEFG", 6), "一二三ABCDEF…");
+        assert_eq!(truncate_fullwidth("", 6), "");
+    }
+
+    /// A rename in the arrangement must appear on the timeline outlet and on
+    /// the mixer inlet it feeds on the very next frame — the old static `T1` /
+    /// `Ch 1` captions went stale.
+    #[test]
+    fn port_names_read_live_track_and_channel_names() {
+        use std::cell::RefCell;
+
+        let project = Project::default();
+        let name = RefCell::new("Bass".to_string());
+        let track_name = |_: TrackKind, _: usize| name.borrow().clone();
+        let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
+        let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
+        let deps = PatchDeps {
+            input: Default::default(),
+            doc: &project.graph,
+            track_count: project.midi_tracks.len(),
+            track_name: &track_name,
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
+        };
+        let mut state = PatchState::default();
+        state.ensure_positions(
+            &project.graph,
+            deps.track_count,
+            deps.auto_count,
+            deps.audio_count,
+        );
+
+        let before = port_name_labels(Pos2::ZERO, &state, &deps);
+        *name.borrow_mut() = "Lead Synth".to_string();
+        let after = port_name_labels(Pos2::ZERO, &state, &deps);
+
+        let outlet = |labels: &[PortNameLabel]| {
+            labels
+                .iter()
+                .find(|l| {
+                    matches!(
+                        l.target,
+                        PortNameTarget::Track {
+                            kind: TrackKind::Midi,
+                            track: 0
+                        }
+                    )
+                })
+                .expect("a caption for MIDI track 0")
+                .full
+                .clone()
+        };
+        let inlet = |labels: &[PortNameLabel]| {
+            labels
+                .iter()
+                .find(|l| matches!(l.target, PortNameTarget::Channel { channel: 0, .. }))
+                .expect("a caption for mixer channel 0")
+                .full
+                .clone()
+        };
+        assert_eq!(outlet(&before), "Bass");
+        assert_eq!(
+            outlet(&after),
+            "Lead Synth",
+            "the timeline outlet must follow the track rename"
+        );
+        // The default project's first voice feeds mixer channel 0.
+        assert_eq!(inlet(&before), "Bass");
+        assert_eq!(inlet(&after), "Lead Synth");
+    }
+
+    /// A custom channel name wins over the derived track name, and the edit
+    /// draft starts from that custom name.
+    #[test]
+    fn a_custom_channel_name_wins_over_the_track_name() {
+        let mut project = Project::default();
+        let mixer = project
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.is_mixer())
+            .map(NodeDoc::node_id)
+            .expect("the default project has a mixer");
+        if let Some(NodeDoc::Mixer { channels, .. }) = project.graph.node_by_id_mut(mixer) {
+            channels[0].name = "Kick Bus".to_string();
+        }
+        let track_name = |_: TrackKind, _: usize| "Bass".to_string();
+        let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
+        let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
+        let deps = PatchDeps {
+            input: Default::default(),
+            doc: &project.graph,
+            track_count: project.midi_tracks.len(),
+            track_name: &track_name,
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
+        };
+        let mut state = PatchState::default();
+        state.ensure_positions(
+            &project.graph,
+            deps.track_count,
+            deps.auto_count,
+            deps.audio_count,
+        );
+        let labels = port_name_labels(Pos2::ZERO, &state, &deps);
+        let channel = labels
+            .iter()
+            .find(|l| {
+                l.target
+                    == PortNameTarget::Channel {
+                        node: mixer,
+                        channel: 0,
+                    }
+            })
+            .expect("a caption for mixer channel 0");
+        assert_eq!(channel.full, "Kick Bus");
+        assert_eq!(channel.raw, "Kick Bus");
+    }
+
+    /// Captions must never steal a cable drag from the port dot, nor paint
+    /// over the mixer's fader strip.
+    #[test]
+    fn port_name_captions_clear_the_port_dot_and_the_fader_strip() {
+        let project = Project::default();
+        let track_name = |_: TrackKind, _: usize| "Bass".to_string();
+        let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
+        let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
+        let deps = PatchDeps {
+            input: Default::default(),
+            doc: &project.graph,
+            track_count: project.midi_tracks.len(),
+            track_name: &track_name,
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
+        };
+        let mut state = PatchState::default();
+        state.ensure_positions(
+            &project.graph,
+            deps.track_count,
+            deps.auto_count,
+            deps.audio_count,
+        );
+        let labels = port_name_labels(Pos2::ZERO, &state, &deps);
+        let n = timeline_port_count(deps.track_count, deps.auto_count, deps.audio_count);
+        for ((_, p), label) in state
+            .out_ports_screen(Pos2::ZERO, PatchId::Timeline, &deps)
+            .iter()
+            .zip(labels.iter().take(n))
+        {
+            assert!(label.rect.right() <= p.x - PORT_HIT_RADIUS + 0.01);
+            assert!(label.rect.left() >= 0.0, "the caption stays inside the box");
+        }
+        let mixer = project
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.is_mixer())
+            .map(NodeDoc::node_id)
+            .unwrap();
+        for ((_, p), label) in state
+            .in_ports_screen(Pos2::ZERO, PatchId::Node(mixer), &deps)
+            .iter()
+            .zip(labels.iter().skip(n))
+        {
+            assert!(label.rect.left() >= p.x + PORT_HIT_RADIUS - 0.01);
+            assert!(label.rect.right() <= p.x + CHANNEL_STRIP_LEFT * state.zoom + 0.01);
+        }
+    }
+
+    /// Right-clicking a port caption opens its inline rename editor instead of
+    /// the canvas-wide add-node menu.
+    #[test]
+    fn right_clicking_a_port_name_opens_rename_not_the_add_menu() {
+        let project = Project::default();
+        let track_name = |_: TrackKind, _: usize| "Bass".to_string();
+        let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
+        let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
+        let deps = PatchDeps {
+            input: Default::default(),
+            doc: &project.graph,
+            track_count: project.midi_tracks.len(),
+            track_name: &track_name,
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
+        };
+        let origin = canvas_origin(deps);
+        let ctx = egui::Context::default();
+        let mut state = PatchState::default();
+        state.ensure_positions(
+            &project.graph,
+            deps.track_count,
+            deps.auto_count,
+            deps.audio_count,
+        );
+        for k in 0..3 {
+            let _ = drive(&ctx, &mut state, deps, vec![], k as f64 * 0.1);
+        }
+        let labels = port_name_labels(origin, &state, &deps);
+        let caption = labels
+            .iter()
+            .find(|l| {
+                matches!(
+                    l.target,
+                    PortNameTarget::Track {
+                        kind: TrackKind::Midi,
+                        track: 0
+                    }
+                )
+            })
+            .expect("a caption for MIDI track 0");
+        right_click(&ctx, &mut state, deps, caption.rect.center(), 1.0);
+        let editor = state
+            .rename
+            .as_ref()
+            .expect("the caption right-click opens the rename editor");
+        assert_eq!(
+            editor.target,
+            PortNameTarget::Track {
+                kind: TrackKind::Midi,
+                track: 0
+            }
+        );
+        assert_eq!(editor.draft, "Bass");
+        assert!(
+            state.add_menu.is_none(),
+            "the add-node menu must stay closed on a caption"
+        );
+    }
+
     /// Regression (v3, spec D18): clicking a cable's midpoint dot must open the
     /// cable menu, and the click that opened it must not dismiss it again.
     ///
@@ -4439,6 +5065,7 @@ mod tests {
             input: Default::default(),
             doc: &project.graph,
             track_count: project.midi_tracks.len(),
+            track_name: &|_, _| String::new(),
             auto_count: project.control_tracks.len(),
             audio_count: project.audio_tracks.len(),
             auto_options: &|_| Vec::new(),
@@ -4511,6 +5138,7 @@ mod tests {
             input: Default::default(),
             doc,
             track_count: project.midi_tracks.len(),
+            track_name: &|_, _| String::new(),
             auto_count: project.control_tracks.len(),
             audio_count: project.audio_tracks.len(),
             auto_options: &|_| Vec::new(),
@@ -4730,6 +5358,7 @@ mod tests {
             input: Default::default(),
             doc,
             track_count: project.midi_tracks.len(),
+            track_name: &|_, _| String::new(),
             auto_count: project.control_tracks.len(),
             audio_count: project.audio_tracks.len(),
             auto_options: &|_| Vec::new(),
@@ -4910,6 +5539,7 @@ mod tests {
             input: Default::default(),
             doc,
             track_count: project.midi_tracks.len(),
+            track_name: &|_, _| String::new(),
             auto_count: project.control_tracks.len(),
             audio_count: project.audio_tracks.len(),
             auto_options: &|_| Vec::new(),
@@ -4958,10 +5588,10 @@ mod tests {
             size_of(PatchId::Node(delay), &deps),
             Vec2::new(NODE_SIZE.x, NODE_SIZE.y + 3.0 * INLINE_ROW_HEIGHT)
         );
-        // Mixer: channel-scaled base + 1 registry row.
+        // Mixer: wider box (port-name column), channel-scaled base + 1 row.
         assert_eq!(
             size_of(PatchId::Node(mixer), &deps),
-            Vec2::new(NODE_SIZE.x, mixer_base + INLINE_ROW_HEIGHT)
+            Vec2::new(MIXER_WIDTH, mixer_base + INLINE_ROW_HEIGHT)
         );
         // Plugin node: 2 session-enumerated rows.
         assert_eq!(
@@ -5181,6 +5811,7 @@ mod tests {
             input: Default::default(),
             doc,
             track_count: project.midi_tracks.len(),
+            track_name: &|_, _| String::new(),
             auto_count: project.control_tracks.len(),
             audio_count: project.audio_tracks.len(),
             auto_options: &|_| Vec::new(),
@@ -5273,6 +5904,7 @@ mod tests {
             input: Default::default(),
             doc: &doc,
             track_count: 1,
+            track_name: &|_, _| String::new(),
             auto_count: 0,
             audio_count: 0,
             auto_options: &auto_options,
@@ -5383,6 +6015,7 @@ mod tests {
             input: Default::default(),
             doc: &doc,
             track_count: 1,
+            track_name: &|_, _| String::new(),
             auto_count: 0,
             audio_count: 0,
             auto_options: &auto_options,
@@ -5432,6 +6065,7 @@ mod tests {
             input: Default::default(),
             doc,
             track_count,
+            track_name: &|_, _| String::new(),
             auto_count,
             audio_count,
             auto_options: &auto_options,
@@ -5513,6 +6147,7 @@ mod tests {
             input: Default::default(),
             doc: &free.graph,
             track_count,
+            track_name: &|_, _| String::new(),
             auto_count,
             audio_count,
             auto_options: &auto_options,
@@ -5532,6 +6167,7 @@ mod tests {
             input: Default::default(),
             doc: &free.graph,
             track_count,
+            track_name: &|_, _| String::new(),
             auto_count,
             audio_count,
             auto_options: &auto_options,
@@ -5596,7 +6232,7 @@ mod tests {
             let mixer_header = NODE_TITLE_BAND + ACTION_ROW_HEIGHT;
             let node = Rect::from_min_size(
                 Pos2::ZERO,
-                Vec2::new(NODE_SIZE.x, mixer_header + 4.0 * PORT_SPACING) * z,
+                Vec2::new(MIXER_WIDTH, mixer_header + 4.0 * PORT_SPACING) * z,
             );
             for port in 0..4 {
                 let y = node.top() + (mixer_header + (port as f32 + 0.5) * PORT_SPACING) * z;
@@ -5712,6 +6348,7 @@ mod tests {
                 input: Default::default(),
                 doc: &project.graph,
                 track_count: 1,
+                track_name: &|_, _| String::new(),
                 auto_count: 0,
                 audio_count: 0,
                 auto_options: &|_| Vec::new(),
@@ -5761,6 +6398,7 @@ mod tests {
                 input: Default::default(),
                 doc: &project.graph,
                 track_count: 1,
+                track_name: &|_, _| String::new(),
                 auto_count: 0,
                 audio_count: 0,
                 auto_options: &|_| Vec::new(),
@@ -5819,6 +6457,7 @@ mod tests {
                 input: Default::default(),
                 doc: &project.graph,
                 track_count: project.midi_tracks.len(),
+                track_name: &|_, _| String::new(),
                 auto_count: 0,
                 audio_count: 0,
                 auto_options: &|_| Vec::new(),
@@ -5859,6 +6498,7 @@ mod tests {
             input: Default::default(),
             doc: &project.graph,
             track_count: project.midi_tracks.len(),
+            track_name: &|_, _| String::new(),
             auto_count: 0,
             audio_count: 0,
             auto_options: &|_| Vec::new(),

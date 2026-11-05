@@ -172,24 +172,24 @@ impl GlitcherZApp {
                                 // the strip is a child of the scrolling row,
                                 // so its available width shrinks with every
                                 // column drawn before it, and the label wrapped
-                                // to fit whatever was left. A cell of a fixed
-                                // size with a truncating label is immune — and
-                                // the whole cell is the click target, so the
-                                // right-click does not have to land on a glyph.
-                                let (cell, cell_resp) = ui.allocate_exact_size(
-                                    egui::vec2(MIXER_STRIP_W, title_h),
-                                    if editing {
-                                        egui::Sense::hover()
-                                    } else {
-                                        egui::Sense::click()
-                                    },
-                                );
+                                // to fit whatever was left. A fixed-size cell
+                                // with truncating text is immune.
+                                //
+                                // The whole cell is a frameless Button — the
+                                // same widget the timeline header uses. A bare
+                                // `Label` is selectable text by default
+                                // (`Interaction::selectable_labels`), so its
+                                // glyph run stole right-clicks and showed the
+                                // I-beam cursor; only the blank tail of the
+                                // strip still answered. A Button owns the
+                                // entire rect, so right-clicking the name
+                                // itself opens the rename editor.
                                 if editing {
                                     let mut cancel = false;
                                     let mut finish = false;
                                     if let Some(r) = rename.as_mut() {
-                                        let resp = ui.put(
-                                            cell,
+                                        let resp = ui.add_sized(
+                                            [MIXER_STRIP_W, title_h],
                                             egui::TextEdit::singleline(&mut r.draft)
                                                 .hint_text(default_label.clone()),
                                         );
@@ -211,17 +211,19 @@ impl GlitcherZApp {
                                         rename = None;
                                     }
                                 } else {
-                                    let mut cell_ui =
-                                        ui.new_child(egui::UiBuilder::new().max_rect(cell).layout(
-                                            egui::Layout::left_to_right(egui::Align::Center),
-                                        ));
-                                    cell_ui.add(
-                                        egui::Label::new(egui::RichText::new(&display).weak())
+                                    let resp = ui
+                                        .add_sized(
+                                            [MIXER_STRIP_W, title_h],
+                                            egui::Button::new(
+                                                egui::RichText::new(&display).size(11.0),
+                                            )
+                                            .frame(false)
+                                            .fill(egui::Color32::TRANSPARENT)
                                             .truncate(),
-                                    );
-                                    let resp = cell_resp.on_hover_text(format!(
-                                        "{display}\nRight-click to rename this channel"
-                                    ));
+                                        )
+                                        .on_hover_text(format!(
+                                            "{display}\nRight-click to rename this channel"
+                                        ));
                                     if resp.secondary_clicked() {
                                         rename = Some(ChannelRename {
                                             node: mixer_doc,
@@ -375,16 +377,8 @@ impl GlitcherZApp {
         // to another console or to a channel that has since been removed.
         self.channel_rename = rename.filter(|r| r.node == mixer_doc && r.channel < n);
         if let Some((idx, name)) = rename_commit {
-            // Renaming is presentation only: no engine param, no rebuild —
-            // one undoable document edit.
-            let before = self.begin_edit();
-            if let Some(NodeDoc::Mixer { channels, .. }) =
-                self.project_mut().graph.node_by_id_mut(mixer_doc)
-                && let Some(c) = channels.get_mut(idx)
-            {
-                c.name = name;
-            }
-            self.commit_edit("Rename Channel", before);
+            // Same undoable document edit the patch view's inlet rename uses.
+            self.rename_mixer_channel(mixer_doc, idx as u8, name);
         }
 
         // ---- Apply edits (document + engine node-param path, D20) ----

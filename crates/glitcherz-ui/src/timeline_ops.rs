@@ -6,6 +6,77 @@
 use super::*;
 
 impl GlitcherZApp {
+    /// Rename one track (any lane). Shared by the arrangement header and the
+    /// patch view's timeline outlets, so both surfaces record the same single
+    /// undo step. Presentation only: no engine push, no node retarget.
+    pub(crate) fn rename_track(
+        &mut self,
+        lane: timeline::TimelineLane,
+        track: usize,
+        name: String,
+    ) {
+        let current = match lane {
+            timeline::TimelineLane::Midi => self
+                .project()
+                .midi_tracks
+                .get(track)
+                .map(|t| t.name.clone()),
+            timeline::TimelineLane::Control => self
+                .project()
+                .control_tracks
+                .get(track)
+                .map(|t| t.name.clone()),
+            timeline::TimelineLane::Audio => self
+                .project()
+                .audio_tracks
+                .get(track)
+                .map(|t| t.name.clone()),
+        };
+        if current.is_some_and(|n| n != name) {
+            let before = self.begin_edit();
+            match lane {
+                timeline::TimelineLane::Midi => {
+                    if let Some(t) = self.project_mut().midi_tracks.get_mut(track) {
+                        t.name = name;
+                    }
+                }
+                timeline::TimelineLane::Control => {
+                    if let Some(t) = self.project_mut().control_tracks.get_mut(track) {
+                        t.name = name;
+                    }
+                }
+                timeline::TimelineLane::Audio => {
+                    if let Some(t) = self.project_mut().audio_tracks.get_mut(track) {
+                        t.name = name;
+                    }
+                }
+            }
+            self.commit_edit("Rename Track", before);
+        }
+    }
+
+    /// Rename one mixer channel's custom name. Shared by the Inspector console
+    /// and the patch view's mixer inlets. An empty name clears the override,
+    /// so the derived track / `Ch N` label comes back.
+    pub(crate) fn rename_mixer_channel(&mut self, node: u64, channel: u8, name: String) {
+        let current = self.project().graph.node_by_id(node).and_then(|n| match n {
+            NodeDoc::Mixer { channels, .. } => {
+                channels.get(channel as usize).map(|c| c.name.clone())
+            }
+            _ => None,
+        });
+        if current.is_some_and(|n| n != name) {
+            let before = self.begin_edit();
+            if let Some(NodeDoc::Mixer { channels, .. }) =
+                self.project_mut().graph.node_by_id_mut(node)
+                && let Some(c) = channels.get_mut(channel as usize)
+            {
+                c.name = name;
+            }
+            self.commit_edit("Rename Channel", before);
+        }
+    }
+
     pub(crate) fn timeline_panel(&mut self, ui: &mut egui::Ui) {
         if self.project().midi_tracks.is_empty() && self.project().control_tracks.is_empty() {
             return;
@@ -135,44 +206,7 @@ impl GlitcherZApp {
             // Inline header rename (right-click → type → Enter). Presentation
             // only: no engine push, no node retarget — one undo step.
             timeline::TimelineAction::RenameTrack { lane, track, name } => {
-                let current = match lane {
-                    timeline::TimelineLane::Midi => self
-                        .project()
-                        .midi_tracks
-                        .get(track)
-                        .map(|t| t.name.clone()),
-                    timeline::TimelineLane::Control => self
-                        .project()
-                        .control_tracks
-                        .get(track)
-                        .map(|t| t.name.clone()),
-                    timeline::TimelineLane::Audio => self
-                        .project()
-                        .audio_tracks
-                        .get(track)
-                        .map(|t| t.name.clone()),
-                };
-                if current.is_some_and(|n| n != name) {
-                    let before = self.begin_edit();
-                    match lane {
-                        timeline::TimelineLane::Midi => {
-                            if let Some(t) = self.project_mut().midi_tracks.get_mut(track) {
-                                t.name = name;
-                            }
-                        }
-                        timeline::TimelineLane::Control => {
-                            if let Some(t) = self.project_mut().control_tracks.get_mut(track) {
-                                t.name = name;
-                            }
-                        }
-                        timeline::TimelineLane::Audio => {
-                            if let Some(t) = self.project_mut().audio_tracks.get_mut(track) {
-                                t.name = name;
-                            }
-                        }
-                    }
-                    self.commit_edit("Rename Track", before);
-                }
+                self.rename_track(lane, track, name);
             }
             // W3a: inline clip rename (F2 / Alt+double-click). Presentation
             // only, so no engine push — one undo step.
