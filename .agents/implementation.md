@@ -874,3 +874,19 @@ flush 归零 → writer 为 None → begin_pass：开新 writer → setup(engine
 **顺手修的一处**：Inspector 的 SF2 preset 表按**存储路径**查 `sf2_preset_names`，改成相对路径存盘后就查不到了（下拉空白）。现在按 `base_dir + stored` 解析后查（`graph_patch` 里 destructure 出 `session`，用 `session.project().base_dir` 而不是 `self.project()`，否则和 `patch_state` 的可变借用打架）。
 
 **测试**（+4）：`media_references_are_enumerated_rewritten_and_checked`（去重 / 空路径跳过 / 重写 / 缺失判定）、`relative_media_paths_resolve_against_the_project_directory`（新增 `/` 存储与 `\` 兼容读两条断言）、`a_free_name_is_used_as_is` / `name_clashes_get_a_suffix_but_the_same_file_does_not`、`relocation_finds_a_file_by_name_inside_a_picked_folder`。
+
+## 全选与「拖出 clip」撤销修复（W3c，2026-11-05）
+
+**Ctrl+A / Ctrl+Shift+A 分两层放**：
+
+- **时间轴 = 视图级命令**（`timeline::show` 开头，和 `Shift+T` 平铺同一层级）。行级键盘 handler 在 `response.has_focus()` 里、每次只拿到本行那一张 clip 表，而"全选"定义上跨轨跨 lane，所以放在 `all_clips(midi, control, audio)`（纯函数，表序 MIDI → control → audio，空轨不产出）。`Ctrl+Shift+A` 先消费：`consume_key` 按逻辑修饰键匹配，窄的 `Ctrl+A` 模式会把 `Ctrl+Shift+A` 一起吃掉。内联改名（`clip_rename` / `rename` 的 `TextEdit`）持焦时整段跳过（`text_edit_focused()`），否则输入框里的全选会被抢。
+- **卷帘 = 焦点 clip 的全部音符**（`RollState.selection` 是 focus clip 的下标表；ghost 不可编辑，不进选区），在 `Keys` 里多两个 `consume_key`，处理点放在"没有模态 / 没有拖拽"的 idle 分支，和 G/T/S/D 同族。
+
+**「音符拖出 clip 外无法 Ctrl+Z」的两处根因**：
+
+1. `clamped_move_deltas` 的右边界只钳 **start**（`loop_ticks - 1 - start`）。240 tick 的音符能被拖到 3839，尾巴挂在 4079 —— clip 只有 3840。这种状态引擎排不下、卷帘只画出半截，撤销/重做往返之后看到的位置和"拖出去"时不一样，读起来就是"撤销没反应"。改成钳**尾巴**：`room = (loop_ticks - note.length - note.start).max(0)`。`max(0)` 是防呆：已经超长的音符（被裁短的 clip 里遗留）不会被右拖反推到左边。拖拽与模态 ghost 共用同一个函数，所以预览和确认永远一致。
+2. **残留的 drag 状态**：释放事件没送到卷帘时（在窗口外松手、远程桌面的 `PointerGone`、切窗口丢焦点），`state.drag` 还在，下一帧继续按指针重放 delta —— 正好把 Ctrl+Z 刚恢复的音符又推回去。`show()` 在拖拽处理之后加一道「指针没按下就丢弃 drag / marquee」的兜底。
+
+**测试**：`ctrl_a_selects_every_note_and_ctrl_shift_a_clears`（卷帘，走真实 egui 帧）、`all_clips_covers_every_lane_in_table_order`（表序 + 空表）、`a_drag_out_of_the_clip_stops_at_the_tail_and_undoes_in_one_step`（拖到窗口外 → 尾巴仍在 clip 内 → 同一 gesture key → 一次 undo 回到 0）、`clamped_move_keeps_notes_inside_the_clip_and_pitch_range` 与模态 clamp 用例的期望值从 `loop-1` 改为 `loop-length`。
+
+**标签顺序**回退成 `Timeline → Edit → Patch → Inspector`（`MainView::ORDER` 仍是唯一来源，标签栏 / `Tab` 循环 / `Alt+1..4` 自动跟随）；默认视图不变。`docs/manual.md`、`docs/shortcuts.md` 同步。
