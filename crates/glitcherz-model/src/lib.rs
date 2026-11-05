@@ -2085,6 +2085,23 @@ impl Default for ResolvedSampleRegion {
     }
 }
 
+impl ResolvedSampleRegion {
+    /// Back to explicit document values.
+    ///
+    /// This is the editing base for the waveform handles: a legacy file has
+    /// every field at `0`, and the first drag must materialize the resolved
+    /// whole-sample window instead of writing `0` back over it.
+    pub fn to_region(self) -> SampleRegion {
+        SampleRegion {
+            start: self.start,
+            loop_start: self.loop_start,
+            loop_end: self.loop_end,
+            end: self.end,
+            loop_mode: self.loop_mode,
+        }
+    }
+}
+
 /// Capacity of one drum kit (W1, spec `drum-kit.md` K3). 32 overlapping
 /// one-shot voices already exceed what a 24-voice engine pool can sustain,
 /// so the document limit stays modest.

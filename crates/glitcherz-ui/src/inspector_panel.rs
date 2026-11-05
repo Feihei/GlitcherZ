@@ -208,7 +208,7 @@ impl GlitcherZApp {
                                     root_note,
                                     play_mode,
                                     gain,
-                                    ..
+                                    region,
                                 },
                             ..
                         } => Some((
@@ -216,11 +216,20 @@ impl GlitcherZApp {
                             *root_note,
                             matches!(play_mode, SamplePlayMode::OneShot),
                             *gain,
+                            *region,
                         )),
                         _ => None,
                     });
-                if let Some((sample_path, root_note, one_shot, gain)) = sample_state {
-                    self.sample_section(ui, instr_id, &sample_path, root_note, one_shot, gain);
+                if let Some((sample_path, root_note, one_shot, gain, region)) = sample_state {
+                    self.sample_section(
+                        ui,
+                        instr_id,
+                        &sample_path,
+                        root_note,
+                        one_shot,
+                        gain,
+                        region,
+                    );
                 }
                 // W1: drum kit table (load / gain / per-slot trim).
                 let drum_state = self.drum_kit_fields(instr_id);
@@ -1412,6 +1421,7 @@ impl GlitcherZApp {
         self.sf2_preset_names.get(Path::new(path)).cloned()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn sample_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -1420,6 +1430,7 @@ impl GlitcherZApp {
         root_note: u8,
         one_shot: bool,
         gain: f32,
+        region: glitcherz_model::SampleRegion,
     ) {
         // File row first, exactly like the SoundFont panel: which file this
         // node plays is the question that matters most, and the node's own
@@ -1504,6 +1515,200 @@ impl GlitcherZApp {
             *gain = gain_value.clamp(0.0, 2.0);
         }
         self.commit_param_edit("Sample Params", before, "sample-params");
+
+        // D12: the play window. Drawn from the cached decode, so it appears as
+        // soon as the file is loaded and carries no extra UI state.
+        if !path.is_empty() {
+            self.sample_region_section(ui, doc_id, path, region);
+        }
+    }
+
+    /// Play window editor (spec `sample-player.md` D12): a peak strip with
+    /// four draggable handles, the loop mode, and the exact frame numbers.
+    ///
+    /// The strip is the gesture and the numbers are the truth — dragging is
+    /// coarse, typing is exact, and both write the same document fields
+    /// through [`Self::apply_sample_region`]: one merged undo step per drag
+    /// stroke, five live `set_node_param` writes per change (no rebuild, the
+    /// window is frozen into voices at trigger time).
+    fn sample_region_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc_id: u64,
+        path: &str,
+        region: glitcherz_model::SampleRegion,
+    ) {
+        let Some(data) = self.sample_data_of(path) else {
+            ui.weak("Trim needs the decoded file — load it first.");
+            return;
+        };
+        let frames = data.frames().len() as u32;
+        if frames < 2 {
+            return;
+        }
+        let resolved = region.resolve(frames);
+        let editing = resolved.to_region();
+        let last = frames - 1;
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.strong("Play window");
+            ui.weak(format!(
+                "{:.2} s · {frames} frames",
+                f64::from(frames) / f64::from(data.sample_rate())
+            ));
+            if !region.is_full_sample()
+                && ui
+                    .small_button("Full")
+                    .on_hover_text("Play the whole file again")
+                    .clicked()
+            {
+                self.apply_sample_region(doc_id, glitcherz_model::SampleRegion::default());
+                self.end_param_edit();
+            }
+        });
+
+        let width = ui.available_width().max(160.0);
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 76.0), egui::Sense::click_and_drag());
+        draw_sample_region(ui, rect, &data, &editing, resolved);
+
+        // A drag grabs the nearest handle **once** and keeps it for the whole
+        // stroke: a handle that slides under the pointer must not steal it.
+        let mut dragged: Option<glitcherz_model::SampleRegion> = None;
+        if response.drag_started()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let handle = (0..REGION_HANDLES)
+                .min_by(|a, b| {
+                    let da = (region_handle_x(rect, *a, &editing, last) - pos.x).abs();
+                    let db = (region_handle_x(rect, *b, &editing, last) - pos.x).abs();
+                    da.total_cmp(&db)
+                })
+                .unwrap_or(0);
+            ui.data_mut(|d| d.insert_temp(response.id, handle as u8));
+        }
+        if response.dragged()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let handle = ui.data(|d| d.get_temp::<u8>(response.id)).unwrap_or(0) as usize;
+            let frame = region_frame_at(rect, pos.x, last);
+            dragged = Some(move_region_handle(&editing, handle, frame, last));
+        }
+        if let Some(next) = dragged {
+            self.apply_sample_region(doc_id, next);
+        }
+        if response.drag_stopped() {
+            self.end_param_edit();
+        }
+
+        let mut picked: Option<glitcherz_model::SampleLoopMode> = None;
+        ui.horizontal(|ui| {
+            ui.label("Loop");
+            egui::ComboBox::from_id_salt(format!("sample_loop_{doc_id}"))
+                .selected_text(editing.loop_mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in glitcherz_model::SampleLoopMode::ALL {
+                        if ui
+                            .selectable_label(editing.loop_mode == mode, mode.label())
+                            .clicked()
+                        {
+                            picked = Some(mode);
+                        }
+                    }
+                });
+            ui.weak(match editing.loop_mode {
+                glitcherz_model::SampleLoopMode::Off => "plays straight through",
+                glitcherz_model::SampleLoopMode::Forward => "repeats while the key is held",
+                glitcherz_model::SampleLoopMode::PingPong => "bounces while the key is held",
+            });
+        });
+        if let Some(mode) = picked
+            && mode != editing.loop_mode
+        {
+            let mut next = editing;
+            next.loop_mode = mode;
+            self.apply_sample_region(doc_id, next);
+            self.end_param_edit();
+        }
+
+        // Exact values. Each handle is clamped against its neighbours, so the
+        // four stay ordered no matter what gets typed.
+        let mut values = [
+            editing.start,
+            editing.loop_start,
+            editing.loop_end,
+            editing.end,
+        ];
+        let mut typed = false;
+        ui.horizontal(|ui| {
+            for (index, label) in ["Start", "Loop A", "Loop B", "End"].iter().enumerate() {
+                ui.label(*label);
+                typed |= ui
+                    .add(
+                        egui::DragValue::new(&mut values[index])
+                            .range(0..=last)
+                            .speed(4.0),
+                    )
+                    .on_hover_text(format!(
+                        "{:.1} ms",
+                        f64::from(values[index]) * 1000.0 / f64::from(data.sample_rate())
+                    ))
+                    .changed();
+            }
+        });
+        if typed {
+            let mut next = editing;
+            for (index, frame) in values.iter().enumerate() {
+                next = move_region_handle(&next, index, *frame, last);
+            }
+            self.apply_sample_region(doc_id, next);
+            self.end_param_edit();
+        }
+    }
+
+    /// Decoded sample behind a node path (session cache; decodes on first
+    /// use, control thread only).
+    fn sample_data_of(&mut self, path: &str) -> Option<Arc<glitcherz_engine::sample::SampleData>> {
+        if path.is_empty() {
+            return None;
+        }
+        let raw = Path::new(path);
+        let resolved = match (&self.project().base_dir, raw.is_absolute()) {
+            (Some(dir), false) => dir.join(raw),
+            _ => raw.to_path_buf(),
+        };
+        self.sample_library
+            .get(&resolved)
+            .or_else(|| self.sample_library.load(&resolved).ok())
+    }
+
+    /// Writes the play window and delivers it to the sounding node.
+    ///
+    /// Merged undo (`sample-region`): a drag is one step; the typed and combo
+    /// paths call [`Self::end_param_edit`] right after, so each of those is a
+    /// step of its own.
+    fn apply_sample_region(&mut self, doc_id: u64, region: glitcherz_model::SampleRegion) {
+        let before = self.begin_param_edit();
+        if let Some(NodeDoc::Instrument {
+            voice: VoiceSpec::Sample {
+                region: current, ..
+            },
+            ..
+        }) = self.project_mut().graph.node_by_id_mut(doc_id)
+        {
+            *current = region;
+        }
+        self.commit_param_edit("Sample Window", before, "sample-region");
+        self.send_node_param(doc_id, ParamId::SampleStart, region.start as f32);
+        self.send_node_param(doc_id, ParamId::SampleLoopStart, region.loop_start as f32);
+        self.send_node_param(doc_id, ParamId::SampleLoopEnd, region.loop_end as f32);
+        self.send_node_param(doc_id, ParamId::SampleEnd, region.end as f32);
+        self.send_node_param(
+            doc_id,
+            ParamId::SampleLoopMode,
+            f32::from(region.loop_mode.index()),
+        );
     }
 
     /// Drum kit table (W1, spec `drum-kit.md` K11): timeline-style overall
@@ -2044,5 +2249,229 @@ impl GlitcherZApp {
                 self.send_node_param(node, ParamId::PluginParam(id), value);
             }
         }
+    }
+}
+
+/// Draggable handles on the play-window strip: head start, loop start, loop
+/// end (tail start), window end.
+const REGION_HANDLES: usize = 4;
+
+/// Frame of one handle.
+fn region_handle_frame(region: &glitcherz_model::SampleRegion, handle: usize) -> u32 {
+    match handle {
+        0 => region.start,
+        1 => region.loop_start,
+        2 => region.loop_end,
+        _ => region.end,
+    }
+}
+
+/// Pixel column of one handle inside the strip.
+fn region_handle_x(
+    rect: egui::Rect,
+    handle: usize,
+    region: &glitcherz_model::SampleRegion,
+    last: u32,
+) -> f32 {
+    let last = last.max(1);
+    let frame = region_handle_frame(region, handle).min(last);
+    rect.left() + rect.width() * (frame as f32 / last as f32)
+}
+
+/// Frame under a pixel column (the inverse of [`region_handle_x`]).
+fn region_frame_at(rect: egui::Rect, x: f32, last: u32) -> u32 {
+    let t = ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+    (t * last as f32).round() as u32
+}
+
+/// Moves one handle and re-establishes the ordering
+/// `start ≤ loop_start < loop_end ≤ end`.
+///
+/// The neighbours win: dragging the head past the loop start pins it at the
+/// loop, so the four can never cross (a crossed window is not representable in
+/// the renderer, which would then play something the handles do not describe).
+pub(crate) fn move_region_handle(
+    region: &glitcherz_model::SampleRegion,
+    handle: usize,
+    frame: u32,
+    last: u32,
+) -> glitcherz_model::SampleRegion {
+    let mut next = *region;
+    let frame = frame.min(last);
+    match handle {
+        0 => next.start = frame.min(next.loop_start),
+        1 => {
+            let upper = next.loop_end.saturating_sub(1).max(next.start);
+            next.loop_start = frame.clamp(next.start, upper);
+        }
+        2 => {
+            let lower = next.loop_start.saturating_add(1);
+            next.loop_end = frame.clamp(lower, next.end.max(lower));
+        }
+        _ => next.end = frame.clamp(next.loop_end, last),
+    }
+    next
+}
+
+/// Paints the peak strip: waveform, the dimmed outside-window region, the
+/// loop tint and the four handle lines with their letters.
+fn draw_sample_region(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    data: &glitcherz_engine::sample::SampleData,
+    region: &glitcherz_model::SampleRegion,
+    resolved: glitcherz_model::ResolvedSampleRegion,
+) {
+    let visuals = ui.visuals();
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, visuals.extreme_bg_color);
+
+    let frames = data.frames().len().max(1);
+    let peaks = data.peaks();
+    let mid = rect.center().y;
+    let half = rect.height() * 0.5 - 3.0;
+    let columns = rect.width().round().max(1.0) as usize;
+    let wave = visuals.text_color().gamma_multiply(0.7);
+    // One pixel column per frame bucket span; `peaks` is already downsampled,
+    // so this is a max over a handful of (min, max) pairs.
+    for col in 0..columns {
+        let f0 = (col * frames / columns).min(frames - 1);
+        let f1 = ((col + 1) * frames / columns).clamp(f0 + 1, frames);
+        let b0 = (f0 * peaks.len() / frames).min(peaks.len() - 1);
+        let b1 = (f1 * peaks.len() / frames).max(b0 + 1).min(peaks.len());
+        let mut lo = 0.0f32;
+        let mut hi = 0.0f32;
+        for (min, max) in &peaks[b0..b1] {
+            lo = lo.min(*min);
+            hi = hi.max(*max);
+        }
+        let x = rect.left() + col as f32 + 0.5;
+        painter.line_segment(
+            [
+                egui::pos2(x, mid - hi * half),
+                egui::pos2(x, mid - lo * half),
+            ],
+            egui::Stroke::new(1.0, wave),
+        );
+    }
+
+    let last = (frames - 1) as u32;
+    let x_start = region_handle_x(rect, 0, region, last);
+    let x_end = region_handle_x(rect, 3, region, last);
+    // Outside the window: dimmed, so the played part is the bright part.
+    let dim = egui::Color32::from_black_alpha(150);
+    painter.rect_filled(
+        egui::Rect::from_min_max(rect.min, egui::pos2(x_start, rect.max.y)),
+        0.0,
+        dim,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(x_end, rect.min.y), rect.max),
+        0.0,
+        dim,
+    );
+    if resolved.loops {
+        let loop_l = region_handle_x(rect, 1, region, last);
+        let loop_r = region_handle_x(rect, 2, region, last);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(loop_l, rect.min.y),
+                egui::pos2(loop_r, rect.max.y),
+            ),
+            0.0,
+            egui::Color32::from_rgb(70, 120, 190).gamma_multiply(0.28),
+        );
+    }
+
+    let accent = egui::Color32::from_rgb(120, 170, 235);
+    let strong = visuals.strong_text_color();
+    for (handle, color, label) in [
+        (0usize, strong, "S"),
+        (1, accent, "A"),
+        (2, accent, "B"),
+        (3, strong, "E"),
+    ] {
+        let x = region_handle_x(rect, handle, region, last);
+        painter.line_segment(
+            [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+            egui::Stroke::new(1.5, color),
+        );
+        painter.text(
+            egui::pos2(x + 2.0, rect.min.y + 1.0),
+            egui::Align2::LEFT_TOP,
+            label,
+            egui::FontId::proportional(9.0),
+            color,
+        );
+    }
+}
+
+#[cfg(test)]
+mod region_handle_tests {
+    use super::*;
+
+    fn region(
+        start: u32,
+        loop_start: u32,
+        loop_end: u32,
+        end: u32,
+    ) -> glitcherz_model::SampleRegion {
+        glitcherz_model::SampleRegion {
+            start,
+            loop_start,
+            loop_end,
+            end,
+            loop_mode: glitcherz_model::SampleLoopMode::Forward,
+        }
+    }
+
+    /// Handles never cross: each one is clamped by its neighbours, so the
+    /// window stays representable no matter what the pointer (or the keyboard)
+    /// does.
+    #[test]
+    fn moving_a_handle_keeps_the_window_ordered() {
+        let base = region(100, 200, 300, 400);
+
+        // Head cannot pass the loop start.
+        let head = move_region_handle(&base, 0, 900, 1_000);
+        assert_eq!(head.start, 200);
+
+        // Loop A stays between the head and one frame before Loop B.
+        let a = move_region_handle(&base, 1, 0, 1_000);
+        assert_eq!(a.loop_start, 100);
+        let a2 = move_region_handle(&base, 1, 999, 1_000);
+        assert_eq!(a2.loop_start, 299);
+
+        // Loop B stays after Loop A and at most at the end.
+        let b = move_region_handle(&base, 2, 0, 1_000);
+        assert_eq!(b.loop_end, 201);
+        let b2 = move_region_handle(&base, 2, 5_000, 1_000);
+        assert_eq!(b2.loop_end, 400);
+
+        // End never runs past the file or before the tail start.
+        let end = move_region_handle(&base, 3, 5_000, 1_000);
+        assert_eq!(end.end, 1_000);
+        let end2 = move_region_handle(&base, 3, 0, 1_000);
+        assert_eq!(end2.end, 300);
+    }
+
+    /// Pixel ↔ frame round-trips, so a drag lands on the frame under the
+    /// cursor and a handle is drawn where it will be grabbed.
+    #[test]
+    fn pixel_and_frame_agree() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 0.0), egui::vec2(200.0, 60.0));
+        let base = region(0, 250, 750, 1_000);
+        for handle in 0..REGION_HANDLES {
+            let x = region_handle_x(rect, handle, &base, 1_000);
+            let frame = region_frame_at(rect, x, 1_000);
+            let expected = region_handle_frame(&base, handle);
+            assert!(
+                frame.abs_diff(expected) <= 6,
+                "handle {handle}: x {x} → frame {frame}, expected {expected}"
+            );
+        }
+        // Out-of-rect pointers clamp instead of wrapping.
+        assert_eq!(region_frame_at(rect, -50.0, 1_000), 0);
+        assert_eq!(region_frame_at(rect, 500.0, 1_000), 1_000);
     }
 }

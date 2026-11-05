@@ -933,3 +933,16 @@ spec `sample-player.md` D12–D15 落地。**文档层**（`SampleRegion`：`sta
 **参数路线**：`push_node_params`（实时）与 `export_ops`（离线渲染）各推一遍同样的五个参数——离线导出漏推就会导出用户听不到的素材（导出的是整条文件而不是裁好的窗口）。
 
 **测试**：`sample_voice.rs` +4（`a_forward_loop_repeats_the_window`、`a_pingpong_loop_has_no_seam`、`a_gate_release_plays_the_tail_before_fading`、`a_one_shot_plays_the_window_once`）；model +4（`sample_region_tests`：0 哨兵、越界钳制、一帧循环拒绝、旧文件 default）。旧的采样用例一个没改，全部照过——"旧工程逐样本不变"这条由它们守。
+
+## 采样窗口 UI：波形条 + 四条把手（2026-11-05）
+
+`Sample` 的 Inspector 多了一块 `Play window`：峰值条上用四条竖线（`S` / `A` / `B` / `E`）标出 **起始 / 循环起 / 循环止 / 结束**，窗外区域压暗、循环段浅蓝着色，下面一行是循环模式下拉 + 四个可输入的帧号。
+
+- **数据源**是会话 `SampleLibrary` 的缓存解码（`sample_data_of` 先 `get` 再 `load`），所以面板不额外存任何 UI 状态：换文件、undo、重开工程，波形跟着文档走。
+- **`resolved.to_region()` 是编辑基准**。旧工程四个字段都是 `0`（等于"整条样本"），第一下拖动必须先把解析结果**落地**成显式帧号再改，否则 `0` 会被当成"0 号帧"写回去，样本瞬间被裁成 0。这条是 model 里 `ResolvedSampleRegion::to_region` 存在的唯一理由。
+- **把手互不越界**：`move_region_handle` 每次按邻居夹一遍（头 ≤ 循环起；循环起在 `[头, 循环止-1]`；循环止在 `[循环起+1, 尾]`；尾在 `[循环止, 末帧]`）。交叉的窗口在渲染器里没有对应行为，会画出"图和声音不一致"的假象，所以干脆不允许。
+- **一次拖动一步 undo**：`apply_sample_region` 用合并键 `sample-region`，`drag_stopped` 时 `end_param_edit()` 收尾；输入框和下来这两个**非拖动**路径在写完立刻 `end_param_edit()`，避免它们和后面某次拖动并进同一步。
+- **不发重建**：五个窗口参数走 `send_node_param` 即时下发，处理器按 D4 的冻结语义只影响后续 note-on——所以拖动把手时正在响的声部不会被拽着跳（听力上的直觉是"改的是下一次触发"）。
+- **`Full` 按钮**只在窗口不是整条样本时出现，点一下把 `region` 复位成 `SampleRegion::default()`（四个 0 + Off），也就是"D12 之前的形态"。
+
+**测试**：`region_handle_tests::moving_a_handle_keeps_the_window_ordered`（四个方向各自的夹取）、`pixel_and_frame_agree`（像素↔帧往返、越界钳制）。
