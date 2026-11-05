@@ -43,6 +43,8 @@
 - [x] 内置合成器多波形 + 滤波器接线（2026-10-31，spec `spec/instrument.md`）：`SineProcessor` 更名 `OscProcessor`（`osc.rs`），新增 Sine/Triangle/Saw/Square 四种波形（锯齿/方波 PolyBLEP 抗锯齿，`SynthWaveform` + `ParamId::OscWaveform`，默认 Sine 保持旧工程音色）；`SvfProcessor` 真正接进 `SynthProcessor`（osc → SVF → ADSR），Inspector 的 Cutoff / Resonance / Filter Mode 从此生效，cutoff/res 加 10 ms 一阶平滑（cutoff 走 log 域）；离线导出改为走同一张 `synth_param_values` 表（顺带修掉导出时 ADSR/cutoff 未下发的不一致）。`ParamId::SineFrequency/SineGain` 更名 `OscFrequency/OscGain`。`SynthParams` 加 `waveform` 为 additive 字段，`PROJECT_VERSION` 不动
 
 - [x] 内置合成器复音化（2026-10-31，spec `spec/instrument.md` §8 D8–D12）：固定 16 声部，voice 池收在 `SynthProcessor` 内部（图/协议/文档零改动）。每声部独立 osc+SVF+ADSR；空闲槽优先、同音先 release、全忙偷最老；`Off{n}` 按音释放、`Off{0}` 保持全释放哨兵；`OscFrequency` 直控只改最新 voice；Idle voice 跳过渲染，预分配 mono scratch 逐 voice 累加。参数广播到全部声部；不设 limiter（交给 master / velocity）。测试：和弦可加性、Off 隔离、同音重触发、17 音 stealing、Off{0} 全释放
+- [x] 视图标签重排 + 键盘切换（2026-11-05）：标签顺序改 `Patch → Timeline → Edit → Inspector`，由 `MainView::ORDER` 单一来源驱动（标签栏、`Tab` 循环、`Alt+1..4` 都读它，不会各自漂移）；默认视图仍为 `Timeline`（DAW 主视图不变，只是不再是最左标签）。新增 `Tab` / `Shift+Tab` 循环切换与 `Alt+1..4` 直达；钢琴卷帘的 clip 焦点切换从裸 `Tab` 改为 `Ctrl+Tab` / `Ctrl+Shift+Tab`（`spec/roll-multiclip.md` D7 同步修订，`implementation.md` 焦点节补注），裸 `Tab` 从此全局归视图切换；卷帘持焦时 `handle_keyboard_input` 跳过 `Ctrl+Tab` 让卷帘先拿。测试：`main_view_tests` 三条（顺序 + 默认值、双向循环、Alt 索引越界）；全仓 fmt/clippy/test 绿
+
 
 ## 新方向：模块节点图架构（spec 已定稿）
 

@@ -679,7 +679,7 @@ CLAP（G1–G3）的 VST3 镜像。UI 层（`plugin_window` 容器 / 面板占�
 
 **`over_focus` 是 ghost 带来的新边界**：窗口现在是 context 跨度，指针可以落在 focus 之外。创建音符的 `snap(...).min(loop_ticks-1)` 会把窗外点击变成"在 tick 0 创建"，所以入口先判 `(0.0..loop_ticks).contains(&geom.local_at(x))`，窗外单击只清空选择 + 状态提示，窗外空拖不起框选（ghost 不可选，框选必然空手）。
 
-**焦点切换是纯 view-state**：`set_roll_focus` 只改 `subject.focus` 并 `clear_gesture()`（顺带清 selection——索引属于旧 focus）。chip 条与 Tab 都在 `midi_editor_body` 里、`show()` 之前绘制，所以 `show` 不需要知道"焦点可能换人"。**Tab 用 `input_mut().consume_key` 消费**，否则 egui 的焦点遍历会先吃掉它；这也意味着多 clip 时编辑器内 Tab 不再切换控件焦点（单 clip 时不消费，保持原行为）。
+**焦点切换是纯 view-state**：`set_roll_focus` 只改 `subject.focus` 并 `clear_gesture()`（顺带清 selection——索引属于旧 focus）。chip 条与 `Ctrl+Tab` 都在 `midi_editor_body` 里、`show()` 之前绘制，所以 `show` 不需要知道"焦点可能换人"。**`Ctrl+Tab` 用 `input_mut().consume_key` 消费**，否则 egui 的焦点遍历会先吃掉它；裸 `Tab` 自 2026-11-05 起归全应用视图切换（`MainView::cycle`），`handle_keyboard_input` 在卷帘持焦时跳过 `Ctrl+Tab` 让这里先拿。
 
 **`EditTarget` 失去 `Copy`**：`Midi(RollSubject)` 带 `Vec`，`edit_panel` 改为 `self.edit_clip.clone()`。80 字节级 clone 每帧一次，比"拆成只读引用 + 内部再取一次 &mut self"容易读得多。
 
