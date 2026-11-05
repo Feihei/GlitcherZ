@@ -43,7 +43,11 @@ pub const HEADER_WIDTH: f32 = 108.0;
 /// Width of the reorder grab handle at the left of every row header.
 const REORDER_GRIP_WIDTH: f32 = 12.0;
 /// Height of one track row at `row_zoom` = 1.
-pub const ROW_HEIGHT: f32 = 28.0;
+///
+/// 40 px is the comfortable default: a track header has to hold its name at
+/// 11 pt, and a clip's label plus its waveform / curve preview need the
+/// vertical room. Ctrl+Alt+wheel scales it (0.5×–3×).
+pub const ROW_HEIGHT: f32 = 40.0;
 /// Row-height zoom bounds (multiplier over [`ROW_HEIGHT`]).
 const ROW_ZOOM_MIN: f32 = 0.5;
 const ROW_ZOOM_MAX: f32 = 3.0;

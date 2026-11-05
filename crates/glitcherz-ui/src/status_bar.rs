@@ -37,10 +37,17 @@ impl GlitcherZApp {
             });
             return;
         };
-        egui::ScrollArea::vertical().show(ui, |ui| match target {
+        // The MIDI target gets no scroll container: the piano roll *is* this
+        // tab and sizes itself to the window (its Event List lives in its own
+        // bottom strip). The curve editor stays a scrollable form.
+        match target {
             EditTarget::Midi(subject) => self.midi_editor_body(ui, &subject),
-            EditTarget::Control { track, clip } => self.control_editor_body(ui, track, clip),
-        });
+            EditTarget::Control { track, clip } => {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.control_editor_body(ui, track, clip);
+                });
+            }
+        }
     }
 
     /// U9 E2: thin banner shown while the startup plugin scan still has

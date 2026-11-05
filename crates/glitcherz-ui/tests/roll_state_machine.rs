@@ -21,7 +21,11 @@ use glitcherz_ui::piano_roll::{
     RollSubject,
 };
 
-const SCREEN: egui::Vec2 = egui::vec2(800.0, 600.0);
+/// 1600 px wide on purpose: the default view shows two bars, so this keeps
+/// the original ~0.21 px/tick scale (one bar = 800 px) the pointer maths in
+/// these tests was written against — a 16th note stays wide enough to have a
+/// body between its two edge-trim zones.
+const SCREEN: egui::Vec2 = egui::vec2(1600.0, 600.0);
 
 /// A roll fixture: one clip with two notes, a live egui context, and the
 /// measured screen geometry.
@@ -105,6 +109,11 @@ impl Fixture {
 
     /// Learns the panel geometry: the roll is allocated at the panel's
     /// full width, so its left edge is the panel's left edge.
+    ///
+    /// The horizontal scale is the **default view**: the fit basis is the
+    /// context span, with a floor of two bars (a one-bar clip alone used to
+    /// fill the whole width). Every fixture clip is one bar, so one bar is
+    /// half the panel here.
     fn measure(&mut self) {
         let mut rect = egui::Rect::NOTHING;
         let raw = self.raw(vec![]);
@@ -115,7 +124,7 @@ impl Fixture {
         });
         out.textures_delta.clear();
         self.left = rect.left();
-        self.ticks_to_x = rect.width() / self.tracks[0].clips[0].loop_ticks as f32;
+        self.ticks_to_x = rect.width() / (2.0 * TICKS_PER_BAR as f32);
     }
 
     /// Probes clicks down a vertical line until one lands on note A,
@@ -1024,9 +1033,9 @@ fn a_ghost_note_is_painted_but_never_hit() {
     });
     f.subject = RollSubject::assemble(ClipRef::midi(0, 0), &[ClipRef::midi(0, 1)], |_| 2, |_| 0);
 
-    // The fit now spans both clips, so a tick is half the single-clip scale
-    // the fixture measured.
-    let t_x = f.ticks_to_x / 2.0;
+    // Both clips together span exactly the default two-bar window, so the
+    // measured scale already is the context scale.
+    let t_x = f.ticks_to_x;
     // Sanity first: the focus note is still selectable at its own position,
     // so a failure below cannot be blamed on a stale geometry.
     f.click(egui::pos2(f.left + 5.0, f.y60));
@@ -1057,8 +1066,8 @@ fn drawing_stops_at_the_focus_clips_edges() {
     });
     f.subject = RollSubject::assemble(ClipRef::midi(0, 0), &[ClipRef::midi(0, 1)], |_| 2, |_| 0);
     f.state.mode = RollMode::Draw;
-    // Two clips in the fit ⇒ half the single-clip pixel scale.
-    let t_x = f.ticks_to_x / 2.0;
+    // The two clips span exactly the default two-bar window.
+    let t_x = f.ticks_to_x;
     let (left, y60) = (f.left, f.y60);
     let at = move |tick: f32| egui::pos2(left + tick * t_x, y60);
 

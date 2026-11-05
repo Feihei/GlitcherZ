@@ -59,8 +59,17 @@ pub const MAX_ROLL_CONTEXT: usize = 8;
 /// Height of each semitone row (pixels).
 pub const ROW_HEIGHT: f32 = 9.0;
 
-/// Roll area height (pixels, 32 semitone rows).
+/// Fallback roll-area height (pixels, 32 semitone rows).
+///
+/// [`show`] normally fills whatever height the caller leaves (the Edit tab
+/// gives it the whole window); this is the fallback for a caller that hands
+/// over an unbounded ui, e.g. inside a scroll area.
 pub const ROLL_HEIGHT: f32 = ROW_HEIGHT * 32.0;
+
+/// Floor for the roll when it sizes itself to the window (~16 rows): below
+/// that the note area stops being usable, so the stack of strips under it
+/// scrolls instead.
+const ROLL_MIN_HEIGHT: f32 = ROW_HEIGHT * 16.0;
 
 /// Velocity lane height (pixels), below the roll.
 pub const LANE_HEIGHT: f32 = 48.0;
@@ -1496,11 +1505,34 @@ pub fn show(
         });
     }
 
+    // ---- Roll area: fills the height the caller left. The Edit tab *is* the
+    // editor, so the old fixed 288 px strip left the rest of the window
+    // blank; instead the strips that follow the roll (velocity lane + one per
+    // overlay curve lane) are reserved out of the budget and the notes get
+    // everything else. `available_height` is unbounded inside a scroll area —
+    // that caller falls back to the fixed height.
+    let strip_stack = LANE_HEIGHT
+        + lanes
+            .iter()
+            .map(|lane| {
+                if state.collapsed_lanes.contains(&lane.clip.track) {
+                    CURVE_LANE_COLLAPSED_HEIGHT
+                } else {
+                    CURVE_LANE_HEIGHT
+                }
+            })
+            .sum::<f32>()
+        // One gap between the roll and the first strip, one more per strip.
+        + ui.spacing().item_spacing.y * (lanes.len() + 1) as f32;
+    let available_h = ui.available_height();
+    let roll_h = if available_h.is_finite() {
+        (available_h - strip_stack).max(ROLL_MIN_HEIGHT)
+    } else {
+        ROLL_HEIGHT
+    };
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(width, ROLL_HEIGHT),
-        egui::Sense::click_and_drag(),
-    );
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, roll_h), egui::Sense::click_and_drag());
     // The roll owns keyboard focus while hovered (the app-level FocusRouter
     // assigns it before layout); the click itself is handled in the
     // interaction section below (it needs the pointer→tick/pitch helpers
@@ -1520,9 +1552,10 @@ pub fn show(
     // axes. Zoom is anchored on the pointer so the note under it stays put.
     //
     // The fit basis is the **context** span (P3, D3), so a multi-clip subject
-    // opens with every ghost on screen; one clip degenerates to its own loop
-    // length, which keeps P2's behaviour byte-identical.
-    let fit_ticks = (window.end - window.start).max(bar_ticks.max(1) as f32);
+    // opens with every ghost on screen — but never narrower than two bars: a
+    // one-bar clip used to fill the whole width with itself, leaving no room
+    // to see what comes next (or to draw into the bar after it).
+    let fit_ticks = (window.end - window.start).max(2.0 * bar_ticks.max(1) as f32);
     let fit_ticks_to_x = width / fit_ticks.max(1.0);
     let (zoom2, wheel, nav_mods) = ui
         .ctx()
@@ -1561,7 +1594,7 @@ pub fn show(
                         sp.y,
                     );
                     state.zoom_y = new_zoom;
-                    let rows = (ROLL_HEIGHT / (ROW_HEIGHT * new_zoom)).max(1.0);
+                    let rows = (roll_h / (ROW_HEIGHT * new_zoom)).max(1.0);
                     state.top_note = top.clamp(rows - 1.0, 127.0);
                 }
                 ui.ctx().request_repaint();
@@ -1572,7 +1605,7 @@ pub fn show(
             ui.ctx().request_repaint();
         } else if wheel.y != 0.0 {
             let row_h = ROW_HEIGHT * state.zoom_y;
-            let rows = (ROLL_HEIGHT / row_h).max(1.0);
+            let rows = (roll_h / row_h).max(1.0);
             state.top_note = (state.top_note + wheel.y / row_h).clamp(rows - 1.0, 127.0);
             ui.ctx().request_repaint();
         }
@@ -1584,14 +1617,14 @@ pub fn show(
         let t_x = fit_ticks_to_x * state.zoom_x;
         let row_h = ROW_HEIGHT * state.zoom_y;
         state.scroll_x = window.clamp_scroll(state.scroll_x - d.x / t_x, width, t_x);
-        let rows = (ROLL_HEIGHT / row_h).max(1.0);
+        let rows = (roll_h / row_h).max(1.0);
         state.top_note = (state.top_note + d.y / row_h).clamp(rows - 1.0, 127.0);
         ui.ctx().request_repaint();
     }
 
     let ticks_to_x = fit_ticks_to_x * state.zoom_x;
     let row_h = ROW_HEIGHT * state.zoom_y;
-    let visible_rows = (ROLL_HEIGHT / row_h).ceil().max(1.0) as i32;
+    let visible_rows = (roll_h / row_h).ceil().max(1.0) as i32;
     let top_note = state.top_note.round() as i32;
     let min_note = top_note - visible_rows + 1;
     // Absolute tick 0's screen x (scroll + zoom applied). Every note / grid

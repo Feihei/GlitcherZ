@@ -542,6 +542,27 @@ impl GlitcherZApp {
                 }
             }
         }
+        // Event List (M3.6): spreadsheet-style precision editing. It is a
+        // bottom strip, not a block stacked under the roll — the roll takes
+        // the rest of the window now, so anything placed after it would be
+        // laid out off-screen. The list scrolls inside a bounded strip so a
+        // busy clip cannot squeeze the notes out.
+        egui::Panel::bottom("glitcherz_event_list").show(ui, |ui| {
+            egui::CollapsingHeader::new("Event List")
+                .default_open(false)
+                .show(ui, |ui| {
+                    let list_intent = {
+                        let clip = &self.project().midi_tracks[sel].clips[clip_index];
+                        egui::ScrollArea::vertical()
+                            .max_height(160.0)
+                            .show(ui, |ui| event_list::show(ui, clip))
+                            .inner
+                    };
+                    if let Some(list_intent) = list_intent {
+                        self.apply_event_list_intent(sel, clip_index, list_intent);
+                    }
+                });
+        });
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
         let intent = {
@@ -608,19 +629,6 @@ impl GlitcherZApp {
         if let Some(status) = self.roll_state.take_status() {
             self.set_message(status);
         }
-
-        // Event List (M3.6): spreadsheet-style precision editing under the roll.
-        egui::CollapsingHeader::new("Event List")
-            .default_open(false)
-            .show(ui, |ui| {
-                let list_intent = {
-                    let clip = &self.project().midi_tracks[sel].clips[clip_index];
-                    event_list::show(ui, clip)
-                };
-                if let Some(list_intent) = list_intent {
-                    self.apply_event_list_intent(sel, clip_index, list_intent);
-                }
-            });
     }
 
     /// Runs an Event List edit as a command (M1.4 contract).
