@@ -543,26 +543,63 @@ impl GlitcherZApp {
             }
         }
         // Event List (M3.6): spreadsheet-style precision editing. It is a
-        // bottom strip, not a block stacked under the roll — the roll takes
-        // the rest of the window now, so anything placed after it would be
-        // laid out off-screen. The list scrolls inside a bounded strip so a
-        // busy clip cannot squeeze the notes out.
-        egui::Panel::bottom("glitcherz_event_list").show(ui, |ui| {
-            egui::CollapsingHeader::new("Event List")
-                .default_open(false)
-                .show(ui, |ui| {
-                    let list_intent = {
-                        let clip = &self.project().midi_tracks[sel].clips[clip_index];
-                        egui::ScrollArea::vertical()
-                            .max_height(160.0)
-                            .show(ui, |ui| event_list::show(ui, clip))
-                            .inner
-                    };
-                    if let Some(list_intent) = list_intent {
-                        self.apply_event_list_intent(sel, clip_index, list_intent);
-                    }
-                });
+        // resizable bottom strip, not a block stacked under the roll — the roll
+        // takes the rest of the tab now, so anything placed after it would be
+        // laid out off-screen. The split defaults to a third of the tab
+        // (two thirds stay with the roll) and the divider is draggable; pulling
+        // it below the minimum collapses the strip to its caption row, as does
+        // clicking the caption.
+        let avail_h = ui.available_height();
+        let first_h =
+            (avail_h * EVENT_LIST_HEIGHT_FRACTION).clamp(EVENT_LIST_MIN_H, EVENT_LIST_MAX_H);
+        let collapsed = egui::Panel::bottom("glitcherz_event_list_collapsed");
+        // A fresh id: the old collapsible block stored its ~190 px height under
+        // the plain name, and a stale size would open the strip at the floor.
+        let expanded = egui::Panel::bottom("glitcherz_event_list_expanded")
+            .resizable(true)
+            .default_size(first_h)
+            .min_size(EVENT_LIST_MIN_H)
+            .max_size((avail_h * 0.75).max(EVENT_LIST_MIN_H));
+        // `show_switched` owns the `bool` for the duration of the call, so the
+        // caption writes into a local and the field is updated after.
+        let mut open = self.event_list_open;
+        let mut toggle = false;
+        egui::Panel::show_switched(ui, &mut open, collapsed, expanded, |ui, expanded| {
+            ui.horizontal(|ui| {
+                let count = self.project().midi_tracks[sel].clips[clip_index]
+                    .notes()
+                    .len();
+                if ui
+                    .selectable_label(expanded, "Event List")
+                    .on_hover_text(if expanded {
+                        "Click to collapse · drag the divider to resize"
+                    } else {
+                        "Click to open the note table"
+                    })
+                    .clicked()
+                {
+                    toggle = true;
+                }
+                ui.weak(format!("{count} notes"));
+            });
+            if !expanded {
+                return;
+            }
+            let list_intent = {
+                let clip = &self.project().midi_tracks[sel].clips[clip_index];
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| event_list::show(ui, clip))
+                    .inner
+            };
+            if let Some(list_intent) = list_intent {
+                self.apply_event_list_intent(sel, clip_index, list_intent);
+            }
         });
+        if toggle {
+            open = !open;
+        }
+        self.event_list_open = open;
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
         let intent = {

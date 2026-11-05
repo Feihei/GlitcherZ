@@ -43,58 +43,57 @@ pub enum EventListIntent {
 }
 
 /// Renders the list and returns at most one intent per frame.
+///
+/// The caller owns the scroll container (the Edit tab puts this in a resizable
+/// bottom panel), so the grid is laid out directly in `ui` at its full
+/// height.
 pub fn show(ui: &mut egui::Ui, clip: &MidiClip) -> Option<EventListIntent> {
     let mut intent = None;
     // All drag values of a frame funnel their changes into one edit.
     let pending: std::cell::RefCell<Option<NoteEdit>> = std::cell::RefCell::default();
 
-    egui::ScrollArea::vertical()
-        .max_height(180.0)
-        .auto_shrink([false, true])
+    egui::Grid::new("event_list_grid")
+        .num_columns(6)
+        .striped(true)
+        .min_col_width(52.0)
         .show(ui, |ui| {
-            egui::Grid::new("event_list_grid")
-                .num_columns(6)
-                .striped(true)
-                .min_col_width(52.0)
-                .show(ui, |ui| {
-                    for label in ["Start", "Note", "Vel", "Length", "Ch", ""] {
-                        ui.strong(label);
-                    }
-                    ui.end_row();
+            for label in ["Start", "Note", "Vel", "Length", "Ch", ""] {
+                ui.strong(label);
+            }
+            ui.end_row();
 
-                    for (index, note) in clip.notes().iter().enumerate() {
-                        drag_i64(
-                            ui,
-                            &pending,
-                            index,
-                            note.start,
-                            |edit, value| edit.start = Some(value.max(0)),
-                            "tick",
-                        );
-                        drag_u8_note(ui, &pending, index, note.note);
-                        drag_i64(
-                            ui,
-                            &pending,
-                            index,
-                            i64::from(note.velocity),
-                            |edit, value| edit.velocity = Some(value.clamp(1, 127) as u8),
-                            "",
-                        );
-                        drag_i64(
-                            ui,
-                            &pending,
-                            index,
-                            note.length,
-                            |edit, value| edit.length = Some(value.max(1)),
-                            "tick",
-                        );
-                        ui.weak(note.channel.to_string());
-                        if ui.button("×").clicked() {
-                            intent = Some(EventListIntent::Delete { index });
-                        }
-                        ui.end_row();
-                    }
-                });
+            for (index, note) in clip.notes().iter().enumerate() {
+                drag_i64(
+                    ui,
+                    &pending,
+                    index,
+                    note.start,
+                    |edit, value| edit.start = Some(value.max(0)),
+                    "tick",
+                );
+                drag_u8_note(ui, &pending, index, note.note);
+                drag_i64(
+                    ui,
+                    &pending,
+                    index,
+                    i64::from(note.velocity),
+                    |edit, value| edit.velocity = Some(value.clamp(1, 127) as u8),
+                    "",
+                );
+                drag_i64(
+                    ui,
+                    &pending,
+                    index,
+                    note.length,
+                    |edit, value| edit.length = Some(value.max(1)),
+                    "tick",
+                );
+                ui.weak(note.channel.to_string());
+                if ui.button("×").clicked() {
+                    intent = Some(EventListIntent::Delete { index });
+                }
+                ui.end_row();
+            }
         });
 
     if let Some(edit) = pending.into_inner() {

@@ -157,6 +157,18 @@ const MIXER_STRIP_TITLE_MIN_H: f32 = 18.0;
 /// corrects itself). Roughly label + S/M + meter + fader + pan + spacing.
 const MIXER_STRIP_MIN_H: f32 = 240.0;
 
+/// Share of the Edit tab's height the Event List strip takes on its first
+/// frame — roughly two thirds of the tab stay with the piano roll.
+const EVENT_LIST_HEIGHT_FRACTION: f32 = 1.0 / 3.0;
+
+/// Floor for the Event List strip: its caption row plus a few note rows.
+/// Dragging the divider below this collapses the strip instead.
+const EVENT_LIST_MIN_H: f32 = 96.0;
+
+/// Ceiling for the Event List strip, so the roll keeps a usable band even on a
+/// tall window (the panel also caps itself at the available height).
+const EVENT_LIST_MAX_H: f32 = 640.0;
+
 /// One in-progress channel-title rename in the mixer console. The console
 /// strips are drawn inside a closure, so the state is `take()`n out of the app
 /// before the row lays out and put back afterwards.
@@ -1553,6 +1565,10 @@ pub struct GlitcherZApp {
     /// Anchor tick currently being dragged in the curve editor (U12; `None`
     /// = no drag). The anchor's tick is its identity while it moves.
     curve_drag: Option<u32>,
+    /// Whether the Edit tab's Event List strip is expanded. It is a resizable
+    /// bottom panel: the roll takes everything above it, and dragging the
+    /// divider past its minimum collapses the strip to its caption row.
+    event_list_open: bool,
     /// Piano roll cross-frame state (scroll/drag).
     roll_state: piano_roll::RollState,
     /// Hover-follow keyboard focus arbiter (Blender-style context; see
@@ -1998,6 +2014,7 @@ impl GlitcherZApp {
             edit_selection: Vec::new(),
             curve_tool: CurveTool::default(),
             curve_drag: None,
+            event_list_open: true,
             roll_state: piano_roll::RollState::new(),
             focus_router: focus::FocusRouter::new(),
             patch_state: patch::PatchState::default(),
