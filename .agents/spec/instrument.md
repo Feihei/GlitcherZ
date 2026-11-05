@@ -1,6 +1,6 @@
 # 内置合成器：多波形 + 滤波器接线
 
-> 状态：M1–M4 已实施（2026-10-31）
+> 状态：M1–M4 已实施（2026-10-31）；D13 波形跨淡已实施（2026-11-05）
 > 相关：`.agents/spec/effects.md`（`Unit::Enum` / `Smoothed`）、`.agents/spec/midi-nodes.md`（内置 ADSR 与 MidiEnvelope 的区别）
 
 ## 1. 背景
@@ -31,6 +31,7 @@
 | D5 | `SynthParams` 新增 `waveform: SynthWaveform`，`serde(default)`，默认 Sine —— 不 bump `PROJECT_VERSION`（与 E4 的 `DelayParams` 扩展同例）。 |
 | D6 | `ParamId::SineFrequency / SineGain` 更名 `OscFrequency / OscGain`，DSP 类型 `SineProcessor` → `OscProcessor`（文件 `sine.rs` → `osc.rs`）。名字必须与"它现在产生四种波形"一致。 |
 | D7 | 波形是离散参数，**不进自动化**（`NodeParam` 不加变体）；cutoff 沿用既有 `AutoParam::FilterCutoff`，接线后曲线/LFO 自动对其生效。 |
+| D13 | 运行中切换波形做 **5 ms 线性 crossfade**（E5 `declick()` 的落地）：两个波形在**同一相位**上求值再混合，因此不需要第二个相位累加器、也不会跑调；首个 block 渲染之前的切换不着色（尚未发声，没有 click 可遮，构造期选中的波形从第 0 个采样起就是纯净的）。 |
 
 ## 4. 处理链
 
@@ -54,13 +55,13 @@ MIDI note ──► OscProcessor (waveform, pitch offset, per-sample glide)
 
 ## 6. 已知边界
 
-- 运行中切换波形不做 crossfade，相位连续但瞬时值可能跳变；ADSR 起音段（默认 10 ms）通常掩盖它。
+- 波形跨淡（D13）只覆盖切换那一刻：淡入过程中再次切换，从当前听感**主导**的那个波形重新起淡，单步不超过半个波形落差；比 5 ms 更密的连续切换不是音乐手势，只保证有界、不保证无阶跃。
 - `FilterMode` 仍是离散参数，不可自动化。
 - 频率极高（接近 Nyquist）时 PolyBLEP 的 dt 接近 0.5，修正项退化，但不会产生 NaN/Inf。
 
 ## 7. 验收
 
-- 引擎：四种波形各自过零率 ≈ 基频；满幅输入无 NaN/Inf；SVF 接线后 cutoff 200 Hz 低通可测衰减；cutoff 阶跃呈 ramp 而非整块跳变。
+- 引擎：四种波形各自过零率 ≈ 基频；满幅输入无 NaN/Inf；SVF 接线后 cutoff 200 Hz 低通可测衰减；cutoff 阶跃呈 ramp 而非整块跳变；运行中切换波形不产生阶跃（测试锁输出一阶差分上界，见 `osc::tests::a_waveform_switch_is_crossfaded`）。
 - 模型：旧文档（无 `waveform` 字段）反序列化为 Sine。
 - UI：Inspector 切换波形/滤波模式写入文档并实时下发；导出路径下发全部 `SynthParams`。
 ## 8. 复音（D8–D12）

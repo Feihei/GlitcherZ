@@ -946,3 +946,15 @@ spec `sample-player.md` D12–D15 落地。**文档层**（`SampleRegion`：`sta
 - **`Full` 按钮**只在窗口不是整条样本时出现，点一下把 `region` 复位成 `SampleRegion::default()`（四个 0 + Off），也就是"D12 之前的形态"。
 
 **测试**：`region_handle_tests::moving_a_handle_keeps_the_window_ordered`（四个方向各自的夹取）、`pixel_and_frame_agree`（像素↔帧往返、越界钳制）。
+
+## 波形切换跨淡（declick，2026-11-05）
+
+spec `instrument.md` D13 落地：`OscProcessor` 在运行中换波形时不再直接换算法，而是把旧波形和新波形在**同一相位**上各求一次值再按 5 ms 线性混合。
+
+- **不需要第二个相位累加器**。crossfade 的两个波形共用 `phase` 和 `inc`（含 PolyBLEP 的 `dt`），所以淡入期间音高完全一致、不会拍频；代价只是淡入这 220 个采样里多算一次 `wave_sample`——RT 安全，无分配。
+- **`started` 是必要的状态**。构造后第一次 `process` 之前换波形不该淡入（还没发声，没有 click 可遮），否则"新建轨 → 选 Saw → 播放"的前 5 ms 会听到 Sine→Saw 的滑变，而不是一开始就是锯齿。这条也让既有测试（`waveform_shapes_are_distinct` 等在构造期设波形后立刻比对形状）保持原意。
+- **5 ms 内再次切换**：从"听感主导"的那个波形重新起淡（淡入进度 < 0.5 就继续淡出旧波形，否则把新波形当成新的起点），单步不超过半个波形落差。比 5 ms 更密的连续切换不是音乐手势，只保证有界。
+- **测试锁的是一阶差分上界**：`a_waveform_switch_is_crossfaded` 把切换点放在相位 ≈ 0.25（Sine ≈ +1、Triangle ≈ 0，硬切是满幅阶跃），断言整段最大帧间步长 < 0.10（Sine 自身斜率 0.063 + 淡入附加 ≈ 0.005）。去掉 crossfade 这条会以 ~1.0 失败。
+- 顺带发现：锯齿在相位 0 的值经 PolyBLEP 修正后是 0 而不是 -1（`-1 - poly_blep(0) = -1 - (-1)`），所以"起手第一采样"的断言用三角波而不是锯齿。
+
+**测试**：`osc.rs` +2（`a_waveform_switch_is_crossfaded`、`a_waveform_change_before_playback_does_not_fade`），既有 13 个振荡器用例全部照过。

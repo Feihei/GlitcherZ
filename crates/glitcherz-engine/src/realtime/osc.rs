@@ -25,6 +25,11 @@ const PITCH_OFFSET_LIMIT: f32 = 24.0;
 /// Number of waveforms the oscillator understands (`ParamId::OscWaveform`).
 pub const OSC_WAVEFORM_COUNT: u8 = 4;
 
+/// Crossfade length when the waveform is switched while sounding, in
+/// seconds (spec `instrument.md` §6: the phase is continuous but the
+/// instantaneous value jumps, and the jump is a click).
+const WAVEFORM_FADE_SECONDS: f32 = 0.005;
+
 /// Sine / triangle / saw / square oscillator.
 ///
 /// Phase is accumulated normalized in 0..1 and wrapped after each sample,
@@ -39,6 +44,17 @@ pub struct OscProcessor {
     gain: f32,
     /// 0 = sine, 1 = triangle, 2 = saw, 3 = square.
     waveform: u8,
+    /// The waveform being faded out after a switch, and how far the fade has
+    /// got (`fade_pos >= fade_len` = idle). Both waveforms are evaluated at
+    /// the **same** phase, so the crossfade costs no second phase accumulator
+    /// and cannot drift.
+    prev_waveform: u8,
+    fade_pos: f32,
+    fade_len: f32,
+    /// Set by the first rendered block. Before that nothing has sounded, so a
+    /// waveform choice carries no click and must not be faded (a construction
+    /// -time selection should produce the requested shape from sample 0).
+    started: bool,
     /// Current pitch multiplier (`2^(offset/12)`), advanced **per sample**.
     pitch_ratio: f32,
     /// Where the multiplier is heading (set once per block by the curve).
@@ -104,12 +120,18 @@ impl OscProcessor {
         } else {
             48_000.0
         };
+        let fade_len = (WAVEFORM_FADE_SECONDS * sample_rate).max(1.0);
         Self {
             sample_rate,
             phase: 0.0,
             frequency_hz: 440.0,
             gain: 0.25,
             waveform: 0,
+            prev_waveform: 0,
+            // `fade_pos >= fade_len` = idle, so a fresh oscillator never fades.
+            fade_pos: fade_len,
+            fade_len,
+            started: false,
             pitch_ratio: 1.0,
             pitch_target: 1.0,
             pitch_coeff: coeff_for(PITCH_SMOOTHING_MS, sample_rate),
@@ -132,11 +154,37 @@ impl OscProcessor {
     }
 
     /// Sets the waveform index (clamped to `0..3`; non-finite values are
-    /// ignored). RT-safe.
+    /// ignored). A change made while the oscillator is sounding arms a
+    /// [`WAVEFORM_FADE_SECONDS`] crossfade instead of a step. RT-safe.
     fn set_waveform(&mut self, waveform: f32) {
-        if waveform.is_finite() {
-            self.waveform = (waveform.round().max(0.0) as u8).min(OSC_WAVEFORM_COUNT - 1);
+        if !waveform.is_finite() {
+            return;
         }
+        let next = (waveform.round().max(0.0) as u8).min(OSC_WAVEFORM_COUNT - 1);
+        if next == self.waveform {
+            return;
+        }
+        if self.started {
+            // A second switch while a fade is still running: restart from
+            // whichever waveform the listener is actually hearing, so the
+            // restart adds at most half a waveform step. Retriggering faster
+            // than 5 ms is not a musical gesture, it only has to stay bounded.
+            let progress = if self.fade_len > 0.0 {
+                (self.fade_pos / self.fade_len).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            self.prev_waveform = if progress < 0.5 {
+                self.prev_waveform
+            } else {
+                self.waveform
+            };
+            self.fade_pos = 0.0;
+        } else {
+            // Nothing has sounded yet: no click to hide.
+            self.prev_waveform = next;
+        }
+        self.waveform = next;
     }
 
     /// Sets frequency: clamped to `[0, sample_rate/2]` (Nyquist),
@@ -183,6 +231,9 @@ impl Processor for OscProcessor {
         let base_inc = self.frequency_hz / self.sample_rate;
         let gain = self.gain;
         let waveform = self.waveform;
+        let prev_waveform = self.prev_waveform;
+        let fade_len = self.fade_len;
+        let mut fade_pos = self.fade_pos;
         let target = self.pitch_target;
         let coeff = self.pitch_coeff;
         let mut ratio = self.pitch_ratio;
@@ -193,7 +244,18 @@ impl Processor for OscProcessor {
         if let Some(ch0) = buffer.channel_mut(0) {
             for slot in ch0.iter_mut() {
                 let inc = (base_inc * ratio).clamp(0.0, 0.5);
-                *slot = wave_sample(waveform, phase, inc) * gain;
+                let mut sample = wave_sample(waveform, phase, inc);
+                if fade_pos < fade_len {
+                    // Linear crossfade at the **shared** phase: the two
+                    // waveforms are read at the same `phase`, so the sum stays
+                    // amplitude-consistent and no second accumulator exists to
+                    // drift out of tune.
+                    let w = (fade_pos / fade_len).clamp(0.0, 1.0);
+                    let old = wave_sample(prev_waveform, phase, inc);
+                    sample = old + (sample - old) * w;
+                    fade_pos += 1.0;
+                }
+                *slot = sample * gain;
                 // P1/D11: the pitch multiplier moves **inside** the sample
                 // loop. Moving it per block is what makes a MIDI bend sound
                 // like a staircase; here a block-boundary step becomes a
@@ -206,6 +268,12 @@ impl Processor for OscProcessor {
             }
         }
         self.pitch_ratio = ratio;
+        self.fade_pos = if fade_pos >= fade_len {
+            fade_len
+        } else {
+            fade_pos
+        };
+        self.started = true;
         for ch in 1..buffer.channels() {
             // Copy per channel: take the read-only sample first, then the
             // mutable slot (avoids holding two borrows at once).
@@ -284,6 +352,22 @@ mod tests {
         let mut osc = OscProcessor::new(SR);
         osc.set_param(ParamId::OscWaveform, waveform as f32);
         osc
+    }
+
+    /// Renders exactly `frames` frames in one block, returning channel 0.
+    fn render_frames(osc: &mut OscProcessor, frames: usize) -> Vec<f32> {
+        let mut buf = AudioBuffer::new(1, frames);
+        buf.set_len(frames);
+        buf.clear();
+        osc.process(&ctx(frames), &mut buf);
+        buf.channel(0).unwrap().to_vec()
+    }
+
+    /// Largest absolute sample-to-sample step in a stream.
+    fn max_step(samples: &[f32]) -> f32 {
+        samples
+            .windows(2)
+            .fold(0.0f32, |acc, pair| acc.max((pair[1] - pair[0]).abs()))
     }
 
     #[test]
@@ -393,6 +477,61 @@ mod tests {
                 assert!(buf.channel(ch).unwrap().iter().all(|s| s.is_finite()));
             }
         }
+    }
+
+    /// E5 `declick()` for the synth: switching waveform mid-note must not
+    /// step. The switch is deliberately made where sine and triangle are
+    /// maximally apart (sine ≈ +1, triangle ≈ 0), i.e. a full-scale jump if
+    /// the waveform were swapped outright. The crossfade has to turn it into a
+    /// ramp whose per-sample rise stays below the sine's own slope plus the
+    /// fade slope.
+    #[test]
+    fn a_waveform_switch_is_crossfaded() {
+        let mut osc = OscProcessor::new(SR);
+        osc.set_param(ParamId::OscGain, 1.0);
+        osc.set_param(ParamId::OscFrequency, 440.0);
+
+        // 440 Hz at 44.1 kHz: 25 frames land on phase 25 * 22/2205 ≈ 0.2494.
+        let mut out = render_frames(&mut osc, 25);
+        let phase_sum: f32 = 25.0 * 440.0 / SR;
+        assert!((phase_sum - 0.25).abs() < 0.01, "phase = {phase_sum}");
+
+        osc.set_param(ParamId::OscWaveform, 1.0);
+        out.extend_from_slice(&render_frames(&mut osc, 512));
+
+        assert!(out.iter().all(|s| s.is_finite()), "output must stay finite");
+        let step = max_step(&out);
+        // Sine slope at 440 Hz is 2π·440/44100 ≈ 0.063; the fade adds at most
+        // |tri - sine| / fade_len ≈ 0.005 per sample. An un-faded switch would
+        // show a step near 1.0 here.
+        assert!(step < 0.10, "switching stepped by {step}");
+        let peak = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+        assert!(
+            peak <= 1.05,
+            "the crossfade must not overshoot, peak = {peak}"
+        );
+        assert!(
+            osc.fade_pos >= osc.fade_len,
+            "the crossfade should be finished after 512 frames"
+        );
+        assert_eq!(osc.waveform(), 1);
+    }
+
+    /// Nothing has sounded before the first block, so a waveform selected at
+    /// construction is heard from sample 0 — no fade, no ramp in.
+    #[test]
+    fn a_waveform_change_before_playback_does_not_fade() {
+        let mut triangle = oscillator(1);
+        assert!(triangle.fade_pos >= triangle.fade_len, "must start idle");
+        let out = render_frames(&mut triangle, 32);
+        // A triangle starts at -1 (× the default 0.25 gain); a fade from the
+        // default sine would start at 0 instead. (Saw is no good here: its
+        // PolyBLEP correction puts the corrected value at 0 for phase 0.)
+        assert!(
+            (out[0] + 0.25).abs() < 1e-6,
+            "first sample should be the triangle's -1, got {}",
+            out[0]
+        );
     }
 
     #[test]
