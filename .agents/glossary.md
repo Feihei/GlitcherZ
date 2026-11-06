@@ -182,15 +182,14 @@
 | 泳道折叠 | lane collapse | 把叠加泳道压到 18px 只留标题；view-state，不落文档 |
 | 音色分流 | voice routing | 同一 `AutoDest::PitchBend` 按节点自答分流：`midi_pitch_bend` 收则走 MIDI，否则回落 `PitchOffset` |
 
-## 符号白名单（egui 默认字体，硬约束）
+## 符号白名单（硬约束）
 
-egui 0.36 默认字体（Ubuntu-Light + NotoEmoji + emoji-icon-font）**没有的字形一律渲染成方块**。窗口内出现的文案（按钮/标签/状态栏/浮窗）只允许以下符号：
+窗口内的文案（按钮/标签/状态栏/浮窗）只能用**字体栈里真有字形**的符号。栈从前往后：Ubuntu-Light → `egui-icons`（5 个 logo 专用码位）→ NotoEmoji + emoji-icon-font → 内置 Noto Sans SC 子集（`FontPriority::Lowest`，只兜底别人没有的字）。**一个都没有就是该字形的 `.notdef` 豆腐块**。
 
-- **允许**：`` `+` `` `-` `×`(U+00D7) `·`(U+00B7) `—`(U+2014) `–`(U+2013) `…`(U+2026) `♪`(U+266A) `▶` `■` `📂` `💾`
-- **禁止（已踩坑）**：全角 `＋`(U+FF0B) / `－`(U+FF0D)、`✕`(U+2715)、`▲`(U+25B2) / `▼`(U+25BC)、`→ ← ↑ ↓`(U+2190–2193，仅等宽 Hack 字体有，窗口文案中不可用)
-- **ASCII 替代**：上下滚动按钮 `^` / `v`；箭头 `->`；关闭按钮 `×`
-- `→` 只允许出现在**注释与 log 消息**中（终端/编辑器渲染，不走 egui）
-- 验证方法：用 fontTools 读 `epaint_default_fonts` 包内 ttf 的 cmap 对照（见 2026-10-09 工作日志），不要凭感觉猜
+- **egui 0.37 的坑**：NotoEmoji 与 emoji-icon-font 被挪进了 `monochrome_emoji_fonts` feature，而 eframe 不转发它。不打开它，走带按钮的 `⏮ ⏸ ⏭ ⏺`、`↩`、`♪`、`▸` 全部变豆腐（编译不报错，只是看起来像方框）。workspace `Cargo.toml` 里那条 `egui = { … features = ["monochrome_emoji_fonts"] }` 就是为此存在的，**不要删**。
+- **允许**（`crates/glitcherz-ui/src/fonts.rs` 的 `UI_SYMBOLS`，即实际用到的全集）：`§ ± · × – — … ‹ › ← ↑ → ↓ ↩ − ∞ ≈ ⏭ ⏮ ⏸ ⏺ ■ ▶ ♪`
+- **仍然禁止**：`✕`(U+2715)、`⌃`(U+2303) / `⌥`(U+2325)（macOS 的 control/option 修饰键字形，只在显示 `Modifiers` 名字时才会用到，本项目不显示）。`▸`(U+25B8) 2026-11-06 起改用 `›` —— 栈里没有任何字体有它。
+- **验证方法**：`cargo test -p glitcherz-ui --lib fonts::tests::every_symbol_the_ui_labels_with_has_a_glyph`。加新符号先把它写进 `UI_SYMBOLS` 再跑；**不要凭感觉猜**，也不要再靠 fontTools 逐个翻 cmap（0.37 起 `has_glyph` 更直接）。
 
 ## 文案风格
 

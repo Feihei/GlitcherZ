@@ -2491,7 +2491,7 @@ impl eframe::App for GlitcherZApp {
         // S1-5: a dead output stream would otherwise look exactly like silence.
         if let Some(err) = self.engine.take_stream_error() {
             self.set_error(format!(
-                "Audio output stopped: {err}. Open Edit ▸ Preferences to pick another device."
+                "Audio output stopped: {err}. Open Edit › Preferences to pick another device."
             ));
             self.last_stream_error = Some(err);
         }

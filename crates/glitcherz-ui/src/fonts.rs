@@ -134,6 +134,44 @@ mod tests {
         }
     }
 
+    /// Every non-ASCII symbol the UI puts inside a label, in code-point order:
+    /// `§ ± · × – — … ‹ › ← ↑ → ↓ ↩ − ∞ ≈ ⏭ ⏮ ⏸ ⏺ ■ ▶ ♪`.
+    ///
+    /// Kept as one string so the test can name the ones that lost their face.
+    /// The media-control block (`U+23xx`) is the fragile part: it is not in GBK,
+    /// so the embedded Noto Sans SC subset cannot cover it, and egui 0.37 ships
+    /// those glyphs only behind its `monochrome_emoji_fonts` feature.
+    ///
+    /// `▸` (U+25B8) used to be here and no face in the stack has it — not even
+    /// with the emoji fonts back on — so the one menu path that wanted a
+    /// submenu arrow (`Edit › Preferences`) uses `›`, which every face except
+    /// the CJK subset already carries.
+    const UI_SYMBOLS: &str = "\u{A7}\u{B1}\u{B7}\u{D7}\u{2013}\u{2014}\u{2026}\u{2039}\u{203A}\
+                              \u{2190}\u{2191}\u{2192}\u{2193}\u{21A9}\u{2212}\u{221E}\u{2248}\
+                              \u{23ED}\u{23EE}\u{23F8}\u{23FA}\u{25A0}\u{25B6}\u{266A}";
+
+    #[test]
+    fn every_symbol_the_ui_labels_with_has_a_glyph() {
+        let ctx = ready_context();
+        // Ask the font stack directly. Layout would not tell us: egui 0.37
+        // shapes with harfrust, and a character no face has comes back as the
+        // face's `.notdef` tofu with `chr` intact — the 0.36-era "look for
+        // U+FFFD" check silently passes on every missing glyph.
+        let missing: Vec<String> = UI_SYMBOLS
+            .chars()
+            .filter(|ch| {
+                let font_id = egui::FontId::proportional(14.0);
+                !ctx.fonts_mut(|fonts| fonts.has_glyph(&font_id, *ch))
+            })
+            .map(|ch| format!("U+{:04X} {ch}", ch as u32))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "no face in the stack carries these UI symbols: {}",
+            missing.join(", ")
+        );
+    }
+
     #[test]
     fn latin_row_height_stays_with_the_bundled_face() {
         // Noto Sans SC's face is 1.448 em tall versus Ubuntu-Light's 1.149 em.

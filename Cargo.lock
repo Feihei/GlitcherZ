@@ -1233,6 +1233,7 @@ name = "glitcherz-ui"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "egui",
  "glitcherz-clap-host",
  "glitcherz-command",
  "glitcherz-engine",

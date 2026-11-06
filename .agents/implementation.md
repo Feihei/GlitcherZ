@@ -994,3 +994,36 @@ spec `instrument.md` D14 落地。新文件 `realtime/moog.rs` 放 DSP，`SvfPro
 **门槛**：`cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace`（39 个测试二进制）全绿，**第一次跑就过**，没有需要改断言的用例——包括最依赖像素几何的 `timeline_focus`(9)、`mixer_strip_scroll`(2)、`egui_event_semantics`(1)、`roll_state_machine`。`cargo build -p glitcherz-app` 也能链接出可执行文件。
 
 **视觉**：0.37 把默认间距、按钮内边距、圆角调大了（"roomier buttons / larger corner radius"），工程没有覆盖全局 `Style`，所以整套界面会比 0.36 略微松一点、圆一点；滚动条命中区和橡胶带滚动也换成了新实现。这是升级的预期代价，需要实际开窗口看一眼再决定要不要用 `Style` 补偿。
+
+## egui 0.37 复盘：丢失的图标字形 + 端口名贴回插口（2026-11-06）
+
+开窗口看到两处升级后的毛病，一处是回归，一处是老账。
+
+### 1. 走带按钮变豆腐块：`monochrome_emoji_fonts` 没打开
+
+egui 0.37 把 NotoEmoji 与 emoji-icon-font 挪进了 `monochrome_emoji_fonts` feature（默认关），而 **eframe 不转发这个 feature**，我们又用 `default-features = false` 构建。结果：字体栈里一个能画媒体控制块的字体都没有，`⏮ ⏸ ⏭ ⏺` 全变成主字体的 `.notdef` 方框。**编译器不会报任何错**——这类"静默降级"比编译失败难查得多。
+
+排查过程本身也踩了一个坑：0.36 时代用 `galley` 里有没有 `U+FFFD` 判断缺字形；0.37 换 harfrust 排版后，找不到的字形是**主字体的 notdef 豆腐**、`chr` 原样保留，所以老判据对每一个缺失字形都"通过"。正确入口是 `FontsView::has_glyph`。
+
+全仓字符串字面量扫出 25 个非 ASCII 符号，逐个查：缺 7 个 —— `⏮ ⏸ ⏭ ⏺`（媒体控制块 U+23xx，GBK 里没有，内置 Noto Sans SC 子集也就兜不住）、`↩`（patch 里的"回车/返回"提示）、`♪`（音符标记）、`▸`（菜单路径箭头）。
+
+- 打开 `monochrome_emoji_fonts`：workspace 加一条 `egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }`，`glitcherz-ui` 里 `egui = { workspace = true }`。**代码里不用它**——这行依赖的唯一作用是让 cargo 做 feature 合并时把 eframe 编译的那份 egui 也带上这两个字体。代价：debug 可执行文件 57.47 MB → 58.21 MB（+722 KB，正好是 NotoEmoji 419 KB + emoji-icon-font 324 KB）。
+- `▸` 是唯一补不回来的（连 emoji 字体都没有 U+25B8）：`Edit ▸ Preferences` 改成 `Edit › Preferences`（U+203A 每个字体都有）。
+
+顺带核对了 egui 自己的控件字符：`⏴ ⏵ ⏶ ⏷ ⇧ ⌘ ⚙ ⚠ ↕ ☀` 与常用 emoji 都齐；只有 `⌃`(U+2303) / `⌥`(U+2325) 没有——那是 macOS 的 control/option 修饰键字形，只在打印 `Modifiers` 名字时才用，本项目不打印，先记在 glossary 里。
+
+新增回归测试 `fonts::tests::every_symbol_the_ui_labels_with_has_a_glyph`：把 UI 实际用到的符号列成 `UI_SYMBOLS`，逐个问 `has_glyph`，缺一个就失败并点名。glossary 的"符号白名单"整节按 0.37 重写（旧版本还写着"egui 0.36 默认字体"、并且把 `→ ← ↑ ↓` 列为禁用——从内置 CJK 兜底之后它们一直能用）。
+
+### 2. 端口名离插口太远：30 pt 是给"最差缩放"付的钱
+
+`Timeline` 输出口 / `Mixer` 输入口的名字本来挂在离圆心 **30 pt** 的列上，而 `Timeline In` 终端的名字是 **10 pt** ——所以同一个画布里两种间距，后者看着才正常。
+
+30 的来历写在注释里：0.6（最小可交互缩放）时 `30 × 0.6 = 18 = PORT_HIT_RADIUS`，即"按下名字不会误起一条连线"。也就是说，间距是为**最差缩放**选的，100% 下就空出 24 pt。
+
+把规则换了个位置实现，间距就能还给视觉：
+
+- `PORT_NAME_GAP` 30 → **10**（和 `Timeline In` 终端同一个值，`Timeline In` 反过来改成读这个常量 + `10.0 * zoom`，缩放行为也与其它标题一致了）。
+- 新增 `port_grab_at()`：**名字矩形内的按下归节点，不再问端口**。于是名字贴到 10 pt（落在 18 pt 抓取圈里）也不会"拖名字拖出一根线"；圆点本身以及名字以外的整圈仍然照旧抓连线。`name_labels` 的每帧快照因此从绘制前挪到按下的路由之前——同一份 rect 现在同时驱动抓取否决、右键改名和绘制。
+- 连带效果：`CHANNEL_STRIP_LEFT` 由 `10 + 72 + 6` 推出 = 88（原 108），混音器推子因此长了 20 pt。这是同一个公式的自然结果，没有额外调参。
+
+测试改写为 `port_name_captions_hug_the_dot_and_own_their_press`：断言名字边缘正好在 `PORT_NAME_GAP * zoom` 处、名字里的按下 `port_grab_at` 返回 `None`、圆点上的按下仍然返回 `Some`，并要求名字不越过推子条。manual 的端口名一段补了一句"左键落在名字上是拖动节点、不会误拽连线"。

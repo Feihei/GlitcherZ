@@ -30,6 +30,15 @@ midir = "0.11"
 rfd = "0.17"
 # GUI（egui 框架）。默认关闭全部 feature；渲染后端由 glitcherz-ui 选择 glow。
 eframe = { version = "0.37", default-features = false, features = ["default_fonts"] }
+# `egui` is declared for exactly one reason: egui 0.37 made the monochrome
+# emoji fonts (NotoEmoji + emoji-icon-font) an opt-in feature and eframe does
+# not forward it. Without them the bundled stack has no face at all for the
+# media-control block (⏮ ⏸ ⏭ ⏺) or for ↩ ▸ ♪ — every one of those renders as
+# the primary face's `.notdef` tofu. Cargo unifies features per crate, so this
+# entry switches the fonts on inside eframe's own egui build too.
+egui = { version = "0.37", default-features = false, features = [
+    "monochrome_emoji_fonts",
+] }
 # 实时无锁队列（UI → 音频线程）
 rtrb = "0.4"
 # 实时无锁 MPMC 队列（R4：输入回调 → 图内 InputProcessor；图重建后句柄仍可共享）

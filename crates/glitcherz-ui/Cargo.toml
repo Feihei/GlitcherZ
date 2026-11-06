@@ -24,6 +24,11 @@ eframe = { workspace = true, features = [
     "wayland",
     "x11",
 ] }
+# Not used from code (everything goes through `eframe::egui`): this line exists
+# to turn on egui's `monochrome_emoji_fonts`, which eframe 0.37 does not
+# re-export. Feature unification makes eframe's egui build pick it up; without
+# it the transport buttons render as `.notdef` tofu.
+egui = { workspace = true }
 log = { workspace = true }
 rfd = { workspace = true }
 glitcherz-clap-host = { workspace = true }

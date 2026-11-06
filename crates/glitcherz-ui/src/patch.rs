@@ -1298,10 +1298,16 @@ const NODE_SIZE: Vec2 = Vec2::new(150.0, 64.0);
 /// Mixer box width. Wider than a plain node: the input-port name column gets
 /// its own space between the port dot and the fader strip.
 const MIXER_WIDTH: f32 = 220.0;
-/// Graph-space gap from a port dot to its name column. At the minimum
-/// interactive zoom this clears `PORT_HIT_RADIUS` (18 screen px), so a press
-/// on the name never starts a cable drag.
-const PORT_NAME_GAP: f32 = 30.0;
+/// Graph-space gap from a port dot to its caption. Same value the `Timeline In`
+/// terminal has always used, so every named port reads the same way — `● Tempo`
+/// / `● Kick` — instead of a caption floating in a column of its own.
+///
+/// It used to be `30`, i.e. sized so that at the *minimum* zoom the caption
+/// cleared `PORT_HIT_RADIUS` (18 screen px). That paid for the port's grab
+/// circle with the spacing of every zoom level, and at 100% it left a 24 px
+/// hole between the dot and the first glyph. The caption owns its own rect now
+/// (see `port_grab_at`), so the gap is free to be a visual gap again.
+const PORT_NAME_GAP: f32 = 10.0;
 /// Graph-space width of one port name column: six full-width (CJK) glyphs at
 /// 10 pt fit, longer names are cut with an ellipsis.
 const PORT_NAME_WIDTH: f32 = 72.0;
@@ -2101,6 +2107,27 @@ fn port_name_labels(
         }
     }
     out
+}
+
+/// Which output port a press at `sp` may grab, if any.
+///
+/// Captions own their own rect: a press that lands on a name belongs to the
+/// node (select / drag), never to the dot the name hugs. The captions sit
+/// `PORT_NAME_GAP` (10 pt) from the dot, i.e. **inside** the port's 18 pt grab
+/// circle, so without this rule dragging a node by its channel name would rip
+/// a cable out of the neighbour port. The dot itself — and the whole ring
+/// around it, everywhere a caption is not painted — still grabs as before.
+fn port_grab_at(
+    labels: &[PortNameLabel],
+    state: &PatchState,
+    rect_min: Pos2,
+    sp: Pos2,
+    deps: &PatchDeps<'_>,
+) -> Option<(PatchId, usize)> {
+    if labels.iter().any(|l| l.rect.contains(sp)) {
+        return None;
+    }
+    state.hit_out_port(rect_min, sp, deps)
 }
 
 impl PatchState {
@@ -2958,12 +2985,21 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     let midi_count = deps.track_count;
     let auto_count = deps.auto_count;
 
+    // ---- Named-port captions (timeline outlets / mixer inlets) ----
+    // One snapshot per frame, taken *before* the press is routed: the same
+    // rects drive the cable-grab veto below, the right-click rename and the
+    // painting, so a caption can never be clicked where it is not drawn (or
+    // vice versa). The captions are *painted*, not widgets, so the canvas
+    // keeps its own click / drag / marquee behaviour — pressing a title still
+    // selects and drags its node.
+    let name_labels = port_name_labels(rect.min, state, &deps);
+
     // ---- Press: hit-test and enter the matching drag ----
     // egui 0.36 (click+drag sense) only starts a drag after the pointer moves
     // decisively; in-place presses are handled by the `clicked` path below.
     if drag_started {
         let sp = pointer.unwrap_or(rect.min);
-        if let Some((source, port)) = state.hit_out_port(rect.min, sp, &deps) {
+        if let Some((source, port)) = port_grab_at(&name_labels, state, rect.min, sp, &deps) {
             state.selection = Selection::default();
             state.drag = Some(DragKind::Cable(CableDrag { from: source, port }));
         } else if let Some(id) = state.hit_node(rect.min, sp, &deps) {
@@ -3017,13 +3053,6 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         }
     }
 
-    // ---- Named-port captions (timeline outlets / mixer inlets) ----
-    // One snapshot per frame: the same rects drive the right-click rename
-    // below and the painting later, so a caption can never be clicked where
-    // it is not drawn (or vice versa). The captions are *painted*, not
-    // widgets, so the canvas keeps its own click / drag / marquee behaviour —
-    // pressing a title still selects and drags its node.
-    let name_labels = port_name_labels(rect.min, state, &deps);
     // The node / channel the editor pointed at may have been removed (or the
     // view zoomed below the caption threshold) — drop a stale editor.
     let stale_rename = state
@@ -3690,11 +3719,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             painter.circle_filled(p, PORT_RADIUS, inbound);
             painter.circle_stroke(p, PORT_RADIUS, egui::Stroke::new(1.0, Color32::BLACK));
             if matches!(id, PatchId::TimelineIn) {
+                // Same gap and size as the captions in `port_name_labels` —
+                // this terminal is the one that made the other two look
+                // detached, so it is the reference, not an exception.
                 painter.text(
-                    Pos2::new(p.x + 10.0, p.y),
+                    Pos2::new(p.x + PORT_NAME_GAP * state.zoom, p.y),
                     egui::Align2::LEFT_CENTER,
                     label,
-                    FontId::proportional(10.0),
+                    FontId::proportional(10.0 * state.zoom),
                     Color32::from_gray(170),
                 );
             }
@@ -4924,10 +4956,11 @@ mod tests {
         assert_eq!(channel.raw, "Kick Bus");
     }
 
-    /// Captions must never steal a cable drag from the port dot, nor paint
-    /// over the mixer's fader strip.
+    /// Captions hug their dot (`PORT_NAME_GAP`), never paint over the mixer's
+    /// fader strip, and inside the caption a press belongs to the node — not to
+    /// the port the caption overlaps.
     #[test]
-    fn port_name_captions_clear_the_port_dot_and_the_fader_strip() {
+    fn port_name_captions_hug_the_dot_and_own_their_press() {
         let project = Project::default();
         let track_name = |_: TrackKind, _: usize| "Bass".to_string();
         let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
@@ -4953,13 +4986,28 @@ mod tests {
         );
         let labels = port_name_labels(Pos2::ZERO, &state, &deps);
         let n = timeline_port_count(deps.track_count, deps.auto_count, deps.audio_count);
+        let gap = PORT_NAME_GAP * state.zoom;
         for ((_, p), label) in state
             .out_ports_screen(Pos2::ZERO, PatchId::Timeline, &deps)
             .iter()
             .zip(labels.iter().take(n))
         {
-            assert!(label.rect.right() <= p.x - PORT_HIT_RADIUS + 0.01);
+            // The caption hangs off the dot by exactly one gap — no column
+            // sized for the worst zoom (that used to be 30 pt).
+            assert!((label.rect.right() - (p.x - gap)).abs() < 0.01);
             assert!(label.rect.left() >= 0.0, "the caption stays inside the box");
+            // A press on the name belongs to the node: the box it sits in
+            // drags, the port beside it stays untouched.
+            assert!(
+                port_grab_at(&labels, &state, Pos2::ZERO, label.rect.center(), &deps).is_none(),
+                "the caption must not hand the press to the port"
+            );
+            // The dot itself still grabs, even though it is inside the
+            // caption's grab-shadow in the other direction.
+            assert!(
+                port_grab_at(&labels, &state, Pos2::ZERO, *p, &deps).is_some(),
+                "the dot must still start a cable"
+            );
         }
         let mixer = project
             .graph
@@ -4973,7 +5021,7 @@ mod tests {
             .iter()
             .zip(labels.iter().skip(n))
         {
-            assert!(label.rect.left() >= p.x + PORT_HIT_RADIUS - 0.01);
+            assert!((label.rect.left() - (p.x + gap)).abs() < 0.01);
             assert!(label.rect.right() <= p.x + CHANNEL_STRIP_LEFT * state.zoom + 0.01);
         }
     }
