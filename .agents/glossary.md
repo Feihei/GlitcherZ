@@ -187,7 +187,7 @@
 窗口内的文案（按钮/标签/状态栏/浮窗）只能用**字体栈里真有字形**的符号。栈从前往后：Ubuntu-Light → `egui-icons`（5 个 logo 专用码位）→ NotoEmoji + emoji-icon-font → 内置 Noto Sans SC 子集（`FontPriority::Lowest`，只兜底别人没有的字）。**一个都没有就是该字形的 `.notdef` 豆腐块**。
 
 - **egui 0.37 的坑**：NotoEmoji 与 emoji-icon-font 被挪进了 `monochrome_emoji_fonts` feature，而 eframe 不转发它。不打开它，走带按钮的 `⏮ ⏸ ⏭ ⏺`、`↩`、`♪`、`▸` 全部变豆腐（编译不报错，只是看起来像方框）。workspace `Cargo.toml` 里那条 `egui = { … features = ["monochrome_emoji_fonts"] }` 就是为此存在的，**不要删**。
-- **允许**（`crates/glitcherz-ui/src/fonts.rs` 的 `UI_SYMBOLS`，即实际用到的全集）：`§ ± · × – — … ‹ › ← ↑ → ↓ ↩ − ∞ ≈ ⏭ ⏮ ⏸ ⏺ ■ ▶ ♪`
+- **允许**（`crates/glitcherz-ui/src/fonts.rs` 的 `UI_SYMBOLS`，即实际用到的全集）：`§ ± · × – — … ‹ › ← ↑ → ↓ ↩ − ∞ ≈ ⏭ ⏮ ⏹ ⏸ ⏺ ▶ ♩ ♪ 🔁`。走带栏 2026-11-06 图标化时用 `⏹`(U+23F9) 取代了 `■`(U+25A0)——后者来自 emoji-icon-font，和媒体控制块不是一个语族。
 - **仍然禁止**：`✕`(U+2715)、`⌃`(U+2303) / `⌥`(U+2325)（macOS 的 control/option 修饰键字形，只在显示 `Modifiers` 名字时才会用到，本项目不显示）。`▸`(U+25B8) 2026-11-06 起改用 `›` —— 栈里没有任何字体有它。
 - **验证方法**：`cargo test -p glitcherz-ui --lib fonts::tests::every_symbol_the_ui_labels_with_has_a_glyph`。加新符号先把它写进 `UI_SYMBOLS` 再跑；**不要凭感觉猜**，也不要再靠 fontTools 逐个翻 cmap（0.37 起 `has_glyph` 更直接）。
 
