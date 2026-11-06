@@ -1027,3 +1027,28 @@ egui 0.37 把 NotoEmoji 与 emoji-icon-font 挪进了 `monochrome_emoji_fonts` f
 - 连带效果：`CHANNEL_STRIP_LEFT` 由 `10 + 72 + 6` 推出 = 88（原 108），混音器推子因此长了 20 pt。这是同一个公式的自然结果，没有额外调参。
 
 测试改写为 `port_name_captions_hug_the_dot_and_own_their_press`：断言名字边缘正好在 `PORT_NAME_GAP * zoom` 处、名字里的按下 `port_grab_at` 返回 `None`、圆点上的按下仍然返回 `Some`，并要求名字不越过推子条。manual 的端口名一段补了一句"左键落在名字上是拖动节点、不会误拽连线"。
+
+## 走带栏图标化 + Timeline In 输入口跟随轨道名（2026-11-06）
+
+### 1. Timeline In 的录音输入口显示轨道名
+
+`Timeline In` 终端每个录音输入口原来画的是固定标号 `T1` / `C1` / `A1`（从端口序号算出来的），所以编曲视图改了轨道名，这个口纹丝不动——而同一张画布上的 timeline 输出口一直用的是**实时**轨道名，两种口对同一件事给出两种答案。
+
+抽出 `timeline_in_port_label(kind, track, deps)`：走 `deps.track_name` 每帧读一次（与 outlet caption 同一个读取器），有名字就显示名字并套 `truncate_fullwidth` 的 6 全角字符上限，没名字才退回标号。终端宽度 150，端口圆心在左边缘，10 pt 间隔 + 60 pt 文字仍留有富余。
+
+测试 `timeline_in_inputs_read_live_track_names_and_fall_back_to_tags`：改名后标签跟着变、超长截断、空名回落 `T1` / `C2` / `A3`。
+
+### 2. 走带栏改成图标优先
+
+顺序按"播放 → 停止 → 回到开头 → 跳到结尾 ‖ 循环 → 上一个/下一个标记 ‖ 节拍器 ‖ 录音 + 录音选项"重排，`▶/⏸`、`⏹`、`⏺`、`🔁`、`♩` 全部只留图标，`Tempo` / `Meter` 两个标签删掉（`128 BPM` 与 `4/4` 自己会说话），`Latency` 标签也删掉（`0 smp` 的后缀已经带单位）。名称和快捷键全部搬进 `on_hover_text`：`Play (Space)`、`Pause (Space)`、`Return to start (Home)`、`Skip to end (End)`、`Previous marker (,)`、`Next marker (.)`、`Record … (R)`；没有快捷键的（stop / loop / metronome）就只写作用。
+
+几个连带决定：
+
+- **录音状态改用底色**。文字没了之后，"预备拍中 / 正在录"必须靠颜色：琥珀 = counting in，暗红 = capturing，红点本身也随状态变亮。tooltip 仍然逐字说明（预备拍那版还带上 `record_pre_roll_bars`）。
+- **tempo 与 meter 合成一组**，中间不再插分隔符：标签一去掉，`128 BPM [4/4]` 本来就是同一件事的两个值，两个 separator 只会切碎视觉。
+- **`⏹` 而不是原来的 `■`**。`■`(U+25A0) 来自 emoji-icon-font，和 `⏸ ⏮ ⏭` 的媒体控制块不是一个语族；换成 `⏹`(U+23F9) 之后八个走带图标全部落在 U+23xx / U+1F5xx，字重也一致。`♩`(U+2669) 同理（`♪` 留给时间轴上的音符合成标记，语义分开）。
+- 拒绝卡片里的 `press ⏺ Rec again` 改成 `press ⏺ again`——按钮上已经没有 `Rec` 这个词了。
+
+`fonts::UI_SYMBOLS` 补 `⏹ U+23F9`、`♩ U+2669`、`🔁 U+1F501`，回归测试保证这三枚在字体栈里真的有字形（`🔁` 需要 `monochrome_emoji_fonts`，见上一节）。
+
+`tests/timeline_focus.rs` 的手搓走带条同步改成图标版，保持它跟真走带栏的形状一致。

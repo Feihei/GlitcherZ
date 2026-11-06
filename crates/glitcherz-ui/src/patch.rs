@@ -1446,6 +1446,26 @@ fn timeline_in_port_track(port: u8, deps: &PatchDeps) -> Option<(TrackKind, usiz
     timeline_in_port_kind(port, deps.track_count, deps.auto_count, deps.audio_count)
 }
 
+/// Caption for one recording input on the `Timeline In` terminal: the **live**
+/// track name, or its `T1` / `C1` / `A1` tag when the track has no name yet.
+///
+/// Read through `deps.track_name` on every frame, exactly like the timeline
+/// outlet captions — the port names the track it feeds, so a rename in the
+/// arrangement shows up here immediately instead of leaving a stale tag.
+fn timeline_in_port_label(kind: TrackKind, track: usize, deps: &PatchDeps) -> String {
+    let name = (deps.track_name)(kind, track);
+    if name.is_empty() {
+        let tag = match kind {
+            TrackKind::Midi => "T",
+            TrackKind::Curve => "C",
+            TrackKind::Audio => "A",
+        };
+        format!("{tag}{}", track + 1)
+    } else {
+        truncate_fullwidth(&name, PORT_NAME_FULLWIDTH)
+    }
+}
+
 /// The cable kind one recording input accepts (D24).
 fn track_kind_cable(kind: TrackKind) -> CableKind {
     match kind {
@@ -3705,14 +3725,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             let (inbound, label) = match id {
                 PatchId::TimelineIn => match timeline_in_port_track(port, &deps) {
                     None => (cable_color(CableKind::Automation), "Tempo".to_string()),
-                    Some((kind, track)) => {
-                        let label = match kind {
-                            TrackKind::Midi => format!("T{}", track + 1),
-                            TrackKind::Curve => format!("C{}", track + 1),
-                            TrackKind::Audio => format!("A{}", track + 1),
-                        };
-                        (cable_color(track_kind_cable(kind)), label)
-                    }
+                    Some((kind, track)) => (
+                        cable_color(track_kind_cable(kind)),
+                        timeline_in_port_label(kind, track, &deps),
+                    ),
                 },
                 _ => (Color32::from_gray(90), String::new()),
             };
@@ -4902,6 +4918,51 @@ mod tests {
         // The default project's first voice feeds mixer channel 0.
         assert_eq!(inlet(&before), "Bass");
         assert_eq!(inlet(&after), "Lead Synth");
+    }
+
+    /// The `Timeline In` recording inputs name the track they feed — the same
+    /// live reader as the outlet captions, so a rename lands there too. An
+    /// unnamed track keeps its positional tag.
+    #[test]
+    fn timeline_in_inputs_read_live_track_names_and_fall_back_to_tags() {
+        use std::cell::RefCell;
+
+        let project = Project::default();
+        let name = RefCell::new("Bass".to_string());
+        let track_name = |_: TrackKind, _: usize| name.borrow().clone();
+        let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
+        let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
+        let deps = PatchDeps {
+            input: Default::default(),
+            doc: &project.graph,
+            track_count: project.midi_tracks.len(),
+            track_name: &track_name,
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
+        };
+
+        assert_eq!(timeline_in_port_label(TrackKind::Midi, 0, &deps), "Bass");
+        *name.borrow_mut() = "Lead Synth".to_string();
+        assert_eq!(
+            timeline_in_port_label(TrackKind::Midi, 0, &deps),
+            "Lead Synth",
+            "renaming a track must rename its Timeline In input"
+        );
+        // Longer than the caption cap: cut, never widened.
+        *name.borrow_mut() = "一二三四五六七".to_string();
+        assert_eq!(
+            timeline_in_port_label(TrackKind::Midi, 0, &deps),
+            "一二三四五六…"
+        );
+        // Unnamed: the port keeps the tag the old build always showed.
+        *name.borrow_mut() = String::new();
+        assert_eq!(timeline_in_port_label(TrackKind::Midi, 0, &deps), "T1");
+        assert_eq!(timeline_in_port_label(TrackKind::Curve, 1, &deps), "C2");
+        assert_eq!(timeline_in_port_label(TrackKind::Audio, 2, &deps), "A3");
     }
 
     /// A custom channel name wins over the derived track name, and the edit

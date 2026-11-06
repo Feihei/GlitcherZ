@@ -165,29 +165,22 @@ impl GlitcherZApp {
                     }
                 });
                 ui.separator();
-                // Transport group (U1): rewind / play-pause / stop /
-                // skip-to-end, then the song-loop toggle and marker jumps.
-                if ui
-                    .button("⏮")
-                    .on_hover_text("Return to start (Home)")
-                    .clicked()
-                {
-                    self.engine.seek_ticks(0.0);
-                }
-                let play_label = if playing { "⏸ Pause" } else { "▶ Play" };
-                let mut play_btn = egui::Button::new(play_label);
+                // Transport group (U1): play-pause, stop, rewind, skip-to-end.
+                // The buttons are icons only — the row stays narrow, and every
+                // caption lives in a tooltip that also names the shortcut where
+                // one exists.
+                let play_tip = if self.is_recording() {
+                    "Punch out: end the take and keep playing (Space)"
+                } else if playing {
+                    "Pause (Space)"
+                } else {
+                    "Play (Space)"
+                };
+                let mut play_btn = egui::Button::new(if playing { "⏸" } else { "▶" });
                 if playing {
                     play_btn = play_btn.fill(egui::Color32::DARK_GREEN);
                 }
-                if ui
-                    .add(play_btn)
-                    .on_hover_text(if self.is_recording() {
-                        "Punch out: end the take and keep playing (Space)"
-                    } else {
-                        "Space"
-                    })
-                    .clicked()
-                {
+                if ui.add(play_btn).on_hover_text(play_tip).clicked() {
                     if playing {
                         // R6 D32: punch out instead of pausing while a take runs.
                         if self.is_recording() {
@@ -199,35 +192,93 @@ impl GlitcherZApp {
                         self.send_sequencer(SequencerCommand::Play);
                     }
                 }
-                if ui
-                    .button("■ Stop")
-                    .on_hover_text(if self.is_recording() {
-                        "End the take and rewind (a take stopped during the pre-roll has nothing to keep)"
-                    } else {
-                        "Stop and rewind"
-                    })
-                    .clicked()
-                {
+                let stop_tip = if self.is_recording() {
+                    "End the take and rewind (a take stopped during the pre-roll has nothing to keep)"
+                } else {
+                    "Stop and rewind"
+                };
+                if ui.button("⏹").on_hover_text(stop_tip).clicked() {
                     self.stop_transport();
                 }
+                if ui
+                    .button("⏮")
+                    .on_hover_text("Return to start (Home)")
+                    .clicked()
+                {
+                    self.engine.seek_ticks(0.0);
+                }
+                if ui.button("⏭").on_hover_text("Skip to end (End)").clicked() {
+                    self.engine
+                        .seek_ticks(f64::from(self.arrangement_end_ticks()));
+                }
+                ui.separator();
+                // Song loop + marker jumps: one icon each, one group.
+                let loop_on = self.project().metadata.loop_range.is_active();
+                let loop_btn = egui::Button::new("🔁").selected(loop_on);
+                if ui
+                    .add(loop_btn)
+                    .on_hover_text("Song loop — drag the range out on the ruler with Ctrl")
+                    .clicked()
+                {
+                    let enable = !loop_on;
+                    self.timeline_toggle_loop(enable);
+                }
+                if ui
+                    .button("‹")
+                    .on_hover_text("Previous marker (,)")
+                    .clicked()
+                {
+                    self.seek_to_previous_marker();
+                }
+                if ui.button("›").on_hover_text("Next marker (.)").clicked() {
+                    self.seek_to_next_marker();
+                }
+                ui.separator();
+                // Metronome (spec `recording.md` R1): the click is generated
+                // inside the engine after the graph, so it keeps sounding with
+                // every track muted and never reaches the exported file.
+                let metro_btn = egui::Button::new("♩").selected(self.metronome_on);
+                if ui
+                    .add(metro_btn)
+                    .on_hover_text("Metronome click — audible while playing, never exported")
+                    .clicked()
+                {
+                    self.metronome_on = !self.metronome_on;
+                    self.metronome_pending = true;
+                }
+                if self.metronome_on {
+                    let level = ui
+                        .add(
+                            egui::Slider::new(&mut self.metronome_gain, 0.0..=1.0)
+                                .show_value(false)
+                                .max_decimals(2),
+                        )
+                        .on_hover_text("Click level");
+                    if level.changed() {
+                        self.metronome_pending = true;
+                    }
+                }
+                // Retry a toggle that hit a full command queue (the queue
+                // drains every block, so one frame is usually enough).
+                if self.metronome_pending
+                    && self
+                        .engine
+                        .set_metronome(self.metronome_on, self.metronome_gain)
+                {
+                    self.metronome_pending = false;
+                }
+                ui.separator();
                 // Record (spec `recording.md` R2): one take into the selected
                 // track, starting on the next bar line after the pre-roll.
+                // Icon-only like the transport buttons, so the take state reads
+                // from the fill — amber for the count-in, dark red for capture
+                // — and the caption moves into the tooltip.
                 let rec_active = self.is_recording();
-                // Pre-roll is dead time for capture — label it, or the user
-                // plays through the count-in and concludes nothing records.
                 let rec_pre_roll = rec_active && !self.recorder.is_capturing();
                 // `⏺` (U+23FA) ships in egui's icon font; `●` (U+25CF) only
                 // exists in the monospace face, so it renders as a tofu box in
                 // the proportional (button) font. Colour the dot separately:
                 // the icon font is monochrome and follows the text format.
-                let rec_label = if rec_pre_roll {
-                    " Pre-roll…"
-                } else if rec_active {
-                    " Rec…"
-                } else {
-                    " Rec"
-                };
-                let rec_font = egui::TextStyle::Button.resolve(ui.style());
                 let dot_color = if rec_active {
                     egui::Color32::from_rgb(255, 120, 120)
                 } else {
@@ -238,23 +289,16 @@ impl GlitcherZApp {
                     "⏺",
                     0.0,
                     egui::TextFormat {
-                        font_id: rec_font.clone(),
+                        font_id: egui::TextStyle::Button.resolve(ui.style()),
                         color: dot_color,
                         valign: egui::Align::Center,
                         ..Default::default()
                     },
                 );
-                rec_text.append(
-                    rec_label,
-                    0.0,
-                    egui::TextFormat {
-                        font_id: rec_font,
-                        color: egui::Color32::PLACEHOLDER,
-                        ..Default::default()
-                    },
-                );
                 let mut rec_btn = egui::Button::new(rec_text);
-                if rec_active {
+                if rec_pre_roll {
+                    rec_btn = rec_btn.fill(egui::Color32::from_rgb(120, 90, 30));
+                } else if rec_active {
                     rec_btn = rec_btn.fill(egui::Color32::from_rgb(150, 40, 40));
                 }
                 let rec_tip = if rec_pre_roll {
@@ -271,9 +315,9 @@ impl GlitcherZApp {
                         .map(|&track| format!("T{}", track + 1))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    format!("Recording {list} — click to end the take")
+                    format!("Recording {list} — click to end the take (R)")
                 } else {
-                    "Record into every track wired to a Timeline In recording port — R".to_string()
+                    "Record into every track wired to a Timeline In recording port (R)".to_string()
                 };
                 if ui.add(rec_btn).on_hover_text(rec_tip).clicked() {
                     self.toggle_recording();
@@ -313,12 +357,8 @@ impl GlitcherZApp {
                     );
                 // R4/R5: the device picker and the input meter live on the Audio In
                 // node and its Inspector panel — the transport keeps only the
-                // take settings (pre-roll, mute others, manual alignment).
-                ui.label("Latency").on_hover_text(
-                    "Manual input latency offset in samples: positive moves audio takes \
-                     earlier on the timeline. Session-only — it depends on this device and \
-                     buffer size, so it is not saved with the project.",
-                );
+                // take settings (pre-roll, mute others, manual alignment). The
+                // `smp` suffix carries the unit, so this field needs no label.
                 ui.add(
                     egui::DragValue::new(&mut self.record_latency_samples)
                         .range(-48_000..=48_000)
@@ -326,78 +366,24 @@ impl GlitcherZApp {
                         .suffix(" smp"),
                 )
                 .on_hover_text(
-                    "Manual input latency offset: positive moves audio takes earlier on the timeline",
+                    "Manual input latency offset in samples: positive moves audio takes \
+                     earlier on the timeline. Session-only — it depends on this device and \
+                     buffer size, so it is not saved with the project.",
                 );
-                if ui.button("⏭").on_hover_text("Skip to end (End)").clicked() {
-                    self.engine
-                        .seek_ticks(f64::from(self.arrangement_end_ticks()));
-                }
-                let loop_on = self.project().metadata.loop_range.is_active();
-                let loop_btn = egui::Button::new("Loop").selected(loop_on);
-                if ui
-                    .add(loop_btn)
-                    .on_hover_text("Song loop (drag it out on the ruler with Ctrl)")
-                    .clicked()
-                {
-                    let enable = !loop_on;
-                    self.timeline_toggle_loop(enable);
-                }
-                // Metronome (spec `recording.md` R1): the click is generated
-                // inside the engine after the graph, so it keeps sounding with
-                // every track muted and never reaches the exported file.
-                let metro_btn = egui::Button::new("Click").selected(self.metronome_on);
-                if ui
-                    .add(metro_btn)
-                    .on_hover_text("Metronome (audible while the transport plays, not exported)")
-                    .clicked()
-                {
-                    self.metronome_on = !self.metronome_on;
-                    self.metronome_pending = true;
-                }
-                if self.metronome_on {
-                    let level = ui
-                        .add(
-                            egui::Slider::new(&mut self.metronome_gain, 0.0..=1.0)
-                                .show_value(false)
-                                .max_decimals(2),
-                        )
-                        .on_hover_text("Click level");
-                    if level.changed() {
-                        self.metronome_pending = true;
-                    }
-                }
-                // Retry a toggle that hit a full command queue (the queue
-                // drains every block, so one frame is usually enough).
-                if self.metronome_pending
-                    && self
-                        .engine
-                        .set_metronome(self.metronome_on, self.metronome_gain)
-                {
-                    self.metronome_pending = false;
-                }
-                if ui
-                    .button("‹")
-                    .on_hover_text("Previous marker (,)")
-                    .clicked()
-                {
-                    self.seek_to_previous_marker();
-                }
-                if ui.button("›").on_hover_text("Next marker (.)").clicked() {
-                    self.seek_to_next_marker();
-                }
                 ui.separator();
-                ui.label("Tempo");
                 // U2: the value is read into a local first — writing the
                 // document every frame would keep `Session::is_dirty` (and
                 // the title's `*`) permanently true.
                 let before = self.begin_param_edit();
                 let mut tempo = self.project().metadata.tempo_bpm;
-                let bpm = ui.add(
-                    egui::DragValue::new(&mut tempo)
-                        .range(*BPM_RANGE.start()..=*BPM_RANGE.end())
-                        .speed(0.5)
-                        .suffix(" BPM"),
-                );
+                let bpm = ui
+                    .add(
+                        egui::DragValue::new(&mut tempo)
+                            .range(*BPM_RANGE.start()..=*BPM_RANGE.end())
+                            .speed(0.5)
+                            .suffix(" BPM"),
+                    )
+                    .on_hover_text("Project tempo in BPM — drag, or double-click to type");
                 if bpm.changed() {
                     self.project_mut().metadata.tempo_bpm = tempo;
                     // One drag = one undo step; keyboard nudges are separate steps.
@@ -423,10 +409,10 @@ impl GlitcherZApp {
                     )
                     .on_hover_text("Tempo curve (Timeline In) is driving the clock");
                 }
-                ui.separator();
                 // U3a: meter. Same read-local-then-write rule as tempo — the
-                // dropdown must not touch the document every frame.
-                ui.label("Meter");
+                // dropdown must not touch the document every frame. No
+                // separator and no label: `128 BPM  [4/4]` reads as one song
+                // setting, and the formats already say what they are.
                 let meter = self.project().metadata.time_signature;
                 let mut chosen = meter;
                 egui::ComboBox::from_id_salt("glitcherz_meter")
@@ -438,7 +424,9 @@ impl GlitcherZApp {
                                 glitcherz_model::TimeSignature::new(numerator, denominator);
                             ui.selectable_value(&mut chosen, candidate, candidate.to_string());
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text("Time signature — beats per bar / note value");
                 if chosen != meter {
                     self.set_meter(chosen);
                 }

@@ -113,10 +113,10 @@ impl Fixture {
             router.begin_frame(root.ctx());
             let transport = egui::Panel::top("glitcherz_transport").show(root, |ui| {
                 ui.horizontal(|ui| {
-                    let _ = ui.button("▶ Play").clicked();
-                    let _ = ui.button("■ Stop").clicked();
+                    // Mirrors the app's icon-only transport row.
+                    let _ = ui.button("▶").clicked();
+                    let _ = ui.button("⏹").clicked();
                     ui.separator();
-                    ui.label("Tempo");
                     let _ = ui.add(
                         egui::DragValue::new(tempo)
                             .range(40.0..=300.0)

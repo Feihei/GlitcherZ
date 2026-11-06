@@ -273,7 +273,7 @@ impl GlitcherZApp {
                          into it.",
                     );
                 } else {
-                    ui.weak("Fix the cause above, then press ⏺ Rec again.");
+                    ui.weak("Fix the cause above, then press ⏺ again.");
                 }
             });
         if !open {

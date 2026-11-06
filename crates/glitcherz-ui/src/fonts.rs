@@ -135,12 +135,13 @@ mod tests {
     }
 
     /// Every non-ASCII symbol the UI puts inside a label, in code-point order:
-    /// `§ ± · × – — … ‹ › ← ↑ → ↓ ↩ − ∞ ≈ ⏭ ⏮ ⏸ ⏺ ■ ▶ ♪`.
+    /// `§ ± · × – — … ‹ › ← ↑ → ↓ ↩ − ∞ ≈ ⏭ ⏮ ⏹ ⏸ ⏺ ■ ▶ ♩ ♪ 🔁`.
     ///
     /// Kept as one string so the test can name the ones that lost their face.
     /// The media-control block (`U+23xx`) is the fragile part: it is not in GBK,
     /// so the embedded Noto Sans SC subset cannot cover it, and egui 0.37 ships
-    /// those glyphs only behind its `monochrome_emoji_fonts` feature.
+    /// those glyphs only behind its `monochrome_emoji_fonts` feature. `🔁`
+    /// (U+1F501, song loop) comes from the same emoji faces.
     ///
     /// `▸` (U+25B8) used to be here and no face in the stack has it — not even
     /// with the emoji fonts back on — so the one menu path that wanted a
@@ -148,7 +149,7 @@ mod tests {
     /// the CJK subset already carries.
     const UI_SYMBOLS: &str = "\u{A7}\u{B1}\u{B7}\u{D7}\u{2013}\u{2014}\u{2026}\u{2039}\u{203A}\
                               \u{2190}\u{2191}\u{2192}\u{2193}\u{21A9}\u{2212}\u{221E}\u{2248}\
-                              \u{23ED}\u{23EE}\u{23F8}\u{23FA}\u{25A0}\u{25B6}\u{266A}";
+                              \u{23ED}\u{23EE}\u{23F8}\u{23F9}\u{23FA}\u{25A0}\u{25B6}\u{2669}\u{266A}\u{1F501}";
 
     #[test]
     fn every_symbol_the_ui_labels_with_has_a_glyph() {
