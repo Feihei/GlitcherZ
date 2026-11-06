@@ -4,6 +4,7 @@
 //! functions stay there and reach here through the glob import.
 
 use super::*;
+use crate::transport_icons::icon_button;
 
 impl GlitcherZApp {
     pub(crate) fn send_sequencer(&mut self, cmd: SequencerCommand) {
@@ -33,6 +34,11 @@ impl GlitcherZApp {
         let playing = self.engine.is_playing();
         let response = egui::Panel::top("glitcherz_transport").show(ui, |ui| {
             ui.horizontal(|ui| {
+                // The row is short of width by design: every control is either
+                // an icon or a value that labels itself. egui 0.37's default
+                // 8 pt item spacing is tuned for stacks of labelled widgets,
+                // not for a run of icons, so it is halved for the whole bar.
+                ui.spacing_mut().item_spacing.x = 4.0;
                 // U2: the file menu is the single entry point for project
                 // work (the old inline Open / Save / Recent buttons live
                 // here now).
@@ -180,7 +186,10 @@ impl GlitcherZApp {
                 if playing {
                     play_btn = play_btn.fill(egui::Color32::DARK_GREEN);
                 }
-                if ui.add(play_btn).on_hover_text(play_tip).clicked() {
+                if icon_button(ui, play_btn)
+                    .on_hover_text(play_tip)
+                    .clicked()
+                {
                     if playing {
                         // R6 D32: punch out instead of pausing while a take runs.
                         if self.is_recording() {
@@ -197,17 +206,22 @@ impl GlitcherZApp {
                 } else {
                     "Stop and rewind"
                 };
-                if ui.button("⏹").on_hover_text(stop_tip).clicked() {
+                if icon_button(ui, egui::Button::new("⏹"))
+                    .on_hover_text(stop_tip)
+                    .clicked()
+                {
                     self.stop_transport();
                 }
-                if ui
-                    .button("⏮")
+                if icon_button(ui, egui::Button::new("⏮"))
                     .on_hover_text("Return to start (Home)")
                     .clicked()
                 {
                     self.engine.seek_ticks(0.0);
                 }
-                if ui.button("⏭").on_hover_text("Skip to end (End)").clicked() {
+                if icon_button(ui, egui::Button::new("⏭"))
+                    .on_hover_text("Skip to end (End)")
+                    .clicked()
+                {
                     self.engine
                         .seek_ticks(f64::from(self.arrangement_end_ticks()));
                 }
@@ -215,31 +229,30 @@ impl GlitcherZApp {
                 // Song loop + marker jumps: one icon each, one group.
                 let loop_on = self.project().metadata.loop_range.is_active();
                 let loop_btn = egui::Button::new("🔁").selected(loop_on);
-                if ui
-                    .add(loop_btn)
+                if icon_button(ui, loop_btn)
                     .on_hover_text("Song loop — drag the range out on the ruler with Ctrl")
                     .clicked()
                 {
                     let enable = !loop_on;
                     self.timeline_toggle_loop(enable);
                 }
-                if ui
-                    .button("‹")
+                if icon_button(ui, egui::Button::new("‹"))
                     .on_hover_text("Previous marker (,)")
                     .clicked()
                 {
                     self.seek_to_previous_marker();
                 }
-                if ui.button("›").on_hover_text("Next marker (.)").clicked() {
+                if icon_button(ui, egui::Button::new("›"))
+                    .on_hover_text("Next marker (.)")
+                    .clicked()
+                {
                     self.seek_to_next_marker();
                 }
                 ui.separator();
                 // Metronome (spec `recording.md` R1): the click is generated
                 // inside the engine after the graph, so it keeps sounding with
                 // every track muted and never reaches the exported file.
-                let metro_btn = egui::Button::new("♩").selected(self.metronome_on);
-                if ui
-                    .add(metro_btn)
+                if transport_icons::metronome_button(ui, self.metronome_on)
                     .on_hover_text("Metronome click — audible while playing, never exported")
                     .clicked()
                 {
@@ -319,7 +332,7 @@ impl GlitcherZApp {
                 } else {
                     "Record into every track wired to a Timeline In recording port (R)".to_string()
                 };
-                if ui.add(rec_btn).on_hover_text(rec_tip).clicked() {
+                if icon_button(ui, rec_btn).on_hover_text(rec_tip).clicked() {
                     self.toggle_recording();
                 }
                 if !rec_active {

@@ -1052,3 +1052,16 @@ egui 0.37 把 NotoEmoji 与 emoji-icon-font 挪进了 `monochrome_emoji_fonts` f
 `fonts::UI_SYMBOLS` 补 `⏹ U+23F9`、`♩ U+2669`、`🔁 U+1F501`，回归测试保证这三枚在字体栈里真的有字形（`🔁` 需要 `monochrome_emoji_fonts`，见上一节）。
 
 `tests/timeline_focus.rs` 的手搓走带条同步改成图标版，保持它跟真走带栏的形状一致。
+
+## 图标间距收紧 + 手绘节拍器（2026-11-06）
+
+图标化之后走带栏仍然比预期宽：一枚 14 pt 图标在 `Button` 里左右各 8 pt padding，再叠上 egui 0.37 默认的 8 pt `item_spacing.x`，两个字形的中心距是 30 pt——一行八个图标像八个不相干的按钮。新模块 `crates/glitcherz-ui/src/transport_icons.rs` 收口这两件事：
+
+- `icon_button(ui, Button)`：只把 `button_padding.x` 压到 4（并立刻还原，别让后面的 DragValue / 复选盒继承），再给 `min_size.x = 22` 兜底，让不同字宽（`▶` 与 `‹`）步距一致。宽度 = 14 + 8 = 22，中心距 = 22 + 4 = 26。
+- 走带栏整行 `item_spacing.x = 4.0`（默认 8）。分隔符因此从 17 pt 收到 9 pt，横向总量省下来的空间足够 Master 电平表伸展。
+
+**节拍器不再用 `♩`**。八分音符是"音符"，不是节拍器——`♩` 放在录音按钮旁边会被读成"音符合成标记"（`♪` 已经占了这个语义），而 Unicode 里根本没有机械节拍器的码位。所以自己画：`metronome_button` 用 `allocate_exact_size(22 × interact_size.y)` 拿到和邻居完全一样的按钮矩形，用 `style().interact_selectable()` 取当前状态的 fill/stroke（悬停、按下、"开着"的选中底色因此全部跟着主题走），再用 `Painter` 画三笔——梯形箱体（一笔闭合 `painter.line`，拐角才会接上而不是四段线头）、斜的摆杆、摆杆上的配重横条。
+
+`metronome_shape(rect)` 是纯几何函数，测试直接断言比例：顶宽 < 0.7 倍底宽、底宽 < 高（否则像口袋）、左右对称、摆杆在**自身高度处**的梯形半宽之内（不是笼统地塞进包围盒）、斜率 > 0.15（近乎垂直会被读成铃铛）。摆杆底端离箱底 10%、顶端离顶板 16%，让它不穿盖。
+
+`fonts::UI_SYMBOLS` 因此删掉 `♩ U+2669`——白名单只留真正还在牌面上的符号。`docs/manual.md` 的走带栏那一行同步改成"节拍器按钮"。

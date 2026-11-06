@@ -135,7 +135,7 @@ mod tests {
     }
 
     /// Every non-ASCII symbol the UI puts inside a label, in code-point order:
-    /// `§ ± · × – — … ‹ › ← ↑ → ↓ ↩ − ∞ ≈ ⏭ ⏮ ⏹ ⏸ ⏺ ▶ ♩ ♪ 🔁`.
+    /// `§ ± · × – — … ‹ › ← ↑ → ↓ ↩ − ∞ ≈ ⏭ ⏮ ⏹ ⏸ ⏺ ▶ ♪ 🔁`.
     ///
     /// Kept as one string so the test can name the ones that lost their face.
     /// The media-control block (`U+23xx`) is the fragile part: it is not in GBK,
@@ -146,11 +146,12 @@ mod tests {
     /// `▸` (U+25B8) used to be here and no face in the stack has it — not even
     /// with the emoji fonts back on — so the one menu path that wanted a
     /// submenu arrow (`Edit › Preferences`) uses `›`, which every face except
-    /// the CJK subset already carries.
+    /// the CJK subset already carries. `♩` (U+2669) used to hold the metronome
+    /// and is gone for a different reason: a note is not a metronome, so the
+    /// button paints the instrument itself (`transport_icons`).
     const UI_SYMBOLS: &str = "\u{A7}\u{B1}\u{B7}\u{D7}\u{2013}\u{2014}\u{2026}\u{2039}\u{203A}\
                               \u{2190}\u{2191}\u{2192}\u{2193}\u{21A9}\u{2212}\u{221E}\u{2248}\
-                              \u{23ED}\u{23EE}\u{23F8}\u{23F9}\u{23FA}\u{25B6}\u{2669}\u{266A}\
-                              \u{1F501}";
+                              \u{23ED}\u{23EE}\u{23F8}\u{23F9}\u{23FA}\u{25B6}\u{266A}\u{1F501}";
 
     #[test]
     fn every_symbol_the_ui_labels_with_has_a_glyph() {

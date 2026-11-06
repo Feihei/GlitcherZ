@@ -90,6 +90,7 @@ pub mod status_bar;
 pub mod timeline;
 pub mod timeline_ops;
 pub mod transport;
+pub mod transport_icons;
 pub mod voices;
 
 /// Filter cutoff frequency slider range (logarithmic scale).
