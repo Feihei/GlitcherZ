@@ -618,6 +618,51 @@ scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 sympho
 明确不做：编码器（导出/录音仍 hound 写 WAV）、Opus / ALAC、元数据展示、
 流式解码、采样率重采样（`rubato` 未引入）、`PROJECT_VERSION` bump。
 
+## Y 系列：headless 渲染 CLI → MCP（2026-11-07 立项，本节即方案）
+
+> 来源：用户 2026-11-07 提问「计划中的 CLI 和 MCP 模式现在适合进行吗，还是先开始 WaveTable、Organ、Plug 这些功能？」
+> 裁定：**Pluck = Karplus-Strong 拨弦**（用户 2026-11-07 确认，不是「plug 节点」）；
+> CLI 先做渲染这一刀，MCP 押后，三个乐器排在 CLI 之后。
+> 此前 CLI / MCP 只是口头方向、从未入 plan（2026-11-07 全仓词边界检索无命中），本节补上。
+
+### 判断依据（读代码得到的事实，不是偏好）
+
+1. **地基已就位**：U7 的 `AudioEngine::start_offline(sample_rate)` 不建 cpal 流（`_stream: None` + `runner: Some`），headless / CI 可跑；`glitcherz-app` 已有手写参数解析（`--open` / `--seconds` / `--list-devices`），加子命令是增量。
+2. **装配重复两份**：`engine_sync.rs::install_node`（1304 行文件、18 处 `VoiceSpec::` 分支）与 `export_ops.rs::spawn_offline_node`（12 处）是同一件事的镜像；每加一个声源要写两遍，等三个乐器做完再抽 session 就要搬两次。**2026-11-07 现状统计**：`engine_sync.rs` 1304 / `export_ops.rs` 851 / `export_audio.rs` 794 / `voices.rs` 1060 行，其中「文档 → 引擎」翻译全部落在 `glitcherz-ui`，`glitcherz-engine` 与 `glitcherz-model` 互不依赖。
+3. **验收瓶颈在听感**：Pluck / Organ / Wavetable 都是纯听感特性，当前唯一验收手段是用户开窗口听（Dexed 的 click 问题至今挂在「待用户复测」）。CLI 一旦能 `render → wav`，即可用 RMS / 频谱 / NaN / 逐样本对拍自动验收，用户只在最后一耳朵签字。
+4. **MCP 不是「加个 server」**：需要 ① headless session 层，否则等于远程点 GUI；② 命令面覆盖（`glitcherz-command` 只覆盖模型编辑，`arm_modal` / G / T 等 UI 级手势不在其中）；③ 运行中工程的访问方式（IPC 到 GUI 或独立 headless 进程）；④ 安全边界（写文件、加载插件）。**没有 render 的 MCP 是盲操作**：改完听不到结果，价值大头归零。
+
+### 路线（按顺序，勿跳步）
+
+| 阶段 | 内容 | 状态 |
+| :--- | :--- | :--- |
+| **S0** | 装配去重（共享 `spawn_node`）+ `glitcherz --render` headless 渲染 | 本轮实施 |
+| **S1** | Pluck（Karplus-Strong 拨弦） | 待办 |
+| **S2** | Organ（drawbar 加法 + 打击泛音） | 待办 |
+| **S3** | Wavetable（表管理 / 抗混叠 / 位置调制，**先写独立 spec**） | 待办 |
+| **S4** | CLI 命令面扩展（open / save / 少量批量操作） | 待办 |
+| **S5** | MCP（前置：把 headless 层提升为独立 `glitcherz-session` crate + 命令面 + 安全边界） | 待办 |
+
+### S0 决策（2026-11-07）
+
+| ID | 决策 |
+| :--- | :--- |
+| S0-D1 | **不新建 crate**：在 `glitcherz-ui` 加纯函数模块 `headless`（不碰 egui / 不建窗口），`glitcherz-app` 本就链接 ui，零新增依赖。理由：实时 `install_node` 与 UI 缓存（param values / preset defaults / meters / guard 回收）深度耦合，整层外迁是大重构且无第二个消费者；S5 真需要独立 server 进程时再原样提升为 `glitcherz-session` crate。 |
+| S0-D2 | **一份装配**：把 `install_node` 与 `spawn_offline_node` 的 per-variant 构建抽成 `headless::spawn_node(node, rate, &mut Resources, InputMode)`，返回 `Spawned { processor, guard, info }`；UI 实时路径把 `info` 写回会话缓存，离线路径丢弃。新增 `VoiceSpec` 变体因此**只改一处**（S1/S2/S3 的直接收益）。`Resources` 借用采样缓存 / SF2 缓存 / `base_dir`，两条路径各自持有，不搬 App 字段。 |
+| S0-D3 | **CLI 形态**：`glitcherz --render <in.glz> <out.wav> [--rate <hz>] [--bits 16\|24\|32f] [--to <ticks>]`；走 `load_project` → `headless::assemble` → `ExportJob::new` → 同步 pump 到完成。不开 cpal 设备、不创建窗口、不 `run_native`。缺省整曲 + 44.1 kHz / 24-bit（GUI 缺省是设备采样率 / 24-bit / FullSong；CLI 没有设备可读故取 44.1 kHz 常量，对拍时须显式 `--rate` / `--bits` 对齐）。 |
+| S0-D4 | **验收**：① 最小无插件工程下，GUI Export Audio 与 CLI `--render` 的 wav **逐样本一致**（同一份装配 + 同一个 `ExportJob`，用测试锁住而非手工比）；② `cargo fmt` + `clippy --workspace --all-targets -D warnings` + `test --workspace` 全绿；③ `--render` 实跑冒烟（无窗口）。 |
+| S0-D5 | **v1 边界**：CLAP / VST3 离线实例化沿用现有 `spawn_rt + load_state`（不额外承诺 GUI-less 兼容）；stems / song-loop 范围 / 进度 banner 仍属 UI，CLI 只出单个 mix 文件；`-D warnings` 与实时铁律不变（装配只在控制线程）。 |
+
+### 三个乐器的量级（按 DrumKit 的既有模式：model `VoiceSpec` 变体 + engine processor + UI 面板 + 装配点 + 自动化词汇）
+
+| 项 | 量级 | 要点 | 风险 |
+| :--- | :--- | :--- | :--- |
+| Pluck（S1）| 小 | 激励噪声 + 延迟线 + 阻尼低通，RT 零分配，可复用 SVF / ADSR | 几乎无，性价比最高 |
+| Organ（S2）| 小–中 | 9 个 drawbar 正弦 + 打击泛音 + 滑音 | 参数多但线性叠加，无算法风险 |
+| Wavetable（S3）| 大 | 表管理 / 抗混叠 / 位置调制 / 可选用户表导入 / RT 表热替换 | 表管理与 UI 最贵，必须单独立 spec 再实现 |
+
+**明确不做**：S0 阶段不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（含 stems / 24-bit / 采样率选择）。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：
