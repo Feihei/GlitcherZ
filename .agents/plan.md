@@ -636,7 +636,7 @@ scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 sympho
 
 | 阶段 | 内容 | 状态 |
 | :--- | :--- | :--- |
-| **S0** | 装配去重（共享 `spawn_node`）+ `glitcherz --render` headless 渲染 | 本轮实施 |
+| **S0** | 装配去重（共享 `spawn_node`）+ `glitcherz --render` headless 渲染 | ✅ 2026-11-07 交付 |
 | **S1** | Pluck（Karplus-Strong 拨弦） | 待办 |
 | **S2** | Organ（drawbar 加法 + 打击泛音） | 待办 |
 | **S3** | Wavetable（表管理 / 抗混叠 / 位置调制，**先写独立 spec**） | 待办 |
@@ -648,7 +648,7 @@ scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 sympho
 | ID | 决策 |
 | :--- | :--- |
 | S0-D1 | **不新建 crate**：在 `glitcherz-ui` 加纯函数模块 `headless`（不碰 egui / 不建窗口），`glitcherz-app` 本就链接 ui，零新增依赖。理由：实时 `install_node` 与 UI 缓存（param values / preset defaults / meters / guard 回收）深度耦合，整层外迁是大重构且无第二个消费者；S5 真需要独立 server 进程时再原样提升为 `glitcherz-session` crate。 |
-| S0-D2 | **一份装配**：把 `install_node` 与 `spawn_offline_node` 的 per-variant 构建抽成 `headless::spawn_node(node, rate, &mut Resources, InputMode)`，返回 `Spawned { processor, guard, info }`；UI 实时路径把 `info` 写回会话缓存，离线路径丢弃。新增 `VoiceSpec` 变体因此**只改一处**（S1/S2/S3 的直接收益）。`Resources` 借用采样缓存 / SF2 缓存 / `base_dir`，两条路径各自持有，不搬 App 字段。 |
+| S0-D2 | **一份装配**：把 `install_node` 与 `spawn_offline_node` 的 per-variant 构建抽成 `headless::spawn_node(node, rate, &mut Resources, InputMode)`，返回 `Spawned { processor, guard, info }`；UI 实时路径把 `info` 写回会话缓存，离线路径丢弃。新增 `VoiceSpec` 变体因此**只在一处构建 processor**（参数重放 / Inspector / 自动化词汇表仍需各自接线，但不再是两份重复的声源装配）。`Resources` 借用采样缓存 / SF2 缓存 / `base_dir`，两条路径各自持有，不搬 App 字段。 |
 | S0-D3 | **CLI 形态**：`glitcherz --render <in.glz> <out.wav> [--rate <hz>] [--bits 16\|24\|32f] [--to <ticks>]`；走 `load_project` → `headless::assemble` → `ExportJob::new` → 同步 pump 到完成。不开 cpal 设备、不创建窗口、不 `run_native`。缺省整曲 + 44.1 kHz / 24-bit（GUI 缺省是设备采样率 / 24-bit / FullSong；CLI 没有设备可读故取 44.1 kHz 常量，对拍时须显式 `--rate` / `--bits` 对齐）。 |
 | S0-D4 | **验收**：① 最小无插件工程下，GUI Export Audio 与 CLI `--render` 的 wav **逐样本一致**（同一份装配 + 同一个 `ExportJob`，用测试锁住而非手工比）；② `cargo fmt` + `clippy --workspace --all-targets -D warnings` + `test --workspace` 全绿；③ `--render` 实跑冒烟（无窗口）。 |
 | S0-D5 | **v1 边界**：CLAP / VST3 离线实例化沿用现有 `spawn_rt + load_state`（不额外承诺 GUI-less 兼容）；stems / song-loop 范围 / 进度 banner 仍属 UI，CLI 只出单个 mix 文件；`-D warnings` 与实时铁律不变（装配只在控制线程）。 |
@@ -662,6 +662,15 @@ scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 sympho
 | Wavetable（S3）| 大 | 表管理 / 抗混叠 / 位置调制 / 可选用户表导入 / RT 表热替换 | 表管理与 UI 最贵，必须单独立 spec 再实现 |
 
 **明确不做**：S0 阶段不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（含 stems / 24-bit / 采样率选择）。
+
+**S0 实施记录（2026-11-07）**：
+
+- 新模块 `glitcherz-ui/src/headless.rs`（纯函数、无 egui 类型）：`Media` trait（实时走 `AppMedia` 借用 App 三个缓存、headless 走 `FreshMedia` 一次性解码）+ `spawn_node` + `midi_clip_table` / `control_clip_table` / `audio_clip_table` + `assemble_offline` + `render_project_to_wav`。
+- `engine_sync.rs::install_node` 与 `export_ops.rs::start_export` 都变成薄封装：前者把 `SpawnInfo`（插件参数表 / 出厂 state / 电平表）写回会话缓存，后者把 `OfflineGraph` 交给 `ExportJob`。**原先两份 per-variant 构建（18 处 / 12 处 `VoiceSpec::`）合并为一处**；`spawn_offline_node` 整个删除。净减约 790 行。
+- **实施勘误 1（D2 补充）**：`live` 标志只控制「额外会话记账」，DSP 一致。为不改动实时首块行为，内置合成器 / 采样窗口参数仍只在离线路径构造期下发（实时靠 `push_node_params` 重放）；离线 Input 节点恒静音；AudioTrack 节点构造期用空表，两条路径随后都推真实 clip 表（单节点安装路径在 `install_node` 尾部补推）。
+- **实施勘误 2（顺带修不一致）**：空路径的 Sample / SoundFont 节点，原来实时静音、离线导出却回落内置合成器 → 统一为静音。
+- **验收**：`gui_export_pipeline_matches_the_cli_render`（GUI 的 `assemble_offline + ExportJob` 与 CLI 输出逐字节相等）、`repeated_headless_renders_are_byte_identical`、`media_paths_resolve_relative_to_the_project`（ui lib 3 项）+ `render_cli.rs` 真起子进程跑 `--render` 的无窗口冒烟 + `main.rs` 参数解析 2 项。`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace`（40 个测试二进制）全绿；`--seconds 3` 窗口冒烟通过（实时 `install_node` 重构后）。
+- 用户文档同步：`docs/README.md` 运行节、`docs/manual.md` 导出节。
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 

@@ -27,6 +27,16 @@ cargo run -p glitcherz-app --release
 | :--- | :--- |
 | `--list-devices` | 打印所有音频输出设备后退出 |
 | `--seconds N` | N 秒后自动关窗（CI 冒烟用） |
+| `--render <in.glz> <out.wav>` | 不开窗口、不占用音频设备，直接把工程渲染成 wav |
+
+命令行渲染（批量 / CI / 脚本）：
+
+```bash
+glitcherz --render song.glz song.wav --rate 44100 --bits 24 --to 7680
+```
+
+`--rate`（默认 44100）、`--bits`（`16` / `24` / `32f`，默认 24）、`--to`（截止 tick，默认整曲）都是可选的。
+它和窗口里的 `File ▸ Export Audio…` 走同一套离线装配，只输出一个混音文件（不做 stems / song loop）。
 
 ## 五分钟做出第一段音乐
 

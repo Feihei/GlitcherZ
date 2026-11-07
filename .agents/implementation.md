@@ -1065,3 +1065,30 @@ egui 0.37 把 NotoEmoji 与 emoji-icon-font 挪进了 `monochrome_emoji_fonts` f
 `metronome_shape(rect)` 是纯几何函数，测试直接断言比例：顶宽 < 0.7 倍底宽、底宽 < 高（否则像口袋）、左右对称、摆杆在**自身高度处**的梯形半宽之内（不是笼统地塞进包围盒）、斜率 > 0.15（近乎垂直会被读成铃铛）。摆杆底端离箱底 10%、顶端离顶板 16%，让它不穿盖。
 
 `fonts::UI_SYMBOLS` 因此删掉 `♩ U+2669`——白名单只留真正还在牌面上的符号。`docs/manual.md` 的走带栏那一行同步改成"节拍器按钮"。
+
+## S0：headless 装配层 + `--render`（2026-11-07）
+
+新模块 `glitcherz-ui/src/headless.rs`。动机不是"给 CLI 加个入口"，而是**文档 → 引擎的装配原来写了两遍**：`engine_sync.rs::install_node`（18 处 `VoiceSpec::` 分支）与 `export_ops.rs::spawn_offline_node`（12 处）互为镜像，`start_export` 又把 `apply_document` 的连线 / clip 表 / floor 逻辑整段抄了一遍。每新增一个声源都要改两处。
+
+**分层**：`Media` trait 只暴露三个"文档路径 → processor"操作（sample / soundfont / drum）加一个 `audio_data`。`AppMedia(&mut GlitcherZApp)` 复用现有会话缓存（`obtain_*`），`FreshMedia` 是 CLI 的一次性 `SampleLibrary`（不做 LRU，渲染只碰一次文件）。`spawn_node(node, rate, &mut impl Media, live, input)` 是全仓**唯一**的 `NodeDoc` → `Box<dyn Processor>` 构造点，返回 `Spawned { processor, guard, info }`；`info` 是纯 UI 记账（插件参数表 / 出厂 state blob / 内置效果电平表），离线路径直接丢掉。
+
+**两条调用链**：
+
+```
+实时  apply_document → install_node → spawn_node(live=true)  → add_node + 会话缓存写回
+GUI   start_export   → assemble_offline → spawn_node(live=false) → ExportJob::new → 帧尾 pump
+CLI   --render       → render_project_to_wav → assemble_offline   → ExportJob::new → 循环 pump
+```
+
+`assemble_offline` 从 `start_export` 原样搬来（track chain / cables / 三张 clip 表 / `SetArrangementFloor` / seek / Play），因此 GUI 导出与 CLI 逐样本一致是**结构上**的保证，测试 `gui_export_pipeline_matches_the_cli_render` 锁住这条契约。
+
+**几个必须记住的取舍**：
+
+- `live` 只影响记账，不影响 DSP——**除了构造期参数**：实时路径靠 `apply_document` 之后的 `push_node_params` 重放内置合成器 / 采样窗口参数（带参数平滑），离线没有这一步所以必须在构造期下发。若两边都提前下发，实时首块的平滑起点会变，属于行为改动，不做。
+- 空路径的 Sample / SoundFont 节点：原来实时静音、导出时 `obtain_*` 失败回落内置合成器（同一工程两种声音）。统一成静音。
+- `AudioTrack` 节点构造期用 `empty_clip_table()`，两条路径随后都推真表；单节点安装（`mixer_panel` / `patch_ops`）不走 `apply_document` 的 step 5b，所以 `install_node` 尾部补一次 `send_audio_clips_for_track`。
+- 虚拟键盘在 `assemble_offline` 里必须 `continue`（`spawn_node` 为保持 total 会返回一个占位 processor，但不能让它进图）；离线 `Input` 恒静音。
+- `AppMedia` 借用整个 `&mut GlitcherZApp`，所以 `input` processor 要在构造 media **之前**从 `self.engine` 取好；`start_export` 先 `self.project().clone()` 结束不可变借用，`build_audio_clip_table` 则只快照本轨的 clips + `base_dir`（不整份克隆文档，stem 多 pass 时每轨都会调一次）。这是本项目反复遇到的 borrow 形状。
+- `render_project_to_wav` 用 `ExportJob` 的同步 pump（不建窗口、不 `AudioEngine::start()`），带一个宽松的 block 上限防走带卡死；结束前检查 `job.outputs()` 非空，再 `hound::WavReader` 回读头部拿帧数。
+
+**验收**：40 个测试二进制全绿（新增 6 项：ui lib 3、app 单测 2、app 集成 1），`fmt` / `clippy -D warnings` 干净，`--seconds 3` 窗口冒烟 + `--render` 无窗口冒烟通过。用户文档：`docs/README.md` 运行节、`docs/manual.md` 导出节。
