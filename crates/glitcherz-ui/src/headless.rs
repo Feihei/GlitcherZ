@@ -1,0 +1,1071 @@
+//! Headless document-to-engine assembly and offline WAV rendering (S0).
+//!
+//! This module deliberately contains **no egui types and creates no window**.
+//! Both the GUI's "Export Audio" and the CLI's `--render` assemble their
+//! offline graph through [`assemble_offline`], and both the live graph and the
+//! offline graph build each node through [`spawn_node`]. A new `VoiceSpec`
+//! variant therefore has exactly one construction site.
+//!
+//! Everything here runs on the control thread: decoding, plugin instantiation
+//! and graph wiring are all non-real-time (see AGENTS.md's real-time rules).
+
+use super::*;
+
+use glitcherz_clap_host::ClapParamInfo;
+use glitcherz_engine::SampleData;
+use glitcherz_vst3_host::Vst3ParamInfo;
+
+/// Media needed to turn a document's voice into a processor.
+///
+/// The live app implements this with its resident sample / SoundFont caches;
+/// the headless renderer implements it with a fresh, one-shot library. Either
+/// way [`spawn_node`] sees the same three operations.
+pub(crate) trait Media {
+    fn sample_voice(
+        &mut self,
+        stored: &str,
+        sample_rate: f32,
+    ) -> Result<SampleVoiceProcessor, SampleError>;
+
+    fn sf2_voice(&mut self, stored: &str, sample_rate: f32) -> Result<Sf2VoiceProcessor, Sf2Error>;
+
+    fn drum_voice(
+        &mut self,
+        slots: &[glitcherz_model::DrumSlot],
+        gain: f32,
+        sample_rate: f32,
+    ) -> DrumKitProcessor;
+
+    fn audio_data(&mut self, resolved: &Path) -> Result<Arc<SampleData>, SampleError>;
+}
+
+/// Resolves a project-relative media path (mirrors
+/// `Project::resolve_media_path`, which needs a whole `Project` reference).
+fn resolve_media(base_dir: Option<&Path>, stored: &str) -> PathBuf {
+    let normalized = stored.replace('\\', "/");
+    let candidate = Path::new(&normalized);
+    if candidate.is_absolute() {
+        return candidate.to_path_buf();
+    }
+    match base_dir {
+        Some(dir) => dir.join(candidate),
+        None => candidate.to_path_buf(),
+    }
+}
+
+/// The live app's caches, seen through the [`Media`] interface.
+pub(crate) struct AppMedia<'a>(pub &'a mut GlitcherZApp);
+
+impl Media for AppMedia<'_> {
+    fn sample_voice(
+        &mut self,
+        stored: &str,
+        sample_rate: f32,
+    ) -> Result<SampleVoiceProcessor, SampleError> {
+        self.0.obtain_sample_voice(stored, sample_rate)
+    }
+
+    fn sf2_voice(&mut self, stored: &str, sample_rate: f32) -> Result<Sf2VoiceProcessor, Sf2Error> {
+        self.0.obtain_sf2_voice(stored, sample_rate)
+    }
+
+    fn drum_voice(
+        &mut self,
+        slots: &[glitcherz_model::DrumSlot],
+        gain: f32,
+        sample_rate: f32,
+    ) -> DrumKitProcessor {
+        self.0.obtain_drum_kit_voice(slots, gain, sample_rate)
+    }
+
+    fn audio_data(&mut self, resolved: &Path) -> Result<Arc<SampleData>, SampleError> {
+        self.0.sample_library.load(resolved)
+    }
+}
+
+/// One-shot caches for a headless render. No LRU: a CLI render touches each
+/// file once, and holding parsed SoundFonts past the job has no consumer.
+pub(crate) struct FreshMedia {
+    base_dir: Option<PathBuf>,
+    samples: SampleLibrary,
+}
+
+impl FreshMedia {
+    fn new(base_dir: Option<PathBuf>) -> Self {
+        Self {
+            base_dir,
+            samples: SampleLibrary::new(),
+        }
+    }
+
+    fn resolve(&self, stored: &str) -> PathBuf {
+        resolve_media(self.base_dir.as_deref(), stored)
+    }
+}
+
+impl Media for FreshMedia {
+    fn sample_voice(
+        &mut self,
+        stored: &str,
+        sample_rate: f32,
+    ) -> Result<SampleVoiceProcessor, SampleError> {
+        let resolved = self.resolve(stored);
+        let data = self.samples.load(&resolved)?;
+        Ok(SampleVoiceProcessor::new(data, sample_rate))
+    }
+
+    fn sf2_voice(&mut self, stored: &str, sample_rate: f32) -> Result<Sf2VoiceProcessor, Sf2Error> {
+        let resolved = self.resolve(stored);
+        let library = Arc::new(Sf2Library::load(&resolved)?);
+        Sf2VoiceProcessor::new(library.font(), sample_rate)
+    }
+
+    fn drum_voice(
+        &mut self,
+        slots: &[glitcherz_model::DrumSlot],
+        gain: f32,
+        sample_rate: f32,
+    ) -> DrumKitProcessor {
+        let mut specs = Vec::with_capacity(slots.len());
+        for slot in slots.iter().take(glitcherz_model::MAX_DRUM_SLOTS) {
+            if slot.path.is_empty() {
+                continue;
+            }
+            let resolved = self.resolve(&slot.path);
+            match self.samples.load(&resolved) {
+                Ok(data) => specs.push(DrumSlotSpec {
+                    note: slot.note,
+                    data,
+                    gain: slot.gain,
+                    pan: slot.pan,
+                    tune_semitones: slot.tune_semitones,
+                    choke: slot.choke,
+                }),
+                Err(err) => log::error!(
+                    "Drum slot {} failed to load '{}': {err}",
+                    slot.note,
+                    slot.path
+                ),
+            }
+        }
+        let mut processor = DrumKitProcessor::new(&specs, sample_rate);
+        processor.set_param(ParamId::DrumGain, gain);
+        processor
+    }
+
+    fn audio_data(&mut self, resolved: &Path) -> Result<Arc<SampleData>, SampleError> {
+        self.samples.load(resolved)
+    }
+}
+
+/// Session-only bookkeeping a live install needs after spawning a node.
+/// The offline path builds exactly the same processor but drops this info.
+#[derive(Default)]
+pub(crate) struct SpawnInfo {
+    /// Plugin id for the guard entry (the document's `plugin_id` / `class_id`).
+    pub label: String,
+    /// Built-in effect meters, live only.
+    pub meter: Option<Arc<EffectMeters>>,
+    /// Factory-default state blob, live only (preset "Reset" target).
+    pub default_state: Option<Vec<u8>>,
+    /// CLAP parameter list + current values, live only.
+    pub clap: Option<(Vec<ClapParamInfo>, HashMap<u32, f64>)>,
+    /// VST3 parameter list + current values, live only.
+    pub vst3: Option<(Vec<Vst3ParamInfo>, HashMap<u32, f64>)>,
+}
+
+pub(crate) struct Spawned {
+    pub processor: Box<dyn Processor>,
+    pub guard: Option<PluginGuard>,
+    pub info: SpawnInfo,
+}
+
+impl Spawned {
+    fn plain(processor: Box<dyn Processor>) -> Self {
+        Self {
+            processor,
+            guard: None,
+            info: SpawnInfo::default(),
+        }
+    }
+}
+
+fn silent() -> Box<dyn Processor> {
+    Box::new(SilentProcessor::new())
+}
+
+/// Builds one document node's processor. `live` only controls the *extra*
+/// bookkeeping the GUI needs (parameter caches, factory-default snapshots,
+/// meters) — the sounding DSP is identical in both modes.
+///
+/// `input` is the live `InputProcessor` built from the engine's capture ring;
+/// offline rendering passes `None` and the node is silent.
+pub(crate) fn spawn_node<M: Media>(
+    node: &NodeDoc,
+    sample_rate: u32,
+    media: &mut M,
+    live: bool,
+    input: Option<InputProcessor>,
+) -> Spawned {
+    if node.is_keyboard() {
+        // G6: document-only routing node, never enters the engine graph.
+        // The caller returns before registering it, but keep the builder total.
+        return Spawned::plain(Box::new(SynthProcessor::new(convert::sample_rate_to_f32(
+            sample_rate,
+        ))));
+    }
+    let sr = convert::sample_rate_to_f32(sample_rate);
+    let mut info = SpawnInfo::default();
+    let (processor, guard): (Box<dyn Processor>, Option<PluginGuard>) = match node {
+        NodeDoc::Instrument { voice, synth, .. } => {
+            spawn_instrument(voice, synth, sample_rate, sr, media, live, &mut info)
+        }
+        NodeDoc::Effect { voice, params, .. } => {
+            spawn_effect(voice, params, sample_rate, sr, media, live, &mut info)
+        }
+        NodeDoc::Mixer {
+            channels,
+            out_pan,
+            out_muted,
+            ..
+        } => {
+            let eng: Vec<EngineMixerChannel> = channels
+                .iter()
+                .map(|c| EngineMixerChannel {
+                    gain: c.gain,
+                    pan: c.pan,
+                    muted: c.muted,
+                    solo: c.solo,
+                })
+                .collect();
+            (
+                Box::new(MixerProcessor::with_channels(&eng, *out_pan, *out_muted)),
+                None,
+            )
+        }
+        NodeDoc::Feedback { gain, .. } => {
+            let mut processor = FeedbackProcessor::new();
+            processor.set_param(ParamId::FeedbackGain, *gain);
+            (Box::new(processor), None)
+        }
+        NodeDoc::ChannelStrip { .. } => (Box::new(ChannelStripProcessor::new()), None),
+        // R4: only a live engine owns the input ring; an offline render has
+        // no input device and must stay silent.
+        NodeDoc::Input { .. } => match input {
+            Some(processor) => (Box::new(processor), None),
+            None => (silent(), None),
+        },
+        NodeDoc::AudioTrack { .. } => {
+            // Both callers push the real clip table right after installation
+            // (`send_audio_clips_for_track` / `assemble_offline`), so an empty
+            // table here avoids decoding the same files twice.
+            (Box::new(AudioTrackProcessor::new(empty_clip_table())), None)
+        }
+        NodeDoc::Keyboard { .. } => (Box::new(SynthProcessor::new(sr)), None),
+        NodeDoc::Arpeggiator { params, .. } => {
+            let mut processor = ArpeggiatorProcessor::new(node.node_id() as u32);
+            processor.apply_params(
+                params.division,
+                params.gate,
+                params.mode.index(),
+                params.octaves,
+                params.latch,
+                params.harmony.index(),
+                params.skip,
+            );
+            (Box::new(processor), None)
+        }
+        NodeDoc::Portamento { params, .. } => {
+            let mut processor = PortamentoProcessor::new();
+            processor.apply_params(params.time_ms, params.min, params.max, params.legato_only);
+            (Box::new(processor), None)
+        }
+        NodeDoc::MidiEnvelope { params, .. } => {
+            let mut processor = MidiEnvelopeProcessor::new();
+            processor.apply_params(params.attack, params.decay, params.sustain, params.release);
+            processor.set_param(ParamId::EnvMin, params.min);
+            processor.set_param(ParamId::EnvMax, params.max);
+            (Box::new(processor), None)
+        }
+        NodeDoc::CurveMap { params, .. } => {
+            let mut processor = CurveMapProcessor::new();
+            processor.apply_params(params.min, params.max, engine_mode(params.mode));
+            (Box::new(processor), None)
+        }
+        NodeDoc::Lfo { params, .. } => {
+            let mut processor = LfoProcessor::new(node.node_id() as u32);
+            processor.apply_params(
+                params.waveform.index(),
+                params.rate_hz,
+                params.sync,
+                params.division,
+                params.depth,
+            );
+            (Box::new(processor), None)
+        }
+    };
+    Spawned {
+        processor,
+        guard,
+        info,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_instrument<M: Media>(
+    voice: &VoiceSpec,
+    synth: &SynthParams,
+    sample_rate: u32,
+    sr: f32,
+    media: &mut M,
+    live: bool,
+    info: &mut SpawnInfo,
+) -> (Box<dyn Processor>, Option<PluginGuard>) {
+    match voice {
+        VoiceSpec::Builtin => {
+            let mut processor = SynthProcessor::new(sr);
+            // The live graph replays every parameter through
+            // `push_node_params` right after installation (smoothed); the
+            // offline graph has no such pass, so it seeds them here.
+            if !live {
+                for (id, value) in synth_param_values(synth) {
+                    processor.set_param(id, value);
+                }
+            }
+            (Box::new(processor), None)
+        }
+        VoiceSpec::Sample {
+            path,
+            root_note,
+            play_mode,
+            gain,
+            region,
+            ..
+        } => {
+            if path.is_empty() {
+                // A node born without a file stays silent in BOTH paths.
+                (silent(), None)
+            } else {
+                match media.sample_voice(path, sr) {
+                    Ok(mut processor) => {
+                        processor.set_param(ParamId::SampleRootNote, f32::from(*root_note));
+                        processor.set_param(
+                            ParamId::SamplePlayMode,
+                            if matches!(play_mode, SamplePlayMode::OneShot) {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                        );
+                        processor.set_param(ParamId::SampleGain, *gain);
+                        if !live {
+                            processor.set_param(ParamId::SampleStart, region.start as f32);
+                            processor.set_param(ParamId::SampleLoopStart, region.loop_start as f32);
+                            processor.set_param(ParamId::SampleLoopEnd, region.loop_end as f32);
+                            processor.set_param(ParamId::SampleEnd, region.end as f32);
+                            processor.set_param(
+                                ParamId::SampleLoopMode,
+                                f32::from(region.loop_mode.index()),
+                            );
+                        }
+                        (Box::new(processor), None)
+                    }
+                    Err(err) => {
+                        log::error!("Failed to load sample {path}: {err}");
+                        (Box::new(SynthProcessor::new(sr)), None)
+                    }
+                }
+            }
+        }
+        VoiceSpec::DrumKit { slots, gain } => {
+            if slots.is_empty() {
+                (silent(), None)
+            } else {
+                (Box::new(media.drum_voice(slots, *gain, sr)), None)
+            }
+        }
+        VoiceSpec::SoundFont {
+            path,
+            bank,
+            program,
+            gain,
+            bend_range,
+        } => {
+            if path.is_empty() {
+                (silent(), None)
+            } else {
+                match media.sf2_voice(path, sr) {
+                    Ok(mut processor) => {
+                        processor.set_param(ParamId::Sf2BankSelect, f32::from(*bank));
+                        processor.set_param(ParamId::Sf2ProgramChange, f32::from(*program));
+                        processor.set_param(ParamId::Sf2Gain, *gain);
+                        processor.set_param(ParamId::Sf2BendRange, *bend_range);
+                        (Box::new(processor), None)
+                    }
+                    Err(err) => {
+                        log::error!("Failed to load SoundFont {path}: {err}");
+                        (Box::new(SynthProcessor::new(sr)), None)
+                    }
+                }
+            }
+        }
+        VoiceSpec::Clap {
+            path,
+            plugin_id,
+            state,
+        } => match ClapInstance::spawn_rt(
+            Path::new(path),
+            plugin_id,
+            ClapInstanceConfig {
+                sample_rate,
+                max_frames: 128,
+            },
+        ) {
+            Ok(mut instance) => {
+                if live {
+                    if let Ok(blob) = instance.guard.save_state() {
+                        info.default_state = Some(blob);
+                    }
+                }
+                if !state.is_empty()
+                    && let Err(err) = instance.guard.load_state(state)
+                {
+                    log::warn!("Failed to restore CLAP state for {plugin_id}: {err}");
+                }
+                if live {
+                    let params = instance.list_params();
+                    let values = instance.read_param_values();
+                    info.clap = Some((params, values));
+                    info.label = plugin_id.clone();
+                }
+                let ClapInstance { guard, node } = instance;
+                (Box::new(node), Some(PluginGuard::Clap(guard)))
+            }
+            Err(err) => {
+                log::error!("Failed to instantiate CLAP plugin {plugin_id}: {err}");
+                (Box::new(SynthProcessor::new(sr)), None)
+            }
+        },
+        VoiceSpec::Vst3 {
+            path,
+            class_id,
+            state,
+            ..
+        } => match glitcherz_vst3_host::Vst3Instance::spawn_rt(
+            Path::new(path),
+            class_id,
+            glitcherz_vst3_host::Vst3InstanceConfig {
+                sample_rate,
+                max_frames: 128,
+            },
+        ) {
+            Ok(instance) => {
+                if live {
+                    if let Ok(blob) = instance.guard.save_state() {
+                        info.default_state = Some(blob);
+                    }
+                }
+                if !state.is_empty()
+                    && let Err(err) = instance.guard.load_state(state)
+                {
+                    log::warn!("Failed to restore VST3 state for {class_id}: {err}");
+                }
+                if live {
+                    info.vst3 = Some((
+                        instance.guard.parameters(),
+                        instance.guard.read_param_values(),
+                    ));
+                    info.label = class_id.clone();
+                }
+                let glitcherz_vst3_host::Vst3Instance { guard, node } = instance;
+                (Box::new(node), Some(PluginGuard::Vst3(guard)))
+            }
+            Err(err) => {
+                log::error!("Failed to instantiate VST3 plugin {class_id}: {err}");
+                (Box::new(SynthProcessor::new(sr)), None)
+            }
+        },
+    }
+}
+
+fn spawn_effect<M: Media>(
+    voice: &VoiceSpec,
+    params: &EffectParams,
+    sample_rate: u32,
+    sr: f32,
+    _media: &mut M,
+    live: bool,
+    info: &mut SpawnInfo,
+) -> (Box<dyn Processor>, Option<PluginGuard>) {
+    match voice {
+        VoiceSpec::Builtin
+        | VoiceSpec::SoundFont { .. }
+        | VoiceSpec::Sample { .. }
+        | VoiceSpec::DrumKit { .. } => {
+            let built = crate::effect::processor(params, sr);
+            if live {
+                info.meter = built.meters;
+            }
+            (built.processor, None)
+        }
+        VoiceSpec::Clap {
+            path,
+            plugin_id,
+            state,
+        } => match ClapInstance::spawn_rt(
+            Path::new(path),
+            plugin_id,
+            ClapInstanceConfig {
+                sample_rate,
+                max_frames: 128,
+            },
+        ) {
+            Ok(mut instance) => {
+                if !state.is_empty()
+                    && let Err(err) = instance.guard.load_state(state)
+                {
+                    log::warn!("Failed to restore CLAP effect state for {plugin_id}: {err}");
+                }
+                if live {
+                    info.clap = Some((instance.list_params(), instance.read_param_values()));
+                    info.label = plugin_id.clone();
+                }
+                let ClapInstance { guard, node } = instance;
+                (Box::new(node), Some(PluginGuard::Clap(guard)))
+            }
+            Err(err) => {
+                log::error!("Failed to instantiate CLAP effect {plugin_id}: {err}");
+                (crate::effect::processor(params, sr).processor, None)
+            }
+        },
+        VoiceSpec::Vst3 {
+            path,
+            class_id,
+            state,
+            ..
+        } => match glitcherz_vst3_host::Vst3Instance::spawn_rt(
+            Path::new(path),
+            class_id,
+            glitcherz_vst3_host::Vst3InstanceConfig {
+                sample_rate,
+                max_frames: 128,
+            },
+        ) {
+            Ok(instance) => {
+                if !state.is_empty()
+                    && let Err(err) = instance.guard.load_state(state)
+                {
+                    log::warn!("Failed to restore VST3 effect state for {class_id}: {err}");
+                }
+                if live {
+                    info.vst3 = Some((
+                        instance.guard.parameters(),
+                        instance.guard.read_param_values(),
+                    ));
+                    info.label = class_id.clone();
+                }
+                let glitcherz_vst3_host::Vst3Instance { guard, node } = instance;
+                (Box::new(node), Some(PluginGuard::Vst3(guard)))
+            }
+            Err(err) => {
+                log::error!("Failed to instantiate VST3 effect {class_id}: {err}");
+                (crate::effect::processor(params, sr).processor, None)
+            }
+        },
+    }
+}
+
+/// Document MIDI clips → engine representation (control thread only; the
+/// `Vec`s are handed to the audio thread through the structure queue).
+pub(crate) fn midi_clip_table(project: &Project, track: usize) -> MidiClipTable {
+    let mut clips = empty_midi_clip_table();
+    let Some(midi_track) = project.midi_tracks.get(track) else {
+        return clips;
+    };
+    for (slot, clip) in clips.iter_mut().zip(midi_track.clips.iter()) {
+        let mut rt = RtMidiClip {
+            start_ticks: clip.start_ticks,
+            span_ticks: clip.span_ticks,
+            loop_ticks: clip.loop_ticks,
+            ..RtMidiClip::default()
+        };
+        for note in clip.notes() {
+            rt.push(RtNote::new(
+                note.start,
+                note.length,
+                note.note,
+                note.channel,
+                note.velocity,
+            ));
+        }
+        for ctrl in &clip.sequence.ctrls {
+            rt.push_ctrl(RtCtrl::new(
+                ctrl.tick,
+                ctrl.channel,
+                rt_ctrl_kind(ctrl.kind),
+                ctrl.value,
+            ));
+        }
+        *slot = rt;
+    }
+    clips
+}
+
+/// Document control clips → engine representation.
+pub(crate) fn control_clip_table(
+    project: &Project,
+    index: usize,
+) -> [RtControlClip; MAX_TRACK_CLIPS] {
+    let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
+    let Some(track) = project.control_tracks.get(index) else {
+        return clips;
+    };
+    for (slot, clip) in clips.iter_mut().zip(track.clips.iter()) {
+        let mut curve = RtAutomation {
+            interp: rt_curve_interp(clip.interp),
+            ..RtAutomation::default()
+        };
+        for point in clip.curve.iter().take(MAX_AUTO_POINTS) {
+            curve.push(RtAutoPoint {
+                tick: point.tick,
+                value: point.value,
+            });
+        }
+        *slot = RtControlClip {
+            start_ticks: clip.start_ticks,
+            span_ticks: clip.span_ticks,
+            loop_ticks: clip.loop_ticks,
+            curve,
+        };
+    }
+    clips
+}
+
+/// Document audio clips → engine representation. Takes the track's clips
+/// (not the whole `Project`) so a live single-node install does not have to
+/// clone the document just to end a borrow.
+pub(crate) fn audio_clip_table<M: Media>(
+    clips: &[glitcherz_model::AudioClip],
+    base_dir: Option<&Path>,
+    media: &mut M,
+) -> glitcherz_engine::realtime::AudioClipTable {
+    let mut table = empty_clip_table();
+    for (slot, clip) in table.iter_mut().zip(clips.iter().take(MAX_TRACK_CLIPS)) {
+        let resolved = resolve_media(base_dir, &clip.path);
+        match media.audio_data(&resolved) {
+            Ok(data) => {
+                *slot = Some(RtAudioClip {
+                    start_ticks: f64::from(clip.start_ticks),
+                    source_offset: clip.source_offset,
+                    source_len: clip.source_len,
+                    data,
+                    gain: clip.gain,
+                });
+            }
+            Err(err) => {
+                log::error!("Failed to load audio clip '{}': {err}", clip.path);
+            }
+        }
+    }
+    table
+}
+
+pub(crate) struct OfflineGraph {
+    pub engine: AudioEngine,
+    pub guards: Vec<PluginGuard>,
+    pub node_map: HashMap<u64, u64>,
+}
+
+/// Assembles a started, playing offline engine from the document — the single
+/// assembly used by the GUI's Export Audio and by the CLI's `--render`.
+///
+/// The window's start is where the transport seeks; the arrangement floor
+/// prevents the sequencer's auto-stop from cutting off audio clip tails.
+pub(crate) fn assemble_offline<M: Media>(
+    project: &Project,
+    sample_rate: u32,
+    window: (f64, f64),
+    media: &mut M,
+) -> OfflineGraph {
+    let mut engine =
+        AudioEngine::start_offline(sample_rate).expect("the offline engine needs no audio device");
+    let mut node_map: HashMap<u64, u64> = HashMap::new();
+    let mut guards: Vec<PluginGuard> = Vec::new();
+    for node in &project.graph.nodes {
+        // G6: virtual keyboards are document-only routing nodes.
+        if node.is_keyboard() {
+            continue;
+        }
+        let spawned = spawn_node(node, sample_rate, media, false, None);
+        let kind = match node {
+            NodeDoc::Mixer { .. } => NodeKind::Mixer,
+            NodeDoc::Feedback { .. } => NodeKind::Feedback,
+            _ => NodeKind::Plain,
+        };
+        let engine_id = engine.fresh_node_id();
+        if engine.add_node(engine_id, kind, spawned.processor) {
+            node_map.insert(node.node_id(), engine_id);
+            if let Some(guard) = spawned.guard {
+                guards.push(guard);
+            }
+        } else {
+            drop(spawned.guard);
+        }
+    }
+    // Track addressing.
+    for track in 0..project.midi_tracks.len() {
+        let resolve = |doc_id: Option<u64>| -> Option<u64> {
+            doc_id.and_then(|id| node_map.get(&id).copied())
+        };
+        let voice = resolve(
+            project
+                .graph
+                .instrument_of_track(track)
+                .map(NodeDoc::node_id),
+        );
+        let delay = resolve(
+            project
+                .graph
+                .builtin_delay_of_track(track)
+                .map(NodeDoc::node_id),
+        );
+        let _ = engine.register_track_chain(track, voice, delay, delay);
+    }
+    // Cables. Virtual keyboards are document-only; offline input is silent.
+    let master = engine.master_node_id();
+    let graph = &project.graph;
+    for cable in &graph.cables {
+        let from = match &cable.from {
+            PortRef::Node(id) => node_map.get(id).copied(),
+            _ => None,
+        };
+        let to_node = match &cable.to {
+            PortRef::Node(id) => node_map.get(id).copied(),
+            PortRef::Master => Some(master),
+            _ => None,
+        };
+        match cable.kind {
+            CableKind::Audio => {
+                if let (Some(from), Some(to)) = (from, to_node) {
+                    let _ = engine.connect_nodes(from, to, cable.in_port);
+                }
+            }
+            CableKind::Midi => match &cable.from {
+                PortRef::MidiTrack(track) => {
+                    if let Some(to) = to_node {
+                        let _ = engine.connect_midi_node(*track, to);
+                    }
+                }
+                PortRef::Node(id) => {
+                    if let (Some(from), Some(to)) = (node_map.get(id).copied(), to_node) {
+                        let _ = engine.connect_event(
+                            from,
+                            to,
+                            EventKind::Midi,
+                            AutoDest::default(),
+                            EngineMapSpec::UNIT,
+                        );
+                    }
+                }
+                _ => {}
+            },
+            CableKind::Automation => {
+                if let PortRef::Node(id) = &cable.from {
+                    if cable.to == PortRef::TimelineIn {
+                        continue;
+                    }
+                    if let (Some(from), Some(to)) = (node_map.get(id).copied(), to_node) {
+                        let _ = engine.connect_event(
+                            from,
+                            to,
+                            EventKind::Control,
+                            event_dest_of(&cable.param, graph, &cable.to),
+                            engine_map(cable_map(cable, graph)),
+                        );
+                    }
+                    continue;
+                }
+                let PortRef::AutoTrack(index) = &cable.from else {
+                    continue;
+                };
+                if cable.to == PortRef::TimelineIn {
+                    let _ =
+                        engine.set_timeline_in_route(*index, engine_map(cable_map(cable, graph)));
+                    continue;
+                }
+                let Some(to) = to_node else {
+                    continue;
+                };
+                if let Some((controller, channel)) = cable.param.cc_of() {
+                    let _ = engine.set_auto_cc_route(
+                        *index,
+                        to,
+                        channel,
+                        controller,
+                        engine_map(cable_map(cable, graph)),
+                    );
+                    continue;
+                }
+                if let Some((channel, _)) = cable.param.pitch_bend_of() {
+                    let _ = engine.set_auto_pitch_bend_route(
+                        *index,
+                        to,
+                        channel,
+                        cable.param.bend_range(graph, &cable.to),
+                        engine_map(cable_map(cable, graph)),
+                    );
+                    continue;
+                }
+                if let Some(id) = param_id_of(&cable.param) {
+                    let _ =
+                        engine.set_auto_route(*index, to, id, engine_map(cable_map(cable, graph)));
+                }
+            }
+        }
+    }
+    engine.set_midi_track_count(project.midi_tracks.len());
+    for track in 0..project.midi_tracks.len() {
+        let _ = engine.send_midi_clips(track, midi_clip_table(project, track));
+    }
+    for index in 0..project.control_tracks.len() {
+        let _ = engine.set_control_clips(index, control_clip_table(project, index));
+    }
+    for track in 0..project.audio_tracks.len() {
+        let Some(&engine_id) = project
+            .graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n, NodeDoc::AudioTrack { track: t, .. } if *t == track))
+            .map(NodeDoc::node_id)
+            .and_then(|doc_id| node_map.get(&doc_id))
+        else {
+            continue;
+        };
+        let table = audio_clip_table(
+            &project.audio_tracks[track].clips,
+            project.base_dir.as_deref(),
+            media,
+        );
+        let _ = engine.send_audio_clips(engine_id, table);
+    }
+    let _ = engine.set_arrangement_floor(export_audio::export_end_ticks(project));
+    engine.seek_ticks(window.0);
+    let _ = engine.send(EngineCommand::Sequencer(SequencerCommand::Play));
+    OfflineGraph {
+        engine,
+        guards,
+        node_map,
+    }
+}
+
+/// Options for [`render_project_to_wav`] (the CLI's `--render` surface).
+#[derive(Debug, Clone, Copy)]
+pub struct RenderOptions {
+    pub sample_rate: u32,
+    pub bits: export_audio::Bits,
+    /// Optional explicit end tick; `None` renders the full song.
+    pub end_ticks: Option<u32>,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            sample_rate: 44_100,
+            bits: export_audio::Bits::Int24,
+            end_ticks: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderReport {
+    /// Interleaved stereo frames written.
+    pub frames: u32,
+    pub sample_rate: u32,
+}
+
+/// Renders a project file to a single stereo WAV without a window or an
+/// audio device. Returns the number of frames written (read back from the
+/// finished file, which also validates the header).
+pub fn render_project_to_wav(
+    project_path: &Path,
+    output: &Path,
+    options: RenderOptions,
+) -> Result<RenderReport, String> {
+    if options.sample_rate == 0 {
+        return Err("--rate must be greater than zero".to_string());
+    }
+    let project = glitcherz_model::file::load_project(project_path)
+        .map_err(|err| format!("{}: {err}", project_path.display()))?;
+    let window = match options.end_ticks {
+        Some(end) => (0.0, f64::from(end)),
+        None => export_audio::ExportRange::FullSong
+            .window(&project)
+            .ok_or_else(|| "the project has no arrangement to render".to_string())?,
+    };
+    if window.1 <= window.0 {
+        return Err(format!(
+            "render window is empty ({:.0}..{:.0} ticks)",
+            window.0, window.1
+        ));
+    }
+    let format = export_audio::WavFormat {
+        sample_rate: options.sample_rate,
+        bits: options.bits,
+    };
+    let mut media = FreshMedia::new(project.base_dir.clone());
+    let graph = assemble_offline(&project, options.sample_rate, window, &mut media);
+    let passes = vec![export_audio::ExportPass::mix(output.to_path_buf())];
+    let mut job = export_audio::ExportJob::new(
+        graph.engine,
+        graph.guards,
+        graph.node_map,
+        format,
+        window,
+        passes,
+    )
+    .map_err(|err| format!("{}: {err}", output.display()))?;
+    // Guard against a stalled transport: the song's duration plus a generous
+    // tail, in blocks. `pump` also returns true on every internal failure.
+    let seconds = (window.1 - window.0) * project.sec_per_tick();
+    let block_size = glitcherz_engine::realtime::FIXED_BLOCK_SIZE;
+    let max_blocks = (seconds * f64::from(options.sample_rate) * 4.0 / block_size as f64) as usize
+        + (u64::from(options.sample_rate) * 60 / block_size as u64) as usize;
+    let mut blocks = 0usize;
+    loop {
+        if job.pump(export_audio::BLOCKS_PER_FRAME, &mut |_, _, _| {}) {
+            break;
+        }
+        blocks += export_audio::BLOCKS_PER_FRAME;
+        if blocks > max_blocks {
+            return Err("render did not finish (stalled transport)".to_string());
+        }
+    }
+    if job.outputs().is_empty() {
+        return Err("render produced no wav (engine or writer failed)".to_string());
+    }
+    drop(job); // flushes + closes the wav, releases the plugin guards
+    let reader =
+        hound::WavReader::open(output).map_err(|err| format!("{}: {err}", output.display()))?;
+    Ok(RenderReport {
+        frames: reader.duration(),
+        sample_rate: options.sample_rate,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use glitcherz_model::{MidiClip, Note};
+
+    fn project_with_note() -> Project {
+        let mut project = Project::default();
+        let mut clip = MidiClip::new(0);
+        clip.sequence.notes.push(Note {
+            start: 0,
+            length: 960,
+            note: 60,
+            velocity: 100,
+            channel: 0,
+        });
+        project.midi_tracks[0].clips.push(clip);
+        project
+    }
+
+    fn save_temp(project: &Project, tag: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("glitcherz_s0_{tag}_{}.glz", std::process::id()));
+        glitcherz_model::file::save_project(project, &path).expect("save project");
+        path
+    }
+
+    #[test]
+    fn media_paths_resolve_relative_to_the_project() {
+        let base = Path::new("/music/song");
+        assert_eq!(
+            resolve_media(Some(base), "stems\\kick.wav"),
+            PathBuf::from("/music/song/stems/kick.wav")
+        );
+        assert_eq!(
+            resolve_media(Some(base), "/abs/kick.wav"),
+            PathBuf::from("/abs/kick.wav")
+        );
+        assert_eq!(resolve_media(None, "kick.wav"), PathBuf::from("kick.wav"));
+    }
+
+    /// The CLI and the GUI export both go through `assemble_offline` +
+    /// `ExportJob`. Two renders of the same document must therefore be
+    /// byte-identical (and non-empty), which is the S0 acceptance lock.
+    #[test]
+    fn repeated_headless_renders_are_byte_identical() {
+        let project = project_with_note();
+        let input = save_temp(&project, "render");
+        let first =
+            std::env::temp_dir().join(format!("glitcherz_s0_first_{}.wav", std::process::id()));
+        let second =
+            std::env::temp_dir().join(format!("glitcherz_s0_second_{}.wav", std::process::id()));
+        let options = RenderOptions {
+            sample_rate: 22_050,
+            bits: export_audio::Bits::Int16,
+            end_ticks: Some(1920),
+        };
+        let a = render_project_to_wav(&input, &first, options).expect("first render");
+        let b = render_project_to_wav(&input, &second, options).expect("second render");
+        assert_eq!(a, b);
+        assert!(a.frames > 0, "the render must contain frames");
+        assert_eq!(
+            std::fs::read(&first).expect("read first"),
+            std::fs::read(&second).expect("read second")
+        );
+        for path in [input, first, second] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Mirrors `GlitcherZApp::start_export` (assemble -> ExportJob -> pump)
+    /// and compares its bytes with the CLI's `render_project_to_wav`. Both
+    /// paths must stay on the same assembly, sample for sample (S0-D4).
+    #[test]
+    fn gui_export_pipeline_matches_the_cli_render() {
+        let project = project_with_note();
+        let input = save_temp(&project, "match");
+        let cli_out =
+            std::env::temp_dir().join(format!("glitcherz_s0_cli_{}.wav", std::process::id()));
+        let gui_out =
+            std::env::temp_dir().join(format!("glitcherz_s0_gui_{}.wav", std::process::id()));
+        let options = RenderOptions {
+            sample_rate: 22_050,
+            bits: export_audio::Bits::Int16,
+            end_ticks: Some(1920),
+        };
+        render_project_to_wav(&input, &cli_out, options).expect("cli render");
+
+        let loaded = glitcherz_model::file::load_project(&input).expect("load project");
+        let window = (0.0, 1920.0);
+        let format = export_audio::WavFormat {
+            sample_rate: options.sample_rate,
+            bits: options.bits,
+        };
+        let mut media = FreshMedia::new(loaded.base_dir.clone());
+        let graph = assemble_offline(&loaded, options.sample_rate, window, &mut media);
+        let mut job = export_audio::ExportJob::new(
+            graph.engine,
+            graph.guards,
+            graph.node_map,
+            format,
+            window,
+            vec![export_audio::ExportPass::mix(gui_out.clone())],
+        )
+        .expect("gui job");
+        while !job.pump(export_audio::BLOCKS_PER_FRAME, &mut |_, _, _| {}) {}
+        drop(job);
+        assert_eq!(
+            std::fs::read(&cli_out).expect("read cli"),
+            std::fs::read(&gui_out).expect("read gui")
+        );
+        for path in [input, cli_out, gui_out] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}

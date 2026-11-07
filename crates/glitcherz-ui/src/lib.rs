@@ -72,6 +72,7 @@ pub mod file_ops;
 pub mod focus;
 pub mod fonts;
 pub mod grid;
+pub mod headless;
 pub mod inspector_panel;
 pub mod keyboard;
 pub mod media;

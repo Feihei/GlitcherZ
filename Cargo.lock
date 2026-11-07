@@ -1161,6 +1161,7 @@ version = "0.1.0"
 dependencies = [
  "env_logger",
  "glitcherz-engine",
+ "glitcherz-model",
  "glitcherz-ui",
 ]
 

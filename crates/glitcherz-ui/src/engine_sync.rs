@@ -245,470 +245,133 @@ impl GlitcherZApp {
         self.push_loop_range();
     }
 
-    /// Install a document node: build the processor (external plugins instantiated
-    /// non-real-time) → engine `add_node` (new engine-side id) → register the mapping and guard.
+    /// Install a document node: build the processor through the shared
+    /// headless builder (S0) -> engine `add_node` -> register the mapping,
+    /// guard and the session-only caches that only the live graph needs.
     pub(crate) fn install_node(&mut self, node: &NodeDoc, sample_rate: u32) {
-        // G6: the virtual keyboard is document-only (UI routing node) — it
+        // G6: the virtual keyboard is document-only (UI routing node) - it
         // never enters the engine graph, so it has no entry in `node_map`.
         if node.is_keyboard() {
             return;
         }
-        let sr = convert::sample_rate_to_f32(sample_rate);
         let doc_id = node.node_id();
         let track = node.track();
-        // Built-in effects that publish meters hand their handle back here; it
-        // is stored in `effect_meters` once the node is actually in the graph.
-        let mut effect_meter: Option<std::sync::Arc<EffectMeters>> = None;
-        let (processor, guard, plugin_label): (Box<dyn Processor>, Option<PluginGuard>, String) =
-            match node {
-                NodeDoc::Instrument { voice, .. } => match voice {
-                    VoiceSpec::Builtin => (Box::new(SynthProcessor::new(sr)), None, String::new()),
-                    VoiceSpec::Sample {
-                        path,
-                        root_note,
-                        play_mode,
-                        gain,
-                        ..
-                    } => {
-                        if path.is_empty() {
-                            // v3: born without a file — silent until the
-                            // node's `Load File…` swaps a real voice in. Not
-                            // the synth fallback: a node labelled Sample must
-                            // not quietly play a synth patch.
-                            (Box::new(SilentProcessor::new()), None, String::new())
-                        } else {
-                            // Document voice restore (D9): the session sample
-                            // cache decodes once per path; a missing or broken
-                            // file falls back to the built-in synth (document
-                            // fields kept for a later retry).
-                            match self.obtain_sample_voice(path, sr) {
-                                Ok(mut processor) => {
-                                    processor
-                                        .set_param(ParamId::SampleRootNote, f32::from(*root_note));
-                                    processor.set_param(
-                                        ParamId::SamplePlayMode,
-                                        if matches!(play_mode, SamplePlayMode::OneShot) {
-                                            1.0
-                                        } else {
-                                            0.0
-                                        },
-                                    );
-                                    processor.set_param(ParamId::SampleGain, *gain);
-                                    (Box::new(processor), None, String::new())
-                                }
-                                Err(err) => {
-                                    log::error!("Failed to load sample {path}: {err}");
-                                    (Box::new(SynthProcessor::new(sr)), None, String::new())
-                                }
-                            }
+        let is_effect = matches!(node, NodeDoc::Effect { .. });
+        let is_clap = matches!(
+            node,
+            NodeDoc::Instrument {
+                voice: VoiceSpec::Clap { .. },
+                ..
+            } | NodeDoc::Effect {
+                voice: VoiceSpec::Clap { .. },
+                ..
+            }
+        );
+        let is_vst3 = matches!(
+            node,
+            NodeDoc::Instrument {
+                voice: VoiceSpec::Vst3 { .. },
+                ..
+            } | NodeDoc::Effect {
+                voice: VoiceSpec::Vst3 { .. },
+                ..
+            }
+        );
+        // R4: the live Input node reads the capture ring. Build it before
+        // the media adapter reborrows the whole app.
+        let input = match node {
+            NodeDoc::Input { channel, gain, .. } => {
+                match (self.engine.input_ring(), self.engine.input_info()) {
+                    (Some(ring), Some(info)) => {
+                        let mut processor =
+                            InputProcessor::new(ring, info.channels, usize::from(*channel), *gain);
+                        if let Some(stats) = self.engine.input_stats() {
+                            processor = processor.with_stats(stats);
                         }
+                        Some(processor)
                     }
-                    VoiceSpec::DrumKit { slots, gain } => {
-                        if slots.is_empty() {
-                            (Box::new(SilentProcessor::new()), None, String::new())
-                        } else {
-                            let processor = self.obtain_drum_kit_voice(slots, *gain, sr);
-                            (Box::new(processor), None, String::new())
-                        }
-                    }
-                    VoiceSpec::SoundFont {
-                        path,
-                        bank,
-                        program,
-                        gain,
-                        bend_range,
-                    } => {
-                        if path.is_empty() {
-                            // U13: born without a file — silent until the
-                            // node's `Load File…` swaps a real voice in.
-                            // Deliberately not the built-in fallback below:
-                            // a node labelled SoundFont must not quietly play
-                            // a synth patch.
-                            (Box::new(SilentProcessor::new()), None, String::new())
-                        } else {
-                            // Document voice restore (D8): prefer the shared
-                            // session library (avoids re-reading a large .sf2
-                            // on every reinstall), otherwise load here; a
-                            // missing or broken file falls back to the
-                            // built-in synth (document fields kept for a
-                            // later retry).
-                            match self.obtain_sf2_voice(path, sr) {
-                                Ok(mut processor) => {
-                                    processor.set_param(ParamId::Sf2BankSelect, f32::from(*bank));
-                                    processor
-                                        .set_param(ParamId::Sf2ProgramChange, f32::from(*program));
-                                    processor.set_param(ParamId::Sf2Gain, *gain);
-                                    processor.set_param(ParamId::Sf2BendRange, *bend_range);
-                                    (Box::new(processor), None, String::new())
-                                }
-                                Err(err) => {
-                                    log::error!("Failed to load SoundFont {path}: {err}");
-                                    (Box::new(SynthProcessor::new(sr)), None, String::new())
-                                }
-                            }
-                        }
-                    }
-                    VoiceSpec::Clap {
-                        path,
-                        plugin_id,
-                        state,
-                    } => {
-                        match ClapInstance::spawn_rt(
-                            std::path::Path::new(path),
-                            plugin_id,
-                            ClapInstanceConfig {
-                                sample_rate,
-                                max_frames: 128,
-                            },
-                        ) {
-                            Ok(mut instance) => {
-                                // Factory-default snapshot for the preset
-                                // "Reset" target — must precede the document
-                                // state restore.
-                                if let Ok(default_blob) = instance.guard.save_state() {
-                                    self.voice_default_state.insert(doc_id, default_blob);
-                                }
-                                // Restore the persisted state blob (project
-                                // reload / undo), then refresh the slider
-                                // cache from the plugin's live values.
-                                if !state.is_empty() {
-                                    if let Err(err) = instance.guard.load_state(state) {
-                                        log::warn!(
-                                            "Failed to restore CLAP state for {plugin_id}: {err}"
-                                        );
-                                    }
-                                }
-                                let values = instance.read_param_values();
-                                // Parameter enumeration must happen before the instance is
-                                // destructured (the guard holds the plugin instance).
-                                let params = instance.list_params();
-                                let ClapInstance { guard, node } = instance;
-                                self.clap_voice_params.insert(doc_id, params);
-                                self.clap_voice_values.insert(doc_id, values);
-                                (
-                                    Box::new(node),
-                                    Some(PluginGuard::Clap(guard)),
-                                    plugin_id.clone(),
-                                )
-                            }
-                            Err(err) => {
-                                log::error!("Failed to instantiate CLAP plugin {plugin_id}: {err}");
-                                self.clap_voice_params.remove(&doc_id);
-                                self.clap_voice_values.remove(&doc_id);
-                                (Box::new(SynthProcessor::new(sr)), None, String::new())
-                            }
-                        }
-                    }
-                    VoiceSpec::Vst3 {
-                        path,
-                        class_id,
-                        state,
-                        ..
-                    } => {
-                        match glitcherz_vst3_host::Vst3Instance::spawn_rt(
-                            std::path::Path::new(path),
-                            class_id,
-                            glitcherz_vst3_host::Vst3InstanceConfig {
-                                sample_rate,
-                                max_frames: 128,
-                            },
-                        ) {
-                            Ok(instance) => {
-                                // Factory-default snapshot for the preset
-                                // "Reset" target — must precede the document
-                                // state restore.
-                                if let Ok(default_blob) = instance.guard.save_state() {
-                                    self.voice_default_state.insert(doc_id, default_blob);
-                                }
-                                // Restore the persisted state blob (project
-                                // reload / undo; the CLAP D4 mirror).
-                                if !state.is_empty() {
-                                    if let Err(err) = instance.guard.load_state(state) {
-                                        log::warn!(
-                                            "Failed to restore VST3 state for {class_id}: {err}"
-                                        );
-                                    }
-                                }
-                                // Slider cache seeded from the controller
-                                // read-back (normalized 0..1).
-                                let values = instance.guard.read_param_values();
-                                let glitcherz_vst3_host::Vst3Instance { guard, node } = instance;
-                                let params = guard.parameters();
-                                self.voice_params.insert(doc_id, params);
-                                self.vst3_voice_values.insert(doc_id, values);
-                                (
-                                    Box::new(node),
-                                    Some(PluginGuard::Vst3(guard)),
-                                    class_id.clone(),
-                                )
-                            }
-                            Err(err) => {
-                                log::error!("Failed to instantiate VST3 plugin {class_id}: {err}");
-                                self.voice_params.remove(&doc_id);
-                                (Box::new(SynthProcessor::new(sr)), None, String::new())
-                            }
-                        }
-                    }
-                },
-                NodeDoc::Effect { voice, params, .. } => match voice {
-                    VoiceSpec::Builtin
-                    | VoiceSpec::SoundFont { .. }
-                    | VoiceSpec::Sample { .. }
-                    | VoiceSpec::DrumKit { .. } => {
-                        // Kind-aware and seeded from the document (D15): a
-                        // restored EQ/compressor starts at its saved values.
-                        let built = crate::effect::processor(params, sr);
-                        effect_meter = built.meters;
-                        (built.processor, None, String::new())
-                    }
-                    VoiceSpec::Clap {
-                        path,
-                        plugin_id,
-                        state,
-                    } => {
-                        match ClapInstance::spawn_rt(
-                            std::path::Path::new(path),
-                            plugin_id,
-                            ClapInstanceConfig {
-                                sample_rate,
-                                max_frames: 128,
-                            },
-                        ) {
-                            Ok(mut instance) => {
-                                if !state.is_empty() {
-                                    if let Err(err) = instance.guard.load_state(state) {
-                                        log::warn!(
-                                            "Failed to restore CLAP effect state for {plugin_id}: {err}"
-                                        );
-                                    }
-                                }
-                                // Effect param caches keyed by the document
-                                // node_id (panel data source; delivery goes
-                                // through node addressing).
-                                let fx_doc = node.node_id();
-                                let params = instance.list_params();
-                                let values = instance.read_param_values();
-                                self.clap_effect_params.insert(fx_doc, params);
-                                self.clap_effect_values.insert(fx_doc, values);
-                                let ClapInstance { guard, node } = instance;
-                                (
-                                    Box::new(node),
-                                    Some(PluginGuard::Clap(guard)),
-                                    plugin_id.clone(),
-                                )
-                            }
-                            Err(err) => {
-                                log::error!("Failed to instantiate CLAP effect {plugin_id}: {err}");
-                                // Fall back to the document's built-in payload
-                                // (a fresh effect node defaults to a delay).
-                                (
-                                    crate::effect::processor(params, sr).processor,
-                                    None,
-                                    String::new(),
-                                )
-                            }
-                        }
-                    }
-                    VoiceSpec::Vst3 {
-                        path,
-                        class_id,
-                        state,
-                        ..
-                    } => {
-                        match glitcherz_vst3_host::Vst3Instance::spawn_rt(
-                            std::path::Path::new(path),
-                            class_id,
-                            glitcherz_vst3_host::Vst3InstanceConfig {
-                                sample_rate,
-                                max_frames: 128,
-                            },
-                        ) {
-                            Ok(instance) => {
-                                // Restore the persisted state blob (project
-                                // reload / undo; the CLAP D4 mirror).
-                                if !state.is_empty() {
-                                    if let Err(err) = instance.guard.load_state(state) {
-                                        log::warn!(
-                                            "Failed to restore VST3 effect state for {class_id}: {err}"
-                                        );
-                                    }
-                                }
-                                // Effect param caches keyed by the document
-                                // node_id (normalized 0..1 domain).
-                                let fx_doc = node.node_id();
-                                let params = instance.guard.parameters();
-                                let values = instance.guard.read_param_values();
-                                self.vst3_effect_params.insert(fx_doc, params);
-                                self.vst3_effect_values.insert(fx_doc, values);
-                                let glitcherz_vst3_host::Vst3Instance { guard, node } = instance;
-                                (
-                                    Box::new(node),
-                                    Some(PluginGuard::Vst3(guard)),
-                                    class_id.clone(),
-                                )
-                            }
-                            Err(err) => {
-                                log::error!("Failed to instantiate VST3 effect {class_id}: {err}");
-                                (
-                                    crate::effect::processor(params, sr).processor,
-                                    None,
-                                    String::new(),
-                                )
-                            }
-                        }
-                    }
-                },
-                NodeDoc::Mixer {
-                    channels,
-                    out_pan,
-                    out_muted,
-                    ..
-                } => {
-                    // P5f D15/D21: engine mixer from the document's console state.
-                    let eng: Vec<EngineMixerChannel> = channels
-                        .iter()
-                        .map(|c| EngineMixerChannel {
-                            gain: c.gain,
-                            pan: c.pan,
-                            muted: c.muted,
-                            solo: c.solo,
-                        })
-                        .collect();
-                    (
-                        Box::new(MixerProcessor::with_channels(&eng, *out_pan, *out_muted)),
-                        None,
-                        String::new(),
-                    )
+                    _ => None,
                 }
-                NodeDoc::Feedback { gain, .. } => {
-                    // P6: the tap gain; the one-block delay is the
-                    // compiler's ordering, not a buffer.
-                    let mut processor = FeedbackProcessor::new();
-                    processor.set_param(ParamId::FeedbackGain, *gain);
-                    (Box::new(processor), None, String::new())
-                }
-                NodeDoc::ChannelStrip { .. } => {
-                    (Box::new(ChannelStripProcessor::new()), None, String::new())
-                }
-                // U6: the audio-track generator. The clip table comes from
-                // the owning document track (decoded via the session sample
-                // cache); a missing file logs and leaves that clip silent.
-                NodeDoc::Input { channel, gain, .. } => {
-                    // R4: the live input stream owns the monitor ring. Without
-                    // a device (or after the stream failed to open) the node is
-                    // born silent; the Inspector reports why.
-                    match (self.engine.input_ring(), self.engine.input_info()) {
-                        (Some(ring), Some(info)) => {
-                            let mut processor = InputProcessor::new(
-                                ring,
-                                info.channels,
-                                usize::from(*channel),
-                                *gain,
-                            );
-                            if let Some(stats) = self.engine.input_stats() {
-                                processor = processor.with_stats(stats);
-                            }
-                            (Box::new(processor), None, String::new())
-                        }
-                        _ => (Box::new(SilentProcessor::new()), None, String::new()),
-                    }
-                }
-                NodeDoc::AudioTrack { track, .. } => {
-                    let table = self.build_audio_clip_table(*track);
-                    (
-                        Box::new(AudioTrackProcessor::new(table)),
-                        None,
-                        String::new(),
-                    )
-                }
-                // G6: unreachable — virtual keyboards return before the match
-                // (document-only node, no engine processor).
-                NodeDoc::Keyboard { .. } => {
-                    (Box::new(SynthProcessor::new(sr)), None, String::new())
-                }
-                // M3/M4: MIDI effects and control sources are live; the keyboard
-                // stays a document-only node.
-                NodeDoc::Arpeggiator { params, .. } => {
-                    let mut processor = ArpeggiatorProcessor::new(doc_id as u32);
-                    processor.apply_params(
-                        params.division,
-                        params.gate,
-                        params.mode.index(),
-                        params.octaves,
-                        params.latch,
-                        params.harmony.index(),
-                        params.skip,
-                    );
-                    (Box::new(processor), None, String::new())
-                }
-                NodeDoc::Portamento { params, .. } => {
-                    let mut processor = PortamentoProcessor::new();
-                    processor.apply_params(
-                        params.time_ms,
-                        params.min,
-                        params.max,
-                        params.legato_only,
-                    );
-                    (Box::new(processor), None, String::new())
-                }
-                NodeDoc::MidiEnvelope { params, .. } => {
-                    let mut processor = MidiEnvelopeProcessor::new();
-                    processor.apply_params(
-                        params.attack,
-                        params.decay,
-                        params.sustain,
-                        params.release,
-                    );
-                    processor.set_param(ParamId::EnvMin, params.min);
-                    processor.set_param(ParamId::EnvMax, params.max);
-                    (Box::new(processor), None, String::new())
-                }
-                // D5: the control pass-through, seeded with its declared axis.
-                NodeDoc::CurveMap { params, .. } => {
-                    let mut processor = CurveMapProcessor::new();
-                    processor.apply_params(params.min, params.max, engine_mode(params.mode));
-                    (Box::new(processor), None, String::new())
-                }
-                // Spec `lfo.md`: free-running control source.
-                NodeDoc::Lfo { params, .. } => {
-                    let mut processor = LfoProcessor::new(doc_id as u32);
-                    processor.apply_params(
-                        params.waveform.index(),
-                        params.rate_hz,
-                        params.sync,
-                        params.division,
-                        params.depth,
-                    );
-                    (Box::new(processor), None, String::new())
-                }
-            };
+            }
+            _ => None,
+        };
+        let mut media = headless::AppMedia(&mut *self);
+        let spawned = headless::spawn_node(node, sample_rate, &mut media, true, input);
+        let headless::Spawned {
+            processor,
+            guard,
+            info,
+        } = spawned;
         let engine_id = self.engine.fresh_node_id();
-        // D15: the mixer is the only multi-input node; the engine compiler
-        // uses the kind for fan-in validation + cable→channel binding. P6
-        // adds the feedback tap kind, which the compiler orders before its
-        // own input sources (the one-block delay).
+        // D15: the mixer is the only multi-input node; P6 adds the feedback
+        // tap kind, which the compiler orders before its own input sources.
         let kind = match node {
             NodeDoc::Mixer { .. } => NodeKind::Mixer,
             NodeDoc::Feedback { .. } => NodeKind::Feedback,
             _ => NodeKind::Plain,
         };
-        if self.engine.add_node(engine_id, kind, processor) {
-            self.node_map.insert(doc_id, engine_id);
-            if let Some(meter) = effect_meter {
-                self.effect_meters.insert(doc_id, meter);
-            }
-            if let Some(guard) = guard {
-                self.voice_guards.push(PluginGuardEntry {
-                    node_id: engine_id,
-                    track,
-                    plugin_id: plugin_label,
-                    _guard: guard,
-                });
-            }
-        } else {
-            drop(guard); // Node never entered the graph: drop the guard immediately (safe unload
-            // of the dynamic library).
+        if !self.engine.add_node(engine_id, kind, processor) {
+            drop(guard); // never entered the graph: unload immediately
             log::error!("Document node {doc_id} installation failed (slots full / queue full)");
+            return;
+        }
+        self.node_map.insert(doc_id, engine_id);
+        if let Some(meter) = info.meter {
+            self.effect_meters.insert(doc_id, meter);
+        }
+        if let Some(state) = info.default_state {
+            self.voice_default_state.insert(doc_id, state);
+        }
+        // G4/G5: parameter caches are keyed by document node id, split by
+        // voice vs effect. A plugin that failed to spawn clears its caches
+        // (the installer falls back to a built-in processor).
+        if let Some((params, values)) = info.clap {
+            if is_effect {
+                self.clap_effect_params.insert(doc_id, params);
+                self.clap_effect_values.insert(doc_id, values);
+            } else {
+                self.clap_voice_params.insert(doc_id, params);
+                self.clap_voice_values.insert(doc_id, values);
+            }
+        } else if is_clap {
+            if is_effect {
+                self.clap_effect_params.remove(&doc_id);
+                self.clap_effect_values.remove(&doc_id);
+            } else {
+                self.clap_voice_params.remove(&doc_id);
+                self.clap_voice_values.remove(&doc_id);
+            }
+        }
+        if let Some((params, values)) = info.vst3 {
+            if is_effect {
+                self.vst3_effect_params.insert(doc_id, params);
+                self.vst3_effect_values.insert(doc_id, values);
+            } else {
+                self.voice_params.insert(doc_id, params);
+                self.vst3_voice_values.insert(doc_id, values);
+            }
+        } else if is_vst3 {
+            if is_effect {
+                self.vst3_effect_params.remove(&doc_id);
+                self.vst3_effect_values.remove(&doc_id);
+            } else {
+                self.voice_params.remove(&doc_id);
+                self.vst3_voice_values.remove(&doc_id);
+            }
+        }
+        if let Some(guard) = guard {
+            self.voice_guards.push(PluginGuardEntry {
+                node_id: engine_id,
+                track,
+                plugin_id: info.label,
+                _guard: guard,
+            });
+        }
+        if let NodeDoc::AudioTrack { track, .. } = node {
+            // S0: the shared builder installs an empty table. Direct
+            // single-node installs (patch / mixer) do not run
+            // `apply_document`'s step 5b, so push the real table here.
+            self.send_audio_clips_for_track(*track);
         }
     }
 
@@ -1083,30 +746,7 @@ impl GlitcherZApp {
     /// Push the clip table of one control track (its delivery endpoints are decided by the graph's
     /// automation cable table, set via `apply_document` / `set_auto_endpoint`).
     pub(crate) fn send_control_clips(&mut self, index: usize) {
-        let Some(track) = self.project().control_tracks.get(index) else {
-            return;
-        };
-        // Document clips → engine representation (D15 batch Copy; over-capacity
-        // content is truncated, the document validator rejects it on save).
-        let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
-        for (slot, clip) in clips.iter_mut().zip(track.clips.iter()) {
-            let mut curve = RtAutomation {
-                interp: rt_curve_interp(clip.interp),
-                ..RtAutomation::default()
-            };
-            for point in clip.curve.iter().take(MAX_AUTO_POINTS) {
-                curve.push(RtAutoPoint {
-                    tick: point.tick,
-                    value: point.value,
-                });
-            }
-            *slot = RtControlClip {
-                start_ticks: clip.start_ticks,
-                span_ticks: clip.span_ticks,
-                loop_ticks: clip.loop_ticks,
-                curve,
-            };
-        }
+        let clips = headless::control_clip_table(self.project(), index);
         // D15 revision: control tables ride the structure queue (they are
         // ~17 KB at 32 clips — too big for the command queue).
         if !self.engine.set_control_clips(index, clips) {
@@ -1212,39 +852,7 @@ impl GlitcherZApp {
     /// allocation is allowed; the audio thread only reads them. **Nothing is
     /// truncated** — a clip holds as many notes as the document does.
     pub(crate) fn rt_clips(&self, track: usize) -> MidiClipTable {
-        let mut clips = empty_midi_clip_table();
-        for (slot, clip) in clips
-            .iter_mut()
-            .zip(self.project().midi_tracks[track].clips.iter())
-        {
-            let mut rt = RtMidiClip {
-                start_ticks: clip.start_ticks,
-                span_ticks: clip.span_ticks,
-                loop_ticks: clip.loop_ticks,
-                ..RtMidiClip::default()
-            };
-            for note in clip.notes() {
-                rt.push(RtNote::new(
-                    note.start,
-                    note.length,
-                    note.note,
-                    note.channel,
-                    note.velocity,
-                ));
-            }
-            // P0: controller events ride along with the clip they belong to —
-            // imported CC/bend must sound, not vanish at the document edge.
-            for ctrl in &clip.sequence.ctrls {
-                rt.push_ctrl(RtCtrl::new(
-                    ctrl.tick,
-                    ctrl.channel,
-                    rt_ctrl_kind(ctrl.kind),
-                    ctrl.value,
-                ));
-            }
-            *slot = rt;
-        }
-        clips
+        headless::midi_clip_table(self.project(), track)
     }
 
     /// Push the current clip table of one track (D15 batch).

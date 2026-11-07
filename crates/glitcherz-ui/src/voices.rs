@@ -660,56 +660,22 @@ impl GlitcherZApp {
         &mut self,
         track: usize,
     ) -> glitcherz_engine::realtime::AudioClipTable {
-        let mut table = empty_clip_table();
-        // Snapshot the placement first: decoding needs `&mut self` (the
-        // session cache), which cannot overlap the document borrow. Paths are
-        // resolved here (R4 D11) so a relative clip path finds its media next
-        // to the project file.
-        let clips: Vec<(String, u32, f64, f64, f32)> = {
+        // S0: one clip-table builder for the live graph and the headless
+        // render. Snapshot only this track's clips (not the whole document)
+        // before the media adapter reborrows the app mutably.
+        let (clips, base_dir) = {
             let project = self.project();
-            project
-                .audio_tracks
-                .get(track)
-                .map(|audio_track| {
-                    audio_track
-                        .clips
-                        .iter()
-                        .take(MAX_TRACK_CLIPS)
-                        .map(|c| {
-                            (
-                                project
-                                    .resolve_media_path(&c.path)
-                                    .to_string_lossy()
-                                    .to_string(),
-                                c.start_ticks,
-                                c.source_offset,
-                                c.source_len,
-                                c.gain,
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+            (
+                project
+                    .audio_tracks
+                    .get(track)
+                    .map(|t| t.clips.clone())
+                    .unwrap_or_default(),
+                project.base_dir.clone(),
+            )
         };
-        for (slot, (path, start_ticks, source_offset, source_len, gain)) in
-            clips.into_iter().enumerate()
-        {
-            match self.sample_library.load(std::path::Path::new(&path)) {
-                Ok(data) => {
-                    table[slot] = Some(RtAudioClip {
-                        start_ticks: f64::from(start_ticks),
-                        source_offset,
-                        source_len,
-                        data,
-                        gain,
-                    });
-                }
-                Err(err) => {
-                    log::error!("Failed to load audio clip '{path}': {err}");
-                }
-            }
-        }
-        table
+        let mut media = headless::AppMedia(&mut *self);
+        headless::audio_clip_table(&clips, base_dir.as_deref(), &mut media)
     }
 
     /// Pushes one audio track's clip table to its engine node (U6 D4).
