@@ -1,6 +1,6 @@
 # Z0：双音频输入口 Spec
 
-> 状态：定稿（2026-11-08）。上游：`plan.md` Z / B 系列、`spec/node-graph.md`（D2/D14/D17/D19/D23–D26）、`spec/effects.md`（§12 边界）。
+> 状态：定稿（2026-11-08）；**Z0 已交付**（同日，验收见 §8，实施期修订见 §6.1）。上游：`plan.md` Z / B 系列、`spec/node-graph.md`（D2/D14/D17/D19/D23–D26）、`spec/effects.md`（§12 边界）。
 > 范围：只做**基建 + 一个最小双口效果器（Ring Mod）**。侧链压缩（Z1）、Vocoder（Z2）不在本 spec。
 
 ## 1. 背景与现状
@@ -82,13 +82,21 @@ D14 修订为「非 mixer、非 Dual 节点 ≤1 条音频入边」；D2 的端�
 | Z0-D4：D19 修订为「双口节点不走旁路」 | **Z-D9：`bypassable` 显式排除 `Dual`** | 原表述可误读为「只看入边数」；双口节点只接一条 Mod 线时仍不可旁路。 |
 | Z0-D1：未提端口范围校验 | **Z-D6：`add_cable` 加 `allowed_ports`** | `add_cable` 只保证 per-port 唯一、不保证端口合法；`in_port = 5` 会被静默当成主输入，必须引擎侧挡住。 |
 
+### 6.1 实施期修订（2026-11-08 交付记录）
+
+| spec 条目 | 实际落地 | 理由 |
+| :--- | :--- | :--- |
+| Z-D2 / §7：`EffectDescriptor` 增 `audio_inputs` 字段（默认 1），由 `BuiltinEffectKind::descriptor().audio_inputs` 作唯一真源 | **端口剖面放在 `BuiltinEffectKind::audio_inputs() -> u8`（engine 与 model 各一份 `const fn`），`EffectDescriptor` 不改** | `EffectDescriptor` 是全仓 14 处 `static DESCRIPTOR` 的结构体字面量（外加 2 处测试构造），加字段要同步改 16 个文件、纯样板改动；而端口数本质是**效果器种类**的属性，与参数表 / 单位 / 平滑无关。放在 kind 上同样满足「文档不加字段、由种类推导」，且 model 侧不依赖 engine。`descriptor()` 仍只管参数表。 |
+
+其余 Z-D1…Z-D13 全部按定稿落地；验收见 §8。
+
 ## 7. 实施切分（按文件，单 commit 内自洽）
 
 | 层 | 文件 | 改动 |
 | :--- | :--- | :--- |
 | engine | `realtime/processor.rs` | `Processor::process_with_aux` 默认方法 |
 | engine | `realtime/graph.rs` | `NodeKind::Dual` + `max_in` / `allowed_ports`、`RtGraph::aux` + 构造、`process_block` 分流、`add_cable` 端口校验、`remove_node` bypass 排除 Dual |
-| engine | `realtime/effect/descriptor.rs` / `mod.rs` | `EffectDescriptor.audio_inputs`（默认 1，`const fn` 兼容）、`BuiltinEffectKind::RingMod` + `ALL` + `descriptor()` 分发 |
+| engine | `realtime/effect/mod.rs`（`descriptor.rs` 不动，见 §6.1 修订） | `BuiltinEffectKind::audio_inputs()`、`RingMod` 变体 + `ALL` + `descriptor()` 分发 |
 | engine | `realtime/ring_mod.rs` + `realtime/mod.rs` | `RingModProcessor`（`EffectParamBank` + `process_with_aux`） |
 | model | `model/lib.rs` | `RingModParams` / `EffectParams::RingMod` / `kind()`；节点 `audio_inputs(&self)` 推导；`validate` 放宽；`CableDoc::audio_to_port`；删除节点语义 |
 | ui | `headless.rs` | `spawn_effect` 的 RingMod 分支；`assemble_offline` 的 kind 决策 |
@@ -96,17 +104,17 @@ D14 修订为「非 mixer、非 Dual 节点 ≤1 条音频入边」；D2 的端�
 | ui | `patch.rs` / `effect.rs` | 两口绘制与标签、落口、表驱动接线 |
 | docs | `node-graph.md` / `effects.md` / `plan.md` / `implementation.md` / `docs/manual.md` / `AGENTS.md` | 索引与边界同步 |
 
-`model` 与 `engine` 互不依赖：`audio_inputs` 的推导在 ui / model 两侧各自查 `BuiltinEffectKind::descriptor()`（model 不依赖 engine，所以 model 侧用 `EffectParams::kind()` 的本地匹配表，与 E 系列 `kind()` 同款做法）。
+`model` 与 `engine` 互不依赖：两侧各自持有一份 `BuiltinEffectKind::audio_inputs()` 本地 `const fn`；模型侧 `NodeDoc::audio_inputs()` 走 `EffectParams::kind().audio_inputs()`（与 E 系列 `kind()` 同款做法），UI 装配两处只查 `NodeDoc::audio_inputs()`。
 
 ## 8. 验收
 
-- [ ] 双口数学：`main = 常数 0.5`、`mod = 常数 -0.25` 时 Ring Mod 输出符合 `lerp` 公式；两路互换不串音；只接 Main / 只接 Mod 两种接线各自符合 Z-D12。
-- [ ] PDC 非零图：给 Main 源挂一个已知 latency 的测试 processor，Mod 源无延迟 → 两路经 `sum_into_delayed` 补偿后逐样本对齐（`compute_pdc` 的 `pdc_delay` 对两条边分别生效）。
-- [ ] 单口零回归：默认工程 `render` 输出与改动前**逐字节一致**；`graph_without_latency_keeps_the_fast_path` 等既有图测试全绿。
-- [ ] 连线防御：`in_port = 2` 落 Dual 节点、`in_port = 1` 落 Plain 节点都被拒；`(Dual, 0)` 与 `(Dual, 1)` 各自唯一。
-- [ ] 删除：双口节点删除后其 Main / Mod 线都被移除，不产生旁路直连。
-- [ ] `rt_audit` 对 Ring Mod 的 `process_with_aux` 零分配；`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` 全绿；`--render` 无窗口冒烟。
-- [ ] 用户文档：modulator 源不要接 master 的说明落 `docs/manual.md`。
+- [x] 双口数学：`dual_input_effect_splits_main_and_mod`（Main 0.5 × Mod -0.25 = -0.125，并断言 aux 只含 Mod）、`dual_input_with_only_one_port_connected_is_silent`（只接 Main / 只接 Mod 两种接线，含跨块 scratch 清理）、`shared_aux_scratch_is_cleared_between_dual_nodes`（同块两个 Dual 节点互不污染）。Ring Mod 自身 5 个单测覆盖 `mix=0` 逐样本直通与满幅无非有限输出。
+- [x] PDC 非零图：`dual_input_pdc_delays_the_mod_port_to_match_the_slow_main_branch` —— Main 源声明 10 帧 latency，Mod 源是 pulse；`pdc_delay` 分别 0 / 10，乘积脉冲落在第 10 帧，aux 本身也读的是延迟 history。
+- [x] 单口零回归：用 parent commit `9edaebf` 的 detached worktree 编出 pre-Z0 二进制，与 post-Z0 二进制对**同一份默认工程**跑 `--render --rate 22050 --bits 16 --to 1920`：两份 WAV 各 44288 帧 / 177196 字节，`cmp` **逐字节一致**。另有 `mixer_channel_one_stays_in_the_main_path` 锁住「mixer 通道 1 不是 Mod 口」，全部既有图测试通过。
+- [x] 连线防御：`dual_input_rejects_out_of_range_ports_and_keeps_per_port_uniqueness`、`plain_and_master_nodes_reject_port_one`（引擎侧）；`dual_input_effect_validates_both_audio_ports`（文档侧 `GraphDoc::validate` + RON 往返）。
+- [x] 删除：`removing_a_dual_input_node_drops_both_cables_without_bypass`（引擎）+ `patch_ops::delete_graph_node` 的 `is_dual` 分支（文档侧）。
+- [x] `rt_audit` 的 `RingModProcessor process_with_aux` 零分配；`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿；`--render` 无窗口冒烟（含 `offline_render_honours_dual_input_ports` 双口工程端到端渲染）。
+- [x] 用户文档：`docs/manual.md` 新增「双输入效果器（Main / Mod）」小节，写明 modulator 源不要接 master。
 
 ## 9. 边界与明确不做
 

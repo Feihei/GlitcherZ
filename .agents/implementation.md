@@ -1092,3 +1092,26 @@ CLI   --render       → render_project_to_wav → assemble_offline   → Export
 - `render_project_to_wav` 用 `ExportJob` 的同步 pump（不建窗口、不 `AudioEngine::start()`），带一个宽松的 block 上限防走带卡死；结束前检查 `job.outputs()` 非空，再 `hound::WavReader` 回读头部拿帧数。
 
 **验收**：40 个测试二进制全绿（新增 6 项：ui lib 3、app 单测 2、app 集成 1），`fmt` / `clippy -D warnings` 干净，`--seconds 3` 窗口冒烟 + `--render` 无窗口冒烟通过。用户文档：`docs/README.md` 运行节、`docs/manual.md` 导出节。
+
+## Z0：双音频输入口 + Ring Mod（2026-11-08）
+
+spec `.agents/spec/dual-audio-input.md`。目标不是「加一个效果器」，而是让 `Processor` 第一次能同时读到两路**语义独立**的逐样本波形，为 Z1 侧链压缩 / Z2 Vocoder 铺路。
+
+**引擎侧最小切面**：`ProcessContext` 全仓约 90 处字面量构造，绝不扩字段。改为 `Processor` 加带默认实现的 `process_with_aux(ctx, main, aux)`（默认转发 `process`），既有 processor 零改动；`RtGraph` 只对 `NodeKind::Dual` 调它。aux 是**整图一个** `AudioBuffer`（`RtGraph::new` 构造期分配 2ch × block_size），不进 `NodeDeployment` / `RecycledNode` / `PendingNode`，部署与回收协议完全不动。`process_block` 开头 `let mut aux = self.aux.take()`、结尾放回，是为了让求和同时借用 `self.slots[src]` 与 scratch，不用把 `self` 拆成一堆字段。
+
+**最容易写错的两处**：
+
+- **分流必须按 kind，不能按 `in_port == 1`**。mixer 的通道 1 也是 `in_port = 1`，按端口判断会把 mixer 的一个通道混进 aux。只有 `plan.kinds[s] == NodeKind::Dual` 时 `ports[i] == 1` 才表示 Mod。测试 `mixer_channel_one_stays_in_the_main_path` 用 0.25 + 0.5 → 0.75 锁住这条。
+- **PDC 两条路径都要分流**。`compute_pdc` 本来就是逐入边算 `pdc_delay[slot][edge]`，与端口无关，不用改；但 `delay == 0` 的 `sum_into` 与 `sum_into_delayed` 两个分支都必须选对目标缓冲。测试用「Main 源声明 10 帧 latency + Mod 源一个脉冲」让 PDC 给 Mod 边补 10 帧，乘积脉冲正好落在第 10 帧；若 Mod 走了快路径，输出会全程为 0。
+
+**端口防御分工**：`add_cable` 的 `allowed_ports(kind)` 负责**端口范围**（Plain/Master/Feedback = 1、Dual = 2、Mixer = `MAX_IN_EDGES`），`compile()` 的 `max_in()` 只管**入边总数**，两者不重叠。`remove_cables_to_port` 本来就保证 `(to, in_port)` 唯一，所以双口不需要新机制。`GraphDoc::validate` 同步放宽为按 `NodeDoc::audio_inputs()` 取上限 / 合法端口，master 仍单独硬校验 0。
+
+**删除语义**：`remove_node` 的 `bypassable` 显式排除 `Dual`——双口节点即使只有一条入边，那条线也可能是 Mod，旁路会把调制源直接接进主信号。文档侧 `patch_ops::delete_graph_node` 同样用 `is_dual` 跳过旁路对生成。
+
+**端口剖面的真源**：定稿 spec 写的是给 `EffectDescriptor` 加 `audio_inputs` 字段，实施时改成 `BuiltinEffectKind::audio_inputs() -> u8`（engine / model 各一份 `const fn`）。原因是 `EffectDescriptor` 是 14 处静态结构体字面量（+2 处测试构造），加字段要同步改 16 个文件且全是样板；端口数是**效果器种类**属性，与参数表 / 单位 / 平滑无关。已作为 §6.1 勘误写回 spec。`NodeDoc::audio_inputs()` 再由 `EffectParams::kind().audio_inputs()` 推导，UI 实时装配（`engine_sync::install_node`）与离线装配（`headless::assemble_offline`）两处都只查它。
+
+**Ring Mod**：`out = lerp(main, main × mod, mix)`，逐样本、零状态、零延迟，`mix` 走 `EffectParamBank` 的 `BuiltinParam(0)`；`mix = 0` 严格不写 buffer（沿用 E 系列直通不变量）；`process` 转发到 `process_with_aux(..., None)`，所以单口图里缺 Mod 时调制器视为静音。它是 Z0 的数学验收样例，不单独立项。
+
+**用户可见的坑（已写进 `docs/manual.md`）**：调制源**不要**再接 `Master`。D6 规定悬空节点照常执行但输出无人消费即静音，所以调制源只需连到 Dual 节点的 `Mod` 口；多连一根到 master 会把原始载波漏进主输出。
+
+**验收**：新增 8 项 `graph.rs` 图级测试、1 项 model 校验 / RON 往返、1 项 `headless.rs` 离线渲染端到端（无 Mod 静音 / 有 Mod 出声）、`effect_rt_audit` 的双口零分配断言、Ring Mod 5 项单测；`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。**零回归**：`9edaebf` worktree 编出的 pre-Z0 二进制与 post-Z0 二进制对同一默认工程渲染，两份 WAV 各 44288 帧 / 177196 字节，`cmp` 逐字节一致。

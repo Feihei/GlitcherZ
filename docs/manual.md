@@ -160,7 +160,7 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 | :--- | :--- |
 | `Search Nodes…` | 打开节点浏览器，可搜名字或模块路径 |
 | `Instrument…` | 乐器：`Synth`（内置）、`SoundFont`、`Sample`、`Drum Kit`，以及 CLAP / VST3 乐器插件 |
-| `Effect…` | 效果：`Delay`、`EQ`、`Compressor`、`Reverb`、`Chorus`、`Flanger`，以及 CLAP / VST3 效果插件 |
+| `Effect…` | 效果：`Delay`、`EQ`、`Compressor`、`Reverb`、`Chorus`、`Flanger`、`Bitcrusher`、`Phaser`、`Saturation`、`Limiter`、`Ring Mod`，以及 CLAP / VST3 效果插件 |
 | `MIDI FX…` | `Arpeggiator`、`Portamento`、`MIDI Envelope`、`LFO`、`Curve Map` |
 | `Mixer` | 多通道求和节点（1–32 通道，可加 / 减通道） |
 | `Keyboard In (computer)` | 电脑键盘输入节点，一个源只允许一个节点 |
@@ -176,7 +176,7 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 | 线 | 从 | 到 |
 | :--- | :--- | :--- |
 | MIDI | `Timeline` 的轨道口（`T1`…）或 `Keyboard In` / MIDI FX 输出 | 乐器节点的 MIDI 输入 |
-| Audio | 乐器 / 效果的音频输出 | 效果输入、`Mixer` 通道、`Master` |
+| Audio | 乐器 / 效果的音频输出 | 效果输入（双口效果器分 `Main` / `Mod`，见下）、`Mixer` 通道、`Master` |
 | Automation | `Timeline` 的曲线口（`C1`…）或控制源输出（`LFO`、`MIDI Envelope`、`Portamento`） | 节点端口——松手后弹出参数表，选一个目标 |
 
 `Ctrl` + 右键拖拽 = 划断连线。点连线中点会弹菜单，可以把效果直接插进这条线，或删掉它。
@@ -188,6 +188,24 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 因此被撑宽；鼠标悬停可看全名。**右键名字就地改名**：`Enter` 确认、`Esc` 取消，通道名
 清空后回落到派生标签。右键落在名字上走改名，落在空白处才是添加节点菜单；左键落在名字
 上是选中 / 拖动**节点**本身（名字紧贴插口，也不会误拽出一条连线）。
+
+### 双输入效果器（Main / Mod）
+
+`Ring Mod` 是第一个有两个音频输入口的效果器。节点左侧会画两个插口并标
+`Main`（上）和 `Mod`（下）：
+
+| 口 | 接什么 | 作用 |
+| :--- | :--- | :--- |
+| `Main` | 主信号（载波 / 被处理的声音） | 与普通效果器的单个输入一样，输出从这里来 |
+| `Mod` | 调制信号 | 逐样本与 `Main` 相乘；`mix` 控制干湿比，`mix = 0` 时逐样本直通 |
+
+**Mod 源不要再接 `Master`。** 悬空节点照常运行，但输出没人消费就等于静音，
+所以调制源只需要拉一根线到 `Mod` 口；如果顺手也接到 `Master` 或 `Mixer`，
+那份原始信号会原样漏进主输出。同理，`Mod` 口没接线时调制信号视为全零，
+`mix > 0` 的 `Ring Mod` 会输出静音——这是预期行为，不是断线。
+
+每个口最多接一根线；往已占用的口再拉一根会替换旧线。删除双口节点时它
+触及的音频线会**一起移除**，不会自动旁路重连（Mod 线没有可解释的主信号替代目标）。
 
 双击节点进 `Inspector`（乐器 / 效果 / 混音 / MIDI FX / LFO / Curve Map / Audio Input）；
 双击固定的 `Timeline` 节点回到编曲视图。

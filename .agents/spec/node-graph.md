@@ -23,7 +23,7 @@ related: [../plan.md, ../architecture.md]
 | # | 决策 | 内容 |
 | :--- | :--- | :--- |
 | D1 | 定容规模 | **64 节点 / 128 连线 / 每节点 ≤8 入边**，超限在 UI 拒绝；全部实时结构定容预分配（与现有 `MAX_*` 风格一致） |
-| D2 | 端口剖面 | 由节点类型决定（见 §3 表），乐器 0 音频入、效果器 1入1出、通道条/求和多入边。**入边部分已被 D14/D15 修订（2026-10-09）** |
+| D2 | 端口剖面 | 由节点类型决定（见 §3 表），乐器 0 音频入、效果器 1入1出、通道条/求和多入边。**入边部分已被 D14/D15 修订（2026-10-09）；Z0（2026-11-08）新增双口内置效果器 2入1出** |
 | D3 | 连线三类型 | `Audio` / `Midi` / `Automation`，与端口类型绑定；类型不匹配 UI 拉线时拒绝，引擎侧零防御 |
 | D4 | 多入边求和 | 一个音频入口可接多条入边，自动求和（模拟信号直觉）。**已被 D14 修订（2026-10-09）：隐式加合废止** |
 | D5 | 结构更新协议 | 拓扑变更 = **重建执行计划**（控制侧拓扑排序 + 缓冲下标分配，微秒级）+ **差异化节点回收**（新旧图都存在的节点复用，只回收被删节点）。参数/事件走命令队列与块内直写，**永不触发重建** |
@@ -35,12 +35,12 @@ related: [../plan.md, ../architecture.md]
 | D11 | node_id 持久化 | `node_id` 随项目文件持久化（完整形态里 cables 跨会话引用节点的前提，补全 P4 过渡期"会话内单调不持久化"的临时口径）；加载后引擎编译器从文档 `max(node_id) + 1` 继续单调分配 |
 | D12 | 轨道动态化 | MIDI 轨 `Vec<MidiTrack>`（引擎侧定容 `MAX_MIDI_TRACKS = 16` + 活跃轨数控制侧下发；`midi_targets`/路由表/音序器全部扩容）；自动化轨道顶层 `Vec<AutomationTrack>`（引擎已定容 16） |
 | D13 | 默认图全显式 | 默认拓扑（每轨 `声源→延迟→通道条→主输出` + MIDI 自连）全部以 `nodes + cables` 写入项目文档；加载器**纯按文档重建**引擎图，`GraphCompiler::default_graph` 退役为"新建项目生成初始文档"的参考实现；文档与引擎一张皮 |
-| D14 | 单输入语义（修订 D4，2026-10-09） | 音频节点**不允许多入边隐式加合**：每个音频入口 ≤1 条入边（乐器 0 条）。需要混合必须显式经 Mixer 节点（模块合成器式显式混音，消除不可见的隐式求和）。compile 期按节点类型校验，违反 → 拒绝连线 |
+| D14 | 单输入语义（修订 D4，2026-10-09） | 音频节点**不允许多入边隐式加合**：每个音频入口 ≤1 条入边（乐器 0 条）。需要混合必须显式经 Mixer 节点（模块合成器式显式混音，消除不可见的隐式求和）。compile 期按节点类型校验，违反 → 拒绝连线。**Z0 修订（2026-11-08）**：唯一例外是 `NodeKind::Dual`——两个语义独立输入口 `Main`(0) / `Mod`(1)，每口 ≤1 条边；Mod 入边求和进整图共享的 aux scratch，**不进 `output`**，因此不构成隐式加合。其余节点逐样本语义不变 |
 | D15 | Mixer 节点 | 新节点类型吸收 ChannelStrip（strip 退役）：**输入通道数可变 1..32**（D21），每通道独立 **gain / pan / mute / solo**（虚拟通道条，2026-10-09 评审升级：弱化传统 DAW 轨道管理，按舞台调音台方式管理 solo/mute/pan）；输出级 pan/mute（主控段）。**solo 语义**：同一 mixer 内任一通道 solo 时，未 solo 通道静音（solo 作用域 = 单台 mixer，级联 mixer 各自独立） |
 | D16 | 主输出单输入 | master 同样遵守单输入（≤1 条音频入边）；多路汇入必须经 mixer（可级联）进 master。MasterGain 参数保留 |
-| D17 | 连线↔输入口绑定 | `CableDoc` 增 `in_port: u8`：mixer 目标的输入口下标（唯一、< 当前口数），其余节点恒 0。per-input 推子与线的绑定关系随文件持久化，删线不错位。UI 连线到 mixer 时自动落第一个空口 |
+| D17 | 连线↔输入口绑定 | `CableDoc` 增 `in_port: u8`：mixer 目标的输入口下标（唯一、< 当前口数），其余节点恒 0。per-input 推子与线的绑定关系随文件持久化，删线不错位。UI 连线到 mixer 时自动落第一个空口。**Z0 推广（2026-11-08）**：`in_port` 的语义由「mixer 通道下标」推广为「目标输入口下标」；Dual 节点合法值 0 / 1，其余非 mixer 仍恒 0。引擎侧 `add_cable` 按 `NodeKind::allowed_ports()` 拒掉越界端口 |
 | D18 | 默认图拓扑（修订 D13，2026-10-29 精简） | 默认图 = **一条可弹的 MIDI 轨**（内置乐器 `voice→mixer.ch0`）+ **单个全局 Mixer（默认 1 通道）→ master** + MIDI 自连 + Computer 键盘 → 该乐器 + 每条 audio 轨一个**未接线**的生成器节点；**不再默认挂 delay**。新建 MIDI 轨只增加**空轨道位**（不建 Instrument / delay、不接 mixer、不扩通道），音源与路由由用户在 patch 自行搭建 |
-| D19 | 旁路语义修订 | `remove_node` 旁路重连仅适用于 ≤1 入边的节点（效果器 1入1出照旧旁通）；mixer/master 不可旁路（多入边无处重连）——删除 mixer 时其触及连线直接移除 |
+| D19 | 旁路语义修订 | `remove_node` 旁路重连仅适用于 ≤1 入边的节点（效果器 1入1出照旧旁通）；mixer/master 不可旁路（多入边无处重连）——删除 mixer 时其触及连线直接移除。**Z0 补充（2026-11-08）**：`Dual` 节点即使只有 1 条入边也不旁路（那条线可能落在 Mod 口，没有可解释的主信号替代目标）；文档侧同样不做旁路重连 |
 | D20 | 入边权重与调参解耦 | per-channel 有效权重（gain × pan 声像系数 × mute × solo）以**立体声 L/R 权重表**参与求和：`Processor` trait 增带默认实现的 `input_weights() -> Option<&[[f32; 2]; MAX_IN_EDGES]>`（默认 `None` = 单位权重，插件零改动），`MixerProcessor` 覆写返回按通道状态实时计算的权重表；求和循环逐边乘权。**推子/pan/mute/solo 拖动走参数命令路径，永不触发拓扑重建**（守 D5） |
 | D21 | 通道数管理（2026-10-09 评审拍板；2026-10-29 下限改 1） | **手动增减**：mixer 面板提供添加/删除通道按钮，下限 1 无法删、上限 32 无法加。通道设置（fader/pan/mute/solo）**与插线状态解耦**——拔线不丢设置、常驻通道可预先留空。连线可落到**任意空通道**（不要求顺序占口）。否决"入口数 = 入边数 + 1 自动增减"方案：拆线丢状态 + 口位重排/留洞语义复杂 + 自动化需要稳定端口身份 |
 | D22 | 画布上的通道条（U14，2026-10-28） | mixer 节点盒内**每个输入口一行**，行内横排 `fader + M + S`：条高 `22`（图空间，< `PORT_SPACING` 30），左起 `22`（避开端口圆点与 `PORT_HIT_RADIUS` 18 的拉线判定），右至盒内缩进 8；`M` 在内、`S` 在最外。**写入走与 Inspector 同一条路**：`PatchAction::SetInlineParam{MixerGain/MixerMute/MixerSolo(ch)}` → `apply_inline_param` → 文档 `channels[ch]` + `ParamId::MixerGain/Mute/Solo(ch)`；fader 用 `commit_param_edit`（key `mixer-gain-{ch}`，一次拖动一步 undo），M/S 用 `begin_edit`/`commit_edit` 各一步 | 调音台之所以好用，是因为推子压在它管的那根线上——底部再堆 32 行会脱离端口。宽度是硬约束：150 图空间的盒子里 fader 76 + M/S 各 18 刚好，故**不加 pan**（窄到放不下，仍留在 Inspector）。fader 命中区取整条高度（3 px 的 rail 抓不住），M/S 自绘（`egui::Button` 保不住 22 × zoom 的行高，与 D15 同一病因） |
@@ -51,11 +51,12 @@ related: [../plan.md, ../architecture.md]
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | 乐器（内置合成器 / CLAP / VST3 乐器） | 0 | 1 | MIDI 入 | ✓ | 只能做音频源头 |
 | 效果器（内置 / CLAP / VST3 效果） | 1 | 1 | 参数入 | ✓ | 链式串联 |
+| 双口内置效果器（Z0，v1 只有 Ring Mod） | 2（Main=0 / Mod=1，每口 ≤1 边） | 1 | 参数入 | ✓ | Mod 入边走 aux scratch，不参与主路径求和；插件效果器恒单口 |
 | Mixer | 1..32（通道数按钮增减，D21；每通道 gain/pan/mute/solo） | 1 | 参数入（通道自动化后续版本） | ✓ | 显式混合点（D15）；吸收原 ChannelStrip；输出级 pan/mute |
 | 主输出 | 1（单输入，D16） | 1（→硬件） | MasterGain 参数 | ✗ 固定 | 拓扑排序的汇点 |
 | 时间轴 | 0 | 0 | MIDI 出 ×n + 自动化出 ×n | ✗ 固定 | 见 §6 |
 
-约束（D14/D15/D17）：非 mixer 节点 ≤1 条音频入边、mixer ≤32 且 `in_port` 唯一，compile 期校验拒绝；节点总出边不设限（一条输出可拉多根线，读同一缓冲）。定容调整：`MAX_IN_EDGES` 8→32（仅 mixer 用得到）、`MAX_CABLES` 128→256（一个 32 通道 mixer 即占 32 条线）。最大并发音频缓冲不变（64 × 2ch × 128 × 4B = 64 KB）。混合开销：32 通道 mixer 每块 32 × 128 × 2 ≈ 8K 次 FMA ≈ 8µs，48kHz 下 <0.5% 单核，可忽略。
+约束（D14/D15/D17，Z0 修订）：非 mixer、非 Dual 节点 ≤1 条音频入边且 `in_port == 0`；Dual 节点 ≤2 条、`in_port ∈ {0,1}` 且每口唯一；mixer ≤32 且 `in_port` 唯一，compile 期校验拒绝；节点总出边不设限（一条输出可拉多根线，读同一缓冲）。定容调整：`MAX_IN_EDGES` 8→32（仅 mixer 用得到）、`MAX_CABLES` 128→256（一个 32 通道 mixer 即占 32 条线）。最大并发音频缓冲不变（64 × 2ch × 128 × 4B = 64 KB）。混合开销：32 通道 mixer 每块 32 × 128 × 2 ≈ 8K 次 FMA ≈ 8µs，48kHz 下 <0.5% 单核，可忽略。
 
 ## 4. 引擎侧数据结构（`glitcherz-engine::realtime::graph`，新模块）
 
@@ -98,11 +99,11 @@ pub struct RtGraph {
 1. 块边界：消费命令队列与结构更新队列（现有协议扩展，见 §5）；
 2. 时间轴调度：Sequencer 窗口扫描出事件，按 **MIDI 连线表**投递到目标节点的 `notes` 槽（现 `(track, event)` 定向的推广）；
 3. 自动化求值：仅播放中，每条自动化轨道按其 `loop_ticks` 取模采样，按 **Automation 连线表**投递 `(node_id, param, value)` 到目标 `params` 槽；
-4. 按 `plan.order` 遍历：`output.clear()` → 各入边源 `output` **乘权累加**（D14：非 mixer 至多 1 条；mixer 逐边乘 `input_weights()` 的 L/R 权重，D20）→ 处理 `notes`/`params` 槽事件 → `processor.process(ctx, &mut output)`；
+4. 按 `plan.order` 遍历：`output.clear()` → 各入边源 `output` **乘权累加**（D14：非 mixer 至多 1 条；mixer 逐边乘 `input_weights()` 的 L/R 权重，D20）→ 处理 `notes`/`params` 槽事件 → `processor.process(ctx, &mut output)`；**Z0 修订**：`kinds[s] == Dual` 时先清空整图共用的 aux scratch，把 `in_port == 1` 的入边按端口求和进 aux（`sum_into` 与 `sum_into_delayed` 两条路径同样分流），再调 `processor.process_with_aux(ctx, &mut output, Some(&aux))`；其余节点仍走 `process`
 5. 主输出槽的 `output` 即交错写出源（现 `master_channel` 的等价物）；
 6. Feedback 回传：电平表按 `node_id` 索引（预分配 64 原子数组），替换现 `track_levels[4]`。
 
-**`Processor` trait 仅增一个带默认实现的方法（D20）**：`input_weights()` 默认返回 `None`（= 单位权重），所有既有内置节点与 CLAP/VST3 节点零改动；仅 `MixerProcessor` 覆写。source 型节点（乐器）清零后写入；effect 型节点先按权求和入边再原地处理——与现语义一致。
+**`Processor` trait 的带默认实现方法**：D20 的 `input_weights()` 默认返回 `None`（= 单位权重），仅 `MixerProcessor` 覆写；Z0 再增 `process_with_aux(ctx, main, aux)`，默认转发 `process(ctx, main)`，仅双口效果覆写。两者都让既有内置节点与 CLAP/VST3 节点零改动。source 型节点（乐器）清零后写入；effect 型节点先按权求和入边再原地处理——与现语义一致。
 
 ## 5. 结构更新协议（D5 展开）
 
@@ -164,13 +165,13 @@ pub struct CableDoc {
     pub kind: CableKind,
     pub from: PortRef,                     // (node_id, port)
     pub to: PortRef,                       // Automation 线的 port 含 (node_id, param)
-    pub in_port: u8,                       // D17：mixer 目标的通道下标（唯一、< channels.len()）；其余恒 0
+    pub in_port: u8,                       // D17/Z0：目标输入口下标（mixer = 通道；Dual = 0 Main / 1 Mod）；其余恒 0
 }
 ```
 
 `VoiceSpec`（`Builtin | Clap | Vst3`）原样复用。serde 全程 `#[serde(default)]`；定容上限在 `load` 时校验，超限报错而非截断（编辑态已有 UI 防御，文件层是最后防线）。
 
-**文档校验（D14/D17，load 与保存双端）**：非 mixer 节点至多 1 条音频入边；mixer 的音频入边 `in_port` 唯一且 < `channels.len()`；`2 ≤ channels.len() ≤ 32`。`PROJECT_VERSION = 4`（v3 自动迁移，见 §10 Q-B 决议）。
+**文档校验（D14/D17，load 与保存双端；Z0 修订）**：非 mixer 节点按 `NodeDoc::audio_inputs()` 取入边上限与合法端口（`in_port < audio_inputs()` 且每口唯一）；双口内置效果为 2 口，其余为 1 口恒 0；mixer 的音频入边 `in_port` 唯一且 < `channels.len()`；`2 ≤ channels.len() ≤ 32`。`PROJECT_VERSION = 4`（v3 自动迁移，见 §10 Q-B 决议）。
 
 ## 8. 实时安全性检查单
 

@@ -278,7 +278,9 @@ voice 分配，S1 spike 用分配计数确认行为，违反铁律则 fork 预�
 - [x] **E4** `ModDelay` 核心 → Chorus / Flanger；Delay 升级 ping-pong + tempo-sync ✅ 2026-10-27：`realtime/mod_delay.rs`（分数延迟线 + 线性插值 + 正弦 LFO + `sampler` 参数助手）；`realtime/chorus.rs`（21 ms 中心双抽头，±9 ms 扫 12–30 ms，无反馈）+ `realtime/flanger.rs`（2.75 ms 中心单抽头，±2.25 ms 扫 0.5–5 ms，feedback ±0.95）；`DelayProcessor` 加 `ping_pong`（交叉馈送，首回声落对侧）+ `sync`/`division`（8 档音符时值 × `sec_per_tick`，缓冲扩到 4 s）；框架新增 `Unit::Enum` + `ParamSpec::choices`/`enumeration`（离散多档，UI 走 ComboBox）。model `ChorusParams`/`FlangerParams` + `EffectParams::{Chorus,Flanger}`；`DelayParams` 加 3 字段（serde default，无版本变更）。落地细节见 spec `effects.md` §17。全仓 fmt/clippy/test 绿
 - [x] **E5** Bitcrusher / Phaser / Saturation（2× 过采样）/ Limiter（lookahead）✅ 2026-11-04：四个效果器经 E1 框架表驱动落地（engine processor + model payload + UI 桥接 + `effect_slot_axis` 轴表，纯 tag 增量、`PROJECT_VERSION` 不变）；Saturation 的 16 样本 wet 延迟与 Limiter 的 5 ms lookahead 均经 `latency_samples()` 参与 S2-3 的图级 PDC 对齐；Limiter 复用 compressor 的 GR 表模式（UI GR 条自动出现）。落地细节见 spec `effects.md` §18 实施勘误。四个 commit：`048c3a6` / `7110d29` / `7bcb668` / `a11bd7e`，全仓 fmt/clippy/test 绿
 
-明确不做：Echo 节点（Delay 即回声）、Gain 节点（通道条已是增益级）、每效果 sidechain。
+明确不做：Echo 节点（Delay 即回声）、Gain 节点（通道条已是增益级）。
+「每效果 sidechain」这一条**已于 2026-11-08 由 Z0 解除**（见下文「Z / B 系列」）：图已提供
+`Main` / `Mod` 两个音频输入口，Z1 侧链压缩 / Z2 Vocoder 复用该基建；`effects.md` §12 边界文字已同步。
 
 ## R 系列：多 clip 钢琴卷帘 + 音高曲线（2026-10-27 立项，2026-10-28 收官，spec `roll-multiclip.md`）
 
@@ -745,6 +747,17 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 
 > **2026-11-08 spec 勘误**：`spec/dual-audio-input.md` §6 已定稿三处修订——Z0-D2 的 per-node aux 改为**整图共享一个 scratch**（部署/回收协议零改动）、Z0-D4 的旁路规则显式排除 `Dual`、Z0-D1 补 `add_cable` 端口范围校验。实施以 spec 为准。
 
+### Z0 实施记录（✅ 2026-11-08 已交付，本节范围结束）
+
+| 项 | 结果 |
+| :--- | :--- |
+| 落地 | `NodeKind::Dual` + `allowed_ports`、`RtGraph` 共享 `aux` scratch、`Processor::process_with_aux` 默认方法、`process_block` 双路径（快路径 / `sum_into_delayed`）按 kind 分流、`add_cable` 端口范围校验、`remove_node` 排除 Dual；model 的 `RingModParams` / `EffectParams::RingMod` / `NodeDoc::audio_inputs()` / `GraphDoc::validate` 放宽 / `CableDoc::audio_to_port` / `first_free_port`；UI 的 `effect.rs` 桥接、`patch.rs` 两口绘制与落口、`patch_ops.rs` 删除语义、`engine_sync.rs` 与 `headless.rs` 两处 kind 决策；新增 `realtime/ring_mod.rs`。 |
+| 标识 | `PROJECT_VERSION = 10` **未动**，文档零新增字段，旧工程零迁移；`Ring Mod` 进 Add 菜单末尾。 |
+| 验收 | 新增 8 项图级测试 + 1 项 model 校验测试 + 1 项离线渲染端到端测试 + `rt_audit` 双口零分配断言 + Ring Mod 5 项单测；`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。 |
+| **零回归硬证据** | 用 parent commit `9edaebf` 的 detached worktree 编出 pre-Z0 二进制，与 post-Z0 二进制对同一份默认工程跑 `--render --rate 22050 --bits 16 --to 1920`：两份 WAV 各 **44288 帧 / 177196 字节，`cmp` 逐字节一致**。 |
+| 实施期修订 | `EffectDescriptor` 未加 `audio_inputs` 字段，端口剖面改由 `BuiltinEffectKind::audio_inputs()` 承载（避开 16 处静态 descriptor 字面量的样板改动）；详见 `spec/dual-audio-input.md` §6.1。 |
+| 文档同步 | `node-graph.md` D2/D14/D17/D19 + §3/§4/§7、`effects.md` §12、`implementation.md`、`docs/manual.md`、`AGENTS.md` 索引。 |
+
 ### Z1 / Z2 要点
 
 - **Z1 侧链压缩**：`CompressorProcessor` 已有 `compute_gr_db`、GR 平滑与 meters；加一个 `sidechain` 开关把检测源从 `main` 切到 `aux`，未接 Mod 口时回落内部检测（保旧工程行为）。键控 HPF / 外部键监听（listen）暂不做。验收：kick → bass 的 GR 随外部键变化，`--render` 可自动测。
@@ -762,7 +775,7 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | Q2 诵钵激励 | **只做单次敲击（strike）**，不做 bow/rub 持续摩擦 → voice 生命周期与 note-off 按一次性激励设计 |
 | Q3 Vocoder | **固定 16 带 + 外部 carrier**，v1 无 formant shift / freeze / 自定义带数 |
 
-下一步：先写 `spec/dual-audio-input.md`（Z0）并提交，再实现 Z0；B1 的 `spec/modal-instrument.md` 在 Z1 交付后写。
+下一步：**Z1 侧链压缩**（架构优先顺序的第 2 项，Z0 的第一个真实消费者；实施前先写 `spec/sidechain-compressor.md`）。B1 的 `spec/modal-instrument.md` 在 Z1 交付后写。
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
