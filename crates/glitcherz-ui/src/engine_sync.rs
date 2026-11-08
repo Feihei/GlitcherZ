@@ -540,6 +540,7 @@ impl GlitcherZApp {
                     // node, an undo and a reload all land on one path.
                     VoiceSpec::Modal { params } => crate::modal_param_values(params).to_vec(),
                     VoiceSpec::Pluck { params } => crate::pluck_param_values(params).to_vec(),
+                    VoiceSpec::Organ { params } => crate::organ_param_values(params).to_vec(),
                 },
                 // Table-driven (spec `effects.md` D6): one entry per slot.
                 NodeDoc::Effect {

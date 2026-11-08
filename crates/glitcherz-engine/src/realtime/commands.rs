@@ -260,6 +260,26 @@ pub enum ParamId {
     PluckRelease,
     /// Plucked string: node output gain (0..2).
     PluckGain,
+    /// Drawbar organ: level of one drawbar (payload = index 0..8, value 0..8;
+    /// spec `.agents/spec/organ-instrument.md` S2-D10).
+    ///
+    /// A payload variant instead of nine enum arms, same shape as
+    /// [`ParamId::DrumSlotGain`]: the engine has one branch and the UI loops.
+    OrganBar(u8),
+    /// Drawbar organ: percussion partial level (0..1; `0` = off). Frozen at
+    /// the next note-on.
+    OrganPercussion,
+    /// Drawbar organ: percussion decay as a T60 in seconds (0.1..2).
+    OrganPercussionDecay,
+    /// Drawbar organ: percussion harmonic (`< 0.5` = 2nd / 4', otherwise
+    /// 3rd / 2⅔'). Discrete: the partial is frozen at the next note-on.
+    OrganPercussionHarmonic,
+    /// Drawbar organ: key-switch attack ramp in seconds (0.001..0.2).
+    OrganAttack,
+    /// Drawbar organ: key-switch release ramp in seconds (0.005..1.0).
+    OrganRelease,
+    /// Drawbar organ: node output gain (0..2).
+    OrganGain,
 }
 
 /// Note event (MIDI semantics). `note` is the MIDI note number (69 = A4),

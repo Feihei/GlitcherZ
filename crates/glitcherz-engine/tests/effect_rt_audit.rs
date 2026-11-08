@@ -28,8 +28,9 @@ use glitcherz_engine::realtime::context::ProcessContext;
 use glitcherz_engine::realtime::processor::Processor;
 use glitcherz_engine::realtime::{
     BitcrusherProcessor, ChorusProcessor, CompressorProcessor, DelayProcessor, EffectMeters,
-    EqProcessor, FlangerProcessor, LimiterProcessor, ModalProcessor, PhaserProcessor,
-    PluckProcessor, ReverbProcessor, RingModProcessor, SaturationProcessor, VocoderProcessor,
+    EqProcessor, FlangerProcessor, LimiterProcessor, ModalProcessor, OrganProcessor,
+    PhaserProcessor, PluckProcessor, ReverbProcessor, RingModProcessor, SaturationProcessor,
+    VocoderProcessor,
 };
 
 // ---------------------------------------------------------------------------
@@ -352,6 +353,48 @@ fn built_in_effects_are_allocation_free() {
     // The blanket sentinel takes the bulk-damp branch.
     pluck.note_event(NoteEvent::Off { note: 0 });
     assert_zero_alloc(&scope, "PluckProcessor process/note_event/set_param");
+
+    // S2: the organ is a generator too, and its inner loop is the widest of the
+    // three (nine `sinf` calls per sample with a full registration). The audit
+    // sweeps every drawbar so the mask rebuild runs inside the scope.
+    let mut organ = OrganProcessor::new(SR);
+    let mut organ_buffer = fixture();
+    for block in 0..2 {
+        organ.note_event(NoteEvent::On {
+            note: 60 + block as u8,
+            velocity: 0.9,
+        });
+        organ.process(&ctx(), &mut organ_buffer);
+    }
+    let scope = AuditScope::begin();
+    for block in 0..64 {
+        for index in 0..9u8 {
+            organ.set_param(
+                ParamId::OrganBar(index),
+                ((block as f32) * 0.37 + f32::from(index)).sin() * 4.0 + 4.0,
+            );
+        }
+        organ.set_param(ParamId::OrganPercussion, 0.8);
+        organ.set_param(ParamId::OrganPercussionDecay, 0.2 + (block as f32) * 0.02);
+        organ.set_param(
+            ParamId::OrganPercussionHarmonic,
+            if block % 2 == 0 { 1.0 } else { 0.0 },
+        );
+        organ.set_param(ParamId::OrganAttack, 0.001 + (block as f32) * 0.001);
+        organ.set_param(ParamId::OrganRelease, 0.02 + (block as f32) * 0.01);
+        organ.set_param(ParamId::OrganGain, 1.0);
+        organ.set_param(ParamId::PitchOffset, (block as f32 * 0.29).sin() * 12.0);
+        organ.note_event(NoteEvent::On {
+            note: 36 + (block % 36) as u8,
+            velocity: 1.0,
+        });
+        organ.process(&ctx(), &mut organ_buffer);
+        organ.note_event(NoteEvent::Off {
+            note: 36 + (block % 36) as u8,
+        });
+    }
+    organ.note_event(NoteEvent::Off { note: 0 });
+    assert_zero_alloc(&scope, "OrganProcessor process/note_event/set_param");
 
     // Z2: 16 bands x 2 banks per channel, all of them fixed-size arrays. The
     // audit alternates the parameter set so the per-block coefficient rebuild

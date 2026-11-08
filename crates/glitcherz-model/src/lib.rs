@@ -424,6 +424,73 @@ impl Default for PluckParams {
     }
 }
 
+/// Drawbar organ parameters (spec `organ-instrument.md` §6).
+///
+/// The nine drawbar levels are the registration — plain integers 0..8, no
+/// preset enum: a "registration" is exactly these nine numbers and would go
+/// stale the moment one of them moves (S2-D14). Every field is
+/// `serde(default)`, so a payload written by an older build still loads.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OrganParams {
+    /// Drawbar levels 0..8 in footage order: 16', 5⅓', 8', 4', 2⅔', 2',
+    /// 1⅗', 1⅓', 1'. The default is `888000000`.
+    #[serde(default = "default_organ_bars")]
+    pub bars: [u8; 9],
+    /// Percussion partial level (0..1; `0` = off).
+    #[serde(default)]
+    pub percussion: f32,
+    /// Percussion decay as a T60 in seconds (0.1..2).
+    #[serde(default = "default_organ_percussion_decay")]
+    pub percussion_decay_s: f32,
+    /// `true` = the percussion partial is the 3rd harmonic (2⅔'), `false` the
+    /// 2nd (4'). Discrete on purpose.
+    #[serde(default)]
+    pub percussion_third: bool,
+    /// Key-switch attack ramp in seconds (0.001..0.2).
+    #[serde(default = "default_organ_attack")]
+    pub attack_s: f32,
+    /// Key-switch release ramp in seconds (0.005..1).
+    #[serde(default = "default_organ_release")]
+    pub release_s: f32,
+    /// Node output gain (0..2).
+    #[serde(default = "default_organ_gain")]
+    pub gain: f32,
+}
+
+fn default_organ_bars() -> [u8; 9] {
+    [8, 8, 8, 0, 0, 0, 0, 0, 0]
+}
+
+fn default_organ_percussion_decay() -> f32 {
+    0.6
+}
+
+fn default_organ_attack() -> f32 {
+    0.005
+}
+
+fn default_organ_release() -> f32 {
+    0.04
+}
+
+fn default_organ_gain() -> f32 {
+    1.0
+}
+
+impl Default for OrganParams {
+    fn default() -> Self {
+        Self {
+            bars: default_organ_bars(),
+            percussion: 0.0,
+            percussion_decay_s: default_organ_percussion_decay(),
+            percussion_third: false,
+            attack_s: default_organ_attack(),
+            release_s: default_organ_release(),
+            gain: default_organ_gain(),
+        }
+    }
+}
+
 /// Per-track delay effect parameters (`mix = 0` means bypass).
 ///
 /// E4 added the stereo/tempo fields; they are additive (`serde(default)`), so
@@ -2260,6 +2327,12 @@ pub enum VoiceSpec {
         #[serde(default)]
         params: PluckParams,
     },
+    /// Drawbar organ (S2, spec `organ-instrument.md`): nine sine drawbars plus
+    /// a decaying percussion partial. No external file, no "born empty" state.
+    Organ {
+        #[serde(default)]
+        params: OrganParams,
+    },
     /// CLAP plugin: dynamic library path + plugin ID (instantiated on the
     /// non-real-time thread).
     Clap {
@@ -2601,6 +2674,22 @@ pub enum NodeParam {
     PluckRelease,
     /// Plucked string: node output gain (0..2).
     PluckGain,
+    /// Drawbar organ: level of one drawbar (payload = index 0..8; 0..8;
+    /// spec `organ-instrument.md` S2-D11).
+    OrganBar(u8),
+    /// Drawbar organ: percussion partial level (0..1; next note-on only).
+    OrganPercussion,
+    /// Drawbar organ: percussion decay as a T60 in seconds (0.1..2).
+    OrganPercussionDecay,
+    /// Drawbar organ: key-switch attack ramp in seconds (0.001..0.2).
+    ///
+    /// Deliberately **not** [`NodeParam::Attack`]: that axis is 0..2, and an
+    /// organ curve would spend most of its travel in the clamp region.
+    OrganAttack,
+    /// Drawbar organ: key-switch release ramp in seconds (0.005..1).
+    OrganRelease,
+    /// Drawbar organ: node output gain (0..2).
+    OrganGain,
 }
 
 /// Which control of a mixer channel a curve drives ([`NodeParam::MixerChannel`]).
@@ -2860,6 +2949,12 @@ pub fn node_param_map(param: NodeParam, graph: &GraphDoc, target: &PortRef) -> M
         NodeParam::PluckDamping | NodeParam::PluckBrightness => MapSpec::linear(0.0, 1.0),
         NodeParam::PluckRelease => MapSpec::linear(0.005, 2.0),
         NodeParam::PluckGain => MapSpec::linear(0.0, 2.0),
+        NodeParam::OrganBar(_) => MapSpec::linear(0.0, 8.0),
+        NodeParam::OrganPercussion => MapSpec::linear(0.0, 1.0),
+        NodeParam::OrganPercussionDecay => MapSpec::linear(0.1, 2.0),
+        NodeParam::OrganAttack => MapSpec::linear(0.001, 0.2),
+        NodeParam::OrganRelease => MapSpec::linear(0.005, 1.0),
+        NodeParam::OrganGain => MapSpec::linear(0.0, 2.0),
     }
 }
 
@@ -4066,6 +4161,7 @@ impl VoiceSpec {
             }
             VoiceSpec::Modal { .. } => std::mem::size_of::<ModalParams>(),
             VoiceSpec::Pluck { .. } => std::mem::size_of::<PluckParams>(),
+            VoiceSpec::Organ { .. } => std::mem::size_of::<OrganParams>(),
             VoiceSpec::Clap {
                 path,
                 plugin_id,
@@ -5511,7 +5607,8 @@ fn voice_engine_identity_eq(a: &VoiceSpec, b: &VoiceSpec) -> bool {
         // No file to reload: every difference is a replayed parameter, so the
         // running engine (including its ringing voices) must survive an edit.
         (VoiceSpec::Modal { .. }, VoiceSpec::Modal { .. })
-        | (VoiceSpec::Pluck { .. }, VoiceSpec::Pluck { .. }) => true,
+        | (VoiceSpec::Pluck { .. }, VoiceSpec::Pluck { .. })
+        | (VoiceSpec::Organ { .. }, VoiceSpec::Organ { .. }) => true,
         (VoiceSpec::SoundFont { path: pa, .. }, VoiceSpec::SoundFont { path: pb, .. }) => pa == pb,
         (VoiceSpec::Sample { path: pa, .. }, VoiceSpec::Sample { path: pb, .. }) => pa == pb,
         (VoiceSpec::DrumKit { slots: sa, .. }, VoiceSpec::DrumKit { slots: sb, .. }) => {
@@ -6387,6 +6484,53 @@ mod tests {
         graph
             .validate(2, 0)
             .expect("a pluck instrument must validate");
+    }
+
+    /// S2: the organ payload is additive as well — a bare `organ` tag loads
+    /// with the documented defaults (the `888000000` registration), and the
+    /// nine drawbar levels survive a RON round-trip.
+    #[test]
+    fn organ_voice_round_trips_and_defaults() {
+        let params = super::OrganParams {
+            bars: [8, 0, 8, 0, 0, 3, 0, 0, 0],
+            percussion: 0.7,
+            percussion_third: true,
+            ..Default::default()
+        };
+        let node = NodeDoc::Instrument {
+            node_id: 2,
+            track: 0,
+            voice: VoiceSpec::Organ { params },
+            synth: SynthParams::default(),
+        };
+        let text = ron::to_string(&node).expect("serialize");
+        assert!(text.contains("organ"), "voice tag missing: {text}");
+        let back: NodeDoc = ron::from_str(&text).expect("deserialize");
+        assert_eq!(node, back);
+
+        let legacy: NodeDoc =
+            ron::from_str(r#"(type:"instrument", node_id:3, track:0, voice:(type:"organ"))"#)
+                .expect("a bare organ payload should parse");
+        let NodeDoc::Instrument {
+            voice: VoiceSpec::Organ { params },
+            ..
+        } = legacy
+        else {
+            panic!("expected an organ instrument");
+        };
+        assert_eq!(params, super::OrganParams::default());
+        assert_eq!(params.bars, [8, 8, 8, 0, 0, 0, 0, 0, 0]);
+        assert!((params.attack_s - 0.005).abs() < 1e-6);
+        assert!((params.gain - 1.0).abs() < 1e-6);
+
+        let graph = GraphDoc {
+            nodes: vec![node],
+            cables: vec![CableDoc::audio(2u64, PortRef::Master)],
+            ..Default::default()
+        };
+        graph
+            .validate(2, 0)
+            .expect("an organ instrument must validate");
     }
 
     // E1: the effect payload's tag *is* the kind (D1), and the legacy sibling

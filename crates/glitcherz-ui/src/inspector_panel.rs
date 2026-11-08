@@ -268,6 +268,21 @@ impl GlitcherZApp {
                 if let Some(params) = pluck_state {
                     self.pluck_section(ui, instr_id, &params);
                 }
+                // S2: drawbar organ (drawbar grid + percussion + ramps).
+                let organ_state = self
+                    .project()
+                    .graph
+                    .node_by_id(instr_id)
+                    .and_then(|n| match n {
+                        NodeDoc::Instrument {
+                            voice: VoiceSpec::Organ { params },
+                            ..
+                        } => Some(*params),
+                        _ => None,
+                    });
+                if let Some(params) = organ_state {
+                    self.organ_section(ui, instr_id, &params);
+                }
                 // Effects are added from the graph only (Add ▸ Effect, or the
                 // cable-midpoint insert — spec `plugin-browser.md` D12); the
                 // track-level "clear" shortcut sits above the effect list.
@@ -1988,6 +2003,177 @@ impl GlitcherZApp {
         }
     }
 
+    /// Drawbar organ (S2, spec `organ-instrument.md`): the full registration
+    /// plus percussion and the key-switch ramps. The 8' bar and the percussion
+    /// level are also the two inline rows; everything else lives here.
+    pub(crate) fn organ_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc_id: u64,
+        params: &glitcherz_model::OrganParams,
+    ) {
+        ui.separator();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.strong("Drawbar Organ");
+            ui.weak("— 3 dB per step; velocity does not change the level");
+        });
+
+        // 3×3 drawbar grid: footage above, level below (0..8, integer steps).
+        let bars = params.bars;
+        let mut bar_change: Option<(usize, u8)> = None;
+        egui::Grid::new(format!("organ_bars_{doc_id}"))
+            .num_columns(3)
+            .spacing([14.0, 6.0])
+            .show(ui, |ui| {
+                for (index, stored) in bars.iter().enumerate() {
+                    ui.vertical(|ui| {
+                        ui.label(crate::ORGAN_FOOTAGES[index]);
+                        let mut level = i32::from(*stored);
+                        let response = ui
+                            .add(egui::Slider::new(&mut level, 0..=8).show_value(true))
+                            .on_hover_text("Drawbar level · 0 = off, 8 = full");
+                        if response.changed() {
+                            bar_change = Some((index, level.clamp(0, 8) as u8));
+                        }
+                    });
+                    if index % 3 == 2 {
+                        ui.end_row();
+                    }
+                }
+            });
+        if let Some((index, level)) = bar_change {
+            let before = self.begin_param_edit();
+            if let Some(NodeDoc::Instrument {
+                voice: VoiceSpec::Organ { params },
+                ..
+            }) = self.project_mut().graph.node_by_id_mut(doc_id)
+            {
+                params.bars[index] = level;
+            }
+            self.commit_param_edit(
+                &format!("Organ {} Bar", crate::ORGAN_FOOTAGES[index]),
+                before,
+                "organ-bar",
+            );
+            self.send_node_param(doc_id, ParamId::OrganBar(index as u8), f32::from(level));
+        }
+
+        // Percussion: discrete harmonic, level and decay.
+        let mut third = params.percussion_third;
+        let harmonic_before = third;
+        ui.horizontal(|ui| {
+            ui.label("Percussion");
+            egui::ComboBox::from_id_salt(format!("organ_perc_{doc_id}"))
+                .selected_text(if third { "3rd (2⅔')" } else { "2nd (4')" })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut third, false, "2nd (4')");
+                    ui.selectable_value(&mut third, true, "3rd (2⅔')");
+                });
+        });
+        if third != harmonic_before {
+            let before = self.begin_edit();
+            if let Some(NodeDoc::Instrument {
+                voice: VoiceSpec::Organ { params },
+                ..
+            }) = self.project_mut().graph.node_by_id_mut(doc_id)
+            {
+                params.percussion_third = third;
+            }
+            self.commit_edit("Organ Percussion Harmonic", before);
+            self.send_node_param(
+                doc_id,
+                ParamId::OrganPercussionHarmonic,
+                if third { 1.0 } else { 0.0 },
+            );
+        }
+
+        let rows: [(&str, f32, f32, ParamId, &str, &str); 5] = [
+            (
+                "Perc Level",
+                0.0,
+                1.0,
+                ParamId::OrganPercussion,
+                "organ-percussion",
+                "Percussion partial level · affects the next note only",
+            ),
+            (
+                "Perc Decay",
+                0.1,
+                2.0,
+                ParamId::OrganPercussionDecay,
+                "organ-percussion-decay",
+                "Percussion T60 · affects the next note only",
+            ),
+            (
+                "Attack",
+                0.001,
+                0.2,
+                ParamId::OrganAttack,
+                "organ-attack",
+                "Key-switch ramp in · too short clicks",
+            ),
+            (
+                "Release",
+                0.005,
+                1.0,
+                ParamId::OrganRelease,
+                "organ-release",
+                "Key-switch ramp out",
+            ),
+            (
+                "Gain",
+                0.0,
+                2.0,
+                ParamId::OrganGain,
+                "organ-gain",
+                "Node output trim",
+            ),
+        ];
+        let mut values = [
+            params.percussion,
+            params.percussion_decay_s,
+            params.attack_s,
+            params.release_s,
+            params.gain,
+        ];
+        let mut changed: Vec<(usize, f32)> = Vec::new();
+        egui::Grid::new(format!("organ_grid_{doc_id}"))
+            .num_columns(2)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| {
+                for (index, (label, min, max, _, _, tooltip)) in rows.iter().enumerate() {
+                    ui.label(*label);
+                    let response = ui
+                        .add(egui::Slider::new(&mut values[index], *min..=*max).fixed_decimals(3))
+                        .on_hover_text(*tooltip);
+                    if response.changed() {
+                        changed.push((index, values[index]));
+                    }
+                    ui.end_row();
+                }
+            });
+        for (index, value) in changed {
+            let before = self.begin_param_edit();
+            if let Some(NodeDoc::Instrument {
+                voice: VoiceSpec::Organ { params },
+                ..
+            }) = self.project_mut().graph.node_by_id_mut(doc_id)
+            {
+                match index {
+                    0 => params.percussion = value.clamp(0.0, 1.0),
+                    1 => params.percussion_decay_s = value.clamp(0.1, 2.0),
+                    2 => params.attack_s = value.clamp(0.001, 0.2),
+                    3 => params.release_s = value.clamp(0.005, 1.0),
+                    4 => params.gain = value.clamp(0.0, 2.0),
+                    _ => {}
+                }
+            }
+            self.commit_param_edit(rows[index].0, before, rows[index].4);
+            self.send_node_param(doc_id, rows[index].3, value);
+        }
+    }
+
     pub(crate) fn drum_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -2484,6 +2670,34 @@ impl GlitcherZApp {
                         params.damping = value.clamp(0.0, 1.0);
                     }
                     self.commit_param_edit("Pluck Damping", before, "pluck-damping");
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+                // S2: the 8' row is a drawbar level, so it rounds to an
+                // integer step (the engine rounds too — this keeps the
+                // document honest before the next reload).
+                patch::InlineParam::OrganBar8 => {
+                    let before = self.begin_param_edit();
+                    let level = value.round().clamp(0.0, 8.0) as u8;
+                    if let Some(NodeDoc::Instrument {
+                        voice: VoiceSpec::Organ { params },
+                        ..
+                    }) = self.project_mut().graph.node_by_id_mut(node)
+                    {
+                        params.bars[2] = level;
+                    }
+                    self.commit_param_edit("Organ 8'", before, "organ-bar-8");
+                    self.send_node_param(node, inline_param_id(p), f32::from(level));
+                }
+                patch::InlineParam::OrganPercussion => {
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Instrument {
+                        voice: VoiceSpec::Organ { params },
+                        ..
+                    }) = self.project_mut().graph.node_by_id_mut(node)
+                    {
+                        params.percussion = value.clamp(0.0, 1.0);
+                    }
+                    self.commit_param_edit("Organ Percussion", before, "organ-percussion");
                     self.send_node_param(node, inline_param_id(p), value);
                 }
                 patch::InlineParam::Sf2Gain => {

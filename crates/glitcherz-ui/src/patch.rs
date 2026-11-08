@@ -72,6 +72,10 @@ pub enum InlineParam {
     PluckDecay,
     /// Plucked-string loop damping (S1).
     PluckDamping,
+    /// Drawbar organ 8' drawbar level (S2): the bar every registration moves.
+    OrganBar8,
+    /// Drawbar organ percussion level (S2).
+    OrganPercussion,
 }
 
 /// How an inline row is presented (U13). Discrete selectors such as a
@@ -146,6 +150,19 @@ const PLUCK_INLINE: [InlineParamSpec; 2] = [
     InlineParamSpec {
         param: InlineParam::PluckDamping,
         label: "damp",
+    },
+];
+
+/// Organ inline rows (S2): the 8' drawbar and the percussion level. A full
+/// registration would be nine rows on the node body — the Inspector owns it.
+const ORGAN_INLINE: [InlineParamSpec; 2] = [
+    InlineParamSpec {
+        param: InlineParam::OrganBar8,
+        label: "8'",
+    },
+    InlineParamSpec {
+        param: InlineParam::OrganPercussion,
+        label: "perc",
     },
 ];
 
@@ -232,6 +249,10 @@ fn inline_params_of(node: &NodeDoc) -> Vec<InlineParamSpec> {
             voice: VoiceSpec::Pluck { .. },
             ..
         } => PLUCK_INLINE.to_vec(),
+        NodeDoc::Instrument {
+            voice: VoiceSpec::Organ { .. },
+            ..
+        } => ORGAN_INLINE.to_vec(),
         // Table-driven from the engine descriptor (spec `effects.md` D6): the
         // row order, labels and count all come from the effect's static table.
         // Only slots flagged `INLINE` get a row — an eight-parameter EQ would
@@ -448,6 +469,22 @@ fn inline_doc_value(node: &NodeDoc, param: InlineParam) -> (f64, f64, f64) {
             },
             InlineParam::PluckDamping,
         ) => (f64::from(params.damping), 0.0, 1.0),
+        // S2: the 8' row edits `bars[2]`, the same field the Inspector grid's
+        // 8' cell writes.
+        (
+            NodeDoc::Instrument {
+                voice: VoiceSpec::Organ { params },
+                ..
+            },
+            InlineParam::OrganBar8,
+        ) => (f64::from(params.bars[2]), 0.0, 8.0),
+        (
+            NodeDoc::Instrument {
+                voice: VoiceSpec::Organ { params },
+                ..
+            },
+            InlineParam::OrganPercussion,
+        ) => (f64::from(params.percussion), 0.0, 1.0),
         _ => (0.0, 0.0, 1.0),
     }
 }
@@ -621,6 +658,9 @@ pub enum NodeSource {
     /// Plucked string (S1, spec `pluck-instrument.md`): Karplus-Strong.
     /// Born audible for the same reason — the string is the engine.
     Pluck,
+    /// Drawbar organ (S2, spec `organ-instrument.md`): nine sine drawbars
+    /// plus a percussion partial. Born audible — there is no file to pick.
+    Organ,
     /// CLAP instrument plugin.
     ClapInstrument {
         /// Module path.
@@ -1922,6 +1962,7 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                     format!("MALLET · {} · Track {}", params.preset.label(), track + 1)
                 }
                 VoiceSpec::Pluck { .. } => format!("PLUCK · Track {}", track + 1),
+                VoiceSpec::Organ { .. } => format!("ORGAN · Track {}", track + 1),
                 VoiceSpec::Clap { plugin_id, .. } => {
                     format!("♪ {}", truncate(plugin_id, 16))
                 }
@@ -1941,7 +1982,8 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 | VoiceSpec::Sample { .. }
                 | VoiceSpec::DrumKit { .. }
                 | VoiceSpec::Modal { .. }
-                | VoiceSpec::Pluck { .. } => {
+                | VoiceSpec::Pluck { .. }
+                | VoiceSpec::Organ { .. } => {
                     format!("{} · Track {}", params.kind().label(), track + 1)
                 }
                 VoiceSpec::Clap { plugin_id, .. } => {
@@ -2070,6 +2112,18 @@ pub(crate) fn auto_param_label(param: &AutoParam) -> String {
             NodeParam::PluckBrightness => "Brightness".to_string(),
             NodeParam::PluckRelease => "Release".to_string(),
             NodeParam::PluckGain => "Gain".to_string(),
+            NodeParam::OrganBar(index) => {
+                let footage = crate::ORGAN_FOOTAGES
+                    .get(*index as usize)
+                    .copied()
+                    .unwrap_or("?");
+                format!("{footage} Bar")
+            }
+            NodeParam::OrganPercussion => "Percussion".to_string(),
+            NodeParam::OrganPercussionDecay => "Perc Decay".to_string(),
+            NodeParam::OrganAttack => "Attack".to_string(),
+            NodeParam::OrganRelease => "Release".to_string(),
+            NodeParam::OrganGain => "Gain".to_string(),
         },
     }
 }

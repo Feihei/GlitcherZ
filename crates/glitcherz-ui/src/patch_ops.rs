@@ -561,6 +561,14 @@ impl GlitcherZApp {
                 },
                 synth: SynthParams::default(),
             },
+            patch::NodeSource::Organ => NodeDoc::Instrument {
+                node_id,
+                track,
+                voice: VoiceSpec::Organ {
+                    params: glitcherz_model::OrganParams::default(),
+                },
+                synth: SynthParams::default(),
+            },
             patch::NodeSource::ClapInstrument { path, plugin_id } => NodeDoc::Instrument {
                 node_id,
                 track,

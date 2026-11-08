@@ -45,11 +45,11 @@ use glitcherz_engine::realtime::{
     FeedbackProcessor, InputProcessor, LfoProcessor, MAX_AUTO_POINTS, MAX_MIDI_FANOUT,
     MAX_TRACK_CLIPS, MapMode as EngineMapMode, MapSpec as EngineMapSpec, MidiClipTable,
     MidiEnvelopeProcessor, MixerChannel as EngineMixerChannel, MixerProcessor, ModalProcessor,
-    NodeKind, NoteEvent, ParamId, PluckProcessor, PortamentoProcessor, Processor, RtAudioClip,
-    RtAutoPoint, RtAutomation, RtControlClip, RtCtrl, RtCtrlKind, RtCurveInterp, RtMidiClip,
-    RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor,
-    SilentProcessor, SynthProcessor, Unit, empty_clip_table, empty_midi_clip_table,
-    mode_value as curve_mode_value,
+    NodeKind, NoteEvent, OrganProcessor, ParamId, PluckProcessor, PortamentoProcessor, Processor,
+    RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCtrl, RtCtrlKind, RtCurveInterp,
+    RtMidiClip, RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand,
+    Sf2VoiceProcessor, SilentProcessor, SynthProcessor, Unit, empty_clip_table,
+    empty_midi_clip_table, mode_value as curve_mode_value,
 };
 use glitcherz_engine::{MidiTarget, Sf2Library, Sf2Preset};
 use glitcherz_model::{
@@ -57,9 +57,9 @@ use glitcherz_model::{
     CtrlKind, CurveInterp, CurveMapParams, EffectParams, GraphDoc, LFO_DIVISION_LABELS, LfoParams,
     LfoWaveform, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS,
     MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip,
-    MidiEnvelopeParams, MidiSource, MidiTrack, ModalParams, NodeDoc, NodeParam, Note, PluckParams,
-    PortRef, PortamentoParams, Project, SamplePlayMode, SongLoop, SynthParams, SynthWaveform,
-    TrackKind, VoiceSpec,
+    MidiEnvelopeParams, MidiSource, MidiTrack, ModalParams, NodeDoc, NodeParam, Note, OrganParams,
+    PluckParams, PortRef, PortamentoParams, Project, SamplePlayMode, SongLoop, SynthParams,
+    SynthWaveform, TrackKind, VoiceSpec,
 };
 
 pub mod autosave;
@@ -354,6 +354,40 @@ pub(crate) fn pluck_param_values(params: &PluckParams) -> [(ParamId, f32); 5] {
     ]
 }
 
+/// Footage labels of the nine drawbars, in the engine's index order
+/// (`ParamId::OrganBar(0)` = 16' … `OrganBar(8)` = 1'). One source of truth
+/// for the automation menu, the inspector grid and the canvas inline rows.
+pub(crate) const ORGAN_FOOTAGES: [&str; 9] =
+    ["16'", "5⅓'", "8'", "4'", "2⅔'", "2'", "1⅗'", "1⅓'", "1'"];
+
+/// Every engine parameter of a drawbar-organ payload (S2-D12): the live
+/// document push and the offline export seed both walk this table.
+///
+/// Fifteen entries: nine drawbar levels plus the six macros. `bars` is indexed
+/// in footage order, which is exactly the order of `ParamId::OrganBar`.
+pub(crate) fn organ_param_values(params: &OrganParams) -> [(ParamId, f32); 15] {
+    [
+        (ParamId::OrganBar(0), f32::from(params.bars[0])),
+        (ParamId::OrganBar(1), f32::from(params.bars[1])),
+        (ParamId::OrganBar(2), f32::from(params.bars[2])),
+        (ParamId::OrganBar(3), f32::from(params.bars[3])),
+        (ParamId::OrganBar(4), f32::from(params.bars[4])),
+        (ParamId::OrganBar(5), f32::from(params.bars[5])),
+        (ParamId::OrganBar(6), f32::from(params.bars[6])),
+        (ParamId::OrganBar(7), f32::from(params.bars[7])),
+        (ParamId::OrganBar(8), f32::from(params.bars[8])),
+        (ParamId::OrganPercussion, params.percussion),
+        (ParamId::OrganPercussionDecay, params.percussion_decay_s),
+        (
+            ParamId::OrganPercussionHarmonic,
+            if params.percussion_third { 1.0 } else { 0.0 },
+        ),
+        (ParamId::OrganAttack, params.attack_s),
+        (ParamId::OrganRelease, params.release_s),
+        (ParamId::OrganGain, params.gain),
+    ]
+}
+
 /// Document automation parameter → engine parameter ID.
 ///
 /// `None` for [`AutoParam::Tempo`] (the engine route uses the Timeline In
@@ -609,6 +643,12 @@ fn node_param_id(param: NodeParam) -> ParamId {
         NodeParam::PluckBrightness => ParamId::PluckBrightness,
         NodeParam::PluckRelease => ParamId::PluckRelease,
         NodeParam::PluckGain => ParamId::PluckGain,
+        NodeParam::OrganBar(index) => ParamId::OrganBar(index),
+        NodeParam::OrganPercussion => ParamId::OrganPercussion,
+        NodeParam::OrganPercussionDecay => ParamId::OrganPercussionDecay,
+        NodeParam::OrganAttack => ParamId::OrganAttack,
+        NodeParam::OrganRelease => ParamId::OrganRelease,
+        NodeParam::OrganGain => ParamId::OrganGain,
     }
 }
 
@@ -710,6 +750,28 @@ fn node_auto_options(
                 ("Brightness", NodeParam::PluckBrightness),
                 ("Release", NodeParam::PluckRelease),
                 ("Gain", NodeParam::PluckGain),
+            ] {
+                options.push((label.to_string(), AutoParam::Node(param)));
+            }
+        }
+        // S2: nine drawbars plus the continuous macros. The percussion
+        // harmonic is discrete and stays out of automation (S2-D11).
+        NodeDoc::Instrument {
+            voice: VoiceSpec::Organ { .. },
+            ..
+        } => {
+            for (index, footage) in ORGAN_FOOTAGES.iter().enumerate() {
+                options.push((
+                    format!("{footage} Bar"),
+                    AutoParam::Node(NodeParam::OrganBar(index as u8)),
+                ));
+            }
+            for (label, param) in [
+                ("Percussion", NodeParam::OrganPercussion),
+                ("Perc Decay", NodeParam::OrganPercussionDecay),
+                ("Attack", NodeParam::OrganAttack),
+                ("Release", NodeParam::OrganRelease),
+                ("Gain", NodeParam::OrganGain),
             ] {
                 options.push((label.to_string(), AutoParam::Node(param)));
             }
@@ -885,6 +947,9 @@ fn inline_param_id(p: patch::InlineParam) -> ParamId {
         patch::InlineParam::ModalBrightness => ParamId::ModalBrightness,
         patch::InlineParam::PluckDecay => ParamId::PluckDecay,
         patch::InlineParam::PluckDamping => ParamId::PluckDamping,
+        // The canvas row edits the 8' drawbar regardless of its current level.
+        patch::InlineParam::OrganBar8 => ParamId::OrganBar(2),
+        patch::InlineParam::OrganPercussion => ParamId::OrganPercussion,
     }
 }
 
