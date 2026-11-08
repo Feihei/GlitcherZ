@@ -1136,3 +1136,25 @@ spec `.agents/spec/sidechain-compressor.md`。Z0 的第一个真实消费者：�
 
 **验收**：8 项压缩器单测（键控跟随 Mod、静音键控逐样本直通、`sidechain = 0` 与普通压缩器逐样本一致、GR 与 program 电平无关、键控不串音、普通表无 slot 8）、1 项图级（`sidechain_compressor_is_keyed_by_the_mod_port`）、1 项 model 校验与 RON 往返（含旧 payload 默认**关闭**键控）、1 项离线端到端（dry / wet / internal 三方 RMS）、`effect_rt_audit` 侧链路径零分配。**零回归**：`aaeb958` worktree + 独立 `CARGO_TARGET_DIR` 编出 pre-Z1 二进制，与 post-Z1 对同一默认工程 `--render --rate 22050 --bits 16 --to 1920`，两份 WAV `cmp` 逐字节一致。
 
+## B1：模态打击声源 Mallet（2026-11-08）
+
+spec `.agents/spec/modal-instrument.md`。一个引擎 + 四张预设表（Mallet / Vibraphone / Bell / Singing Bowl），一组二阶谐振器被一次噪声脉冲激励。不是「Synth 换个预设」：频谱非谐波、每个模态各自衰减、note-off 不管尾音。
+
+**为什么用复旋转子而不是两极点递归**：`(re, im)` 每采样 `re' = c·re − s·im`、`im' = s·re + c·im`，衰减**每块乘一次** `exp(−frames/τ)`。教科书形式 `y[n] = 2r·cosθ·y[n−1] − r²·y[n−2]` 里 `r = exp(−1/τ)`，诵钵 26 s T60 时 `r = 0.9999979`，而 f32 在 1.0 附近的分辨率只有 `1.19e−7` —— 衰减率误差能到几个百分点，尾音长度直接失控。块率 exp 同时把 `exp` 移出内层循环（16 模态 × 16 声部 × 375 块/s 可忽略），f32 乘法级联稳定，且单位冲激响应 `|a| = 1`，不需要按 `1/sin θ` 补偿幅度。
+
+**实施期发现的真实缺陷：激励相位必须随机**。第一版把激励只加进 `re`，两次同音敲击相位相同 → 相干抵消，`retrigger_adds_to_the_ringing_state` 实测「第二次敲击反而更弱」（0.6009 → 0.4329）。物理上敲击相对模态相位本来就是任意的，所以每次 `trigger` 抽一个相位 `φ = π·U(−1,1)`，激励按 `(cos φ, sin φ)` 同时注入 `re` / `im`。这条是测试逼出来的，不是设计时想到的。
+
+**T60 与声部释放**：预设表的 `decay_s` 是 −60 dB 时间，`τ = T60 / ln(1000)`；释放阈值 `IDLE_EPS = 1e−3`（也是 −60 dB）与 T60 天然重合，所以「表里写 26 s 就是响 26 s」。模态瞬时频率越过 `0.45·fs` 时该谐振器本块 `on = false`（增益 0、状态冻结），高音区自然只留低次模态，不混叠。
+
+**note 语义是鼓机 K6 的照搬**：`Off{n}`（n ≠ 0）忽略，敲击乐的尾音不该被松键掐断；`Off{0}` 是 blanket 哨兵（Stop / Panic），全池 10 ms 线性 fade。池子 16 声部，同音重击复用同一槽**叠加**激励，池满偷最老声部时**保留谐振器状态、只重算 `c` / `s` / `gain` / `tau`** —— 尾音滑到新音高而不是清零。清零是明确否决的方案，必然 click。
+
+**响度归一**：四个预设的 `Σgain` 差 2.6 倍（1.56 … 4.50），激励幅度按 `1/Σgain · gain · velocity^1.5` 归一，所以切预设不会跳音量。激励长度 `0.5 ms + (1−hardness)² · 8 ms`，低通截止 `300 · 2^(brightness·6)` Hz（上限 `0.45·fs`），包络 `(1 − t)²` 保证尾部无 click；两个参数在 note-on 时冻结，只影响下一次敲击。
+
+**model / 装配 / UI 的接线**：`VoiceSpec::Modal { params: ModalParams }` 加法变体（serde tag `modal`），`ModalPreset` 是 `snake_case` 枚举，`PROJECT_VERSION` 保持 10。装配仍然只改 `headless::spawn_instrument` 一处：离线在构造期 seed `modal_param_values`，实时靠 `engine_sync::push_node_params` 重放（与内置合成器同形）。`NodeParam` 新增 5 个自动化词汇，`preset` 不进自动化（离散值，与 `SynthWaveform` 同例）。画布节点内联 `decay` / `bright` 两行，其余四个参数在 Inspector 的 modal 分区；节点标题 `MALLET · <preset> · Track N`。
+
+**两个测试口径的坑**（都踩过）：
+
+- `decay_scale` 的对比必须用 Bowl。用 Mallet 比「5 s 后的能量」时两个值都是 0（T60 只有 1.2 s），测试会以 `0 vs 0` 通过 —— 那是假绿。
+- 拍频断言不能用 512 帧的短窗 RMS：窗里是数百 Hz 的模态内振荡，包络起伏被完全淹没（实测 0.39 vs 0.30，看着像拍频其实不是）。改用 250 ms 窗的慢包络，把模态振荡平均掉，只留 1–2 Hz 的失谐拍频。
+
+**验收**：15 项 `modal.rs` 单测（静音、预设表形状、原子起音、10 s 后仍有能量、尾音释放槽位、note-off 不掐尾 + blanket 收尾、重击叠加、非谐波峰 Goertzel、拍频、decay 缩放、brightness 频谱、偷声部有界、极端参数有限、参数 clamp、零力度不敲）、1 项 model 往返与旧 payload 默认、`effect_rt_audit` 的 `process` / `note_event` / `set_param` 零分配、1 项离线端到端（Bowl 预设 6 s 渲染，末四分之一仍有尾音能量）。

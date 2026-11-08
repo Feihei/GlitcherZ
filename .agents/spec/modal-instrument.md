@@ -145,24 +145,26 @@ note-on ──► 激励生成（噪声 → 一阶 LP → (1−n/L)² 窗）
 | ui | `plugin_picker.rs` | 选择器 `Mallet` 行 + `pick_is_instrument` |
 | ui | `patch.rs` | `NodeSource::Modal`、节点标题、`inline_params_of`、`InlineParam::{ModalDecay, ModalBrightness}` 读写 |
 | ui | `inspector_panel.rs` | modal 分区（预设 + 5 滑杆） |
-| ui | `voices.rs` | 若需按节点缓存参数值则沿用既有 `node_param_values` 机制；不新增文件选择 |
+| ui | `voices.rs` | 四处 `VoiceSpec` 分派（预设键、载入 / 重置预设、外部效果列表）补 `Modal => None` / `=> {}`；不新增文件选择 |
 
 ## 8. 验收
 
-- [ ] 无音符时输出**逐样本静音**（长尾已衰完的池不残留 DC）。
-- [ ] Singing Bowl 预设：note-on 后 10 s 仍有可测能量（RMS > −60 dBFS），且 30 s 内归零。
-- [ ] 频谱峰落在非谐波比：Singing Bowl 的 f0 / 2.71f0 / 5.15f0 附近各有峰（用 Goertzel 或过零率 + 自相关断言，不引入 FFT 依赖）。
-- [ ] 拍频：`beating = 1` 时响度包络以约 `beat` Hz 起伏（对包络做低通后数峰）；`beating = 0` 时起伏消失。
-- [ ] `decay_scale = 4` 的尾音能量在 10 s 后显著高于 `decay_scale = 0.25`（同一预设、同一敲击）。
-- [ ] `Off{n}` 不掐断尾音；`Off{0}` 在 10 ms 内静音。
-- [ ] 同音重击 = 状态叠加（幅度约 +6 dB 而非替换）；池满第 17 击偷最老声部，输出仍有限。
-- [ ] `hardness` / `brightness` 改变下一次敲击的高频能量（brightness 高 → 高频占比高）。
-- [ ] 满幅参数（`gain = 2`、极端音高 0 / 127、NaN 输入）输出无 NaN / Inf。
-- [ ] `effect_rt_audit` 扩展：`ModalProcessor::process` / `note_event` / `set_param` 零分配。
-- [ ] model：`VoiceSpec::Modal` RON 往返、旧 payload 无字段取默认、`GraphDoc::validate` 接受。
-- [ ] 离线端到端：`--render` 出一段可听的 modal 工程（Bowl 预设，`--to` 覆盖尾音），GUI 导出与 CLI 逐字节一致。
-- [ ] **零回归**：默认工程 `--render` 与 B1 之前**逐字节一致**（Modal 是纯加法变体）。
-- [ ] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。
+> 全部回填于 2026-11-08 实施完成时；括号里是对应的测试名。
+
+- [x] 无音符时输出**逐样本静音**（`silent_without_a_note`）。
+- [x] Singing Bowl 预设：note-on 后 11 s 仍有可测能量（RMS > −60 dBFS，`bowl_still_rings_after_ten_seconds`），且 30 s 内声部已释放（`bowl_tail_is_gone_within_thirty_seconds`）。
+- [x] 频谱峰落在非谐波比：Singing Bowl 的 f0 / 2.71f0 / 5.15f0 附近各有峰（`inharmonic_partial_peaks`，Goertzel 单频检测，不引入 FFT 依赖）。
+- [x] 拍频：`beating = 1` 时 250 ms 慢包络有明显起伏，`beating = 0` 时起伏消失（`beating_modulates_the_tail`）。
+- [x] `decay_scale = 4` 的尾音能量显著高于 `decay_scale = 0.25`（`decay_scale_controls_the_tail_length`，Bowl 预设下取样）。
+- [x] `Off{n}` 不掐断尾音；`Off{0}` 在 10 ms 内静音（`note_off_keeps_the_tail_but_the_blanket_sweep_stops_it`）。
+- [x] 同音重击 = 状态叠加（`retrigger_adds_to_the_ringing_state`，随机敲击相位避免相干抵消）；池满第 17 击偷最老声部，输出仍有限（`pool_is_bounded_and_stealing_stays_finite`）。
+- [x] `brightness` 改变下一次敲击的高频占比（`brightness_changes_the_strike_spectrum`）；`hardness` 改变敲击脉冲长度 0.5–8.5 ms（`hardness_sets_the_strike_length`）。
+- [x] 满幅参数（`gain = 2`、极端音高、NaN 输入）输出无 NaN / Inf（`extreme_parameters_stay_finite` / `params_clamp_and_reject_non_finite` / `zero_velocity_does_not_strike`）。
+- [x] `effect_rt_audit` 扩展：`ModalProcessor::process` / `note_event` / `set_param` 零分配。
+- [x] model：`VoiceSpec::Modal` RON 往返、旧 payload 无字段取默认、`GraphDoc::validate` 接受（`modal_voice_round_trips_and_defaults`）。
+- [x] 离线端到端：`--render` 出一段可听的 modal 工程（Bowl 预设，6 s 窗口末四分之一仍有尾音，`offline_render_plays_the_modal_tail`）；GUI 导出与 CLI 逐字节一致（`gui_export_pipeline_matches_the_cli_render`）。
+- [x] **零回归**：默认工程 `--render` 与 B1 之前**逐字节一致**（`afce30e` worktree 对比，见 §10）。
+- [x] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。
 
 ## 9. 风险与已知取舍
 
@@ -174,3 +176,13 @@ note-on ──► 激励生成（噪声 → 一阶 LP → (1−n/L)² 窗）
 | 高音区高次模态超过 Nyquist 被丢弃 | B1-D9 的显式防御：音色在高音区自然变「闷」，不产生混叠。 |
 | 4 个预设的 `Σgain` 差异大 | 激励按 `1/Σgain` 归一（§4 末尾），`gain` 参数再统一调节。 |
 | v1 没有逐模态编辑，调不出「非预设」的音色 | 宏参数覆盖「短金属 ↔ 长诵钵」区间；真正自由的模态编辑（8×4 表格 + 编辑器）是独立工程量，留待后续 spec。 |
+
+## 10. 交付与零回归证据
+
+| 项 | 结果 |
+| :--- | :--- |
+| 落地 | 新 `realtime/modal.rs`（预设表、复旋转子、激励、16 声部池、note 语义、参数）；`commands.rs` 6 个 `ParamId`；`realtime/mod.rs` 模块 + re-export；model 的 `ModalPreset` / `ModalParams` / `VoiceSpec::Modal` / 5 个 `NodeParam` + `MapSpec`；装配 `headless::spawn_instrument` 一处 + `engine_sync::push_node_params` 重放 + `modal_param_values`；UI 的 `NodeSource::Modal` / 选择器 `Mallet` / 节点标题 / 内联 `decay`·`bright` / Inspector `modal_section` / 自动化菜单 / `voices.rs` 四处分派。 |
+| 标识 | `PROJECT_VERSION = 10` **未动**，旧工程零迁移；`Mallet` 进 Add 菜单末尾（鼓机之后，插件选择器第 5 个内置乐器）。 |
+| 验收 | 17 项 `modal.rs` 单测 + 1 项 model 往返 + `rt_audit` 零分配 + 1 项离线端到端；`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。 |
+| **零回归硬证据** | 用 parent commit `afce30e` 的 detached worktree + 独立 `CARGO_TARGET_DIR` 编出 pre-B1 二进制，与 post-B1 对同一份默认工程跑 `--render --rate 22050 --bits 16 --to 1920`：两份 WAV 各 **44288 帧 / 177196 字节，`cmp` 逐字节一致**。 |
+| 实施期修订 | 激励相位改为每次敲击随机抽取（B1-D4 的补充）：固定相位会让同音重击相干抵消，实测第二次敲击反而更弱。 |

@@ -159,7 +159,7 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 | 菜单项 | 产生 |
 | :--- | :--- |
 | `Search Nodes…` | 打开节点浏览器，可搜名字或模块路径 |
-| `Instrument…` | 乐器：`Synth`（内置）、`SoundFont`、`Sample`、`Drum Kit`，以及 CLAP / VST3 乐器插件 |
+| `Instrument…` | 乐器：`Synth`（内置）、`SoundFont`、`Sample`、`Drum Kit`、`Mallet`（模态敲击），以及 CLAP / VST3 乐器插件 |
 | `Effect…` | 效果：`Delay`、`EQ`、`Compressor`、`Reverb`、`Chorus`、`Flanger`、`Bitcrusher`、`Phaser`、`Saturation`、`Limiter`、`Ring Mod`、`Sidechain Comp`，以及 CLAP / VST3 效果插件 |
 | `MIDI FX…` | `Arpeggiator`、`Portamento`、`MIDI Envelope`、`LFO`、`Curve Map` |
 | `Mixer` | 多通道求和节点（1–32 通道，可加 / 减通道） |
@@ -170,6 +170,9 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 
 `SoundFont` / `Sample` / `Drum Kit` 出生时不带文件（沉默），在节点上的 `Load File…` /
 `Load Samples…` 按钮里选，换文件不需要重建节点和连线。
+
+`Mallet`（模态敲击）没有文件，出生即可发声：预设表内建在引擎里，见下面的
+[模态打击](#模态打击mallet)。
 
 三种连线，从输出口拖到输入口即可：
 
@@ -216,6 +219,39 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 每个口最多接一根线；往已占用的口再拉一根会替换旧线。删除双口节点时它
 触及的音频线会**一起移除**，不会自动旁路重连（Mod 线没有可解释的主信号替代目标）。
 
+### 模态打击（Mallet）
+
+`Mallet` 是一组二阶谐振器被一次噪声敲击激励出来的声音（和 STK ModalBar / LMMS
+Mallets 同一路线），一个引擎覆盖四个预设：
+
+| preset | 听感 | T60 |
+| :--- | :--- | :--- |
+| `Mallet` | 木琴 / 马林巴，近谐波、短促 | 1.2 s（基频） |
+| `Vibraphone` | 金属棒，带电机式拍频 | 6 s |
+| `Bell` | 钟 / 管钟，非谐波、偏暗 | 14 s（最低模态） |
+| `Singing Bowl` | 诵钵，极长尾音、强拍频 | 26 s |
+
+**敲是敲，不是弓**：`note-on` 敲一下，松键**不会**掐断尾音——敲击乐物理上就是响到底。
+要立刻收掉所有尾音用 `Stop` / Panic（走 `Off{0}` 哨兵，10 ms 淡出）。
+
+池子 16 个声部。长尾预设（诵钵单音就有 26 s）连续敲会占满池子，第 17 击偷最老的声部：
+**保留谐振器状态、只把系数重算到新音高**，所以尾音会滑过去而不是被清零，不会 click。
+
+参数（Inspector 的 modal 分区，画布节点上另有 `decay` / `bright` 两行内联）：
+
+| 参数 | 范围 | 说明 |
+| :--- | :--- | :--- |
+| `preset` | 四选一 | 换表**不重置**正在响的尾音，它们会滑到新的模态比 |
+| `decay` | 0.25–4 | 所有模态 T60 的倍率，实时作用于正在响的尾音 |
+| `beating` | 0–2 | 预设拍频的倍率，`0` = 每模态只留一个谐振器（拍频消失） |
+| `hardness` | 0–1 | 敲击脉冲长度，**只影响下一次敲击** |
+| `brightness` | 0–1 | 敲击噪声的低通截止，**只影响下一次敲击** |
+| `gain` | 0–2 | 节点输出增益 |
+
+音高按 MIDI 音符换算（A4 = 440 Hz）。高音区里超过 Nyquist 的高次模态会被丢弃，音色
+自然变闷而不是混叠。`decay` / `beating` / `hardness` / `brightness` / `gain` 都能接
+自动化曲线，`preset` 是离散值、不进自动化列表。
+
 双击节点进 `Inspector`（乐器 / 效果 / 混音 / MIDI FX / LFO / Curve Map / Audio Input）；
 双击固定的 `Timeline` 节点回到编曲视图。
 
@@ -225,7 +261,7 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 
 | 节点 | 面板内容 |
 | :--- | :--- |
-| 乐器 | 内置合成器的波形与滤波（Low-pass / High-pass / Band-pass / Moog 四级 ladder）、ADSR、滑音；`SoundFont` 的 bank / patch 与文件；`Sample` 的根音、增益，以及**播放窗口**（波形图上四条可拖标记：起始 / 循环起 / 循环止 / 结束，外加循环模式 Off / Forward / Ping-pong）；`Drum Kit` 的每个槽位（触发键写作 `C2 · 36`，可直接拖动换键） |
+| 乐器 | 内置合成器的波形与滤波（Low-pass / High-pass / Band-pass / Moog 四级 ladder）、ADSR、滑音；`SoundFont` 的 bank / patch 与文件；`Sample` 的根音、增益，以及**播放窗口**（波形图上四条可拖标记：起始 / 循环起 / 循环止 / 结束，外加循环模式 Off / Forward / Ping-pong）；`Drum Kit` 的每个槽位（触发键写作 `C2 · 36`，可直接拖动换键）；`Mallet` 的预设下拉与 decay / beating / hardness / brightness / gain |
 | 效果 | 该效果的全部参数；插件效果用插件自己的 GUI（`Open Editor`） |
 | `Mixer` | 通道条：每路推子、声像、静音、独奏、电平表，加 / 减通道；输出级的声像与静音 |
 | 插件乐器 | 参数列表（可右键接到自动化）+ `Open Editor` |
