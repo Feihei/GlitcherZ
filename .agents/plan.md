@@ -743,6 +743,8 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | Z0-D6 | 附一个**最小双口效果 Ring Mod**（`out = main × mod`，几十行）作为 Z0 的数学样例与可听验证，进 Add 菜单但不单独立项；它是 Z0 的验收手段，不替代 Z1 / Z2。 |
 | Z0-D7 | 验收：主 / 副口互不串音的数学测试（含 PDC 非零图）、单口节点与默认工程 `render` **逐样本零回归**、双口 `rt_audit` 零分配、`fmt` / `clippy -D warnings` / `test --workspace` 全绿。 |
 
+> **2026-11-08 spec 勘误**：`spec/dual-audio-input.md` §6 已定稿三处修订——Z0-D2 的 per-node aux 改为**整图共享一个 scratch**（部署/回收协议零改动）、Z0-D4 的旁路规则显式排除 `Dual`、Z0-D1 补 `add_cable` 端口范围校验。实施以 spec 为准。
+
 ### Z1 / Z2 要点
 
 - **Z1 侧链压缩**：`CompressorProcessor` 已有 `compute_gr_db`、GR 平滑与 meters；加一个 `sidechain` 开关把检测源从 `main` 切到 `aux`，未接 Mod 口时回落内部检测（保旧工程行为）。键控 HPF / 外部键监听（listen）暂不做。验收：kick → bass 的 GR 随外部键变化，`--render` 可自动测。
