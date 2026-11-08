@@ -1199,3 +1199,31 @@ spec `.agents/spec/pluck-instrument.md`。Karplus-Strong：一根分数延迟的
 **model / 装配 / UI 的接线**：`VoiceSpec::Pluck { params: PluckParams }` 加法变体（serde tag `pluck`，`#[serde(default)]`），`PROJECT_VERSION` 保持 10，旧工程零迁移。装配仍然只改 `headless::spawn_instrument` 一处：离线在构造期 seed `pluck_param_values`，实时靠 `engine_sync::push_node_params` 重放。`NodeParam` 新增 5 个自动化词汇（全部连续量，全可自动化，与 B1 的 `preset` 不同），`MapSpec` 的 `decay` 0.1..20 / `damping`·`brightness` 0..1 / `release` 0.005..2 / `gain` 0..2 与 `node_param_map` 对齐。画布节点内联 `decay` / `damp` 两行，其余三个在 Inspector 的 pluck 分区；节点标题 `PLUCK · Track N`。`voices.rs` 四处分派补 `Pluck => None`（无外部文件）。
 
 **验收**：16 项 `pluck.rs` 单测（静音、发声、音高与 `PitchOffset` 的 Goertzel、T60 偏差、decay 尾音长度、damping 明暗、brightness 频谱、note-off 阻尼、blanket、重击叠加、偷声部有界、非有限参数、极端参数、零力度、可复现、非法采样率）、1 项 model RON 往返与旧 payload 默认、`effect_rt_audit` 的 `process` / `note_event` / `set_param` 零分配、1 项离线端到端（拨弦窗口 RMS 0.061，松键后窗口 0.000）。默认工程渲染与 pre-S1 逐字节一致（44288 帧 / 177196 字节），全量 1154 项通过。
+
+## S2：拉杆风琴 Organ（2026-11-09）
+
+spec `.agents/spec/organ-instrument.md`。九个严格谐波分量的加权和，听上去是最没有算法风险的一类声源——难点确实不在 DSP，在**相位管理**与**参数面**。因此 `realtime/organ.rs` 的实现比 `pluck.rs` 短，测试却更长（19 项）。
+
+**9 个 drawbar 必须共享一个相位累加器。** 直觉做法是每根 bar 一个累加器（9 个 `OscProcessor` 或 9 个 `phase` 字段），每根各自 `exp2` 出频率。这在数学上等价，在数值上不等价：它们是 9 段互相独立的浮点累加，误差各自长，分钟级尺度上会互相滑动。16'（0.5·f0）与 8'（f0）本来就是八度关系、拍频为零，漂移一出现就变成可闻的慢速拍——这是听感上立刻能发现的错，不是「理论上不严谨」。所以基准取 **16'**（`dp = 0.5·f0/fs`），9 根 bar 相对 8' 的比值 0.5 / 1.5 / 1 / 2 / 3 / 4 / 5 / 6 / 8 全是 `0.5·f0` 的整数倍，第 k 根就是 `sin(TAU · fract(k·p))`，`k ∈ {1, 3, 2, 4, 6, 8, 10, 12, 16}`。一个 `p` 保证九个分量恒有固定的相位关系，还省掉 8 份状态。
+
+**`L = 0` 必须特判为精确 0。** 电平阶梯按 `10^(−0.15·(8−L))` 算，`L = 0` 得到的是 `10^(−1.2) ≈ 0.063`（−24 dB）——不是「关掉」。九根全归零时这 9 个 −24 dB 的残留仍会叠出可闻的糊音，而「把所有拉杆推回去」是风琴最基本的动作。所以 `LEVEL_GAIN[0] = 0.0` 硬编码，`L = 0` 的 bar 连 `sin` 都不算（掩码在 `configure` 里，`on[index] = gain > 0`）。
+
+**`OUTPUT_SCALE = 0.25` 是响度折中，不做归一化。** 默认注册 `888000000` 的 `Σ = 3.0`，乘 0.25 后单声部峰值约 0.75，与内置合成器的单位振荡器同一量级；九根全开时峰值 2.25，会顶到 limiter——这在真机上也一样（拉满更响）。不做「按开着的 bar 数自动归一」是刻意的：归一化会让「加一根 bar」听不出变化，那比削波更糟。
+
+**A/R 直接复用 `AdsrProcessor`，`decay = 0`、`sustain = 1.0`。** 风琴没有 ADSR，但键开关必须有斜坡，否则每个音的头尾都是 click。选 `AdsrProcessor` 而不是写一个线性斜坡，关键收益是 `trigger` **从当前电平重新起音**——偷声部和同音重按天然无 click，不需要额外的淡出淡入逻辑。默认 `attack = 5 ms` / `release = 40 ms`。
+
+**`held` 与 `note` 必须分成两个字段。** 第一版只有 `note: Option<u8>`：note-off 时清成 `None`，声部靠包络自然衰减。结果松键后的尾音**全部掉到 f0 上**——因为音高是从 `note` 算的，`note` 一没了，`base_inc` 就成了「无音高」的兜底值。改成 `note: Option<u8>` 保留到声部真正空闲 + `held: bool` 单独表示「键还按着」，尾音才在正确的音高上跑完。`held` 同时给 `Off{0}` 的 blanket 语义用。
+
+**力度不参与音量，但 `velocity == 0` 仍然不发声。** 真实音轮风琴的键触点就是开关，`trigger` 恒传 `1.0`；响度来源是注册 + `gain`，这是乐器的性格。但 `velocity = 0` 必须静音，一是与另外两个引擎一致，二是兼容「velocity 0 当 note-off」的 MIDI 习惯。
+
+**打击泛音加在总包络之前。** 它是一根额外的正弦（2nd → `k = 4`（4'），3rd → `k = 6`（2⅔'）），带自己的指数衰减：`perc -= perc·c`，`c = 1 − exp(−ln1000/(T60·fs))`，逐样本一极点（比块率乘法少一级台阶，长 T60 下不会有 zipper）。电平冻结在 note-on（中途改 `percussion` 不影响已经在响的打击音），`percussion = 0` 时整段 `if` 跳过、零成本。**为什么在包络之前**：键松开时打击音要跟着一起被关掉，这是真机行为；如果加在包络之后，松键的瞬间会漏出一小段干净的打击音。
+
+**Nyquist 掩码用 `max(当前, 目标)` 的 pitch ratio。** 某根 bar 令 `k · 0.5 · f0 ≥ 0.45·fs` 时本块不参与。判定若只看当前音高，滑音往上冲的过程中会有一块「刚越界但还没更新」的样本段；取两者较大值就不会瞬时越界。高音区上方 bar 自然消失（音色变薄），v1 不做 foldback——真机在那个位置是折回低八度，但那是每根 bar 一条额外的频率映射，且与「注册决定音色」的直觉相反。
+
+**`OrganBar(u8)` 是一个 payload 变体，不是 9 个枚举变体。** 与既有的 `DrumSlotGain(u8)` 同例：`set_param` 里只有一条分支，`NodeParam` / `node_param_map` / 自动化标签也各只有一处，代价是编译期无法穷尽检查索引——由 `set_param` 里 `index >= 9 → false` 守住。自动化词汇里 `OrganAttack` / `OrganRelease` **不复用** `NodeParam::Attack` / `Release`：后者的 `MapSpec` 是 0..2 / 0..3，而风琴的合法区是 0.001..0.2 / 0.005..1.0，共用会让曲线 90% 的行程落在 clamp 上。
+
+**测试口径的坑**：用默认 `888000000` 测 `PitchOffset` 是测不出来的——+12 半音只是把 16' 挪到了原来的 8' 位置，注册本身掩盖了偏移。测偏移前必须先 `silence_bars` 再只开 8'。另一个坑是 Nyquist 断言不能写「很小」：掩码生效时是**精确 0**，`1'` 在 C8 上实测峰值 0.000000，写成 `> 0.001` 之类的宽松阈值会让「漏掉掩码」和「掩码偏严」都通过。
+
+**model / 装配 / UI 的接线**：`VoiceSpec::Organ { params: OrganParams }` 加法变体（serde tag `organ`，`#[serde(default)]`），`PROJECT_VERSION` 保持 10。装配仍然只改 `headless::spawn_instrument` 一处：离线在构造期 seed `organ_param_values`（9 根 bar + 6 个宏共 15 条），实时靠 `engine_sync::push_node_params` 重放。`NodeParam` 新增 14 个词汇（9 根 bar + 打击三件套 + A/R + gain），打击谐波不进自动化（离散值，与 `ModalPreset` / `SynthWaveform` 同例）。UI 的 footage 字符串只有一处来源（`ORGAN_FOOTAGES`），选择器 / Inspector 网格 / 自动化菜单 / 内联行全引用它，避免 `2⅔'` 这种带 unicode 分数字符的标签被抄成两份后不一致。节点标题 `ORGAN · Track N`，画布内联 `8'`（drawbar 2）与 `perc`（最常拧的两个），Inspector 是 3×3 的 drawbar 网格 + 打击三件套 + A/R + gain。
+
+**验收**：19 项 `organ.rs` 单测（静音、发声、音高与 `PitchOffset` 的 Goertzel、频谱由 drawbar 决定、16' 次八度、3 dB 阶梯、全归零静音、A·R、blanket、打击泛音与谐波切换、同音复用、偷声部有界、Nyquist、非有限参数、极端参数、零力度、可复现、非法采样率）、1 项 model RON 往返与旧 payload 默认、`effect_rt_audit` 的 `process` / `note_event` / `set_param` 零分配、1 项离线端到端（held RMS 0.42235，松键后 0.00000）。实测：默认注册 RMS 0.3062 / 峰值 0.6249；只开 8' 时 f0 / 2f0 = 1 689 272；`8 → 4` 电平比 0.251（−12.0 dB）、`8 → 1` 为 0.089；打击早/晚能量比 1 479 044；`1'` 在 C8 上峰值 0.000000。默认工程渲染与 pre-S2 逐字节一致（44288 帧 / 177196 字节），全量 1175 项通过。

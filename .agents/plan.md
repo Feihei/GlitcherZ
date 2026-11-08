@@ -640,7 +640,7 @@ scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 sympho
 | :--- | :--- | :--- |
 | **S0** | 装配去重（共享 `spawn_node`）+ `glitcherz --render` headless 渲染 | ✅ 2026-11-07 交付 |
 | **S1** | Pluck（Karplus-Strong 拨弦） | ✅ 2026-11-08 交付 |
-| **S2** | Organ（drawbar 加法 + 打击泛音） | 待办 |
+| **S2** | Organ（drawbar 加法 + 打击泛音） | ✅ 2026-11-09 交付 |
 | **S3** | Wavetable（表管理 / 抗混叠 / 位置调制，**先写独立 spec**） | 待办 |
 | **S4** | CLI 命令面扩展（open / save / 少量批量操作） | 待办 |
 | **S5** | MCP（前置：把 headless 层提升为独立 `glitcherz-session` crate + 命令面 + 安全边界） | 待办 |
@@ -687,6 +687,18 @@ scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 sympho
 | **零回归硬证据** | 用 `86a4244`（S1 spec commit，最后一个 pre-S1 代码状态）的 detached worktree + 独立 `CARGO_TARGET_DIR` 编出 pre-S1 二进制，与 post-S1 对同一份含 4 个音符的工程跑 `--render --rate 22050 --bits 16 --to 1920`：两份 WAV 各 **44288 帧 / 177196 字节，`cmp` 逐字节一致**。 |
 | 文档同步 | `pluck-instrument.md`（新 spec）、`implementation.md` S1 小节、`docs/manual.md`（Add 菜单 `Pluck` 行 + 拨弦小节 + Inspector 行 + 自动化说明）、`AGENTS.md` 索引。 |
 
+### S2 实施记录（✅ 2026-11-09 已交付，Y 系列第二个乐器）
+
+| 项 | 结果 |
+| :--- | :--- |
+| 落地 | 新 `realtime/organ.rs`（`OrganProcessor`）：**9 根 drawbar 共享一个相位累加器**（基准 16'，第 k 根 = `sin(TAU·k·p)`，k ∈ {1,3,2,4,6,8,10,12,16}）+ 3 dB/级电平阶梯 + Nyquist 掩码 + 打击泛音（2nd / 3rd，逐样本一极点衰减，note-on 冻结）+ `AdsrProcessor` 的 A/R（`decay = 0`、`sustain = 1`）+ 16 声部池 + `PitchOffset` 逐样本平滑；`ParamId` 7 个、`NodeParam` 14 个、`VoiceSpec::Organ` 加法变体；装配仍只改 `headless::spawn_instrument` 一处；UI 的 `NodeSource::Organ`、选择器 `Organ`、节点标题 `ORGAN · Track N`、内联 `8'`·`perc`、Inspector organ 分区（3×3 drawbar 网格 + 打击 + A/R + gain）。**不做预设枚举**（S2-D14）、**不做内置滑音**（S2-D9，交给既有 `Portamento`）。 |
+| 标识 | `PROJECT_VERSION = 10` **未动**，旧工程零迁移；`Organ` 进 Add 菜单（`Pluck` 之后）。无新 crate / 新依赖。 |
+| DSP 关键点 | ① 9 个独立相位累加器会各自漂移，16' 与 8' 的拍频随时间变化——**一个累加器**是唯一正确解，也省掉 8 份状态；② `L = 0` 必须特判为**精确 0**，否则 `10^(−1.2)` 的 −24 dB 残留在 9 根全归零时仍有可闻噪声；③ 打击泛音加在**总包络之前**，松键时一起关掉（真机行为），且 `percussion = 0` 整段跳过；④ Nyquist 掩码用 `max(当前, 目标)` 的 pitch ratio 判定，滑音途中不会瞬时越界；⑤ `held: bool` 与 `note: Option<u8>` **分离**——松键后 `held = false` 但音高保留，尾音才在正确音高上渲染（第一版只清 `note`，松键后尾音掉到 f0 上）；⑥ `AdsrProcessor::trigger` 从**当前电平**起音，偷声部与同音重按天然无 click。 |
+| 验收 | 19 项引擎单测（静音 / 发声 / 音高与 `PitchOffset` 的 Goertzel / 频谱由 drawbar 决定 / 16' 次八度 / 3 dB 阶梯 / 全归零静音 / A·R / blanket / 打击泛音与谐波切换 / 同音复用 / 偷声部有界 / Nyquist / 非有限参数 / 极端参数 / 零力度 / 可复现 / 非法采样率）+ 1 项 model RON 往返与旧 payload 默认 + `rt_audit` 的 `process` / `note_event` / `set_param` 零分配 + 1 项离线端到端（held RMS 0.42235，松键后 0.00000）。实测：默认注册 RMS 0.3062 / 峰值 0.6249；只开 8' 时 f0 / 2f0 = 1 689 272；`8 → 4` 电平比 0.251（−12.0 dB）、`8 → 1` 为 0.089；打击早/晚能量比 1 479 044；`1'` 在 C8 上峰值 0.000000（掩码生效）。`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace`（1175 项）/ `build --workspace` 全绿。 |
+| **零回归硬证据** | 用 `063e650`（S2 spec commit，最后一个 pre-S2 代码状态）的 detached worktree + 独立 `CARGO_TARGET_DIR` 编出 pre-S2 二进制，与 post-S2 对同一份含 4 个音符的工程跑 `--render --rate 22050 --bits 16 --to 1920`：两份 WAV 各 **44288 帧 / 177196 字节，`cmp` 逐字节一致**。 |
+| 实施期踩坑 | ① 默认 `888000000` 会**掩盖** `PitchOffset` 测试——+12 半音只是把 16' 挪到原来的 8' 位置，测偏移前必须先把其它 bar 静音、只留 8'；② `auto_param_label` 里 `param` 是 `&NodeParam`，`OrganBar(index)` 绑定成 `&u8`，`as usize` 前要解引用；③ 两处 `needless_range_loop`（`DRAWBAR_K` 与 `bars` 都改 `.iter().enumerate()`）；④ 加 `Organ` 行后 `plugin_picker` 的 5 处行数断言全部要跟着改（6 → 7 内置乐器、8 → 9 键盘行、`1..9`）。 |
+| 文档同步 | `organ-instrument.md`（新 spec，§8 验收 20 条与 §10 证据已回填）、`implementation.md` S2 小节、`docs/manual.md`（Add 菜单 `Organ` 行 + 拉杆风琴小节 + Inspector 行）、`AGENTS.md` 索引。 |
+
 ## Z / B 系列：双音频输入口 + 模态打击声源（2026-11-08 立项，本节即方案）
 
 > 来源：用户 2026-11-08 提出三项——① 敲击金属器具的合成器（类 LMMS Mallets），尤其要「敲诵钵那种悠长的声音」；② 现有效果器都是单 audio 入，想要**两个 audio 口**的调制类效果器，目标是类似 vocoder 的效果；③ 侧链压缩同样需要两个 audio 口。
@@ -729,7 +741,7 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | 2 | **Z1** 侧链压缩 ✅ | 已交付。Z0 的第一个真实消费者兼**验收钉子**：复用现成 `CompressorProcessor`，证明 aux 在实时 / 离线两条路径都通。Z0 自带的 Ring Mod 只是数学样例，Z1 才是用户要的效果。 |
 | 3 | **B1** Modal 声源 ✅ | 已交付。与图架构完全解耦，与 Z0/Z1 无交叉；声源只改 `headless::spawn_instrument` 一处，长尾 / 拍频 / 频谱峰全部由 S0 的 `--render` 自动验收。 |
 | 4 | **Z2** Vocoder ✅ | 已交付。最贵的一项，失败模式本可能暴露 Z0 的设计缺口（两路 PDC / 缓冲形状）；Z1 已把 Z0 验证过，实际零返工。 |
-| 5 | **S1** Pluck ✅ → **S2** Organ → **S3** Wavetable | S1 已交付（2026-11-08）。Y 系列原三个乐器顺延；Wavetable 仍按原约定「先写独立 spec 再实现」。 |
+| 5 | **S1** Pluck ✅ → **S2** Organ ✅ → **S3** Wavetable | S1 已交付（2026-11-08）、S2 已交付（2026-11-09）。Y 系列原三个乐器顺延；Wavetable 仍按原约定「先写独立 spec 再实现」。 |
 | 6 | **S4** CLI 命令面 → **S5** MCP | 不取消。新功能把它们往后推，但 S0 的判别（没有 render 的 MCP 是盲操作）不变。 |
 
 **备选（听感优先，未采用）**：B1 → Z0 → Z1 → Z2 → S1…。两条链互不依赖，本可无损切换；用户 2026-11-08 选架构优先，**按上表执行**。
@@ -828,7 +840,11 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | Q2 诵钵激励 | **只做单次敲击（strike）**，不做 bow/rub 持续摩擦 → voice 生命周期与 note-off 按一次性激励设计 |
 | Q3 Vocoder | **固定 16 带 + 外部 carrier**，v1 无 formant shift / freeze / 自定义带数 |
 
-下一步：**S2 Organ 声源**（Y 系列第二个乐器、执行顺序仍是第 5 项），沿用 B1 / Z2 / S1 的形状——先写 `spec/organ-instrument.md`，再实现引擎、装配、UI，最后分实现 / 文档两个 commit。要点（立项粗版）：9 个 drawbar 正弦（footage 16′..1′）+ 每个 drawbar 独立电平 + 打击泛音（percussion，衰减包络）+ 滑音（glide）；纯加法、无算法风险，主要工作量在参数面与 UI 版图。
+下一步：**S3 Wavetable 声源**（Y 系列第三个乐器、执行顺序仍是第 5 项），沿用 B1 / Z2 / S1 / S2 的形状——先写 `spec/wavetable-instrument.md`，再实现引擎、装配、UI，最后分实现 / 文档两个 commit。
+
+这一项和前面四个**不是一个量级**（`plan.md` 早在立项时就把 S3 标为「大」，并写死「必须单独立 spec 再实现」），原因是表管理这一层前面四个声源都没有：① 内置表要有内容（不是几个公式能生成的东西，得决定是代码生成还是嵌资源）；② 用户表导入需要文件格式 + 校验 + 缓存淘汰，是一整套 `media` / `sf2_library` 级别的基建；③ 抗混叠（每个八度区一套带限表，或 mipmap 式多级表）直接决定工作量和内存；④ RT 表热替换要满足零分配零锁，即表必须**先在控制线程换成 `Arc`，再做一次原子换指针**。定位调制（`position` 参数）反而是最简单的部分。
+
+建议 spec 阶段先回答四个问题再动手：表来源（内置合成 / 资源嵌入 / 用户导入，可分批交付）、抗混叠策略（多级带限表 vs 单表 + 过采样）、表大小与插值口径（2048 帧 + 线性 vs 更大 + 三次）、`position` 的语义（相邻表插值 / 表内相位失真）。可先只做「内置表 + 表间插值」，把用户导入拆成独立后续阶段——那部分的风险全在文件与 UI，不在 DSP。
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 

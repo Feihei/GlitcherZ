@@ -159,7 +159,7 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 | 菜单项 | 产生 |
 | :--- | :--- |
 | `Search Nodes…` | 打开节点浏览器，可搜名字或模块路径 |
-| `Instrument…` | 乐器：`Synth`（内置）、`SoundFont`、`Sample`、`Drum Kit`、`Mallet`（模态敲击）、`Pluck`（拨弦），以及 CLAP / VST3 乐器插件 |
+| `Instrument…` | 乐器：`Synth`（内置）、`SoundFont`、`Sample`、`Drum Kit`、`Mallet`（模态敲击）、`Pluck`（拨弦）、`Organ`（拉杆风琴），以及 CLAP / VST3 乐器插件 |
 | `Effect…` | 效果：`Delay`、`EQ`、`Compressor`、`Reverb`、`Chorus`、`Flanger`、`Bitcrusher`、`Phaser`、`Saturation`、`Limiter`、`Ring Mod`、`Sidechain Comp`、`Vocoder`，以及 CLAP / VST3 效果插件 |
 | `MIDI FX…` | `Arpeggiator`、`Portamento`、`MIDI Envelope`、`LFO`、`Curve Map` |
 | `Mixer` | 多通道求和节点（1–32 通道，可加 / 减通道） |
@@ -171,8 +171,9 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 `SoundFont` / `Sample` / `Drum Kit` 出生时不带文件（沉默），在节点上的 `Load File…` /
 `Load Samples…` 按钮里选，换文件不需要重建节点和连线。
 
-`Mallet`（模态敲击）和 `Pluck`（拨弦）都没有文件，出生即可发声：DSP 全在引擎里，见下面的
-[模态打击](#模态打击mallet) 与 [拨弦](#拨弦pluck)。
+`Mallet`（模态敲击）、`Pluck`（拨弦）和 `Organ`（拉杆风琴）都没有文件，出生即可发声：DSP
+全在引擎里，见下面的 [模态打击](#模态打击mallet)、[拨弦](#拨弦pluck) 与
+[拉杆风琴](#拉杆风琴organ)。
 
 三种连线，从输出口拖到输入口即可：
 
@@ -313,6 +314,66 @@ Mallets 同一路线），一个引擎覆盖四个预设：
 `decay` / `damping` / `brightness` / `release` / `gain` 五个都能接自动化曲线
 （画布节点上另有 `decay` / `damp` 两行内联）。
 
+### 拉杆风琴（Organ）
+
+`Organ` 是音轮风琴的加法合成：**九根 drawbar 就是九个严格谐波的正弦**，同时发声、各自
+独立电平。音色完全由「哪几根拉出来」决定，中间没有滤波器——这就是拉杆风琴和 `Synth`
+的根本区别（`Synth` 是一个振荡器过一个滤波器，这里是九个振荡器并联直出）。
+
+| # | drawbar | 音程 | 相位倍数 | 音色作用 |
+| :-- | :-- | :-- | :-- | :-- |
+| 0 | `16'` | 低八度 | 1 | 底噪层，给和弦垫脚 |
+| 1 | `5⅓'` | 16' 的三次谐波 | 3 | 偏「爵士」的厚重感 |
+| 2 | `8'` | 同度 | 2 | 主体，几乎所有注册都开 |
+| 3 | `4'` | 八度 | 4 | 明亮度 |
+| 4 | `2⅔'` | 三次谐波 | 6 | 中空的「鼻音」 |
+| 5 | `2'` | 两个八度 | 8 | 穿透力 |
+| 6 | `1⅗'` | 五次谐波 | 10 | 金属光 |
+| 7 | `1⅓'` | 六次谐波 | 12 | 尖 |
+| 8 | `1'` | 三个八度 | 16 | 最尖，独奏时用 |
+
+每根 0–8 级，**3 dB/级**：`8` = 1.0、`4` = 0.251、`1` = 0.089、`0` = 关断。默认注册
+`888000000`（16' / 5⅓' / 8'），也是真机最常见的「全下」音色。
+
+九根拉杆的顺序是按 footage 排的，不是按谐波序号——`5⅓'` 排在 `8'` 前面是因为它更低。
+
+参数（Inspector 的 organ 分区，画布节点上另有 `8'` / `perc` 两行内联）：
+
+| 参数 | 范围 | 说明 |
+| :--- | :--- | :--- |
+| `16'` … `1'` | 每根 0–8 级 | 逐根电平（3 dB/级），**实时作用于正在响的和弦**——拉杆就是演奏动作 |
+| `perc` | 0–1 | 打击泛音电平，`0` = 关 |
+| `perc decay` | 0.1–2 s | 打击泛音的 T60 |
+| `perc harmonic` | 2nd / 3rd | 打击泛音取 `4'`（2nd）还是 `2⅔'`（3rd） |
+| `attack` | 1–200 ms | 起音斜坡，防止每个音头 click |
+| `release` | 5 ms–1 s | 松键斜坡 |
+| `gain` | 0–2 | 节点输出增益 |
+
+**打击泛音（percussion）** 是音轮风琴攻击性的来源：一下键就额外叠一根 `4'` 或 `2⅔'`
+的正弦，按 `perc decay` 指数衰减到没。它加在总包络**之前**，所以松键时一起被关掉——这是
+真机行为。和真机的一处差异：真机在按住别的键时不会再触发打击（single-trigger），这里
+**每次按键都触发**，所以弹和弦时打击更厚。
+
+**力度不起作用**，这是刻意复刻真机：音轮风琴的键触点就是个开关，只有按下和松开。想要
+力度动态请换 `Mallet` 或 `Pluck`。响度靠注册 + `gain`。
+
+**滑音不内置，但白拿**：`PitchOffset` 是逐样本平滑的，接一个 `Portamento` MIDI FX 就得到
+滑音，还附带 `legato_only` / `min` / `max` 三个开关。风琴本身不做 glide。
+
+三点容易误判：
+
+- **高音区音色会变薄**。超过 Nyquist 的 drawbar 被丢掉（而不是折回低八度 foldback），
+  所以越往高音弹，上方那几根越听不见。这是刻意的：foldback 会让「注册决定音色」这个
+  直觉失效。
+- **把所有拉杆推回 0 才是静音**。留一根在 1 级也仍然发声（−21 dB），这也是真机行为。
+- **同音重按不会更响**。同一个键按两次是复用同一个声部、从当前电平重新起音，不是叠加
+  两个声部。这一点和 `Pluck` 的重拨不同（拨弦重拨是真叠加）。
+
+池子 16 个声部，第 17 个音偷最老声部（从当前电平淡出、重触发打击，不会 click）。
+九根 drawbar + `perc` / `perc decay` / `attack` / `release` / `gain` 都能接自动化曲线，
+`perc harmonic` 是离散值、不进自动化列表。九个 drawbar 全在自动化菜单里是按设计来的：
+**拉杆扫动本身就是风琴最标志性的演奏动作**。
+
 双击节点进 `Inspector`（乐器 / 效果 / 混音 / MIDI FX / LFO / Curve Map / Audio Input）；
 双击固定的 `Timeline` 节点回到编曲视图。
 
@@ -322,7 +383,7 @@ Mallets 同一路线），一个引擎覆盖四个预设：
 
 | 节点 | 面板内容 |
 | :--- | :--- |
-| 乐器 | 内置合成器的波形与滤波（Low-pass / High-pass / Band-pass / Moog 四级 ladder）、ADSR、滑音；`SoundFont` 的 bank / patch 与文件；`Sample` 的根音、增益，以及**播放窗口**（波形图上四条可拖标记：起始 / 循环起 / 循环止 / 结束，外加循环模式 Off / Forward / Ping-pong）；`Drum Kit` 的每个槽位（触发键写作 `C2 · 36`，可直接拖动换键）；`Mallet` 的预设下拉与 decay / beating / hardness / brightness / gain；`Pluck` 的 decay / damping / brightness / release / gain |
+| 乐器 | 内置合成器的波形与滤波（Low-pass / High-pass / Band-pass / Moog 四级 ladder）、ADSR、滑音；`SoundFont` 的 bank / patch 与文件；`Sample` 的根音、增益，以及**播放窗口**（波形图上四条可拖标记：起始 / 循环起 / 循环止 / 结束，外加循环模式 Off / Forward / Ping-pong）；`Drum Kit` 的每个槽位（触发键写作 `C2 · 36`，可直接拖动换键）；`Mallet` 的预设下拉与 decay / beating / hardness / brightness / gain；`Pluck` 的 decay / damping / brightness / release / gain；`Organ` 的 3×3 drawbar 网格（每根 0–8 级）、打击泛音（电平 / 衰减 / 2nd·3rd）与 attack / release / gain |
 | 效果 | 该效果的全部参数；插件效果用插件自己的 GUI（`Open Editor`） |
 | `Mixer` | 通道条：每路推子、声像、静音、独奏、电平表，加 / 减通道；输出级的声像与静音 |
 | 插件乐器 | 参数列表（可右键接到自动化）+ `Open Editor` |

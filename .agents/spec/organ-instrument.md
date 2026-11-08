@@ -1,6 +1,6 @@
 # S2：拉杆风琴声源 Spec（Organ / Drawbar）
 
-> 状态：定稿（2026-11-09）。上游：`plan.md`（Y 系列 S2，执行顺序第 5 项）、`spec/instrument.md`（synth 的声部 / note 语义）、`spec/modal-instrument.md` / `spec/pluck-instrument.md`（同一家族的声源形状：一个引擎 + 宏参数 + 单处装配）。
+> 状态：已交付（2026-11-09）。上游：`plan.md`（Y 系列 S2，执行顺序第 5 项）、`spec/instrument.md`（synth 的声部 / note 语义）、`spec/modal-instrument.md` / `spec/pluck-instrument.md`（同一家族的声源形状：一个引擎 + 宏参数 + 单处装配）。
 > 范围：**一个加法式拉杆风琴**（9 根 drawbar 正弦 + 打击泛音）。不做 scanner vibrato / chorus、不做 foldback、不做音轮漏音与键噪。
 
 ## 1. 背景
@@ -122,30 +122,30 @@ drawbar 电平实时作用于正在响的声部（拉杆就是演奏动作）；
 
 ## 8. 验收
 
-> 全部回填于实施完成时；括号里是对应的测试名。
+> 全部回填于实施完成时；括号里是对应的测试名，`→` 后是实测值。
 
-- [ ] 无音符时输出**逐样本静音**（`silent_without_a_note`）。
-- [ ] 按住一个音就发声：A4 的 RMS 落在 0.05..0.6（`a_held_note_produces_sound`）。
-- [ ] 音高准确：A4 的 Goertzel 能量在 440 Hz 处远高于邻半音 415 / 466 Hz；`PitchOffset = +12` 让峰值落到 880 Hz（`pitch_follows_the_note_and_the_offset`）。
-- [ ] 谐波结构由 drawbar 决定：只开 `8'` 时 f0 远强于 2·f0，只开 `4'` 时反过来（`drawbars_set_the_harmonic_spectrum`）。
-- [ ] `16'` 单独打开时能量落在 f0/2（`sixteen_foot_adds_the_sub_octave`）。
-- [ ] 电平阶梯是 3 dB/级：同一根在 `L = 8` 与 `L = 4` 的能量比 ≈ 12 dB（`level_taper_is_three_db_per_step`）。
-- [ ] 所有 bar 归零 = 静音，即使有音符（`all_drawbars_down_is_silent`）。
-- [ ] A/R 生效：`attack = 50 ms` 时前 10 ms 的能量显著低于 60 ms 处；`Off` 后在 `release` 时间内归零（`attack_and_release_shape_the_envelope`）。
-- [ ] `Off{n}` 释放对应声部，`Off{0}` 在 50 ms 内静音（`blanket_off_stops_everything`）。
-- [ ] 打击泛音：`percussion = 1` 时起音瞬间 3rd / 2nd 谐波有能量、0.6 s 后显著下降；`percussion = 0` 时没有这段（`percussion_adds_a_decaying_harmonic`）。
-- [ ] 打击谐波切换真的换峰：2nd 时 2·f0 强于 3·f0，3rd 时反过来（`percussion_harmonic_switches_the_peak`）。
-- [ ] 同音重按**复用槽位**（`active_voices() == 1`，不翻倍），池满第 17 个音偷最老声部且输出有限（`retrigger_reuses_the_voice` / `pool_is_bounded_and_stealing_stays_finite`）。
-- [ ] Nyquist：只开 `1'`（k = 16）时，足够高的音（16·f0 > Nyquist）输出静音（`upper_drawbars_stop_above_nyquist`）。
-- [ ] 非有限参数被拒、非法 bar 索引被拒；满幅参数（`gain = 2`、±24 半音、1 ms attack）输出无 NaN / Inf（`params_reject_non_finite` / `extreme_parameters_stay_finite`）。
-- [ ] 零力度不发声（`zero_velocity_is_silent`）。
-- [ ] 可复现：两个新实例对同一事件序列逐样本相同（`renders_are_reproducible`）。
-- [ ] 构造期容错：非法采样率不崩、不产生 NaN（`constructor_tolerates_a_bad_sample_rate`）。
-- [ ] `effect_rt_audit` 扩展：`OrganProcessor::process` / `note_event` / `set_param` 零分配（含偷声部、`Off{0}`、`PitchOffset` 重调音）。
-- [ ] model：`VoiceSpec::Organ` RON 往返、旧 payload 无字段取默认、`GraphDoc::validate` 接受（`organ_voice_round_trips_and_defaults`）。
-- [ ] 离线端到端：`--render` 出一段可听的 organ 工程（RMS > 0，`offline_render_plays_the_organ`）；GUI 导出与 CLI 逐字节一致（既有测试覆盖同一装配）。
-- [ ] **零回归**：默认工程 `--render` 与 S2 之前**逐字节一致**（detached worktree 对比，见 §10）。
-- [ ] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。
+- [x] 无音符时输出**逐样本静音**（`silent_without_a_note`）→ 全部样本精确 0.0。
+- [x] 按住一个音就发声：A4 的 RMS 落在 0.05..0.6（`a_held_note_produces_sound`）→ 默认 `888000000`：RMS **0.3062**、峰值 **0.6249**（`3 × OUTPUT_SCALE` 的理论值 0.75 减去相位不相干的损失）。
+- [x] 音高准确：A4 的 Goertzel 能量在 440 Hz 处远高于邻半音 415 / 466 Hz；`PitchOffset = +12` 让峰值落到 880 Hz（`pitch_follows_the_note_and_the_offset`）。
+- [x] 谐波结构由 drawbar 决定：只开 `8'` 时 f0 远强于 2·f0，只开 `4'` 时反过来（`drawbars_set_the_harmonic_spectrum`）→ 只开 `8'` 时 f0 / 2f0 能量比 **1 689 272**（≈ 纯正弦）。
+- [x] `16'` 单独打开时能量落在 f0/2（`sixteen_foot_adds_the_sub_octave`）。
+- [x] 电平阶梯是 3 dB/级：同一根在 `L = 8` 与 `L = 4` 的能量比 ≈ 12 dB（`level_taper_is_three_db_per_step`）→ `8 → 4` 比值 **0.251**（正好 −12.0 dB）、`8 → 1` 比值 **0.089**（−21.0 dB）。
+- [x] 所有 bar 归零 = 静音，即使有音符（`all_drawbars_down_is_silent`）。
+- [x] A/R 生效：`attack = 50 ms` 时前 10 ms 的能量显著低于 60 ms 处；`Off` 后在 `release` 时间内归零（`attack_and_release_shape_the_envelope`）。
+- [x] `Off{n}` 释放对应声部，`Off{0}` 在 50 ms 内静音（`blanket_off_stops_everything`）。
+- [x] 打击泛音：`percussion = 1` 时起音瞬间 3rd / 2nd 谐波有能量、0.6 s 后显著下降；`percussion = 0` 时没有这段（`percussion_adds_a_decaying_harmonic`）→ `percussion = 1` 早 / 晚能量比 **1 479 044**；`percussion = 0` 时早期 2 次谐波仅 **0.00054**（来自 8' 自身的尾巴，不是打击）。
+- [x] 打击谐波切换真的换峰：2nd 时 2·f0 强于 3·f0，3rd 时反过来（`percussion_harmonic_switches_the_peak`）。
+- [x] 同音重按**复用槽位**（`active_voices() == 1`，不翻倍），池满第 17 个音偷最老声部且输出有限（`retrigger_reuses_the_voice` / `pool_is_bounded_and_stealing_stays_finite`）。
+- [x] Nyquist：只开 `1'`（k = 16）时，足够高的音（16·f0 > Nyquist）输出静音（`upper_drawbars_stop_above_nyquist`）→ C8 上 `1'` 独占时峰值 **0.000000**（掩码生效，不是「很小」）。
+- [x] 非有限参数被拒、非法 bar 索引被拒；满幅参数（`gain = 2`、±24 半音、1 ms attack）输出无 NaN / Inf（`params_reject_non_finite` / `extreme_parameters_stay_finite`）。
+- [x] 零力度不发声（`zero_velocity_is_silent`）。
+- [x] 可复现：两个新实例对同一事件序列逐样本相同（`renders_are_reproducible`）。
+- [x] 构造期容错：非法采样率不崩、不产生 NaN（`constructor_tolerates_a_bad_sample_rate`）。
+- [x] `effect_rt_audit` 扩展：`OrganProcessor::process` / `note_event` / `set_param` 零分配（含偷声部、`Off{0}`、`PitchOffset` 重调音）→ 每块扫 9 根 drawbar + 6 个宏 + `PitchOffset` + note-on / note-off / `Off{0}`，计数全 0。
+- [x] model：`VoiceSpec::Organ` RON 往返、旧 payload 无字段取默认、`GraphDoc::validate` 接受（`organ_voice_round_trips_and_defaults`）。
+- [x] 离线端到端：`--render` 出一段可听的 organ 工程（RMS > 0，`offline_render_plays_the_organ`）；GUI 导出与 CLI 逐字节一致（既有测试覆盖同一装配）→ 6 s 渲染，按住窗口 RMS **0.42235**（`bars: [8; 9]` + `percussion: 0.8`），松键后 **0.00000**。
+- [x] **零回归**：默认工程 `--render` 与 S2 之前**逐字节一致**（detached worktree 对比，见 §10）→ 44288 帧 / 177196 字节，`cmp` 一致。
+- [x] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿 → **1175 passed / 0 failed**。
 
 ## 9. 风险与已知取舍
 
@@ -162,3 +162,42 @@ drawbar 电平实时作用于正在响的声部（拉杆就是演奏动作）；
 ## 10. 交付与零回归证据
 
 > 实施完成后回填。
+
+### 落地
+
+| 层 | 文件 | 改动 |
+| :--- | :--- | :--- |
+| engine | `realtime/organ.rs`（新，约 400 行实现 + 约 480 行测试） | `OrganProcessor`：单一共享相位累加器（16' 基准）+ 9 根 drawbar 的 `k` 倍数求值 + Nyquist 掩码 + 打击泛音（逐样本一极点衰减）+ A/R 包络 + 16 声部池 + 音高一极点平滑 + `set_param` |
+| engine | `realtime/commands.rs` | `ParamId::OrganBar(u8)` + 6 个宏 |
+| engine | `realtime/mod.rs` | `pub mod organ;` + re-export（`OrganProcessor`、`ORGAN_MAX_VOICES`、`DRAWBAR_COUNT`） |
+| model | `src/lib.rs` | `OrganParams` + `VoiceSpec::Organ { #[serde(default)] params }` + 7 个 `NodeParam` + 6 条 `MapSpec` + `payload_bytes` + 身份等价 |
+| ui | `lib.rs` | `ORGAN_FOOTAGES`（footage 字符串唯一来源）、`organ_param_values`（15 条）、`node_param_id`、自动化菜单、`inline_param_id` |
+| ui | `patch.rs` / `patch_ops.rs` | `InlineParam::{OrganBar8, OrganPercussion}` + `ORGAN_INLINE` + `NodeSource::Organ` + 节点标题 + `auto_param_label` |
+| ui | `headless.rs` / `engine_sync.rs` | `spawn_instrument` 的 Organ 分支（离线构造期 seed 15 条）+ `push_node_params` 重放 |
+| ui | `inspector_panel.rs` | `organ_section`（3×3 drawbar 网格 + 打击三件套 + attack / release / gain）+ 内联写回 |
+| ui | `plugin_picker.rs` / `voices.rs` | Add 菜单 `Organ` 行（内置乐器 6 → 7）+ 四处分派的「无文件」分支 |
+
+### 标识
+
+- `PROJECT_VERSION` 保持 **10**，旧工程零迁移（`VoiceSpec::Organ` 是 serde tag 加法，`#[serde(default)]` 让缺字段的旧 payload 读作默认 `888000000`）。
+- 无新 crate、无新依赖、无新文件格式。
+- 内存：每节点 `16 × 9 × 4 B` 的 bar 状态 ≈ 0.6 KB，加 1024 帧 scratch 与 16 个时间戳 = 构造期一次分配（约 5 KB）。
+
+### 零回归硬证据
+
+用 `063e650`（S2 spec commit，最后一个 pre-S2 代码状态）的 detached worktree + 独立 `CARGO_TARGET_DIR`（`target-s2-base`）编出 pre-S2 二进制，与 post-S2 对同一份 5.1 KB / 含 4 个音符的工程跑：
+
+```
+glitcherz --render <in.glz> <out.wav> --rate 22050 --bits 16 --to 1920
+```
+
+两份 WAV 各 **44288 帧 / 177196 字节，`cmp` 逐字节一致**。
+
+### 门禁
+
+| 项 | 结果 |
+| :--- | :--- |
+| `cargo fmt --all --check` | OK |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 无 error、无 warning |
+| `cargo test --workspace` | **1175 passed / 0 failed**（S2 新增 organ 19 项 + model 1 项 + 离线端到端 1 项） |
+| `cargo build --workspace` | OK |
