@@ -396,6 +396,17 @@ fn spawn_instrument<M: Media>(
             }
             (Box::new(processor), None)
         }
+        VoiceSpec::Pluck { params } => {
+            let mut processor = PluckProcessor::new(sr);
+            // Same split as the modal instrument: the live graph replays
+            // through `push_node_params`, the offline graph seeds here.
+            if !live {
+                for (id, value) in crate::pluck_param_values(params) {
+                    processor.set_param(id, value);
+                }
+            }
+            (Box::new(processor), None)
+        }
         VoiceSpec::SoundFont {
             path,
             bank,
@@ -516,7 +527,8 @@ fn spawn_effect<M: Media>(
         | VoiceSpec::DrumKit { .. }
         // Unreachable for effects (a Modal voice only ever sits on an
         // instrument node); grouped so the match stays exhaustive.
-        | VoiceSpec::Modal { .. } => {
+        | VoiceSpec::Modal { .. }
+        | VoiceSpec::Pluck { .. } => {
             let built = crate::effect::processor(params, sr);
             if live {
                 info.meter = built.meters;
@@ -1381,6 +1393,60 @@ mod tests {
         assert!(
             tail > strike * 0.05,
             "the bowl tail must still ring 4.5 s after note-off: strike {strike}, tail {tail}"
+        );
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(out);
+    }
+
+    /// S1 end-to-end: the document → assembly → graph → WAV chain must make a
+    /// pluck instrument audible with no external media, and — unlike the
+    /// struck modal voice — note-off must damp the string. That single
+    /// difference is what the release parameter exists for.
+    #[test]
+    fn offline_render_plucks_and_damps_on_note_off() {
+        let mut project = project_with_note();
+        let mut patched = false;
+        for node in &mut project.graph.nodes {
+            if let NodeDoc::Instrument {
+                track: 0, voice, ..
+            } = node
+            {
+                *voice = VoiceSpec::Pluck {
+                    params: glitcherz_model::PluckParams {
+                        decay_s: 8.0,
+                        release_s: 0.12,
+                        ..Default::default()
+                    },
+                };
+                patched = true;
+            }
+        }
+        assert!(patched, "the default project must own a track-0 instrument");
+
+        // Same window as the modal test: a 0.5 s note at 120 BPM inside a 6 s
+        // render, so note-off lands at 8.3 % of the file.
+        let options = RenderOptions {
+            sample_rate: 22_050,
+            bits: export_audio::Bits::Int16,
+            end_ticks: Some(11_520),
+        };
+        let input = save_temp(&project, "pluck");
+        let out =
+            std::env::temp_dir().join(format!("glitcherz_s1_pluck_{}.wav", std::process::id()));
+        let report = render_project_to_wav(&input, &out, options).expect("render");
+        assert!(report.frames > 0);
+        assert!(
+            wav_has_signal(&out),
+            "a pluck instrument must be born audible"
+        );
+
+        let plucked = wav_window_rms(&out, 0.015, 0.08);
+        let after = wav_window_rms(&out, 0.25, 0.35);
+        assert!(plucked > 0.01, "the pluck must be loud: {plucked}");
+        assert!(
+            after < plucked * 0.1,
+            "note-off must damp the string: plucked {plucked}, after {after}"
         );
 
         let _ = std::fs::remove_file(input);

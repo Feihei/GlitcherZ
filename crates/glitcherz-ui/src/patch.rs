@@ -67,6 +67,11 @@ pub enum InlineParam {
     ModalDecay,
     /// Modal instrument strike brightness (B1).
     ModalBrightness,
+    /// Plucked-string fundamental T60 (S1): the "how long does it ring"
+    /// control, the one most worth having on the node body.
+    PluckDecay,
+    /// Plucked-string loop damping (S1).
+    PluckDamping,
 }
 
 /// How an inline row is presented (U13). Discrete selectors such as a
@@ -128,6 +133,19 @@ const MODAL_INLINE: [InlineParamSpec; 2] = [
     InlineParamSpec {
         param: InlineParam::ModalBrightness,
         label: "bright",
+    },
+];
+
+/// Pluck inline rows (S1): decay and damping. Brightness / release / gain
+/// live in the Inspector — same rule as the modal node.
+const PLUCK_INLINE: [InlineParamSpec; 2] = [
+    InlineParamSpec {
+        param: InlineParam::PluckDecay,
+        label: "decay",
+    },
+    InlineParamSpec {
+        param: InlineParam::PluckDamping,
+        label: "damp",
     },
 ];
 
@@ -210,6 +228,10 @@ fn inline_params_of(node: &NodeDoc) -> Vec<InlineParamSpec> {
             voice: VoiceSpec::Modal { .. },
             ..
         } => MODAL_INLINE.to_vec(),
+        NodeDoc::Instrument {
+            voice: VoiceSpec::Pluck { .. },
+            ..
+        } => PLUCK_INLINE.to_vec(),
         // Table-driven from the engine descriptor (spec `effects.md` D6): the
         // row order, labels and count all come from the effect's static table.
         // Only slots flagged `INLINE` get a row — an eight-parameter EQ would
@@ -410,6 +432,22 @@ fn inline_doc_value(node: &NodeDoc, param: InlineParam) -> (f64, f64, f64) {
             },
             InlineParam::ModalBrightness,
         ) => (f64::from(params.brightness), 0.0, 1.0),
+        // S1: the two pluck rows read the same document fields the Inspector
+        // sliders edit.
+        (
+            NodeDoc::Instrument {
+                voice: VoiceSpec::Pluck { params },
+                ..
+            },
+            InlineParam::PluckDecay,
+        ) => (f64::from(params.decay_s), 0.1, 20.0),
+        (
+            NodeDoc::Instrument {
+                voice: VoiceSpec::Pluck { params },
+                ..
+            },
+            InlineParam::PluckDamping,
+        ) => (f64::from(params.damping), 0.0, 1.0),
         _ => (0.0, 0.0, 1.0),
     }
 }
@@ -580,6 +618,9 @@ pub enum NodeSource {
     /// vibraphone / bell / singing bowl. Born audible — the preset tables are
     /// built in, so there is no file to pick.
     Modal,
+    /// Plucked string (S1, spec `pluck-instrument.md`): Karplus-Strong.
+    /// Born audible for the same reason — the string is the engine.
+    Pluck,
     /// CLAP instrument plugin.
     ClapInstrument {
         /// Module path.
@@ -1880,6 +1921,7 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 VoiceSpec::Modal { params } => {
                     format!("MALLET · {} · Track {}", params.preset.label(), track + 1)
                 }
+                VoiceSpec::Pluck { .. } => format!("PLUCK · Track {}", track + 1),
                 VoiceSpec::Clap { plugin_id, .. } => {
                     format!("♪ {}", truncate(plugin_id, 16))
                 }
@@ -1898,7 +1940,8 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 | VoiceSpec::SoundFont { .. }
                 | VoiceSpec::Sample { .. }
                 | VoiceSpec::DrumKit { .. }
-                | VoiceSpec::Modal { .. } => {
+                | VoiceSpec::Modal { .. }
+                | VoiceSpec::Pluck { .. } => {
                     format!("{} · Track {}", params.kind().label(), track + 1)
                 }
                 VoiceSpec::Clap { plugin_id, .. } => {
@@ -2022,6 +2065,11 @@ pub(crate) fn auto_param_label(param: &AutoParam) -> String {
             NodeParam::ModalHardness => "Hardness".to_string(),
             NodeParam::ModalBrightness => "Brightness".to_string(),
             NodeParam::ModalGain => "Gain".to_string(),
+            NodeParam::PluckDecay => "Decay".to_string(),
+            NodeParam::PluckDamping => "Damping".to_string(),
+            NodeParam::PluckBrightness => "Brightness".to_string(),
+            NodeParam::PluckRelease => "Release".to_string(),
+            NodeParam::PluckGain => "Gain".to_string(),
         },
     }
 }

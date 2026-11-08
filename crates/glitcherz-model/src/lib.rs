@@ -367,6 +367,63 @@ impl Default for ModalParams {
     }
 }
 
+/// Plucked-string parameters (spec `pluck-instrument.md` §5).
+///
+/// Five macros, all continuous — no preset enum: a pluck "preset" would only
+/// be a combination of these scalars and would go stale the moment one of
+/// them moves (S1-D7). Every field is `serde(default)`, so a payload written
+/// by an older build still loads.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PluckParams {
+    /// Fundamental T60 in seconds (0.1..20).
+    #[serde(default = "default_pluck_decay")]
+    pub decay_s: f32,
+    /// Loop low-pass darkness (0..1): `0` keeps `32·f0`, `1` leaves `4·f0`.
+    #[serde(default = "default_pluck_damping")]
+    pub damping: f32,
+    /// Excitation low-pass (0..1); affects the next pluck only.
+    #[serde(default = "default_pluck_brightness")]
+    pub brightness: f32,
+    /// Note-off damper T60 in seconds (0.005..2).
+    #[serde(default = "default_pluck_release")]
+    pub release_s: f32,
+    /// Node output gain (0..2).
+    #[serde(default = "default_pluck_gain")]
+    pub gain: f32,
+}
+
+fn default_pluck_decay() -> f32 {
+    4.0
+}
+
+fn default_pluck_damping() -> f32 {
+    0.35
+}
+
+fn default_pluck_brightness() -> f32 {
+    0.6
+}
+
+fn default_pluck_release() -> f32 {
+    0.15
+}
+
+fn default_pluck_gain() -> f32 {
+    1.0
+}
+
+impl Default for PluckParams {
+    fn default() -> Self {
+        Self {
+            decay_s: default_pluck_decay(),
+            damping: default_pluck_damping(),
+            brightness: default_pluck_brightness(),
+            release_s: default_pluck_release(),
+            gain: default_pluck_gain(),
+        }
+    }
+}
+
 /// Per-track delay effect parameters (`mix = 0` means bypass).
 ///
 /// E4 added the stereo/tempo fields; they are additive (`serde(default)`), so
@@ -2196,6 +2253,13 @@ pub enum VoiceSpec {
         #[serde(default)]
         params: ModalParams,
     },
+    /// Plucked string (S1, spec `pluck-instrument.md`): Karplus-Strong delay
+    /// line. No external file, no "born empty" state — the string is there
+    /// the moment the node is.
+    Pluck {
+        #[serde(default)]
+        params: PluckParams,
+    },
     /// CLAP plugin: dynamic library path + plugin ID (instantiated on the
     /// non-real-time thread).
     Clap {
@@ -2527,6 +2591,16 @@ pub enum NodeParam {
     ModalBrightness,
     /// Modal instrument output gain (0..2).
     ModalGain,
+    /// Plucked string: fundamental T60 in seconds (0.1..20; S1-D10).
+    PluckDecay,
+    /// Plucked string: loop low-pass darkness (0..1).
+    PluckDamping,
+    /// Plucked string: excitation low-pass (0..1; next pluck only).
+    PluckBrightness,
+    /// Plucked string: note-off damper T60 in seconds (0.005..2).
+    PluckRelease,
+    /// Plucked string: node output gain (0..2).
+    PluckGain,
 }
 
 /// Which control of a mixer channel a curve drives ([`NodeParam::MixerChannel`]).
@@ -2782,6 +2856,10 @@ pub fn node_param_map(param: NodeParam, graph: &GraphDoc, target: &PortRef) -> M
         NodeParam::ModalBeating => MapSpec::linear(0.0, 2.0),
         NodeParam::ModalHardness | NodeParam::ModalBrightness => MapSpec::linear(0.0, 1.0),
         NodeParam::ModalGain => MapSpec::linear(0.0, 2.0),
+        NodeParam::PluckDecay => MapSpec::linear(0.1, 20.0),
+        NodeParam::PluckDamping | NodeParam::PluckBrightness => MapSpec::linear(0.0, 1.0),
+        NodeParam::PluckRelease => MapSpec::linear(0.005, 2.0),
+        NodeParam::PluckGain => MapSpec::linear(0.0, 2.0),
     }
 }
 
@@ -3987,6 +4065,7 @@ impl VoiceSpec {
                     + slots.iter().map(|slot| slot.path.len()).sum::<usize>()
             }
             VoiceSpec::Modal { .. } => std::mem::size_of::<ModalParams>(),
+            VoiceSpec::Pluck { .. } => std::mem::size_of::<PluckParams>(),
             VoiceSpec::Clap {
                 path,
                 plugin_id,
@@ -5429,6 +5508,10 @@ fn node_engine_identity_eq(a: &NodeDoc, b: &NodeDoc) -> bool {
 fn voice_engine_identity_eq(a: &VoiceSpec, b: &VoiceSpec) -> bool {
     match (a, b) {
         (VoiceSpec::Builtin, VoiceSpec::Builtin) => true,
+        // No file to reload: every difference is a replayed parameter, so the
+        // running engine (including its ringing voices) must survive an edit.
+        (VoiceSpec::Modal { .. }, VoiceSpec::Modal { .. })
+        | (VoiceSpec::Pluck { .. }, VoiceSpec::Pluck { .. }) => true,
         (VoiceSpec::SoundFont { path: pa, .. }, VoiceSpec::SoundFont { path: pb, .. }) => pa == pb,
         (VoiceSpec::Sample { path: pa, .. }, VoiceSpec::Sample { path: pb, .. }) => pa == pb,
         (VoiceSpec::DrumKit { slots: sa, .. }, VoiceSpec::DrumKit { slots: sb, .. }) => {
@@ -6258,6 +6341,52 @@ mod tests {
         graph
             .validate(2, 0)
             .expect("a modal instrument must validate");
+    }
+
+    /// S1: the pluck voice is additive too — a graph written before the
+    /// variant existed loads with the documented defaults, and the payload
+    /// round-trips through RON without losing a parameter.
+    #[test]
+    fn pluck_voice_round_trips_and_defaults() {
+        let params = super::PluckParams {
+            decay_s: 6.5,
+            damping: 0.7,
+            ..Default::default()
+        };
+        let node = NodeDoc::Instrument {
+            node_id: 2,
+            track: 0,
+            voice: VoiceSpec::Pluck { params },
+            synth: SynthParams::default(),
+        };
+        let text = ron::to_string(&node).expect("serialize");
+        assert!(text.contains("pluck"), "voice tag missing: {text}");
+        let back: NodeDoc = ron::from_str(&text).expect("deserialize");
+        assert_eq!(node, back);
+
+        // A bare payload loads with the documented defaults.
+        let legacy: NodeDoc =
+            ron::from_str(r#"(type:"instrument", node_id:3, track:0, voice:(type:"pluck"))"#)
+                .expect("a bare pluck payload should parse");
+        let NodeDoc::Instrument {
+            voice: VoiceSpec::Pluck { params },
+            ..
+        } = legacy
+        else {
+            panic!("expected a pluck instrument");
+        };
+        assert_eq!(params, super::PluckParams::default());
+        assert!((params.decay_s - 4.0).abs() < 1e-6);
+        assert!((params.release_s - 0.15).abs() < 1e-6);
+
+        let graph = GraphDoc {
+            nodes: vec![node],
+            cables: vec![CableDoc::audio(2u64, PortRef::Master)],
+            ..Default::default()
+        };
+        graph
+            .validate(2, 0)
+            .expect("a pluck instrument must validate");
     }
 
     // E1: the effect payload's tag *is* the kind (D1), and the legacy sibling

@@ -252,6 +252,22 @@ impl GlitcherZApp {
                 if let Some(params) = modal_state {
                     self.modal_section(ui, instr_id, &params);
                 }
+                // S1: plucked-string macros (decay / damping / brightness /
+                // release / gain).
+                let pluck_state = self
+                    .project()
+                    .graph
+                    .node_by_id(instr_id)
+                    .and_then(|n| match n {
+                        NodeDoc::Instrument {
+                            voice: VoiceSpec::Pluck { params },
+                            ..
+                        } => Some(*params),
+                        _ => None,
+                    });
+                if let Some(params) = pluck_state {
+                    self.pluck_section(ui, instr_id, &params);
+                }
                 // Effects are added from the graph only (Add ▸ Effect, or the
                 // cable-midpoint insert — spec `plugin-browser.md` D12); the
                 // track-level "clear" shortcut sits above the effect list.
@@ -1871,6 +1887,107 @@ impl GlitcherZApp {
         }
     }
 
+    /// Plucked string (S1, spec `pluck-instrument.md`): five macros. `decay`
+    /// and `damping` are also the two inline rows; the rest live here only.
+    pub(crate) fn pluck_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc_id: u64,
+        params: &glitcherz_model::PluckParams,
+    ) {
+        ui.separator();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.strong("Plucked String");
+            ui.weak("— Karplus-Strong; note-off damps the string");
+        });
+
+        let rows: [(&str, f32, f32, ParamId, &str, &str); 5] = [
+            (
+                "Decay",
+                0.1,
+                20.0,
+                ParamId::PluckDecay,
+                "pluck-decay",
+                "Fundamental T60 in seconds",
+            ),
+            (
+                "Damping",
+                0.0,
+                1.0,
+                ParamId::PluckDamping,
+                "pluck-damping",
+                "Loop low-pass · darker and shorter as it rises",
+            ),
+            (
+                "Brightness",
+                0.0,
+                1.0,
+                ParamId::PluckBrightness,
+                "pluck-brightness",
+                "Excitation low-pass · affects the next pluck only",
+            ),
+            (
+                "Release",
+                0.005,
+                2.0,
+                ParamId::PluckRelease,
+                "pluck-release",
+                "Note-off damper T60",
+            ),
+            (
+                "Gain",
+                0.0,
+                2.0,
+                ParamId::PluckGain,
+                "pluck-gain",
+                "Node output trim",
+            ),
+        ];
+        let mut values = [
+            params.decay_s,
+            params.damping,
+            params.brightness,
+            params.release_s,
+            params.gain,
+        ];
+        let mut changed: Vec<(usize, f32)> = Vec::new();
+        egui::Grid::new(format!("pluck_grid_{doc_id}"))
+            .num_columns(2)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| {
+                for (index, (label, min, max, _, _, tooltip)) in rows.iter().enumerate() {
+                    ui.label(*label);
+                    let response = ui
+                        .add(egui::Slider::new(&mut values[index], *min..=*max).fixed_decimals(2))
+                        .on_hover_text(*tooltip);
+                    if response.changed() {
+                        changed.push((index, values[index]));
+                    }
+                    ui.end_row();
+                }
+            });
+        for (index, value) in changed {
+            let before = self.begin_param_edit();
+            if let Some(NodeDoc::Instrument {
+                voice: VoiceSpec::Pluck { params },
+                ..
+            }) = self.project_mut().graph.node_by_id_mut(doc_id)
+            {
+                match index {
+                    0 => params.decay_s = value.clamp(0.1, 20.0),
+                    1 => params.damping = value.clamp(0.0, 1.0),
+                    2 => params.brightness = value.clamp(0.0, 1.0),
+                    3 => params.release_s = value.clamp(0.005, 2.0),
+                    4 => params.gain = value.clamp(0.0, 2.0),
+                    _ => {}
+                }
+            }
+            self.commit_param_edit(rows[index].0, before, rows[index].4);
+            self.send_node_param(doc_id, rows[index].3, value);
+        }
+    }
+
     pub(crate) fn drum_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -2343,6 +2460,30 @@ impl GlitcherZApp {
                         params.brightness = value.clamp(0.0, 1.0);
                     }
                     self.commit_param_edit("Modal Brightness", before, "modal-brightness");
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::PluckDecay => {
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Instrument {
+                        voice: VoiceSpec::Pluck { params },
+                        ..
+                    }) = self.project_mut().graph.node_by_id_mut(node)
+                    {
+                        params.decay_s = value.clamp(0.1, 20.0);
+                    }
+                    self.commit_param_edit("Pluck Decay", before, "pluck-decay");
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::PluckDamping => {
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Instrument {
+                        voice: VoiceSpec::Pluck { params },
+                        ..
+                    }) = self.project_mut().graph.node_by_id_mut(node)
+                    {
+                        params.damping = value.clamp(0.0, 1.0);
+                    }
+                    self.commit_param_edit("Pluck Damping", before, "pluck-damping");
                     self.send_node_param(node, inline_param_id(p), value);
                 }
                 patch::InlineParam::Sf2Gain => {

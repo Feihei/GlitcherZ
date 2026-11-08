@@ -29,7 +29,7 @@ use glitcherz_engine::realtime::processor::Processor;
 use glitcherz_engine::realtime::{
     BitcrusherProcessor, ChorusProcessor, CompressorProcessor, DelayProcessor, EffectMeters,
     EqProcessor, FlangerProcessor, LimiterProcessor, ModalProcessor, PhaserProcessor,
-    ReverbProcessor, RingModProcessor, SaturationProcessor, VocoderProcessor,
+    PluckProcessor, ReverbProcessor, RingModProcessor, SaturationProcessor, VocoderProcessor,
 };
 
 // ---------------------------------------------------------------------------
@@ -318,6 +318,40 @@ fn built_in_effects_are_allocation_free() {
     }
     modal.note_event(NoteEvent::Off { note: 0 });
     assert_zero_alloc(&scope, "ModalProcessor process/note_event/set_param");
+
+    // S1: the pluck engine is a generator as well. `new` builds the 16 delay
+    // rings and the mono scratch (about 1 MiB, control thread); everything the
+    // audio thread touches afterwards — including the excitation fill and the
+    // pool's voice stealing — must be preallocated.
+    let mut pluck = PluckProcessor::new(SR);
+    let mut pluck_buffer = fixture();
+    for block in 0..2 {
+        pluck.note_event(NoteEvent::On {
+            note: 55 + block as u8,
+            velocity: 0.9,
+        });
+        pluck.process(&ctx(), &mut pluck_buffer);
+    }
+    let scope = AuditScope::begin();
+    for block in 0..64 {
+        pluck.set_param(ParamId::PluckDecay, 0.5 + (block as f32) * 0.2);
+        pluck.set_param(ParamId::PluckDamping, (block as f32 * 0.13).sin().abs());
+        pluck.set_param(ParamId::PluckBrightness, 1.0 - (block % 5) as f32 * 0.2);
+        pluck.set_param(ParamId::PluckRelease, 0.02 + (block as f32) * 0.01);
+        pluck.set_param(ParamId::PluckGain, 0.8);
+        pluck.set_param(ParamId::PitchOffset, (block as f32 * 0.29).sin() * 12.0);
+        pluck.note_event(NoteEvent::On {
+            note: 36 + (block % 36) as u8,
+            velocity: 1.0,
+        });
+        pluck.process(&ctx(), &mut pluck_buffer);
+        pluck.note_event(NoteEvent::Off {
+            note: 36 + (block % 36) as u8,
+        });
+    }
+    // The blanket sentinel takes the bulk-damp branch.
+    pluck.note_event(NoteEvent::Off { note: 0 });
+    assert_zero_alloc(&scope, "PluckProcessor process/note_event/set_param");
 
     // Z2: 16 bands x 2 banks per channel, all of them fixed-size arrays. The
     // audit alternates the parameter set so the per-block coefficient rebuild

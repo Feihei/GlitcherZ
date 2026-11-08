@@ -45,9 +45,9 @@ use glitcherz_engine::realtime::{
     FeedbackProcessor, InputProcessor, LfoProcessor, MAX_AUTO_POINTS, MAX_MIDI_FANOUT,
     MAX_TRACK_CLIPS, MapMode as EngineMapMode, MapSpec as EngineMapSpec, MidiClipTable,
     MidiEnvelopeProcessor, MixerChannel as EngineMixerChannel, MixerProcessor, ModalProcessor,
-    NodeKind, NoteEvent, ParamId, PortamentoProcessor, Processor, RtAudioClip, RtAutoPoint,
-    RtAutomation, RtControlClip, RtCtrl, RtCtrlKind, RtCurveInterp, RtMidiClip, RtNote,
-    SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor,
+    NodeKind, NoteEvent, ParamId, PluckProcessor, PortamentoProcessor, Processor, RtAudioClip,
+    RtAutoPoint, RtAutomation, RtControlClip, RtCtrl, RtCtrlKind, RtCurveInterp, RtMidiClip,
+    RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor,
     SilentProcessor, SynthProcessor, Unit, empty_clip_table, empty_midi_clip_table,
     mode_value as curve_mode_value,
 };
@@ -57,9 +57,9 @@ use glitcherz_model::{
     CtrlKind, CurveInterp, CurveMapParams, EffectParams, GraphDoc, LFO_DIVISION_LABELS, LfoParams,
     LfoWaveform, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS,
     MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip,
-    MidiEnvelopeParams, MidiSource, MidiTrack, ModalParams, NodeDoc, NodeParam, Note, PortRef,
-    PortamentoParams, Project, SamplePlayMode, SongLoop, SynthParams, SynthWaveform, TrackKind,
-    VoiceSpec,
+    MidiEnvelopeParams, MidiSource, MidiTrack, ModalParams, NodeDoc, NodeParam, Note, PluckParams,
+    PortRef, PortamentoParams, Project, SamplePlayMode, SongLoop, SynthParams, SynthWaveform,
+    TrackKind, VoiceSpec,
 };
 
 pub mod autosave;
@@ -342,6 +342,18 @@ pub(crate) fn modal_param_values(params: &ModalParams) -> [(ParamId, f32); 6] {
     ]
 }
 
+/// Every engine parameter of a plucked-string payload (S1-D11): the live
+/// document push and the offline export seed both walk this table.
+pub(crate) fn pluck_param_values(params: &PluckParams) -> [(ParamId, f32); 5] {
+    [
+        (ParamId::PluckDecay, params.decay_s),
+        (ParamId::PluckDamping, params.damping),
+        (ParamId::PluckBrightness, params.brightness),
+        (ParamId::PluckRelease, params.release_s),
+        (ParamId::PluckGain, params.gain),
+    ]
+}
+
 /// Document automation parameter → engine parameter ID.
 ///
 /// `None` for [`AutoParam::Tempo`] (the engine route uses the Timeline In
@@ -592,6 +604,11 @@ fn node_param_id(param: NodeParam) -> ParamId {
         NodeParam::ModalHardness => ParamId::ModalHardness,
         NodeParam::ModalBrightness => ParamId::ModalBrightness,
         NodeParam::ModalGain => ParamId::ModalGain,
+        NodeParam::PluckDecay => ParamId::PluckDecay,
+        NodeParam::PluckDamping => ParamId::PluckDamping,
+        NodeParam::PluckBrightness => ParamId::PluckBrightness,
+        NodeParam::PluckRelease => ParamId::PluckRelease,
+        NodeParam::PluckGain => ParamId::PluckGain,
     }
 }
 
@@ -678,6 +695,21 @@ fn node_auto_options(
                 ("Hardness", NodeParam::ModalHardness),
                 ("Brightness", NodeParam::ModalBrightness),
                 ("Gain", NodeParam::ModalGain),
+            ] {
+                options.push((label.to_string(), AutoParam::Node(param)));
+            }
+        }
+        // S1: every pluck macro is continuous, so all five are automatable.
+        NodeDoc::Instrument {
+            voice: VoiceSpec::Pluck { .. },
+            ..
+        } => {
+            for (label, param) in [
+                ("Decay", NodeParam::PluckDecay),
+                ("Damping", NodeParam::PluckDamping),
+                ("Brightness", NodeParam::PluckBrightness),
+                ("Release", NodeParam::PluckRelease),
+                ("Gain", NodeParam::PluckGain),
             ] {
                 options.push((label.to_string(), AutoParam::Node(param)));
             }
@@ -851,6 +883,8 @@ fn inline_param_id(p: patch::InlineParam) -> ParamId {
         patch::InlineParam::InputChannel => ParamId::InputChannel,
         patch::InlineParam::ModalDecay => ParamId::ModalDecay,
         patch::InlineParam::ModalBrightness => ParamId::ModalBrightness,
+        patch::InlineParam::PluckDecay => ParamId::PluckDecay,
+        patch::InlineParam::PluckDamping => ParamId::PluckDamping,
     }
 }
 

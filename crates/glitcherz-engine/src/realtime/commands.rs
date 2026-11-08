@@ -250,6 +250,16 @@ pub enum ParamId {
     /// Modal instrument: node output gain (linear, clamped 0..2; applies to
     /// every sounding voice).
     ModalGain,
+    /// Plucked string: fundamental T60 in seconds (0.1..20; S1-D9).
+    PluckDecay,
+    /// Plucked string: loop low-pass darkness (0..1; 1 = `4·f0`, 0 = `32·f0`).
+    PluckDamping,
+    /// Plucked string: excitation low-pass (0..1); affects the next pluck.
+    PluckBrightness,
+    /// Plucked string: note-off damper T60 in seconds (0.005..2).
+    PluckRelease,
+    /// Plucked string: node output gain (0..2).
+    PluckGain,
 }
 
 /// Note event (MIDI semantics). `note` is the MIDI note number (69 = A4),

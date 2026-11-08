@@ -775,7 +775,7 @@ impl GlitcherZApp {
                 | VoiceSpec::SoundFont { .. }
                 | VoiceSpec::Sample { .. }
                 | VoiceSpec::DrumKit { .. } => None,
-                VoiceSpec::Modal { .. } => None,
+                VoiceSpec::Modal { .. } | VoiceSpec::Pluck { .. } => None,
             },
             _ => None,
         }
@@ -853,7 +853,7 @@ impl GlitcherZApp {
                 | VoiceSpec::SoundFont { .. }
                 | VoiceSpec::Sample { .. }
                 | VoiceSpec::DrumKit { .. } => {}
-                VoiceSpec::Modal { .. } => {}
+                VoiceSpec::Modal { .. } | VoiceSpec::Pluck { .. } => {}
             }
         }
         self.commit_edit("Load Preset", before);
@@ -924,7 +924,7 @@ impl GlitcherZApp {
                 | VoiceSpec::SoundFont { .. }
                 | VoiceSpec::Sample { .. }
                 | VoiceSpec::DrumKit { .. } => {}
-                VoiceSpec::Modal { .. } => {}
+                VoiceSpec::Modal { .. } | VoiceSpec::Pluck { .. } => {}
             }
         }
         self.commit_edit("Reset Preset", before);
@@ -1021,7 +1021,7 @@ impl GlitcherZApp {
                     | VoiceSpec::SoundFont { .. }
                     | VoiceSpec::Sample { .. }
                     | VoiceSpec::DrumKit { .. } => None,
-                    VoiceSpec::Modal { .. } => None,
+                    VoiceSpec::Modal { .. } | VoiceSpec::Pluck { .. } => None,
                 },
                 _ => None,
             })
