@@ -1115,3 +1115,24 @@ spec `.agents/spec/dual-audio-input.md`。目标不是「加一个效果器」�
 **用户可见的坑（已写进 `docs/manual.md`）**：调制源**不要**再接 `Master`。D6 规定悬空节点照常执行但输出无人消费即静音，所以调制源只需连到 Dual 节点的 `Mod` 口；多连一根到 master 会把原始载波漏进主输出。
 
 **验收**：新增 8 项 `graph.rs` 图级测试、1 项 model 校验 / RON 往返、1 项 `headless.rs` 离线渲染端到端（无 Mod 静音 / 有 Mod 出声）、`effect_rt_audit` 的双口零分配断言、Ring Mod 5 项单测；`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。**零回归**：`9edaebf` worktree 编出的 pre-Z0 二进制与 post-Z0 二进制对同一默认工程渲染，两份 WAV 各 44288 帧 / 177196 字节，`cmp` 逐字节一致。
+
+## Z1：侧链压缩 Sidechain Comp（2026-11-08）
+
+spec `.agents/spec/sidechain-compressor.md`。Z0 的第一个真实消费者：检测源从节点自己的输入换到 `Mod` 口。
+
+**为什么不改 `Compressor`**：端口剖面是**种类**属性（Z0-D2 的 `params.kind().audio_inputs()`）。把现有压缩器改成双口，旧工程里每个压缩器都会变成 `NodeKind::Dual`，而 D19 规定 Dual 即使只有一条入边也不旁路——旧工程删除压缩器会断链。所以新增 `BuiltinEffectKind::SidechainCompressor`（label `"Sidechain Comp"`），`Compressor` 的参数表、逐样本行为、删除语义保持原样。
+
+**一个 struct 服务两张参数表**：`EffectParamBank` 对越界槽返回 `0.0` / `false`（`bank.rs:58-87`），所以普通压缩器没有 slot 8 时 `is_on(SLOT_SIDECHAIN)` 恒为 `false`，`run` 里一句 `key.filter(|_| self.params.is_on(SLOT_SIDECHAIN))` 就同时覆盖两种种类。参数表用 `const fn sidechain_params()` 在 `BASE_PARAMS` 之上追加第 9 项，避免复制 8 行 `ParamSpec`。
+
+**`process` / `process_with_aux` 收敛到 `run(buffer, key)`**：原来的 `process` 主体整体挪进 `run`，`linked` 分支的 `max(|L|,|R|)` 抽成 `stereo_peak()`，两声道增益应用抽成 `apply_gain()`。侧链分支与 `linked` 分支形状相同，只是峰值来自 `key`。`aux` 可能比 `frames` 短（离线渲染最后一块），`stereo_peak` 用 `get()` 越界读 0，不 panic 不分配。
+
+**静音键控不回落内部检测（修订 Z0 的 Z-D12）**：`aux` 在未接线时是静音缓冲而非 `None`，处理器无法区分「没接线」和「接了静音源」。两者都应当**不压缩**——键控源安静时放行正是侧链要的效果，回落会在 kick 的空隙里抽吸 bass。想回退内部检测是显式操作：把 `sidechain` 开关关掉（slot 8，默认 on）。
+
+**侧链语义**：检测源 `max(|L|, |R|)` 单探测器，一个 GR 同时作用于两个输出声道（键控是控制信号，不是音频路径）；侧链模式下 `stereo_link` 不参与。增益计算、GR 平滑、makeup、mix、GR 表全部沿用 E2b，`latency_samples()` 仍为 0。
+
+**model 层**：`CompressorParams` 加 `sidechain: bool`（`serde(default = "default_true")`），`EffectParams::SidechainCompressor(Box<CompressorParams>)` 与 `Compressor` 共享 struct——重复 8 个字段的独立 struct 维护成本更高；普通压缩器上该字段不可达（descriptor 无该槽，Inspector 不显示，`set` 返回 `false`），只是 serde 写出一份无害默认值。参数轴表补 slot 8 → `M::linear(0.0, 1.0)`。
+
+**画布零改动**：`NodeDoc::audio_inputs()` 的既有条件（`voice == Builtin && params.kind().audio_inputs() == 2`）自动把新种类认成双口，`patch.rs` / `patch_ops.rs` 不需要任何分支。
+
+**验收**：8 项压缩器单测（键控跟随 Mod、静音键控逐样本直通、`sidechain = 0` 与普通压缩器逐样本一致、GR 与 program 电平无关、键控不串音、普通表无 slot 8）、1 项图级（`sidechain_compressor_is_keyed_by_the_mod_port`）、1 项 model 校验与 RON 往返（含旧 payload 默认开键控）、1 项离线端到端（dry / wet / internal 三方 RMS）、`effect_rt_audit` 侧链路径零分配。**零回归**：`aaeb958` worktree + 独立 `CARGO_TARGET_DIR` 编出 pre-Z1 二进制，与 post-Z1 对同一默认工程 `--render --rate 22050 --bits 16 --to 1920`，两份 WAV `cmp` 逐字节一致。
+

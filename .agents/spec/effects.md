@@ -246,6 +246,23 @@ GR 表（E2b 收尾项）：`Arc<EffectMeters> { gr_db: AtomicF32, out_peak_l/r:
 构造期由节点持有、UI 按文档 node_id 查表读取；每块写一次，沿用 `AtomicF32` 的
 `Relaxed` 语义。**不做**动态注册表——meter 句柄随节点生命周期走。
 
+### Z1 Sidechain Compressor（`sidechain_compressor`）
+
+E2b 的双口变体（完整 spec 见 `sidechain-compressor.md`）：`Main` 是被压缩的声部，`Mod`
+是键控源。增益计算、GR 平滑、makeup、mix、GR 表全部复用 E2b，**唯一区别是检测源**：
+`sidechain = 1` 时峰值取自 `Mod` 口（`max(|L|, |R|)`，单探测器，一个 GR 作用于两声道），
+`0` 时回落内部检测。它是独立的效果器种类而不是 `compressor` 的一个开关，因为**端口剖面
+是种类的属性**：把 `Compressor` 改成双口会让旧工程里所有压缩器失去删除旁路（`node-graph.md` D19）。
+
+参数表 = E2b 的 0–7 逐项相同，追加：
+
+| # | 参数 | 范围 | 单位 | 曲线 | 平滑 | 速率 |
+| :-- | :-- | :-- | :-- | :-- | :-- | :-- |
+| 8 | `sidechain` | 0/1 | bool | —— | 0（吸附） | Block |
+
+**键控源静音时不压缩，绝不回落内部检测**——否则键控空隙会突然抽吸主信号。零延迟、
+`PROJECT_VERSION` 不动；不做键控 HPF / listen / lookahead / 自动 makeup / 侧链电平表。
+
 ### E3 Reverb（`reverb`）
 
 **FDN-8**（8 条延迟线 + Hadamard 反馈矩阵 + 每线一阶阻尼 + 低切），不用 Freeverb：
@@ -377,6 +394,7 @@ D16 的 `latency_samples()` 口子接入 S2-3 落地的图级 PDC。实施细节
 - **不做** Echo 节点、Gain 节点（D17）。
 - **Z0 已解除原 sidechain 边界（2026-11-08）**：原文「不做每效果的 sidechain 输入（压缩器外部键控需要图的新端口类型，另立项）」中的「另立项」即 `spec/dual-audio-input.md` —— 图已提供 `Main` / `Mod` 两个音频输入口，Z1 侧链压缩、Z2 Vocoder 复用该基建。E 系列本身仍不新增 sidechain 参数；新增的 `Ring Mod` 属于 Z0 验收样例，不归 E 系列排期。
 - **不做** 效果的 L/R 完全独立参数（除联动开关）；EQ 单套参数。
+- **Z1 已交付首次消费（2026-11-08）**：`sidechain_compressor` 复用 `Main`/`Mod` 双口做外部键控，见 §E2b 之后一节与 `sidechain-compressor.md`；键控 HPF / listen / lookahead 仍不做。
 - **不做** 延迟时间的分数采样插值（v1 整数抽头 + 块率平滑）；调制效果内部用插值，两者不冲突。
 - **不做** 尾音冻结 / 节点自动休眠（mix 为 0 仍跑湿路径，见 §6）。
 - **不做** 自动化的离散参数（`STEREO_LINK` 等 `smoothing_ms = 0` 的槽位不进自动化菜单）。

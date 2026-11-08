@@ -707,7 +707,7 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | :--- | :--- | :--- | :--- | :--- |
 | **B1** | Modal 声源（Mallet / Singing Bowl） | 小–中 | 无（S0 装配已就位） | 高 Q 谐振器数值稳定、长尾音的 voice 生命周期 / 偷声部策略 |
 | **Z0** | 双音频输入口基建 | 中–大 | 无 | 触碰 `process_block` + PDC + 文档校验 + 画布，是实时铁律最敏感处 |
-| **Z1** | 侧链压缩 | 小 | Z0 | 复用现成 detector / GR 表，几乎无算法风险 |
+| ~~**Z1**~~ ✅ | 侧链压缩（已交付 2026-11-08） | 小 | Z0 | 复用现成 detector / GR 表，几乎无算法风险 |
 | **Z2** | Vocoder | 大 | Z0（最好经 Z1 验证 aux） | 滤波器组全预分配、RT 零分配、两路相位对齐 |
 
 ### 执行顺序（当前唯一有效顺序；Y 系列编号保留为历史记录）
@@ -715,7 +715,7 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | # | 阶段 | 为什么在这个位置 |
 | :--- | :--- | :--- |
 | 1 | **Z0** 双口基建 | 用户 2026-11-08 拍板「架构优先」：唯一碰实时图核心的重活，先在**没有其它并行改动**的干净基线上单独 spec + 单独 commit + 全量门禁做完，后面所有双口效果器才不会返工。 |
-| 2 | **Z1** 侧链压缩 | Z0 的第一个真实消费者兼**验收钉子**：复用现成 `CompressorProcessor`，改动小，立刻证明 aux 在实时 / 离线两条路径都通。Z0 自带的 Ring Mod 只是数学样例，Z1 才是用户要的效果。 |
+| 2 | **Z1** 侧链压缩 ✅ | 已交付。Z0 的第一个真实消费者兼**验收钉子**：复用现成 `CompressorProcessor`，证明 aux 在实时 / 离线两条路径都通。Z0 自带的 Ring Mod 只是数学样例，Z1 才是用户要的效果。 |
 | 3 | **B1** Modal 声源 | 与图架构完全解耦，放在 Z0/Z1 之后不会返工；声源只改 `headless::spawn_instrument` 一处，且正好用 S0 的 `--render` 自动验收长尾 / 拍频 / 频谱峰。 |
 | 4 | **Z2** Vocoder | 最贵，且失败模式可能暴露 Z0 的设计缺口（两路 PDC / 缓冲形状）。Z1 已把 Z0 验证过，返工范围可控。 |
 | 5 | **S1** Pluck → **S2** Organ → **S3** Wavetable | Y 系列原三个乐器顺延；Wavetable 仍按原约定「先写独立 spec 再实现」。 |
@@ -758,9 +758,29 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | 实施期修订 | `EffectDescriptor` 未加 `audio_inputs` 字段，端口剖面改由 `BuiltinEffectKind::audio_inputs()` 承载（避开 16 处静态 descriptor 字面量的样板改动）；详见 `spec/dual-audio-input.md` §6.1。 |
 | 文档同步 | `node-graph.md` D2/D14/D17/D19 + §3/§4/§7、`effects.md` §12、`implementation.md`、`docs/manual.md`、`AGENTS.md` 索引。 |
 
-### Z1 / Z2 要点
+### Z1 决策（实施前细化为 `spec/sidechain-compressor.md`）
 
-- **Z1 侧链压缩**：`CompressorProcessor` 已有 `compute_gr_db`、GR 平滑与 meters；加一个 `sidechain` 开关把检测源从 `main` 切到 `aux`，未接 Mod 口时回落内部检测（保旧工程行为）。键控 HPF / 外部键监听（listen）暂不做。验收：kick → bass 的 GR 随外部键变化，`--render` 可自动测。
+| ID | 决策 |
+| :--- | :--- |
+| Z1-D1 | **新增 `BuiltinEffectKind::SidechainCompressor`，不改 `Compressor`**：端口剖面是种类属性（Z0-D2），把现有压缩器改成双口会让旧工程里的压缩器变成 `Dual`，从而失去删除旁路（D19），是行为回归。代价只是 Add 菜单多一项。 |
+| Z1-D2 | `sidechain` 是**显式开关**（slot 8，默认 on）。`aux` 在未接线时是静音缓冲而非 `None`，处理器无法区分「没接线」与「接了静音源」；两者都应当不压缩，所以开关只用于**显式**回退内部检测（A/B、临时禁用）。 |
+| Z1-D3 | **侧链开启时恒定只读 aux，不回落内部检测**（修订 Z0 spec 的 Z-D12）：键控源安静时放行才是侧链的正确语义，回落会在键控空隙里抽吸主信号。 |
+| Z1-D4 | 检测源 `max(|L|, |R|)` 单探测器，一个 GR 作用于两声道；侧链模式下 `stereo_link` 无效。 |
+| Z1-D5 | 复用 `CompressorProcessor` / `compute_gr_db` / GR 平滑 / meters，**不新写 DSP**：普通表无 slot 8 → `is_on(8)` 返回 `false`，一个 `run` 服务两种 descriptor。 |
+| Z1-D6 | 零延迟不变；`PROJECT_VERSION = 10` 不动；不做键控 HPF / listen / lookahead / 自动 makeup / 侧链电平表。 |
+
+### Z1 实施记录（✅ 2026-11-08 已交付，本节范围结束）
+
+| 项 | 结果 |
+| :--- | :--- |
+| 落地 | `compressor.rs` 的 `SLOT_SIDECHAIN` / `SIDECHAIN_PARAMS`（9 项）/ `SIDECHAIN_DESCRIPTOR` / `CompressorProcessor::sidechain` / `process` 重构为共享 `run` + `process_with_aux` 覆写；`effect/mod.rs` 的种类、`ALL`、`audio_inputs`、descriptor 分发；model 的 `CompressorParams.sidechain`、`BuiltinEffectKind::SidechainCompressor`、`EffectParams::SidechainCompressor`、`as_sidechain_compressor()`、参数表 slot 8；UI `effect.rs` 五处分派（`processor` 走 `sidechain(sr, meters)`）。画布无需改动（端口数由 `audio_inputs()` 推导）。 |
+| 标识 | `PROJECT_VERSION = 10` **未动**；`Compressor` 的参数表、逐样本行为、删除旁路**全部不变**；`sidechain` 字段在普通压缩器上不可达，旧工程零迁移。 |
+| 验收 | 新增 8 项压缩器单测（键控跟随 Mod、静音键控不压缩、开关回退逐样本一致、GR 与 program 电平无关、键控不串音、普通表无 slot 8）+ 1 项图级测试（`sidechain_compressor_is_keyed_by_the_mod_port`）+ 1 项 model 校验与 RON 往返 + 1 项离线渲染端到端（dry/wet/internal 三方 RMS）+ `rt_audit` 侧链路径零分配；`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。 |
+| **零回归硬证据** | 用 `aaeb958` 的 detached worktree + 独立 `CARGO_TARGET_DIR` 编出 pre-Z1 二进制，与 post-Z1 对同一默认工程跑 `--render --rate 22050 --bits 16 --to 1920`：两份 WAV 各 **44288 帧 / 177196 字节，`cmp` 逐字节一致**。 |
+| 文档同步 | `sidechain-compressor.md`（新 spec）、`effects.md`（E2b 后新增小节 + §12）、`dual-audio-input.md` Z-D12 勘误、`implementation.md`、`docs/manual.md`、`AGENTS.md` 索引。 |
+
+### Z2 要点
+
 - **Z2 Vocoder（Q3 定稿）**：**固定 16 带**滤波器组 × 两路 + 逐带包络跟随（attack/release）+ 清浊处理；carrier 必须由 Main 口外部送入，**不做内置载波**；所有滤波器状态与包络构造期预分配。v1 **不做** formant shift / freeze / 用户自定义带数。
 
 ### 明确不做（本节范围）
@@ -775,7 +795,7 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | Q2 诵钵激励 | **只做单次敲击（strike）**，不做 bow/rub 持续摩擦 → voice 生命周期与 note-off 按一次性激励设计 |
 | Q3 Vocoder | **固定 16 带 + 外部 carrier**，v1 无 formant shift / freeze / 自定义带数 |
 
-下一步：**Z1 侧链压缩**（架构优先顺序的第 2 项，Z0 的第一个真实消费者；实施前先写 `spec/sidechain-compressor.md`）。B1 的 `spec/modal-instrument.md` 在 Z1 交付后写。
+下一步：**B1 Modal 声源**（架构优先顺序的第 3 项，与图架构解耦；实施前先写 `spec/modal-instrument.md`，只做单次敲击激励）。Z2 Vocoder 在 B1 之后，A/B 顺序见上表。
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 

@@ -160,7 +160,7 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 | :--- | :--- |
 | `Search Nodes…` | 打开节点浏览器，可搜名字或模块路径 |
 | `Instrument…` | 乐器：`Synth`（内置）、`SoundFont`、`Sample`、`Drum Kit`，以及 CLAP / VST3 乐器插件 |
-| `Effect…` | 效果：`Delay`、`EQ`、`Compressor`、`Reverb`、`Chorus`、`Flanger`、`Bitcrusher`、`Phaser`、`Saturation`、`Limiter`、`Ring Mod`，以及 CLAP / VST3 效果插件 |
+| `Effect…` | 效果：`Delay`、`EQ`、`Compressor`、`Reverb`、`Chorus`、`Flanger`、`Bitcrusher`、`Phaser`、`Saturation`、`Limiter`、`Ring Mod`、`Sidechain Comp`，以及 CLAP / VST3 效果插件 |
 | `MIDI FX…` | `Arpeggiator`、`Portamento`、`MIDI Envelope`、`LFO`、`Curve Map` |
 | `Mixer` | 多通道求和节点（1–32 通道，可加 / 减通道） |
 | `Keyboard In (computer)` | 电脑键盘输入节点，一个源只允许一个节点 |
@@ -191,18 +191,28 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 
 ### 双输入效果器（Main / Mod）
 
-`Ring Mod` 是第一个有两个音频输入口的效果器。节点左侧会画两个插口并标
+`Ring Mod` 和 `Sidechain Comp` 有两个音频输入口。节点左侧会画两个插口并标
 `Main`（上）和 `Mod`（下）：
 
-| 口 | 接什么 | 作用 |
+| 效果器 | `Main` 接什么 | `Mod` 接什么 |
 | :--- | :--- | :--- |
-| `Main` | 主信号（载波 / 被处理的声音） | 与普通效果器的单个输入一样，输出从这里来 |
-| `Mod` | 调制信号 | 逐样本与 `Main` 相乘；`mix` 控制干湿比，`mix = 0` 时逐样本直通 |
+| `Ring Mod` | 主信号（载波 / 被处理的声音） | 调制信号，逐样本与 `Main` 相乘；`mix` 控制干湿比，`mix = 0` 时逐样本直通 |
+| `Sidechain Comp` | 要被压缩的声部（例如 bass） | **键控源**（例如 kick）。压缩量由 `Mod` 的电平决定，与 `Main` 自己的电平无关 |
+
+`Sidechain Comp` 的 `sidechain` 开关默认打开（在 Inspector 最下方）：
+
+- **打开**：只读 `Mod` 口检测。没接 `Mod` 线、或键控源当前安静时，压缩器**不压缩**，
+  `Main` 原样通过——这是侧链压缩的正确行为（kick 不打的时候 bass 不该被压），
+  不是节点坏了。
+- **关闭**：回落到用 `Main` 自己检测，行为与普通 `Compressor` 相同。想先听压缩效果、
+  或者临时禁用侧链而不拆线时用它。`stereo_link` 只在关闭时生效（外部键控恒为单一
+  探测器，左右输出同步压缩）。
 
 **Mod 源不要再接 `Master`。** 悬空节点照常运行，但输出没人消费就等于静音，
-所以调制源只需要拉一根线到 `Mod` 口；如果顺手也接到 `Master` 或 `Mixer`，
-那份原始信号会原样漏进主输出。同理，`Mod` 口没接线时调制信号视为全零，
-`mix > 0` 的 `Ring Mod` 会输出静音——这是预期行为，不是断线。
+所以调制源 / 键控源只需要拉一根线到 `Mod` 口；如果顺手也接到 `Master` 或 `Mixer`，
+那份原始信号会原样漏进主输出（键控源是 kick 时，你会额外听到一轨 kick）。
+同理，`Mod` 口没接线时调制信号视为全零：`mix > 0` 的 `Ring Mod` 输出静音，
+`Sidechain Comp` 不压缩——两者都是预期行为，不是断线。
 
 每个口最多接一根线；往已占用的口再拉一根会替换旧线。删除双口节点时它
 触及的音频线会**一起移除**，不会自动旁路重连（Mod 线没有可解释的主信号替代目标）。

@@ -1,6 +1,6 @@
 # Z1：侧链压缩 Spec
 
-> 状态：定稿（2026-11-08）。上游：`plan.md` Z / B 系列、`spec/dual-audio-input.md`（Z0 已交付）、`spec/effects.md`（E2b Compressor）。
+> 状态：定稿（2026-11-08）；**Z1 已交付**（同日，验收见 §7）。上游：`plan.md` Z / B 系列、`spec/dual-audio-input.md`（Z0 已交付）、`spec/effects.md`（E2b Compressor）。
 > 范围：只做**一个复用现有 DSP 的双口压缩器**。Vocoder（Z2）、键控 HPF、外部键监听不在本 spec。
 
 ## 1. 背景
@@ -110,19 +110,20 @@ NodeDoc::Effect { voice, params, .. }
     if matches!(voice, VoiceSpec::Builtin) && params.kind().audio_inputs() == 2 => 2,
 ```
 
-## 7. 验收
+## 7. 验收（✅ 2026-11-08 全部通过）
 
-- [ ] `sidechain = 1` + Main 恒定 0.5 + Mod 周期性脉冲 → GR 只在脉冲期间下降（容差内），Main 输出被压；脉冲结束 GR 按 release 回升。
-- [ ] `sidechain = 1` 且 Mod 全零 → **恒不压缩**（GR = 0），Main 逐样本直通（混合因子 `1.0`）。锁住 Z1-D3，防止有人把「aux 静音回落内部检测」加回来。
-- [ ] `sidechain = 1`、Main 高于阈值、Mod 高于阈值 → 输出的降幅由 **Mod 电平**决定，与 Main 电平无关。这是「外部键控」的定义性断言。
-- [ ] `sidechain = 0` → 与 `CompressorProcessor::new` 在相同参数下**逐样本一致**（同一个 `run` 的内部检测分支）。
-- [ ] 两路不串音：Mod 的波形不出现在 Main 输出里（对比 `mix` 前后差值只剩增益变化）。
-- [ ] PDC：Main 上游挂已知延迟节点、Mod 无延迟 → 键控在 `pdc_delay` 补偿后与 Main 对齐（复用 Z0 的 `dual_input_pdc_delays_the_mod_port_to_match_the_slow_main_branch` 形状）。
-- [ ] `effect_rt_audit`：`process_with_aux` 侧链路径零分配。
-- [ ] 文档侧：`GraphDoc` 校验接受 `(SidechainCompressor, in_port = 1)`，拒绝 `in_port = 2`；RON 往返保持 `sidechain` 字段。
-- [ ] 离线端到端：`headless::assemble_offline` 把 `SidechainCompressor` 装成 `NodeKind::Dual`，`--render` 出的 WAV 里能看到键控触发的电平下陷。
-- [ ] **零回归**：默认工程 `--render` 与 Z1 之前**逐字节一致**（`Compressor` 未改动、`EffectParams` 只是加变体）。
-- [ ] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。
+- [x] `sidechain = 1` + Main 恒定 0.5 + Mod 周期性脉冲 → GR 只在脉冲期间下降，Main 输出被压；脉冲结束 GR 按 release 回升。`sidechain_reduces_only_while_the_key_is_loud`
+- [x] `sidechain = 1` 且 Mod 全零 → **恒不压缩**（GR = 0），Main 逐样本直通。锁住 Z1-D3，防止有人把「aux 静音回落内部检测」加回来。`silent_key_never_compresses_the_programme` + 离线端到端 `offline_render_honours_sidechain_keying` 的 dry 分支
+- [x] `sidechain = 1`、Main 高于阈值、Mod 高于阈值 → 输出的降幅由 **Mod 电平**决定，与 Main 电平无关。`sidechain_reduction_ignores_the_programme_level`
+- [x] `sidechain = 0` → 与 `CompressorProcessor::new` 在相同参数下**逐样本一致**。`sidechain_switch_off_matches_internal_detection`
+- [x] 两路不串音。`key_signal_does_not_leak_into_the_output`（program 静音 + 键控响 → 输出仍静音，但 GR 已反应）
+- [x] PDC：**由 Z0 的 `dual_input_pdc_delays_the_mod_port_to_match_the_slow_main_branch` 覆盖**（Main 声明 10 帧 latency → Mod 边补 10 帧）。侧链复用同一条分流通路，Z1 不重复该测试。
+- [x] `effect_rt_audit`：`CompressorProcessor sidechain process_with_aux` 零分配
+- [x] 文档侧：`sidechain_compressor_has_two_ports_and_a_persistent_switch` —— `GraphDoc::validate` 接受 `(SidechainCompressor, in_port = 1)`、RON 往返保留 `sidechain`、旧 payload 默认开键控
+- [x] 离线端到端：`headless::assemble_offline` 把 `SidechainCompressor` 装成 `NodeKind::Dual`，dry / wet / internal 三方 RMS 断言
+- [x] **零回归**：默认工程 `--render --rate 22050 --bits 16 --to 1920`，pre-Z1（`aaeb958` + 独立 `CARGO_TARGET_DIR`）与 post-Z1 各 **44288 帧 / 177196 字节，`cmp` 逐字节一致**
+- [x] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿
+- [x] 普通压缩器：`plain_compressor_has_no_sidechain_slot`（slot 8 被拒、传 aux 也不改变输出）
 
 ## 8. 风险与已知取舍
 

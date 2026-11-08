@@ -39,7 +39,7 @@
 | Z-D9 | **删除语义修订**：`GraphCompiler::remove_node` 的 `bypassable` 增加 `kind != Dual`；`GraphDoc` 侧删除双口节点时其触及的音频线一并移除，不做旁路重连。理由同 §1 —— Mod 线没有可解释的旁路目标。 |
 | Z-D10 | **PDC 两条路径同步分流**：`compute_pdc` 不改（已按所有入边累积）；`process_block` 的 `delay == 0` 与 `sum_into_delayed` 两个分支都按端口选择目标缓冲（`output` 或 `aux`）。两条入边各自按 `pdc_delay[slot][edge]` 补偿，保证 carrier / modulator 相位对齐。 |
 | Z-D11 | **Ring Mod 是 Z0 的验收样例**，不是额外立项：`BuiltinEffectKind::RingMod` + `EffectParams::RingMod(RingModParams { mix })` + `realtime/ring_mod.rs`。DSP `out = lerp(main, main × mod, mix)`，逐样本、零状态、零延迟；`mix = 0` 逐样本直通（与 E 系列直通不变量一致）。`mix` 走 `EffectParamBank` 的 `BuiltinParam(0)`，沿用 `Unit::Percent` / 平滑。进 Add 菜单（`BuiltinEffectKind::ALL` 追加）。 |
-| Z-D12 | Mod 口未接线时 `aux` 全零：Ring Mod 在 `mix > 0` 时输出静音，符合「调制源缺失」的物理直觉。Z1 侧链压缩则回落内部检测（其行为在 Z1 spec 定），两者不冲突。 |
+| Z-D12 | Mod 口未接线时 `aux` 全零：Ring Mod 在 `mix > 0` 时输出静音，符合「调制源缺失」的物理直觉。~~Z1 侧链压缩则回落内部检测~~ **Z1 已修订（2026-11-08）**：侧链键控恒定只读 aux，静音键控 = 不压缩，**不**回落内部检测——回落会让键控空隙突然抽吸主信号。见 `sidechain-compressor.md` Z1-D3。 |
 | Z-D13 | **modulator 源不应再接 master**：D6 规定悬空节点照常执行、输出无人消费即静音，因此调制源只需连到 Dual 节点的 Mod 口。用户文档必须写明，否则原声会漏进主输出。 |
 
 ## 4. 每块执行序（对 `node-graph.md` §4 第 4 步的修订）
