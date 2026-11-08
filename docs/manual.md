@@ -160,7 +160,7 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 | :--- | :--- |
 | `Search Nodes…` | 打开节点浏览器，可搜名字或模块路径 |
 | `Instrument…` | 乐器：`Synth`（内置）、`SoundFont`、`Sample`、`Drum Kit`、`Mallet`（模态敲击），以及 CLAP / VST3 乐器插件 |
-| `Effect…` | 效果：`Delay`、`EQ`、`Compressor`、`Reverb`、`Chorus`、`Flanger`、`Bitcrusher`、`Phaser`、`Saturation`、`Limiter`、`Ring Mod`、`Sidechain Comp`，以及 CLAP / VST3 效果插件 |
+| `Effect…` | 效果：`Delay`、`EQ`、`Compressor`、`Reverb`、`Chorus`、`Flanger`、`Bitcrusher`、`Phaser`、`Saturation`、`Limiter`、`Ring Mod`、`Sidechain Comp`、`Vocoder`，以及 CLAP / VST3 效果插件 |
 | `MIDI FX…` | `Arpeggiator`、`Portamento`、`MIDI Envelope`、`LFO`、`Curve Map` |
 | `Mixer` | 多通道求和节点（1–32 通道，可加 / 减通道） |
 | `Keyboard In (computer)` | 电脑键盘输入节点，一个源只允许一个节点 |
@@ -194,13 +194,14 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 
 ### 双输入效果器（Main / Mod）
 
-`Ring Mod` 和 `Sidechain Comp` 有两个音频输入口。节点左侧会画两个插口并标
+`Ring Mod`、`Sidechain Comp` 和 `Vocoder` 有两个音频输入口。节点左侧会画两个插口并标
 `Main`（上）和 `Mod`（下）：
 
 | 效果器 | `Main` 接什么 | `Mod` 接什么 |
 | :--- | :--- | :--- |
 | `Ring Mod` | 主信号（载波 / 被处理的声音） | 调制信号，逐样本与 `Main` 相乘；`mix` 控制干湿比，`mix = 0` 时逐样本直通 |
 | `Sidechain Comp` | 要被压缩的声部（例如 bass） | **键控源**（例如 kick）。压缩量由 `Mod` 的电平决定，与 `Main` 自己的电平无关 |
+| `Vocoder` | **载波**：合成器、噪音、任何有谐波的声音 | **调制源**：人声 / 节奏，它的频谱包络被套到载波上 |
 
 `Sidechain Comp` 的 `sidechain` 开关默认**关闭**（在 Inspector 最下方）：
 
@@ -218,6 +219,36 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 
 每个口最多接一根线；往已占用的口再拉一根会替换旧线。删除双口节点时它
 触及的音频线会**一起移除**，不会自动旁路重连（Mod 线没有可解释的主信号替代目标）。
+
+### Vocoder
+
+`Vocoder` 是 16 带的分析 / 合成滤波器组：`Mod` 口的频谱包络被逐带套到 `Main` 口的
+载波上。**接线方向很重要**——`Main` 是载波（合成器、噪音），`Mod` 是人声：
+
+```
+instr（载波，例如锯齿波） ──► Main ┐
+                                   ├─► Vocoder ──► Mixer / Master
+instr（人声 / 鼓）      ──► Mod  ┘
+```
+
+`Mod` 口没接就等于包络全零，输出**静音**——不会退化成「用 `Main` 自己分析自己」。
+
+参数：
+
+| 参数 | 范围 | 说明 |
+| :--- | :--- | :--- |
+| `attack` | 0.5–100 ms | 包络上升速度，短 = 咬字硬，长 = 模糊 |
+| `release` | 5–500 ms | 包络下落速度，长 = 尾音拖、糊 |
+| `q` | 0.7–16 | 每带的尖锐度。高 = 更「机器人」、带缝更明显；它**只改选择性**，不改响度 |
+| `low` / `high` | 40 Hz–1 kHz / 1 kHz–16 kHz | 最低 / 最高带的中心频率，中间 14 个按对数均分 |
+| `sibilance` | 0–1 | 带组之上的噪声激励量。人声的齿音 / 气声靠它，`0` 时辅音会发闷 |
+| `mix` | 0–1 | 干湿比，`0` 逐样本直通 |
+| `output` | −24..+12 dB | 只作用于湿声 |
+
+电平：两个满幅正弦（同频、落在带中心）大约 −4 dBFS，而白噪载波会明显更小 ——
+所以先调 `output` 再调 `q`。左右声道的包络与滤波器状态各自独立，参数共用。
+vocoder 是当前最重的内置效果（每帧 64 个二阶滤波器），长 release + 高 `q` 也不例外；
+它没有延迟，不参与延迟补偿。
 
 ### 模态打击（Mallet）
 

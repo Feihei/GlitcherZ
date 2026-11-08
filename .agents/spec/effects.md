@@ -263,6 +263,29 @@ E2b 的双口变体（完整 spec 见 `sidechain-compressor.md`）：`Main` 是�
 **键控源静音时不压缩，绝不回落内部检测**——否则键控空隙会突然抽吸主信号。零延迟、
 `PROJECT_VERSION` 不动；不做键控 HPF / listen / lookahead / 自动 makeup / 侧链电平表。
 
+### Z2 Vocoder（`vocoder`）
+
+Z0 双口的第二个消费者（完整 spec 见 `vocoder.md`）：**`Main` = carrier，`Mod` = modulator**，
+与 Z1 的 programme / key 同向。16 个固定对数带，两路各一套 Simper SVF 带通；分析侧整流后
+过 attack/release 一极点得到逐带包络，合成侧用同一带组滤 carrier 再乘包络求和。带组之上的
+清浊旁路把 modulator 的高频能量乘到确定性噪声上（不做音高检测）。
+
+| # | 参数 | 范围 | 单位 | 曲线 | 平滑 | 速率 |
+| :-- | :-- | :-- | :-- | :-- | :-- | :-- |
+| 0 | `attack` | 0.5..100 | ms | Log | 20 ms | Block |
+| 1 | `release` | 5..500 | ms | Log | 20 ms | Block |
+| 2 | `q` | 0.7..16 | ratio | Log | 20 ms | Block |
+| 3 | `low` | 40..1000 | Hz | Log | 20 ms | Block |
+| 4 | `high` | 1000..16000 | Hz | Log | 20 ms | Block |
+| 5 | `sibilance` | 0..1 | % | Linear | 10 ms | Sample |
+| 6 | `mix` | 0..1 | % | Linear | 10 ms | Sample |
+| 7 | `output` | −24..12 | dB | Linear | 10 ms | Sample |
+
+带通输出取 `k · v1`（单位峰值）而不是 `v1`：分析与合成两级串联，若都用原始抽头，输出电平
+会随 `Q²` 变化——用户调 `q` 会听到响度而不是选择性。**Mod 口不接 = 包络恒 0 = 输出静音**，
+不回落内部检测（与 Z1-D3 同一判断）。`mix = 0` 逐样本直通但滤波器照常推进。零延迟，
+`PROJECT_VERSION` 不动；不做 formant shift / freeze / 可变带数 / 内置载波 / 逐带编辑。
+
 ### E3 Reverb（`reverb`）
 
 **FDN-8**（8 条延迟线 + Hadamard 反馈矩阵 + 每线一阶阻尼 + 低切），不用 Freeverb：
@@ -395,6 +418,7 @@ D16 的 `latency_samples()` 口子接入 S2-3 落地的图级 PDC。实施细节
 - **Z0 已解除原 sidechain 边界（2026-11-08）**：原文「不做每效果的 sidechain 输入（压缩器外部键控需要图的新端口类型，另立项）」中的「另立项」即 `spec/dual-audio-input.md` —— 图已提供 `Main` / `Mod` 两个音频输入口，Z1 侧链压缩、Z2 Vocoder 复用该基建。E 系列本身仍不新增 sidechain 参数；新增的 `Ring Mod` 属于 Z0 验收样例，不归 E 系列排期。
 - **不做** 效果的 L/R 完全独立参数（除联动开关）；EQ 单套参数。
 - **Z1 已交付首次消费（2026-11-08）**：`sidechain_compressor` 复用 `Main`/`Mod` 双口做外部键控，见 §E2b 之后一节与 `sidechain-compressor.md`；键控 HPF / listen / lookahead 仍不做。
+- **Z2 已交付第二个消费（2026-11-08）**：`vocoder` 复用同一双口（`Main` = carrier、`Mod` = modulator），见 §Z1 之后一节与 `vocoder.md`；formant shift / freeze / 可变带数 / 内置载波仍不做。
 - **不做** 延迟时间的分数采样插值（v1 整数抽头 + 块率平滑）；调制效果内部用插值，两者不冲突。
 - **不做** 尾音冻结 / 节点自动休眠（mix 为 0 仍跑湿路径，见 §6）。
 - **不做** 自动化的离散参数（`STEREO_LINK` 等 `smoothing_ms = 0` 的槽位不进自动化菜单）。

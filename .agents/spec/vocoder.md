@@ -1,6 +1,6 @@
 # Z2：Vocoder Spec
 
-> 状态：定稿（2026-11-08）。上游：`plan.md` Z / B 系列（Q3 决议：固定 16 带 + 外部 carrier）、`spec/dual-audio-input.md`（Z0 已交付）、`spec/sidechain-compressor.md`（Z1 已交付）、`spec/effects.md`（E 系列框架）。
+> 状态：定稿（2026-11-08）；**Z2 已交付**（同日，验收见 §7，交付记录见 §10）。上游：`plan.md` Z / B 系列（Q3 决议：固定 16 带 + 外部 carrier）、`spec/dual-audio-input.md`（Z0 已交付）、`spec/sidechain-compressor.md`（Z1 已交付）、`spec/effects.md`（E 系列框架）。
 > 范围：只做**一个双口效果器**：`Main` = carrier，`Mod` = modulator，16 带分析/合成 + 清浊旁路。不做 formant shift / freeze / 自定义带数 / 内置载波。
 
 ## 1. 背景
@@ -111,6 +111,7 @@ process_with_aux(ctx, buffer, aux):
 - **`aux == None` 整块包络为 0** → `wet = 0` → 输出 = `main·(1−mix)`。`process`（单口图不可达）走同一条路径。
 - **`on = false` 的带整段跳过**并把 `env[k]` 置 0：否则它重新生效时会带着旧包络弹出。
 - **状态在参数变化时不重置**：改 `q` / `low` / `high` 只换系数，SVF 积分器继续跑，因此拖参数不会清空尾音（可能有一个小的瞬态，可接受）。
+- **电平标定**：两个满幅正弦（同频、落在带中心）实测 RMS ≈ 0.62（−4 dB）——差的那部分是包络的整流均值损失，不是缺陷；白噪载波会明显更低，所以 `output` 是必要的手动档。`matched_sines_land_near_unity` 锁住这条。
 
 ## 6. 各层改动
 
@@ -123,22 +124,24 @@ process_with_aux(ctx, buffer, aux):
 | ui | `src/effect.rs` | `engine_kind` / `default_params` / `processor` / `value` / `set_value` 五处分派；meters 断言不变（vocoder 不带表） |
 | ui | `src/patch*.rs` / `headless.rs` | **无需改动**：端口数由 `NodeDoc::audio_inputs()` 推导（Z0 已接通），`spawn_effect` 走 `effect::processor` 的通用路径 |
 
-## 7. 验收
+## 7. 验收（✅ 2026-11-08 全部通过）
 
-- [ ] 描述符合规：`validate_descriptor` 通过，8 个槽位范围 / 默认 / 曲线自洽；model 默认值与 descriptor 默认值逐项一致（既有 `model_defaults_match_the_engine_descriptors` 覆盖）。
-- [ ] 静音语义：有载波、aux 全 0 → 输出逐样本 0（`mix = 1`）；`aux = None` 同结果；`mix = 0` → 逐样本直通（bit-exact）。
-- [ ] 包络跟随：carrier = 带中心正弦、modulator = 同频门控突发 → 突发段输出 RMS 明显高于空隙段；`attack` 越长，起始段能量越低。
-- [ ] 频率选择性：modulator = 300 Hz 正弦、carrier = 白噪 → 输出能量集中在 300 Hz 附近（Goertzel：`|X(300)| >> |X(3000)|`）。
-- [ ] 带边界：同一 100 Hz modulator，`low = 200` 时输出近静音，`low = 80` 时有能量（带组真的在动）。
-- [ ] `q` 选择性：`q = 12` 时偏离带中心的 modulator 贡献显著小于 `q = 1`。
-- [ ] 清浊旁路：carrier = 150 Hz 正弦、modulator = 白噪；`sibilance = 1` 时 9 kHz 处有能量，`sibilance = 0` 时近静音。
-- [ ] 声道独立：只有 aux 左声道有信号 → 左声道有声、右声道静音。
-- [ ] 极端参数：`q = 16`、`low = high`、满幅方波 carrier + 满幅 modulator、NaN 参数 → 输出全部 `is_finite()`。
-- [ ] `effect_rt_audit`：`VocoderProcessor process_with_aux` 零分配（含 `set_param`）。
-- [ ] model：`EffectParams::Vocoder` RON 往返、旧 payload 缺字段取默认、`GraphDoc::validate` 接受 `in_port = 1`、`effect_slot_axis` 八行与 descriptor 一致。
-- [ ] 离线端到端：`--render` 一段 vocoder 工程（carrier + modulator 两轨）出声且 RMS > 0。
-- [ ] **零回归**：默认工程 `--render` 与 Z2 之前逐字节一致。
-- [ ] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。
+- [x] 描述符合规：`descriptor_is_well_formed`（8 槽、内联两行 `sib`/`mix`、`Mono` 不可联动）；model 默认值与 descriptor 逐项一致由既有 `model_defaults_match_the_engine_descriptors` 与 `axis_table_matches_the_engine_descriptors` 覆盖（`DocEffectKind::ALL` 遍历，新种类自动进网）。
+- [x] 静音语义：`silent_modulator_stops_the_output`（aux 全 0 → 输出逐样本 `0.0`，不是「很小」）、`missing_aux_is_a_silent_modulator`（`process` 路径）、`dry_mix_is_a_sample_exact_passthrough`（`mix = 0` 与输入逐位相等）。
+- [x] 包络跟随：`envelope_follows_the_modulator_gate`（0.2–0.4 s 开窗，开启段 RMS > 前后各 20 倍）、`attack_time_controls_the_onset`（1 ms vs 50 ms，起音前 6 ms 能量差 3 倍以上）、`release_length_changes_the_tail`（5 ms vs 500 ms）。
+- [x] 频率选择性：`output_follows_the_modulator_frequency` —— 白噪载波 + 300 Hz modulator，Goertzel `|X(300)|` > 5 × `|X(3k)|`。
+- [x] 带边界：`low_and_high_move_the_bank` —— 同一 100 Hz 素材，`low = 200` 时 RMS 0.023，`low = 80` 时 0.324（14 倍），并断言被覆盖时 RMS > 0.1（防止「两边都为零」的假绿）。
+- [x] `q` 选择性：`q_controls_selectivity` —— carrier 1 kHz、modulator 2 kHz：`q = 1` RMS 1.05，`q = 16` RMS 0.018。
+- [x] 清浊旁路：`sibilance_adds_a_noise_excited_top_end` —— 150 Hz 正弦载波 + 白噪调制，9 kHz 处 Goertzel 从 5.4e-7（`sibilance = 0`）升到 2.2e-3（`sibilance = 1`）。
+- [x] 声道独立：`channels_use_their_own_modulator` —— aux 只有左声道有信号 → 左声道有声、右声道**恰好 0.0**。
+- [x] 极端参数：`extreme_parameters_stay_finite`（`q = 16`、`low = high = 1 kHz`、满幅方波对、`output = +12`、`sibilance = 1`）、`non_finite_parameters_fall_back_to_defaults`（NaN / ∞ 落回合法值）。
+- [x] 可复现：`renders_are_reproducible` —— 两个新实例对同一素材逐样本相同（噪声旁路用固定种子，离线渲染才可能逐字节稳定）。
+- [x] 电平标定：`matched_sines_land_near_unity` —— 两个满幅正弦落在带中心时 RMS ∈ 0.45..0.85（实测 0.62），锁住 Z2-D3 的「`k·v1` 单位峰值」。
+- [x] `effect_rt_audit`：`VocoderProcessor process_with_aux/set_param` 零分配（参数每块都在变，系数的 `powf` 重算也在审计范围内）。
+- [x] model：`vocoder_has_two_ports_and_round_trips_its_macros` —— `audio_inputs() == 2`、label `"Vocoder"`、RON 往返、旧 payload `(kind:"vocoder")` 取默认、`GraphDoc::validate` 接受 `in_port = 1`。
+- [x] 离线端到端：`offline_render_honours_the_vocoder_modulator` —— 同一工程只改 Mod 线：没接线渲染**无信号**（不是载波直通），接线后出声且 RMS > 0.005。
+- [x] **零回归**：pre-Z2 二进制（`d223fb0` + 独立 `CARGO_TARGET_DIR`）与 post-Z2 对默认工程 `--render --rate 22050 --bits 16 --to 1920` 各 44288 帧 / 177196 字节，`cmp` 逐字节一致。
+- [x] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace`（1136 项）/ `build --workspace` 全绿。
 
 ## 8. 风险与已知取舍
 
@@ -157,3 +160,12 @@ process_with_aux(ctx, buffer, aux):
 - 不做 formant shift、freeze、可变带数、内置载波、逐带编辑、逐带声像、M/S 处理。
 - 不做音高检测 / 清浊分类器（D5 的取舍），不做 listen / solo modulator。
 - 不给 CLAP / VST3 效果器开第二个口；不引入新 crate；不新增 `ParamId`（全部走 `BuiltinParam(slot)`）。
+
+## 10. 交付与零回归证据
+
+| 项 | 结果 |
+| :--- | :--- |
+| 落地 | 新 `realtime/vocoder.rs`（16 带带通 × 2 路 × 2 声道、双系数包络、清浊旁路、8 槽位、18 项单测）；`realtime/mod.rs` 模块 + re-export；`effect/mod.rs` 名册 / `audio_inputs()` / descriptor；model 的 `VocoderParams` / `BuiltinEffectKind::Vocoder` / `EffectParams::Vocoder` / `effect_slot_axis`；UI `effect.rs` 五处分派。 |
+| 零改动的部分 | 画布、装配（`spawn_effect` 走 `effect::processor`）、删除语义、PDC、`PROJECT_VERSION` —— 全部沿用 Z0 的「端口剖面由种类推导」。 |
+| 门禁 | `fmt --check`、`clippy --workspace --all-targets -D warnings`、`test --workspace` **1136 passed / 0 failed**、`build --workspace`。 |
+| 实施期修订 | ① NaN 防御写成 `!(freq > 0.0)` 会被 clippy 的 `neg_cmp_op_on_partial_ord` 拒，改 `!freq.is_finite() \|\| freq <= 0.0`。② 新离线测试沿用 `"dry"/"wet"` 临时文件名会与 Z0/Z1 撞车（`save_temp` 只按 tag + pid 区分），改用 `z2_dry` / `z2_wet`。 |

@@ -708,7 +708,7 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | ~~**B1**~~ ✅ | Modal 声源（Mallet / Singing Bowl，已交付 2026-11-08） | 小–中 | 无（S0 装配已就位） | 高 Q 谐振器数值稳定、长尾音的 voice 生命周期 / 偷声部策略 |
 | **Z0** | 双音频输入口基建 | 中–大 | 无 | 触碰 `process_block` + PDC + 文档校验 + 画布，是实时铁律最敏感处 |
 | ~~**Z1**~~ ✅ | 侧链压缩（已交付 2026-11-08） | 小 | Z0 | 复用现成 detector / GR 表，几乎无算法风险 |
-| **Z2** | Vocoder | 大 | Z0（最好经 Z1 验证 aux） | 滤波器组全预分配、RT 零分配、两路相位对齐 |
+| ~~**Z2**~~ ✅ | Vocoder（已交付 2026-11-08） | 大 | Z0（最好经 Z1 验证 aux） | 滤波器组全预分配、RT 零分配、两路相位对齐 |
 
 ### 执行顺序（当前唯一有效顺序；Y 系列编号保留为历史记录）
 
@@ -717,7 +717,7 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | 1 | **Z0** 双口基建 | 用户 2026-11-08 拍板「架构优先」：唯一碰实时图核心的重活，先在**没有其它并行改动**的干净基线上单独 spec + 单独 commit + 全量门禁做完，后面所有双口效果器才不会返工。 |
 | 2 | **Z1** 侧链压缩 ✅ | 已交付。Z0 的第一个真实消费者兼**验收钉子**：复用现成 `CompressorProcessor`，证明 aux 在实时 / 离线两条路径都通。Z0 自带的 Ring Mod 只是数学样例，Z1 才是用户要的效果。 |
 | 3 | **B1** Modal 声源 ✅ | 已交付。与图架构完全解耦，与 Z0/Z1 无交叉；声源只改 `headless::spawn_instrument` 一处，长尾 / 拍频 / 频谱峰全部由 S0 的 `--render` 自动验收。 |
-| 4 | **Z2** Vocoder | 最贵，且失败模式可能暴露 Z0 的设计缺口（两路 PDC / 缓冲形状）。Z1 已把 Z0 验证过，返工范围可控。 |
+| 4 | **Z2** Vocoder ✅ | 已交付。最贵的一项，失败模式本可能暴露 Z0 的设计缺口（两路 PDC / 缓冲形状）；Z1 已把 Z0 验证过，实际零返工。 |
 | 5 | **S1** Pluck → **S2** Organ → **S3** Wavetable | Y 系列原三个乐器顺延；Wavetable 仍按原约定「先写独立 spec 再实现」。 |
 | 6 | **S4** CLI 命令面 → **S5** MCP | 不取消。新功能把它们往后推，但 S0 的判别（没有 render 的 MCP 是盲操作）不变。 |
 
@@ -793,7 +793,17 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 ### Z2 要点
 
 - **Z2 Vocoder（Q3 定稿）**：**固定 16 带**滤波器组 × 两路 + 逐带包络跟随（attack/release）+ 清浊处理；carrier 必须由 Main 口外部送入，**不做内置载波**；所有滤波器状态与包络构造期预分配。v1 **不做** formant shift / freeze / 用户自定义带数。
-- 实施前细化为 `spec/vocoder.md`（已定稿）：`Main` = carrier、`Mod` = modulator；8 个宏参数（attack / release / q / low / high / sibilance / mix / output）；清浊 = 带组顶端之上的噪声激励旁路（不做音高检测）；`mix = 0` 逐样本直通。
+- 实施前细化为 `spec/vocoder.md`：`Main` = carrier、`Mod` = modulator；8 个宏参数（attack / release / q / low / high / sibilance / mix / output）；清浊 = 带组顶端之上的噪声激励旁路（不做音高检测）；`mix = 0` 逐样本直通。
+
+### Z2 实施记录（✅ 2026-11-08 已交付，本节范围结束）
+
+| 项 | 结果 |
+| :--- | :--- |
+| 落地 | 新 `realtime/vocoder.rs`（16 带 SVF 带通 × 2 路 × 2 声道 + 双系数包络 + 清浊噪声旁路 + 8 个槽位）；`effect/mod.rs` 名册 / `audio_inputs() → 2` / descriptor 分发；model 的 `VocoderParams` / `BuiltinEffectKind::Vocoder` / `EffectParams::Vocoder` / `effect_slot_axis` 8 行；UI `effect.rs` 五处分派。**画布、装配、删除、PDC 全部零改动**——端口数由 `kind().audio_inputs()` 推导（Z0 已接通）。 |
+| 标识 | `PROJECT_VERSION = 10` **未动**，旧工程零迁移；`Vocoder` 进 Add 菜单末尾（`Sidechain Comp` 之后）。 |
+| 验收 | 18 项 `vocoder.rs` 单测 + 1 项 model RON 往返与旧 payload 默认 + `rt_audit` 的 `process_with_aux` 零分配 + 1 项离线端到端（无 Mod 线静音 / 接线出声）；`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace`（1136 项）/ `build --workspace` 全绿。 |
+| **零回归硬证据** | 用 `d223fb0` 的 detached worktree + 独立 `CARGO_TARGET_DIR` 编出 pre-Z2 二进制，与 post-Z2 对同一份默认工程跑 `--render --rate 22050 --bits 16 --to 1920`：两份 WAV 各 **44288 帧 / 177196 字节，`cmp` 逐字节一致**。 |
+| 实施期发现 | ① `!(freq > 0.0)` 这类 NaN 防御写法被 clippy 拒（`neg_cmp_op_on_partial_ord`），改成 `!freq.is_finite() || freq <= 0.0`。② 新离线测试沿用 `"dry"/"wet"` tag 会与 Z0/Z1 的临时文件名撞车（`save_temp` 只按 tag + pid 区分），必须用独立 tag。 |
 
 ### 明确不做（本节范围）
 
@@ -807,7 +817,7 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | Q2 诵钵激励 | **只做单次敲击（strike）**，不做 bow/rub 持续摩擦 → voice 生命周期与 note-off 按一次性激励设计 |
 | Q3 Vocoder | **固定 16 带 + 外部 carrier**，v1 无 formant shift / freeze / 自定义带数 |
 
-下一步：**Z2 Vocoder**（架构优先顺序的第 4 项）：固定 16 带滤波器组 + 外部 carrier（`Main` 口）+ 逐带包络跟随，全部状态构造期预分配。实施前先写 `spec/vocoder.md`。
+下一步：**S1 Pluck 声源**（架构优先顺序的第 5 项），沿用 B1 的形状——先写 `spec/pluck-instrument.md`，再实现引擎、装配、UI，最后分实现 / 文档两个 commit。
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 

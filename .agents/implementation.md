@@ -1158,3 +1158,24 @@ spec `.agents/spec/modal-instrument.md`。一个引擎 + 四张预设表（Malle
 - 拍频断言不能用 512 帧的短窗 RMS：窗里是数百 Hz 的模态内振荡，包络起伏被完全淹没（实测 0.39 vs 0.30，看着像拍频其实不是）。改用 250 ms 窗的慢包络，把模态振荡平均掉，只留 1–2 Hz 的失谐拍频。
 
 **验收**：15 项 `modal.rs` 单测（静音、预设表形状、原子起音、10 s 后仍有能量、尾音释放槽位、note-off 不掐尾 + blanket 收尾、重击叠加、非谐波峰 Goertzel、拍频、decay 缩放、brightness 频谱、偷声部有界、极端参数有限、参数 clamp、零力度不敲）、1 项 model 往返与旧 payload 默认、`effect_rt_audit` 的 `process` / `note_event` / `set_param` 零分配、1 项离线端到端（Bowl 预设 6 s 渲染，末四分之一仍有尾音能量）。
+## Z2：16 带 Vocoder（2026-11-08）
+
+spec `.agents/spec/vocoder.md`。`Main` = carrier、`Mod` = modulator，16 个固定对数带，两路各一套 Simper SVF 带通；分析侧整流 + attack/release 一极点得到逐带包络，合成侧用同一带组滤 carrier 再乘包络求和，外加一条带组之上的噪声旁路。
+
+**带通取 `k · v1`，不是 `v1`。** SVF 的原始带通抽头峰值是 `1/k = Q`，而 vocoder 天生是两级串联（分析 + 合成），两边都用原始抽头的话输出电平随 `Q²` 走——用户拧 `q` 会听到响度而不是选择性。`k · v1` 归一成单位峰值后，`q` 只改选择性。代价是带组不再「重构原信号」（带宽变窄时总能量下降），这正是 vocoder 该有的行为。实测两个满幅正弦（同频、落在带中心）RMS ≈ 0.62（−4 dB），差的那部分是包络的整流均值损失；`matched_sines_land_near_unity` 把这条钉住，否则以后有人「顺手去掉那个多余的 `k`」，只会发现声音变大而不明白为什么。
+
+**包络一极点必须有硬地板。** f32 的一极点会停在目标上方几个 1e−5 不动（`Smoothed` 里的「no-progress snap」是同一现象的另一面）。在 compressor 里那点残量只是让 GR 差 0.0001 dB，在 vocoder 里它会把 carrier 永远乘出去——「Mod 口静音」就永远到不了零。`ENV_FLOOR = 1e−6` 直接归零，`envelope_follower_snaps_to_zero` 锁住。
+
+**清浊不做分类器。** 原本的说法是「逐带包络 + 清浊处理」，落地时改成**频段划界**：modulator 过 `max(high, 4 kHz)` 的二阶高通，用固定 2 ms / 40 ms 的包络去乘确定性噪声。理由有两条：① 带组之上的能量本来就是「带组盖不到」的那部分，按频率切不需要判断；② 音高检测式的浊音 / 清音分类一旦误判，噪声会忽开忽关，比不做更刺耳。旁路用自己的固定包络而不是共享 `release`——共享的话慢 release 会把齿音拖成一片「嘶」。
+
+**参数变化不重置状态。** 每块重算 16 组 `g = tan(πf/sr)`（一次 `powf` 算带间距，其余靠连乘），但 SVF 的 `ic1`/`ic2` 与包络继续跑。拖 `q` / `low` / `high` 时可能有一个小瞬态，但不会像「重建滤波器组」那样清空尾音。`low` / `high` 范围重叠，用户可以把 `high` 拖到等于 `low`，DSP 侧强制 `high = max(high, 2·low)`（16 个带叠在同一个中心频率上会共振爆炸）。
+
+**Mix 与 air 的两处细节**：`mix = 0` 时仍然跑完整 DSP，只让输出退化成 `carrier · 1 + wet · 0`——短路它会让重新打开 mix 的第一块是冷启动。air 探测器**始终运行**（即使 `sibilance = 0`），否则包络会停留在很久以前的值，一拧上去先来一记噪声爆音。
+
+**三个踩过的坑**：
+
+- NaN 防御写成 `if !(freq > 0.0) || …` 会被 clippy 的 `neg_cmp_op_on_partial_ord` 拒（clippy 认为这种写法掩盖了不可比性）；改 `!freq.is_finite() || freq <= 0.0`。
+- `low_and_high_move_the_bank` 第一版只断言「覆盖时 RMS 是未覆盖时的 10 倍」——两个数都可能是 1e−9 的假绿。补了 `included > 0.1` 的绝对下限，顺手把阈值收紧到 0.15 倍。
+- 离线端到端测试沿用 `"dry"` / `"wet"` 作临时文件名会与 Z0 / Z1 的同名测试撞车（`save_temp` 只按 tag + process id 区分），单独跑必过、全量跑偶发 `拒绝访问`。改用 `z2_dry` / `z2_wet`。
+
+**验收**：18 项 `vocoder.rs` 单测（描述符、单位峰值 × 三个 Q、静音、缺 aux、直通、门控包络、起音、频率选择、带边界、Q、sibilance、声道独立、极端参数、NaN 参数、可复现、release、地板、电平标定）、1 项 model RON 往返与旧 payload 默认、`effect_rt_audit` 的 `process_with_aux`/`set_param` 零分配、1 项离线端到端（无 Mod 线 → 静音；接线 → 出声）。全量 1136 项通过，默认工程渲染与 pre-Z2 逐字节一致。
