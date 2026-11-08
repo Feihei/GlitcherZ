@@ -77,6 +77,7 @@ pub mod phaser;
 pub mod portamento;
 pub mod processor;
 pub mod reverb;
+pub mod ring_mod;
 pub mod sample;
 pub mod saturation;
 pub mod sequencer;
@@ -154,6 +155,7 @@ pub use phaser::PhaserProcessor;
 pub use portamento::{MAX_PENDING_NOTES, PortamentoProcessor};
 pub use processor::{ChannelWeights, MAX_WEIGHT_CHANNELS, Processor, ProcessorChain};
 pub use reverb::ReverbProcessor;
+pub use ring_mod::RingModProcessor;
 pub use sample::{SAMPLE_DEFAULT_ROOT, SAMPLE_POLYPHONY, SampleVoiceProcessor};
 pub use saturation::SaturationProcessor;
 pub use sequencer::{

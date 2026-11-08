@@ -29,7 +29,7 @@ use glitcherz_engine::realtime::processor::Processor;
 use glitcherz_engine::realtime::{
     BitcrusherProcessor, ChorusProcessor, CompressorProcessor, DelayProcessor, EffectMeters,
     EqProcessor, FlangerProcessor, LimiterProcessor, PhaserProcessor, ReverbProcessor,
-    SaturationProcessor,
+    RingModProcessor, SaturationProcessor,
 };
 
 // ---------------------------------------------------------------------------
@@ -246,6 +246,22 @@ fn built_in_effects_are_allocation_free() {
     let scope = AuditScope::begin();
     exercise(&mut limiter, &mut limiter_buffer, 64);
     assert_zero_alloc(&scope, "LimiterProcessor process/set_param");
+
+    // Z0: the two-buffer path must stay allocation-free too. The graph owns
+    // the aux scratch; the processor only reads it.
+    let mut ring = RingModProcessor::new(SR);
+    let mut main = fixture();
+    let aux = fixture();
+    for _ in 0..2 {
+        ring.set_param(ParamId::BuiltinParam(0), 0.7);
+        ring.process_with_aux(&ctx(), &mut main, Some(&aux));
+    }
+    let scope = AuditScope::begin();
+    for block in 0..64 {
+        ring.set_param(ParamId::BuiltinParam(0), (block as f32 * 0.37).sin());
+        ring.process_with_aux(&ctx(), &mut main, Some(&aux));
+    }
+    assert_zero_alloc(&scope, "RingModProcessor process_with_aux");
 
     // The meter handle itself is written from the audio thread.
     let meters = EffectMeters::new();

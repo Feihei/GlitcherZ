@@ -26,6 +26,27 @@ pub trait Processor: Send {
     /// Processes one fixed block.
     fn process(&mut self, ctx: &ProcessContext, buffer: &mut AudioBuffer);
 
+    /// Processes one block for a node with a second audio input
+    /// (Z0, spec `.agents/spec/dual-audio-input.md` Z-D3).
+    ///
+    /// `buffer` is the Main port (in-place), `aux` is the Mod port's
+    /// block-aligned buffer; `None` means the graph did not supply one. The
+    /// default forwards to [`Processor::process`] so every existing node
+    /// stays untouched — only dual-input effects override it. The graph calls
+    /// this only for `NodeKind::Dual` slots.
+    ///
+    /// The aux buffer belongs to the graph and is reused on the next dual
+    /// node / next block; implementations must not retain the reference.
+    /// RT-safe, same iron rules as `process`.
+    fn process_with_aux(
+        &mut self,
+        ctx: &ProcessContext,
+        buffer: &mut AudioBuffer,
+        _aux: Option<&AudioBuffer>,
+    ) {
+        self.process(ctx, buffer);
+    }
+
     /// Number of samples of latency this node introduces (spec
     /// `.agents/spec/effects.md` D16).
     ///

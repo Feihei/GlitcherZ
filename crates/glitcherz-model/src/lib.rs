@@ -755,6 +755,22 @@ impl Default for LimiterParams {
     }
 }
 
+/// Ring modulator parameters (Z0, spec `dual-audio-input.md` Z-D11).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RingModParams {
+    /// Dry/wet mix (`0` = sample-exact passthrough, `1` = full ring mod).
+    #[serde(default = "default_mix_one")]
+    pub mix: f32,
+}
+
+impl Default for RingModParams {
+    fn default() -> Self {
+        Self {
+            mix: default_mix_one(),
+        }
+    }
+}
+
 /// Built-in effect kind (spec `.agents/spec/effects.md` D1).
 ///
 /// The wire format is the `kind` tag of [`EffectParams`]; this enum lets UI and
@@ -785,6 +801,8 @@ pub enum BuiltinEffectKind {
     Saturation,
     /// Lookahead ceiling keeper.
     Limiter,
+    /// Two-input ring modulator (Z0 validation effect).
+    RingMod,
 }
 
 impl BuiltinEffectKind {
@@ -801,6 +819,15 @@ impl BuiltinEffectKind {
             Self::Phaser => "Phaser",
             Self::Saturation => "Saturation",
             Self::Limiter => "Limiter",
+            Self::RingMod => "Ring Mod",
+        }
+    }
+
+    /// Number of audio input ports (Z0). Only dual-input effects answer 2.
+    pub const fn audio_inputs(self) -> u8 {
+        match self {
+            Self::RingMod => 2,
+            _ => 1,
         }
     }
 
@@ -816,6 +843,7 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Phaser,
         BuiltinEffectKind::Saturation,
         BuiltinEffectKind::Limiter,
+        BuiltinEffectKind::RingMod,
     ];
 }
 
@@ -848,6 +876,8 @@ pub enum EffectParams {
     Saturation(Box<SaturationParams>),
     /// Lookahead ceiling keeper.
     Limiter(Box<LimiterParams>),
+    /// Two-input ring modulator (Z0).
+    RingMod(Box<RingModParams>),
 }
 
 impl Default for EffectParams {
@@ -870,6 +900,7 @@ impl EffectParams {
             Self::Phaser(_) => BuiltinEffectKind::Phaser,
             Self::Saturation(_) => BuiltinEffectKind::Saturation,
             Self::Limiter(_) => BuiltinEffectKind::Limiter,
+            Self::RingMod(_) => BuiltinEffectKind::RingMod,
         }
     }
 
@@ -2579,6 +2610,8 @@ pub fn effect_slot_axis(params: &EffectParams, slot: u8) -> MapSpec {
         (EffectParams::Limiter(_), 1) => M::log(5.0, 1_000.0),
         (EffectParams::Limiter(_), 2) => M::linear(0.0, 1.0),
         (EffectParams::Limiter(_), 3) => M::linear(-12.0, 12.0),
+        // Z0: dry/wet mix of the two-input ring modulator (0..1).
+        (EffectParams::RingMod(_), 0) => M::linear(0.0, 1.0),
         // Out-of-range slot (a plugin payload, or a document that kept a
         // stale slot after the effect changed kind): normalized pass-through.
         _ => M::linear(0.0, 1.0),
@@ -3801,6 +3834,21 @@ impl NodeDoc {
                 | NodeDoc::CurveMap { .. }
         )
     }
+
+    /// Number of audio input ports (Z0). A mixer exposes one per channel,
+    /// dual-input built-in effects expose Main (0) and Mod (1), everything
+    /// else the single port 0. MIDI/control-only nodes answer 0.
+    pub fn audio_inputs(&self) -> u8 {
+        match self {
+            NodeDoc::Mixer { inputs, .. } => *inputs,
+            NodeDoc::Effect { voice, params, .. }
+                if matches!(voice, VoiceSpec::Builtin) && params.kind().audio_inputs() == 2 =>
+            {
+                2
+            }
+            _ => u8::from(self.has_audio_ports()),
+        }
+    }
 }
 
 /// Cable port reference (spec §7 `PortRef`).
@@ -3967,6 +4015,14 @@ impl CableDoc {
 
     /// Audio cable landing on a specific mixer channel (P5f D17).
     pub fn audio_to_channel(from: impl Into<PortRef>, to: impl Into<PortRef>, in_port: u8) -> Self {
+        Self {
+            in_port,
+            ..CableDoc::audio(from, to)
+        }
+    }
+
+    /// Audio cable landing on a specific input port (Z0: Main = 0, Mod = 1).
+    pub fn audio_to_port(from: impl Into<PortRef>, to: impl Into<PortRef>, in_port: u8) -> Self {
         Self {
             in_port,
             ..CableDoc::audio(from, to)
@@ -4264,6 +4320,18 @@ impl GraphDoc {
         (0..inputs).find(|ch| !used.contains(ch)).map(|ch| ch as u8)
     }
 
+    /// First audio input port with no cable (Z0). Unlike
+    /// [`GraphDoc::first_free_channel`] this covers any node; `None` means
+    /// every port is occupied.
+    pub fn first_free_port(&self, node_id: u64) -> Option<u8> {
+        let ports = self.node_by_id(node_id)?.audio_inputs();
+        (0..ports).find(|port| {
+            !self.cables.iter().any(|c| {
+                c.kind == CableKind::Audio && c.to == PortRef::Node(node_id) && c.in_port == *port
+            })
+        })
+    }
+
     /// The channel strip node of a track (mutable).
     pub fn channel_strip_of_track_mut(&mut self, track: usize) -> Option<&mut NodeDoc> {
         self.nodes
@@ -4442,9 +4510,9 @@ impl GraphDoc {
                 ));
             }
         }
-        // Single-input discipline (P5f D14/D16): audio cables into one
-        // destination — only mixers accept multiple (≤ 32 with unique
-        // in_port); everything else ≤ 1, master included.
+        // Input discipline (P5f D14/D16, Z0 Z-D7): audio cables into one
+        // destination — mixers accept up to 32 (unique in_port), dual-input
+        // effects accept 2 (Main/Mod), everything else ≤ 1.
         let mut audio_in_count: std::collections::BTreeMap<u64, usize> = Default::default();
         let mut mixer_ports: std::collections::BTreeMap<u64, Vec<u8>> = Default::default();
         // MIDI event-cable bookkeeping (spec `midi-nodes.md` §7): node event
@@ -4566,6 +4634,8 @@ impl GraphDoc {
                             "node {dest_key} has no audio input (MIDI/control only)"
                         ));
                     }
+                    let dest_node = self.node_by_id(dest_key);
+                    let port_limit = dest_node.map_or(1, |node| usize::from(node.audio_inputs()));
                     if dest_key == MASTER_NODE_ID {
                         // Master (D16): single input; in_port must be 0.
                         if cable.in_port != 0 {
@@ -4573,7 +4643,7 @@ impl GraphDoc {
                                 "master input has no channel ports (in_port must be 0)".to_string()
                             );
                         }
-                    } else if let Some(NodeDoc::Mixer { inputs, .. }) = self.node_by_id(dest_key) {
+                    } else if let Some(NodeDoc::Mixer { inputs, .. }) = dest_node {
                         if cable.in_port as usize >= *inputs as usize {
                             return Err(format!(
                                 "audio cable targets mixer {dest_key} channel {} out of range (inputs = {inputs})",
@@ -4589,24 +4659,36 @@ impl GraphDoc {
                         }
                         ports.push(cable.in_port);
                     } else {
-                        if cable.in_port != 0 {
+                        // Z0: a dual-input effect accepts ports 0 (Main) and
+                        // 1 (Mod), each at most one cable; every other node
+                        // keeps port 0 only (pre-Z0 behaviour unchanged).
+                        if usize::from(cable.in_port) >= port_limit {
                             return Err(format!(
-                                "non-mixer node {dest_key} has no channel ports (in_port must be 0)"
+                                "node {dest_key} has no input port {} (has {port_limit})",
+                                cable.in_port
                             ));
                         }
+                        let ports = mixer_ports.entry(dest_key).or_default();
+                        if ports.contains(&cable.in_port) {
+                            return Err(format!(
+                                "node {dest_key} input port {} receives multiple cables",
+                                cable.in_port
+                            ));
+                        }
+                        ports.push(cable.in_port);
                     }
                     let count = audio_in_count.entry(dest_key).or_insert(0);
                     *count += 1;
                     let limit = if dest_key == MASTER_NODE_ID {
                         1
-                    } else if matches!(self.node_by_id(dest_key), Some(NodeDoc::Mixer { .. })) {
+                    } else if matches!(dest_node, Some(NodeDoc::Mixer { .. })) {
                         MAX_MIXER_CHANNELS
                     } else {
-                        1
+                        port_limit
                     };
                     if *count > limit {
                         return Err(format!(
-                            "node {dest_key} receives {count} audio cables (limit {limit}, D14/D16: only mixers sum multiple inputs)"
+                            "node {dest_key} receives {count} audio cables (limit {limit}, D14/D16/Z0)"
                         ));
                     }
                 }
@@ -5884,6 +5966,66 @@ mod tests {
                 other => panic!("expected an effect node, got {other:?}"),
             }
         }
+    }
+
+    // Z0: the port profile is derived from the effect kind, the document
+    // validator enforces the same port range / per-port uniqueness, and the
+    // new payload round-trips without a PROJECT_VERSION bump.
+    #[test]
+    fn dual_input_effect_validates_both_audio_ports() {
+        let instrument = |node_id: u64, track: usize| NodeDoc::Instrument {
+            node_id,
+            track,
+            voice: VoiceSpec::Builtin,
+            synth: SynthParams::default(),
+        };
+        let dual = NodeDoc::Effect {
+            node_id: 4,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params: EffectParams::RingMod(Box::default()),
+            delay: None,
+        };
+        assert_eq!(dual.audio_inputs(), 2, "Ring Mod has Main + Mod");
+        assert_eq!(
+            effect_node(EffectParams::Delay(DelayParams::default())).audio_inputs(),
+            1,
+            "every existing effect stays single-input"
+        );
+
+        let build = |cables: Vec<CableDoc>| GraphDoc {
+            nodes: vec![instrument(2, 0), instrument(3, 1), dual.clone()],
+            cables,
+            ..Default::default()
+        };
+        let legal = build(vec![
+            CableDoc::audio_to_port(2u64, 4u64, 0),
+            CableDoc::audio_to_port(3u64, 4u64, 1),
+            CableDoc::audio(4u64, PortRef::Master),
+        ]);
+        legal.validate(2, 0).expect("Main + Mod must be legal");
+        assert_eq!(legal.first_free_port(4), None, "both ports are occupied");
+        assert_eq!(legal.first_free_port(2), Some(0));
+
+        // A port that does not exist must be rejected by the document layer.
+        let mut bad = legal.clone();
+        bad.cables[1] = CableDoc::audio_to_port(3u64, 4u64, 2);
+        assert!(bad.validate(2, 0).is_err());
+
+        // Two cables may not share the Mod port.
+        let mut bad = legal.clone();
+        bad.cables[0] = CableDoc::audio_to_port(2u64, 4u64, 1);
+        assert!(bad.validate(2, 0).is_err());
+
+        // Plain nodes keep the pre-Z0 rule: port 0 only.
+        let mut bad = legal.clone();
+        bad.cables[0] = CableDoc::audio_to_port(2u64, 3u64, 1);
+        assert!(bad.validate(2, 0).is_err());
+
+        let text = ron::to_string(&dual).expect("serialize");
+        assert!(text.contains("ring_mod"), "tag missing: {text}");
+        let back: NodeDoc = ron::from_str(&text).expect("deserialize");
+        assert_eq!(dual, back);
     }
 
     // E2: a payload written by a newer build without some fields still loads

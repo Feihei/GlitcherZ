@@ -57,6 +57,8 @@ pub enum BuiltinEffectKind {
     Saturation,
     /// Lookahead ceiling keeper.
     Limiter,
+    /// Two-input ring modulator (Z0 validation effect).
+    RingMod,
 }
 
 impl BuiltinEffectKind {
@@ -72,7 +74,18 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Phaser,
         BuiltinEffectKind::Saturation,
         BuiltinEffectKind::Limiter,
+        BuiltinEffectKind::RingMod,
     ];
+
+    /// Number of audio input ports (Z0). The kind — not the parameter
+    /// descriptor — owns the port profile, so adding a second input never
+    /// means touching every static descriptor table.
+    pub const fn audio_inputs(self) -> u8 {
+        match self {
+            BuiltinEffectKind::RingMod => 2,
+            _ => 1,
+        }
+    }
 
     /// Static descriptor of this kind.
     pub const fn descriptor(self) -> &'static EffectDescriptor {
@@ -87,6 +100,7 @@ impl BuiltinEffectKind {
             BuiltinEffectKind::Phaser => &crate::realtime::phaser::DESCRIPTOR,
             BuiltinEffectKind::Saturation => &crate::realtime::saturation::DESCRIPTOR,
             BuiltinEffectKind::Limiter => &crate::realtime::limiter::DESCRIPTOR,
+            BuiltinEffectKind::RingMod => &crate::realtime::ring_mod::DESCRIPTOR,
         }
     }
 }

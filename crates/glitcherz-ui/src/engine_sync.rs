@@ -308,6 +308,8 @@ impl GlitcherZApp {
         let kind = match node {
             NodeDoc::Mixer { .. } => NodeKind::Mixer,
             NodeDoc::Feedback { .. } => NodeKind::Feedback,
+            // Z0: the document's port profile decides the runtime kind.
+            _ if node.audio_inputs() == 2 => NodeKind::Dual,
             _ => NodeKind::Plain,
         };
         if !self.engine.add_node(engine_id, kind, processor) {

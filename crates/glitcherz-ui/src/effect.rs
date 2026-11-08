@@ -13,8 +13,9 @@ use std::sync::Arc;
 use glitcherz_engine::realtime::{
     BitcrusherProcessor, BuiltinEffectKind, ChorusProcessor, CompressorProcessor, DelayProcessor,
     EffectDescriptor, EffectMeters, EqProcessor, FlangerProcessor, LimiterProcessor, ParamId,
-    ParamSpec, PhaserProcessor, Processor, ReverbProcessor, SaturationProcessor, Unit, bitcrusher,
-    chorus, compressor, delay, eq, flanger, limiter, phaser, reverb, saturation,
+    ParamSpec, PhaserProcessor, Processor, ReverbProcessor, RingModProcessor, SaturationProcessor,
+    Unit, bitcrusher, chorus, compressor, delay, eq, flanger, limiter, phaser, reverb, ring_mod,
+    saturation,
 };
 use glitcherz_model::{BuiltinEffectKind as DocEffectKind, EffectParams};
 
@@ -40,6 +41,7 @@ pub fn engine_kind(params: &EffectParams) -> BuiltinEffectKind {
         DocEffectKind::Phaser => BuiltinEffectKind::Phaser,
         DocEffectKind::Saturation => BuiltinEffectKind::Saturation,
         DocEffectKind::Limiter => BuiltinEffectKind::Limiter,
+        DocEffectKind::RingMod => BuiltinEffectKind::RingMod,
     }
 }
 
@@ -61,6 +63,7 @@ pub fn default_params(kind: DocEffectKind) -> EffectParams {
         DocEffectKind::Phaser => EffectParams::Phaser(Box::default()),
         DocEffectKind::Saturation => EffectParams::Saturation(Box::default()),
         DocEffectKind::Limiter => EffectParams::Limiter(Box::default()),
+        DocEffectKind::RingMod => EffectParams::RingMod(Box::default()),
     }
 }
 
@@ -92,6 +95,7 @@ pub fn processor(params: &EffectParams, sample_rate: f32) -> BuiltinProcessor {
             meters = Some(handle.clone());
             Box::new(LimiterProcessor::with_meters(sample_rate, Some(handle)))
         }
+        BuiltinEffectKind::RingMod => Box::new(RingModProcessor::new(sample_rate)),
     };
     let descriptor = descriptor(params);
     for slot in 0..descriptor.params.len() {
@@ -181,6 +185,10 @@ pub fn value(params: &EffectParams, slot: u8) -> f32 {
             saturation::SLOT_TONE => sat.tone,
             saturation::SLOT_TRIM => sat.trim,
             saturation::SLOT_MIX => sat.mix,
+            _ => 0.0,
+        },
+        EffectParams::RingMod(rm) => match slot {
+            ring_mod::SLOT_MIX => rm.mix,
             _ => 0.0,
         },
         EffectParams::Limiter(lim) => match slot {
@@ -275,6 +283,11 @@ pub fn set_value(params: &mut EffectParams, slot: u8, value: f32) {
             saturation::SLOT_MIX => sat.mix = value,
             _ => {}
         },
+        EffectParams::RingMod(rm) => {
+            if slot == ring_mod::SLOT_MIX {
+                rm.mix = value;
+            }
+        }
         EffectParams::Limiter(lim) => match slot {
             limiter::SLOT_THRESHOLD => lim.threshold = value,
             limiter::SLOT_RELEASE => lim.release = value,

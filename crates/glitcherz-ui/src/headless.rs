@@ -700,6 +700,8 @@ pub(crate) fn assemble_offline<M: Media>(
         let kind = match node {
             NodeDoc::Mixer { .. } => NodeKind::Mixer,
             NodeDoc::Feedback { .. } => NodeKind::Feedback,
+            // Z0: the document's port profile decides the runtime kind.
+            _ if node.audio_inputs() == 2 => NodeKind::Dual,
             _ => NodeKind::Plain,
         };
         let engine_id = engine.fresh_node_id();
@@ -957,7 +959,9 @@ pub fn render_project_to_wav(
 mod tests {
     use super::*;
 
-    use glitcherz_model::{MidiClip, Note};
+    use glitcherz_model::{
+        CableDoc, CableKind, EffectParams, MidiClip, NodeDoc, Note, PortRef, VoiceSpec,
+    };
 
     fn project_with_note() -> Project {
         let mut project = Project::default();
@@ -1021,6 +1025,88 @@ mod tests {
         for path in [input, first, second] {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    fn wav_has_signal(path: &Path) -> bool {
+        let bytes = std::fs::read(path).expect("read wav");
+        let Some(pos) = bytes.windows(4).position(|w| w == b"data") else {
+            panic!("wav has no data chunk");
+        };
+        bytes[pos + 8..].iter().any(|&b| b != 0)
+    }
+
+    /// Z0 end-to-end: the offline assembly must install a dual-input document
+    /// node as `NodeKind::Dual`. With both ports fed from the same instrument
+    /// the render carries signal; without the Mod cable it goes silent
+    /// (Z-D12). This locks the document → assembly → graph → WAV chain.
+    #[test]
+    fn offline_render_honours_dual_input_ports() {
+        let mut project = project_with_note();
+        let dual_id = project
+            .graph
+            .nodes
+            .iter()
+            .map(NodeDoc::node_id)
+            .max()
+            .unwrap_or(1)
+            + 1;
+        project.graph.nodes.push(NodeDoc::Effect {
+            node_id: dual_id,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params: EffectParams::RingMod(Box::default()),
+            delay: None,
+        });
+        let voice = project.graph.instrument_of_track(0).unwrap().node_id();
+        let mixer = project.graph.first_mixer().unwrap().node_id();
+        // Replace voice → mixer.ch0 with voice → dual.Main → mixer.ch0.
+        project.graph.cables.retain(|c| {
+            !(c.kind == CableKind::Audio
+                && c.from == PortRef::Node(voice)
+                && c.to == PortRef::Node(mixer))
+        });
+        project
+            .graph
+            .cables
+            .push(CableDoc::audio_to_port(voice, dual_id, 0));
+        project
+            .graph
+            .cables
+            .push(CableDoc::audio_to_channel(dual_id, mixer, 0));
+
+        let options = RenderOptions {
+            sample_rate: 22_050,
+            bits: export_audio::Bits::Int16,
+            end_ticks: Some(1920),
+        };
+        let render = |tag: &str, p: &Project| -> PathBuf {
+            let input = save_temp(p, tag);
+            let out =
+                std::env::temp_dir().join(format!("glitcherz_z0_{tag}_{}.wav", std::process::id()));
+            render_project_to_wav(&input, &out, options).expect("render");
+            let _ = std::fs::remove_file(input);
+            out
+        };
+
+        let dry = render("dry", &project);
+        assert!(
+            !wav_has_signal(&dry),
+            "a Ring Mod with no Mod cable must be silent"
+        );
+
+        // Feed the Mod port from the same instrument: out = x × x ≠ 0.
+        project
+            .graph
+            .cables
+            .push(CableDoc::audio_to_port(voice, dual_id, 1));
+        let wet = render("wet", &project);
+        assert!(
+            wav_has_signal(&wet),
+            "a wired Mod port must reach the processor"
+        );
+
+        let _ = std::fs::remove_file(dry);
+        let _ = std::fs::remove_file(wet);
     }
 
     /// Mirrors `GlitcherZApp::start_export` (assemble -> ExportJob -> pump)

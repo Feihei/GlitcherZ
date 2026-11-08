@@ -2129,6 +2129,40 @@ fn port_name_labels(
     out
 }
 
+/// Destination input port for an audio cable drop (Z0 Z-D8).
+///
+/// Mixer and dual-input nodes expose several ports: a precise hit on a dot
+/// wins, otherwise the first free port. Every other node lands on port 0.
+fn audio_landing_port(
+    doc: &GraphDoc,
+    state: &PatchState,
+    rect_min: Pos2,
+    sp: Pos2,
+    target: PatchId,
+    deps: &PatchDeps<'_>,
+) -> Option<u8> {
+    let PatchId::Node(to_doc) = target else {
+        return Some(0);
+    };
+    let Some(node) = doc.node_by_id(to_doc) else {
+        return Some(0);
+    };
+    let ports = node.audio_inputs();
+    if ports <= 1 {
+        return Some(0);
+    }
+    if let Some((PatchId::Node(_), port)) = state.hit_in_port(rect_min, sp, deps)
+        && port < ports
+    {
+        return Some(port);
+    }
+    if node.is_mixer() {
+        doc.first_free_channel(to_doc)
+    } else {
+        doc.first_free_port(to_doc)
+    }
+}
+
 /// Which output port a press at `sp` may grab, if any.
 ///
 /// Captions own their own rect: a press that lands on a name belongs to the
@@ -2277,6 +2311,8 @@ impl PatchState {
                 {
                     0
                 }
+                // Z0: dual-input effects expose Main (0) and Mod (1).
+                Some(node) if node.audio_inputs() == 2 => 2,
                 _ => 1,
             },
         };
@@ -3370,21 +3406,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                                                 PatchId::Master => PortRef::Master,
                                                 _ => PortRef::Master,
                                             };
-                                            let in_port = match target {
-                                                PatchId::Node(to_doc)
-                                                    if doc
-                                                        .node_by_id(to_doc)
-                                                        .is_some_and(|n| n.is_mixer()) =>
-                                                {
-                                                    match state.hit_in_port(rect.min, sp, &deps) {
-                                                        Some((PatchId::Node(_), port)) => {
-                                                            Some(port)
-                                                        }
-                                                        _ => doc.first_free_channel(to_doc),
-                                                    }
-                                                }
-                                                _ => Some(0),
-                                            };
+                                            let in_port = audio_landing_port(
+                                                doc, state, rect.min, sp, target, &deps,
+                                            );
                                             if let Some(in_port) = in_port {
                                                 actions.push(PatchAction::ConnectAudio {
                                                     from_doc,
@@ -3465,21 +3489,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                                             // input (D14): the new cable replaces
                                             // the old one on the same slot; no free
                                             // channel → reject.
-                                            let in_port = match target {
-                                                PatchId::Node(to_doc)
-                                                    if doc
-                                                        .node_by_id(to_doc)
-                                                        .is_some_and(|n| n.is_mixer()) =>
-                                                {
-                                                    match state.hit_in_port(rect.min, sp, &deps) {
-                                                        Some((PatchId::Node(_), port)) => {
-                                                            Some(port)
-                                                        }
-                                                        _ => doc.first_free_channel(to_doc),
-                                                    }
-                                                }
-                                                _ => Some(0),
-                                            };
+                                            let in_port = audio_landing_port(
+                                                doc, state, rect.min, sp, target, &deps,
+                                            );
                                             if let Some(in_port) = in_port {
                                                 actions.push(PatchAction::ConnectAudio {
                                                     from_doc,
@@ -3730,11 +3742,28 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                         timeline_in_port_label(kind, track, &deps),
                     ),
                 },
+                // Z0: label the two ports of a dual-input effect so the Mod
+                // inlet is not a second unmarked grey dot.
+                PatchId::Node(node_id)
+                    if deps
+                        .doc
+                        .node_by_id(node_id)
+                        .is_some_and(|n| n.audio_inputs() == 2) =>
+                {
+                    (
+                        Color32::from_gray(90),
+                        if port == 0 {
+                            "Main".to_string()
+                        } else {
+                            "Mod".to_string()
+                        },
+                    )
+                }
                 _ => (Color32::from_gray(90), String::new()),
             };
             painter.circle_filled(p, PORT_RADIUS, inbound);
             painter.circle_stroke(p, PORT_RADIUS, egui::Stroke::new(1.0, Color32::BLACK));
-            if matches!(id, PatchId::TimelineIn) {
+            if !label.is_empty() {
                 // Same gap and size as the captions in `port_name_labels` —
                 // this terminal is the one that made the other two look
                 // detached, so it is the reference, not an exception.

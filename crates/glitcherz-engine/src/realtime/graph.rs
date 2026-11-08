@@ -122,6 +122,10 @@ pub enum NodeKind {
     /// sources), so the tap sources still hold last block's output when the
     /// sum happens — the explicit one-block delay, no extra buffer needed.
     Feedback,
+    /// Dual-input effect (Z0): `in_port` 0 = Main, 1 = Mod. Each port takes
+    /// at most one in-edge; the Mod edges are summed into the graph's aux
+    /// scratch instead of the node's output buffer.
+    Dual,
 }
 
 impl NodeKind {
@@ -129,7 +133,20 @@ impl NodeKind {
     pub fn max_in(self) -> usize {
         match self {
             NodeKind::Mixer | NodeKind::Feedback => MAX_IN_EDGES,
+            NodeKind::Dual => 2,
             NodeKind::Plain | NodeKind::Master => 1,
+        }
+    }
+
+    /// Number of distinct destination input ports (Z0 Z-D6). `in_port`
+    /// values at or above this are rejected by `add_cable`; mixer / feedback
+    /// keep their historical wide range (the document validator owns their
+    /// per-channel rules).
+    pub const fn allowed_ports(self) -> u8 {
+        match self {
+            NodeKind::Dual => 2,
+            NodeKind::Plain | NodeKind::Master => 1,
+            NodeKind::Mixer | NodeKind::Feedback => MAX_IN_EDGES as u8,
         }
     }
 }
@@ -400,6 +417,12 @@ pub struct RtGraph {
     /// update payload stays small.
     pdc_delay: [[u16; MAX_IN_EDGES]; MAX_NODES],
     block_size: usize,
+    /// Shared Mod-port scratch (Z0 Z-D4): one stereo block, reused by every
+    /// dual-input node in a block. `Option` lets `process_block` move it into
+    /// a local so summing can borrow the graph's slots at the same time, with
+    /// no field-splitting of the rest of `self`. Allocated once on the control
+    /// side; never allocated or dropped on the audio thread.
+    aux: Option<AudioBuffer>,
     /// Panic sweep cursor (see [`RtGraph::panic`]): `Some(start)` = the next
     /// block must release pitches `start..` and advance; `None` = idle.
     panic_sweep: Option<u8>,
@@ -529,14 +552,16 @@ pub struct NodeDeployment {
 }
 
 impl RtGraph {
-    /// Empty graph (all slots empty, silent output). **Not RT-safe** (no heap
-    /// allocation; construction only).
+    /// Empty graph (all slots empty, silent output). **Not RT-safe** (the
+    /// output/aux buffers are heap-allocated; construction only).
     pub fn new(block_size: usize) -> Self {
+        let block_size = block_size.max(1);
         Self {
             slots: std::array::from_fn(|_| None),
             plan: ExecPlan::EMPTY,
             pdc_delay: [[0; MAX_IN_EDGES]; MAX_NODES],
-            block_size: block_size.max(1),
+            block_size,
+            aux: Some(AudioBuffer::new(2, block_size)),
             panic_sweep: None,
             last_cc: [-1; MAX_AUTO_TRACKS],
             last_bend: [i32::MIN; MAX_AUTO_TRACKS],
@@ -769,6 +794,10 @@ impl RtGraph {
         // (bounded batch per block, see `panic`).
         self.drain_panic_sweep();
         let frames = self.block_size.min(ctx.frames);
+        // Z0: move the shared Mod scratch out of `self` for the whole block so
+        // summing can borrow the graph's slots and the scratch at once without
+        // splitting every other field of `self`. Put back before returning.
+        let mut aux = self.aux.take();
         for i in 0..self.plan.order_len {
             let s = self.plan.order[i] as usize;
             // Temporarily take this node out: borrowing the source buffer
@@ -778,6 +807,14 @@ impl RtGraph {
             };
             node.output.set_len(frames);
             node.output.clear();
+            // Z0 (Z-D5): only `NodeKind::Dual` splits its in-edges. Mixer
+            // channel 1 also uses `in_port == 1`, so the kind — not the port
+            // number — decides whether a second buffer exists.
+            let dual = self.plan.kinds[s] == NodeKind::Dual;
+            if dual && let Some(scratch) = aux.as_mut() {
+                scratch.set_len(frames);
+                scratch.clear();
+            }
             let count = self.plan.in_counts[s] as usize;
             // Copy the edge tables out (arrays are `Copy`) so summing does not
             // borrow `self` while `self.slots` is being mutated.
@@ -798,7 +835,25 @@ impl RtGraph {
                         0
                     };
                     let weight = weights.map(|w| w[ports[i] as usize]);
-                    if delay == 0 {
+                    if dual && ports[i] == 1 {
+                        // Mod port: summed into the shared scratch, never
+                        // weighted and never mixed into Main. Both the fast
+                        // path and the PDC path honour the same split (Z-D10).
+                        let Some(scratch) = aux.as_mut() else {
+                            continue;
+                        };
+                        if delay == 0 {
+                            sum_into(scratch, &src_node.output);
+                        } else {
+                            sum_into_delayed(
+                                scratch,
+                                &src_node.history,
+                                src_node.history_write,
+                                delay,
+                                None,
+                            );
+                        }
+                    } else if delay == 0 {
                         match weight {
                             Some(w) => sum_into_weighted(&mut node.output, &src_node.output, w),
                             None => sum_into(&mut node.output, &src_node.output),
@@ -814,7 +869,12 @@ impl RtGraph {
                     }
                 }
             }
-            node.processor.process(ctx, &mut node.output);
+            if dual {
+                node.processor
+                    .process_with_aux(ctx, &mut node.output, aux.as_ref());
+            } else {
+                node.processor.process(ctx, &mut node.output);
+            }
             // S2-3: publish this block into the PDC history. Downstream edges
             // (which run later in topology order) read it at their offset.
             if pdc_active {
@@ -902,6 +962,7 @@ impl RtGraph {
                 }
             }
         }
+        self.aux = aux;
         let mut levels = GraphLevels::default();
         for (t, &slot) in self.plan.track_channel.iter().enumerate() {
             levels.tracks[t] = self.slot_peak(slot);
@@ -1873,6 +1934,16 @@ impl GraphCompiler {
     /// in_port)` slot disconnects the previous one. Exact duplicates are
     /// idempotent. Returns [`TopologyError::TooManyCables`] when full.
     fn add_cable(&mut self, from: u16, to: u16, in_port: u8) -> Result<(), TopologyError> {
+        // Z0 Z-D6: `remove_cables_to_port` guarantees per-port uniqueness but
+        // not that the port exists. Reject out-of-range ports here so the
+        // engine never silently treats a stray port as Main.
+        let allowed = self
+            .kinds
+            .get(to as usize)
+            .map_or(1, |kind| kind.allowed_ports());
+        if in_port >= allowed {
+            return Err(TopologyError::TooManyCables);
+        }
         if self.cables[..self.cable_count]
             .iter()
             .any(|c| c.from == from && c.to == to && c.in_port == in_port)
@@ -2973,7 +3044,11 @@ impl GraphCompiler {
         // P6: a feedback node's cables are taps — bypassing it would turn
         // the loop into a direct edge and, usually, into a rejected cycle;
         // its cables are dropped instead (mixer-like).
-        let bypassable = in_count <= 1 && self.kinds[slot as usize] != NodeKind::Feedback;
+        // Z0 Z-D9: a dual-input node's single in-edge may be the Mod port;
+        // bypassing it would wire a modulator straight into the main signal.
+        let bypassable = in_count <= 1
+            && self.kinds[slot as usize] != NodeKind::Feedback
+            && self.kinds[slot as usize] != NodeKind::Dual;
         if bypassable {
             for cable in &self.cables[..self.cable_count] {
                 if cable.to == slot {
@@ -3108,6 +3183,7 @@ mod tests {
     use crate::realtime::map::MapSpec;
     use crate::realtime::mixer::MixerProcessor;
     use crate::realtime::processor::Processor;
+    use crate::realtime::ring_mod::RingModProcessor;
     use crate::realtime::sequencer::{RtCtrl, RtCtrlKind};
     use crate::realtime::voice::{RecycledNode, recycle_channel};
     use std::sync::Arc;
@@ -3684,6 +3760,418 @@ mod tests {
                 levels.master
             );
         }
+    }
+
+    // ---- Z0: dual audio input ports (spec `dual-audio-input.md`) ----
+
+    /// DC source that *declares* a latency without delaying its own signal,
+    /// used to make PDC compensate the opposite in-edge of a dual node.
+    struct LatentDc {
+        value: f32,
+        latency: usize,
+    }
+
+    impl Processor for LatentDc {
+        fn process(&mut self, _ctx: &ProcessContext, buffer: &mut AudioBuffer) {
+            for ch in 0..buffer.channels() {
+                if let Some(channel) = buffer.channel_mut(ch) {
+                    channel.fill(self.value);
+                }
+            }
+        }
+
+        fn latency_samples(&self) -> usize {
+            self.latency
+        }
+    }
+
+    /// Builds `main(2) → dual(4).Main`, `mod(3) → dual(4).Mod`,
+    /// `dual(4) → master`, and returns the running graph plus the dual slot.
+    fn dual_rig(
+        main: Box<dyn Processor>,
+        modulator: Box<dyn Processor>,
+    ) -> (GraphCompiler, RtGraph, u16) {
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let mut apply =
+            |graph: &mut RtGraph, update: GraphUpdate| graph.apply_update(update, &mut recycle_tx);
+        apply(
+            &mut graph,
+            compiler
+                .add_node(2, NodeKind::Plain, main)
+                .expect("add Main source"),
+        );
+        apply(
+            &mut graph,
+            compiler
+                .add_node(3, NodeKind::Plain, modulator)
+                .expect("add Mod source"),
+        );
+        apply(
+            &mut graph,
+            compiler
+                .add_node(4, NodeKind::Dual, Box::new(RingModProcessor::new(SR)))
+                .expect("add dual-input effect"),
+        );
+        apply(
+            &mut graph,
+            compiler.connect_nodes(2, 4, 0).expect("Main → port 0"),
+        );
+        apply(
+            &mut graph,
+            compiler.connect_nodes(3, 4, 1).expect("Mod → port 1"),
+        );
+        apply(
+            &mut graph,
+            compiler
+                .connect_nodes(4, super::MASTER_NODE_ID, 0)
+                .expect("dual → master"),
+        );
+        let dual = compiler.node_slot(4).expect("dual slot");
+        (compiler, graph, dual)
+    }
+
+    /// Reads the dual node's own output buffer (before the master gain stage,
+    /// whose smoothing is irrelevant to the port math).
+    fn dual_output(graph: &RtGraph, dual: u16) -> &[f32] {
+        graph.slots[dual as usize]
+            .as_ref()
+            .expect("dual node installed")
+            .output
+            .channel(0)
+            .expect("left channel")
+    }
+
+    #[test]
+    fn dual_input_effect_splits_main_and_mod() {
+        let (_compiler, mut graph, dual) = dual_rig(
+            Box::new(DcSource { value: 0.5 }),
+            Box::new(DcSource { value: -0.25 }),
+        );
+        assert_eq!(graph.plan.kinds[dual as usize], NodeKind::Dual);
+        assert_eq!(graph.plan.in_counts[dual as usize], 2);
+        let ports = &graph.plan.in_ports[dual as usize][..2];
+        assert!(ports.contains(&0) && ports.contains(&1), "both ports wired");
+
+        graph.process_block(&ctx());
+
+        // Z-D11: mix defaults to 1.0 → out = main × mod = 0.5 × -0.25.
+        // If the two ports were summed into one buffer, the result would be
+        // 0.75 × 0 (missing modulator) instead.
+        assert!(
+            dual_output(&graph, dual)
+                .iter()
+                .all(|s| (s + 0.125).abs() < 1e-6)
+        );
+        // The shared scratch carries the Mod source only — Main must not leak.
+        let aux = graph.aux.as_ref().expect("aux scratch installed");
+        assert_eq!(aux.len(), BLOCK);
+        for ch in 0..2 {
+            assert!(
+                aux.channel(ch)
+                    .expect("aux channel")
+                    .iter()
+                    .all(|s| (s + 0.25).abs() < 1e-6)
+            );
+        }
+    }
+
+    #[test]
+    fn dual_input_with_only_one_port_connected_is_silent() {
+        // Z-D12: a missing Mod means an all-zero modulator; a missing Main
+        // means an all-zero carrier. Both must be silent — and primed scratch
+        // data from an earlier block must not survive the disconnect.
+        for drop_source in [2u64, 3u64] {
+            let (mut compiler, mut graph, dual) = dual_rig(
+                Box::new(DcSource { value: 0.5 }),
+                Box::new(DcSource { value: -0.25 }),
+            );
+            graph.process_block(&ctx());
+            let (mut recycle_tx, _recycle_rx) = recycle_channel();
+            let update = compiler
+                .disconnect_nodes(drop_source, 4)
+                .expect("drop one in-edge");
+            graph.apply_update(update, &mut recycle_tx);
+            graph.process_block(&ctx());
+            assert!(
+                dual_output(&graph, dual).iter().all(|s| s.abs() < 1e-6),
+                "dropping source {drop_source} must silence the Ring Mod"
+            );
+            let aux = graph.aux.as_ref().expect("aux scratch installed");
+            assert_eq!(aux.len(), BLOCK, "a dual node always activates the scratch");
+            // Dropping the Mod source must leave a cleared scratch; dropping
+            // the Main source leaves the Mod edge intact in the scratch.
+            let expected_mod = if drop_source == 3 { 0.0 } else { -0.25 };
+            assert!(
+                aux.channel(0)
+                    .expect("aux left")
+                    .iter()
+                    .all(|s| (s - expected_mod).abs() < 1e-6),
+                "dropping source {drop_source}: the scratch must carry only the Mod edge"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_aux_scratch_is_cleared_between_dual_nodes() {
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let mut apply =
+            |graph: &mut RtGraph, update: GraphUpdate| graph.apply_update(update, &mut recycle_tx);
+        for (id, value) in [(2, 0.5), (3, 0.25)] {
+            apply(
+                &mut graph,
+                compiler
+                    .add_node(id, NodeKind::Plain, Box::new(DcSource { value }))
+                    .expect("add source"),
+            );
+        }
+        for id in [4u64, 5u64] {
+            apply(
+                &mut graph,
+                compiler
+                    .add_node(id, NodeKind::Dual, Box::new(RingModProcessor::new(SR)))
+                    .expect("add dual effect"),
+            );
+        }
+        apply(&mut graph, compiler.connect_nodes(2, 4, 0).expect("main"));
+        apply(&mut graph, compiler.connect_nodes(3, 4, 1).expect("mod"));
+        apply(&mut graph, compiler.connect_nodes(4, 5, 0).expect("chain"));
+        apply(
+            &mut graph,
+            compiler
+                .connect_nodes(5, super::MASTER_NODE_ID, 0)
+                .expect("to master"),
+        );
+        let first = compiler.node_slot(4).expect("first dual slot");
+        let second = compiler.node_slot(5).expect("second dual slot");
+
+        graph.process_block(&ctx());
+        assert!(
+            dual_output(&graph, first)
+                .iter()
+                .all(|s| (s - 0.125).abs() < 1e-6),
+            "the first dual node receives both ports"
+        );
+        assert!(
+            dual_output(&graph, second).iter().all(|s| s.abs() < 1e-6),
+            "the second dual node has no Mod edge: stale aux must be cleared"
+        );
+    }
+
+    #[test]
+    fn dual_input_pdc_delays_the_mod_port_to_match_the_slow_main_branch() {
+        const DELAY: usize = 10;
+        let (_compiler, mut graph, dual) = dual_rig(
+            Box::new(LatentDc {
+                value: 0.5,
+                latency: DELAY,
+            }),
+            Box::new(PulseSource {
+                position: 0,
+                pulse_at: 0,
+            }),
+        );
+        assert!(graph.plan.pdc_active, "a latency node must activate PDC");
+        let ports = &graph.plan.in_ports[dual as usize][..2];
+        let main_edge = ports.iter().position(|&p| p == 0).expect("Main edge");
+        let mod_edge = ports.iter().position(|&p| p == 1).expect("Mod edge");
+        assert_eq!(graph.pdc_delay[dual as usize][main_edge], 0);
+        assert_eq!(
+            usize::from(graph.pdc_delay[dual as usize][mod_edge]),
+            DELAY,
+            "the fast Mod branch is shifted to the slow Main branch"
+        );
+
+        graph.process_block(&ctx());
+        let output = dual_output(&graph, dual);
+        assert!(
+            output[..DELAY].iter().all(|s| s.abs() < 1e-6),
+            "nothing may precede the aligned pulse"
+        );
+        assert!(
+            (output[DELAY] - 0.5).abs() < 1e-6,
+            "0.5 × 1.0 must land at frame {DELAY}, got {}",
+            output[DELAY]
+        );
+        assert!(
+            output[DELAY + 1..].iter().all(|s| s.abs() < 1e-6),
+            "nothing may follow the aligned pulse"
+        );
+        let aux = graph.aux.as_ref().expect("aux scratch").channel(0).unwrap();
+        assert!(
+            aux[0].abs() < 1e-6 && (aux[DELAY] - 1.0).abs() < 1e-6,
+            "the Mod pulse itself must travel through sum_into_delayed"
+        );
+    }
+
+    #[test]
+    fn dual_input_rejects_out_of_range_ports_and_keeps_per_port_uniqueness() {
+        let (mut compiler, _graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        for id in 2..=4 {
+            compiler
+                .add_node(id, NodeKind::Plain, Box::new(DcSource { value: 0.25 }))
+                .expect("add source");
+        }
+        compiler
+            .add_node(5, NodeKind::Dual, Box::new(RingModProcessor::new(SR)))
+            .expect("add dual effect");
+        let dual = compiler.node_slot(5).expect("dual slot");
+
+        assert!(matches!(
+            compiler.connect_nodes(2, 5, 2),
+            Err(TopologyError::TooManyCables)
+        ));
+        assert!(matches!(
+            compiler.connect_nodes(2, 5, u8::MAX),
+            Err(TopologyError::TooManyCables)
+        ));
+        compiler.connect_nodes(2, 5, 0).expect("Main port");
+        compiler.connect_nodes(3, 5, 1).expect("Mod port");
+        assert_eq!(
+            compiler.cables[..compiler.cable_count]
+                .iter()
+                .filter(|c| c.to == dual)
+                .count(),
+            2
+        );
+        // A third source onto the Mod port replaces the old cable instead of
+        // creating a third in-edge (per-port uniqueness, Z-D1).
+        compiler.connect_nodes(4, 5, 1).expect("replace Mod cable");
+        let edges: Vec<_> = compiler.cables[..compiler.cable_count]
+            .iter()
+            .filter(|c| c.to == dual)
+            .collect();
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().any(|c| c.in_port == 0));
+        assert_eq!(edges.iter().filter(|c| c.in_port == 1).count(), 1);
+        assert!(compiler.compile().is_ok());
+    }
+
+    #[test]
+    fn plain_and_master_nodes_reject_port_one() {
+        let (mut compiler, _graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        compiler
+            .add_node(2, NodeKind::Plain, Box::new(DcSource { value: 0.25 }))
+            .expect("add source");
+        compiler
+            .add_node(3, NodeKind::Plain, Box::new(DcSource { value: 0.25 }))
+            .expect("add plain effect");
+        assert!(matches!(
+            compiler.connect_nodes(2, 3, 1),
+            Err(TopologyError::TooManyCables)
+        ));
+        compiler.connect_nodes(2, 3, 0).expect("port 0 only");
+        assert!(matches!(
+            compiler.connect_nodes(3, super::MASTER_NODE_ID, 1),
+            Err(TopologyError::TooManyCables)
+        ));
+        compiler
+            .connect_nodes(3, super::MASTER_NODE_ID, 0)
+            .expect("master port 0 only");
+        assert!(compiler.compile().is_ok());
+    }
+
+    #[test]
+    fn mixer_channel_one_stays_in_the_main_path() {
+        // Z-D5 regression: port 1 on a *mixer* is channel 1, not the Mod
+        // port. Only `NodeKind::Dual` may divert an in-edge into the aux
+        // scratch.
+        let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let mut apply =
+            |graph: &mut RtGraph, update: GraphUpdate| graph.apply_update(update, &mut recycle_tx);
+        apply(
+            &mut graph,
+            compiler
+                .add_node(2, NodeKind::Plain, Box::new(DcSource { value: 0.25 }))
+                .expect("channel 0 source"),
+        );
+        apply(
+            &mut graph,
+            compiler
+                .add_node(3, NodeKind::Plain, Box::new(DcSource { value: 0.5 }))
+                .expect("channel 1 source"),
+        );
+        apply(
+            &mut graph,
+            compiler
+                .add_node(
+                    4,
+                    NodeKind::Mixer,
+                    Box::new(MixerProcessor::with_channels(
+                        &[
+                            crate::realtime::mixer::MixerChannel {
+                                gain: 1.0,
+                                ..Default::default()
+                            },
+                            crate::realtime::mixer::MixerChannel {
+                                gain: 1.0,
+                                ..Default::default()
+                            },
+                        ],
+                        0.0,
+                        false,
+                    )),
+                )
+                .expect("add mixer"),
+        );
+        apply(
+            &mut graph,
+            compiler.connect_nodes(2, 4, 0).expect("mixer ch0"),
+        );
+        apply(
+            &mut graph,
+            compiler.connect_nodes(3, 4, 1).expect("mixer ch1"),
+        );
+        apply(
+            &mut graph,
+            compiler
+                .connect_nodes(4, super::MASTER_NODE_ID, 0)
+                .expect("mixer → master"),
+        );
+        let mixer = compiler.node_slot(4).expect("mixer slot");
+
+        graph.process_block(&ctx());
+        let output = graph.slots[mixer as usize]
+            .as_ref()
+            .expect("mixer installed")
+            .output
+            .channel(0)
+            .expect("left channel");
+        assert!(
+            output.iter().all(|s| (s - 0.75).abs() < 1e-6),
+            "both mixer channels must still be summed into the Main buffer"
+        );
+        assert_eq!(
+            graph.aux.as_ref().expect("aux scratch").len(),
+            0,
+            "no dual node in the graph → the scratch is never activated"
+        );
+    }
+
+    #[test]
+    fn removing_a_dual_input_node_drops_both_cables_without_bypass() {
+        // Z-D9: even with a single in-edge, a dual node must not be bypassed —
+        // that edge may be the Mod port and has no meaningful main-path target.
+        let (mut compiler, mut graph, _dual) = dual_rig(
+            Box::new(DcSource { value: 0.5 }),
+            Box::new(DcSource { value: 0.25 }),
+        );
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let update = compiler.remove_node(4).expect("remove dual node");
+        graph.apply_update(update, &mut recycle_tx);
+        assert_eq!(
+            compiler.cable_count, 0,
+            "all three cables touched the removed node and none may be rewired"
+        );
+        assert!(
+            compiler.cables[..compiler.cable_count]
+                .iter()
+                .all(|c| c.to != compiler.master_slot),
+            "no modulator or carrier may be bypassed straight into master"
+        );
+        assert!(compiler.compile().is_ok());
     }
 
     // ---- structural update protocol ----
