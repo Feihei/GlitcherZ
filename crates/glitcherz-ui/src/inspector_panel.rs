@@ -236,6 +236,22 @@ impl GlitcherZApp {
                 if let Some((slots, gain)) = drum_state {
                     self.drum_section(ui, instr_id, &slots, gain);
                 }
+                // B1: modal strike macros (preset + decay / beating /
+                // hardness / brightness / gain).
+                let modal_state = self
+                    .project()
+                    .graph
+                    .node_by_id(instr_id)
+                    .and_then(|n| match n {
+                        NodeDoc::Instrument {
+                            voice: VoiceSpec::Modal { params },
+                            ..
+                        } => Some(*params),
+                        _ => None,
+                    });
+                if let Some(params) = modal_state {
+                    self.modal_section(ui, instr_id, &params);
+                }
                 // Effects are added from the graph only (Add ▸ Effect, or the
                 // cable-midpoint insert — spec `plugin-browser.md` D12); the
                 // track-level "clear" shortcut sits above the effect list.
@@ -1729,6 +1745,132 @@ impl GlitcherZApp {
     /// trigger key is a note-name drag that rebuilds the kit once per drop —
     /// the RT table is indexed by key at construction, so a moved slot needs
     /// a new processor, and `rebuild_drum_kit` swaps it in place.
+    /// Modal strike instrument (B1, spec `modal-instrument.md`): preset plus
+    /// the four macros. Every control is one undo step and goes live through
+    /// `send_node_param`, the same path the inline rows use.
+    pub(crate) fn modal_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc_id: u64,
+        params: &glitcherz_model::ModalParams,
+    ) {
+        ui.separator();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.strong("Modal Strike");
+            ui.weak("— struck metal; note-off does not damp the tail");
+        });
+
+        let mut preset = params.preset;
+        ui.horizontal(|ui| {
+            ui.label("Preset");
+            egui::ComboBox::from_id_salt(format!("modal_preset_{doc_id}"))
+                .selected_text(preset.label())
+                .show_ui(ui, |ui| {
+                    for option in glitcherz_model::ModalPreset::ALL {
+                        ui.selectable_value(&mut preset, option, option.label());
+                    }
+                });
+        });
+        if preset != params.preset {
+            let before = self.begin_edit();
+            if let Some(NodeDoc::Instrument {
+                voice: VoiceSpec::Modal { params },
+                ..
+            }) = self.project_mut().graph.node_by_id_mut(doc_id)
+            {
+                params.preset = preset;
+            }
+            self.commit_edit("Modal Preset", before);
+            self.send_node_param(doc_id, ParamId::ModalPreset, f32::from(preset.index()));
+        }
+
+        let rows: [(&str, f32, f32, ParamId, &str, &str); 5] = [
+            (
+                "Decay",
+                0.25,
+                4.0,
+                ParamId::ModalDecay,
+                "modal-decay",
+                "Ring time multiplier over every mode (T60)",
+            ),
+            (
+                "Beating",
+                0.0,
+                2.0,
+                ParamId::ModalBeating,
+                "modal-beating",
+                "Detune between paired modes · 0 = perfectly harmonic",
+            ),
+            (
+                "Hardness",
+                0.0,
+                1.0,
+                ParamId::ModalHardness,
+                "modal-hardness",
+                "Strike length · affects the next hit only",
+            ),
+            (
+                "Brightness",
+                0.0,
+                1.0,
+                ParamId::ModalBrightness,
+                "modal-brightness",
+                "Strike low-pass · affects the next hit only",
+            ),
+            (
+                "Gain",
+                0.0,
+                2.0,
+                ParamId::ModalGain,
+                "modal-gain",
+                "Node output trim",
+            ),
+        ];
+        let mut values = [
+            params.decay_scale,
+            params.beating,
+            params.hardness,
+            params.brightness,
+            params.gain,
+        ];
+        let mut changed: Vec<(usize, f32)> = Vec::new();
+        egui::Grid::new(format!("modal_grid_{doc_id}"))
+            .num_columns(2)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| {
+                for (index, (label, min, max, _, _, tooltip)) in rows.iter().enumerate() {
+                    ui.label(*label);
+                    let response = ui
+                        .add(egui::Slider::new(&mut values[index], *min..=*max).fixed_decimals(2))
+                        .on_hover_text(*tooltip);
+                    if response.changed() {
+                        changed.push((index, values[index]));
+                    }
+                    ui.end_row();
+                }
+            });
+        for (index, value) in changed {
+            let before = self.begin_param_edit();
+            if let Some(NodeDoc::Instrument {
+                voice: VoiceSpec::Modal { params },
+                ..
+            }) = self.project_mut().graph.node_by_id_mut(doc_id)
+            {
+                match index {
+                    0 => params.decay_scale = value.clamp(0.25, 4.0),
+                    1 => params.beating = value.clamp(0.0, 2.0),
+                    2 => params.hardness = value.clamp(0.0, 1.0),
+                    3 => params.brightness = value.clamp(0.0, 1.0),
+                    4 => params.gain = value.clamp(0.0, 2.0),
+                    _ => {}
+                }
+            }
+            self.commit_param_edit(rows[index].0, before, rows[index].4);
+            self.send_node_param(doc_id, rows[index].3, value);
+        }
+    }
+
     pub(crate) fn drum_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -2177,6 +2319,30 @@ impl GlitcherZApp {
                         *gain = value.clamp(0.0, 2.0);
                     }
                     self.commit_param_edit("Sample Gain", before, "sample-gain");
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::ModalDecay => {
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Instrument {
+                        voice: VoiceSpec::Modal { params },
+                        ..
+                    }) = self.project_mut().graph.node_by_id_mut(node)
+                    {
+                        params.decay_scale = value.clamp(0.25, 4.0);
+                    }
+                    self.commit_param_edit("Modal Decay", before, "modal-decay");
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::ModalBrightness => {
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Instrument {
+                        voice: VoiceSpec::Modal { params },
+                        ..
+                    }) = self.project_mut().graph.node_by_id_mut(node)
+                    {
+                        params.brightness = value.clamp(0.0, 1.0);
+                    }
+                    self.commit_param_edit("Modal Brightness", before, "modal-brightness");
                     self.send_node_param(node, inline_param_id(p), value);
                 }
                 patch::InlineParam::Sf2Gain => {

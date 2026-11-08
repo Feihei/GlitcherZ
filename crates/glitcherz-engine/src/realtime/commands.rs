@@ -228,6 +228,28 @@ pub enum ParamId {
     CurveMapMax,
     /// Curve Map: mapping mode (0 = Linear, 1 = Log, 2 = Exp).
     CurveMapMode,
+    /// Modal instrument: preset index (0 = Mallet, 1 = Vibraphone,
+    /// 2 = Bell, 3 = Singing Bowl; spec `.agents/spec/modal-instrument.md`).
+    ///
+    /// Discrete: the mode table is rebuilt at the block boundary, but the
+    /// ringing resonator states are kept (a retuned tail glides instead of
+    /// clicking).
+    ModalPreset,
+    /// Modal instrument: decay multiplier over every mode's T60
+    /// (0.25..4; non-finite values are ignored).
+    ModalDecay,
+    /// Modal instrument: multiplier over the preset's beating offsets
+    /// (0..2; `0` = perfectly harmonic pairs, `2` = exaggerated).
+    ModalBeating,
+    /// Modal instrument: strike length / softness (0..1). Affects the
+    /// **next** strike only; sounding tails keep their excitation.
+    ModalHardness,
+    /// Modal instrument: strike brightness, i.e. the excitation low-pass
+    /// cutoff (0..1). Affects the next strike only.
+    ModalBrightness,
+    /// Modal instrument: node output gain (linear, clamped 0..2; applies to
+    /// every sounding voice).
+    ModalGain,
 }
 
 /// Note event (MIDI semantics). `note` is the MIDI note number (69 = A4),

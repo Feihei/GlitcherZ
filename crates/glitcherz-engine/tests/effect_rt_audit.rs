@@ -23,13 +23,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use glitcherz_engine::realtime::buffer::AudioBuffer;
-use glitcherz_engine::realtime::commands::ParamId;
+use glitcherz_engine::realtime::commands::{NoteEvent, ParamId};
 use glitcherz_engine::realtime::context::ProcessContext;
 use glitcherz_engine::realtime::processor::Processor;
 use glitcherz_engine::realtime::{
     BitcrusherProcessor, ChorusProcessor, CompressorProcessor, DelayProcessor, EffectMeters,
-    EqProcessor, FlangerProcessor, LimiterProcessor, PhaserProcessor, ReverbProcessor,
-    RingModProcessor, SaturationProcessor,
+    EqProcessor, FlangerProcessor, LimiterProcessor, ModalProcessor, PhaserProcessor,
+    ReverbProcessor, RingModProcessor, SaturationProcessor,
 };
 
 // ---------------------------------------------------------------------------
@@ -282,6 +282,42 @@ fn built_in_effects_are_allocation_free() {
         keyed.process_with_aux(&ctx(), &mut main, Some(&key));
     }
     assert_zero_alloc(&scope, "CompressorProcessor sidechain process_with_aux");
+
+    // B1: the modal engine is a generator, so the strike path is audited too —
+    // `note_event` must not allocate, and the 16-voice pool plus the mono
+    // scratch are built in `new` (control thread).
+    let mut modal = ModalProcessor::new(SR);
+    let mut modal_buffer = fixture();
+    for block in 0..2 {
+        modal.note_event(NoteEvent::On {
+            note: 60 + block as u8,
+            velocity: 0.9,
+        });
+        modal.process(&ctx(), &mut modal_buffer);
+    }
+    let scope = AuditScope::begin();
+    for block in 0..64 {
+        // Every branch: preset swaps and decay/pitch edits set `tables_dirty`
+        // and force a retune inside `process`.
+        modal.set_param(ParamId::ModalPreset, (block % 4) as f32);
+        modal.set_param(ParamId::ModalDecay, 0.25 + (block as f32) * 0.05);
+        modal.set_param(ParamId::ModalBeating, (block as f32 * 0.21).sin());
+        modal.set_param(ParamId::ModalHardness, 0.5);
+        modal.set_param(ParamId::ModalBrightness, 0.7);
+        modal.set_param(ParamId::ModalGain, 1.0);
+        modal.set_param(ParamId::PitchOffset, (block as f32 * 0.37).sin() * 12.0);
+        modal.note_event(NoteEvent::On {
+            note: 48 + (block % 24) as u8,
+            velocity: 1.0,
+        });
+        modal.process(&ctx(), &mut modal_buffer);
+        // A pitch-matched release must keep the tail (struck semantics).
+        modal.note_event(NoteEvent::Off {
+            note: 48 + (block % 24) as u8,
+        });
+    }
+    modal.note_event(NoteEvent::Off { note: 0 });
+    assert_zero_alloc(&scope, "ModalProcessor process/note_event/set_param");
 
     // The meter handle itself is written from the audio thread.
     let meters = EffectMeters::new();

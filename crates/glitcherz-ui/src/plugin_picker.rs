@@ -165,6 +165,10 @@ impl PickChoice {
             NodeSource::DrumKit => {
                 "Drum kit — samples are loaded on the node and mapped to MIDI keys".to_string()
             }
+            NodeSource::Modal => {
+                "Modal strike: mallet / vibraphone / bell / singing bowl (struck, long tails)"
+                    .to_string()
+            }
             NodeSource::Builtin(kind) => format!("Built-in effect: {}", kind.label()),
             NodeSource::Arpeggiator => "MIDI effect: arpeggiator (MIDI in / out)".to_string(),
             NodeSource::Portamento => {
@@ -217,6 +221,14 @@ pub fn builtin_instruments() -> Vec<PickChoice> {
             name: "Drum Kit".to_string(),
             tag: PickTag::BuiltIn,
             source: NodeSource::DrumKit,
+        },
+        // B1: one row for the whole modal family — the preset is a combo on
+        // the node, not four separate instruments (spec `modal-instrument.md`
+        // B1-D13).
+        PickChoice {
+            name: "Mallet".to_string(),
+            tag: PickTag::BuiltIn,
+            source: NodeSource::Modal,
         },
     ]
 }
@@ -436,6 +448,7 @@ fn pick_is_instrument(pick: &PickChoice) -> bool {
             | NodeSource::SoundFont { .. }
             | NodeSource::Sample { .. }
             | NodeSource::DrumKit
+            | NodeSource::Modal
             | NodeSource::ClapInstrument { .. }
             | NodeSource::Vst3Instrument { .. }
     )
@@ -1088,9 +1101,9 @@ mod tests {
         assert_eq!(effects[0].tag, PickTag::BuiltIn);
         assert!(matches!(effects[0].source, NodeSource::Builtin(_)));
 
-        // Instruments offer the four built-ins, all tagged built-in.
+        // Instruments offer the five built-ins, all tagged built-in.
         let all_instruments = builtin_choices(PickFilter::category(Some(true)), "");
-        assert_eq!(all_instruments.len(), 4);
+        assert_eq!(all_instruments.len(), 5);
         assert!(
             all_instruments
                 .iter()
@@ -1105,6 +1118,8 @@ mod tests {
             NodeSource::Sample { .. }
         ));
         assert!(matches!(all_instruments[3].source, NodeSource::DrumKit));
+        // B1: the modal strike engine sits after the drum kit.
+        assert!(matches!(all_instruments[4].source, NodeSource::Modal));
     }
 
     #[test]
@@ -1358,11 +1373,11 @@ mod tests {
         // Opening frame: no events, nothing picked, the popup stays open.
         assert!(frame(&ctx, &mut picker, &entries, &[], vec![], 0.0).is_none());
         assert!(picker.is_open());
-        // Rows: Synth / SoundFont / Sample / Drum Kit, then Alpha / Beta (spec
-        // D15) — the highlight starts on the first built-in.
-        assert_eq!(picker.row_count(), 6);
+        // Rows: Synth / SoundFont / Sample / Drum Kit / Mallet, then Alpha /
+        // Beta (spec D15) — the highlight starts on the first built-in.
+        assert_eq!(picker.row_count(), 7);
         // ↓ moves the highlight down one row at a time…
-        for step in 1..6 {
+        for step in 1..7 {
             assert!(
                 frame(
                     &ctx,
@@ -1375,7 +1390,7 @@ mod tests {
                 .is_none()
             );
         }
-        // …and Enter takes the fifth step's row (the second plugin).
+        // …and Enter takes the last step's row (the second plugin).
         let outcome = frame(
             &ctx,
             &mut picker,
@@ -1467,10 +1482,10 @@ mod tests {
 
         // Rows carry explicit ids, so the test can address one directly and
         // click its centre — the same gesture as clicking the name with the
-        // mouse. Index 4 is the first plugin: the four built-ins lead.
+        // mouse. Index 5 is the first plugin: the five built-ins lead.
         let row_rect = ctx
-            .read_response(egui::Id::unique(("plugin_picker_row", 4)))
-            .expect("row 4 drew once the popup settled")
+            .read_response(egui::Id::unique(("plugin_picker_row", 5)))
+            .expect("row 5 drew once the popup settled")
             .rect;
         let pos = row_rect.center();
         assert!(frame(&ctx, &mut picker, &entries, &[], vec![hover(pos)], 0.1).is_none());
@@ -1566,8 +1581,8 @@ mod tests {
         picker.open(PickFilter::category(Some(true)));
         assert!(frame(&ctx, &mut picker, &entries, &[], vec![], 0.0).is_none());
         assert!(frame(&ctx, &mut picker, &entries, &[], vec![], 0.05).is_none());
-        // 4 built-ins + Alpha + Beta.
-        assert_eq!(picker.row_count(), 6);
+        // 5 built-ins + Alpha + Beta.
+        assert_eq!(picker.row_count(), 7);
 
         // Chips carry explicit ids, so the test can click one like the mouse
         // would: BUILT-IN / CLAP / VST3 all exist under "instruments" here.
@@ -1603,7 +1618,7 @@ mod tests {
         );
         assert!(picker.is_open());
         assert!(!picker.filter.tags.has(PickTag::Vst3));
-        assert_eq!(picker.row_count(), 5);
+        assert_eq!(picker.row_count(), 6);
 
         // Clicking it again brings Beta back.
         assert!(
@@ -1629,7 +1644,7 @@ mod tests {
             .is_none()
         );
         assert!(picker.filter.tags.has(PickTag::Vst3));
-        assert_eq!(picker.row_count(), 6);
+        assert_eq!(picker.row_count(), 7);
     }
 
     #[test]

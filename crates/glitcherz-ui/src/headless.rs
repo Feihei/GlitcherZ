@@ -384,6 +384,18 @@ fn spawn_instrument<M: Media>(
                 (Box::new(media.drum_voice(slots, *gain, sr)), None)
             }
         }
+        VoiceSpec::Modal { params } => {
+            let mut processor = ModalProcessor::new(sr);
+            // Same split as the built-in synth: the live graph replays the
+            // parameters through `push_node_params`, the offline graph has no
+            // such pass and seeds them here.
+            if !live {
+                for (id, value) in crate::modal_param_values(params) {
+                    processor.set_param(id, value);
+                }
+            }
+            (Box::new(processor), None)
+        }
         VoiceSpec::SoundFont {
             path,
             bank,
@@ -501,7 +513,10 @@ fn spawn_effect<M: Media>(
         VoiceSpec::Builtin
         | VoiceSpec::SoundFont { .. }
         | VoiceSpec::Sample { .. }
-        | VoiceSpec::DrumKit { .. } => {
+        | VoiceSpec::DrumKit { .. }
+        // Unreachable for effects (a Modal voice only ever sits on an
+        // instrument node); grouped so the match stays exhaustive.
+        | VoiceSpec::Modal { .. } => {
             let built = crate::effect::processor(params, sr);
             if live {
                 info.meter = built.meters;
@@ -1217,6 +1232,83 @@ mod tests {
             internal < dry * 0.2,
             "sidechain off must fall back to the internal detector: {internal} vs {dry}"
         );
+    }
+
+    /// RMS over a fractional window of an Int16 WAV (`0.0..=1.0` of the
+    /// interleaved payload). Used to compare a strike against its tail.
+    fn wav_window_rms(path: &Path, from: f32, to: f32) -> f32 {
+        let bytes = std::fs::read(path).expect("read wav");
+        let pos = bytes
+            .windows(4)
+            .position(|w| w == b"data")
+            .expect("wav has no data chunk");
+        let samples: Vec<f32> = bytes[pos + 8..]
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32768.0)
+            .collect();
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let start = ((samples.len() as f32) * from).floor() as usize;
+        let end = (((samples.len() as f32) * to).ceil() as usize).min(samples.len());
+        let window = &samples[start.min(end)..end];
+        if window.is_empty() {
+            return 0.0;
+        }
+        (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt()
+    }
+
+    /// B1 end-to-end: the document → assembly → graph → WAV chain must make a
+    /// modal instrument audible with **no external media**, and the tail must
+    /// outlive the note — that is the whole point of the singing-bowl preset
+    /// (26 s T60, and `Off` never damps a struck voice).
+    #[test]
+    fn offline_render_plays_the_modal_tail() {
+        let mut project = project_with_note();
+        let mut patched = false;
+        for node in &mut project.graph.nodes {
+            if let NodeDoc::Instrument {
+                track: 0, voice, ..
+            } = node
+            {
+                *voice = VoiceSpec::Modal {
+                    params: glitcherz_model::ModalParams {
+                        preset: glitcherz_model::ModalPreset::SingingBowl,
+                        ..Default::default()
+                    },
+                };
+                patched = true;
+            }
+        }
+        assert!(patched, "the default project must own a track-0 instrument");
+
+        // The note lasts 960 ticks (0.5 s at 120 BPM); 11_520 ticks is 6 s, so
+        // the last quarter of the file is tail only.
+        let options = RenderOptions {
+            sample_rate: 22_050,
+            bits: export_audio::Bits::Int16,
+            end_ticks: Some(11_520),
+        };
+        let input = save_temp(&project, "modal");
+        let out =
+            std::env::temp_dir().join(format!("glitcherz_b1_modal_{}.wav", std::process::id()));
+        let report = render_project_to_wav(&input, &out, options).expect("render");
+        assert!(report.frames > 0);
+        assert!(
+            wav_has_signal(&out),
+            "a modal instrument must be born audible"
+        );
+
+        let strike = wav_window_rms(&out, 0.0, 0.25);
+        let tail = wav_window_rms(&out, 0.75, 1.0);
+        assert!(strike > 0.01, "the strike must be loud: {strike}");
+        assert!(
+            tail > strike * 0.05,
+            "the bowl tail must still ring 4.5 s after note-off: strike {strike}, tail {tail}"
+        );
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(out);
     }
 
     /// Mirrors `GlitcherZApp::start_export` (assemble -> ExportJob -> pump)

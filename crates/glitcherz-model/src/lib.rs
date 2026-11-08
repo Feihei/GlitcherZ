@@ -250,6 +250,123 @@ impl Default for SynthParams {
     }
 }
 
+/// Modal strike presets (spec `.agents/spec/modal-instrument.md` §4).
+///
+/// The mode tables live in the engine (`realtime/modal.rs`); the document only
+/// carries the choice, exactly like [`SynthWaveform`]. Index order must match
+/// the engine's `PRESETS` array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModalPreset {
+    /// Wooden / metal bar: short decay, close to harmonic.
+    #[default]
+    Mallet,
+    /// Metal bar with motor-like beating on the low modes.
+    Vibraphone,
+    /// Inharmonic bell with a long tail.
+    Bell,
+    /// Singing bowl: very long tail, strong beating.
+    SingingBowl,
+}
+
+impl ModalPreset {
+    /// All presets, in engine index order.
+    pub const ALL: [Self; 4] = [
+        Self::Mallet,
+        Self::Vibraphone,
+        Self::Bell,
+        Self::SingingBowl,
+    ];
+
+    /// Short English label (UI combo / node caption).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mallet => "Mallet",
+            Self::Vibraphone => "Vibraphone",
+            Self::Bell => "Bell",
+            Self::SingingBowl => "Singing Bowl",
+        }
+    }
+
+    /// Engine parameter index (0..=3).
+    pub fn index(self) -> u8 {
+        match self {
+            Self::Mallet => 0,
+            Self::Vibraphone => 1,
+            Self::Bell => 2,
+            Self::SingingBowl => 3,
+        }
+    }
+
+    /// Index → preset (unknown indices fall back to `Mallet`).
+    pub fn from_index(index: u8) -> Self {
+        Self::ALL
+            .get(index as usize)
+            .copied()
+            .unwrap_or(Self::Mallet)
+    }
+}
+
+/// Modal strike instrument parameters (spec `modal-instrument.md` §6).
+///
+/// Only macro controls: the per-mode tables are engine-side preset data
+/// (B1-D7). Every field is `serde(default)`, so a payload written by an older
+/// build still loads.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModalParams {
+    /// Preset family.
+    #[serde(default)]
+    pub preset: ModalPreset,
+    /// Multiplier over every mode's T60 (0.25..4).
+    #[serde(default = "default_modal_decay")]
+    pub decay_scale: f32,
+    /// Multiplier over the preset's beating offsets (0..2; `0` = no beat).
+    #[serde(default = "default_modal_beating")]
+    pub beating: f32,
+    /// Strike length / softness (0..1); affects the next strike only.
+    #[serde(default = "default_modal_hardness")]
+    pub hardness: f32,
+    /// Strike brightness, i.e. the excitation low-pass (0..1); next strike only.
+    #[serde(default = "default_modal_brightness")]
+    pub brightness: f32,
+    /// Node output gain (0..2).
+    #[serde(default = "default_modal_gain")]
+    pub gain: f32,
+}
+
+fn default_modal_decay() -> f32 {
+    1.0
+}
+
+fn default_modal_beating() -> f32 {
+    1.0
+}
+
+fn default_modal_hardness() -> f32 {
+    0.7
+}
+
+fn default_modal_brightness() -> f32 {
+    0.7
+}
+
+fn default_modal_gain() -> f32 {
+    1.0
+}
+
+impl Default for ModalParams {
+    fn default() -> Self {
+        Self {
+            preset: ModalPreset::default(),
+            decay_scale: default_modal_decay(),
+            beating: default_modal_beating(),
+            hardness: default_modal_hardness(),
+            brightness: default_modal_brightness(),
+            gain: default_modal_gain(),
+        }
+    }
+}
+
 /// Per-track delay effect parameters (`mix = 0` means bypass).
 ///
 /// E4 added the stereo/tempo fields; they are additive (`serde(default)`), so
@@ -1977,6 +2094,15 @@ pub enum VoiceSpec {
         #[serde(default = "sample_default_gain")]
         gain: f32,
     },
+    /// Modal strike instrument (B1, spec `modal-instrument.md`): mallet,
+    /// vibraphone, bell and singing bowl from one resonator engine.
+    ///
+    /// No external file and no "born empty" state: the mode tables are
+    /// engine-side preset data, so a node is audible the moment it exists.
+    Modal {
+        #[serde(default)]
+        params: ModalParams,
+    },
     /// CLAP plugin: dynamic library path + plugin ID (instantiated on the
     /// non-real-time thread).
     Clap {
@@ -2297,6 +2423,17 @@ pub enum NodeParam {
     Sustain,
     /// Built-in synth envelope release (seconds, 0..3).
     Release,
+    /// Modal instrument decay multiplier over every mode's T60
+    /// (0.25..4; spec `modal-instrument.md` B1-D11).
+    ModalDecay,
+    /// Modal instrument beating multiplier (0..2; `0` = harmonic pairs).
+    ModalBeating,
+    /// Modal instrument strike hardness (0..1; next strike only).
+    ModalHardness,
+    /// Modal instrument strike brightness (0..1; next strike only).
+    ModalBrightness,
+    /// Modal instrument output gain (0..2).
+    ModalGain,
 }
 
 /// Which control of a mixer channel a curve drives ([`NodeParam::MixerChannel`]).
@@ -2548,6 +2685,10 @@ pub fn node_param_map(param: NodeParam, graph: &GraphDoc, target: &PortRef) -> M
         NodeParam::Attack | NodeParam::Decay => MapSpec::linear(0.0, 2.0),
         NodeParam::Sustain => MapSpec::linear(0.0, 1.0),
         NodeParam::Release => MapSpec::linear(0.0, 3.0),
+        NodeParam::ModalDecay => MapSpec::linear(0.25, 4.0),
+        NodeParam::ModalBeating => MapSpec::linear(0.0, 2.0),
+        NodeParam::ModalHardness | NodeParam::ModalBrightness => MapSpec::linear(0.0, 1.0),
+        NodeParam::ModalGain => MapSpec::linear(0.0, 2.0),
     }
 }
 
@@ -3742,6 +3883,7 @@ impl VoiceSpec {
                 slots.len() * std::mem::size_of::<DrumSlot>()
                     + slots.iter().map(|slot| slot.path.len()).sum::<usize>()
             }
+            VoiceSpec::Modal { .. } => std::mem::size_of::<ModalParams>(),
             VoiceSpec::Clap {
                 path,
                 plugin_id,
@@ -5965,6 +6107,54 @@ mod tests {
             params,
             delay: None,
         }
+    }
+
+    /// B1: the modal voice is an additive variant — a payload with no
+    /// parameters loads with the documented defaults, and the graph accepts
+    /// it as an ordinary single-output instrument.
+    #[test]
+    fn modal_voice_round_trips_and_defaults() {
+        let params = super::ModalParams {
+            preset: super::ModalPreset::SingingBowl,
+            decay_scale: 2.5,
+            beating: 0.5,
+            ..Default::default()
+        };
+        let node = NodeDoc::Instrument {
+            node_id: 2,
+            track: 0,
+            voice: VoiceSpec::Modal { params },
+            synth: SynthParams::default(),
+        };
+        let text = ron::to_string(&node).expect("serialize");
+        assert!(text.contains("modal"), "voice tag missing: {text}");
+        assert!(text.contains("singing_bowl"), "preset tag missing: {text}");
+        let back: NodeDoc = ron::from_str(&text).expect("deserialize");
+        assert_eq!(node, back);
+
+        // A payload written before the macros existed still loads.
+        let legacy: NodeDoc =
+            ron::from_str(r#"(type:"instrument", node_id:3, track:0, voice:(type:"modal"))"#)
+                .expect("a bare modal payload should parse");
+        let NodeDoc::Instrument {
+            voice: VoiceSpec::Modal { params },
+            ..
+        } = legacy
+        else {
+            panic!("expected a modal instrument");
+        };
+        assert_eq!(params, super::ModalParams::default());
+        assert_eq!(params.preset, super::ModalPreset::Mallet);
+        assert!((params.decay_scale - 1.0).abs() < 1e-6);
+
+        let graph = GraphDoc {
+            nodes: vec![node],
+            cables: vec![CableDoc::audio(2u64, PortRef::Master)],
+            ..Default::default()
+        };
+        graph
+            .validate(2, 0)
+            .expect("a modal instrument must validate");
     }
 
     // E1: the effect payload's tag *is* the kind (D1), and the legacy sibling

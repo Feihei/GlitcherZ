@@ -44,11 +44,12 @@ use glitcherz_engine::realtime::{
     CurveMapProcessor, DrumKitProcessor, DrumSlotSpec, EffectMeters, EngineCommand, EventKind,
     FeedbackProcessor, InputProcessor, LfoProcessor, MAX_AUTO_POINTS, MAX_MIDI_FANOUT,
     MAX_TRACK_CLIPS, MapMode as EngineMapMode, MapSpec as EngineMapSpec, MidiClipTable,
-    MidiEnvelopeProcessor, MixerChannel as EngineMixerChannel, MixerProcessor, NodeKind, NoteEvent,
-    ParamId, PortamentoProcessor, Processor, RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip,
-    RtCtrl, RtCtrlKind, RtCurveInterp, RtMidiClip, RtNote, SAMPLE_DEFAULT_ROOT,
-    SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor, SilentProcessor, SynthProcessor,
-    Unit, empty_clip_table, empty_midi_clip_table, mode_value as curve_mode_value,
+    MidiEnvelopeProcessor, MixerChannel as EngineMixerChannel, MixerProcessor, ModalProcessor,
+    NodeKind, NoteEvent, ParamId, PortamentoProcessor, Processor, RtAudioClip, RtAutoPoint,
+    RtAutomation, RtControlClip, RtCtrl, RtCtrlKind, RtCurveInterp, RtMidiClip, RtNote,
+    SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand, Sf2VoiceProcessor,
+    SilentProcessor, SynthProcessor, Unit, empty_clip_table, empty_midi_clip_table,
+    mode_value as curve_mode_value,
 };
 use glitcherz_engine::{MidiTarget, Sf2Library, Sf2Preset};
 use glitcherz_model::{
@@ -56,8 +57,9 @@ use glitcherz_model::{
     CtrlKind, CurveInterp, CurveMapParams, EffectParams, GraphDoc, LFO_DIVISION_LABELS, LfoParams,
     LfoWaveform, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS,
     MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip,
-    MidiEnvelopeParams, MidiSource, MidiTrack, NodeDoc, NodeParam, Note, PortRef, PortamentoParams,
-    Project, SamplePlayMode, SongLoop, SynthParams, SynthWaveform, TrackKind, VoiceSpec,
+    MidiEnvelopeParams, MidiSource, MidiTrack, ModalParams, NodeDoc, NodeParam, Note, PortRef,
+    PortamentoParams, Project, SamplePlayMode, SongLoop, SynthParams, SynthWaveform, TrackKind,
+    VoiceSpec,
 };
 
 pub mod autosave;
@@ -326,6 +328,20 @@ fn synth_param_values(synth: &SynthParams) -> [(ParamId, f32); 8] {
     ]
 }
 
+/// Every engine parameter of a modal instrument payload, in one place
+/// (spec `modal-instrument.md`): the live document push and the offline
+/// export seed both walk this table, so they cannot drift apart.
+pub(crate) fn modal_param_values(params: &ModalParams) -> [(ParamId, f32); 6] {
+    [
+        (ParamId::ModalPreset, f32::from(params.preset.index())),
+        (ParamId::ModalDecay, params.decay_scale),
+        (ParamId::ModalBeating, params.beating),
+        (ParamId::ModalHardness, params.hardness),
+        (ParamId::ModalBrightness, params.brightness),
+        (ParamId::ModalGain, params.gain),
+    ]
+}
+
 /// Document automation parameter → engine parameter ID.
 ///
 /// `None` for [`AutoParam::Tempo`] (the engine route uses the Timeline In
@@ -571,6 +587,11 @@ fn node_param_id(param: NodeParam) -> ParamId {
         NodeParam::Decay => ParamId::Decay,
         NodeParam::Sustain => ParamId::Sustain,
         NodeParam::Release => ParamId::Release,
+        NodeParam::ModalDecay => ParamId::ModalDecay,
+        NodeParam::ModalBeating => ParamId::ModalBeating,
+        NodeParam::ModalHardness => ParamId::ModalHardness,
+        NodeParam::ModalBrightness => ParamId::ModalBrightness,
+        NodeParam::ModalGain => ParamId::ModalGain,
     }
 }
 
@@ -645,6 +666,22 @@ fn node_auto_options(
             voice: VoiceSpec::Sample { .. },
             ..
         } => options.push(("Gain".to_string(), AutoParam::Node(NodeParam::SampleGain))),
+        // B1: macro controls of the modal instrument. `preset` is discrete
+        // and stays out of automation (same rule as `SynthWaveform`).
+        NodeDoc::Instrument {
+            voice: VoiceSpec::Modal { .. },
+            ..
+        } => {
+            for (label, param) in [
+                ("Decay", NodeParam::ModalDecay),
+                ("Beating", NodeParam::ModalBeating),
+                ("Hardness", NodeParam::ModalHardness),
+                ("Brightness", NodeParam::ModalBrightness),
+                ("Gain", NodeParam::ModalGain),
+            ] {
+                options.push((label.to_string(), AutoParam::Node(param)));
+            }
+        }
         NodeDoc::Instrument { .. } => {}
         // Table-driven (spec `effects.md` D6): every slot, not just the inline
         // ones — an EQ band that is not on the node body is still automatable.
@@ -812,6 +849,8 @@ fn inline_param_id(p: patch::InlineParam) -> ParamId {
         patch::InlineParam::Sf2Program => ParamId::Sf2ProgramChange,
         patch::InlineParam::InputGain => ParamId::InputGain,
         patch::InlineParam::InputChannel => ParamId::InputChannel,
+        patch::InlineParam::ModalDecay => ParamId::ModalDecay,
+        patch::InlineParam::ModalBrightness => ParamId::ModalBrightness,
     }
 }
 

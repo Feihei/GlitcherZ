@@ -536,6 +536,9 @@ impl GlitcherZApp {
                     // Plugin parameters live in the host cache and are pushed
                     // by the parameter UI itself; undo never changes them.
                     VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. } => Vec::new(),
+                    // B1: the modal macros ride the same replay so a fresh
+                    // node, an undo and a reload all land on one path.
+                    VoiceSpec::Modal { params } => crate::modal_param_values(params).to_vec(),
                 },
                 // Table-driven (spec `effects.md` D6): one entry per slot.
                 NodeDoc::Effect {

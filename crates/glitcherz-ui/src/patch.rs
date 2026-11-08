@@ -62,6 +62,11 @@ pub enum InlineParam {
     InputGain,
     /// Live input node channel selector (R4): a combo row, 0 / 1.
     InputChannel,
+    /// Modal instrument decay multiplier (B1): the "how long does it ring"
+    /// control, the one most worth having on the node body.
+    ModalDecay,
+    /// Modal instrument strike brightness (B1).
+    ModalBrightness,
 }
 
 /// How an inline row is presented (U13). Discrete selectors such as a
@@ -109,6 +114,20 @@ const SYNTH_INLINE: [InlineParamSpec; 2] = [
     InlineParamSpec {
         param: InlineParam::Resonance,
         label: "res",
+    },
+];
+
+/// Modal inline rows (B1): decay and strike brightness. The preset, beating,
+/// hardness and gain controls live in the Inspector — a modal node must not
+/// turn into a column of sliders.
+const MODAL_INLINE: [InlineParamSpec; 2] = [
+    InlineParamSpec {
+        param: InlineParam::ModalDecay,
+        label: "decay",
+    },
+    InlineParamSpec {
+        param: InlineParam::ModalBrightness,
+        label: "bright",
     },
 ];
 
@@ -187,6 +206,10 @@ fn inline_params_of(node: &NodeDoc) -> Vec<InlineParamSpec> {
             voice: VoiceSpec::SoundFont { .. },
             ..
         } => SF2_INLINE.to_vec(),
+        NodeDoc::Instrument {
+            voice: VoiceSpec::Modal { .. },
+            ..
+        } => MODAL_INLINE.to_vec(),
         // Table-driven from the engine descriptor (spec `effects.md` D6): the
         // row order, labels and count all come from the effect's static table.
         // Only slots flagged `INLINE` get a row — an eight-parameter EQ would
@@ -371,6 +394,22 @@ fn inline_doc_value(node: &NodeDoc, param: InlineParam) -> (f64, f64, f64) {
             },
             InlineParam::Sf2Gain,
         ) => (f64::from(*gain), 0.0, 2.0),
+        // B1: the two modal rows read the same document fields the Inspector
+        // sliders edit.
+        (
+            NodeDoc::Instrument {
+                voice: VoiceSpec::Modal { params },
+                ..
+            },
+            InlineParam::ModalDecay,
+        ) => (f64::from(params.decay_scale), 0.25, 4.0),
+        (
+            NodeDoc::Instrument {
+                voice: VoiceSpec::Modal { params },
+                ..
+            },
+            InlineParam::ModalBrightness,
+        ) => (f64::from(params.brightness), 0.0, 1.0),
         _ => (0.0, 0.0, 1.0),
     }
 }
@@ -537,6 +576,10 @@ pub enum NodeSource {
     /// Multi-sample drum kit (W1, spec `drum-kit.md` K2): born with no
     /// slots; the node's own `Load Samples…` button fills it.
     DrumKit,
+    /// Modal strike instrument (B1, spec `modal-instrument.md`): mallet /
+    /// vibraphone / bell / singing bowl. Born audible — the preset tables are
+    /// built in, so there is no file to pick.
+    Modal,
     /// CLAP instrument plugin.
     ClapInstrument {
         /// Module path.
@@ -1834,6 +1877,9 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                         format!("DRUM {} slots · Track {}", slots.len(), track + 1)
                     }
                 }
+                VoiceSpec::Modal { params } => {
+                    format!("MALLET · {} · Track {}", params.preset.label(), track + 1)
+                }
                 VoiceSpec::Clap { plugin_id, .. } => {
                     format!("♪ {}", truncate(plugin_id, 16))
                 }
@@ -1851,7 +1897,8 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 VoiceSpec::Builtin
                 | VoiceSpec::SoundFont { .. }
                 | VoiceSpec::Sample { .. }
-                | VoiceSpec::DrumKit { .. } => {
+                | VoiceSpec::DrumKit { .. }
+                | VoiceSpec::Modal { .. } => {
                     format!("{} · Track {}", params.kind().label(), track + 1)
                 }
                 VoiceSpec::Clap { plugin_id, .. } => {
@@ -1970,6 +2017,11 @@ pub(crate) fn auto_param_label(param: &AutoParam) -> String {
             NodeParam::Decay => "Decay".to_string(),
             NodeParam::Sustain => "Sustain".to_string(),
             NodeParam::Release => "Release".to_string(),
+            NodeParam::ModalDecay => "Decay".to_string(),
+            NodeParam::ModalBeating => "Beating".to_string(),
+            NodeParam::ModalHardness => "Hardness".to_string(),
+            NodeParam::ModalBrightness => "Brightness".to_string(),
+            NodeParam::ModalGain => "Gain".to_string(),
         },
     }
 }
