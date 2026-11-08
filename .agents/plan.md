@@ -695,7 +695,7 @@ scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 sympho
 
 ### 诵钵不是 Pluck 的预设
 
-用户要的「悠长」不是 Karplus-Strong（Y 系列 S1）换参数能给的：Pluck 是**谐波泛音 + 短延迟线 + 阻尼**，诵钵是**非谐波模态比 + 每模态独立长衰减（10–30 s）+ 同一模态轻微失谐产生的 1–5 Hz 拍频**，激励还可能是持续摩擦（bow/rub）而非单次敲击。两者同属「激励—共鸣」家族但 DSP 不共用，所以**单独立 B 系列**；LMMS Mallets 本身走 STK ModalBar 的模态合成路线，一个引擎用不同预设族即可覆盖 Mallet（颤音琴 / 钟 / 管钟，短衰减）与 Singing Bowl（长衰减、拍频）。
+用户要的「悠长」不是 Karplus-Strong（Y 系列 S1）换参数能给的：Pluck 是**谐波泛音 + 短延迟线 + 阻尼**，诵钵是**非谐波模态比 + 每模态独立长衰减（10–30 s）+ 同一模态轻微失谐产生的 1–5 Hz 拍频**，激励只做**单次敲击（strike）**（用户 2026-11-08 决议，不做 bow/rub 持续摩擦）。两者同属「激励—共鸣」家族但 DSP 不共用，所以**单独立 B 系列**；LMMS Mallets 本身走 STK ModalBar 的模态合成路线，一个引擎用不同预设族即可覆盖 Mallet（颤音琴 / 钟 / 管钟，短衰减）与 Singing Bowl（长衰减、拍频）。
 
 S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 池 / 激励抽象，**不预设过早抽象**。
 
@@ -706,29 +706,29 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | **B1** | Modal 声源（Mallet / Singing Bowl） | 小–中 | 无（S0 装配已就位） | 高 Q 谐振器数值稳定、长尾音的 voice 生命周期 / 偷声部策略 |
 | **Z0** | 双音频输入口基建 | 中–大 | 无 | 触碰 `process_block` + PDC + 文档校验 + 画布，是实时铁律最敏感处 |
 | **Z1** | 侧链压缩 | 小 | Z0 | 复用现成 detector / GR 表，几乎无算法风险 |
-| **Z2** | Vocoder | 大 | Z0（最好经 Z1 验证 aux） | 滤波器组全预分配、RT 零分配、两路相位对齐、带数取舍 |
+| **Z2** | Vocoder | 大 | Z0（最好经 Z1 验证 aux） | 滤波器组全预分配、RT 零分配、两路相位对齐 |
 
 ### 执行顺序（当前唯一有效顺序；Y 系列编号保留为历史记录）
 
 | # | 阶段 | 为什么在这个位置 |
 | :--- | :--- | :--- |
-| 1 | **B1** Modal 声源 | 与图架构完全解耦，先做不会给 Z0 增加返工；用户本次最具体、最想听到的东西；且正好验证 S0 立项时承诺的「render → wav 自动验收听感特性」（长尾 / 拍频 / 频谱峰）。风险最低、回报最早。 |
-| 2 | **Z0** 双口基建 | 唯一碰实时图核心的重活，必须在**没有其它并行改动**的干净基线上单独 spec + 单独 commit + 跑全量门禁。B1 已清掉，基线干净。 |
-| 3 | **Z1** 侧链压缩 | Z0 的第一个真实消费者兼**验收钉子**：复用现成 `CompressorProcessor`，改动小，能立刻证明 aux 在实时 / 离线两条路径都通。Z0 自带的 Ring Mod 只是数学样例，Z1 才是用户要的效果。 |
-| 4 | **Z2** Vocoder | 最贵，且它的失败模式可能暴露 Z0 的设计缺口（两路 PDC / 带数 / 缓冲形状）。Z1 已把 Z0 验证过，返工范围可控。 |
+| 1 | **Z0** 双口基建 | 用户 2026-11-08 拍板「架构优先」：唯一碰实时图核心的重活，先在**没有其它并行改动**的干净基线上单独 spec + 单独 commit + 全量门禁做完，后面所有双口效果器才不会返工。 |
+| 2 | **Z1** 侧链压缩 | Z0 的第一个真实消费者兼**验收钉子**：复用现成 `CompressorProcessor`，改动小，立刻证明 aux 在实时 / 离线两条路径都通。Z0 自带的 Ring Mod 只是数学样例，Z1 才是用户要的效果。 |
+| 3 | **B1** Modal 声源 | 与图架构完全解耦，放在 Z0/Z1 之后不会返工；声源只改 `headless::spawn_instrument` 一处，且正好用 S0 的 `--render` 自动验收长尾 / 拍频 / 频谱峰。 |
+| 4 | **Z2** Vocoder | 最贵，且失败模式可能暴露 Z0 的设计缺口（两路 PDC / 缓冲形状）。Z1 已把 Z0 验证过，返工范围可控。 |
 | 5 | **S1** Pluck → **S2** Organ → **S3** Wavetable | Y 系列原三个乐器顺延；Wavetable 仍按原约定「先写独立 spec 再实现」。 |
 | 6 | **S4** CLI 命令面 → **S5** MCP | 不取消。新功能把它们往后推，但 S0 的判别（没有 render 的 MCP 是盲操作）不变。 |
 
-**备选（架构优先）**：Z0 → Z1 → B1 → Z2 → S1…。若你更想尽快拿到「两个 audio 口」这个能力而不是先听钟声，选这一版；两条链互不依赖，切换成本只是换一行表，不改任何设计。**默认按上表（听感优先）执行。**
+**备选（听感优先，未采用）**：B1 → Z0 → Z1 → Z2 → S1…。两条链互不依赖，本可无损切换；用户 2026-11-08 选架构优先，**按上表执行**。
 
 ### B1 决策（实施前细化为 `spec/modal-instrument.md`）
 
 | ID | 决策 |
 | :--- | :--- |
 | B1-D1 | `VoiceSpec::Modal { params: ModalParams }` 加法变体 + `serde(default)`，`PROJECT_VERSION` 不动（DrumKit K1 先例）；空 / 非法参数 = 静音，不回落内置合成器。 |
-| B1-D2 | DSP：`realtime/modal.rs`，定容**二阶谐振器组**（复旋转子 vs 高 Q SVF 在 spec 阶段定），`MAX_MODES = 8`（含 detune 对），16 voice 池、激励脉冲 / 噪声、全部状态构造期预分配；热路径零分配零锁。 |
-| B1-D3 | 参数族：模态频率比 / 每模态衰减时间 / 幅度 / detune（拍频）/ 激励硬度与亮度 / 敲击 vs 摩擦激励 / 整体 gain。预设族用 `ModalPreset` 枚举放在 `ModalParams` 里（下拉 + 可覆盖），**不新建预设文件系统**（`effects.md` 已明确内建效果无预设系统）。 |
-| B1-D4 | 装配只改 `headless::spawn_instrument` 一处；另需 `ParamId` / `NodeParam` 自动化词汇、Inspector 面板、patch 节点内联行。摩擦激励若入选，需明确 note-off 后的尾音仍在 16 voice 池内占用槽位，偷声部时从当前电平淡出。 |
+| B1-D2 | DSP：`realtime/modal.rs`，定容**二阶谐振器组**（复旋转子 vs 高 Q SVF 在 spec 阶段定），`MAX_MODES = 8`（含 detune 对），16 voice 池、**单次敲击激励（脉冲 / 噪声，无持续摩擦）**、全部状态构造期预分配；热路径零分配零锁。 |
+| B1-D3 | 参数族：模态频率比 / 每模态衰减时间 / 幅度 / detune（拍频）/ 激励硬度与亮度 / 整体 gain。预设族用 `ModalPreset` 枚举放在 `ModalParams` 里（下拉 + 可覆盖），**不新建预设文件系统**（`effects.md` 已明确内建效果无预设系统）。**v1 不做 bow/rub 持续激励**（Q2 决议），因此不需要摩擦强度 / bow 速度等参数。 |
+| B1-D4 | 装配只改 `headless::spawn_instrument` 一处；另需 `ParamId` / `NodeParam` 自动化词汇、Inspector 面板、patch 节点内联行。note-off 后的长尾音仍占用 16 voice 池的槽位，偷声部时从当前电平淡出（复刻 Modal D10 同款语义）。 |
 | B1-D5 | 验收（全部可用 `--render` 自动跑）：诵钵预设在 note-off 后 10 s 仍有可测能量、频谱峰落在非谐波比、detune 对产生预期拍频、满幅参数无 NaN/Inf、无音符时输出静音、`rt_audit` 零分配、GUI 导出与 CLI 逐字节一致。 |
 
 ### Z0 决策（实施前细化为 `spec/dual-audio-input.md`，并修订 `node-graph.md` D2/D14/D19）
@@ -746,17 +746,21 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 ### Z1 / Z2 要点
 
 - **Z1 侧链压缩**：`CompressorProcessor` 已有 `compute_gr_db`、GR 平滑与 meters；加一个 `sidechain` 开关把检测源从 `main` 切到 `aux`，未接 Mod 口时回落内部检测（保旧工程行为）。键控 HPF / 外部键监听（listen）暂不做。验收：kick → bass 的 GR 随外部键变化，`--render` 可自动测。
-- **Z2 Vocoder**：固定带数滤波器组（候选 16 / 24，spec 阶段定）× 两路 + 逐带包络跟随（attack/release）+ 清浊处理；carrier 必须由 Main 口外部送入，**不做内置载波**；所有滤波器状态与包络构造期预分配。v1 不做 formant shift / freeze / 用户自定义带数。
+- **Z2 Vocoder（Q3 定稿）**：**固定 16 带**滤波器组 × 两路 + 逐带包络跟随（attack/release）+ 清浊处理；carrier 必须由 Main 口外部送入，**不做内置载波**；所有滤波器状态与包络构造期预分配。v1 **不做** formant shift / freeze / 用户自定义带数。
 
 ### 明确不做（本节范围）
 
 不改 `PROJECT_VERSION`、不改单口节点的逐样本行为、**不给 CLAP / VST3 插件效果器开双口**（宿主侧 port 协商是大工程，另立项）、不引入新 crate / 新依赖、不做任意多输入口（只 `0` / `1` 两个）、不做端口间自动降混、不取消或重排 Y 系列编号、不改 MCP 的判别结论。
 
-### 实施前待确认（影响 spec，不阻塞本节入 plan）
+### 决议（用户 2026-11-08 拍板）
 
-- **Q1 顺序**：默认听感优先（B1 先）；若想先拿双口能力，改选架构优先（Z0 先）。
-- **Q2 诵钵激励**：只做敲击（strike），还是同时要持续摩擦（bow/rub）？后者影响 voice 生命周期、note-off 语义与参数面。
-- **Q3 Vocoder 带数 / 载波**：固定 16 带 + 外部 carrier 是否可接受？v1 无 formant shift / freeze 是否可接受？
+| Q | 结论 |
+| :--- | :--- |
+| Q1 顺序 | **架构优先**：Z0 → Z1 → B1 → Z2 → S1…（本节执行顺序表已按此改定） |
+| Q2 诵钵激励 | **只做单次敲击（strike）**，不做 bow/rub 持续摩擦 → voice 生命周期与 note-off 按一次性激励设计 |
+| Q3 Vocoder | **固定 16 带 + 外部 carrier**，v1 无 formant shift / freeze / 自定义带数 |
+
+下一步：先写 `spec/dual-audio-input.md`（Z0）并提交，再实现 Z0；B1 的 `spec/modal-instrument.md` 在 Z1 交付后写。
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
