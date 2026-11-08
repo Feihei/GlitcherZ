@@ -82,7 +82,7 @@ const fn sidechain_params() -> [ParamSpec; 9] {
         params[index] = BASE_PARAMS[index];
         index += 1;
     }
-    params[SLOT_SIDECHAIN as usize] = ParamSpec::switch("sidechain", 1.0);
+    params[SLOT_SIDECHAIN as usize] = ParamSpec::switch("sidechain", 0.0);
     params
 }
 
@@ -688,6 +688,9 @@ mod tests {
     /// E2b settings, hard knee so the expected GR is arithmetic.
     fn keyed_comp() -> CompressorProcessor {
         let mut comp = CompressorProcessor::sidechain(SR, None);
+        // The switch is off by default (no inert node waiting for a cable),
+        // so every keying test has to arm it explicitly.
+        set(&mut comp, SLOT_SIDECHAIN, 1.0);
         set(&mut comp, SLOT_THRESHOLD, -18.0);
         set(&mut comp, SLOT_RATIO, 4.0);
         set(&mut comp, SLOT_KNEE, 0.0);
@@ -710,6 +713,16 @@ mod tests {
             Some("sidechain")
         );
         assert!(SIDECHAIN_DESCRIPTOR.spec(9).is_none());
+
+        // Fresh nodes key from their own input until the switch is armed.
+        let mut fresh = CompressorProcessor::sidechain(SR, None);
+        assert_eq!(fresh.value(SLOT_SIDECHAIN), 0.0, "keying starts off");
+        let main = vec![0.5f32; BLOCK * 16];
+        let key = vec![0.9f32; BLOCK * 16];
+        let keyed_off = run_keyed(&mut fresh, &main, &key);
+        let mut reference = CompressorProcessor::new(SR);
+        let plain = run_mono(&mut reference, &main);
+        assert_eq!(keyed_off, plain, "an unarmed key must be ignored");
     }
 
     /// A plain compressor has no slot 8, which is what makes one code path

@@ -404,9 +404,11 @@ pub struct CompressorParams {
     pub stereo_link: bool,
     /// Detect from the Mod port instead of the node input (spec Z1).
     ///
-    /// Only the sidechain variant exposes a slot for it, so a plain
-    /// `Compressor` never reads this field.
-    #[serde(default = "default_true")]
+    /// Off by default: a fresh `Sidechain Comp` compresses from its own
+    /// input until the key is wired and the switch is enabled, so it never
+    /// sits inert waiting for a cable. Only the sidechain variant exposes a
+    /// slot for it, so a plain `Compressor` never reads this field.
+    #[serde(default)]
     pub sidechain: bool,
 }
 
@@ -449,7 +451,7 @@ impl Default for CompressorParams {
             makeup: 0.0,
             mix: default_mix_one(),
             stereo_link: default_true(),
-            sidechain: default_true(),
+            sidechain: false,
         }
     }
 }
@@ -6107,7 +6109,7 @@ mod tests {
         let back: NodeDoc = ron::from_str(&text).expect("deserialize");
         assert_eq!(node, back);
 
-        // A payload that predates the switch loads with keying on.
+        // A payload that predates the switch loads with keying off.
         let legacy: NodeDoc = ron::from_str(
             r#"(type:"effect", node_id:3, track:0, voice:(type:"builtin"),
                 params:(kind:"sidechain_compressor"))"#,
@@ -6117,7 +6119,7 @@ mod tests {
             panic!("expected an effect node");
         };
         let comp = params.as_sidechain_compressor().expect("sidechain payload");
-        assert!(comp.sidechain, "keying starts enabled");
+        assert!(!comp.sidechain, "keying starts disabled");
     }
 
     // E2: a payload written by a newer build without some fields still loads

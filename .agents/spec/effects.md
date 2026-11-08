@@ -251,14 +251,14 @@ GR 表（E2b 收尾项）：`Arc<EffectMeters> { gr_db: AtomicF32, out_peak_l/r:
 E2b 的双口变体（完整 spec 见 `sidechain-compressor.md`）：`Main` 是被压缩的声部，`Mod`
 是键控源。增益计算、GR 平滑、makeup、mix、GR 表全部复用 E2b，**唯一区别是检测源**：
 `sidechain = 1` 时峰值取自 `Mod` 口（`max(|L|, |R|)`，单探测器，一个 GR 作用于两声道），
-`0` 时回落内部检测。它是独立的效果器种类而不是 `compressor` 的一个开关，因为**端口剖面
+`0`（**默认**）时用内部检测、等价于普通 `Compressor`。它是独立的效果器种类而不是 `compressor` 的一个开关，因为**端口剖面
 是种类的属性**：把 `Compressor` 改成双口会让旧工程里所有压缩器失去删除旁路（`node-graph.md` D19）。
 
 参数表 = E2b 的 0–7 逐项相同，追加：
 
 | # | 参数 | 范围 | 单位 | 曲线 | 平滑 | 速率 |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
-| 8 | `sidechain` | 0/1 | bool | —— | 0（吸附） | Block |
+| 8 | `sidechain` | 0/1 | bool | —— | 0（吸附） | Block（默认 0） |
 
 **键控源静音时不压缩，绝不回落内部检测**——否则键控空隙会突然抽吸主信号。零延迟、
 `PROJECT_VERSION` 不动；不做键控 HPF / listen / lookahead / 自动 makeup / 侧链电平表。

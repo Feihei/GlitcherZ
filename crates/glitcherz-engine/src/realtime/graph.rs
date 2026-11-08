@@ -3177,7 +3177,7 @@ mod tests {
     };
     use crate::realtime::buffer::AudioBuffer;
     use crate::realtime::commands::{NoteEvent, ParamId};
-    use crate::realtime::compressor::CompressorProcessor;
+    use crate::realtime::compressor::{self, CompressorProcessor};
     use crate::realtime::context::ProcessContext;
     use crate::realtime::events::NodeEvents;
     use crate::realtime::gain::GainProcessor;
@@ -4021,10 +4021,13 @@ mod tests {
     fn sidechain_compressor_is_keyed_by_the_mod_port() {
         let mut tails = Vec::new();
         for key_value in [0.0f32, 0.5] {
+            // Keying is off by default, so the test arms it explicitly.
+            let mut comp = CompressorProcessor::sidechain(SR, None);
+            comp.set_param(ParamId::BuiltinParam(compressor::SLOT_SIDECHAIN), 1.0);
             let (_compiler, mut graph, dual) = dual_rig_with(
                 Box::new(DcSource { value: 0.5 }),
                 Box::new(DcSource { value: key_value }),
-                Box::new(CompressorProcessor::sidechain(SR, None)),
+                Box::new(comp),
             );
             assert_eq!(graph.plan.kinds[dual as usize], NodeKind::Dual);
             // Descriptor defaults: −18 dB threshold, 4:1, 10 ms attack. A
