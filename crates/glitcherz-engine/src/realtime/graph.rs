@@ -3177,6 +3177,7 @@ mod tests {
     };
     use crate::realtime::buffer::AudioBuffer;
     use crate::realtime::commands::{NoteEvent, ParamId};
+    use crate::realtime::compressor::CompressorProcessor;
     use crate::realtime::context::ProcessContext;
     use crate::realtime::events::NodeEvents;
     use crate::realtime::gain::GainProcessor;
@@ -3791,6 +3792,15 @@ mod tests {
         main: Box<dyn Processor>,
         modulator: Box<dyn Processor>,
     ) -> (GraphCompiler, RtGraph, u16) {
+        dual_rig_with(main, modulator, Box::new(RingModProcessor::new(SR)))
+    }
+
+    /// Same rig with an arbitrary two-input effect at node 4.
+    fn dual_rig_with(
+        main: Box<dyn Processor>,
+        modulator: Box<dyn Processor>,
+        effect: Box<dyn Processor>,
+    ) -> (GraphCompiler, RtGraph, u16) {
         let (mut compiler, mut graph) = GraphCompiler::empty_graph(SR, BLOCK);
         let (mut recycle_tx, _recycle_rx) = recycle_channel();
         let mut apply =
@@ -3810,7 +3820,7 @@ mod tests {
         apply(
             &mut graph,
             compiler
-                .add_node(4, NodeKind::Dual, Box::new(RingModProcessor::new(SR)))
+                .add_node(4, NodeKind::Dual, effect)
                 .expect("add dual-input effect"),
         );
         apply(
@@ -4002,6 +4012,37 @@ mod tests {
         assert!(
             aux[0].abs() < 1e-6 && (aux[DELAY] - 1.0).abs() < 1e-6,
             "the Mod pulse itself must travel through sum_into_delayed"
+        );
+    }
+
+    /// Z1: the compressor's detector must follow the graph's Mod port, not its
+    /// own input. Same topology in both runs — only the key source differs.
+    #[test]
+    fn sidechain_compressor_is_keyed_by_the_mod_port() {
+        let mut tails = Vec::new();
+        for key_value in [0.0f32, 0.5] {
+            let (_compiler, mut graph, dual) = dual_rig_with(
+                Box::new(DcSource { value: 0.5 }),
+                Box::new(DcSource { value: key_value }),
+                Box::new(CompressorProcessor::sidechain(SR, None)),
+            );
+            assert_eq!(graph.plan.kinds[dual as usize], NodeKind::Dual);
+            // Descriptor defaults: −18 dB threshold, 4:1, 10 ms attack. A
+            // constant source needs a few blocks for the one-pole to settle.
+            for _ in 0..96 {
+                graph.process_block(&ctx());
+            }
+            tails.push(*dual_output(&graph, dual).last().expect("frames"));
+        }
+        assert!(
+            (tails[0] - 0.5).abs() < 1e-6,
+            "a silent key must not compress the programme, got {}",
+            tails[0]
+        );
+        assert!(
+            tails[1] < 0.4,
+            "a loud key must compress the programme, got {}",
+            tails[1]
         );
     }
 

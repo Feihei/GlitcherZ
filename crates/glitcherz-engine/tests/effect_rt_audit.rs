@@ -263,6 +263,26 @@ fn built_in_effects_are_allocation_free() {
     }
     assert_zero_alloc(&scope, "RingModProcessor process_with_aux");
 
+    // Z1: the sidechain compressor reads a second buffer instead of the
+    // programme; the keyed branch must not allocate either.
+    let mut keyed = CompressorProcessor::sidechain(SR, None);
+    let mut main = fixture();
+    let key = fixture();
+    for _ in 0..2 {
+        keyed.set_param(ParamId::BuiltinParam(0), -18.0);
+        keyed.process_with_aux(&ctx(), &mut main, Some(&key));
+    }
+    let scope = AuditScope::begin();
+    for block in 0..64 {
+        keyed.set_param(ParamId::BuiltinParam(1), 2.0 + (block as f32 * 0.11).sin());
+        keyed.set_param(
+            ParamId::BuiltinParam(8),
+            if block % 2 == 0 { 1.0 } else { 0.0 },
+        );
+        keyed.process_with_aux(&ctx(), &mut main, Some(&key));
+    }
+    assert_zero_alloc(&scope, "CompressorProcessor sidechain process_with_aux");
+
     // The meter handle itself is written from the audio thread.
     let meters = EffectMeters::new();
     let scope = AuditScope::begin();

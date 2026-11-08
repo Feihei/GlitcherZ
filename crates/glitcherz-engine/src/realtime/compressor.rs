@@ -53,8 +53,11 @@ pub const SLOT_MAKEUP: u8 = 5;
 pub const SLOT_MIX: u8 = 6;
 /// Slot of the stereo-link switch.
 pub const SLOT_LINK: u8 = 7;
+/// Slot of the sidechain switch (sidechain variant only, spec Z1).
+pub const SLOT_SIDECHAIN: u8 = 8;
 
-static COMPRESSOR_PARAMS: [ParamSpec; 8] = [
+/// The eight parameters every compressor shares (E2b order).
+const BASE_PARAMS: [ParamSpec; 8] = [
     ParamSpec::level("threshold", -60.0, 0.0, -18.0)
         .short("thr")
         .inline_row(),
@@ -69,10 +72,33 @@ static COMPRESSOR_PARAMS: [ParamSpec; 8] = [
     ParamSpec::switch_with("stereo_link", 1.0, ParamFlags::STEREO_LINK),
 ];
 
+static COMPRESSOR_PARAMS: [ParamSpec; 8] = BASE_PARAMS;
+
+/// Sidechain table: the shared eight plus the keying switch (Z1-D6).
+const fn sidechain_params() -> [ParamSpec; 9] {
+    let mut params = [BASE_PARAMS[0]; 9];
+    let mut index = 0;
+    while index < BASE_PARAMS.len() {
+        params[index] = BASE_PARAMS[index];
+        index += 1;
+    }
+    params[SLOT_SIDECHAIN as usize] = ParamSpec::switch("sidechain", 1.0);
+    params
+}
+
+static SIDECHAIN_PARAMS: [ParamSpec; 9] = sidechain_params();
+
 /// Static parameter table (spec `.agents/spec/effects.md` E2b).
 pub static DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     name: "Compressor",
     params: &COMPRESSOR_PARAMS,
+    stereo: StereoClass::Linkable { default_link: true },
+};
+
+/// Parameter table of the two-input sidechain variant (spec Z1).
+pub static SIDECHAIN_DESCRIPTOR: EffectDescriptor = EffectDescriptor {
+    name: "Sidechain Comp",
+    params: &SIDECHAIN_PARAMS,
     stereo: StereoClass::Linkable { default_link: true },
 };
 
@@ -148,12 +174,29 @@ pub struct CompressorProcessor {
 impl CompressorProcessor {
     /// Falls back to 48 kHz when `sample_rate <= 0` (construction tolerance).
     pub fn new(sample_rate: f32) -> Self {
-        Self::with_meters(sample_rate, None)
+        Self::build(sample_rate, &DESCRIPTOR, None)
     }
 
     /// Same, with a meter handle the control thread keeps a clone of.
     /// Construction time only.
     pub fn with_meters(sample_rate: f32, meters: Option<Arc<EffectMeters>>) -> Self {
+        Self::build(sample_rate, &DESCRIPTOR, meters)
+    }
+
+    /// Two-input variant: external keying from the Mod port (spec Z1).
+    ///
+    /// The table is the shared eight plus `sidechain`; every other slot keeps
+    /// the E2b range and smoothing, so the DSP is literally the same code.
+    pub fn sidechain(sample_rate: f32, meters: Option<Arc<EffectMeters>>) -> Self {
+        Self::build(sample_rate, &SIDECHAIN_DESCRIPTOR, meters)
+    }
+
+    /// Shared constructor; `descriptor` decides the parameter table.
+    fn build(
+        sample_rate: f32,
+        descriptor: &'static EffectDescriptor,
+        meters: Option<Arc<EffectMeters>>,
+    ) -> Self {
         let sr = if sample_rate > 0.0 {
             sample_rate
         } else {
@@ -161,7 +204,7 @@ impl CompressorProcessor {
         };
         Self {
             sample_rate: sr,
-            params: EffectParamBank::new(&DESCRIPTOR, sr),
+            params: EffectParamBank::new(descriptor, sr),
             gr: [0.0; 2],
             meters,
         }
@@ -202,10 +245,15 @@ impl CompressorProcessor {
         *current = if next == *current { target } else { next };
         *current
     }
-}
 
-impl Processor for CompressorProcessor {
-    fn process(&mut self, _ctx: &ProcessContext, buffer: &mut AudioBuffer) {
+    /// Block loop shared by both variants. `key` is the external detector
+    /// source (the Mod port); `None` keeps the internal detector.
+    ///
+    /// A silent key means "no compression", never a fallback to the internal
+    /// detector (spec Z1-D3): the whole point of keying is that the key signal
+    /// decides, so a gap in the key must release instead of squeezing the
+    /// programme material.
+    fn run(&mut self, buffer: &mut AudioBuffer, key: Option<&AudioBuffer>) {
         let frames = buffer.len();
         let channels = buffer.channels().min(2);
         if frames == 0 || channels == 0 {
@@ -219,6 +267,9 @@ impl Processor for CompressorProcessor {
         let release_ms = self.params.advance(SLOT_RELEASE, frames);
         let knee = self.params.advance(SLOT_KNEE, frames);
         let linked = self.params.is_on(SLOT_LINK);
+        // Slot 8 exists only in the sidechain table; the plain table answers
+        // `false` for out-of-range slots, so one loop serves both kinds.
+        let key = key.filter(|_| self.params.is_on(SLOT_SIDECHAIN));
 
         let settings = Settings {
             threshold,
@@ -237,33 +288,18 @@ impl Processor for CompressorProcessor {
             let mix = self.params.tick(SLOT_MIX);
             let makeup = self.params.tick(SLOT_MAKEUP);
 
-            if linked {
-                let left = buffer
-                    .channel(0)
-                    .and_then(|c| c.get(index).copied())
-                    .unwrap_or(0.0)
-                    .abs();
-                let right = buffer
-                    .channel(1)
-                    .and_then(|c| c.get(index).copied())
-                    .unwrap_or(0.0)
-                    .abs();
-                let gr = self.step_gr(0, left.max(right), &settings);
-                let factor = mix_factor(gr, makeup, mix);
+            if let Some(key) = key {
+                // External keying: one detector drives both channels (Z1-D4).
+                // `stereo_peak` reads before `apply_gain` writes.
+                let gr = self.step_gr(0, stereo_peak(key, index), &settings);
                 block_gr = block_gr.min(gr);
-                for ch in 0..channels {
-                    let Some(channel) = buffer.channel_mut(ch) else {
-                        continue;
-                    };
-                    let Some(sample) = channel.get_mut(index) else {
-                        continue;
-                    };
-                    let y = *sample * factor;
-                    *sample = y;
-                    if let Some(peak) = out_peak.get_mut(ch) {
-                        *peak = peak.max(y.abs());
-                    }
-                }
+                let factor = mix_factor(gr, makeup, mix);
+                apply_gain(buffer, channels, index, factor, &mut out_peak);
+            } else if linked {
+                let gr = self.step_gr(0, stereo_peak(buffer, index), &settings);
+                block_gr = block_gr.min(gr);
+                let factor = mix_factor(gr, makeup, mix);
+                apply_gain(buffer, channels, index, factor, &mut out_peak);
             } else {
                 for ch in 0..channels {
                     let Some(channel) = buffer.channel_mut(ch) else {
@@ -288,6 +324,56 @@ impl Processor for CompressorProcessor {
             meters.store(block_gr, out_peak[0], out_peak[1]);
         }
     }
+}
+
+/// `max(|L|, |R|)` at `index`; missing channels or frames read as `0`.
+fn stereo_peak(buffer: &AudioBuffer, index: usize) -> f32 {
+    let peak = |ch| {
+        buffer
+            .channel(ch)
+            .and_then(|channel| channel.get(index).copied())
+            .unwrap_or(0.0)
+            .abs()
+    };
+    peak(0).max(peak(1))
+}
+
+/// Applies one gain factor to every output channel at `index`.
+fn apply_gain(
+    buffer: &mut AudioBuffer,
+    channels: usize,
+    index: usize,
+    factor: f32,
+    out_peak: &mut [f32; 2],
+) {
+    for ch in 0..channels {
+        let Some(channel) = buffer.channel_mut(ch) else {
+            continue;
+        };
+        let Some(sample) = channel.get_mut(index) else {
+            continue;
+        };
+        let y = *sample * factor;
+        *sample = y;
+        if let Some(peak) = out_peak.get_mut(ch) {
+            *peak = peak.max(y.abs());
+        }
+    }
+}
+
+impl Processor for CompressorProcessor {
+    fn process(&mut self, _ctx: &ProcessContext, buffer: &mut AudioBuffer) {
+        self.run(buffer, None);
+    }
+
+    fn process_with_aux(
+        &mut self,
+        _ctx: &ProcessContext,
+        buffer: &mut AudioBuffer,
+        aux: Option<&AudioBuffer>,
+    ) {
+        self.run(buffer, aux);
+    }
 
     fn set_param(&mut self, id: ParamId, value: f32) -> bool {
         match id {
@@ -307,8 +393,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        CompressorProcessor, DESCRIPTOR, SLOT_ATTACK, SLOT_KNEE, SLOT_LINK, SLOT_MAKEUP, SLOT_MIX,
-        SLOT_RATIO, SLOT_RELEASE, SLOT_THRESHOLD, compute_gr_db,
+        CompressorProcessor, DESCRIPTOR, SIDECHAIN_DESCRIPTOR, SLOT_ATTACK, SLOT_KNEE, SLOT_LINK,
+        SLOT_MAKEUP, SLOT_MIX, SLOT_RATIO, SLOT_RELEASE, SLOT_SIDECHAIN, SLOT_THRESHOLD,
+        compute_gr_db,
     };
     use crate::realtime::buffer::AudioBuffer;
     use crate::realtime::commands::ParamId;
@@ -573,5 +660,196 @@ mod tests {
         assert!((comp.value(SLOT_ATTACK) - 10.0).abs() < 1e-6);
         assert!(!comp.set_param(ParamId::BuiltinParam(42), 1.0));
         assert!(!comp.set_param(ParamId::MasterGain, 1.0));
+    }
+
+    // --- Sidechain variant (spec Z1) ----------------------------------------
+
+    /// Feeds `main` through with `key` on the Mod port.
+    fn run_keyed(comp: &mut CompressorProcessor, main: &[f32], key: &[f32]) -> Vec<f32> {
+        let mut buf = AudioBuffer::new(1, BLOCK);
+        let mut aux = AudioBuffer::new(2, BLOCK);
+        let mut out = Vec::with_capacity(main.len());
+        for (index, chunk) in main.chunks(BLOCK).enumerate() {
+            let start = index * BLOCK;
+            let len = chunk.len();
+            buf.set_len(len);
+            buf.channel_mut(0).unwrap()[..len].copy_from_slice(chunk);
+            aux.set_len(len);
+            let end = start + len;
+            for ch in 0..2 {
+                aux.channel_mut(ch).unwrap()[..len].copy_from_slice(&key[start..end]);
+            }
+            comp.process_with_aux(&ctx(), &mut buf, Some(&aux));
+            out.extend_from_slice(&buf.channel(0).unwrap()[..len]);
+        }
+        out
+    }
+
+    /// E2b settings, hard knee so the expected GR is arithmetic.
+    fn keyed_comp() -> CompressorProcessor {
+        let mut comp = CompressorProcessor::sidechain(SR, None);
+        set(&mut comp, SLOT_THRESHOLD, -18.0);
+        set(&mut comp, SLOT_RATIO, 4.0);
+        set(&mut comp, SLOT_KNEE, 0.0);
+        set(&mut comp, SLOT_ATTACK, 1.0);
+        set(&mut comp, SLOT_RELEASE, 50.0);
+        comp
+    }
+
+    #[test]
+    fn sidechain_descriptor_is_well_formed() {
+        assert_eq!(validate_descriptor(&SIDECHAIN_DESCRIPTOR), Ok(()));
+        assert_eq!(SIDECHAIN_DESCRIPTOR.params.len(), 9);
+        assert!(SIDECHAIN_DESCRIPTOR.is_linkable());
+        // The link switch stays at slot 7; the key switch is appended.
+        assert_eq!(SIDECHAIN_DESCRIPTOR.link_slot(), Some(SLOT_LINK));
+        assert_eq!(
+            SIDECHAIN_DESCRIPTOR
+                .spec(SLOT_SIDECHAIN)
+                .map(|spec| spec.name),
+            Some("sidechain")
+        );
+        assert!(SIDECHAIN_DESCRIPTOR.spec(9).is_none());
+    }
+
+    /// A plain compressor has no slot 8, which is what makes one code path
+    /// serve both tables: `is_on(8)` answers `false` and the key is ignored.
+    #[test]
+    fn plain_compressor_has_no_sidechain_slot() {
+        let mut comp = CompressorProcessor::new(SR);
+        assert!(!comp.set_param(ParamId::BuiltinParam(SLOT_SIDECHAIN), 1.0));
+        assert_eq!(comp.value(SLOT_SIDECHAIN), 0.0);
+
+        // Handing it an aux buffer must change nothing.
+        let main = vec![0.5f32; BLOCK * 8];
+        let key = vec![0.5f32; BLOCK * 8];
+        let mut plain = CompressorProcessor::new(SR);
+        set(&mut plain, SLOT_THRESHOLD, -18.0);
+        set(&mut plain, SLOT_RATIO, 4.0);
+        set(&mut plain, SLOT_KNEE, 0.0);
+        set(&mut plain, SLOT_ATTACK, 1.0);
+        set(&mut plain, SLOT_RELEASE, 50.0);
+        let with_aux = run_keyed(&mut plain, &main, &key);
+
+        let mut reference = CompressorProcessor::new(SR);
+        set(&mut reference, SLOT_THRESHOLD, -18.0);
+        set(&mut reference, SLOT_RATIO, 4.0);
+        set(&mut reference, SLOT_KNEE, 0.0);
+        set(&mut reference, SLOT_ATTACK, 1.0);
+        set(&mut reference, SLOT_RELEASE, 50.0);
+        let internal = run_mono(&mut reference, &main);
+
+        assert_eq!(
+            with_aux, internal,
+            "the plain table must ignore the aux port entirely"
+        );
+    }
+
+    /// The defining assertion of external keying: the reduction is decided by
+    /// the key level, and a silent key releases instead of compressing.
+    #[test]
+    fn sidechain_reduces_only_while_the_key_is_loud() {
+        let main = vec![0.5f32; BLOCK * 80];
+        // Quiet half, then a loud half.
+        let mut key = vec![0.0f32; BLOCK * 80];
+        key[BLOCK * 40..].fill(0.5);
+
+        let mut comp = keyed_comp();
+        let out = run_keyed(&mut comp, &main, &key);
+
+        // Key silent → no reduction, programme passes untouched.
+        let quiet_tail = out[BLOCK * 39];
+        assert!(
+            (quiet_tail - 0.5).abs() < 1e-6,
+            "a silent key must not compress, got {quiet_tail}"
+        );
+
+        // Key at 0.5 → 11.98 dB over a 4:1 threshold → −8.98 dB.
+        let expected_gr = (20.0 * 0.5f32.log10() + 18.0) * (0.25 - 1.0);
+        let expected = 0.5 * 10f32.powf(expected_gr / 20.0);
+        let loud_tail = out[out.len() - 1];
+        assert!(
+            (loud_tail / expected - 1.0).abs() < 0.01,
+            "keyed output {loud_tail}, expected {expected} (gr {expected_gr:.2} dB)"
+        );
+        assert!(
+            (comp.gain_reduction_db(0) - expected_gr).abs() < 0.05,
+            "reported GR {}",
+            comp.gain_reduction_db(0)
+        );
+    }
+
+    /// Z1-D3: no fallback to the internal detector. The programme is well over
+    /// the threshold, so a fallback would show up as a big reduction.
+    #[test]
+    fn silent_key_never_compresses_the_programme() {
+        let main = vec![0.5f32; BLOCK * 32];
+        let key = vec![0.0f32; BLOCK * 32];
+        let mut comp = keyed_comp();
+        let out = run_keyed(&mut comp, &main, &key);
+        for (index, (x, y)) in main.iter().zip(out.iter()).enumerate() {
+            assert!((x - y).abs() < 1e-7, "sample {index}: {x} → {y}");
+        }
+        assert!(comp.gain_reduction_db(0).abs() < 1e-6);
+    }
+
+    /// Same key, different programme levels → same reduction.
+    #[test]
+    fn sidechain_reduction_ignores_the_programme_level() {
+        let key = vec![0.5f32; BLOCK * 64];
+        let mut loud_comp = keyed_comp();
+        let mut quiet_comp = keyed_comp();
+        let loud = vec![0.5f32; BLOCK * 64];
+        let quiet = vec![0.2f32; BLOCK * 64];
+
+        run_keyed(&mut loud_comp, &loud, &key);
+        run_keyed(&mut quiet_comp, &quiet, &key);
+
+        let a = loud_comp.gain_reduction_db(0);
+        let b = quiet_comp.gain_reduction_db(0);
+        assert!((a - b).abs() < 1e-6, "GR must follow the key: {a} vs {b}");
+        assert!(a < -8.0, "expected a strong reduction, got {a}");
+    }
+
+    /// `sidechain = 0` is a switch back to the internal detector, sample for
+    /// sample identical to the plain compressor.
+    #[test]
+    fn sidechain_switch_off_matches_internal_detection() {
+        let main = sine(220.0, 0.3);
+        let key = vec![0.9f32; main.len()];
+
+        let mut keyed = keyed_comp();
+        set(&mut keyed, SLOT_SIDECHAIN, 0.0);
+        let keyed_out = run_keyed(&mut keyed, &main, &key);
+
+        let mut plain = CompressorProcessor::new(SR);
+        set(&mut plain, SLOT_THRESHOLD, -18.0);
+        set(&mut plain, SLOT_RATIO, 4.0);
+        set(&mut plain, SLOT_KNEE, 0.0);
+        set(&mut plain, SLOT_ATTACK, 1.0);
+        set(&mut plain, SLOT_RELEASE, 50.0);
+        let plain_out = run_mono(&mut plain, &main);
+
+        assert_eq!(
+            keyed_out, plain_out,
+            "sidechain off must be the internal detector bit for bit"
+        );
+    }
+
+    /// The key is a control signal: it must not leak into the output.
+    #[test]
+    fn key_signal_does_not_leak_into_the_output() {
+        // Programme is silence, key is loud: the output must stay silent.
+        let main = vec![0.0f32; BLOCK * 16];
+        let key = vec![0.9f32; BLOCK * 16];
+        let mut comp = keyed_comp();
+        set(&mut comp, SLOT_MAKEUP, 0.0);
+        let out = run_keyed(&mut comp, &main, &key);
+        assert!(
+            out.iter().all(|s| s.abs() < 1e-9),
+            "key leaked into the programme path"
+        );
+        // ... while the detector did react to it.
+        assert!(comp.gain_reduction_db(0) < -8.0);
     }
 }

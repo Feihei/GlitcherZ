@@ -59,6 +59,8 @@ pub enum BuiltinEffectKind {
     Limiter,
     /// Two-input ring modulator (Z0 validation effect).
     RingMod,
+    /// Compressor with an external key input (Z1).
+    SidechainCompressor,
 }
 
 impl BuiltinEffectKind {
@@ -75,6 +77,7 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Saturation,
         BuiltinEffectKind::Limiter,
         BuiltinEffectKind::RingMod,
+        BuiltinEffectKind::SidechainCompressor,
     ];
 
     /// Number of audio input ports (Z0). The kind — not the parameter
@@ -82,7 +85,7 @@ impl BuiltinEffectKind {
     /// means touching every static descriptor table.
     pub const fn audio_inputs(self) -> u8 {
         match self {
-            BuiltinEffectKind::RingMod => 2,
+            BuiltinEffectKind::RingMod | BuiltinEffectKind::SidechainCompressor => 2,
             _ => 1,
         }
     }
@@ -101,6 +104,9 @@ impl BuiltinEffectKind {
             BuiltinEffectKind::Saturation => &crate::realtime::saturation::DESCRIPTOR,
             BuiltinEffectKind::Limiter => &crate::realtime::limiter::DESCRIPTOR,
             BuiltinEffectKind::RingMod => &crate::realtime::ring_mod::DESCRIPTOR,
+            BuiltinEffectKind::SidechainCompressor => {
+                &crate::realtime::compressor::SIDECHAIN_DESCRIPTOR
+            }
         }
     }
 }

@@ -42,6 +42,7 @@ pub fn engine_kind(params: &EffectParams) -> BuiltinEffectKind {
         DocEffectKind::Saturation => BuiltinEffectKind::Saturation,
         DocEffectKind::Limiter => BuiltinEffectKind::Limiter,
         DocEffectKind::RingMod => BuiltinEffectKind::RingMod,
+        DocEffectKind::SidechainCompressor => BuiltinEffectKind::SidechainCompressor,
     }
 }
 
@@ -64,6 +65,7 @@ pub fn default_params(kind: DocEffectKind) -> EffectParams {
         DocEffectKind::Saturation => EffectParams::Saturation(Box::default()),
         DocEffectKind::Limiter => EffectParams::Limiter(Box::default()),
         DocEffectKind::RingMod => EffectParams::RingMod(Box::default()),
+        DocEffectKind::SidechainCompressor => EffectParams::SidechainCompressor(Box::default()),
     }
 }
 
@@ -96,6 +98,11 @@ pub fn processor(params: &EffectParams, sample_rate: f32) -> BuiltinProcessor {
             Box::new(LimiterProcessor::with_meters(sample_rate, Some(handle)))
         }
         BuiltinEffectKind::RingMod => Box::new(RingModProcessor::new(sample_rate)),
+        BuiltinEffectKind::SidechainCompressor => {
+            let handle = Arc::new(EffectMeters::new());
+            meters = Some(handle.clone());
+            Box::new(CompressorProcessor::sidechain(sample_rate, Some(handle)))
+        }
     };
     let descriptor = descriptor(params);
     for slot in 0..descriptor.params.len() {
@@ -137,6 +144,18 @@ pub fn value(params: &EffectParams, slot: u8) -> f32 {
             compressor::SLOT_MAKEUP => comp.makeup,
             compressor::SLOT_MIX => comp.mix,
             compressor::SLOT_LINK => bool_value(comp.stereo_link),
+            _ => 0.0,
+        },
+        EffectParams::SidechainCompressor(comp) => match slot {
+            compressor::SLOT_THRESHOLD => comp.threshold,
+            compressor::SLOT_RATIO => comp.ratio,
+            compressor::SLOT_ATTACK => comp.attack,
+            compressor::SLOT_RELEASE => comp.release,
+            compressor::SLOT_KNEE => comp.knee,
+            compressor::SLOT_MAKEUP => comp.makeup,
+            compressor::SLOT_MIX => comp.mix,
+            compressor::SLOT_LINK => bool_value(comp.stereo_link),
+            compressor::SLOT_SIDECHAIN => bool_value(comp.sidechain),
             _ => 0.0,
         },
         EffectParams::Reverb(rev) => match slot {
@@ -233,6 +252,18 @@ pub fn set_value(params: &mut EffectParams, slot: u8, value: f32) {
             compressor::SLOT_MAKEUP => comp.makeup = value,
             compressor::SLOT_MIX => comp.mix = value,
             compressor::SLOT_LINK => comp.stereo_link = value >= 0.5,
+            _ => {}
+        },
+        EffectParams::SidechainCompressor(comp) => match slot {
+            compressor::SLOT_THRESHOLD => comp.threshold = value,
+            compressor::SLOT_RATIO => comp.ratio = value,
+            compressor::SLOT_ATTACK => comp.attack = value,
+            compressor::SLOT_RELEASE => comp.release = value,
+            compressor::SLOT_KNEE => comp.knee = value,
+            compressor::SLOT_MAKEUP => comp.makeup = value,
+            compressor::SLOT_MIX => comp.mix = value,
+            compressor::SLOT_LINK => comp.stereo_link = value >= 0.5,
+            compressor::SLOT_SIDECHAIN => comp.sidechain = value >= 0.5,
             _ => {}
         },
         EffectParams::Reverb(rev) => match slot {
@@ -525,7 +556,12 @@ mod tests {
             let built = processor(&params, 48_000.0);
             assert_eq!(
                 built.meters.is_some(),
-                matches!(kind, DocEffectKind::Compressor | DocEffectKind::Limiter),
+                matches!(
+                    kind,
+                    DocEffectKind::Compressor
+                        | DocEffectKind::SidechainCompressor
+                        | DocEffectKind::Limiter
+                ),
                 "{kind:?} meter handle"
             );
         }

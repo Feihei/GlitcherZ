@@ -402,6 +402,12 @@ pub struct CompressorParams {
     /// Link both channels to one `max(|L|, |R|)` detector (D14).
     #[serde(default = "default_true")]
     pub stereo_link: bool,
+    /// Detect from the Mod port instead of the node input (spec Z1).
+    ///
+    /// Only the sidechain variant exposes a slot for it, so a plain
+    /// `Compressor` never reads this field.
+    #[serde(default = "default_true")]
+    pub sidechain: bool,
 }
 
 fn default_comp_threshold() -> f32 {
@@ -443,6 +449,7 @@ impl Default for CompressorParams {
             makeup: 0.0,
             mix: default_mix_one(),
             stereo_link: default_true(),
+            sidechain: default_true(),
         }
     }
 }
@@ -803,6 +810,8 @@ pub enum BuiltinEffectKind {
     Limiter,
     /// Two-input ring modulator (Z0 validation effect).
     RingMod,
+    /// Compressor keyed from the second audio port (Z1).
+    SidechainCompressor,
 }
 
 impl BuiltinEffectKind {
@@ -820,13 +829,14 @@ impl BuiltinEffectKind {
             Self::Saturation => "Saturation",
             Self::Limiter => "Limiter",
             Self::RingMod => "Ring Mod",
+            Self::SidechainCompressor => "Sidechain Comp",
         }
     }
 
     /// Number of audio input ports (Z0). Only dual-input effects answer 2.
     pub const fn audio_inputs(self) -> u8 {
         match self {
-            Self::RingMod => 2,
+            Self::RingMod | Self::SidechainCompressor => 2,
             _ => 1,
         }
     }
@@ -844,6 +854,7 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Saturation,
         BuiltinEffectKind::Limiter,
         BuiltinEffectKind::RingMod,
+        BuiltinEffectKind::SidechainCompressor,
     ];
 }
 
@@ -878,6 +889,8 @@ pub enum EffectParams {
     Limiter(Box<LimiterParams>),
     /// Two-input ring modulator (Z0).
     RingMod(Box<RingModParams>),
+    /// Compressor keyed from the second audio port (Z1).
+    SidechainCompressor(Box<CompressorParams>),
 }
 
 impl Default for EffectParams {
@@ -901,6 +914,7 @@ impl EffectParams {
             Self::Saturation(_) => BuiltinEffectKind::Saturation,
             Self::Limiter(_) => BuiltinEffectKind::Limiter,
             Self::RingMod(_) => BuiltinEffectKind::RingMod,
+            Self::SidechainCompressor(_) => BuiltinEffectKind::SidechainCompressor,
         }
     }
 
@@ -948,6 +962,22 @@ impl EffectParams {
     pub fn as_compressor_mut(&mut self) -> Option<&mut CompressorParams> {
         match self {
             Self::Compressor(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Compressor parameters, when this is a sidechain compressor node.
+    pub fn as_sidechain_compressor(&self) -> Option<&CompressorParams> {
+        match self {
+            Self::SidechainCompressor(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Mutable compressor parameters, when this is a sidechain compressor node.
+    pub fn as_sidechain_compressor_mut(&mut self) -> Option<&mut CompressorParams> {
+        match self {
+            Self::SidechainCompressor(params) => Some(params),
             _ => None,
         }
     }
@@ -2569,6 +2599,16 @@ pub fn effect_slot_axis(params: &EffectParams, slot: u8) -> MapSpec {
         (EffectParams::Compressor(_), 5) => M::linear(0.0, 24.0),
         (EffectParams::Compressor(_), 6) => M::linear(0.0, 1.0),
         (EffectParams::Compressor(_), 7) => M::linear(0.0, 1.0),
+        // Same eight slots plus the keying switch (Z1).
+        (EffectParams::SidechainCompressor(_), 0) => M::linear(-60.0, 0.0),
+        (EffectParams::SidechainCompressor(_), 1) => M::log(1.0, 20.0),
+        (EffectParams::SidechainCompressor(_), 2) => M::log(0.1, 200.0),
+        (EffectParams::SidechainCompressor(_), 3) => M::log(5.0, 2_000.0),
+        (EffectParams::SidechainCompressor(_), 4) => M::linear(0.0, 24.0),
+        (EffectParams::SidechainCompressor(_), 5) => M::linear(0.0, 24.0),
+        (EffectParams::SidechainCompressor(_), 6) => M::linear(0.0, 1.0),
+        (EffectParams::SidechainCompressor(_), 7) => M::linear(0.0, 1.0),
+        (EffectParams::SidechainCompressor(_), 8) => M::linear(0.0, 1.0),
         // pre-delay (ms), decay (s), damping, low cut, width, mix.
         (EffectParams::Reverb(_), 0) => M::linear(0.0, 200.0),
         (EffectParams::Reverb(_), 1) => M::log(0.2, 12.0),
@@ -6026,6 +6066,58 @@ mod tests {
         assert!(text.contains("ring_mod"), "tag missing: {text}");
         let back: NodeDoc = ron::from_str(&text).expect("deserialize");
         assert_eq!(dual, back);
+    }
+
+    /// Z1: a second dual-input kind. Both ports validate, and the keying switch
+    /// survives a round trip while older payloads default to keying on.
+    #[test]
+    fn sidechain_compressor_has_two_ports_and_a_persistent_switch() {
+        let node = NodeDoc::Effect {
+            node_id: 4,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params: EffectParams::SidechainCompressor(Box::default()),
+            delay: None,
+        };
+        assert_eq!(node.audio_inputs(), 2, "Main + Mod");
+        let kind = EffectParams::SidechainCompressor(Box::default()).kind();
+        assert_eq!(kind, super::BuiltinEffectKind::SidechainCompressor);
+        assert_eq!(kind.label(), "Sidechain Comp");
+
+        let instrument = |node_id: u64, track: usize| NodeDoc::Instrument {
+            node_id,
+            track,
+            voice: VoiceSpec::Builtin,
+            synth: SynthParams::default(),
+        };
+        let graph = GraphDoc {
+            nodes: vec![instrument(2, 0), instrument(3, 1), node.clone()],
+            cables: vec![
+                CableDoc::audio_to_port(2u64, 4u64, 0),
+                CableDoc::audio_to_port(3u64, 4u64, 1),
+                CableDoc::audio(4u64, PortRef::Master),
+            ],
+            ..Default::default()
+        };
+        graph.validate(2, 0).expect("Main + Mod must be legal");
+
+        let text = ron::to_string(&node).expect("serialize");
+        assert!(text.contains("sidechain_compressor"), "tag missing: {text}");
+        assert!(text.contains("sidechain:"), "switch missing: {text}");
+        let back: NodeDoc = ron::from_str(&text).expect("deserialize");
+        assert_eq!(node, back);
+
+        // A payload that predates the switch loads with keying on.
+        let legacy: NodeDoc = ron::from_str(
+            r#"(type:"effect", node_id:3, track:0, voice:(type:"builtin"),
+                params:(kind:"sidechain_compressor"))"#,
+        )
+        .expect("a bare sidechain payload should parse");
+        let NodeDoc::Effect { params, .. } = legacy else {
+            panic!("expected an effect node");
+        };
+        let comp = params.as_sidechain_compressor().expect("sidechain payload");
+        assert!(comp.sidechain, "keying starts enabled");
     }
 
     // E2: a payload written by a newer build without some fields still loads

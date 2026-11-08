@@ -960,7 +960,8 @@ mod tests {
     use super::*;
 
     use glitcherz_model::{
-        CableDoc, CableKind, EffectParams, MidiClip, NodeDoc, Note, PortRef, VoiceSpec,
+        CableDoc, CableKind, CompressorParams, EffectParams, MidiClip, NodeDoc, Note, PortRef,
+        VoiceSpec,
     };
 
     fn project_with_note() -> Project {
@@ -1035,6 +1036,24 @@ mod tests {
         bytes[pos + 8..].iter().any(|&b| b != 0)
     }
 
+    /// RMS of an Int16 WAV payload (all channels interleaved).
+    fn wav_rms(path: &Path) -> f32 {
+        let bytes = std::fs::read(path).expect("read wav");
+        let pos = bytes
+            .windows(4)
+            .position(|w| w == b"data")
+            .expect("wav has no data chunk");
+        let samples: Vec<f32> = bytes[pos + 8..]
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32768.0)
+            .collect();
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let mean = samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32;
+        mean.sqrt()
+    }
+
     /// Z0 end-to-end: the offline assembly must install a dual-input document
     /// node as `NodeKind::Dual`. With both ports fed from the same instrument
     /// the render carries signal; without the Mod cable it goes silent
@@ -1107,6 +1126,97 @@ mod tests {
 
         let _ = std::fs::remove_file(dry);
         let _ = std::fs::remove_file(wet);
+    }
+
+    /// Z1 end-to-end: the document → assembly → graph → WAV chain must key the
+    /// compressor from the Mod port. Same project in every render except the
+    /// key cable and the switch.
+    #[test]
+    fn offline_render_honours_sidechain_keying() {
+        let build = |key_wired: bool, sidechain: bool| {
+            let mut project = project_with_note();
+            let effect_id = project
+                .graph
+                .nodes
+                .iter()
+                .map(NodeDoc::node_id)
+                .max()
+                .unwrap_or(1)
+                + 1;
+            project.graph.nodes.push(NodeDoc::Effect {
+                node_id: effect_id,
+                track: 0,
+                voice: VoiceSpec::Builtin,
+                params: EffectParams::SidechainCompressor(Box::new(CompressorParams {
+                    // Always compress: the point is which input the detector
+                    // reads, not the curve.
+                    threshold: -60.0,
+                    ratio: 20.0,
+                    attack: 0.1,
+                    release: 50.0,
+                    knee: 0.0,
+                    sidechain,
+                    ..Default::default()
+                })),
+                delay: None,
+            });
+            let voice = project.graph.instrument_of_track(0).unwrap().node_id();
+            let mixer = project.graph.first_mixer().unwrap().node_id();
+            // Replace voice → mixer.ch0 with voice → comp.Main → mixer.ch0.
+            project.graph.cables.retain(|c| {
+                !(c.kind == CableKind::Audio
+                    && c.from == PortRef::Node(voice)
+                    && c.to == PortRef::Node(mixer))
+            });
+            project
+                .graph
+                .cables
+                .push(CableDoc::audio_to_port(voice, effect_id, 0));
+            project
+                .graph
+                .cables
+                .push(CableDoc::audio_to_channel(effect_id, mixer, 0));
+            if key_wired {
+                project
+                    .graph
+                    .cables
+                    .push(CableDoc::audio_to_port(voice, effect_id, 1));
+            }
+            project
+        };
+
+        let options = RenderOptions {
+            sample_rate: 22_050,
+            bits: export_audio::Bits::Int16,
+            end_ticks: Some(1920),
+        };
+        let render = |tag: &str, project: &Project| -> f32 {
+            let input = save_temp(project, tag);
+            let out =
+                std::env::temp_dir().join(format!("glitcherz_z1_{tag}_{}.wav", std::process::id()));
+            render_project_to_wav(&input, &out, options).expect("render");
+            let _ = std::fs::remove_file(input);
+            let rms = wav_rms(&out);
+            let _ = std::fs::remove_file(&out);
+            rms
+        };
+
+        // No key cable → silent key → the programme passes untouched (Z1-D3).
+        let dry = render("z1_dry", &build(false, true));
+        // Key cable → the key squashes the programme.
+        let wet = render("z1_wet", &build(true, true));
+        // Switch off → internal detector, which here is the same signal.
+        let internal = render("z1_internal", &build(true, false));
+
+        assert!(dry > 0.0, "the unkeyed render must carry signal");
+        assert!(
+            wet < dry * 0.2,
+            "a loud key must squash the programme: dry {dry}, wet {wet}"
+        );
+        assert!(
+            internal < dry * 0.2,
+            "sidechain off must fall back to the internal detector: {internal} vs {dry}"
+        );
     }
 
     /// Mirrors `GlitcherZApp::start_export` (assemble -> ExportJob -> pump)
