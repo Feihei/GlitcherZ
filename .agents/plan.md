@@ -639,7 +639,7 @@ scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 sympho
 | 阶段 | 内容 | 状态 |
 | :--- | :--- | :--- |
 | **S0** | 装配去重（共享 `spawn_node`）+ `glitcherz --render` headless 渲染 | ✅ 2026-11-07 交付 |
-| **S1** | Pluck（Karplus-Strong 拨弦） | 待办 |
+| **S1** | Pluck（Karplus-Strong 拨弦） | ✅ 2026-11-08 交付 |
 | **S2** | Organ（drawbar 加法 + 打击泛音） | 待办 |
 | **S3** | Wavetable（表管理 / 抗混叠 / 位置调制，**先写独立 spec**） | 待办 |
 | **S4** | CLI 命令面扩展（open / save / 少量批量操作） | 待办 |
@@ -676,6 +676,17 @@ scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 sympho
 - **验收**：`gui_export_pipeline_matches_the_cli_render`（GUI 的 `assemble_offline + ExportJob` 与 CLI 输出逐字节相等）、`repeated_headless_renders_are_byte_identical`、`media_paths_resolve_relative_to_the_project`（ui lib 3 项）+ `render_cli.rs` 真起子进程跑 `--render` 的无窗口冒烟 + `main.rs` 参数解析 2 项。`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace`（40 个测试二进制）全绿；`--seconds 3` 窗口冒烟通过（实时 `install_node` 重构后）。
 - 用户文档同步：`docs/README.md` 运行节、`docs/manual.md` 导出节。
 
+### S1 实施记录（✅ 2026-11-08 已交付，Y 系列第一个乐器）
+
+| 项 | 结果 |
+| :--- | :--- |
+| 落地 | 新 `realtime/pluck.rs`（`PluckProcessor`）：分数延迟环 + 环路一阶低通 + 环路增益 T60 反解（含 `\|H(f0)\|` 补偿，上限 0.99995）+ 一周期噪声激励（xorshift32）+ 16 声部池；`ParamId` 5 个、`NodeParam` 5 个（全部可自动化）、`VoiceSpec::Pluck` 加法变体；装配只改 `headless::spawn_instrument` 一处（离线 seed / 实时 `push_node_params` 重放）；UI 的 `NodeSource::Pluck`、选择器 `Pluck`、节点标题、内联 `decay`·`damp`、Inspector pluck 分区。**不做预设枚举**（S1-D7，与 B1-D7 相反的刻意选择）。 |
+| 标识 | `PROJECT_VERSION = 10` **未动**，旧工程零迁移；`Pluck` 进 Add 菜单（`Mallet` 之后）。无新 crate / 新依赖。内存每节点固定 1 MiB（构造期分配）。 |
+| DSP 关键点 | ① 环路增益必须除以阻尼低通在 f0 的 `\|H(f0)\|`，否则 `decay` 描述的 T60 在重阻尼下畸变；② note-off 阻尼必须乘在**环内**（`ring[w] = exc + damp_gain·g·lp'`），挂到输出端会每环路周期复合一次——实测把 0.15 s 的松键尾音压成 0，这是第一版被推翻的原因；③ 分数延迟读在写之前，环路周期严格等于 `D`，无额外样本延迟；④ 激励电平 0.8（A4 峰值约 0.49），0.35 时尾音过早落入 `IDLE_EPS`；⑤ `retune` 必须吃 `pitch_ratio`，否则 `PitchOffset` 改不动已在响的弦。 |
+| 验收 | 16 项引擎单测（音高 Goertzel / T60 偏差 / 阻尼明暗 / 起音亮度 / note-off / blanket / 重击叠加 / 偷声部 / 极端参数 / 可复现）+ 1 项 model RON 往返 + `rt_audit` 零分配 + 1 项离线端到端（拨弦 RMS 0.061、松键后 0.000）；`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。 |
+| **零回归硬证据** | 用 `86a4244`（S1 spec commit，最后一个 pre-S1 代码状态）的 detached worktree + 独立 `CARGO_TARGET_DIR` 编出 pre-S1 二进制，与 post-S1 对同一份含 4 个音符的工程跑 `--render --rate 22050 --bits 16 --to 1920`：两份 WAV 各 **44288 帧 / 177196 字节，`cmp` 逐字节一致**。 |
+| 文档同步 | `pluck-instrument.md`（新 spec）、`implementation.md` S1 小节、`docs/manual.md`（Add 菜单 `Pluck` 行 + 拨弦小节 + Inspector 行 + 自动化说明）、`AGENTS.md` 索引。 |
+
 ## Z / B 系列：双音频输入口 + 模态打击声源（2026-11-08 立项，本节即方案）
 
 > 来源：用户 2026-11-08 提出三项——① 敲击金属器具的合成器（类 LMMS Mallets），尤其要「敲诵钵那种悠长的声音」；② 现有效果器都是单 audio 入，想要**两个 audio 口**的调制类效果器，目标是类似 vocoder 的效果；③ 侧链压缩同样需要两个 audio 口。
@@ -699,7 +710,7 @@ scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 sympho
 
 用户要的「悠长」不是 Karplus-Strong（Y 系列 S1）换参数能给的：Pluck 是**谐波泛音 + 短延迟线 + 阻尼**，诵钵是**非谐波模态比 + 每模态独立长衰减（10–30 s）+ 同一模态轻微失谐产生的 1–5 Hz 拍频**，激励只做**单次敲击（strike）**（用户 2026-11-08 决议，不做 bow/rub 持续摩擦）。两者同属「激励—共鸣」家族但 DSP 不共用，所以**单独立 B 系列**；LMMS Mallets 本身走 STK ModalBar 的模态合成路线，一个引擎用不同预设族即可覆盖 Mallet（颤音琴 / 钟 / 管钟，短衰减）与 Singing Bowl（长衰减、拍频）。
 
-S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 池 / 激励抽象，**不预设过早抽象**。
+S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 池 / 激励抽象，**不预设过早抽象**。**2026-11-08 已交付并回答这个问题**：没有抽象。两者唯一共用的是 `note_to_frequency` 与「16 声部池」这条语义（各自 30 行实现），强行抽出 trait 只会多一层间接、并让 Pluck 的环路状态被 B1 的谐振器形状绑架。
 
 ### 量级与依赖
 
@@ -718,7 +729,7 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | 2 | **Z1** 侧链压缩 ✅ | 已交付。Z0 的第一个真实消费者兼**验收钉子**：复用现成 `CompressorProcessor`，证明 aux 在实时 / 离线两条路径都通。Z0 自带的 Ring Mod 只是数学样例，Z1 才是用户要的效果。 |
 | 3 | **B1** Modal 声源 ✅ | 已交付。与图架构完全解耦，与 Z0/Z1 无交叉；声源只改 `headless::spawn_instrument` 一处，长尾 / 拍频 / 频谱峰全部由 S0 的 `--render` 自动验收。 |
 | 4 | **Z2** Vocoder ✅ | 已交付。最贵的一项，失败模式本可能暴露 Z0 的设计缺口（两路 PDC / 缓冲形状）；Z1 已把 Z0 验证过，实际零返工。 |
-| 5 | **S1** Pluck → **S2** Organ → **S3** Wavetable | Y 系列原三个乐器顺延；Wavetable 仍按原约定「先写独立 spec 再实现」。 |
+| 5 | **S1** Pluck ✅ → **S2** Organ → **S3** Wavetable | S1 已交付（2026-11-08）。Y 系列原三个乐器顺延；Wavetable 仍按原约定「先写独立 spec 再实现」。 |
 | 6 | **S4** CLI 命令面 → **S5** MCP | 不取消。新功能把它们往后推，但 S0 的判别（没有 render 的 MCP 是盲操作）不变。 |
 
 **备选（听感优先，未采用）**：B1 → Z0 → Z1 → Z2 → S1…。两条链互不依赖，本可无损切换；用户 2026-11-08 选架构优先，**按上表执行**。
@@ -817,7 +828,7 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | Q2 诵钵激励 | **只做单次敲击（strike）**，不做 bow/rub 持续摩擦 → voice 生命周期与 note-off 按一次性激励设计 |
 | Q3 Vocoder | **固定 16 带 + 外部 carrier**，v1 无 formant shift / freeze / 自定义带数 |
 
-下一步：**S1 Pluck 声源**（架构优先顺序的第 5 项），沿用 B1 的形状——先写 `spec/pluck-instrument.md`，再实现引擎、装配、UI，最后分实现 / 文档两个 commit。
+下一步：**S2 Organ 声源**（Y 系列第二个乐器、执行顺序仍是第 5 项），沿用 B1 / Z2 / S1 的形状——先写 `spec/organ-instrument.md`，再实现引擎、装配、UI，最后分实现 / 文档两个 commit。要点（立项粗版）：9 个 drawbar 正弦（footage 16′..1′）+ 每个 drawbar 独立电平 + 打击泛音（percussion，衰减包络）+ 滑音（glide）；纯加法、无算法风险，主要工作量在参数面与 UI 版图。
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 

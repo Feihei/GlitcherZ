@@ -1179,3 +1179,23 @@ spec `.agents/spec/vocoder.md`。`Main` = carrier、`Mod` = modulator，16 个�
 - 离线端到端测试沿用 `"dry"` / `"wet"` 作临时文件名会与 Z0 / Z1 的同名测试撞车（`save_temp` 只按 tag + process id 区分），单独跑必过、全量跑偶发 `拒绝访问`。改用 `z2_dry` / `z2_wet`。
 
 **验收**：18 项 `vocoder.rs` 单测（描述符、单位峰值 × 三个 Q、静音、缺 aux、直通、门控包络、起音、频率选择、带边界、Q、sibilance、声道独立、极端参数、NaN 参数、可复现、release、地板、电平标定）、1 项 model RON 往返与旧 payload 默认、`effect_rt_audit` 的 `process_with_aux`/`set_param` 零分配、1 项离线端到端（无 Mod 线 → 静音；接线 → 出声）。全量 1136 项通过，默认工程渲染与 pre-Z2 逐字节一致。
+
+## S1：拨弦声源 Pluck（2026-11-08）
+
+spec `.agents/spec/pluck-instrument.md`。Karplus-Strong：一根分数延迟的环，环里串一个一阶低通当阻尼，一圈噪声当激励。与 B1 同属「激励—共鸣」，但没有一行 DSP 可以共用——B1 是并联谐振器组的非谐波谱，S1 是严格谐波谱、所有谐波共享一个环路增益。所以是独立模块，`realtime/pluck.rs`。
+
+**环路增益不是 T60 增益。** `g_target = exp(−ln1000 / (f0·decay_s))` 只描述「一个谐波衰减到 −60 dB」；但环里还串着阻尼低通，它在 f0 处的幅度 `|H(f0)| = a / sqrt(1 − 2(1−a)cosω + (1−a)²)` 小于 1，会额外吃掉能量。直接写 `g = g_target` 的话，`decay` 在重阻尼下会被压短一半以上。所以写入的是 `g = min(0.99995, g_target / |H(f0)|)`：`decay` 描述的是**基频的 T60**，高次谐波由阻尼自然先死。`0.99995` 的硬上限意味着「阻尼很重时尾音短于 `decay`」——这时阻尼赢，是物理正确的，不是缺陷。
+
+**note-off 阻尼必须乘在环里，不能挂在输出上。** 第一版是输出端 per-sample 指数淡出（`fade *= fade_coeff`，T60 = `release_s`），实测 `release = 0.15` 时松键 0.1 s 内 RMS 归零。原因很直白：淡出是逐样本复合的，而一个环路周期有 `D ≈ 436` 个样本（A4 @48 kHz），也就是这个「每样本一次」的衰减在一圈内被乘了 436 次。改成环路增益 `damp_gain = exp(−ln1000·D / (release_s·fs))`，一圈正好 −60 dB。同一个 bug 还让 `decay` 的 T60 实测值偏了 7 倍（42 / 37 而不是 5.6），因为阻尼和激励电平两个误差叠在一起——把 `EXCITATION_LEVEL` 从 0.35 提到 0.8（A4 峰值约 0.49）后尾音才不再提前落进 `IDLE_EPS`。
+
+**第一个环路周期是静音。** 激励要走完一圈才到输出：D = 2 时 0.04 ms，A4 时 2.3 ms，MIDI 0 @48 kHz 时 122 ms。这是 Karplus-Strong 的固有性质，不是延迟缺陷，所以不「修复」。读写顺序保证 `read` 永远是 `D` 个样本之前写入的值（分数延迟线性插值读在写之前），环路周期严格等于 `D`，没有隐含的额外样本延迟。
+
+**`retune` 必须吃 `pitch_ratio`。** 第一版 `retune` 只 clamp 已有的 `delay`，于是 `PitchOffset` 改不动已经在响的声部——拨弦变成「只有下一个音才跟」。改成从 `voice.note` + `note_to_frequency` 重建 `delay`，`PitchOffset` 立即作用于全池。
+
+**没有预设枚举，这是刻意的。** B1 的预设表是结构性的（模态比 / 每模态衰减，参数化不了），Pluck 的「木吉他 / 贝斯 / 竖琴」只是五个标量的组合——预设会立刻被滑杆改脏，还多出「我现在在哪个预设里」的状态问题。五个宏参数直接给用户（`decay` / `damping` / `brightness` / `release` / `gain`）。
+
+**几个常量与它们的理由**：`MAX_DELAY = 16384`（96 kHz 覆盖 MIDI 0；48 kHz 到 2.9 Hz）、`MAX_VOICES = 16`（每节点固定 1 MiB，构造期分配）、`MAX_EXCITATION_FRAMES = 4096`、`SCRATCH_FRAMES = 1024`、`IDLE_EPS = 1e−6`（1e−4 会让尾音提前判死）、`GAIN_CEILING = 0.99995`。激励噪声是 xorshift32——确定性，所以离线渲染可复现，两个新实例对同一事件序列逐样本相同。
+
+**model / 装配 / UI 的接线**：`VoiceSpec::Pluck { params: PluckParams }` 加法变体（serde tag `pluck`，`#[serde(default)]`），`PROJECT_VERSION` 保持 10，旧工程零迁移。装配仍然只改 `headless::spawn_instrument` 一处：离线在构造期 seed `pluck_param_values`，实时靠 `engine_sync::push_node_params` 重放。`NodeParam` 新增 5 个自动化词汇（全部连续量，全可自动化，与 B1 的 `preset` 不同），`MapSpec` 的 `decay` 0.1..20 / `damping`·`brightness` 0..1 / `release` 0.005..2 / `gain` 0..2 与 `node_param_map` 对齐。画布节点内联 `decay` / `damp` 两行，其余三个在 Inspector 的 pluck 分区；节点标题 `PLUCK · Track N`。`voices.rs` 四处分派补 `Pluck => None`（无外部文件）。
+
+**验收**：16 项 `pluck.rs` 单测（静音、发声、音高与 `PitchOffset` 的 Goertzel、T60 偏差、decay 尾音长度、damping 明暗、brightness 频谱、note-off 阻尼、blanket、重击叠加、偷声部有界、非有限参数、极端参数、零力度、可复现、非法采样率）、1 项 model RON 往返与旧 payload 默认、`effect_rt_audit` 的 `process` / `note_event` / `set_param` 零分配、1 项离线端到端（拨弦窗口 RMS 0.061，松键后窗口 0.000）。默认工程渲染与 pre-S1 逐字节一致（44288 帧 / 177196 字节），全量 1154 项通过。

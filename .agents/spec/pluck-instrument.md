@@ -1,6 +1,6 @@
 # S1：拨弦声源 Spec（Pluck / Karplus-Strong）
 
-> 状态：定稿（2026-11-08）。上游：`plan.md`（Y 系列 S1，Z / B 执行顺序第 5 项）、`spec/instrument.md`（声部 / note 语义）、`spec/drum-kit.md`（`VoiceSpec` 加法变体先例）、`spec/modal-instrument.md`（同一家族的声源形状：一个引擎 + 宏参数）。
+> 状态：已交付（2026-11-08）。上游：`plan.md`（Y 系列 S1，Z / B 执行顺序第 5 项）、`spec/instrument.md`（声部 / note 语义）、`spec/drum-kit.md`（`VoiceSpec` 加法变体先例）、`spec/modal-instrument.md`（同一家族的声源形状：一个引擎 + 宏参数）。
 > 范围：**单次拨弦**的 Karplus-Strong 延迟线。不做弓 / 摩擦激励、不做逐谐波编辑、不做采样混合。
 
 ## 1. 背景
@@ -38,11 +38,11 @@
 | ID | 决策 |
 | :--- | :--- |
 | S1-D1 | **`VoiceSpec::Pluck { params: PluckParams }` 加法变体**（serde tag `pluck`），旧文件零迁移，`PROJECT_VERSION` 保持 10。和 B1 一样没有外部文件，**不存在「空路径」态**，节点出生即有声。 |
-| S1-D2 | **DSP 是一根数字延迟线 + 一个环路一阶低通**：<br>`read = 环形缓冲[w − D]`（分数延迟用线性插值补足）<br>`lp' = a·read + (1−a)·lp`（阻尼低通，状态 per voice）<br>`ring[w] = exc + g·lp'`<br>`out = read`<br>环路周期 `D = fs / f0`，`f0 = note_to_frequency(note) · 2^(pitch/12)`。读写顺序保证 `read` 永远是 `D` 个样本之前写入的值，因此**环路周期就是 `D`**，没有隐含的额外样本延迟。 |
+| S1-D2 | **DSP 是一根数字延迟线 + 一个环路一阶低通**：<br>`read = 环形缓冲[w − D]`（分数延迟用线性插值补足）<br>`lp' = a·read + (1−a)·lp`（阻尼低通，状态 per voice）<br>`ring[w] = exc + damp_gain·g·lp'`<br>`out = read`<br>环路周期 `D = fs / f0`，`f0 = note_to_frequency(note) · 2^(pitch/12)`。读写顺序保证 `read` 永远是 `D` 个样本之前写入的值，因此**环路周期就是 `D`**，没有隐含的额外样本延迟。`damp_gain`（note-off 阻尼，S1-D5）乘在环内而不是输出上。 |
 | S1-D3 | **环路增益由 T60 反解，并按阻尼滤波在 f0 的衰减补偿**。`g_target = exp(−ln1000 / (f0 · decay_s))`（T60 秒内的周期数 = `f0 · T60`）。阻尼低通本身在 f0 处有 `|H(f0)| < 1`，所以实际写入 `g = min(0.99995, g_target / |H(f0)|)`，其中 `\|H(f0)\| = a / sqrt(1 − 2(1−a)cos ω + (1−a)²)`、`ω = 2π f0 / fs`。这样 `decay` 描述的是**基频的 T60**，而高次谐波按阻尼滤波自然地先衰减。`0.99995` 是硬上限：阻尼很重时 `g_target / \|H(f0)\|` 会大于 1，此时**阻尼赢**、实际尾音短于 `decay`——这是物理正确的，不是 bug。 |
 | S1-D4 | **环形缓冲固定容量**：`MAX_DELAY = 16384` 样本/声部（48 kHz 下最低 2.9 Hz，96 kHz 下覆盖到 MIDI 0），`MAX_VOICES = 16`，`MAX_EXCITATION_FRAMES = 4096`，`SCRATCH_FRAMES = 1024`。每声部一条 `Vec<f32>`，构造期一次性分配（16 × 64 KiB = **1 MiB 固定占用**），热路径零分配。`D` 在 `[2, MAX_DELAY − 2]` 内 clamp（插值要读 `w − i − 1`）。 |
-| S1-D5 | **note 语义与 B1 不同：拨弦会被松键按住**。`Off{n}`（n ≠ 0）匹配到某个正在响的声部 → 该声部进入**阻尼**（per-sample 指数淡出，T60 = `release_s`，默认 0.15 s）；`Off{0}` 是 blanket 哨兵（Stop / Panic），所有声部进入 10 ms 阻尼。声部在环内容峰值 < 1e−4 且淡出系数 < 1e−4 时释放槽位。理由：MIDI 音符长度是拨弦乐器唯一的「闷音」手段，忽略它会让人写不出《加州旅馆》那种断奏。 |
-| S1-D6 | **激励 = 一个周期的噪声**：长度 = `round(D)`（clamp 到 `MAX_EXCITATION_FRAMES`），每个样本是一阶低通后的均匀噪声（xorshift32，确定性），幅值 `0.35 · velocity^1.5`，低通截止 `400 Hz · 2^(5 · brightness) · (0.35 + 0.65 · velocity)`（上限 `0.45 fs`）。激励**加性注入**环缓冲：同音重击 = 在仍在响的弦上再拨一下；池满偷最老声部时**保留环状态、只重算延迟长度与环路系数**，尾音滑到新音高而不是清零（与 B1-D5 同一语义）。 |
+| S1-D5 | **note 语义与 B1 不同：拨弦会被松键阻尼**。`Off{n}`（n ≠ 0）匹配到某个正在响的声部 → 该声部把环路增益乘上 `damp_gain = exp(−ln1000 · D / (release_s · fs))`（即「**每圈**衰减一次，一个环路周期后正好 −60 dB，故 T60 = `release_s`），默认 0.15 s；`Off{0}` 是 blanket 哨兵（Stop / Panic），所有声部进入 10 ms 阻尼。声部在环内容峰值 < 1e−6 时释放槽位。**阻尼必须挂在环路上、不能挂在输出端**：输出端的 per-sample 淡出会在一个环路周期内复合 `D` 次（A4 @48 kHz 约 436 次），实测把 0.15 s 的松键尾音压成 0，这是第一版实现被推翻的原因。理由：MIDI 音符长度是拨弦乐器唯一的「闷音」手段，忽略它会让人写不出《加州旅馆》那种断奏。 |
+| S1-D6 | **激励 = 一个周期的噪声**：长度 = `round(D)`（clamp 到 `MAX_EXCITATION_FRAMES`），每个样本是一阶低通后的均匀噪声（xorshift32，确定性），幅值 `0.8 · velocity^1.5`（A4 单音峰值约 0.49，不削波），低通截止 `400 Hz · 2^(5 · brightness) · (0.35 + 0.65 · velocity)`（上限 `0.45 fs`）。激励**加性注入**环缓冲：同音重击 = 在仍在响的弦上再拨一下；池满偷最老声部时**保留环状态、只重算延迟长度与环路系数**，尾音滑到新音高而不是清零（与 B1-D5 同一语义）。 |
 | S1-D7 | **不做预设枚举**（与 B1-D7 相反，且是刻意的）。B1 的预设表是**结构不同**（模态比 / 每模态衰减），只能内建；Pluck 的「木吉他 / 贝斯 / 竖琴 / 古筝」只是三个标量的组合，预设会立刻被滑杆改脏，还多出一个「我现在在哪个预设里」的状态问题。五个宏参数直接给到用户，比四个会失真的预设更诚实。 |
 | S1-D8 | **音高准确性与 clamp**：`D` clamp 后实际音高是 `fs / D`，环路增益与阻尼截止都用这个**实际 f0** 计算，因此极端音高下衰减时间仍然正确，只是音高不再跟随。`PitchOffset` 沿用既有语义（半音，块级，±24），改的是所有声部的 `D`，不重建缓冲区。 |
 | S1-D9 | **`ParamId` 新增 5 个**：`PluckDecay` / `PluckDamping` / `PluckBrightness` / `PluckRelease` / `PluckGain`。非有限值一律返回 `false`（与 `synth.rs` / `modal.rs` / `drum_kit.rs` 一致）。`decay` / `damping` / `PitchOffset` 改动会重算所有声部的环路系数（`tables_dirty`），不改缓冲内容。 |
@@ -62,7 +62,7 @@ note-on ──► 噪声 ─► 一阶 LP（brightness × velocity）─► × a
         │                                   │
         └──► read = ring[w − D] ────────────┘
                     │
-                    └──► 输出（× gain，× 阻尼淡出，Σ 到所有通道）
+                    └──► 输出（× gain，Σ 到所有通道）
 ```
 
 - 声部渲染进预分配的 mono scratch，再累加到输出（与 `ModalProcessor` 同形）。
@@ -100,25 +100,26 @@ note-on ──► 噪声 ─► 一阶 LP（brightness × velocity）─► × a
 
 ## 7. 验收
 
-> 全部回填于实施完成时；括号里是对应的测试名。
+> 全部回填于实施完成时（2026-11-08）；括号里是对应的测试名。
 
-- [ ] 无音符时输出**逐样本静音**（`silent_without_a_note`）。
-- [ ] 拨弦发声：第一个周期的静音之后能量出现，A4 的 RMS ∈ 0.02..0.6（`a_pluck_produces_sound`）。
-- [ ] 音高准确：A4（note 69）的 Goertzel 能量在 440 Hz 处远高于 466 Hz / 415 Hz（半音邻域），且 `PitchOffset = +12` 让峰值落到 880 Hz（`pitch_follows_the_note_and_the_offset`）。
-- [ ] `decay` 控制尾音：`decay = 0.3` 与 `8.0` 在 1.5 s 处的能量差至少 10 倍（`decay_sets_the_tail_length`），且实测 T60 与请求值的偏差在 ±35% 内（`decay_matches_the_requested_t60`）。
-- [ ] `damping` 变暗：`damping = 1.0` 时 4·f0 的能量显著低于 `damping = 0.0`（`damping_darkens_the_spectrum`）。
-- [ ] `brightness` 改变起音的频谱：高亮度时前 30 ms 的高频占比更高（`brightness_changes_the_attack`）。
-- [ ] note-off 阻尼：`Off{69}` 后 0.5 s 能量衰减到松键前的 10% 以下；不发 `Off` 时仍有能量（`note_off_damps_the_string`）。
-- [ ] `Off{0}` 在 50 ms 内静音（`blanket_off_stops_everything`）。
-- [ ] 同音重击 = 在响的弦上叠加（能量上升），池满第 17 个音偷最老声部且输出有限（`pool_is_bounded_and_stealing_stays_finite`）。
-- [ ] 非有限参数被拒，满幅参数（`gain = 2`、极端音高、NaN）输出无 NaN / Inf（`params_reject_non_finite` / `extreme_parameters_stay_finite`）。
-- [ ] 零力度不发声（`zero_velocity_is_silent`）。
-- [ ] 可复现：两个新实例对同一事件序列逐样本相同（`renders_are_reproducible`）。
-- [ ] `effect_rt_audit` 扩展：`PluckProcessor::process` / `note_event` / `set_param` 零分配。
-- [ ] model：`VoiceSpec::Pluck` RON 往返、旧 payload 无字段取默认、`GraphDoc::validate` 接受（`pluck_voice_round_trips_and_defaults`）。
-- [ ] 离线端到端：`--render` 出一段可听的 pluck 工程（RMS > 0，松键后尾音收敛，`offline_render_plays_the_pluck`）；GUI 导出与 CLI 逐字节一致（既有测试覆盖同一装配）。
-- [ ] **零回归**：默认工程 `--render` 与 S1 之前**逐字节一致**（detached worktree 对比，见 §9）。
-- [ ] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。
+- [x] 无音符时输出**逐样本静音**（`silent_without_a_note`）。
+- [x] 拨弦发声：第一个周期的静音之后能量出现，A4 的 RMS 实测 **0.044**（判据 0.02..0.6），峰值 0.49（`a_pluck_produces_sound`）。
+- [x] 音高准确：A4（note 69）的 Goertzel 能量在 440 Hz 处是 415 Hz / 466 Hz 邻半音的 **约 11 倍**，且 `PitchOffset = +12` 让峰值落到 880 Hz（`pitch_follows_the_note_and_the_offset`）。
+- [x] `decay` 控制尾音：`decay = 0.3` 与 `8.0` 在 1.5 s 处的能量差远超 10 倍（`decay_sets_the_tail_length`），且实测 T60 与请求值的偏差在 ±35% 内（`decay_matches_the_requested_t60`）。
+- [x] `damping` 变暗：`damping = 1.0` 时 4·f0/f0 的能量比不到 `damping = 0.0` 的 1/5（断言 `bright > dark * 5.0`，`damping_darkens_the_spectrum`）。
+- [x] `brightness` 改变起音的频谱：前 20 ms 的 4 kHz 能量在 `brightness = 1` 时是 `0` 的 4 倍以上（`brightness_changes_the_attack`）。
+- [x] note-off 阻尼：`Off{69}` 后 0.25–0.30 s 的能量掉到松键前的 **5% 以下**；不发 `Off` 时同窗口仍有 20% 以上（`note_off_damps_the_string`）。
+- [x] `Off{0}` 在 50 ms 内静音（`blanket_off_stops_everything`）。
+- [x] 同音重击 = 在响的弦上叠加（能量上升，`retrigger_adds_to_the_ringing_string`）；池满第 17 个音偷最老声部，`active_voices() ≤ 16` 且 16 声部堆叠的峰值 **2.1**（断言 < 20，`pool_is_bounded_and_stealing_stays_finite`）。
+- [x] 非有限参数被拒，满幅参数（`gain = 2`、极端音高、NaN）输出无 NaN / Inf（`params_reject_non_finite` / `extreme_parameters_stay_finite`）。
+- [x] 零力度不发声（`zero_velocity_is_silent`）。
+- [x] 可复现：两个新实例对同一事件序列逐样本相同（`renders_are_reproducible`）。
+- [x] 构造期容错：`sample_rate = 0` / 非有限值不崩、不产生 NaN（`constructor_tolerates_a_bad_sample_rate`）。
+- [x] `effect_rt_audit` 扩展：`PluckProcessor::process` / `note_event` / `set_param` 零分配（含偷声部、`Off{0}` blanket 与 `PitchOffset` 重调音）。
+- [x] model：`VoiceSpec::Pluck` RON 往返、旧 payload 无字段取默认、`GraphDoc::validate` 接受（`pluck_voice_round_trips_and_defaults`）。
+- [x] 离线端到端：`--render` 出一段可听的 pluck 工程——拨弦窗口 RMS **0.061**，松键后的窗口 **0.000**（判据 < 10%），（`offline_render_plucks_and_damps_on_note_off`）；GUI 导出与 CLI 逐字节一致（既有 `gui_export_pipeline_matches_the_cli_render` 锁定同一装配）。
+- [x] **零回归**：默认工程 `--render` 与 S1 之前**逐字节一致**（detached worktree 对比，见 §9）。
+- [x] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。
 
 ## 8. 风险与已知取舍
 
@@ -130,8 +131,17 @@ note-on ──► 噪声 ─► 一阶 LP（brightness × velocity）─► × a
 | 线性插值的分数延迟在高频有一点点额外衰减 | 与阻尼滤波同向（高次谐波先死），听感上是「弦的阻尼」，不是失真；且 DC 处插值精确 → 基频调准。 |
 | 无拨弦位置梳状滤波，音色比真吉他「平」 | 梳状滤波需要每声部的激励历史缓冲（又是一份 64 KiB），收益是音色细节；`brightness` + 力度联动已能覆盖「指弹 ↔ 硬拨」的主轴。留待后续。 |
 | 池满偷声部时尾音滑到新音高 | 与 B1-D5 同一取舍：清零必 click，滑音被新激励的噪声掩蔽，是更小的恶。 |
-| 阻尼是逐样本乘性淡出，`release` 很短时可能有 zipper | 淡出系数是常数（不是逐块跳变），T60 = 5 ms 时每样本乘 0.9963，包络本身平滑；没有阶跃。 |
+| 阻尼做成输出端 per-sample 淡出（第一版的写法）会把松键尾音直接掐死 | 已改为环路增益 `damp_gain`（S1-D5）：一个环路周期内只乘一次，`release_s` 才是真正的 T60。后续任何「淡出」都不要挂在 `read` 之后，一律乘进 `ring[w]`。 |
 
 ## 9. 交付与零回归证据
 
-> 实施完成后回填。
+> 实施完成于 2026-11-08。
+
+| 项 | 结果 |
+| :--- | :--- |
+| 落地 | 新 `realtime/pluck.rs`（`PluckProcessor`，约 500 行实现 + 约 420 行测试）：分数延迟环 + 环路一阶低通 + 环路增益 T60 反解（含 `\|H(f0)\|` 补偿，上限 0.99995）+ 一周期噪声激励（xorshift32，确定性）+ 16 声部池（空闲优先 / 同音复用叠加 / 偷最老保留状态）+ `Off{n}` 环路阻尼 / `Off{0}` blanket。 |
+| 标识 | `PROJECT_VERSION = 10` **未动**；`VoiceSpec::Pluck` 加法变体 + `#[serde(default)]`，旧工程零迁移。无新 crate / 新依赖。 |
+| 内存 | 每节点固定 **1 MiB**（16 × `MAX_DELAY` 16384 × f32），构造期一次性分配；`process` / `note_event` / `set_param` 零分配（`effect_rt_audit` 断言）。 |
+| 测试 | 引擎单测 **16 项**、model RON 往返 **1 项**、`effect_rt_audit` 扩展 **1 段**、离线端到端 **1 项**；`test --workspace` 全绿（`glitcherz-engine` lib 472、`glitcherz-model` lib 177、`glitcherz-ui` lib 250）。 |
+| **零回归硬证据** | 用 `86a4244`（S1 spec commit，即最后一个 pre-S1 代码状态）的 detached worktree + 独立 `CARGO_TARGET_DIR='E:\play\coding\GlitcherZ\target-s1-base'` 编出 pre-S1 二进制，与 post-S1 对同一份 5.1 KB 工程（默认图 + 4 个音符）跑 `--render --rate 22050 --bits 16 --to 1920`：两份 WAV 各 **44288 帧 / 177196 字节，`cmp` 逐字节一致**（工程非静音：峰值 32767、RMS 9305）。 |
+| 文档同步 | 本 spec 回填 + `.agents/plan.md`（S1 标已交付 + 实施记录 + 下一步指向 S2 Organ）+ `.agents/implementation.md` S1 小节 + `docs/manual.md`（Add 菜单 `Pluck` 行、拨弦小节、Inspector 行、自动化说明）+ `AGENTS.md` 索引标已交付。 |

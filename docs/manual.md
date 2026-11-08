@@ -159,7 +159,7 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 | 菜单项 | 产生 |
 | :--- | :--- |
 | `Search Nodes…` | 打开节点浏览器，可搜名字或模块路径 |
-| `Instrument…` | 乐器：`Synth`（内置）、`SoundFont`、`Sample`、`Drum Kit`、`Mallet`（模态敲击），以及 CLAP / VST3 乐器插件 |
+| `Instrument…` | 乐器：`Synth`（内置）、`SoundFont`、`Sample`、`Drum Kit`、`Mallet`（模态敲击）、`Pluck`（拨弦），以及 CLAP / VST3 乐器插件 |
 | `Effect…` | 效果：`Delay`、`EQ`、`Compressor`、`Reverb`、`Chorus`、`Flanger`、`Bitcrusher`、`Phaser`、`Saturation`、`Limiter`、`Ring Mod`、`Sidechain Comp`、`Vocoder`，以及 CLAP / VST3 效果插件 |
 | `MIDI FX…` | `Arpeggiator`、`Portamento`、`MIDI Envelope`、`LFO`、`Curve Map` |
 | `Mixer` | 多通道求和节点（1–32 通道，可加 / 减通道） |
@@ -171,8 +171,8 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 `SoundFont` / `Sample` / `Drum Kit` 出生时不带文件（沉默），在节点上的 `Load File…` /
 `Load Samples…` 按钮里选，换文件不需要重建节点和连线。
 
-`Mallet`（模态敲击）没有文件，出生即可发声：预设表内建在引擎里，见下面的
-[模态打击](#模态打击mallet)。
+`Mallet`（模态敲击）和 `Pluck`（拨弦）都没有文件，出生即可发声：DSP 全在引擎里，见下面的
+[模态打击](#模态打击mallet) 与 [拨弦](#拨弦pluck)。
 
 三种连线，从输出口拖到输入口即可：
 
@@ -283,6 +283,36 @@ Mallets 同一路线），一个引擎覆盖四个预设：
 自然变闷而不是混叠。`decay` / `beating` / `hardness` / `brightness` / `gain` 都能接
 自动化曲线，`preset` 是离散值、不进自动化列表。
 
+### 拨弦（Pluck）
+
+`Pluck` 是 Karplus-Strong 拨弦：一根延迟线（弦长决定音高）+ 一个环路低通（阻尼）+
+一圈噪声（拨的那一下）。音色是**严格谐波**的，和 `Mallet` 的非谐波金属感互补：
+
+| 参数 | 范围 | 说明 |
+| :--- | :--- | :--- |
+| `decay` | 0.1–20 s | 基频的 T60，实时作用于正在响的弦 |
+| `damping` | 0–1 | 环路低通截止 `f0 · 2^(2+3(1−damping))`，越大越闷，实时生效 |
+| `brightness` | 0–1 | 激励噪声的亮度，**只影响下一次拨弦** |
+| `release` | 0.005–2 s | 松键后弦被闷掉的时间（T60），**只影响下一次松键** |
+| `gain` | 0–2 | 节点输出增益 |
+
+**和 `Mallet` 相反：松键会闷弦。** 拨弦乐器唯一的「止音」手段就是抬起手指，所以
+`note-off` 会按 `release` 把弦闷掉；`Mallet` 则响到底。要立刻收掉所有尾音用
+`Stop` / Panic（`Off{0}` 哨兵，10 ms 淡出）。
+
+两点容易误判：
+
+- **第一个周期是静音**。激励要走完一圈才到输出，A4 约 2.3 ms 听不出来，但 MIDI 0
+  （约 8 Hz）要 122 ms——低音区会觉得「起音晚了一点」，这是算法本身，不是坏了。
+- **`damping` 很重时尾音比 `decay` 短**。阻尼吃掉的能量无法靠增益补回来（增益有
+  0.99995 的硬上限，再高就自激了）。想让长尾拖住就把 `damping` 往下拧。
+
+池子 16 个声部，第 17 个音偷最老声部：**保留环里的振动、只把弦长重算到新音高**，
+尾音滑过去而不是被清零。同音重拨 = 在还在响的弦上再拨一下，两次激励叠加。
+
+`decay` / `damping` / `brightness` / `release` / `gain` 五个都能接自动化曲线
+（画布节点上另有 `decay` / `damp` 两行内联）。
+
 双击节点进 `Inspector`（乐器 / 效果 / 混音 / MIDI FX / LFO / Curve Map / Audio Input）；
 双击固定的 `Timeline` 节点回到编曲视图。
 
@@ -292,7 +322,7 @@ Mallets 同一路线），一个引擎覆盖四个预设：
 
 | 节点 | 面板内容 |
 | :--- | :--- |
-| 乐器 | 内置合成器的波形与滤波（Low-pass / High-pass / Band-pass / Moog 四级 ladder）、ADSR、滑音；`SoundFont` 的 bank / patch 与文件；`Sample` 的根音、增益，以及**播放窗口**（波形图上四条可拖标记：起始 / 循环起 / 循环止 / 结束，外加循环模式 Off / Forward / Ping-pong）；`Drum Kit` 的每个槽位（触发键写作 `C2 · 36`，可直接拖动换键）；`Mallet` 的预设下拉与 decay / beating / hardness / brightness / gain |
+| 乐器 | 内置合成器的波形与滤波（Low-pass / High-pass / Band-pass / Moog 四级 ladder）、ADSR、滑音；`SoundFont` 的 bank / patch 与文件；`Sample` 的根音、增益，以及**播放窗口**（波形图上四条可拖标记：起始 / 循环起 / 循环止 / 结束，外加循环模式 Off / Forward / Ping-pong）；`Drum Kit` 的每个槽位（触发键写作 `C2 · 36`，可直接拖动换键）；`Mallet` 的预设下拉与 decay / beating / hardness / brightness / gain；`Pluck` 的 decay / damping / brightness / release / gain |
 | 效果 | 该效果的全部参数；插件效果用插件自己的 GUI（`Open Editor`） |
 | `Mixer` | 通道条：每路推子、声像、静音、独奏、电平表，加 / 减通道；输出级的声像与静音 |
 | 插件乐器 | 参数列表（可右键接到自动化）+ `Open Editor` |
