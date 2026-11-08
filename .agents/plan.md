@@ -793,6 +793,7 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 ### Z2 要点
 
 - **Z2 Vocoder（Q3 定稿）**：**固定 16 带**滤波器组 × 两路 + 逐带包络跟随（attack/release）+ 清浊处理；carrier 必须由 Main 口外部送入，**不做内置载波**；所有滤波器状态与包络构造期预分配。v1 **不做** formant shift / freeze / 用户自定义带数。
+- 实施前细化为 `spec/vocoder.md`（已定稿）：`Main` = carrier、`Mod` = modulator；8 个宏参数（attack / release / q / low / high / sibilance / mix / output）；清浊 = 带组顶端之上的噪声激励旁路（不做音高检测）；`mix = 0` 逐样本直通。
 
 ### 明确不做（本节范围）
 
