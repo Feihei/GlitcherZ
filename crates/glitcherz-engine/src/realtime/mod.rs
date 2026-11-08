@@ -87,6 +87,7 @@ pub mod silent;
 
 pub mod svf;
 pub mod synth;
+pub mod vocoder;
 pub mod voice;
 
 /// Fixed processing block size (in samples). See AGENTS.md "Processing Graph" (64 or 128 recommended).
@@ -170,4 +171,5 @@ pub use sf2::{SF2_POLYPHONY, Sf2VoiceProcessor};
 pub use silent::SilentProcessor;
 pub use svf::{FilterMode, SvfProcessor};
 pub use synth::{SynthProcessor, note_to_frequency};
+pub use vocoder::VocoderProcessor;
 pub use voice::{RecycledNode, STRUCTURE_QUEUE_CAPACITY, recycle_channel, structure_channel};

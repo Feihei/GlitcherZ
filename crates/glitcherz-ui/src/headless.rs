@@ -1143,6 +1143,82 @@ mod tests {
         let _ = std::fs::remove_file(wet);
     }
 
+    /// Z2 end-to-end: the vocoder reaches the WAV writer with both ports. Same
+    /// project in every render except the modulator cable — and because a
+    /// silent modulator means no spectral envelope, the un-wired render must
+    /// be silent rather than a passthrough.
+    #[test]
+    fn offline_render_honours_the_vocoder_modulator() {
+        let build = |modulator_wired: bool| {
+            let mut project = project_with_note();
+            let vocoder_id = project
+                .graph
+                .nodes
+                .iter()
+                .map(NodeDoc::node_id)
+                .max()
+                .unwrap_or(1)
+                + 1;
+            project.graph.nodes.push(NodeDoc::Effect {
+                node_id: vocoder_id,
+                track: 0,
+                voice: VoiceSpec::Builtin,
+                params: EffectParams::Vocoder(Box::default()),
+                delay: None,
+            });
+            let voice = project.graph.instrument_of_track(0).unwrap().node_id();
+            let mixer = project.graph.first_mixer().unwrap().node_id();
+            project.graph.cables.retain(|c| {
+                !(c.kind == CableKind::Audio
+                    && c.from == PortRef::Node(voice)
+                    && c.to == PortRef::Node(mixer))
+            });
+            project
+                .graph
+                .cables
+                .push(CableDoc::audio_to_port(voice, vocoder_id, 0));
+            if modulator_wired {
+                project
+                    .graph
+                    .cables
+                    .push(CableDoc::audio_to_port(voice, vocoder_id, 1));
+            }
+            project
+                .graph
+                .cables
+                .push(CableDoc::audio_to_channel(vocoder_id, mixer, 0));
+            project
+        };
+
+        let options = RenderOptions {
+            sample_rate: 22_050,
+            bits: export_audio::Bits::Int16,
+            end_ticks: Some(1920),
+        };
+        let render = |tag: &str, p: &Project| -> PathBuf {
+            let input = save_temp(p, tag);
+            let out =
+                std::env::temp_dir().join(format!("glitcherz_z2_{tag}_{}.wav", std::process::id()));
+            render_project_to_wav(&input, &out, options).expect("render");
+            let _ = std::fs::remove_file(input);
+            out
+        };
+
+        // Unique tags: `save_temp` only disambiguates by tag + process id, and
+        // the other dual-input tests also render a "dry"/"wet" pair.
+        let dry = render("z2_dry", &build(false));
+        assert!(
+            !wav_has_signal(&dry),
+            "no modulator means no output, not a carrier passthrough"
+        );
+        let wet = render("z2_wet", &build(true));
+        assert!(wav_has_signal(&wet), "a wired modulator must vocode");
+        assert!(wav_rms(&wet) > 0.005, "the vocoded render is far too quiet");
+
+        let _ = std::fs::remove_file(dry);
+        let _ = std::fs::remove_file(wet);
+    }
+
     /// Z1 end-to-end: the document → assembly → graph → WAV chain must key the
     /// compressor from the Mod port. Same project in every render except the
     /// key cable and the switch.

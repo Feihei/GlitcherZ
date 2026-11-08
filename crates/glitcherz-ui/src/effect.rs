@@ -14,8 +14,8 @@ use glitcherz_engine::realtime::{
     BitcrusherProcessor, BuiltinEffectKind, ChorusProcessor, CompressorProcessor, DelayProcessor,
     EffectDescriptor, EffectMeters, EqProcessor, FlangerProcessor, LimiterProcessor, ParamId,
     ParamSpec, PhaserProcessor, Processor, ReverbProcessor, RingModProcessor, SaturationProcessor,
-    Unit, bitcrusher, chorus, compressor, delay, eq, flanger, limiter, phaser, reverb, ring_mod,
-    saturation,
+    Unit, VocoderProcessor, bitcrusher, chorus, compressor, delay, eq, flanger, limiter, phaser,
+    reverb, ring_mod, saturation, vocoder,
 };
 use glitcherz_model::{BuiltinEffectKind as DocEffectKind, EffectParams};
 
@@ -43,6 +43,7 @@ pub fn engine_kind(params: &EffectParams) -> BuiltinEffectKind {
         DocEffectKind::Limiter => BuiltinEffectKind::Limiter,
         DocEffectKind::RingMod => BuiltinEffectKind::RingMod,
         DocEffectKind::SidechainCompressor => BuiltinEffectKind::SidechainCompressor,
+        DocEffectKind::Vocoder => BuiltinEffectKind::Vocoder,
     }
 }
 
@@ -66,6 +67,7 @@ pub fn default_params(kind: DocEffectKind) -> EffectParams {
         DocEffectKind::Limiter => EffectParams::Limiter(Box::default()),
         DocEffectKind::RingMod => EffectParams::RingMod(Box::default()),
         DocEffectKind::SidechainCompressor => EffectParams::SidechainCompressor(Box::default()),
+        DocEffectKind::Vocoder => EffectParams::Vocoder(Box::default()),
     }
 }
 
@@ -103,6 +105,7 @@ pub fn processor(params: &EffectParams, sample_rate: f32) -> BuiltinProcessor {
             meters = Some(handle.clone());
             Box::new(CompressorProcessor::sidechain(sample_rate, Some(handle)))
         }
+        BuiltinEffectKind::Vocoder => Box::new(VocoderProcessor::new(sample_rate)),
     };
     let descriptor = descriptor(params);
     for slot in 0..descriptor.params.len() {
@@ -217,6 +220,17 @@ pub fn value(params: &EffectParams, slot: u8) -> f32 {
             limiter::SLOT_OUTPUT => lim.output,
             _ => 0.0,
         },
+        EffectParams::Vocoder(voc) => match slot {
+            vocoder::SLOT_ATTACK => voc.attack,
+            vocoder::SLOT_RELEASE => voc.release,
+            vocoder::SLOT_Q => voc.q,
+            vocoder::SLOT_LOW => voc.low,
+            vocoder::SLOT_HIGH => voc.high,
+            vocoder::SLOT_SIBILANCE => voc.sibilance,
+            vocoder::SLOT_MIX => voc.mix,
+            vocoder::SLOT_OUTPUT => voc.output,
+            _ => 0.0,
+        },
     }
 }
 
@@ -324,6 +338,17 @@ pub fn set_value(params: &mut EffectParams, slot: u8, value: f32) {
             limiter::SLOT_RELEASE => lim.release = value,
             limiter::SLOT_LINK => lim.stereo_link = value >= 0.5,
             limiter::SLOT_OUTPUT => lim.output = value,
+            _ => {}
+        },
+        EffectParams::Vocoder(voc) => match slot {
+            vocoder::SLOT_ATTACK => voc.attack = value,
+            vocoder::SLOT_RELEASE => voc.release = value,
+            vocoder::SLOT_Q => voc.q = value,
+            vocoder::SLOT_LOW => voc.low = value,
+            vocoder::SLOT_HIGH => voc.high = value,
+            vocoder::SLOT_SIBILANCE => voc.sibilance = value,
+            vocoder::SLOT_MIX => voc.mix = value,
+            vocoder::SLOT_OUTPUT => voc.output = value,
             _ => {}
         },
     }

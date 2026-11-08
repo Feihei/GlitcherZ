@@ -61,6 +61,8 @@ pub enum BuiltinEffectKind {
     RingMod,
     /// Compressor with an external key input (Z1).
     SidechainCompressor,
+    /// 16-band vocoder: carrier on Main, modulator on Mod (Z2).
+    Vocoder,
 }
 
 impl BuiltinEffectKind {
@@ -78,6 +80,7 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Limiter,
         BuiltinEffectKind::RingMod,
         BuiltinEffectKind::SidechainCompressor,
+        BuiltinEffectKind::Vocoder,
     ];
 
     /// Number of audio input ports (Z0). The kind — not the parameter
@@ -85,7 +88,9 @@ impl BuiltinEffectKind {
     /// means touching every static descriptor table.
     pub const fn audio_inputs(self) -> u8 {
         match self {
-            BuiltinEffectKind::RingMod | BuiltinEffectKind::SidechainCompressor => 2,
+            BuiltinEffectKind::RingMod
+            | BuiltinEffectKind::SidechainCompressor
+            | BuiltinEffectKind::Vocoder => 2,
             _ => 1,
         }
     }
@@ -107,6 +112,7 @@ impl BuiltinEffectKind {
             BuiltinEffectKind::SidechainCompressor => {
                 &crate::realtime::compressor::SIDECHAIN_DESCRIPTOR
             }
+            BuiltinEffectKind::Vocoder => &crate::realtime::vocoder::DESCRIPTOR,
         }
     }
 }

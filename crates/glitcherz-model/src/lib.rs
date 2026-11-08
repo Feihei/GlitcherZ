@@ -897,6 +897,76 @@ impl Default for RingModParams {
     }
 }
 
+/// 16-band vocoder parameters (Z2; slot order matches the engine descriptor).
+///
+/// `Main` is the carrier, `Mod` is the modulator (spec `vocoder.md` Z2-D2).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct VocoderParams {
+    /// Envelope attack time (ms).
+    #[serde(default = "default_vocoder_attack")]
+    pub attack: f32,
+    /// Envelope release time (ms).
+    #[serde(default = "default_vocoder_release")]
+    pub release: f32,
+    /// Band quality factor.
+    #[serde(default = "default_vocoder_q")]
+    pub q: f32,
+    /// Lowest band centre (Hz).
+    #[serde(default = "default_vocoder_low")]
+    pub low: f32,
+    /// Highest band centre (Hz).
+    #[serde(default = "default_vocoder_high")]
+    pub high: f32,
+    /// Noise-excited bypass above the band bank (`0` = off).
+    #[serde(default = "default_vocoder_sibilance")]
+    pub sibilance: f32,
+    /// Dry/wet mix (`0` = sample-exact passthrough).
+    #[serde(default = "default_mix_one")]
+    pub mix: f32,
+    /// Output trim (dB), wet path only.
+    #[serde(default)]
+    pub output: f32,
+}
+
+fn default_vocoder_attack() -> f32 {
+    8.0
+}
+
+fn default_vocoder_release() -> f32 {
+    60.0
+}
+
+fn default_vocoder_q() -> f32 {
+    4.0
+}
+
+fn default_vocoder_low() -> f32 {
+    120.0
+}
+
+fn default_vocoder_high() -> f32 {
+    7_000.0
+}
+
+fn default_vocoder_sibilance() -> f32 {
+    0.25
+}
+
+impl Default for VocoderParams {
+    fn default() -> Self {
+        Self {
+            attack: default_vocoder_attack(),
+            release: default_vocoder_release(),
+            q: default_vocoder_q(),
+            low: default_vocoder_low(),
+            high: default_vocoder_high(),
+            sibilance: default_vocoder_sibilance(),
+            mix: default_mix_one(),
+            output: 0.0,
+        }
+    }
+}
+
 /// Built-in effect kind (spec `.agents/spec/effects.md` D1).
 ///
 /// The wire format is the `kind` tag of [`EffectParams`]; this enum lets UI and
@@ -931,6 +1001,8 @@ pub enum BuiltinEffectKind {
     RingMod,
     /// Compressor keyed from the second audio port (Z1).
     SidechainCompressor,
+    /// 16-band vocoder: carrier on Main, modulator on Mod (Z2).
+    Vocoder,
 }
 
 impl BuiltinEffectKind {
@@ -949,13 +1021,14 @@ impl BuiltinEffectKind {
             Self::Limiter => "Limiter",
             Self::RingMod => "Ring Mod",
             Self::SidechainCompressor => "Sidechain Comp",
+            Self::Vocoder => "Vocoder",
         }
     }
 
     /// Number of audio input ports (Z0). Only dual-input effects answer 2.
     pub const fn audio_inputs(self) -> u8 {
         match self {
-            Self::RingMod | Self::SidechainCompressor => 2,
+            Self::RingMod | Self::SidechainCompressor | Self::Vocoder => 2,
             _ => 1,
         }
     }
@@ -974,6 +1047,7 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Limiter,
         BuiltinEffectKind::RingMod,
         BuiltinEffectKind::SidechainCompressor,
+        BuiltinEffectKind::Vocoder,
     ];
 }
 
@@ -1010,6 +1084,8 @@ pub enum EffectParams {
     RingMod(Box<RingModParams>),
     /// Compressor keyed from the second audio port (Z1).
     SidechainCompressor(Box<CompressorParams>),
+    /// 16-band vocoder: carrier on Main, modulator on Mod (Z2).
+    Vocoder(Box<VocoderParams>),
 }
 
 impl Default for EffectParams {
@@ -1034,6 +1110,7 @@ impl EffectParams {
             Self::Limiter(_) => BuiltinEffectKind::Limiter,
             Self::RingMod(_) => BuiltinEffectKind::RingMod,
             Self::SidechainCompressor(_) => BuiltinEffectKind::SidechainCompressor,
+            Self::Vocoder(_) => BuiltinEffectKind::Vocoder,
         }
     }
 
@@ -1097,6 +1174,22 @@ impl EffectParams {
     pub fn as_sidechain_compressor_mut(&mut self) -> Option<&mut CompressorParams> {
         match self {
             Self::SidechainCompressor(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Vocoder parameters, when this is a vocoder node.
+    pub fn as_vocoder(&self) -> Option<&VocoderParams> {
+        match self {
+            Self::Vocoder(params) => Some(params),
+            _ => None,
+        }
+    }
+
+    /// Mutable vocoder parameters, when this is a vocoder node.
+    pub fn as_vocoder_mut(&mut self) -> Option<&mut VocoderParams> {
+        match self {
+            Self::Vocoder(params) => Some(params),
             _ => None,
         }
     }
@@ -2795,6 +2888,16 @@ pub fn effect_slot_axis(params: &EffectParams, slot: u8) -> MapSpec {
         (EffectParams::Limiter(_), 3) => M::linear(-12.0, 12.0),
         // Z0: dry/wet mix of the two-input ring modulator (0..1).
         (EffectParams::RingMod(_), 0) => M::linear(0.0, 1.0),
+        // Z2: attack (ms), release (ms), Q, low band, high band, sibilance,
+        // mix, output (dB).
+        (EffectParams::Vocoder(_), 0) => M::log(0.5, 100.0),
+        (EffectParams::Vocoder(_), 1) => M::log(5.0, 500.0),
+        (EffectParams::Vocoder(_), 2) => M::log(0.7, 16.0),
+        (EffectParams::Vocoder(_), 3) => M::log(40.0, 1_000.0),
+        (EffectParams::Vocoder(_), 4) => M::log(1_000.0, 16_000.0),
+        (EffectParams::Vocoder(_), 5) => M::linear(0.0, 1.0),
+        (EffectParams::Vocoder(_), 6) => M::linear(0.0, 1.0),
+        (EffectParams::Vocoder(_), 7) => M::linear(-24.0, 12.0),
         // Out-of-range slot (a plugin payload, or a document that kept a
         // stale slot after the effect changed kind): normalized pass-through.
         _ => M::linear(0.0, 1.0),
@@ -6310,6 +6413,67 @@ mod tests {
         };
         let comp = params.as_sidechain_compressor().expect("sidechain payload");
         assert!(!comp.sidechain, "keying starts disabled");
+    }
+
+    // Z2: the vocoder is the second real dual-input effect, and its payload
+    // must survive a round trip plus the "written by a newer build" path.
+    #[test]
+    fn vocoder_has_two_ports_and_round_trips_its_macros() {
+        let node = NodeDoc::Effect {
+            node_id: 4,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params: EffectParams::Vocoder(Box::new(super::VocoderParams {
+                q: 8.0,
+                low: 90.0,
+                sibilance: 0.6,
+                ..Default::default()
+            })),
+            delay: None,
+        };
+        assert_eq!(node.audio_inputs(), 2, "Main = carrier, Mod = modulator");
+        let kind = EffectParams::Vocoder(Box::default()).kind();
+        assert_eq!(kind, super::BuiltinEffectKind::Vocoder);
+        assert_eq!(kind.label(), "Vocoder");
+
+        let instrument = |node_id: u64, track: usize| NodeDoc::Instrument {
+            node_id,
+            track,
+            voice: VoiceSpec::Builtin,
+            synth: SynthParams::default(),
+        };
+        let graph = GraphDoc {
+            nodes: vec![instrument(2, 0), instrument(3, 1), node.clone()],
+            cables: vec![
+                CableDoc::audio_to_port(2u64, 4u64, 0),
+                CableDoc::audio_to_port(3u64, 4u64, 1),
+                CableDoc::audio(4u64, PortRef::Master),
+            ],
+            ..Default::default()
+        };
+        graph
+            .validate(2, 0)
+            .expect("carrier + modulator must be legal");
+
+        let text = ron::to_string(&node).expect("serialize");
+        assert!(text.contains("vocoder"), "tag missing: {text}");
+        assert!(text.contains("sibilance:"), "macro missing: {text}");
+        let back: NodeDoc = ron::from_str(&text).expect("deserialize");
+        assert_eq!(node, back);
+
+        // A payload that predates the parameters loads at the shipped defaults.
+        let legacy: NodeDoc = ron::from_str(
+            r#"(type:"effect", node_id:3, track:0, voice:(type:"builtin"),
+                params:(kind:"vocoder"))"#,
+        )
+        .expect("a bare vocoder payload should parse");
+        let NodeDoc::Effect { params, .. } = legacy else {
+            panic!("expected an effect node");
+        };
+        let voc = params.as_vocoder().expect("vocoder payload");
+        assert_eq!(*voc, super::VocoderParams::default());
+        assert!((voc.high - 7_000.0).abs() < 1e-3);
+        assert!((voc.mix - 1.0).abs() < 1e-6, "fully wet by default");
     }
 
     // E2: a payload written by a newer build without some fields still loads

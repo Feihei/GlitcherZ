@@ -29,7 +29,7 @@ use glitcherz_engine::realtime::processor::Processor;
 use glitcherz_engine::realtime::{
     BitcrusherProcessor, ChorusProcessor, CompressorProcessor, DelayProcessor, EffectMeters,
     EqProcessor, FlangerProcessor, LimiterProcessor, ModalProcessor, PhaserProcessor,
-    ReverbProcessor, RingModProcessor, SaturationProcessor,
+    ReverbProcessor, RingModProcessor, SaturationProcessor, VocoderProcessor,
 };
 
 // ---------------------------------------------------------------------------
@@ -318,6 +318,30 @@ fn built_in_effects_are_allocation_free() {
     }
     modal.note_event(NoteEvent::Off { note: 0 });
     assert_zero_alloc(&scope, "ModalProcessor process/note_event/set_param");
+
+    // Z2: 16 bands x 2 banks per channel, all of them fixed-size arrays. The
+    // audit alternates the parameter set so the per-block coefficient rebuild
+    // (including the `powf` band spacing) runs inside the scope.
+    let mut vocoder = VocoderProcessor::new(SR);
+    let mut carrier = fixture();
+    let modulator = fixture();
+    for _ in 0..2 {
+        vocoder.set_param(ParamId::BuiltinParam(2), 4.0);
+        vocoder.process_with_aux(&ctx(), &mut carrier, Some(&modulator));
+    }
+    let scope = AuditScope::begin();
+    for block in 0..64 {
+        vocoder.set_param(ParamId::BuiltinParam(0), 1.0 + (block as f32) * 0.5);
+        vocoder.set_param(ParamId::BuiltinParam(1), 20.0 + block as f32);
+        vocoder.set_param(ParamId::BuiltinParam(2), 0.7 + (block as f32) * 0.2);
+        vocoder.set_param(ParamId::BuiltinParam(3), 60.0 + (block as f32) * 10.0);
+        vocoder.set_param(ParamId::BuiltinParam(4), 4_000.0 + (block as f32) * 50.0);
+        vocoder.set_param(ParamId::BuiltinParam(5), 0.5);
+        vocoder.set_param(ParamId::BuiltinParam(6), 0.9);
+        vocoder.set_param(ParamId::BuiltinParam(7), (block as f32 * 0.37).sin() * 6.0);
+        vocoder.process_with_aux(&ctx(), &mut carrier, Some(&modulator));
+    }
+    assert_zero_alloc(&scope, "VocoderProcessor process_with_aux/set_param");
 
     // The meter handle itself is written from the audio thread.
     let meters = EffectMeters::new();
