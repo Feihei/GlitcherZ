@@ -76,9 +76,10 @@ jobs:
             rust_targets: x86_64-pc-windows-msvc
             bin: target/x86_64-pc-windows-msvc/release/glitcherz.exe
           # macOS universal (arm64 runner cross-builds the Intel half, then
-          # lipo merges both slices into one binary).
+          # lipo merges both slices into one binary). macos-14 is retired,
+          # macos-15 is the current arm64 stable image.
           - name: macos-universal
-            os: macos-14
+            os: macos-15
             target: universal
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
             bin: target/glitcherz-universal
