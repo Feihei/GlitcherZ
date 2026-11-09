@@ -30,6 +30,7 @@ cargo run -p glitcherz-app --release
 | `--render <in.glz> <out.wav>` | 不开窗口、不占用音频设备，直接把工程渲染成 wav |
 | `--commands` | 列出命令行能跑的编辑命令（`--json` 附带菜单 / 快捷键 / 不可用原因） |
 | `--ops <file\|->` / `--do <id>` | 对一份工程按顺序跑一批编辑命令，可配 `--save` / `--wav` |
+| `--mcp` | 把命令面开成 MCP 工具，跑在 stdio 上给 AI 客户端用 |
 
 命令行渲染（批量 / CI / 脚本）：
 
@@ -48,6 +49,16 @@ glitcherz --open song.glz --ops steps.json --save out.glz --wav out.wav
 
 命令来自窗口菜单用的同一张注册表，批次是**全或无**的（任一命令失败就不写文件），
 `--wav` 渲染的是刚改完的内存文档。详见 [`manual.md`](manual.md#命令行批量命令)。
+
+给 AI 客户端（脚本 / agent）：
+
+```bash
+glitcherz --mcp --root ~/Music/glitcherz
+```
+
+在客户端里把上面这行配成 stdio MCP server 即可：六个工具（开 / 存 / 摘要 / 列命令 / 跑命令 / 渲 wav），
+路径只能落在 `--root` 里，插件二进制默认不加载（`--allow-plugins` 才放开）。
+详见 [`manual.md`](manual.md#命令行mcp-server)。
 所有模式共用一套退出码（0 成功 / 1 引擎 / 2 参数 / 3 工程或渲染 / 4 命令失败）。
 
 ## 五分钟做出第一段音乐

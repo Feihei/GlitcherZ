@@ -1284,3 +1284,23 @@ spec `.agents/spec/cli-commands.md`。这一项的特殊之处是**它几乎没�
 **已知限制（写进 spec §9 并用测试钉住）**：新工程的轨道上**没有 clip**，而 16 条 `midi.*` 全部作用于既有 clip，所以 `--do midi.note_add` 在默认工程上直接退出 4——「从零造一首曲子」仍需要一份模板工程。这是词汇表的问题（缺 `clip.add`），不是运输层的问题，另开一期。
 
 **验收**：21 条（19 条用例 + 零回归 + 门禁）全部回填。39 项新测试（21 单测 + 18 项真子进程用例），全量 **1 245 项通过 / 0 失败**。`fmt` / `clippy --workspace --all-targets -D warnings` / `build --workspace` 全绿。零回归：`8c3ec61` 的 detached worktree 与 post-S4 对同一份工程各出 44 288 帧 / 177 196 字节，`cmp` 逐字节一致。
+
+## S5：MCP server（2026-11-09）
+
+spec `.agents/spec/mcp-server.md`。立项时 plan 写的前置是「把 headless 层提升为独立 `glitcherz-session` crate」，S0-D1 的原话却是「真需要独立 server 进程时再原样提升」。到了要判断的时刻，读了代码的结论是**不提升**：客户端 spawn 的本来就是独立进程，`--mcp` 与窗口不共享任何内存，「进程隔离」这个真需求已经满足；而 `headless` 的 `spawn_node` / `Media` / `SpawnInfo` 与 UI 的 `install_node` 缓存深度耦合（`AppMedia` 就是 `&mut GlitcherZApp`），外迁是一次大重构，收益只有一个消费者。于是 MCP 成了 `glitcherz` 的**第四种 headless 模式**，与 `--render` / `--ops` / `--commands` 共用 `Session`、`render_doc_to_wav`、`save_project`——同一份代码，零重复。
+
+**协议是手写的，不是引库。** MCP 的 stdio 传输就是「一行一个 JSON 对象」，`serde_json` 早在依赖里；而引入 `rmcp` 之类的框架，省下的 200 行换来的是把版本协商、错误码、握手顺序全部交给第三方——这三样恰恰是本阶段要定死的东西。实现只有三处：`protocol.rs`（帧解析 + 错误码 + 版本协商）、`mod.rs`（服务循环 + 方法分派）、`tools.rs`（6 个工具 + JSON Schema）。服务端支持的版本是 `2024-11-05` / `2025-03-26` / `2025-06-18`，客户端请求哪个就回显哪个，不认识就回 `2025-06-18`——对「只有 tools」的服务端三版没有行为差异，回显只是省客户端一次降级。
+
+**失败走两条通道。** 工具执行失败（文件读不到、命令不接受这个编辑、渲染失败）是 `isError: true` + `content[0].text` 里一个 JSON 错误对象——错误是给**模型**读的，模型要能看到原因并自己纠正，不能让它变成协议栈里一句 `-32602`。JSON-RPC error 只留给「请求本身不合规」：坏 JSON `-32700`、不是请求对象 `-32600`、未知方法 `-32601`、参数不符 schema 或未知工具 `-32602`。`isError` 与报告里的 `ok` 同真同假，客户端读哪条都对，`stage` 复用 S4 的词表（`load` / `command` / `save` / `render`）再加一个 `path`。
+
+**会话是全或无的反面。** S4 的批次能全或无，是因为它不写文件——「最后才写一次」天然原子。MCP 没有这个杠杆：会话是活的，第 3 条命令失败时前 2 条已经改了文档。所以这里只承诺**单条命令原子**（`Session::execute` 的既有保证），批次默认 `stop_on_error: true` 失败即停，报告里剩下的列进 `skipped`。补偿手段是 `commands_run` 的 `dry_run`：调用前捕获 `Arc<Project>` 快照，跑完全部命令再 `restore` 回去，`applied: false`。这让 agent 能「先验证这套编辑，再落地」，比「跑坏了重开」便宜得多。不做全或无也不假装做，是这一段的取舍核心。
+
+**路径沙箱**。`--root`（缺省 cwd）是唯一可写区：相对路径 join、绝对路径原样，然后**词法规整**（消 `.` / `..`，纯字符串操作——写入目标还不存在，`canonicalize` 用不上），再校验 `starts_with(root)`，绕过前缀的 `..` 在弹到根之后自然被这一步挡住。绝对路径同样受检，否则「给个绝对路径」就是后门。词法规整看不见「root 内指向外部的软链接」，所以父目录存在时再 `canonicalize` 复检一次；残余的 TOCTOU 写进 spec §9，不假装解决。
+
+**插件默认禁用**是 MCP 场景独有的风险：S4 的批次是人手敲参数，MCP 是模型拼参数，而 CLAP / VST3 就是 `dlopen` 任意二进制。为此把 `headless::spawn_node` 的 `live: bool` 换成 `SpawnPolicy::{Live, Offline, OfflineNoPlugins}`——**布尔参数长出第三个值时，枚举才是诚实的**，而且顺手让「是否收集 GUI 簿记」与「是否允许加载插件」两个概念分开（`policy.live()` / `policy.plugins()`）。插件乐器被拒时渲染静音；插件效果器被拒时回落到内置效果，这正好是「实例化失败」已有的行为，所以拒绝和失败走同一条路。`warnings` 不从 `spawn_node` 回传（那要给 `SpawnInfo` 加字段、要跨 `Media` 泛型），而是在渲染前扫一遍文档拿节点列表——同一份信息，零侵入。
+
+**零回归的边界**：`render_doc_to_wav` 的签名和 `RenderOptions` 一个字段都没动，新增的是 `render_doc_to_wav_with(…, policy)` 这个带策略的版本，前者变成后者的 `SpawnPolicy::Offline` 薄包装。11 处 `RenderOptions { … }` 字面量因此一处都不用改——**给老函数加参数会让每个调用点都要动，加一个变体函数只多三行**。
+
+**验收**：25 条（23 条用例 + 零回归 + 门禁）全部回填。58 项新测试（35 单测：沙箱 6 / 协议 10 / 工具 9 / 分派 10；23 项真子进程端到端），全量 **1 303 项通过 / 0 失败**。`fmt` / `clippy --workspace --all-targets -D warnings` / `build --workspace` 全绿。零回归：`f4fafe9`（S5 spec commit，最后一个 pre-S5 代码状态）的 detached worktree 与 post-S5 对同一份工程各出 44 288 帧 / 177 196 字节，`cmp` 逐字节一致（sha256 `04ab77f9…`）。另有一条独立证据：`render_wav` 与 `--render` 同参数产出的 wav 在测试里 `assert!(cli == via_mcp)` 逐字节相等——这是 `render_doc_to_wav_with` 没有偷偷改变渲染行为的钉子。
+
+**没做的（写进 spec §2，用户 2026-11-09 拍板）**：命令词汇扩容（`NodeParam` 稳定字符串名、`clip.add`）、undo / redo / history 工具、resources / prompts / sampling / progress、HTTP / SSE 传输。前两项是独立一期——词汇表要定命名规范、要迁移 40+ 参数、要决定 `node_id` 跨工程不稳定怎么办，塞进 MCP 会把「协议 + 安全」撑成三份设计。

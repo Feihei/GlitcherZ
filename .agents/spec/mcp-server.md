@@ -1,6 +1,6 @@
 # S5：MCP Server Spec
 
-> 状态：**实施中**。上游：`plan.md`（Y 系列 S5，执行顺序第 6 项的后半）、`spec/cli-commands.md`（S4：命令面与失败语义）、`spec/node-graph.md`。
+> 状态：**已交付（2026-11-09）**。上游：`plan.md`（Y 系列 S5，执行顺序第 6 项的后半）、`spec/cli-commands.md`（S4：命令面与失败语义）、`spec/node-graph.md`。
 > 范围：**在无窗口进程里把「打开 → 改 → 存 → 听」暴露成一个 MCP server**。不做命令词汇扩容（`NodeParam` 稳定名、`clip.add` 另排一期），不做 resources / prompts / sampling / progress，不做 HTTP / SSE 传输。
 
 ## 1. 背景
@@ -93,6 +93,8 @@
 ```
 
 `isError` 与 `ok` **同真同假**（两条通道，客户端读哪条都对）。`stage` 复用 S4 的词表：`load` / `command` / `save` / `render` / `path`（新增，沙箱越界）。
+
+**参数类型不对算协议错误，不算工具失败**：`rate: "44100"`、少给必填字段这类「请求没匹配 schema」的事回 `-32602`。区别在责任方——schema 不符是客户端没照清单发，操作失败是服务端试过了没成。
 
 ## 5. 工具
 
@@ -212,4 +214,68 @@ pub fn resolve(root: &Path, raw: &str) -> Result<PathBuf, String>
 
 ## 10. 交付与证据
 
-（实施完成后回填：落地文件清单、验收结果、零回归、门禁。）
+### 10.1 落地
+
+| 文件 | 内容 |
+| :--- | :--- |
+| `crates/glitcherz-app/src/mcp/mod.rs` | `Server`（`Session` + `Sandbox` + `allow_plugins` + 来源路径）、`handle()` 分派、`run()` 的 stdio 循环、10 项单测 |
+| `crates/glitcherz-app/src/mcp/protocol.rs` | 帧解析、错误码、`negotiate()`、响应构造，10 项单测 |
+| `crates/glitcherz-app/src/mcp/tools.rs` | 6 个工具的 `inputSchema` + 执行 + `summary()` + 参数读取器，9 项单测 |
+| `crates/glitcherz-app/src/mcp/sandbox.rs` | `Sandbox::new` / `resolve` / `normalize`，6 项单测 |
+| `crates/glitcherz-app/src/args.rs` | `Mode::Mcp`、`--mcp` / `--root` / `--allow-plugins`、互斥规则（`--root` / `--allow-plugins` 脱离 `--mcp` 直接退出 2） |
+| `crates/glitcherz-app/src/main.rs` | `mcp_command()` + 一个分派分支 + usage 三行 |
+| `crates/glitcherz-app/tests/mcp_cli.rs` | 23 项真子进程端到端用例 |
+| `crates/glitcherz-ui/src/headless.rs` | `SpawnPolicy{Live, Offline, OfflineNoPlugins}`、4 个「插件被拒」分支、`render_doc_to_wav_with(…, policy)`；`render_doc_to_wav` 变成 `Offline` 薄包装 |
+| `crates/glitcherz-ui/src/engine_sync.rs`、`export_ops.rs` | 调用点改 `SpawnPolicy::Live` / `Offline` |
+
+`glitcherz-command` / `glitcherz-model` / `glitcherz-engine` **一行未改**；无新 crate、无新外部依赖；`PROJECT_VERSION = 10` 未动。
+
+### 10.2 验收结果
+
+§8 的 25 条全部达标：
+
+| # | 结论 |
+| :--- | :--- |
+| 1–2 | 版本回显 / 回落都有用例（`initialize_echoes_the_version_and_declares_tools`、`an_unknown_protocol_version_falls_back_to_the_latest`） |
+| 3–4 | 6 个工具名逐一比对；每个 schema 都是 `type: object` + `required` 数组 + 非空 `properties` |
+| 5–9 | 通知无响应（用「通知后紧跟 ping，看下一帧 id」判定，不依赖超时）、ping `{}`、未知方法 `-32601`、坏 JSON `-32700` 后继续服务、未知工具 `-32602` |
+| 10–14 | `project_open` 摘要 4 音符 / 1 片段；越界 `stage: "path"`；文件不存在 `stage: "load"` 且原文档仍在；无路径保存 `stage: "path"`；保存后 `load_project` 读回音高一致 |
+| 15–17 | `+12` 生效；坏 id 停机 + `skipped` + 首条已生效（证明「不是全或无」）；`dry_run` 后保存出的文件仍是原音高 |
+| 18 | 16 条命令，`only_enabled` 过滤后数量变少且全为 `true`，`midi.change_velocity` 在空工程上带 `disabled_reason` |
+| 19 | `render_wav`（22050 / 16 / 1920）与 `--render` 的 wav **逐字节相等** |
+| 20 | 输出路径 `../escape.wav` → `stage: "path"`，且文件未产生 |
+| 21 | 含 CLAP 声源节点的工程：`plugin_nodes == 1`、渲染有帧、`warnings` 一条且含 plugin id |
+| 22 | 端到端用例全程记录每一行 stdout，`read_line` 逐行 `serde_json::from_str`，并断言帧数恰好等于请求数 |
+| 23–24 | 关 stdin → 0；`--mcp --ops` / `--mcp --render` → 2；`--root` 脱离 `--mcp` → 2；`--root` 不存在 → 2；`--open` 预载失败 → 3 |
+| 25 | 见 §10.3 |
+
+### 10.3 零回归硬证据
+
+用 `f4fafe9`（S5 spec commit，最后一个 pre-S5 代码状态）的 detached worktree + 独立
+`CARGO_TARGET_DIR` 编出 pre-S5 二进制，与 post-S5 对 `working_files/regression-project.glz`
+跑 `--render --rate 22050 --bits 16 --to 1920`：
+
+```
+pre : 44 288 frames → 177 196 字节
+post: 44 288 frames → 177 196 字节
+cmp: 逐字节一致    sha256 04ab77f91e0ae7594d943f2b8feed633d1e51766211a244fbc65d8d3d9d24fb2
+```
+
+另一条独立证据在端到端测试里：`render_wav` 与 `--render` 同参数产出的两个 wav
+`assert!(cli == via_mcp)`——证明 `render_doc_to_wav_with` 没有改变渲染行为，只是多了一个策略参数。
+
+### 10.4 门禁
+
+| 项 | 结果 |
+| :--- | :--- |
+| `cargo fmt` | 干净 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 零警告 |
+| `cargo test --workspace` | **1 303 项通过 / 0 失败**（S4 是 1 245，新增 58：35 单测 + 23 子进程） |
+| `cargo build --workspace` | 通过 |
+
+### 10.5 已知边界（未解决，不算欠账）
+
+- symlink TOCTOU：`resolve` 的 canonical 复检与真正的写入之间有窗口。
+- 无 undo 工具：坏批次只能重开工程；`dry_run` 与 `save_project` 的 `.bak` 是两道防线。
+- 大工程渲染期间同步阻塞，没有 progress 通知。
+- 工程内部引用的媒体 / SF2 路径不做沙箱校验（见 §9 最后一行）。

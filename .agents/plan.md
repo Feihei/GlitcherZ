@@ -643,7 +643,7 @@ scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 sympho
 | **S2** | Organ（drawbar 加法 + 打击泛音） | ✅ 2026-11-09 交付 |
 | **S3** | Wavetable（表管理 / 抗混叠 / 位置调制，**先写独立 spec**） | ✅ 2026-11-09 交付 |
 | **S4** | CLI 命令面扩展（open / save / 少量批量操作） | ✅ 2026-11-09 交付 |
-| **S5** | MCP（前置：把 headless 层提升为独立 `glitcherz-session` crate + 命令面 + 安全边界） | 待办 |
+| **S5** | MCP（协议外壳 + 会话状态 + 安全边界；**不新建 crate**，`--mcp` 子模式） | ✅ 2026-11-09 交付 |
 
 > **2026-11-08 顺序修订**：本表编号**保持不变**（S0 决策与实施记录都按此编号引用），但 S1 及以后整体顺延到新立的 Z / B 系列之后。当前唯一有效的执行顺序见下文「Z / B 系列」一节的《执行顺序》表。S4 / S5 不取消，只是排队靠后。
 
@@ -754,7 +754,7 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | 3 | **B1** Modal 声源 ✅ | 已交付。与图架构完全解耦，与 Z0/Z1 无交叉；声源只改 `headless::spawn_instrument` 一处，长尾 / 拍频 / 频谱峰全部由 S0 的 `--render` 自动验收。 |
 | 4 | **Z2** Vocoder ✅ | 已交付。最贵的一项，失败模式本可能暴露 Z0 的设计缺口（两路 PDC / 缓冲形状）；Z1 已把 Z0 验证过，实际零返工。 |
 | 5 | **S1** Pluck ✅ → **S2** Organ ✅ → **S3** Wavetable ✅ | S1 已交付（2026-11-08）、S2 已交付（2026-11-09）、S3 已交付（2026-11-09）。Y 系列三个乐器到 S3 全部完成；Wavetable 按原约定先写独立 spec 再实现。 |
-| 6 | **S4** CLI 命令面 ✅ → **S5** MCP | S4 已交付（2026-11-09）：命令面 = 既有 `glitcherz-command` 注册表，CLI 只做运输层。S5 的前置只剩「把 headless 层提升为独立 session crate + 安全边界」——命令面与失败语义这两块已经就位。 |
+| 6 | **S4** CLI 命令面 ✅ → **S5** MCP ✅ | S4 已交付（2026-11-09）：命令面 = 既有 `glitcherz-command` 注册表，CLI 只做运输层。S5 已交付（2026-11-09）：`glitcherz --mcp` 在同一份注册表上开 stdio 协议面，6 个工具 + root 沙箱 + 插件默认禁用。「提升为 `glitcherz-session` crate」这条前置经复核**放弃**（S5-D1）。 |
 
 **备选（听感优先，未采用）**：B1 → Z0 → Z1 → Z2 → S1…。两条链互不依赖，本可无损切换；用户 2026-11-08 选架构优先，**按上表执行**。
 
@@ -869,16 +869,25 @@ sidechain off 的侧链压缩器与普通压缩器逐样本一致（Z1-D2 本就
 | 实施期踩坑 | ① **新工程的轨道上没有 clip**，而 16 条 `midi.*` 全都作用于既有 clip → `--do midi.note_add` 在默认工程上直接退出 4；「从零造曲子」仍需模板工程，这条写进 spec §9 并用测试钉住；② `--commands` 的 `enabled` 只有 `midi.change_velocity` 会变（其余 15 条是 `always`），验收不能用 `midi.transpose` 验；③ 人读模式的错误行原设计会重复打印命令名（`CommandError` 的 `Display` 已含 id），改成单列；④ `RenderInfo` 别 derive `Copy`（有 `String`）；`&OsStr` 与 `"-"` 不能直接 match，要先转成 bool；⑤ 测试断言得对齐**流**：批次失败是「结果」进 stdout，只有参数层错误进 stderr。 |
 | 文档同步 | `cli-commands.md`（新 spec，§8 21 条与 §10 证据已回填）、`implementation.md` S4 小节、`docs/manual.md`（命令行批量命令小节 + 退出码表 + `--render` 失败码变更）、`README.md` / `docs/README.md` 运行节、`AGENTS.md` 索引。 |
 
-下一步：**S5 MCP**（执行顺序第 6 项的后半）。S4 交付之后，它缺的东西比立项时少了整整一半：
+### S5 实施记录（✅ 2026-11-09 已交付，Y 系列收官）
 
-- ✅ 命令面：注册表可枚举（`--commands --json`）、可批量驱动（`--ops`）、有事务语义（`Session`）。
-- ✅ 失败语义：固定退出码 + `--json` 信封，`kind` 区分「写错 id」与「这条命令现在不适用」。
-- ✅ 闭环：改完能立刻 `--wav` 听到结果，渲染的是内存文档而不是磁盘上的旧文件。
-- ❌ **session 层仍是 `glitcherz-ui::headless`**：MCP 要的是独立进程，得按 S0-D1 的承诺把它提升为 `glitcherz-session` crate（顺带把 `ExportJob` 的 pump 循环也搬过去）。
-- ❌ **安全边界**：写文件（`--save` 的 `.bak` 堆积）、加载插件（CLAP / VST3 会执行第三方代码）、以及「只许在某个工作目录里读写」的约束，全都还没定。
-- ❌ **词汇表仍只有 `midi.*`**：改音色参数需要稳定字符串名（`NodeParam` 现在只有 UI 显示名），`clip.add` 缺了会让「从空工程开始」写不成。这两项要么进 S5 的 spec，要么单独排一期——**别在 MCP 的 spec 里顺手做**，那会把一个「协议 + 安全」的 spec 撑成「协议 + 安全 + 参数命名 + clip 命令」。
+| 项 | 结果 |
+| :--- | :--- |
+| 落地 | `crates/glitcherz-app/src/mcp/`：`mod.rs`（服务循环 + 方法分派 + `Server`）、`protocol.rs`（JSON-RPC 帧 / 错误码 / 版本协商）、`tools.rs`（6 个工具 + JSON Schema + 执行）、`sandbox.rs`（root 解析）。`args.rs` 加 `Mode::Mcp` / `--mcp` / `--root` / `--allow-plugins`，`main.rs` 加一个分支，`tests/mcp_cli.rs`（23 项真子进程用例）。`glitcherz-ui::headless` 把 `spawn_node` 的 `live: bool` 换成 `SpawnPolicy`，新增 `render_doc_to_wav_with(…, policy)`。 |
+| **推翻了 plan 自己写的前置** | 原写「把 headless 层提升为独立 `glitcherz-session` crate」，复核后**放弃**（S5-D1）：客户端 spawn 的本就是独立进程，`--mcp` 与窗口零共享内存，「进程隔离」已满足；而 `headless` 与 UI 的 `install_node` 缓存深度耦合（`AppMedia` 就是 `&mut GlitcherZApp`），外迁是大重构且只有一个消费者。MCP 因此是第四种 headless 模式，与 `--render` / `--ops` / `--commands` 共用同一份 `Session` 与渲染路径。 |
+| 工具面 | `project_open` / `project_save` / `project_info` / `commands_list` / `commands_run` / `render_wav`。协议版本 `2024-11-05` / `2025-03-26` / `2025-06-18` 回显，未知回落最新；`capabilities` 只声明 `tools`。 |
+| 语义关键点 | ① **失败走两条通道**：工具执行失败 → `isError: true` + 文本里的 JSON（给模型读）；只有「请求本身不合规」才用 JSON-RPC error（`-32700` / `-32600` / `-32601` / `-32602`）。② **批次不是全或无**——会话是活的，S4 靠「最后才写文件」拿到的原子性这里没有；只承诺单条命令原子 + 默认 `stop_on_error` + `skipped` 列表，补偿手段是 `dry_run`（跑完 `restore` 快照）。③ **路径沙箱**：`--root` 内词法规整 + 前缀校验 + 父目录 canonical 复检，绝对路径同样受检。④ **插件默认禁用**（`dlopen` 任意二进制，而参数是模型拼的）：乐器静音、效果器回落内置，`warnings` 逐节点说明，`--allow-plugins` 才放开。 |
+| 标识 | `PROJECT_VERSION = 10` **未动**；`glitcherz-command` / `glitcherz-model` / `glitcherz-engine` **一行未改**；无新 crate、无新外部依赖（JSON-RPC 手写）；`RenderOptions` 一个字段没动（新增 `render_doc_to_wav_with` 变体函数而不是给老函数加参数，11 处字面量零改动）。 |
+| 验收 | 25 条（23 条用例 + 零回归 + 门禁），全部回填。58 项新测试（35 单测 + 23 子进程），全量 **1 303 项通过 / 0 失败**。`fmt` / `clippy --workspace --all-targets -D warnings` / `build --workspace` 全绿。 |
+| **零回归硬证据** | 用 `f4fafe9`（S5 spec commit，最后一个 pre-S5 代码状态）的 detached worktree + 独立 `CARGO_TARGET_DIR` 编出 pre-S5 二进制，与 post-S5 对 `working_files/regression-project.glz` 跑 `--render --rate 22050 --bits 16 --to 1920`：各 **44 288 帧 / 177 196 字节，`cmp` 逐字节一致**（sha256 `04ab77f9…`）。另有一条独立断言：`render_wav` 与 `--render` 同参数产出的 wav 在端到端测试里逐字节相等。 |
+| 实施期踩坑 | ① `live: bool` 换成枚举时，两处 `VoiceSpec::Vst3` / `Clap` 分支文本完全相同，多文件批量替换会撞车——得带后续语句才能唯一定位；② MCP 进程里没有 `log` 直接依赖（只有 `env_logger`），启动提示改走 `eprintln!`（stderr 本来就是它该去的地方）；③ 测试里 `finish()` 吃掉 `self`，要断言「帧数」得先把 `seen` 克隆出来；④ `report["ok"] == json!(true)` 与 `&Value`/`Value` 比较不成立，改成先存 `bool`；⑤ 别再假设 `Project::default()` 的 `midi_tracks` 是 4——它是 1。 |
 
-顺带记一笔：S3 把「表管理」这条线开了一个口子但只做了一半——**用户表导入**（`.wav` / `.wt` 文件、命名、缓存淘汰、文件对话 UI）按 spec §2 刻意留给后续阶段，风险全在文件与 UI，不在 DSP；真要做得先按 `media` / `sf2_library` 的形状写一份 spec，别直接往 `wavetable.rs` 里加。
+**S5 之后**（Y 系列到此结束，路线图上没有下一个 Y 项）：
+
+- **词汇表**是现在唯一的硬阻塞：16 条 `midi.*` 全都作用于**既有 clip**，改音色参数也还没有稳定字符串名（`NodeParam` 只有 UI 显示名）。MCP 能「改音符」但改不了「用什么音色」、也开不了新 clip——这一期是 `NodeParam` 稳定名 + `clip.add` + `graph.set_param`，按 `spec/` 的规矩先写独立 spec。
+- **用户表导入**（S3 留的口子）：`.wav` / `.wt` 文件、命名、缓存淘汰、文件对话 UI，风险全在文件与 UI，不在 DSP。
+- 安全边界还可以往前走一步：现在只管客户端给的路径，工程内部引用的媒体 / SF2 路径是照单全收（等同于在窗口里打开一个不信任的工程）。要做就得先有「工程信任模型」。
+
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 

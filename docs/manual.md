@@ -618,6 +618,64 @@ glitcherz --open song.glz --ops steps.json --save out.glz
 `stage` 是 `command` 时还有 `id` 和 `kind`（`unknown` 写错了 id、`unavailable` 这条命令现在不适用、
 `bad_params` 参数不对、`panicked` 命令内部崩了但已回滚）。
 
+#### 命令行：MCP server
+
+`glitcherz --mcp` 把上面那套命令面**当成 MCP 工具**开放给 AI 客户端（Claude Desktop、
+各种 agent 框架）。协议跑在 stdin/stdout 上，一行一个 JSON 对象，不需要端口、不需要网络。
+
+```bash
+glitcherz --mcp --root ~/Music/glitcherz
+```
+
+客户端那边加一条 stdio server 即可：
+
+```json
+{
+  "mcpServers": {
+    "glitcherz": {
+      "command": "glitcherz",
+      "args": ["--mcp", "--root", "/Users/me/Music/glitcherz"]
+    }
+  }
+}
+```
+
+六个工具：
+
+| 工具 | 做什么 |
+| :--- | :--- |
+| `project_open` | 打开一份 `.glz`，返回摘要（轨道 / 片段 / 音符数 / 时长 / 有多少节点用插件） |
+| `project_save` | 存盘（原子写 + `.bak`）；不给路径就存回原文件 |
+| `project_info` | 只读摘要，字段与 `project_open` 一样 |
+| `commands_list` | 枚举命令（与 `--commands --json` 同一份），含「现在为什么不可用」 |
+| `commands_run` | 按顺序跑一批命令，可 `dry_run`（跑完自动回滚） |
+| `render_wav` | 把**当前内存里的文档**渲成立体声 wav |
+
+三条边界，全都默认收紧：
+
+- **只能在 `--root` 里读写。** 客户端给的每个路径都先相对 root 解析，再判越界；绝对路径也照样判。
+  越界不会「尽力而为」，直接报 `stage: "path"`。
+- **插件默认不加载。** CLAP / VST3 是 `dlopen` 任意二进制，而 MCP 那头的参数是模型拼的。所以在
+  MCP 模式下，插件乐器渲染成静音、插件效果器回落成内置效果，`render_wav` 的 `warnings` 会逐节点
+  说明是哪几个。确实要用就显式加 `--allow-plugins`。
+- **没有 undo / redo 工具。** 改坏了重开一次工程。`commands_run` 的 `dry_run` 是先验证再落地的那条路。
+
+和 CLI 的一处重要差别：**批次不是全或无**。`commands_run` 里每条命令各自原子（要么完整生效要么
+完全不生效），但第 3 条失败时前 2 条已经改了文档——会话是活的，没有「先攒着最后一起提交」这回事。
+默认 `stop_on_error: true`，失败即停，报告里把剩下的列进 `skipped`。
+
+一次典型的来回（`tools/call` 的 `content[0].text` 是一个 JSON 字符串，这里摊开展示）：
+
+```text
+→ {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"commands_run","arguments":{
+     "commands":[{"id":"midi.transpose","params":{"track":0,"clip":0,"semitones":12}}]}}}
+← {"id":1,"result":{"isError":false,"content":[{"type":"text","text":
+     "{\"ok\":true,\"applied\":true,\"results\":[{\"id\":\"midi.transpose\",\"ok\":true,…}],\"skipped\":[]}"}]}}
+```
+
+`--mcp` 的退出码：`0` 对端关闭 stdin、`1` stdout 写不出去、`2` 参数错（`--root` 不存在、
+与 `--render` / `--ops` 混用）、`3` `--open` 预载的工程读不了。工具自身失败**不**影响退出码。
+
 #### 退出码
 
 `glitcherz` 的所有模式共用一套退出码，脚本可以据此分支：
@@ -626,8 +684,8 @@ glitcherz --open song.glz --ops steps.json --save out.glz
 | :--- | :--- |
 | `0` | 成功 |
 | `1` | 音频引擎或窗口启动失败（仅开窗口时） |
-| `2` | 参数或输入文档有问题（未知开关、`--params` 不是 JSON 对象、`--ops` 读不到或不是数组、`--render` 与批次混用） |
-| `3` | 工程文件读写/解析失败，或渲染失败 |
+| `2` | 参数或输入文档有问题（未知开关、`--params` 不是 JSON 对象、`--ops` 读不到或不是数组、`--render` 与批次混用、`--mcp` 的 `--root` 不存在或与其它模式混用） |
+| `3` | 工程文件读写/解析失败，或渲染失败（`--mcp --open` 预载失败也是 `3`） |
 | `4` | 某条命令执行失败 |
 
 注意：`--render` 失败以前一律返回 `1`，现在归到 `3`（与批次共用）。靠退出码区分「工程读不了」和
