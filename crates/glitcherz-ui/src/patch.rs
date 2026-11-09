@@ -1505,6 +1505,12 @@ const PORT_RADIUS: f32 = 6.0;
 const PORT_HIT_RADIUS: f32 = 18.0;
 /// Cable hit distance.
 const CABLE_HIT_DIST: f32 = 8.0;
+/// Automation cable dash pattern (D27): the only line-style channel, kept
+/// separate from stroke width, which encodes interaction state.
+const CABLE_DASH_LENGTH: f32 = 7.0;
+const CABLE_DASH_GAP: f32 = 5.0;
+/// Bezier samples used to render a dashed cable.
+const CABLE_DASH_SAMPLES: usize = 32;
 /// Cable-cut hit distance (pointer path within this distance of a cable severs it).
 const CUT_HIT_DIST: f32 = 10.0;
 /// Cable midpoint control dot radius / hit radius.
@@ -1795,35 +1801,38 @@ fn channel_toggle(
         .clicked()
 }
 
-/// Type coloring (spec P5d): stroke varies by type, fill is a dark base.
+/// Node identity colour (spec P5d, D27): stroke carries the node family, fill
+/// is a dark base. Strokes stay at ~30% saturation so that fully saturated
+/// hues belong to cables and ports alone; the fixed entities keep a slightly
+/// higher luminance as canvas anchors. Grey fallbacks are already neutral.
 fn node_color(id: PatchId, doc: &GraphDoc) -> (Color32, Color32) {
     let stroke = match id {
-        PatchId::Master => Color32::from_rgb(230, 110, 90),
-        PatchId::Timeline => Color32::from_rgb(170, 120, 225),
+        PatchId::Master => Color32::from_rgb(168, 112, 104),
+        PatchId::Timeline => Color32::from_rgb(136, 120, 168),
         // The sink shares the timeline's identity colour (same subsystem).
-        PatchId::TimelineIn => Color32::from_rgb(150, 105, 205),
+        PatchId::TimelineIn => Color32::from_rgb(120, 106, 148),
         PatchId::Node(id) => match doc.node_by_id(id) {
-            Some(NodeDoc::Instrument { .. }) => Color32::from_rgb(90, 160, 220),
-            Some(NodeDoc::Effect { .. }) => Color32::from_rgb(220, 150, 70),
-            Some(NodeDoc::Mixer { .. }) => Color32::from_rgb(110, 190, 120),
-            Some(NodeDoc::Keyboard { .. }) => Color32::from_rgb(95, 205, 190),
+            Some(NodeDoc::Instrument { .. }) => Color32::from_rgb(91, 124, 156),
+            Some(NodeDoc::Effect { .. }) => Color32::from_rgb(154, 124, 92),
+            Some(NodeDoc::Mixer { .. }) => Color32::from_rgb(110, 140, 120),
+            Some(NodeDoc::Keyboard { .. }) => Color32::from_rgb(94, 136, 128),
             // R4: a live input is an audio source, one shade warmer than the
             // keyboard's routing colour.
-            Some(NodeDoc::Input { .. }) => Color32::from_rgb(80, 185, 205),
-            Some(NodeDoc::Feedback { .. }) => Color32::from_rgb(215, 105, 160),
+            Some(NodeDoc::Input { .. }) => Color32::from_rgb(86, 126, 136),
+            Some(NodeDoc::Feedback { .. }) => Color32::from_rgb(146, 102, 122),
             // U6: audio tracks share the sample-player family's warm tone.
-            Some(NodeDoc::AudioTrack { .. }) => Color32::from_rgb(205, 165, 90),
+            Some(NodeDoc::AudioTrack { .. }) => Color32::from_rgb(140, 124, 92),
             // MIDI FX / control sources carry the MIDI cable's green (spec
-            // `midi-nodes.md` §8).
-            Some(NodeDoc::Arpeggiator { .. }) => Color32::from_rgb(90, 200, 110),
-            Some(NodeDoc::Portamento { .. }) => Color32::from_rgb(80, 190, 100),
-            Some(NodeDoc::MidiEnvelope { .. }) => Color32::from_rgb(70, 180, 90),
+            // `midi-nodes.md` §8), one saturation step below it.
+            Some(NodeDoc::Arpeggiator { .. }) => Color32::from_rgb(94, 140, 100),
+            Some(NodeDoc::Portamento { .. }) => Color32::from_rgb(88, 134, 96),
+            Some(NodeDoc::MidiEnvelope { .. }) => Color32::from_rgb(82, 128, 94),
             // A free-running LFO is a control *generator*: same family, one
             // shade warmer than the note-triggered envelope.
-            Some(NodeDoc::Lfo { .. }) => Color32::from_rgb(120, 195, 100),
+            Some(NodeDoc::Lfo { .. }) => Color32::from_rgb(110, 136, 94),
             // A curve map is a control-stage node too, one shade cooler than
             // the sources it sits behind (spec `curve-map.md` D5).
-            Some(NodeDoc::CurveMap { .. }) => Color32::from_rgb(85, 175, 150),
+            Some(NodeDoc::CurveMap { .. }) => Color32::from_rgb(88, 126, 116),
             Some(NodeDoc::ChannelStrip { .. }) => Color32::from_gray(140),
             None => Color32::from_gray(120),
         },
@@ -1837,12 +1846,43 @@ fn node_color(id: PatchId, doc: &GraphDoc) -> (Color32, Color32) {
     (stroke, fill)
 }
 
-/// Cable color (by type).
+/// Cable colour by signal type (D27). These three hues are the type contract:
+/// a port and the cable that may land on it share one colour. Cool cyan for
+/// audio keeps it distinguishable from MIDI green and automation amber under
+/// red-green colour deficiency; the automation dash adds a non-hue channel.
 fn cable_color(kind: CableKind) -> Color32 {
     match kind {
-        CableKind::Audio => Color32::from_rgb(150, 152, 160),
+        CableKind::Audio => Color32::from_rgb(84, 178, 196),
         CableKind::Midi => Color32::from_rgb(90, 200, 110),
         CableKind::Automation => Color32::from_rgb(230, 190, 70),
+    }
+}
+
+/// Paint one cable. Automation cables are dashed — the only line-style
+/// channel, chosen to break the green/amber pair for colour-deficient users
+/// without giving every type its own pattern (D27). epaint's
+/// `CubicBezierShape` has no dash attribute, so the dashed variant samples the
+/// same curve and feeds the polyline to `Shape::dashed_line_many`. Audio and
+/// MIDI keep the exact bezier path they had before.
+fn paint_cable(painter: &egui::Painter, bez: [Pos2; 4], kind: CableKind, stroke: egui::Stroke) {
+    if kind == CableKind::Automation {
+        let points = bezier_points(bez, CABLE_DASH_SAMPLES);
+        let mut shapes = Vec::new();
+        egui::Shape::dashed_line_many(
+            &points,
+            stroke,
+            CABLE_DASH_LENGTH,
+            CABLE_DASH_GAP,
+            &mut shapes,
+        );
+        painter.extend(shapes);
+    } else {
+        painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+            bez,
+            false,
+            Color32::TRANSPARENT,
+            stroke,
+        ));
     }
 }
 
@@ -2933,6 +2973,26 @@ fn node_out_port_kind(node: &NodeDoc, port: usize) -> CableKind {
     }
 }
 
+/// Structural signal kind of a node's input ports (D27).
+///
+/// Automation has no physical input port: a cable is addressed to
+/// `(node_id, param)` and only reuses the structural inlet as a layout
+/// landing spot. Input rings therefore show the signal the node consumes,
+/// not the cables currently attached to it — a yellow dashed automation line
+/// may legitimately end on a cyan or green ring. The cable's own dash and
+/// midpoint parameter label carry that distinction.
+fn node_in_port_kind(node: &NodeDoc) -> CableKind {
+    match node {
+        NodeDoc::Instrument { .. }
+        | NodeDoc::Arpeggiator { .. }
+        | NodeDoc::Portamento { .. }
+        | NodeDoc::MidiEnvelope { .. } => CableKind::Midi,
+        // D5 (`curve-map.md`): the map node's only inlet is the control signal.
+        NodeDoc::CurveMap { .. } => CableKind::Automation,
+        _ => CableKind::Audio,
+    }
+}
+
 /// The one parameter a node's single control port carries, when offering a
 /// menu would be noise (spec `curve-map.md` D5: the Curve Map has exactly one
 /// input and it is the signal itself).
@@ -3712,12 +3772,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             },
             color,
         );
-        painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
-            bez,
-            false,
-            Color32::TRANSPARENT,
-            stroke,
-        ));
+        paint_cable(&painter, bez, cable.kind, stroke);
         let mid = bezier_points(bez, 24)[12];
         // Label automation cables with the endpoint parameter above the midpoint.
         if cable.kind == CableKind::Automation {
@@ -3801,12 +3856,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 .find(|(k, _)| *k == drag.port)
                 .map(|(_, p)| p);
             if let Some(p0) = p0 {
-                painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                paint_cable(
+                    &painter,
                     bezier_controls(p0, sp),
-                    false,
-                    Color32::TRANSPARENT,
+                    kind,
                     egui::Stroke::new(2.0, cable_color(kind).gamma_multiply(0.7)),
-                ));
+                );
                 // Highlight the hovered target.
                 if let Some(target) = state.hit_node(rect.min, sp, &deps) {
                     if accepts(kind, target, doc) && drag.from != target {
@@ -3884,9 +3939,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             // the port-name section below, together with the mixer captions —
             // the old static `T1` / `C1` / `A1` tags went stale on a rename.
         }
-        // Input ports: mixers draw one per channel (P5f D17), other nodes /
-        // master the single port 0. The Timeline In terminal names its port
-        // (U3b: v1 has the `Tempo` port only).
+        // Input ports: hollow rings hue-coded by the structural signal they
+        // accept (D27). Outputs are solid discs; position already encodes
+        // direction, so brightness no longer doubles as an in/out cue.
         for (port, p) in state.in_ports_screen(rect.min, id, &deps) {
             let (inbound, label) = match id {
                 PatchId::TimelineIn => match timeline_in_port_track(port, &deps) {
@@ -3896,27 +3951,28 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                         timeline_in_port_label(kind, track, &deps),
                     ),
                 },
-                // Z0: label the two ports of a dual-input effect so the Mod
-                // inlet is not a second unmarked grey dot.
-                PatchId::Node(node_id)
-                    if deps
-                        .doc
-                        .node_by_id(node_id)
-                        .is_some_and(|n| n.audio_inputs() == 2) =>
-                {
-                    (
-                        Color32::from_gray(90),
-                        if port == 0 {
-                            "Main".to_string()
-                        } else {
-                            "Mod".to_string()
-                        },
-                    )
+                // Unreachable (the timeline is a pure source, no input ports).
+                PatchId::Timeline | PatchId::Master => {
+                    (cable_color(CableKind::Audio), String::new())
                 }
-                _ => (Color32::from_gray(90), String::new()),
+                PatchId::Node(node_id) => {
+                    let node = deps.doc.node_by_id(node_id);
+                    let color = cable_color(node.map_or(CableKind::Audio, node_in_port_kind));
+                    // Z0: label the two ports of a dual-input effect so the
+                    // Mod inlet is not a second unmarked dot.
+                    let label = if node.is_some_and(|n| n.audio_inputs() == 2) {
+                        if port == 0 { "Main" } else { "Mod" }.to_string()
+                    } else {
+                        String::new()
+                    };
+                    (color, label)
+                }
             };
-            painter.circle_filled(p, PORT_RADIUS, inbound);
-            painter.circle_stroke(p, PORT_RADIUS, egui::Stroke::new(1.0, Color32::BLACK));
+            // The hole is the entity's own fill, so the ring reads as a socket
+            // cut into the box rather than a dot sitting on top of it.
+            painter.circle_filled(p, PORT_RADIUS, fill);
+            painter.circle_stroke(p, PORT_RADIUS, egui::Stroke::new(1.8, inbound));
+            painter.circle_stroke(p, PORT_RADIUS + 0.9, egui::Stroke::new(0.8, Color32::BLACK));
             if !label.is_empty() {
                 // Same gap and size as the captions in `port_name_labels` —
                 // this terminal is the one that made the other two look
@@ -4894,6 +4950,131 @@ mod tests {
             single_control_port(&project.graph, instrument.node_id()),
             None
         );
+    }
+
+    /// D27: the three hues are the type contract. Audio must be a real colour
+    /// now — the old neutral grey blended into the dark canvas and into the
+    /// grey input dots.
+    #[test]
+    fn d27_cable_hues_are_distinct() {
+        let audio = cable_color(CableKind::Audio);
+        let midi = cable_color(CableKind::Midi);
+        let automation = cable_color(CableKind::Automation);
+        assert_ne!(audio, midi);
+        assert_ne!(audio, automation);
+        assert_ne!(midi, automation);
+        let [r, g, b, _] = audio.to_array();
+        let (r, g, b) = (u16::from(r), u16::from(g), u16::from(b));
+        assert!(
+            g > r + 50 && b > r + 50,
+            "audio must be a saturated cool hue, got {audio:?}"
+        );
+    }
+
+    /// D27: saturated hue belongs to cables and ports alone; node strokes are
+    /// one saturation step down so the two meanings never compete.
+    #[test]
+    fn d27_node_strokes_are_desaturated() {
+        fn chroma(c: Color32) -> u8 {
+            let [r, g, b, _] = c.to_array();
+            [r, g, b].into_iter().max().unwrap() - [r, g, b].into_iter().min().unwrap()
+        }
+        let project = Project::default();
+        let doc = &project.graph;
+        let instrument = doc.instrument_of_track(0).expect("default synth");
+        let stroke = node_color(PatchId::Node(instrument.node_id()), doc).0;
+        assert!(
+            chroma(stroke) < 80,
+            "node stroke chroma {} is too high",
+            chroma(stroke)
+        );
+        for kind in [CableKind::Audio, CableKind::Midi, CableKind::Automation] {
+            assert!(
+                chroma(cable_color(kind)) > chroma(stroke),
+                "cables must be more saturated than node boxes for {kind:?}"
+            );
+        }
+    }
+
+    /// D27: input rings show the *structural* signal a node consumes.
+    /// Automation has no physical port, so it must not steal the ring colour
+    /// of the nodes it modulates — the yellow dashed line and its midpoint
+    /// parameter label carry that distinction.
+    #[test]
+    fn d27_input_rings_follow_the_structural_signal() {
+        let project = Project::default();
+        let doc = &project.graph;
+        let instrument = doc.instrument_of_track(0).expect("default synth");
+        assert_eq!(
+            node_in_port_kind(instrument),
+            CableKind::Midi,
+            "an instrument consumes notes, not audio"
+        );
+        let mixer = doc
+            .nodes
+            .iter()
+            .find(|node| node.is_mixer())
+            .expect("default mixer");
+        assert_eq!(node_in_port_kind(mixer), CableKind::Audio);
+        assert_eq!(
+            node_in_port_kind(&NodeDoc::CurveMap {
+                node_id: 99,
+                track: 0,
+                params: CurveMapParams::default(),
+            }),
+            CableKind::Automation,
+            "the map node's only inlet is the control signal"
+        );
+        assert_eq!(
+            node_in_port_kind(&NodeDoc::Arpeggiator {
+                node_id: 99,
+                track: 0,
+                params: glitcherz_model::ArpeggiatorParams::default(),
+            }),
+            CableKind::Midi
+        );
+    }
+
+    /// D27: the dashed automation path must survive a real egui frame.
+    /// `CubicBezierShape` has no dash attribute, so this exercises the
+    /// sampled-polyline branch of `paint_cable` end to end.
+    #[test]
+    fn d27_automation_cable_renders_in_a_frame() {
+        let mut project = Project::default();
+        let instrument = project
+            .graph
+            .instrument_of_track(0)
+            .expect("default synth")
+            .node_id();
+        project
+            .graph
+            .cables
+            .push(CableDoc::automation(0, instrument, AutoParam::TrackGain));
+        let track_name = |_: TrackKind, _: usize| String::new();
+        let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
+        let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
+        let deps = PatchDeps {
+            input: Default::default(),
+            doc: &project.graph,
+            track_count: project.midi_tracks.len(),
+            track_name: &track_name,
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
+        };
+        let ctx = egui::Context::default();
+        let mut state = PatchState::default();
+        state.ensure_positions(
+            &project.graph,
+            deps.track_count,
+            deps.auto_count,
+            deps.audio_count,
+        );
+        let actions = drive(&ctx, &mut state, deps, vec![], 0.0);
+        assert!(actions.is_empty(), "a passive frame produces no intents");
     }
 
     #[test]
