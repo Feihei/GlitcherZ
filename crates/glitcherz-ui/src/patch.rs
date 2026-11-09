@@ -1503,6 +1503,25 @@ const CANVAS_HEIGHT: f32 = 300.0;
 /// Output port circle radius / hit radius (generous so port drags are easy to start).
 const PORT_RADIUS: f32 = 6.0;
 const PORT_HIT_RADIUS: f32 = 18.0;
+/// Input port ring width (D27). Inputs are hollow rings, so the hue has less
+/// pixel area than an output disc: keep the ring noticeably heavier than the
+/// 1px outline or the type colour disappears against the dark canvas.
+const PORT_RING_WIDTH: f32 = 3.0;
+/// Hairline outside the ring, offset past its outer edge so it never eats
+/// into the hue (egui strokes are centred on the given radius).
+const PORT_RING_OUTLINE: f32 = 0.8;
+// The original 1.8px ring read as too faint against the dark canvas.
+const _: () = assert!(
+    PORT_RING_WIDTH >= 2.5,
+    "input rings must stay visibly heavier than the 1px output outline"
+);
+
+/// Radius of the hairline outside an input ring: its inner edge just touches
+/// the ring's outer edge, so the outline never covers the type colour (egui
+/// strokes are centred on the given radius, not drawn outside it).
+fn port_ring_outline_radius() -> f32 {
+    PORT_RADIUS + (PORT_RING_WIDTH + PORT_RING_OUTLINE) * 0.5
+}
 /// Cable hit distance.
 const CABLE_HIT_DIST: f32 = 8.0;
 /// Automation cable dash pattern (D27): the only line-style channel, kept
@@ -3059,6 +3078,47 @@ fn drag_cable_kind(drag: &CableDrag, doc: &GraphDoc, deps: &PatchDeps) -> CableK
     }
 }
 
+/// Resolve a cable drop on the `Timeline In` terminal.
+///
+/// Port 0 is the fixed Tempo automation sink (U3b D7); ports 1+ are the
+/// per-track recording inputs (R6 D24). Keeping both in one place matters:
+/// R6's terminal-level drop branch used to swallow *every* drop on this box,
+/// which silently disabled the older tempo wiring (`ConnectTempoIn`).
+fn timeline_in_drop_action(
+    drag: &CableDrag,
+    port: u8,
+    doc: &GraphDoc,
+    deps: &PatchDeps,
+) -> Option<PatchAction> {
+    // `timeline_in_port_kind` returns `None` for both port 0 and out-of-range
+    // ports, so guard the range before treating `None` as Tempo.
+    if usize::from(port)
+        >= timeline_in_port_count(deps.track_count, deps.auto_count, deps.audio_count)
+    {
+        return None;
+    }
+    match timeline_in_port_track(port, deps) {
+        // Tempo: only a timeline control-track outlet may drive the song clock.
+        // MIDI/audio outlets are rejected (D7), and node control outputs are
+        // deliberately excluded as well (`midi-nodes.md` §7) — they go through
+        // the parameter popup, never straight to the terminal.
+        None => match drag.from {
+            PatchId::Timeline => {
+                match timeline_port_kind(drag.port, deps.track_count, deps.auto_count) {
+                    TimelinePort::Auto(index) => Some(PatchAction::ConnectTempoIn { index }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        Some((kind, track)) => {
+            let from = drag_source_port(drag, doc, deps)?;
+            (drag_cable_kind(drag, doc, deps) == track_kind_cable(kind))
+                .then_some(PatchAction::ConnectTrackIn { from, kind, track })
+        }
+    }
+}
+
 /// Cable kind → whether the target entity accepts it (port type rules, spec §7/D3).
 fn accepts(kind: CableKind, target: PatchId, doc: &GraphDoc) -> bool {
     if let PatchId::Node(id) = target {
@@ -3543,17 +3603,20 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     && let Some(target) = state.hit_node(rect.min, sp, &deps)
                 {
                     if target == PatchId::TimelineIn {
-                        // R6 D24: a recording input accepts one source whose data
-                        // kind matches the track family. The drop has to land on a
-                        // specific port — dropping anywhere on the box would make
-                        // "which track did I mean" ambiguous.
-                        if let (Some(from), Some((PatchId::TimelineIn, port))) = (
-                            drag_source_port(&drag, doc, &deps),
-                            state.hit_in_port(rect.min, sp, &deps),
-                        ) && let Some((kind, track)) = timeline_in_port_track(port, &deps)
-                            && drag_cable_kind(&drag, doc, &deps) == track_kind_cable(kind)
+                        // U3b D7 + R6 D24: the Tempo port and the per-track
+                        // recording inputs share this box, so the drop has to
+                        // land on a specific port — dropping anywhere on the
+                        // box would make "which port did I mean" ambiguous.
+                        // Query this terminal's own ports only: an overlapping
+                        // entity must not steal the hit.
+                        let hit = state
+                            .in_ports_screen(rect.min, PatchId::TimelineIn, &deps)
+                            .into_iter()
+                            .find(|(_, p)| p.distance(sp) <= PORT_HIT_RADIUS);
+                        if let Some((port, _)) = hit
+                            && let Some(action) = timeline_in_drop_action(&drag, port, doc, &deps)
                         {
-                            actions.push(PatchAction::ConnectTrackIn { from, kind, track });
+                            actions.push(action);
                         }
                     } else {
                         match drag.from {
@@ -3572,38 +3635,31 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                                     TimelinePort::Auto(index)
                                         if accepts(CableKind::Automation, target, doc) =>
                                     {
-                                        match target {
-                                            // The conductor terminal has a single
-                                            // port, so the cable commits straight
-                                            // away — no parameter popup (U3b D7).
-                                            PatchId::TimelineIn => {
-                                                actions.push(PatchAction::ConnectTempoIn { index });
+                                        // `TimelineIn` never reaches this `else`:
+                                        // the terminal drop branch above owns
+                                        // port 0 (Tempo) and commits without a
+                                        // parameter popup.
+                                        if let PatchId::Node(to_doc) = target {
+                                            // A node with exactly one control
+                                            // port (the Curve Map) needs no
+                                            // menu: the pick is unambiguous
+                                            // (spec `curve-map.md` D5).
+                                            if let Some(param) = single_control_port(doc, to_doc) {
+                                                actions.push(PatchAction::ConnectAuto {
+                                                    index,
+                                                    to_doc,
+                                                    param,
+                                                });
+                                            } else {
+                                                // The cable is committed after
+                                                // the parameter is picked in the
+                                                // popup menu.
+                                                state.pending_auto = Some((
+                                                    AutoSource::Track(index),
+                                                    to_doc,
+                                                    sp + Vec2::new(4.0, 4.0),
+                                                ));
                                             }
-                                            PatchId::Node(to_doc) => {
-                                                // A node with exactly one control
-                                                // port (the Curve Map) needs no
-                                                // menu: the pick is unambiguous
-                                                // (spec `curve-map.md` D5).
-                                                if let Some(param) =
-                                                    single_control_port(doc, to_doc)
-                                                {
-                                                    actions.push(PatchAction::ConnectAuto {
-                                                        index,
-                                                        to_doc,
-                                                        param,
-                                                    });
-                                                } else {
-                                                    // The cable is committed after
-                                                    // the parameter is picked in the
-                                                    // popup menu.
-                                                    state.pending_auto = Some((
-                                                        AutoSource::Track(index),
-                                                        to_doc,
-                                                        sp + Vec2::new(4.0, 4.0),
-                                                    ));
-                                                }
-                                            }
-                                            _ => {}
                                         }
                                     }
                                     TimelinePort::Auto(_) => {}
@@ -3971,8 +4027,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             // The hole is the entity's own fill, so the ring reads as a socket
             // cut into the box rather than a dot sitting on top of it.
             painter.circle_filled(p, PORT_RADIUS, fill);
-            painter.circle_stroke(p, PORT_RADIUS, egui::Stroke::new(1.8, inbound));
-            painter.circle_stroke(p, PORT_RADIUS + 0.9, egui::Stroke::new(0.8, Color32::BLACK));
+            painter.circle_stroke(p, PORT_RADIUS, egui::Stroke::new(PORT_RING_WIDTH, inbound));
+            painter.circle_stroke(
+                p,
+                port_ring_outline_radius(),
+                egui::Stroke::new(PORT_RING_OUTLINE, Color32::BLACK),
+            );
             if !label.is_empty() {
                 // Same gap and size as the captions in `port_name_labels` —
                 // this terminal is the one that made the other two look
@@ -5032,6 +5092,112 @@ mod tests {
                 params: glitcherz_model::ArpeggiatorParams::default(),
             }),
             CableKind::Midi
+        );
+    }
+
+    /// D27 tuning: a hollow ring carries far less coloured area than a solid
+    /// output disc, so it must stay visibly heavier than the 1px disc outline.
+    #[test]
+    fn d27_input_rings_are_heavier_than_output_outlines() {
+        // The width floor itself is a compile-time assertion next to the
+        // constant; here we only check the ring / outline geometry.
+        // The hairline sits outside the ring, never on top of the hue.
+        let ring_outer = PORT_RADIUS + PORT_RING_WIDTH * 0.5;
+        let outline_inner = port_ring_outline_radius() - PORT_RING_OUTLINE * 0.5;
+        assert!(
+            outline_inner >= ring_outer - 0.01,
+            "the black outline must not eat into the type colour"
+        );
+    }
+
+    /// U3b D7 regression: R6 added the per-track recording inputs to the
+    /// `Timeline In` box and its terminal-level drop branch swallowed every
+    /// drop on that box — including the Tempo port, which turned
+    /// `ConnectTempoIn` into dead code. Port 0 must accept a control-track
+    /// outlet and nothing else.
+    #[test]
+    fn tempo_port_accepts_only_control_track_outlets() {
+        let project = Project::default();
+        let track_name = |_: TrackKind, _: usize| String::new();
+        let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
+        let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
+        let deps = PatchDeps {
+            input: Default::default(),
+            doc: &project.graph,
+            track_count: project.midi_tracks.len(),
+            track_name: &track_name,
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
+        };
+        let doc = deps.doc;
+        // Timeline outlets are MIDI → curve → audio, so the first control
+        // outlet sits right after the MIDI ones.
+        let auto_out = deps.track_count;
+        let curve_in = timeline_in_port(
+            TrackKind::Curve,
+            0,
+            deps.track_count,
+            deps.auto_count,
+            deps.audio_count,
+        )
+        .expect("default project has a curve-track recording input");
+        let timeline_drag = |port| CableDrag {
+            from: PatchId::Timeline,
+            port,
+        };
+
+        // C1 → Tempo: the wiring U3b promised.
+        assert!(matches!(
+            timeline_in_drop_action(&timeline_drag(auto_out), 0, doc, &deps),
+            Some(PatchAction::ConnectTempoIn { index: 0 })
+        ));
+        // MIDI / audio outlets are not automation (D7).
+        assert!(timeline_in_drop_action(&timeline_drag(0), 0, doc, &deps).is_none());
+        assert!(
+            timeline_in_drop_action(
+                &timeline_drag(deps.track_count + deps.auto_count),
+                0,
+                doc,
+                &deps
+            )
+            .is_none()
+        );
+        // A node control outlet (LFO / Portamento) never targets the clock
+        // directly — it goes through the parameter popup (`midi-nodes.md` §7).
+        assert!(
+            timeline_in_drop_action(
+                &CableDrag {
+                    from: PatchId::Node(999),
+                    port: 0,
+                },
+                0,
+                doc,
+                &deps
+            )
+            .is_none()
+        );
+
+        // R6 D24 still holds on the recording ports: C1 → C1 is a legal (if
+        // currently unrecordable, see D26 R8) automation connection.
+        assert!(matches!(
+            timeline_in_drop_action(&timeline_drag(auto_out), curve_in, doc, &deps),
+            Some(PatchAction::ConnectTrackIn {
+                kind: TrackKind::Curve,
+                track: 0,
+                ..
+            })
+        ));
+        // Type mismatch on a recording port is still rejected.
+        assert!(timeline_in_drop_action(&timeline_drag(0), curve_in, doc, &deps).is_none());
+        // The model helper returns `None` for both port 0 and out-of-range
+        // ports, so a stray port index must not be read as Tempo.
+        assert!(
+            timeline_in_drop_action(&timeline_drag(auto_out), 200, doc, &deps).is_none(),
+            "an out-of-range port must not be read as Tempo"
         );
     }
 
