@@ -542,6 +542,97 @@ glitcherz --render song.glz song.wav --rate 48000 --bits 16 --to 7680
 得到逐样本一致的声音。差别只在交互：命令行只出单个混音文件，没有 stems、song loop 范围和进度条；
 工程里的相对媒体路径仍然相对工程文件所在目录解析。
 
+#### 命令行：批量命令
+
+`--ops` 与 `--do` 让脚本（或 AI agent）在无窗口状态下**改**工程，而不只是把它转成 wav。
+命令来自窗口里 `Edit ▸ …` / `Event ▸ MIDI Operations` 用的**同一张注册表**——同一个 id、同一套参数、
+同一份撤销语义，命令行没有任何「隐藏版」。
+
+先看看有哪些命令：
+
+```bash
+glitcherz --commands                    # 一行一条：id、名称、参数
+glitcherz --commands --json | jq .      # 再加 menu / 快捷键 / 为什么现在不可用
+```
+
+然后按顺序跑一批：
+
+```bash
+glitcherz --open song.glz \
+  --do midi.transpose --params '{"track": 0, "clip": 0, "semitones": 12}' \
+  --do midi.quantize  --params '{"track": 0, "clip": 0, "grid_ticks": 240, "strength": 0.8}' \
+  --save song-up.glz --wav song-up.wav
+```
+
+命令多了就写进文件，避免命令行里的引号地狱：
+
+```bash
+glitcherz --open song.glz --ops steps.json --save out.glz
+```
+
+`steps.json` 就是一个数组，`params` 可以省（等同 `{}`）：
+
+```json
+[
+  { "id": "midi.transpose", "params": { "track": 0, "clip": 0, "semitones": -12 } },
+  { "id": "midi.velocity_op", "params": { "track": 0, "clip": 0, "op": "humanize", "value": 15 } },
+  { "id": "midi.query", "params": { "track": 0, "clip": 0 } }
+]
+```
+
+`--ops -` 从标准输入读，效果与文件一样。`--ops` 与 `--do` 可以混用，
+**按它们在命令行里出现的顺序执行**（`--do a --ops list.json --do b` 就是 `a, list…, b`）。
+
+| 参数 | 说明 |
+| :--- | :--- |
+| `--open <工程.glz>` | 起始工程。不给就从**新建工程**开始 |
+| `--ops <file\|->` | 读一个 JSON 数组，`-` 表示标准输入 |
+| `--do <id>` | 追加一条命令；紧跟其后的 `--params` 给它参数 |
+| `--save <out.glz>` | 全部命令成功后写盘 |
+| `--wav <out.wav>` | 全部命令成功后渲染（可用 `--rate` / `--bits` / `--to`） |
+| `--json` | 把结果输出成单个 JSON 对象，供程序消费 |
+
+四点值得先知道：
+
+- **批次是全或无的。** 任何一条命令失败，整批立即停止，`--save` 与 `--wav` 都不写——不会留下半个
+  改过的工程。想要「跳过坏的继续」，就把批次拆成几次调用。
+- **`--wav` 渲染的是刚改完的样子**，不是磁盘上那份旧文件。所以「改一版 → 听一版」一次调用就够。
+- **`--save` 沿用窗口里的保存语义**：先写 `.glz.tmp` 再改名，并把被替换的那一版留成 `.glz.bak`。
+  反复覆盖同一份文件会让 `.bak` 跟着翻滚，批量脚本最好每次写新文件。
+- **新建工程里没有 clip**，而全部 `midi.*` 命令都作用于已有的 clip。所以从零开始编曲仍要先准备一份
+  模板工程（窗口里存一份带 clip 的空工程即可）。
+
+`--json` 输出的信封长这样（`saved` / `render` / `failed` 只在对应情况发生时出现）：
+
+```json
+{
+  "ok": true,
+  "project": "song.glz",
+  "commands": [ { "id": "midi.transpose", "ok": true, "result": { "transposed": 4 } } ],
+  "saved": "out.glz",
+  "render": { "path": "out.wav", "frames": 44288, "sample_rate": 22050 }
+}
+```
+
+失败时 `ok` 为 `false`，`failed` 里带 `stage`（`ops` / `load` / `command` / `save` / `render`）；
+`stage` 是 `command` 时还有 `id` 和 `kind`（`unknown` 写错了 id、`unavailable` 这条命令现在不适用、
+`bad_params` 参数不对、`panicked` 命令内部崩了但已回滚）。
+
+#### 退出码
+
+`glitcherz` 的所有模式共用一套退出码，脚本可以据此分支：
+
+| 码 | 含义 |
+| :--- | :--- |
+| `0` | 成功 |
+| `1` | 音频引擎或窗口启动失败（仅开窗口时） |
+| `2` | 参数或输入文档有问题（未知开关、`--params` 不是 JSON 对象、`--ops` 读不到或不是数组、`--render` 与批次混用） |
+| `3` | 工程文件读写/解析失败，或渲染失败 |
+| `4` | 某条命令执行失败 |
+
+注意：`--render` 失败以前一律返回 `1`，现在归到 `3`（与批次共用）。靠退出码区分「工程读不了」和
+「渲染失败」的话，两种都落在 `3`，具体原因看 stderr。
+
 ### MIDI
 
 `File ▸ Export MIDI…` 把 MIDI 轨写成标准 MIDI 文件（SMF）。

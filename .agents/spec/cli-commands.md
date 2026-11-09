@@ -1,6 +1,6 @@
 # S4：CLI 命令面 Spec（Batch Commands）
 
-> 状态：定稿（2026-11-09）。上游：`plan.md`（Y 系列 S4，执行顺序第 6 项）、`spec/node-graph.md`、`spec/editing-model.md`（命令注册表的原始设计）。
+> 状态：**已交付（2026-11-09）**。上游：`plan.md`（Y 系列 S4，执行顺序第 6 项）、`spec/node-graph.md`、`spec/editing-model.md`（命令注册表的原始设计）。
 > 范围：**把已有的 `glitcherz-command` 注册表从 CLI 打通**——批量跑命令、读结果、存盘、渲染，一条命令都不新增。不做参数 / 节点编辑词汇，不做交互式会话，不做 MCP server。
 
 ## 1. 背景
@@ -111,20 +111,21 @@ parse_args
 ### 6.1 人读模式
 
 ```
-loaded regression-project.glz (format v10)
-ok  midi.query      {"notes":[…]}
-ok  midi.transpose  {"transposed": 4}
-ok  midi.quantize   {"quantized": 4}
+loaded working_files/regression-project.glz
+ok  midi.transpose  {"transposed":4}
+ok  midi.quantize   {"quantized":4}
 saved working_files/out.glz
 rendered 44288 frames at 22050 Hz to working_files/out.wav
 ```
 
-失败时：
+失败时（`<id>` 不重复：每个 `CommandError` 的 `Display` 里已经带了命令名）：
 
 ```
 ok  midi.query      {"notes":[…]}
-error  midi.transpose  midi.transpose is unavailable: there are no notes to edit
+error  midi.transpose: no clip 0 on track 0
 ```
+
+人读模式下错误行进 **stdout** 的这段转录（它是一条结果，不是用法错误）；只有参数 / 输入文档层面的错误（退出 2）才直接写 stderr。
 
 ### 6.2 `--json` 信封
 
@@ -149,14 +150,16 @@ error  midi.transpose  midi.transpose is unavailable: there are no notes to edit
   "ok": false,
   "project": "regression-project.glz",
   "commands": [ { "id": "midi.query", "ok": true, "result": { "notes": [] } } ],
-  "failed": { "id": "midi.transpose", "kind": "unavailable",
-              "error": "there are no notes to edit" }
+  "failed": { "stage": "command", "id": "midi.transpose", "kind": "unavailable",
+              "error": "midi.transpose is unavailable: there are no notes to edit" }
 }
 ```
 
+`failed.stage` 是失败发生的阶段：`ops`（`--ops` 读不到或格式错）/ `load` / `command` / `save` / `render`。只有 `command` 才有 `id` 与 `kind`——前四个阶段还没轮到某条命令。
+
 - `saved` / `render` 在没给对应终点时**整个键不出现**，而不是 `null`——消费方用「键在不在」判断，比判空更不容易出错。
 - `kind` 是 `CommandError` 的变体名小写：`unknown` / `unavailable` / `bad_params` / `panicked`。MCP 靠它区分「你写错了 id」和「这条命令现在不适用」。
-- `--json` 时 stdout 不混任何非 JSON 文本；日志走 stderr（`env_logger` 默认行为）。
+- `--json` 时 stdout 不混任何非 JSON 文本；日志与失败摘要走 stderr（`env_logger` 默认行为），所以终端里既拿到纯 JSON 又看得见错在哪。
 
 ### 6.3 退出码
 
@@ -174,7 +177,7 @@ error  midi.transpose  midi.transpose is unavailable: there are no notes to edit
 
 | 文件 | 改动 |
 | :--- | :--- |
-| `crates/glitcherz-app/Cargo.toml` | 加 `glitcherz-model`（从 dev 提升）、`glitcherz-command`、`serde_json` |
+| `crates/glitcherz-app/Cargo.toml` | 加 `glitcherz-model`（从 dev 提升）、`glitcherz-command`、`serde_json`；`Cargo.lock` 只多出两条依赖边，**没有新的外部 crate** |
 | `crates/glitcherz-app/src/main.rs` | 只留 `main` + 分派（GUI / `--render` / `--commands` / 批次 / `--list-devices`） |
 | `crates/glitcherz-app/src/args.rs`（新） | 现有 `parse_args` 迁入 + 新 flag；`BatchStep` / `Mode` 枚举；单测 |
 | `crates/glitcherz-app/src/batch.rs`（新） | `load_ops`、`run_batch(&Project, &[BatchStep]) -> Report`、`Report → 人读 / 信封` |
@@ -182,33 +185,35 @@ error  midi.transpose  midi.transpose is unavailable: there are no notes to edit
 | `crates/glitcherz-ui/src/headless.rs` | 拆出 `render_doc_to_wav(&Project, …)`；`render_project_to_wav` 改为载入 + 调用 |
 | `crates/glitcherz-app/tests/batch_cli.rs`（新） | 真起子进程：改音符 → 存盘 → 重新载入核对；失败批次不写文件；`--json` 信封形状；退出码矩阵 |
 | `docs/manual.md` | 新增「命令行：批量命令」小节 + 退出码表；`--render` 失败码说明 |
-| `README.md` / `docs/README.md` | 运行节补一句 `--ops` |
+| `docs/README.md` | 运行节的参数表加 `--commands` / `--ops`，并补一段「命令行改工程」与退出码概述（根 `README.md` 是介绍性文档，不放 CLI 细节） |
 
 **不动**：`glitcherz-command`（一行不改，这是本 spec 的核心约束）、`glitcherz-engine`、`glitcherz-model`、`PROJECT_VERSION`、任何 `realtime/` 代码。
 
 ## 8. 验收
 
-> 全部回填于实施完成时；括号里是对应的测试名。
+> 全部回填于实施完成时；括号里是对应的测试名。共 21 条，19 条对应用例 + 零回归 + 门禁。
 
-- [ ] `--commands` 列出全部 16 条命令，JSON 模式下每项有 `id` / `label` / `params` / `enabled`（`commands_lists_the_registry`）。
-- [ ] `--commands` 的 `enabled` 随 `--open` 变化：空工程下 `midi.transpose` 为 `false` 且带 `disabled_reason`（`commands_gate_on_the_open_project`）。
-- [ ] `--do midi.query` 对已知 clip 输出音符数组，人读与 JSON 两种模式都可用（`query_returns_the_notes`）。
-- [ ] **批次的顺序就是 argv 顺序**：`--do note_add --ops list.json --do transpose` 三步的效果与一次 `--ops` 写死三步等价的最终文档（`argv_order_is_execution_order`）。
-- [ ] `--ops -` 从 stdin 读同一份数组，效果与文件等价（`ops_reads_stdin`）。
-- [ ] `--params` 不是 JSON 对象 → 退出 2；`--params` 前面没有 `--do` → 退出 2（`bad_params_json_exits_two` / `params_needs_a_do`）。
-- [ ] `--ops` 指向不存在的文件 / 内容不是数组 → 退出 2（`bad_ops_file_exits_two`）。
-- [ ] **改完存盘再读回来，改动还在**：`note_add` + `transpose` + `--save`，重新 `load_project` 后音符数量与音高都符合预期（`batch_edits_survive_a_save`）。
-- [ ] **无 `--open` 时从默认工程起**：`--do midi.note_add --save out.glz` 产出可被 `load_project` 读入的合法工程（`batch_can_start_from_a_new_project`）。
-- [ ] **失败批次不写任何文件**：`--do midi.transpose`（空工程，`unavailable`）+ `--save` → 退出 4，目标 `.glz` 不存在（`a_failed_batch_writes_nothing`）。
-- [ ] 未知命令 id → 退出 4、`kind = "unknown"`（`unknown_command_exits_four`）。
-- [ ] **`--wav` 渲染的是编辑后的文档**：先 `note_add` 再 `--wav`，与「先存盘、再 `--render` 那份文件」的 WAV **逐字节一致**；与「不跑命令直接 `--wav`」明显不同（`wav_renders_the_edited_document`）。
-- [ ] `--render` 与 `--ops` 同时出现 → 退出 2，报错提到 `--wav`（`render_and_batch_are_exclusive`）。
-- [ ] `--render` 既有行为不变：同一个工程、同样的 `--rate/--bits/--to` 仍产出与 S0/S3 逐字节一致的 wav（`render_cli.rs` 既有测试保持绿）。
-- [ ] 工程文件版本过新 → 退出 3（`load_failure_exits_three`）。
-- [ ] `--json` 时 stdout 可被 `serde_json` 整体解析，且 `saved` / `render` 键在没给终点时**不存在**（`json_envelope_shape`）。
-- [ ] `--save` 走原子写并留下 `.bak`（第二次保存时出现），写前 `validate` 拦住非法图（`save_keeps_the_atomic_semantics`）。
-- [ ] **零回归**：默认工程 `--render` 与 S4 之前**逐字节一致**（detached worktree 对比，见 §10）。
-- [ ] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。
+- [x] `--commands` 列出全部 16 条命令，JSON 模式下每项有 `id` / `label` / `params` / `enabled`（`commands_lists_the_registry`）。实测 16 条，`midi.query` 的 `params` 为 `{track, clip}`。
+- [x] `--commands` 的 `enabled` 随 `--open` 变化：默认工程下 `midi.change_velocity` 为 `false` 且 `disabled_reason` 是 "there are no notes to edit"；换成带音符的工程后变 `true`、`disabled_reason` 为 `null`（`commands_gate_on_the_open_project`）。**注**：注册表里只有 `midi.change_velocity` 用了 `has_notes` 谓词，其余 15 条都是 `always`——所以这条只能用它验。
+- [x] `--do midi.query` 对已知 clip 输出音符数组，人读与 JSON 两种模式都可用（`query_returns_the_notes`）。
+- [x] **批次的顺序就是 argv 顺序**：`--do note_add --ops list.json --do transpose` 与一次 `--ops` 写死三步，最终 `midi.query` 的返回值完全相同（`argv_order_is_execution_order`）。实测 60 → 72、72 → 84。
+- [x] `--ops -` 从 stdin 读同一份数组，效果与文件等价（`ops_reads_stdin`）。
+- [x] `--params` 不是合法 JSON → 退出 2；是 JSON 但不是对象 → 退出 2；前面没有 `--do` → 退出 2（`bad_params_json_exits_two` / `params_needs_a_do` / `args` 单测）。
+- [x] `--ops` 指向不存在的文件 → 退出 2 且消息带文件名；内容不是数组 → 退出 2 且提示 "must be a JSON array"（`bad_ops_file_exits_two`）。
+- [x] **改完存盘再读回来，改动还在**：`note_add` + `transpose` + `--save`，重新 `load_project` 后 2 个音符、音高 `[72, 79]`（`batch_edits_survive_a_save`）。
+- [x] **无 `--open` 时从默认工程起**：`--save` 产出可被 `load_project` 读入的合法工程（`saving_without_open_writes_a_default_project`）。
+- [x] **新工程的轨道上没有 clip**，所以 `--do midi.note_add` 退出 4、不写文件——这是 §9 记录的已知限制，专门用一条测试钉住（`a_new_project_has_no_clip_to_edit`）。
+- [x] **失败批次不写任何文件**：默认工程上 `--do midi.transpose --save` → 退出 4，目标 `.glz` 不存在（`a_failed_batch_writes_nothing`）。
+- [x] 未知命令 id → 退出 4、`failed.stage = "command"`、`kind = "unknown"`、不写文件（`unknown_command_exits_four`）。
+- [x] **`--wav` 渲染的是编辑后的文档**：`transpose +12 + --save + --wav` 的 wav 与「`--render` 那份存盘文件」**逐字节一致**，与「不跑命令直接 `--wav`」不同（`wav_renders_the_edited_document`）。
+- [x] `--render` 与 `--ops` / `--do` 同时出现 → 退出 2，报错提到 `--wav`（`render_and_batch_are_exclusive`）。
+- [x] `--render` 既有行为不变：`render_cli.rs` 的 `render_subcommand_writes_a_wav_without_a_window` 保持绿。
+- [x] 工程文件版本过新（把 `version: 10` 改成 99）→ 退出 3，消息含 `v99`（`load_failure_exits_three`）。
+- [x] `--json` 时 stdout 可被 `serde_json` 整体解析；`saved` / `render` / `failed` 键在对应情况发生前**不存在**（`json_envelope_shape`）。
+- [x] `--save` 走原子写并留下 `.bak`：连存两次后 `.glz.bak` 存在、`.glz.tmp` 已被 rename 掉（`save_keeps_the_atomic_semantics`）。
+- [x] 非命令阶段失败带 `stage`：`ops` / `load` 都没有 `kind`，`command` 才有（`the_envelope_names_the_stage_for_non_command_failures` + 退出码矩阵单测 `exit_codes_match_the_documented_matrix`）。
+- [x] **零回归**：默认工程 `--render` 与 S4 之前**逐字节一致**（detached worktree 对比，见 §10）。
+- [x] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace`（**1 245 项**）/ `build --workspace` 全绿。
 
 ## 9. 风险与已知取舍
 
@@ -220,8 +225,43 @@ error  midi.transpose  midi.transpose is unavailable: there are no notes to edit
 | JSON 信封是**新**的对外契约，一旦发布就得稳 | 键名取最保守的一套（`ok` / `commands` / `failed` / `kind`），不塞内部字段（`revision` / `journal` / `history`）。`kind` 用 `CommandError` 的变体名，变体改名就是破坏性变更。 |
 | 一次跑几十条命令时没有进度 | 不做。批次的量级是「几十步、毫秒级」，加进度条只会让输出不再是纯净的 JSON。真要长任务，那是有音频渲染的场景，`--wav` 本身会打印帧数。 |
 | 失败即停，不能「跳过坏命令继续」 | 刻意不做。批次的语义是**一次编辑**，跳过坏命令等于带着未知状态继续写文件；需要容错就由调用方拆成多次调用。 |
+| **新工程的轨道上没有 clip**，而 16 条命令全都作用于既有 clip | 所以「从零造一首曲子」仍需要一份模板工程。这是词汇表的问题，不是运输层的问题：`clip.add` 一类命令是下一个自然增量，且它连同 `--open` 缺省值一起才真正解决「从空开始」。暂记为已知限制，用 `a_new_project_has_no_clip_to_edit` 钉住现状。 |
+| `--commands` 的 `enabled` 有 15/16 恒为 `true` | 注册表里只有 `midi.change_velocity` 挂了 `has_notes`。所以 `--commands` 的主要价值是**发现 id 与参数**，不是「预览可用性」；别指望它能告诉你某个编辑在语义上合不合适（那要等命令真正跑起来才知道，错误码 4 + `kind = "bad_params"`）。 |
 | `Session` 的 panic 兜底把 panic 变成错误 | 已经是现状（`catch_unwind` + 回滚），CLI 退出码 `4` + `kind = "panicked"`。**不要**在 CLI 里再套一层 `catch_unwind`。 |
 
 ## 10. 交付与零回归证据
 
-> 实施完成后回填。
+### 10.1 落地
+
+| 文件 | 内容 |
+| :--- | :--- |
+| `crates/glitcherz-app/src/args.rs`（新，396 行） | `StepSource`（`Inline` / `Ops`）、`Mode`（Help / ListDevices / Commands / Render / Batch / Gui）、`Args`；**互斥规则只在 `Args::mode()` 一处判断**，不在各调用点重复。11 项单测覆盖 `--params` 与前置 `--do` 的绑定、`--ops` 的 argv 位置、互斥报错、`--help` 的最高优先级 |
+| `crates/glitcherz-app/src/batch.rs`（新，450 行） | `parse_ops` / `load_ops`（含 `-` 读 stdin）/ `resolve` / `run` / `Report` / `Failure`（带 `stage` 与 `exit_code`）。8 项单测覆盖 ops 文档的合法与非法形状、argv 顺序、失败即停、信封键的「缺席非 null」、退出码矩阵 |
+| `crates/glitcherz-app/src/render_cmd.rs`（新，72 行） | `--bits` 解析与 `RenderArgs → RenderOptions`，`--render` 与 `--wav` 共用 |
+| `crates/glitcherz-app/src/main.rs`（279 行） | 只留 `main` + 六个模式的分派；`batch_command` 的编排（load → resolve → run → save → render）与打印 |
+| `crates/glitcherz-app/tests/batch_cli.rs`（新，614 行） | 18 项真子进程用例，覆盖 §8 除零回归与门禁外的全部条目 |
+| `crates/glitcherz-ui/src/headless.rs` | `render_project_to_wav` 拆成「载入 + `render_doc_to_wav`」，后者吃 `&Project`；前者行为逐字节不变 |
+| `crates/glitcherz-app/Cargo.toml` + `Cargo.lock` | 加 `glitcherz-model` / `glitcherz-command` / `serde_json`；lock 只多两条依赖边 |
+| **未动** | `glitcherz-command`（一行没改，这是本 spec 的核心约束）、`glitcherz-engine`、`glitcherz-model`、`PROJECT_VERSION = 10`、任何 `realtime/` 代码 |
+
+### 10.2 零回归硬证据
+
+用 `8c3ec61`（S4 spec commit，最后一个 pre-S4 代码状态）的 detached worktree + 独立 `CARGO_TARGET_DIR` 编出 pre-S4 二进制，与 post-S4 对同一份含 4 个音符的工程跑 `--render --rate 22050 --bits 16 --to 1920`：
+
+| | pre-S4（`8c3ec61`） | post-S4 |
+| :--- | :--- | :--- |
+| 帧数 | 44 288 | 44 288 |
+| 字节数 | 177 196 | 177 196 |
+| `cmp` | — | **逐字节一致** |
+
+「`--wav` 渲染的是内存文档」这一条另有独立证据：同一份工程 `transpose +12` 后 `--save` + `--wav`，与前一次运行 `--render` 那份存盘文件**逐字节一致**，而与不跑命令的 `--wav` 不同。
+
+### 10.3 门禁
+
+| 项 | 结果 |
+| :--- | :--- |
+| `cargo fmt --all` | 干净 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **0 警告** |
+| `cargo test --workspace` | **1 245 项通过，0 失败**（S3 交付时 1 208，本阶段新增 39：21 单测 + 18 子进程） |
+| `cargo build --workspace` | 通过 |
+

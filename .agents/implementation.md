@@ -1262,3 +1262,25 @@ spec `.agents/spec/wavetable-instrument.md`。前面四个声源的谐波要么�
 **v1 边界**：不做用户表导入（`.wav` / `.wt`、命名、缓存淘汰、文件对话 UI），不做滤波器、不做 unison / detune / FM。用户导入是「文件 + UI」的活，风险不在 DSP，真要做得按 `media` / `sf2_library` 的形状单独写 spec；滤波器接既有效果器即可，塞进引擎会让「表决定音色」这件事变模糊，也会给 `--render` 的频谱验收多一个变量。
 
 **验收**：24 项 `wavetable.rs` 单测（静音、发声、音高与 `PitchOffset` 的 Goertzel、position 0 纯正弦、position 1 方波奇次、扫动频谱单调、混叠防御、低音保留更多谐波、选层随音高单调、跨层响度不变、层边界连续、A·R、blanket、力度线性、零力度、同音复用、偷声部有界、position 平滑、非有限参数、极端参数、可复现、非法采样率、预览跟随 position、表完整）、1 项 model RON 往返与旧 payload 默认、`effect_rt_audit` 的 wavetable 零分配段、1 项离线端到端。实测：默认（正弦帧）RMS 0.2475 / 峰值 0.3500；f0/2f0 = 269 723、f0/3f0 = 2 511 366；方波 3f0/2f0 = 29 551；扫动 4f0 = 0 / 0 / 0.02370（⅓ 处为 0，三角帧只有奇次）；A6 锯齿 8f0/9f0 = 138 264；A1 / A6 RMS 比 1.790；velocity 0.5 / 1.0 = 0.500；层接缝步长 0.478 对稳态 0.457（1.046×）。默认工程渲染与 pre-S3 逐字节一致（44288 帧 / 177196 字节），全量 1208 项通过。
+
+## S4：CLI 批量命令（2026-11-09）
+
+spec `.agents/spec/cli-commands.md`。这一项的特殊之处是**它几乎没有新设计**：写 spec 时读代码才发现 `glitcherz-command` 早就是那条「命令面」——`Session::new(Project)` 不碰 egui，`execute(id, &serde_json::Value)` 自带快照 / 回滚 / panic 兜底 / undo / journal（journal 的 doc 注释原文就是「macros and **agent scripting**」），`CommandInfo` 已经 `Serialize`，`serde_json` 早在 lock 文件里，`load_project` / `save_project` 本就在 `glitcherz-model` 且与 UI 无关。plan 立项时预设的三个问题里，前两个的答案都是「不用设计，已经有了」。剩下要做的只有三件：**一个入口、一个枚举口、一套失败语义**。
+
+**一个入口。** `--open` 给文档，`--ops <file|->` 或可重复的 `--do <id> [--params <json>]` 给命令序列，`--save` / `--wav` 是可选终点。三者拼成一条流水线：载入 → 执行 → 存盘 → 渲染。**argv 顺序就是执行顺序**，实现方式是 `--ops` 在解析期只记路径、执行期才读文件，所以 `--do a --ops list.json --do b` 的次序是 `a, list…, b`——这一点有专门的等价性测试（同一个混排批次与一次写死的 `--ops` 必须得到同一份文档），因为「参数按什么顺序生效」是最容易在重构里悄悄坏掉的东西。
+
+**全或无。** 任一命令失败立即停，`--save` 与 `--wav` 都不写。不需要手工回滚：文件只在全部命令成功之后才写一次，所以「跑一半崩了」不会留下半个文件。这是把 `Session::execute` 对单条命令的承诺（一条命令不能留下半个编辑）提到批次粒度，也是为什么失败批次可以为「跳过坏命令继续」——那等于带着未知状态写文件。
+
+**`--wav` 必须渲染编辑后的内存文档。** 否则「改完渲染」变成「渲染改之前的文件」，整个闭环是假的。为此把 `render_project_to_wav` 拆成「`load_project` + `render_doc_to_wav(&Project, …)`」，前者行为逐字节不变（S0 的零回归与对拍测试都还在）。验收方式很有意思：同一份工程 `transpose +12` 后 `--save` + `--wav`，产出的 wav 必须与「`--render` 那份存盘文件」**逐字节一致**，同时必须与「不跑命令的 `--wav`」不同——两条断言一起才排除了「其实只是碰巧渲染了磁盘上的旧文件」。
+
+**失败语义**是 S4 唯一真正的新东西，因为原来所有失败都是 `ExitCode::FAILURE`（1），机器分不清「参数写错」和「这条命令现在不适用」。现在固定 0（成功）/ 1（引擎或窗口）/ 2（参数或输入文档）/ 3（工程或渲染）/ 4（命令失败），`--json` 信封里的 `failed.stage` 再区分 `ops` / `load` / `command` / `save` / `render`，只有 `command` 带 `id` 与 `kind`（`CommandError` 变体名小写：`unknown` / `unavailable` / `bad_params` / `panicked`）。`--render` 失败的退出码因此从 1 变成 3——这是本阶段唯一一处对外行为变更。
+
+**流的选择**也踩过一次：批次失败是「结果」不是「用法错误」，所以人读模式下错误行进 stdout 的转录、`--json` 模式下信封进 stdout 并把人类可读的那一行另写 stderr；只有参数层错误（退出 2）直接进 stderr。三条测试一开始都按「错误进 stderr」写，全红。
+
+**`--render` 与批次互斥**（同时出现退出 2）而不是按参数个数猜语义：`--render` 一个参数时表示输出、两个参数时表示输入+输出，这种解析迟早咬人。冲突信息直接指路 `--wav`。
+
+**模块切分**：`main.rs` 只剩 `main` + 六个模式的分派（279 行）；解析、批次执行、渲染分别进 `args.rs` / `batch.rs` / `render_cmd.rs`。互斥规则只在 `Args::mode()` 一处判断，不在各调用点重复。
+
+**已知限制（写进 spec §9 并用测试钉住）**：新工程的轨道上**没有 clip**，而 16 条 `midi.*` 全部作用于既有 clip，所以 `--do midi.note_add` 在默认工程上直接退出 4——「从零造一首曲子」仍需要一份模板工程。这是词汇表的问题（缺 `clip.add`），不是运输层的问题，另开一期。
+
+**验收**：21 条（19 条用例 + 零回归 + 门禁）全部回填。39 项新测试（21 单测 + 18 项真子进程用例），全量 **1 245 项通过 / 0 失败**。`fmt` / `clippy --workspace --all-targets -D warnings` / `build --workspace` 全绿。零回归：`8c3ec61` 的 detached worktree 与 post-S4 对同一份工程各出 44 288 帧 / 177 196 字节，`cmp` 逐字节一致。

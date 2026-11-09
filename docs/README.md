@@ -28,6 +28,8 @@ cargo run -p glitcherz-app --release
 | `--list-devices` | 打印所有音频输出设备后退出 |
 | `--seconds N` | N 秒后自动关窗（CI 冒烟用） |
 | `--render <in.glz> <out.wav>` | 不开窗口、不占用音频设备，直接把工程渲染成 wav |
+| `--commands` | 列出命令行能跑的编辑命令（`--json` 附带菜单 / 快捷键 / 不可用原因） |
+| `--ops <file\|->` / `--do <id>` | 对一份工程按顺序跑一批编辑命令，可配 `--save` / `--wav` |
 
 命令行渲染（批量 / CI / 脚本）：
 
@@ -37,6 +39,16 @@ glitcherz --render song.glz song.wav --rate 44100 --bits 24 --to 7680
 
 `--rate`（默认 44100）、`--bits`（`16` / `24` / `32f`，默认 24）、`--to`（截止 tick，默认整曲）都是可选的。
 它和窗口里的 `File ▸ Export Audio…` 走同一套离线装配，只输出一个混音文件（不做 stems / song loop）。
+
+命令行改工程（脚本 / agent）：
+
+```bash
+glitcherz --open song.glz --ops steps.json --save out.glz --wav out.wav
+```
+
+命令来自窗口菜单用的同一张注册表，批次是**全或无**的（任一命令失败就不写文件），
+`--wav` 渲染的是刚改完的内存文档。详见 [`manual.md`](manual.md#命令行批量命令)。
+所有模式共用一套退出码（0 成功 / 1 引擎 / 2 参数 / 3 工程或渲染 / 4 命令失败）。
 
 ## 五分钟做出第一段音乐
 

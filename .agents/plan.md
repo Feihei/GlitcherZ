@@ -642,7 +642,7 @@ scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 sympho
 | **S1** | Pluck（Karplus-Strong 拨弦） | ✅ 2026-11-08 交付 |
 | **S2** | Organ（drawbar 加法 + 打击泛音） | ✅ 2026-11-09 交付 |
 | **S3** | Wavetable（表管理 / 抗混叠 / 位置调制，**先写独立 spec**） | ✅ 2026-11-09 交付 |
-| **S4** | CLI 命令面扩展（open / save / 少量批量操作） | 待办 |
+| **S4** | CLI 命令面扩展（open / save / 少量批量操作） | ✅ 2026-11-09 交付 |
 | **S5** | MCP（前置：把 headless 层提升为独立 `glitcherz-session` crate + 命令面 + 安全边界） | 待办 |
 
 > **2026-11-08 顺序修订**：本表编号**保持不变**（S0 决策与实施记录都按此编号引用），但 S1 及以后整体顺延到新立的 Z / B 系列之后。当前唯一有效的执行顺序见下文「Z / B 系列」一节的《执行顺序》表。S4 / S5 不取消，只是排队靠后。
@@ -754,7 +754,7 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | 3 | **B1** Modal 声源 ✅ | 已交付。与图架构完全解耦，与 Z0/Z1 无交叉；声源只改 `headless::spawn_instrument` 一处，长尾 / 拍频 / 频谱峰全部由 S0 的 `--render` 自动验收。 |
 | 4 | **Z2** Vocoder ✅ | 已交付。最贵的一项，失败模式本可能暴露 Z0 的设计缺口（两路 PDC / 缓冲形状）；Z1 已把 Z0 验证过，实际零返工。 |
 | 5 | **S1** Pluck ✅ → **S2** Organ ✅ → **S3** Wavetable ✅ | S1 已交付（2026-11-08）、S2 已交付（2026-11-09）、S3 已交付（2026-11-09）。Y 系列三个乐器到 S3 全部完成；Wavetable 按原约定先写独立 spec 再实现。 |
-| 6 | **S4** CLI 命令面 → **S5** MCP | 不取消。新功能把它们往后推，但 S0 的判别（没有 render 的 MCP 是盲操作）不变。 |
+| 6 | **S4** CLI 命令面 ✅ → **S5** MCP | S4 已交付（2026-11-09）：命令面 = 既有 `glitcherz-command` 注册表，CLI 只做运输层。S5 的前置只剩「把 headless 层提升为独立 session crate + 安全边界」——命令面与失败语义这两块已经就位。 |
 
 **备选（听感优先，未采用）**：B1 → Z0 → Z1 → Z2 → S1…。两条链互不依赖，本可无损切换；用户 2026-11-08 选架构优先，**按上表执行**。
 
@@ -856,9 +856,27 @@ sidechain off 的侧链压缩器与普通压缩器逐样本一致（Z1-D2 本就
 | Q2 诵钵激励 | **只做单次敲击（strike）**，不做 bow/rub 持续摩擦 → voice 生命周期与 note-off 按一次性激励设计 |
 | Q3 Vocoder | **固定 16 带 + 外部 carrier**，v1 无 formant shift / freeze / 自定义带数 |
 
-下一步：**S4 CLI 命令面扩展**（执行顺序第 6 项），让 `glitcherz` 在无窗口状态下能做 open / save / 少量批量操作，把它变成 MCP（S5）真正可用的前置。
+### S4 实施记录（✅ 2026-11-09 已交付，Y 系列运输层）
 
-S4 的价值不在「多几个子命令」，而在于 S0 的判别：没有命令面的 render 只是「把工程转成 wav」，有命令面之后 MCP 才能**改**工程而不是只能**读**。spec 阶段要先回答三个问题：① 命令面边界（只 open/save/query，还是也包含改参数 / 加节点——后者会引入撤销栈与事务语义）；② 与 `load_project` / `save_project` 的关系（复用 UI 层函数，还是抽到 `headless`）；③ 失败语义（CLI 出错只打印，还是要机器可读的退出码 / 结构化输出，后者是 MCP 需要的）。
+| 项 | 结果 |
+| :--- | :--- |
+| 落地 | `glitcherz-app` 拆成 `args.rs`（396 行，11 项单测）/ `batch.rs`（450 行，8 项单测）/ `render_cmd.rs`（72 行，2 项单测）/ `main.rs`（279 行，只留分派）+ `tests/batch_cli.rs`（614 行，18 项真子进程用例）。三个新模式：`--commands` 枚举注册表；`--ops <file\|->` / 重复 `--do <id> [--params]` 按 argv 顺序执行；`--save` / `--wav` 是可选终点。`glitcherz-ui::headless` 拆出 `render_doc_to_wav(&Project, …)`，`--wav` 因此渲染**编辑后的内存文档**。 |
+| 关键发现 | **命令面早就存在**：`Session::new(Project)` 不碰 egui，`execute(id, &serde_json::Value)` 自带快照 / 回滚 / panic 兜底 / undo / journal（journal 的 doc 注释原文就是「macros and agent scripting」），`CommandInfo` 已 `Serialize`，`serde_json` 早在 lock 里，`load_project` / `save_project` 本就在 `glitcherz-model` 且与 UI 无关。plan 立项时预设的三个问题里，前两个的答案都是「不用设计，已经有了」。 |
+| 标识 | `PROJECT_VERSION = 10` **未动**；`glitcherz-command` **一行未改**（本阶段的核心约束）；无新 crate、无新外部 crate（`Cargo.lock` 只多两条依赖边）。**唯一对外行为变更**：`--render` 失败的退出码 1 → 3。 |
+| 语义关键点 | ① **批次全或无**：任一命令失败即停，`--save` / `--wav` 都不写——文件只在最后写一次，天然原子，不需要手工回滚；② `--ops` 在 argv 里的位置就是执行位置（解析期只记路径，执行期才读）；③ `--render` 与批次**互斥**而不是按参数个数猜语义；④ 退出码 0/1/2/3/4 里「参数错」与「命令不接受这个编辑」分开，是 MCP 唯一真正需要的新东西；⑤ `failed.stage` 区分 `ops` / `load` / `command` / `save` / `render`，只有 `command` 带 `id` 与 `kind`。 |
+| 验收 | 21 条（19 条用例 + 零回归 + 门禁），全部回填。39 项新测试（21 单测 + 18 子进程），全量 **1 245 项通过 / 0 失败**。`fmt` / `clippy --workspace --all-targets -D warnings` / `build --workspace` 全绿。 |
+| **零回归硬证据** | 用 `8c3ec61`（S4 spec commit，最后一个 pre-S4 代码状态）的 detached worktree + 独立 `CARGO_TARGET_DIR` 编出 pre-S4 二进制，与 post-S4 对同一份 4 音符工程跑 `--render --rate 22050 --bits 16 --to 1920`：各 **44 288 帧 / 177 196 字节，`cmp` 逐字节一致**。另有一条独立证据：`transpose +12 --save --wav` 的 wav 与 `--render` 那份存盘文件逐字节一致、与不跑命令的 `--wav` 不同。 |
+| 实施期踩坑 | ① **新工程的轨道上没有 clip**，而 16 条 `midi.*` 全都作用于既有 clip → `--do midi.note_add` 在默认工程上直接退出 4；「从零造曲子」仍需模板工程，这条写进 spec §9 并用测试钉住；② `--commands` 的 `enabled` 只有 `midi.change_velocity` 会变（其余 15 条是 `always`），验收不能用 `midi.transpose` 验；③ 人读模式的错误行原设计会重复打印命令名（`CommandError` 的 `Display` 已含 id），改成单列；④ `RenderInfo` 别 derive `Copy`（有 `String`）；`&OsStr` 与 `"-"` 不能直接 match，要先转成 bool；⑤ 测试断言得对齐**流**：批次失败是「结果」进 stdout，只有参数层错误进 stderr。 |
+| 文档同步 | `cli-commands.md`（新 spec，§8 21 条与 §10 证据已回填）、`implementation.md` S4 小节、`docs/manual.md`（命令行批量命令小节 + 退出码表 + `--render` 失败码变更）、`README.md` / `docs/README.md` 运行节、`AGENTS.md` 索引。 |
+
+下一步：**S5 MCP**（执行顺序第 6 项的后半）。S4 交付之后，它缺的东西比立项时少了整整一半：
+
+- ✅ 命令面：注册表可枚举（`--commands --json`）、可批量驱动（`--ops`）、有事务语义（`Session`）。
+- ✅ 失败语义：固定退出码 + `--json` 信封，`kind` 区分「写错 id」与「这条命令现在不适用」。
+- ✅ 闭环：改完能立刻 `--wav` 听到结果，渲染的是内存文档而不是磁盘上的旧文件。
+- ❌ **session 层仍是 `glitcherz-ui::headless`**：MCP 要的是独立进程，得按 S0-D1 的承诺把它提升为 `glitcherz-session` crate（顺带把 `ExportJob` 的 pump 循环也搬过去）。
+- ❌ **安全边界**：写文件（`--save` 的 `.bak` 堆积）、加载插件（CLAP / VST3 会执行第三方代码）、以及「只许在某个工作目录里读写」的约束，全都还没定。
+- ❌ **词汇表仍只有 `midi.*`**：改音色参数需要稳定字符串名（`NodeParam` 现在只有 UI 显示名），`clip.add` 缺了会让「从空工程开始」写不成。这两项要么进 S5 的 spec，要么单独排一期——**别在 MCP 的 spec 里顺手做**，那会把一个「协议 + 安全」的 spec 撑成「协议 + 安全 + 参数命名 + clip 命令」。
 
 顺带记一笔：S3 把「表管理」这条线开了一个口子但只做了一半——**用户表导入**（`.wav` / `.wt` 文件、命名、缓存淘汰、文件对话 UI）按 spec §2 刻意留给后续阶段，风险全在文件与 UI，不在 DSP；真要做得先按 `media` / `sf2_library` 的形状写一份 spec，别直接往 `wavetable.rs` 里加。
 
