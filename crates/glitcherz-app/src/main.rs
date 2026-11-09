@@ -6,13 +6,16 @@
 //! The engine starts silent. `--autoplay` deliberately holds one note so a
 //! smoke run can prove the audio path end to end without touching the UI.
 //!
-//! Three headless modes share this binary (S0 + S4, spec `cli-commands.md`):
-//! `--render` bounces a project to a wav, `--ops` / `--do` run a batch of
-//! registry commands against a project, and `--commands` enumerates that
-//! registry. None of them create a window or an audio device.
+//! Four headless modes share this binary (S0 + S4 + S5, specs
+//! `cli-commands.md` and `mcp-server.md`): `--render` bounces a project to a
+//! wav, `--ops` / `--do` run a batch of registry commands against a project,
+//! `--commands` enumerates that registry, and `--mcp` serves the same command
+//! surface to an MCP client over stdio. None of them create a window or an
+//! audio device.
 
 mod args;
 mod batch;
+mod mcp;
 mod render_cmd;
 
 use std::process::ExitCode;
@@ -53,6 +56,7 @@ fn main() -> ExitCode {
         Ok(Mode::Commands) => commands_command(&args),
         Ok(Mode::Render { input, output }) => render_command(&args, &input, &output),
         Ok(Mode::Batch) => batch_command(&args),
+        Ok(Mode::Mcp) => mcp_command(&args),
         Ok(Mode::Gui) => gui(&args),
     }
 }
@@ -246,6 +250,16 @@ fn finish_batch(args: &Args, report: &batch::Report) -> ExitCode {
     }
 }
 
+/// Serves the MCP protocol on stdio (S5).
+fn mcp_command(args: &Args) -> ExitCode {
+    let root = args
+        .root
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    ExitCode::from(mcp::run(&root, args.allow_plugins, args.open.as_deref()))
+}
+
 fn failure_message(failure: &batch::Failure) -> String {
     match failure {
         batch::Failure::Step { id, error } => format!("{id}: {error}"),
@@ -264,7 +278,8 @@ fn print_usage() {
          glitcherz [--open <project>] [--autoplay [--note <0-127>]] [--gain <0.0-1.0>] [--seconds <secs>] [--list-devices]\n  \
          glitcherz --render <in.glz> <out.wav> [--rate <hz>] [--bits 16|24|32f] [--to <ticks>]\n  \
          glitcherz [--open <in.glz>] (--ops <file|-> | --do <id> [--params <json>])... [--save <out.glz>] [--wav <out.wav>] [--json]\n  \
-         glitcherz --commands [--open <in.glz>] [--json]\n\
+         glitcherz --commands [--open <in.glz>] [--json]\n  \
+         glitcherz --mcp [--root <dir>] [--open <in.glz>] [--allow-plugins]\n\
          Defaults: opens the main window and stays silent.\n\
          Play with the on-screen keyboard or the computer keyboard (A W S E D ..., Z/X to shift octaves); close the window to quit.\n\
          --autoplay holds one note from startup (diagnostic: proves the audio path);\n\
@@ -274,6 +289,9 @@ fn print_usage() {
          without --open the batch starts from a new project; --save / --wav write the result, and a batch\n\
          that fails writes nothing.\n\
          --commands lists the registry (--json adds menu, shortcut and disabled reasons).\n\
+         --mcp serves that same command surface as MCP tools over stdio: one JSON-RPC object per\n\
+         line, nothing but protocol on stdout, every client-supplied path confined to --root\n\
+         (default: the current directory), and plugin binaries not loaded unless --allow-plugins.\n\
          Exit codes: 0 ok, 1 engine or window failure, 2 bad arguments, 3 project or render failure, 4 command failed."
     );
 }

@@ -24,7 +24,13 @@ impl GlitcherZApp {
         };
         let project = self.project().clone();
         let mut media = headless::AppMedia(&mut *self);
-        let graph = headless::assemble_offline(&project, format.sample_rate, window, &mut media);
+        let graph = headless::assemble_offline(
+            &project,
+            format.sample_rate,
+            window,
+            &mut media,
+            headless::SpawnPolicy::Offline,
+        );
         match export_audio::ExportJob::new(
             graph.engine,
             graph.guards,

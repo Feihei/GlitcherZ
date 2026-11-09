@@ -296,7 +296,13 @@ impl GlitcherZApp {
             _ => None,
         };
         let mut media = headless::AppMedia(&mut *self);
-        let spawned = headless::spawn_node(node, sample_rate, &mut media, true, input);
+        let spawned = headless::spawn_node(
+            node,
+            sample_rate,
+            &mut media,
+            headless::SpawnPolicy::Live,
+            input,
+        );
         let headless::Spawned {
             processor,
             guard,

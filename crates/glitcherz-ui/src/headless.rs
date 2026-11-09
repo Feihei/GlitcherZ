@@ -194,9 +194,42 @@ fn silent() -> Box<dyn Processor> {
     Box::new(SilentProcessor::new())
 }
 
-/// Builds one document node's processor. `live` only controls the *extra*
+/// What a node builder is allowed to do beyond producing DSP (S5, spec
+/// `mcp-server.md` S5-D10).
+///
+/// The sounding graph is identical in every mode; the policy only decides how
+/// much bookkeeping to collect and whether third-party plugin binaries may be
+/// loaded into this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnPolicy {
+    /// The GUI's live graph: full bookkeeping (meters, parameter caches,
+    /// factory defaults) and plugin instantiation.
+    Live,
+    /// Offline render (CLI `--render`, the GUI's Export Audio): no
+    /// bookkeeping, plugins allowed.
+    Offline,
+    /// MCP without `--allow-plugins`: no bookkeeping, and a plugin voice is
+    /// never `dlopen`ed. Instruments render silence; effects fall back to the
+    /// built-in effect, which is what a failed instantiation already does.
+    OfflineNoPlugins,
+}
+
+impl SpawnPolicy {
+    /// Whether to build the GUI-only bookkeeping.
+    pub fn live(self) -> bool {
+        matches!(self, SpawnPolicy::Live)
+    }
+
+    /// Whether a CLAP / VST3 binary may be loaded.
+    pub fn plugins(self) -> bool {
+        !matches!(self, SpawnPolicy::OfflineNoPlugins)
+    }
+}
+
+/// Builds one document node's processor. `policy` controls the *extra*
 /// bookkeeping the GUI needs (parameter caches, factory-default snapshots,
-/// meters) — the sounding DSP is identical in both modes.
+/// meters) and whether plugins may be loaded — the sounding DSP is otherwise
+/// identical in every mode.
 ///
 /// `input` is the live `InputProcessor` built from the engine's capture ring;
 /// offline rendering passes `None` and the node is silent.
@@ -204,7 +237,7 @@ pub(crate) fn spawn_node<M: Media>(
     node: &NodeDoc,
     sample_rate: u32,
     media: &mut M,
-    live: bool,
+    policy: SpawnPolicy,
     input: Option<InputProcessor>,
 ) -> Spawned {
     if node.is_keyboard() {
@@ -218,10 +251,10 @@ pub(crate) fn spawn_node<M: Media>(
     let mut info = SpawnInfo::default();
     let (processor, guard): (Box<dyn Processor>, Option<PluginGuard>) = match node {
         NodeDoc::Instrument { voice, synth, .. } => {
-            spawn_instrument(voice, synth, sample_rate, sr, media, live, &mut info)
+            spawn_instrument(voice, synth, sample_rate, sr, media, policy, &mut info)
         }
         NodeDoc::Effect { voice, params, .. } => {
-            spawn_effect(voice, params, sample_rate, sr, media, live, &mut info)
+            spawn_effect(voice, params, sample_rate, sr, media, policy, &mut info)
         }
         NodeDoc::Mixer {
             channels,
@@ -318,7 +351,7 @@ fn spawn_instrument<M: Media>(
     sample_rate: u32,
     sr: f32,
     media: &mut M,
-    live: bool,
+    policy: SpawnPolicy,
     info: &mut SpawnInfo,
 ) -> (Box<dyn Processor>, Option<PluginGuard>) {
     match voice {
@@ -327,7 +360,7 @@ fn spawn_instrument<M: Media>(
             // The live graph replays every parameter through
             // `push_node_params` right after installation (smoothed); the
             // offline graph has no such pass, so it seeds them here.
-            if !live {
+            if !policy.live() {
                 for (id, value) in synth_param_values(synth) {
                     processor.set_param(id, value);
                 }
@@ -358,7 +391,7 @@ fn spawn_instrument<M: Media>(
                             },
                         );
                         processor.set_param(ParamId::SampleGain, *gain);
-                        if !live {
+                        if !policy.live() {
                             processor.set_param(ParamId::SampleStart, region.start as f32);
                             processor.set_param(ParamId::SampleLoopStart, region.loop_start as f32);
                             processor.set_param(ParamId::SampleLoopEnd, region.loop_end as f32);
@@ -389,7 +422,7 @@ fn spawn_instrument<M: Media>(
             // Same split as the built-in synth: the live graph replays the
             // parameters through `push_node_params`, the offline graph has no
             // such pass and seeds them here.
-            if !live {
+            if !policy.live() {
                 for (id, value) in crate::modal_param_values(params) {
                     processor.set_param(id, value);
                 }
@@ -400,7 +433,7 @@ fn spawn_instrument<M: Media>(
             let mut processor = PluckProcessor::new(sr);
             // Same split as the modal instrument: the live graph replays
             // through `push_node_params`, the offline graph seeds here.
-            if !live {
+            if !policy.live() {
                 for (id, value) in crate::pluck_param_values(params) {
                     processor.set_param(id, value);
                 }
@@ -410,7 +443,7 @@ fn spawn_instrument<M: Media>(
         VoiceSpec::Organ { params } => {
             let mut processor = OrganProcessor::new(sr);
             // Same split as the other built-in engines.
-            if !live {
+            if !policy.live() {
                 for (id, value) in crate::organ_param_values(params) {
                     processor.set_param(id, value);
                 }
@@ -420,7 +453,7 @@ fn spawn_instrument<M: Media>(
         VoiceSpec::Wavetable { params } => {
             let mut processor = WavetableProcessor::new(sr);
             // Same split as the other built-in engines.
-            if !live {
+            if !policy.live() {
                 for (id, value) in crate::wavetable_param_values(params) {
                     processor.set_param(id, value);
                 }
@@ -452,6 +485,13 @@ fn spawn_instrument<M: Media>(
                 }
             }
         }
+        // S5-D10: a plugin binary is third-party code executed in this
+        // process. MCP can refuse to load it; an instrument has no dry path,
+        // so it renders silence and the caller reports the node.
+        VoiceSpec::Clap { plugin_id, .. } if !policy.plugins() => {
+            log::warn!("CLAP instrument `{plugin_id}` is disabled here; rendering silence");
+            (silent(), None)
+        }
         VoiceSpec::Clap {
             path,
             plugin_id,
@@ -465,7 +505,7 @@ fn spawn_instrument<M: Media>(
             },
         ) {
             Ok(mut instance) => {
-                if live {
+                if policy.live() {
                     if let Ok(blob) = instance.guard.save_state() {
                         info.default_state = Some(blob);
                     }
@@ -475,7 +515,7 @@ fn spawn_instrument<M: Media>(
                 {
                     log::warn!("Failed to restore CLAP state for {plugin_id}: {err}");
                 }
-                if live {
+                if policy.live() {
                     let params = instance.list_params();
                     let values = instance.read_param_values();
                     info.clap = Some((params, values));
@@ -489,6 +529,10 @@ fn spawn_instrument<M: Media>(
                 (Box::new(SynthProcessor::new(sr)), None)
             }
         },
+        VoiceSpec::Vst3 { class_id, .. } if !policy.plugins() => {
+            log::warn!("VST3 instrument `{class_id}` is disabled here; rendering silence");
+            (silent(), None)
+        }
         VoiceSpec::Vst3 {
             path,
             class_id,
@@ -503,7 +547,7 @@ fn spawn_instrument<M: Media>(
             },
         ) {
             Ok(instance) => {
-                if live {
+                if policy.live() {
                     if let Ok(blob) = instance.guard.save_state() {
                         info.default_state = Some(blob);
                     }
@@ -513,7 +557,7 @@ fn spawn_instrument<M: Media>(
                 {
                     log::warn!("Failed to restore VST3 state for {class_id}: {err}");
                 }
-                if live {
+                if policy.live() {
                     info.vst3 = Some((
                         instance.guard.parameters(),
                         instance.guard.read_param_values(),
@@ -537,7 +581,7 @@ fn spawn_effect<M: Media>(
     sample_rate: u32,
     sr: f32,
     _media: &mut M,
-    live: bool,
+    policy: SpawnPolicy,
     info: &mut SpawnInfo,
 ) -> (Box<dyn Processor>, Option<PluginGuard>) {
     match voice {
@@ -552,10 +596,17 @@ fn spawn_effect<M: Media>(
         | VoiceSpec::Organ { .. }
         | VoiceSpec::Wavetable { .. } => {
             let built = crate::effect::processor(params, sr);
-            if live {
+            if policy.live() {
                 info.meter = built.meters;
             }
             (built.processor, None)
+        }
+        // Same rule as instruments, but an effect already has a dry path: a
+        // failed instantiation falls through to the built-in effect, and a
+        // refused one does exactly the same thing.
+        VoiceSpec::Clap { plugin_id, .. } if !policy.plugins() => {
+            log::warn!("CLAP effect `{plugin_id}` is disabled here; using the built-in effect");
+            (crate::effect::processor(params, sr).processor, None)
         }
         VoiceSpec::Clap {
             path,
@@ -575,7 +626,7 @@ fn spawn_effect<M: Media>(
                 {
                     log::warn!("Failed to restore CLAP effect state for {plugin_id}: {err}");
                 }
-                if live {
+                if policy.live() {
                     info.clap = Some((instance.list_params(), instance.read_param_values()));
                     info.label = plugin_id.clone();
                 }
@@ -587,6 +638,10 @@ fn spawn_effect<M: Media>(
                 (crate::effect::processor(params, sr).processor, None)
             }
         },
+        VoiceSpec::Vst3 { class_id, .. } if !policy.plugins() => {
+            log::warn!("VST3 effect `{class_id}` is disabled here; using the built-in effect");
+            (crate::effect::processor(params, sr).processor, None)
+        }
         VoiceSpec::Vst3 {
             path,
             class_id,
@@ -606,7 +661,7 @@ fn spawn_effect<M: Media>(
                 {
                     log::warn!("Failed to restore VST3 effect state for {class_id}: {err}");
                 }
-                if live {
+                if policy.live() {
                     info.vst3 = Some((
                         instance.guard.parameters(),
                         instance.guard.read_param_values(),
@@ -735,6 +790,7 @@ pub(crate) fn assemble_offline<M: Media>(
     sample_rate: u32,
     window: (f64, f64),
     media: &mut M,
+    policy: SpawnPolicy,
 ) -> OfflineGraph {
     let mut engine =
         AudioEngine::start_offline(sample_rate).expect("the offline engine needs no audio device");
@@ -745,7 +801,7 @@ pub(crate) fn assemble_offline<M: Media>(
         if node.is_keyboard() {
             continue;
         }
-        let spawned = spawn_node(node, sample_rate, media, false, None);
+        let spawned = spawn_node(node, sample_rate, media, policy, None);
         let kind = match node {
             NodeDoc::Mixer { .. } => NodeKind::Mixer,
             NodeDoc::Feedback { .. } => NodeKind::Feedback,
@@ -963,6 +1019,20 @@ pub fn render_doc_to_wav(
     output: &Path,
     options: RenderOptions,
 ) -> Result<RenderReport, String> {
+    render_doc_to_wav_with(project, output, options, SpawnPolicy::Offline)
+}
+
+/// [`render_doc_to_wav`] with an explicit [`SpawnPolicy`] (S5).
+///
+/// The MCP server renders with [`SpawnPolicy::OfflineNoPlugins`] unless the
+/// caller passed `--allow-plugins`; every other path keeps the default and is
+/// byte-identical to before this function existed.
+pub fn render_doc_to_wav_with(
+    project: &Project,
+    output: &Path,
+    options: RenderOptions,
+    policy: SpawnPolicy,
+) -> Result<RenderReport, String> {
     if options.sample_rate == 0 {
         return Err("--rate must be greater than zero".to_string());
     }
@@ -983,7 +1053,7 @@ pub fn render_doc_to_wav(
         bits: options.bits,
     };
     let mut media = FreshMedia::new(project.base_dir.clone());
-    let graph = assemble_offline(project, options.sample_rate, window, &mut media);
+    let graph = assemble_offline(project, options.sample_rate, window, &mut media, policy);
     let passes = vec![export_audio::ExportPass::mix(output.to_path_buf())];
     let mut job = export_audio::ExportJob::new(
         graph.engine,
@@ -1624,7 +1694,13 @@ mod tests {
             bits: options.bits,
         };
         let mut media = FreshMedia::new(loaded.base_dir.clone());
-        let graph = assemble_offline(&loaded, options.sample_rate, window, &mut media);
+        let graph = assemble_offline(
+            &loaded,
+            options.sample_rate,
+            window,
+            &mut media,
+            SpawnPolicy::Offline,
+        );
         let mut job = export_audio::ExportJob::new(
             graph.engine,
             graph.guards,

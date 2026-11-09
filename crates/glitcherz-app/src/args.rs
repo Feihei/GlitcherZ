@@ -33,6 +33,8 @@ pub enum Mode {
     },
     /// `--ops` / `--do` / `--save` / `--wav`: load, run, maybe write.
     Batch,
+    /// `--mcp`: serve the MCP protocol on stdio (S5).
+    Mcp,
     /// No mode flag: open the main window.
     Gui,
 }
@@ -62,6 +64,12 @@ pub struct Args {
     pub wav: Option<PathBuf>,
     pub commands: bool,
     pub json: bool,
+    /// Serve MCP on stdio (S5).
+    pub mcp: bool,
+    /// Sandbox root for MCP path arguments (default: the current directory).
+    pub root: Option<PathBuf>,
+    /// Let the MCP server load CLAP / VST3 binaries (off by default).
+    pub allow_plugins: bool,
     /// Argument parsing error (reported before anything starts).
     pub error: Option<String>,
 }
@@ -78,6 +86,23 @@ impl Args {
             return Ok(Mode::ListDevices);
         }
         let batch = self.has_batch();
+        if self.mcp {
+            if self.render.is_some() {
+                return Err("--mcp cannot be combined with --render".to_string());
+            }
+            if self.commands || batch {
+                return Err(
+                    "--mcp cannot be combined with --commands / --ops / --do / --save / --wav"
+                        .to_string(),
+                );
+            }
+            return Ok(Mode::Mcp);
+        }
+        // Silently ignoring these would leave an operator believing the
+        // sandbox or the plugin policy is in force when it is not.
+        if self.root.is_some() || self.allow_plugins {
+            return Err("--root and --allow-plugins only apply to --mcp".to_string());
+        }
         if self.commands {
             if self.render.is_some() {
                 return Err("--commands cannot be combined with --render".to_string());
@@ -132,6 +157,9 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Args {
         wav: None,
         commands: false,
         json: false,
+        mcp: false,
+        root: None,
+        allow_plugins: false,
         error: None,
     };
     let mut it = raw;
@@ -228,6 +256,12 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Args {
                 None => fail(&mut args, "--wav needs <out.wav>"),
             },
             "--commands" => args.commands = true,
+            "--mcp" => args.mcp = true,
+            "--root" => match it.next() {
+                Some(path) => args.root = Some(PathBuf::from(path)),
+                None => fail(&mut args, "--root needs a directory"),
+            },
+            "--allow-plugins" => args.allow_plugins = true,
             "--json" => args.json = true,
             "--help" | "-h" => args.help = true,
             other => eprintln!("Ignoring unknown argument: {other} (see --help for usage)"),
