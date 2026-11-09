@@ -1,7 +1,7 @@
 ---
 title: "模块节点图架构"
 summary: "GlitcherZ 引擎演进：可自由布线的处理图 + 时间轴信号源（Cardinal/PureData 式布线，乐队现场隐喻）"
-status: 已评审定稿（2026-10-07 拷问式 Q&A 两轮）；v2 修订（2026-10-09 D14–D21 单输入 + Mixer 语义）评审通过
+status: 已评审定稿（2026-10-07 拷问式 Q&A 两轮）；v2 修订（2026-10-09 D14–D21 单输入 + Mixer 语义）评审通过；v3 修订（2026-11-09 D27 信号类型视觉编码）
 related: [../plan.md, ../architecture.md]
 ---
 
@@ -226,3 +226,49 @@ pub struct CableDoc {
 **验证**：`pdc_aligns_a_fast_branch_to_a_latency_node`（两路脉冲汇合对齐）、`graph_without_latency_keeps_the_fast_path`（默认图零 PDC 开销）、`pdc_clamps_to_the_history_ring`；CLAP/VST3 宿主各有一项 `node_reports_the_plugins_latency`（fixture 无延迟扩展时回落 0）。
 
 **仍待做**：录音 PDC 自动对齐（R5 目前用手动 `Latency` offset）、插件动态延迟更新、外部输入/输出的整体 round-trip 对齐。
+
+## 12. D27 — 信号类型视觉编码（2026-11-09）
+
+**背景**：画布自 P5d 起用 `cable_color(CableKind)` 给**线**分色（Audio 灰 / Midi 绿 / Automation 黄），但 `node_color` 另有一套高饱和**节点家族**色，且 `show` 里所有输入口一律 `from_gray(90)`。结果是同一个色相同时表达「信号类型」与「节点家族」，mixer 节点绿 `(110,190,120)` 与 MIDI 线绿 `(90,200,110)` 几乎同色；Audio 的灰又与暗灰输入口混成「深浅灰猜进出」。本章把四个视觉维度各自绑定到唯一语义。
+
+### 决策
+
+| # | 决策 | 理由 |
+| :--- | :--- | :--- |
+| D27-1 | **颜色 = 类型契约**（能不能插），只用在端口与线上 | 节点图类型色的通用纪律（Blender socket / Unreal pin）；同一条规则同时驱动 `accepts()` 与渲染，不留两套口径 |
+| D27-2 | 三类型配色：Audio `#54B2C4` 冷青、Midi `#5AC86E` 绿（不变）、Automation `#E6BE46` 黄（不变） | Audio 从「无颜色 = 亮灰」升为真类型；冷青在红绿色觉缺陷下仍与绿/黄可分，且不与节点家族的暖色调撞色。MIDI / Automation 保持现状，既有心智模型与 MIDI FX 节点绿、curve 轨暖黄的一致性不动 |
+| D27-3 | **只有 Automation 线画虚线**，Audio / MIDI 保持实线 | 色觉缺陷（男性约 8%）下绿 ↔ 黄几乎同色，只需拆开这一对；三类各配一种线形是纯噪声。**否决 MIDI 双线**：多股线在音频软件里被读成双通道/立体声，而 MIDI 是单路事件流；且线交叉处由 2 条变 4 条、缩放时线距难处理 |
+| D27-4 | **线宽不参与类型编码** | 已被交互状态占用：选中 3.5 / 正常 2.0 / dormant 1.2。选中时颜色转白也是瞬时态，不改变 dash |
+| D27-5 | **输入口用类型色画空心环，输出口实心圆盘，同类型同色**；位置（左进右出）仍是方向的主编码 | 明度不再兼职区分进出；「实心 / 空心」是形状冗余，不占色相。空心环内部填该实体的 `node_color().1` 底色，看起来像在盒子上挖了个洞 |
+| D27-6 | **节点描边统一降饱和到 ~30%**，保留原色相（如乐器 `#5AA0DC → #5B7C9C`、效果器 `#DC9646 → #9A7C5C`、mixer `#6EBE78 → #6E8C78`）；Master / Timeline / TimelineIn 保留略高亮度作固定身份锚点。**否决全灰** | 缩放时文字先隐藏，全灰会让节点退化成一堆相同的盒子，丢失远距离导航；降彩度则把「高饱和 = 线/端口、低饱和 = 盒子」变成稳定层级。`node_color` 是单点函数，只改 stroke 常量，fill 与布局零改动 |
+| D27-7 | **pitch / tempo / CC 不拆颜色、不拆线形、不加端口形状** | 文档层它们都是 `CableKind::Automation` 上按块采样的标量 f32（`AutoParam::{Tempo, Cc, PitchBend, Node(PitchOffset), ...}`），差异是**量程/单位/终点动作**，不是数据类型；引擎侧的四条分发路径由 `auto_param_label_at` 的中点文字标签表达，再做一次视觉编码是第三次重复。Tempo 的自指（曲线按 tick 位置写 BPM，tick 速率又由该 BPM 决定）是**逐块因果的不动点**，不是需要 Feedback 语义的数据环（`tempo-meter.md` D3 的 base + override 保证时钟恒有确定值），无需特殊标记 |
+| D27-8 | **不为假想类型预留颜色** | `CableKind` 是持久化枚举且有 load 期校验，加一个值 = 一次文件格式成本。Pitch / Gate 当前打包在 MIDI 事件里；只有真正把音高/门拆成两根线（modular 化）或引入 Transport 时钟线时才扩展，届时一次加够 |
+
+### 输入口类型的歧义与口径
+
+`in_ports_screen` 对大多数节点只给**一个**物理入口，而 `accepts` 允许同一个口落两种线（如 Effect 收 Audio + Automation、Instrument 收 Midi + Automation）。根因是**自动化没有独立物理端口**：`CableDoc` 的终点是 `(node_id, param)`，参数经弹窗选择，`in_port` 只是借结构入口做布局落点。
+
+**口径**：输入环的颜色 = 该节点的**结构入口信号**（`node_in_port_kind`），不是当前插着的线：
+
+| 节点 | 结构入口 | 说明 |
+| :--- | :--- | :--- |
+| Instrument / Arpeggiator / Portamento / MidiEnvelope | Midi | 乐器 0 音频入（§3 D2）；MIDI FX 收音符事件 |
+| Effect / Mixer / Feedback / dual-input 效果（Main + Mod） | Audio | Mod 口也是音频（Z0/Z1/Z2） |
+| CurveMap | Automation | 唯一入口就是控制信号本身（`curve-map.md` D5） |
+| Master | Audio | 单输入（D16） |
+| Timeline In | 逐口判定 | Tempo → Automation；每个录音输入 → `track_kind_cable(TrackKind)`（沿用现状） |
+
+因此允许「黄色虚线落在一个冷青/绿色空心环上」：这恰好说明该线是**参数调制**、没有流入这个结构入口。中点参数标签 + 虚线承担这个区分，不靠端口颜色。
+
+### 实现要点
+
+- 单点改动集中在 `glitcherz-ui/src/patch.rs`：`cable_color`、`node_color`、`node_out_port_kind`（新增输入侧镜像 `node_in_port_kind`）、`show` 的连线/端口绘制循环与拖拽预览。
+- `egui::epaint::CubicBezierShape` 无 dash 属性；虚线用现成的 `bezier_points(bez, 32)` 采样后喂 `egui::Shape::dashed_line_many(points, stroke, dash, gap, &mut shapes)`，再 `painter.extend(shapes)`。UI 线程允许分配，不触及实时铁律。
+- 连线绘制抽一个 `paint_cable(painter, bez, kind, stroke)` 供文档连线与拖拽预览共用；cable-cut 的红色高亮是交互态叠加，保持实线。
+- 不改 `CableKind`、不改 `PROJECT_VERSION`、不改端口命中/落口/accepts 规则、不改时间轴轨道色（`timeline.rs` 的 clip 色表示轨道归属，与线色表示信号类型是两套正交语义，允许并存）。
+
+### 验收
+
+- `cargo fmt` / `cargo clippy --workspace -- -D warnings` / `cargo test --workspace` 全绿；
+- 单测锁定三类型色互不相同、节点描边饱和度显著低于线色、`node_in_port_kind` 对各类节点的判定；
+- 肉眼：暗底画布上「线/端口跳出来、节点退到背景」；缩放后仍能用类型色辨认端口；关闭颜色后虚线仍能把 Automation 与 MIDI 分开。
