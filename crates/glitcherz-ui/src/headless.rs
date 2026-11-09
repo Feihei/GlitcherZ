@@ -938,20 +938,38 @@ pub struct RenderReport {
 /// Renders a project file to a single stereo WAV without a window or an
 /// audio device. Returns the number of frames written (read back from the
 /// finished file, which also validates the header).
+///
+/// This is the one-shot form (`--render`); a caller that already holds a
+/// document — the CLI's batch runner after applying edits — wants
+/// [`render_doc_to_wav`] instead.
 pub fn render_project_to_wav(
     project_path: &Path,
+    output: &Path,
+    options: RenderOptions,
+) -> Result<RenderReport, String> {
+    let project = glitcherz_model::file::load_project(project_path)
+        .map_err(|err| format!("{}: {err}", project_path.display()))?;
+    render_doc_to_wav(&project, output, options)
+}
+
+/// Renders an in-memory document to a single stereo WAV (S4).
+///
+/// Same assembly and the same `ExportJob` as [`render_project_to_wav`], so the
+/// output is byte-identical for the same document. The only difference is the
+/// source: a caller that has just edited a `Session` must render *that*
+/// document, not re-read the file on disk (the edit would be invisible).
+pub fn render_doc_to_wav(
+    project: &Project,
     output: &Path,
     options: RenderOptions,
 ) -> Result<RenderReport, String> {
     if options.sample_rate == 0 {
         return Err("--rate must be greater than zero".to_string());
     }
-    let project = glitcherz_model::file::load_project(project_path)
-        .map_err(|err| format!("{}: {err}", project_path.display()))?;
     let window = match options.end_ticks {
         Some(end) => (0.0, f64::from(end)),
         None => export_audio::ExportRange::FullSong
-            .window(&project)
+            .window(project)
             .ok_or_else(|| "the project has no arrangement to render".to_string())?,
     };
     if window.1 <= window.0 {
@@ -965,7 +983,7 @@ pub fn render_project_to_wav(
         bits: options.bits,
     };
     let mut media = FreshMedia::new(project.base_dir.clone());
-    let graph = assemble_offline(&project, options.sample_rate, window, &mut media);
+    let graph = assemble_offline(project, options.sample_rate, window, &mut media);
     let passes = vec![export_audio::ExportPass::mix(output.to_path_buf())];
     let mut job = export_audio::ExportJob::new(
         graph.engine,

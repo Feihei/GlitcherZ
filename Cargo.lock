@@ -1160,9 +1160,11 @@ name = "glitcherz-app"
 version = "0.1.0-preview.1"
 dependencies = [
  "env_logger",
+ "glitcherz-command",
  "glitcherz-engine",
  "glitcherz-model",
  "glitcherz-ui",
+ "serde_json",
 ]
 
 [[package]]

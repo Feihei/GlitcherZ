@@ -5,65 +5,60 @@
 //!
 //! The engine starts silent. `--autoplay` deliberately holds one note so a
 //! smoke run can prove the audio path end to end without touching the UI.
+//!
+//! Three headless modes share this binary (S0 + S4, spec `cli-commands.md`):
+//! `--render` bounces a project to a wav, `--ops` / `--do` run a batch of
+//! registry commands against a project, and `--commands` enumerates that
+//! registry. None of them create a window or an audio device.
 
-use std::path::{Path, PathBuf};
+mod args;
+mod batch;
+mod render_cmd;
+
 use std::process::ExitCode;
 use std::time::Duration;
 
+use glitcherz_command::Session;
 use glitcherz_engine::AudioEngine;
-use glitcherz_ui::headless::RenderOptions;
+use glitcherz_model::Project;
 
-/// Command line arguments (parsed manually, keeping dependencies minimal).
-struct Args {
-    /// MIDI note auto-triggered at startup (69 = A4).
-    note: u8,
-    /// Hold a note at startup (diagnostic; the default is silent).
-    autoplay: bool,
-    /// Project file loaded at startup.
-    open: Option<PathBuf>,
-    gain: f64,
-    seconds: Option<f64>,
-    list_devices: bool,
-    help: bool,
-    /// Headless render: input project + output wav (S0).
-    render: Option<(PathBuf, PathBuf)>,
-    render_rate: u32,
-    render_bits: Option<String>,
-    render_to: Option<u32>,
-    /// Argument parsing error (reported before anything starts).
-    error: Option<String>,
-}
+use args::{Args, Mode};
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let args = parse_args(std::env::args().skip(1));
+    let args = args::parse(std::env::args().skip(1));
     if let Some(err) = &args.error {
         eprintln!("{err}");
         print_usage();
-        return ExitCode::FAILURE;
+        return ExitCode::from(2);
     }
-    if args.help {
-        print_usage();
-        return ExitCode::SUCCESS;
-    }
-    if args.list_devices {
-        println!("Available output devices:");
-        for name in glitcherz_engine::available_outputs() {
-            println!("  - {name}");
+    match args.mode() {
+        Err(err) => {
+            eprintln!("{err}");
+            print_usage();
+            ExitCode::from(2)
         }
-        return ExitCode::SUCCESS;
+        Ok(Mode::Help) => {
+            print_usage();
+            ExitCode::SUCCESS
+        }
+        Ok(Mode::ListDevices) => {
+            println!("Available output devices:");
+            for name in glitcherz_engine::available_outputs() {
+                println!("  - {name}");
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Mode::Commands) => commands_command(&args),
+        Ok(Mode::Render { input, output }) => render_command(&args, &input, &output),
+        Ok(Mode::Batch) => batch_command(&args),
+        Ok(Mode::Gui) => gui(&args),
     }
-    if let Some((input, output)) = args.render {
-        return render_command(
-            &input,
-            &output,
-            args.render_rate,
-            args.render_bits.as_deref(),
-            args.render_to,
-        );
-    }
+}
 
+/// The window (the only mode that opens one).
+fn gui(args: &Args) -> ExitCode {
     let engine = match AudioEngine::start() {
         Ok(engine) => engine,
         Err(err) => {
@@ -81,7 +76,7 @@ fn main() -> ExitCode {
         gain: args.gain,
         auto_play_note: args.autoplay.then_some(args.note),
         auto_close_after: args.seconds.map(|s| Duration::from_secs_f64(s.max(0.0))),
-        open_path: args.open,
+        open_path: args.open.clone(),
     };
 
     if let Err(err) = glitcherz_ui::run(engine, ui_config) {
@@ -91,31 +86,17 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Headless render (S0): no window, no output device, no eframe event loop.
-fn render_command(
-    input: &Path,
-    output: &Path,
-    rate: u32,
-    bits: Option<&str>,
-    end_ticks: Option<u32>,
-) -> ExitCode {
-    use glitcherz_ui::export_audio::Bits;
+fn render_args(args: &Args) -> render_cmd::RenderArgs<'_> {
+    render_cmd::RenderArgs {
+        rate: args.render_rate,
+        bits: args.render_bits.as_deref(),
+        end_ticks: args.render_to,
+    }
+}
 
-    let bits = match bits.unwrap_or("24") {
-        "16" => Bits::Int16,
-        "24" => Bits::Int24,
-        "32" | "32f" => Bits::Float32,
-        other => {
-            eprintln!("Unknown --bits {other} (use 16, 24 or 32f)");
-            return ExitCode::FAILURE;
-        }
-    };
-    let options = RenderOptions {
-        sample_rate: rate,
-        bits,
-        end_ticks,
-    };
-    match glitcherz_ui::headless::render_project_to_wav(input, output, options) {
+/// Headless one-shot render (S0): no window, no output device, no event loop.
+fn render_command(args: &Args, input: &std::path::Path, output: &std::path::Path) -> ExitCode {
+    match render_cmd::one_shot(input, output, render_args(args)) {
         Ok(report) => {
             println!(
                 "Rendered {} frames at {} Hz to {}",
@@ -127,131 +108,172 @@ fn render_command(
         }
         Err(err) => {
             eprintln!("Render failed: {err}");
-            ExitCode::FAILURE
+            ExitCode::from(3)
         }
     }
+}
+
+/// Enumerates the command registry (S4).
+///
+/// `enabled` is resolved against `--open` (or a default project), so the
+/// answer includes *why* a command is unavailable right now.
+fn commands_command(args: &Args) -> ExitCode {
+    let project = match starting_project(args) {
+        Ok(project) => project,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(3);
+        }
+    };
+    let session = Session::new(project);
+    let infos: Vec<glitcherz_command::CommandInfo> = glitcherz_command::command_specs()
+        .iter()
+        .map(|spec| spec.info(&session))
+        .collect();
+    if args.json {
+        // `CommandInfo` is already `Serialize`; going through a `Value` keeps
+        // this file free of a direct `serde` dependency.
+        let registry = serde_json::to_value(&infos).unwrap_or(serde_json::Value::Null);
+        println!("{}", to_json(&registry));
+        return ExitCode::SUCCESS;
+    }
+    for info in &infos {
+        println!("{:<22} {:<18} {}", info.id, info.label, info.params);
+    }
+    println!(
+        "{} commands; --json adds menu, shortcut and why a command is unavailable",
+        infos.len()
+    );
+    ExitCode::SUCCESS
+}
+
+/// Loads `--open`, or starts from a default document (S4-D4).
+fn starting_project(args: &Args) -> Result<Project, String> {
+    match &args.open {
+        Some(path) => glitcherz_model::file::load_project(path)
+            .map_err(|err| format!("{}: {err}", path.display())),
+        None => Ok(Project::default()),
+    }
+}
+
+/// Runs a batch of registry commands, then optionally saves and renders (S4).
+fn batch_command(args: &Args) -> ExitCode {
+    let mut report = batch::Report::default();
+
+    // `--ops` is resolved first: an unreadable or malformed batch is an input
+    // problem, and it must be reported before anything touches the project.
+    let steps = match batch::resolve(&args.steps) {
+        Ok(steps) => steps,
+        Err(failure) => {
+            report.failure = Some(failure);
+            return finish_batch(args, &report);
+        }
+    };
+
+    let project = match &args.open {
+        Some(path) => match glitcherz_model::file::load_project(path) {
+            Ok(project) => {
+                report.project = Some(path.display().to_string());
+                project
+            }
+            Err(err) => {
+                report.failure = Some(batch::Failure::Load(format!("{}: {err}", path.display())));
+                return finish_batch(args, &report);
+            }
+        },
+        None => Project::default(),
+    };
+
+    let mut session = Session::new(project);
+    let (outcomes, failure) = batch::run(&mut session, &steps);
+    report.outcomes = outcomes;
+    if let Some(failure) = failure {
+        report.failure = Some(failure);
+        return finish_batch(args, &report);
+    }
+
+    if let Some(path) = &args.save {
+        match glitcherz_model::file::save_project(session.project(), path) {
+            Ok(()) => report.saved = Some(path.display().to_string()),
+            Err(err) => {
+                report.failure = Some(batch::Failure::Save(format!("{}: {err}", path.display())));
+                return finish_batch(args, &report);
+            }
+        }
+    }
+
+    if let Some(path) = &args.wav {
+        let options = match render_args(args).options() {
+            Ok(options) => options,
+            Err(err) => {
+                report.failure = Some(batch::Failure::Render(err));
+                return finish_batch(args, &report);
+            }
+        };
+        // The *edited* document, not the one on disk (S4-D6).
+        match glitcherz_ui::headless::render_doc_to_wav(session.project(), path, options) {
+            Ok(rendered) => {
+                report.render = Some(batch::RenderInfo {
+                    path: path.display().to_string(),
+                    frames: rendered.frames,
+                    sample_rate: rendered.sample_rate,
+                })
+            }
+            Err(err) => {
+                report.failure = Some(batch::Failure::Render(format!("{}: {err}", path.display())));
+            }
+        }
+    }
+
+    finish_batch(args, &report)
+}
+
+/// Prints the report and maps the failure to an exit code.
+fn finish_batch(args: &Args, report: &batch::Report) -> ExitCode {
+    if args.json {
+        println!("{}", to_json(&report.to_json()));
+        // stdout stays pure JSON; a human reading the terminal still needs the
+        // message somewhere.
+        if let Some(failure) = &report.failure {
+            eprintln!("{}", failure_message(failure));
+        }
+    } else {
+        print!("{}", report.to_text());
+    }
+    match &report.failure {
+        None => ExitCode::SUCCESS,
+        Some(failure) => ExitCode::from(failure.exit_code()),
+    }
+}
+
+fn failure_message(failure: &batch::Failure) -> String {
+    match failure {
+        batch::Failure::Step { id, error } => format!("{id}: {error}"),
+        other => other.message(),
+    }
+}
+
+fn to_json(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value)
+        .unwrap_or_else(|err| format!("{{\"serialization_error\":\"{err}\"}}"))
 }
 
 fn print_usage() {
     println!(
-        "Usage: glitcherz [--open <project>] [--autoplay [--note <0-127>]] [--gain <0.0-1.0>] \
-         [--seconds <secs>] [--list-devices]\n\
-         Usage: glitcherz --render <in.glz> <out.wav> [--rate <hz>] [--bits 16|24|32f] [--to <ticks>]\n\
+        "Usage:\n  \
+         glitcherz [--open <project>] [--autoplay [--note <0-127>]] [--gain <0.0-1.0>] [--seconds <secs>] [--list-devices]\n  \
+         glitcherz --render <in.glz> <out.wav> [--rate <hz>] [--bits 16|24|32f] [--to <ticks>]\n  \
+         glitcherz [--open <in.glz>] (--ops <file|-> | --do <id> [--params <json>])... [--save <out.glz>] [--wav <out.wav>] [--json]\n  \
+         glitcherz --commands [--open <in.glz>] [--json]\n\
          Defaults: opens the main window and stays silent.\n\
          Play with the on-screen keyboard or the computer keyboard (A W S E D ..., Z/X to shift octaves); close the window to quit.\n\
          --autoplay holds one note from startup (diagnostic: proves the audio path);\n\
          --seconds auto-closes the window after N seconds (for smoke tests);\n\
-         --render bounces a project to a stereo wav without opening a window (44.1 kHz / 24-bit by default)."
+         --render bounces a project to a stereo wav without opening a window (44.1 kHz / 24-bit by default).\n\
+         --ops runs a JSON array of {{id, params}} commands (\"-\" reads stdin); --do runs one, in argv order;\n\
+         without --open the batch starts from a new project; --save / --wav write the result, and a batch\n\
+         that fails writes nothing.\n\
+         --commands lists the registry (--json adds menu, shortcut and disabled reasons).\n\
+         Exit codes: 0 ok, 1 engine or window failure, 2 bad arguments, 3 project or render failure, 4 command failed."
     );
-}
-
-fn parse_args(raw: impl Iterator<Item = String>) -> Args {
-    let mut args = Args {
-        note: 69,
-        autoplay: false,
-        open: None,
-        gain: 0.8,
-        seconds: None,
-        list_devices: false,
-        help: false,
-        render: None,
-        render_rate: 44_100,
-        render_bits: None,
-        render_to: None,
-        error: None,
-    };
-    let mut it = raw;
-    while let Some(flag) = it.next() {
-        match flag.as_str() {
-            "--note" => {
-                if let Some(v) = it.next().and_then(|s| s.parse::<i32>().ok()) {
-                    args.note = v.clamp(0, 127) as u8;
-                    // Naming a note is an explicit request to hear it.
-                    args.autoplay = true;
-                }
-            }
-            "--freq" => {
-                // Legacy flag compatibility: convert the frequency to the
-                // nearest MIDI note.
-                if let Some(f) = it.next().and_then(|s| s.parse::<f64>().ok()) {
-                    if f.is_finite() && f > 0.0 {
-                        let note = (69.0 + 12.0 * (f / 440.0).log2()).round() as i32;
-                        args.note = note.clamp(0, 127) as u8;
-                        args.autoplay = true;
-                    }
-                }
-            }
-            "--autoplay" => args.autoplay = true,
-            // Compatibility alias from the days when autoplay was the default.
-            "--no-autoplay" => args.autoplay = false,
-            "--open" => {
-                if let Some(v) = it.next() {
-                    args.open = Some(PathBuf::from(v));
-                }
-            }
-            "--gain" => {
-                if let Some(v) = it.next().and_then(|s| s.parse().ok()) {
-                    args.gain = v;
-                }
-            }
-            "--seconds" => {
-                if let Some(v) = it.next().and_then(|s| s.parse().ok()) {
-                    args.seconds = Some(v);
-                }
-            }
-            "--list-devices" => args.list_devices = true,
-            "--render" => match (it.next(), it.next()) {
-                (Some(input), Some(output)) => {
-                    args.render = Some((PathBuf::from(input), PathBuf::from(output)));
-                }
-                _ => args.error = Some("--render needs <in.glz> <out.wav>".to_string()),
-            },
-            "--rate" => {
-                if let Some(v) = it.next().and_then(|s| s.parse::<u32>().ok()) {
-                    args.render_rate = v;
-                } else {
-                    args.error = Some("--rate needs a positive sample rate".to_string());
-                }
-            }
-            "--bits" => args.render_bits = it.next(),
-            "--to" => {
-                if let Some(v) = it.next().and_then(|s| s.parse::<u32>().ok()) {
-                    args.render_to = Some(v);
-                } else {
-                    args.error = Some("--to needs a tick count".to_string());
-                }
-            }
-            "--help" | "-h" => args.help = true,
-            other => eprintln!("Ignoring unknown argument: {other} (see --help for usage)"),
-        }
-    }
-    args
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn render_args_capture_paths_and_options() {
-        let raw = [
-            "--render", "song.glz", "out.wav", "--rate", "48000", "--bits", "16", "--to", "3840",
-        ];
-        let args = parse_args(raw.into_iter().map(String::from));
-        assert!(args.error.is_none());
-        assert_eq!(
-            args.render,
-            Some((PathBuf::from("song.glz"), PathBuf::from("out.wav")))
-        );
-        assert_eq!(args.render_rate, 48_000);
-        assert_eq!(args.render_bits.as_deref(), Some("16"));
-        assert_eq!(args.render_to, Some(3840));
-    }
-
-    #[test]
-    fn render_needs_both_paths() {
-        let args = parse_args(["--render", "song.glz"].into_iter().map(String::from));
-        assert!(args.error.is_some());
-        assert!(args.render.is_none());
-    }
 }
