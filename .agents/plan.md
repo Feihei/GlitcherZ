@@ -813,6 +813,10 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | **零回归硬证据** | 用 `aaeb958` 的 detached worktree + 独立 `CARGO_TARGET_DIR` 编出 pre-Z1 二进制，与 post-Z1 对同一默认工程跑 `--render --rate 22050 --bits 16 --to 1920`：两份 WAV 各 **44288 帧 / 177196 字节，`cmp` 逐字节一致**。 |
 | 文档同步 | `sidechain-compressor.md`（新 spec）、`effects.md`（E2b 后新增小节 + §12）、`dual-audio-input.md` Z-D12 勘误、`implementation.md`、`docs/manual.md`、`AGENTS.md` 索引。 |
 
+### Z1 合并修订（✅ 2026-11-09：`Sidechain Comp` 并回 `Compressor`）
+
+sidechain off 的侧链压缩器与普通压缩器逐样本一致（Z1-D2 本就有测试锁定），两个节点种类是重复入口。经确认合并：删除 `BuiltinEffectKind::SidechainCompressor`，`Compressor.audio_inputs() → 2`，统一 9 项参数表；删除旁路细化（`Dual` 唯一入边在 Main 且 Mod 无线 → 仍旁路，见 `sidechain-compressor.md` §9.1，同步修订 Z-D9）使旧工程压缩器删除行为不变；旧文件用 serde alias（`sidechain_compressor` → `compressor`）零迁移加载，`sidechain` 状态保留。`PROJECT_VERSION = 10` 未动。
+
 ### Z2 要点
 
 - **Z2 Vocoder（Q3 定稿）**：**固定 16 带**滤波器组 × 两路 + 逐带包络跟随（attack/release）+ 清浊处理；carrier 必须由 Main 口外部送入，**不做内置载波**；所有滤波器状态与包络构造期预分配。v1 **不做** formant shift / freeze / 用户自定义带数。

@@ -41,7 +41,8 @@ pub enum BuiltinEffectKind {
     Delay,
     /// Three-band EQ with a low cut.
     Eq,
-    /// Feed-forward peak compressor.
+    /// Feed-forward peak compressor. Owns a Mod port (Z1 merge): the keying
+    /// switch at slot 8 decides whether it is read.
     Compressor,
     /// Stereo FDN-8 reverb.
     Reverb,
@@ -59,8 +60,6 @@ pub enum BuiltinEffectKind {
     Limiter,
     /// Two-input ring modulator (Z0 validation effect).
     RingMod,
-    /// Compressor with an external key input (Z1).
-    SidechainCompressor,
     /// 16-band vocoder: carrier on Main, modulator on Mod (Z2).
     Vocoder,
 }
@@ -79,7 +78,6 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Saturation,
         BuiltinEffectKind::Limiter,
         BuiltinEffectKind::RingMod,
-        BuiltinEffectKind::SidechainCompressor,
         BuiltinEffectKind::Vocoder,
     ];
 
@@ -89,7 +87,7 @@ impl BuiltinEffectKind {
     pub const fn audio_inputs(self) -> u8 {
         match self {
             BuiltinEffectKind::RingMod
-            | BuiltinEffectKind::SidechainCompressor
+            | BuiltinEffectKind::Compressor
             | BuiltinEffectKind::Vocoder => 2,
             _ => 1,
         }
@@ -109,9 +107,6 @@ impl BuiltinEffectKind {
             BuiltinEffectKind::Saturation => &crate::realtime::saturation::DESCRIPTOR,
             BuiltinEffectKind::Limiter => &crate::realtime::limiter::DESCRIPTOR,
             BuiltinEffectKind::RingMod => &crate::realtime::ring_mod::DESCRIPTOR,
-            BuiltinEffectKind::SidechainCompressor => {
-                &crate::realtime::compressor::SIDECHAIN_DESCRIPTOR
-            }
             BuiltinEffectKind::Vocoder => &crate::realtime::vocoder::DESCRIPTOR,
         }
     }

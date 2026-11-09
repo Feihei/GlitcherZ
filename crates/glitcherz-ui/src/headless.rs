@@ -1261,7 +1261,7 @@ mod tests {
                 node_id: effect_id,
                 track: 0,
                 voice: VoiceSpec::Builtin,
-                params: EffectParams::SidechainCompressor(Box::new(CompressorParams {
+                params: EffectParams::Compressor(Box::new(CompressorParams {
                     // Always compress: the point is which input the detector
                     // reads, not the curve.
                     threshold: -60.0,

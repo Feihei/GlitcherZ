@@ -72,10 +72,8 @@ const BASE_PARAMS: [ParamSpec; 8] = [
     ParamSpec::switch_with("stereo_link", 1.0, ParamFlags::STEREO_LINK),
 ];
 
-static COMPRESSOR_PARAMS: [ParamSpec; 8] = BASE_PARAMS;
-
-/// Sidechain table: the shared eight plus the keying switch (Z1-D6).
-const fn sidechain_params() -> [ParamSpec; 9] {
+/// The shared parameters (E2b order) plus the keying switch (Z1 merge).
+const fn compressor_params() -> [ParamSpec; 9] {
     let mut params = [BASE_PARAMS[0]; 9];
     let mut index = 0;
     while index < BASE_PARAMS.len() {
@@ -86,19 +84,13 @@ const fn sidechain_params() -> [ParamSpec; 9] {
     params
 }
 
-static SIDECHAIN_PARAMS: [ParamSpec; 9] = sidechain_params();
+static COMPRESSOR_PARAMS: [ParamSpec; 9] = compressor_params();
 
-/// Static parameter table (spec `.agents/spec/effects.md` E2b).
+/// Static parameter table (spec `.agents/spec/effects.md` E2b; Z1 merge adds
+/// the keying switch at slot 8, default off = internal detection).
 pub static DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     name: "Compressor",
     params: &COMPRESSOR_PARAMS,
-    stereo: StereoClass::Linkable { default_link: true },
-};
-
-/// Parameter table of the two-input sidechain variant (spec Z1).
-pub static SIDECHAIN_DESCRIPTOR: EffectDescriptor = EffectDescriptor {
-    name: "Sidechain Comp",
-    params: &SIDECHAIN_PARAMS,
     stereo: StereoClass::Linkable { default_link: true },
 };
 
@@ -183,14 +175,6 @@ impl CompressorProcessor {
         Self::build(sample_rate, &DESCRIPTOR, meters)
     }
 
-    /// Two-input variant: external keying from the Mod port (spec Z1).
-    ///
-    /// The table is the shared eight plus `sidechain`; every other slot keeps
-    /// the E2b range and smoothing, so the DSP is literally the same code.
-    pub fn sidechain(sample_rate: f32, meters: Option<Arc<EffectMeters>>) -> Self {
-        Self::build(sample_rate, &SIDECHAIN_DESCRIPTOR, meters)
-    }
-
     /// Shared constructor; `descriptor` decides the parameter table.
     fn build(
         sample_rate: f32,
@@ -267,8 +251,8 @@ impl CompressorProcessor {
         let release_ms = self.params.advance(SLOT_RELEASE, frames);
         let knee = self.params.advance(SLOT_KNEE, frames);
         let linked = self.params.is_on(SLOT_LINK);
-        // Slot 8 exists only in the sidechain table; the plain table answers
-        // `false` for out-of-range slots, so one loop serves both kinds.
+        // Z1 merge: the switch lives at slot 8, default off = internal
+        // detection. A wired key is ignored until it is armed.
         let key = key.filter(|_| self.params.is_on(SLOT_SIDECHAIN));
 
         let settings = Settings {
@@ -393,9 +377,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        CompressorProcessor, DESCRIPTOR, SIDECHAIN_DESCRIPTOR, SLOT_ATTACK, SLOT_KNEE, SLOT_LINK,
-        SLOT_MAKEUP, SLOT_MIX, SLOT_RATIO, SLOT_RELEASE, SLOT_SIDECHAIN, SLOT_THRESHOLD,
-        compute_gr_db,
+        CompressorProcessor, DESCRIPTOR, SLOT_ATTACK, SLOT_KNEE, SLOT_LINK, SLOT_MAKEUP, SLOT_MIX,
+        SLOT_RATIO, SLOT_RELEASE, SLOT_SIDECHAIN, SLOT_THRESHOLD, compute_gr_db,
     };
     use crate::realtime::buffer::AudioBuffer;
     use crate::realtime::commands::ParamId;
@@ -687,7 +670,7 @@ mod tests {
 
     /// E2b settings, hard knee so the expected GR is arithmetic.
     fn keyed_comp() -> CompressorProcessor {
-        let mut comp = CompressorProcessor::sidechain(SR, None);
+        let mut comp = CompressorProcessor::new(SR);
         // The switch is off by default (no inert node waiting for a cable),
         // so every keying test has to arm it explicitly.
         set(&mut comp, SLOT_SIDECHAIN, 1.0);
@@ -700,22 +683,19 @@ mod tests {
     }
 
     #[test]
-    fn sidechain_descriptor_is_well_formed() {
-        assert_eq!(validate_descriptor(&SIDECHAIN_DESCRIPTOR), Ok(()));
-        assert_eq!(SIDECHAIN_DESCRIPTOR.params.len(), 9);
-        assert!(SIDECHAIN_DESCRIPTOR.is_linkable());
+    fn keying_switch_is_the_ninth_slot() {
+        assert_eq!(DESCRIPTOR.params.len(), 9);
+        assert!(DESCRIPTOR.is_linkable());
         // The link switch stays at slot 7; the key switch is appended.
-        assert_eq!(SIDECHAIN_DESCRIPTOR.link_slot(), Some(SLOT_LINK));
+        assert_eq!(DESCRIPTOR.link_slot(), Some(SLOT_LINK));
         assert_eq!(
-            SIDECHAIN_DESCRIPTOR
-                .spec(SLOT_SIDECHAIN)
-                .map(|spec| spec.name),
+            DESCRIPTOR.spec(SLOT_SIDECHAIN).map(|spec| spec.name),
             Some("sidechain")
         );
-        assert!(SIDECHAIN_DESCRIPTOR.spec(9).is_none());
+        assert!(DESCRIPTOR.spec(9).is_none());
 
         // Fresh nodes key from their own input until the switch is armed.
-        let mut fresh = CompressorProcessor::sidechain(SR, None);
+        let mut fresh = CompressorProcessor::new(SR);
         assert_eq!(fresh.value(SLOT_SIDECHAIN), 0.0, "keying starts off");
         let main = vec![0.5f32; BLOCK * 16];
         let key = vec![0.9f32; BLOCK * 16];
@@ -725,24 +705,25 @@ mod tests {
         assert_eq!(keyed_off, plain, "an unarmed key must be ignored");
     }
 
-    /// A plain compressor has no slot 8, which is what makes one code path
-    /// serve both tables: `is_on(8)` answers `false` and the key is ignored.
+    /// Z1 merge: slot 8 exists on every compressor, and a switch that is off
+    /// makes a wired key inert — the aux port is ignored entirely.
     #[test]
-    fn plain_compressor_has_no_sidechain_slot() {
+    fn switch_off_ignores_the_key_input() {
         let mut comp = CompressorProcessor::new(SR);
-        assert!(!comp.set_param(ParamId::BuiltinParam(SLOT_SIDECHAIN), 1.0));
+        assert!(comp.set_param(ParamId::BuiltinParam(SLOT_SIDECHAIN), 1.0));
+        assert!(comp.set_param(ParamId::BuiltinParam(SLOT_SIDECHAIN), 0.0));
         assert_eq!(comp.value(SLOT_SIDECHAIN), 0.0);
 
-        // Handing it an aux buffer must change nothing.
+        // Handing it a loud aux buffer must change nothing.
         let main = vec![0.5f32; BLOCK * 8];
         let key = vec![0.5f32; BLOCK * 8];
-        let mut plain = CompressorProcessor::new(SR);
-        set(&mut plain, SLOT_THRESHOLD, -18.0);
-        set(&mut plain, SLOT_RATIO, 4.0);
-        set(&mut plain, SLOT_KNEE, 0.0);
-        set(&mut plain, SLOT_ATTACK, 1.0);
-        set(&mut plain, SLOT_RELEASE, 50.0);
-        let with_aux = run_keyed(&mut plain, &main, &key);
+        let mut with_key = CompressorProcessor::new(SR);
+        set(&mut with_key, SLOT_THRESHOLD, -18.0);
+        set(&mut with_key, SLOT_RATIO, 4.0);
+        set(&mut with_key, SLOT_KNEE, 0.0);
+        set(&mut with_key, SLOT_ATTACK, 1.0);
+        set(&mut with_key, SLOT_RELEASE, 50.0);
+        let with_aux = run_keyed(&mut with_key, &main, &key);
 
         let mut reference = CompressorProcessor::new(SR);
         set(&mut reference, SLOT_THRESHOLD, -18.0);
@@ -754,7 +735,7 @@ mod tests {
 
         assert_eq!(
             with_aux, internal,
-            "the plain table must ignore the aux port entirely"
+            "an unarmed key must be ignored entirely"
         );
     }
 

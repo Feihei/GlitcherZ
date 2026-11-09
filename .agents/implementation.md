@@ -1136,6 +1136,15 @@ spec `.agents/spec/sidechain-compressor.md`。Z0 的第一个真实消费者：�
 
 **验收**：8 项压缩器单测（键控跟随 Mod、静音键控逐样本直通、`sidechain = 0` 与普通压缩器逐样本一致、GR 与 program 电平无关、键控不串音、普通表无 slot 8）、1 项图级（`sidechain_compressor_is_keyed_by_the_mod_port`）、1 项 model 校验与 RON 往返（含旧 payload 默认**关闭**键控）、1 项离线端到端（dry / wet / internal 三方 RMS）、`effect_rt_audit` 侧链路径零分配。**零回归**：`aaeb958` worktree + 独立 `CARGO_TARGET_DIR` 编出 pre-Z1 二进制，与 post-Z1 对同一默认工程 `--render --rate 22050 --bits 16 --to 1920`，两份 WAV `cmp` 逐字节一致。
 
+### Z1 合并修订（2026-11-09）：`Sidechain Comp` 并回 `Compressor`
+
+用户确认两个节点种类重复（sidechain off ≡ 普通压缩器，Z1-D2 有逐样本一致测试锁定），合并实施。spec 修订见 `sidechain-compressor.md` §9，Z-D9 的旁路细化同步登记在 `dual-audio-input.md` §6。
+
+- **model**：`BuiltinEffectKind` / `EffectParams` 删除 `SidechainCompressor`，`Compressor` 加 `#[serde(alias = "sidechain_compressor")]`（旧文件零迁移加载，`sidechain` 键控状态保留，序列化收敛写 `"compressor"`）；`audio_inputs() → 2`；参数轴表 slot 8 并入 Compressor；`as_sidechain_compressor*` 删除。
+- **engine**：`COMPRESSOR_PARAMS` 统一 9 项（`SIDECHAIN_PARAMS` / `SIDECHAIN_DESCRIPTOR` / `CompressorProcessor::sidechain()` 删除，UI 用 `with_meters`）；`effect/mod.rs` 名册合并。**删除旁路细化**：`remove_node` 的 `bypassable` 从「排除 Dual」改为「Dual 且无非 Main 口入边（`mod_edges == 0`）→ 可旁路」，配图级测试 `removing_a_dual_node_with_only_main_wired_bypasses_again`；「Mod 有线不旁路」由原测试继续锁定。
+- **UI**：`effect.rs` 五处分派合并（Compressor 分支加 `SLOT_SIDECHAIN` 读写）；`patch_ops::delete_graph_node` 同步旁路细化（`mod_wired` 判断）；端口绘制 / Main-Mod 标签由 `audio_inputs()` 推导自动跟随，画布零分支改动。
+- **验收**：model `compressor_has_two_ports_and_a_persistent_switch`（含 alias 往返与键控状态保留）、engine `keying_switch_is_the_ninth_slot` / `switch_off_ignores_the_key_input` 与双删除语义测试、UI slot 8 往返断言；`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` 全绿。
+
 ## B1：模态打击声源 Mallet（2026-11-08）
 
 spec `.agents/spec/modal-instrument.md`。一个引擎 + 四张预设表（Mallet / Vibraphone / Bell / Singing Bowl），一组二阶谐振器被一次噪声脉冲激励。不是「Synth 换个预设」：频谱非谐波、每个模态各自衰减、note-off 不管尾音。

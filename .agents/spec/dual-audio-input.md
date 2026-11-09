@@ -81,6 +81,7 @@ D14 修订为「非 mixer、非 Dual 节点 ≤1 条音频入边」；D2 的端�
 | Z0-D2：`NodeSlot` 只对 Dual 节点预分配 `aux: Option<AudioBuffer>` | **Z-D4：整图一个 scratch** | 每块任一时刻只处理一个节点，aux 用完即弃，per-node 没有并行需求；改成共享后 `PendingNode` / `NodeDeployment` / `RecycledNode` / `apply_update` 四条部署回收路径**全部不用改**，内存从 ~64 个块缓冲降到 1 个，风险与改动面都更小。 |
 | Z0-D4：D19 修订为「双口节点不走旁路」 | **Z-D9：`bypassable` 显式排除 `Dual`** | 原表述可误读为「只看入边数」；双口节点只接一条 Mod 线时仍不可旁路。 |
 | Z0-D1：未提端口范围校验 | **Z-D6：`add_cable` 加 `allowed_ports`** | `add_cable` 只保证 per-port 唯一、不保证端口合法；`in_port = 5` 会被静默当成主输入，必须引擎侧挡住。 |
+| Z-D9：`bypassable` 显式排除 `Dual` | **Z1 合并修订（2026-11-09）：`Dual` 且唯一入边在 Main（port 0）且 Mod 无线 → 仍旁路** | `Sidechain Comp` 并回 `Compressor` 后，旧工程压缩器（只接 Main）都变 `Dual`；不细化会失去删除旁路。见 `sidechain-compressor.md` §9.1。 |
 
 ### 6.1 实施期修订（2026-11-08 交付记录）
 

@@ -1,6 +1,6 @@
 # Z1：侧链压缩 Spec
 
-> 状态：定稿（2026-11-08）；**Z1 已交付**（同日，验收见 §7）。上游：`plan.md` Z / B 系列、`spec/dual-audio-input.md`（Z0 已交付）、`spec/effects.md`（E2b Compressor）。
+> 状态：定稿（2026-11-08）；**Z1 已交付**（同日，验收见 §7）；**2026-11-09 合并修订**（§9：`Sidechain Comp` 并回 `Compressor`，Z1-D1/D5 被修订）。上游：`plan.md` Z / B 系列、`spec/dual-audio-input.md`（Z0 已交付）、`spec/effects.md`（E2b Compressor）。
 > 范围：只做**一个复用现有 DSP 的双口压缩器**。Vocoder（Z2）、键控 HPF、外部键监听不在本 spec。
 
 ## 1. 背景
@@ -134,3 +134,28 @@ NodeDoc::Effect { voice, params, .. }
 | 侧链键控带低频内容（整段 kick）→ 低频能量主导检测 | 这是侧链压缩的固有特性，键控 HPF 已列为非目标（D9）。用户可先对键控源挂 EQ。 |
 | 一个 struct 服务两种参数表 → slot 8 在普通 `Compressor` 上是死字段 | 不可达（descriptor 无该槽，Inspector 不显示、`set` 返回 `false`）；`sidechain` 字段在普通压缩器上被 serde 写成默认值，无害冗余。 |
 | 侧链模式下 `stereo_link` 无效，用户可能以为开关坏了 | 参数表保留该槽（切换种类会保留参数），文档与参数提示写明「仅内部检测时生效」。 |
+## 9. 合并修订（2026-11-09）：`Sidechain Comp` 并回 `Compressor`
+
+用户提出「sidechain off 的侧链压缩器就是普通压缩器，两个节点是重复的」，经确认后合并。Z1-D2 本就以逐样本一致的测试（`sidechain_switch_off_matches_internal_detection`）锁定了两者的等价性，重复的只是菜单入口与种类名。
+
+### 9.1 决策修订
+
+| 原决策 | 修订后 | 理由 |
+| :--- | :--- | :--- |
+| Z1-D1：新增独立种类 `SidechainCompressor`，不改 `Compressor` | **删除 `SidechainCompressor`；`Compressor.audio_inputs() → 2`** | 当时反对合并的唯一硬回归是「旧压缩器变 `Dual` 后删除不再旁路」（Z-D9）。现把删除旁路细化：`Dual` 节点唯一入边在 Main（port 0）且 Mod 口无线 → 仍旁路（`graph.rs::remove_node` 统计 `mod_edges`，`patch_ops::delete_graph_node` 同步 `mod_wired` 判断）。旧工程压缩器（只接 Main）删除行为逐位不变，Z1-D1 的理由不再成立；Add 菜单的重复项随之消失。 |
+| Z1-D5：一个 struct 服务两种 descriptor（8 / 9 项表） | **统一 9 项表**：`COMPRESSOR_PARAMS` 直接含 slot 8；`SIDECHAIN_PARAMS` / `SIDECHAIN_DESCRIPTOR` / `CompressorProcessor::sidechain()` 删除，UI 用 `with_meters` | 只剩一张表后「越界槽返回 false」的分叉机制不再需要；`is_on(SLOT_SIDECHAIN)` 恒有定义，默认 0 = 内部检测。 |
+| Z1-D2 / D3 / D4 / D6 | 不变 | 显式开关、默认 off、静音键控不回落、单探测器、零延迟照旧。 |
+
+### 9.2 旧工程兼容（`PROJECT_VERSION` 不动）
+
+- model 侧 `BuiltinEffectKind::Compressor` 与 `EffectParams::Compressor` 各加 `#[serde(alias = "sidechain_compressor")]`：旧文件 `kind: "sidechain_compressor"` 反序列化为 `Compressor`，`sidechain: true/false` 保留在 `CompressorParams` 里照常生效；序列化写回 `"compressor"`（单向收敛，不做双向别名）。
+- 旧普通压缩器的 `sidechain` 字段本就以 `false` 序列化（`#[serde(default)]`），加载零差异。
+- 端口剖面：`audio_inputs()` 由种类推导 → 旧压缩器加载后自动获得 `NodeKind::Dual` 与 Main/Mod 两口，`sidechain = false` 时 Mod 口的线（若有）被忽略。
+
+### 9.3 验收（✅ 2026-11-09）
+
+- [x] model：`compressor_has_two_ports_and_a_persistent_switch` —— 两口 validate、RON 往返保留 `sidechain:`、旧 `kind:"compressor"` 与 `kind:"sidechain_compressor"`（alias）payload 均可解析且键控状态保留、alias 后 `audio_inputs()` 仍为 2
+- [x] engine：`keying_switch_is_the_ninth_slot`（9 项表 / `spec(8)="sidechain"` / 默认 off / armed 前忽略 key）、`switch_off_ignores_the_key_input`（off + 响 aux ≡ 无 aux，逐样本）、`sidechain_switch_off_matches_internal_detection` 等键控语义测试全部保留并改用统一构造器
+- [x] engine 删除语义：`removing_a_dual_node_with_only_main_wired_bypasses_again`（Dual 只接 Main → 旁路回补）+ `removing_a_dual_input_node_drops_both_cables_without_bypass`（Mod 有线仍不旁路）
+- [x] UI：slot 8 文档往返断言、meters 断言更新、`offline_render_honours_sidechain_keying` 改用 `EffectParams::Compressor`
+- [x] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` 全绿

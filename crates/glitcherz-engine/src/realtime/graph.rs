@@ -3031,10 +3031,16 @@ impl GraphCompiler {
         // (in-edge sources × out-edge destinations become direct pairs).
         // Multi-input nodes (mixers) have no meaningful bypass — their cables
         // are simply dropped.
-        let in_count = self.cables[..self.cable_count]
-            .iter()
-            .filter(|c| c.to == slot)
-            .count();
+        let mut in_count = 0usize;
+        let mut mod_edges = 0usize;
+        for cable in &self.cables[..self.cable_count] {
+            if cable.to == slot {
+                in_count += 1;
+                if cable.in_port != 0 {
+                    mod_edges += 1;
+                }
+            }
+        }
         let mut bypass = [Cable {
             from: 0,
             to: 0,
@@ -3046,9 +3052,12 @@ impl GraphCompiler {
         // its cables are dropped instead (mixer-like).
         // Z0 Z-D9: a dual-input node's single in-edge may be the Mod port;
         // bypassing it would wire a modulator straight into the main signal.
+        // Z1 merge revision: when a dual node's only in-edge sits on Main
+        // (port 0) and the Mod port is unwired, bypassing is safe again —
+        // this keeps the pre-dual delete behaviour of single-port effects.
         let bypassable = in_count <= 1
             && self.kinds[slot as usize] != NodeKind::Feedback
-            && self.kinds[slot as usize] != NodeKind::Dual;
+            && (self.kinds[slot as usize] != NodeKind::Dual || mod_edges == 0);
         if bypassable {
             for cable in &self.cables[..self.cable_count] {
                 if cable.to == slot {
@@ -4022,7 +4031,7 @@ mod tests {
         let mut tails = Vec::new();
         for key_value in [0.0f32, 0.5] {
             // Keying is off by default, so the test arms it explicitly.
-            let mut comp = CompressorProcessor::sidechain(SR, None);
+            let mut comp = CompressorProcessor::new(SR);
             comp.set_param(ParamId::BuiltinParam(compressor::SLOT_SIDECHAIN), 1.0);
             let (_compiler, mut graph, dual) = dual_rig_with(
                 Box::new(DcSource { value: 0.5 }),
@@ -4196,8 +4205,8 @@ mod tests {
 
     #[test]
     fn removing_a_dual_input_node_drops_both_cables_without_bypass() {
-        // Z-D9: even with a single in-edge, a dual node must not be bypassed —
-        // that edge may be the Mod port and has no meaningful main-path target.
+        // Z-D9: with a Mod edge present, a dual node must not be bypassed —
+        // the modulator has no meaningful main-path target.
         let (mut compiler, mut graph, _dual) = dual_rig(
             Box::new(DcSource { value: 0.5 }),
             Box::new(DcSource { value: 0.25 }),
@@ -4214,6 +4223,32 @@ mod tests {
                 .iter()
                 .all(|c| c.to != compiler.master_slot),
             "no modulator or carrier may be bypassed straight into master"
+        );
+        assert!(compiler.compile().is_ok());
+    }
+
+    #[test]
+    fn removing_a_dual_node_with_only_main_wired_bypasses_again() {
+        // Z1 merge revision: a dual node whose only in-edge sits on Main (the
+        // pre-dual shape of every plain compressor) keeps the bypass delete —
+        // the source reconnects straight to the master.
+        let (mut compiler, mut graph, _dual) = dual_rig(
+            Box::new(DcSource { value: 0.5 }),
+            Box::new(DcSource { value: 0.25 }),
+        );
+        // Drop the Mod edge: node 3 → dual(4).Mod.
+        let (mut recycle_tx, _recycle_rx) = recycle_channel();
+        let update = compiler.disconnect_nodes(3, 4).expect("remove Mod edge");
+        graph.apply_update(update, &mut recycle_tx);
+
+        let main_slot = compiler.node_slot(2).expect("Main source slot");
+        let update = compiler.remove_node(4).expect("remove dual node");
+        graph.apply_update(update, &mut recycle_tx);
+        assert!(
+            compiler.cables[..compiler.cable_count]
+                .iter()
+                .any(|c| c.from == main_slot && c.to == compiler.master_slot),
+            "the Main source must be bypassed straight into master"
         );
         assert!(compiler.compile().is_ok());
     }

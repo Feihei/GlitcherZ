@@ -1348,12 +1348,18 @@ impl GlitcherZApp {
             .iter()
             .filter(|c| c.kind == CableKind::Audio && c.to == PortRef::Node(doc_id))
             .count();
-        // Z0 Z-D9: a dual-input node never bypasses — its single in-edge may
-        // be the Mod port, which has no meaningful direct replacement.
+        // Z0 Z-D9: a dual-input node with a wired Mod port never bypasses —
+        // the modulator has no meaningful direct replacement. Z1 merge
+        // revision: when its only in-edge sits on Main (the pre-dual shape of
+        // every plain compressor), bypassing is safe again.
         let is_dual = node.audio_inputs() == 2;
+        let mod_wired =
+            self.project().graph.cables.iter().any(|c| {
+                c.kind == CableKind::Audio && c.to == PortRef::Node(doc_id) && c.in_port != 0
+            });
         // Document bypass pairs: in-cable sources × out-cable targets (audio
         // only; skipped for multi-input nodes — D19 mixer/master deletion).
-        let ins: Vec<PortRef> = if audio_in_count <= 1 && !is_dual {
+        let ins: Vec<PortRef> = if audio_in_count <= 1 && (!is_dual || !mod_wired) {
             self.project()
                 .graph
                 .cables

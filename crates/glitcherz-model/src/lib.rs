@@ -645,10 +645,10 @@ pub struct CompressorParams {
     pub stereo_link: bool,
     /// Detect from the Mod port instead of the node input (spec Z1).
     ///
-    /// Off by default: a fresh `Sidechain Comp` compresses from its own
-    /// input until the key is wired and the switch is enabled, so it never
-    /// sits inert waiting for a cable. Only the sidechain variant exposes a
-    /// slot for it, so a plain `Compressor` never reads this field.
+    /// Off by default: the compressor works from its own input until the key
+    /// is wired and the switch is enabled, so it never sits inert waiting for
+    /// a cable (Z1 merge: every `Compressor` owns both the port and this
+    /// switch).
     #[serde(default)]
     pub sidechain: bool,
 }
@@ -1105,7 +1105,10 @@ pub enum BuiltinEffectKind {
     Delay,
     /// Three-band EQ with a low cut.
     Eq,
-    /// Feed-forward peak compressor.
+    /// Feed-forward peak compressor. Owns a Mod port (Z1 merge): the keying
+    /// switch decides whether it is read. The alias keeps pre-merge projects
+    /// (`kind: "sidechain_compressor"`) loading unchanged.
+    #[serde(alias = "sidechain_compressor")]
     Compressor,
     /// Stereo FDN-8 reverb.
     Reverb,
@@ -1123,8 +1126,6 @@ pub enum BuiltinEffectKind {
     Limiter,
     /// Two-input ring modulator (Z0 validation effect).
     RingMod,
-    /// Compressor keyed from the second audio port (Z1).
-    SidechainCompressor,
     /// 16-band vocoder: carrier on Main, modulator on Mod (Z2).
     Vocoder,
 }
@@ -1144,15 +1145,14 @@ impl BuiltinEffectKind {
             Self::Saturation => "Saturation",
             Self::Limiter => "Limiter",
             Self::RingMod => "Ring Mod",
-            Self::SidechainCompressor => "Sidechain Comp",
             Self::Vocoder => "Vocoder",
         }
     }
 
-    /// Number of audio input ports (Z0). Only dual-input effects answer 2.
+    /// Number of audio input ports (Z0). Dual-input effects answer 2.
     pub const fn audio_inputs(self) -> u8 {
         match self {
-            Self::RingMod | Self::SidechainCompressor | Self::Vocoder => 2,
+            Self::RingMod | Self::Compressor | Self::Vocoder => 2,
             _ => 1,
         }
     }
@@ -1170,7 +1170,6 @@ impl BuiltinEffectKind {
         BuiltinEffectKind::Saturation,
         BuiltinEffectKind::Limiter,
         BuiltinEffectKind::RingMod,
-        BuiltinEffectKind::SidechainCompressor,
         BuiltinEffectKind::Vocoder,
     ];
 }
@@ -1188,7 +1187,10 @@ pub enum EffectParams {
     Delay(DelayParams),
     /// Three-band EQ with a low cut (`Box` keeps `NodeDoc` small).
     Eq(Box<EqParams>),
-    /// Feed-forward peak compressor.
+    /// Feed-forward peak compressor. Owns a Mod port (Z1 merge): keying stays
+    /// dormant until the switch is on. The alias keeps pre-merge projects
+    /// (`kind: "sidechain_compressor"`) loading unchanged.
+    #[serde(alias = "sidechain_compressor")]
     Compressor(Box<CompressorParams>),
     /// Stereo FDN-8 reverb.
     Reverb(Box<ReverbParams>),
@@ -1206,8 +1208,6 @@ pub enum EffectParams {
     Limiter(Box<LimiterParams>),
     /// Two-input ring modulator (Z0).
     RingMod(Box<RingModParams>),
-    /// Compressor keyed from the second audio port (Z1).
-    SidechainCompressor(Box<CompressorParams>),
     /// 16-band vocoder: carrier on Main, modulator on Mod (Z2).
     Vocoder(Box<VocoderParams>),
 }
@@ -1233,7 +1233,7 @@ impl EffectParams {
             Self::Saturation(_) => BuiltinEffectKind::Saturation,
             Self::Limiter(_) => BuiltinEffectKind::Limiter,
             Self::RingMod(_) => BuiltinEffectKind::RingMod,
-            Self::SidechainCompressor(_) => BuiltinEffectKind::SidechainCompressor,
+
             Self::Vocoder(_) => BuiltinEffectKind::Vocoder,
         }
     }
@@ -1282,22 +1282,6 @@ impl EffectParams {
     pub fn as_compressor_mut(&mut self) -> Option<&mut CompressorParams> {
         match self {
             Self::Compressor(params) => Some(params),
-            _ => None,
-        }
-    }
-
-    /// Compressor parameters, when this is a sidechain compressor node.
-    pub fn as_sidechain_compressor(&self) -> Option<&CompressorParams> {
-        match self {
-            Self::SidechainCompressor(params) => Some(params),
-            _ => None,
-        }
-    }
-
-    /// Mutable compressor parameters, when this is a sidechain compressor node.
-    pub fn as_sidechain_compressor_mut(&mut self) -> Option<&mut CompressorParams> {
-        match self {
-            Self::SidechainCompressor(params) => Some(params),
             _ => None,
         }
     }
@@ -2999,7 +2983,7 @@ pub fn effect_slot_axis(params: &EffectParams, slot: u8) -> MapSpec {
         (EffectParams::Eq(_), 6) => M::log(1_500.0, 16_000.0),
         (EffectParams::Eq(_), 7) => M::log(20.0, 500.0),
         // threshold (dB), ratio, attack (ms), release (ms), knee (dB),
-        // makeup (dB), mix, stereo link.
+        // makeup (dB), mix, stereo link, keying switch (Z1 merge).
         (EffectParams::Compressor(_), 0) => M::linear(-60.0, 0.0),
         (EffectParams::Compressor(_), 1) => M::log(1.0, 20.0),
         (EffectParams::Compressor(_), 2) => M::log(0.1, 200.0),
@@ -3008,16 +2992,7 @@ pub fn effect_slot_axis(params: &EffectParams, slot: u8) -> MapSpec {
         (EffectParams::Compressor(_), 5) => M::linear(0.0, 24.0),
         (EffectParams::Compressor(_), 6) => M::linear(0.0, 1.0),
         (EffectParams::Compressor(_), 7) => M::linear(0.0, 1.0),
-        // Same eight slots plus the keying switch (Z1).
-        (EffectParams::SidechainCompressor(_), 0) => M::linear(-60.0, 0.0),
-        (EffectParams::SidechainCompressor(_), 1) => M::log(1.0, 20.0),
-        (EffectParams::SidechainCompressor(_), 2) => M::log(0.1, 200.0),
-        (EffectParams::SidechainCompressor(_), 3) => M::log(5.0, 2_000.0),
-        (EffectParams::SidechainCompressor(_), 4) => M::linear(0.0, 24.0),
-        (EffectParams::SidechainCompressor(_), 5) => M::linear(0.0, 24.0),
-        (EffectParams::SidechainCompressor(_), 6) => M::linear(0.0, 1.0),
-        (EffectParams::SidechainCompressor(_), 7) => M::linear(0.0, 1.0),
-        (EffectParams::SidechainCompressor(_), 8) => M::linear(0.0, 1.0),
+        (EffectParams::Compressor(_), 8) => M::linear(0.0, 1.0),
         // pre-delay (ms), decay (s), damping, low cut, width, mix.
         (EffectParams::Reverb(_), 0) => M::linear(0.0, 200.0),
         (EffectParams::Reverb(_), 1) => M::log(0.2, 12.0),
@@ -6636,21 +6611,22 @@ mod tests {
         assert_eq!(dual, back);
     }
 
-    /// Z1: a second dual-input kind. Both ports validate, and the keying switch
-    /// survives a round trip while older payloads default to keying on.
+    /// Z1 merge: the compressor is a dual-input kind. Both ports validate, the
+    /// keying switch survives a round trip, and pre-merge
+    /// `sidechain_compressor` payloads load through the serde alias.
     #[test]
-    fn sidechain_compressor_has_two_ports_and_a_persistent_switch() {
+    fn compressor_has_two_ports_and_a_persistent_switch() {
         let node = NodeDoc::Effect {
             node_id: 4,
             track: 0,
             voice: VoiceSpec::Builtin,
-            params: EffectParams::SidechainCompressor(Box::default()),
+            params: EffectParams::Compressor(Box::default()),
             delay: None,
         };
         assert_eq!(node.audio_inputs(), 2, "Main + Mod");
-        let kind = EffectParams::SidechainCompressor(Box::default()).kind();
-        assert_eq!(kind, super::BuiltinEffectKind::SidechainCompressor);
-        assert_eq!(kind.label(), "Sidechain Comp");
+        let kind = EffectParams::Compressor(Box::default()).kind();
+        assert_eq!(kind, super::BuiltinEffectKind::Compressor);
+        assert_eq!(kind.label(), "Compressor");
 
         let instrument = |node_id: u64, track: usize| NodeDoc::Instrument {
             node_id,
@@ -6670,7 +6646,7 @@ mod tests {
         graph.validate(2, 0).expect("Main + Mod must be legal");
 
         let text = ron::to_string(&node).expect("serialize");
-        assert!(text.contains("sidechain_compressor"), "tag missing: {text}");
+        assert!(text.contains("compressor"), "tag missing: {text}");
         assert!(text.contains("sidechain:"), "switch missing: {text}");
         let back: NodeDoc = ron::from_str(&text).expect("deserialize");
         assert_eq!(node, back);
@@ -6678,14 +6654,29 @@ mod tests {
         // A payload that predates the switch loads with keying off.
         let legacy: NodeDoc = ron::from_str(
             r#"(type:"effect", node_id:3, track:0, voice:(type:"builtin"),
-                params:(kind:"sidechain_compressor"))"#,
+                params:(kind:"compressor"))"#,
         )
-        .expect("a bare sidechain payload should parse");
+        .expect("a bare compressor payload should parse");
         let NodeDoc::Effect { params, .. } = legacy else {
             panic!("expected an effect node");
         };
-        let comp = params.as_sidechain_compressor().expect("sidechain payload");
+        let comp = params.as_compressor().expect("compressor payload");
         assert!(!comp.sidechain, "keying starts disabled");
+
+        // A pre-merge sidechain payload loads as a Compressor via the alias,
+        // keeping its keying state and its two ports.
+        let merged: NodeDoc = ron::from_str(
+            r#"(type:"effect", node_id:5, track:0, voice:(type:"builtin"),
+                params:(kind:"sidechain_compressor", sidechain:true))"#,
+        )
+        .expect("a pre-merge sidechain payload should parse");
+        assert_eq!(merged.audio_inputs(), 2, "the alias keeps both ports");
+        let NodeDoc::Effect { params, .. } = merged else {
+            panic!("expected an effect node");
+        };
+        assert_eq!(params.kind(), super::BuiltinEffectKind::Compressor);
+        let comp = params.as_compressor().expect("compressor payload");
+        assert!(comp.sidechain, "keying survives the alias");
     }
 
     // Z2: the vocoder is the second real dual-input effect, and its payload
