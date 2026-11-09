@@ -124,6 +124,7 @@ jobs:
           mkdir -p "$stage"
           cp "${{ matrix.bin }}" "$stage/"
           cp README.md "$stage/"
+          cp docs/manual.md docs/shortcuts.md "$stage/"
           # Font licence: OFL 1.1 requires the notice to travel with the binary.
           cp THIRD-PARTY-NOTICES.md "$stage/"
           tar -czf "$stage.tar.gz" -C dist "$(basename "$stage")"
@@ -139,6 +140,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "${{ matrix.bin }}" $stage
           Copy-Item "README.md" $stage
+          Copy-Item "docs/manual.md", "docs/shortcuts.md" $stage
           # Font licence: OFL 1.1 requires the notice to travel with the binary.
           Copy-Item "THIRD-PARTY-NOTICES.md" $stage
           Compress-Archive -Path $stage -DestinationPath "$stage.zip" -Force
@@ -215,6 +217,7 @@ jobs:
             echo "## Runtime requirements"
             echo
             echo "- **Windows / macOS**: nothing extra, just unpack and run."
+            echo "- **Unsigned binaries**: macOS Gatekeeper and Windows SmartScreen will warn on first launch. On macOS, right-click the binary and choose *Open*, or allow it under System Settings → Privacy & Security. On Windows, click *More info* → *Run anyway*."
             echo "- **Linux**: needs ALSA, OpenGL and an X11 or Wayland session, e.g. on Debian/Ubuntu:"
             echo "  \`sudo apt install libasound2 libgl1 libxkbcommon0 libwayland-client0\`."
             echo "- CLAP / VST3 plugins are optional; point GlitcherZ at your plugin folders in the app."
@@ -235,4 +238,6 @@ jobs:
             dist/sha256sums.txt
           fail_on_unmatched_files: true
           draft: false
-          prerelease: false
+          # Semver prerelease tags (e.g. v0.1.0-preview.1) become GitHub
+          # pre-releases; plain tags like v0.1.0 stay full releases.
+          prerelease: auto
