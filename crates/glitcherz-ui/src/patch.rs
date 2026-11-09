@@ -76,6 +76,9 @@ pub enum InlineParam {
     OrganBar8,
     /// Drawbar organ percussion level (S2).
     OrganPercussion,
+    /// Wavetable frame blend (S3): the instrument's only timbre control, so it
+    /// is the one row that has to sit on the node body.
+    WavetablePosition,
 }
 
 /// How an inline row is presented (U13). Discrete selectors such as a
@@ -166,6 +169,13 @@ const ORGAN_INLINE: [InlineParamSpec; 2] = [
     },
 ];
 
+/// Wavetable inline row (S3): `position` is the whole timbre axis; the three
+/// macros live in the Inspector.
+const WAVETABLE_INLINE: [InlineParamSpec; 1] = [InlineParamSpec {
+    param: InlineParam::WavetablePosition,
+    label: "pos",
+}];
+
 /// Mixer inline row (output-stage pan; channel parameters stay on the
 /// mixer console — spec §7).
 const MIXER_INLINE: [InlineParamSpec; 1] = [InlineParamSpec {
@@ -253,6 +263,10 @@ fn inline_params_of(node: &NodeDoc) -> Vec<InlineParamSpec> {
             voice: VoiceSpec::Organ { .. },
             ..
         } => ORGAN_INLINE.to_vec(),
+        NodeDoc::Instrument {
+            voice: VoiceSpec::Wavetable { .. },
+            ..
+        } => WAVETABLE_INLINE.to_vec(),
         // Table-driven from the engine descriptor (spec `effects.md` D6): the
         // row order, labels and count all come from the effect's static table.
         // Only slots flagged `INLINE` get a row — an eight-parameter EQ would
@@ -485,6 +499,13 @@ fn inline_doc_value(node: &NodeDoc, param: InlineParam) -> (f64, f64, f64) {
             },
             InlineParam::OrganPercussion,
         ) => (f64::from(params.percussion), 0.0, 1.0),
+        (
+            NodeDoc::Instrument {
+                voice: VoiceSpec::Wavetable { params },
+                ..
+            },
+            InlineParam::WavetablePosition,
+        ) => (f64::from(params.position), 0.0, 1.0),
         _ => (0.0, 0.0, 1.0),
     }
 }
@@ -661,6 +682,9 @@ pub enum NodeSource {
     /// Drawbar organ (S2, spec `organ-instrument.md`): nine sine drawbars
     /// plus a percussion partial. Born audible — there is no file to pick.
     Organ,
+    /// Wavetable synthesizer (S3, spec `wavetable-instrument.md`): a built-in
+    /// band-limited frame bank. Born audible — there is no file to pick.
+    Wavetable,
     /// CLAP instrument plugin.
     ClapInstrument {
         /// Module path.
@@ -2022,6 +2046,7 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 }
                 VoiceSpec::Pluck { .. } => format!("PLUCK · Track {}", track + 1),
                 VoiceSpec::Organ { .. } => format!("ORGAN · Track {}", track + 1),
+                VoiceSpec::Wavetable { .. } => format!("WTABLE · Track {}", track + 1),
                 VoiceSpec::Clap { plugin_id, .. } => {
                     format!("♪ {}", truncate(plugin_id, 16))
                 }
@@ -2042,7 +2067,8 @@ fn label_of(id: PatchId, doc: &GraphDoc) -> String {
                 | VoiceSpec::DrumKit { .. }
                 | VoiceSpec::Modal { .. }
                 | VoiceSpec::Pluck { .. }
-                | VoiceSpec::Organ { .. } => {
+                | VoiceSpec::Organ { .. }
+                | VoiceSpec::Wavetable { .. } => {
                     format!("{} · Track {}", params.kind().label(), track + 1)
                 }
                 VoiceSpec::Clap { plugin_id, .. } => {
@@ -2183,6 +2209,10 @@ pub(crate) fn auto_param_label(param: &AutoParam) -> String {
             NodeParam::OrganAttack => "Attack".to_string(),
             NodeParam::OrganRelease => "Release".to_string(),
             NodeParam::OrganGain => "Gain".to_string(),
+            NodeParam::WavetablePosition => "Position".to_string(),
+            NodeParam::WavetableAttack => "Attack".to_string(),
+            NodeParam::WavetableRelease => "Release".to_string(),
+            NodeParam::WavetableGain => "Gain".to_string(),
         },
     }
 }

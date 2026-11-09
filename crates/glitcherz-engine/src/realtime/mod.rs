@@ -91,6 +91,7 @@ pub mod svf;
 pub mod synth;
 pub mod vocoder;
 pub mod voice;
+pub mod wavetable;
 
 /// Fixed processing block size (in samples). See AGENTS.md "Processing Graph" (64 or 128 recommended).
 pub const FIXED_BLOCK_SIZE: usize = 128;
@@ -177,3 +178,7 @@ pub use svf::{FilterMode, SvfProcessor};
 pub use synth::{SynthProcessor, note_to_frequency};
 pub use vocoder::VocoderProcessor;
 pub use voice::{RecycledNode, STRUCTURE_QUEUE_CAPACITY, recycle_channel, structure_channel};
+pub use wavetable::{
+    FRAMES as WAVETABLE_FRAMES, MAX_VOICES as WAVETABLE_MAX_VOICES, WavetableProcessor,
+    preview_waveform as wavetable_preview,
+};

@@ -491,6 +491,47 @@ impl Default for OrganParams {
     }
 }
 
+/// Wavetable parameters (spec `wavetable-instrument.md` §6).
+///
+/// One timbre axis: `position` slides through the built-in frame bank (sine →
+/// triangle → saw → square). There is no preset enum and no filter — the
+/// position *is* the sound (S3-D15). Every field is `serde(default)`, so a
+/// payload written by an older build still loads.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WavetableParams {
+    /// Frame blend (0..1): `0` = pure sine, `1` = square.
+    #[serde(default)]
+    pub position: f32,
+    /// Key-switch attack ramp in seconds (0.001..2).
+    #[serde(default = "default_wavetable_attack")]
+    pub attack_s: f32,
+    /// Key-switch release ramp in seconds (0.005..5).
+    #[serde(default = "default_wavetable_release")]
+    pub release_s: f32,
+    /// Node output gain (0..2).
+    #[serde(default = "default_organ_gain")]
+    pub gain: f32,
+}
+
+fn default_wavetable_attack() -> f32 {
+    0.005
+}
+
+fn default_wavetable_release() -> f32 {
+    0.12
+}
+
+impl Default for WavetableParams {
+    fn default() -> Self {
+        Self {
+            position: 0.0,
+            attack_s: default_wavetable_attack(),
+            release_s: default_wavetable_release(),
+            gain: default_organ_gain(),
+        }
+    }
+}
+
 /// Per-track delay effect parameters (`mix = 0` means bypass).
 ///
 /// E4 added the stereo/tempo fields; they are additive (`serde(default)`), so
@@ -2317,6 +2358,13 @@ pub enum VoiceSpec {
         #[serde(default)]
         params: OrganParams,
     },
+    /// Wavetable synthesizer (S3, spec `wavetable-instrument.md`): a built-in
+    /// bank of band-limited single-cycle tables, blended by `position`. No
+    /// external file, no "born empty" state.
+    Wavetable {
+        #[serde(default)]
+        params: WavetableParams,
+    },
     /// CLAP plugin: dynamic library path + plugin ID (instantiated on the
     /// non-real-time thread).
     Clap {
@@ -2674,6 +2722,14 @@ pub enum NodeParam {
     OrganRelease,
     /// Drawbar organ: node output gain (0..2).
     OrganGain,
+    /// Wavetable: frame blend (0..1; spec `wavetable-instrument.md` S3-D13).
+    WavetablePosition,
+    /// Wavetable: key-switch attack ramp in seconds (0.001..2).
+    WavetableAttack,
+    /// Wavetable: key-switch release ramp in seconds (0.005..5).
+    WavetableRelease,
+    /// Wavetable: node output gain (0..2).
+    WavetableGain,
 }
 
 /// Which control of a mixer channel a curve drives ([`NodeParam::MixerChannel`]).
@@ -2939,6 +2995,10 @@ pub fn node_param_map(param: NodeParam, graph: &GraphDoc, target: &PortRef) -> M
         NodeParam::OrganAttack => MapSpec::linear(0.001, 0.2),
         NodeParam::OrganRelease => MapSpec::linear(0.005, 1.0),
         NodeParam::OrganGain => MapSpec::linear(0.0, 2.0),
+        NodeParam::WavetablePosition => MapSpec::linear(0.0, 1.0),
+        NodeParam::WavetableAttack => MapSpec::linear(0.001, 2.0),
+        NodeParam::WavetableRelease => MapSpec::linear(0.005, 5.0),
+        NodeParam::WavetableGain => MapSpec::linear(0.0, 2.0),
     }
 }
 
@@ -4137,6 +4197,7 @@ impl VoiceSpec {
             VoiceSpec::Modal { .. } => std::mem::size_of::<ModalParams>(),
             VoiceSpec::Pluck { .. } => std::mem::size_of::<PluckParams>(),
             VoiceSpec::Organ { .. } => std::mem::size_of::<OrganParams>(),
+            VoiceSpec::Wavetable { .. } => std::mem::size_of::<WavetableParams>(),
             VoiceSpec::Clap {
                 path,
                 plugin_id,
@@ -5584,6 +5645,7 @@ fn voice_engine_identity_eq(a: &VoiceSpec, b: &VoiceSpec) -> bool {
         (VoiceSpec::Modal { .. }, VoiceSpec::Modal { .. })
         | (VoiceSpec::Pluck { .. }, VoiceSpec::Pluck { .. })
         | (VoiceSpec::Organ { .. }, VoiceSpec::Organ { .. }) => true,
+        (VoiceSpec::Wavetable { .. }, VoiceSpec::Wavetable { .. }) => true,
         (VoiceSpec::SoundFont { path: pa, .. }, VoiceSpec::SoundFont { path: pb, .. }) => pa == pb,
         (VoiceSpec::Sample { path: pa, .. }, VoiceSpec::Sample { path: pb, .. }) => pa == pb,
         (VoiceSpec::DrumKit { slots: sa, .. }, VoiceSpec::DrumKit { slots: sb, .. }) => {
@@ -6506,6 +6568,53 @@ mod tests {
         graph
             .validate(2, 0)
             .expect("an organ instrument must validate");
+    }
+
+    /// S3: the wavetable payload is additive too — a bare `wavetable` tag loads
+    /// with the documented defaults (sine frame, 5 ms attack), and the
+    /// position survives a RON round-trip.
+    #[test]
+    fn wavetable_voice_round_trips_and_defaults() {
+        let params = super::WavetableParams {
+            position: 0.625,
+            attack_s: 0.3,
+            release_s: 1.5,
+            gain: 0.8,
+        };
+        let node = NodeDoc::Instrument {
+            node_id: 2,
+            track: 0,
+            voice: VoiceSpec::Wavetable { params },
+            synth: SynthParams::default(),
+        };
+        let text = ron::to_string(&node).expect("serialize");
+        assert!(text.contains("wavetable"), "voice tag missing: {text}");
+        let back: NodeDoc = ron::from_str(&text).expect("deserialize");
+        assert_eq!(node, back);
+
+        let legacy: NodeDoc =
+            ron::from_str(r#"(type:"instrument", node_id:3, track:0, voice:(type:"wavetable"))"#)
+                .expect("a bare wavetable payload should parse");
+        let NodeDoc::Instrument {
+            voice: VoiceSpec::Wavetable { params },
+            ..
+        } = legacy
+        else {
+            panic!("expected a wavetable instrument");
+        };
+        assert_eq!(params, super::WavetableParams::default());
+        assert!((params.position - 0.0).abs() < 1e-6);
+        assert!((params.release_s - 0.12).abs() < 1e-6);
+        assert!((params.gain - 1.0).abs() < 1e-6);
+
+        let graph = GraphDoc {
+            nodes: vec![node],
+            cables: vec![CableDoc::audio(2u64, PortRef::Master)],
+            ..Default::default()
+        };
+        graph
+            .validate(2, 0)
+            .expect("a wavetable instrument must validate");
     }
 
     // E1: the effect payload's tag *is* the kind (D1), and the legacy sibling

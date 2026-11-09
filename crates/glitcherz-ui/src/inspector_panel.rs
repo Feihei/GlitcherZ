@@ -283,6 +283,21 @@ impl GlitcherZApp {
                 if let Some(params) = organ_state {
                     self.organ_section(ui, instr_id, &params);
                 }
+                // S3: wavetable (position + one-cycle preview + ramps).
+                let wavetable_state = self
+                    .project()
+                    .graph
+                    .node_by_id(instr_id)
+                    .and_then(|n| match n {
+                        NodeDoc::Instrument {
+                            voice: VoiceSpec::Wavetable { params },
+                            ..
+                        } => Some(*params),
+                        _ => None,
+                    });
+                if let Some(params) = wavetable_state {
+                    self.wavetable_section(ui, instr_id, &params);
+                }
                 // Effects are added from the graph only (Add ▸ Effect, or the
                 // cable-midpoint insert — spec `plugin-browser.md` D12); the
                 // track-level "clear" shortcut sits above the effect list.
@@ -2174,6 +2189,121 @@ impl GlitcherZApp {
         }
     }
 
+    pub(crate) fn wavetable_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc_id: u64,
+        params: &glitcherz_model::WavetableParams,
+    ) {
+        ui.separator();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.strong("Wavetable");
+            ui.weak("— sine → triangle → saw → square; velocity sets the level");
+        });
+
+        // One cycle at the current position. The shape *is* the instrument, so
+        // drawing it beats any number of sliders (S3-D14).
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 64.0), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+        let mut cycle = [0.0f32; 192];
+        crate::wavetable_preview(params.position, &mut cycle);
+        let mid = rect.center().y;
+        let half = rect.height() * 0.42;
+        let points: Vec<egui::Pos2> = cycle
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                egui::pos2(
+                    rect.left() + rect.width() * i as f32 / (cycle.len() - 1) as f32,
+                    mid - value * half,
+                )
+            })
+            .collect();
+        painter.add(egui::Shape::line(
+            points,
+            egui::Stroke::new(1.5, ui.visuals().selection.bg_fill),
+        ));
+
+        let rows: [(&str, f32, f32, ParamId, &str, &str); 4] = [
+            (
+                "Position",
+                0.0,
+                1.0,
+                ParamId::WavetablePosition,
+                "wavetable-position",
+                "0 = sine, 0.33 = triangle, 0.67 = saw, 1 = square",
+            ),
+            (
+                "Attack",
+                0.001,
+                2.0,
+                ParamId::WavetableAttack,
+                "wavetable-attack",
+                "Key-switch ramp in · too short clicks",
+            ),
+            (
+                "Release",
+                0.005,
+                5.0,
+                ParamId::WavetableRelease,
+                "wavetable-release",
+                "Key-switch ramp out · long values make a pad",
+            ),
+            (
+                "Gain",
+                0.0,
+                2.0,
+                ParamId::WavetableGain,
+                "wavetable-gain",
+                "Node output trim",
+            ),
+        ];
+        let mut values = [
+            params.position,
+            params.attack_s,
+            params.release_s,
+            params.gain,
+        ];
+        let mut changed: Vec<(usize, f32)> = Vec::new();
+        egui::Grid::new(format!("wavetable_grid_{doc_id}"))
+            .num_columns(2)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| {
+                for (index, (label, min, max, _, _, tooltip)) in rows.iter().enumerate() {
+                    ui.label(*label);
+                    let response = ui
+                        .add(egui::Slider::new(&mut values[index], *min..=*max).fixed_decimals(3))
+                        .on_hover_text(*tooltip);
+                    if response.changed() {
+                        changed.push((index, values[index]));
+                    }
+                    ui.end_row();
+                }
+            });
+
+        for (index, value) in changed {
+            let before = self.begin_param_edit();
+            if let Some(NodeDoc::Instrument {
+                voice: VoiceSpec::Wavetable { params },
+                ..
+            }) = self.project_mut().graph.node_by_id_mut(doc_id)
+            {
+                match index {
+                    0 => params.position = value.clamp(0.0, 1.0),
+                    1 => params.attack_s = value.clamp(0.001, 2.0),
+                    2 => params.release_s = value.clamp(0.005, 5.0),
+                    3 => params.gain = value.clamp(0.0, 2.0),
+                    _ => {}
+                }
+            }
+            self.commit_param_edit(rows[index].0, before, rows[index].4);
+            self.send_node_param(doc_id, rows[index].3, value);
+        }
+    }
+
     pub(crate) fn drum_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -2698,6 +2828,18 @@ impl GlitcherZApp {
                         params.percussion = value.clamp(0.0, 1.0);
                     }
                     self.commit_param_edit("Organ Percussion", before, "organ-percussion");
+                    self.send_node_param(node, inline_param_id(p), value);
+                }
+                patch::InlineParam::WavetablePosition => {
+                    let before = self.begin_param_edit();
+                    if let Some(NodeDoc::Instrument {
+                        voice: VoiceSpec::Wavetable { params },
+                        ..
+                    }) = self.project_mut().graph.node_by_id_mut(node)
+                    {
+                        params.position = value.clamp(0.0, 1.0);
+                    }
+                    self.commit_param_edit("Wavetable Position", before, "wavetable-position");
                     self.send_node_param(node, inline_param_id(p), value);
                 }
                 patch::InlineParam::Sf2Gain => {

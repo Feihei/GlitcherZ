@@ -30,7 +30,7 @@ use glitcherz_engine::realtime::{
     BitcrusherProcessor, ChorusProcessor, CompressorProcessor, DelayProcessor, EffectMeters,
     EqProcessor, FlangerProcessor, LimiterProcessor, ModalProcessor, OrganProcessor,
     PhaserProcessor, PluckProcessor, ReverbProcessor, RingModProcessor, SaturationProcessor,
-    VocoderProcessor,
+    VocoderProcessor, WavetableProcessor,
 };
 
 // ---------------------------------------------------------------------------
@@ -395,6 +395,37 @@ fn built_in_effects_are_allocation_free() {
     }
     organ.note_event(NoteEvent::Off { note: 0 });
     assert_zero_alloc(&scope, "OrganProcessor process/note_event/set_param");
+
+    // S3: the wavetable reads a process-wide bank through a `&'static` slice.
+    // The audit sweeps `position` and the pitch so both the frame blend and the
+    // band-limited level selection run inside the scope.
+    let mut wavetable = WavetableProcessor::new(SR);
+    let mut wavetable_buffer = fixture();
+    for block in 0..2 {
+        wavetable.note_event(NoteEvent::On {
+            note: 60 + block as u8,
+            velocity: 0.9,
+        });
+        wavetable.process(&ctx(), &mut wavetable_buffer);
+    }
+    let scope = AuditScope::begin();
+    for block in 0..64 {
+        wavetable.set_param(ParamId::WavetablePosition, (block as f32 * 0.11).fract());
+        wavetable.set_param(ParamId::WavetableAttack, 0.001 + (block as f32) * 0.001);
+        wavetable.set_param(ParamId::WavetableRelease, 0.02 + (block as f32) * 0.01);
+        wavetable.set_param(ParamId::WavetableGain, 1.0);
+        wavetable.set_param(ParamId::PitchOffset, (block as f32 * 0.29).sin() * 12.0);
+        wavetable.note_event(NoteEvent::On {
+            note: 36 + (block % 60) as u8,
+            velocity: 1.0,
+        });
+        wavetable.process(&ctx(), &mut wavetable_buffer);
+        wavetable.note_event(NoteEvent::Off {
+            note: 36 + (block % 60) as u8,
+        });
+    }
+    wavetable.note_event(NoteEvent::Off { note: 0 });
+    assert_zero_alloc(&scope, "WavetableProcessor process/note_event/set_param");
 
     // Z2: 16 bands x 2 banks per channel, all of them fixed-size arrays. The
     // audit alternates the parameter set so the per-block coefficient rebuild

@@ -569,6 +569,14 @@ impl GlitcherZApp {
                 },
                 synth: SynthParams::default(),
             },
+            patch::NodeSource::Wavetable => NodeDoc::Instrument {
+                node_id,
+                track,
+                voice: VoiceSpec::Wavetable {
+                    params: glitcherz_model::WavetableParams::default(),
+                },
+                synth: SynthParams::default(),
+            },
             patch::NodeSource::ClapInstrument { path, plugin_id } => NodeDoc::Instrument {
                 node_id,
                 track,

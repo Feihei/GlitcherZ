@@ -48,8 +48,8 @@ use glitcherz_engine::realtime::{
     NodeKind, NoteEvent, OrganProcessor, ParamId, PluckProcessor, PortamentoProcessor, Processor,
     RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCtrl, RtCtrlKind, RtCurveInterp,
     RtMidiClip, RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand,
-    Sf2VoiceProcessor, SilentProcessor, SynthProcessor, Unit, empty_clip_table,
-    empty_midi_clip_table, mode_value as curve_mode_value,
+    Sf2VoiceProcessor, SilentProcessor, SynthProcessor, Unit, WavetableProcessor, empty_clip_table,
+    empty_midi_clip_table, mode_value as curve_mode_value, wavetable_preview,
 };
 use glitcherz_engine::{MidiTarget, Sf2Library, Sf2Preset};
 use glitcherz_model::{
@@ -59,7 +59,7 @@ use glitcherz_model::{
     MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip,
     MidiEnvelopeParams, MidiSource, MidiTrack, ModalParams, NodeDoc, NodeParam, Note, OrganParams,
     PluckParams, PortRef, PortamentoParams, Project, SamplePlayMode, SongLoop, SynthParams,
-    SynthWaveform, TrackKind, VoiceSpec,
+    SynthWaveform, TrackKind, VoiceSpec, WavetableParams,
 };
 
 pub mod autosave;
@@ -388,6 +388,17 @@ pub(crate) fn organ_param_values(params: &OrganParams) -> [(ParamId, f32); 15] {
     ]
 }
 
+/// Every engine parameter of a wavetable payload (S3-D12): the live document
+/// push and the offline export seed both walk this table.
+pub(crate) fn wavetable_param_values(params: &WavetableParams) -> [(ParamId, f32); 4] {
+    [
+        (ParamId::WavetablePosition, params.position),
+        (ParamId::WavetableAttack, params.attack_s),
+        (ParamId::WavetableRelease, params.release_s),
+        (ParamId::WavetableGain, params.gain),
+    ]
+}
+
 /// Document automation parameter → engine parameter ID.
 ///
 /// `None` for [`AutoParam::Tempo`] (the engine route uses the Timeline In
@@ -649,6 +660,10 @@ fn node_param_id(param: NodeParam) -> ParamId {
         NodeParam::OrganAttack => ParamId::OrganAttack,
         NodeParam::OrganRelease => ParamId::OrganRelease,
         NodeParam::OrganGain => ParamId::OrganGain,
+        NodeParam::WavetablePosition => ParamId::WavetablePosition,
+        NodeParam::WavetableAttack => ParamId::WavetableAttack,
+        NodeParam::WavetableRelease => ParamId::WavetableRelease,
+        NodeParam::WavetableGain => ParamId::WavetableGain,
     }
 }
 
@@ -772,6 +787,21 @@ fn node_auto_options(
                 ("Attack", NodeParam::OrganAttack),
                 ("Release", NodeParam::OrganRelease),
                 ("Gain", NodeParam::OrganGain),
+            ] {
+                options.push((label.to_string(), AutoParam::Node(param)));
+            }
+        }
+        // S3: `position` is the instrument's whole timbre axis, so it leads the
+        // list; the three macros follow in inspector order.
+        NodeDoc::Instrument {
+            voice: VoiceSpec::Wavetable { .. },
+            ..
+        } => {
+            for (label, param) in [
+                ("Position", NodeParam::WavetablePosition),
+                ("Attack", NodeParam::WavetableAttack),
+                ("Release", NodeParam::WavetableRelease),
+                ("Gain", NodeParam::WavetableGain),
             ] {
                 options.push((label.to_string(), AutoParam::Node(param)));
             }
@@ -950,6 +980,7 @@ fn inline_param_id(p: patch::InlineParam) -> ParamId {
         // The canvas row edits the 8' drawbar regardless of its current level.
         patch::InlineParam::OrganBar8 => ParamId::OrganBar(2),
         patch::InlineParam::OrganPercussion => ParamId::OrganPercussion,
+        patch::InlineParam::WavetablePosition => ParamId::WavetablePosition,
     }
 }
 

@@ -417,6 +417,16 @@ fn spawn_instrument<M: Media>(
             }
             (Box::new(processor), None)
         }
+        VoiceSpec::Wavetable { params } => {
+            let mut processor = WavetableProcessor::new(sr);
+            // Same split as the other built-in engines.
+            if !live {
+                for (id, value) in crate::wavetable_param_values(params) {
+                    processor.set_param(id, value);
+                }
+            }
+            (Box::new(processor), None)
+        }
         VoiceSpec::SoundFont {
             path,
             bank,
@@ -539,7 +549,8 @@ fn spawn_effect<M: Media>(
         // instrument node); grouped so the match stays exhaustive.
         | VoiceSpec::Modal { .. }
         | VoiceSpec::Pluck { .. }
-        | VoiceSpec::Organ { .. } => {
+        | VoiceSpec::Organ { .. }
+        | VoiceSpec::Wavetable { .. } => {
             let built = crate::effect::processor(params, sr);
             if live {
                 info.meter = built.meters;
@@ -1508,6 +1519,58 @@ mod tests {
         // The note lasts 0.5 s (8.3 % of the file); release is 40 ms.
         let held = wav_window_rms(&out, 0.02, 0.08);
         let after = wav_window_rms(&out, 0.25, 0.35);
+        assert!(held > 0.02, "the held note must be loud: {held}");
+        assert!(
+            after < held * 0.05,
+            "the key-switch release must silence the note: held {held}, after {after}"
+        );
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(out);
+    }
+
+    /// S3: the wavetable is wired end to end — born audible, and the key-switch
+    /// release really silences it. The spectrum is covered by the engine's own
+    /// tests; this one only has to prove the assembly.
+    #[test]
+    fn offline_render_plays_the_wavetable() {
+        let mut project = project_with_note();
+        let mut patched = false;
+        for node in &mut project.graph.nodes {
+            if let NodeDoc::Instrument {
+                track: 0, voice, ..
+            } = node
+            {
+                *voice = VoiceSpec::Wavetable {
+                    params: glitcherz_model::WavetableParams {
+                        // The saw frame: the widest spectrum the bank can give.
+                        position: 2.0 / 3.0,
+                        ..Default::default()
+                    },
+                };
+                patched = true;
+            }
+        }
+        assert!(patched, "the default project must own a track-0 instrument");
+
+        let options = RenderOptions {
+            sample_rate: 22_050,
+            bits: export_audio::Bits::Int16,
+            end_ticks: Some(11_520),
+        };
+        let input = save_temp(&project, "wavetable");
+        let out =
+            std::env::temp_dir().join(format!("glitcherz_s3_wavetable_{}.wav", std::process::id()));
+        let report = render_project_to_wav(&input, &out, options).expect("render");
+        assert!(report.frames > 0);
+        assert!(
+            wav_has_signal(&out),
+            "a wavetable instrument must be born audible"
+        );
+
+        // The note lasts 0.5 s (8.3 % of the file); release is 120 ms.
+        let held = wav_window_rms(&out, 0.02, 0.08);
+        let after = wav_window_rms(&out, 0.3, 0.4);
         assert!(held > 0.02, "the held note must be loud: {held}");
         assert!(
             after < held * 0.05,

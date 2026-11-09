@@ -280,6 +280,15 @@ pub enum ParamId {
     OrganRelease,
     /// Drawbar organ: node output gain (0..2).
     OrganGain,
+    /// Wavetable: position inside the frame bank (0..1; spec
+    /// `.agents/spec/wavetable-instrument.md` S3-D12). Smoothed per sample.
+    WavetablePosition,
+    /// Wavetable: key-switch attack ramp in seconds (0.001..2).
+    WavetableAttack,
+    /// Wavetable: key-switch release ramp in seconds (0.005..5).
+    WavetableRelease,
+    /// Wavetable: node output gain (0..2).
+    WavetableGain,
 }
 
 /// Note event (MIDI semantics). `note` is the MIDI note number (69 = A4),
