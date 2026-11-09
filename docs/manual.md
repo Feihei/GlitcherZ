@@ -159,7 +159,7 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 | 菜单项 | 产生 |
 | :--- | :--- |
 | `Search Nodes…` | 打开节点浏览器，可搜名字或模块路径 |
-| `Instrument…` | 乐器：`Synth`（内置）、`SoundFont`、`Sample`、`Drum Kit`、`Mallet`（模态敲击）、`Pluck`（拨弦）、`Organ`（拉杆风琴），以及 CLAP / VST3 乐器插件 |
+| `Instrument…` | 乐器：`Synth`（内置）、`SoundFont`、`Sample`、`Drum Kit`、`Mallet`（模态敲击）、`Pluck`（拨弦）、`Organ`（拉杆风琴）、`Wavetable`（波表），以及 CLAP / VST3 乐器插件 |
 | `Effect…` | 效果：`Delay`、`EQ`、`Compressor`、`Reverb`、`Chorus`、`Flanger`、`Bitcrusher`、`Phaser`、`Saturation`、`Limiter`、`Ring Mod`、`Vocoder`，以及 CLAP / VST3 效果插件 |
 | `MIDI FX…` | `Arpeggiator`、`Portamento`、`MIDI Envelope`、`LFO`、`Curve Map` |
 | `Mixer` | 多通道求和节点（1–32 通道，可加 / 减通道） |
@@ -171,9 +171,9 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 `SoundFont` / `Sample` / `Drum Kit` 出生时不带文件（沉默），在节点上的 `Load File…` /
 `Load Samples…` 按钮里选，换文件不需要重建节点和连线。
 
-`Mallet`（模态敲击）、`Pluck`（拨弦）和 `Organ`（拉杆风琴）都没有文件，出生即可发声：DSP
-全在引擎里，见下面的 [模态打击](#模态打击mallet)、[拨弦](#拨弦pluck) 与
-[拉杆风琴](#拉杆风琴organ)。
+`Mallet`（模态敲击）、`Pluck`（拨弦）、`Organ`（拉杆风琴）和 `Wavetable`（波表）都没有
+文件，出生即可发声：DSP 全在引擎里，见下面的 [模态打击](#模态打击mallet)、
+[拨弦](#拨弦pluck)、[拉杆风琴](#拉杆风琴organ) 与 [波表合成](#波表合成wavetable)。
 
 三种连线，从输出口拖到输入口即可：
 
@@ -375,6 +375,64 @@ Mallets 同一路线），一个引擎覆盖四个预设：
 `perc harmonic` 是离散值、不进自动化列表。九个 drawbar 全在自动化菜单里是按设计来的：
 **拉杆扫动本身就是风琴最标志性的演奏动作**。
 
+### 波表合成（Wavetable）
+
+`Wavetable` 是这组声源里唯一「有数据」的一个。它内置四张单周期波形表，`position` 在你的
+演奏下在相邻两张之间做插值——**同一时刻只有一条波形**，不是四个振荡器相加。这是它和
+`Organ` 的根本区别：
+
+| | `Organ` | `Wavetable` |
+| :--- | :--- | :--- |
+| 谐波从哪来 | 九根 drawbar 实时算正弦 | 烘焙在表里 |
+| 谐波数量 | 九根，固定 | 最多 256 次，随音高变化 |
+| 改变音色 | 推拉某几根 bar | 扫 `position`，整条波形连续变形 |
+| CPU | 每根 bar 一次 `sin` | 一次查表 + 插值，**与谐波数无关** |
+
+四张表就是 `position` 的四个落点：
+
+| `position` | 波形 | 谐波成分 |
+| :--- | :--- | :--- |
+| `0.00` | 正弦 | 只有基频，最干净 |
+| `0.33` | 三角 | 奇次谐波，幅度按 `1/k²` 快速衰减，圆润 |
+| `0.67` | 锯齿 | 全部谐波，按 `1/k` 衰减，最「亮」 |
+| `1.00` | 方波 | 只有奇次，按 `1/k` 衰减，空心 |
+
+中间位置是相邻两张表**逐样本线性插值**的结果，所以从 `0` 慢慢推到 `1` 是一个连续的变形，
+不是四个档位跳变。
+
+参数（Inspector 的 wavetable 分区，画布节点上另有 `pos` 一行内联）：
+
+| 参数 | 范围 | 说明 |
+| :--- | :--- | :--- |
+| `position` | 0–1 | 在四张表之间插值，**实时作用于正在响的音** |
+| `attack` | 1 ms–2 s | 起音斜坡 |
+| `release` | 5 ms–5 s | 松键斜坡（合成器可以拖很长） |
+| `gain` | 0–2 | 节点输出增益 |
+
+Inspector 里那条小波形是你**当前 `position` 下的一个周期**，扫滑杆时会实时重画——想知道
+`0.5` 听起来长什么样，看它比听它快。
+
+**高音区会自动丢谐波。** 一张表的谐波数原本是固定的，音越高，高次谐波越容易越过
+Nyquist 折回成不合谐的杂音（混叠）。所以引擎为每张表预生成了九层「带限」版本
+（256 / 128 / 64 / … / 1 次谐波），按音高选层。结果是：低音保留全部 256 次谐波，越往上
+谐波越少、音色越薄，但**永远不会有混叠杂音**。这是刻意的取舍，也是所有波表合成器的做法。
+
+三点容易误判：
+
+- **力度是真的有作用的**，与 `Organ` 相反：`velocity` 直接决定这个音的电平（0.5 的力度约
+  是一半音量）。想要力度不敏感的键盘音色用 `Organ`。
+- **扫 `position` 不会改变音量**。四张表各自按峰值归一化，响度靠 `gain` 与 Master。所以
+  「换个位置听不出音量变化」是对的，不是坏了。
+- **高音区不是「坏了」**，是谐波被合法地丢掉了。想在高音区也要亮，接一个 EQ 往上提，或
+  干脆用 `Organ`（它的 drawbar 是各自判 Nyquist 的，不会整体变薄）。
+
+池子 16 个声部，第 17 个音偷最老声部。`position` / `attack` / `release` / `gain` 都能接
+自动化曲线——**扫 `position` 就是这个乐器最标志性的演奏动作**，和风琴的拉杆扫动一个地位。
+滑音同样白拿：`PitchOffset` 逐样本平滑，接 `Portamento` 即可。
+
+这一版**不支持导入自己的波形文件**（`.wav` / `.wt`），也不带滤波器与 unison：音色完全由
+`position` 决定。要更有个性的音色，接既有 EQ 或后续的 Filter。
+
 双击节点进 `Inspector`（乐器 / 效果 / 混音 / MIDI FX / LFO / Curve Map / Audio Input）；
 双击固定的 `Timeline` 节点回到编曲视图。
 
@@ -384,7 +442,7 @@ Mallets 同一路线），一个引擎覆盖四个预设：
 
 | 节点 | 面板内容 |
 | :--- | :--- |
-| 乐器 | 内置合成器的波形与滤波（Low-pass / High-pass / Band-pass / Moog 四级 ladder）、ADSR、滑音；`SoundFont` 的 bank / patch 与文件；`Sample` 的根音、增益，以及**播放窗口**（波形图上四条可拖标记：起始 / 循环起 / 循环止 / 结束，外加循环模式 Off / Forward / Ping-pong）；`Drum Kit` 的每个槽位（触发键写作 `C2 · 36`，可直接拖动换键）；`Mallet` 的预设下拉与 decay / beating / hardness / brightness / gain；`Pluck` 的 decay / damping / brightness / release / gain；`Organ` 的 3×3 drawbar 网格（每根 0–8 级）、打击泛音（电平 / 衰减 / 2nd·3rd）与 attack / release / gain |
+| 乐器 | 内置合成器的波形与滤波（Low-pass / High-pass / Band-pass / Moog 四级 ladder）、ADSR、滑音；`SoundFont` 的 bank / patch 与文件；`Sample` 的根音、增益，以及**播放窗口**（波形图上四条可拖标记：起始 / 循环起 / 循环止 / 结束，外加循环模式 Off / Forward / Ping-pong）；`Drum Kit` 的每个槽位（触发键写作 `C2 · 36`，可直接拖动换键）；`Mallet` 的预设下拉与 decay / beating / hardness / brightness / gain；`Pluck` 的 decay / damping / brightness / release / gain；`Organ` 的 3×3 drawbar 网格（每根 0–8 级）、打击泛音（电平 / 衰减 / 2nd·3rd）与 attack / release / gain；`Wavetable` 的 `position` 滑杆 + **一个周期的波形预览** + attack / release / gain |
 | 效果 | 该效果的全部参数；插件效果用插件自己的 GUI（`Open Editor`） |
 | `Mixer` | 通道条：每路推子、声像、静音、独奏、电平表，加 / 减通道；输出级的声像与静音 |
 | 插件乐器 | 参数列表（可右键接到自动化）+ `Open Editor` |

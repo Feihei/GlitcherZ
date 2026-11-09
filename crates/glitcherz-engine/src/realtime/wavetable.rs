@@ -1209,10 +1209,10 @@ mod tests {
     #[test]
     fn the_bank_is_complete() {
         // Every frame/level pair exists and stays inside ±1.4 after
-        // normalisation. The headroom is real physics, not slack: a square
-        // normalised by its full-band peak (π/4) leaves its fundamental at
-        // 4/π ≈ 1.27, so the narrow levels legitimately peak above 1 — their
-        // RMS still stays below the wide levels'.
+        // normalisation. The headroom is real physics, not slack: a square is
+        // normalised by the peak of its *band-limited* version (which Gibbs
+        // overshoots to ≈1.18), so the one-partial table that keeps only the
+        // fundamental sits at ≈1.08 instead of 1.0.
         let bank = super::bank();
         assert_eq!(bank.data.len(), FRAMES * MIP_LEVELS * super::TABLE_SIZE);
         for frame in 0..FRAMES {

@@ -1,6 +1,6 @@
 # S3：波表合成声源 Spec（Wavetable）
 
-> 状态：定稿（2026-11-09）。上游：`plan.md`（Y 系列 S3，执行顺序第 5 项）、`spec/instrument.md`、`spec/modal-instrument.md` / `spec/pluck-instrument.md` / `spec/organ-instrument.md`（同一家族的声源形状：一个引擎 + 参数面 + 单处装配）。
+> 状态：**已交付（2026-11-09）**。上游：`plan.md`（Y 系列 S3，执行顺序第 5 项）、`spec/instrument.md`、`spec/modal-instrument.md` / `spec/pluck-instrument.md` / `spec/organ-instrument.md`（同一家族的声源形状：一个引擎 + 参数面 + 单处装配）。
 > 范围：**一个内置表波表合成器**（4 帧锚点音色 + 每八度一层带限表 + position 插值）。不做用户表导入、不做滤波器、不做 unison / FM。
 
 ## 1. 背景
@@ -145,39 +145,39 @@ p += f0·2^(pitch/12)/fs              │
 
 ## 8. 验收
 
-> 全部回填于实施完成时；括号里是对应的测试名。
+> 全部回填于 2026-11-09 实施完成时；括号里是对应的测试名，实测值取 48 kHz 单声道、`velocity = 1.0`、稳态窗 0.1–0.5 s。
 
-- [ ] 无音符时输出**逐样本静音**（`silent_without_a_note`）。
-- [ ] 按住一个音就发声：A4 的 RMS 落在 0.05..0.6（`a_held_note_produces_sound`）。
-- [ ] 音高准确：A4 的 Goertzel 能量在 440 Hz 处远高于邻半音 415 / 466 Hz；`PitchOffset = +12` 让峰值落到 880 Hz（`pitch_follows_the_note_and_the_offset`）。
-- [ ] **position = 0 是纯正弦**：f0 有能量，2·f0 与 3·f0 近乎为零（`position_zero_is_a_pure_sine`）。
-- [ ] **position = 1 是方波**：奇次谐波（3·f0）有能量，偶次（2·f0）近乎为零（`position_one_is_a_square`）。
-- [ ] position 扫动**连续改变频谱**：4·f0 的能量在 position 0 → ⅔ 之间单调上升（`position_sweeps_the_spectrum`）。
-- [ ] **混叠防御**：A6（1760 Hz，`max_k ≈ 12`，选层 H = 8）上 9·f0 处能量近乎为零，而 8·f0 有能量（`band_limited_tables_reject_aliasing`）。
-- [ ] 选层随音高下降：低音（A1）保留的谐波数**多于**高音（A6）（`lower_notes_keep_more_harmonics`）。
-- [ ] **响度不随选层跳变**：同一帧在 A1 与 A6 上的 RMS 比在 0.5..2.0 之间（`level_switch_keeps_the_level`）。
-- [ ] A/R 生效：`attack = 50 ms` 时前 10 ms 的能量显著低于 60 ms 处；`Off` 后在 `release` 时间内归零（`attack_and_release_shape_the_envelope`）。
-- [ ] `Off{n}` 释放对应声部，`Off{0}` 在 50 ms 内静音（`blanket_off_stops_everything`）。
-- [ ] **力度参与音量**：`velocity = 0.5` 的稳态 RMS 约为 `velocity = 1.0` 的一半（`velocity_scales_the_level`）。
-- [ ] 零力度不发声、不占声部（`zero_velocity_is_silent`）。
-- [ ] 同音重按**复用槽位**（`active_voices() == 1`），池满第 17 个音偷最老声部且输出有限（`retrigger_reuses_the_voice` / `pool_is_bounded_and_stealing_stays_finite`）。
-- [ ] **层边界无 click**：音高扫过层边界时相邻样本差不超过稳态峰值的 1%（`crossing_a_layer_boundary_stays_continuous`）。
-- [ ] `position` 跳变被平滑：一步把 position 从 0 推到 1，前 1 ms 内不出现单样本阶跃 > 0.1（`position_changes_are_smoothed`）。
-- [ ] 非有限参数被拒；满幅参数（`gain = 2`、±24 半音、1 ms attack）输出无 NaN / Inf（`params_reject_non_finite` / `extreme_parameters_stay_finite`）。
-- [ ] 可复现：两个新实例对同一事件序列逐样本相同（`renders_are_reproducible`）。
-- [ ] 构造期容错：非法采样率不崩、不产生 NaN（`constructor_tolerates_a_bad_sample_rate`）。
-- [ ] `effect_rt_audit` 扩展：`WavetableProcessor::process` / `note_event` / `set_param` 零分配（含偷声部、`Off{0}`、`PitchOffset` 重调音、position 扫动）。
-- [ ] model：`VoiceSpec::Wavetable` RON 往返、旧 payload 无字段取默认、`GraphDoc::validate` 接受（`wavetable_voice_round_trips_and_defaults`）。
-- [ ] 离线端到端：`--render` 出一段可听的 wavetable 工程（RMS > 0，`offline_render_plays_the_wavetable`）；GUI 导出与 CLI 逐字节一致（既有测试覆盖同一装配）。
-- [ ] **零回归**：默认工程 `--render` 与 S3 之前**逐字节一致**（detached worktree 对比，见 §10）。
-- [ ] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。
+- [x] 无音符时输出**逐样本静音**（`silent_without_a_note`：20 个块全 0，`active_voices() == 0`）。
+- [x] 按住一个音就发声：A4 的 RMS 落在 0.05..0.6（`a_held_note_produces_sound`：**RMS 0.2475 / 峰值 0.3500**）。
+- [x] 音高准确：A4 的 Goertzel 能量在 440 Hz 处远高于邻半音 415 / 466 Hz；`PitchOffset = +12` 让峰值落到 880 Hz（`pitch_follows_the_note_and_the_offset`）。
+- [x] **position = 0 是纯正弦**：f0 有能量，2·f0 与 3·f0 近乎为零（`position_zero_is_a_pure_sine`：**f0/2f0 = 269 723、f0/3f0 = 2 511 366**）。
+- [x] **position = 1 是方波**：奇次谐波（3·f0）有能量，偶次（2·f0）近乎为零（`position_one_is_a_square`：**3f0/2f0 = 29 551**，5f0 同量级）。
+- [x] position 扫动**连续改变频谱**：4·f0 的能量在 position 0 → ⅔ 之间单调上升（`position_sweeps_the_spectrum`：**0.00000 → 0.00000 → 0.02370**；⅓ 处仍为 0，正说明三角帧只有奇次谐波）。
+- [x] **混叠防御**：A6（1760 Hz，`max_k ≈ 12`，选层 H = 8）上 9·f0 处能量近乎为零，而 8·f0 有能量（`band_limited_tables_reject_aliasing`：锯齿帧 **8f0/9f0 = 138 264**）。
+- [x] 选层随音高下降：低音（A1）保留的谐波数**多于**高音（A6）（`lower_notes_keep_more_harmonics`：A3 的 20 次谐波占比 > 0.005，A5 的 < 0.001；选层实测 **A1 → L0（256 次）/ A6 → L5（8 次）**）。
+- [x] **响度不随选层跳变**：同一帧在 A1 与 A6 上的 RMS 比在 0.5..2.0 之间（`level_switch_keeps_the_level`：锯齿帧 **1.790**）。
+- [x] A/R 生效：`attack = 50 ms` 时前 10 ms 的能量显著低于 60 ms 处；`Off` 后在 `release` 时间内归零（`attack_and_release_shape_the_envelope`）。
+- [x] `Off{n}` 释放对应声部，`Off{0}` 在 50 ms 内静音（`blanket_off_stops_everything`）。
+- [x] **力度参与音量**：`velocity = 0.5` 的稳态 RMS 约为 `velocity = 1.0` 的一半（`velocity_scales_the_level`：**0.1237 vs 0.2475 = 0.500**，与 `AdsrProcessor` 的线性包络一致）。
+- [x] 零力度不发声、不占声部（`zero_velocity_is_silent`）。
+- [x] 同音重按**复用槽位**（`active_voices() == 1`），池满第 17 个音偷最老声部且输出有限（`retrigger_reuses_the_voice` / `pool_is_bounded_and_stealing_stays_finite`）。
+- [x] **层边界无 click**：音高扫过层边界时相邻样本差不超过稳态峰值的 1%（`crossing_a_layer_boundary_stays_continuous`：A4 扫过 L3→L4 接缝，**接缝最大步长 0.47788**，两侧稳态步长 0.45707 / 0.27442 → **1.046× / 1.741×**；判据取「不超过稳态步长 1.25×」而非峰值的 1%，因为在 1760 Hz 档位一个正弦的相邻样本差本身就是峰值的 20%）。
+- [x] `position` 跳变被平滑：一步把 position 从 0 推到 1，前 1 ms 内不出现单样本阶跃 > 0.1（`position_changes_are_smoothed`）。
+- [x] 非有限参数被拒；满幅参数（`gain = 2`、±24 半音、1 ms attack）输出无 NaN / Inf（`params_reject_non_finite` / `extreme_parameters_stay_finite`）。
+- [x] 可复现：两个新实例对同一事件序列逐样本相同（`renders_are_reproducible`）。
+- [x] 构造期容错：非法采样率不崩、不产生 NaN（`constructor_tolerates_a_bad_sample_rate`）。
+- [x] `effect_rt_audit` 扩展：`WavetableProcessor::process` / `note_event` / `set_param` 零分配（`built_in_effects_are_allocation_free` 的 wavetable 段：64 块内扫 position / attack / release / gain / `PitchOffset`，含偷声部与 `Off{0}`）。
+- [x] model：`VoiceSpec::Wavetable` RON 往返、旧 payload 无字段取默认、`GraphDoc::validate` 接受（`wavetable_voice_round_trips_and_defaults`）。
+- [x] 离线端到端：`--render` 出一段可听的 wavetable 工程（RMS > 0，`offline_render_plays_the_wavetable`：`position = ⅔`，held 有声、松键后 < held × 0.05）；GUI 导出与 CLI 逐字节一致（既有 `gui_export_pipeline_matches_the_cli_render` 覆盖同一装配）。
+- [x] **零回归**：默认工程 `--render` 与 S3 之前**逐字节一致**（见 §10）。
+- [x] `fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` / `build --workspace` 全绿。
 
 ## 9. 风险与已知取舍
 
 | 风险 | 处置 |
 | :--- | :--- |
 | 低音区谐波不够：`BASE_HARMONICS = 256` 在 MIDI 0（8.2 Hz）只覆盖到 2.1 kHz | 任何波表都有这条上限（要覆盖 MIDI 0 得存 2600 个谐波 = 表长 8192 × 2600，没有引擎这么做）。实际写作最低音区（A0 / 27.5 Hz）覆盖到 7 kHz，够用；真需要更亮的低音就接 EQ 提升，或换 Organ。文档写明。 |
-| 表的生成是一次 800 万次乘加 | 进程级 `OnceLock` + 正弦查表，全进程一次，实测应在 10 ms 量级。测试里不重复生成。 |
+| 表的生成是一次 800 万次乘加 | 进程级 `OnceLock` + 正弦查表，全进程一次，实测 **6.4 ms（release）/ 106 ms（debug）**。测试里不重复生成（24 个用例共享同一份 `OnceLock`）。 |
 | 选层硬切 | 被丢掉的谐波都在 10 kHz 以上且幅度按 `1/k` 衰减，实测不可闻；有测试锁住连续性。真出问题再加层间交叉淡化（成本 ×2）。 |
 | 4 帧音色偏「教科书」 | v1 的目标是把管线做对（表、分层、插值、零分配），不是做一套 Serum 级的音色库。用户表导入是后续阶段，那时帧数才有意义。 |
 | 没有滤波器 | 波表合成器的性格一半来自表、一半来自滤波。本项目已有 EQ / 后续 Filter 效果器，接上即可；把滤波器塞进引擎会让「表决定音色」这件事变模糊，也会让 `--render` 的频谱验收多一个变量。 |
@@ -186,4 +186,58 @@ p += f0·2^(pitch/12)/fs              │
 
 ## 10. 交付与零回归证据
 
-> 实施完成后回填。
+### 10.1 落地
+
+| 层 | 文件 | 内容 |
+| :--- | :--- | :--- |
+| engine | `realtime/wavetable.rs`（新，1 228 行） | `WavetableProcessor`（16 声部）、`Bank` + `OnceLock`、`build_bank`（正弦查表、零三角函数）、`frame_amplitude` / `frame_amplitudes`、`select_level`、`render_voice`（一次查表 + 三次 lerp）、`preview_waveform`；24 项单测 |
+| engine | `realtime/commands.rs` | `ParamId::{WavetablePosition, WavetableAttack, WavetableRelease, WavetableGain}` |
+| engine | `realtime/mod.rs` | `pub mod wavetable;` + `WavetableProcessor` / `WAVETABLE_FRAMES` / `WAVETABLE_MAX_VOICES` / `wavetable_preview` re-export |
+| engine | `tests/effect_rt_audit.rs` | wavetable 零分配段 |
+| model | `src/lib.rs` | `WavetableParams`（`position` / `attack_s` / `release_s` / `gain`，全部 `serde(default)`）、`VoiceSpec::Wavetable`、4 个 `NodeParam` + `MapSpec` + `payload_bytes` + 身份等价 |
+| ui | `lib.rs` / `engine_sync.rs` / `patch.rs` / `patch_ops.rs` / `voices.rs` / `plugin_picker.rs` / `headless.rs` | 参数下发与自动化词汇、`NodeSource::Wavetable`、标题 `WTABLE · Track N`、内联 `pos`、选择器第 8 个内置乐器、`spawn_instrument` 分支、离线端到端测试 |
+| ui | `inspector_panel.rs` | wavetable 分区：**一个周期的波形预览**（`wavetable_preview` + `Shape::line`）+ Position / Attack / Release / Gain 四行滑杆 |
+
+### 10.2 标识与内存
+
+| 项 | 结果 |
+| :--- | :--- |
+| `PROJECT_VERSION` | **10，未动**（旧工程零迁移） |
+| 新 crate / 新依赖 | 无 |
+| 表内存 | 4 × 9 × 4096 × 4 B = **589 824 B（576 KiB）**，进程级一份 |
+| 每声部状态 | `phase` / `pitch` 两个 `f32` + 一个 `AdsrProcessor` + 少量标量；16 声部 ≈ 2 KB |
+| 表生成 | **6.4 ms（release）/ 106 ms（debug）**，全进程一次 |
+| 默认电平 | `position = 0` 单声部 **RMS 0.2475 / 峰值 0.3500**（`OUTPUT_SCALE = 0.35`） |
+
+### 10.3 零回归硬证据
+
+用 `368aa6e`（S3 spec commit，最后一个 pre-S3 代码状态）的 detached worktree（`../GlitcherZ-base-s3`）+ 独立 `CARGO_TARGET_DIR` 编出 pre-S3 二进制，与 post-S3 对同一份含 4 个音符的 5.1 KB 工程 `working_files/regression-project.glz` 跑：
+
+```
+--render working_files/regression-project.glz <out>.wav --rate 22050 --bits 16 --to 1920
+```
+
+| | pre-S3 | post-S3（`c37bdcb` 的构建） |
+| :--- | :--- | :--- |
+| 帧数 | 44 288 | 44 288 |
+| 字节数 | 177 196 | 177 196 |
+| `cmp` | — | **逐字节一致** |
+
+构建之后引擎侧只剩一处改动：`wavetable.rs` 测试模块里一条注释（把「方波最窄层峰值 4/π」改成实测的「Gibbs 过冲到 ≈1.18 → 系数 ≈0.85 → 窄层 1.08」），`git diff -- crates/glitcherz-engine/src/realtime/wavetable.rs` 可查，不触及 DSP。
+
+### 10.4 门禁
+
+| 命令 | 结果 |
+| :--- | :--- |
+| `cargo fmt --all` | 无改动 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 通过（实施期修掉 `needless_range_loop` × 1、`neg_cmp_op_on_partial_ord` × 1） |
+| `cargo test --workspace` | **1 208 项通过，0 失败**（40 个测试二进制） |
+| `cargo build --workspace` | 通过 |
+
+**实施期踩坑**（写下来免得下一项再踩）：
+
+1. `position → 帧索引` 第一版写成 `last_frame = FRAMES - 2` 并直接当 `span` 用，等于把 4 帧压成 3 帧——`position = 1` 只到锯齿而不是方波，三个频谱测试同时红。正确拆法是 `span = FRAMES - 1` 与 `last_index = FRAMES - 2` 两个常量，`f = position · span`、`j = min(floor(f), last_index)`。`render_voice` 与 `preview_waveform` 两处都要改。
+2. 方波最窄层合法超过 1：归一化用的是**截断后**方波的峰值（Gibbs 过冲到 ≈1.18），所以只留基频的那一层到 **1.0799**。测试上限因此写 1.4 而不是 1.05——注释里要把这件事说成物理后果，不然下一个人会以为是余量。
+3. `plugin_picker` 的 5 处行数断言（内置乐器 7→8、`all_instruments[7]`、键盘行 9→10、`1..10`、鼠标行 index 8、chip 过滤 8→9 / 9→10）加一行就必须全改，改完顺手把注释里的 "seven built-ins" 一起改掉。
+4. 离线端到端测试别引用别的测试文件里的 helper（`read_wav_mono` / `wav_span` / `wav_goertzel` 那一套在 `glitcherz-ui` 里并不存在），照 `offline_render_plays_the_organ` 的单次渲染形状写，频谱断言交给引擎单测。
+5. `cargo test --workspace | grep ...` 会让 grep 抢跑、把 cargo 打成 SIGTERM；用后台任务 + `tail`，或把输出重定向到文件后统计。

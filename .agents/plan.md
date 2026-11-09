@@ -641,7 +641,7 @@ scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 sympho
 | **S0** | 装配去重（共享 `spawn_node`）+ `glitcherz --render` headless 渲染 | ✅ 2026-11-07 交付 |
 | **S1** | Pluck（Karplus-Strong 拨弦） | ✅ 2026-11-08 交付 |
 | **S2** | Organ（drawbar 加法 + 打击泛音） | ✅ 2026-11-09 交付 |
-| **S3** | Wavetable（表管理 / 抗混叠 / 位置调制，**先写独立 spec**） | 待办 |
+| **S3** | Wavetable（表管理 / 抗混叠 / 位置调制，**先写独立 spec**） | ✅ 2026-11-09 交付 |
 | **S4** | CLI 命令面扩展（open / save / 少量批量操作） | 待办 |
 | **S5** | MCP（前置：把 headless 层提升为独立 `glitcherz-session` crate + 命令面 + 安全边界） | 待办 |
 
@@ -699,6 +699,18 @@ scratch Vec。未入库真实 flac/mp3 fixture（用 hound 现写 WAV 喂 sympho
 | 实施期踩坑 | ① 默认 `888000000` 会**掩盖** `PitchOffset` 测试——+12 半音只是把 16' 挪到原来的 8' 位置，测偏移前必须先把其它 bar 静音、只留 8'；② `auto_param_label` 里 `param` 是 `&NodeParam`，`OrganBar(index)` 绑定成 `&u8`，`as usize` 前要解引用；③ 两处 `needless_range_loop`（`DRAWBAR_K` 与 `bars` 都改 `.iter().enumerate()`）；④ 加 `Organ` 行后 `plugin_picker` 的 5 处行数断言全部要跟着改（6 → 7 内置乐器、8 → 9 键盘行、`1..9`）。 |
 | 文档同步 | `organ-instrument.md`（新 spec，§8 验收 20 条与 §10 证据已回填）、`implementation.md` S2 小节、`docs/manual.md`（Add 菜单 `Organ` 行 + 拉杆风琴小节 + Inspector 行）、`AGENTS.md` 索引。 |
 
+### S3 实施记录（✅ 2026-11-09 已交付，Y 系列第三个乐器 / 收官）
+
+| 项 | 结果 |
+| :--- | :--- |
+| 落地 | 新 `realtime/wavetable.rs`（`WavetableProcessor`，1 228 行含 24 项单测）：**4 帧锚点音色由谐波谱生成**（Sine / Triangle / Saw / Square，`frame_amplitude` 带符号 → 相位 π 不需要 cos 表）、**每八度一层带限表**（`H(L) = 256 >> L`，9 层）、`position` 在相邻帧间线性插值 + 10 ms 一极点平滑、`select_level` 按 `0.45·fs/(f0·ratio)` 在块率硬切、`AdsrProcessor` 的 A/R（峰值即 velocity）、16 声部池、`PitchOffset` 逐样本平滑；进程级 `OnceLock<Bank>`（576 KiB）+ 表生成用正弦查表零三角函数；`ParamId` 4 个、`NodeParam` 4 个、`VoiceSpec::Wavetable` 加法变体；装配仍只改 `headless::spawn_instrument` 一处；UI 加选择器第 8 个内置乐器、标题 `WTABLE · Track N`、内联 `pos`、Inspector wavetable 分区（**一个周期的波形预览** + 4 行滑杆）。**不做用户表导入**（v1 边界）、不做滤波器 / unison。 |
+| 标识 | `PROJECT_VERSION = 10` **未动**，旧工程零迁移；`Wavetable` 进 Add 菜单（`Organ` 之后）。无新 crate / 新依赖。表内存 589 824 B，进程级一份。 |
+| DSP 关键点 | ① **同一帧的所有层共用一个归一化系数**（取 L=0 峰值倒数）——按层各自归一会让高音区突然变响，这是这类引擎最难查的 bug；② 选层用 `max(当前, 目标)` 的 pitch ratio，滑音途中不越界；③ 一次查表 + 三次 lerp，**每样本成本与谐波数无关**；④ 力度白拿：`AdsrProcessor` 的峰值本来就是 velocity，不需要额外乘法，偷声部仍无 click；⑤ `preview_waveform` 不读播放表（播放表的分层按音高选、预览没有音高），而是重新求和同一套谱并复用 `bank.scales`，所以预览不会漂；⑥ 归一化用的是**截断后**波形的峰值，方波最窄层合法到 1.08（Gibbs 过冲），测试上限写 1.4。 |
+| 验收 | 24 项引擎单测（静音 / 发声 / 音高与 `PitchOffset` / 纯正弦 / 方波奇次 / 扫动频谱 / 混叠防御 / 低音多谐波 / 选层单调 / 跨层响度 / A·R / blanket / 力度 / 零力度 / 同音复用 / 偷声部 / **层边界连续** / position 平滑 / 非有限参数 / 极端参数 / 可复现 / 非法采样率 / 预览跟随 / 表完整）+ 1 项 model RON 往返与旧 payload 默认 + `rt_audit` 零分配 + 1 项离线端到端。实测：默认（正弦帧）RMS 0.2475 / 峰值 0.3500；f0/2f0 = 269 723、f0/3f0 = 2 511 366；方波 3f0/2f0 = 29 551；扫动 4f0 = 0 / 0 / 0.02370；A6 锯齿 8f0/9f0 = 138 264；A1/A6 RMS 比 1.790；velocity 0.5/1.0 = 0.500；层接缝步长 0.478 对稳态 0.457（1.046×）；建表 6.4 ms（release）/ 106 ms（debug）。`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace`（1 208 项）/ `build --workspace` 全绿。 |
+| **零回归硬证据** | 用 `368aa6e`（S3 spec commit，最后一个 pre-S3 代码状态）的 detached worktree + 独立 `CARGO_TARGET_DIR` 编出 pre-S3 二进制，与 post-S3 对同一份含 4 个音符的工程跑 `--render --rate 22050 --bits 16 --to 1920`：两份 WAV 各 **44288 帧 / 177196 字节，`cmp` 逐字节一致**（用最终代码复跑一次确认）。 |
+| 实施期踩坑 | ① `position → 帧索引` 第一版把 `last_frame = FRAMES - 2` 当 `span` 用，等于把 4 帧压成 3 帧，`position = 1` 只到锯齿——三个频谱测试同时红，必须拆成 `span` 与 `last_index` 两个常量、两处（`render_voice` / `preview_waveform`）同改；② 方波最窄层峰值 1.08 是 Gibbs 的物理后果，不是余量，注释与测试上限都要照实写；③ `plugin_picker` 5 处行数断言加一行就全失效；④ 离线端到端别引用其它测试文件的 helper；⑤ clippy 抓了 1 处 `needless_range_loop` + 1 处 `neg_cmp_op_on_partial_ord`（`!(x >= 1.0)` 改 `!is_finite() \|\| x < 1.0`）。 |
+| 文档同步 | `wavetable-instrument.md`（新 spec，§8 验收 24 条与 §10 证据已回填）、`implementation.md` S3 小节、`docs/manual.md`（Add 菜单 `Wavetable` 行 + 波表小节 + Inspector 行）、`AGENTS.md` 索引。 |
+
 ## Z / B 系列：双音频输入口 + 模态打击声源（2026-11-08 立项，本节即方案）
 
 > 来源：用户 2026-11-08 提出三项——① 敲击金属器具的合成器（类 LMMS Mallets），尤其要「敲诵钵那种悠长的声音」；② 现有效果器都是单 audio 入，想要**两个 audio 口**的调制类效果器，目标是类似 vocoder 的效果；③ 侧链压缩同样需要两个 audio 口。
@@ -741,7 +753,7 @@ S1 Pluck 保留、不取消，等 B1 落地后再评估是否复用它的 voice 
 | 2 | **Z1** 侧链压缩 ✅ | 已交付。Z0 的第一个真实消费者兼**验收钉子**：复用现成 `CompressorProcessor`，证明 aux 在实时 / 离线两条路径都通。Z0 自带的 Ring Mod 只是数学样例，Z1 才是用户要的效果。 |
 | 3 | **B1** Modal 声源 ✅ | 已交付。与图架构完全解耦，与 Z0/Z1 无交叉；声源只改 `headless::spawn_instrument` 一处，长尾 / 拍频 / 频谱峰全部由 S0 的 `--render` 自动验收。 |
 | 4 | **Z2** Vocoder ✅ | 已交付。最贵的一项，失败模式本可能暴露 Z0 的设计缺口（两路 PDC / 缓冲形状）；Z1 已把 Z0 验证过，实际零返工。 |
-| 5 | **S1** Pluck ✅ → **S2** Organ ✅ → **S3** Wavetable | S1 已交付（2026-11-08）、S2 已交付（2026-11-09）。Y 系列原三个乐器顺延；Wavetable 仍按原约定「先写独立 spec 再实现」。 |
+| 5 | **S1** Pluck ✅ → **S2** Organ ✅ → **S3** Wavetable ✅ | S1 已交付（2026-11-08）、S2 已交付（2026-11-09）、S3 已交付（2026-11-09）。Y 系列三个乐器到 S3 全部完成；Wavetable 按原约定先写独立 spec 再实现。 |
 | 6 | **S4** CLI 命令面 → **S5** MCP | 不取消。新功能把它们往后推，但 S0 的判别（没有 render 的 MCP 是盲操作）不变。 |
 
 **备选（听感优先，未采用）**：B1 → Z0 → Z1 → Z2 → S1…。两条链互不依赖，本可无损切换；用户 2026-11-08 选架构优先，**按上表执行**。
@@ -844,11 +856,11 @@ sidechain off 的侧链压缩器与普通压缩器逐样本一致（Z1-D2 本就
 | Q2 诵钵激励 | **只做单次敲击（strike）**，不做 bow/rub 持续摩擦 → voice 生命周期与 note-off 按一次性激励设计 |
 | Q3 Vocoder | **固定 16 带 + 外部 carrier**，v1 无 formant shift / freeze / 自定义带数 |
 
-下一步：**S3 Wavetable 声源**（Y 系列第三个乐器、执行顺序仍是第 5 项），沿用 B1 / Z2 / S1 / S2 的形状——先写 `spec/wavetable-instrument.md`，再实现引擎、装配、UI，最后分实现 / 文档两个 commit。
+下一步：**S4 CLI 命令面扩展**（执行顺序第 6 项），让 `glitcherz` 在无窗口状态下能做 open / save / 少量批量操作，把它变成 MCP（S5）真正可用的前置。
 
-这一项和前面四个**不是一个量级**（`plan.md` 早在立项时就把 S3 标为「大」，并写死「必须单独立 spec 再实现」），原因是表管理这一层前面四个声源都没有：① 内置表要有内容（不是几个公式能生成的东西，得决定是代码生成还是嵌资源）；② 用户表导入需要文件格式 + 校验 + 缓存淘汰，是一整套 `media` / `sf2_library` 级别的基建；③ 抗混叠（每个八度区一套带限表，或 mipmap 式多级表）直接决定工作量和内存；④ RT 表热替换要满足零分配零锁，即表必须**先在控制线程换成 `Arc`，再做一次原子换指针**。定位调制（`position` 参数）反而是最简单的部分。
+S4 的价值不在「多几个子命令」，而在于 S0 的判别：没有命令面的 render 只是「把工程转成 wav」，有命令面之后 MCP 才能**改**工程而不是只能**读**。spec 阶段要先回答三个问题：① 命令面边界（只 open/save/query，还是也包含改参数 / 加节点——后者会引入撤销栈与事务语义）；② 与 `load_project` / `save_project` 的关系（复用 UI 层函数，还是抽到 `headless`）；③ 失败语义（CLI 出错只打印，还是要机器可读的退出码 / 结构化输出，后者是 MCP 需要的）。
 
-建议 spec 阶段先回答四个问题再动手：表来源（内置合成 / 资源嵌入 / 用户导入，可分批交付）、抗混叠策略（多级带限表 vs 单表 + 过采样）、表大小与插值口径（2048 帧 + 线性 vs 更大 + 三次）、`position` 的语义（相邻表插值 / 表内相位失真）。可先只做「内置表 + 表间插值」，把用户导入拆成独立后续阶段——那部分的风险全在文件与 UI，不在 DSP。
+顺带记一笔：S3 把「表管理」这条线开了一个口子但只做了一半——**用户表导入**（`.wav` / `.wt` 文件、命名、缓存淘汰、文件对话 UI）按 spec §2 刻意留给后续阶段，风险全在文件与 UI，不在 DSP；真要做得先按 `media` / `sf2_library` 的形状写一份 spec，别直接往 `wavetable.rs` 里加。
 
 ## 附：VST3 调研结论（2026-10-07，已实施）
 

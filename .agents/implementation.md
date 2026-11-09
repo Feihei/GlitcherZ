@@ -1236,3 +1236,29 @@ spec `.agents/spec/organ-instrument.md`。九个严格谐波分量的加权和�
 **model / 装配 / UI 的接线**：`VoiceSpec::Organ { params: OrganParams }` 加法变体（serde tag `organ`，`#[serde(default)]`），`PROJECT_VERSION` 保持 10。装配仍然只改 `headless::spawn_instrument` 一处：离线在构造期 seed `organ_param_values`（9 根 bar + 6 个宏共 15 条），实时靠 `engine_sync::push_node_params` 重放。`NodeParam` 新增 14 个词汇（9 根 bar + 打击三件套 + A/R + gain），打击谐波不进自动化（离散值，与 `ModalPreset` / `SynthWaveform` 同例）。UI 的 footage 字符串只有一处来源（`ORGAN_FOOTAGES`），选择器 / Inspector 网格 / 自动化菜单 / 内联行全引用它，避免 `2⅔'` 这种带 unicode 分数字符的标签被抄成两份后不一致。节点标题 `ORGAN · Track N`，画布内联 `8'`（drawbar 2）与 `perc`（最常拧的两个），Inspector 是 3×3 的 drawbar 网格 + 打击三件套 + A/R + gain。
 
 **验收**：19 项 `organ.rs` 单测（静音、发声、音高与 `PitchOffset` 的 Goertzel、频谱由 drawbar 决定、16' 次八度、3 dB 阶梯、全归零静音、A·R、blanket、打击泛音与谐波切换、同音复用、偷声部有界、Nyquist、非有限参数、极端参数、零力度、可复现、非法采样率）、1 项 model RON 往返与旧 payload 默认、`effect_rt_audit` 的 `process` / `note_event` / `set_param` 零分配、1 项离线端到端（held RMS 0.42235，松键后 0.00000）。实测：默认注册 RMS 0.3062 / 峰值 0.6249；只开 8' 时 f0 / 2f0 = 1 689 272；`8 → 4` 电平比 0.251（−12.0 dB）、`8 → 1` 为 0.089；打击早/晚能量比 1 479 044；`1'` 在 C8 上峰值 0.000000。默认工程渲染与 pre-S2 逐字节一致（44288 帧 / 177196 字节），全量 1175 项通过。
+
+## S3：波表合成 Wavetable（2026-11-09）
+
+spec `.agents/spec/wavetable-instrument.md`。前面四个声源的谐波要么实时算（Organ 的 9 根 bar）、要么由物理模型自然长出来（Modal / Pluck），这一项第一次把**一整个数据层**塞进引擎：表从哪来、装多少、怎么抗混叠、怎么在不分配的前提下换。DSP 本身只有「一次查表 + 三次 lerp」。
+
+**表由谐波谱生成，不是手工画点。** 4 帧锚点音色各写一条 `(k, amp)` 定义：Sine 只有 `k=1`；Triangle 奇次 `(−1)^((k−1)/2)/k²`；Saw 全次 `1/k`；Square 奇次 `1/k`。`amp` 带符号，等于把相位 π 烘进表里——不需要 cos 表，也不需要 `phase_offset` 字段。这个选择的真正价值在带限：想做「只保留到 H 次谐波」的版本，只需把求和上限从 `BASE_HARMONICS` 换成 `H`，一行代码，不用 FFT、不用滤波、不用过采样。手工画点做不到这件事，因为画出来的点没有「第几阶谐波」这个维度。
+
+**每八度一层，共 9 层（256 / 128 / … / 1 次谐波）。** 固定波的谐波数恒定，f0 升高时高次谐波越 Nyquist 折回成非谐波杂音——这是波表唯一真正的技术风险。选层按 `max_k = 0.45·fs/(f0·ratio)` 取**最小**的 L 使 `256 >> L ≤ max_k`，连 `H(8) = 1` 都不满足（基频自己越过 0.45·fs）则该声部静音。每八度一层是最小够用粒度：再多只省内存不改善音质，再少会让高音区过早丢谐波。`ratio` 取 `max(当前, 目标)`，与 Organ 的 Nyquist 掩码同一规则，滑音途中不瞬时越界。选层在**块率**完成、硬切、不做层间交叉淡化——被丢掉的谐波都在 `(0.225·fs, 0.45·fs]`，且幅度按 `1/k` 已经很小；交叉淡化要把查表次数翻倍（每样本 8 次），听感上换不回来。`crossing_a_layer_boundary_stays_continuous` 用「接缝处的最大样本步长 vs 两侧稳态的最大样本步长」锁住这件事，实测 A4 跨 L3→L4 是 **1.046×**——接缝的步长恰好等于信号自己在该音高上的斜率，没有第三种成分。
+
+**同一帧的所有层共用一个归一化系数，这是整个模块最重要的一行。** 系数取该帧在 L=0 下的峰值倒数，所有层乘同一个数。若按层各自归一，弹到高音区会**突然变响**：窄层里只剩几个谐波，归一化把每个都抬到接近峰值。这是这类引擎最常见也最难查的 bug（听感上是「高音区整体偏响」，而单听任何一个音都正常），`level_switch_keeps_the_level` 用 A1 / A6 的 RMS 比（实测 1.790，窗口 0.5..2.0）把它钉住。
+
+**归一化用的是截断后波形的峰值，所以窄层合法超过 1。** 方波带限到 256 次谐波时 Gibbs 过冲到 ≈1.18，系数因此是 ≈0.85；只留基频的那一层乘完到 **1.0799**。这不是余量，是物理后果——`the_bank_is_complete` 的上限写 1.4 而不是 1.05，注释里也照实写 Gibbs，不然下一个人会把它当成为保险留的空白。
+
+**表用正弦查表生成，零三角函数。** `sin(2π·k·i/N)` 在 `i` 整数、`N` 为 2 的幂时正好落在同一张 `N` 点正弦表的网格上：`SIN_LUT[(k·i) & (N−1)]`，数学上精确而非近似。这把构造期的 800 万次 `sin` 换成 800 万次乘加，实测建表 **6.4 ms（release）/ 106 ms（debug）**。表本身是进程级 `OnceLock<Bank>`（`4 × 9 × 4096 × 4 B = 576 KiB`），全进程一份，节点只持 `&'static` 切片——理由不只是省内存：24 个单测每个都 `new` 一遍，不共享会让测试慢到不可接受。`process` 里因此既没有分配也没有锁，而且**每样本成本与表里的谐波数无关**（4 次查表 + 3 次 lerp），这正是波表相对加法合成的性价比所在。
+
+**力度白拿。** `AdsrProcessor` 的峰值本来就是 velocity（`trigger` 把 level clamp 进 `[0, velocity]` 并从当前电平起音），所以把真实 velocity 传进去即可：`velocity = 0.5` 的稳态 RMS 实测是 `velocity = 1.0` 的 **0.500**，不需要额外乘法链，重按 / 偷声部仍然无 click。这一条与 Organ 刻意相反——音轮风琴的键触点是开关，波表是键盘合成器，`velocity → 电平` 是它的自然语义。
+
+**`position` 是唯一新增的平滑状态。** 它是块率下发的参数，硬切会在自动化扫动时产生 zipper；每样本一极点（10 ms）把阶梯变成斜坡。`position → 帧` 的映射踩过一次坑：第一版把 `FRAMES - 2` 当 `span` 用，等于把 4 帧压成 3 帧，`position = 1` 只到锯齿而到不了方波，三个频谱测试同时红。正确写法是两个常量——`span = FRAMES - 1`、`last_index = FRAMES - 2`，`f = position·span`、`j = min(floor(f), last_index)`——并且 `render_voice` 与 `preview_waveform` 两处必须同时改。
+
+**Inspector 的波形预览不读播放用的表。** 播放表的分层按音高选，而预览没有音高（它画的是一周期形状），读哪一层都是错的。所以 `preview_waveform` 用同一套 `frame_amplitude` 重新求和，带限到 `out.len()/2`，并复用 `bank.scales` 保持与播放一致的归一化——共用同一份谱定义与同一组系数，预览就不会随实现漂。这也解释了为什么它是 `pub` 的控制线程函数而不是 RT 路径的一部分。
+
+**model / 装配 / UI 的接线**：`VoiceSpec::Wavetable { params: WavetableParams }` 加法变体（serde tag `wavetable`，`#[serde(default)]`），`PROJECT_VERSION` 保持 10，旧工程零迁移。因为表是内置的，不存在「空路径」态，节点出生即有声——这是它比 Sample / SoundFont 简单的地方。装配仍然只改 `headless::spawn_instrument` 一处：离线在构造期 seed `wavetable_param_values`（4 条），实时靠 `engine_sync::push_node_params` 重放。`NodeParam` 新增 4 个词汇，全部连续、全部可自动化（扫 `position` 就是这个乐器的核心演奏动作，必须能挂曲线）；`WavetablePosition` / `Attack` / `Release` **不复用** `NodeParam::Attack` / `Release`，原因同 S2（合法区 0.001..2 / 0.005..5，共用会让曲线大半行程落在 clamp 上）。UI 加选择器第 8 个内置乐器（Add 菜单在 `Organ` 之后）、节点标题 `WTABLE · Track N`、画布内联 `pos`、Inspector wavetable 分区（一个周期的波形预览 + Position / Attack / Release / Gain 四行滑杆）。
+
+**v1 边界**：不做用户表导入（`.wav` / `.wt`、命名、缓存淘汰、文件对话 UI），不做滤波器、不做 unison / detune / FM。用户导入是「文件 + UI」的活，风险不在 DSP，真要做得按 `media` / `sf2_library` 的形状单独写 spec；滤波器接既有效果器即可，塞进引擎会让「表决定音色」这件事变模糊，也会给 `--render` 的频谱验收多一个变量。
+
+**验收**：24 项 `wavetable.rs` 单测（静音、发声、音高与 `PitchOffset` 的 Goertzel、position 0 纯正弦、position 1 方波奇次、扫动频谱单调、混叠防御、低音保留更多谐波、选层随音高单调、跨层响度不变、层边界连续、A·R、blanket、力度线性、零力度、同音复用、偷声部有界、position 平滑、非有限参数、极端参数、可复现、非法采样率、预览跟随 position、表完整）、1 项 model RON 往返与旧 payload 默认、`effect_rt_audit` 的 wavetable 零分配段、1 项离线端到端。实测：默认（正弦帧）RMS 0.2475 / 峰值 0.3500；f0/2f0 = 269 723、f0/3f0 = 2 511 366；方波 3f0/2f0 = 29 551；扫动 4f0 = 0 / 0 / 0.02370（⅓ 处为 0，三角帧只有奇次）；A6 锯齿 8f0/9f0 = 138 264；A1 / A6 RMS 比 1.790；velocity 0.5 / 1.0 = 0.500；层接缝步长 0.478 对稳态 0.457（1.046×）。默认工程渲染与 pre-S3 逐字节一致（44288 帧 / 177196 字节），全量 1208 项通过。
