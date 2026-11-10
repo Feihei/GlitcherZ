@@ -685,3 +685,53 @@ fn key_with(k: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
         modifiers,
     }
 }
+
+/// The timeline's keyboard surface is the whole panel, not the lane strips.
+///
+/// The rows are only ~40 px tall at the top of a tall central area, so a
+/// pointer parked anywhere below them used to be "outside every surface":
+/// no focus, every focus-gated shortcut dead, and the keys fell through to
+/// the virtual piano (the reported "timeline shortcuts don't work, keys play
+/// notes" with a perfectly healthy pointer). The roll never had the bug
+/// because it registers its whole panel — this pins the same rule here.
+#[test]
+fn hovering_below_the_last_row_keeps_the_timelines_keyboard() {
+    let mut f = Fixture::new();
+    f.frame(vec![]);
+    f.frame(vec![]);
+    let row = f
+        .ctx
+        .read_response(egui::Id::unique("glitcherz_timeline_row").with((false, 0usize)))
+        .expect("row 0 is missing from the widget stack")
+        .rect;
+    // Below every row, still inside the central panel.
+    let empty = egui::pos2(LANE_X, row.bottom() + 150.0);
+    f.frame(vec![hover(empty)]);
+    assert!(
+        f.owns_focus(),
+        "the panel — not just the lane strips — must own the timeline's keyboard"
+    );
+}
+
+/// Same rule above the rows: the toolbar and the ruler belong to the panel
+/// too. This used to work only AFTER some lane had been hovered once (the
+/// old band was registered for `focus_id`, which starts out `None`), so a
+/// fresh window could not be driven from its own toolbar.
+#[test]
+fn the_toolbar_belongs_to_the_panel_surface_from_the_first_frame() {
+    let mut f = Fixture::new();
+    f.frame(vec![]);
+    f.frame(vec![]);
+    let row = f
+        .ctx
+        .read_response(egui::Id::unique("glitcherz_timeline_row").with((false, 0usize)))
+        .expect("row 0 is missing from the widget stack")
+        .rect;
+    // The ruler / toolbar strip just above the first row.
+    let above = egui::pos2(LANE_X, row.top() - 20.0);
+    f.frame(vec![hover(above)]);
+    assert!(
+        f.owns_focus(),
+        "hovering the timeline's own toolbar must hand it the keyboard"
+    );
+}

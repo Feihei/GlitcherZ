@@ -122,7 +122,7 @@ impl FocusRouter {
         // as gone (remote/touch sessions — see `last_pos` docs).
         let pointer = pointer.or(self.last_pos);
 
-        if !protected && !any_down && !self.focus_hold {
+        if !protected && !any_down {
             if let Some(pos) = pointer {
                 // Last match wins: regions registered later are drawn on top.
                 let desired = self
@@ -137,9 +137,17 @@ impl FocusRouter {
                     if focused != Some(id) {
                         ctx.memory_mut(|m| m.request_focus(id));
                     }
-                } else if self.neutral.iter().any(|rect| rect.contains(pos)) {
+                } else if !self.focus_hold && self.neutral.iter().any(|rect| rect.contains(pos)) {
                     // Chrome hover releases only OUR surfaces' focus; foreign
                     // widgets (the button under the pointer itself) keep it.
+                    //
+                    // A live modal / armed knife (`focus_hold`) suppresses
+                    // this half only: the owning view must never lose the keys
+                    // while its modal runs, but it must still be able to TAKE
+                    // them back by hovering its own surface. Freezing both
+                    // halves deadlocked — an armed knife with the focus parked
+                    // on the button that armed it could not be cancelled, since
+                    // Esc never reached the view that owned the armed state.
                     if let Some(id) = focused {
                         if registered(id) {
                             ctx.memory_mut(|m| m.surrender_focus(id));
@@ -264,6 +272,76 @@ mod tests {
         assert_eq!(
             released, None,
             "without the hold, the neutral hover releases the surface again"
+        );
+    }
+
+    /// A live hold suppresses the *release* half only. The owner must still be
+    /// able to take its keys back by hovering its own surface: a hold that
+    /// froze both halves deadlocked the timeline — arming the knife (or a
+    /// modal) from a toolbar button left the focus on that button, so Esc
+    /// never reached the view that owned the armed state and nothing could
+    /// cancel it.
+    #[test]
+    fn a_live_hold_still_lets_the_owner_take_its_keys_back() {
+        let ctx = egui::Context::default();
+        let mut router = FocusRouter::new();
+        let id = egui::Id::unique("timeline");
+        let kb = kb_rect();
+        let neutral = neutral_rect();
+
+        let step =
+            |router: &mut FocusRouter, events: Vec<egui::Event>, hold: bool| -> Option<egui::Id> {
+                let mut focused = None;
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let _ = ui.interact(kb, id, egui::Sense::click());
+                        router.register_keyboard(id, kb);
+                        router.register_neutral(neutral);
+                        router.set_focus_hold(hold);
+                        router.begin_frame(ui.ctx());
+                        focused = ui.ctx().memory(|m| m.focused());
+                    },
+                );
+                out.textures_delta.clear();
+                focused
+            };
+
+        // Take the keyboard, then hand it to the chrome (no hold yet).
+        step(
+            &mut router,
+            vec![egui::Event::PointerMoved(egui::pos2(5.0, 5.0))],
+            false,
+        );
+        assert_eq!(
+            step(
+                &mut router,
+                vec![egui::Event::PointerMoved(egui::pos2(5.0, 5.0))],
+                false
+            ),
+            Some(id)
+        );
+        assert_eq!(
+            step(
+                &mut router,
+                vec![egui::Event::PointerMoved(egui::pos2(25.0, 5.0))],
+                false
+            ),
+            None,
+            "sanity: the neutral hover took the keys away"
+        );
+        // With a hold live, hovering the owner's own surface gives them back.
+        assert_eq!(
+            step(
+                &mut router,
+                vec![egui::Event::PointerMoved(egui::pos2(5.0, 5.0))],
+                true
+            ),
+            Some(id),
+            "a live hold must not lock the owner out of its own keyboard surface"
         );
     }
 }

@@ -311,6 +311,19 @@ pub struct TimelineState {
     /// still holds focus to gate the virtual piano against the command
     /// keys (G/T/K/D collide with the FL layout).
     focus_id: Option<Id>,
+    /// The FIRST lane row's widget id as of the last frame. The whole panel
+    /// is registered as a keyboard surface under it: the rows are only 40 px
+    /// strips at the top of a tall panel, so a pointer parked on the toolbar,
+    /// the ruler or the empty track area below them used to be "outside every
+    /// surface" — no focus, every focus-gated shortcut dead (G/T/Delete just
+    /// played the virtual piano). The roll never had this bug because it
+    /// registers its whole panel; this is the same rule, anchored on a real
+    /// row widget so egui's focus dead-man switch keeps the id alive.
+    lane_anchor: Option<Id>,
+    /// This frame's first lane id, promoted to `lane_anchor` once the rows
+    /// have run (the anchor is one frame behind by construction — the same
+    /// frame of lag the focus router already works with).
+    frame_lane: Option<Id>,
     /// Knife armed via K (M4b.2): the next LMB click cuts the clip under
     /// the pointer at the bar-snapped position. Stays armed for multiple
     /// cuts; Esc / RMB disarms.
@@ -374,6 +387,8 @@ impl Default for TimelineState {
             marquee_ending: false,
             had_focus: false,
             focus_id: None,
+            lane_anchor: None,
+            frame_lane: None,
             knife_armed: false,
             status: None,
             modal: None,
@@ -1397,6 +1412,21 @@ pub fn show(
     router: &mut crate::focus::FocusRouter,
 ) -> Vec<TimelineAction> {
     let mut actions = Vec::new();
+    // The timeline's keyboard surface is the whole panel it owns — toolbar,
+    // ruler, rows and the empty track area below them — not just the 40 px
+    // lane strips. Registered FIRST so the per-lane rects below win on
+    // overlap: a lane under the pointer keeps its own focus, everything else
+    // in the panel falls back to the anchor row. Without this, a pointer
+    // parked below the last track (or on the toolbar before any lane had been
+    // hovered) was "outside every surface": no focus, so G / T / K / Delete /
+    // Esc were all dead and the keys went to the virtual piano instead.
+    // The anchor is last frame's first lane id (a live widget — egui's focus
+    // dead-man switch drops ids no widget claims), so this costs one frame
+    // of lag, the same lag the router itself works with.
+    if let Some(id) = state.lane_anchor.or(state.focus_id) {
+        let area = ui.max_rect().expand(ui.style().interaction.interact_radius);
+        router.register_keyboard(id, area);
+    }
     // 2026-11-04: the tile shortcut (Shift+T, Alt+T as a fallback) is a
     // view-level command, not a focus-gated lane key — losing lane focus
     // while a modifier is pressed would otherwise swallow it; run it before
@@ -1597,7 +1627,6 @@ pub fn show(
     }
     view.show(ui, |ui| {
         // Toolbar: zoom + track add/remove + hints.
-        let toolbar_top = ui.cursor().min.y;
         ui.horizontal(|ui| {
             ui.strong("Arrangement");
             if ui.button("-").on_hover_text("Zoom out").clicked() {
@@ -2011,6 +2040,7 @@ pub fn show(
         // row of the same kind, so they are drawn after all rows have run).
         let mut geom: Vec<(RowKind, Rect)> = Vec::new();
         state.had_focus = false;
+        state.frame_lane = None;
         let rows_top = ui.cursor().min.y;
         // Rows must butt against each other vertically: their clip lanes are
         // stacked with no gap, so the per-lane playhead segments join into
@@ -2173,24 +2203,11 @@ pub fn show(
             Rect::from_min_max(pos2(left, rows_top), pos2(right, ui.cursor().min.y))
         });
         state.rows_rect = rows_frame;
-        // The toolbar row above the lanes belongs to the timeline's keyboard
-        // surface too: a click on a tool button is a click *outside* the
-        // focused lane for egui, which surrenders the lane's focus
-        // (`SurrenderFocusOn::Clicks`) — and hover-follow only hands it back
-        // once the pointer is inside a lane, so G / T / Shift+D / Delete /
-        // Esc stayed dead with the pointer parked on the button just clicked.
-        // The band is registered for whichever row holds the keyboard, and it
-        // stops at the first lane so it can never steal another row's focus.
-        if let Some((_, first)) = geom.first()
-            && let Some(id) = state.focus_id
-        {
-            let band = Rect::from_min_max(
-                pos2(first.left() - HEADER_WIDTH, toolbar_top),
-                pos2(first.right(), first.top()),
-            )
-            .expand(ui.style().interaction.interact_radius);
-            router.register_keyboard(id, band);
-        }
+        // The rows have all run: remember this frame's first lane id as the
+        // keyboard anchor for the panel-wide surface registered at the top of
+        // the next frame (see the `register_keyboard` call there). `or` keeps
+        // the previous anchor if a frame somehow laid out no rows.
+        state.lane_anchor = state.frame_lane.or(state.lane_anchor);
         if rows_frame.is_some() {
             state.rows_viewport_min = ui.clip_rect().min;
         }
@@ -2972,6 +2989,11 @@ fn lane_row<T: Placement>(
     if response.has_focus() {
         state.had_focus = true;
         state.focus_id = Some(response.id);
+    }
+    // First row of the frame: the panel-wide keyboard surface anchors on its
+    // id (registered at the top of the next frame — see `show`).
+    if state.frame_lane.is_none() {
+        state.frame_lane = Some(response.id);
     }
     let painter = ui.painter_at(lane);
     painter.rect_filled(lane, 0.0, colors.lane_bg);
