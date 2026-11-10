@@ -1046,8 +1046,9 @@ fn node_action_buttons(id: PatchId, row: usize, deps: &PatchDeps) -> Vec<NodeAct
         PatchId::Timeline => Vec::new(),
         PatchId::Node(doc_id) => {
             if let Some(NodeDoc::Keyboard { transpose, .. }) = deps.doc.node_by_id(doc_id) {
-                // I1: octave is view state (the strip's left edge), transpose
-                // is the document field that shifts the outgoing notes.
+                // I1: octave is view state (the home octave the G-to-G strip
+                // brackets), transpose is the document field that shifts the
+                // outgoing notes.
                 return if row == 0 {
                     vec![
                         NodeAction {
@@ -1403,8 +1404,9 @@ pub struct PatchState {
     input_sources: Vec<InputSourceItem>,
     /// Open inline rename on a track / channel name, if any.
     rename: Option<PortRename>,
-    /// I1: the octave a virtual keyboard box shows (view state only — see
-    /// [`PatchAction::KeyboardOctave`]). Missing = 4 (C4 at the left edge).
+    /// I1: the home octave a virtual keyboard box brackets (view state only —
+    /// see [`PatchAction::KeyboardOctave`]). Missing = 4 (strip = G3..G5, C4
+    /// inside).
     pub(crate) keyboard_octaves: HashMap<u64, i8>,
     /// I1: keys currently held on a keyboard node's strip, `(node, note)`.
     /// Drives the pressed-key fill; released when the pointer comes up or the
@@ -1540,8 +1542,8 @@ const PORT_NAME_FULLWIDTH: usize = 6;
 /// dropped — the glyphs would be too small to read or hit, mirroring the
 /// in-node action buttons and inline sliders.
 const PORT_NAME_MIN_ZOOM: f32 = ACTION_MIN_ZOOM;
-/// Virtual keyboard box (G6/I1): title + octave/transpose row + one key
-/// strip spanning two octaves.
+/// Virtual keyboard box (G6/I1): title + octave/transpose row + one 25-key
+/// strip from G to G (the view octave's C sits inside it).
 const KEYBOARD_SIZE: Vec2 = Vec2::new(200.0, 96.0);
 /// Height of the keyboard strip in graph space (I1).
 const KEYBOARD_STRIP_HEIGHT: f32 = 46.0;
@@ -1803,22 +1805,33 @@ fn keyboard_strip_rect(r: Rect, zoom: f32) -> Rect {
     )
 }
 
-/// I1: white-key semitone offsets inside one octave.
+/// I1: white-key semitone offsets from the strip's base note. The base is a
+/// G — starting on any white key preserves the C octave's interval table, so
+/// the C-based constants work unchanged.
 const WHITE_STEPS: [u8; 7] = [0, 2, 4, 5, 7, 9, 11];
 /// I1: black keys — semitone offset plus the white key they sit after.
 const BLACK_KEYS: [(u8, usize); 5] = [(1, 0), (3, 1), (6, 3), (8, 4), (10, 5)];
+/// I1: white columns on the strip — two octaves plus the closing G.
+const KEYBOARD_WHITE_COLUMNS: usize = 15;
 
-/// I1: the MIDI note under `pos` on a two-octave strip starting at `octave`
-/// (C4 = 60 at octave 4). Black keys win over the white row beneath them.
+/// I1: the strip's lowest note — the G one octave below the view octave's C
+/// (`G3` at octave 4), so the 25-key window G-to-G brackets the home octave
+/// with five bass keys below middle C and the return G above.
+fn keyboard_base_note(octave: i8) -> i32 {
+    i32::from(octave) * 12 + 7
+}
+
+/// I1: the MIDI note under `pos` on the 25-key G-to-G strip (`C4` = 60 at
+/// octave 4). Black keys win over the white row beneath them.
 fn keyboard_key_at(strip: Rect, octave: i8, pos: Pos2) -> Option<u8> {
     if !strip.contains(pos) {
         return None;
     }
-    let white_w = strip.width() / 14.0;
+    let white_w = strip.width() / KEYBOARD_WHITE_COLUMNS as f32;
     if white_w <= 0.0 {
         return None;
     }
-    let base = (i32::from(octave) + 1) * 12;
+    let base = keyboard_base_note(octave);
     let black_w = white_w * 0.62;
     let black_h = strip.height() * 0.62;
     if pos.y <= strip.top() + black_h {
@@ -1833,14 +1846,15 @@ fn keyboard_key_at(strip: Rect, octave: i8, pos: Pos2) -> Option<u8> {
         }
     }
     let column = ((pos.x - strip.left()) / white_w).floor() as usize;
-    if column >= 14 {
+    if column >= KEYBOARD_WHITE_COLUMNS {
         return None;
     }
     let note = base + (column / 7) as i32 * 12 + i32::from(WHITE_STEPS[column % 7]);
     u8::try_from(note).ok().filter(|n| *n <= 127)
 }
 
-/// I1: paints the two-octave key strip and lights the held keys.
+/// I1: paints the 25-key G-to-G strip and lights the held keys. Labels anchor
+/// the range: every C plus the two endpoint Gs.
 #[allow(clippy::too_many_arguments)]
 fn draw_keyboard_strip(
     painter: &egui::Painter,
@@ -1851,13 +1865,13 @@ fn draw_keyboard_strip(
     node: u64,
     zoom: f32,
 ) {
-    let white_w = strip.width() / 14.0;
-    let base = (i32::from(octave) + 1) * 12;
+    let white_w = strip.width() / KEYBOARD_WHITE_COLUMNS as f32;
+    let base = keyboard_base_note(octave);
     let is_held = |note: i32| u8::try_from(note).is_ok_and(|n| held.contains(&(node, n)));
     let pressed = Color32::from_rgb(240, 190, 80);
 
     // White row first; the black blocks overlap its top edge.
-    for column in 0..14 {
+    for column in 0..KEYBOARD_WHITE_COLUMNS {
         let step = WHITE_STEPS[column % 7];
         let note = base + (column / 7) as i32 * 12 + i32::from(step);
         let key = Rect::from_min_size(
@@ -1881,7 +1895,8 @@ fn draw_keyboard_strip(
         );
         // The label shows what the note will actually send (post-transpose).
         let sounding = note + i32::from(transpose);
-        if step == 0 && (0..=127).contains(&sounding) {
+        let labeled = sounding % 12 == 0 || column == 0 || column == KEYBOARD_WHITE_COLUMNS - 1;
+        if labeled && (0..=127).contains(&sounding) {
             painter.text(
                 Pos2::new(key.center().x, key.bottom() - 3.0 * zoom),
                 egui::Align2::CENTER_BOTTOM,
@@ -1912,7 +1927,8 @@ fn draw_keyboard_strip(
     }
 }
 
-/// I1: the octave a keyboard node shows (view state; C4 when unset).
+/// I1: the home octave a keyboard node brackets (view state; the strip shows
+/// G3..G5 — middle C inside — when unset).
 fn keyboard_octave_of(octaves: &HashMap<u64, i8>, node: u64) -> i8 {
     octaves.get(&node).copied().unwrap_or(4)
 }
@@ -3417,36 +3433,6 @@ fn accepts(kind: CableKind, target: PatchId, doc: &GraphDoc) -> bool {
 
 /// Virtual-keyboard glyph (G6): a mini white/black key strip inside the node
 /// box, drawn beneath the label.
-fn paint_key_strip(painter: &egui::Painter, node: Rect) {
-    let strip = Rect::from_min_max(
-        Pos2::new(node.left() + 10.0, node.top() + 30.0),
-        Pos2::new(node.right() - 10.0, node.bottom() - 8.0),
-    );
-    if strip.width() <= 8.0 || strip.height() <= 4.0 {
-        return;
-    }
-    let white_keys = 7;
-    let key_w = strip.width() / white_keys as f32;
-    for i in 0..white_keys {
-        let key = Rect::from_min_size(
-            Pos2::new(strip.left() + i as f32 * key_w, strip.top()),
-            Vec2::new((key_w - 1.0).max(1.0), strip.height()),
-        );
-        painter.rect_filled(key, 1.0, Color32::from_rgb(232, 234, 236));
-    }
-    // Black keys on the C-D-E / F-G-A boundaries of the one-octave strip.
-    for i in [0, 1, 3, 4, 5] {
-        let x = strip.left() + (i as f32 + 1.0) * key_w;
-        let key = Rect::from_min_size(
-            Pos2::new(x - key_w * 0.28, strip.top()),
-            Vec2::new(key_w * 0.56, strip.height() * 0.6),
-        );
-        if key.right() <= strip.right() {
-            painter.rect_filled(key, 1.0, Color32::from_rgb(30, 32, 36));
-        }
-    }
-}
-
 /// Cubic bezier control points: horizontal extension scales with distance.
 fn bezier_controls(p0: Pos2, p3: Pos2) -> [Pos2; 4] {
     let dx = ((p3.x - p0.x).abs() * 0.5).clamp(40.0, 140.0);
@@ -4213,13 +4199,6 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             FontId::proportional(13.0),
             Color32::from_rgb(225, 225, 228),
         );
-
-        // G6: mini key strip — the virtual keyboard's visual signature.
-        if let PatchId::Node(node_id) = id
-            && doc.node_by_id(node_id).is_some_and(NodeDoc::is_keyboard)
-        {
-            paint_key_strip(&painter, r);
-        }
 
         // Output ports (the timeline draws one per track with a small label).
         for (port, p) in state.out_ports_screen(rect.min, id, &deps) {
@@ -7490,20 +7469,29 @@ mod tests {
             "Reverb · Track 1"
         );
     }
-    /// I1: the strip maps two octaves from the view octave; black keys win
-    /// over the white row and nothing maps outside the box.
+    /// I1: the strip maps G-to-G (25 keys) from the view octave; black keys
+    /// win over the white row and nothing maps outside the box.
     #[test]
-    fn keyboard_strip_maps_two_octaves() {
+    fn keyboard_strip_maps_g_to_g() {
         let strip = Rect::from_min_size(Pos2::new(10.0, 50.0), Vec2::new(196.0, 46.0));
-        let white = strip.width() / 14.0;
+        let white = strip.width() / 15.0;
         assert_eq!(
             keyboard_key_at(
                 strip,
                 4,
                 Pos2::new(strip.left() + 1.0, strip.bottom() - 2.0)
             ),
+            Some(55),
+            "first white key is G3 — five keys of bass below middle C"
+        );
+        assert_eq!(
+            keyboard_key_at(
+                strip,
+                4,
+                Pos2::new(strip.left() + 3.0 * white + 1.0, strip.bottom() - 2.0)
+            ),
             Some(60),
-            "first white key is C4"
+            "the 4th white key is C4"
         );
         assert_eq!(
             keyboard_key_at(
@@ -7511,19 +7499,25 @@ mod tests {
                 4,
                 Pos2::new(strip.right() - 1.0, strip.bottom() - 2.0)
             ),
-            Some(83),
-            "last white key is B5"
+            Some(79),
+            "last white key is G5 — both endpoints included"
         );
         let seam = strip.left() + white;
         assert_eq!(
             keyboard_key_at(strip, 4, Pos2::new(seam, strip.top() + 1.0)),
-            Some(61),
-            "C# sits on the first seam"
+            Some(56),
+            "G#3 sits on the first seam"
         );
+        // Half a key past the seam: exactly on it would round into the
+        // previous column (15 columns make white_w an inexact float).
         assert_eq!(
-            keyboard_key_at(strip, 4, Pos2::new(seam, strip.bottom() - 2.0)),
-            Some(62),
-            "below the black key the white D wins"
+            keyboard_key_at(
+                strip,
+                4,
+                Pos2::new(seam + white * 0.5, strip.bottom() - 2.0)
+            ),
+            Some(57),
+            "below the black key the white A3 wins"
         );
         assert_eq!(
             keyboard_key_at(strip, 4, Pos2::new(strip.left() - 1.0, strip.center().y)),
@@ -7537,8 +7531,17 @@ mod tests {
     #[test]
     fn keyboard_octave_and_transpose_stay_in_range() {
         let strip = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(196.0, 46.0));
-        assert_eq!(keyboard_key_at(strip, 3, Pos2::new(1.0, 44.0)), Some(48));
-        assert_eq!(keyboard_key_at(strip, 5, Pos2::new(1.0, 44.0)), Some(72));
+        assert_eq!(keyboard_key_at(strip, 3, Pos2::new(1.0, 44.0)), Some(43));
+        assert_eq!(keyboard_key_at(strip, 5, Pos2::new(1.0, 44.0)), Some(67));
+        // Octave 8 tops out exactly at the MIDI ceiling (G9 = 127).
+        assert_eq!(
+            keyboard_key_at(
+                strip,
+                8,
+                Pos2::new(strip.right() - 1.0, strip.bottom() - 2.0)
+            ),
+            Some(127)
+        );
         assert_eq!(super::super::shifted_note(60, 2), Some(62));
         assert_eq!(super::super::shifted_note(120, 7), Some(127));
         assert_eq!(super::super::shifted_note(120, 8), None);
