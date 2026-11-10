@@ -1806,11 +1806,15 @@ fn keyboard_strip_rect(r: Rect, zoom: f32) -> Rect {
 }
 
 /// I1: white-key semitone offsets from the strip's base note. The base is a
-/// G — starting on any white key preserves the C octave's interval table, so
-/// the C-based constants work unchanged.
-const WHITE_STEPS: [u8; 7] = [0, 2, 4, 5, 7, 9, 11];
-/// I1: black keys — semitone offset plus the white key they sit after.
-const BLACK_KEYS: [(u8, usize); 5] = [(1, 0), (3, 1), (6, 3), (8, 4), (10, 5)];
+/// G, so the row reads G A B C D E F — the **C-major** shape (the half
+/// steps sit between B-C and E-F), not a G-major one. Starting on a C would
+/// need `[0, 2, 4, 5, 7, 9, 11]`; a G base shifts the last white key down a
+/// semitone because F sits a whole step below it.
+const WHITE_STEPS: [u8; 7] = [0, 2, 4, 5, 7, 9, 10];
+/// I1: black keys — semitone offset plus the white key they sit after. The
+/// C-major shape again: sharps after G, A, C, D and F — never after B or E,
+/// whose next white key is already a semitone up.
+const BLACK_KEYS: [(u8, usize); 5] = [(1, 0), (3, 1), (6, 3), (8, 4), (11, 6)];
 /// I1: white columns on the strip — two octaves plus the closing G.
 const KEYBOARD_WHITE_COLUMNS: usize = 15;
 
@@ -1893,9 +1897,13 @@ fn draw_keyboard_strip(
             Stroke::new(zoom, Color32::from_gray(110)),
             egui::StrokeKind::Inside,
         );
-        // The label shows what the note will actually send (post-transpose).
+        // The label shows what the note will actually send (post-transpose),
+        // but the *column* it sits on is the physical one: the C and G
+        // landmarks of the C-major layout. Anchoring on the sounding pitch
+        // instead would slide the labels to other keys the moment the
+        // transpose changes.
         let sounding = note + i32::from(transpose);
-        let labeled = sounding % 12 == 0 || column == 0 || column == KEYBOARD_WHITE_COLUMNS - 1;
+        let labeled = note % 12 == 0 || note % 12 == 7;
         if labeled && (0..=127).contains(&sounding) {
             painter.text(
                 Pos2::new(key.center().x, key.bottom() - 3.0 * zoom),
@@ -7524,6 +7532,47 @@ mod tests {
             None,
             "outside the box"
         );
+    }
+
+    /// I1: the strip keeps the **C-major** black/white shape even though it
+    /// starts on G — F is a white key, F# is a black one, and the pattern
+    /// matches `wbwbw wbwbwwbwbwbw …` key for key.
+    #[test]
+    fn keyboard_strip_keeps_the_c_major_shape_from_g() {
+        let strip = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(196.0, 46.0));
+        let white = strip.width() / 15.0;
+        // G3 A3 B3 C4 D4 E4 F4 G4 A4 B4 C5 D5 E5 F5 G5
+        let expected_white = [55u8, 57, 59, 60, 62, 64, 65, 67, 69, 71, 72, 74, 76, 77, 79];
+        for (column, want) in expected_white.iter().enumerate() {
+            let x = strip.left() + (column as f32 + 0.5) * white;
+            assert_eq!(
+                keyboard_key_at(strip, 4, Pos2::new(x, strip.bottom() - 2.0)),
+                Some(*want),
+                "white column {column} is {want}"
+            );
+        }
+        // G#3 A#3 C#4 D#4 F#4 G#4 A#4 C#5 D#5 F#5 — sharps sit after G, A,
+        // C, D and F, never after B or E.
+        let expected_black = [
+            (0usize, 56u8),
+            (1, 58),
+            (3, 61),
+            (4, 63),
+            (6, 66),
+            (7, 68),
+            (8, 70),
+            (10, 73),
+            (11, 75),
+            (13, 78),
+        ];
+        for (after_column, want) in expected_black {
+            let seam_x = strip.left() + (after_column as f32 + 1.0) * white;
+            assert_eq!(
+                keyboard_key_at(strip, 4, Pos2::new(seam_x, strip.top() + 1.0)),
+                Some(want),
+                "the black key after white column {after_column} is {want}"
+            );
+        }
     }
 
     /// I1: the octave buttons move the whole strip (view state only), and a
