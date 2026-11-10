@@ -191,7 +191,7 @@ M4A（AAC-LC）、AIFF —— 文件选择框的 `Audio` 过滤器就是这份�
 | `Effect…` | 效果：`Delay`、`EQ`、`Compressor`、`Reverb`、`Chorus`、`Flanger`、`Bitcrusher`、`Phaser`、`Saturation`、`Limiter`、`Ring Mod`、`Vocoder`，以及 CLAP / VST3 效果插件 |
 | `MIDI FX…` | `Arpeggiator`、`Portamento`、`MIDI Envelope`、`LFO`、`Curve Map` |
 | `Mixer` | 多通道求和节点（1–32 通道，可加 / 减通道） |
-| `Keyboard In (computer)` | 电脑键盘输入节点，一个源只允许一个节点；节点上的两个八度键条可直接点击试听，`Oct -/Oct +` 改显示八度，`Tr -/Tr +` 移调（存盘，影响该节点发出的音符） |
+| `Keyboard In (computer)` | 电脑键盘输入节点，一个源只允许一个节点；节点上的音条可直接点击试听（`G(octave)..G(octave+2)`，默认 `G3..G5`），`Oct -/Oct +` 改音区、`Tr -/Tr +` 移调，两者都存盘并影响该节点发出的音符；音区同时决定电脑键盘从哪个音开始（窗口的 C），电脑键盘按下时音条上对应的键会亮 |
 | `Audio Input (microphone)` | 实时输入节点，带设备选择和电平表 |
 | `Feedback Tap` | 反馈抽头：把输入晚一个块求和，让环路合法 |
 | `Rescan Plug-ins` | 重新扫描插件 |

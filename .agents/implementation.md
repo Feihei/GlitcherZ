@@ -1384,3 +1384,28 @@ I3 上线后用户反馈"改完快捷键都无效了"。根因不在按键映射
 **测试**：新增 `keyboard_strip_keeps_the_c_major_shape_from_g`，逐列断言 15 根白键（G3…G5）与 10 个黑键（G#3 A#3 C#4 D#4 F#4 G#4 A#4 C#5 D#5 F#5）的音高与位置。
 
 **门禁**：`cargo fmt` / `cargo clippy --workspace --all-targets` / `cargo test --workspace` = **1336 通过 / 0 失败 / 11 ignored**。提交 `ef14e28`。
+
+### 后续修：vk 音区接管电脑键盘，双向联动（2026-11-10）
+
+用户反馈两条：「vk node 上的 transpose 在电脑键盘上可以起作用，但 oct 调整对电脑键盘无效，应该是联动的才对」+「电脑键盘弹奏的时候，vk 上相应的琴键应该也要有按下的显示，是互相关联的」。
+
+**根因一是两套互不相通的「八度」。** `Tr -/Tr +` 改的是文档字段 `NodeDoc::Keyboard.transpose`，电脑键盘路径 `vk_transpose()` 读它 → 移调对电脑键盘生效。`Oct -/Oct +` 改的却是视图态 `PatchState.keyboard_octaves`，唯一消费者是琴条的绘制与命中 → 电脑键盘根本不读它；电脑键盘的实际音高由**另一个全局 app 字段** `octave_base`（默认 60 = C4，`Z`/`X` 在 24–84 之间调）决定。两套八度各走各的，所以「移调管用、八度不管用」。
+
+**根因二是高亮分居两处。** 电脑键盘按下的音高记在 app 级 `held_notes`，琴条高亮只读 patch 级 `keyboard_held`——后者只在鼠标点琴条时被填。两条路径之间没有任何连接。
+
+**决策翻转（I-D1 B → C）**：八度一旦影响发声，就不再是 viewport 属性。改成文档字段 `NodeDoc::Keyboard.octave: i8`（serde `default = 4`，`PROJECT_VERSION` 不动），并让**节点拥有音区**：
+
+- 琴条仍括 `G(octave)..G(octave+2)`（`keyboard_base_note`，公式不动，默认八度 4 → G3..G5）；
+- 电脑键盘从**窗口的 C** 开始（`C(octave) = octave*12+12`）：17 个电脑键（半音 0..16）永远落在窗口内 → 音高映射天然成立，按下的键必然能对上琴条上的某个键；
+- `Z`/`X` 与节点的 `Oct -`/`Oct +` 是同一个值（`Z`/`X` 在有节点时改节点的 `octave`，没有节点才动全局 `octave_base`）——一个音区，两处入口；
+- 默认值零变化：八度 4 → 基准 C4 = 60，与改动前 `octave_base` 的默认值一致，老工程打开就是原样。
+
+**高亮桥接**：电脑键盘的按下 / 松开写进 patch 级 `keyboard_held_keys`，**与鼠标的 `keyboard_held` 分开**——指针抬起的兜底清理只释放鼠标按下的键，否则会把用户还按着的电脑键盘键误发 Off，声音戛然而止。琴条绘制吃两个集合的并集。映射是纯音高映射（`strip_key_for`：音高落在窗口内 → 键就是它自己；落在窗口外 → 不亮，音区在按住时移动也不会留下假高亮）。
+
+**顺带收掉的冲突**：卷帘 / 时间轴的模态里 `X`/`Y` 是轴选择器，音区不能同时动——`Z`/`X` 在模态激活时不改音区（`modal_transform_active()`）。
+
+**已知遗留（未在本轮修）**：`refresh_vk_targets` 在路由变化时用**物理音高**发 Note Off，而按下时发的是**移调后**的音高——移调不为 0 时会留下卡住的音。这是既有缺陷（transpose 早就存在），与本轮的音区无关；彻底修法是让 `held_notes` 记「物理 → 实际发声」的映射。
+
+**测试**：新增 6 条——model 的 `the_keyboard_register_survives_a_reload`（存盘往返 + 旧 payload 落到默认八度）、UI 的 `the_computer_keyboard_plays_the_node_register` / `every_computer_key_lands_inside_the_strip` / `a_note_outside_the_window_lights_nothing` / `the_keyboard_register_stays_in_range`。
+
+**门禁**：`cargo fmt` / `cargo clippy --workspace --all-targets -D warnings` / `cargo test --workspace` = **1344 通过 / 0 失败 / 11 ignored**。

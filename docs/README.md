@@ -67,7 +67,8 @@ glitcherz --mcp --root ~/Music/glitcherz
    一条 Audio 轨、一个 `Mixer`（1 个通道）和一个 `Keyboard In (computer)` 节点。
    切到 `Patch` 标签能看到整张图。
 2. **弹几个音。** 切到 `Patch` 视图，按 `A W S E D F T G Y H U J K O L P ;` 是半音阶
-   （`Z` / `X` 降 / 升八度）。声音走 `Keyboard In → Synth → Mixer → Master`。
+   （`Z` / `X` 降 / 升音区，也就是 `Keyboard In` 节点上的 `Oct -` / `Oct +`）。
+   声音走 `Keyboard In → Synth → Mixer → Master`，节点音条上对应的键会跟着亮。
 3. **画一段。** 在 `Timeline` 的空轨道上双击 → 插入一小节片段；双击片段进入 `Edit`
    画音符（双击空白处插入音符，拖拽移动，右键删除）。
 4. **排成曲。** 在标尺上 `Ctrl` + 拖拽画出 song loop，按 `Space` 播放听循环。
