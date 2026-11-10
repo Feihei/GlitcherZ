@@ -963,10 +963,12 @@ fn keyboard_ownership_tracks_egui_focus_exactly() {
     if let Some(id) = f.state.focus_id() {
         f.ctx.memory_mut(|m| m.surrender_focus(id));
     }
-    // Park the pointer off the roll (over the toolbar — not a registered
-    // keyboard surface) BEFORE settling: with hover-follow focus, a pointer
-    // still over the roll re-acquires focus the very next frame by design.
-    f.frame(vec![hover(egui::pos2(10.0, 20.0))]);
+    // Park the pointer off the roll — the dead space in the bottom-left
+    // corner, below the velocity strip and left of it — BEFORE settling:
+    // with hover-follow focus, a pointer still over the roll (the toolbar
+    // included: it is part of the roll's surface now) re-acquires focus the
+    // very next frame by design.
+    f.frame(vec![hover(egui::pos2(20.0, 599.0))]);
     assert!(
         !f.state.owns_keyboard_focus(&f.ctx),
         "a roll without focus does not own the keyboard"
@@ -1386,4 +1388,45 @@ fn a_drag_out_of_the_clip_stops_at_the_tail_and_undoes_in_one_step() {
         0,
         "one Ctrl+Z restores the whole drag"
     );
+}
+
+// ---- The toolbar is part of the roll's keyboard surface -------------------
+
+/// The mode buttons and the action buttons sit *above* the note grid, so a
+/// click on one of them is a click "elsewhere" as far as egui's focus
+/// machinery is concerned: it surrenders the roll's focus
+/// (`SurrenderFocusOn::Clicks`). When only the note grid was registered with
+/// the hover-follow router, the only way to get the shortcuts back was to
+/// move the pointer down into the grid — with the pointer parked on the
+/// button it had just clicked, `d` / `g` / `s` / `t` / `k` were all dead.
+#[test]
+fn clicking_a_toolbar_button_keeps_the_shortcuts_alive() {
+    let mut f = Fixture::new();
+    // The [Draw] button, found by probing the toolbar row (the row's height
+    // is egui's business, and the button order is a UI decision).
+    let mut draw_at = None;
+    'outer: for y in (2..48).step_by(2) {
+        for x in (2..420).step_by(4) {
+            f.state.mode = RollMode::Select;
+            f.click(egui::pos2(x as f32, y as f32));
+            if f.state.mode == RollMode::Draw {
+                draw_at = Some(egui::pos2(x as f32, y as f32));
+                break 'outer;
+            }
+        }
+    }
+    let draw_at = draw_at.expect("the toolbar's [Draw] button was never hit");
+
+    // The pointer never leaves the toolbar: `d` must still switch the mode.
+    f.tap_key(egui::Key::D);
+    assert_eq!(
+        f.state.mode,
+        RollMode::Select,
+        "d must still toggle the mode after clicking a toolbar button"
+    );
+    // And the button keeps working (the surface did not swallow its click).
+    f.click(draw_at);
+    assert_eq!(f.state.mode, RollMode::Draw);
+    f.tap_key(egui::Key::D);
+    assert_eq!(f.state.mode, RollMode::Select);
 }

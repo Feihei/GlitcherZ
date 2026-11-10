@@ -258,6 +258,50 @@ fn focus_survives_the_rows_own_hints_coming_and_going() {
     }
 }
 
+/// The toolbar (zoom, add/remove track) sits above the lanes, so clicking
+/// one of its buttons is a click *outside* the focused lane for egui, which
+/// surrenders the lane's focus (`SurrenderFocusOn::Clicks`). The hover-follow
+/// router only hands focus back once the pointer is inside a lane — with the
+/// pointer parked on the button that was just clicked, G / T / Shift+D /
+/// Delete / Esc stayed dead. The toolbar row is registered as part of the
+/// focused row's surface, so the keys survive the click.
+#[test]
+fn clicking_a_toolbar_button_keeps_the_lanes_keyboard_focus() {
+    let mut f = Fixture::new();
+    let _ = f.click_into_a_lane();
+    assert!(f.owns_focus(), "a clicked lane holds the keyboard");
+    // Find a toolbar button by probing the row above the lanes (the layout
+    // stack puts it below the transport and view-tab panels): a zoom button
+    // is the observable one (`px_per_bar` moves).
+    let mut hit = None;
+    'outer: for y in (36..160).step_by(4) {
+        for x in (2..320).step_by(4) {
+            let before = f.state.px_per_bar;
+            f.click(egui::pos2(x as f32, y as f32));
+            if f.state.px_per_bar != before {
+                hit = Some(egui::pos2(x as f32, y as f32));
+                break 'outer;
+            }
+        }
+    }
+    let at = hit.expect("no toolbar button changed the zoom");
+    // The router resolves at the start of a frame, so the pointer resting on
+    // the button is what must restore the focus — exactly the user's state
+    // right after clicking a tool.
+    f.frame(vec![hover(at)]);
+    assert!(
+        f.owns_focus(),
+        "the toolbar click must not hand the keyboard away while the pointer is still on it"
+    );
+    for _ in 0..3 {
+        f.frame(vec![hover(at)]);
+        assert!(
+            f.owns_focus(),
+            "and it must stay while the pointer rests there"
+        );
+    }
+}
+
 /// Anything appearing or disappearing ABOVE the timeline must not re-id
 /// the rows: egui keeps focus on the id, so a moved row leaves focus
 /// parked on a phantom — no row reports focus, the keys stop working and

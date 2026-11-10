@@ -1459,6 +1459,9 @@ pub fn show(
 
     // Toolbar: grid menu, mode / armed-command chips, hints.
     let mut intent = None;
+    // The toolbar top, so the keyboard surface can cover it too (see the
+    // `register_keyboard` call after the grid is measured).
+    let toolbar_top = ui.cursor().min.y;
 
     ui.horizontal(|ui| {
         let current = state.grid;
@@ -1814,13 +1817,28 @@ pub fn show(
         ui.scope_id().with("roll-notes"),
         egui::Sense::click_and_drag(),
     );
-    // The roll owns keyboard focus while hovered (the app-level FocusRouter
-    // assigns it before layout); the click itself is handled in the
-    // interaction section below (it needs the pointer→tick/pitch helpers
-    // defined there). Registration is enough for hover-follow focus; the
-    // explicit click is a fallback that also pulls focus out of an inline
-    // DragValue edit, which the router is frozen on.
-    router.register_keyboard(response.id, response.rect);
+    // The roll's keyboard surface is the whole panel it owns, not just the
+    // note grid: the toolbar sits directly above the grid, and egui surrenders
+    // a widget's focus on any click that lands outside it
+    // (`SurrenderFocusOn::Clicks`). With only `rect` registered, clicking
+    // [Draw] / [Grab] / the grid menu handed the keyboard away and hover-follow
+    // could not take it back until the pointer re-entered the note area — every
+    // focus-gated shortcut (d, g, s, t, k, Delete, Ctrl+A, Esc) went dead with
+    // the pointer still sitting on the toolbar the user just clicked. The
+    // surface therefore spans the toolbar row, the key column and the grid, so
+    // hovering any of them keeps the roll's keys alive.
+    let roll_id = response.id;
+    // The surface grows by egui's hit-test radius for the same reason the
+    // buttons are hittable from a few pixels outside their rect: the toolbar
+    // row's top edge sits on the panel margin, and a click that lands on a
+    // button there must not count as "outside the roll".
+    let surface =
+        egui::Rect::from_min_max(egui::pos2(outer.left(), toolbar_top), outer.right_bottom())
+            .expand(ui.style().interaction.interact_radius);
+    // Registration is enough for hover-follow focus; the explicit click is a
+    // fallback that also pulls focus out of an inline DragValue edit, which the
+    // router is frozen on.
+    router.register_keyboard(roll_id, surface);
     if response.clicked() {
         response.request_focus();
     }
@@ -2214,6 +2232,10 @@ pub fn show(
 
     // ---- Velocity lane (M2.4): bars under the roll, drag to set. ----
     let (lane_rect, lane_response) = allocate_roll_strip(ui, LANE_HEIGHT, egui::Sense::drag());
+    // The velocity strip is part of the same panel, so it is part of the same
+    // keyboard surface (see the `register_keyboard` call above): dragging a
+    // velocity bar must not cost the roll its shortcuts either.
+    router.register_keyboard(roll_id, lane_rect);
     // Same time axis, its own strip: `over` moves only the left edge and the
     // vertical anchor, so the bars line up with the notes above them.
     let lane_geom = geom.over(lane_rect);

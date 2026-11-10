@@ -1597,6 +1597,7 @@ pub fn show(
     }
     view.show(ui, |ui| {
         // Toolbar: zoom + track add/remove + hints.
+        let toolbar_top = ui.cursor().min.y;
         ui.horizontal(|ui| {
             ui.strong("Arrangement");
             if ui.button("-").on_hover_text("Zoom out").clicked() {
@@ -2172,6 +2173,24 @@ pub fn show(
             Rect::from_min_max(pos2(left, rows_top), pos2(right, ui.cursor().min.y))
         });
         state.rows_rect = rows_frame;
+        // The toolbar row above the lanes belongs to the timeline's keyboard
+        // surface too: a click on a tool button is a click *outside* the
+        // focused lane for egui, which surrenders the lane's focus
+        // (`SurrenderFocusOn::Clicks`) — and hover-follow only hands it back
+        // once the pointer is inside a lane, so G / T / Shift+D / Delete /
+        // Esc stayed dead with the pointer parked on the button just clicked.
+        // The band is registered for whichever row holds the keyboard, and it
+        // stops at the first lane so it can never steal another row's focus.
+        if let Some((_, first)) = geom.first()
+            && let Some(id) = state.focus_id
+        {
+            let band = Rect::from_min_max(
+                pos2(first.left() - HEADER_WIDTH, toolbar_top),
+                pos2(first.right(), first.top()),
+            )
+            .expand(ui.style().interaction.interact_radius);
+            router.register_keyboard(id, band);
+        }
         if rows_frame.is_some() {
             state.rows_viewport_min = ui.clip_rect().min;
         }
