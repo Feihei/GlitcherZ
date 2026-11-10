@@ -15,7 +15,9 @@
 //! and the measured panel width.
 
 use eframe::egui;
-use glitcherz_model::{AutoPoint, ControlClip, MidiClip, MidiTrack, Note, Sequence, TICKS_PER_BAR};
+use glitcherz_model::{
+    AutoPoint, ControlClip, MidiClip, MidiTrack, Note, Sequence, TICKS_PER_BAR, TICKS_PER_QUARTER,
+};
 use glitcherz_ui::piano_roll::{
     CURVE_LANE_COLLAPSED_HEIGHT, ClipRef, KEYS_WIDTH, OverlayLane, ROW_HEIGHT, RollIntent,
     RollMode, RollState, RollSubject,
@@ -463,6 +465,32 @@ fn draw_mode_paints_on_an_empty_drag_and_d_toggles_back() {
     assert_eq!(f.state.mode, RollMode::Select);
     let intents = f.drag(f.pos(1000.0, 70), f.pos(1400.0, 70));
     assert!(!has_add_note(&intents), "got {intents:?}");
+}
+
+/// User request (2026-11-10): a plain click in Draw mode paints a note at the
+/// default length — the click form of the drag above. Select mode keeps its
+/// plain click as "clear the selection".
+#[test]
+fn a_plain_click_in_draw_mode_paints_a_default_length_note() {
+    let mut f = Fixture::new();
+    f.tap_key(egui::Key::D);
+    assert_eq!(f.state.mode, RollMode::Draw);
+
+    let intents = f.click(f.pos(1000.0, 70));
+    let added = intents.iter().find_map(|intent| match intent {
+        RollIntent::AddNote {
+            note,
+            start,
+            length,
+            ..
+        } => Some((*note, *start, *length)),
+        _ => None,
+    });
+    assert_eq!(
+        added,
+        Some((70, 960, i64::from(TICKS_PER_QUARTER))),
+        "a draw click inserts at the snapped tick with the default length: {intents:?}"
+    );
 }
 
 #[test]

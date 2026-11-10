@@ -2504,10 +2504,10 @@ pub fn show(
     // *confirmation* (LMB anywhere fixes the geometry); an armed knife
     // consumes it as a zero-length stroke (one cut through every note
     // spanning the pointer tick, no pre-selection needed); otherwise it
-    // selects the note under the pointer, or on empty space deselects —
-    // or inserts a default note on the second click of a double-click.
-    // Creation deliberately requires a drag (draw mode) or a double-click,
-    // so a stray click meant as "clear the selection" never paints a note.
+    // selects the note under the pointer. On empty space, Draw mode paints a
+    // default-length note (2026-11-10 user request), while Select mode keeps
+    // the click as "clear the selection"; a double-click inserts one note in
+    // either mode (its second click must not paint a second one on top).
     // (egui only reports drag_started once the pointer moved, so click and
     // drag are already disambiguated.)
     if response.clicked() {
@@ -2565,7 +2565,16 @@ pub fn show(
                         }
                     }
                     None => {
-                        if response.double_clicked() {
+                        // Draw mode: a plain click paints the default-length
+                        // note (2026-11-10 user request). Select mode keeps a
+                        // plain click as "clear the selection" and inserts
+                        // only on the second click of a double-click. In Draw
+                        // mode the second click of a double-click must not
+                        // paint another note on top of the first.
+                        let draw_click = state.mode == RollMode::Draw && !response.double_clicked();
+                        let select_double =
+                            state.mode == RollMode::Select && response.double_clicked();
+                        if draw_click || select_double {
                             // No awaiting_create: a follow-up drag would have
                             // fired drag_started (draw) instead of a click.
                             let length = state.draw_note_length();
