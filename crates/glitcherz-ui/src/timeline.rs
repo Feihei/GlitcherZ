@@ -29,6 +29,7 @@
 //! (re-push clips) or cross-panel state (selection, editor target) is reported
 //! back as [`TimelineAction`]s.
 
+use crate::snap::Snap;
 use eframe::egui;
 use egui::{
     Align2, Color32, EventFilter, FontId, Id, Key, Modifiers, Pos2, Rect, Sense, Stroke,
@@ -1881,7 +1882,8 @@ pub fn show(
             let tick_at = |x: f32| {
                 (((x - rect.left()) / px_per_tick).max(0.0) as f64).min(max_tick)
             };
-            let snap_bar = |tick: f64| ((tick / bar_ticks_f).round() * bar_ticks_f).max(0.0);
+            let ruler_snap = Snap::on(i64::from(bar_ticks));
+            let snap_bar = |tick: f64| ruler_snap.ticks_f64(tick);
             let loop_has_range = p.loop_range.end_ticks > p.loop_range.start_ticks;
             let brace_y = (rect.bottom() - 5.0, rect.bottom() - 1.0);
             let start_x = rect.left() + p.loop_range.start_ticks as f32 * px_per_tick;
@@ -2849,6 +2851,7 @@ fn lane_row<T: Placement>(
     // W3b: group table for the colour stripe + name tag.
     clip_groups: &[ClipGroup],
 ) {
+    let snap = Snap::on(i64::from(bar_ticks));
     // The row's widget ids must be STABLE. The lane is the keyboard focus
     // carrier, and egui auto ids are positional: anything above the rows
     // appearing or disappearing (the focus chip, the knife / modal hints,
@@ -3285,7 +3288,7 @@ fn lane_row<T: Placement>(
     // snapped bar line through the hovered lane).
     if state.knife_armed && response.hovered() {
         if let Some(pos) = response.hover_pos() {
-            let at = snap_bar(tick_at(pos.x), bar_ticks);
+            let at = snap_bar(tick_at(pos.x), bar_ticks, snap);
             let x = lane.left() + at as f32 * px_per_tick;
             painter.line_segment(
                 [pos2(x, lane.top()), pos2(x, lane.bottom())],
@@ -3355,7 +3358,7 @@ fn lane_row<T: Placement>(
                 }
             } else if clips.len() < MAX_CLIPS_PER_TRACK {
                 let bound = ARRANGEMENT_LIMIT_TICKS - bar_ticks;
-                let start = snap_bar(tick, bar_ticks).min(bound);
+                let start = snap_bar(tick, bar_ticks, snap).min(bound);
                 if let RowKind::Audio(t) = row {
                     // U6 D2: an empty audio lane asks for a wav — the caller
                     // opens the file dialog and creates the clip.
@@ -3480,7 +3483,8 @@ fn lane_row<T: Placement>(
                     }) if clip < clips.len() => {
                         let span = clips[clip].span(sec_per_tick);
                         let limit = ARRANGEMENT_LIMIT_TICKS - span;
-                        let start = snap_bar(tick_at(pos.x) - grab_ticks, bar_ticks).min(limit);
+                        let start =
+                            snap_bar(tick_at(pos.x) - grab_ticks, bar_ticks, snap).min(limit);
                         if clips[clip].start() != start {
                             let lane = row.lane();
                             let track = row.track();
@@ -3528,7 +3532,7 @@ fn lane_row<T: Placement>(
                         ResizeEdge::End => {
                             let start = clips[clip].start();
                             let limit = ARRANGEMENT_LIMIT_TICKS - start;
-                            let edge = snap_bar(tick_at(pos.x) - start as f32, bar_ticks)
+                            let edge = snap_bar(tick_at(pos.x) - start as f32, bar_ticks, snap)
                                 .clamp(bar_ticks, limit.max(bar_ticks));
                             // 2026-11-04: the plain right edge extends/trims
                             // the clip time. A single-period clip grows its
@@ -4066,17 +4070,17 @@ fn knife_target<T: Placement>(
 ) -> Option<(usize, u32)> {
     let index = hit_clip(clips, tick, sec_per_tick)?;
     let clip = &clips[index];
-    let at = snap_bar(tick, bar_ticks);
+    let at = snap_bar(tick, bar_ticks, Snap::on(i64::from(bar_ticks)));
     let left_ok = at >= clip.start() + bar_ticks;
     let right_ok = at + bar_ticks <= clip.start() + clip.span(sec_per_tick);
     (left_ok && right_ok).then_some((index, at))
 }
 
 /// Snaps to the nearest whole bar (0 stays 0). `bar_ticks` is the document's
-/// bar length (U3a), so the snap follows the meter.
-fn snap_bar(ticks: f32, bar_ticks: u32) -> u32 {
-    let bar = bar_ticks.max(1) as f32;
-    ((ticks / bar).round().max(0.0) as u32) * bar_ticks.max(1)
+/// bar length (U3a), so the snap follows the meter; `snap` may turn the grid
+/// off (`Snap::OFF`) for a Ctrl drag.
+fn snap_bar(ticks: f32, _bar_ticks: u32, snap: Snap) -> u32 {
+    snap.ticks(ticks).max(0) as u32
 }
 
 /// I6: the bar-snapped start of a head trim.
@@ -4095,7 +4099,7 @@ pub(crate) fn trim_head_start(
         .saturating_add(origin_span)
         .saturating_sub(bar)
         .max(origin_start);
-    snap_bar(pointer_tick, bar).clamp(origin_start, max_start)
+    snap_bar(pointer_tick, bar, Snap::on(i64::from(bar))).clamp(origin_start, max_start)
 }
 
 /// The insertion row a track-reorder drag points at, plus the screen y the
@@ -4865,7 +4869,14 @@ mod tests {
             knife_target(&clips, 1.6 * SIX_EIGHT as f32, SIX_EIGHT, SPT),
             Some((0, 2 * SIX_EIGHT))
         );
-        assert_eq!(snap_bar(1.6 * SIX_EIGHT as f32, SIX_EIGHT), 2 * SIX_EIGHT);
+        assert_eq!(
+            snap_bar(
+                1.6 * SIX_EIGHT as f32,
+                SIX_EIGHT,
+                Snap::on(i64::from(SIX_EIGHT))
+            ),
+            2 * SIX_EIGHT
+        );
         // A 3/4 clip of exactly one bar still cannot be cut (one bar minimum
         // on both sides), even though it is shorter than a 4/4 bar.
         let short = vec![clip(0, SIX_EIGHT)];

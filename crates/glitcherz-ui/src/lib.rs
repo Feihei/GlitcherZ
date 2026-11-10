@@ -90,6 +90,7 @@ pub mod project_files;
 pub mod recorder;
 pub mod recording;
 pub mod settings;
+pub mod snap;
 pub mod status_bar;
 pub mod timeline;
 pub mod timeline_ops;

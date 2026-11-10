@@ -325,11 +325,12 @@ impl GlitcherZApp {
         }
 
         // ---- Interaction ----
-        let snap = crate::curve::SNAP_TICKS.max(1);
+        let snap = crate::snap::Snap::on(i64::from(crate::curve::SNAP_TICKS));
         let mapped = |pos: egui::Pos2| -> (u32, f32) {
             let phase = tick_at(pos.x).max(0.0);
-            let tick = ((phase / snap as f32).round() as u32) * snap;
-            (tick.min(loop_ticks.saturating_sub(1)), y_value(pos.y))
+            let limit = i64::from(loop_ticks.saturating_sub(1));
+            let tick = snap.ticks(phase).clamp(0, limit) as u32;
+            (tick, y_value(pos.y))
         };
         let hit_anchor = |pos: egui::Pos2| -> Option<u32> {
             curve

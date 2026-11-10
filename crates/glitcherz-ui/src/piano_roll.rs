@@ -44,6 +44,7 @@
 use eframe::egui;
 
 use crate::grid::GridValue;
+use crate::snap::Snap;
 use glitcherz_model::{
     ControlClip, MidiClip, MidiTrack, Note, RandomizeOptions, StrumDirection, StrumOptions,
     TICKS_PER_QUARTER, TICKS_PER_STEP,
@@ -685,13 +686,12 @@ impl Modal {
         selection: &[usize],
         pointer_tick: f32,
         pointer_note: u8,
-        grid_ticks: i64,
+        snap: Snap,
         loop_ticks: i64,
     ) -> ModalFrame {
         match self.kind {
             ModalKind::Move { axis } => {
-                let want_start =
-                    snap_ticks(pointer_tick, grid_ticks) - snap_ticks(self.grab_tick, grid_ticks);
+                let want_start = snap.ticks(pointer_tick) - snap.ticks(self.grab_tick);
                 let want_note = i64::from(pointer_note) - i64::from(self.grab_note);
                 // An axis lock zeroes that axis' target (pressing it again
                 // walks the preview back to the grab position).
@@ -729,8 +729,8 @@ impl Modal {
             }
             ModalKind::Stretch { edge, lo, hi } => {
                 let delta = match edge {
-                    StretchEdge::End => draw_end(lo, pointer_tick, grid_ticks, loop_ticks) - hi,
-                    StretchEdge::Start => trim_start(hi, pointer_tick, grid_ticks) - lo,
+                    StretchEdge::End => draw_end(lo, pointer_tick, snap, loop_ticks) - hi,
+                    StretchEdge::Start => trim_start(hi, pointer_tick, snap) - lo,
                 };
                 ModalFrame {
                     delta_start: 0,
@@ -1955,7 +1955,7 @@ pub fn show(
     // editing stops at its edges — a click out there must not conjure a note
     // clamped to tick 0.
     let over_focus = |pos: egui::Pos2| (0.0..loop_ticks as f32).contains(&geom.local_at(pos.x));
-    let snap = |ticks: f32| -> i64 { snap_ticks(ticks, grid_ticks) };
+    let snap = Snap::on(grid_ticks);
     let modifiers = ui.ctx().input(|i| i.modifiers);
     let additive = modifiers.shift || modifiers.ctrl;
 
@@ -1972,7 +1972,7 @@ pub fn show(
             &state.selection,
             pointer_tick(pos),
             pointer_note(pos),
-            grid_ticks,
+            snap,
             loop_ticks,
         )
     });
@@ -2489,7 +2489,7 @@ pub fn show(
                     &state.selection,
                     pointer_tick(pos),
                     pointer_note(pos),
-                    grid_ticks,
+                    snap,
                     loop_ticks,
                 );
                 intent = modal.finalize(clip, &state.selection, frame, loop_ticks);
@@ -2543,7 +2543,7 @@ pub fn show(
                             state.last_note_length = Some(length);
                             intent = Some(RollIntent::AddNote {
                                 note: pointer_note(pos),
-                                start: snap(pointer_tick(pos)).min(loop_ticks - 1),
+                                start: snap.ticks(pointer_tick(pos)).min(loop_ticks - 1),
                                 length,
                                 gesture: state.next_gesture(),
                             });
@@ -2749,7 +2749,7 @@ pub fn show(
                             // parks in `awaiting_create` and `resolve_created`
                             // starts the draw-drag.
                             let gesture = state.next_gesture();
-                            let start = snap(pointer_tick(pos)).min(loop_ticks - 1);
+                            let start = snap.ticks(pointer_tick(pos)).min(loop_ticks - 1);
                             // I4: the note enters at the chosen length (the
                             // last one used in Auto); a drag that follows
                             // replaces it with the pointer's extent.
@@ -2822,7 +2822,7 @@ pub fn show(
                         // clamped on the UI side so no note hits the engine's
                         // clamp asymmetrically (that would permute the sort
                         // and invalidate the selection).
-                        let want_start = snap(pointer_tick(pos)) - snap(drag.grab_tick);
+                        let want_start = snap.ticks(pointer_tick(pos)) - snap.ticks(drag.grab_tick);
                         let want_note = i64::from(pointer_note(pos)) - i64::from(drag.grab_note);
                         // An axis lock zeroes that axis' target: locking
                         // mid-drag walks it back to the grab position (the
@@ -2867,7 +2867,7 @@ pub fn show(
                         // stretches by the same delta. The start is the
                         // frozen anchor — a right-edge trim never moves it.
                         let start = drag.current_start();
-                        let target = draw_end(start, pointer_tick(pos), grid_ticks, loop_ticks);
+                        let target = draw_end(start, pointer_tick(pos), snap, loop_ticks);
                         let delta = target - drag.current_end();
                         if delta != 0 {
                             drag.applied_end += delta;
@@ -2883,7 +2883,7 @@ pub fn show(
                         // selection shifts its starts by the same delta. The
                         // end stays put — the command mirrors the length.
                         let end = drag.current_end();
-                        let target = trim_start(end, pointer_tick(pos), grid_ticks);
+                        let target = trim_start(end, pointer_tick(pos), snap);
                         let delta = target - drag.current_start();
                         if delta != 0 {
                             drag.applied_start += delta;
@@ -3026,7 +3026,7 @@ pub fn show(
                 &state.selection,
                 pointer_tick(pos),
                 pointer_note(pos),
-                grid_ticks,
+                snap,
                 loop_ticks,
             );
             intent = modal.finalize(clip, &state.selection, frame, loop_ticks);
@@ -3195,14 +3195,11 @@ fn curve_lanes(
         }
 
         // ---- Interaction: click adds, drag moves, right-click deletes ----
-        let snap = crate::curve::SNAP_TICKS.max(1);
+        let snap = Snap::on(i64::from(crate::curve::SNAP_TICKS));
         let mapped = |pos: egui::Pos2| -> (u32, f32) {
             let local = lane_geom.local_at(pos.x).max(0.0);
-            let tick = ((local / snap as f32).round() as u32) * snap;
-            (
-                tick.min(loop_ticks as u32 - 1),
-                lane.y_to_value(pos.y, rect),
-            )
+            let tick = snap.ticks(local).clamp(0, (loop_ticks - 1).max(0)) as u32;
+            (tick, lane.y_to_value(pos.y, rect))
         };
         let hit_anchor = |pos: egui::Pos2| -> Option<u32> {
             anchor_positions
@@ -3276,11 +3273,6 @@ fn curve_lanes(
     intent
 }
 
-/// Snap a tick position to the grid (nearest line, never negative).
-fn snap_ticks(ticks: f32, grid_ticks: i64) -> i64 {
-    ((ticks / grid_ticks as f32).round() as i64).max(0) * grid_ticks
-}
-
 /// Time-axis zoom anchored at the pointer: the tick under `anchor_x` stays
 /// under it after the zoom (unclamped new scroll; the caller clamps).
 fn zoom_scroll_anchor(
@@ -3316,18 +3308,18 @@ fn zoom_top_note_anchor(
 /// End tick of a note being drawn: the pointer snapped to the grid, at least
 /// one grid cell after the start (a zero-length note is invisible and cannot
 /// be grabbed), and never past the loop end.
-fn draw_end(start: i64, pointer_tick: f32, grid_ticks: i64, loop_ticks: i64) -> i64 {
-    let snapped = snap_ticks(pointer_tick, grid_ticks);
+fn draw_end(start: i64, pointer_tick: f32, snap: Snap, loop_ticks: i64) -> i64 {
+    let snapped = snap.ticks(pointer_tick);
     snapped
-        .max(start + grid_ticks)
+        .max(start + snap.grid())
         .min(loop_ticks.max(start + 1))
 }
 
 /// Start tick of a left-edge trim: the pointer snapped to the grid, never
 /// past the note's own end (min length one tick), never negative. `end` is
 /// the grabbed note's *current* end — the trim's fixed boundary.
-fn trim_start(end: i64, pointer_tick: f32, grid_ticks: i64) -> i64 {
-    snap_ticks(pointer_tick, grid_ticks).min(end - 1).max(0)
+fn trim_start(end: i64, pointer_tick: f32, snap: Snap) -> i64 {
+    snap.ticks(pointer_tick).min(end - 1).max(0)
 }
 
 /// Which edge of a note (in pixels) the pointer is on, if either — a grab
@@ -3639,9 +3631,10 @@ mod tests {
         RollArm, RollGeom, RollIntent, RollMode, RollState, RollSubject, STRUM_DIVISIONS,
         StretchEdge, ViewWindow, clamped_move, default_strum_options, draw_end, draw_length_label,
         edge_zone, is_black_key, key_at, knife_crossing, modal_ghost, scale_max_k, selection_bbox,
-        snap_ticks, strum_division_label, trim_start, zoom_scroll_anchor, zoom_top_note_anchor,
+        strum_division_label, trim_start, zoom_scroll_anchor, zoom_top_note_anchor,
     };
     use crate::grid::{GridValue, NoteValue};
+    use crate::snap::Snap;
     use eframe::egui;
     use glitcherz_model::{MidiClip, MidiTrack, Note, TICKS_PER_QUARTER, TICKS_PER_STEP, strum};
 
@@ -3828,22 +3821,21 @@ mod tests {
     }
 
     #[test]
-    fn snap_ticks_rounds_to_the_nearest_grid_line() {
-        assert_eq!(snap_ticks(0.0, 240), 0);
-        assert_eq!(snap_ticks(100.0, 240), 0);
-        assert_eq!(snap_ticks(120.0, 240), 240); // exactly half → rounds away from zero
-        assert_eq!(snap_ticks(359.0, 240), 240);
-        assert_eq!(snap_ticks(360.0, 240), 480);
-        assert_eq!(snap_ticks(-50.0, 240), 0); // negative positions clamp to 0
-    }
 
-    #[test]
     fn draw_end_follows_the_pointer_snapped_to_the_grid() {
         let grid = TICKS_PER_STEP as i64; // 1/16
-        assert_eq!(draw_end(0, 240.0, grid, 3840), 240, "one cell right");
-        assert_eq!(draw_end(0, 300.0, grid, 3840), 240, "rounds down");
-        assert_eq!(draw_end(0, 360.0, grid, 3840), 480, "rounds up");
-        assert_eq!(draw_end(480, 700.0, grid, 3840), 720, "start-relative");
+        assert_eq!(
+            draw_end(0, 240.0, Snap::on(grid), 3840),
+            240,
+            "one cell right"
+        );
+        assert_eq!(draw_end(0, 300.0, Snap::on(grid), 3840), 240, "rounds down");
+        assert_eq!(draw_end(0, 360.0, Snap::on(grid), 3840), 480, "rounds up");
+        assert_eq!(
+            draw_end(480, 700.0, Snap::on(grid), 3840),
+            720,
+            "start-relative"
+        );
     }
 
     #[test]
@@ -3851,16 +3843,16 @@ mod tests {
         let grid = TICKS_PER_STEP as i64;
         // Dragging left of the press point (note on) still leaves a visible
         // note — a zero-length note would be invisible and ungrabbable.
-        assert_eq!(draw_end(960, 0.0, grid, 3840), 960 + grid);
-        assert_eq!(draw_end(960, 1000.0, grid, 3840), 960 + grid);
+        assert_eq!(draw_end(960, 0.0, Snap::on(grid), 3840), 960 + grid);
+        assert_eq!(draw_end(960, 1000.0, Snap::on(grid), 3840), 960 + grid);
     }
 
     #[test]
     fn draw_end_stays_inside_the_loop() {
         let grid = TICKS_PER_STEP as i64;
-        assert_eq!(draw_end(0, 999_999.0, grid, 3840), 3840);
+        assert_eq!(draw_end(0, 999_999.0, Snap::on(grid), 3840), 3840);
         // Even a note starting in the last grid cell keeps a positive length.
-        assert_eq!(draw_end(3840 - grid, 999_999.0, grid, 3840), 3840);
+        assert_eq!(draw_end(3840 - grid, 999_999.0, Snap::on(grid), 3840), 3840);
     }
 
     #[test]
@@ -3901,11 +3893,11 @@ mod tests {
     fn trim_start_snaps_and_never_crosses_the_note_end() {
         // The grabbed note ends at 720 (480 + 240).
         // Pointer well before the start: snaps to the grid line at 240.
-        assert_eq!(trim_start(720, 300.0, 240), 240);
+        assert_eq!(trim_start(720, 300.0, Snap::on(240)), 240);
         // Pointer past the end: clamped to end - 1 (min length one tick).
-        assert_eq!(trim_start(720, 900.0, 240), 719);
+        assert_eq!(trim_start(720, 900.0, Snap::on(240)), 719);
         // Pointer before zero: floored at 0.
-        assert_eq!(trim_start(720, -50.0, 240), 0);
+        assert_eq!(trim_start(720, -50.0, Snap::on(240)), 0);
     }
 
     // ---- Drag anchoring / increment (the "note flies away" regressions) ----
@@ -3963,7 +3955,7 @@ mod tests {
         let mut drag = DragSelection::anchored(&note(0, grid, 60), 0.0, 60, DragKind::ResizeEnd, 1);
         for cell in 1..=5 {
             let pointer = cell as f32 * grid as f32;
-            let target = draw_end(drag.current_start(), pointer, grid, 3840);
+            let target = draw_end(drag.current_start(), pointer, Snap::on(grid), 3840);
             let delta = target - drag.current_end();
             drag.applied_end += delta;
         }
@@ -3973,7 +3965,12 @@ mod tests {
             "the note's end sits under the pointer after five frames"
         );
         // A sixth frame at the same spot owes nothing.
-        let target = draw_end(drag.current_start(), 5.0 * grid as f32, grid, 3840);
+        let target = draw_end(
+            drag.current_start(),
+            5.0 * grid as f32,
+            Snap::on(grid),
+            3840,
+        );
         assert_eq!(target - drag.current_end(), 0);
     }
 
@@ -3991,13 +3988,13 @@ mod tests {
         );
         let end = drag.current_end();
         for cell in [3, 2, 1, 0] {
-            let target = trim_start(drag.current_end(), (cell * grid) as f32, grid);
+            let target = trim_start(drag.current_end(), (cell * grid) as f32, Snap::on(grid));
             drag.applied_start += target - drag.current_start();
             assert_eq!(drag.current_end(), end, "a left trim never moves the end");
         }
         assert_eq!(drag.current_start(), 0);
         // Pulling past the end clamps to end - 1 rather than inverting.
-        let target = trim_start(drag.current_end(), 9999.0, grid);
+        let target = trim_start(drag.current_end(), 9999.0, Snap::on(grid));
         assert_eq!(target, end - 1);
     }
 
@@ -4309,7 +4306,7 @@ mod tests {
         let modal = move_modal(240.0, 60);
 
         // The pointer walked one grid cell right and four semitones up.
-        let frame = modal.frame(&clip, &[0], 480.0, 64, 240, 3840);
+        let frame = modal.frame(&clip, &[0], 480.0, 64, Snap::on(240), 3840);
         assert_eq!((frame.delta_start, frame.delta_note), (240, 4));
         let intent = modal
             .finalize(&clip, &[0], frame, 3840)
@@ -4326,13 +4323,13 @@ mod tests {
 
         // A pointer parked on the grab point confirms nothing: a no-op
         // must not spend an undo step.
-        let frame = modal.frame(&clip, &[0], 240.0, 60, 240, 3840);
+        let frame = modal.frame(&clip, &[0], 240.0, 60, Snap::on(240), 3840);
         assert_eq!(modal.finalize(&clip, &[0], frame, 3840), None);
 
         // The move clamps against the loop end (snap(4000) = 4080 → a
         // want of 3840 ticks, clamped so the 240-tick note's **tail** lands
         // on the clip end: 3840 - 240 = 3600).
-        let frame = modal.frame(&clip, &[0], 4000.0, 60, 240, 3840);
+        let frame = modal.frame(&clip, &[0], 4000.0, 60, Snap::on(240), 3840);
         let intent = modal.finalize(&clip, &[0], frame, 3840).expect("clamps");
         match intent {
             RollIntent::MoveNotes { delta_start, .. } => assert_eq!(delta_start, 3600),
@@ -4359,7 +4356,7 @@ mod tests {
             grab_note: 60,
             gesture: 3,
         };
-        let frame = modal.frame(&clip, &[0, 1], 720.0, 60, 240, 3840);
+        let frame = modal.frame(&clip, &[0, 1], 720.0, 60, Snap::on(240), 3840);
         assert!((frame.scale_k - 2.0).abs() < 1e-6);
         let intent = modal
             .finalize(&clip, &[0, 1], frame, 3840)
@@ -4371,7 +4368,7 @@ mod tests {
         ));
 
         // A no-op scale (factor exactly 1) spends no undo step.
-        let frame = modal.frame(&clip, &[0, 1], 360.0, 60, 240, 3840);
+        let frame = modal.frame(&clip, &[0, 1], 360.0, 60, Snap::on(240), 3840);
         assert_eq!(modal.finalize(&clip, &[0, 1], frame, 3840), None);
     }
 
@@ -4391,7 +4388,7 @@ mod tests {
             grab_note: 60,
             gesture: 4,
         };
-        let frame = modal.frame(&clip, &[0, 1], 1200.0, 60, 240, 3840);
+        let frame = modal.frame(&clip, &[0, 1], 1200.0, 60, Snap::on(240), 3840);
         assert_eq!(frame.edge, Some((StretchEdge::End, 480)));
         let intent = modal
             .finalize(&clip, &[0, 1], frame, 3840)
@@ -4411,7 +4408,7 @@ mod tests {
             lo: 0,
             hi: 720,
         };
-        let frame = modal.frame(&clip, &[0, 1], 480.0, 60, 240, 3840);
+        let frame = modal.frame(&clip, &[0, 1], 480.0, 60, Snap::on(240), 3840);
         assert_eq!(frame.edge, Some((StretchEdge::Start, 480)));
         let intent = modal
             .finalize(&clip, &[0, 1], frame, 3840)
@@ -4425,7 +4422,7 @@ mod tests {
         ));
 
         // A pointer at the edge confirms nothing.
-        let frame = modal.frame(&clip, &[0, 1], 0.0, 60, 240, 3840);
+        let frame = modal.frame(&clip, &[0, 1], 0.0, 60, Snap::on(240), 3840);
         assert_eq!(modal.finalize(&clip, &[0, 1], frame, 3840), None);
     }
 
