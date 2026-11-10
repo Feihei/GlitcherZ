@@ -1338,3 +1338,5 @@ spec `timeline.md` D31。需求原话是「ctrl 中键切换 mute、mute 之后�
 **I3 的两组按钮必须长得不一样。** `toolbar.rs` 只提供两个原语：`mode_group`（互斥、填充、点当前模式不关掉自己）和 `action_button`（一次性、armed 时描边不填充）。`Select`/`Draw` 从"一个循环切换的文字 chip"变成两个互斥按钮；`Grab`/`Scale`/`Stretch`/`Knife` 是动作，`Knife` 不再额外显示 `K` chip。**从按钮 arm 的抓取点要推迟**：按钮在网格/轨道区外面，用它当零点会让选区在指针移动途中先跳一下。roll 用 `pending_arm`，等指针进入网格那一帧再 `arm_tool`；timeline 直接把 `grab` 传 `None`，复用既有的 `INFINITY` 哨兵 + 首帧 latch。键盘路径和按钮路径共用同一个 `arm_tool` / `arm_modal`，不会各写一份。
 
 **门禁**：`cargo fmt --all`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` = **1322 通过 / 0 失败 / 11 ignored**。新增测试 14 条：I5 默认值 + 分数标签往返、I4 长度解析 + 自动回退、I2 `key_at` 几何 + 试听序列、I1 键条两八度 + 八度/移调边界、I6 `trim_head_start` 吸附/夹取 + 头裁保留跨界尾巴、I3 `mode_group` 互斥点击 + `arm_tool` 抓取点/空选区/`pending_arm`。
+
+**零回归**：`5419ed1`（最后一个 pre-I 代码状态）的 detached worktree 与本轮之后的二进制，对同一份 `working_files/regression-project.glz` 各渲染 132 352 帧 / 794 180 字节，`cmp` 逐字节一致（sha256 `268d5306e2979f8b082b1f007af5fce1d161e2f2bccded9e1f8d674fb47aacac`）。I 系列只动视图与输入，B2 的 `muted` 默认全 false 且不写序列化键，所以音频路径确实没被触碰。
