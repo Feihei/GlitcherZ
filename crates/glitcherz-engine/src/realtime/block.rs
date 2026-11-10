@@ -591,6 +591,12 @@ impl BlockRunner {
             } => {
                 self.sequencer.set_loop_range(start_ticks, end_ticks);
             }
+            SequencerCommand::SetAuditionRange {
+                start_ticks,
+                end_ticks,
+            } => {
+                self.sequencer.set_audition_range(start_ticks, end_ticks);
+            }
             SequencerCommand::SetBpm(bpm) => self.sequencer.set_bpm(bpm),
             SequencerCommand::SetTimeSignature {
                 numerator,

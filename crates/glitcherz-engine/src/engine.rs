@@ -823,6 +823,18 @@ impl AudioEngine {
         }))
     }
 
+    /// Sets the one-shot audition range (Aud series); `end == 0` or `end <=
+    /// start` disables it. While active it takes priority over the song loop:
+    /// the transport stops at `end` and rewinds to `start`.
+    pub fn set_audition_range(&mut self, start_ticks: u32, end_ticks: u32) -> bool {
+        self.send(EngineCommand::Sequencer(
+            SequencerCommand::SetAuditionRange {
+                start_ticks,
+                end_ticks,
+            },
+        ))
+    }
+
     /// Sets the document's meter (U3a): the derived bar length feeds the
     /// arrangement-end rounding. No event moves and the transport keeps its
     /// position.

@@ -389,6 +389,12 @@ pub struct Sequencer {
     /// loop_start` — anything else means looping is disabled.
     loop_start_ticks: u32,
     loop_end_ticks: u32,
+    /// One-shot audition range (Aud series): a clip preview that stops at
+    /// `audition_end` and rewinds to `audition_start` (never wraps). While
+    /// active it takes priority over the song loop. Invariant:
+    /// `audition_end == 0 || audition_end > audition_start`.
+    audition_start_ticks: u32,
+    audition_end_ticks: u32,
     /// Per-track pending NoteOffs (absolute sample position where the length
     /// ends + note), several slots per track so a chord's notes each keep
     /// their own off (a single slot orphans all but the last note).
@@ -426,6 +432,8 @@ impl Sequencer {
             arrangement_floor_ticks: 0,
             loop_start_ticks: 0,
             loop_end_ticks: 0,
+            audition_start_ticks: 0,
+            audition_end_ticks: 0,
             pending_offs: [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS],
             record_mute: 0,
         }
@@ -538,6 +546,9 @@ impl Sequencer {
         self.playing = false;
         self.bpm_override = None;
         self.position_ticks = 0.0;
+        // Stop ends any audition: the next Play is a normal song playback.
+        self.audition_start_ticks = 0;
+        self.audition_end_ticks = 0;
         self.pending_offs = [[None; MAX_PENDING_OFFS_PER_TRACK]; MAX_MIDI_TRACKS];
     }
 
@@ -580,6 +591,25 @@ impl Sequencer {
     /// Whether the song loop is active. RT-safe.
     fn loop_active(&self) -> bool {
         self.loop_end_ticks > 0
+    }
+
+    /// Sets the one-shot audition range (Aud series). `end == 0` or `end <=
+    /// start` disables it. While active it wins over the song loop: the
+    /// transport stops at `end` and rewinds to `start` instead of wrapping.
+    /// RT-safe.
+    pub fn set_audition_range(&mut self, start_ticks: u32, end_ticks: u32) {
+        if end_ticks == 0 || end_ticks <= start_ticks {
+            self.audition_start_ticks = 0;
+            self.audition_end_ticks = 0;
+        } else {
+            self.audition_start_ticks = start_ticks;
+            self.audition_end_ticks = end_ticks;
+        }
+    }
+
+    /// Whether the one-shot audition range is active. RT-safe.
+    fn audition_active(&self) -> bool {
+        self.audition_end_ticks > 0
     }
 
     /// Takes the pending note offs (clearing them). The caller must release
@@ -767,8 +797,40 @@ impl Sequencer {
         let mut budget = dt_ticks;
         let mut t = self.position_ticks;
         let mut stop_at_end = false;
+        // Set when the audition window ends: the transport rewinds to its
+        // start instead of the song loop's wrap or the arrangement's 0.
+        let mut rewind_to: Option<f64> = None;
         while budget > 0.0 {
-            if self.loop_active() {
+            if self.audition_active() {
+                let aus = f64::from(self.audition_start_ticks);
+                let aue = f64::from(self.audition_end_ticks);
+                // A stale position outside the range starts at its beginning.
+                if t >= aue {
+                    t = aus;
+                }
+                let seg_end = (t + budget).min(aue);
+                if seg_end <= t {
+                    break;
+                }
+                for track in 0..self.track_count {
+                    self.schedule_track_clips(
+                        track,
+                        t,
+                        seg_end,
+                        block_start,
+                        samples_per_tick,
+                        sink,
+                    );
+                }
+                budget -= (seg_end - t).min(budget);
+                if seg_end >= aue {
+                    stop_at_end = true;
+                    rewind_to = Some(aus);
+                    t = aue;
+                    break;
+                }
+                t = seg_end;
+            } else if self.loop_active() {
                 let ls = f64::from(self.loop_start_ticks);
                 let le = f64::from(self.loop_end_ticks);
                 if t >= le {
@@ -826,6 +888,9 @@ impl Sequencer {
             }
         }
 
+        if let Some(start) = rewind_to {
+            t = start;
+        }
         self.position_ticks = t;
         if stop_at_end {
             // Keep the pending offs: they drain in the following blocks and
@@ -2017,6 +2082,91 @@ mod tests {
             seq.position_ticks() < f64::from(TICKS_PER_BAR) + 1.0,
             "the position stays inside the loop after wrapping"
         );
+    }
+
+    #[test]
+    fn audition_stops_at_the_end_and_rewinds_to_start() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        place(
+            &mut seq,
+            0,
+            0,
+            TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, TICKS_PER_STEP, 60)],
+        );
+        seq.set_audition_range(0, TICKS_PER_BAR);
+        seq.play();
+        // One bar = 750 blocks at 48 kHz / 128 frames; run past it.
+        let fired = ons(&run(&mut seq, 1_000));
+        assert_eq!(fired.len(), 1, "the audition plays once: {fired:?}");
+        assert!(!seq.is_playing(), "the audition auto-stops at its end");
+        assert!(
+            seq.position_ticks() < 1.0,
+            "the transport rewinds to the audition start, not to 0 or the end"
+        );
+    }
+
+    #[test]
+    fn audition_takes_priority_over_the_song_loop() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        place(
+            &mut seq,
+            0,
+            0,
+            TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, TICKS_PER_STEP, 60)],
+        );
+        seq.set_loop_range(0, TICKS_PER_BAR);
+        seq.set_audition_range(0, TICKS_PER_BAR);
+        seq.play();
+        let fired = ons(&run(&mut seq, 1_500));
+        assert_eq!(
+            fired.len(),
+            1,
+            "the audition must not wrap like the song loop: {fired:?}"
+        );
+        assert!(!seq.is_playing(), "the audition still auto-stops");
+    }
+
+    #[test]
+    fn degenerate_audition_range_is_ignored() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_audition_range(0, 0);
+        assert!(!seq.audition_active(), "0/0 disables");
+        seq.set_audition_range(100, 100);
+        assert!(!seq.audition_active(), "end <= start disables");
+        seq.set_audition_range(200, 100);
+        assert!(!seq.audition_active(), "reversed range disables");
+        seq.set_audition_range(100, 200);
+        assert!(seq.audition_active());
+        seq.set_audition_range(0, 0);
+        assert!(!seq.audition_active(), "clearing disables again");
+    }
+
+    #[test]
+    fn audition_keeps_its_end_after_a_seek_inside_the_range() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        place(
+            &mut seq,
+            0,
+            0,
+            4 * TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            &[clip_note(0, TICKS_PER_STEP, 60)],
+        );
+        seq.set_audition_range(0, 2 * TICKS_PER_BAR);
+        seq.play();
+        // Seek into the second bar: the next note fires once, and the
+        // original audition end (not the clip end) still stops the transport.
+        seq.seek(f64::from(TICKS_PER_BAR));
+        let fired = ons(&run(&mut seq, 1_000));
+        assert_eq!(fired.len(), 1, "one note at the seek target: {fired:?}");
+        assert!(!seq.is_playing(), "the original audition end still applies");
     }
 
     #[test]

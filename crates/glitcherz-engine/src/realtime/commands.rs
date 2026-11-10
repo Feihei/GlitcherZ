@@ -329,6 +329,11 @@ pub enum SequencerCommand {
     /// `end_ticks` back to `start_ticks`. `end_ticks == 0` (or `end <=
     /// start`) disables looping.
     SetLoopRange { start_ticks: u32, end_ticks: u32 },
+    /// One-shot audition range (Aud series): while playing, the transport
+    /// stops at `end_ticks` and rewinds to `start_ticks` (a clip preview, not
+    /// a loop). Takes priority over the song loop while active. `end_ticks ==
+    /// 0` (or `end <= start`) disables it. RT-safe.
+    SetAuditionRange { start_ticks: u32, end_ticks: u32 },
     /// Set BPM (20..300).
     SetBpm(f32),
     /// Set the document's meter (U3a). Only the bar length derived from it
