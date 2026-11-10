@@ -951,6 +951,61 @@ sidechain off 的侧链压缩器与普通压缩器逐样本一致（Z1-D2 本就
 
 不做 vk 节点的**和弦/琶音器**、不做键条力度分区（y 轴力度）、不做 note repeat、不做 timeline 的 draw 到「音频片段内容编辑」、不改 `StrumOptions` 的模型默认值、不改 `PROJECT_VERSION`、不新增 crate、不动实时线程。
 
+## 吸附统一与拍号变化（Met 系列，2026-11-10 立项）
+
+用户一句话需求：**编辑时按住 Ctrl 临时禁用吸附**；**timeline 可加 meter 标记中途换拍号**；**拍号范围扩到每小节 1–12 拍、每拍 1/2–1/16**。
+
+Spec：`spec/snap.md`（S1–S8）、`spec/meter-map.md`（D1–D10，扩展 `tempo-meter.md` D5）。
+
+### 现状评估（已核对代码，不是猜测）
+
+| 项 | 现状（位置） | 差距 | 体量 | 风险 |
+| :--- | :--- | :--- | :--- | :--- |
+| **Met-1** 临时禁用吸附 | 吸附是**五套并行实现**：卷帘 `snap_ticks`（`piano_roll.rs:3258`，用 `RollState.grid`）、时间轴 `snap_bar`（`timeline.rs:4036`，整小节）、标尺同名闭包（`:1854`）、模态内联 round（`:1072/1131/1213`）、曲线固定 `SNAP_TICKS`（`curve.rs:18`，1/32）。全部不接收修饰键 | 无关闭入口；粒度也不统一 | 中（新 `snap.rs` + ~30 个调用点参数化，~350 行） | `Ctrl` 已被占用：卷帘 `Ctrl+拖 = 复制`（`piano_roll.rs:2653`）直接冲突；时间轴 ruler `Ctrl+拖 = loop`（区域隔离）、lane `Ctrl+拖 = 追加选择`（可叠加） |
+| **Met-2** meter 标记 | 拍号是 `ProjectMetadata.time_signature` **单值**（`model/lib.rs:6375`）；`ticks_per_bar()` 一步乘法（`lib.rs:1538`）；引擎 `Sequencer.bar_ticks` 单值 + `SetTimeSignature`（`sequencer.rs:631`）；SMF 只写一条 `FF 58` | 无变化点数据结构；小节换算不可分段 | **大**（model 求值层 + timeline/ruler/状态栏/seek/录音/导出分段 + 引擎段表 + SMF 多段，~900 行） | 像素映射：现在 `px_per_tick = px_per_bar / bar_ticks`（`timeline.rs:1498-1502`），按段改映射会波及整条 timeline |
+| **Met-3** 拍号范围 | 模型已支持 `numerator 1..=16`、`denominator {1,2,4,8,16,32}`（`lib.rs:1520-1532`）；UI 只有 6 个预设（`METER_PRESETS`，`ui/lib.rs:227`、`transport.rs:429-445`） | UI 输入太窄，13/8 进不来 | 小（控件替换，~80 行） | 不能收窄模型范围，否则 SMF 导入的 16/32 分母会被 `validate` 拒 |
+
+### 决策（2026-11-10 已拍板）
+
+| ID | 问题 | 结论 |
+| :--- | :--- | :--- |
+| Met-D1 | 禁用吸附用什么键 | **`Ctrl` / `Cmd`**。`Alt` 排除：Windows 松开 Alt 触发 `SC_KEYMENU` 吞鼠标事件、按住时 egui `PointerGone`（D29 已实证）；且 `Alt+拖` 在 timeline 已绑定拆组（`timeline.rs:3364`） |
+| Met-D2 | 卷帘 `Ctrl+拖动复制` 怎么办 | **删除**。复制只保留 `Shift+D` 模态与工具栏 `Duplicate ⇧D` 按钮（roll + timeline 各一个） |
+| Met-D3 | meter marker 能否落在半小节 | **不能**，必须吸附到当前段小节线；文件里的非法位置在 `MeterMap::new` 向下吸附（宽容读取，不拒绝） |
+| Met-D4 | 拍号变段后的像素映射 | `px_per_tick` **全局线性**，锚定第 0 段小节宽度（`px_per_bar / base_bar_ticks`）；只有网格/标号/吸附按段变化 |
+| Met-D5 | 复合拍分组（12/8 = 3+3+3+3） | **不做**，12/8 按 12 个八分拍计数、重音只在第 1 拍 |
+| Met-D6 | 拍号范围 | 模型不动（1..=16 / {1,2,4,8,16,32}）；UI 给分子 1–12、分母 {1/2, 1/4, 1/8, 1/16}；超范围值只读显示并提示 |
+| Met-D7 | 文件版本 | `PROJECT_VERSION` 10 → 11；`meter_markers` 是 `serde(default)` 加法字段，**无迁移函数**，空表时行为逐字节不变 |
+
+### 里程碑与依赖
+
+| 里程碑 | 内容 | 依赖 | 规模 |
+| :--- | :--- | :--- | :--- |
+| **M0** 文档 | `spec/snap.md` + `spec/meter-map.md` + `tempo-meter.md` D5 改口 + `timeline.md` D32 + 本小节 | — | 小（已完成） |
+| **M1** 拍号输入 | 走带控件改为「分子 1–12 + 分母四选一」；超范围只读；`METER_PRESETS` 退休 | M0 | 小 |
+| **M2a** 吸附收口 | 新 `snap.rs`；五套实现改吃 `Snap`；**恒 on，零行为变化**；on/off 纯函数单测 | M0 | 中 |
+| **M2b** Ctrl 接线 | 视图入口派生 `Snap::OFF`；状态栏 `Snap off`；删除卷帘 `Ctrl+拖动复制`；两个工具栏加 `Duplicate ⇧D`；快捷键文档同步 | M2a | 中 |
+| **M3** MeterMap | `MeterMarker` + 上限 + `validate` + `model/src/meter.rs` 全部查询 + 分段数学单测；版本 11 | M0 | 中 |
+| **M4** timeline 分段 | `TimelineParams` 借 `&MeterMap`；ruler / lane 网格 / 吸附 / knife / trim / 状态栏 / seek / 录音 / 导出；ruler 画 meter 胶囊（只读） | M3、M2b | 大 |
+| **M5a** marker 编辑 | ruler 右键新建、拖动、双击改值、右键删除；Inspector 拍号区；`TimelineAction` 四个变体；复用 M1 控件 | M4、M1 | 中 |
+| **M5b** 引擎 + SMF | `MeterSeg` / `SetMeterMarkers`；`Sequencer` 段表与 metronome 跨段重锚；SMF 多段 `FF 58` 导入导出 | M3 | 大 |
+
+实施顺序：**M1 → M2a → M2b → M3 → M4 → M5a → M5b**。M1 是 M5a 的前置控件；M2b 先落地，M4 的吸附逻辑只需改一次。
+
+### 验收门禁
+
+- 每个里程碑单独 commit（`feat(ui):` / `feat(model):` / `feat(engine):`），文档（M0）先合。
+- `cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` 全绿；**在本机沙箱外跑**（沙箱内 cargo 会毒化 `target/debug/incremental`）。
+- M2 零回归证据：不按 Ctrl 时所有落点逐 tick 一致；M3 空表时 `MeterMap` 单段，旧工程导出/渲染逐字节一致。
+- M4/M5 回归：`working_files/regression-project.glz` 在无 marker 下 `--render` 与 pre-Met 二进制逐字节一致；有 marker 的用例另建 fixture。
+
+### 明确不做（本系列）
+
+- 复合拍分组、拍号自动化（`Timeline In` 不加 `Meter` 端口）、半小节换拍号。
+- 持久化「吸附开关」/ `GridValue::Off`、时间轴可配置吸附粒度。
+- 把复制迁到 `Alt+拖动`（Met-D1 已排除 Alt）。
+- 按段改变 `px_per_tick`、按新拍号重排/量化既有内容。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：

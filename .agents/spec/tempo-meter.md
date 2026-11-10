@@ -55,7 +55,7 @@ position_n ──(曲线采样)──> tempo_n ──(积分一个块)──> po
 | D2 | **单例由「身份」保证，不靠校验** | 它不是一个可实例化的对象，所以"第二个"在结构上不存在，`GraphDoc::validate` 不需要写单例规则，也不会有"用户把节点删了、工程里没有 tempo 目标"的存档。校验只需约束连线：指向 `TimelineIn` 的线必须是 `Automation`，`param` 只能是 `AutoParam::Tempo`。 |
 | D3 | **base + override 两层 tempo** | `Sequencer` 保留 `base_bpm`（用户拧的值）+ `bpm_override: Option<f32>`（每块由自动化重算，无覆盖时清空）。`ticks_per_sample()` 用 effective。曲线**绝对覆盖**而非叠加——tempo 语义是"这里就是 140"，不是"+20"。 |
 | D4 | **块级量化 + 评估顺序前移** | `evaluate_automation()` 从 `advance()` 之后移到之前（用 `position_before` 采样），tempo 与块起始 tick 对齐；否则第一块永远用未覆盖的 base 跑 10 ms。块内认为 bpm 恒定，最大误差 = 块长。 |
-| D5 | **拍号静态，不自动化** | 拍号改小节长度，牵动网格、loop 吸附、arrangement 取整、SMF、piano roll；做成可自动化等于把"变长小节"引入所有时间数学。U3 只做文档级标量。`Timeline In` 也**不**预留拍号端口。 |
+| D5 | **拍号静态，不自动化**（2026-11-10 由 `meter-map.md` 扩展） | U3 只做文档级标量。后续允许**离散的拍号变化标记**（`meter_markers` + 分段换算），见 `spec/meter-map.md`；但拍号仍是阶梯而不是曲线——连续自动化无法表达「从第 5 小节起换拍号」，所以 `Timeline In` **仍不**预留拍号端口。 |
 | D6 | **文件版本不动（仍 v6）** | `time_signature` 带 serde default（4/4），旧文档读出来行为与今天完全一致，属于加法；不需要 `version 7` 分支。原 plan 里"v6→v7 迁移"的判断作废。 |
 | D7 | **`Timeline In` 只接自动化线** | `accepts(CableKind::Automation, PatchId::TimelineIn)` = true，音频/MIDI 线一律拒绝；端口 `Tempo` 不收用户选的参数（拖上去直接成线，跳过参数弹窗）。Synth 面板的 "Pick Parameter…" 里也加一条 `Song Tempo`，走同一条电缆路径。 |
 | D8 | **改拍号不改写任何事件** | 拍号是**度量定义**，不是数据变换：note / clip / marker / loop 的 tick 值一律不动，不需要迁移，也不需要"按新拍号重排"的选项。变的只有**引用"小节"的换算**（ruler 标号、bar 网格、loop 吸附、arrangement 末尾取整、quantize-to-bar、SMF `FF 58`）。与"改调号不改音高"同性质，比"移调"弱——不存在移调那种数据改写。 |
