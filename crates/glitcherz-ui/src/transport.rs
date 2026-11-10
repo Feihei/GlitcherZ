@@ -423,25 +423,20 @@ impl GlitcherZApp {
                     .on_hover_text("Tempo curve (Timeline In) is driving the clock");
                 }
                 // U3a: meter. Same read-local-then-write rule as tempo — the
-                // dropdown must not touch the document every frame. No
-                // separator and no label: `128 BPM  [4/4]` reads as one song
-                // setting, and the formats already say what they are.
+                // editor must not touch the document every frame. No separator
+                // and no label: `128 BPM  4/4` reads as one song setting, and
+                // the formats already say what they are. Met series: beats-per
+                // -bar is a drag value, the beat unit a four-way dropdown, and
+                // an imported out-of-range meter is shown read-only.
                 let meter = self.project().metadata.time_signature;
-                let mut chosen = meter;
-                egui::ComboBox::from_id_salt("glitcherz_meter")
-                    .selected_text(meter.to_string())
-                    .width(52.0)
-                    .show_ui(ui, |ui| {
-                        for (numerator, denominator) in METER_PRESETS {
-                            let candidate =
-                                glitcherz_model::TimeSignature::new(numerator, denominator);
-                            ui.selectable_value(&mut chosen, candidate, candidate.to_string());
-                        }
-                    })
-                    .response
-                    .on_hover_text("Time signature — beats per bar / note value");
-                if chosen != meter {
-                    self.set_meter(chosen);
+                let before = self.begin_param_edit();
+                let edit = crate::meter_ui::meter_editor(ui, meter);
+                let drag_stopped = edit.drag_stopped;
+                if let Some(chosen) = edit.value {
+                    self.set_meter(chosen, before);
+                }
+                if drag_stopped {
+                    self.end_param_edit();
                 }
                 ui.separator();
                 self.master_section(ui);

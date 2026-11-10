@@ -429,18 +429,23 @@ impl GlitcherZApp {
         });
     }
 
-    /// Meter change from the transport (U3a): one undo step, and **no event
-    /// moves** — only the bar-derived measures (grid, loop snapping,
-    /// arrangement end, the ruler's bar numbers) change. Existing clips,
-    /// markers and the loop range keep their ticks, so a loop may stop sitting
-    /// on a bar line; the next manual drag snaps to the new grid.
-    pub(crate) fn set_meter(&mut self, meter: glitcherz_model::TimeSignature) {
+    /// Meter change from the transport (U3a / Met): the caller passes the
+    /// gesture snapshot, so a numerator drag is one merged undo step and a
+    /// dropdown click is a step of its own. **No event moves** — only the
+    /// bar-derived measures (grid, loop snapping, arrangement end, the ruler's
+    /// bar numbers) change. Existing clips, markers and the loop range keep
+    /// their ticks, so a loop may stop sitting on a bar line; the next manual
+    /// drag snaps to the new grid.
+    pub(crate) fn set_meter(
+        &mut self,
+        meter: glitcherz_model::TimeSignature,
+        before: std::sync::Arc<Project>,
+    ) {
         if meter == self.project().metadata.time_signature {
             return;
         }
-        let before = self.begin_edit();
         self.project_mut().metadata.time_signature = meter;
-        self.commit_edit("Meter", before);
+        self.commit_param_edit("Meter", before, "meter");
         self.push_time_signature();
         self.set_message(format!("Meter {meter}"));
     }

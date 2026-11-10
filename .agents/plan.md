@@ -982,7 +982,7 @@ Spec：`spec/snap.md`（S1–S8）、`spec/meter-map.md`（D1–D10，扩展 `te
 | 里程碑 | 内容 | 依赖 | 规模 |
 | :--- | :--- | :--- | :--- |
 | **M0** 文档 | `spec/snap.md` + `spec/meter-map.md` + `tempo-meter.md` D5 改口 + `timeline.md` D32 + 本小节 | — | 小（已完成） |
-| **M1** 拍号输入 | 走带控件改为「分子 1–12 + 分母四选一」；超范围只读；`METER_PRESETS` 退休 | M0 | 小 |
+| **M1** 拍号输入（2026-11-10 交付） | 走带控件改为「分子 1–12 + 分母四选一」；超范围只读；`METER_PRESETS` 退休；`meter_ui::meter_editor` 复用给 M5a；拖动经 `set_meter(before)` 合并为一步 undo | M0 | 小 |
 | **M2a** 吸附收口 | 新 `snap.rs`；五套实现改吃 `Snap`；**恒 on，零行为变化**；on/off 纯函数单测 | M0 | 中 |
 | **M2b** Ctrl 接线 | 视图入口派生 `Snap::OFF`；状态栏 `Snap off`；删除卷帘 `Ctrl+拖动复制`；两个工具栏加 `Duplicate ⇧D`；快捷键文档同步 | M2a | 中 |
 | **M3** MeterMap | `MeterMarker` + 上限 + `validate` + `model/src/meter.rs` 全部查询 + 分段数学单测；版本 11 | M0 | 中 |

@@ -78,6 +78,7 @@ pub mod headless;
 pub mod inspector_panel;
 pub mod keyboard;
 pub mod media;
+pub mod meter_ui;
 pub mod mixer_panel;
 pub mod patch;
 pub mod patch_ops;
@@ -221,10 +222,6 @@ fn inline_plugin_label(name: &str, id: u32) -> String {
 
 /// BPM adjustable range (f64 in the document: time computation convention).
 pub const BPM_RANGE: RangeInclusive<f64> = 20.0..=300.0;
-
-/// Meters offered by the transport dropdown (U3a). The document stores any
-/// valid numerator/denominator pair; this is just the pick list.
-pub const METER_PRESETS: [(u8, u8); 6] = [(4, 4), (3, 4), (2, 4), (5, 4), (6, 8), (7, 8)];
 
 /// Computer keyboard → semitone offset (relative to the octave base, FL Studio-style layout).
 const KEYMAP: &[(egui::Key, u8)] = &[
