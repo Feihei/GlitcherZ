@@ -6,6 +6,44 @@
 use super::*;
 use crate::patch::strip_key_for;
 
+/// Physical computer key → the pitch actually sent to the engine.
+///
+/// A note-on is transposed by the keyboard node **at press time**. Every
+/// note-off must use that same pitch: `Tr -/Tr +` can move while a key is
+/// down, and [`GlitcherZApp::refresh_vk_targets`] releases the held notes
+/// when a route drops out. Using the physical pitch (or re-applying the
+/// current transpose) in either place leaves the voice ringing forever.
+///
+/// The physical keys are deliberately not exposed as an iterator — a caller
+/// that needs "what is sounding" must go through [`HeldNotes::sounding`].
+#[derive(Default)]
+pub(crate) struct HeldNotes(HashMap<u8, u8>);
+
+impl HeldNotes {
+    pub(crate) fn is_held(&self, physical: u8) -> bool {
+        self.0.contains_key(&physical)
+    }
+
+    pub(crate) fn press(&mut self, physical: u8, sounding: u8) {
+        self.0.insert(physical, sounding);
+    }
+
+    /// Lift one key and return the pitch that must be released, if it was
+    /// actually pressed. `None` means there is no note-on to pair with.
+    pub(crate) fn release(&mut self, physical: u8) -> Option<u8> {
+        self.0.remove(&physical)
+    }
+
+    /// The pitches currently sounding — the ones a route change must turn off.
+    pub(crate) fn sounding(&self) -> impl Iterator<Item = u8> + '_ {
+        self.0.values().copied()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 /// I1: the note the computer keyboard starts on.
 ///
 /// The keyboard node owns the register: its strip brackets
@@ -30,7 +68,7 @@ impl GlitcherZApp {
             note: sounding,
             velocity,
         });
-        self.held_notes.insert(note);
+        self.held_notes.press(note, sounding);
         self.current_note = Some(sounding);
         // I1: the pressed key lights up on the node's strip — the strip on the
         // box and the keys under the fingers are one instrument.
@@ -40,12 +78,17 @@ impl GlitcherZApp {
     }
 
     pub(crate) fn send_note_off(&mut self, note: u8) {
-        let sounding = shifted_note(note, self.vk_transpose()).unwrap_or(note);
-        self.send_to_vk_targets(NoteEvent::Off { note: sounding });
-        self.held_notes.remove(&note);
+        // Release the pitch that was actually sent at press time. Re-applying
+        // the *current* transpose here would miss if `Tr -/Tr +` moved while
+        // the key was down, and the voice would ring forever.
+        let sounding = self.held_notes.release(note);
         if let Some((node, key)) = self.computer_key_to_strip(note) {
             self.patch_state.keyboard_held_keys.remove(&(node, key));
         }
+        let Some(sounding) = sounding else {
+            return;
+        };
+        self.send_to_vk_targets(NoteEvent::Off { note: sounding });
     }
 
     /// I1: the transposition of the computer-keyboard node (0 when the patch
@@ -167,7 +210,9 @@ impl GlitcherZApp {
     /// that just **dropped out**: a route that gains an instrument must not
     /// cut the notes already sounding on the others (the new synth simply
     /// starts on the next key press), while deleting the input node or its
-    /// cables releases whatever was sounding.
+    /// cables releases whatever was sounding. The Off events use the pitches
+    /// that were actually sent (post-transpose), not the physical keys — a
+    /// transposed note-on needs a transposed note-off or the voice sticks.
     pub(crate) fn refresh_vk_targets(&mut self) {
         let (tracks, targets) = {
             let doc = &self.project().graph;
@@ -181,7 +226,10 @@ impl GlitcherZApp {
         }
         let old = std::mem::take(&mut self.vk_targets);
         let old_tracks = std::mem::take(&mut self.vk_track_targets);
-        let held: Vec<u8> = self.held_notes.iter().copied().collect();
+        // Release the pitches that are actually sounding. The physical keys
+        // are only the *identity* of a held note; a route change must turn off
+        // what the engine heard on the way in.
+        let held: Vec<u8> = self.held_notes.sounding().collect();
         for doc in old {
             if targets.contains(&doc) {
                 continue;
@@ -706,10 +754,10 @@ impl GlitcherZApp {
                                 // mode toggle); do not also play a note.
                                 continue;
                             }
-                            if !self.held_notes.contains(&note) {
+                            if !self.held_notes.is_held(note) {
                                 self.send_note_on(note, 0.9);
                             }
-                        } else if self.held_notes.contains(&note) {
+                        } else if self.held_notes.is_held(note) {
                             self.send_note_off(note);
                         }
                     }
@@ -767,5 +815,60 @@ mod tests {
         assert_eq!(strip_key_for(80, 4), None);
         assert_eq!(strip_key_for(55, 4), Some(55));
         assert_eq!(strip_key_for(79, 4), Some(79));
+    }
+
+    /// A note-on is transposed at press time; its note-off must use that same
+    /// pitch — not the physical key and not a freshly transposed one.
+    #[test]
+    fn a_transposed_note_releases_the_pitch_that_was_sent() {
+        let mut held = HeldNotes::default();
+        held.press(60, 62); // C4, node transposed +2
+        assert!(held.is_held(60));
+        assert_eq!(held.release(60), Some(62));
+        assert!(!held.is_held(60));
+        // A repeated release has no note-on to pair with.
+        assert_eq!(held.release(60), None);
+        assert_eq!(held.sounding().count(), 0);
+    }
+
+    /// `Tr -/Tr +` can move while a key is down. The old key must still
+    /// release at the pitch it sounded; a new key uses the new transpose.
+    #[test]
+    fn a_transpose_change_while_held_keeps_the_original_release() {
+        let mut held = HeldNotes::default();
+        held.press(60, 62); // transpose +2
+        held.press(64, 69); // transpose now +5
+        assert_eq!(held.release(60), Some(62));
+        assert_eq!(held.release(64), Some(69));
+    }
+
+    /// The route-refresh path turns off what is actually sounding. Releasing
+    /// the physical pitches here is the bug that left transposed voices stuck
+    /// when a cable was deleted (or the input node was removed).
+    #[test]
+    fn a_route_change_releases_the_sounding_pitches() {
+        let mut held = HeldNotes::default();
+        held.press(60, 62);
+        held.press(64, 66);
+        let mut off: Vec<u8> = held.sounding().collect();
+        off.sort_unstable();
+        assert_eq!(off, vec![62, 66]);
+        assert_ne!(off, vec![60, 64]);
+        // Dropping a route does not lift the physical keys — they still
+        // release normally when the user lets go.
+        assert!(held.is_held(60));
+        assert!(held.is_held(64));
+    }
+
+    /// New / load resets the mapping: nothing is held, nothing sounds.
+    #[test]
+    fn clearing_drops_every_held_key() {
+        let mut held = HeldNotes::default();
+        held.press(60, 62);
+        held.press(64, 66);
+        held.clear();
+        assert_eq!(held.sounding().count(), 0);
+        assert_eq!(held.release(60), None);
+        assert!(!held.is_held(64));
     }
 }

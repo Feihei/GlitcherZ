@@ -1853,10 +1853,10 @@ pub struct GlitcherZApp {
     /// Ports the last binding pass could not find (bound but unplugged). Shown
     /// once in the status bar, not every frame.
     midi_missing: Vec<String>,
-    /// Currently held notes of the computer keyboard (the physical pitch, before
-    /// the node's transpose) — for de-duplication and for the route changes
-    /// that must release what is still sounding.
-    held_notes: HashSet<u8>,
+    /// Held computer keys: physical pitch → the pitch actually sent (after the
+    /// node's transpose). Note-off and route-change releases must use the
+    /// sounding pitch, or a transposed voice rings forever.
+    held_notes: keyboard::HeldNotes,
     /// Most recently triggered note (shown in the status bar).
     current_note: Option<u8>,
     /// Master meter peak-hold, one per channel (the transport meter).
@@ -2262,7 +2262,7 @@ impl GlitcherZApp {
             midi_ports: Vec::new(),
             midi_bindings: Vec::new(),
             midi_missing: Vec::new(),
-            held_notes: HashSet::new(),
+            held_notes: keyboard::HeldNotes::default(),
             current_note: None,
             meter_l: PeakMeter::new(),
             meter_r: PeakMeter::new(),
