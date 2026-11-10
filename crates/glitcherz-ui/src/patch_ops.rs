@@ -324,6 +324,12 @@ impl GlitcherZApp {
                         self.patch_state.keyboard_held.remove(&(doc_id, note));
                         self.send_keyboard_node_note(doc_id, note, false);
                     }
+                    // The computer keyboard's keys are not released here (they
+                    // sound through the app-level route, which the target
+                    // refresh drops) — only the strip's highlight goes away.
+                    self.patch_state
+                        .keyboard_held_keys
+                        .retain(|(n, _)| *n != doc_id);
                     self.delete_graph_node(doc_id);
                 }
                 patch::PatchAction::SelectTrack(track) => {
@@ -387,8 +393,7 @@ impl GlitcherZApp {
                     self.rename_mixer_channel(node, channel, name);
                 }
                 patch::PatchAction::KeyboardOctave { node, delta } => {
-                    let entry = self.patch_state.keyboard_octaves.entry(node).or_insert(4);
-                    *entry = (*entry + delta).clamp(0, 8);
+                    self.set_keyboard_octave(node, delta);
                 }
                 patch::PatchAction::KeyboardTranspose { node, delta } => {
                     self.transpose_keyboard_node(node, delta);
@@ -398,6 +403,40 @@ impl GlitcherZApp {
                 }
             }
         }
+    }
+
+    /// I1: moves a virtual keyboard node one octave up or down.
+    ///
+    /// The register is a document field (`NodeDoc::Keyboard::octave`): the
+    /// strip on the box brackets `G(octave)..G(octave+2)` and the computer
+    /// keyboard starts on that window's C, so the two are always the same
+    /// instrument — and the register survives a reload.
+    pub(crate) fn set_keyboard_octave(&mut self, node: u64, delta: i8) {
+        let current = match self
+            .project()
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.node_id() == node)
+        {
+            Some(NodeDoc::Keyboard { octave, .. }) => *octave,
+            _ => return,
+        };
+        let next = clamp_keyboard_octave(current, delta);
+        if next == current {
+            return;
+        }
+        let before = self.begin_edit();
+        if let Some(NodeDoc::Keyboard { octave, .. }) = self
+            .project_mut()
+            .graph
+            .nodes
+            .iter_mut()
+            .find(|n| n.node_id() == node)
+        {
+            *octave = next;
+        }
+        self.commit_edit("Keyboard octave", before);
     }
 
     /// I1: transposes a virtual keyboard node's outgoing notes.
@@ -730,6 +769,7 @@ impl GlitcherZApp {
                 track,
                 source: MidiSource::Computer,
                 transpose: 0,
+                octave: DEFAULT_KEYBOARD_OCTAVE,
             },
             // R4: a live input node (no owning track: recording ownership is
             // the `Timeline In` cable).
@@ -1575,5 +1615,31 @@ impl GlitcherZApp {
         // The deleted node may have filled a role (voice / delay / channel) in the track
         // addressing table — refresh it from the remaining document nodes.
         self.register_track_chain(track);
+    }
+}
+
+/// I1: the register a keyboard node moves to, clamped to the strip's range.
+///
+/// `0` is the lowest window (`G0..G2`), `MAX_KEYBOARD_OCTAVE` the highest
+/// (the strip then tops out exactly at MIDI 127).
+pub(crate) fn clamp_keyboard_octave(current: i8, delta: i8) -> i8 {
+    (i16::from(current) + i16::from(delta)).clamp(0, i16::from(MAX_KEYBOARD_OCTAVE)) as i8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// I1: the register stays inside the strip's range — the lowest window is
+    /// `G0..G2`, the highest tops out exactly at MIDI 127.
+    #[test]
+    fn the_keyboard_register_stays_in_range() {
+        assert_eq!(clamp_keyboard_octave(4, 1), 5);
+        assert_eq!(clamp_keyboard_octave(4, -1), 3);
+        assert_eq!(clamp_keyboard_octave(0, -1), 0);
+        assert_eq!(
+            clamp_keyboard_octave(MAX_KEYBOARD_OCTAVE, 1),
+            MAX_KEYBOARD_OCTAVE
+        );
     }
 }

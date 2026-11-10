@@ -18,9 +18,9 @@ use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 use glitcherz_model::{
     AutoParam, BuiltinEffectKind, CableDoc, CableKind, ChannelParam, CurveMapParams, GraphDoc,
-    LFO_DIVISION_LABELS, LayoutDoc, MAX_AUDIO_TRACKS, MAX_AUTO_TRACKS, MAX_MIDI_TRACKS,
-    MAX_MIXER_CHANNELS, MIN_MIXER_CHANNELS, MidiSource, NodeDoc, NodeParam, PortRef, TrackKind,
-    VoiceSpec, note_name, timeline_in_port, timeline_in_port_kind,
+    LFO_DIVISION_LABELS, LayoutDoc, MAX_AUDIO_TRACKS, MAX_AUTO_TRACKS, MAX_KEYBOARD_OCTAVE,
+    MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MIN_MIXER_CHANNELS, MidiSource, NodeDoc, NodeParam,
+    PortRef, TrackKind, VoiceSpec, note_name, timeline_in_port, timeline_in_port_kind,
 };
 
 /// Inline parameter identity for built-in node kinds (G5, spec
@@ -1045,16 +1045,20 @@ fn node_action_buttons(id: PatchId, row: usize, deps: &PatchDeps) -> Vec<NodeAct
         ],
         PatchId::Timeline => Vec::new(),
         PatchId::Node(doc_id) => {
-            if let Some(NodeDoc::Keyboard { transpose, .. }) = deps.doc.node_by_id(doc_id) {
-                // I1: octave is view state (the home octave the G-to-G strip
-                // brackets), transpose is the document field that shifts the
-                // outgoing notes.
+            if let Some(NodeDoc::Keyboard {
+                transpose, octave, ..
+            }) = deps.doc.node_by_id(doc_id)
+            {
+                // I1: the octave is the register this node plays in (the
+                // strip brackets it and the computer keyboard starts on its
+                // C), the transpose shifts the notes it sends. Both are
+                // document fields.
                 return if row == 0 {
                     vec![
                         NodeAction {
                             label: "Oct -",
-                            enabled: true,
-                            hover: "Show the strip one octave lower (view only)",
+                            enabled: *octave > 0,
+                            hover: "Play one octave lower (the strip and the computer keyboard follow)",
                             action: PatchAction::KeyboardOctave {
                                 node: doc_id,
                                 delta: -1,
@@ -1062,8 +1066,8 @@ fn node_action_buttons(id: PatchId, row: usize, deps: &PatchDeps) -> Vec<NodeAct
                         },
                         NodeAction {
                             label: "Oct +",
-                            enabled: true,
-                            hover: "Show the strip one octave higher (view only)",
+                            enabled: *octave < MAX_KEYBOARD_OCTAVE,
+                            hover: "Play one octave higher (the strip and the computer keyboard follow)",
                             action: PatchAction::KeyboardOctave {
                                 node: doc_id,
                                 delta: 1,
@@ -1404,14 +1408,17 @@ pub struct PatchState {
     input_sources: Vec<InputSourceItem>,
     /// Open inline rename on a track / channel name, if any.
     rename: Option<PortRename>,
-    /// I1: the home octave a virtual keyboard box brackets (view state only —
-    /// see [`PatchAction::KeyboardOctave`]). Missing = 4 (strip = G3..G5, C4
-    /// inside).
-    pub(crate) keyboard_octaves: HashMap<u64, i8>,
-    /// I1: keys currently held on a keyboard node's strip, `(node, note)`.
-    /// Drives the pressed-key fill; released when the pointer comes up or the
-    /// node leaves the view.
+    /// I1: keys currently held on a keyboard node's strip **with the mouse**,
+    /// `(node, note)`. Drives the pressed-key fill; released when the pointer
+    /// comes up.
     pub(crate) keyboard_held: std::collections::HashSet<(u64, u8)>,
+    /// I1: keys currently held on the **computer keyboard**, `(node, note)`.
+    ///
+    /// The strip lights them too — the box and the physical keys are one
+    /// instrument — but they are tracked apart: the pointer-up cleanup owns
+    /// the mouse's keys only, and must not cut a note the user is still
+    /// holding on the computer keyboard.
+    pub(crate) keyboard_held_keys: std::collections::HashSet<(u64, u8)>,
 }
 
 impl Default for PatchState {
@@ -1430,8 +1437,8 @@ impl Default for PatchState {
             pending_input_menu: None,
             input_sources: Vec::new(),
             rename: None,
-            keyboard_octaves: HashMap::default(),
             keyboard_held: std::collections::HashSet::new(),
+            keyboard_held_keys: std::collections::HashSet::new(),
         }
     }
 }
@@ -1821,8 +1828,20 @@ const KEYBOARD_WHITE_COLUMNS: usize = 15;
 /// I1: the strip's lowest note — the G one octave below the view octave's C
 /// (`G3` at octave 4), so the 25-key window G-to-G brackets the home octave
 /// with five bass keys below middle C and the return G above.
-fn keyboard_base_note(octave: i8) -> i32 {
+pub(crate) fn keyboard_base_note(octave: i8) -> i32 {
     i32::from(octave) * 12 + 7
+}
+
+/// I1: the strip key a computer-keyboard note lights up.
+///
+/// The strip is a fixed pitch layout (25 semitones, G to G), so the key is
+/// the note itself — as long as it falls inside the window the node
+/// brackets. A note outside the window (the register moved while the key was
+/// held) lights nothing.
+pub(crate) fn strip_key_for(note: u8, octave: i8) -> Option<u8> {
+    let base = keyboard_base_note(octave);
+    let note = i32::from(note);
+    (base..=base + 24).contains(&note).then_some(note as u8)
 }
 
 /// I1: the MIDI note under `pos` on the 25-key G-to-G strip (`C4` = 60 at
@@ -1859,6 +1878,10 @@ fn keyboard_key_at(strip: Rect, octave: i8, pos: Pos2) -> Option<u8> {
 
 /// I1: paints the 25-key G-to-G strip and lights the held keys. Labels anchor
 /// the range: every C plus the two endpoint Gs.
+///
+/// Two sets light up: the keys the **mouse** holds on the strip and the ones
+/// the **computer keyboard** holds — the strip and the physical keys are one
+/// instrument.
 #[allow(clippy::too_many_arguments)]
 fn draw_keyboard_strip(
     painter: &egui::Painter,
@@ -1866,12 +1889,16 @@ fn draw_keyboard_strip(
     octave: i8,
     transpose: i8,
     held: &std::collections::HashSet<(u64, u8)>,
+    held_keys: &std::collections::HashSet<(u64, u8)>,
     node: u64,
     zoom: f32,
 ) {
     let white_w = strip.width() / KEYBOARD_WHITE_COLUMNS as f32;
     let base = keyboard_base_note(octave);
-    let is_held = |note: i32| u8::try_from(note).is_ok_and(|n| held.contains(&(node, n)));
+    let is_held = |note: i32| {
+        u8::try_from(note)
+            .is_ok_and(|n| held.contains(&(node, n)) || held_keys.contains(&(node, n)))
+    };
     let pressed = Color32::from_rgb(240, 190, 80);
 
     // White row first; the black blocks overlap its top edge.
@@ -1933,12 +1960,6 @@ fn draw_keyboard_strip(
             );
         }
     }
-}
-
-/// I1: the home octave a keyboard node brackets (view state; the strip shows
-/// G3..G5 — middle C inside — when unset).
-fn keyboard_octave_of(octaves: &HashMap<u64, i8>, node: u64) -> i8 {
-    octaves.get(&node).copied().unwrap_or(4)
 }
 
 /// Buttons of one action row: they share the band width evenly, inset by
@@ -5022,16 +5043,19 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
 
     // ---- I1: virtual keyboard strips ----
     // Painted and hit-tested after the canvas, so a press on a key reaches
-    // the strip instead of starting a node drag. The octave is view state and
-    // the transpose is the document field; both only affect what this node
-    // sends (no timeline edit, no undo entry).
+    // the strip instead of starting a node drag. The octave and the transpose
+    // are document fields: they decide the register this node plays in, both
+    // for the strip on the box and for the computer keyboard routed here.
     if state.zoom >= ACTION_MIN_ZOOM {
         let ids: Vec<PatchId> = state.positions.keys().copied().collect();
         for id in ids {
             let PatchId::Node(doc_id) = id else {
                 continue;
             };
-            let Some(NodeDoc::Keyboard { transpose, .. }) = deps.doc.node_by_id(doc_id) else {
+            let Some(NodeDoc::Keyboard {
+                transpose, octave, ..
+            }) = deps.doc.node_by_id(doc_id)
+            else {
                 continue;
             };
             let Some(r) = state.screen_rect(rect.min, id, &deps) else {
@@ -5045,13 +5069,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             if strip.width() <= 1.0 || strip.height() <= 1.0 {
                 continue;
             }
-            let octave = keyboard_octave_of(&state.keyboard_octaves, doc_id);
             draw_keyboard_strip(
                 &painter,
                 strip,
-                octave,
+                *octave,
                 *transpose,
                 &state.keyboard_held,
+                &state.keyboard_held_keys,
                 doc_id,
                 z,
             );
@@ -5063,7 +5087,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             if resp.hovered()
                 && ui.ctx().input(|i| i.pointer.primary_pressed())
                 && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
-                && let Some(note) = keyboard_key_at(strip, octave, pos)
+                && let Some(note) = keyboard_key_at(strip, *octave, pos)
             {
                 state.keyboard_held.insert((doc_id, note));
                 actions.push(PatchAction::KeyboardNote {
@@ -5270,7 +5294,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glitcherz_model::Project;
+    use glitcherz_model::{DEFAULT_KEYBOARD_OCTAVE, Project};
 
     /// Regression: `#[derive(Default)]` gave `zoom: 0.0`, collapsing the whole
     /// graph onto the pan point (top-left corner) until Reset was clicked.
@@ -6175,6 +6199,7 @@ mod tests {
                     track: 0,
                     source: MidiSource::Computer,
                     transpose: 0,
+                    octave: DEFAULT_KEYBOARD_OCTAVE,
                 },
             ],
             cables: vec![CableDoc::keyboard_midi(6, 2)],
@@ -6836,6 +6861,7 @@ mod tests {
             track: 0,
             source: MidiSource::Device("KeyStep".to_string()),
             transpose: 0,
+            octave: DEFAULT_KEYBOARD_OCTAVE,
         });
         let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
         let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };

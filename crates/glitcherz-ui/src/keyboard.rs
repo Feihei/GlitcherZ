@@ -4,6 +4,22 @@
 //! functions stay there and reach here through the glob import.
 
 use super::*;
+use crate::patch::strip_key_for;
+
+/// I1: the note the computer keyboard starts on.
+///
+/// The keyboard node owns the register: its strip brackets
+/// `G(octave)..G(octave+2)` and the computer keys start on that window's C,
+/// so the 17 computer keys always land **inside** the strip the user sees —
+/// that is also what makes the pressed key light up on the strip. Without a
+/// node the global base stands alone.
+pub(crate) fn computer_base_note_for(octave: Option<i8>, fallback: u8) -> u8 {
+    match octave {
+        // C of the window; the top key (base + 16) must stay below 127.
+        Some(octave) => (i32::from(octave) * 12 + 12).clamp(0, 127 - 16) as u8,
+        None => fallback,
+    }
+}
 
 impl GlitcherZApp {
     pub(crate) fn send_note_on(&mut self, note: u8, velocity: f32) {
@@ -16,12 +32,20 @@ impl GlitcherZApp {
         });
         self.held_notes.insert(note);
         self.current_note = Some(sounding);
+        // I1: the pressed key lights up on the node's strip — the strip on the
+        // box and the keys under the fingers are one instrument.
+        if let Some((node, key)) = self.computer_key_to_strip(note) {
+            self.patch_state.keyboard_held_keys.insert((node, key));
+        }
     }
 
     pub(crate) fn send_note_off(&mut self, note: u8) {
         let sounding = shifted_note(note, self.vk_transpose()).unwrap_or(note);
         self.send_to_vk_targets(NoteEvent::Off { note: sounding });
         self.held_notes.remove(&note);
+        if let Some((node, key)) = self.computer_key_to_strip(note) {
+            self.patch_state.keyboard_held_keys.remove(&(node, key));
+        }
     }
 
     /// I1: the transposition of the computer-keyboard node (0 when the patch
@@ -34,6 +58,66 @@ impl GlitcherZApp {
                 _ => None,
             })
             .unwrap_or(0)
+    }
+
+    /// I1: the keyboard node the computer keyboard plays through, if the
+    /// patch has one (the node bound to [`MidiSource::Computer`]).
+    fn computer_keyboard_node(&self) -> Option<u64> {
+        self.project().graph.computer_keyboard()
+    }
+
+    /// I1: the register of the computer-keyboard node, if the patch has one.
+    fn vk_octave(&self) -> Option<i8> {
+        let doc = &self.project().graph;
+        doc.computer_keyboard()
+            .and_then(|node| match doc.node_by_id(node) {
+                Some(NodeDoc::Keyboard { octave, .. }) => Some(*octave),
+                _ => None,
+            })
+    }
+
+    /// I1: the note the computer keyboard starts on.
+    ///
+    /// The keyboard node owns the register: its strip brackets
+    /// `G(octave)..G(octave+2)` and the computer keys start on that window's
+    /// C, so the 17 computer keys always land **inside** the strip the user
+    /// sees — that is also what makes the pressed key light up on the strip.
+    /// Without a node the global base (`Z` / `X`) stands alone.
+    fn computer_base_note(&self) -> u8 {
+        computer_base_note_for(self.vk_octave(), self.octave_base)
+    }
+
+    /// I1: the strip key a computer-keyboard note lights up, `(node, key)`.
+    ///
+    /// `None` when the patch has no keyboard node, or when the note falls
+    /// outside the window the node currently brackets.
+    fn computer_key_to_strip(&self, note: u8) -> Option<(u64, u8)> {
+        let node = self.computer_keyboard_node()?;
+        let octave = self.vk_octave()?;
+        Some((node, strip_key_for(note, octave)?))
+    }
+
+    /// I1: moves the computer keyboard one octave down or up.
+    ///
+    /// The bound keyboard node owns the register, so `Z` / `X` move **that
+    /// node's** octave (a document edit, like the box's `Oct -` / `Oct +`) and
+    /// the strip follows. Without a node the global base stands alone.
+    fn shift_computer_octave(&mut self, delta: i8) {
+        if let Some(node) = self.computer_keyboard_node() {
+            self.set_keyboard_octave(node, delta);
+        } else if delta < 0 {
+            self.octave_base = self.octave_base.saturating_sub(12).max(24);
+        } else {
+            self.octave_base = (self.octave_base + 12).min(84);
+        }
+    }
+
+    /// I1: whether a modal transform (roll / timeline) is live.
+    ///
+    /// `X` / `Y` pick the axis of such a modal, so the register must not move
+    /// under it — the keys would land on two commands at once.
+    fn modal_transform_active(&self) -> bool {
+        self.roll_state.modal_active() || self.timeline_state.modal_active()
     }
 
     /// Delivers one live event to every destination of the keyboard input
@@ -596,10 +680,14 @@ impl GlitcherZApp {
 
             match (key, pressed) {
                 (egui::Key::Z, true) => {
-                    self.octave_base = (self.octave_base.saturating_sub(12)).max(24);
+                    if !self.modal_transform_active() {
+                        self.shift_computer_octave(-1);
+                    }
                 }
                 (egui::Key::X, true) => {
-                    self.octave_base = (self.octave_base + 12).min(84);
+                    if !self.modal_transform_active() {
+                        self.shift_computer_octave(1);
+                    }
                 }
                 (egui::Key::R, true) => {
                     // Record (spec `recording.md` R2). While the piano roll owns
@@ -611,7 +699,7 @@ impl GlitcherZApp {
                 }
                 _ => {
                     if let Some((_, semi)) = KEYMAP.iter().find(|(k, _)| *k == key) {
-                        let note = self.octave_base + semi;
+                        let note = self.computer_base_note() + semi;
                         if pressed {
                             if roll_owns_focus {
                                 // The roll owns this key (modal command /
@@ -628,5 +716,56 @@ impl GlitcherZApp {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// I1: the keyboard node owns the register — the computer keyboard starts
+    /// on the window's C, so `Oct -` / `Oct +` on the box moves the keys under
+    /// the fingers as well.
+    #[test]
+    fn the_computer_keyboard_plays_the_node_register() {
+        // Octave 4 → C4 (the default; the window is G3..G5).
+        assert_eq!(computer_base_note_for(Some(4), 60), 60);
+        assert_eq!(computer_base_note_for(Some(5), 60), 72);
+        assert_eq!(computer_base_note_for(Some(3), 60), 48);
+        // Without a keyboard node the global base stands alone.
+        assert_eq!(computer_base_note_for(None, 60), 60);
+        assert_eq!(computer_base_note_for(None, 24), 24);
+    }
+
+    /// I1: every computer key lands inside the strip the node brackets — that
+    /// is what makes the pressed key light up on the box.
+    #[test]
+    fn every_computer_key_lands_inside_the_strip() {
+        for octave in 0..=MAX_KEYBOARD_OCTAVE {
+            let base = computer_base_note_for(Some(octave), 60);
+            for semi in 0..=16u8 {
+                let note = base + semi;
+                assert!(
+                    note <= 127,
+                    "octave {octave}: the top key must stay inside MIDI"
+                );
+                assert_eq!(
+                    strip_key_for(note, octave),
+                    Some(note),
+                    "octave {octave}: {note} must light a key on the strip"
+                );
+            }
+        }
+    }
+
+    /// I1: a note outside the window lights nothing (the register may have
+    /// moved while the key was held).
+    #[test]
+    fn a_note_outside_the_window_lights_nothing() {
+        assert_eq!(strip_key_for(60, 4), Some(60));
+        assert_eq!(strip_key_for(54, 4), None);
+        assert_eq!(strip_key_for(80, 4), None);
+        assert_eq!(strip_key_for(55, 4), Some(55));
+        assert_eq!(strip_key_for(79, 4), Some(79));
     }
 }

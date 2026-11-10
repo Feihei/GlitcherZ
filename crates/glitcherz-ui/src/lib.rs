@@ -54,12 +54,13 @@ use glitcherz_engine::realtime::{
 use glitcherz_engine::{MidiTarget, Sf2Library, Sf2Preset};
 use glitcherz_model::{
     ArpeggiatorParams, AutoParam, AutoPoint, CableKind, ChannelParam, ControlClip, ControlTrack,
-    CtrlKind, CurveInterp, CurveMapParams, EffectParams, GraphDoc, LFO_DIVISION_LABELS, LfoParams,
-    LfoWaveform, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS, MAX_CLIPS_PER_TRACK, MAX_MARKERS,
-    MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS, MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip,
-    MidiEnvelopeParams, MidiSource, MidiTrack, ModalParams, NodeDoc, NodeParam, Note, OrganParams,
-    PluckParams, PortRef, PortamentoParams, Project, SamplePlayMode, SongLoop, SynthParams,
-    SynthWaveform, TrackKind, VoiceSpec, WavetableParams,
+    CtrlKind, CurveInterp, CurveMapParams, DEFAULT_KEYBOARD_OCTAVE, EffectParams, GraphDoc,
+    LFO_DIVISION_LABELS, LfoParams, LfoWaveform, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS,
+    MAX_CLIPS_PER_TRACK, MAX_KEYBOARD_OCTAVE, MAX_MARKERS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS,
+    MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip, MidiEnvelopeParams, MidiSource, MidiTrack,
+    ModalParams, NodeDoc, NodeParam, Note, OrganParams, PluckParams, PortRef, PortamentoParams,
+    Project, SamplePlayMode, SongLoop, SynthParams, SynthWaveform, TrackKind, VoiceSpec,
+    WavetableParams,
 };
 
 pub mod autosave;
@@ -1820,6 +1821,10 @@ pub struct GlitcherZApp {
     /// Active main view (tab bar).
     view: MainView,
     /// Octave base (MIDI number of C, default 60 = C4).
+    ///
+    /// I1: the fallback register of the computer keyboard — it only applies
+    /// when the patch has **no** keyboard node. A bound node owns the
+    /// register (its `octave` field), and `Z` / `X` move that one.
     octave_base: u8,
     /// Live keyboard destinations (G6, spec `plugin-gui.md` §8): every
     /// instrument reachable from the **computer-keyboard input node's** cables,
@@ -1848,8 +1853,9 @@ pub struct GlitcherZApp {
     /// Ports the last binding pass could not find (bound but unplugged). Shown
     /// once in the status bar, not every frame.
     midi_missing: Vec<String>,
-    /// Currently held notes (shared by on-screen keys and computer keys, for highlighting and
-    /// de-duplication).
+    /// Currently held notes of the computer keyboard (the physical pitch, before
+    /// the node's transpose) — for de-duplication and for the route changes
+    /// that must release what is still sounding.
     held_notes: HashSet<u8>,
     /// Most recently triggered note (shown in the status bar).
     current_note: Option<u8>,
@@ -3229,6 +3235,7 @@ mod panel_target_tests {
             track: 0,
             source: glitcherz_model::MidiSource::default(),
             transpose: 0,
+            octave: DEFAULT_KEYBOARD_OCTAVE,
         });
         let doc = &project.graph;
         assert_eq!(resolve_panel_target(doc, &[keyboard], true, 0), None);

@@ -132,6 +132,22 @@ pub const DEFAULT_VELOCITY: u8 = 100;
 /// Lowest MIDI velocity (a note-off; silence).
 pub const MIN_VELOCITY: u8 = 1;
 
+/// I1: the default register of a keyboard node.
+///
+/// The strip brackets `G3..G5` — middle C sits inside the window — and the
+/// computer keyboard starts on the window's C.
+pub const DEFAULT_KEYBOARD_OCTAVE: i8 = 4;
+
+/// I1: the highest register a keyboard node can be moved to (the strip then
+/// tops out exactly at MIDI 127).
+pub const MAX_KEYBOARD_OCTAVE: i8 = 8;
+
+/// serde default for [`NodeDoc::Keyboard::octave`] — old documents (written
+/// before the register became a document field) land on the default window.
+fn default_keyboard_octave() -> i8 {
+    DEFAULT_KEYBOARD_OCTAVE
+}
+
 /// Built-in oscillator waveform (spec `.agents/spec/instrument.md` D1).
 ///
 /// The engine keeps its own index form (`ParamId::OscWaveform` takes a rounded
@@ -4042,10 +4058,19 @@ pub enum NodeDoc {
         #[serde(default)]
         source: MidiSource,
         /// Semitone offset applied to this node's outgoing notes (I1).
-        /// Range `-24..=24`; the octave shown on the box is view state, this
-        /// is the musical transposition that survives a reload.
+        /// Range `-24..=24`; this is the musical transposition that survives
+        /// a reload.
         #[serde(default)]
         transpose: i8,
+        /// I1: the register this keyboard node plays in.
+        ///
+        /// The 25-key strip brackets `G(octave)..G(octave+2)` and the computer
+        /// keyboard starts on that window's C, so the strip on the box and the
+        /// keys under the user's fingers are the same instrument. Range
+        /// `0..=8`; the default ([`DEFAULT_KEYBOARD_OCTAVE`]) is the
+        /// `G3..G5` window around middle C.
+        #[serde(default = "default_keyboard_octave")]
+        octave: i8,
     },
     /// MIDI effect: arpeggiator (1 MIDI in, 1 MIDI out, no audio ports;
     /// spec `.agents/spec/midi-nodes.md` §5.1).
@@ -5548,6 +5573,7 @@ pub fn default_graph_doc(midi_track_count: usize, audio_track_count: usize) -> G
             track: 0,
             source: MidiSource::Computer,
             transpose: 0,
+            octave: DEFAULT_KEYBOARD_OCTAVE,
         });
         cables.push(CableDoc::keyboard_midi(keyboard_id, voice_id));
     }
@@ -6439,14 +6465,15 @@ mod tests {
     use super::{
         ArpMode, ArpeggiatorParams, AudioClip, AudioTrack, AutoParam, AutoPoint, CableDoc,
         CableKind, ChannelParam, ControlClip, ControlTrack, CurveMapParams, DEFAULT_AUDIO_TRACKS,
-        DEFAULT_CONTROL_TRACKS, DEFAULT_MIDI_TRACKS, DelayParams, EffectParams, GraphDoc,
-        LFO_DEFAULT_DIVISION, LFO_DIVISION_COUNT, LFO_DIVISION_LABELS, LfoParams, LfoWaveform,
-        MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS, MAX_AUDIO_TRACKS,
-        MAX_BEND_RANGE, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES, MAX_TEMPO_BPM,
-        MIN_BEND_RANGE, MIN_TEMPO_BPM, MapMode, MapSpec, MidiClip, MidiEnvelopeParams, MidiSource,
-        MidiTrack, MixerChannel, NodeDoc, NodeParam, PortRef, PortamentoParams, Project,
-        SamplePlayMode, SampleRegion, SynthParams, SynthWaveform, TICKS_PER_BAR, TICKS_PER_QUARTER,
-        TICKS_PER_STEP, TrackKind, VoiceSpec, default_audio_source_len, default_graph_doc,
+        DEFAULT_CONTROL_TRACKS, DEFAULT_KEYBOARD_OCTAVE, DEFAULT_MIDI_TRACKS, DelayParams,
+        EffectParams, GraphDoc, LFO_DEFAULT_DIVISION, LFO_DIVISION_COUNT, LFO_DIVISION_LABELS,
+        LfoParams, LfoWaveform, MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS,
+        MAX_AUDIO_TRACKS, MAX_BEND_RANGE, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES,
+        MAX_TEMPO_BPM, MIN_BEND_RANGE, MIN_TEMPO_BPM, MapMode, MapSpec, MidiClip,
+        MidiEnvelopeParams, MidiSource, MidiTrack, MixerChannel, NodeDoc, NodeParam, PortRef,
+        PortamentoParams, Project, SamplePlayMode, SampleRegion, SynthParams, SynthWaveform,
+        TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, TrackKind, VoiceSpec,
+        default_audio_source_len, default_graph_doc,
     };
 
     fn effect_node(params: EffectParams) -> NodeDoc {
@@ -8352,6 +8379,7 @@ mod tests {
                     source: MidiSource::Computer,
 
                     transpose: 0,
+                    octave: DEFAULT_KEYBOARD_OCTAVE,
                 },
             ],
             cables: Vec::new(),
@@ -8375,6 +8403,7 @@ mod tests {
             source: MidiSource::Computer,
 
             transpose: 0,
+            octave: DEFAULT_KEYBOARD_OCTAVE,
         })
         .expect("serialization failed");
         assert!(text.contains("keyboard"), "tag missing: {text}");
@@ -8388,6 +8417,46 @@ mod tests {
                 source: MidiSource::Computer,
 
                 transpose: 0,
+                octave: DEFAULT_KEYBOARD_OCTAVE,
+            }
+        );
+    }
+
+    /// I1: the register is a document field — it survives a reload, and a
+    /// document written before the field existed lands on the default window.
+    #[test]
+    fn the_keyboard_register_survives_a_reload() {
+        let text = ron::to_string(&NodeDoc::Keyboard {
+            node_id: 6,
+            track: 0,
+            source: MidiSource::Computer,
+            transpose: 0,
+            octave: 6,
+        })
+        .expect("serialization failed");
+        let back: NodeDoc = ron::from_str(&text).expect("deserialization failed");
+        assert_eq!(
+            back,
+            NodeDoc::Keyboard {
+                node_id: 6,
+                track: 0,
+                source: MidiSource::Computer,
+                transpose: 0,
+                octave: 6,
+            }
+        );
+
+        // An old payload (no `octave` field) opens on the default window.
+        let old = r#"(type:"keyboard", node_id:6, track:0, source:computer, transpose:0)"#;
+        let back: NodeDoc = ron::from_str(old).expect("deserialization failed");
+        assert_eq!(
+            back,
+            NodeDoc::Keyboard {
+                node_id: 6,
+                track: 0,
+                source: MidiSource::Computer,
+                transpose: 0,
+                octave: DEFAULT_KEYBOARD_OCTAVE,
             }
         );
     }
@@ -8403,6 +8472,7 @@ mod tests {
             source: MidiSource::Device("KeyStep".to_string()),
 
             transpose: 0,
+            octave: DEFAULT_KEYBOARD_OCTAVE,
         });
         assert_eq!(doc.computer_keyboard(), Some(6));
 
@@ -8489,6 +8559,7 @@ mod tests {
             source: MidiSource::Computer,
 
             transpose: 0,
+            octave: DEFAULT_KEYBOARD_OCTAVE,
         });
         let err = doc
             .validate(2, 0)
@@ -8503,6 +8574,7 @@ mod tests {
             source: MidiSource::Device("KeyStep".to_string()),
 
             transpose: 0,
+            octave: DEFAULT_KEYBOARD_OCTAVE,
         });
         assert!(doc.validate(2, 0).is_ok());
     }
