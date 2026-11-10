@@ -1833,6 +1833,12 @@ pub struct MidiClip {
     /// across tracks and lane kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<u32>,
+    /// Temporary clip mute (B2). A muted clip keeps its placement, content
+    /// and length — the sequencer simply schedules nothing for it, so the
+    /// toggle is non-destructive and costs no re-layout. Track mute stays on
+    /// the mixer channel; this is the per-clip layer.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub muted: bool,
     /// Absolute start position on the arrangement (tick).
     #[serde(default)]
     pub start_ticks: u32,
@@ -1913,11 +1919,18 @@ fn default_clip_loop() -> u32 {
     TICKS_PER_BAR
 }
 
+/// `serde(skip_serializing_if)` helper for flags that default to `false`:
+/// a document only carries the key once it is actually set.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl Default for MidiClip {
     fn default() -> Self {
         Self {
             name: String::new(),
             group: None,
+            muted: false,
             start_ticks: 0,
             span_ticks: default_clip_span(),
             loop_ticks: default_clip_loop(),
@@ -1980,6 +1993,10 @@ pub struct AudioClip {
     /// Optional clip-group id (W3b).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<u32>,
+    /// Temporary clip mute (B2): the wav keeps its trim window and position,
+    /// playback just skips it. Non-destructive (see [`MidiClip::muted`]).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub muted: bool,
     /// Path to the .wav file (decoded via the session sample cache; a
     /// missing file makes the clip silent, not invalid).
     #[serde(default)]
@@ -2010,6 +2027,7 @@ impl Default for AudioClip {
         Self {
             name: String::new(),
             group: None,
+            muted: false,
             path: String::new(),
             start_ticks: 0,
             source_offset: 0.0,
@@ -2075,6 +2093,11 @@ pub struct ControlClip {
     /// Optional clip-group id (W3b).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<u32>,
+    /// Temporary clip mute (B2): the curve keeps its anchors and span, the
+    /// automation is simply not delivered — the target holds its last value,
+    /// exactly as outside the clip (see [`MidiClip::muted`]).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub muted: bool,
     /// Absolute start position on the arrangement (tick).
     #[serde(default)]
     pub start_ticks: u32,
@@ -2098,6 +2121,7 @@ impl Default for ControlClip {
         Self {
             name: String::new(),
             group: None,
+            muted: false,
             start_ticks: 0,
             span_ticks: default_clip_span(),
             loop_ticks: default_clip_loop(),
@@ -4017,6 +4041,11 @@ pub enum NodeDoc {
         /// rejects two nodes bound to the same source.
         #[serde(default)]
         source: MidiSource,
+        /// Semitone offset applied to this node's outgoing notes (I1).
+        /// Range `-24..=24`; the octave shown on the box is view state, this
+        /// is the musical transposition that survives a reload.
+        #[serde(default)]
+        transpose: i8,
     },
     /// MIDI effect: arpeggiator (1 MIDI in, 1 MIDI out, no audio ports;
     /// spec `.agents/spec/midi-nodes.md` §5.1).
@@ -5518,6 +5547,7 @@ pub fn default_graph_doc(midi_track_count: usize, audio_track_count: usize) -> G
             node_id: keyboard_id,
             track: 0,
             source: MidiSource::Computer,
+            transpose: 0,
         });
         cables.push(CableDoc::keyboard_midi(keyboard_id, voice_id));
     }
@@ -6879,6 +6909,45 @@ mod tests {
         assert_eq!(eq.low_cut, super::EQ_LOW_CUT_OFF_HZ);
     }
 
+    /// B2: `muted` is an additive, optional field. An unmuted clip writes no
+    /// key at all (older documents and older readers are untouched), a muted
+    /// one round-trips — for all three clip tables.
+    #[test]
+    fn clip_mute_is_optional_and_round_trips() {
+        let plain = MidiClip::default();
+        let text = ron::ser::to_string(&plain).expect("serialize");
+        assert!(
+            !text.contains("muted"),
+            "an unmuted clip must not write the key: {text}"
+        );
+        let back: MidiClip = ron::from_str(&text).expect("deserialize");
+        assert!(!back.muted, "a missing key means unmuted");
+
+        let muted = MidiClip {
+            muted: true,
+            ..MidiClip::default()
+        };
+        let text = ron::ser::to_string(&muted).expect("serialize");
+        assert!(text.contains("muted:true"), "mute must persist: {text}");
+        let back: MidiClip = ron::from_str(&text).expect("deserialize");
+        assert!(back.muted);
+
+        for text in [
+            ron::ser::to_string(&ControlClip {
+                muted: true,
+                ..ControlClip::default()
+            })
+            .expect("serialize"),
+            ron::ser::to_string(&AudioClip {
+                muted: true,
+                ..AudioClip::default()
+            })
+            .expect("serialize"),
+        ] {
+            assert!(text.contains("muted:true"), "mute must persist: {text}");
+        }
+    }
+
     // E1: a v7 node (sibling `delay` payload) still parses, and the migration
     // moves those values into `params` (D3/D4).
     #[test]
@@ -7123,6 +7192,7 @@ mod tests {
                 clips: vec![AudioClip {
                     name: String::new(),
                     group: None,
+                    muted: false,
                     path: "a.wav".to_string(),
                     start_ticks: 0,
                     source_offset: 1.0,
@@ -8280,6 +8350,8 @@ mod tests {
                     node_id: 6,
                     track: 0,
                     source: MidiSource::Computer,
+
+                    transpose: 0,
                 },
             ],
             cables: Vec::new(),
@@ -8301,6 +8373,8 @@ mod tests {
             node_id: 6,
             track: 2,
             source: MidiSource::Computer,
+
+            transpose: 0,
         })
         .expect("serialization failed");
         assert!(text.contains("keyboard"), "tag missing: {text}");
@@ -8312,6 +8386,8 @@ mod tests {
                 node_id: 6,
                 track: 2,
                 source: MidiSource::Computer,
+
+                transpose: 0,
             }
         );
     }
@@ -8325,6 +8401,8 @@ mod tests {
             node_id: 8,
             track: 1,
             source: MidiSource::Device("KeyStep".to_string()),
+
+            transpose: 0,
         });
         assert_eq!(doc.computer_keyboard(), Some(6));
 
@@ -8409,6 +8487,8 @@ mod tests {
             node_id: 8,
             track: 1,
             source: MidiSource::Computer,
+
+            transpose: 0,
         });
         let err = doc
             .validate(2, 0)
@@ -8421,6 +8501,8 @@ mod tests {
             node_id: 8,
             track: 1,
             source: MidiSource::Device("KeyStep".to_string()),
+
+            transpose: 0,
         });
         assert!(doc.validate(2, 0).is_ok());
     }

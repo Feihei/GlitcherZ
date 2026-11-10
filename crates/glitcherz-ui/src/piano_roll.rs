@@ -110,9 +110,6 @@ const ZOOM_X_MAX: f32 = 64.0;
 const ZOOM_Y_MIN: f32 = 0.4;
 const ZOOM_Y_MAX: f32 = 6.0;
 
-/// Default duration of a new note (tick) — a 16th note.
-const DEFAULT_NOTE_LENGTH: i64 = TICKS_PER_STEP as i64;
-
 /// Accent color for selected notes / velocity bars.
 const SELECTED: egui::Color32 = egui::Color32::from_rgb(240, 190, 80);
 
@@ -522,6 +519,33 @@ pub struct RollState {
     /// W5: the inline strum panel is open, plus its live parameters.
     pub strum_open: bool,
     pub strum_options: StrumOptions,
+    /// I4: the length a click drops in Draw mode, and the last length a
+    /// created note ended up with (the `Auto` fallback). View state only —
+    /// the length itself is written into the note at creation.
+    pub draw_length: DrawLength,
+    pub last_note_length: Option<i64>,
+    /// I2: the note currently held for audition (key column or a note body).
+    /// Drives the pressed-key highlight; the engine events themselves are
+    /// queued in `preview_events` so they never share the intent slot.
+    preview_held: Option<u8>,
+    preview_events: Vec<(u8, f32, bool)>,
+    /// I3: a one-shot tool armed from the **toolbar**, waiting for the
+    /// pointer to be over the roll. The click that armed it landed on a
+    /// button, so using that position as the grab point would make the
+    /// selection jump the moment the pointer enters the grid — the arm
+    /// therefore latches its grab on the first in-roll frame instead.
+    pending_arm: Option<RollArm>,
+}
+
+/// I3: the roll's one-shot tools, as the toolbar names them. `Grab`/`Scale`/
+/// `Stretch` arm a modal transform; `Knife` arms a stroke. All four are
+/// one-shot: none of them persists the way [`RollMode`] does (I-D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollArm {
+    Grab,
+    Scale,
+    Stretch,
+    Knife,
 }
 
 /// Persistent mode: what a left-drag on the roll means (M4).
@@ -542,6 +566,27 @@ impl RollMode {
         match self {
             RollMode::Select => RollMode::Draw,
             RollMode::Draw => RollMode::Select,
+        }
+    }
+}
+
+/// I4: the length a click drops in Draw mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawLength {
+    /// Repeat the last created note's length; a quarter note until one has
+    /// been created (960 ticks at 960 PPQ).
+    Auto,
+    /// A fixed tick length from the division menu.
+    Fixed(i64),
+}
+
+impl DrawLength {
+    fn resolve(self, last: Option<i64>) -> i64 {
+        match self {
+            DrawLength::Fixed(ticks) => ticks.max(1),
+            DrawLength::Auto => last
+                .filter(|length| *length > 0)
+                .unwrap_or(i64::from(TICKS_PER_QUARTER)),
         }
     }
 }
@@ -940,8 +985,29 @@ impl RollState {
             randomize_open: false,
             randomize_options: RandomizeOptions::default(),
             strum_open: false,
-            strum_options: StrumOptions::default(),
+            strum_options: default_strum_options(),
+            draw_length: DrawLength::Auto,
+            last_note_length: None,
+            preview_held: None,
+            preview_events: Vec::new(),
+            pending_arm: None,
         }
+    }
+
+    /// I2: drains the audition events queued this frame.
+    ///
+    /// Previews are not document edits: they never reach the command layer,
+    /// the undo history or the selection. The caller turns them into engine
+    /// note events for the focus track.
+    pub fn take_preview_events(&mut self) -> Vec<(u8, f32, bool)> {
+        std::mem::take(&mut self.preview_events)
+    }
+
+    /// I4: the length a click-created note gets right now: the fixed
+    /// division, or the last created note's length (a quarter note before
+    /// the first one).
+    pub fn draw_note_length(&self) -> i64 {
+        self.draw_length.resolve(self.last_note_length)
     }
 
     /// Replaces the selection with `index` (the note a gesture just
@@ -1039,7 +1105,11 @@ impl RollState {
     /// running interaction cancellable without side effects on the mode or
     /// selection it was about to act on.
     fn escape(&mut self) {
-        if self.modal.take().is_some() || self.knife.take().is_some() || self.knife_armed {
+        if self.modal.take().is_some()
+            || self.knife.take().is_some()
+            || self.knife_armed
+            || self.pending_arm.take().is_some()
+        {
             self.knife_armed = false;
             return;
         }
@@ -1048,6 +1118,77 @@ impl RollState {
         } else {
             self.selection.clear();
         }
+    }
+
+    /// I3: arms one of the one-shot tools — `g` / `s` / `t` / `k` and the
+    /// toolbar's buttons both funnel through here, so the two paths cannot
+    /// drift apart.
+    ///
+    /// The grab point is a parameter, not something this reads: only the
+    /// caller knows the pointer (and, for a toolbar click, whether the pointer
+    /// has entered the roll yet — a modal armed from a button must not use the
+    /// button's position, or the selection would jump on the way in).
+    ///
+    /// Every refusal is *visible*: an empty selection or an empty bbox writes
+    /// a status message instead of arming nothing silently.
+    fn arm_tool(
+        &mut self,
+        arm: RollArm,
+        clip: &MidiClip,
+        grab_tick: f32,
+        grab_note: u8,
+        loop_ticks: i64,
+    ) {
+        match arm {
+            RollArm::Knife => {
+                self.knife_armed = true;
+                self.modal = None;
+                return;
+            }
+            RollArm::Grab => {
+                if self.selection.is_empty() {
+                    self.note_status("Grab: nothing selected");
+                    return;
+                }
+                self.start_modal(ModalKind::Move { axis: None }, grab_tick, grab_note);
+                return;
+            }
+            RollArm::Scale | RollArm::Stretch => {}
+        }
+        let Some((lo, hi)) = selection_bbox(clip, &self.selection) else {
+            self.note_status(match arm {
+                RollArm::Scale => "Scale: nothing selected",
+                _ => "Stretch: nothing selected",
+            });
+            return;
+        };
+        let kind = match arm {
+            RollArm::Scale => ModalKind::Scale {
+                // The pivot is the bbox *start*: scaling from the start keeps
+                // the notes' relative layout intact (nothing sits left of it).
+                pivot_tick: lo,
+                grab_dist: (grab_tick - lo as f32).abs().max(1.0),
+                max_k: scale_max_k(lo, hi, loop_ticks),
+            },
+            _ => ModalKind::Stretch {
+                edge: StretchEdge::End,
+                lo,
+                hi,
+            },
+        };
+        self.start_modal(kind, grab_tick, grab_note);
+    }
+
+    /// Opens a modal transform on the current selection. Arming one tool
+    /// always disarms the knife: the modal family never chains.
+    fn start_modal(&mut self, kind: ModalKind, grab_tick: f32, grab_note: u8) {
+        self.knife_armed = false;
+        self.modal = Some(Modal {
+            kind,
+            grab_tick,
+            grab_note,
+            gesture: self.next_gesture(),
+        });
     }
 
     /// Applies an axis qualifier (X/Y) to the running modal move or the
@@ -1076,6 +1217,20 @@ impl Default for RollState {
 
 fn is_black_key(note: i32) -> bool {
     matches!(note.rem_euclid(12), 1 | 3 | 6 | 8 | 10)
+}
+
+/// I2: the MIDI note under a position in the key column.
+///
+/// Rows are uniform, so this is pure geometry — the whole row is the target
+/// (a black key's painted block is only 62% wide, but the blank right of it
+/// belongs to the same pitch). `None` outside the column or past 0..=127.
+fn key_at(keys: egui::Rect, top_note: i32, row_h: f32, pos: egui::Pos2) -> Option<u8> {
+    if row_h <= 0.0 || !keys.contains(pos) {
+        return None;
+    }
+    let row = ((pos.y - keys.top()) / row_h).floor() as i32;
+    let note = top_note - row;
+    (0..=127).contains(&note).then_some(note as u8)
 }
 
 /// Time / pitch mapping shared by every paint and hit test (P2, spec
@@ -1321,32 +1476,110 @@ pub fn show(
                     }
                 }
             });
-        // Mode chip (clickable: mouse users never need the keyboard), and
-        // the armed one-shot command beside it with its qualifiers.
-        let mode_text = match state.mode {
-            RollMode::Select => "SELECT",
-            RollMode::Draw => "DRAW",
-        };
-        let mode_color = if state.mode == RollMode::Draw {
-            SELECTED
-        } else {
-            ui.visuals().weak_text_color()
-        };
-        if ui
-            .add(
-                egui::Label::new(egui::RichText::new(mode_text).color(mode_color).strong())
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_text("Persistent mode (d toggles): what a drag does")
-            .clicked()
-        {
-            state.mode = state.mode.toggled();
+        // I3: [Select][Draw] is the *mode* group — mutually exclusive,
+        // persistent, filled while active. Everything right of the separator
+        // is a *one-shot* action: it arms, it never stays down, and while
+        // armed it is outlined instead of filled (I-D2).
+        if let Some(picked) = crate::toolbar::mode_group(
+            ui,
+            usize::from(state.mode == RollMode::Draw),
+            &[("Select", "d toggles"), ("Draw", "d")],
+        ) {
+            state.mode = if picked == 0 {
+                RollMode::Select
+            } else {
+                RollMode::Draw
+            };
+            state.knife_armed = false;
+            state.pending_arm = None;
         }
-        // The live modal transform beside the mode chip (with its
-        // qualifiers); clicking it cancels. Otherwise, the armed knife.
+        ui.separator();
+        let grab_armed = state.pending_arm == Some(RollArm::Grab)
+            || matches!(state.modal.as_ref().map(|m| m.kind), Some(ModalKind::Move { .. }));
+        let scale_armed = state.pending_arm == Some(RollArm::Scale)
+            || matches!(state.modal.as_ref().map(|m| m.kind), Some(ModalKind::Scale { .. }));
+        let stretch_armed = state.pending_arm == Some(RollArm::Stretch)
+            || matches!(
+                state.modal.as_ref().map(|m| m.kind),
+                Some(ModalKind::Stretch { .. })
+            );
+        if crate::toolbar::action_button(
+            ui,
+            "Grab",
+            "g",
+            grab_armed,
+            "the selection follows the pointer · LMB confirms · RMB / Esc cancels",
+        )
+        .clicked()
+        {
+            // A second click on an armed tool cancels it (the same click that
+            // armed it would otherwise be un-cancellable by mouse).
+            if grab_armed {
+                state.modal = None;
+                state.pending_arm = None;
+            } else {
+                state.knife_armed = false;
+                state.knife = None;
+                state.pending_arm = Some(RollArm::Grab);
+            }
+        }
+        if crate::toolbar::action_button(
+            ui,
+            "Scale",
+            "s",
+            scale_armed,
+            "time-scales the selection around its start · LMB confirms · Esc cancels",
+        )
+        .clicked()
+        {
+            if scale_armed {
+                state.modal = None;
+                state.pending_arm = None;
+            } else {
+                state.knife_armed = false;
+                state.knife = None;
+                state.pending_arm = Some(RollArm::Scale);
+            }
+        }
+        if crate::toolbar::action_button(
+            ui,
+            "Stretch",
+            "t",
+            stretch_armed,
+            "trims the selection's end edge · s flips to the start · LMB confirms",
+        )
+        .clicked()
+        {
+            if stretch_armed {
+                state.modal = None;
+                state.pending_arm = None;
+            } else {
+                state.knife_armed = false;
+                state.knife = None;
+                state.pending_arm = Some(RollArm::Stretch);
+            }
+        }
+        if crate::toolbar::action_button(
+            ui,
+            "Knife",
+            "k",
+            state.knife_armed,
+            "a stroke cuts every note it crosses · Esc / RMB cancels",
+        )
+        .clicked()
+        {
+            // The knife needs no grab point, so it arms immediately.
+            state.knife_armed = !state.knife_armed;
+            state.modal = None;
+            state.pending_arm = None;
+        }
+        ui.separator();
+        // The live modal transform beside the group (with its qualifiers);
+        // clicking it cancels. The action button tells *which* tool is armed,
+        // this chip tells how far it has been pulled (G·X, T·S).
         let modal_label = state.modal.as_ref().map(Modal::label);
-        if let Some(label) = modal_label {
-            if ui
+        if let Some(label) = modal_label
+            && ui
                 .add(
                     egui::Label::new(
                         egui::RichText::new(label).color(egui::Color32::YELLOW).strong(),
@@ -1355,21 +1588,8 @@ pub fn show(
                 )
                 .on_hover_text("Modal transform — the selection follows the pointer · LMB confirms · RMB/Esc cancels")
                 .clicked()
-            {
-                state.modal = None;
-            }
-        } else if state.knife_armed
-            && ui
-                .add(
-                    egui::Label::new(
-                        egui::RichText::new("K").color(egui::Color32::YELLOW).strong(),
-                    )
-                    .sense(egui::Sense::click()),
-                )
-                .on_hover_text("Knife armed — a stroke cuts every note it crosses · Esc cancels")
-                .clicked()
         {
-            state.knife_armed = false;
+            state.modal = None;
         }
         // W4/W5: generator panels (view state + a one-shot command on
         // Apply). Opening one closes the other: they share the parameter row.
@@ -1391,6 +1611,29 @@ pub fn show(
             state.strum_open = !state.strum_open;
             state.randomize_open = false;
         }
+        // I4: length of a click-created note (Draw mode and double-click).
+        ui.label("len");
+        egui::ComboBox::from_id_salt("roll_draw_length")
+            .selected_text(draw_length_label(state.draw_length))
+            .width(56.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(state.draw_length == DrawLength::Auto, "auto")
+                    .on_hover_text("The last note's length — a quarter note until one exists")
+                    .clicked()
+                {
+                    state.draw_length = DrawLength::Auto;
+                }
+                for (ticks, label) in DRAW_LENGTH_DIVISIONS {
+                    if ui
+                        .selectable_label(state.draw_length == DrawLength::Fixed(ticks), label)
+                        .on_hover_text(format!("{ticks} ticks"))
+                        .clicked()
+                    {
+                        state.draw_length = DrawLength::Fixed(ticks);
+                    }
+                }
+            });
         // The hint must never overflow the panel: an overflowing child
         // expands the ui's available rect (egui grows `max_rect` to include
         // every allocated frame), and the roll below would then be laid out
@@ -1486,30 +1729,40 @@ pub fn show(
                     }
                 });
             ui.label("spread");
-            ui.add(
-                egui::DragValue::new(&mut state.strum_options.spread_ticks)
-                    .range(0..=2 * bar)
-                    .suffix(" t"),
+            strum_division_combo(
+                ui,
+                "roll_strum_spread",
+                &mut state.strum_options.spread_ticks,
+                true,
             );
-            ui.label("window");
-            ui.add(
-                egui::DragValue::new(&mut state.strum_options.group_window_ticks)
-                    .range(0..=bar)
-                    .suffix(" t"),
+            ui.label("chord window");
+            strum_division_combo(
+                ui,
+                "roll_strum_window",
+                &mut state.strum_options.group_window_ticks,
+                false,
             );
             ui.label("ramp");
-            ui.add(egui::DragValue::new(&mut state.strum_options.velocity_ramp).range(-64..=64));
+            ui.add(egui::DragValue::new(&mut state.strum_options.velocity_ramp).range(-64..=64))
+                .on_hover_text("Velocity change from the first attack to the last");
             ui.label("jitter");
             ui.add(
                 egui::DragValue::new(&mut state.strum_options.jitter_ticks)
                     .range(0..=(bar / 2).max(1))
                     .suffix(" t"),
-            );
+            )
+            .on_hover_text("Random ± ticks added to each attack");
             if ui.button("Apply").clicked() {
-                intent = Some(RollIntent::Strum {
-                    options: state.strum_options,
-                });
-                state.strum_open = false;
+                if state.strum_options.spread_ticks == 0 {
+                    // A zero gap is the model's identity: keep the panel open
+                    // and say why nothing would happen.
+                    state.note_status("Strum: spread is off — pick a note division");
+                } else {
+                    intent = Some(RollIntent::Strum {
+                        options: state.strum_options,
+                    });
+                    state.strum_open = false;
+                }
             }
             if ui.button("Cancel").clicked() {
                 state.strum_open = false;
@@ -1725,10 +1978,13 @@ pub fn show(
             egui::pos2(keys_rect.left(), y),
             egui::vec2(if black { KEYS_WIDTH * 0.62 } else { KEYS_WIDTH }, row_h),
         );
+        // I2: an auditioned key lights up while the button is held.
         keys_painter.rect_filled(
             block,
             0.0,
-            if black {
+            if state.preview_held == Some(note as u8) {
+                SELECTED
+            } else if black {
                 egui::Color32::from_gray(46)
             } else {
                 egui::Color32::from_gray(92)
@@ -1748,6 +2004,45 @@ pub fn show(
         [keys_rect.right_top(), keys_rect.right_bottom()],
         egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
     );
+
+    // I2: the key column auditions on **press** (the sound follows the
+    // button, not the release) and never touches the document. The events
+    // leave through `preview_events`, so they cannot collide with the single
+    // intent slot.
+    //
+    // The hit rect stops one pixel short of the grid: `keys_rect.right()`
+    // and the note area's left edge are the *same* line, and `Rect::contains`
+    // is inclusive on both ends — a press exactly on that seam (tick 0 of an
+    // unscrolled view) would otherwise audition a key instead of starting a
+    // note gesture. This widget interacts after the roll, so it wins ties.
+    let keys_hit = egui::Rect::from_min_max(
+        keys_rect.min,
+        egui::pos2(
+            (keys_rect.right() - 1.0).max(keys_rect.left()),
+            keys_rect.bottom(),
+        ),
+    );
+    let keys_resp = ui.interact(
+        keys_hit,
+        ui.scope_id().with("roll_keys_audition"),
+        egui::Sense::click_and_drag(),
+    );
+    if keys_resp.hovered()
+        && ui.ctx().input(|i| i.pointer.primary_pressed())
+        && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
+        && let Some(note) = key_at(keys_hit, top_note, row_h, pos)
+    {
+        state.preview_held = Some(note);
+        state.preview_events.push((note, 0.9, true));
+    }
+    // Losing the button always releases the audition (a dropped release
+    // event must not leave a note stuck on).
+    if let Some(note) = state.preview_held
+        && !ui.ctx().input(|i| i.pointer.any_down())
+    {
+        state.preview_held = None;
+        state.preview_events.push((note, 0.0, false));
+    }
 
     // 1. Row background (black keys darker).
     for note in min_note..=top_note {
@@ -1971,6 +2266,23 @@ pub fn show(
     ui.painter_at(gutter)
         .rect_filled(gutter, 0.0, egui::Color32::from_gray(14));
 
+    // I3: a toolbar click arms a one-shot tool while the pointer is still on
+    // the button — using that position as the grab point would make the
+    // selection jump as soon as the pointer reaches the grid. The arm
+    // therefore waits for the first frame whose pointer is over the roll; a
+    // press anywhere else gives it up (that click released in an earlier
+    // frame, so it cannot be its own arming click).
+    if let Some(arm) = state.pending_arm {
+        match ui.ctx().input(|i| i.pointer.hover_pos()) {
+            Some(pos) if rect.contains(pos) => {
+                state.pending_arm = None;
+                state.arm_tool(arm, clip, pointer_tick(pos), pointer_note(pos), loop_ticks);
+            }
+            _ if ui.ctx().input(|i| i.pointer.primary_pressed()) => state.pending_arm = None,
+            _ => {}
+        }
+    }
+
     // ---- Keyboard: mode + the modal command family (M4a). ----
     // Gated on focus so the keys never leak into text fields elsewhere.
     // Axis qualifiers also apply mid-transform (Blender convention); the
@@ -2088,57 +2400,28 @@ pub fn show(
                 // A state command cancels the armed knife first, then
                 // toggles the mode.
                 state.knife_armed = false;
+                state.pending_arm = None;
                 state.mode = state.mode.toggled();
-            } else if keys.g {
-                if state.selection.is_empty() {
-                    state.note_status("Grab: nothing selected");
+            } else if keys.g || keys.s || keys.t || keys.k {
+                // The keyboard family and the toolbar share one arming path
+                // (I3): the pointer is where it is, so it *is* the grab point.
+                let arm = if keys.g {
+                    RollArm::Grab
+                } else if keys.s {
+                    RollArm::Scale
+                } else if keys.t {
+                    RollArm::Stretch
                 } else {
-                    state.modal = Some(Modal {
-                        kind: ModalKind::Move { axis: None },
-                        grab_tick: pointer_tick(arm_pos),
-                        grab_note: pointer_note(arm_pos),
-                        gesture: state.next_gesture(),
-                    });
-                }
-            } else if keys.s {
-                match selection_bbox(clip, &state.selection) {
-                    Some((lo, hi)) => {
-                        let grab_tick = pointer_tick(arm_pos);
-                        state.modal = Some(Modal {
-                            kind: ModalKind::Scale {
-                                // The pivot is the bbox *start*: scaling from
-                                // the start keeps the notes' relative layout
-                                // intact (nothing sits left of it).
-                                pivot_tick: lo,
-                                grab_dist: (grab_tick - lo as f32).abs().max(1.0),
-                                max_k: scale_max_k(lo, hi, loop_ticks),
-                            },
-                            grab_tick,
-                            grab_note: pointer_note(arm_pos),
-                            gesture: state.next_gesture(),
-                        });
-                    }
-                    None => state.note_status("Scale: nothing selected"),
-                }
-            } else if keys.t {
-                match selection_bbox(clip, &state.selection) {
-                    Some((lo, hi)) => {
-                        let grab_tick = pointer_tick(arm_pos);
-                        state.modal = Some(Modal {
-                            kind: ModalKind::Stretch {
-                                edge: StretchEdge::End,
-                                lo,
-                                hi,
-                            },
-                            grab_tick,
-                            grab_note: pointer_note(arm_pos),
-                            gesture: state.next_gesture(),
-                        });
-                    }
-                    None => state.note_status("Stretch: nothing selected"),
-                }
-            } else if keys.k {
-                state.knife_armed = true;
+                    RollArm::Knife
+                };
+                state.pending_arm = None;
+                state.arm_tool(
+                    arm,
+                    clip,
+                    pointer_tick(arm_pos),
+                    pointer_note(arm_pos),
+                    loop_ticks,
+                );
             } else if keys.delete && !state.selection.is_empty() {
                 intent = Some(RollIntent::DeleteNotes {
                     indices: state.selection.clone(),
@@ -2150,6 +2433,21 @@ pub fn show(
     // ---- Interaction → intents. ----
     // (The pointer helpers live above the keyboard section, which needs
     // them for the modal grab point.)
+
+    // I2: pressing a note auditions it (velocity from the note itself).
+    // The press still selects / drags it as before — only the sound is new,
+    // and it is never a document edit.
+    if response.hovered()
+        && ui.ctx().input(|i| i.pointer.primary_pressed())
+        && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
+        && let Some(index) = hit_note(pos)
+    {
+        let note = clip.notes()[index];
+        state.preview_held = Some(note.note);
+        state
+            .preview_events
+            .push((note.note, f32::from(note.velocity) / 127.0, true));
+    }
 
     // A plain click (no drag): a modal transform consumes it as the
     // *confirmation* (LMB anywhere fixes the geometry); an armed knife
@@ -2219,10 +2517,12 @@ pub fn show(
                         if response.double_clicked() {
                             // No awaiting_create: a follow-up drag would have
                             // fired drag_started (draw) instead of a click.
+                            let length = state.draw_note_length();
+                            state.last_note_length = Some(length);
                             intent = Some(RollIntent::AddNote {
                                 note: pointer_note(pos),
                                 start: snap(pointer_tick(pos)).min(loop_ticks - 1),
-                                length: DEFAULT_NOTE_LENGTH,
+                                length,
                                 gesture: state.next_gesture(),
                             });
                         } else {
@@ -2428,10 +2728,15 @@ pub fn show(
                             // starts the draw-drag.
                             let gesture = state.next_gesture();
                             let start = snap(pointer_tick(pos)).min(loop_ticks - 1);
+                            // I4: the note enters at the chosen length (the
+                            // last one used in Auto); a drag that follows
+                            // replaces it with the pointer's extent.
+                            let length = state.draw_note_length();
+                            state.last_note_length = Some(length);
                             intent = Some(RollIntent::AddNote {
                                 note: pointer_note(pos),
                                 start,
-                                length: DEFAULT_NOTE_LENGTH,
+                                length,
                                 gesture,
                             });
                             state.awaiting_create = Some(AwaitCreate {
@@ -2594,7 +2899,12 @@ pub fn show(
                 state.selection = hits;
             }
         }
-        state.drag = None;
+        if let Some(drag) = state.drag.take()
+            && drag.kind == DragKind::ResizeEnd
+        {
+            // I4: remember where the draw settled so `Auto` repeats it.
+            state.last_note_length = Some((drag.current_end() - drag.current_start()).max(1));
+        }
         // A knife stroke ends here: the gathered cuts land as one batch
         // (one undo step). One stroke per arming — a stroke that crossed
         // nothing just disarms.
@@ -3202,18 +3512,116 @@ fn strum_direction_label(direction: StrumDirection) -> &'static str {
     }
 }
 
+/// Note divisions offered for the strum gap / chord window, in ticks.
+///
+/// Every entry divides `TICKS_PER_QUARTER * 4` (one 4/4 bar) exactly, so a
+/// label always round-trips to the same tick count (no rounding drift when
+/// the panel is reopened).
+const STRUM_DIVISIONS: [(i64, &str); 10] = [
+    (60, "1/64"),
+    (120, "1/32"),
+    (160, "1/24"),
+    (240, "1/16"),
+    (320, "1/12"),
+    (480, "1/8"),
+    (640, "1/6"),
+    (960, "1/4"),
+    (1280, "1/3"),
+    (1920, "1/2"),
+];
+
+/// Note divisions offered for the Draw-mode note length (I4). Same tick
+/// values as the strum picker, ordered by note value instead.
+const DRAW_LENGTH_DIVISIONS: [(i64, &str); 10] = [
+    (1920, "1/2"),
+    (960, "1/4"),
+    (480, "1/8"),
+    (240, "1/16"),
+    (120, "1/32"),
+    (60, "1/64"),
+    (1280, "1/3"),
+    (640, "1/6"),
+    (320, "1/12"),
+    (160, "1/24"),
+];
+
+/// The strum panel's opening state.
+///
+/// The model's `Default` is deliberately all-zero — `strum()` is then the
+/// identity, which a unit test pins as a contract. Opening the panel with
+/// those values made Apply do nothing and close silently ("the tool does
+/// not work"). The UI therefore seeds a musically useful gap (1/32) and a
+/// 30-tick chord window, and Apply refuses a zero spread with a hint.
+fn default_strum_options() -> StrumOptions {
+    StrumOptions {
+        spread_ticks: i64::from(TICKS_PER_QUARTER / 8),
+        group_window_ticks: 30,
+        velocity_ramp: 0,
+        jitter_ticks: 0,
+        direction: StrumDirection::Up,
+    }
+}
+
+/// `ticks` as a note-division label (`"1/32"`), or `"off"` for zero and
+/// `"{n} t"` when the value is not one of [`STRUM_DIVISIONS`].
+fn strum_division_label(ticks: i64) -> String {
+    if ticks == 0 {
+        return "off".to_owned();
+    }
+    STRUM_DIVISIONS
+        .iter()
+        .find(|(value, _)| *value == ticks)
+        .map(|(_, label)| (*label).to_owned())
+        .unwrap_or_else(|| format!("{ticks} t"))
+}
+
+/// I4: the label of the Draw-mode length picker (`auto`, `1/4`, …).
+fn draw_length_label(length: DrawLength) -> String {
+    match length {
+        DrawLength::Auto => "auto".to_owned(),
+        DrawLength::Fixed(ticks) => DRAW_LENGTH_DIVISIONS
+            .iter()
+            .find(|(value, _)| *value == ticks)
+            .map(|(_, label)| (*label).to_owned())
+            .unwrap_or_else(|| format!("{ticks} t")),
+    }
+}
+
+/// A note-division picker for one strum parameter. `allow_off` adds a zero
+/// entry (only the gap has a meaningful "no offset").
+fn strum_division_combo(ui: &mut egui::Ui, id: &str, value: &mut i64, allow_off: bool) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(strum_division_label(*value))
+        .width(64.0)
+        .show_ui(ui, |ui| {
+            if allow_off && ui.selectable_label(*value == 0, "off").clicked() {
+                *value = 0;
+            }
+            for (ticks, name) in STRUM_DIVISIONS {
+                if ui
+                    .selectable_label(*value == ticks, name)
+                    .on_hover_text(format!("{ticks} ticks"))
+                    .clicked()
+                {
+                    *value = ticks;
+                }
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AwaitCreate, Axis, ClipRef, DragKind, DragSelection, EDGE_PX, HIT_SLOP, MAX_ROLL_CONTEXT,
-        Modal, ModalFrame, ModalKind, ROLL_HEIGHT, ROW_HEIGHT, RollGeom, RollIntent, RollMode,
-        RollState, RollSubject, StretchEdge, ViewWindow, clamped_move, draw_end, edge_zone,
-        is_black_key, knife_crossing, modal_ghost, scale_max_k, selection_bbox, snap_ticks,
-        trim_start, zoom_scroll_anchor, zoom_top_note_anchor,
+        AwaitCreate, Axis, ClipRef, DRAW_LENGTH_DIVISIONS, DragKind, DragSelection, DrawLength,
+        EDGE_PX, HIT_SLOP, MAX_ROLL_CONTEXT, Modal, ModalFrame, ModalKind, ROLL_HEIGHT, ROW_HEIGHT,
+        RollArm, RollGeom, RollIntent, RollMode, RollState, RollSubject, STRUM_DIVISIONS,
+        StretchEdge, ViewWindow, clamped_move, default_strum_options, draw_end, draw_length_label,
+        edge_zone, is_black_key, key_at, knife_crossing, modal_ghost, scale_max_k, selection_bbox,
+        snap_ticks, strum_division_label, trim_start, zoom_scroll_anchor, zoom_top_note_anchor,
     };
     use crate::grid::{GridValue, NoteValue};
     use eframe::egui;
-    use glitcherz_model::{MidiClip, MidiTrack, Note, TICKS_PER_STEP};
+    use glitcherz_model::{MidiClip, MidiTrack, Note, TICKS_PER_QUARTER, TICKS_PER_STEP, strum};
 
     fn note(start: i64, length: i64, note: u8) -> Note {
         Note {
@@ -4227,5 +4635,199 @@ mod tests {
         let window = ViewWindow::of(&tracks, &subject);
         assert_eq!(window.start, 0.0);
         assert_eq!(window.end, 2880.0);
+    }
+
+    /// I5: the panel's opening values must actually stagger a chord. The
+    /// model `Default` is the identity (all zeros), which is exactly why
+    /// the tool looked broken: Apply ran, nothing moved, the panel closed.
+    #[test]
+    fn ui_strum_defaults_stagger_a_chord() {
+        let mut notes = [
+            Note {
+                start: 0,
+                length: 480,
+                note: 60,
+                velocity: 100,
+                channel: 0,
+            },
+            Note {
+                start: 0,
+                length: 480,
+                note: 64,
+                velocity: 100,
+                channel: 0,
+            },
+            Note {
+                start: 0,
+                length: 480,
+                note: 67,
+                velocity: 100,
+                channel: 0,
+            },
+        ];
+        let options = default_strum_options();
+        assert!(options.spread_ticks > 0, "default spread must not be zero");
+        strum(&mut notes, &options, 0);
+        let mut starts: Vec<i64> = notes.iter().map(|n| n.start).collect();
+        starts.sort_unstable();
+        assert_eq!(
+            starts,
+            vec![0, options.spread_ticks, 2 * options.spread_ticks]
+        );
+        // The notated length is untouched (the ends stagger with the starts).
+        assert!(notes.iter().all(|n| n.length == 480));
+    }
+
+    /// I5: the division picker round-trips labels and ticks, and an
+    /// off-list value still shows its tick count instead of lying.
+    #[test]
+    fn strum_division_labels_round_trip() {
+        for (ticks, label) in STRUM_DIVISIONS {
+            assert_eq!(strum_division_label(ticks), label);
+        }
+        assert_eq!(strum_division_label(0), "off");
+        assert_eq!(strum_division_label(7), "7 t");
+    }
+
+    /// I4: a fresh roll drops a quarter note; `Auto` then repeats the last
+    /// created length and a fixed division wins outright.
+    #[test]
+    fn draw_length_defaults_to_a_quarter_then_follows_the_last_note() {
+        let mut state = RollState::new();
+        assert_eq!(state.draw_length, DrawLength::Auto);
+        assert_eq!(
+            state.draw_note_length(),
+            i64::from(TICKS_PER_QUARTER),
+            "the first click is a quarter note"
+        );
+        state.last_note_length = Some(240);
+        assert_eq!(state.draw_note_length(), 240);
+        state.draw_length = DrawLength::Fixed(480);
+        assert_eq!(
+            state.draw_note_length(),
+            480,
+            "a fixed division ignores the memory"
+        );
+    }
+
+    /// I4: every offered division divides one 4/4 bar exactly, so a label
+    /// and its tick value round-trip.
+    #[test]
+    fn draw_length_divisions_divide_the_bar() {
+        let bar = i64::from(TICKS_PER_QUARTER) * 4;
+        for (ticks, label) in DRAW_LENGTH_DIVISIONS {
+            assert_eq!(bar % ticks, 0, "{label} must divide the bar");
+            assert_eq!(draw_length_label(DrawLength::Fixed(ticks)), label);
+        }
+    }
+
+    /// I2: the key column maps a row to its MIDI note; a black key owns its
+    /// whole row (the blank right of the painted block is the same pitch).
+    #[test]
+    fn key_at_maps_rows_to_notes() {
+        let keys = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(48.0, 9.0 * 12.0));
+        let row = 9.0;
+        assert_eq!(key_at(keys, 60, row, egui::pos2(10.0, 104.0)), Some(60));
+        assert_eq!(
+            key_at(keys, 60, row, egui::pos2(10.0, 100.0 + 9.0 * 11.5)),
+            Some(49)
+        );
+        assert_eq!(
+            key_at(keys, 60, row, egui::pos2(60.0, 104.0)),
+            None,
+            "outside the column"
+        );
+        assert_eq!(
+            key_at(keys, 3, row, egui::pos2(10.0, 100.0 + 9.0 * 5.5)),
+            None,
+            "below MIDI 0"
+        );
+        assert_eq!(
+            key_at(keys, 60, 0.0, egui::pos2(10.0, 104.0)),
+            None,
+            "degenerate row height"
+        );
+    }
+
+    // ---- I3: the toolbar's one-shot tools ----
+
+    /// A two-note clip (A: 60 @ 0..240, B: 62 @ 480..720) in a one-bar loop.
+    fn pair_clip() -> MidiClip {
+        MidiClip {
+            loop_ticks: TICKS_PER_QUARTER * 4,
+            sequence: glitcherz_model::Sequence {
+                notes: vec![note(0, 240, 60), note(480, 240, 62)],
+                ..glitcherz_model::Sequence::default()
+            },
+            ..MidiClip::default()
+        }
+    }
+
+    /// The toolbar and the keyboard share `arm_tool`: the grab point is the
+    /// caller's, so a toolbar click can defer it until the pointer is over the
+    /// roll. That deferral is what keeps the selection from jumping.
+    #[test]
+    fn arm_tool_moves_the_grab_point_to_the_caller() {
+        let clip = pair_clip();
+        let mut state = RollState::new();
+        state.selection = vec![0, 1];
+        state.knife_armed = true;
+        state.arm_tool(RollArm::Grab, &clip, 300.0, 60, 3840);
+        let modal = state.modal.as_ref().expect("grab must arm");
+        assert_eq!(modal.grab_tick, 300.0);
+        assert_eq!(modal.grab_note, 60);
+        assert!(!state.knife_armed, "arming a modal disarms the knife");
+        // Stretch arms on the selection's bbox, not on the pointer.
+        state.arm_tool(RollArm::Stretch, &clip, 300.0, 60, 3840);
+        assert!(matches!(
+            state.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::Stretch {
+                edge: StretchEdge::End,
+                lo: 0,
+                hi: 720
+            })
+        ));
+        // Scale pivots on the bbox start and measures the grab distance from
+        // it — the deferred grab point lands here, not on a button.
+        state.arm_tool(RollArm::Scale, &clip, 300.0, 60, 3840);
+        assert!(matches!(
+            state.modal.as_ref().map(|m| m.kind),
+            Some(ModalKind::Scale { pivot_tick: 0, .. })
+        ));
+    }
+
+    /// An arm with nothing selected must say so instead of opening a modal
+    /// that would move nothing (and, for Scale, divide by a nonsense distance).
+    #[test]
+    fn arm_tool_refuses_an_empty_selection_out_loud() {
+        let clip = pair_clip();
+        let mut state = RollState::new();
+        for arm in [RollArm::Grab, RollArm::Scale, RollArm::Stretch] {
+            state.arm_tool(arm, &clip, 0.0, 60, 3840);
+            assert!(!state.modal_active(), "{arm:?} must not arm empty");
+            assert!(
+                state.take_status().is_some(),
+                "{arm:?} must explain itself in the status line"
+            );
+        }
+        // The knife needs no selection: it cuts whatever the stroke crosses.
+        state.arm_tool(RollArm::Knife, &clip, 0.0, 60, 3840);
+        assert!(state.knife_armed);
+    }
+
+    /// A toolbar click only *queues* an arm (the pointer is still on the
+    /// button). Until it lands, the roll is not in a modal: no ghosts, no
+    /// focus hold, and Esc gives the arm up without touching the mode or the
+    /// selection.
+    #[test]
+    fn a_pending_toolbar_arm_is_not_a_modal_and_esc_drops_it() {
+        let mut state = RollState::new();
+        state.selection = vec![0];
+        state.pending_arm = Some(RollArm::Grab);
+        assert!(!state.modal_active(), "nothing follows the pointer yet");
+        state.escape();
+        assert_eq!(state.pending_arm, None);
+        assert_eq!(state.selection, vec![0], "the selection survives Esc here");
+        assert!(!state.modal_active());
     }
 }

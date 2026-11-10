@@ -254,6 +254,9 @@ pub struct RtMidiClip {
     pub span_ticks: u32,
     /// Content loop length (in ticks).
     pub loop_ticks: u32,
+    /// Temporarily muted (B2): the clip keeps its span — the arrangement
+    /// length does not shrink — but scheduling skips it entirely.
+    pub muted: bool,
     /// Notes, relative to the clip start.
     pub notes: Vec<RtNote>,
     /// Controller events, relative to the clip start (P0).
@@ -269,6 +272,7 @@ impl Default for RtMidiClip {
             // own placement.
             span_ticks: 0,
             loop_ticks: TICKS_PER_BAR,
+            muted: false,
             notes: Vec::new(),
             ctrls: Vec::new(),
         }
@@ -851,7 +855,7 @@ impl Sequencer {
         let clips = &self.clips[track];
         let pending = &mut self.pending_offs[track];
         for clip in clips {
-            if clip.is_empty() || clip.loop_ticks == 0 || clip.span_ticks == 0 {
+            if clip.is_empty() || clip.loop_ticks == 0 || clip.span_ticks == 0 || clip.muted {
                 continue;
             }
             let start = f64::from(clip.start_ticks);
@@ -1185,6 +1189,51 @@ mod tests {
         assert_eq!(notes.len(), 1, "the armed track still plays: {notes:?}");
         // The mute is a scheduling mask, not a transport change.
         assert!(seq.position_ticks() > 0.0);
+    }
+
+    /// B2: a muted clip schedules nothing at all, while its span still
+    /// counts toward the arrangement end — muting must not shorten the song.
+    /// Un-muting re-pushes the same clip and it plays again.
+    #[test]
+    fn muted_clip_schedules_nothing_but_keeps_its_span() {
+        let mut seq = Sequencer::new(SR);
+        seq.set_bpm(120.0);
+        let table = |muted: bool| {
+            let mut clip = RtMidiClip {
+                start_ticks: 0,
+                span_ticks: TICKS_PER_BAR,
+                loop_ticks: TICKS_PER_BAR,
+                muted,
+                ..RtMidiClip::default()
+            };
+            clip.push(clip_note(0, TICKS_PER_STEP, 60));
+            let mut clips = empty_midi_clip_table();
+            clips[0] = clip;
+            clips
+        };
+        seq.set_track_clips(0, table(true));
+        seq.play();
+
+        let events = run(&mut seq, 375);
+        assert!(
+            events.is_empty(),
+            "a muted clip must schedule no notes, got {events:?}"
+        );
+        assert_eq!(
+            seq.arrangement_end_ticks(),
+            TICKS_PER_BAR,
+            "mute keeps the clip's span: the arrangement end must not move"
+        );
+
+        // Un-mute: the identical clip is audible again.
+        seq.seek(0.0);
+        seq.set_track_clips(0, table(false));
+        seq.play();
+        assert_eq!(
+            ons(&run(&mut seq, 375)),
+            vec![(0, 60)],
+            "clearing the flag restores the clip"
+        );
     }
 
     /// P0: within one block, controllers are delivered before notes — a pitch
@@ -1748,6 +1797,7 @@ mod tests {
                 });
                 curve
             },
+            ..RtControlClip::default()
         };
         seq.set_control_clips(5, clips);
         seq.set_control_clips(MAX_AUTO_TRACKS, clips); // out-of-range index ignored

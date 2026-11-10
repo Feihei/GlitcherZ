@@ -92,6 +92,7 @@ pub mod settings;
 pub mod status_bar;
 pub mod timeline;
 pub mod timeline_ops;
+pub mod toolbar;
 pub mod transport;
 pub mod transport_icons;
 pub mod voices;
@@ -465,6 +466,15 @@ fn keyboard_live_routes(doc: &GraphDoc, node: u64) -> (Vec<usize>, Vec<u64>) {
         Vec::new()
     };
     (tracks, nodes)
+}
+
+/// I1: shifts a MIDI note by `semitones`, refusing values outside 0..=127
+/// (a transposed key at the edge of the range stays silent rather than
+/// wrapping around).
+fn shifted_note(note: u8, semitones: i8) -> Option<u8> {
+    u8::try_from(i32::from(note) + i32::from(semitones))
+        .ok()
+        .filter(|n| *n <= 127)
 }
 
 /// Frames of audio the take ring holds before capture starts: a span in
@@ -3180,6 +3190,7 @@ mod panel_target_tests {
             node_id: keyboard,
             track: 0,
             source: glitcherz_model::MidiSource::default(),
+            transpose: 0,
         });
         let doc = &project.graph;
         assert_eq!(resolve_panel_target(doc, &[keyboard], true, 0), None);

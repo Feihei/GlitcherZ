@@ -142,6 +142,7 @@ fn table_with(data: &Arc<SampleData>, start: f64, len: f64) -> AudioClipTable {
         source_len: len,
         data: Arc::clone(data),
         gain: 1.0,
+        muted: false,
     });
     table[1] = Some(RtAudioClip {
         start_ticks: start + 200.0,
@@ -149,6 +150,7 @@ fn table_with(data: &Arc<SampleData>, start: f64, len: f64) -> AudioClipTable {
         source_len: len,
         data: Arc::clone(data),
         gain: 0.5,
+        muted: false,
     });
     table
 }

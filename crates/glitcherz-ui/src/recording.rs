@@ -726,6 +726,7 @@ impl GlitcherZApp {
                         start_ticks / self.project().ticks_per_bar() + 1
                     ),
                     group: None,
+                    muted: false,
                     path: stored,
                     start_ticks,
                     source_offset: 0.0,

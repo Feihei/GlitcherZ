@@ -655,6 +655,19 @@ impl GlitcherZApp {
                 router,
             )
         };
+        // I2: audition events bypass the command layer entirely — no undo
+        // entry, no document change. They go to the focus track's
+        // instrument (the same fan-out the recording path listens to).
+        for (note, velocity, on) in self.roll_state.take_preview_events() {
+            self.engine.send(EngineCommand::Note {
+                track: sel,
+                event: if on {
+                    NoteEvent::On { note, velocity }
+                } else {
+                    NoteEvent::Off { note }
+                },
+            });
+        }
         // Intents run as commands, so every roll edit is undoable. A drag
         // emits one intent per frame under the same gesture key: one drag,
         // one undo step.

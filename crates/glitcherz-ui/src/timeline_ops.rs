@@ -276,6 +276,10 @@ impl GlitcherZApp {
             // W3b: create / dissolve a cross-track, cross-lane clip group.
             timeline::TimelineAction::GroupClips { clips } => self.timeline_group_clips(clips),
             timeline::TimelineAction::UngroupClips { clips } => self.timeline_ungroup_clips(clips),
+            // B2: temporary clip mute (Ctrl+middle click / H / Alt+H).
+            timeline::TimelineAction::SetClipMuted { clips, muted } => {
+                self.timeline_set_clip_muted(clips, muted)
+            }
             timeline::TimelineAction::AddClip {
                 lane,
                 track,
@@ -299,6 +303,22 @@ impl GlitcherZApp {
                 span_ticks,
                 loop_ticks,
             ),
+            timeline::TimelineAction::TrimClipHead {
+                lane,
+                track,
+                clip,
+                start_ticks,
+                span_ticks,
+                delta_ticks,
+            } => self.timeline_trim_clip_head(
+                lane,
+                track,
+                clip,
+                start_ticks,
+                span_ticks,
+                delta_ticks,
+            ),
+            timeline::TimelineAction::EndClipTrim => self.timeline_end_clip_trim(),
             timeline::TimelineAction::RemoveClip { lane, track, clip } => {
                 self.timeline_remove_clip(lane, track, clip)
             }
@@ -648,6 +668,151 @@ impl GlitcherZApp {
         }
     }
 
+    /// I6: one frame of a head trim (dragging a clip's left edge).
+    ///
+    /// The content is re-based from the drag-origin snapshot: `retain_from`
+    /// rewrites the note/curve positions, so rebuilding from the live clip
+    /// every frame would remove a little more material on every frame. MIDI
+    /// and control clips with a single period get a real cut; a tiled clip
+    /// has no "start of the content" to cut, so only its container shrinks
+    /// and the repeat phase is kept.
+    pub(crate) fn timeline_trim_clip_head(
+        &mut self,
+        lane: timeline::TimelineLane,
+        track: usize,
+        clip: usize,
+        start_ticks: u32,
+        span_ticks: u32,
+        delta_ticks: u32,
+    ) {
+        use crate::timeline::Placement;
+
+        let sel = timeline::ClipSel { lane, track, clip };
+        if self
+            .timeline_state
+            .head_trim
+            .as_ref()
+            .is_none_or(|t| t.sel != sel)
+        {
+            let origin = match lane {
+                timeline::TimelineLane::Midi => self
+                    .project()
+                    .midi_tracks
+                    .get(track)
+                    .and_then(|t| t.clips.get(clip))
+                    .map(|c| timeline::HeadTrimOrigin::Midi(Box::new(c.clone()))),
+                timeline::TimelineLane::Control => self
+                    .project()
+                    .control_tracks
+                    .get(track)
+                    .and_then(|t| t.clips.get(clip))
+                    .map(|c| timeline::HeadTrimOrigin::Control(Box::new(c.clone()))),
+                timeline::TimelineLane::Audio => self
+                    .project()
+                    .audio_tracks
+                    .get(track)
+                    .and_then(|t| t.clips.get(clip))
+                    .map(|c| timeline::HeadTrimOrigin::Audio {
+                        offset: c.source_offset,
+                    }),
+            };
+            let Some(origin) = origin else {
+                return;
+            };
+            self.timeline_state.head_trim = Some(timeline::HeadTrim { sel, origin });
+        }
+
+        let sec_per_tick = self.project().sec_per_tick();
+        let before = self.begin_edit();
+        let changed = {
+            let Some(trim) = self.timeline_state.head_trim.clone() else {
+                return;
+            };
+            let project = self.project_mut();
+            match (&trim.origin, lane) {
+                (timeline::HeadTrimOrigin::Midi(origin), timeline::TimelineLane::Midi) => project
+                    .midi_tracks
+                    .get_mut(track)
+                    .and_then(|t| t.clips.get_mut(clip))
+                    .map(|c| {
+                        let mut next = origin.clone();
+                        if origin.loop_ticks >= origin.span_ticks {
+                            // Single period: cut the material before the new
+                            // start (crossing notes keep their tails).
+                            next.retain_from(delta_ticks, sec_per_tick);
+                            next.loop_ticks = span_ticks;
+                        } else {
+                            next.loop_ticks =
+                                timeline::resolve_loop(origin.loop_ticks, span_ticks, None);
+                        }
+                        next.start_ticks = start_ticks;
+                        next.span_ticks = span_ticks;
+                        let changed = *c != *next;
+                        *c = *next;
+                        changed
+                    })
+                    .unwrap_or(false),
+                (timeline::HeadTrimOrigin::Control(origin), timeline::TimelineLane::Control) => {
+                    project
+                        .control_tracks
+                        .get_mut(track)
+                        .and_then(|t| t.clips.get_mut(clip))
+                        .map(|c| {
+                            let mut next = origin.clone();
+                            if origin.loop_ticks >= origin.span_ticks {
+                                next.retain_from(delta_ticks, sec_per_tick);
+                                next.loop_ticks = span_ticks;
+                            } else {
+                                next.loop_ticks =
+                                    timeline::resolve_loop(origin.loop_ticks, span_ticks, None);
+                            }
+                            next.start_ticks = start_ticks;
+                            next.span_ticks = span_ticks;
+                            let changed = *c != *next;
+                            *c = *next;
+                            changed
+                        })
+                        .unwrap_or(false)
+                }
+                (timeline::HeadTrimOrigin::Audio { offset, .. }, timeline::TimelineLane::Audio) => {
+                    project
+                        .audio_tracks
+                        .get_mut(track)
+                        .and_then(|t| t.clips.get_mut(clip))
+                        .map(|c| {
+                            // U11: the trim window advances with the head so the
+                            // remaining material stays where it is on screen.
+                            let offset = (offset + delta_ticks as f64 * sec_per_tick).max(0.0);
+                            let len = f64::from(span_ticks).max(1.0) * sec_per_tick;
+                            let changed = c.start_ticks != start_ticks
+                                || (c.source_offset - offset).abs() > f64::EPSILON
+                                || (c.source_len - len).abs() > f64::EPSILON;
+                            c.start_ticks = start_ticks;
+                            c.source_offset = offset;
+                            c.source_len = len;
+                            changed
+                        })
+                        .unwrap_or(false)
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.commit_param_edit(
+                "Trim Clip Head",
+                before,
+                &format!("timeline-trim:{}:{}:{}", lane as u8, track, clip),
+            );
+            self.sync_clip_row(lane, track);
+        }
+    }
+
+    /// I6: the head-trim gesture ended — drop its origin snapshot so the
+    /// next drag starts from the then-current clip.
+    pub(crate) fn timeline_end_clip_trim(&mut self) {
+        self.timeline_state.head_trim = None;
+    }
+
     /// W3b: puts every selected clip into one new group (auto-named
     /// `Group N`, palette colour). The selection may span MIDI / control /
     /// audio lanes and several tracks. One undo step.
@@ -747,6 +912,101 @@ impl GlitcherZApp {
             project.clip_groups.retain(|group| !ids.contains(&group.id));
         }
         self.commit_edit("Ungroup Clips", before);
+    }
+
+    /// B2: sets the temporary mute flag of every listed clip — one undo step.
+    ///
+    /// Clips already in the target state are skipped; when nothing changes no
+    /// history entry is recorded and no table is re-pushed. Mute lives in the
+    /// clip tables themselves (the engine has no separate mute command), so
+    /// every touched track is re-sent afterwards.
+    pub(crate) fn timeline_set_clip_muted(&mut self, clips: Vec<timeline::ClipSel>, muted: bool) {
+        if clips.is_empty() {
+            return;
+        }
+        let project = self.project();
+        let changes = clips.iter().any(|sel| {
+            let current = match sel.lane {
+                timeline::TimelineLane::Midi => project
+                    .midi_tracks
+                    .get(sel.track)
+                    .and_then(|track| track.clips.get(sel.clip))
+                    .map(timeline::Placement::muted),
+                timeline::TimelineLane::Control => project
+                    .control_tracks
+                    .get(sel.track)
+                    .and_then(|track| track.clips.get(sel.clip))
+                    .map(timeline::Placement::muted),
+                timeline::TimelineLane::Audio => project
+                    .audio_tracks
+                    .get(sel.track)
+                    .and_then(|track| track.clips.get(sel.clip))
+                    .map(timeline::Placement::muted),
+            };
+            current.is_some_and(|current| current != muted)
+        });
+        if !changes {
+            return;
+        }
+        // One push per touched track, in table order; a lane may be touched
+        // by several clips, so the sets keep that deduplicated.
+        let mut midi: Vec<usize> = Vec::new();
+        let mut control: Vec<usize> = Vec::new();
+        let mut audio: Vec<usize> = Vec::new();
+        let before = self.begin_edit();
+        for sel in &clips {
+            match sel.lane {
+                timeline::TimelineLane::Midi => {
+                    if let Some(clip) = self
+                        .project_mut()
+                        .midi_tracks
+                        .get_mut(sel.track)
+                        .and_then(|track| track.clips.get_mut(sel.clip))
+                    {
+                        timeline::Placement::set_muted(clip, muted);
+                        midi.push(sel.track);
+                    }
+                }
+                timeline::TimelineLane::Control => {
+                    if let Some(clip) = self
+                        .project_mut()
+                        .control_tracks
+                        .get_mut(sel.track)
+                        .and_then(|track| track.clips.get_mut(sel.clip))
+                    {
+                        timeline::Placement::set_muted(clip, muted);
+                        control.push(sel.track);
+                    }
+                }
+                timeline::TimelineLane::Audio => {
+                    if let Some(clip) = self
+                        .project_mut()
+                        .audio_tracks
+                        .get_mut(sel.track)
+                        .and_then(|track| track.clips.get_mut(sel.clip))
+                    {
+                        timeline::Placement::set_muted(clip, muted);
+                        audio.push(sel.track);
+                    }
+                }
+            }
+        }
+        self.commit_edit(if muted { "Mute Clips" } else { "Unmute Clips" }, before);
+        midi.sort_unstable();
+        midi.dedup();
+        control.sort_unstable();
+        control.dedup();
+        audio.sort_unstable();
+        audio.dedup();
+        for track in midi {
+            self.send_track_clips(track);
+        }
+        for index in control {
+            self.send_control_clips(index);
+        }
+        for track in audio {
+            self.send_audio_clips_for_track(track);
+        }
     }
 
     /// Sets one clip's group tag (all three lane tables share the shape).

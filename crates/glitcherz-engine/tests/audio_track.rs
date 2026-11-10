@@ -105,6 +105,7 @@ fn one_clip(data: Arc<SampleData>, start: f64, offset: f64, len: f64, gain: f32)
         source_len: len,
         data,
         gain,
+        muted: false,
     }])
 }
 
@@ -138,6 +139,30 @@ fn silence_when_transport_inactive() {
     );
 }
 
+/// B2: a muted clip keeps its table slot and trim window but renders
+/// nothing; clearing the flag brings the exact same clip back.
+#[test]
+fn muted_clip_renders_silence() {
+    let data = load(&flat_fixture("mute", 4096));
+    let clip = |muted: bool| {
+        table(&[RtAudioClip {
+            start_ticks: 0.0,
+            source_offset: 0.0,
+            source_len: 0.05,
+            data: Arc::clone(&data),
+            gain: 1.0,
+            muted,
+        }])
+    };
+    let mut muted = AudioTrackProcessor::new(clip(true));
+    let out = render(&mut muted, &ctx_at(0.0));
+    assert!(peak(&out) < 1e-9, "a muted clip must be silent");
+
+    let mut audible = AudioTrackProcessor::new(clip(false));
+    let out = render(&mut audible, &ctx_at(0.0));
+    assert!(peak(&out) > 0.1, "clearing the flag restores playback");
+}
+
 #[test]
 fn extreme_tables_stay_finite() {
     let data = load(&flat_fixture("extreme", 4096));
@@ -148,6 +173,7 @@ fn extreme_tables_stay_finite() {
             source_len: 1.0,
             data: Arc::clone(&data),
             gain: f32::NAN,
+            muted: false,
         },
         RtAudioClip {
             start_ticks: f64::NAN,
@@ -155,6 +181,7 @@ fn extreme_tables_stay_finite() {
             source_len: 1.0,
             data: Arc::clone(&data),
             gain: f32::INFINITY,
+            muted: false,
         },
         RtAudioClip {
             start_ticks: 0.0,
@@ -162,6 +189,7 @@ fn extreme_tables_stay_finite() {
             source_len: 0.0,
             data: Arc::clone(&data),
             gain: 1.0,
+            muted: false,
         },
     ]));
     let out = render(&mut proc, &ctx_at(0.0));
@@ -325,6 +353,7 @@ fn overlapping_clips_sum() {
             source_len: 0.05,
             data: Arc::clone(&data),
             gain: 0.25,
+            muted: false,
         },
         RtAudioClip {
             start_ticks: 0.0,
@@ -332,6 +361,7 @@ fn overlapping_clips_sum() {
             source_len: 0.05,
             data: Arc::clone(&data),
             gain: 0.5,
+            muted: false,
         },
     ]));
     let out = render(&mut proc, &ctx_at(0.0));

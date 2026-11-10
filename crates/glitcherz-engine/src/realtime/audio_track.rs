@@ -70,6 +70,9 @@ pub struct RtAudioClip {
     pub data: Arc<SampleData>,
     /// Clip gain (linear).
     pub gain: f32,
+    /// Temporarily muted (B2): the clip keeps its table slot (index
+    /// correspondence with the document) and its window; playback skips it.
+    pub muted: bool,
 }
 
 /// Clip table of one audio track: at most [`MAX_TRACK_CLIPS`] clips,
@@ -127,7 +130,7 @@ impl Processor for AudioTrackProcessor {
         let t0 = ctx.song_ticks;
         let dt = ctx.transport_dt_ticks;
         let sec_per_tick = ctx.sec_per_tick;
-        for clip in self.clips.iter().flatten() {
+        for clip in self.clips.iter().flatten().filter(|clip| !clip.muted) {
             render_clip(clip, t0, dt, sec_per_tick, frames, buffer);
         }
     }

@@ -110,6 +110,8 @@
 | 录音片段 | take | 一次录音产出的 clip；一次 take = 一个 undo 步（D15） |
 | 录音素材目录 | media directory | 工程旁的 `<stem>.media/`，clip 存相对路径（D11） |
 | 片段 | clip | 钢琴卷帘编辑的音符集合 |
+| 片段静音 | clip mute | clip 的 `muted` 标志：调度层跳过该片段（不发声 / 不投递自动化），位置、长度、内容不变；与 Mixer 的轨静音（track mute）是两个层级 |
+| 恢复（静音） | reveal | `Alt+H`：把全编曲里所有 muted 片段清回可发声（Blender 的 reveal-all）；不要写成 unlock（"锁定"只由 ghost 表达） |
 | 音符 | note | MIDI 音符；音名如 `A4` |
 | 延音尾 | gate tail | 音符 off 事件前的延续播放（pending off 机制）；项目级"音长 gate"已随 Steps 退役，音符收尾用自身 length |
 | 循环长度 | loop length | tick 数（默认 384） |

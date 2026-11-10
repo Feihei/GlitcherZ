@@ -7,14 +7,33 @@ use super::*;
 
 impl GlitcherZApp {
     pub(crate) fn send_note_on(&mut self, note: u8, velocity: f32) {
-        self.send_to_vk_targets(NoteEvent::On { note, velocity });
+        // I1: the keyboard node's transpose applies here too — the computer
+        // keyboard and a virtual keyboard box share one musical meaning.
+        let sounding = shifted_note(note, self.vk_transpose()).unwrap_or(note);
+        self.send_to_vk_targets(NoteEvent::On {
+            note: sounding,
+            velocity,
+        });
         self.held_notes.insert(note);
-        self.current_note = Some(note);
+        self.current_note = Some(sounding);
     }
 
     pub(crate) fn send_note_off(&mut self, note: u8) {
-        self.send_to_vk_targets(NoteEvent::Off { note });
+        let sounding = shifted_note(note, self.vk_transpose()).unwrap_or(note);
+        self.send_to_vk_targets(NoteEvent::Off { note: sounding });
         self.held_notes.remove(&note);
+    }
+
+    /// I1: the transposition of the computer-keyboard node (0 when the patch
+    /// has no keyboard node).
+    fn vk_transpose(&self) -> i8 {
+        let doc = &self.project().graph;
+        doc.computer_keyboard()
+            .and_then(|node| match doc.node_by_id(node) {
+                Some(NodeDoc::Keyboard { transpose, .. }) => Some(*transpose),
+                _ => None,
+            })
+            .unwrap_or(0)
     }
 
     /// Delivers one live event to every destination of the keyboard input

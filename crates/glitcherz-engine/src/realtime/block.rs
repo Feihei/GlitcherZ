@@ -990,6 +990,7 @@ mod tests {
             span_ticks: TICKS_PER_BAR,
             loop_ticks: TICKS_PER_BAR,
             curve,
+            ..RtControlClip::default()
         };
         structure_tx
             .push(GraphUpdate::SetControlClips { index: 0, clips })
@@ -1118,6 +1119,7 @@ mod tests {
             span_ticks: TICKS_PER_BAR,
             loop_ticks: TICKS_PER_BAR,
             curve,
+            ..RtControlClip::default()
         };
         structure_tx
             .push(GraphUpdate::SetControlClips { index: 0, clips })
@@ -1220,6 +1222,7 @@ mod tests {
             span_ticks: span,
             loop_ticks: span,
             curve,
+            ..RtControlClip::default()
         }
     }
 

@@ -1304,3 +1304,37 @@ spec `.agents/spec/mcp-server.md`。立项时 plan 写的前置是「把 headles
 **验收**：25 条（23 条用例 + 零回归 + 门禁）全部回填。58 项新测试（35 单测：沙箱 6 / 协议 10 / 工具 9 / 分派 10；23 项真子进程端到端），全量 **1 303 项通过 / 0 失败**。`fmt` / `clippy --workspace --all-targets -D warnings` / `build --workspace` 全绿。零回归：`f4fafe9`（S5 spec commit，最后一个 pre-S5 代码状态）的 detached worktree 与 post-S5 对同一份工程各出 44 288 帧 / 177 196 字节，`cmp` 逐字节一致（sha256 `04ab77f9…`）。另有一条独立证据：`render_wav` 与 `--render` 同参数产出的 wav 在测试里 `assert!(cli == via_mcp)` 逐字节相等——这是 `render_doc_to_wav_with` 没有偷偷改变渲染行为的钉子。
 
 **没做的（写进 spec §2，用户 2026-11-09 拍板）**：命令词汇扩容（`NodeParam` 稳定字符串名、`clip.add`）、undo / redo / history 工具、resources / prompts / sampling / progress、HTTP / SSE 传输。前两项是独立一期——词汇表要定命名规范、要迁移 40+ 参数、要决定 `node_id` 跨工程不稳定怎么办，塞进 MCP 会把「协议 + 安全」撑成三份设计。
+
+## B2：片段临时静音（clip mute，2026-11-10）
+
+spec `timeline.md` D31。需求原话是「ctrl 中键切换 mute、mute 之后淡显，外加 h 隐藏 / alt h 显示的 blender 键位」。
+
+**静音是调度层的，不是增益层的。** `muted` 存在 clip 上（三类 clip 各一个 `bool`，serde `default` + 假值不序列化，`PROJECT_VERSION` 不动），一路带到引擎的三个 RT 结构（`RtMidiClip` / `RtControlClip` / `RtAudioClip`）。这样 clip 的表索引与文档完全对齐（`MAX_TRACK_CLIPS` 的槽位语义依赖这一点），而「不发声」只有三处判定：`schedule_track_clips` 的 `continue`、`RtControlClip::value_at_absolute` 的 `None`、`AudioTrackProcessor::process` 的 `filter`。**没有新命令、没有新的队列载荷**——静音跟着每次既有 push 走，改一次 = 重推被触及的轨道表。
+
+**span 不动是有意的。** 最省事的实现是在 `headless` 的搬运层把 muted clip 换成 `RtMidiClip::default()`（span 0 即不调度），但那样 `refresh_arrangement_end` 也会跳过它：整首曲子静音后 arrangement end 变 0（= 无界），transport 从此不再自动停。静音在 DAW 里不该改变曲长，所以 RT 侧保留 span、只加标志位。控制轨同理：静音 = 不投递，目标保持最后值，与「clip 之外」完全一致（D17 的既有语义，不需要新规则）。
+
+**中键的冲突要先解决。** middle drag 是平移（在 `show()` 里读上一帧的行几何、直接推 ScrollArea offset），所以 `Ctrl` + 中键必须在**两处**同时让路：平移那段加 `!ctrl`，否则「点一下切 mute」会顺带把视图推走；`lane_row` 里用 `response.middle_clicked()` 判定，只在 `Ctrl` 按下时动作。撤销/重做只记一步（`timeline_set_clip_muted` 先只读地判断有没有真的要改，没有就不 `project_mut`、不记 undo、不推引擎——`push_undo` 只比 `Arc::ptr_eq`，空 `project_mut` 也会留下一个假的历史步）。
+
+**`H` 是虚拟钢琴键位**（FL 布局的 KEYMAP 里 `H` = 半音 9），所以它必须和 `G` / `T` / `K` 一样焦点门控：`show()` 顶部用 `state.owns_keyboard_focus(ctx)`。`Alt+H` 是「恢复全编曲」，需要跨三张表，于是放在 `show()` 的视图级命令区（与 `Ctrl+A` 同一处），而不是 `lane_row` 里——行级 handler 看不见别的轨道。`take_mute_shortcut` 照 `take_tile_shortcut` 的写法同时读事件的 modifier 快照与当前持有态（winit 的 modifier 会晚一帧）。回执也走视图自己的 status（「N clips muted」/「Alt+H: no muted clips」），跟 Ctrl+A 的计数提示一致。
+
+**淡显是一层遮罩，不是逐个调色。** clip 块上有缝线、波形、曲线预览、组色条四层绘制，逐个降 alpha 会漏。做法是这些画完之后压一层 lane 底色的半透明矩形（alpha 165），再画选中/编辑描边（保持全强度：静音不能把"选中"也吃掉），最后是降透明度的标签和右上角 `M` 角标（窄块没有标签时仍可认出静音）。选择态与 modal 变暗是两个独立效果，可以叠加。
+
+**测试**：`timeline_mute.rs` 两条集成用例驱动真实 egui 帧（Ctrl+中键切换、裸中键不切换、`H` 静音选区、`Alt+H` 全恢复且未静音时为零动作）；引擎三条（muted clip 不排任何事件但 arrangement end 不变、un-mute 后同一份表恢复发声；control clip 不投递、span 仍在；audio clip 静音/恢复）；model 一条（未静音不写键、静音往返，三张表都覆盖）。
+
+## I 系列：交互打磨（I1–I6，2026-11-10）
+
+用户一次提了 5 条（vk 节点可弹、卷帘键列试听、工具栏按钮、draw 默认长度、strum 失效），评审后加第 6 条（timeline 头裁）。决策见 `plan.md` 的 I-D1…I-D7，按 I5 → I6 → I4 → I2 → I1 → I3 落地。
+
+**I5 是默认值的锅，不是命令层的。** `StrumOptions::default()` 全 0，而 `model::ops::strum()` 在 spread = 0 时是恒等变换（`strum_with_zero_spread_is_the_identity` 锁着这条契约）。UI 用 default 打开面板、Apply 静默关闭——所以"strum 没反应"。修法放在 UI 侧 `default_strum_options()`（spread = 1/32 = 120 t、window = 30 t），并在 spread = 0 时给状态栏提示、保持面板打开。模型契约不动。
+
+**I6 的每帧必须从拖拽起点快照重算。** `Placement::retain_from()` 已经实现真头裁（裁头 + 跨界音符保留尾巴 + 内容前移），但它是按 delta 改文档的——每帧拿"当前" clip 再算 delta 会累积吞音符。所以 `Drag::Resize` 带 `origin_start / origin_span / origin_loop` 和一份 `HeadTrimOrigin` 快照（MIDI/Control 是 `Box<Clip>` 克隆，音频只要 offset）。左边缘按下曾是 Move，现在左右各 `EDGE_GRAB`，窄于 `3×EDGE_GRAB` 的 clip 仍优先当作移动。tiled clip 的头裁只缩短容器并提示——真裁会毁掉重复相位。
+
+**I2 的试听不能走 intent 槽。** `show()` 一帧只返回一个 `RollIntent`，键列试听会和拖动音符抢这个槽。改成 `preview_events: Vec<(note, velocity, on)>`，`editing.rs` 在 `apply_roll_intent` 之前排空成 `EngineCommand::Note`。松手兜底：`!pointer.any_down()` 时强制 Off，丢事件不会留下卡住的音。
+
+**顺带修的边界 bug**：键列和网格的 x 边界是同一条像素线，`Rect::contains` 两端闭区间，而键列的 `interact` 注册在网格之后（更上层）——点 tick 0（未滚动视图的最左一列）会被判给琴键列，选框起不来。命中矩形收进 1 px 解决。这是 `select_mode_empty_drag_marquee_selects_what_it_covers` 变红的真正原因，不是 test 本身的问题。
+
+**I1 的 transpose 是文档字段。** `NodeDoc::Keyboard.transpose: i8`（serde `default`，`PROJECT_VERSION` 不动），只影响该节点发出的事件；`send_keyboard_node_note` 与电脑键盘路径都过一次 `shifted_note()`（越界返回 `None`，不 clamp）。八度是纯视图态（`PatchState.keyboard_octaves`），不写文档。键条命中在 `allocate_rect` 之后 `ui.interact`，压过画布拖拽；删节点先释放 held 键再删。
+
+**I3 的两组按钮必须长得不一样。** `toolbar.rs` 只提供两个原语：`mode_group`（互斥、填充、点当前模式不关掉自己）和 `action_button`（一次性、armed 时描边不填充）。`Select`/`Draw` 从"一个循环切换的文字 chip"变成两个互斥按钮；`Grab`/`Scale`/`Stretch`/`Knife` 是动作，`Knife` 不再额外显示 `K` chip。**从按钮 arm 的抓取点要推迟**：按钮在网格/轨道区外面，用它当零点会让选区在指针移动途中先跳一下。roll 用 `pending_arm`，等指针进入网格那一帧再 `arm_tool`；timeline 直接把 `grab` 传 `None`，复用既有的 `INFINITY` 哨兵 + 首帧 latch。键盘路径和按钮路径共用同一个 `arm_tool` / `arm_modal`，不会各写一份。
+
+**门禁**：`cargo fmt --all`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` = **1322 通过 / 0 失败 / 11 ignored**。新增测试 14 条：I5 默认值 + 分数标签往返、I4 长度解析 + 自动回退、I2 `key_at` 几何 + 试听序列、I1 键条两八度 + 八度/移调边界、I6 `trim_head_start` 吸附/夹取 + 头裁保留跨界尾巴、I3 `mode_group` 互斥点击 + `arm_tool` 抓取点/空选区/`pending_arm`。

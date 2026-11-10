@@ -311,6 +311,19 @@ impl GlitcherZApp {
                     self.delete_cable(i);
                 }
                 patch::PatchAction::DeleteNode(doc_id) => {
+                    // I1: a held keyboard key must be released before its
+                    // node disappears, or the instrument rings forever.
+                    let held: Vec<u8> = self
+                        .patch_state
+                        .keyboard_held
+                        .iter()
+                        .filter(|(n, _)| *n == doc_id)
+                        .map(|(_, note)| *note)
+                        .collect();
+                    for note in held {
+                        self.patch_state.keyboard_held.remove(&(doc_id, note));
+                        self.send_keyboard_node_note(doc_id, note, false);
+                    }
                     self.delete_graph_node(doc_id);
                 }
                 patch::PatchAction::SelectTrack(track) => {
@@ -373,7 +386,89 @@ impl GlitcherZApp {
                 } => {
                     self.rename_mixer_channel(node, channel, name);
                 }
+                patch::PatchAction::KeyboardOctave { node, delta } => {
+                    let entry = self.patch_state.keyboard_octaves.entry(node).or_insert(4);
+                    *entry = (*entry + delta).clamp(0, 8);
+                }
+                patch::PatchAction::KeyboardTranspose { node, delta } => {
+                    self.transpose_keyboard_node(node, delta);
+                }
+                patch::PatchAction::KeyboardNote { node, note, on } => {
+                    self.send_keyboard_node_note(node, note, on);
+                }
             }
+        }
+    }
+
+    /// I1: transposes a virtual keyboard node's outgoing notes.
+    ///
+    /// The transpose is a document field (`NodeDoc::Keyboard::transpose`), so
+    /// it survives a reload; the engine has no counterpart to push — the
+    /// offset is applied as each note leaves the node.
+    pub(crate) fn transpose_keyboard_node(&mut self, node: u64, delta: i8) {
+        let current = match self
+            .project()
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.node_id() == node)
+        {
+            Some(NodeDoc::Keyboard { transpose, .. }) => *transpose,
+            _ => return,
+        };
+        let next = (i16::from(current) + i16::from(delta)).clamp(-24, 24) as i8;
+        if next == current {
+            return;
+        }
+        let before = self.begin_edit();
+        if let Some(NodeDoc::Keyboard { transpose, .. }) = self
+            .project_mut()
+            .graph
+            .nodes
+            .iter_mut()
+            .find(|n| n.node_id() == node)
+        {
+            *transpose = next;
+        }
+        self.commit_edit("Transpose Keyboard", before);
+    }
+
+    /// I1: auditions one key on a virtual keyboard node.
+    ///
+    /// Resolves **this** node's routes (track input first, else the directly
+    /// cabled instrument — the same helper the computer keyboard uses) and
+    /// applies the node's transpose. A preview: no document edit, no undo.
+    pub(crate) fn send_keyboard_node_note(&mut self, node: u64, note: u8, on: bool) {
+        let transpose = match self
+            .project()
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.node_id() == node)
+        {
+            Some(NodeDoc::Keyboard { transpose, .. }) => *transpose,
+            _ => return,
+        };
+        let Some(note) = shifted_note(note, transpose) else {
+            return;
+        };
+        let event = if on {
+            NoteEvent::On {
+                note,
+                velocity: 0.9,
+            }
+        } else {
+            NoteEvent::Off { note }
+        };
+        let (tracks, targets) = {
+            let doc = &self.project().graph;
+            keyboard_live_routes(doc, node)
+        };
+        for track in tracks {
+            self.engine.send(EngineCommand::Note { track, event });
+        }
+        for target in targets {
+            self.send_note_event_at(target, event);
         }
     }
 
@@ -634,6 +729,7 @@ impl GlitcherZApp {
                 node_id,
                 track,
                 source: MidiSource::Computer,
+                transpose: 0,
             },
             // R4: a live input node (no owning track: recording ownership is
             // the `Timeline In` cable).

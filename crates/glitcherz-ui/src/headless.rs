@@ -691,6 +691,9 @@ pub(crate) fn midi_clip_table(project: &Project, track: usize) -> MidiClipTable 
             start_ticks: clip.start_ticks,
             span_ticks: clip.span_ticks,
             loop_ticks: clip.loop_ticks,
+            // B2: mute travels with the clip; the engine skips it while
+            // keeping its span (the arrangement length does not move).
+            muted: clip.muted,
             ..RtMidiClip::default()
         };
         for note in clip.notes() {
@@ -739,6 +742,7 @@ pub(crate) fn control_clip_table(
             start_ticks: clip.start_ticks,
             span_ticks: clip.span_ticks,
             loop_ticks: clip.loop_ticks,
+            muted: clip.muted,
             curve,
         };
     }
@@ -764,6 +768,9 @@ pub(crate) fn audio_clip_table<M: Media>(
                     source_len: clip.source_len,
                     data,
                     gain: clip.gain,
+                    // B2: a muted clip keeps its slot (index correspondence
+                    // with the document's clip order) and loses only sound.
+                    muted: clip.muted,
                 });
             }
             Err(err) => {

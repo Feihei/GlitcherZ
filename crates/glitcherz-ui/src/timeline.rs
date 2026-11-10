@@ -7,11 +7,17 @@
 //! - drag its right edge → extend/trim the clip time; a single-period clip
 //!   grows its content with the container, a tiled clip keeps its repeat
 //!   count and scales the period;
+//! - drag its left edge (I6) → trim the head: the start moves right and the
+//!   content after the cut stays in place (a single-period MIDI/control clip
+//!   is really cut); a tiled clip only shortens its container;
 //! - Alt+T → tile the selection: drag to set the content period
 //!   (`loop_ticks`), bar-aligned; one drop = one undo step;
 //! - double-click an empty lane spot → insert a one-bar clip;
 //! - double-click a clip → jump to the Edit tab (piano roll / curve lane);
 //!   Alt+double-click renames it in place, `F2` renames the selected clip;
+//! - Ctrl+middle-click a clip toggles its temporary mute, `H` mutes the
+//!   selection and `Alt+H` reveals (unmutes) everything; a muted clip is
+//!   drawn faded and stays fully editable;
 //! - right-click a clip → delete;
 //! - header: click to select the track (mute lives on the mixer node);
 //! - ruler (U1): click/drag → seek; Ctrl+drag → set the song loop range;
@@ -207,6 +213,16 @@ impl RowKind {
     }
 }
 
+/// Which boundary of a clip follows the pointer during a resize drag (I6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeEdge {
+    /// Left boundary: trim the head. The content is re-based from the drag
+    /// origin so the material after the cut stays where it is.
+    Start,
+    /// Right boundary: extend / trim the tail (the pre-I6 behavior).
+    End,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Drag {
     Move {
@@ -217,10 +233,35 @@ enum Drag {
     Resize {
         row: RowKind,
         clip: usize,
+        edge: ResizeEdge,
         /// Snapshot at drag start so per-frame stretching scales from the
-        /// original period (not from the previous frame's result).
+        /// original placement (not from the previous frame's result).
+        origin_start: u32,
         origin_span: u32,
         origin_loop: u32,
+    },
+}
+
+/// Drag-origin snapshot of a head trim (I6).
+///
+/// `retain_from` rewrites the content, so a frame that started from the
+/// *live* clip would remove a little more material on every frame. The
+/// snapshot is taken by the first trim frame and dropped when the drag
+/// ends; each frame rebuilds the target from it.
+#[derive(Debug, Clone)]
+pub(crate) struct HeadTrim {
+    pub(crate) sel: ClipSel,
+    pub(crate) origin: HeadTrimOrigin,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum HeadTrimOrigin {
+    Midi(Box<MidiClip>),
+    Control(Box<ControlClip>),
+    /// Audio needs no content copy — the trim window is a pair of scalars,
+    /// and only the origin offset is read back.
+    Audio {
+        offset: f64,
     },
 }
 
@@ -317,6 +358,9 @@ pub struct TimelineState {
     /// it is set (otherwise the expanded selection would snap back every
     /// frame).
     break_group: bool,
+    /// Drag-origin snapshot of an in-flight head trim (I6). `None` between
+    /// gestures; the first trim frame fills it and `drag_stopped` drops it.
+    pub(crate) head_trim: Option<HeadTrim>,
 }
 
 impl Default for TimelineState {
@@ -344,6 +388,7 @@ impl Default for TimelineState {
             clip_rename: None,
             clip_rename_focus: false,
             break_group: false,
+            head_trim: None,
         }
     }
 }
@@ -432,6 +477,22 @@ pub enum TimelineAction {
         /// drag-start snapshot. `None` = keep the current loop (a move).
         loop_ticks: Option<u32>,
     },
+    /// One frame of a head trim (I6): the left edge follows the pointer and
+    /// the content is re-based from the drag-origin snapshot. The caller
+    /// merges the gesture into a single undo step.
+    TrimClipHead {
+        lane: TimelineLane,
+        track: usize,
+        clip: usize,
+        /// Absolute start after the trim (bar-snapped, ≥ 1 bar kept).
+        start_ticks: u32,
+        span_ticks: u32,
+        /// Ticks removed from the head since the drag started (`> 0`).
+        delta_ticks: u32,
+    },
+    /// End a head-trim gesture: drop the origin snapshot so the next trim
+    /// starts from the then-current clip.
+    EndClipTrim,
     /// Delete the clip at `clip`.
     RemoveClip {
         lane: TimelineLane,
@@ -535,6 +596,14 @@ pub enum TimelineAction {
     UngroupClips {
         clips: Vec<ClipSel>,
     },
+    /// B2: set the temporary mute flag of every listed clip (one undo step;
+    /// clips already in that state are skipped, so the action is idempotent).
+    /// `muted: false` clears it — the same action serves H (mute selection),
+    /// Alt+H (unmute the whole arrangement) and the Ctrl+middle-click toggle.
+    SetClipMuted {
+        clips: Vec<ClipSel>,
+        muted: bool,
+    },
     OpenMidiEditor {
         track: usize,
         clip: usize,
@@ -630,6 +699,9 @@ pub(crate) trait Placement {
     /// Optional clip-group id (W3b). Ungrouped clips return `None`.
     fn group(&self) -> Option<u32>;
     fn set_group(&mut self, group: Option<u32>);
+    /// Temporary mute (B2): the clip keeps everything, playback skips it.
+    fn muted(&self) -> bool;
+    fn set_muted(&mut self, muted: bool);
 }
 
 /// W2: the loop length after a span edit that does NOT explicitly ask for a
@@ -729,6 +801,12 @@ impl Placement for MidiClip {
     fn set_group(&mut self, group: Option<u32>) {
         self.group = group;
     }
+    fn muted(&self) -> bool {
+        self.muted
+    }
+    fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+    }
 }
 
 impl Placement for ControlClip {
@@ -772,6 +850,12 @@ impl Placement for ControlClip {
     }
     fn set_group(&mut self, group: Option<u32>) {
         self.group = group;
+    }
+    fn muted(&self) -> bool {
+        self.muted
+    }
+    fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
     }
 }
 
@@ -819,6 +903,12 @@ impl Placement for AudioClip {
     }
     fn set_group(&mut self, group: Option<u32>) {
         self.group = group;
+    }
+    fn muted(&self) -> bool {
+        self.muted
+    }
+    fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
     }
 }
 
@@ -1314,7 +1404,9 @@ pub fn show(
     // bar, so even a single-bar clip halves into two repeats.
     if state.modal.is_none() && !state.knife_armed && take_tile_shortcut(ui.ctx()) {
         state.knife_armed = false;
-        arm_modal(state, ui.ctx(), Arm::Tile);
+        // Tile latches its grab on the first real pointer (the shortcut may
+        // arrive while Alt has dropped the cursor on Windows).
+        arm_modal(state, Arm::Tile, ui.ctx().pointer_hover_pos());
     }
     // Ctrl+A / Ctrl+Shift+A (W3c): select every clip in the arrangement, or
     // drop the selection. A view-level command like the tile shortcut — the
@@ -1346,6 +1438,53 @@ pub fn show(
                 state.set_status("Select all: the arrangement is empty");
             } else {
                 state.set_status(format!("{count} clips selected"));
+            }
+        }
+    }
+    // B2: H mutes the selected clips, Alt+H reveals (unmutes) everything in
+    // the arrangement — Blender's hide / reveal-all, mapped onto clip mute.
+    // View-level like Ctrl+A: the selection is cross-lane by definition.
+    // Gated on the lane owning the keyboard because plain `H` is also a
+    // virtual-piano key (FL layout), exactly like G / T / K.
+    if state.modal.is_none()
+        && !ui.ctx().text_edit_focused()
+        && state.owns_keyboard_focus(ui.ctx())
+        && let Some(mute_all) = take_mute_shortcut(ui.ctx())
+    {
+        state.knife_armed = false;
+        if mute_all {
+            let targets: Vec<ClipSel> = all_clips(midi_tracks, control_tracks, audio_tracks)
+                .into_iter()
+                .filter(|sel| clip_is_muted(sel, midi_tracks, control_tracks, audio_tracks))
+                .collect();
+            if targets.is_empty() {
+                state.set_status("Alt+H: no muted clips");
+            } else {
+                let count = targets.len();
+                actions.push(TimelineAction::SetClipMuted {
+                    clips: targets,
+                    muted: false,
+                });
+                state.set_status(format!("{count} clips unmuted"));
+            }
+        } else if state.selection.is_empty() {
+            state.set_status("H mutes the selection \u{2014} nothing selected");
+        } else {
+            let targets: Vec<ClipSel> = state
+                .selection
+                .iter()
+                .copied()
+                .filter(|sel| !clip_is_muted(sel, midi_tracks, control_tracks, audio_tracks))
+                .collect();
+            if targets.is_empty() {
+                state.set_status("H: the selection is already muted (Alt+H reveals all)");
+            } else {
+                let count = targets.len();
+                actions.push(TimelineAction::SetClipMuted {
+                    clips: targets,
+                    muted: true,
+                });
+                state.set_status(format!("{count} clips muted"));
             }
         }
     }
@@ -1420,8 +1559,11 @@ pub fn show(
             ui.ctx().request_repaint();
         }
         // Middle-drag pans the viewport (the ScrollArea's drag-to-scroll is
-        // touch-only by default).
+        // touch-only by default). Ctrl+middle is the clip-mute toggle (B2),
+        // so the pan stays out of its way — otherwise the click that should
+        // toggle would also nudge the view.
         if in_rows
+            && !ctrl
             && ui
                 .ctx()
                 .input(|i| i.pointer.button_down(egui::PointerButton::Middle))
@@ -1500,6 +1642,64 @@ pub fn show(
                 .clicked()
             {
                 actions.push(TimelineAction::RemoveLastAudioTrack);
+            }
+            ui.separator();
+            // I3: the one-shot tools, next to the track add/remove pair. The
+            // timeline has no persistent mode (I-D5 — creating a clip here is
+            // a double-click), so this row is all *actions*: they arm, never
+            // latch, and an armed one is outlined. Arming from a button passes
+            // a deferred grab point (see `arm_modal`), so the clips do not
+            // jump when the pointer reaches the lanes.
+            let armed = |state: &TimelineState| match state.modal.as_ref().map(|m| m.kind) {
+                Some(ModalKind::Grab { .. }) => Some(Arm::Grab),
+                Some(ModalKind::Stretch { .. }) => Some(Arm::Stretch),
+                Some(ModalKind::Tile) => Some(Arm::Tile),
+                _ => None,
+            };
+            for (label, shortcut, arm, hint) in [
+                (
+                    "Grab",
+                    "g",
+                    Arm::Grab,
+                    "the clips follow the pointer · LMB drops · RMB / Esc cancels",
+                ),
+                (
+                    "Stretch",
+                    "t",
+                    Arm::Stretch,
+                    "pull the selection's end · s flips to the start · LMB drops",
+                ),
+                (
+                    "Tile",
+                    "Shift+T",
+                    Arm::Tile,
+                    "repeat the clip by dragging right · LMB drops · Esc cancels",
+                ),
+            ] {
+                let is_armed = armed(state) == Some(arm);
+                if crate::toolbar::action_button(ui, label, shortcut, is_armed, hint).clicked() {
+                    if is_armed {
+                        // A second click on an armed tool cancels it.
+                        state.modal = None;
+                    } else {
+                        state.knife_armed = false;
+                        arm_modal(state, arm, None);
+                    }
+                }
+            }
+            // The knife is not a modal: it arms a stroke, so it owns no grab
+            // point and no ghost — only the `armed` flag.
+            if crate::toolbar::action_button(
+                ui,
+                "Knife",
+                "k",
+                state.knife_armed,
+                "one click cuts the clip under the pointer at the bar line · Esc cancels",
+            )
+            .clicked()
+            {
+                state.knife_armed = !state.knife_armed;
+                state.modal = None;
             }
             ui.separator();
             // Every variable hint must live INSIDE this child ui. Drawn in
@@ -1599,7 +1799,7 @@ pub fn show(
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(
-                        "Drag move · edge resize (T: extend time) · Shift+T / Alt+T: tile · dbl-click edit · F2 / Alt+dbl-click: rename · Ctrl+G group · Ctrl+Shift+G ungroup · Alt+click: single · right-click delete · marquee select · Del · K knife · dots: reorder track · ruler: seek / Ctrl+loop / RMB marker · Ctrl+wheel zoom · Ctrl+Alt+wheel height · MMB pan",
+                        "Drag move · either edge: trim (head included) · T: extend time · Shift+T / Alt+T: tile · dbl-click edit · F2 / Alt+dbl-click: rename · Ctrl+G group · Ctrl+Shift+G ungroup · Alt+click: single · right-click delete · Ctrl+MMB mute clip · H mute / Alt+H unmute all · marquee select · Del · K knife · dots: reorder track · ruler: seek / Ctrl+loop / RMB marker · Ctrl+wheel zoom · Ctrl+Alt+wheel height · MMB pan",
                     )
                     .weak(),
                 )
@@ -2797,6 +2997,10 @@ fn lane_row<T: Placement>(
             track,
             clip: index,
         });
+        // B2: a muted clip is drawn faded (a lane-coloured veil over the
+        // whole block, see below). Its geometry, tiling and content preview
+        // all stay in place, so "muted" never reads as "moved" or "deleted".
+        let muted = clip.muted();
         let fill = if selected && state.modal.is_some() {
             Color32::from_rgba_unmultiplied(
                 colors.clip_fill.r(),
@@ -2851,6 +3055,22 @@ fn lane_row<T: Placement>(
                     color,
                 );
             }
+        }
+        // B2: the mute veil. Drawn over everything the block has produced
+        // (seams, waveform, curve preview, group stripe) so the clip reads
+        // as "parked" at a glance without any of its content disappearing;
+        // the selection / edit strokes come after and stay full strength.
+        if muted {
+            painter.rect_filled(
+                rect,
+                3.0,
+                Color32::from_rgba_unmultiplied(
+                    colors.lane_bg.r(),
+                    colors.lane_bg.g(),
+                    colors.lane_bg.b(),
+                    165,
+                ),
+            );
         }
         if state.selection.contains(&ClipSel {
             lane: lane_kind,
@@ -2929,13 +3149,29 @@ fn lane_row<T: Placement>(
         if repeats > 1 {
             label = format!("{label} ×{repeats}");
         }
+        let text_color = if muted {
+            colors.clip_text.gamma_multiply(0.5)
+        } else {
+            colors.clip_text
+        };
         painter.text(
             pos2(rect.left() + 4.0, rect.center().y),
             Align2::LEFT_CENTER,
             label,
             FontId::proportional(10.0),
-            colors.clip_text,
+            text_color,
         );
+        // B2: a small `M` badge in the top-right corner — fading alone is
+        // easy to mistake for a dim theme, and narrow clips lose the label.
+        if muted && rect.width() > 18.0 {
+            painter.text(
+                pos2(rect.right() - 4.0, rect.top() + 1.0),
+                Align2::RIGHT_TOP,
+                "M",
+                FontId::proportional(9.0),
+                Color32::from_rgb(210, 160, 90),
+            );
+        }
     }
 
     // Drop a rename editor whose clip disappeared (deleted, or the track's
@@ -3015,6 +3251,26 @@ fn lane_row<T: Placement>(
                 Stroke::new(1.5, Color32::from_rgb(240, 190, 80)),
             );
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+    }
+
+    // I6: show the resize cursor over either edge so the head handle is
+    // discoverable (before I6 the left edge read as "move").
+    if state.drag.is_none()
+        && state.modal.is_none()
+        && !state.knife_armed
+        && response.hovered()
+        && let Some(pos) = response.hover_pos()
+        && let Some(index) = hit_clip(clips, tick_at(pos.x), sec_per_tick)
+    {
+        let start_x = lane.left() + clips[index].start() as f32 * px_per_tick;
+        let end_x = lane.left()
+            + (clips[index].start() + clips[index].span(sec_per_tick)) as f32 * px_per_tick;
+        let wide_enough = end_x - start_x >= 3.0 * EDGE_GRAB;
+        if (wide_enough && (pos.x - start_x).abs() <= EDGE_GRAB)
+            || (pos.x - end_x).abs() <= EDGE_GRAB
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
     }
 
@@ -3121,17 +3377,38 @@ fn lane_row<T: Placement>(
                 } else if !state.selection.contains(&sel) {
                     state.selection = vec![sel];
                 }
-                let edge_x = lane.left()
-                    + (clips[index].start() + clips[index].span(sec_per_tick)) as f32 * px_per_tick;
-                if (pos.x - edge_x).abs() <= EDGE_GRAB {
+                let origin_start = clips[index].start();
+                let origin_span = clips[index].span(sec_per_tick);
+                let origin_loop = clips[index].loop_len(sec_per_tick);
+                let start_x = lane.left() + origin_start as f32 * px_per_tick;
+                let end_x = lane.left() + (origin_start + origin_span) as f32 * px_per_tick;
+                // I6: both edges resize. The left edge is only a handle when
+                // the clip is wide enough to keep a body to grab for a move
+                // (a narrow clip would otherwise be impossible to move).
+                let wide_enough = end_x - start_x >= 3.0 * EDGE_GRAB;
+                let edge = if wide_enough && (pos.x - start_x).abs() <= EDGE_GRAB {
+                    Some(ResizeEdge::Start)
+                } else if (pos.x - end_x).abs() <= EDGE_GRAB {
+                    Some(ResizeEdge::End)
+                } else {
+                    None
+                };
+                if let Some(edge) = edge {
+                    if origin_loop < origin_span {
+                        state.set_status(
+                            "tiled clip: the head trim shortens the container, the repeats keep their phase",
+                        );
+                    }
                     state.drag = Some(Drag::Resize {
                         row,
                         clip: index,
-                        origin_span: clips[index].span(sec_per_tick),
-                        origin_loop: clips[index].loop_len(sec_per_tick),
+                        edge,
+                        origin_start,
+                        origin_span,
+                        origin_loop,
                     });
                 } else {
-                    let grab = tick - clips[index].start() as f32;
+                    let grab = tick - origin_start as f32;
                     state.drag = Some(Drag::Move {
                         row,
                         clip: index,
@@ -3178,36 +3455,65 @@ fn lane_row<T: Placement>(
                     }
                     Some(Drag::Resize {
                         clip,
+                        edge,
+                        origin_start,
                         origin_span,
                         origin_loop,
                         ..
-                    }) if clip < clips.len() => {
-                        let start = clips[clip].start();
-                        let limit = ARRANGEMENT_LIMIT_TICKS - start;
-                        let edge = snap_bar(tick_at(pos.x) - start as f32, bar_ticks)
-                            .clamp(bar_ticks, limit.max(bar_ticks));
-                        // 2026-11-04: the plain right edge extends/trims the
-                        // clip time. A single-period clip grows its content
-                        // with the container; a tiled clip keeps its repeat
-                        // count and scales its period. The origin snapshot
-                        // avoids drift across the per-frame updates.
-                        let span = edge;
-                        let loop_ticks = Some(resolve_stretch_loop(origin_loop, origin_span, span));
-                        let loop_changed =
-                            loop_ticks.is_some_and(|l| l != clips[clip].loop_len(sec_per_tick));
-                        if clips[clip].span(sec_per_tick) != span || loop_changed {
-                            let lane = row.lane();
-                            let track = row.track();
-                            actions.push(TimelineAction::MoveResizeClip {
-                                lane,
-                                track,
-                                clip,
-                                start_ticks: start,
-                                span_ticks: span,
-                                loop_ticks,
-                            });
+                    }) if clip < clips.len() => match edge {
+                        ResizeEdge::Start => {
+                            // I6: the left edge trims the head — the start
+                            // moves right, the span shrinks, and the content
+                            // is re-based from the snapshot. Bar-snapped and
+                            // never closer than one bar to the tail.
+                            let new_start = trim_head_start(
+                                tick_at(pos.x),
+                                origin_start,
+                                origin_span,
+                                bar_ticks,
+                            );
+                            let delta = new_start - origin_start;
+                            if delta > 0 {
+                                actions.push(TimelineAction::TrimClipHead {
+                                    lane: row.lane(),
+                                    track: row.track(),
+                                    clip,
+                                    start_ticks: new_start,
+                                    span_ticks: origin_span - delta,
+                                    delta_ticks: delta,
+                                });
+                            }
                         }
-                    }
+                        ResizeEdge::End => {
+                            let start = clips[clip].start();
+                            let limit = ARRANGEMENT_LIMIT_TICKS - start;
+                            let edge = snap_bar(tick_at(pos.x) - start as f32, bar_ticks)
+                                .clamp(bar_ticks, limit.max(bar_ticks));
+                            // 2026-11-04: the plain right edge extends/trims
+                            // the clip time. A single-period clip grows its
+                            // content with the container; a tiled clip keeps
+                            // its repeat count and scales its period. The
+                            // origin snapshot avoids drift across the
+                            // per-frame updates.
+                            let span = edge;
+                            let loop_ticks =
+                                Some(resolve_stretch_loop(origin_loop, origin_span, span));
+                            let loop_changed =
+                                loop_ticks.is_some_and(|l| l != clips[clip].loop_len(sec_per_tick));
+                            if clips[clip].span(sec_per_tick) != span || loop_changed {
+                                let lane = row.lane();
+                                let track = row.track();
+                                actions.push(TimelineAction::MoveResizeClip {
+                                    lane,
+                                    track,
+                                    clip,
+                                    start_ticks: start,
+                                    span_ticks: span,
+                                    loop_ticks,
+                                });
+                            }
+                        }
+                    },
                     _ => {}
                 }
             }
@@ -3216,6 +3522,9 @@ fn lane_row<T: Placement>(
 
     if response.drag_stopped_by(egui::PointerButton::Primary) {
         state.drag = None;
+        if state.head_trim.take().is_some() {
+            actions.push(TimelineAction::EndClipTrim);
+        }
         if state.marquee.is_some() {
             state.marquee_ending = true;
         }
@@ -3299,6 +3608,29 @@ fn lane_row<T: Placement>(
         }
     }
 
+    // B2: Ctrl + middle click toggles the mute flag of the clip under the
+    // pointer (the single-clip counterpart of H, which acts on the
+    // selection). Middle is otherwise the pan button, so `show()` skips
+    // panning exactly while Ctrl is held; a plain middle click still pans and
+    // never toggles.
+    if response.clicked_by(egui::PointerButton::Middle)
+        && state.modal.is_none()
+        && ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.command)
+        && let Some(pos) = response.interact_pointer_pos()
+        && let Some(index) = hit_clip(clips, tick_at(pos.x), sec_per_tick)
+    {
+        let muted = !clips[index].muted();
+        actions.push(TimelineAction::SetClipMuted {
+            clips: vec![ClipSel {
+                lane: lane_kind,
+                track,
+                clip: index,
+            }],
+            muted,
+        });
+        state.set_status(if muted { "clip muted" } else { "clip unmuted" });
+    }
+
     // Right-click: cancel a live band, disarm the knife, otherwise
     // delete the clip under the pointer.
     if response.secondary_clicked() && state.modal.is_none() {
@@ -3313,6 +3645,9 @@ fn lane_row<T: Placement>(
                         clip: index,
                     });
                     state.drag = None;
+                    if state.head_trim.take().is_some() {
+                        actions.push(TimelineAction::EndClipTrim);
+                    }
                 }
             }
         }
@@ -3470,7 +3805,17 @@ fn lane_row<T: Placement>(
             } else {
                 Arm::Stretch
             };
-            arm_modal(state, ui.ctx(), arm);
+            // Holding Alt can drop the egui cursor on Windows (CursorLeft →
+            // PointerGone), so a missing pointer is VISIBLE rather than a
+            // silent no-op — it used to fail silently here. Tile is the one
+            // arm that proceeds without it: it latches its grab on the first
+            // valid pointer instead (the toolbar arms the same way, I3).
+            let ptr = ui.ctx().pointer_hover_pos();
+            if ptr.is_none() && !matches!(arm, Arm::Tile) {
+                state.set_status("move the pointer over the timeline first");
+            } else {
+                arm_modal(state, arm, ptr);
+            }
         }
         if escape {
             if state.modal.is_some() {
@@ -3531,7 +3876,79 @@ fn take_tile_shortcut(ctx: &egui::Context) -> bool {
     })
 }
 
+/// Consumes the clip-mute shortcut (B2) and classifies it.
+///
+/// `Some(true)` = Alt+H (reveal / unmute everything), `Some(false)` = plain
+/// H (mute the selection), `None` = not pressed. Like the tile shortcut it
+/// reads the event's modifier snapshot AND the currently held state: winit
+/// can deliver modifiers one frame late, and `consume_key` would only see
+/// the snapshot. Ctrl+H is deliberately left alone (not ours to eat).
+fn take_mute_shortcut(ctx: &egui::Context) -> Option<bool> {
+    ctx.input_mut(|i| {
+        let alt_held = i.modifiers.alt;
+        let ctrl_held = i.modifiers.ctrl || i.modifiers.command;
+        let mut plain = false;
+        let mut with_alt = false;
+        i.events.retain(|event| {
+            let egui::Event::Key {
+                key,
+                physical_key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            if *key != Key::H && physical_key.as_ref() != Some(&Key::H) {
+                return true;
+            }
+            if modifiers.alt || alt_held {
+                with_alt = true;
+            } else if modifiers.ctrl || modifiers.command || ctrl_held {
+                return true;
+            } else {
+                plain = true;
+            }
+            false
+        });
+        if with_alt {
+            Some(true)
+        } else if plain {
+            Some(false)
+        } else {
+            None
+        }
+    })
+}
+
+/// B2: one clip's mute flag, resolved across the three track tables (the
+/// reveal-all / mute-selection shortcuts only act on clips whose state would
+/// actually change).
+fn clip_is_muted(
+    sel: &ClipSel,
+    midi: &[MidiTrack],
+    control: &[ControlTrack],
+    audio: &[AudioTrack],
+) -> bool {
+    match sel.lane {
+        TimelineLane::Midi => midi
+            .get(sel.track)
+            .and_then(|track| track.clips.get(sel.clip))
+            .is_some_and(Placement::muted),
+        TimelineLane::Control => control
+            .get(sel.track)
+            .and_then(|track| track.clips.get(sel.clip))
+            .is_some_and(Placement::muted),
+        TimelineLane::Audio => audio
+            .get(sel.track)
+            .and_then(|track| track.clips.get(sel.clip))
+            .is_some_and(Placement::muted),
+    }
+}
+
 /// Which modal G / Shift+D / T / Alt+T arms (M4b.3/4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arm {
     Grab,
     Duplicate,
@@ -3551,7 +3968,13 @@ fn axis_hint(locked: Option<Axis>) -> &'static str {
 /// Arms a modal from the current selection. G and Shift+D require a
 /// single track kind (cross-kind moves are meaningless); all need a
 /// non-empty selection and a pointer position to grab from.
-fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
+///
+/// `grab` is the pointer the transform measures from. `None` means **defer**:
+/// the modal latches its grab on the first frame the pointer is over a lane.
+/// That is what the toolbar (I3) passes — a click there lands on a button, and
+/// measuring from the button's position would shove the selection sideways as
+/// soon as the pointer reaches the lanes.
+fn arm_modal(state: &mut TimelineState, arm: Arm, grab: Option<Pos2>) {
     if state.selection.is_empty() {
         state.set_status("nothing selected \u{2014} G / Shift+D / T need a selection");
         return;
@@ -3559,15 +3982,6 @@ fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
     // U11: the modal family is three-table now — audio clips arm G / T /
     // Shift+D just like MIDI/control (the geometry layer derives audio spans
     // from the seconds window at the base tempo).
-    // Holding Alt can drop the egui cursor on Windows (CursorLeft →
-    // PointerGone), so a missing pointer must be VISIBLE — it used to fail
-    // silently here. Tile is the one arm that can proceed without it: it
-    // latches its grab on the first valid pointer instead.
-    let ptr = ctx.pointer_hover_pos();
-    if ptr.is_none() && !matches!(arm, Arm::Tile) {
-        state.set_status("move the pointer over the timeline first");
-        return;
-    }
     let kind = match arm {
         Arm::Grab => ModalKind::Grab { locked: None },
         Arm::Duplicate => ModalKind::Duplicate { locked: None },
@@ -3587,9 +4001,9 @@ fn arm_modal(state: &mut TimelineState, ctx: &egui::Context, arm: Arm) {
     state.modal = Some(Modal {
         kind,
         origin: state.selection.clone(),
-        // Tile arms without a pointer on purpose; the sentinel is latched to
-        // the first real pointer position while the modal runs.
-        grab: ptr.unwrap_or(pos2(f32::INFINITY, f32::INFINITY)),
+        // A deferred grab is the sentinel the latch looks for (see the modal
+        // block in `show`): the first real hover replaces it.
+        grab: grab.unwrap_or(pos2(f32::INFINITY, f32::INFINITY)),
     });
 }
 
@@ -3622,6 +4036,25 @@ fn knife_target<T: Placement>(
 fn snap_bar(ticks: f32, bar_ticks: u32) -> u32 {
     let bar = bar_ticks.max(1) as f32;
     ((ticks / bar).round().max(0.0) as u32) * bar_ticks.max(1)
+}
+
+/// I6: the bar-snapped start of a head trim.
+///
+/// Clamped to `[origin_start, origin_start + origin_span - 1 bar]`: the
+/// drag never extends the clip leftwards (MIDI/control carry no content
+/// offset to fill the gap) and never closes it past one bar.
+pub(crate) fn trim_head_start(
+    pointer_tick: f32,
+    origin_start: u32,
+    origin_span: u32,
+    bar_ticks: u32,
+) -> u32 {
+    let bar = bar_ticks.max(1);
+    let max_start = origin_start
+        .saturating_add(origin_span)
+        .saturating_sub(bar)
+        .max(origin_start);
+    snap_bar(pointer_tick, bar).clamp(origin_start, max_start)
 }
 
 /// The insertion row a track-reorder drag points at, plus the screen y the
@@ -3819,6 +4252,63 @@ mod tests {
     /// Seconds per tick at 120 BPM / 960 PPQ — the base-tempo conversion the
     /// placement helpers take (U11 D3); MIDI/control clips ignore it.
     const SPT: f64 = 60.0 / (120.0 * 960.0);
+
+    /// I6: the head-trim start is bar-snapped, never moves left of the drag
+    /// origin (no leftwards extension without a content offset), and always
+    /// leaves at least one bar of clip.
+    #[test]
+    fn head_trim_start_is_snapped_and_clamped() {
+        let bar = TICKS_PER_BAR;
+        let start = 2 * bar;
+        let span = 4 * bar;
+        // Pointer left of the origin: refused.
+        assert_eq!(trim_head_start(0.0, start, span, bar), start);
+        // Inside the clip: follows the bar grid.
+        assert_eq!(
+            trim_head_start((3 * bar) as f32 + 20.0, start, span, bar),
+            3 * bar
+        );
+        // Past the tail: the tail keeps one bar.
+        assert_eq!(
+            trim_head_start((99 * bar) as f32, start, span, bar),
+            start + span - bar
+        );
+    }
+
+    /// I6: a single-period clip's head cut removes the material before the
+    /// new start, and a note crossing the cut keeps its tail (this is the
+    /// `retain_from` contract the trim relies on).
+    #[test]
+    fn head_trim_cuts_midi_content_without_losing_the_crossing_tail() {
+        let mut clip = MidiClip {
+            start_ticks: 0,
+            span_ticks: 2 * TICKS_PER_BAR,
+            loop_ticks: 2 * TICKS_PER_BAR,
+            ..MidiClip::default()
+        };
+        clip.sequence.notes = vec![
+            Note {
+                start: 0,
+                length: 480,
+                note: 60,
+                velocity: 100,
+                channel: 0,
+            },
+            Note {
+                start: 960,
+                length: 960,
+                note: 64,
+                velocity: 100,
+                channel: 0,
+            },
+        ];
+        let delta = 1200;
+        clip.retain_from(delta, SPT);
+        assert_eq!(clip.sequence.notes.len(), 1);
+        assert_eq!(clip.sequence.notes[0].note, 64);
+        assert_eq!(clip.sequence.notes[0].start, 0);
+        assert_eq!(clip.sequence.notes[0].end(), 1920 - i64::from(delta));
+    }
 
     /// W3a: clip names are optional and the `Placement` helpers are the
     /// single read/write path the timeline uses for all three clip kinds.

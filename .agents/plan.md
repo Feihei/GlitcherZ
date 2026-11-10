@@ -889,6 +889,68 @@ sidechain off 的侧链压缩器与普通压缩器逐样本一致（Z1-D2 本就
 - 安全边界还可以往前走一步：现在只管客户端给的路径，工程内部引用的媒体 / SF2 路径是照单全收（等同于在窗口里打开一个不信任的工程）。要做就得先有「工程信任模型」。
 
 
+## 片段临时静音（B2，2026-11-10 交付）
+
+用户一句话需求：**timeline 上给 clip 加临时 mute**——`Ctrl` + 中键切换、mute 后淡显，外加 Blender 的 `H` 隐藏 / `Alt+H` 显示映射到静音切换。
+
+| 项 | 结果 |
+| :--- | :--- |
+| 落地 | model 三个 clip 结构各加 `muted: bool`（additive serde，`PROJECT_VERSION` 不动）；engine 三个 RT 结构同步带标志位，判定集中在 `schedule_track_clips` / `value_at_absolute` / `AudioTrackProcessor::process`；UI 侧 `Placement::muted/set_muted` + `TimelineAction::SetClipMuted` + `timeline_set_clip_muted`（一步 undo，只重推被触及的轨道） |
+| 键位 | `Ctrl`+中键单击 = 切换单个（裸中键仍是平移，平移只在无 Ctrl 时生效）；`H` = 静音选区；`Alt+H` = 恢复全编曲（Blender hide / reveal-all）。`H` 与 G/T/K 一样**焦点门控**（它同时是虚拟钢琴键位） |
+| 视觉 | 整块压一层 lane 底色遮罩（波形/曲线/缝线一并淡显）+ 右上角 `M` 角标 + 标签降透明；选中 / 编辑描边保持全强度 |
+| 语义关键点 | 非破坏性：位置、长度、内容不动；**span 仍计入 arrangement 末尾**（静音不得让曲子变短）；control clip 静音 = 不投递（目标保持最后值）；轨道静音仍归 Mixer 通道条 |
+| 验收 | 6 条新测试（2 条 UI 集成 + 3 条引擎 + 1 条 model）；全量 **1 309 项通过 / 0 失败**；`fmt` / `clippy --workspace --all-targets -D warnings` / `test --workspace` 全绿 |
+| 文档同步 | `spec/timeline.md` D31、`implementation.md` B2 小节、`glossary.md`（clip mute / reveal）、`docs/manual.md`、`docs/shortcuts.md`、`timeline.rs` 模块注释 |
+
+## 交互打磨（I 系列 I1–I6，2026-11-10 立项，已交付）
+
+用户一句话需求：vk 节点可弹、卷帘键盘与音符试听、视图工具栏、draw 默认音符长度、strum 不起作用。五项都是 UI / 交互层，**不碰实时线程、不动 DSP、不改 `NodeDoc` 之外的引擎协议**——这是本系列能一次收干净的前提。
+
+### 现状评估（已核对代码，不是猜测）
+
+| 项 | 现状（位置） | 差距 | 体量 | 风险 |
+| :--- | :--- | :--- | :--- | :--- |
+| **I1** vk 节点可交互 | `NodeDoc::Keyboard` 只有 `source`；`KEYBOARD_SIZE = 150×56`（`patch.rs:1470`）是个纯标题盒；事件源只有全局电脑键盘（`keyboard.rs`，Z/X 改 `octave_base`） | 节点内没有键条、没有命中、没有八度/移调；点了等于拖节点 | 中（`patch.rs` 绘制 + 命中 + `PatchAction` + `patch_ops` 路由，~400 行） | 键条命中必须压过画布拖拽（`allocate_rect` 后置已有先例：inline slider / input chip）；挂音释放 |
+| **I2** 卷帘键列 / 音符试听 | 左键列纯 painted（`piano_roll.rs:1709–1750`）；`RollIntent` 没有 preview 变体；`held_notes` 只服务电脑键盘 | 点击无声、无按下态 | 中（新增 `RollIntent::PreviewNote` + editing 顶层分流 + 键列命中 + 按下态绘制，~250 行） | preview **绝不能进 undo**；松手事件丢失要兜底 Off；录音 armed 时会被 capture |
+| **I3** 视图工具栏 | 卷帘只是一行文字 chip（`piano_roll.rs:1305–1417`，模式靠 `RollMode{Select,Draw}`、G/S/T/K 靠键盘）；timeline **没有工具栏**，只有 G / T / Shift+T / K 快捷键（`timeline.rs:3470–3630`） | 没有可点的工具按钮，也没有 hover 提示 | 中（统一按钮组件 + 两个视图重排，~350 行；**无新增文档语义**） | 按钮必须分「模式 / 动作」两组，视觉上不能混（见 I-D2） |
+| **I4** draw 默认长度 | 单击建音符 `length: DEFAULT_NOTE_LENGTH`（=240，1/16，`piano_roll.rs:114/2225/2434`）；拖拽才改长度 | 没有长度下拉、不记忆上一次长度 | 小（`DrawLength` + 下拉 + `AddNote` 取值，~150 行） | 长度与网格解耦（grid 只管吸附位置），别顺手对齐 |
+| **I5** strum 不起作用 | **根因已定位**：`StrumOptions::default()` 全 0（`model/ops.rs:445`），而 `strum()` 在 spread/window 全 0 时是**恒等变换**（有测试 `strum_with_zero_spread_is_the_identity` 锁着）。UI 面板用 default 打开，按 Apply 什么都没发生还静默关闭 | 命令层没问题（`midi.strum` 5 条测试全绿），**是 UI 默认值的锅** | 极小（默认值 + 空操作提示 + 单位文案，~80 行） | 模型语义不要动（default = identity 是契约），默认值放 UI 侧 |
+| **I6** timeline 首尾裁剪 | 只有**右边缘**有命中（`EDGE_GRAB = 6 px`，`timeline.rs:3244` 判 `Drag::Resize`）；左边缘点下去等于**移动 clip**。ops 层其实已经写好头裁：`timeline_move_resize_clip` 的音频分支在 start 变化时推进 `source_offset`（`timeline_ops.rs:610–616`），MIDI/control 走 `resolve_loop` | clip 头部裁不了 | 中（`Drag::Resize` 加 edge + 起点快照、命中、hover cursor、单周期 clip 走 `retain_from`，~250 行） | 每帧必须从**拖拽起点快照**重算，否则 `retain_from` 会累积吞掉音符；tiled clip 的头裁只能是容器截断 |
+
+### 决策（2026-11-10 已拍板）
+
+| ID | 问题 | 选项 | 结论 |
+| :--- | :--- | :--- | :--- |
+| I-D1 | vk 节点的**八度**与**移调**存哪 | A. 都是视图态（`PatchState`，会话内）<br>B. 八度 = 视图态、移调 = `NodeDoc::Keyboard` 字段（serde default，`PROJECT_VERSION` 不动）<br>C. 两者都进文档 | **B**：八度是 viewport 属性（还有多个 keyboard 节点，全局 Z/X 已占「演奏八度」）；移调是音乐属性，存盘后应当还在，且只影响该节点发出的事件 |
+| I-D2 | 工具栏按钮怎么分组 | A. 一排平铺，全部画成「按下态」<br>B. **两组**：模式组（互斥、持久、有 pressed 态）+ 动作组（一次性，点一下触发一次，不保持） | **B**（用户 2026-11-10 指定）。卷帘模式组 = `[Select][Draw]`（唯一的持久态，`d` 切换、Esc 退出）；`Tweak / Grab / Scale / Stretch / Knife` 全部是**一次性动作**，点按钮 == 按一次对应快捷键，触发后按钮**不保持高亮**（Knife 保持到单击一次，沿用现有 `knife_armed` 语义，视觉上用「armed」描边而非「pressed」填充）。timeline 没有持久模式（Grab 是默认态），工具栏只有动作组 |
+| I-D3 | 试听是否受录音影响 | A. 照常走 `EngineCommand::Note{track}`（录音 armed 时会被 capture 录进去）<br>B. 试听打标记，录音期间屏蔽 | **A**（v1）：路径与「键盘弹奏」完全一致，用户按下时听到的就是会录下的；B 需要给 `EngineCommand` 加字段，收益不足以覆盖风险 |
+| I-D4 | timeline 要不要独立的 `Scale` | A. 不补，`T`（Stretch）就是时间缩放，按钮写 `Stretch (T)`<br>B. 补一个真正等比缩放 clip 内容的模态 | **A**（v1）：timeline 已经有 G / T / ⇧T / K 四个模态，再加 Scale 会把按键表挤爆 |
+| I-D5 | timeline 要不要 `Draw` 工具 | A. 补 Draw：空 lane 拖拽建 clip<br>B. 不补，timeline 本来就没有 draw 模式 | **B**（用户 2026-11-10 指定）。timeline 的「创建」语义已经由**双击**承担（MIDI/control 建空 clip、audio 导文件），再塞一个 Draw 会和双击、和 G 的拖拽选区分混。I3 不再引入 `TimelineState.mode`，也不动 `TimelineAction::AddClip` |
+| I-D6 | strum 参数用什么单位 | A. 保持 tick（现状）<br>B. 换成音符分数（1/32、1/16…）+ 悬停显示 `@BPM` 毫秒数 | **B**：用户对「120 t」没有直觉，这正是「用了没反应」的次因 |
+| I-D7 | timeline 头裁的内容语义 | A. 容器截断（start/span 变，内容相对起点不动 → 实际裁掉的是**尾部**）<br>B. 真头裁（`retain_from`：内容前移、裁掉开头，跨界音符保留尾巴） | **B**（用户要的是「裁剪 clip 头部」，A 的行为会被一眼看穿是错的）。单周期 clip（`loop == span`）走 B；tiled clip（`loop < span`）只能走 A 并给状态栏提示——重复相位没有「开头」可裁。MIDI/control 头裁只能**向右**（没有内容偏移字段，向左拉伸会让内容整体右移），音频靠 `source_offset` 可以向左回补到 0 |
+
+
+### 实施顺序
+
+按「小成本先落地 + 依赖方向」排：I5（bug，独立）→ I6（timeline 首尾裁剪，和 I3 的按钮提示互相印证，先让交互成立）→ I4（卷帘小改）→ I2（卷帘试听，I1 复用同一套按下态）→ I1（patch 键条）→ I3（工具栏，纯 UI 收尾）。
+
+- [x] **I5 strum 修复**：UI 侧 `default_strum_options()`（spread = 1/32 = 120 t、window = 30 t、ramp 0、jitter 0、Up）；参数行改音符分数 + hover 毫秒；全 0 时 Apply 给状态栏提示「spread is 0 — nothing to stagger」；`window` 改名 `chord window`。验收：新测试把默认值喂给 `strum()` 断言 3 音和弦 start 递增；现有 5 条 strum 测试 + identity 测试不动
+- [x] **I6 timeline 首尾裁剪**：`Drag::Resize` 加 `edge: ClipEdge::{Start,End}` 与 **拖拽起点快照**（`ClipOrigin::Midi(Box<MidiClip>) / Control(Box<ControlClip>)`；音频只需要 `origin_start / origin_span / origin_offset`）。命中：左右各 `EDGE_GRAB`（6 px），窄 clip（宽 < 3×EDGE_GRAB）优先右边缘、左边缘不缩到 < 1 bar。左边缘每帧**从起点快照重算**：`new_start = snap_bar(tick_at(px), bar_ticks)` clamp 到 `[origin_start, origin_start + origin_span - bar_ticks]`（MIDI/control 不向左扩）；单周期 clip（`loop == span`）先 `retain_from(delta)` 再 `set_span(span - delta)`，得到真头裁；tiled clip 只改容器并给状态栏提示；音频 `source_offset = origin_offset + delta·sec_per_tick`（clamp ≥ 0）。hover 边缘 → `ResizeHorizontal` cursor；状态栏 hint 补 "drag either edge to trim (head included)"。验收：`trim_head_clamp()` 纯函数表驱动测试（最小 1 bar、不越过自身尾巴、bar 吸附）+ MIDI 头裁后「音符 start 前移 delta、跨界音符保留尾巴」+ 单拖拽只产生一个 undo 步
+- [x] **I4 draw 默认长度**：`RollState.draw_length: DrawLength`（`Auto` / `Fixed`）；`Auto` = 上一次创建的 note 长度，没有则 1/4 = 960；下拉 `1/2 1/4 1/8 1/16 1/32 1/64 1/3 1/6 1/12 1/24`（= `TICKS_PER_QUARTER * 4 / n`，全部整除）+ `Auto`；单击不拖拽 → 直接用该长度；拖拽仍以拖动为准，松手后记成「上一次长度」；双击插入同源。验收：长度解析表驱动测试（3840/n）+ Auto 回退 + 「单击落 1/4」的 `RollState` 级测试
+- [x] **I2 卷帘试听**：`RollIntent::PreviewNote { note: u8, on: bool }`，editing.rs **顶层提前分流**（和 curve intents 同处，不进命令表）→ `EngineCommand::Note { track, event }`（焦点轨的乐器，`velocity` 用音符自身力度 / 键列用 0.9）；键列与网格音符共用一个 `preview_held: Option<u8>`，指针移到别的键先 Off 再 On（滑奏）；每帧检查 `pointer.any_down()`，抬起即 Off（丢事件兜底）；按下态绘制吃 `held_notes ∪ preview_held`（`show` 新增一个 `pressed: &[u8]` 参数）；预览**不碰文档、不进 undo**。验收：键列几何抽成纯函数 `key_at(keys_rect, pos) -> Option<u8>` + 测试；手势序列（press/glide/release）在 `tests/` 里以 intent 序列断言
+- [x] **I1 vk 节点可弹**：`KEYBOARD_SIZE` → ~`210×(24 + 18 + 34)`；标题带下一行动作按钮（`Oct -` / `Oct +` / `Tr -` / `Tr +`，复用 `NodeAction` / `action_button`），再下一行 2 个八度的键条（白键 ~15 px @zoom1，黑键 62% 宽叠在上缘，同 `piano_roll` 的 `is_black_key` 剪影）；键条 `allocate_rect` + `vk_key_at()` 命中，按下 → `PatchAction::PreviewNote { node, note, on }`；`patch_ops` 用 `keyboard_live_routes(doc, node)` 解析目标（track 输入优先、否则直连乐器，含「被 track 接管时直连休眠」），与电脑键盘同语义；按下态合并 `held_notes`；删节点 / 改连线 / 离开 patch 视图 / 指针抬起 → 强制 Off；八度视图态 + 移调文档字段见 I-D1。验收：`vk_key_at` 边界测试（两个八度的首末键、黑键不越界、zoom≠1）+ `label_of` 显示 `C4–B5 · +0` 往返
+- [x] **I3 工具栏**：新 `crates/glitcherz-ui/src/toolbar.rs`，两个用于绘制的原语 `mode_button(ui, label, active, shortcut)`（互斥组，active 画 pressed 填充 + 强调色底）与 `action_button_ui(ui, label, shortcut, armed)`（一次性，`armed` 只用于 Knife 的描边态），风格沿用 `patch.rs` 的 `action_button`；**roll**：`[Select][Draw] | Grab G · Scale S · Stretch T · Knife K | Grid ▾ | Length ▾ | Randomize · Strum`，Grab/Scale/Stretch 按钮 = 「点击等于按一次 G/S/T」（用当前指针位置 arm 模态，把 `piano_roll.rs:2080–2130` 的内联 arm 逻辑抽成 `RollState::arm_modal`）；**timeline**：只有动作组 `Grab G · Stretch T · Tile ⇧T · Knife K`（无 Draw、无持久模式，见 I-D5）；所有按钮 `on_hover_text("Grab (G) — move the selection")`；Esc 逐层退出沿用现有优先级。验收：按钮只做冒烟（不强制 UI 测试）；两组按钮的「点击后是否保持 active」用 `toolbar.rs` 的纯状态单测钉住（mode 组保持、action 组不保持）
+
+### 验收与门禁
+
+- 全量 `cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`；**在本机沙箱外跑**（沙箱内的 cargo 会毒化 `target/debug/incremental`，下一轮用户的 `cargo run` 直接 ICE）。
+- 每项一件 commit（`feat(ui):` / `fix(ui):`），I5 单独先合——它是 bug，不该和功能混在一个 commit 里。
+- 零回归证据：本系列不改 DSP / 引擎协议，用同一份 `working_files/regression-project.glz` 跑 `--render --rate 22050 --bits 16 --to 1920`，与 pre-I 二进制 `cmp` 逐字节一致即可（预期必然一致，写下来是为了下一位不用再想）。
+
+### 明确不做（本系列）
+
+不做 vk 节点的**和弦/琶音器**、不做键条力度分区（y 轴力度）、不做 note repeat、不做 timeline 的 draw 到「音频片段内容编辑」、不改 `StrumOptions` 的模型默认值、不改 `PROJECT_VERSION`、不新增 crate、不动实时线程。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：

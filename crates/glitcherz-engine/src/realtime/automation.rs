@@ -202,6 +202,9 @@ pub struct RtControlClip {
     pub span_ticks: u32,
     /// Content loop length (in ticks).
     pub loop_ticks: u32,
+    /// Temporarily muted (B2): nothing is delivered, so the target holds its
+    /// last value for the whole span (same as being outside the clip).
+    pub muted: bool,
     /// Anchor curve (pure anchors; target determined by the routing table).
     pub curve: RtAutomation,
 }
@@ -215,6 +218,7 @@ impl Default for RtControlClip {
             // placement.
             span_ticks: 0,
             loop_ticks: 384,
+            muted: false,
             curve: RtAutomation::default(),
         }
     }
@@ -223,11 +227,11 @@ impl Default for RtControlClip {
 impl RtControlClip {
     /// Samples the value at the absolute transport position: `None` outside
     /// `[start, start + span)` (D17: nothing is delivered outside the span,
-    /// the target keeps its last value); inside, the local position is
-    /// reduced modulo `loop_ticks` (periodic tiling, D14) and mapped through
-    /// the curve. RT-safe.
+    /// the target keeps its last value) and while the clip is muted; inside,
+    /// the local position is reduced modulo `loop_ticks` (periodic tiling,
+    /// D14) and mapped through the curve. RT-safe.
     pub fn value_at_absolute(&self, position_ticks: f64) -> Option<f32> {
-        if self.span_ticks == 0 {
+        if self.span_ticks == 0 || self.muted {
             return None;
         }
         let start = f64::from(self.start_ticks);
@@ -350,6 +354,7 @@ mod tests {
             span_ticks: 384,
             loop_ticks: 384,
             curve: curve(&[(0, 1.0), (384, 0.0)]),
+            ..RtControlClip::default()
         };
         // Before the clip: nothing is delivered (D17).
         assert!(clip.value_at_absolute(0.0).is_none());
@@ -364,6 +369,35 @@ mod tests {
         assert!(clip.value_at_absolute(400.0).is_none());
     }
 
+    /// B2: a muted control clip delivers nothing for its whole span — the
+    /// target holds its last value, exactly as outside the clip — and
+    /// un-muting restores delivery without touching the anchors.
+    #[test]
+    fn muted_control_clip_delivers_nothing() {
+        let mut clip = RtControlClip {
+            start_ticks: 0,
+            span_ticks: 384,
+            loop_ticks: 384,
+            curve: curve(&[(0, 1.0), (384, 0.0)]),
+            ..RtControlClip::default()
+        };
+        assert!((clip.value_at_absolute(100.0).unwrap() - 0.74).abs() < 1e-3);
+
+        clip.muted = true;
+        assert!(
+            clip.value_at_absolute(100.0).is_none(),
+            "a muted clip must deliver nothing"
+        );
+        // The span is untouched: the arrangement end keeps counting it.
+        assert_eq!(clip.span_ticks, 384);
+
+        clip.muted = false;
+        assert!(
+            clip.value_at_absolute(100.0).is_some(),
+            "clearing the flag restores delivery"
+        );
+    }
+
     #[test]
     fn control_clip_tiles_curve_within_span() {
         // span = 2 × loop: the same phase value repeats in the second period.
@@ -372,6 +406,7 @@ mod tests {
             span_ticks: 768,
             loop_ticks: 384,
             curve: curve(&[(0, 1.0), (96, 0.5)]),
+            ..RtControlClip::default()
         };
         assert!((clip.value_at_absolute(48.0).unwrap() - 0.75).abs() < 1e-6);
         assert!(
