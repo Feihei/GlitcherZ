@@ -179,6 +179,17 @@ impl Fixture {
         self.frame(vec![hover(pos), press(pos, false)]);
     }
 
+    /// A press-drag-release along one row; returns every action the frames
+    /// emitted.
+    fn drag(&mut self, from: egui::Pos2, to: egui::Pos2) -> Vec<timeline::TimelineAction> {
+        let mut actions = self.frame(vec![hover(from)]);
+        actions.extend(self.frame(vec![hover(from), press(from, true)]));
+        actions.extend(self.frame(vec![hover(to)]));
+        actions.extend(self.frame(vec![hover(to)]));
+        actions.extend(self.frame(vec![hover(to), press(to, false)]));
+        actions
+    }
+
     fn owns_focus(&self) -> bool {
         self.state.owns_keyboard_focus(&self.ctx)
     }
@@ -733,5 +744,38 @@ fn the_toolbar_belongs_to_the_panel_surface_from_the_first_frame() {
     assert!(
         f.owns_focus(),
         "hovering the timeline's own toolbar must hand it the keyboard"
+    );
+}
+/// Regression (2026-11-10): dragging a clip's edge must resize it. egui only
+/// fires `drag_started` after the pointer travelled past its click distance,
+/// so classifying by the *current* pointer put an edge drag outside the clip
+/// and it fell through to the rubber band — the pointer cursor changed on
+/// hover, but the drag selected instead of resizing.
+#[test]
+fn dragging_a_clip_edge_resizes_instead_of_starting_a_band() {
+    let mut f = Fixture::new();
+    let y = f.click_into_a_lane();
+
+    // Walk right until the clicks stop selecting the clip: `edge` is the last
+    // x still inside its right edge (one two-bar clip sits on track 0).
+    let mut edge = 0.0;
+    for x in (120..=700).step_by(2) {
+        f.click(egui::pos2(x as f32, y));
+        if f.state.selection.is_empty() {
+            break;
+        }
+        edge = x as f32;
+    }
+    assert!(edge >= 120.0, "no clip was selected along the probe line");
+
+    // Press on the edge (inside `EDGE_GRAB`), release more than a bar past
+    // it: the press point is inside the clip, the current pointer is not.
+    let to_x = edge + f.state.px_per_bar + 10.0;
+    let actions = f.drag(egui::pos2(edge - 2.0, y), egui::pos2(to_x, y));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, timeline::TimelineAction::MoveResizeClip { .. })),
+        "an edge drag must resize, not start a rubber band: {actions:?}"
     );
 }

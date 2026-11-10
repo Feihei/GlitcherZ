@@ -3413,7 +3413,16 @@ fn lane_row<T: Placement>(
         && !state.knife_armed
         && state.modal.is_none()
     {
-        if let Some(pos) = response.interact_pointer_pos() {
+        // Classify the grab by the **press point**, not the current pointer:
+        // egui reports `drag_started` only after the pointer travelled past
+        // `max_click_dist`, so dragging a clip's edge has already left the
+        // clip by this frame — the hit test below then misses and the drag
+        // degrades into a rubber band.
+        let press = ui
+            .ctx()
+            .input(|i| i.pointer.press_origin())
+            .or_else(|| response.interact_pointer_pos());
+        if let Some(pos) = press {
             let tick = tick_at(pos.x);
             if let Some(index) = hit_clip(clips, tick, sec_per_tick) {
                 let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
