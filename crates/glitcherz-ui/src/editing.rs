@@ -325,7 +325,11 @@ impl GlitcherZApp {
         }
 
         // ---- Interaction ----
-        let snap = crate::snap::Snap::on(i64::from(crate::curve::SNAP_TICKS));
+        let snap = if ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.command) {
+            crate::snap::Snap::OFF
+        } else {
+            crate::snap::Snap::on(i64::from(crate::curve::SNAP_TICKS))
+        };
         let mapped = |pos: egui::Pos2| -> (u32, f32) {
             let phase = tick_at(pos.x).max(0.0);
             let limit = i64::from(loop_ticks.saturating_sub(1));

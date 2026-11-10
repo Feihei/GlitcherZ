@@ -15,9 +15,10 @@
 //!   arms the knife: its stroke cuts every note it crosses, where it
 //!   crosses (no pre-selection needed). Commands work in both modes.
 //! - **Gesture shortcuts** — dragging a note moves, dragging its edge
-//!   trims, Ctrl+drag copies: the unlimited forms of G/T/Shift+D, so the
-//!   highest-frequency edits never need a key press. Dragging *is* the
-//!   tweak gesture — the modal commands never wait for one.
+//!   trims: the unlimited forms of G/T, so the highest-frequency edits
+//!   never need a key press. Dragging *is* the tweak gesture — the modal
+//!   commands never wait for one. Holding `Ctrl` suppresses snapping
+//!   (spec `snap.md`); copies come from `Shift+D` or the toolbar.
 //!
 //! Mainstream DAW muscle memory preserved: double-click on empty space
 //! inserts a default-length note; Shift/Ctrl click toggles selection;
@@ -1576,6 +1577,30 @@ pub fn show(
             state.modal = None;
             state.pending_arm = None;
         }
+        // spec `snap.md` S4: with Ctrl now owning the snap override, the
+        // toolbar is the second copy entry point besides Shift+D. It copies
+        // in place (no grab point is available on a button); press G to move.
+        if crate::toolbar::action_button(
+            ui,
+            "Duplicate",
+            "Shift+D",
+            false,
+            "copies the selection in place · Shift+D copies and starts a move",
+        )
+        .clicked()
+        {
+            if state.selection.is_empty() {
+                state.note_status("Duplicate: nothing selected");
+            } else {
+                let gesture = state.next_gesture();
+                intent = Some(RollIntent::Duplicate {
+                    indices: state.selection.clone(),
+                    gesture,
+                });
+                state.knife_armed = false;
+                state.pending_arm = None;
+            }
+        }
         ui.separator();
         // The live modal transform beside the group (with its qualifiers);
         // clicking it cancels. The action button tells *which* tool is armed,
@@ -1955,8 +1980,12 @@ pub fn show(
     // editing stops at its edges — a click out there must not conjure a note
     // clamped to tick 0.
     let over_focus = |pos: egui::Pos2| (0.0..loop_ticks as f32).contains(&geom.local_at(pos.x));
-    let snap = Snap::on(grid_ticks);
     let modifiers = ui.ctx().input(|i| i.modifiers);
+    let snap = if modifiers.ctrl || modifiers.command {
+        Snap::OFF
+    } else {
+        Snap::on(grid_ticks)
+    };
     let additive = modifiers.shift || modifiers.ctrl;
 
     // Live modal geometry: computed from the pointer's latest position (a
@@ -2668,27 +2697,10 @@ pub fn show(
                 match hit_note(pos) {
                     Some(index) => {
                         let grabbed = clip.notes()[index];
-                        // Ctrl + drag (no edge): duplicate the selection — or the
-                        // grabbed note alone — and drag the copies. A plain
-                        // Ctrl+click still toggles the selection (that is a
-                        // click, handled above; a drag never is).
-                        if modifiers.ctrl && edge.is_none() {
-                            if !state.selection.contains(&index) {
-                                state.selection = vec![index];
-                            }
-                            let gesture = state.next_gesture();
-                            intent = Some(RollIntent::Duplicate {
-                                indices: state.selection.clone(),
-                                gesture,
-                            });
-                            state.drag = Some(DragSelection::anchored(
-                                &grabbed,
-                                pointer_tick(pos),
-                                pointer_note(pos),
-                                DragKind::Move { axis: None },
-                                gesture,
-                            ));
-                        } else if let Some(kind) = edge {
+                        // Ctrl is the temporary snap override (spec `snap.md`
+                        // S4): it no longer duplicates on drag — the copy
+                        // entry points are Shift+D and the toolbar button.
+                        if let Some(kind) = edge {
                             // Edge grab on an unselected note selects just it; on
                             // a selected note it trims the whole selection.
                             if !state.selection.contains(&index) {
@@ -2784,8 +2796,8 @@ pub fn show(
     }
 
     // One intent per frame: a frame that already spent its slot on the
-    // gesture's *setup* intent (Ctrl-drag's Duplicate, draw-mode's AddNote,
-    // Shift+D's copy) must not also emit the drag's first increment, or the
+    // gesture's *setup* intent (draw-mode's AddNote, Shift+D's copy, the
+    // toolbar's Duplicate) must not also emit the drag's first increment, or the
     // setup edit is silently dropped and the copy-drag degrades into a
     // plain move. The increment lands on the next frame instead (a real
     // drag has many; the grab-relative delta is computed from the press
@@ -3195,7 +3207,11 @@ fn curve_lanes(
         }
 
         // ---- Interaction: click adds, drag moves, right-click deletes ----
-        let snap = Snap::on(i64::from(crate::curve::SNAP_TICKS));
+        let snap = if ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.command) {
+            Snap::OFF
+        } else {
+            Snap::on(i64::from(crate::curve::SNAP_TICKS))
+        };
         let mapped = |pos: egui::Pos2| -> (u32, f32) {
             let local = lane_geom.local_at(pos.x).max(0.0);
             let tick = snap.ticks(local).clamp(0, (loop_ticks - 1).max(0)) as u32;

@@ -1683,6 +1683,7 @@ pub fn show(
             // jump when the pointer reaches the lanes.
             let armed = |state: &TimelineState| match state.modal.as_ref().map(|m| m.kind) {
                 Some(ModalKind::Grab { .. }) => Some(Arm::Grab),
+                Some(ModalKind::Duplicate { .. }) => Some(Arm::Duplicate),
                 Some(ModalKind::Stretch { .. }) => Some(Arm::Stretch),
                 Some(ModalKind::Tile) => Some(Arm::Tile),
                 _ => None,
@@ -1705,6 +1706,12 @@ pub fn show(
                     "Shift+T",
                     Arm::Tile,
                     "repeat the clip by dragging right · LMB drops · Esc cancels",
+                ),
+                (
+                    "Duplicate",
+                    "Shift+D",
+                    Arm::Duplicate,
+                    "copy the selection, then move the copies · LMB drops · Esc cancels",
                 ),
             ] {
                 let is_armed = armed(state) == Some(arm);
@@ -2851,7 +2858,14 @@ fn lane_row<T: Placement>(
     // W3b: group table for the colour stripe + name tag.
     clip_groups: &[ClipGroup],
 ) {
-    let snap = Snap::on(i64::from(bar_ticks));
+    let snap = if parent
+        .ctx()
+        .input(|i| i.modifiers.ctrl || i.modifiers.command)
+    {
+        Snap::OFF
+    } else {
+        Snap::on(i64::from(bar_ticks))
+    };
     // The row's widget ids must be STABLE. The lane is the keyboard focus
     // carrier, and egui auto ids are positional: anything above the rows
     // appearing or disappearing (the focus chip, the knife / modal hints,
@@ -3256,7 +3270,7 @@ fn lane_row<T: Placement>(
                 let tiled = hit_clip(clips, tick_at(pos.x), sec_per_tick).is_some_and(|index| {
                     clips[index].loop_len(sec_per_tick) < clips[index].span(sec_per_tick)
                 });
-                match knife_target(clips, tick_at(pos.x), bar_ticks, sec_per_tick) {
+                match knife_target(clips, tick_at(pos.x), bar_ticks, sec_per_tick, snap) {
                     // W2: a cut would need a phase-relative loop origin,
                     // which the model does not carry.
                     Some(_) if tiled => {
@@ -3516,6 +3530,7 @@ fn lane_row<T: Placement>(
                                 origin_start,
                                 origin_span,
                                 bar_ticks,
+                                snap,
                             );
                             let delta = new_start - origin_start;
                             if delta > 0 {
@@ -4067,10 +4082,11 @@ fn knife_target<T: Placement>(
     tick: f32,
     bar_ticks: u32,
     sec_per_tick: f64,
+    snap: Snap,
 ) -> Option<(usize, u32)> {
     let index = hit_clip(clips, tick, sec_per_tick)?;
     let clip = &clips[index];
-    let at = snap_bar(tick, bar_ticks, Snap::on(i64::from(bar_ticks)));
+    let at = snap_bar(tick, bar_ticks, snap);
     let left_ok = at >= clip.start() + bar_ticks;
     let right_ok = at + bar_ticks <= clip.start() + clip.span(sec_per_tick);
     (left_ok && right_ok).then_some((index, at))
@@ -4093,13 +4109,14 @@ pub(crate) fn trim_head_start(
     origin_start: u32,
     origin_span: u32,
     bar_ticks: u32,
+    snap: Snap,
 ) -> u32 {
     let bar = bar_ticks.max(1);
     let max_start = origin_start
         .saturating_add(origin_span)
         .saturating_sub(bar)
         .max(origin_start);
-    snap_bar(pointer_tick, bar, Snap::on(i64::from(bar))).clamp(origin_start, max_start)
+    snap_bar(pointer_tick, bar, snap).clamp(origin_start, max_start)
 }
 
 /// The insertion row a track-reorder drag points at, plus the screen y the
@@ -4307,15 +4324,30 @@ mod tests {
         let start = 2 * bar;
         let span = 4 * bar;
         // Pointer left of the origin: refused.
-        assert_eq!(trim_head_start(0.0, start, span, bar), start);
+        assert_eq!(
+            trim_head_start(0.0, start, span, bar, Snap::on(i64::from(bar))),
+            start
+        );
         // Inside the clip: follows the bar grid.
         assert_eq!(
-            trim_head_start((3 * bar) as f32 + 20.0, start, span, bar),
+            trim_head_start(
+                (3 * bar) as f32 + 20.0,
+                start,
+                span,
+                bar,
+                Snap::on(i64::from(bar))
+            ),
             3 * bar
         );
         // Past the tail: the tail keeps one bar.
         assert_eq!(
-            trim_head_start((99 * bar) as f32, start, span, bar),
+            trim_head_start(
+                (99 * bar) as f32,
+                start,
+                span,
+                bar,
+                Snap::on(i64::from(bar))
+            ),
             start + span - bar
         );
     }
@@ -4813,7 +4845,13 @@ mod tests {
         // 2.6 bars in → snaps to bar 3.
         let tick = 2.6 * TICKS_PER_BAR as f32;
         assert_eq!(
-            knife_target(&clips, tick, TICKS_PER_BAR, SPT),
+            knife_target(
+                &clips,
+                tick,
+                TICKS_PER_BAR,
+                SPT,
+                Snap::on(i64::from(TICKS_PER_BAR))
+            ),
             Some((0, 3 * TICKS_PER_BAR)),
             "the cut lands on the nearest bar line"
         );
@@ -4824,17 +4862,35 @@ mod tests {
         let clips = vec![clip(0, 2 * TICKS_PER_BAR)];
         // Middle of a 2-bar clip snaps to bar 1 — valid.
         assert_eq!(
-            knife_target(&clips, TICKS_PER_BAR as f32, TICKS_PER_BAR, SPT),
+            knife_target(
+                &clips,
+                TICKS_PER_BAR as f32,
+                TICKS_PER_BAR,
+                SPT,
+                Snap::on(i64::from(TICKS_PER_BAR))
+            ),
             Some((0, TICKS_PER_BAR))
         );
         // Near the start edge: snap lands on bar 0 → zero-length left half.
         assert_eq!(
-            knife_target(&clips, 0.2 * TICKS_PER_BAR as f32, TICKS_PER_BAR, SPT),
+            knife_target(
+                &clips,
+                0.2 * TICKS_PER_BAR as f32,
+                TICKS_PER_BAR,
+                SPT,
+                Snap::on(i64::from(TICKS_PER_BAR))
+            ),
             None
         );
         // Near the end edge: snap lands on the clip's end → zero right half.
         assert_eq!(
-            knife_target(&clips, 1.8 * TICKS_PER_BAR as f32, TICKS_PER_BAR, SPT),
+            knife_target(
+                &clips,
+                1.8 * TICKS_PER_BAR as f32,
+                TICKS_PER_BAR,
+                SPT,
+                Snap::on(i64::from(TICKS_PER_BAR))
+            ),
             None
         );
         // One-bar clips can never be split.
@@ -4843,7 +4899,8 @@ mod tests {
                 &[clip(4 * TICKS_PER_BAR, TICKS_PER_BAR)],
                 4.4 * TICKS_PER_BAR as f32,
                 TICKS_PER_BAR,
-                SPT
+                SPT,
+                Snap::on(i64::from(TICKS_PER_BAR))
             ),
             None
         );
@@ -4853,7 +4910,13 @@ mod tests {
     fn knife_misses_empty_lane() {
         let clips = vec![clip(0, 4 * TICKS_PER_BAR)];
         assert_eq!(
-            knife_target(&clips, 6.0 * TICKS_PER_BAR as f32, TICKS_PER_BAR, SPT),
+            knife_target(
+                &clips,
+                6.0 * TICKS_PER_BAR as f32,
+                TICKS_PER_BAR,
+                SPT,
+                Snap::on(i64::from(TICKS_PER_BAR))
+            ),
             None
         );
     }
@@ -4866,7 +4929,13 @@ mod tests {
         const SIX_EIGHT: u32 = 2880;
         let clips = vec![clip(0, 4 * TICKS_PER_BAR)];
         assert_eq!(
-            knife_target(&clips, 1.6 * SIX_EIGHT as f32, SIX_EIGHT, SPT),
+            knife_target(
+                &clips,
+                1.6 * SIX_EIGHT as f32,
+                SIX_EIGHT,
+                SPT,
+                Snap::on(i64::from(SIX_EIGHT))
+            ),
             Some((0, 2 * SIX_EIGHT))
         );
         assert_eq!(
@@ -4881,7 +4950,13 @@ mod tests {
         // on both sides), even though it is shorter than a 4/4 bar.
         let short = vec![clip(0, SIX_EIGHT)];
         assert_eq!(
-            knife_target(&short, 0.4 * SIX_EIGHT as f32, SIX_EIGHT, SPT),
+            knife_target(
+                &short,
+                0.4 * SIX_EIGHT as f32,
+                SIX_EIGHT,
+                SPT,
+                Snap::on(i64::from(SIX_EIGHT))
+            ),
             None
         );
     }

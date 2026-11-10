@@ -984,7 +984,7 @@ Spec：`spec/snap.md`（S1–S8）、`spec/meter-map.md`（D1–D10，扩展 `te
 | **M0** 文档 | `spec/snap.md` + `spec/meter-map.md` + `tempo-meter.md` D5 改口 + `timeline.md` D32 + 本小节 | — | 小（已完成） |
 | **M1** 拍号输入（2026-11-10 交付） | 走带控件改为「分子 1–12 + 分母四选一」；超范围只读；`METER_PRESETS` 退休；`meter_ui::meter_editor` 复用给 M5a；拖动经 `set_meter(before)` 合并为一步 undo | M0 | 小 |
 | **M2a** 吸附收口 | 新 `snap.rs`；五套实现改吃 `Snap`；**恒 on，零行为变化**；on/off 纯函数单测 | M0 | 中 |
-| **M2b** Ctrl 接线 | 视图入口派生 `Snap::OFF`；状态栏 `Snap off`；删除卷帘 `Ctrl+拖动复制`；两个工具栏加 `Duplicate ⇧D`；快捷键文档同步 | M2a | 中 |
+| **M2b** Ctrl 接线（2026-11-10 交付） | 视图入口派生 `Snap::OFF`；状态栏 `Snap off`；删除卷帘 `Ctrl+拖动复制`；两个工具栏加 `Duplicate ⇧D`；快捷键文档同步；G / T / Tile 模态保持 bar 步进（spec S7） | M2a | 中 |
 | **M3** MeterMap | `MeterMarker` + 上限 + `validate` + `model/src/meter.rs` 全部查询 + 分段数学单测；版本 11 | M0 | 中 |
 | **M4** timeline 分段 | `TimelineParams` 借 `&MeterMap`；ruler / lane 网格 / 吸附 / knife / trim / 状态栏 / seek / 录音 / 导出；ruler 画 meter 胶囊（只读） | M3、M2b | 大 |
 | **M5a** marker 编辑 | ruler 右键新建、拖动、双击改值、右键删除；Inspector 拍号区；`TimelineAction` 四个变体；复用 M1 控件 | M4、M1 | 中 |

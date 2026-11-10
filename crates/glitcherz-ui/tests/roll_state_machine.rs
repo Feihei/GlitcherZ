@@ -1005,19 +1005,26 @@ fn the_gesture_shortcuts_still_work_without_arming_anything() {
 }
 
 #[test]
-fn ctrl_drag_still_copies_the_selection() {
+fn ctrl_drag_is_a_snap_override_not_a_copy() {
     let mut f = Fixture::new();
     f.state.selection = vec![0, 1];
-    let intents = f.drag_with(f.pos(60.0, 60), f.pos(300.0, 60), ctrl());
+    let intents = f.drag_with(f.pos(60.0, 60), f.pos(400.0, 60), ctrl());
     assert!(
-        intents
+        !intents
             .iter()
             .any(|intent| matches!(intent, RollIntent::Duplicate { .. })),
-        "got {intents:?}"
+        "Ctrl no longer copies on drag: got {intents:?}"
     );
-    assert!(
-        has_move(&intents),
-        "the copies are dragged: got {intents:?}"
+    let delta = intents.iter().rev().find_map(|intent| match intent {
+        RollIntent::MoveNotes { delta_start, .. } => Some(*delta_start),
+        _ => None,
+    });
+    // 60 -> 400 ticks: the 1/16 grid (240) would snap the target to 480
+    // (delta 480); with Ctrl the raw 340-tick displacement survives.
+    assert_eq!(
+        delta,
+        Some(340),
+        "Ctrl places on the nearest tick: got {intents:?}"
     );
 }
 

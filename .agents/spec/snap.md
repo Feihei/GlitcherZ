@@ -34,6 +34,7 @@
 | S4 | **复制只保留 `Shift+D` + 工具栏按钮** | 删除卷帘 `Ctrl+拖动复制`（`piano_roll.rs:2649-2668`）与对应 `RollIntent::Duplicate` 的拖动分支。卷帘工具栏（`toolbar.rs`，I3 已交付）加 `Duplicate ⇧D` 动作按钮；timeline 工具栏同样加。`Shift+D` 模态语义不变（复制 + Grab）。 |
 | S5 | **删除命中的容差不属于吸附** | `timeline_ops.rs:1134` `remove_near(tick, SNAP_TICKS/2)` 是「点得够近就删」，与落点吸附无关，不改。 |
 | S6 | **Ctrl 的既有拖动语义与新语义叠加，不迁移** | 时间轴：ruler 区 `Ctrl+拖 = 新建 loop`（区域隔离，不冲突）；clip 区 `Ctrl+拖 = 追加选择 + 不吸附`。卷帘：`Ctrl+单击 = 多选`（单击无落点，不冲突）；`Ctrl+拖` 改为纯「不吸附」（复制已按 S4 移除）。`Ctrl+中键 = clip mute` 不涉及位置。 |
+| S7 | **G / T / Shift+T 模态不参与 Ctrl 禁吸附** | 这三者是**离散的 bar / 周期工具**，关掉吸附会让「按小节移动 / 拉伸 / 平铺」失去意义；只有直接拖拽、边缘裁剪、切刀、曲线锚点享受自由落点。模态保持原步进，实现上它们同样吃 `Snap`，但传进去的永远是 `Snap::on(...)`。 |
 
 ## 4. 统一类型
 
@@ -114,9 +115,9 @@ pub fn snap_bar(meter: &MeterMap, raw: f64, snap: Snap) -> u32 {
 | `:3469-3474 / :4057` 头裁 | 同上 |
 | `:3490` 右缘 resize | 同上 |
 | `:4028` `knife_target` / `:3247` 切刀预览 | 同上 |
-| `:1072` `grab_targets` | bar_delta 由 `Snap` 决定（off → 按 tick 连续移动） |
-| `:1131` `stretch_targets` | 同上 |
-| `:1213-1245` `tile_targets` | 关闭吸附时**不分份**，只按 tick 连续拉伸；份数取整逻辑仅在 snap on 时生效 |
+| `:1072` `grab_targets` | **保持整小节步进**：G / Shift+D 是离散工具，Ctrl 不改变其粒度（S7） |
+| `:1131` `stretch_targets` | 同上（T 仍按小节） |
+| `:1213-1245` `tile_targets` | 同上（Tile 按周期份数） |
 
 ### 5.3 曲线（`editing.rs`）
 
