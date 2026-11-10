@@ -1006,6 +1006,53 @@ Spec：`spec/snap.md`（S1–S8）、`spec/meter-map.md`（D1–D10，扩展 `te
 - 把复制迁到 `Alt+拖动`（Met-D1 已排除 Alt）。
 - 按段改变 `px_per_tick`、按新拍号重排/量化既有内容。
 
+## Edit 视图试听与独立时间轴（Aud 系列，2026-11-10 立项）
+
+用户一句话需求：**Edit 界面加独立于 timeline 的 clip 时间线与播放头，用于试听当前 clip 范围；Edit 播放中切 tab 自动停止。**
+
+Spec：`spec/edit-audition.md`（D1–D10）。
+
+### 现状评估（已核对代码）
+
+| 项 | 现状（位置） | 差距 | 体量 | 风险 |
+| :--- | :--- | :--- | :--- | :--- |
+| **Aud-1** Edit 时间轴 | 卷帘无 ruler；小节线只画 `loop_ticks`（`piano_roll.rs:2083-2110`）；`ViewWindow` 用 `start + loop`（`:1342-1375`） | 无 ruler、看不到平铺 span | 中（ruler 绘制 + `clip_span` 参数 + seek intent，~200 行） | 与主区共用时间轴，滚动范围扩到 span 后平铺区在主区是空白，需靠 ruler 表达 |
+| **Aud-2** 播放头 | 只在 `playing` 时画；按 `loop` 取模且**未减 `origin_tick`**（`piano_roll.rs:2221-2231 / 2263-2273`） | 停止时不显示；起点非整周期会偏 | 小（相位 + 静态显示，~40 行） | velocity / overlay 两条泳道各有一份，必须同时修 |
+| **Aud-3** clip 范围试听 | 引擎无 audition 概念；只有 song loop（`loop_range` 序列化）；Edit 按 Play 播整曲 | 无区间试听 | 中（`SetAuditionRange` + `advance` 三分支 + 4 测试，~150 行） | `advance` 的窗口切分已有 loop/arrangement 两支，加第三支必须保证 pending offs 与循环回卷零回归 |
+| **Aud-4** 切 tab 停止 | tab 点击（`transport.rs:565-575`）与快捷键（`keyboard.rs:529-563`）各自直接写 `self.view`，无停止副作用 | 无统一入口 | 小（`set_view` 收口 + 策略纯函数，~60 行） | 只有 Edit 发起的试听才该停；Timeline 播放中切 Edit 不能误停 |
+
+### 决策（2026-11-10 已拍板）
+
+| ID | 问题 | 结论 |
+| :--- | :--- | :--- |
+| Aud-D1 | 试听范围 | **整个 clip = `[start, start+span)`**；ruler 覆盖 span，主区仍只显示一个 loop 周期 |
+| Aud-D2 | 播完怎么办 | **单次播放**：到 span 末尾自动停并回到 clip 起点；引擎精确处理，不靠 UI 轮询 |
+| Aud-D3 | 怎么触发 | **复用全局 Play / Space**；不新增 Edit 专属按钮 |
+| Aud-D4 | 用 song loop 实现？ | **不用**。新增独立 `SetAuditionRange`，不写文档、不弄脏工程、不与走带 loop 灯混淆 |
+| Aud-D5 | 切 tab 用 Stop 还是 Pause | **Pause**（保留位置）+ 清范围；不清文档、不动 song loop |
+| Aud-D6 | 视图切换入口 | 收口为 `set_view()`，tab 点击与快捷键共用 |
+| Aud-D7 | 文件格式 | **不动**；audition 是会话态，不进 undo、不进版本 |
+
+### 里程碑与依赖
+
+| 里程碑 | 内容 | 依赖 | 规模 |
+| :--- | :--- | :--- | :--- |
+| **Aud1** 引擎 | `SetAuditionRange` + `Sequencer` 字段 + `advance` 三分支 + 4 条单测 | 无 | 中 |
+| **Aud2** 试听路由 | `audition` 会话态、`toggle_transport`、自然结束清理、`set_view` + 切 tab 停止、策略纯函数单测 | Aud1 | 中 |
+| **Aud3** ruler + 播放头 | `clip_span` 参数、`ViewWindow` 扩到 span、ruler 绘制/seek、播放头相位与静态显示、roll fixture 测试、文档同步 | Aud2 | 中 |
+
+顺序：**Aud1 → Aud2 → Aud3**。Aud3 会改 `piano_roll.rs`，需与 Met 系列的 M2b（同一文件）错开，避免两个系列在同一区域反复改。
+
+### 验收门禁
+
+- 每里程碑单独 commit；`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` 全绿（`sf2_rt_audit` 的并行 flaky 单跑确认）。
+- 零回归：audition 未激活时 `advance` 行为与今天逐字节一致；Timeline 下 Play 不走新分支。
+- 切 tab 停止必须是**纯策略**可测（旧视图、新视图、audition 是否激活 → 是否 Pause），不依赖 egui 帧。
+
+### 明确不做（本系列）
+
+- 试听循环、Edit 独立播放按钮、audio clip 的 Edit 波形/试听、平铺区在主卷帘展开、audition 序列化、试听淡入淡出。
+
 ## 附：VST3 调研结论（2026-10-07，已实施）
 
 crates.io 上 `vst3` crate（0.3.0）为可用起点。VST3 宿主比 CLAP 复杂（预估 2-3 倍工作量），差异点：
