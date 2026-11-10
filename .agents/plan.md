@@ -1037,8 +1037,8 @@ Spec：`spec/edit-audition.md`（D1–D10）。
 
 | 里程碑 | 内容 | 依赖 | 规模 |
 | :--- | :--- | :--- | :--- |
-| **Aud1** 引擎 | `SetAuditionRange` + `Sequencer` 字段 + `advance` 三分支 + 4 条单测 | 无 | 中 |
-| **Aud2** 试听路由 | `audition` 会话态、`toggle_transport`、自然结束清理、`set_view` + 切 tab 停止、策略纯函数单测 | Aud1 | 中 |
+| **Aud1** 引擎（2026-11-10 交付） | `SetAuditionRange` + `Sequencer` 字段 + `advance` 三分支 + 4 条单测 | 无 | 中 |
+| **Aud2** 试听路由（2026-11-10 交付） | `audition` 会话态、`toggle_transport`（Play 按钮 + Space 共用）、自然结束清理、`set_view` + 切 tab 停止、策略纯函数单测；`docs/manual.md` / `docs/shortcuts.md` 同步 | Aud1 | 中 |
 | **Aud3** ruler + 播放头 | `clip_span` 参数、`ViewWindow` 扩到 span、ruler 绘制/seek、播放头相位与静态显示、roll fixture 测试、文档同步 | Aud2 | 中 |
 
 顺序：**Aud1 → Aud2 → Aud3**。Aud3 会改 `piano_roll.rs`，需与 Met 系列的 M2b（同一文件）错开，避免两个系列在同一区域反复改。

@@ -1577,9 +1577,15 @@ impl MainView {
     }
 }
 
+/// Whether a view switch must stop the running audition (Aud series): only
+/// leaving the Edit view, and only while an audition is active.
+fn stops_audition_on_switch(old: MainView, new: MainView, audition_active: bool) -> bool {
+    audition_active && old == MainView::Edit && new != MainView::Edit
+}
+
 #[cfg(test)]
 mod main_view_tests {
-    use super::MainView;
+    use super::{MainView, stops_audition_on_switch};
 
     /// The tab bar, the `Tab` cycle and `Alt+1..4` all read `ORDER`, so this
     /// pins the one order the user asked for: arrangement, editor, patch.
@@ -1618,6 +1624,32 @@ mod main_view_tests {
         assert_eq!(MainView::from_index(2), Some(MainView::Patch));
         assert_eq!(MainView::from_index(3), Some(MainView::Inspector));
         assert_eq!(MainView::from_index(4), None, "only four tabs");
+    }
+
+    #[test]
+    fn leaving_edit_stops_an_active_audition() {
+        assert!(stops_audition_on_switch(
+            MainView::Edit,
+            MainView::Timeline,
+            true
+        ));
+        assert!(stops_audition_on_switch(
+            MainView::Edit,
+            MainView::Inspector,
+            true
+        ));
+        assert!(
+            !stops_audition_on_switch(MainView::Edit, MainView::Timeline, false),
+            "no audition, nothing to stop"
+        );
+        assert!(
+            !stops_audition_on_switch(MainView::Timeline, MainView::Edit, true),
+            "entering Edit never stops the song transport"
+        );
+        assert!(
+            !stops_audition_on_switch(MainView::Edit, MainView::Edit, true),
+            "re-selecting the current tab is not a switch"
+        );
     }
 }
 
@@ -1750,6 +1782,10 @@ pub struct GlitcherZApp {
     /// selection actually moved — the roll's own focus (chip strip / Tab)
     /// would otherwise be reset every frame (spec `roll-multiclip.md` E15).
     edit_selection: Vec<timeline::ClipSel>,
+    /// Active one-shot audition (Aud series): `(start, end)` in ticks while the
+    /// Edit view previews its clip. Session-only — never persisted, never part
+    /// of undo (spec `edit-audition.md`).
+    audition: Option<(u32, u32)>,
     /// Curve editor tool (U12; transient input mode, not persisted).
     curve_tool: CurveTool,
     /// Anchor tick currently being dragged in the curve editor (U12; `None`
@@ -2202,6 +2238,7 @@ impl GlitcherZApp {
             timeline_state: timeline::TimelineState::default(),
             edit_clip: None,
             edit_selection: Vec::new(),
+            audition: None,
             curve_tool: CurveTool::default(),
             curve_drag: None,
             event_list_open: true,
@@ -2633,6 +2670,9 @@ impl eframe::App for GlitcherZApp {
             if self.is_recording() {
                 self.finish_recording();
             }
+            // Aud series: a clip audition ends the same way (the engine has
+            // already rewound to the range start) — drop the range.
+            self.clear_audition();
             self.push_node_params();
         }
         self.was_playing = playing;

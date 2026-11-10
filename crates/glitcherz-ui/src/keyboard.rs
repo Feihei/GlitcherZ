@@ -466,17 +466,7 @@ impl GlitcherZApp {
                     egui::Key::Space if pressed && !modifiers.ctrl => {
                         ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::Space));
                         if !repeat {
-                            if self.engine.is_playing() {
-                                // R6 D32: Play while recording punches out —
-                                // the take closes, the transport keeps rolling.
-                                if self.is_recording() {
-                                    self.finish_recording();
-                                } else {
-                                    self.pause_transport();
-                                }
-                            } else {
-                                self.send_sequencer(SequencerCommand::Play);
-                            }
+                            self.toggle_transport();
                         }
                         continue;
                     }
@@ -557,7 +547,7 @@ impl GlitcherZApp {
                     // An open menu (File / Edit) would otherwise float over
                     // the view we are switching to.
                     egui::Popup::close_all(ctx);
-                    self.view = target;
+                    self.set_view(target);
                 }
                 continue;
             }

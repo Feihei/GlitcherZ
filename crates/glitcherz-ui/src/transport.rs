@@ -14,6 +14,8 @@ impl GlitcherZApp {
     /// Transport stop, with the recording edge: the take is closed **before**
     /// the transport rewinds (its end position would otherwise read 0).
     pub(crate) fn stop_transport(&mut self) {
+        // Stop also leaves any Edit audition: the next Play is the whole song.
+        self.clear_audition();
         if self.is_recording() {
             self.finish_recording();
         }
@@ -28,6 +30,93 @@ impl GlitcherZApp {
             self.finish_recording();
         }
         self.engine.pause();
+    }
+
+    /// Play / Pause from the transport button or Space (Aud series): while the
+    /// Edit view shows a clip, a stopped transport auditions that clip's whole
+    /// range once instead of playing the song.
+    pub(crate) fn toggle_transport(&mut self) {
+        if self.engine.is_playing() {
+            // R6 D32: Play while recording punches out — the take closes, the
+            // transport keeps rolling (the pause path stops it).
+            if self.is_recording() {
+                self.finish_recording();
+            } else {
+                self.pause_transport();
+            }
+            self.clear_audition();
+        } else if self.view == MainView::Edit {
+            self.start_audition();
+        } else {
+            self.send_sequencer(SequencerCommand::Play);
+        }
+    }
+
+    /// Starts the one-shot audition of the Edit view's clip. A no-op (with a
+    /// status message) when nothing editable is targeted.
+    fn start_audition(&mut self) {
+        let Some((start, end)) = self.audition_range() else {
+            self.set_message("Audition: no editable clip selected".to_string());
+            return;
+        };
+        if end <= start {
+            self.set_message("Audition: the clip is empty".to_string());
+            return;
+        }
+        self.engine.seek_ticks(f64::from(start));
+        self.engine.set_audition_range(start, end);
+        self.send_sequencer(SequencerCommand::Play);
+        self.audition = Some((start, end));
+    }
+
+    /// The Edit target's `[start, start + span)` in ticks. Audio clips have no
+    /// editor, so they never reach this path.
+    fn audition_range(&self) -> Option<(u32, u32)> {
+        match self.edit_clip.as_ref()? {
+            EditTarget::Midi(subject) => {
+                let focus = subject.focus();
+                let clip = self
+                    .project()
+                    .midi_tracks
+                    .get(focus.track)?
+                    .clips
+                    .get(focus.clip)?;
+                Some((
+                    clip.start_ticks,
+                    clip.start_ticks.saturating_add(clip.span_ticks),
+                ))
+            }
+            EditTarget::Control { track, clip } => {
+                let clip = self
+                    .project()
+                    .control_tracks
+                    .get(*track)?
+                    .clips
+                    .get(*clip)?;
+                Some((
+                    clip.start_ticks,
+                    clip.start_ticks.saturating_add(clip.span_ticks),
+                ))
+            }
+        }
+    }
+
+    /// Clears the audition state and the engine range (idempotent).
+    pub(crate) fn clear_audition(&mut self) {
+        if self.audition.take().is_some() {
+            self.engine.set_audition_range(0, 0);
+        }
+    }
+
+    /// The one view-switch entry point (tab clicks, `Tab`, `Alt+1..4`).
+    /// Leaving Edit while an audition runs stops it: the preview belongs to
+    /// that view, and a clip playing after tab-away reads as a bug.
+    pub(crate) fn set_view(&mut self, next: MainView) {
+        if stops_audition_on_switch(self.view, next, self.audition.is_some()) {
+            self.clear_audition();
+            self.pause_transport();
+        }
+        self.view = next;
     }
 
     pub(crate) fn transport_panel(&mut self, ui: &mut egui::Ui) {
@@ -190,16 +279,7 @@ impl GlitcherZApp {
                     .on_hover_text(play_tip)
                     .clicked()
                 {
-                    if playing {
-                        // R6 D32: punch out instead of pausing while a take runs.
-                        if self.is_recording() {
-                            self.finish_recording();
-                        } else {
-                            self.pause_transport();
-                        }
-                    } else {
-                        self.send_sequencer(SequencerCommand::Play);
-                    }
+                    self.toggle_transport();
                 }
                 let stop_tip = if self.is_recording() {
                     "End the take and rewind (a take stopped during the pre-roll has nothing to keep)"
@@ -566,7 +646,12 @@ impl GlitcherZApp {
         let response = egui::Panel::top("glitcherz_views").show(ui, |ui| {
             ui.horizontal(|ui| {
                 for view in MainView::ORDER {
-                    ui.selectable_value(&mut self.view, view, view.label());
+                    if ui
+                        .selectable_label(self.view == view, view.label())
+                        .clicked()
+                    {
+                        self.set_view(view);
+                    }
                 }
             });
         });
