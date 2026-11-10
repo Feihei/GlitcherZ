@@ -1404,8 +1404,29 @@ I3 上线后用户反馈"改完快捷键都无效了"。根因不在按键映射
 
 **顺带收掉的冲突**：卷帘 / 时间轴的模态里 `X`/`Y` 是轴选择器，音区不能同时动——`Z`/`X` 在模态激活时不改音区（`modal_transform_active()`）。
 
-**已知遗留（未在本轮修）**：`refresh_vk_targets` 在路由变化时用**物理音高**发 Note Off，而按下时发的是**移调后**的音高——移调不为 0 时会留下卡住的音。这是既有缺陷（transpose 早就存在），与本轮的音区无关；彻底修法是让 `held_notes` 记「物理 → 实际发声」的映射。
+**已知遗留（未在本轮修，已于 2026-11-11 修复 → 见下一节）**：`refresh_vk_targets` 在路由变化时用**物理音高**发 Note Off，而按下时发的是**移调后**的音高——移调不为 0 时会留下卡住的音。这是既有缺陷（transpose 早就存在），与本轮的音区无关；彻底修法是让 `held_notes` 记「物理 → 实际发声」的映射。
 
 **测试**：新增 6 条——model 的 `the_keyboard_register_survives_a_reload`（存盘往返 + 旧 payload 落到默认八度）、UI 的 `the_computer_keyboard_plays_the_node_register` / `every_computer_key_lands_inside_the_strip` / `a_note_outside_the_window_lights_nothing` / `the_keyboard_register_stays_in_range`。
 
 **门禁**：`cargo fmt` / `cargo clippy --workspace --all-targets -D warnings` / `cargo test --workspace` = **1344 通过 / 0 失败 / 11 ignored**。
+
+### 后续修：移调后卡住的音（2026-11-11）
+
+上节记的遗留缺陷：**Note On 发的是移调后音高，两处 Note Off 都不认它**。
+
+1. `send_note_off` 重新用**当前** `vk_transpose()` 算一遍 → 按住某个键期间点了 `Tr -/Tr +`，松开时算出的音高与按下时不同，Off 打空；
+2. `refresh_vk_targets` 遍历 `held_notes`（当时是 `HashSet<u8>`，**物理音高**）给掉线的目标发 Off → 移调 ≠ 0 时删掉输入线/输入节点会留下永远在响的 voice。
+
+**修法**：`held_notes` 从 `HashSet<u8>` 换成 `HeldNotes(HashMap<u8, u8>)`，键是物理键、值是**按下那一刻真正发出去的音高**。封装类型刻意只暴露 `press(physical, sounding)` / `release(physical) -> Option<sounding>` / `is_held(physical)` / `sounding()` / `clear()`——**不提供物理键的迭代器**，以后想拿「正在响的音」只能走 `sounding()`，API 层面堵死复发。
+
+- `send_note_off` 用 `release()` 返回的旧值发 Off，不再重算 transpose；返回 `None`（没有配对的 On）就干脆不发 Off，但**无条件**清 strip 高亮，避免残留；
+- `refresh_vk_targets` 改用 `held_notes.sounding().collect()`；
+- 去重判断 `contains(&note)` → `is_held(note)`；`file_ops` 的 `clear()` 语义不变。
+
+**范围刻意收窄**：鼠标点琴条的路径（`PatchState.keyboard_held` + `PatchAction::KeyboardNote`）不动。同一个指针不可能既按住琴条上的键又去点 `Tr` 按钮，所以它的 On/Off 一定落在同一个 transpose 上；它也不经过 `refresh_vk_targets`。为它引入同样的映射只会多一份状态、没有收益。
+
+**顺带修好**：按住键时改移调不再卡音（这是第 1 条的同一根因，之前没写进遗留清单）。
+
+**测试**：`keyboard.rs` 新增 4 条纯逻辑回归——`a_transposed_note_releases_the_pitch_that_was_sent`、`a_transpose_change_while_held_keeps_the_original_release`、`a_route_change_releases_the_sounding_pitches`（核心：Off 列表是 `[62, 66]` 而不是物理 `[60, 64]`）、`clearing_drops_every_held_key`。
+
+**门禁**：`cargo fmt --all` / `cargo clippy --workspace --all-targets -D warnings` / `cargo test --workspace` = **1348 通过 / 0 失败 / 11 ignored**。
