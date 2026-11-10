@@ -2501,16 +2501,51 @@ pub fn show(
     }
 
     // A plain click (no drag): a modal transform consumes it as the
-    // *confirmation* (LMB anywhere fixes the geometry); an armed knife
-    // consumes it as a zero-length stroke (one cut through every note
-    // spanning the pointer tick, no pre-selection needed); otherwise it
-    // selects the note under the pointer. On empty space, Draw mode paints a
-    // default-length note (2026-11-10 user request), while Select mode keeps
-    // the click as "clear the selection"; a double-click inserts one note in
-    // either mode (its second click must not paint a second one on top).
-    // (egui only reports drag_started once the pointer moved, so click and
-    // drag are already disambiguated.)
+    // *confirmation*; an armed knife as a zero-length stroke; otherwise it
+    // selects the note under the pointer.
+    //
+    // Draw mode paints on **press**, not on release: a plain click must
+    // produce a note even when the platform's release frame does not report
+    // `clicked` (2026-11-10 user report — the mode chip was lit, but a click
+    // painted nothing). `resolve_created` then arms the draw-drag; a click
+    // that never drags clears that parked drag on release below.
+    if state.mode == RollMode::Draw
+        && !additive
+        && state.modal.is_none()
+        && !state.knife_armed
+        && ui.ctx().input(|i| i.pointer.primary_pressed())
+        && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
+        && over_focus(pos)
+        && hit_note(pos).is_none()
+    {
+        let gesture = state.next_gesture();
+        let start = snap.ticks(pointer_tick(pos)).min(loop_ticks - 1);
+        let length = state.draw_note_length();
+        state.last_note_length = Some(length);
+        intent = Some(RollIntent::AddNote {
+            note: pointer_note(pos),
+            start,
+            length,
+            gesture,
+        });
+        state.awaiting_create = Some(AwaitCreate {
+            grab_tick: pointer_tick(pos),
+            grab_note: pointer_note(pos),
+            gesture,
+        });
+    }
+
+    // Release: a modal confirms, a knife cuts, a note under the pointer is
+    // selected. Select mode's plain click clears the selection and its
+    // double-click inserts one note. Draw mode already painted on press, so
+    // its release only ends a parked (un-dragged) draw.
     if response.clicked() {
+        // Draw mode painted on press (above); a click that never dragged has
+        // no `drag_started`, so the draw-drag `resolve_created` armed must be
+        // dropped here — it would otherwise swallow the next gesture.
+        if state.mode == RollMode::Draw {
+            state.drag = None;
+        }
         if let Some(pos) = response.interact_pointer_pos() {
             if let Some(modal) = state.modal.take() {
                 let frame = modal.frame(
@@ -2565,28 +2600,24 @@ pub fn show(
                         }
                     }
                     None => {
-                        // Draw mode: a plain click paints the default-length
-                        // note (2026-11-10 user request). Select mode keeps a
-                        // plain click as "clear the selection" and inserts
-                        // only on the second click of a double-click. In Draw
-                        // mode the second click of a double-click must not
-                        // paint another note on top of the first.
-                        let draw_click = state.mode == RollMode::Draw && !response.double_clicked();
-                        let select_double =
-                            state.mode == RollMode::Select && response.double_clicked();
-                        if draw_click || select_double {
-                            // No awaiting_create: a follow-up drag would have
-                            // fired drag_started (draw) instead of a click.
-                            let length = state.draw_note_length();
-                            state.last_note_length = Some(length);
-                            intent = Some(RollIntent::AddNote {
-                                note: pointer_note(pos),
-                                start: snap.ticks(pointer_tick(pos)).min(loop_ticks - 1),
-                                length,
-                                gesture: state.next_gesture(),
-                            });
-                        } else {
-                            state.selection.clear();
+                        // Draw mode painted on press (above); its release must
+                        // not paint again. Select mode keeps the double-click
+                        // insert and the plain-click "clear the selection".
+                        if state.mode == RollMode::Select {
+                            if response.double_clicked() {
+                                // No awaiting_create: a follow-up drag would
+                                // have fired drag_started instead of a click.
+                                let length = state.draw_note_length();
+                                state.last_note_length = Some(length);
+                                intent = Some(RollIntent::AddNote {
+                                    note: pointer_note(pos),
+                                    start: snap.ticks(pointer_tick(pos)).min(loop_ticks - 1),
+                                    length,
+                                    gesture: state.next_gesture(),
+                                });
+                            } else {
+                                state.selection.clear();
+                            }
                         }
                     }
                 }
@@ -2666,10 +2697,16 @@ pub fn show(
     // Left-button gestures only: the middle button owns panning, and egui's
     // unfiltered `drag_started`/`dragged`/`drag_stopped` fire for ANY button
     // (the patch hit the same trap and filters by button everywhere).
+    //
+    // A press-created Draw note arms its own draw-drag (`resolve_created`);
+    // that parked drag must not be reclassified as a move/trim when the
+    // pointer finally moves.
     if response.drag_started_by(egui::PointerButton::Primary) {
         // Belt-and-suspenders: hover-follow focus (the router) already covers
         // this, but a drag on the roll must never run without focus.
         response.request_focus();
+    }
+    if response.drag_started_by(egui::PointerButton::Primary) && state.drag.is_none() {
         // Classify the grab by where the press *landed*, never by where the
         // pointer is on this frame. egui only reports `drag_started` once
         // the pointer has travelled past `max_click_dist` (6 pt), so
@@ -2964,6 +3001,17 @@ pub fn show(
         // failed) leaves a parked grab point; drop it so no drag starts
         // from a stale gesture.
         state.awaiting_create = None;
+    }
+
+    // A Draw press-drag parked by `resolve_created` must end even when the
+    // platform reports the release without a `clicked` (the reason the press
+    // block above exists). `drag_stopped` already took a real drag; this only
+    // sweeps a parked one, so it cannot swallow the next gesture.
+    if state.mode == RollMode::Draw
+        && state.drag.is_some()
+        && !ui.ctx().input(|i| i.pointer.primary_down())
+    {
+        state.drag = None;
     }
 
     if response.secondary_clicked() {
