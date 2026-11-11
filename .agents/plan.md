@@ -19,8 +19,8 @@
 
 路线图 1–10 全部落地；基础功能、节点图、MIDI 编辑、插件宿主、可用性（U 系列）、录音（R 系列）、内建效果器（E 系列）、声源扩展（Y / Z / B 系列）与交互打磨（I 系列）均已交付。已完成系列的设计与实现位置见下方「历史系列索引」——本文件不再逐项记录它们的实施细节。
 
-- **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）。
-- **下一步候选**：CLI / MCP 的命令词汇表（`NodeParam` 稳定名 + `clip.add` + `graph.set_param`）。
+- **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）；命令词汇表（F-039）V1a / V2 / V3 已交付，V1b 待做。
+- **下一步候选**：命令词汇表 V1b（`effect_slot` / 声源参数 / `graph.set_voice`）。
 - **门禁**：`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`，在本机沙箱外跑（沙箱内 cargo 会毒化 `target/debug/incremental`）。
 
 ## 未完成项
@@ -45,9 +45,9 @@ Spec：`spec/command-vocabulary.md`（D1–D8：`NodeParam` 稳定 key、`node_i
 | **V1a** 参数词汇表（2026-11-11 交付） | `NodeParam` 稳定 key + `graph.set_param` / `graph.query`（synth / mixer / feedback） | — | 中 |
 | **V1b** 效果器 / 声源参数 | `effect_slot` + 声源参数 + `graph.set_voice` | V1a | 中 |
 | **V2** `clip.add`（2026-11-11 交付） | `clip.add`（MIDI）：按拍号段默认时长，`span = loop` | — | 小 |
-| **V3** 端到端 | MCP `commands_run` 测试、CLI、`docs/` 同步 | V1a、V2 | 小 |
+| **V3** 端到端（2026-11-11 交付） | MCP `commands_run` 测试（graph.query → graph.set_param → clip.add → note_add → transpose → render 非静音）、`docs/manual.md` 同步 | V1a、V2 | 小 |
 
-顺序：**V1a → V1b → V2 → V3**；每个里程碑单独提交。
+顺序：**V1a → V2 → V3 已交付**；**V1b（效果器槽 / 声源参数 / `graph.set_voice`）待做**。每个里程碑单独提交。
 
 ## 吸附统一与拍号变化（Met 系列 → F-033 / F-018，2026-11-10 立项）
 

@@ -1668,6 +1668,13 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - 测试：`clip_add_creates_an_empty_midi_clip`（追加、命名、`span == loop`、空内容、可写音符、`lane` 非 midi 报错）。
 - **门禁**：fmt / clippy workspace 干净；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
 
+#### 命令词汇表 V3：端到端（2026-11-11 交付）
+
+- 新集成测试 `mcp_cli::scratch_build_adds_a_clip_notes_and_renders`：真实启动 `--mcp` 进程，`graph.query` 找 instrument 节点 → `graph.set_param attack` → `clip.add`（从报告取 `clip` 索引）→ `midi.note_add` + `midi.transpose` → 两次 `render_wav` 对比，断言有音符后渲染字节不同（证明命令真的进了音频路径）。
+- `docs/manual.md` 的「命令行：批量命令」补三行命令表（`clip.add` / `graph.query` / `graph.set_param`）与「`commands_run` 的 `results` 带回 clip 索引」的用法说明。
+- **门禁**：fmt / clippy workspace 干净；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`（新增集成用例计入 `mcp_cli`）。
+- **V1b 待做**：`effect_slot` 读写、声源参数（Modal / Pluck / Organ / Wavetable / Sf2 / Sample）、`graph.set_voice`；这三项是「换音色」诉求的最后一段。
+
 #### 阶段边界（自 plan.md 归位）
 
 - **Y 系列 S0**：不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（stems / 24-bit / 采样率选择）。

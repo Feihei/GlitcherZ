@@ -623,6 +623,17 @@ glitcherz --open song.glz --ops steps.json --save out.glz
 ]
 ```
 
+从空工程搭内容也能全在命令行 / MCP 里完成（命令族见 `spec/midi-commands.md` 与 `spec/command-vocabulary.md`）：
+
+| 命令 | 作用 |
+| :--- | :--- |
+| `clip.add {track, start_ticks?, span_ticks?, name?}` | 新建空 MIDI clip（默认长度 = 起点所在拍号段一小节，`span = loop`），返回 `{clip, start_ticks, span_ticks}` |
+| `graph.query {track?}` | 列出节点与可写参数（`key` / `value` / `min` / `max`） |
+| `graph.set_param {node, param, value, index?, channel?, channel_param?}` | 按稳定参数名调节点参数；`node` 是 `graph.query` 的 `node`（`node_id`）。插件节点参数暂不支持 |
+
+`clip.add` 与 `graph.*` 和其他命令一样进撤销栈、进 journal；MCP 不需要新工具，仍在 `commands_run` 里调用。
+`commands_run` 的 `results` 会带回 `clip.add` 的 `clip` 索引，可以接着用它写音符。
+
 `--ops -` 从标准输入读，效果与文件一样。`--ops` 与 `--do` 可以混用，
 **按它们在命令行里出现的顺序执行**（`--do a --ops list.json --do b` 就是 `a, list…, b`）。
 

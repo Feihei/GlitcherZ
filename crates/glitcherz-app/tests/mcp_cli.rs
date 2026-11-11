@@ -466,6 +466,75 @@ fn dry_run_leaves_the_document_untouched() {
     assert_eq!(mcp.finish(), 0);
 }
 
+// ---------------------------------------------------------------- scratch build
+
+/// F-039 V3: an agent can go from an empty clip to an audible render without
+/// touching the UI — discover the graph, write a parameter, add a clip, write
+/// a note, then render.
+#[test]
+fn scratch_build_adds_a_clip_notes_and_renders() {
+    let dir = scratch("scratch-build");
+    let mut mcp = Mcp::start(&dir, &[]);
+
+    // Graph vocabulary: find the default instrument, write one parameter.
+    let (error, report) = mcp.call(
+        "commands_run",
+        json!({"commands": [{"id": "graph.query", "params": {}}]}),
+    );
+    assert!(!error, "{report}");
+    let nodes = report["results"][0]["result"]["nodes"]
+        .as_array()
+        .expect("nodes");
+    let node = nodes
+        .iter()
+        .find(|entry| entry["kind"] == json!("instrument"))
+        .and_then(|entry| entry["node"].as_u64())
+        .expect("the default template carries an instrument");
+    let (error, report) = mcp.call(
+        "commands_run",
+        json!({"commands": [
+            {"id": "graph.set_param", "params": {"node": node, "param": "attack", "value": 0.1}}
+        ]}),
+    );
+    assert!(!error, "{report}");
+
+    // Add a clip; the report carries its index for the following commands.
+    let (error, report) = mcp.call(
+        "commands_run",
+        json!({"commands": [
+            {"id": "clip.add", "params": {"track": 0, "name": "Scratch"}}
+        ]}),
+    );
+    assert!(!error, "{report}");
+    let clip = report["results"][0]["result"]["clip"]
+        .as_u64()
+        .expect("clip index");
+
+    // Render the empty clip, then the same range with one loud note.
+    let (error, report) = mcp.call("render_wav", json!({"path": "empty.wav", "to_ticks": 3840}));
+    assert!(!error, "{report}");
+    let empty = std::fs::read(dir.join("empty.wav")).expect("empty render");
+
+    let (error, report) = mcp.call(
+        "commands_run",
+        json!({"commands": [
+            {"id": "midi.note_add", "params": {
+                "track": 0, "clip": clip, "note": 69,
+                "start_ticks": 0, "length_ticks": 960, "velocity": 120
+            }},
+            {"id": "midi.transpose", "params": {"track": 0, "clip": clip, "semitones": 0}}
+        ]}),
+    );
+    assert!(!error, "{report}");
+    let (error, report) = mcp.call("render_wav", json!({"path": "note.wav", "to_ticks": 3840}));
+    assert!(!error, "{report}");
+    let with_note = std::fs::read(dir.join("note.wav")).expect("note render");
+
+    assert!(with_note.len() > 44, "the render has samples");
+    assert_ne!(empty, with_note, "the note must change the rendered audio");
+    assert_eq!(mcp.finish(), 0);
+}
+
 // ---------------------------------------------------------------- render
 
 #[test]
