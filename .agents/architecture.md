@@ -22,7 +22,7 @@ UI 线程 (egui)                音频线程 (cpal callback)
 - 节点实现 `Processor` trait，`process(&mut self, ctx: &ProcessContext, buffer: &mut AudioBuffer)`，**就地读写**活动区域（生成器写入、效果器原地修改）。
 - 图结构变更（增删节点）由 UI 线程构建新图，通过**双缓冲交换**（`ArcSwap` 或消息队列重建指令）应用到音频线程，绝不原地修改运行中的图。
 - 固定块大小处理（128 samples），`cpal` 回调内的剩余样本用预分配的中间缓冲拆分。
-- 节点图化（模块布线 + 时间轴信号源）的演进方向见 `plan.md`「模块节点图架构」。
+- 节点图化（模块布线 + 时间轴信号源）的设计与决策见 `spec/node-graph.md`。
 
 ## 数据模型
 

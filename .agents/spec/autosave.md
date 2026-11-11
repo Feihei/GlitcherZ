@@ -1,9 +1,8 @@
 # Spec: 自动保存与崩溃恢复（Auto-save & Crash Recovery）
 
 > 状态：已交付（2026-11-03，S3a）。实现：`glitcherz-ui/src/autosave.rs` +
-> `glitcherz_model::file::save_autosave`；进度见 `plan.md`「S3」。
-> 关联：`review-2026-11-01.md` §2「自动保存 / 崩溃恢复」、
-> `spec/plugin-state.md`（插件状态 blob 的捕获时机）。
+> `glitcherz_model::file::save_autosave`；细节见 `implementation.md`「自动保存与崩溃恢复」。
+> 关联：`spec/plugin-state.md`（插件状态 blob 的捕获时机）。
 
 ## 1. 问题
 

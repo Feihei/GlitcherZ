@@ -1,6 +1,6 @@
 # MIDI 事件处理节点 Spec
 
-> 状态：**M1–M5 全部实施（2026-10-29）**；2026-10-30 增强：连线自动顶替、MIDI 线中点插入、MIDI FX picker、琶音 harmony/skip/DownUp/8 档 rate、滑音默认每音滑入。实现要点见 `.agents/plan.md` 同名条目。
+> 状态：**M1–M5 全部实施（2026-10-29）**；2026-10-30 增强：连线自动顶替、MIDI 线中点插入、MIDI FX picker、琶音 harmony/skip/DownUp/8 档 rate、滑音默认每音滑入。实现要点见 `.agents/implementation.md` 的「MIDI 事件处理节点 M1–M5」小节。
 > 上游：`node-graph.md`（D3 连线三类型、D5 结构更新、D9 实施策略）、`control-tracks.md`（D3 `midi_cc` / D4 去重、`AutoDest::PitchBend`）、`roll-multiclip.md` D9–D11（`PitchOffset` 逐样本平滑）。
 
 ## 1. 背景与问题

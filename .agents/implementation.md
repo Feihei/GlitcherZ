@@ -6,6 +6,7 @@
 
 按落地时间倒序；详细内容按标题往下找。
 
+- 系列实施补记（U1 / U11 / U13 / MIDI nodes / W / LFO / X / 录音 / G4·G5 / I 决策，2026-11-11 自 plan.md 归位）
 - UI 模块拆分（S3，2026-11-04）
 - 媒体路径、收集与重定位（S3b，2026-11-03）
 - 导出规格化（S3c，2026-11-03）
@@ -224,7 +225,7 @@
 
 ### 插件 GUI 宿主（plugin-gui spec，G1–G3，2026-10-20）
 
-G1（gui 扩展宿主）/ G2（Win32 嵌入容器）/ G3（参数回接）已落地，Dexed 实测通过；决策 D1–D10 与阶段明细见 `spec/plugin-gui.md` 与 plan.md。跨版本 gotchas：
+G1（gui 扩展宿主）/ G2（Win32 嵌入容器）/ G3（参数回接）已落地，Dexed 实测通过；决策 D1–D10 与阶段明细见 `spec/plugin-gui.md`。跨版本 gotchas：
 
 - **CLAP gui 契约**：`destroy` 即 `closed(was_destroyed=true)` 的**宿主确认**（宿主主动关闭后插件才回调 closed；spec 初稿方向写反已修）。gui/flush 调用**不过 StateGate**（[main-thread] 调用与 process 的并发安全由插件契约保证，D7 同款裁决）；GUI 编辑**不进 undo**（preset save 捕获 state 覆盖持久化，D8）；tab 切走 = hide、切轨/retire = destroy（D9）。
 - **test-plugin 观察通道**：cdylib 的 static 宿主进程读不到——插件内观察状态（gui 调用序列位图 GuiCallMask、destroy 计数）经**只读参数**暴露，宿主侧 `read_param_values` 读回断言。改 test-plugin 后须显式 `cargo build -p glitcherz-test-plugin`——**dll 不随 clap-host 测试自动重建**（测试仍链旧 dll，症状是"改了没生效"）。
@@ -1323,7 +1324,7 @@ spec `timeline.md` D31。需求原话是「ctrl 中键切换 mute、mute 之后�
 
 ## I 系列：交互打磨（I1–I6，2026-11-10）
 
-用户一次提了 5 条（vk 节点可弹、卷帘键列试听、工具栏按钮、draw 默认长度、strum 失效），评审后加第 6 条（timeline 头裁）。决策见 `plan.md` 的 I-D1…I-D7，按 I5 → I6 → I4 → I2 → I1 → I3 落地。
+用户一次提了 5 条（vk 节点可弹、卷帘键列试听、工具栏按钮、draw 默认长度、strum 失效），评审后加第 6 条（timeline 头裁）。决策见本章末的 I-D1…I-D7，按 I5 → I6 → I4 → I2 → I1 → I3 落地。
 
 **I5 是默认值的锅，不是命令层的。** `StrumOptions::default()` 全 0，而 `model::ops::strum()` 在 spread = 0 时是恒等变换（`strum_with_zero_spread_is_the_identity` 锁着这条契约）。UI 用 default 打开面板、Apply 静默关闭——所以"strum 没反应"。修法放在 UI 侧 `default_strum_options()`（spread = 1/32 = 120 t、window = 30 t），并在 spread = 0 时给状态栏提示、保持面板打开。模型契约不动。
 
@@ -1430,3 +1431,117 @@ I3 上线后用户反馈"改完快捷键都无效了"。根因不在按键映射
 **测试**：`keyboard.rs` 新增 4 条纯逻辑回归——`a_transposed_note_releases_the_pitch_that_was_sent`、`a_transpose_change_while_held_keeps_the_original_release`、`a_route_change_releases_the_sounding_pitches`（核心：Off 列表是 `[62, 66]` 而不是物理 `[60, 64]`）、`clearing_drops_every_held_key`。
 
 **门禁**：`cargo fmt --all` / `cargo clippy --workspace --all-targets -D warnings` / `cargo test --workspace` = **1348 通过 / 0 失败 / 11 ignored**。
+
+## 系列实施补记（2026-11-11 自 plan.md 归位）
+
+plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录此前只存在于 plan.md，现按系列归位。与上方既有章节重复的以既有章节为准。
+
+### U1：transport 完整化 + seek 基建（2026-10-22）
+
+- 引擎 `SequencerCommand::{Seek, Pause, SetLoopRange}`；`play()` 改为**从当前位置续播**（stop 回零 / pause 保位 / seek 清 pending offs）。
+- `advance()` 重写为**分段调度**：块跨回卷点时同时调度尾段 `[t0, loop_end)` 与回卷头段 `[loop_start, …)`；loop 激活时抑制 D16 自停。
+- pending off 按样本钟释放。**踩过的错**：想当然地按环绕映射 off 会把长音的 off 提早到错误的块；正确做法是让 off 按连续样本钟自然释放，不需要 wrap 映射。
+- model：`ProjectMetadata.loop_range: SongLoop{enabled,start,end}`（serde default，版本不动）+ `markers: Vec<Marker>`（上限 32）+ validate。
+- UI：transport 按钮组；Space 全局 play/pause（`egui_wants_keyboard_input` 守卫防劫持文本编辑）、Home/End；ruler 交互化——裸点击/拖 = seek scrub、Ctrl+拖 = 拉选 song loop（bar 吸附，一次拖 = 一步 undo）、拖 loop 边 = 单端重塑、右键 = 加 marker。undo/redo 与 `do_open` 经 `apply_document` 重推 loop range。
+- 测试：引擎 7 新增 + model 3；sequencer 两条旧测试补显式 `seek(0)`（play 语义变了）。
+
+### U11：audio clip 裁剪 + 模态编辑（2026-10-26，spec `audio-trim.md`）
+
+- 语义从 U6 的「变速跟随」改为「裁剪」：拖边缘调裁剪窗口、不变调。**核心代价**：clip 时长必须从 tick 域挪到秒域，属时间基修订而非字段加法。
+- `AudioClip{path, start_ticks, source_offset(f64 秒), source_len(f64 秒), gain, legacy_span_ticks(read-only)}`；`Project::{sec_per_tick, audio_clip_span_ticks}` 派生 tick 长度；`migrate_v6_to_v7` + `PROJECT_VERSION` 6→7。
+- 引擎：`RtAudioClip` 秒域 + `render_clip` 原生速率读（窗口外 / 文件尾静音）；`ProcessContext.sec_per_tick`（`Sequencer::base_sec_per_tick()`，**有意不跟随 tempo 曲线**）。
+- `Placement` trait 方法加 `sec_per_tick: f64`（MIDI/control 忽略）；modal 几何 / targets / ghost / batch 两表 → 三表，`arm_modal` 放行 audio。
+- 交互：T = 裁尾、`t+s` = 裁头、G = 移动（含跨 audio 轨）、Shift+D = 复制 + G；跨轨移动经 `relocate_in` + `sync_clip_row` 重推源/目标轨表，一步 undo。
+- **已知取舍（用户确认接受）**：audio 不跟随 tempo 曲线，有曲线的段落会与 MIDI 错位；精确方案（tick↔秒积分 + `song_sec` 累积 + clip 表存 `start_sec`）见 spec §12，未实施。
+
+### U13：SoundFont 节点自足化（2026-10-28，spec `sf2-loader.md` D10–D17）
+
+- 空节点**静音**（不回落内置合成器）：`SilentProcessor` 清零并显式吃掉 note/CC/bend 事件。
+- `Sf2MasterVolume` 改名 `Sf2Gain`（线性 0..2，非有限值丢弃），构造期 `set_master_volume(1.0)` 抵消 crate 默认 0.5 的隐藏 -6 dB；`VoiceSpec::SoundFont { gain }`（`serde(default = 1.0)`，版本不动）。
+- 字体缓存改为 `sf2_libraries` LRU（cap 2，用户拍板）+ 独立 `sf2_preset_names` 名表（淘汰后仍能列 preset）；`load_sound_font(doc_id)` = 解析 → 写文档 → `replace_node` 原位换装（保 node id，线缆 / 端口 / MIDI 路由零改动）→ 一步 undo。
+- `BlockingJob` 三相位状态机（排队帧 → banner 帧 → 运行帧），banner 与插件扫描条同槽位；**不做异步**（用户拍板）。
+- 节点内 `Load File…` / `Replace…` + `bank`/`patch` 自绘 chip（原生 `ComboBox` 在缩放绘制中会溢出节点）+ gain 滑条；Inspector 与节点调同一对函数（`pick_sound_font` / `set_soundfont_preset`）。
+- **已知边界**：解析先 alloc `Vec<u8>` 再转 `Vec<i16>`，峰值 ≈ 2× 文件大小；2 GB 文件会冻结 UI 数秒（banner 只解决「看得见」）。
+
+### MIDI 事件处理节点 M1–M5（2026-10-29，spec `midi-nodes.md`）
+
+- 一次架构投入：**块内事件 / 控制总线**（`Processor::process_events` 默认空实现、`NodeEvents` 定容 32、`EventCable` 参与 Kahn 排序）+ 三种节点（`Arpeggiator` / `Portamento` / `MidiEnvelope`）。
+- `GraphCompiler` 维护独立 `event_cables` 表（不旁路、不混入音频电缆）；`connect_event` / `disconnect_event` + `EventFanInOverflow` / `EventFanOutOverflow` / `TooManyEventCables`。
+- Arpeggiator：held 有序表 16、step 按 `song_ticks` 锚定（首次入块立即触发）、gate 先 off 后 on、Up/Down/UpDown/Random（seed = node_id 的 XorShift32）、octave 1..4、latch、blanket `Off{0}` 清空。
+- Portamento：偏移初始 = `previous - new`，按 `exp(-dt/tau)` 收敛，支持 legato-only；MidiEnvelope：块级线性 ADSR、零时长段立即跳转、blanket → Release。
+- 2026-10-30 增强：连线自动顶替（`clear_midi_sources` / `clear_control_sources`）、MIDI 线中点 `Insert MIDI FX…`、`MIDI FX…` picker；琶音加 harmony / skip / DownUp / 8 档 rate；滑音 `legato_only` 默认 false（每个音起始都从上一音高滑入）。
+- **已知边界**：块粒度（≈2.7 ms）无采样内偏移；复音滑音不逐 voice 独立；transport stop 的 blanket off 只覆盖时间轴目标链首。
+
+### W 系列：鼓机 / clip 编排 / MIDI 生成（2026-10-31）
+
+- **W1 鼓机**：`VoiceSpec::DrumKit { slots, gain }` + `DrumSlot{note,path,gain,pan,tune_semitones,choke}`；引擎 128 项 note 直索引表 + 24 槽 voice 池，全部构造期预分配；1× 原生速率、全 OneShot、choke group 10 ms fade。W1b 把 `note_name` 收进 `model::ops`（C4 = 60 为唯一实现，删掉 ui 三份拷贝），Inspector 键列可拖动改键（`move_drum_slot` 复用 `rebuild_drum_kit`，落点被占用时吸附最近空闲键，松手一次重建 = 一步 undo）。
+- **W2 clip 平铺**：拆掉 UI 四处 `loop = span` 强制；`resolve_loop(current, span, requested)` 统一规则（拉长保留周期 → 平铺；缩短裁尾；显式请求钳进容器）。2026-11-04 修订：T / 拖右缘改为真正扩展时间，平铺独立成 **Shift+T** 模态（Alt+T 在 Windows 触发 `SC_KEYMENU` 吞后续鼠标事件，仅保留备用）。
+- **W3a clip 命名**：三类 clip 加 `name`（serde default + 空值不序列化，版本不动），`F2` / `Alt+双击` 就地 `TextEdit`，一步 undo、不推引擎。
+- **W3b clip 编组**：`Project.clip_groups` + 三类 clip 的 `group: Option<u32>`；`Ctrl+G` 建组 / `Ctrl+Shift+G` 解组；选区扩组在 `show()` 末尾幂等收敛，`Alt+单击` 临时拆组；组内混合类型（MIDI + Curve + Audio）在 G / Shift+D 下作为刚性组一起移动。组名编辑 / 成员手动增删仍为后续项。
+- **W4 随机化 / W5 strum**：`RandomizeOptions` + `randomize()`、`StrumOptions` + `strum()`，均 seeded、原地、不改 slice 长度；命令 `midi.randomize` / `midi.strum` + roll 工具栏面板。strum 的 UI 默认值问题见 I5。
+- **W3c**（全选与拖出 clip 撤销修复）见上文独立章节。
+
+### LFO 控制源节点（2026-10-31，spec `lfo.md`）
+
+- 1 control out，输出归一化 `[-1,1]`，可直连参数 / CC / pitch bend，或先过 Curve Map。
+- 参数：Waveform（Sine / Triangle / Saw / Square / SampleHold）、Rate（0.01–40 Hz）、Sync + 分频（1/1…1/32）、Depth（0–1）。
+- 时间基准：Hz 模式累计播放秒数；sync 模式由 `song_ticks` 派生（跟随 tempo 曲线 / seek / loop）。停止时冻结相位**且不投递**；Stop→Play 从 0 重启，Pause→Play 继续。
+- **已知边界**：输出是**绝对覆盖**而非相对调制；无 MIDI key-sync、Phase / Offset、Reverse Saw。
+
+### X 系列：symphonia 解码（2026-11-04，spec `audio-decoding.md`）
+
+- 选型：`fundsp` 不引依赖（只读公式写标量版）；`symphonia 0.6.1` 整体引入（MPL-2.0，`default-features = false` + 显式 `flac / mp3 / mpa / ogg / vorbis / aac / isomp4 / aiff / pcm / wav`）；`midly` / `dasp` 不引入。
+- `engine/src/sample.rs` 拆 `decode_wav`（hound 原逻辑零改动）与 `decode_symphonia`；`.wav` 走前者，其余按扩展名 hint + 内容探测走后者；`AUDIO_FILE_EXTENSIONS` 是格式清单唯一真源。
+- **0.6 API gotcha**：`Probe::probe()`（不是 `format()`）、`CodecRegistry::make_audio_decoder()`（不是 `make()`）、`next_packet() -> Result<Option<Packet>>`、`Track.codec_params` 是 `Option<CodecParameters>` 要 `.audio()` 取出、`Hint` 在 `core::formats::probe`、`decode()` 返回 `GenericAudioBufferRef`；`copy_to_vec_interleaved` 会 `resize` 目标 Vec（覆盖而非 append），每包复用 scratch。
+- 验收含「同一 fixture 两条分路逐帧相等」（两边 i16 都除以 32768）；未入库真实 flac/mp3 fixture。RT 侧 / `SampleData` / 文档版本全不动。
+
+### 录音引擎链路 R1–R8（2026-11-01，spec `recording.md`）
+
+- **R1 节拍器**：构造期预生成重拍 / 弱拍 click 表；`Sequencer` 增 `numerator` / `denominator` + `beat_ticks()`；`BlockRunner` 在 `process_block` **之后**混入（不进节点图、不进主电平表），Play/Stop/Pause/Seek 时 `resync`；离线导出恒关闭。
+- **R2 capture**：`realtime/capture.rs`（`CaptureTap` + `CapturedNote` + 8192 ring + 溢出计数）；`EngineCommand::SetCapture`；`BlockRunner` 在 Note 入口先取 `position_ticks()` 再入库——**sequencer 排的音符不经命令队列，天然不入 ring**。
+- **R3 midir**：`CommandSender(Arc<Mutex<Producer>>)` 让驱动回调直推命令队列；`MidiInputHub` 差量开合 + 回调内零分配的**路由快照**；`EngineCommand::CtrlAtNode` 接进既有 `dispatch_ctrl`。设备绑定是文档编辑（一次 undo），不是应用配置。
+- **R6 轨输入口**：`PortRef::TrackIn{kind,track}`（v10，无迁移）+ `GraphDoc::{track_input_source, track_input_tracks, node_track_inputs}`；录音归属由 `Timeline In` 的轨输入口连线决定（默认工程不预接）。`SequencerCommand::SetRecordMute` 只丢 On。
+- **R4 音频录音**：`NodeDoc::Input` + `crossbeam-queue` 双无锁 ring（monitor + take，Arc 句柄跨图重建存活）；cpal 输入流按引擎采样率打开、f32、无重采样；`realtime::input::InputProcessor`（通道选择 / gain / 欠采样计数）；`.media/` 写 32-bit float mono wav（相对路径）。
+- **R7 / R8 烘培**：`RtGraph` 烘培表 + 块末 `baked_notes` / `baked_controls`；MIDI 在事件派发处抓取（Arp / Portamento 输出），控制源在块边界抓值（LFO / Envelope / Portamento / CurveMap）。限制：Timeline 曲线出口 → 曲线输入仍未采样，见 spec R8 备注。
+- UI 侧输入控件归位见上文「录音输入 UI 归位」章。
+
+### S1-1 / S1-2 / S1-3a（2026-11-01，review 修复）
+
+- **S1-1 启动默认不发声**：`Args.no_autoplay` → `Args.autoplay`（默认 `false`），`--autoplay` 显式开启；`--note` / `--freq` 视作显式请求（隐含 autoplay，保住旧冒烟脚本）；`--no-autoplay` 保留为兼容别名。usage 与 `main.rs` 头注释同步（原写 "roadmap step 3"）。
+- **S1-2 原子保存 + 备份 + 拒绝未来版本**：`写 <name>.glz.tmp → sync_all → copy 旧文件到 .bak → rename` 覆盖；备份是 **best effort**（`.bak` 被占用不该让一次成功的保存变成失败）。顺带用 `ProjectFileRef<'a>`（只 derive `Serialize`、借用文档）去掉保存路径上一次 `Project` 全量深拷贝；`parse_project` 新增 `version > PROJECT_VERSION` 拒绝（`ModelError::NewerVersion`，文案带两个版本号）。
+- **S1-3a undo 栈按字节预算裁剪**：`Project::approx_bytes()`（`Vec` 按 `len × size_of::<T>()` 计价，忽略不会长大的标量载荷）+ `NodeDoc::payload_bytes()` / `VoiceSpec::payload_bytes()`（插件 state blob、采样路径）；`DEFAULT_HISTORY_BYTES = 256 MiB`，`HistoryEntry.bytes` 在入栈时缓存。`trim_history()` **先按条数裁、再按字节裁，且先丢 redo 尾部、再丢 undo 最旧**，永远保留 ≥1 步（单步就超预算时也不清空，否则重工程等于没有 undo）。`undo` / `redo` 在栈间搬运时同步维护字节数。
+- **S1-3a 踩坑（真 bug）**：初版 `take_oldest_undo/redo` 用 `drain(..1)`，在**空栈**上越界 panic——预算裁剪第一次就会走到；改为 `drain(..len.min(1))`，由 `one_oversized_step_still_leaves_undo_usable` 捕获。
+- **S2-4 的立项依据（P1-4）**：`begin_param_edit` 持有文档 `Arc` 克隆 → `project_mut()` 的 `Arc::make_mut` 发现 refcount ≥ 2 → **每帧整体深拷贝**；当时全仓该模式 62 处，密集工程会明显掉帧。这是「快照只在首帧取、值变化才写、release 提交」手势 API 的直接原因。
+
+### G4 / G5：面板按选中节点 + 节点内联参数（2026-10-20）
+
+- **G4**：patch 双击节点 → `OpenNode` 跳 Inspector + `selected_doc_nodes()`；`resolve_panel_target` 纯函数（文档序首个可编辑节点，无选中回落 selected_track 乐器）；六个乐器会话缓存键从 track 改为 **doc node_id**（与效果器缓存对齐）；synth 面板按 `NodeDoc` 变体分派（Instrument / Effect / Mixer），滑条下发 `send_node_param`。
+- **G5**：静态注册表 `SYNTH_INLINE`(cut/res) / `DELAY_INLINE`(time/fdbk/mix) / `MIXER_INLINE`(pan)，插件节点走 `PatchDeps.plugin_inline` 取前 2 个枚举参数；`InlineParam` + `PatchAction::SetInlineParam`；节点高度公式加 `inline_row_count × INLINE_ROW_HEIGHT(16)`；滑条在 `show()` 尾部用 `ui.put` 后置注册，**后层赢得指针 → 拖滑条不改节点位置**。
+
+### 视图标签 / 全选补充 / Edit 页纵向空间（2026-11-05）
+
+- 标签顺序由 `MainView::ORDER` 单一来源驱动（标签栏 / Tab 循环 / Alt+1..4 都读它）；裸 Tab 从此全局归视图切换，卷帘 clip 焦点切换改 `Ctrl+Tab` / `Ctrl+Shift+Tab`。最终顺序 `Timeline → Edit → Patch → Inspector`。
+- `Ctrl+A` / `Ctrl+Shift+A` 全选是**视图级**命令（`all_clips()`：MIDI → control → audio 表序），因为行级 handler 只看得见自己那一轨。同时修「音符拖出 clip 后 Ctrl+Z 没反应」：`clamped_move_deltas` 从只钳 start 改为连尾巴一起钳（`loop_ticks - length - start`），指针已抬起时丢弃残留 `drag` / `marquee`。
+- Edit 页纵向空间：timeline `ROW_HEIGHT` 28→40；piano roll 改为吃满 `available_height - (velocity + overlay lanes + spacing)`（下限 `ROLL_MIN_HEIGHT`，`ROLL_HEIGHT` 降级为无边界兜底）；Edit 页 MIDI 目标去掉外层 ScrollArea，Event List 进 `Panel::bottom`（默认 1/3 高、可拖分隔条）；默认时间缩放 fit 基准加两小节下限。
+
+### patch timeline 三类轨统一增删（2026-10-26）
+
+- timeline 工具栏与 patch timeline 节点都补齐 `+/- MIDI`、`+/- Curve`、`+/- Audio` 三对按钮，走同一批 `add_*` / `remove_*`；`TIMELINE_ACTION_ROWS` 2→3。
+- **audio 节点折入是呈现层合并**：`ensure_positions` 跳过 `NodeDoc::AudioTrack`（不进 positions → 不绘制 / 不命中 / 不框选），`patch_port_from` 把该节点映射到 timeline 的端口，`timeline_port_kind` 成为端口→轨唯一真源；文档 / 引擎拓扑不动，音频信号仍由生成器节点产生。端口序 MIDI → Curve → Audio。
+
+### I 系列决策（I-D1…I-D7，2026-11-10）
+
+- **I-D1 八度与移调存哪**：原定「八度视图态 + 移调文档字段」，同日修订为 **C：两者都是文档字段**——八度一旦影响发声就不是 viewport 属性；节点拥有音区，电脑键盘从窗口的 C 开始，`Z`/`X` 与 `Oct -/+` 是同一个值。实施见上文「vk 音区接管电脑键盘」。
+- **I-D2 工具栏分组**：模式组（互斥、持久、pressed 态）+ 动作组（一次性、armed 描边）。卷帘模式组 = `[Select][Draw]`；Grab / Scale / Stretch / Knife 是动作，点按钮 == 按一次对应快捷键；timeline 无持久模式，只有动作组。
+- **I-D3 试听是否受录音影响**：v1 照常走 `EngineCommand::Note{track}`，录音 armed 时会被 capture（按下听到的就是会录下的）。
+- **I-D4 timeline 不补独立 Scale**：`T`（Stretch）就是时间缩放，按钮写 `Stretch (T)`。
+- **I-D5 timeline 不补 Draw**：创建语义已由双击承担（MIDI/control 建空 clip、audio 导文件），再加 Draw 会与双击和 G 的拖拽选区混。
+- **I-D6 strum 单位改音符分数**（1/32、1/16…）+ 悬停显示 `@BPM` 毫秒数。
+- **I-D7 头裁内容语义**：单周期 clip（`loop == span`）走真头裁（`retain_from`：内容前移、裁掉开头、跨界音符保留尾巴）；tiled clip 只能容器截断并给状态栏提示；MIDI/control 头裁只能向右，音频靠 `source_offset` 可向左回补到 0。
+
+### 阶段边界（自 plan.md 归位）
+
+- **Y 系列 S0**：不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（stems / 24-bit / 采样率选择）。
+- **Z / B 系列**：不改 `PROJECT_VERSION`、不改单口节点的逐样本行为、**不给 CLAP / VST3 插件效果器开双口**（宿主侧 port 协商是大工程，另立项）、不引入新依赖、不做任意多输入口（只 `0` / `1` 两个）、不做端口间自动降混。
+- **X 系列**：不做编码器（导出 / 录音仍 hound 写 WAV）、Opus / ALAC、元数据展示、流式解码、采样率重采样（`rubato` 未引入）、`PROJECT_VERSION` bump。
+- **I 系列**：不做 vk 节点的和弦 / 琶音器、键条力度分区（y 轴力度）、note repeat、timeline draw 到「音频片段内容编辑」；不改 `StrumOptions` 的模型默认值、不改 `PROJECT_VERSION`、不新增 crate、不动实时线程。

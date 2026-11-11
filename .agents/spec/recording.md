@@ -3,8 +3,7 @@
 > 状态：实施中（2026-11-01）。R1 节拍器、R2 录音骨架、R3 硬件 MIDI 输入、**R6 轨输入口**、
 > **R4 音频录音**、**R5 收尾**、**R7 MIDI 烘培 / R8 控制烘培**已交付；
 > PDC 自动对齐并入 S2-3，Timeline 曲线出口再采样留作后续。
-> 关联：`plan.md`「S2 补最短的板」、`review-2026-11-01.md`、
-> `spec/audio-track.md`（音频轨播放与 trim）、`spec/tempo-meter.md`（tick 时钟 / 拍号）。
+> 关联：`spec/audio-track.md`（音频轨播放与 trim）、`spec/tempo-meter.md`（tick 时钟 / 拍号）。
 > 前置事实：引擎已有完整的 tick 时钟（`Sequencer::position_ticks` + `base_bpm` +
 > `bar_ticks`）与 block 边界事件量化（≤ 1 block ≈ 2.7 ms @48 kHz/128）；
 > `AudioClip` 已是「path + source_offset + source_len + start_ticks」；

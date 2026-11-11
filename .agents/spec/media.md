@@ -3,8 +3,7 @@
 > 状态：已交付（2026-11-03，S3b）。实现：`glitcherz-model`（`media_paths` /
 > `rewrite_media_paths` / `missing_media` / `resolve_media_path` 规范化）+
 > `glitcherz-ui/src/media.rs`（收集落点 / 按名搜索）+ File 菜单两项动作。
-> 关联：`review-2026-11-01.md` §2「工程可移植」、
-> `spec/recording.md` D11（录音素材落 `<stem>.media/` + 相对路径，本 spec 把
+> 关联：`spec/recording.md` D11（录音素材落 `<stem>.media/` + 相对路径，本 spec 把
 > 这条规则推广到全部媒体）。
 
 ## 1. 问题
