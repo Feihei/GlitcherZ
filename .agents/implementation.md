@@ -1713,6 +1713,16 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - 测试：`repaint_tick_tests::only_runs_while_the_ui_moves`（播放、指针、smoke、空闲四种）。
 - **门禁**：`cargo fmt --all` / `cargo clippy --workspace --all-targets -D warnings` 干净；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
 
+#### 录音 PDC 自动对齐（2026-11-11 交付）
+
+- 引擎：`AudioInputInfo` 新增 `buffer_frames`（输入流 `BufferSize::Fixed` 才有；`Default` 为 `None`），记录输入缓冲帧数。
+- UI：录音开始时冻结 `record_latency_auto_samples = record_latency_total(输入缓冲, 输出缓冲, 轨道链 PDC, 0)`：
+  - 设备往返 = 输入缓冲（未知时回落输出缓冲）+ `AudioEngineInfo.buffer_frames`；
+  - 轨道链 PDC = 目标音频轨上 `NodeDoc::Effect { voice: VoiceSpec::Builtin }` 的 `Processor::latency_samples()` 之和（插件效果器暂计 0，图内 PDC 未回传控制线程）；
+  - take 落盘时 `offset_ticks = (auto + manual) / sample_rate / sec_per_tick`，正值前移；手动 `Latency offset` 保留为微调。
+- 测试：`record_latency_total` 5 条断言（输入 / 输出 / 链路 / 手动负值 clamp）。
+- **门禁**：`cargo fmt --all` / `cargo clippy --workspace --all-targets -D warnings` 干净；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
+
 #### 阶段边界（自 plan.md 归位）
 
 - **Y 系列 S0**：不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（stems / 24-bit / 采样率选择）。

@@ -176,6 +176,9 @@ pub struct AudioInputInfo {
     pub sample_rate: u32,
     /// Whether the samples are this machine's playback (WASAPI loopback).
     pub loopback: bool,
+    /// Input stream buffer size in frames when the host exposes a fixed size;
+    /// `None` = the host chose it (recording falls back to the output buffer).
+    pub buffer_frames: Option<u32>,
 }
 
 /// The live input stream plus the handles its callback and consumers share.
@@ -287,6 +290,10 @@ impl AudioInput {
         let (device, loopback) = resolve_source(&host, source)?;
         let device_name = device.to_string();
         let chosen = choose_config(&device, sample_rate, &device_name, loopback)?;
+        let buffer_frames = match chosen.config().buffer_size {
+            cpal::BufferSize::Fixed(frames) => Some(frames),
+            cpal::BufferSize::Default => None,
+        };
         let channels = chosen.channels() as usize;
         let monitor = InputRing::new(INPUT_RING_CAPACITY);
         let record = InputRing::new(RECORD_RING_CAPACITY);
@@ -355,6 +362,7 @@ impl AudioInput {
                 channels,
                 sample_rate,
                 loopback,
+                buffer_frames,
             },
             _stream: stream,
         })

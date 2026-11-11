@@ -20,7 +20,7 @@
 路线图 1–10 全部落地；基础功能、节点图、MIDI 编辑、插件宿主、可用性（U 系列）、录音（R 系列）、内建效果器（E 系列）、声源扩展（Y / Z / B 系列）与交互打磨（I 系列）均已交付。已完成系列的设计与实现位置见下方「历史系列索引」——本文件不再逐项记录它们的实施细节。
 
 - **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）；命令词汇表（F-039）V1a / V1b-1 / V1b-2 / V2 / V3 **全部交付**；剪贴板（F-040）C1–C2 已交付（2026-11-11）；clip 与数据分离（F-041）M0 文档已入库，M1 待实施。
-- **下一步候选**：无固定下一项；未完成项见下方列表（录音 PDC 自动对齐 / 用户表导入 / 安全边界）。
+- **下一步候选**：无固定下一项；未完成项见下方列表（用户表导入 / 安全边界）。
 - **门禁**：`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`，在本机沙箱外跑（沙箱内 cargo 会毒化 `target/debug/incremental`）。
 
 ## 未完成项
@@ -28,7 +28,7 @@
 - [x] **命令族扩展（2026-11-11 交付）**：quantize / legato / glue / remove_overlap / transpose 全部有命令与 UI 入口（`Notes` 菜单 + `Q` / `L` / `R` / `Shift+G`，菜单顶部可调 quantize 强度与 legato/glue 空隙）；`glue` 是唯一会缩短音符表的 op（返回新索引重建选区）。
 - [ ] **C5 一曲线多目标（暂不做，2026-11-11 用户拍板：暂时用不着）**：结论是**不需要**强制 map 节点——轴本来就是每条边自己的，放开多路后每路按目标各自推导即可。真正的阻塞在别处：`auto_routes` 每轨只 1 槽、`DedupKey::Auto` 是 per-track 的 CC/bend last-value 记忆（两条分支会互相污染）、model 的 `auto_endpoint` / `auto_target` / `remove_auto_cable` 都是单值语义。
 - [x] **空闲重绘（2026-11-11 交付）**：`ui()` 末尾不再无条件 `request_repaint_after(50 ms)`；`repaint_tick(animating, interacting, auto_close)` 只在播放 / 录音 / 指针按下时 50 ms 重绘，smoke auto-close 模式下 250 ms 唤醒，其余完全事件驱动。纯 UI 性能项，不碰引擎。
-- [ ] **录音 PDC 自动对齐**（review 2026-11-01 遗留）：PDC 已进图（S2-3），但 R5 仍靠手动 `Latency` offset；自动值需要汇总「输入设备 → 轨道链」的往返延迟。
+- [x] **录音 PDC 自动对齐（2026-11-11 交付）**：自动值 = 输入缓冲 + 输出缓冲 + 目标音频轨内置效果器链 PDC，录音开始时冻结并随 take 落盘前移；手动 `Latency offset` 保留为微调。插件效果器延迟暂不计入（引擎图内 PDC 未回传控制线程）。
 - **S5 之后的硬阻塞**（Y 系列收官时记下的三条）：
   - **命令词汇表**（**F-039，2026-11-11 已立项**，见下方小节）——`midi.*` 全都作用于既有 clip，改音色参数也还没有稳定字符串名。MCP 能「改音符」但改不了「用什么音色」、也开不了新 clip。这一期 = `NodeParam` 稳定名 + `clip.add` + `graph.set_param`，spec 已写：`spec/command-vocabulary.md`（D1–D8）。
   - **用户表导入**（Wavetable S3 留的口子）：`.wav` / `.wt` 文件、命名、缓存淘汰、文件对话 UI；风险全在文件与 UI，不在 DSP。

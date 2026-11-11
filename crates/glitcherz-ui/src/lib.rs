@@ -2067,8 +2067,12 @@ pub struct GlitcherZApp {
     /// Scratch buffer for one frame's recorded samples (reused).
     audio_scratch: Vec<f32>,
     /// Manual input-latency offset in samples (D13): positive values move the
-    /// clip earlier on the timeline. Session-only until PDC exists.
+    /// clip earlier on the timeline. A trim on top of the automatic value.
     record_latency_samples: i64,
+    /// R5: automatic latency frozen when the take starts — device round-trip
+    /// (input + output buffers) plus the target tracks' built-in effect-chain
+    /// PDC. Computed once so a mid-take device change cannot move the clip.
+    record_latency_auto_samples: i64,
     /// Input drop count at the last warning (R5: report once per burst).
     input_dropped_seen: u64,
     /// The range-selection modal for a pending export (U7 D2).
@@ -2341,6 +2345,7 @@ impl GlitcherZApp {
             audio_take: None,
             audio_scratch: Vec::new(),
             record_latency_samples: 0,
+            record_latency_auto_samples: 0,
             input_dropped_seen: 0,
             export_dialog_open: false,
             export_range_choice: export_audio::ExportRange::FullSong,

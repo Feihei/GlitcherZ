@@ -6,6 +6,40 @@
 use super::*;
 
 impl GlitcherZApp {
+    /// R5: automatic latency in samples for a take on `tracks`: device
+    /// round-trip (input + output buffers) plus the target tracks' built-in
+    /// effect-chain PDC. Plugin effects report 0 — their latency lives in the
+    /// engine graph and is not readable from the control thread.
+    pub(crate) fn automatic_record_latency_samples(&self, tracks: &[usize]) -> i64 {
+        let output = self.engine.info().buffer_frames;
+        let input = self.engine.input_info().and_then(|info| info.buffer_frames);
+        let chain = self.track_chain_latency_samples(tracks);
+        record_latency_total(input, output, chain, 0)
+    }
+
+    /// Sum of the built-in effect processors on the target tracks.
+    fn track_chain_latency_samples(&self, tracks: &[usize]) -> i64 {
+        let sample_rate = self.engine.info().sample_rate as f32;
+        self.project()
+            .graph
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                NodeDoc::Effect {
+                    track,
+                    voice: VoiceSpec::Builtin,
+                    params,
+                    ..
+                } if tracks.contains(track) => Some(
+                    crate::effect::processor(params, sample_rate)
+                        .processor
+                        .latency_samples() as i64,
+                ),
+                _ => None,
+            })
+            .sum()
+    }
+
     // ---- MIDI recording (spec `recording.md` R2) ----
 
     /// Per-frame recording housekeeping: takes whatever the capture tap
@@ -481,6 +515,11 @@ impl GlitcherZApp {
         for (node_id, tracks) in ctrl_bakes {
             self.engine.set_ctrl_bake(node_id, tracks);
         }
+        // R5: freeze the automatic latency for this take (device round-trip
+        // + the target tracks' built-in effect-chain PDC).
+        if !audio_armed.is_empty() {
+            self.record_latency_auto_samples = self.automatic_record_latency_samples(&audio_armed);
+        }
         if !audio_armed.is_empty() {
             let info = self
                 .engine
@@ -707,11 +746,11 @@ impl GlitcherZApp {
             .unwrap_or(0);
         let sample_rate = take.sample_rate.max(1);
         let source_len = frames as f64 / f64::from(sample_rate);
-        // D13: manual latency compensation moves the clip earlier (positive
-        // samples) or later (negative) on the timeline.
+        // R5 / D13: automatic device + chain latency, plus the manual trim, moves
+        // the clip earlier (positive samples) on the timeline.
         let sec_per_tick = self.project().sec_per_tick().max(1e-9);
-        let offset_ticks =
-            self.record_latency_samples as f64 / f64::from(sample_rate) / sec_per_tick;
+        let offset_samples = self.record_latency_auto_samples + self.record_latency_samples;
+        let offset_ticks = offset_samples as f64 / f64::from(sample_rate) / sec_per_tick;
         let start_ticks = (take.start_ticks - offset_ticks).round().max(0.0) as u32;
         let mut clips = Vec::new();
         for &track in &take.tracks {
@@ -1039,5 +1078,35 @@ impl GlitcherZApp {
         } else {
             self.start_recording();
         }
+    }
+}
+/// Total record offset in samples (R5): device round-trip (input + output
+/// buffers) + the track chain's PDC + the user's manual trim. `None` input
+/// falls back to the output buffer; the result is never negative.
+fn record_latency_total(input: Option<u32>, output: Option<u32>, chain: i64, manual: i64) -> i64 {
+    let input = input.or(output).unwrap_or(0) as i64;
+    let output = output.unwrap_or(0) as i64;
+    (input + output + chain + manual).max(0)
+}
+
+#[cfg(test)]
+mod record_latency_tests {
+    use super::*;
+
+    #[test]
+    fn device_and_chain_latency_add_up() {
+        assert_eq!(record_latency_total(Some(256), Some(512), 0, 0), 768);
+        assert_eq!(
+            record_latency_total(None, Some(512), 0, 0),
+            1024,
+            "an unknown input buffer falls back to the output buffer"
+        );
+        assert_eq!(record_latency_total(None, None, 0, 0), 0);
+        assert_eq!(record_latency_total(Some(256), Some(512), 100, -64), 804);
+        assert_eq!(
+            record_latency_total(None, None, 0, -100),
+            0,
+            "the offset never moves a clip forward past zero"
+        );
     }
 }
