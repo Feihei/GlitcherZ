@@ -798,6 +798,89 @@ impl GlitcherZApp {
         }
     }
 
+    /// F-040: snapshot the selected notes into the app clipboard (clip-local
+    /// ticks + the earliest start, so a paste can realign them).
+    pub(crate) fn copy_roll_notes(&mut self, track: usize, clip: usize) {
+        let selection = self.roll_state.selection.clone();
+        if selection.is_empty() {
+            self.set_message("Copy: nothing selected".to_string());
+            return;
+        }
+        let notes: Vec<glitcherz_model::Note> = {
+            let Some(midi) = self
+                .project()
+                .midi_tracks
+                .get(track)
+                .and_then(|t| t.clips.get(clip))
+            else {
+                return;
+            };
+            selection
+                .iter()
+                .filter_map(|index| midi.notes().get(*index))
+                .copied()
+                .collect()
+        };
+        if notes.is_empty() {
+            self.set_message("Copy: nothing selected".to_string());
+            return;
+        }
+        let min_start = notes.iter().map(|n| n.start).min().unwrap_or(0);
+        let count = notes.len();
+        self.clipboard = Some(clipboard::Clipboard::Notes(clipboard::NotesCopy {
+            notes,
+            min_start,
+        }));
+        self.set_message(format!("Copied {count} note(s)"));
+    }
+
+    /// F-040: paste the clipboard's notes at the playhead (spec §4.2). The
+    /// playhead is converted to clip-local ticks; the earliest pasted note
+    /// lands there and the rest keep their relative offsets. One undo step.
+    pub(crate) fn paste_roll_notes(&mut self, track: usize, clip: usize) {
+        let copy = match self.clipboard.as_ref() {
+            Some(clipboard::Clipboard::Notes(copy)) => copy.clone(),
+            Some(other) => {
+                let label = other.label();
+                self.set_message(format!("Paste: the clipboard holds {label} (not notes)"));
+                return;
+            }
+            None => {
+                self.set_message("Paste: the clipboard is empty".to_string());
+                return;
+            }
+        };
+        let Some(clip_start) = self
+            .project()
+            .midi_tracks
+            .get(track)
+            .and_then(|t| t.clips.get(clip))
+            .map(|c| c.start_ticks)
+        else {
+            return;
+        };
+        let anchor = self.engine.musical_ticks() as i64 - i64::from(clip_start);
+        let pasted = clipboard::pasted_notes(&copy, anchor.max(0));
+        let before = self.begin_edit();
+        let indices = {
+            let Some(midi) = self
+                .project_mut()
+                .midi_tracks
+                .get_mut(track)
+                .and_then(|t| t.clips.get_mut(clip))
+            else {
+                return;
+            };
+            midi.notes_mut().extend(pasted.iter().copied());
+            midi.sort();
+            clipboard::locate_notes(midi.notes(), &pasted)
+        };
+        self.commit_edit("Paste Notes", before);
+        let count = indices.len();
+        self.roll_state.selection = indices;
+        self.set_message(format!("Pasted {count} note(s) at the playhead"));
+    }
+
     /// Runs a piano-roll edit as a command (M1.4: no direct document mutation).
     pub(crate) fn apply_roll_intent(
         &mut self,
@@ -816,6 +899,14 @@ impl GlitcherZApp {
                 // Aud series: a ruler seek is transient — no document change,
                 // no undo entry (it only moves the transport).
                 self.engine.seek_ticks(*tick as f64);
+                return;
+            }
+            RollIntent::CopyNotes => {
+                self.copy_roll_notes(track, clip);
+                return;
+            }
+            RollIntent::PasteNotes => {
+                self.paste_roll_notes(track, clip);
                 return;
             }
             RollIntent::MidiOp { op, indices } => {
@@ -858,6 +949,9 @@ impl GlitcherZApp {
             // into the command layer.
             RollIntent::Seek { .. } => return,
             RollIntent::MidiOp { .. } => return,
+            RollIntent::CopyNotes | RollIntent::PasteNotes => {
+                unreachable!("clipboard intents never reach the note command table")
+            }
             RollIntent::AddNote {
                 note,
                 start,

@@ -64,6 +64,7 @@ use glitcherz_model::{
 };
 
 pub mod autosave;
+pub mod clipboard;
 pub mod curve;
 pub mod editing;
 pub mod effect;
@@ -1804,6 +1805,9 @@ pub struct GlitcherZApp {
     focus_router: focus::FocusRouter,
     /// Node patch cross-frame state (pan/zoom/selection/drag).
     patch_state: patch::PatchState,
+    /// App-wide clipboard (F-040). Cleared whenever the document is replaced:
+    /// its snapshots reference the old project's tracks and node ids.
+    clipboard: Option<clipboard::Clipboard>,
     /// Mixer strip row viewport as of the last frame: scroll area id + visible
     /// rect. The middle-drag pan reads it **before** the ScrollArea lays out,
     /// so the offset and the pointer move in the same frame (the same trick
@@ -2251,6 +2255,7 @@ impl GlitcherZApp {
             roll_state: piano_roll::RollState::new(),
             focus_router: focus::FocusRouter::new(),
             patch_state: patch::PatchState::default(),
+            clipboard: None,
             mixer_strip_view: None,
             mixer_strip_h: MIXER_STRIP_MIN_H,
             channel_rename: None,

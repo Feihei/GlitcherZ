@@ -561,6 +561,12 @@ pub enum TimelineAction {
     DuplicateClipsBatch {
         dups: Vec<ClipDup>,
     },
+    /// Copy the selected clips to the app clipboard (F-040). Not a document
+    /// edit: no undo step.
+    CopySelection,
+    /// Paste the clipboard's clips at the playhead (F-040), keeping relative
+    /// offsets. One undo step.
+    PasteClips,
     SelectTrack(usize),
     SelectControlTrack(usize),
     /// Transport seek (U1): a ruler click/drag moves the playhead. Not a
@@ -3978,6 +3984,21 @@ fn lane_row<T: Placement>(
         let shift_d = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::D));
+        // F-040: the app-wide clipboard. `COMMAND` is Ctrl on Windows/Linux
+        // and Cmd on macOS. Both are consumed here so they never reach the
+        // note map or egui's own focus machinery.
+        let copy = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::C));
+        let paste = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::V));
+        if copy {
+            actions.push(TimelineAction::CopySelection);
+        }
+        if paste {
+            actions.push(TimelineAction::PasteClips);
+        }
         let x = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::NONE, Key::X));

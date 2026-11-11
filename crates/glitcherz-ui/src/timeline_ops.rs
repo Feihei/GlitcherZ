@@ -348,6 +348,8 @@ impl GlitcherZApp {
             timeline::TimelineAction::DuplicateClipsBatch { dups } => {
                 self.timeline_duplicate_clips_batch(dups)
             }
+            timeline::TimelineAction::CopySelection => self.copy_timeline_selection(),
+            timeline::TimelineAction::PasteClips => self.paste_timeline_clips(),
             timeline::TimelineAction::Seek { ticks } => {
                 // Not a document edit: straight to the engine.
                 self.engine.seek_ticks(ticks);
@@ -1732,6 +1734,160 @@ impl GlitcherZApp {
             }
             self.timeline_state.selection = new_sel;
         }
+    }
+
+    /// F-040: snapshot the selected clips into the app clipboard. A detached
+    /// value copy, not selection indices (undo would invalidate those).
+    pub(crate) fn copy_timeline_selection(&mut self) {
+        let selection = self.timeline_state.selection.clone();
+        if selection.is_empty() {
+            self.set_message("Copy: nothing selected".to_string());
+            return;
+        }
+        let mut copies = Vec::new();
+        {
+            let project = self.project();
+            for sel in selection {
+                let clip = match sel.lane {
+                    timeline::TimelineLane::Midi => project
+                        .midi_tracks
+                        .get(sel.track)
+                        .and_then(|t| t.clips.get(sel.clip))
+                        .cloned()
+                        .map(clipboard::ClipSnapshot::Midi),
+                    timeline::TimelineLane::Control => project
+                        .control_tracks
+                        .get(sel.track)
+                        .and_then(|t| t.clips.get(sel.clip))
+                        .cloned()
+                        .map(clipboard::ClipSnapshot::Control),
+                    timeline::TimelineLane::Audio => project
+                        .audio_tracks
+                        .get(sel.track)
+                        .and_then(|t| t.clips.get(sel.clip))
+                        .cloned()
+                        .map(clipboard::ClipSnapshot::Audio),
+                };
+                let Some(clip) = clip else { continue };
+                copies.push(clipboard::ClipCopy {
+                    lane: sel.lane,
+                    track: sel.track,
+                    start: clip.start_ticks(),
+                    clip,
+                });
+            }
+        }
+        if copies.is_empty() {
+            self.set_message("Copy: nothing selected".to_string());
+            return;
+        }
+        let count = copies.len();
+        self.clipboard = Some(clipboard::Clipboard::Clips(copies));
+        self.set_message(format!("Copied {count} clip(s)"));
+    }
+
+    /// F-040: paste the clipboard's clips at the playhead (spec §4.1). The
+    /// earliest source clip lands exactly on the playhead; the rest keep their
+    /// relative offsets. One undo step.
+    pub(crate) fn paste_timeline_clips(&mut self) {
+        let copies = match self.clipboard.as_ref() {
+            Some(clipboard::Clipboard::Clips(copies)) => copies.clone(),
+            Some(other) => {
+                let label = other.label();
+                self.set_message(format!("Paste: the clipboard holds {label} (not clips)"));
+                return;
+            }
+            None => {
+                self.set_message("Paste: the clipboard is empty".to_string());
+                return;
+            }
+        };
+        let anchor = self.engine.musical_ticks().max(0.0) as u32;
+        let starts = clipboard::pasted_starts(&copies, anchor);
+        let before = self.begin_edit();
+        let mut new_sel = Vec::new();
+        let mut touched = Vec::new();
+        {
+            let project = self.project_mut();
+            for (copy, start_ticks) in copies.iter().zip(starts) {
+                let lane = copy.lane;
+                match &copy.clip {
+                    clipboard::ClipSnapshot::Midi(source) => {
+                        let Some(t) = project.midi_tracks.get_mut(copy.track) else {
+                            continue;
+                        };
+                        if t.clips.len() >= MAX_CLIPS_PER_TRACK {
+                            continue;
+                        }
+                        let mut clip = source.clone();
+                        clip.start_ticks = start_ticks;
+                        let index = t.clips.len();
+                        t.clips.push(clip);
+                        new_sel.push(timeline::ClipSel {
+                            lane,
+                            track: copy.track,
+                            clip: index,
+                        });
+                        let touched_row = (lane, copy.track);
+                        if !touched.contains(&touched_row) {
+                            touched.push(touched_row);
+                        }
+                    }
+                    clipboard::ClipSnapshot::Control(source) => {
+                        let Some(t) = project.control_tracks.get_mut(copy.track) else {
+                            continue;
+                        };
+                        if t.clips.len() >= MAX_CLIPS_PER_TRACK {
+                            continue;
+                        }
+                        let mut clip = source.clone();
+                        clip.start_ticks = start_ticks;
+                        let index = t.clips.len();
+                        t.clips.push(clip);
+                        new_sel.push(timeline::ClipSel {
+                            lane,
+                            track: copy.track,
+                            clip: index,
+                        });
+                        let touched_row = (lane, copy.track);
+                        if !touched.contains(&touched_row) {
+                            touched.push(touched_row);
+                        }
+                    }
+                    clipboard::ClipSnapshot::Audio(source) => {
+                        let Some(t) = project.audio_tracks.get_mut(copy.track) else {
+                            continue;
+                        };
+                        if t.clips.len() >= MAX_CLIPS_PER_TRACK {
+                            continue;
+                        }
+                        let mut clip = source.clone();
+                        clip.start_ticks = start_ticks;
+                        let index = t.clips.len();
+                        t.clips.push(clip);
+                        new_sel.push(timeline::ClipSel {
+                            lane,
+                            track: copy.track,
+                            clip: index,
+                        });
+                        let touched_row = (lane, copy.track);
+                        if !touched.contains(&touched_row) {
+                            touched.push(touched_row);
+                        }
+                    }
+                }
+            }
+        }
+        if new_sel.is_empty() {
+            self.set_message("Paste: no destination tracks".to_string());
+            return;
+        }
+        self.commit_edit("Paste Clips", before);
+        for (lane, track) in touched {
+            self.sync_clip_row(lane, track);
+        }
+        self.timeline_state.selection = new_sel;
+        self.set_message("Pasted clips at the playhead".to_string());
     }
 
     /// Re-pushes one timeline row's clip table after an undoable edit.

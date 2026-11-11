@@ -173,6 +173,10 @@ struct Keys {
     select_all: bool,
     /// `Ctrl+Shift+A`: drop the selection.
     deselect_all: bool,
+    /// `Ctrl+C`: copy the selected notes to the app clipboard (F-040).
+    copy: bool,
+    /// `Ctrl+V`: paste the clipboard's notes at the playhead (F-040).
+    paste: bool,
 }
 
 /// A named MIDI command exposed by the roll's Notes menu (the W6 command
@@ -237,6 +241,12 @@ pub enum RollIntent {
     /// copies' indices; the caller selects them, and the move frames of the
     /// same gesture share `gesture`, so copy + move is a single undo step.
     Duplicate { indices: Vec<usize>, gesture: u64 },
+    /// Copy the selected notes into the app clipboard (F-040). Not a document
+    /// edit: no undo step.
+    CopyNotes,
+    /// Paste the clipboard's notes at the playhead (F-040), keeping relative
+    /// offsets. One undo step.
+    PasteNotes,
     /// Ruler seek (Aud series): move the transport to this absolute tick.
     /// Bypasses the command layer — no document change, no undo.
     Seek { tick: i64 },
@@ -2692,6 +2702,9 @@ pub fn show(
                 i.consume_key(mods, egui::Key::A)
             },
             select_all: i.consume_key(egui::Modifiers::CTRL, egui::Key::A),
+            // F-040: `COMMAND` = Ctrl on Windows/Linux, Cmd on macOS.
+            copy: i.consume_key(egui::Modifiers::COMMAND, egui::Key::C),
+            paste: i.consume_key(egui::Modifiers::COMMAND, egui::Key::V),
         });
         if keys.x {
             state.apply_axis(Axis::Time);
@@ -2739,7 +2752,11 @@ pub fn show(
                     state.note_status(format!("{count} notes selected"));
                 }
             }
-            if keys.shift_d {
+            if keys.copy {
+                intent = Some(RollIntent::CopyNotes);
+            } else if keys.paste {
+                intent = Some(RollIntent::PasteNotes);
+            } else if keys.shift_d {
                 if state.selection.is_empty() {
                     state.note_status("Duplicate: nothing selected");
                 } else {

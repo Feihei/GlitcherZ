@@ -81,6 +81,8 @@ impl GlitcherZApp {
         self.cancel_recording();
         self.send_sequencer(SequencerCommand::Stop);
         self.session.replace(Project::default());
+        // F-040: snapshots reference the replaced document's tracks.
+        self.clipboard = None;
         self.project_path = None;
         // S3a: the snapshot clock belongs to the document that just went away.
         self.autosave_clock.reset(Instant::now());
@@ -551,6 +553,8 @@ impl GlitcherZApp {
     /// from, not on where they are going.
     pub(crate) fn adopt_document(&mut self, project: Project, path: Option<PathBuf>, dirty: bool) {
         self.session.replace(project);
+        // F-040: snapshots reference the replaced document's tracks.
+        self.clipboard = None;
         if dirty {
             self.session.mark_dirty();
         }
