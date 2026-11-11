@@ -1808,6 +1808,10 @@ pub struct GlitcherZApp {
     /// App-wide clipboard (F-040). Cleared whenever the document is replaced:
     /// its snapshots reference the old project's tracks and node ids.
     clipboard: Option<clipboard::Clipboard>,
+    /// Copy hook into the OS clipboard (F-040). egui-winit turns Ctrl+V into
+    /// `Event::Paste` only when the OS clipboard is non-empty, so every copy
+    /// leaves a short sentinel there for the paste event to exist at all.
+    egui_ctx: egui::Context,
     /// Mixer strip row viewport as of the last frame: scroll area id + visible
     /// rect. The middle-drag pan reads it **before** the ScrollArea lays out,
     /// so the offset and the pointer move in the same frame (the same trick
@@ -2256,6 +2260,7 @@ impl GlitcherZApp {
             focus_router: focus::FocusRouter::new(),
             patch_state: patch::PatchState::default(),
             clipboard: None,
+            egui_ctx: cc.egui_ctx.clone(),
             mixer_strip_view: None,
             mixer_strip_h: MIXER_STRIP_MIN_H,
             channel_rename: None,

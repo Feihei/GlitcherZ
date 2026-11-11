@@ -2702,9 +2702,13 @@ pub fn show(
                 i.consume_key(mods, egui::Key::A)
             },
             select_all: i.consume_key(egui::Modifiers::CTRL, egui::Key::A),
-            // F-040: `COMMAND` = Ctrl on Windows/Linux, Cmd on macOS.
-            copy: i.consume_key(egui::Modifiers::COMMAND, egui::Key::C),
-            paste: i.consume_key(egui::Modifiers::COMMAND, egui::Key::V),
+            // F-040: winit turns Ctrl+C/V into `Event::Copy` / `Event::Paste`
+            // and pushes no Key event, so the events are the real path; the
+            // key checks serve headless tests / other backends.
+            copy: crate::clipboard::take_copy_event(i)
+                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::C),
+            paste: crate::clipboard::take_paste_event(i)
+                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::V),
         });
         if keys.x {
             state.apply_axis(Axis::Time);

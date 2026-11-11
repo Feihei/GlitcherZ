@@ -10,6 +10,49 @@ use glitcherz_model::{AudioClip, CableDoc, ControlClip, MidiClip, NodeDoc, Note}
 
 use crate::timeline::TimelineLane;
 
+/// Takes a pending [`egui::Event::Copy`] from this frame.
+///
+/// egui-winit turns Ctrl+C into `Event::Copy` and **returns before pushing a
+/// `Event::Key`** (egui-winit 0.36.2 `on_keyboard_input`), so `consume_key`
+/// never sees the shortcut in a real window. The key path is still accepted by
+/// the callers for headless tests and non-winit backends.
+pub(crate) fn take_copy_event(input: &mut egui::InputState) -> bool {
+    let hit = input
+        .events
+        .iter()
+        .any(|event| matches!(event, egui::Event::Copy));
+    if hit {
+        input
+            .events
+            .retain(|event| !matches!(event, egui::Event::Copy));
+    }
+    hit
+}
+
+/// Takes a pending [`egui::Event::Paste`] from this frame (same winit
+/// shortcut translation as [`take_copy_event`]). The payload is ignored: the
+/// app pastes its own snapshot, and a non-empty OS clipboard only acts as the
+/// event carrier.
+pub(crate) fn take_paste_event(input: &mut egui::InputState) -> bool {
+    let hit = input
+        .events
+        .iter()
+        .any(|event| matches!(event, egui::Event::Paste(_)));
+    if hit {
+        input
+            .events
+            .retain(|event| !matches!(event, egui::Event::Paste(_)));
+    }
+    hit
+}
+
+/// The sentinel written to the OS clipboard on copy. egui-winit only emits
+/// `Event::Paste` when the OS clipboard is non-empty (0.36.2 line 1027-1034),
+/// so the app's own snapshot would otherwise never receive a paste event.
+pub(crate) fn sentinel(kind: &str, count: usize) -> String {
+    format!("GlitcherZ clipboard: {count} {kind}")
+}
+
 /// One clipboard slot for the whole app (spec D1).
 #[derive(Clone)]
 pub(crate) enum Clipboard {

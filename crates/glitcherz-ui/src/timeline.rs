@@ -3984,15 +3984,17 @@ fn lane_row<T: Placement>(
         let shift_d = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::D));
-        // F-040: the app-wide clipboard. `COMMAND` is Ctrl on Windows/Linux
-        // and Cmd on macOS. Both are consumed here so they never reach the
-        // note map or egui's own focus machinery.
-        let copy = ui
-            .ctx()
-            .input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::C));
-        let paste = ui
-            .ctx()
-            .input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::V));
+        // F-040: the app-wide clipboard. egui-winit turns the shortcut into
+        // `Event::Copy` / `Event::Paste` and never pushes a Key event for it,
+        // so the events are the real path; the key checks keep headless tests
+        // and non-winit backends working. `COMMAND` is Ctrl on Windows/Linux
+        // and Cmd on macOS.
+        let (copy, paste) = ui.ctx().input_mut(|i| {
+            (
+                crate::clipboard::take_copy_event(i) || i.consume_key(Modifiers::COMMAND, Key::C),
+                crate::clipboard::take_paste_event(i) || i.consume_key(Modifiers::COMMAND, Key::V),
+            )
+        });
         if copy {
             actions.push(TimelineAction::CopySelection);
         }

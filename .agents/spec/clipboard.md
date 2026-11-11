@@ -28,7 +28,7 @@
 | :--- | :--- | :--- |
 | D1 | 剪贴板作用域 | **全局单剪贴板**：`GlitcherZApp.clipboard: Option<Clipboard>`，内容带类型标记。任何视图都可复制，但粘贴只在类型匹配的视图生效 |
 | D2 | 存索引还是存值 | **存值快照**。undo / 删除会让 `ClipSel` 的 clip 索引、`RollState.selection` 的音符索引失效，剪贴板不能持有索引 |
-| D3 | 键位与归属 | 各视图在自己的键盘块内 `consume_key(COMMAND, C/V)`：Timeline / Edit 沿用 `response.has_focus()`，Patch 沿用 `response.hovered()`（与 Delete 一致）。全局 `keyboard.rs` 白名单保持现状（只 `continue`、不消费），视图在后续绘制中仍能拿到事件 |
+| D3 | 键位与归属 | 视图消费 **`Event::Copy` / `Event::Paste`**：egui-winit 把 Ctrl+C/V 转成这两个事件，并在推 `Event::Key` 之前 `return`，所以真实窗口里 `consume_key` 永远收不到。同时保留 `consume_key(COMMAND, C/V)` 以兼容 headless 测试与非 winit 后端。Timeline / Edit 用 `response.has_focus()`，Patch 用 `response.hovered()`（与 Delete 一致）。全局 `keyboard.rs` 白名单保持现状（只 `continue`、不消费） |
 | D4 | macOS 兼容 | 用 `egui::Modifiers::COMMAND` 匹配：Windows / Linux 等价 Ctrl，macOS 为 Cmd。既有全局 Ctrl 白名单不动（其 Cmd 缺口是历史问题，不在本特性范围） |
 | D5 | 空选 / 空剪贴板 | 不覆盖既有剪贴板；状态栏提示 `Copy: nothing selected` / `Paste: clipboard is empty`。类型不匹配提示 `Paste: clipboard holds <notes/clips/nodes>`，不改文档 |
 | D6 | 文本输入冲突 | 焦点在文本输入框时视图不消费（`ctx.text_edit_focused()`），交给系统剪贴板——与 eframe 的 `clipboard` feature 分工不变 |
@@ -37,6 +37,7 @@
 - 不新增命令注册表条目，走既有编辑守卫（`begin_edit` / `commit_edit`，复合操作用 `session.suspend_history()`），因此不影响 MCP / CLI 的命令计数断言 |
 | D8 | 跨工程 | 新建 / 打开 / 关闭工程时**清空剪贴板**（内容引用旧工程轨道与节点 id，跨工程粘贴无意义） |
 | D9 | 明确不做 | Ctrl+X（cut 另立）、系统剪贴板互操作（文本 / 图片 / 文件）、跨视图类型转换（把 clip 粘贴成音符等） |
+| D10 | 系统剪贴板载体 | egui-winit 只在系统剪贴板**非空**时推 `Event::Paste`，空剪贴板时 Ctrl+V 连事件都没有。因此复制时用 `ctx.copy_text("GlitcherZ clipboard: N …")` 留一条哨兵；粘贴忽略其内容，只用应用内快照。副作用是复制会覆盖用户系统剪贴板（用户主动按复制时的正常预期） |
 
 ## 3. 剪贴板结构
 

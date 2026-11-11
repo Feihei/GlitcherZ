@@ -597,6 +597,9 @@ impl GlitcherZApp {
         };
         let count = copy.nodes.len();
         self.clipboard = Some(clipboard::Clipboard::Nodes(copy));
+        // F-040: sentinel so the next Ctrl+V produces a paste event.
+        self.egui_ctx
+            .copy_text(clipboard::sentinel("node(s)", count));
         self.set_message(format!("Copied {count} node(s)"));
     }
 

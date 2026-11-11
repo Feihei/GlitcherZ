@@ -1685,6 +1685,7 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - Patch 只复制**两端都在选中集内**的线（外部线不复制，避免把未选节点拖进副本）；引擎拒绝的节点（槽满 / 插件加载失败）单独回滚文档 + `engine.remove_node` 后跳过，其内部线一并丢弃，状态栏报跳过数量。
 - 测试：`clipboard` 5 条（相对偏移、负锚点 clamp、first-match 定位、包围盒对齐、内部线筛选）+ `patch` 的 `ctrl_c_on_the_patch_requests_a_copy`（真实 egui 帧 + hover + `COMMAND`）。
 - **门禁**：`cargo fmt` / `cargo clippy --workspace --all-targets -D warnings` 干净；`cargo test -p glitcherz-ui` 与 `cargo test --workspace` 全 `ok. 0 failed`（FSM 的 FAIL 为已知误报，以原始 `test result` 与退出码为准）。
+- **事件链勘误（2026-11-11，用户实测）**：首版用 `consume_key(COMMAND, C/V)`，真实窗口里 `Shift+D` 生效而 Ctrl+C/V 完全无响应。根因在 `egui-winit 0.36.2 on_keyboard_input`：`is_copy_command` / `is_paste_command` 命中后只推 `Event::Copy` / `Event::Paste(内容)` 并 `return`，**不再推 `Event::Key`**；且系统剪贴板为空时连 `Paste` 都不推。修复：视图改消费 Copy/Paste 事件（`clipboard::take_copy_event` / `take_paste_event`，从 `InputState.events` 中移除），Key 路径保留给 headless / 非 winit 后端；复制时 `ctx.copy_text(sentinel)` 写一条哨兵，保证下一次 Ctrl+V 一定有 `Paste` 事件。测试改为注入 `Event::Copy` / `Event::Paste`，并新增 Patch 粘贴分发用例。
 
 #### 命令词汇表 V1b-1：声源参数 + graph.set_voice（2026-11-11 交付）
 

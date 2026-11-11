@@ -5184,8 +5184,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     if response.hovered() {
         let (copy, paste, shift_d) = ui.ctx().input_mut(|i| {
             (
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::C),
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::V),
+                // F-040: winit turns Ctrl+C/V into `Event::Copy` / `Event::Paste`
+                // and pushes no Key event; the key checks serve headless tests.
+                crate::clipboard::take_copy_event(i)
+                    || i.consume_key(egui::Modifiers::COMMAND, egui::Key::C),
+                crate::clipboard::take_paste_event(i)
+                    || i.consume_key(egui::Modifiers::COMMAND, egui::Key::V),
                 i.consume_key(egui::Modifiers::SHIFT, egui::Key::D),
             )
         });
@@ -7738,13 +7742,9 @@ mod tests {
             &ctx,
             &mut state,
             deps,
-            vec![egui::Event::Key {
-                key: egui::Key::C,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::COMMAND,
-            }],
+            // The real winit path: Ctrl+C is translated to `Event::Copy` and
+            // no Key event is pushed, so this is what the app actually sees.
+            vec![egui::Event::Copy],
             0.2,
         );
         assert!(
@@ -7752,6 +7752,56 @@ mod tests {
                 .iter()
                 .any(|action| matches!(action, PatchAction::CopySelection)),
             "Ctrl+C must ask the app for a copy"
+        );
+    }
+
+    /// F-040: the matching paste path — winit pushes `Event::Paste` instead of
+    /// a Key event, and the patch must turn it into a paste at the pointer.
+    #[test]
+    fn ctrl_v_on_the_patch_requests_a_paste_at_the_pointer() {
+        let project = Project::default();
+        let track_name = |_: TrackKind, _: usize| String::new();
+        let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
+        let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
+        let deps = PatchDeps {
+            input: Default::default(),
+            doc: &project.graph,
+            track_count: project.midi_tracks.len(),
+            track_name: &track_name,
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
+        };
+        let ctx = egui::Context::default();
+        let mut state = PatchState::default();
+        state.ensure_positions(
+            &project.graph,
+            project.midi_tracks.len(),
+            project.control_tracks.len(),
+            project.audio_tracks.len(),
+        );
+        drive(
+            &ctx,
+            &mut state,
+            deps,
+            vec![egui::Event::PointerMoved(Pos2::new(400.0, 300.0))],
+            0.1,
+        );
+        let actions = drive(
+            &ctx,
+            &mut state,
+            deps,
+            vec![egui::Event::Paste("sentinel".to_owned())],
+            0.2,
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, PatchAction::PasteNodes { .. })),
+            "Ctrl+V must ask the app for a paste"
         );
     }
 }

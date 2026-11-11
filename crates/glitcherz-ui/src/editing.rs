@@ -831,6 +831,9 @@ impl GlitcherZApp {
             notes,
             min_start,
         }));
+        // F-040: sentinel so the next Ctrl+V produces a paste event.
+        self.egui_ctx
+            .copy_text(clipboard::sentinel("note(s)", count));
         self.set_message(format!("Copied {count} note(s)"));
     }
 

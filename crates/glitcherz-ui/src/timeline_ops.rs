@@ -1783,6 +1783,10 @@ impl GlitcherZApp {
         }
         let count = copies.len();
         self.clipboard = Some(clipboard::Clipboard::Clips(copies));
+        // F-040: leave a sentinel in the OS clipboard. egui-winit only
+        // produces `Event::Paste` when the OS clipboard is non-empty.
+        self.egui_ctx
+            .copy_text(clipboard::sentinel("clip(s)", count));
         self.set_message(format!("Copied {count} clip(s)"));
     }
 
