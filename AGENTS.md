@@ -55,7 +55,8 @@ glitcherz/
 
 ## 编码规范
 
-- **语言约定**：代码注释、doc comment、日志、UI 文案、错误消息一律**英文**（UI 语言约定；CJK 字形由内嵌 Noto Sans SC 兜底，仅服务用户数据如轨名/片段名）；术语以 `.agents/glossary.md` 为准，新概念先登记再使用。`.agents/` 与本文件等项目文档可用中文。
+- **语言约定**：代码注释、doc comment、日志、UI 文案、错误消息、**提交信息（commit message）** 一律**英文**（UI 语言约定；CJK 字形由内嵌 Noto Sans SC 兜底，仅服务用户数据如轨名/片段名）；术语以 `.agents/glossary.md` 为准，新概念先登记再使用。`.agents/` 与本文件等项目文档可用中文。
+- **提交信息格式**：`<type>(<scope>): <summary>`，type 用 `feat` / `fix` / `docs` / `refactor` / `test` / `chore`，summary 用英文祈使句；正文用要点列表说明 why。历史中文提交不回溯。
 - `cargo clippy -- -D warnings` 必须零警告。
 - `cargo fmt` 格式化所有代码。
 - 禁止 `unsafe`，除非：模块顶部有 `// SAFETY:` 注释 + 理由 + 测试。当前允许的边界：`glitcherz-clap-host` / `glitcherz-vst3-host` 的插件绑定层，以及 `glitcherz-ui` 的 `plugin_window` 模块（Win32 容器窗口，spec `plugin-gui.md` §4）。
