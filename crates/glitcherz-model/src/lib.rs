@@ -46,8 +46,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 pub mod file;
+pub mod meter;
 pub mod ops;
 pub mod smf;
+
+pub use meter::{MeterMap, MeterSegment};
 
 pub use file::{
     AUTOSAVE_SUFFIX, ModelError, PROJECT_VERSION, ProjectFile, autosave_path, load_project,
@@ -6126,6 +6129,23 @@ impl Project {
         self.metadata.time_signature.ticks_per_bar()
     }
 
+    /// The piecewise meter table (Met M3): the base meter plus every
+    /// [`MeterMarker`]. Building it is cheap (one small table); the UI and the
+    /// engine each keep their own cache and rebuild it on document changes.
+    pub fn meter_map(&self) -> MeterMap {
+        MeterMap::new(self.metadata.time_signature, &self.metadata.meter_markers)
+    }
+
+    /// 0-based `(bar, beat)` at an absolute tick, following meter changes.
+    pub fn bar_beat_at(&self, tick: u32) -> (u32, u32) {
+        self.meter_map().bar_beat_at(tick)
+    }
+
+    /// Bar length in ticks at an absolute tick, following meter changes.
+    pub fn ticks_per_bar_at(&self, tick: u32) -> u32 {
+        self.meter_map().ticks_per_bar_at(tick)
+    }
+
     /// Seconds per tick at the project's **base** tempo (U11 D2). Audio clips
     /// convert between the tick domain and seconds with this constant — they
     /// deliberately do not follow the tempo curve.
@@ -6157,6 +6177,7 @@ impl Project {
 
         total += self.metadata.name.len();
         total += self.metadata.markers.len() * std::mem::size_of::<Marker>();
+        total += self.metadata.meter_markers.len() * std::mem::size_of::<MeterMarker>();
         total += self.clip_groups.len() * std::mem::size_of::<ClipGroup>();
         for group in &self.clip_groups {
             total += group.name.len();
@@ -6332,6 +6353,36 @@ impl Project {
                 ));
             }
         }
+        // Met M3: meter changes are a bounded, strictly ascending table. The
+        // bar-line position is deliberately *not* validated: `MeterMap::new`
+        // snaps a stray marker down instead of refusing the document (D2).
+        if self.metadata.meter_markers.len() > MAX_METER_MARKERS {
+            return Err(format!(
+                "meter change count {} exceeds the limit {MAX_METER_MARKERS}",
+                self.metadata.meter_markers.len()
+            ));
+        }
+        for (i, marker) in self.metadata.meter_markers.iter().enumerate() {
+            if !marker.signature.is_valid() {
+                return Err(format!(
+                    "meter change #{i} has an invalid time signature {}",
+                    marker.signature
+                ));
+            }
+            if marker.tick == 0 {
+                return Err("meter change at tick 0 is reserved for the base meter".to_string());
+            }
+            if u64::from(marker.tick) > MAX_ARRANGEMENT_TICKS {
+                return Err(format!(
+                    "meter change #{i} lies beyond the {MAX_ARRANGEMENT_BARS}-bar arrangement bound"
+                ));
+            }
+            if i > 0 && marker.tick <= self.metadata.meter_markers[i - 1].tick {
+                return Err(format!(
+                    "meter change #{i} is not strictly after the previous one"
+                ));
+            }
+        }
         self.graph
             .validate(self.midi_tracks.len(), self.control_tracks.len())?;
         // R6 D21: an audio recording input must reference a real audio track.
@@ -6398,11 +6449,30 @@ pub struct ProjectMetadata {
     /// kept sorted by tick. Additive field — old files load with none.
     #[serde(default)]
     pub markers: Vec<Marker>,
-    /// Musical meter (U3a). Additive field: documents written before it
-    /// existed load as 4/4, byte-identical to the old behavior — which is why
-    /// `PROJECT_VERSION` stays at 6.
+    /// Musical meter (U3a): the base meter, in effect from tick 0 until the
+    /// first [`MeterMarker`]. Documents written before it existed load as 4/4.
     #[serde(default)]
     pub time_signature: TimeSignature,
+    /// Mid-song meter changes (Met M3; spec `meter-map.md` D1–D3). Each entry
+    /// says "from this tick on, the meter is X". Kept sorted by tick and never
+    /// placed at tick 0 (that is what `time_signature` expresses). Additive
+    /// field: older files load with an empty table, which evaluates exactly
+    /// like the single-meter behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub meter_markers: Vec<MeterMarker>,
+}
+
+/// A mid-song meter change (Met M3). See [`ProjectMetadata::meter_markers`].
+///
+/// `tick` must be `> 0` and, for the file layer, strictly ascending. It should
+/// also sit on a bar line; [`MeterMap::new`] snaps a stray value down to the
+/// containing segment's grid instead of rejecting the document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MeterMarker {
+    #[serde(default)]
+    pub tick: u32,
+    #[serde(default)]
+    pub signature: TimeSignature,
 }
 
 /// Song loop range (U1). See [`ProjectMetadata::loop_range`].
@@ -6427,6 +6497,10 @@ impl SongLoop {
 /// Maximum number of timeline markers (U1).
 pub const MAX_MARKERS: usize = 32;
 
+/// Maximum number of meter changes (Met M3). Matches the engine's fixed
+/// segment table (`MAX_METER_SEGS`), so the UI can always push a valid map.
+pub const MAX_METER_MARKERS: usize = 64;
+
 /// One timeline marker (U1): a named jump target on the arrangement ruler.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Marker {
@@ -6448,6 +6522,7 @@ impl Default for ProjectMetadata {
             loop_range: SongLoop::default(),
             markers: Vec::new(),
             time_signature: TimeSignature::COMMON,
+            meter_markers: Vec::new(),
         }
     }
 }
@@ -8236,6 +8311,88 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_a_sorted_meter_change_table() {
+        let mut project = Project::default();
+        project.metadata.meter_markers = vec![
+            super::MeterMarker {
+                tick: TICKS_PER_BAR * 4,
+                signature: super::TimeSignature::new(6, 8),
+            },
+            super::MeterMarker {
+                tick: TICKS_PER_BAR * 8,
+                signature: super::TimeSignature::new(3, 4),
+            },
+        ];
+        project
+            .validate()
+            .expect("a sorted meter table must validate");
+        assert_eq!(project.ticks_per_bar_at(TICKS_PER_BAR * 2), TICKS_PER_BAR);
+        assert_eq!(project.ticks_per_bar_at(TICKS_PER_BAR * 4), 2880);
+        assert_eq!(project.bar_beat_at(TICKS_PER_BAR * 4), (4, 0));
+    }
+
+    #[test]
+    fn validate_rejects_a_meter_change_at_tick_zero() {
+        let mut project = Project::default();
+        project.metadata.meter_markers = vec![super::MeterMarker {
+            tick: 0,
+            signature: super::TimeSignature::new(3, 4),
+        }];
+        let err = project.validate().expect_err("tick 0 is the base meter's");
+        assert!(err.contains("tick 0"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_unsorted_or_duplicate_meter_changes() {
+        let mut project = Project::default();
+        project.metadata.meter_markers = vec![
+            super::MeterMarker {
+                tick: TICKS_PER_BAR * 4,
+                signature: super::TimeSignature::new(3, 4),
+            },
+            super::MeterMarker {
+                tick: TICKS_PER_BAR * 4,
+                signature: super::TimeSignature::new(6, 8),
+            },
+        ];
+        let err = project.validate().expect_err("duplicates must fail");
+        assert!(err.contains("strictly after"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_too_many_meter_changes() {
+        let mut project = Project::default();
+        project.metadata.meter_markers = (1..=super::MAX_METER_MARKERS + 1)
+            .map(|i| super::MeterMarker {
+                tick: u32::try_from(i).expect("small index") * TICKS_PER_BAR,
+                signature: super::TimeSignature::new(3, 4),
+            })
+            .collect();
+        let err = project.validate().expect_err("should reject");
+        assert!(
+            err.contains("meter change count"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_an_invalid_meter_change_signature() {
+        let mut project = Project::default();
+        project.metadata.meter_markers = vec![super::MeterMarker {
+            tick: TICKS_PER_BAR,
+            signature: super::TimeSignature {
+                numerator: 0,
+                denominator: 4,
+            },
+        }];
+        let err = project.validate().expect_err("0 beats per bar is invalid");
+        assert!(
+            err.contains("invalid time signature"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn validate_rejects_too_many_clips() {
         let mut project = Project::default();
         for i in 0..=MAX_CLIPS_PER_TRACK {
@@ -9571,10 +9728,11 @@ mod tests {
     /// D11: the new node variants are purely additive — the version must not
     /// move (bumping it here means old files suddenly "need" a migration).
     /// v9 is the one exception, and it *does* carry a migration: the curve
-    /// value domain changed (spec `curve-map.md` D7).
+    /// value domain changed (spec `curve-map.md` D7). v11 (Met M3) moves the
+    /// number for the additive `meter_markers` field, without a migration.
     #[test]
     fn project_version_matches_the_curve_migration() {
-        assert_eq!(super::PROJECT_VERSION, 10);
+        assert_eq!(super::PROJECT_VERSION, 11);
     }
 
     // ---- SF2 bend range (spec `curve-map.md` D8/D9) ----

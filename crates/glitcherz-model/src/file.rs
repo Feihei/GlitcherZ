@@ -35,8 +35,11 @@ use crate::Project;
 /// payload → `params`); `version < 9` goes through
 /// [`Project::migrate_v8_to_v9`] (curve anchors → normalized domain).
 /// v10 (R6) only adds the [`crate::PortRef::TrackIn`] enum branch — no
-/// migration function: v9 files simply contain none.
-pub const PROJECT_VERSION: u32 = 10;
+/// migration function: v9 files simply contain none. v11 (Met M3) adds
+/// [`crate::ProjectMetadata::meter_markers`], likewise additive and
+/// migration-free: v10 files load with an empty table, which evaluates exactly
+/// like the single-meter behavior.
+pub const PROJECT_VERSION: u32 = 11;
 
 fn default_version() -> u32 {
     PROJECT_VERSION
@@ -408,6 +411,47 @@ mod tests {
         assert_eq!(loaded.metadata.loop_range, project.metadata.loop_range);
         assert_eq!(loaded.metadata.markers, project.metadata.markers);
         assert!(loaded.metadata.loop_range.is_active());
+    }
+
+    // Met M3: meter changes round-trip, and an empty table stays out of the
+    // file so v10 documents keep their bytes when nothing changed.
+    #[test]
+    fn meter_changes_roundtrip_and_empty_tables_are_omitted() {
+        let mut project = demo_project();
+        let path =
+            std::env::temp_dir().join(format!("glitcherz_meter_map_{}.glz", std::process::id()));
+
+        save_project(&project, &path).expect("save failed");
+        let text = std::fs::read_to_string(&path).expect("read failed");
+        assert!(
+            !text.contains("meter_markers"),
+            "an empty meter table must not be written"
+        );
+
+        project.metadata.meter_markers = vec![
+            crate::MeterMarker {
+                tick: TICKS_PER_BAR * 4,
+                signature: crate::TimeSignature::new(6, 8),
+            },
+            crate::MeterMarker {
+                tick: TICKS_PER_BAR * 4 + 2880 * 4,
+                signature: crate::TimeSignature::new(3, 4),
+            },
+        ];
+        save_project(&project, &path).expect("save failed");
+        let loaded = load_project(&path).expect("load failed");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            loaded.metadata.meter_markers,
+            project.metadata.meter_markers
+        );
+        assert_eq!(loaded.ticks_per_bar_at(TICKS_PER_BAR * 4), 2880);
+        assert_eq!(
+            loaded.bar_beat_at(TICKS_PER_BAR * 4 + 2880 * 4),
+            (8, 0),
+            "bar numbers accumulate across the 6/8 segment"
+        );
     }
 
     // U3a: the meter survives the roundtrip and drives the derived bar length.

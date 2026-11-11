@@ -1593,6 +1593,15 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - **I-D6 strum 单位改音符分数**（1/32、1/16…）+ 悬停显示 `@BPM` 毫秒数。
 - **I-D7 头裁内容语义**：单周期 clip（`loop == span`）走真头裁（`retain_from`：内容前移、裁掉开头、跨界音符保留尾巴）；tiled clip 只能容器截断并给状态栏提示；MIDI/control 头裁只能向右，音频靠 `source_offset` 可向左回补到 0。
 
+#### Met M3：拍号变化求值层（2026-11-11，spec `meter-map.md`）
+
+- `MeterMarker { tick, signature }`（`serde(default)`，空表 `skip_serializing_if`）+ `MAX_METER_MARKERS = 64`；`PROJECT_VERSION` 10 → 11，**纯加法、无迁移函数**——v10 文件读出空表，单段行为逐字节不变。
+- `validate`：每项签名合法、`tick > 0`、严格升序、总数 ≤ 上限；**不校验「落在小节线」**，宽容读取交给求值层向下吸附（D2/D3）。
+- `model/src/meter.rs`：`MeterMap::new(base, &markers)` 一次展开成 `MeterSegment { tick, bar, signature }` 段表（乱序输入内部排序，半小节 marker 向下对齐到所在段网格，tick 0 / 重复起点丢弃）。查询全部二分 + 整数运算：`at` / `ticks_per_bar_at` / `ticks_per_beat_at` / `bar_beat_at` / `bar_start` / `next_bar` / `prev_bar` / `snap_bar`（吸附基准是**当前段**网格，D5 的像素线性由此不受影响）。
+- 空表 = 单段，`Project::{meter_map, bar_beat_at, ticks_per_bar_at}` 是 M4 的唯一读取入口；`ticks_per_bar()` 保留为第 0 段快捷方式。
+- 测试 +13：`meter.rs` 7 项（单段 / 跨段小节编号连续 / `bar_start` 往返 / 半小节吸附 / 乱序输入 / 段内吸附 / 跨段 `next`·`prev`）、`lib.rs` 5 项 validate（合法 / tick 0 / 乱序重复 / 超上限 / 非法签名）、`file.rs` 1 项 RON 往返 + 空表不落盘。
+- **门禁**：`cargo test -p glitcherz-model` = 194 通过；`fmt` / `clippy -D warnings` 干净。本阶段无调用点改动，零回归。
+
 #### 阶段边界（自 plan.md 归位）
 
 - **Y 系列 S0**：不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（stems / 24-bit / 采样率选择）。
