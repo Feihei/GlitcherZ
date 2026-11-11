@@ -37,8 +37,8 @@ use egui::{
 };
 use glitcherz_model::{
     AudioClip, AudioTrack, AutoPoint, ClipGroup, ControlClip, ControlTrack, CtrlEvent,
-    MAX_ARRANGEMENT_TICKS, MAX_CLIPS_PER_TRACK, Marker, MeterMap, MidiClip, MidiTrack, Note,
-    SongLoop,
+    MAX_ARRANGEMENT_TICKS, MAX_CLIPS_PER_TRACK, Marker, MeterMap, MeterMarker, MidiClip, MidiTrack,
+    Note, SongLoop,
 };
 
 /// Absolute arrangement ceiling in ticks (U3a). The bound is a **tick** count,
@@ -360,6 +360,11 @@ pub struct TimelineState {
     /// Song-loop drag on the ruler (U1): `None` means an in-progress ruler
     /// drag is a plain seek scrub instead.
     loop_drag: Option<LoopDrag>,
+    /// Meter-capsule drag on the ruler (Met M5a): index into the document's
+    /// `meter_markers`. Takes precedence over the loop / seek drag.
+    meter_drag: Option<usize>,
+    /// Meter marker whose inline signature editor is open (Met M5a).
+    pub(crate) meter_edit: Option<usize>,
     /// Inline track-rename editor (right-click a track name, type, Enter
     /// commits): which lane and track, plus the draft text.
     rename: Option<(TimelineLane, usize, String)>,
@@ -403,6 +408,8 @@ impl Default for TimelineState {
             rows_viewport_min: Pos2::ZERO,
             reorder: None,
             loop_drag: None,
+            meter_drag: None,
+            meter_edit: None,
             rename: None,
             rename_focus: false,
             clip_rename: None,
@@ -578,6 +585,30 @@ pub enum TimelineAction {
     RemoveMarker {
         index: usize,
     },
+    /// Add a meter change at `tick` (Met M5a; bar-snapped by the view). The
+    /// signature starts as the containing segment's meter, so the marker is a
+    /// no-op until edited; a marker already at `tick` is selected instead.
+    AddMeterMarker {
+        tick: u32,
+    },
+    /// Drag a meter capsule (Met M5a). Every frame of the gesture shares one
+    /// undo step (`end_param_edit` closes it).
+    MoveMeterMarker {
+        index: usize,
+        tick: u32,
+    },
+    /// Edit a meter marker's signature (Met M5a; the inline editor reports
+    /// every frame of a numerator drag, merged into one undo step).
+    SetMeterMarker {
+        index: usize,
+        signature: glitcherz_model::TimeSignature,
+    },
+    /// End the meter-edit gesture (Met M5a).
+    EndMeterMarkerEdit,
+    /// Remove the meter change at `index` (Met M5a). One undo step.
+    RemoveMeterMarker {
+        index: usize,
+    },
     /// Reorder one track family (MIDI / curve / audio): the track at `from`
     /// is re-inserted so it ends up just before original index `to` (an
     /// insertion index, 0..=len; `to == from` / `to == from + 1` are identity
@@ -675,6 +706,9 @@ pub struct TimelineParams<'a> {
     pub loop_range: &'a SongLoop,
     /// Timeline markers for the ruler (U1).
     pub markers: &'a [Marker],
+    /// Meter changes for the ruler capsules (Met M5a): hit-testing, dragging
+    /// and the inline signature editor read this table.
+    pub meter_markers: &'a [MeterMarker],
     /// Piecewise meter table (Met M4): every bar-based measure — grid,
     /// snapping, knife edges, resize minimums, ruler numbering — reads this
     /// instead of the 4/4 [`TICKS_PER_BAR`] constant or a single bar length.
@@ -1745,6 +1779,33 @@ pub fn show(
                 state.knife_armed = !state.knife_armed;
                 state.modal = None;
             }
+            // Met M5a: inline signature editor for a meter marker
+            // (double-click its capsule on the ruler). A numerator drag
+            // reports every frame; the app merges them into one undo step
+            // until `EndMeterMarkerEdit`.
+            if let Some(index) = state.meter_edit
+                && let Some(marker) = p.meter_markers.get(index)
+            {
+                ui.separator();
+                ui.label(egui::RichText::new("Meter change").weak());
+                let edit = crate::meter_ui::meter_editor(ui, marker.signature);
+                if let Some(value) = edit.value {
+                    actions.push(TimelineAction::SetMeterMarker {
+                        index,
+                        signature: value,
+                    });
+                }
+                if edit.drag_stopped {
+                    actions.push(TimelineAction::EndMeterMarkerEdit);
+                }
+                if ui
+                    .small_button("Close")
+                    .on_hover_text("Close the meter editor")
+                    .clicked()
+                {
+                    state.meter_edit = None;
+                }
+            }
             ui.separator();
             // Every variable hint must live INSIDE this child ui. Drawn in
             // the toolbar's parent instead, appearing and disappearing
@@ -1984,22 +2045,38 @@ pub fn show(
 
             // ---- Interaction: drag intent locks in at drag start. ----
             let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+            let meter_hit = |x: f32| -> Option<usize> {
+                p.meter_markers.iter().enumerate().find_map(|(index, marker)| {
+                    ((rect.left() + marker.tick as f32 * px_per_tick - x).abs() <= MARKER_GRAB)
+                        .then_some(index)
+                })
+            };
             if response.drag_started_by(egui::PointerButton::Primary) {
                 if let Some(pos) = response.interact_pointer_pos() {
-                    let hit_start = loop_has_range && (pos.x - start_x).abs() <= LOOP_EDGE_GRAB;
-                    let hit_end = loop_has_range && (pos.x - end_x).abs() <= LOOP_EDGE_GRAB;
-                    if hit_start {
-                        state.loop_drag = Some(LoopDrag::StartEdge);
-                    } else if hit_end {
-                        state.loop_drag = Some(LoopDrag::EndEdge);
-                    } else if ctrl {
-                        state.loop_drag =
-                            Some(LoopDrag::New { anchor: snap_bar(tick_at(pos.x)) });
-                    } else {
+                    if let Some(index) = meter_hit(pos.x) {
+                        // Met M5a: dragging a meter capsule wins over the
+                        // loop / seek gestures.
+                        state.meter_drag = Some(index);
                         state.loop_drag = None;
-                        actions.push(TimelineAction::Seek {
-                            ticks: tick_at(pos.x),
-                        });
+                        state.meter_edit = None;
+                    } else {
+                        state.meter_drag = None;
+                        let hit_start =
+                            loop_has_range && (pos.x - start_x).abs() <= LOOP_EDGE_GRAB;
+                        let hit_end = loop_has_range && (pos.x - end_x).abs() <= LOOP_EDGE_GRAB;
+                        if hit_start {
+                            state.loop_drag = Some(LoopDrag::StartEdge);
+                        } else if hit_end {
+                            state.loop_drag = Some(LoopDrag::EndEdge);
+                        } else if ctrl {
+                            state.loop_drag =
+                                Some(LoopDrag::New { anchor: snap_bar(tick_at(pos.x)) });
+                        } else {
+                            state.loop_drag = None;
+                            actions.push(TimelineAction::Seek {
+                                ticks: tick_at(pos.x),
+                            });
+                        }
                     }
                 }
             }
@@ -2007,12 +2084,28 @@ pub fn show(
                 && state.loop_drag.is_none()
                 && let Some(pos) = response.interact_pointer_pos()
             {
-                // Plain scrub: every frame of the drag seeks.
-                actions.push(TimelineAction::Seek {
-                    ticks: tick_at(pos.x),
-                });
+                if let Some(index) = state.meter_drag {
+                    let raw = tick_at(pos.x);
+                    let tick = if ctrl {
+                        raw.round().max(0.0) as u32
+                    } else {
+                        p.meter.snap_bar(raw)
+                    };
+                    let tick = clamp_meter_tick(p.meter_markers, index, tick);
+                    if tick > 0 {
+                        actions.push(TimelineAction::MoveMeterMarker { index, tick });
+                    }
+                } else {
+                    // Plain scrub: every frame of the drag seeks.
+                    actions.push(TimelineAction::Seek {
+                        ticks: tick_at(pos.x),
+                    });
+                }
             }
             if response.drag_stopped_by(egui::PointerButton::Primary) {
+                if state.meter_drag.take().is_some() {
+                    actions.push(TimelineAction::EndMeterMarkerEdit);
+                }
                 if let (Some(drag), Some(pos)) =
                     (state.loop_drag, response.interact_pointer_pos())
                 {
@@ -2043,19 +2136,37 @@ pub fn show(
                 }
                 state.loop_drag = None;
             }
-            // RMB: add a marker at the click (bar-snapped); RMB right on a
-            // marker's flag line removes it instead.
+            // Double-click a meter capsule: open its signature editor (Met
+            // M5a). Anywhere else closes it.
+            if response.double_clicked()
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                state.meter_edit = meter_hit(pos.x);
+            }
+            // RMB: on a meter capsule remove the change; otherwise add a
+            // named marker (U1), or a meter change with Shift held (Met M5a).
             if response.secondary_clicked()
                 && let Some(pos) = response.interact_pointer_pos()
             {
-                let hit = p.markers.iter().enumerate().find(|(_, m)| {
-                    (rect.left() + m.tick as f32 * px_per_tick - pos.x).abs() <= MARKER_GRAB
-                });
-                match hit {
-                    Some((index, _)) => actions.push(TimelineAction::RemoveMarker { index }),
-                    None => actions.push(TimelineAction::AddMarker {
-                        tick: snap_bar(tick_at(pos.x)) as u32,
-                    }),
+                let shift = ui.input(|i| i.modifiers.shift);
+                if let Some(index) = meter_hit(pos.x) {
+                    actions.push(TimelineAction::RemoveMeterMarker { index });
+                    if state.meter_edit == Some(index) {
+                        state.meter_edit = None;
+                    }
+                } else {
+                    let hit = p.markers.iter().enumerate().find(|(_, m)| {
+                        (rect.left() + m.tick as f32 * px_per_tick - pos.x).abs() <= MARKER_GRAB
+                    });
+                    match hit {
+                        Some((index, _)) => actions.push(TimelineAction::RemoveMarker { index }),
+                        None if shift => actions.push(TimelineAction::AddMeterMarker {
+                            tick: snap_bar(tick_at(pos.x)) as u32,
+                        }),
+                        None => actions.push(TimelineAction::AddMarker {
+                            tick: snap_bar(tick_at(pos.x)) as u32,
+                        }),
+                    }
                 }
             }
 
@@ -4223,6 +4334,19 @@ fn for_each_bar_line(
     }
 }
 
+/// Clamps a dragged meter marker (Met M5a): tick 0 belongs to the base meter
+/// (D3), and a marker may not cross its neighbours (they must stay sorted).
+fn clamp_meter_tick(markers: &[MeterMarker], index: usize, tick: u32) -> u32 {
+    let lo = index
+        .checked_sub(1)
+        .and_then(|i| markers.get(i))
+        .map_or(1, |prev| prev.tick.saturating_add(1));
+    let hi = markers
+        .get(index + 1)
+        .map_or(u32::MAX, |next| next.tick.saturating_sub(1));
+    tick.max(lo).min(hi)
+}
+
 /// Snaps to the nearest bar line (0 stays 0). Met M4: the grid is the
 /// containing segment's, so a drag that crosses a meter change switches its
 /// snap basis at the boundary; `snap` may turn the grid off (`Snap::OFF`)
@@ -5155,6 +5279,27 @@ mod tests {
         assert_eq!(snap_bar(&map, t, Snap::on(1)), start + 2 * 2880);
         // Ctrl (Snap::OFF) lands on the nearest tick, not a bar line.
         assert_eq!(snap_bar(&map, 100.4, Snap::OFF), 100);
+    }
+
+    #[test]
+    fn meter_drag_stays_sorted_and_off_tick_zero() {
+        let markers = [
+            MeterMarker {
+                tick: 2880,
+                signature: TimeSignature::new(6, 8),
+            },
+            MeterMarker {
+                tick: 9600,
+                signature: TimeSignature::new(3, 4),
+            },
+        ];
+        // The first marker may not reach tick 0.
+        assert_eq!(clamp_meter_tick(&markers, 0, 0), 1);
+        // ... nor cross the next one.
+        assert_eq!(clamp_meter_tick(&markers, 0, 99_999), 9599);
+        // The last one may not cross the previous.
+        assert_eq!(clamp_meter_tick(&markers, 1, 0), 2881);
+        assert_eq!(clamp_meter_tick(&markers, 1, 30_000), 30_000);
     }
 
     #[test]

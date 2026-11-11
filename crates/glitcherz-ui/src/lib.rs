@@ -57,10 +57,10 @@ use glitcherz_model::{
     CtrlKind, CurveInterp, CurveMapParams, DEFAULT_KEYBOARD_OCTAVE, EffectParams, GraphDoc,
     LFO_DIVISION_LABELS, LfoParams, LfoWaveform, MAX_ARRANGEMENT_TICKS, MAX_AUTO_TRACKS,
     MAX_CLIPS_PER_TRACK, MAX_KEYBOARD_OCTAVE, MAX_MARKERS, MAX_MIDI_TRACKS, MAX_MIXER_CHANNELS,
-    MAX_NODES, MIN_MIXER_CHANNELS, Marker, MidiClip, MidiEnvelopeParams, MidiSource, MidiTrack,
-    ModalParams, NodeDoc, NodeParam, Note, OrganParams, PluckParams, PortRef, PortamentoParams,
-    Project, SamplePlayMode, SongLoop, SynthParams, SynthWaveform, TrackKind, VoiceSpec,
-    WavetableParams,
+    MAX_NODES, MIN_MIXER_CHANNELS, Marker, MeterMarker, MidiClip, MidiEnvelopeParams, MidiSource,
+    MidiTrack, ModalParams, NodeDoc, NodeParam, Note, OrganParams, PluckParams, PortRef,
+    PortamentoParams, Project, SamplePlayMode, SongLoop, SynthParams, SynthWaveform, TrackKind,
+    VoiceSpec, WavetableParams,
 };
 
 pub mod autosave;

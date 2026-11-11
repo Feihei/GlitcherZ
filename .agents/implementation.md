@@ -1612,6 +1612,15 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - 测试 +2（`bar_lines_follow_meter_segments` 锁段内网格与连续编号、`snapping_switches_basis_at_a_meter_change` 锁跨段吸附 + Ctrl 关闭）+ 5 个既有调用点改传 `MeterMap`。
 - **门禁**：`cargo fmt` / `cargo clippy --workspace --all-targets -D warnings` / `cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
 
+#### Met M5a：meter 标记编辑（2026-11-11，spec `meter-map.md` §6.3）
+
+- ruler 胶囊交互：**左键拖动**（按段小节吸附，按住 Ctrl 不吸附；`clamp_meter_tick` 保证 `tick > 0` 且不越过相邻 marker）；**双击**打开工具栏里的内联拍号编辑器（复用 `meter_ui::meter_editor`，即时改值）；**右键**删除；**Shift+右键空白**新建（tick 已按段吸附）。
+- `TimelineAction` 新增 `AddMeterMarker` / `MoveMeterMarker` / `SetMeterMarker` / `EndMeterMarkerEdit` / `RemoveMeterMarker`；`TimelineState` 新增 `meter_drag` / `meter_edit`（`meter_edit` 为 `pub(crate)`，app 在新建后自动打开编辑器）。
+- app 侧：排序插入（初始签名 = 所在段拍号，等于没改，直到用户编辑）、同 bar 已存在时只提示、`tick == 0` 拒绝（D3 的 base meter 归 `metadata.time_signature`）、上限 `MAX_METER_MARKERS`。拖动与数值手势走 `commit_param_edit`（key `meter-marker-move` / `meter-marker-value`），`EndMeterMarkerEdit` 收手势——一次拖动 / 一次数字拖动 = 一步 undo。
+- **与 spec §6.3 的偏离（记录在案）**：没有引入右键菜单，新建走 `Shift+右键`，改值走工具栏内联编辑器而非 Inspector——保留既有的「右键即加命名 marker」习惯，且 Inspector 是节点参数面板，不适合常驻一条与选中节点无关的拍号区。
+- 测试 +1：`meter_drag_stays_sorted_and_off_tick_zero`（tick 0 与邻位钳制）。
+- **门禁**：`fmt` / `clippy -p glitcherz-ui --all-targets -D warnings` 干净；`cargo test -p glitcherz-ui` = 11 个 test binary 全 `ok. 0 failed`。
+
 #### 阶段边界（自 plan.md 归位）
 
 - **Y 系列 S0**：不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（stems / 24-bit / 采样率选择）。

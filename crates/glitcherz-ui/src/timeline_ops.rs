@@ -154,6 +154,7 @@ impl GlitcherZApp {
                     edit_target,
                     loop_range: &project.metadata.loop_range,
                     markers: &project.metadata.markers,
+                    meter_markers: &project.metadata.meter_markers,
                     // Met M4: the piecewise meter table, not a single bar.
                     meter: &meter,
                     // U11 D3: audio clip spans are derived at the base tempo.
@@ -358,7 +359,108 @@ impl GlitcherZApp {
             timeline::TimelineAction::ToggleLoop(enabled) => self.timeline_toggle_loop(enabled),
             timeline::TimelineAction::AddMarker { tick } => self.timeline_add_marker(tick),
             timeline::TimelineAction::RemoveMarker { index } => self.timeline_remove_marker(index),
+            // Met M5a: meter changes are a sorted document table; each
+            // action below is one undo step (a drag / numerator gesture is
+            // merged by the parameter-edit key).
+            timeline::TimelineAction::AddMeterMarker { tick } => {
+                self.timeline_add_meter_marker(tick)
+            }
+            timeline::TimelineAction::MoveMeterMarker { index, tick } => {
+                self.timeline_move_meter_marker(index, tick)
+            }
+            timeline::TimelineAction::SetMeterMarker { index, signature } => {
+                self.timeline_set_meter_marker(index, signature)
+            }
+            timeline::TimelineAction::EndMeterMarkerEdit => self.end_param_edit(),
+            timeline::TimelineAction::RemoveMeterMarker { index } => {
+                self.timeline_remove_meter_marker(index)
+            }
         }
+    }
+
+    /// Adds a meter change at `tick` (Met M5a): sorted insert, initial
+    /// signature = the containing segment's meter, and the inline editor opens
+    /// on the new marker. Tick 0 belongs to the base meter (D3).
+    pub(crate) fn timeline_add_meter_marker(&mut self, tick: u32) {
+        if tick == 0 {
+            self.set_message(
+                "Meter changes start after bar 1 — tick 0 is the base meter".to_string(),
+            );
+            return;
+        }
+        let markers = &self.project().metadata.meter_markers;
+        if markers.iter().any(|marker| marker.tick == tick) {
+            self.set_message("A meter change already sits on that bar".to_string());
+            return;
+        }
+        if markers.len() >= glitcherz_model::MAX_METER_MARKERS {
+            self.set_message(format!(
+                "Meter change limit reached ({})",
+                glitcherz_model::MAX_METER_MARKERS
+            ));
+            return;
+        }
+        let signature = self.project().meter_map().at(tick);
+        let before = self.begin_edit();
+        let markers = &mut self.project_mut().metadata.meter_markers;
+        let index = markers
+            .iter()
+            .position(|marker| marker.tick > tick)
+            .unwrap_or(markers.len());
+        markers.insert(index, MeterMarker { tick, signature });
+        self.commit_edit("Add Meter Change", before);
+        self.timeline_state.meter_edit = Some(index);
+    }
+
+    /// Drags a meter capsule (Met M5a). The view already snapped the tick and
+    /// clamped it between the neighbours; one gesture = one undo step.
+    pub(crate) fn timeline_move_meter_marker(&mut self, index: usize, tick: u32) {
+        let Some(current) = self.project().metadata.meter_markers.get(index).copied() else {
+            return;
+        };
+        if current.tick == tick {
+            return;
+        }
+        let before = self.begin_param_edit();
+        let Some(marker) = self.project_mut().metadata.meter_markers.get_mut(index) else {
+            return;
+        };
+        marker.tick = tick;
+        self.commit_param_edit("Move Meter Change", before, "meter-marker-move");
+    }
+
+    /// Edits a meter marker's signature (Met M5a). A numerator drag reports
+    /// every frame; the key merges them into one undo step.
+    pub(crate) fn timeline_set_meter_marker(
+        &mut self,
+        index: usize,
+        signature: glitcherz_model::TimeSignature,
+    ) {
+        let Some(current) = self.project().metadata.meter_markers.get(index).copied() else {
+            return;
+        };
+        if current.signature == signature {
+            return;
+        }
+        let before = self.begin_param_edit();
+        let Some(marker) = self.project_mut().metadata.meter_markers.get_mut(index) else {
+            return;
+        };
+        marker.signature = signature;
+        self.commit_param_edit("Meter Change", before, "meter-marker-value");
+        self.set_message(format!("Meter change {signature}"));
+    }
+
+    /// Removes the meter change at `index` (Met M5a). One undo step; the
+    /// segment falls back to the previous signature.
+    pub(crate) fn timeline_remove_meter_marker(&mut self, index: usize) {
+        if index >= self.project().metadata.meter_markers.len() {
+            return;
+        }
+        let before = self.begin_edit();
+        self.project_mut().metadata.meter_markers.remove(index);
+        self.commit_edit("Remove Meter Change", before);
+        self.timeline_state.meter_edit = None;
     }
 
     /// Sets the song loop range (U1): one undoable document edit, then the
