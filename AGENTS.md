@@ -69,6 +69,17 @@ glitcherz/
 - **MIDI ops 纯函数化**：签名一律 `fn(&mut [Note], Options)`，原地修改、**不改变 slice 长度**（故可作用于选区），不碰 clip/track/context；随机部分走 seeded XorShift 保可测可复现。
 - **`glitcherz-ui` 面板方法分模块**：`impl GlitcherZApp` 的方法分布在 14 个同级模块（`transport` / `inspector_panel` / `mixer_panel` / `timeline_ops` / `patch_ops` / `file_ops` / `voices` / `recording` / `editing` / `engine_sync` / `settings` / `status_bar` / `keyboard` / `export_ops`），`lib.rs` 只留结构体、`new`、编辑守卫与 `ui()`。新方法写进对应模块，且必须 `pub(crate)` 才能被父模块与兄弟模块调用（私有方法对父模块不可见）。
 
+## 特性编号（F-ID）
+
+**一个特性 = 一份独立 spec = 一个 `F-###`。** 编号是身份，域是标签，二者分离——跨领域的特性不必拍板归属。
+
+- **格式**：`F-001`，三位补零，全局递增，**永不复用、不回收**。下一个号 = 注册表当前最大号 +1。
+- **域标签**（固定 9 个，可多值）：`ENGINE`（实时 / DSP / sequencer / PDC）、`PATCH`（节点图 / 路由 / 自动化 / 控制信号）、`EDIT`（MIDI / 曲线 / 时间轴 / 卷帘）、`MIX`（混音器 / 内建效果器）、`VOICE`（声源：synth / sample / SF2 / drums / modal / pluck / organ / wavetable）、`PLUG`（CLAP / VST3）、`PROJ`（工程文件 / 迁移 / 媒体 / 自动保存）、`IO`（录音 / 导出 / CLI / MCP）、`UI`（跨面板交互规范：快捷键 / 焦点 / 图标）。
+- **写法**：标题 `### F-142 · clip 头裁（EDIT / PROJ，2026-10-26）`；里程碑 `F-142/M1`；spec 头部 `> ID: F-142 · 域: EDIT / PROJ`。
+- **登记**：分配号后先写入 `implementation.md` 的「特性 ID 注册表」，再写 spec / 实现；`implementation.md` 的记录标题必须带 ID。
+- **历史条目**：字母系列（U / W / X / Y / Z / B / I / E / S / M / P / G / R / C / A / SP）保留为别名，不重命名、不回溯编号；新内容一律用 F-ID。
+- **无 spec 的特性**：先补一份最小 spec 再领号——编号与 spec 一一对应。
+
 ## 测试
 
 - `glitcherz-engine`：单元测试覆盖每个 `Processor`（输入输出数学验证）；使用 `cargo test` 即可，不需要真实音频设备。
