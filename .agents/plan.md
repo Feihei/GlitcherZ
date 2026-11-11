@@ -19,7 +19,7 @@
 
 路线图 1–10 全部落地；基础功能、节点图、MIDI 编辑、插件宿主、可用性（U 系列）、录音（R 系列）、内建效果器（E 系列）、声源扩展（Y / Z / B 系列）与交互打磨（I 系列）均已交付。已完成系列的设计与实现位置见下方「历史系列索引」——本文件不再逐项记录它们的实施细节。
 
-- **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）；命令词汇表（F-039）V1a / V2 / V3 已交付，V1b 待做。
+- **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）；命令词汇表（F-039）V1a / V2 / V3 已交付，V1b 待做；剪贴板（F-040）C1–C2 待做。
 - **下一步候选**：命令词汇表 V1b（`effect_slot` / 声源参数 / `graph.set_voice`）。
 - **门禁**：`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`，在本机沙箱外跑（沙箱内 cargo 会毒化 `target/debug/incremental`）。
 
@@ -33,6 +33,36 @@
   - **命令词汇表**（**F-039，2026-11-11 已立项**，见下方小节）——`midi.*` 全都作用于既有 clip，改音色参数也还没有稳定字符串名。MCP 能「改音符」但改不了「用什么音色」、也开不了新 clip。这一期 = `NodeParam` 稳定名 + `clip.add` + `graph.set_param`，spec 已写：`spec/command-vocabulary.md`（D1–D8）。
   - **用户表导入**（Wavetable S3 留的口子）：`.wav` / `.wt` 文件、命名、缓存淘汰、文件对话 UI；风险全在文件与 UI，不在 DSP。
   - **安全边界**：现在只管客户端给的路径，工程内部引用的媒体 / SF2 路径照单全收（等同于在窗口里打开一个不信任的工程）。要做就得先有「工程信任模型」。
+
+## 剪贴板与复制粘贴（F-040，2026-11-11 立项）
+
+用户一句话需求：**Ctrl+C / Ctrl+V 在各 tab 生效；Timeline / Edit 粘贴到播放头，Patch 粘贴到光标；Patch 补 Shift+D 复制移动。**
+
+Spec：`spec/clipboard.md`（D1–D9 + 剪贴板结构 + 粘贴语义）。
+
+### 现状评估（已核对代码）
+
+| 项 | 现状（位置） | 差距 |
+| :--- | :--- | :--- |
+| 全局快捷键 | `keyboard.rs` Ctrl 白名单仅 S / N / O / Z / Y / L，C/V 落入 `_ => continue` 且不消费 | 无剪贴板 |
+| App 状态 | `GlitcherZApp` 无剪贴板字段；`timeline_state.selection` / `roll_state.selection` / `patch_state.selection` 都是索引 | 需值快照 |
+| Timeline | `Shift+D` → 鼠标相对 grab 落点（`grab_targets`）；无粘贴 | 需播放头锚点 |
+| Edit | `Shift+D` → 复制后进 Move modal；工具栏 Duplicate 原位复制；无粘贴 | 需播放头锚点 |
+| Patch | 只有 Delete；`PatchAction` 无 Copy / Paste / Duplicate；无 `Shift+D` | 需整套复制粘贴 |
+| 命令层 | 无 clip duplicate / node duplicate 命令 | 走编辑守卫，不新增命令 |
+
+### 里程碑
+
+| 里程碑 | 内容 | 依赖 | 规模 |
+| :--- | :--- | :--- | :--- |
+| **C1** | `Clipboard` 枚举 + `GlitcherZApp.clipboard` + Timeline / Edit Ctrl+C/V + 播放头锚点 + undo + 跨工程清空 | — | 中 |
+| **C2** | Patch Ctrl+C/V + `NodeDoc::set_node_id` + 内部连线复制 + `Shift+D` 复制到指针 + 插件失败回滚 | C1 | 中 |
+
+顺序：**C1 → C2**，每个里程碑单独提交。验收表见 spec §7。
+
+### 明确不做（本系列）
+
+- Ctrl+X（cut）、系统剪贴板互操作（文本 / 图片 / 文件）、跨视图类型转换。
 
 ## 命令词汇表（F-039，2026-11-11 立项）
 

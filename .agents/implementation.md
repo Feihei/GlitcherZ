@@ -62,6 +62,7 @@
 | F-037 | 波表合成 | VOICE | `wavetable-instrument.md` | S3 |
 | F-038 | MIDI 命令族（量化 / 连奏 / 粘合 / 去重叠 / 移调） | EDIT | `midi-commands.md` | W6 |
 | F-039 | CLI / MCP 命令词汇表（节点参数稳定名 + clip.add） | PATCH / EDIT / IO | `command-vocabulary.md` | 遗留硬阻塞 |
+| F-040 | 剪贴板与复制粘贴（Ctrl+C / Ctrl+V） | EDIT / PATCH / UI | `clipboard.md` | C1–C2 |
 
 > 无独立 spec 的历史条目（transport / 文件管理 U2 / U10 / U14 / I 系列 / B2 / W3a–c 等）保留字母别名，不做回溯编号；新特性一律先写 spec 再领号。
 
