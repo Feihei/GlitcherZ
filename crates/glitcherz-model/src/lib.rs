@@ -6810,6 +6810,59 @@ impl Project {
         out
     }
 
+    /// Whether a stored path points outside the project directory (F-042 D2).
+    ///
+    /// Absolute paths are external unless they live under `base_dir`; relative
+    /// paths are project assets by definition. Without a `base_dir` (unsaved
+    /// document) every absolute path is external.
+    pub fn is_external_path(&self, path: &str) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+        let stored = path.replace('\\', "/");
+        let candidate = Path::new(&stored);
+        if !candidate.is_absolute() {
+            return false;
+        }
+        let Some(base) = &self.base_dir else {
+            return true;
+        };
+        !normalize_path(candidate).starts_with(normalize_path(base))
+    }
+
+    /// Every project reference outside the project directory (F-042): media plus
+    /// plugin binaries. Empty paths are skipped and each path appears once.
+    pub fn external_refs(&self) -> Vec<ExternalRef> {
+        let mut out = Vec::new();
+        for path in self.media_paths() {
+            if self.is_external_path(&path) {
+                out.push(ExternalRef {
+                    kind: "media",
+                    path,
+                });
+            }
+        }
+        for node in &self.graph.nodes {
+            let voice = match node {
+                NodeDoc::Instrument { voice, .. } | NodeDoc::Effect { voice, .. } => voice,
+                _ => continue,
+            };
+            let path = match voice {
+                VoiceSpec::Clap { path, .. } | VoiceSpec::Vst3 { path, .. } => path,
+                _ => continue,
+            };
+            if self.is_external_path(path) {
+                out.push(ExternalRef {
+                    kind: "plugin",
+                    path: path.clone(),
+                });
+            }
+        }
+        out.sort_by(|a, b| (a.kind, &a.path).cmp(&(b.kind, &b.path)));
+        out.dedup();
+        out
+    }
+
     /// Rewrites stored media paths through `map` (old string → new string);
     /// anything not in the map is left alone. The building block of "collect
     /// media files" and "relocate missing media" (S3b) — both are one edit.
@@ -7259,6 +7312,34 @@ impl Default for ProjectMetadata {
             meter_markers: Vec::new(),
         }
     }
+}
+
+/// One project reference that points outside the project directory (F-042).
+///
+/// `kind` is `"media"` (sample / SoundFont / drum slot / audio clip) or
+/// `"plugin"` (CLAP / VST3 binary). The path is the string stored in the
+/// document, not a resolved one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalRef {
+    /// Reference family.
+    pub kind: &'static str,
+    /// Stored path.
+    pub path: String,
+}
+
+/// Removes `.` / `..` components without touching the filesystem (F-042).
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Appends `path` to `out` unless it is empty or already listed (S3b: one
@@ -9891,6 +9972,63 @@ mod tests {
             gain: 3.0,
         });
         assert!(doc.validate(2, 0).is_err(), "gain above 2 is rejected");
+    }
+
+    /// F-042: only references outside the project directory need a trust
+    /// decision; relative paths are project assets by definition.
+    #[test]
+    fn external_refs_are_paths_outside_the_project_directory() {
+        let base = std::env::temp_dir().join("glitcherz-trust");
+        let outside = std::env::temp_dir().join("elsewhere.wav");
+        let mut project = Project {
+            base_dir: Some(base.clone()),
+            ..Project::default()
+        };
+        assert!(!project.is_external_path(&base.join("in.wav").to_string_lossy()));
+        assert!(project.is_external_path(&outside.to_string_lossy()));
+        assert!(!project.is_external_path("demo.media/in.wav"));
+        assert!(!project.is_external_path(""));
+
+        project.graph.nodes.push(NodeDoc::Instrument {
+            node_id: 100,
+            track: 0,
+            voice: VoiceSpec::SoundFont {
+                path: outside.to_string_lossy().to_string(),
+                bank: 0,
+                program: 0,
+                gain: 1.0,
+                bend_range: 2.0,
+            },
+            synth: SynthParams::default(),
+        });
+        project.graph.nodes.push(NodeDoc::Instrument {
+            node_id: 101,
+            track: 0,
+            voice: VoiceSpec::Clap {
+                path: outside.to_string_lossy().to_string(),
+                plugin_id: String::new(),
+                state: Vec::new(),
+            },
+            synth: SynthParams::default(),
+        });
+        let refs = project.external_refs();
+        assert!(refs.iter().any(|item| item.kind == "media"));
+        assert!(refs.iter().any(|item| item.kind == "plugin"));
+        assert_eq!(
+            refs.iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                outside.to_string_lossy().as_ref(),
+                outside.to_string_lossy().as_ref()
+            ],
+            "the same outside file listed as media and as plugin"
+        );
+
+        // An unsaved document has no trusted root: absolute paths are external.
+        project.base_dir = None;
+        assert!(project.is_external_path(&outside.to_string_lossy()));
+        assert!(!project.is_external_path("demo.media/in.wav"));
     }
 
     /// R4 D11: relative media paths resolve against the project directory and
