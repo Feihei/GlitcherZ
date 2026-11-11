@@ -15,7 +15,7 @@
 - **录音与 headless I/O**：录音、导出、Preferences、CLI、MCP
 - **框架升级与 gotchas**：依赖版本契约、egui 升级、跨平台构建
 - **系列实施补记与交互打磨**：2026-11-11 自 plan.md 归位的系列记录、I 系列
-- **特性 ID 注册表**：`F-001`–`F-041`（新特性先登记再实现）
+- **特性 ID 注册表**：`F-001`–`F-043`（新特性先登记再实现）
 
 ## 特性 ID 注册表
 
@@ -64,6 +64,8 @@
 | F-039 | CLI / MCP 命令词汇表（节点参数稳定名 + clip.add） | PATCH / EDIT / IO | `command-vocabulary.md` | 遗留硬阻塞 |
 | F-040 | 剪贴板与复制粘贴（Ctrl+C / Ctrl+V） | EDIT / PATCH / UI | `clipboard.md` | C1–C2 |
 | F-041 | clip 与数据分离（数据池 + 实例引用） | EDIT / PROJ / ENGINE | `clip-data-instances.md` | — |
+| F-042 | 工程信任模型（外部媒体 / SF2 / 插件路径审计） | PROJ / IO | `project-trust.md` | 安全边界 |
+| F-043 | 用户波表导入（单周期 WAV → 第 5 帧） | VOICE / PROJ | `wavetable-import.md` | 用户表导入 |
 
 > 无独立 spec 的历史条目（transport / 文件管理 U2 / U10 / U14 / I 系列 / B2 / W3a–c 等）保留字母别名，不做回溯编号；新特性一律先写 spec 再领号。
 
