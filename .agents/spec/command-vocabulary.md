@@ -38,6 +38,8 @@ S5 收官时记下的硬阻塞：MCP 已能改音符（`midi.*` 19 条命令，F
 
 返回 `{node, param, value}`。失败码：`unknown_node` / `unknown_param` / `unsupported_node` / `bad_params`（值非有限数）。undo 一步、journal。
 
+`effect_slot` 用 `index` 指定内置效果器的参数槽（0 起，数量与顺序见 `EffectParams::slot_count`）；值会 clamp 到该效果器的描述符范围（`effect_slot_axis`），越界槽位返回错误。
+
 ### 3.2 `graph.query`
 
 `{track}` → `{nodes:[{node_id, kind, label, params:[{key, min, max, value, kind}]}]}`。只读、不 undo、不进 journal。
@@ -64,9 +66,9 @@ S5 收官时记下的硬阻塞：MCP 已能改音符（`midi.*` 19 条命令，F
 | :--- | :--- | :--- | :--- |
 | **V1a** 参数词汇表（2026-11-11 交付） | `NodeParam::key()` / `from_key()` / `from_key_indexed()` + `node_param_range` / `node_param_value` / `set_node_param` / `node_param_keys`；`graph.set_param` + `graph.query`。覆盖 instrument synth（resonance / attack / decay / sustain / release）、mixer channel（gain / pan / mute / solo）与 out pan / mute、feedback gain | — | 中 |
 | **V1b-1** 声源参数 + `set_voice`（2026-11-11 交付） | `node_param_value` / `set_node_param` 覆盖 Modal / Pluck / Organ / Wavetable / Sf2 / Sample 参数；`node_param_keys` 按 `VoiceSpec` 列出可写 key；`graph.set_voice`（builtin / modal / pluck / organ / wavetable；文件音色与插件不做） | V1a | 中 |
-| **V1b-2** 效果器槽 | `effect_slot` 读写：把 `glitcherz-ui::effect` 的槽映射下沉为 `EffectParams::slot_value` / `set_slot_value` / `slot_count`，UI 改为薄委托 | V1a | 中 |
+| **V1b-2** 效果器槽（2026-11-11 交付） | `effect_slot` 读写：`EffectParams::slot_count` / `slot_value` / `set_slot_value` 下沉 model（UI `effect.rs` 改为薄委托），`graph.set_param` 按 `effect_slot_axis` clamp，`graph.query` 列出全部槽 | V1a | 中 |
 | **V2** `clip.add`（2026-11-11 交付） | `clip.add`（MIDI）：按拍号段给默认时长，`span = loop`，push 到轨道末尾 | — | 小 |
-| **V3** 端到端 | MCP `commands_run` 测试、CLI、`docs/`、plan 同步 | V1a、V2 | 小 |
+| **V3** 端到端（2026-11-11 交付） | MCP `commands_run` 测试、CLI、`docs/`、plan 同步 | V1a、V2 | 小 |
 
 ## 5. 明确不做
 
@@ -79,6 +81,7 @@ S5 收官时记下的硬阻塞：MCP 已能改音符（`midi.*` 19 条命令，F
 
 - `NodeParam` 每个变体都有 key，`from_key(key)` 往返；key 唯一性测试。
 - `graph.set_param` 改参数后文档读回正确值，且引擎收到参数更新。
+- `effect_slot` 通过 `index` 读写内置效果器参数，越界槽位报错；`graph.query` 列出该效果器的全部槽。
 - `clip.add` 后 `midi.note_add` 能写入该 clip。
 - MCP 端到端：空工程 → `clip.add` → `midi.note_add` → `midi.transpose` → `render` 非静音。
 - MCP 工具数仍为 6；命令数 +4（`graph.set_param` / `graph.query` / `graph.set_voice` / `clip.add`）。

@@ -2960,6 +2960,9 @@ pub fn node_param_value(node: &NodeDoc, param: NodeParam) -> Option<f32> {
         (NodeDoc::Mixer { out_muted, .. }, NodeParam::MixerOutMute) => Some(bool_value(*out_muted)),
         (NodeDoc::Feedback { gain, .. }, NodeParam::FeedbackGain) => Some(*gain),
         (NodeDoc::Instrument { voice, .. }, param) => voice_param_value(voice, param),
+        (NodeDoc::Effect { params, .. }, NodeParam::EffectSlot(slot)) => {
+            (usize::from(slot) < usize::from(params.slot_count())).then(|| params.slot_value(slot))
+        }
         _ => None,
     }
 }
@@ -3017,6 +3020,13 @@ pub fn set_node_param(node: &mut NodeDoc, param: NodeParam, value: f32) -> bool 
             true
         }
         (NodeDoc::Instrument { voice, .. }, param) => set_voice_param(voice, param, value),
+        (NodeDoc::Effect { params, .. }, NodeParam::EffectSlot(slot)) => {
+            if slot >= params.slot_count() {
+                return false;
+            }
+            params.set_slot_value(slot, value);
+            true
+        }
         _ => false,
     }
 }
@@ -3221,6 +3231,9 @@ pub fn node_param_keys(node: &NodeDoc) -> Vec<NodeParam> {
             keys
         }
         NodeDoc::Feedback { .. } => vec![NodeParam::FeedbackGain],
+        NodeDoc::Effect { params, .. } => (0..params.slot_count())
+            .map(NodeParam::EffectSlot)
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -3594,6 +3607,245 @@ pub fn effect_slot_axis(params: &EffectParams, slot: u8) -> MapSpec {
         // Out-of-range slot (a plugin payload, or a document that kept a
         // stale slot after the effect changed kind): normalized pass-through.
         _ => M::linear(0.0, 1.0),
+    }
+}
+
+impl EffectParams {
+    /// Number of parameter slots on this payload (F-039 V1b-2). Mirrors the
+    /// engine descriptor and [`effect_slot_axis`].
+    pub fn slot_count(&self) -> u8 {
+        match self {
+            Self::Delay(_) => 6,
+            Self::Eq(_) => 8,
+            Self::Compressor(_) => 9,
+            Self::Reverb(_) => 6,
+            Self::Chorus(_) => 4,
+            Self::Flanger(_) => 5,
+            Self::Bitcrusher(_) => 4,
+            Self::Phaser(_) => 6,
+            Self::Saturation(_) => 5,
+            Self::RingMod(_) => 1,
+            Self::Limiter(_) => 4,
+            Self::Vocoder(_) => 8,
+        }
+    }
+
+    /// Value of `slot` (`0.0` for an out-of-range slot).
+    pub fn slot_value(&self, slot: u8) -> f32 {
+        match self {
+            Self::Delay(p) => match slot {
+                0 => p.time_s,
+                1 => p.feedback,
+                2 => p.mix,
+                3 => bool_value(p.ping_pong),
+                4 => bool_value(p.sync),
+                5 => f32::from(p.sync_division),
+                _ => 0.0,
+            },
+            Self::Eq(p) => match slot {
+                0 => p.low_gain,
+                1 => p.low_freq,
+                2 => p.mid_gain,
+                3 => p.mid_freq,
+                4 => p.mid_q,
+                5 => p.high_gain,
+                6 => p.high_freq,
+                7 => p.low_cut,
+                _ => 0.0,
+            },
+            Self::Compressor(p) => match slot {
+                0 => p.threshold,
+                1 => p.ratio,
+                2 => p.attack,
+                3 => p.release,
+                4 => p.knee,
+                5 => p.makeup,
+                6 => p.mix,
+                7 => bool_value(p.stereo_link),
+                8 => bool_value(p.sidechain),
+                _ => 0.0,
+            },
+            Self::Reverb(p) => match slot {
+                0 => p.pre_delay,
+                1 => p.decay,
+                2 => p.damping,
+                3 => p.low_cut,
+                4 => p.width,
+                5 => p.mix,
+                _ => 0.0,
+            },
+            Self::Chorus(p) => match slot {
+                0 => p.rate,
+                1 => p.depth,
+                2 => p.width,
+                3 => p.mix,
+                _ => 0.0,
+            },
+            Self::Flanger(p) => match slot {
+                0 => p.rate,
+                1 => p.depth,
+                2 => p.feedback,
+                3 => p.width,
+                4 => p.mix,
+                _ => 0.0,
+            },
+            Self::Bitcrusher(p) => match slot {
+                0 => p.drive,
+                1 => p.bits,
+                2 => p.downsample,
+                3 => p.mix,
+                _ => 0.0,
+            },
+            Self::Phaser(p) => match slot {
+                0 => p.rate,
+                1 => p.depth,
+                2 => p.feedback,
+                3 => p.spread,
+                4 => f32::from(p.stages),
+                5 => p.mix,
+                _ => 0.0,
+            },
+            Self::Saturation(p) => match slot {
+                0 => f32::from(p.mode),
+                1 => p.drive,
+                2 => p.tone,
+                3 => p.trim,
+                4 => p.mix,
+                _ => 0.0,
+            },
+            Self::RingMod(p) => match slot {
+                0 => p.mix,
+                _ => 0.0,
+            },
+            Self::Limiter(p) => match slot {
+                0 => p.threshold,
+                1 => p.release,
+                2 => bool_value(p.stereo_link),
+                3 => p.output,
+                _ => 0.0,
+            },
+            Self::Vocoder(p) => match slot {
+                0 => p.attack,
+                1 => p.release,
+                2 => p.q,
+                3 => p.low,
+                4 => p.high,
+                5 => p.sibilance,
+                6 => p.mix,
+                7 => p.output,
+                _ => 0.0,
+            },
+        }
+    }
+
+    /// Writes `slot` (out-of-range slots are ignored). Discrete slots round and
+    /// clamp exactly like the UI editors.
+    pub fn set_slot_value(&mut self, slot: u8, value: f32) {
+        match self {
+            Self::Delay(p) => match slot {
+                0 => p.time_s = value,
+                1 => p.feedback = value,
+                2 => p.mix = value,
+                3 => p.ping_pong = value >= 0.5,
+                4 => p.sync = value >= 0.5,
+                5 => p.sync_division = value.round().clamp(0.0, 7.0) as u8,
+                _ => {}
+            },
+            Self::Eq(p) => match slot {
+                0 => p.low_gain = value,
+                1 => p.low_freq = value,
+                2 => p.mid_gain = value,
+                3 => p.mid_freq = value,
+                4 => p.mid_q = value,
+                5 => p.high_gain = value,
+                6 => p.high_freq = value,
+                7 => p.low_cut = value,
+                _ => {}
+            },
+            Self::Compressor(p) => match slot {
+                0 => p.threshold = value,
+                1 => p.ratio = value,
+                2 => p.attack = value,
+                3 => p.release = value,
+                4 => p.knee = value,
+                5 => p.makeup = value,
+                6 => p.mix = value,
+                7 => p.stereo_link = value >= 0.5,
+                8 => p.sidechain = value >= 0.5,
+                _ => {}
+            },
+            Self::Reverb(p) => match slot {
+                0 => p.pre_delay = value,
+                1 => p.decay = value,
+                2 => p.damping = value,
+                3 => p.low_cut = value,
+                4 => p.width = value,
+                5 => p.mix = value,
+                _ => {}
+            },
+            Self::Chorus(p) => match slot {
+                0 => p.rate = value,
+                1 => p.depth = value,
+                2 => p.width = value,
+                3 => p.mix = value,
+                _ => {}
+            },
+            Self::Flanger(p) => match slot {
+                0 => p.rate = value,
+                1 => p.depth = value,
+                2 => p.feedback = value,
+                3 => p.width = value,
+                4 => p.mix = value,
+                _ => {}
+            },
+            Self::Bitcrusher(p) => match slot {
+                0 => p.drive = value,
+                1 => p.bits = value,
+                2 => p.downsample = value,
+                3 => p.mix = value,
+                _ => {}
+            },
+            Self::Phaser(p) => match slot {
+                0 => p.rate = value,
+                1 => p.depth = value,
+                2 => p.feedback = value,
+                3 => p.spread = value,
+                4 => p.stages = value.round().clamp(0.0, 3.0) as u8,
+                5 => p.mix = value,
+                _ => {}
+            },
+            Self::Saturation(p) => match slot {
+                0 => p.mode = value.round().clamp(0.0, 2.0) as u8,
+                1 => p.drive = value,
+                2 => p.tone = value,
+                3 => p.trim = value,
+                4 => p.mix = value,
+                _ => {}
+            },
+            Self::RingMod(p) => {
+                if slot == 0 {
+                    p.mix = value;
+                }
+            }
+            Self::Limiter(p) => match slot {
+                0 => p.threshold = value,
+                1 => p.release = value,
+                2 => p.stereo_link = value >= 0.5,
+                3 => p.output = value,
+                _ => {}
+            },
+            Self::Vocoder(p) => match slot {
+                0 => p.attack = value,
+                1 => p.release = value,
+                2 => p.q = value,
+                3 => p.low = value,
+                4 => p.high = value,
+                5 => p.sibilance = value,
+                6 => p.mix = value,
+                7 => p.output = value,
+                _ => {}
+            },
+        }
     }
 }
 
@@ -7227,6 +7479,46 @@ mod tests {
         };
         assert!(super::set_node_param(&mut sf2, NodeParam::Sf2Gain, 1.5));
         assert_eq!(super::node_param_value(&sf2, NodeParam::Sf2Gain), Some(1.5));
+    }
+
+    #[test]
+    fn effect_slot_values_round_trip() {
+        let mut params = EffectParams::Delay(DelayParams::default());
+        assert_eq!(params.slot_count(), 6);
+        params.set_slot_value(0, 0.5);
+        assert_eq!(params.slot_value(0), 0.5);
+        assert_eq!(params.slot_value(6), 0.0, "out-of-range slot");
+
+        let mut node = NodeDoc::Effect {
+            node_id: 9,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params,
+            delay: None,
+        };
+        assert_eq!(super::node_param_keys(&node).len(), 6);
+        assert_eq!(
+            super::node_param_value(&node, NodeParam::EffectSlot(0)),
+            Some(0.5)
+        );
+        assert_eq!(
+            super::node_param_value(&node, NodeParam::EffectSlot(6)),
+            None
+        );
+        assert!(super::set_node_param(
+            &mut node,
+            NodeParam::EffectSlot(0),
+            0.75
+        ));
+        assert_eq!(
+            super::node_param_value(&node, NodeParam::EffectSlot(0)),
+            Some(0.75)
+        );
+        assert!(!super::set_node_param(
+            &mut node,
+            NodeParam::EffectSlot(6),
+            0.1
+        ));
     }
 
     fn effect_node(params: EffectParams) -> NodeDoc {

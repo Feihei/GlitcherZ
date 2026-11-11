@@ -14,8 +14,7 @@ use glitcherz_engine::realtime::{
     BitcrusherProcessor, BuiltinEffectKind, ChorusProcessor, CompressorProcessor, DelayProcessor,
     EffectDescriptor, EffectMeters, EqProcessor, FlangerProcessor, LimiterProcessor, ParamId,
     ParamSpec, PhaserProcessor, Processor, ReverbProcessor, RingModProcessor, SaturationProcessor,
-    Unit, VocoderProcessor, bitcrusher, chorus, compressor, delay, eq, flanger, limiter, phaser,
-    reverb, ring_mod, saturation, vocoder,
+    Unit, VocoderProcessor,
 };
 use glitcherz_model::{BuiltinEffectKind as DocEffectKind, EffectParams};
 
@@ -112,227 +111,16 @@ pub fn processor(params: &EffectParams, sample_rate: f32) -> BuiltinProcessor {
 }
 
 /// Value of `slot` in the document payload (`0.0` for an unknown slot).
+///
+/// F-039 V1b-2: the slot table lives in the model
+/// (`EffectParams::slot_value`), so the UI, CLI and MCP share one source.
 pub fn value(params: &EffectParams, slot: u8) -> f32 {
-    match params {
-        EffectParams::Delay(delay) => match slot {
-            delay::SLOT_TIME => delay.time_s,
-            delay::SLOT_FEEDBACK => delay.feedback,
-            delay::SLOT_MIX => delay.mix,
-            delay::SLOT_PING_PONG => bool_value(delay.ping_pong),
-            delay::SLOT_SYNC => bool_value(delay.sync),
-            delay::SLOT_DIVISION => delay.sync_division as f32,
-            _ => 0.0,
-        },
-        EffectParams::Eq(eq) => match slot {
-            eq::SLOT_LOW_GAIN => eq.low_gain,
-            eq::SLOT_LOW_FREQ => eq.low_freq,
-            eq::SLOT_MID_GAIN => eq.mid_gain,
-            eq::SLOT_MID_FREQ => eq.mid_freq,
-            eq::SLOT_MID_Q => eq.mid_q,
-            eq::SLOT_HIGH_GAIN => eq.high_gain,
-            eq::SLOT_HIGH_FREQ => eq.high_freq,
-            eq::SLOT_LOW_CUT => eq.low_cut,
-            _ => 0.0,
-        },
-        EffectParams::Compressor(comp) => match slot {
-            compressor::SLOT_THRESHOLD => comp.threshold,
-            compressor::SLOT_RATIO => comp.ratio,
-            compressor::SLOT_ATTACK => comp.attack,
-            compressor::SLOT_RELEASE => comp.release,
-            compressor::SLOT_KNEE => comp.knee,
-            compressor::SLOT_MAKEUP => comp.makeup,
-            compressor::SLOT_MIX => comp.mix,
-            compressor::SLOT_LINK => bool_value(comp.stereo_link),
-
-            compressor::SLOT_SIDECHAIN => bool_value(comp.sidechain),
-            _ => 0.0,
-        },
-        EffectParams::Reverb(rev) => match slot {
-            reverb::SLOT_PRE_DELAY => rev.pre_delay,
-            reverb::SLOT_DECAY => rev.decay,
-            reverb::SLOT_DAMPING => rev.damping,
-            reverb::SLOT_LOW_CUT => rev.low_cut,
-            reverb::SLOT_WIDTH => rev.width,
-            reverb::SLOT_MIX => rev.mix,
-            _ => 0.0,
-        },
-        EffectParams::Chorus(ch) => match slot {
-            chorus::SLOT_RATE => ch.rate,
-            chorus::SLOT_DEPTH => ch.depth,
-            chorus::SLOT_WIDTH => ch.width,
-            chorus::SLOT_MIX => ch.mix,
-            _ => 0.0,
-        },
-        EffectParams::Flanger(fl) => match slot {
-            flanger::SLOT_RATE => fl.rate,
-            flanger::SLOT_DEPTH => fl.depth,
-            flanger::SLOT_FEEDBACK => fl.feedback,
-            flanger::SLOT_WIDTH => fl.width,
-            flanger::SLOT_MIX => fl.mix,
-            _ => 0.0,
-        },
-        EffectParams::Bitcrusher(cr) => match slot {
-            bitcrusher::SLOT_DRIVE => cr.drive,
-            bitcrusher::SLOT_BITS => cr.bits,
-            bitcrusher::SLOT_DOWNSAMPLE => cr.downsample,
-            bitcrusher::SLOT_MIX => cr.mix,
-            _ => 0.0,
-        },
-        EffectParams::Phaser(ph) => match slot {
-            phaser::SLOT_RATE => ph.rate,
-            phaser::SLOT_DEPTH => ph.depth,
-            phaser::SLOT_FEEDBACK => ph.feedback,
-            phaser::SLOT_SPREAD => ph.spread,
-            phaser::SLOT_STAGES => ph.stages as f32,
-            phaser::SLOT_MIX => ph.mix,
-            _ => 0.0,
-        },
-        EffectParams::Saturation(sat) => match slot {
-            saturation::SLOT_MODE => sat.mode as f32,
-            saturation::SLOT_DRIVE => sat.drive,
-            saturation::SLOT_TONE => sat.tone,
-            saturation::SLOT_TRIM => sat.trim,
-            saturation::SLOT_MIX => sat.mix,
-            _ => 0.0,
-        },
-        EffectParams::RingMod(rm) => match slot {
-            ring_mod::SLOT_MIX => rm.mix,
-            _ => 0.0,
-        },
-        EffectParams::Limiter(lim) => match slot {
-            limiter::SLOT_THRESHOLD => lim.threshold,
-            limiter::SLOT_RELEASE => lim.release,
-            limiter::SLOT_LINK => bool_value(lim.stereo_link),
-            limiter::SLOT_OUTPUT => lim.output,
-            _ => 0.0,
-        },
-        EffectParams::Vocoder(voc) => match slot {
-            vocoder::SLOT_ATTACK => voc.attack,
-            vocoder::SLOT_RELEASE => voc.release,
-            vocoder::SLOT_Q => voc.q,
-            vocoder::SLOT_LOW => voc.low,
-            vocoder::SLOT_HIGH => voc.high,
-            vocoder::SLOT_SIBILANCE => voc.sibilance,
-            vocoder::SLOT_MIX => voc.mix,
-            vocoder::SLOT_OUTPUT => voc.output,
-            _ => 0.0,
-        },
-    }
+    params.slot_value(slot)
 }
 
 /// Writes `slot` in the document payload (unknown slots are ignored).
 pub fn set_value(params: &mut EffectParams, slot: u8, value: f32) {
-    match params {
-        EffectParams::Delay(delay) => match slot {
-            delay::SLOT_TIME => delay.time_s = value,
-            delay::SLOT_FEEDBACK => delay.feedback = value,
-            delay::SLOT_MIX => delay.mix = value,
-            delay::SLOT_PING_PONG => delay.ping_pong = value >= 0.5,
-            delay::SLOT_SYNC => delay.sync = value >= 0.5,
-            delay::SLOT_DIVISION => delay.sync_division = value.round().clamp(0.0, 7.0) as u8,
-            _ => {}
-        },
-        EffectParams::Eq(eq) => match slot {
-            eq::SLOT_LOW_GAIN => eq.low_gain = value,
-            eq::SLOT_LOW_FREQ => eq.low_freq = value,
-            eq::SLOT_MID_GAIN => eq.mid_gain = value,
-            eq::SLOT_MID_FREQ => eq.mid_freq = value,
-            eq::SLOT_MID_Q => eq.mid_q = value,
-            eq::SLOT_HIGH_GAIN => eq.high_gain = value,
-            eq::SLOT_HIGH_FREQ => eq.high_freq = value,
-            eq::SLOT_LOW_CUT => eq.low_cut = value,
-            _ => {}
-        },
-        EffectParams::Compressor(comp) => match slot {
-            compressor::SLOT_THRESHOLD => comp.threshold = value,
-            compressor::SLOT_RATIO => comp.ratio = value,
-            compressor::SLOT_ATTACK => comp.attack = value,
-            compressor::SLOT_RELEASE => comp.release = value,
-            compressor::SLOT_KNEE => comp.knee = value,
-            compressor::SLOT_MAKEUP => comp.makeup = value,
-            compressor::SLOT_MIX => comp.mix = value,
-            compressor::SLOT_LINK => comp.stereo_link = value >= 0.5,
-
-            compressor::SLOT_SIDECHAIN => comp.sidechain = value >= 0.5,
-            _ => {}
-        },
-        EffectParams::Reverb(rev) => match slot {
-            reverb::SLOT_PRE_DELAY => rev.pre_delay = value,
-            reverb::SLOT_DECAY => rev.decay = value,
-            reverb::SLOT_DAMPING => rev.damping = value,
-            reverb::SLOT_LOW_CUT => rev.low_cut = value,
-            reverb::SLOT_WIDTH => rev.width = value,
-            reverb::SLOT_MIX => rev.mix = value,
-            _ => {}
-        },
-        EffectParams::Chorus(ch) => match slot {
-            chorus::SLOT_RATE => ch.rate = value,
-            chorus::SLOT_DEPTH => ch.depth = value,
-            chorus::SLOT_WIDTH => ch.width = value,
-            chorus::SLOT_MIX => ch.mix = value,
-            _ => {}
-        },
-        EffectParams::Flanger(fl) => match slot {
-            flanger::SLOT_RATE => fl.rate = value,
-            flanger::SLOT_DEPTH => fl.depth = value,
-            flanger::SLOT_FEEDBACK => fl.feedback = value,
-            flanger::SLOT_WIDTH => fl.width = value,
-            flanger::SLOT_MIX => fl.mix = value,
-            _ => {}
-        },
-        EffectParams::Bitcrusher(cr) => match slot {
-            bitcrusher::SLOT_DRIVE => cr.drive = value,
-            bitcrusher::SLOT_BITS => cr.bits = value,
-            bitcrusher::SLOT_DOWNSAMPLE => cr.downsample = value,
-            bitcrusher::SLOT_MIX => cr.mix = value,
-            _ => {}
-        },
-        EffectParams::Phaser(ph) => match slot {
-            phaser::SLOT_RATE => ph.rate = value,
-            phaser::SLOT_DEPTH => ph.depth = value,
-            phaser::SLOT_FEEDBACK => ph.feedback = value,
-            phaser::SLOT_SPREAD => ph.spread = value,
-            phaser::SLOT_STAGES => ph.stages = value.round().clamp(0.0, 3.0) as u8,
-            phaser::SLOT_MIX => ph.mix = value,
-            _ => {}
-        },
-        EffectParams::Saturation(sat) => match slot {
-            saturation::SLOT_MODE => sat.mode = value.round().clamp(0.0, 2.0) as u8,
-            saturation::SLOT_DRIVE => sat.drive = value,
-            saturation::SLOT_TONE => sat.tone = value,
-            saturation::SLOT_TRIM => sat.trim = value,
-            saturation::SLOT_MIX => sat.mix = value,
-            _ => {}
-        },
-        EffectParams::RingMod(rm) => {
-            if slot == ring_mod::SLOT_MIX {
-                rm.mix = value;
-            }
-        }
-        EffectParams::Limiter(lim) => match slot {
-            limiter::SLOT_THRESHOLD => lim.threshold = value,
-            limiter::SLOT_RELEASE => lim.release = value,
-            limiter::SLOT_LINK => lim.stereo_link = value >= 0.5,
-            limiter::SLOT_OUTPUT => lim.output = value,
-            _ => {}
-        },
-        EffectParams::Vocoder(voc) => match slot {
-            vocoder::SLOT_ATTACK => voc.attack = value,
-            vocoder::SLOT_RELEASE => voc.release = value,
-            vocoder::SLOT_Q => voc.q = value,
-            vocoder::SLOT_LOW => voc.low = value,
-            vocoder::SLOT_HIGH => voc.high = value,
-            vocoder::SLOT_SIBILANCE => voc.sibilance = value,
-            vocoder::SLOT_MIX => voc.mix = value,
-            vocoder::SLOT_OUTPUT => voc.output = value,
-            _ => {}
-        },
-    }
-}
-
-/// `true` as `1.0` (switch slots are floats on the parameter path).
-fn bool_value(on: bool) -> f32 {
-    if on { 1.0 } else { 0.0 }
+    params.set_slot_value(slot, value);
 }
 
 /// Range of a slot straight from the descriptor (`0..1` when unknown).

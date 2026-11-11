@@ -125,6 +125,15 @@ fn set_param(session: &mut Session, params: &Value) -> crate::Result<Value> {
         None => value,
     };
     let node = node_mut(session, node_id, "graph.set_param")?;
+    // Effect slots have no context-free range: clamp against the node's own
+    // descriptor table (F-039 V1b-2).
+    let value =
+        if let (NodeParam::EffectSlot(slot), NodeDoc::Effect { params, .. }) = (param, &*node) {
+            let axis = glitcherz_model::effect_slot_axis(params, slot);
+            value.clamp(f64::from(axis.min), f64::from(axis.max))
+        } else {
+            value
+        };
     if !set_node_param(node, param, value as f32) {
         return Err(bad_params(
             "graph.set_param",

@@ -1694,7 +1694,16 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - 新命令 `graph.set_voice {node, voice: builtin|modal|pluck|organ|wavetable}`：切换 `VoiceSpec` 到对应内置音色的默认参数；只对 instrument 节点有效，文件音色（SF2 / sample）与插件拒绝。命令数 22 → 23。
 - 测试：model `voice_params_read_and_write`（Modal decay、Organ bar clamp / 越界、Sf2 gain、keys 按 voice）；command `graph_set_voice_switches_and_exposes_voice_params`（切换 → 调 `modal_decay` → 文档读回 + query 只列该 voice 参数 + `sf2` 拒绝）。
 - **门禁**：`cargo check -p glitcherz-model -p glitcherz-command --all-targets` / `cargo clippy -p glitcherz-model -p glitcherz-command --all-targets -- -D warnings` 干净；`cargo test -p glitcherz-model voice_param` 与 `cargo test -p glitcherz-command --test transactional graph_set_voice` 均 `ok. 1 passed; 0 failed`。**全量 `cargo test --workspace` 本轮无法跑完**：工作区 UI 有未提交的 F-040 剪贴板在途改动（`timeline.rs` 引用 `clipboard::…` 而 `lib.rs` 缺 `mod clipboard;`），与本轮无关、未触碰。
-- **V1b-2 待做**：`effect_slot` 读写（需把 `glitcherz-ui::effect` 的槽映射下沉到 model，`EffectParams::slot_value` / `set_slot_value` / `slot_count`）。
+- **V1b-2 已在下一小节交付**。
+
+#### 命令词汇表 V1b-2：effect_slot（2026-11-11 交付）
+
+- model：`EffectParams::slot_count()`（Delay 6 / Eq 8 / Compressor 9 / Reverb 6 / Chorus 4 / Flanger 5 / Bitcrusher 4 / Phaser 6 / Saturation 5 / RingMod 1 / Limiter 4 / Vocoder 8）、`slot_value(slot)` / `set_slot_value(slot, value)` 按 `effect_slot_axis` 的槽顺序读写；离散槽按 UI 规则取整（division / stages / mode），布尔槽 ≥ 0.5。
+- UI：`glitcherz-ui/src/effect.rs` 的 `value` / `set_value` 改为薄委托（单一来源下沉 model），删除本地 match 与 `bool_value`；engine 槽常量 import 只在测试模块保留。
+- model 节点接口：`node_param_value` / `set_node_param` 增加 `(Effect { params }, EffectSlot(slot))` 分支（越界槽返回不支持），`node_param_keys` 对 Effect 返回全部槽；`graph.set_param` 对 `effect_slot` 按 `effect_slot_axis` 的 min / max clamp。
+- 测试：model `effect_slot_values_round_trip`（6 槽、越界、node_param_keys）；command `graph_set_effect_slot_param`（写入 / clamp 到描述符上限 / 越界 index 报错 / query 列出槽）。
+- **门禁**：`cargo fmt --all` / `cargo clippy --workspace --all-targets -D warnings` 干净；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
+- **F-039 收官**：V1a / V1b-1 / V1b-2 / V2 / V3 全部交付；命令数 23（MCP 工具面仍为 6）。
 
 #### 阶段边界（自 plan.md 归位）
 

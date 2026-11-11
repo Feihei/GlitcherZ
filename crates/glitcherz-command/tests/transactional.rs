@@ -1,7 +1,7 @@
 //! The guarantees [`Session::execute`] makes, exercised end to end.
 
 use glitcherz_command::{CommandError, Session, command_specs};
-use glitcherz_model::{MidiClip, NodeDoc, Note, Project, VoiceSpec};
+use glitcherz_model::{DelayParams, EffectParams, MidiClip, NodeDoc, Note, Project, VoiceSpec};
 use serde_json::json;
 
 /// A session with one track holding one clip of four notes.
@@ -552,6 +552,71 @@ fn graph_set_voice_switches_and_exposes_voice_params() {
                 &json!({ "node": node_id, "voice": "sf2" })
             )
             .is_err()
+    );
+}
+
+#[test]
+fn graph_set_effect_slot_param() {
+    let mut session = Session::new(Project::default());
+    session.project_mut().graph.nodes.push(NodeDoc::Effect {
+        node_id: 99,
+        track: 0,
+        voice: VoiceSpec::Builtin,
+        params: EffectParams::Delay(DelayParams::default()),
+        delay: None,
+    });
+    let outcome = session
+        .execute(
+            "graph.set_param",
+            &json!({"node": 99, "param": "effect_slot", "index": 0, "value": 0.5}),
+        )
+        .expect("effect slot");
+    assert_eq!(outcome["value"], json!(0.5));
+    let node = session
+        .project()
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.node_id() == 99)
+        .expect("node");
+    let NodeDoc::Effect { params, .. } = node else {
+        panic!("effect node");
+    };
+    assert!((params.slot_value(0) - 0.5).abs() < 1e-6);
+
+    // Clamped to the descriptor slot range (delay time is log 0.005..1).
+    let outcome = session
+        .execute(
+            "graph.set_param",
+            &json!({"node": 99, "param": "effect_slot", "index": 0, "value": 99.0}),
+        )
+        .expect("clamped");
+    assert_eq!(outcome["value"], json!(1.0));
+
+    // An out-of-range index is rejected, never silently ignored.
+    assert!(
+        session
+            .execute(
+                "graph.set_param",
+                &json!({"node": 99, "param": "effect_slot", "index": 6, "value": 0.1}),
+            )
+            .is_err()
+    );
+
+    // The query advertises the slots of this effect.
+    let queried = session.execute("graph.query", &json!({})).expect("query");
+    let entry = queried["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .find(|entry| entry["node"] == json!(99))
+        .expect("effect in query");
+    assert!(
+        entry["params"]
+            .as_array()
+            .expect("params")
+            .iter()
+            .any(|param| param["key"] == json!("effect_slot"))
     );
 }
 
