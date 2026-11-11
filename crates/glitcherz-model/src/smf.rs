@@ -11,7 +11,8 @@
 //! offset. Event and track counts are capped.
 
 use crate::{
-    CtrlEvent, CtrlKind, MidiClip, MidiTrack, Note, Sequence, TICKS_PER_QUARTER, TimeSignature,
+    CtrlEvent, CtrlKind, MeterMarker, MidiClip, MidiTrack, Note, Sequence, TICKS_PER_QUARTER,
+    TimeSignature,
 };
 
 /// Parser safety limits.
@@ -60,25 +61,25 @@ pub fn export_smf(project: &crate::Project) -> Vec<u8> {
     out.extend_from_slice(&(track_count as u16).to_be_bytes());
     out.extend_from_slice(&(TICKS_PER_QUARTER as u16).to_be_bytes());
 
-    // Conductor: tempo + meter + end of track.
+    // Conductor: tempo, then one `FF 58` per meter segment (Met M5b).
     let micros_per_quarter = (60.0 / project.metadata.tempo_bpm * 1_000_000.0).round() as u32;
-    let meter = project.metadata.time_signature;
     let mut conductor = Vec::new();
     conductor.extend_from_slice(&vlq(0));
     conductor.extend_from_slice(&[0xFF, 0x51, 0x03]);
     conductor.extend_from_slice(&micros_per_quarter.to_be_bytes()[1..4]);
-    conductor.extend_from_slice(&vlq(0));
     // FF 58 04 nn dd cc bb: nn beats per bar, dd = log2(denominator),
     // cc = MIDI clocks per metronome click, bb = 32nd notes per quarter.
-    conductor.extend_from_slice(&[
-        0xFF,
-        0x58,
-        0x04,
-        meter.numerator,
-        meter.denominator.trailing_zeros() as u8,
-        24,
-        8,
-    ]);
+    // The base meter sits at tick 0; every marker follows at its own tick.
+    let mut meter_tick = 0i64;
+    push_meter_event(&mut conductor, 0, project.metadata.time_signature);
+    for marker in &project.metadata.meter_markers {
+        let tick = i64::from(marker.tick);
+        if tick <= meter_tick {
+            continue;
+        }
+        push_meter_event(&mut conductor, tick - meter_tick, marker.signature);
+        meter_tick = tick;
+    }
     conductor.extend_from_slice(&vlq(0));
     conductor.extend_from_slice(&[0xFF, 0x2F, 0x00]);
     write_chunk(&mut out, b"MTrk", &conductor);
@@ -270,6 +271,20 @@ fn write_track(out: &mut Vec<u8>, name: &str, events: &[SmfEvent]) {
 type OpenNotes = Vec<((u8, u8), Vec<(i64, u8)>)>;
 
 /// MIDI variable-length quantity (up to 4 bytes).
+/// Appends one `FF 58` meter event with a delta of `delta` ticks (Met M5b).
+fn push_meter_event(out: &mut Vec<u8>, delta: i64, signature: TimeSignature) {
+    out.extend_from_slice(&vlq(delta.max(0)));
+    out.extend_from_slice(&[
+        0xFF,
+        0x58,
+        0x04,
+        signature.numerator,
+        signature.denominator.trailing_zeros() as u8,
+        24,
+        8,
+    ]);
+}
+
 fn vlq(mut value: i64) -> Vec<u8> {
     debug_assert!(value >= 0);
     let mut buffer = [0u8; 5];
@@ -299,8 +314,10 @@ fn vlq(mut value: i64) -> Vec<u8> {
 pub struct SmfImport {
     /// The note-bearing tracks (the conductor track folds into this header).
     pub tracks: Vec<MidiTrack>,
-    /// The first `FF 58` meter in the file, if any.
+    /// The file's base meter (the earliest `FF 58`, normally at tick 0), if any.
     pub time_signature: Option<TimeSignature>,
+    /// Meter changes at tick > 0 (Met M5b). Sorted and deduplicated by tick.
+    pub meter_markers: Vec<MeterMarker>,
 }
 
 /// Parses a format-0/1 SMF into MIDI tracks plus the file's meter.
@@ -337,7 +354,7 @@ pub fn import_smf(bytes: &[u8]) -> Result<SmfImport, SmfError> {
     cursor.skip(header_len - 6)?;
 
     let mut tracks = Vec::new();
-    let mut meter: Option<TimeSignature> = None;
+    let mut meters: Vec<(i64, TimeSignature)> = Vec::new();
     let mut parsed = 0usize;
     while parsed < declared_tracks.min(MAX_TRACKS) {
         parsed += 1;
@@ -350,7 +367,7 @@ pub fn import_smf(bytes: &[u8]) -> Result<SmfImport, SmfError> {
             ));
         }
         let payload = &bytes[cursor.offset..cursor.offset + length];
-        let track = parse_track(payload, ticks_per_quarter, tracks.len(), &mut meter)?;
+        let track = parse_track(payload, ticks_per_quarter, tracks.len(), &mut meters)?;
         // A format-1 conductor track carries only meta events: it folds into
         // the project's global tempo/meter, so it becomes no track here.
         if !track.clips.iter().all(|c| c.sequence.notes.is_empty()) {
@@ -358,9 +375,30 @@ pub fn import_smf(bytes: &[u8]) -> Result<SmfImport, SmfError> {
         }
         cursor.skip(length)?;
     }
+    // Met M5b: every `FF 58` is collected. The earliest one is the base meter
+    // (normally tick 0); the rest become meter changes. Sorting across tracks
+    // matters because later tracks may restate the header.
+    meters.sort_by_key(|(tick, _)| *tick);
+    let base_index = meters.iter().position(|(tick, _)| *tick <= 0).unwrap_or(0);
+    let time_signature = meters.get(base_index).map(|(_, signature)| *signature);
+    let mut meter_markers: Vec<MeterMarker> = Vec::new();
+    for (index, (tick, signature)) in meters.iter().enumerate() {
+        if index == base_index {
+            continue;
+        }
+        let tick = (*tick).clamp(0, i64::from(u32::MAX)) as u32;
+        if tick == 0 || meter_markers.last().is_some_and(|last| last.tick >= tick) {
+            continue;
+        }
+        meter_markers.push(MeterMarker {
+            tick,
+            signature: *signature,
+        });
+    }
     Ok(SmfImport {
         tracks,
-        time_signature: meter,
+        time_signature,
+        meter_markers,
     })
 }
 
@@ -417,14 +455,14 @@ impl Cursor<'_> {
 
 /// Parses one MTrk payload into note events.
 ///
-/// The meter (`FF 58`) lands in `meter` — first occurrence wins, so a format-1
-/// conductor track's header is what the caller sees even when later tracks
-/// restate it.
+/// Every meter (`FF 58`) lands in `meters` with its absolute tick (Met M5b).
+/// A format-1 conductor track's header is normally the tick-0 entry, so the
+/// caller treats the earliest one as the base meter and the rest as changes.
 fn parse_track(
     payload: &[u8],
     ticks_per_quarter: i64,
     track_index: usize,
-    meter: &mut Option<TimeSignature>,
+    meters: &mut Vec<(i64, TimeSignature)>,
 ) -> Result<MidiTrack, SmfError> {
     let mut cursor = Cursor {
         bytes: payload,
@@ -552,8 +590,8 @@ fn parse_track(
                         .trim_end_matches('\0')
                         .to_string();
                 }
-                // FF 58 04 nn dd cc bb — the first meter in the file wins.
-                if kind == 0x58 && length >= 2 && meter.is_none() {
+                // FF 58 04 nn dd cc bb — every occurrence is kept (Met M5b).
+                if kind == 0x58 && length >= 2 {
                     let data = payload
                         .get(cursor.offset..cursor.offset + length)
                         .unwrap_or(&[]);
@@ -561,7 +599,7 @@ fn parse_track(
                         // dd is log2(denominator); anything beyond 32 is
                         // clamped by `TimeSignature::new`.
                         let denominator = 1u8.checked_shl(u32::from(exponent)).unwrap_or(32);
-                        *meter = Some(TimeSignature::new(numerator, denominator));
+                        meters.push((tick, TimeSignature::new(numerator, denominator)));
                     }
                 }
                 cursor.skip(length)?;
@@ -1021,6 +1059,32 @@ mod tests {
             imported.tracks.is_empty(),
             "a conductor-only file holds no note tracks"
         );
+    }
+
+    #[test]
+    fn meter_changes_round_trip_as_multiple_ff_58_events() {
+        let mut project = project_with(Vec::new(), 120.0);
+        project.metadata.time_signature = TimeSignature::COMMON;
+        project.metadata.meter_markers = vec![
+            crate::MeterMarker {
+                tick: 2 * crate::TICKS_PER_BAR,
+                signature: TimeSignature::new(6, 8),
+            },
+            crate::MeterMarker {
+                tick: 5 * crate::TICKS_PER_BAR,
+                signature: TimeSignature::new(3, 4),
+            },
+        ];
+        let bytes = export_smf(&project);
+        let count = bytes
+            .windows(3)
+            .filter(|w| *w == [0xFF, 0x58, 0x04])
+            .count();
+        assert_eq!(count, 3, "the base meter plus one event per change");
+
+        let imported = import_smf(&bytes).expect("parse");
+        assert_eq!(imported.time_signature, Some(TimeSignature::COMMON));
+        assert_eq!(imported.meter_markers, project.metadata.meter_markers);
     }
 
     #[test]

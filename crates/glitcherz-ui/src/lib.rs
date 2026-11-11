@@ -42,14 +42,14 @@ use glitcherz_engine::convert;
 use glitcherz_engine::realtime::{
     ArpeggiatorProcessor, AudioTrackProcessor, AutoDest, ChannelStripProcessor, Curve,
     CurveMapProcessor, DrumKitProcessor, DrumSlotSpec, EffectMeters, EngineCommand, EventKind,
-    FeedbackProcessor, InputProcessor, LfoProcessor, MAX_AUTO_POINTS, MAX_MIDI_FANOUT,
-    MAX_TRACK_CLIPS, MapMode as EngineMapMode, MapSpec as EngineMapSpec, MidiClipTable,
-    MidiEnvelopeProcessor, MixerChannel as EngineMixerChannel, MixerProcessor, ModalProcessor,
-    NodeKind, NoteEvent, OrganProcessor, ParamId, PluckProcessor, PortamentoProcessor, Processor,
-    RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCtrl, RtCtrlKind, RtCurveInterp,
-    RtMidiClip, RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor, SequencerCommand,
-    Sf2VoiceProcessor, SilentProcessor, SynthProcessor, Unit, WavetableProcessor, empty_clip_table,
-    empty_midi_clip_table, mode_value as curve_mode_value, wavetable_preview,
+    FeedbackProcessor, InputProcessor, LfoProcessor, MAX_AUTO_POINTS, MAX_METER_SEGS,
+    MAX_MIDI_FANOUT, MAX_TRACK_CLIPS, MapMode as EngineMapMode, MapSpec as EngineMapSpec, MeterSeg,
+    MidiClipTable, MidiEnvelopeProcessor, MixerChannel as EngineMixerChannel, MixerProcessor,
+    ModalProcessor, NodeKind, NoteEvent, OrganProcessor, ParamId, PluckProcessor,
+    PortamentoProcessor, Processor, RtAudioClip, RtAutoPoint, RtAutomation, RtControlClip, RtCtrl,
+    RtCtrlKind, RtCurveInterp, RtMidiClip, RtNote, SAMPLE_DEFAULT_ROOT, SampleVoiceProcessor,
+    SequencerCommand, Sf2VoiceProcessor, SilentProcessor, SynthProcessor, Unit, WavetableProcessor,
+    empty_clip_table, empty_midi_clip_table, mode_value as curve_mode_value, wavetable_preview,
 };
 use glitcherz_engine::{MidiTarget, Sf2Library, Sf2Preset};
 use glitcherz_model::{

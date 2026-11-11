@@ -301,6 +301,42 @@ pub enum NoteEvent {
     Off { note: u8 },
 }
 
+/// One meter segment on the audio-thread side (Met M5b; spec
+/// `.agents/spec/meter-map.md` §7). Segment 0 always starts at tick 0 with the
+/// base meter; every later segment starts on a bar line of the previous one.
+#[derive(Debug, Clone, Copy)]
+pub struct MeterSeg {
+    /// Absolute segment start (ticks; 0 for the base segment).
+    pub tick: u32,
+    /// 0-based number of the bar starting at `tick`.
+    pub bar: u32,
+    /// Beats per bar in this segment.
+    pub numerator: u8,
+    /// Beat unit denominator in this segment.
+    pub denominator: u8,
+}
+
+impl MeterSeg {
+    /// An empty/default segment (the 4/4 base meter).
+    pub const DEFAULT: MeterSeg = MeterSeg {
+        tick: 0,
+        bar: 0,
+        numerator: 4,
+        denominator: 4,
+    };
+}
+
+impl Default for MeterSeg {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Capacity of the engine's meter-segment table. One more than the model's
+/// `MAX_METER_MARKERS` (64) because segment 0 is the base meter, so a full
+/// marker table still fits.
+pub const MAX_METER_SEGS: usize = 65;
+
 /// Sequencer transport and configuration commands.
 ///
 /// Clip tables are **not** here (D15 revision, 2026-10-28): MIDI and control
@@ -341,6 +377,15 @@ pub enum SequencerCommand {
     /// position is kept — a meter is notation plus a bar length, not a data
     /// transform. Invalid fields are clamped on the real-time side.
     SetTimeSignature { numerator: u8, denominator: u8 },
+    /// Replaces the meter-change table (Met M5b; spec `meter-map.md` D6).
+    ///
+    /// `segs[..count]` is the whole table (segment 0 = tick 0, ascending).
+    /// Pushing the same table twice is idempotent; `SetTimeSignature` still
+    /// carries the base meter and the two are always sent together.
+    SetMeterMarkers {
+        count: u8,
+        segs: [MeterSeg; MAX_METER_SEGS],
+    },
     /// Enable / configure the transport metronome (`spec/recording.md` D1–D5).
     ///
     /// The click is synthesized inside [`crate::realtime::block::BlockRunner`]

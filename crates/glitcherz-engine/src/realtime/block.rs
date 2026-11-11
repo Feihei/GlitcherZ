@@ -340,7 +340,10 @@ impl BlockRunner {
         // 5b. Metronome (spec `recording.md` D1): beat tracking and the click
         // buffer, filled **after** the graph so the click stays outside it.
         // `tick` also owns the beat tracker, which is why it must see the
-        // post-advance position.
+        // post-advance position. Met M5b: the cached meter segment is
+        // re-anchored first so a mid-block meter change clicks on the new
+        // segment's first beat.
+        self.sequencer.sync_meter_segment();
         {
             let Self {
                 metronome,
@@ -545,8 +548,7 @@ impl BlockRunner {
                 // The click re-anchors to the play position: starting exactly
                 // on a beat fires that beat (the bar-one downbeat), a resume
                 // mid-beat waits for the next one.
-                self.metronome
-                    .resync(self.sequencer.position_ticks(), self.sequencer.beat_ticks());
+                self.metronome.resync(&self.sequencer);
                 // Release the previous run's still-pending notes **by pitch**
                 // (see `take_pending_offs`), then a blanket off for the
                 // built-in chain — clearing manual notes that may still be
@@ -556,8 +558,7 @@ impl BlockRunner {
             }
             SequencerCommand::Stop => {
                 self.sequencer.stop();
-                self.metronome
-                    .resync(self.sequencer.position_ticks(), self.sequencer.beat_ticks());
+                self.metronome.resync(&self.sequencer);
                 // Same pitch-matched release: a blanket `Off { note: 0 }`
                 // alone never reaches a pitch-matching plugin (Dexed), whose
                 // sounding notes then hang forever.
@@ -568,8 +569,7 @@ impl BlockRunner {
                 // U1: the position stays (resume via Play); sounding notes
                 // still fall silent — same release semantics as Stop.
                 self.sequencer.pause();
-                self.metronome
-                    .resync(self.sequencer.position_ticks(), self.sequencer.beat_ticks());
+                self.metronome.resync(&self.sequencer);
                 self.release_pending_notes();
                 self.graph.note_off_all();
             }
@@ -580,8 +580,7 @@ impl BlockRunner {
                 self.sequencer.seek(ticks);
                 // A seek silently lands wherever the user clicked: the beat
                 // it happened to cross must not click.
-                self.metronome
-                    .resync(self.sequencer.position_ticks(), self.sequencer.beat_ticks());
+                self.metronome.resync(&self.sequencer);
                 self.release_pending_notes();
                 self.graph.note_off_all();
             }
@@ -602,6 +601,12 @@ impl BlockRunner {
                 numerator,
                 denominator,
             } => self.sequencer.set_time_signature(numerator, denominator),
+            SequencerCommand::SetMeterMarkers { count, segs } => {
+                self.sequencer.set_meter_markers(count, segs);
+                // A meter change re-anchors the click on the new segment's
+                // first beat (Met M5b).
+                self.metronome.resync(&self.sequencer);
+            }
             SequencerCommand::SetMidiTrackCount(count) => {
                 self.sequencer.set_track_count(count);
             }

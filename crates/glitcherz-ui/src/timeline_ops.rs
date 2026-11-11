@@ -409,6 +409,7 @@ impl GlitcherZApp {
             .unwrap_or(markers.len());
         markers.insert(index, MeterMarker { tick, signature });
         self.commit_edit("Add Meter Change", before);
+        self.push_time_signature();
         self.timeline_state.meter_edit = Some(index);
     }
 
@@ -427,6 +428,7 @@ impl GlitcherZApp {
         };
         marker.tick = tick;
         self.commit_param_edit("Move Meter Change", before, "meter-marker-move");
+        self.push_time_signature();
     }
 
     /// Edits a meter marker's signature (Met M5a). A numerator drag reports
@@ -448,6 +450,7 @@ impl GlitcherZApp {
         };
         marker.signature = signature;
         self.commit_param_edit("Meter Change", before, "meter-marker-value");
+        self.push_time_signature();
         self.set_message(format!("Meter change {signature}"));
     }
 
@@ -460,6 +463,7 @@ impl GlitcherZApp {
         let before = self.begin_edit();
         self.project_mut().metadata.meter_markers.remove(index);
         self.commit_edit("Remove Meter Change", before);
+        self.push_time_signature();
         self.timeline_state.meter_edit = None;
     }
 
@@ -525,13 +529,30 @@ impl GlitcherZApp {
         self.engine.set_loop_range(start, end);
     }
 
-    /// Pushes the document meter to the engine (U3a): the engine derives its
-    /// bar length from it (arrangement-end rounding).
+    /// Pushes the document meter to the engine (U3a / Met M5b): the base meter
+    /// **and** the full piecewise segment table. Idempotent, so every caller
+    /// (meter edit, marker edit, load, undo) can just call this.
     pub(crate) fn push_time_signature(&mut self) {
         let meter = self.project().metadata.time_signature;
         self.send_sequencer(SequencerCommand::SetTimeSignature {
             numerator: meter.numerator,
             denominator: meter.denominator,
+        });
+        let map = self.project().meter_map();
+        let mut segs = [MeterSeg::DEFAULT; MAX_METER_SEGS];
+        let mut count = 0usize;
+        for (index, seg) in map.segments().iter().take(MAX_METER_SEGS).enumerate() {
+            segs[index] = MeterSeg {
+                tick: seg.tick,
+                bar: seg.bar,
+                numerator: seg.signature.numerator,
+                denominator: seg.signature.denominator,
+            };
+            count += 1;
+        }
+        self.send_sequencer(SequencerCommand::SetMeterMarkers {
+            count: count as u8,
+            segs,
         });
     }
 

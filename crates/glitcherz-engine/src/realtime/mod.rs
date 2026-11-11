@@ -125,7 +125,8 @@ pub use capture::{
 };
 pub use chorus::ChorusProcessor;
 pub use commands::{
-    COMMAND_QUEUE_CAPACITY, EngineCommand, NoteEvent, ParamId, SequencerCommand, command_channel,
+    COMMAND_QUEUE_CAPACITY, EngineCommand, MAX_METER_SEGS, MeterSeg, NoteEvent, ParamId,
+    SequencerCommand, command_channel,
 };
 pub use compressor::CompressorProcessor;
 pub use context::ProcessContext;

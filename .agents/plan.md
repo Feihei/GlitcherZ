@@ -19,7 +19,7 @@
 
 路线图 1–10 全部落地；基础功能、节点图、MIDI 编辑、插件宿主、可用性（U 系列）、录音（R 系列）、内建效果器（E 系列）、声源扩展（Y / Z / B 系列）与交互打磨（I 系列）均已交付。已完成系列的设计与实现位置见下方「历史系列索引」——本文件不再逐项记录它们的实施细节。
 
-- **进行中**：Met 系列（吸附统一 + 拍号变化，M1–M5a 已交付，M5b 待做）、Aud 系列（Edit 试听，Aud1 / Aud2 已交付，Aud3 待做）。
+- **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听，Aud1 / Aud2 已交付，Aud3 待做）。
 - **下一步候选**：命令族扩展（quantize / legato / glue / transpose）、C5 一曲线多目标、CLI / MCP 的命令词汇表。
 - **门禁**：`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`，在本机沙箱外跑（沙箱内 cargo 会毒化 `target/debug/incremental`）。
 
@@ -71,7 +71,7 @@ Spec：`spec/snap.md`（S1–S8）、`spec/meter-map.md`（D1–D10，扩展 `te
 | **M3** MeterMap（2026-11-11 交付） | `MeterMarker` + 上限 + `validate` + `model/src/meter.rs` 全部查询 + 分段数学单测；版本 11 | M0 | 中 |
 | **M4** timeline 分段（2026-11-11 交付） | `TimelineParams` 借 `&MeterMap`；ruler / lane 网格 / 吸附 / knife / trim / 状态栏 / seek / 录音 / 导出；ruler 画 meter 胶囊（只读） | M3、M2b | 大 |
 | **M5a** marker 编辑（2026-11-11 交付） | ruler 胶囊拖动 / 双击改值 / 右键删除 / Shift+右键新建；`TimelineAction` 五个变体；复用 M1 控件（内联编辑器） | M4、M1 | 中 |
-| **M5b** 引擎 + SMF | `MeterSeg` / `SetMeterMarkers`；`Sequencer` 段表与 metronome 跨段重锚；SMF 多段 `FF 58` 导入导出 | M3 | 大 |
+| **M5b** 引擎 + SMF（2026-11-11 交付） | `MeterSeg` / `SetMeterMarkers`；`Sequencer` 段表与 metronome 跨段重锚；SMF 多段 `FF 58` 导入导出 | M3 | 大 |
 
 实施顺序：**M1 → M2a → M2b → M3 → M4 → M5a → M5b**。M1 是 M5a 的前置控件；M2b 先落地，M4 的吸附逻辑只需改一次。
 

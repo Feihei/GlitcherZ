@@ -26,7 +26,7 @@
 
 use crate::realtime::MAX_MIDI_TRACKS;
 use crate::realtime::automation::{MAX_AUTO_TRACKS, RtControlClip};
-use crate::realtime::commands::NoteEvent;
+use crate::realtime::commands::{MAX_METER_SEGS, MeterSeg, NoteEvent};
 use crate::realtime::context::ProcessContext;
 
 /// Note time base: ticks per quarter note.
@@ -354,6 +354,15 @@ pub struct Sequencer {
     numerator: u8,
     /// Meter denominator; [`ticks_per_beat_of`] turns it into the beat length.
     denominator: u8,
+    /// Meter-change table (Met M5b, spec `meter-map.md` D6):
+    /// `meter_segs[..meter_len]` is the whole table, ascending, segment 0 at
+    /// tick 0. Fixed capacity — no allocation on the audio thread.
+    meter_segs: [MeterSeg; MAX_METER_SEGS],
+    /// Number of live segments (`>= 1`).
+    meter_len: u8,
+    /// Index of the segment cached in `bar_ticks` / `numerator` /
+    /// `denominator`; advanced/rewound by `sync_meter_segment`.
+    meter_index: usize,
     position_ticks: f64,
     /// Active MIDI track count (D12 dynamic tracks: sent from the control side
     /// via `SetMidiTrackCount`, scheduling only scans `0..track_count`;
@@ -420,6 +429,9 @@ impl Sequencer {
             bar_ticks: TICKS_PER_BAR,
             numerator: 4,
             denominator: 4,
+            meter_segs: [MeterSeg::DEFAULT; MAX_METER_SEGS],
+            meter_len: 1,
+            meter_index: 0,
             position_ticks: 0.0,
             track_count: crate::realtime::DEFAULT_MIDI_TRACKS,
             clips: std::array::from_fn(|_| empty_midi_clip_table()),
@@ -667,11 +679,116 @@ impl Sequencer {
     pub fn set_time_signature(&mut self, numerator: u8, denominator: u8) {
         self.numerator = numerator.clamp(1, MAX_TIME_SIGNATURE_NUMERATOR);
         self.denominator = denominator.clamp(1, 32).next_power_of_two().min(32);
+        // Met M5b: the base meter lives in segment 0 of the table, so a
+        // `SetTimeSignature` followed by `SetMeterMarkers` stays consistent
+        // regardless of arrival order.
+        self.meter_segs[0].tick = 0;
+        self.meter_segs[0].bar = 0;
+        self.meter_segs[0].numerator = self.numerator;
+        self.meter_segs[0].denominator = self.denominator;
+        if self.meter_len == 0 {
+            self.meter_len = 1;
+        }
         let bar_ticks = ticks_per_bar_of(self.numerator, self.denominator);
         if bar_ticks != self.bar_ticks {
             self.bar_ticks = bar_ticks;
             self.refresh_arrangement_end();
         }
+    }
+
+    /// Replaces the meter-change table (Met M5b; spec `meter-map.md` D6).
+    ///
+    /// RT-safe: the table is a fixed `Copy` array; the method only normalizes
+    /// it (segment 0 pinned to tick 0, ticks strictly ascending — later
+    /// out-of-order entries are dropped) and refreshes the cached current
+    /// segment plus the arrangement end. Never allocates.
+    pub fn set_meter_markers(&mut self, count: u8, segs: [MeterSeg; MAX_METER_SEGS]) {
+        let count = usize::from(count).clamp(1, MAX_METER_SEGS);
+        self.meter_segs = segs;
+        self.meter_segs[0].tick = 0;
+        self.meter_segs[0].bar = 0;
+        let base_numerator = self.meter_segs[0]
+            .numerator
+            .clamp(1, MAX_TIME_SIGNATURE_NUMERATOR);
+        let base_denominator = self.meter_segs[0]
+            .denominator
+            .clamp(1, 32)
+            .next_power_of_two()
+            .min(32);
+        let mut len = 1;
+        for index in 1..count {
+            let seg = self.meter_segs[index];
+            let numerator = seg.numerator.clamp(1, MAX_TIME_SIGNATURE_NUMERATOR);
+            let denominator = seg.denominator.clamp(1, 32).next_power_of_two().min(32);
+            if seg.tick <= self.meter_segs[len - 1].tick {
+                break;
+            }
+            self.meter_segs[len] = MeterSeg {
+                tick: seg.tick,
+                bar: seg.bar,
+                numerator,
+                denominator,
+            };
+            len += 1;
+        }
+        self.meter_segs[0].numerator = base_numerator;
+        self.meter_segs[0].denominator = base_denominator;
+        self.meter_len = len as u8;
+        self.meter_index = 0;
+        self.sync_meter_segment();
+        self.refresh_arrangement_end();
+    }
+
+    /// Re-anchors the cached current segment to the transport position (Met
+    /// M5b). Called once per block before the metronome reads the cache, and
+    /// after any meter-table change. RT-safe: at most `meter_len` steps.
+    pub fn sync_meter_segment(&mut self) {
+        let tick = self.position_ticks.max(0.0) as u32;
+        let len = usize::from(self.meter_len).clamp(1, MAX_METER_SEGS);
+        let mut index = self.meter_index.min(len - 1);
+        while index + 1 < len && tick >= self.meter_segs[index + 1].tick {
+            index += 1;
+        }
+        while index > 0 && tick < self.meter_segs[index].tick {
+            index -= 1;
+        }
+        self.meter_index = index;
+        let seg = self.meter_segs[index];
+        self.numerator = seg.numerator;
+        self.denominator = seg.denominator;
+        self.bar_ticks = ticks_per_bar_of(seg.numerator, seg.denominator).max(1);
+    }
+
+    /// Tick of the segment containing the transport (Met M5b): the metronome
+    /// re-anchors its beat count on it so a 6/8 section starts on beat 1.
+    /// RT-safe.
+    pub fn meter_segment_tick(&self) -> u32 {
+        self.meter_segs[self.meter_index.min(self.meter_segs.len() - 1)].tick
+    }
+
+    /// Tick of the segment containing `tick` (Met M5b). RT-safe.
+    fn meter_segment_tick_at(&self, tick: u32) -> u32 {
+        let len = usize::from(self.meter_len).clamp(1, MAX_METER_SEGS);
+        let mut index = 0;
+        while index + 1 < len && tick >= self.meter_segs[index + 1].tick {
+            index += 1;
+        }
+        self.meter_segs[index].tick
+    }
+
+    /// The first bar line strictly after `tick` (Met M5b): arrangement-end
+    /// rounding follows the segment the end lands in. RT-safe.
+    fn next_bar(&self, tick: u32) -> u32 {
+        let seg_start = self.meter_segment_tick_at(tick);
+        let len = usize::from(self.meter_len).clamp(1, MAX_METER_SEGS);
+        let mut index = 0;
+        while index + 1 < len && tick >= self.meter_segs[index + 1].tick {
+            index += 1;
+        }
+        let seg = self.meter_segs[index];
+        let bar = ticks_per_bar_of(seg.numerator, seg.denominator).max(1);
+        let offset = tick.saturating_sub(seg_start);
+        seg_start.saturating_add((offset / bar + 1) * bar)
     }
 
     /// Meter numerator (beats per bar). RT-safe.
@@ -741,11 +858,12 @@ impl Sequencer {
             }
         }
         latest = latest.max(self.arrangement_floor_ticks);
-        let bar = self.bar_ticks.max(1);
+        // Met M5b: round up to the next bar line of the segment holding the
+        // end (`next_bar(latest - 1)` keeps an end already on a line).
         self.arrangement_end_ticks = if latest == 0 {
             0
         } else {
-            latest.div_ceil(bar) * bar
+            self.next_bar(latest - 1)
         };
     }
 

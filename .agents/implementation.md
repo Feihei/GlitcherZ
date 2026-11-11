@@ -1621,6 +1621,16 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - 测试 +1：`meter_drag_stays_sorted_and_off_tick_zero`（tick 0 与邻位钳制）。
 - **门禁**：`fmt` / `clippy -p glitcherz-ui --all-targets -D warnings` 干净；`cargo test -p glitcherz-ui` = 11 个 test binary 全 `ok. 0 failed`。
 
+#### Met M5b：引擎段表 + SMF 多段（2026-11-11，spec `meter-map.md` §7 / D7）
+
+- 引擎：`commands::MeterSeg { tick, bar, numerator, denominator }`（`Copy`）+ `MAX_METER_SEGS = 65`（64 个 marker + base 段）+ `SequencerCommand::SetMeterMarkers { count, segs }`。`Sequencer` 新增定容 `meter_segs` / `meter_len` / `meter_index`；`bar_ticks` / `numerator` / `denominator` 降级为**当前段缓存**，由 `sync_meter_segment()` 每块（block runner 在 `metronome.tick` 之前）重锚。`set_meter_markers` 做段表规整（seg0 固定 tick 0、tick 严格升序，乱序后续项丢弃），`set_time_signature` 同步写 seg0。
+- `refresh_arrangement_end` 改为 `next_bar(latest - 1)`（段内小节线取整，结束点已在线上保持不变）；`next_bar` 是引擎侧纯整数实现。
+- 节拍器：`Metronome` 记录 `last_beat_ticks` / `last_seg_start`；跨段时 `resync(&sequencer)` 并让该块静音，拍索引改为**相对当前段起点**（6/8 段从自己的第 1 拍数，重音落在段首）。`resync` 签名从 `(pos, beat_ticks)` 改为 `(&Sequencer)`，四处 transport 调用点同步。
+- UI：`push_time_signature` 现在同时下发 base（`SetTimeSignature`）与整张段表（`SetMeterMarkers`），幂等；marker 增删/移动/改值都会调用它，加载与 undo 走同一入口。
+- SMF：导出 conductor 在 tick 0 写 base，再在每个 marker tick 写一条 `FF 58`（delta 递增）；导入收集**所有** `FF 58`（绝对 tick），排序后最早一条作 base、其余作 `meter_markers`（同 tick 去重）。`SmfImport` 增加 `meter_markers`；空白工程导入时 base + markers 一起继承（`file_ops`），非空工程保留工程拍号并提示。
+- 测试：model 新增 `meter_changes_round_trip_as_multiple_ff_58_events`（3 条 `FF 58` + 往返相等）；metronome 四处 `resync` 调用点改签名。
+- **门禁（2026-11-11 实跑）**：`cargo fmt --all` / `cargo clippy --workspace --all-targets -- -D warnings` 干净；`cargo test --workspace` 日志中 **43 个 test binary 全 `ok. 0 failed`**，无 `FAILED` / `panicked` / `error`。补跑前修过两处：`sequencer.rs` 的 `MeterSeg` import 误落在测试模块（主模块找不到类型），SMF 测试 `windows(3)` 的结果是 `&&[u8]` 需解引用；clippy 另要求 `max(1).min(N)` → `clamp`。
+
 #### 阶段边界（自 plan.md 归位）
 
 - **Y 系列 S0**：不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（stems / 24-bit / 采样率选择）。

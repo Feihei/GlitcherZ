@@ -235,7 +235,12 @@ impl GlitcherZApp {
         };
         match project_files::read_midi(&path) {
             Ok(imported) => {
-                self.import_midi_tracks(imported.tracks, imported.time_signature, &path);
+                self.import_midi_tracks(
+                    imported.tracks,
+                    imported.time_signature,
+                    &imported.meter_markers,
+                    &path,
+                );
             }
             Err(err) => {
                 self.set_message(format!("MIDI import failed: {err}"));
@@ -256,6 +261,7 @@ impl GlitcherZApp {
         &mut self,
         imported: Vec<MidiTrack>,
         file_meter: Option<glitcherz_model::TimeSignature>,
+        file_meter_markers: &[glitcherz_model::MeterMarker],
         source: &std::path::Path,
     ) {
         let imported_len = imported.len();
@@ -314,18 +320,25 @@ impl GlitcherZApp {
                 " — {skipped} skipped (track limit {MAX_MIDI_TRACKS})"
             ));
         }
-        // Meter (U3a): same undo step as the tracks, so one Ctrl+Z undoes the
-        // import as a whole.
-        if let Some(meter) = file_meter {
-            let current = self.project().metadata.time_signature;
-            if meter != current {
-                if unwritten {
-                    self.project_mut().metadata.time_signature = meter;
-                    self.push_time_signature();
+        // Meter (U3a / Met M5b): same undo step as the tracks, so one Ctrl+Z
+        // undoes the import as a whole. A base meter and meter changes are
+        // adopted together — the file's grid only makes sense as one table.
+        let current = self.project().metadata.time_signature;
+        if unwritten && (file_meter.is_some() || !file_meter_markers.is_empty()) {
+            if let Some(meter) = file_meter {
+                if meter != current {
                     message.push_str(&format!(" — meter set to {meter}"));
-                } else {
-                    message.push_str(&format!(" — file is {meter}, project stays {current}"));
                 }
+                self.project_mut().metadata.time_signature = meter;
+            }
+            if !file_meter_markers.is_empty() {
+                message.push_str(&format!(" — {} meter change(s)", file_meter_markers.len()));
+                self.project_mut().metadata.meter_markers = file_meter_markers.to_vec();
+            }
+            self.push_time_signature();
+        } else if let Some(meter) = file_meter {
+            if meter != current {
+                message.push_str(&format!(" — file is {meter}, project stays {current}"));
             }
         }
         self.set_message(message);

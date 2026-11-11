@@ -93,10 +93,15 @@ pub struct Metronome {
     normal: ClickWave,
     /// Playback cursor into the active table; `None` = silent.
     cursor: Option<Cursor>,
-    /// Beat index of the previous block (absolute, `floor(pos / beat)`).
+    /// Beat index of the previous block (relative to the current meter segment).
     last_beat: Option<i64>,
     /// Transport position of the previous block, for loop-wrap detection.
     last_pos: f64,
+    /// Beat length of the previous block (Met M5b: a meter change re-anchors
+    /// the beat count so a 6/8 section starts on beat 1).
+    last_beat_ticks: u32,
+    /// Start tick of the previous block's meter segment (Met M5b).
+    last_seg_start: u32,
     /// Scratch: how many frames of the active click are left to play.
     remaining: usize,
 }
@@ -125,6 +130,8 @@ impl Metronome {
             cursor: None,
             last_beat: None,
             last_pos: 0.0,
+            last_beat_ticks: 0,
+            last_seg_start: 0,
             remaining: 0,
         }
     }
@@ -148,17 +155,27 @@ impl Metronome {
         self.enabled
     }
 
-    /// Drops any in-flight click and re-anchors beat tracking to `pos`.
+    /// Drops any in-flight click and re-anchors beat tracking to the sequencer's
+    /// current position, beat length and meter segment.
     ///
-    /// Called on play / stop / pause / seek: a seek must not fire the beat it
-    /// happened to land on, while starting **exactly** on a beat must fire it
-    /// (the bar-one downbeat). A resume in the middle of a beat therefore
-    /// waits for the next beat instead of clicking immediately.
-    pub fn resync(&mut self, pos: f64, beat_ticks: u32) {
+    /// Called on play / stop / pause / seek / meter change: a seek must not
+    /// fire the beat it happened to land on, while starting **exactly** on a
+    /// beat must fire it (the bar-one downbeat). A resume in the middle of a
+    /// beat therefore waits for the next beat instead of clicking immediately.
+    /// Beat indices are relative to the current segment's start (Met M5b), so
+    /// a 6/8 section counts from its own first beat.
+    pub fn resync(&mut self, sequencer: &crate::realtime::Sequencer) {
+        let pos = sequencer.position_ticks();
+        let beat_ticks = sequencer.beat_ticks();
+        let seg_start = sequencer.meter_segment_tick();
+        self.last_beat_ticks = beat_ticks;
+        self.last_seg_start = seg_start;
         self.cursor = None;
         self.remaining = 0;
         self.last_pos = pos;
-        self.last_beat = Some(Self::beat_index(pos, beat_ticks) - Self::on_beat(pos, beat_ticks));
+        let local = pos - f64::from(seg_start);
+        self.last_beat =
+            Some(Self::beat_index(local, beat_ticks) - Self::on_beat(local, beat_ticks));
     }
 
     /// Fills `out` with this block's click (mono; the caller adds it to both
@@ -171,15 +188,23 @@ impl Metronome {
         if beat_ticks == 0 {
             return;
         }
+        let seg_start = sequencer.meter_segment_tick();
+        let numerator = sequencer.numerator();
+        // Met M5b: a meter change re-anchors the beat count on the segment's
+        // first beat; the frame that notices it stays silent.
+        if beat_ticks != self.last_beat_ticks || seg_start != self.last_seg_start {
+            self.resync(sequencer);
+            return;
+        }
         let pos = sequencer.position_ticks();
-        let index = Self::beat_index(pos, beat_ticks);
+        let index = Self::beat_index(pos - f64::from(seg_start), beat_ticks);
 
         if self.enabled && sequencer.is_playing() {
             let wrapped = pos + 0.5 < self.last_pos;
             let advanced = self.last_beat.is_some_and(|last| index != last);
             if wrapped || advanced {
                 self.last_beat = Some(index);
-                let downbeat = index.rem_euclid(i64::from(sequencer.numerator())) == 0;
+                let downbeat = index.rem_euclid(i64::from(numerator)) == 0;
                 self.cursor = Some(Cursor {
                     accent: downbeat,
                     pos: 0,
@@ -307,7 +332,7 @@ mod tests {
         let mut seq = playing(120.0);
         let mut metronome = Metronome::new(48_000.0);
         metronome.configure(true, 1.0);
-        metronome.resync(0.0, seq.beat_ticks());
+        metronome.resync(&seq);
         // 1 second at 120 bpm = 2 beats → onsets at block 0 and ~block 187.
         let peaks = run(&mut seq, &mut metronome, 400);
         let onsets: Vec<usize> = peaks
@@ -330,7 +355,7 @@ mod tests {
         seq.set_bpm(120.0);
         let mut metronome = Metronome::new(48_000.0);
         metronome.configure(true, 1.0);
-        metronome.resync(0.0, seq.beat_ticks());
+        metronome.resync(&seq);
         let peaks = run(&mut seq, &mut metronome, 200);
         assert!(peaks.iter().all(|p| *p == 0.0));
     }
@@ -342,7 +367,7 @@ mod tests {
         metronome.configure(true, 1.0);
         // Land 100 ticks into a beat: the resume must wait for the next beam.
         seq.seek(1_060.0);
-        metronome.resync(1_060.0, seq.beat_ticks());
+        metronome.resync(&seq);
         let mut buf = [0.0f32; 128];
         metronome.tick(&seq, &mut buf);
         assert!(
@@ -356,7 +381,7 @@ mod tests {
         let mut seq = playing(120.0);
         let mut metronome = Metronome::new(48_000.0);
         metronome.configure(true, 1.0);
-        metronome.resync(0.0, seq.beat_ticks());
+        metronome.resync(&seq);
         let peaks = run(&mut seq, &mut metronome, 400);
         // Block 0 is the bar downbeat (accent), block ~187 is a weak beat.
         let first = peaks[0];
