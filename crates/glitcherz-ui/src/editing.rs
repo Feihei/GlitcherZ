@@ -458,8 +458,8 @@ impl GlitcherZApp {
             return;
         }
         let clip_index = focus.clip;
-        // U3a: the roll's bar lines follow the document meter.
-        let bar_ticks = self.project().ticks_per_bar();
+        // Met M4: the roll's bar lines follow the meter segments.
+        let meter = self.project().meter_map();
         let track_name = self.track_label(sel);
         ui.horizontal(|ui| {
             ui.label(format!(
@@ -501,7 +501,7 @@ impl GlitcherZApp {
                     let label = format!(
                         "{} · bar {}",
                         self.track_label(clip.track),
-                        c.start_ticks / bar_ticks.max(1) + 1
+                        self.project().bar_beat_at(c.start_ticks).0 + 1
                     );
                     let focused = *clip == focus;
                     if ui
@@ -656,7 +656,7 @@ impl GlitcherZApp {
                 roll_state,
                 playhead,
                 playing,
-                bar_ticks,
+                &meter,
                 router,
             )
         };

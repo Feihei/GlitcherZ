@@ -47,8 +47,8 @@ use eframe::egui;
 use crate::grid::GridValue;
 use crate::snap::Snap;
 use glitcherz_model::{
-    ControlClip, MidiClip, MidiTrack, Note, RandomizeOptions, StrumDirection, StrumOptions,
-    TICKS_PER_QUARTER, TICKS_PER_STEP,
+    ControlClip, MeterMap, MidiClip, MidiTrack, Note, RandomizeOptions, StrumDirection,
+    StrumOptions, TICKS_PER_QUARTER, TICKS_PER_STEP,
 };
 
 pub use crate::grid::NoteValue;
@@ -1419,7 +1419,7 @@ pub fn show(
     state: &mut RollState,
     playhead_ticks: f32,
     playing: bool,
-    bar_ticks: u32,
+    meter: &MeterMap,
     router: &mut crate::focus::FocusRouter,
 ) -> Option<RollIntent> {
     let focus = subject.focus();
@@ -1429,6 +1429,10 @@ pub fn show(
     // (`roll-multiclip.md` D2/D3). With one clip both degenerate to exactly
     // the P2 behaviour.
     let origin_tick = i64::from(clip.start_ticks);
+    // Met M4: bar-based geometry (fit margin, randomize ranges, grid) uses
+    // the segment holding the clip's origin; the grid itself walks every
+    // segment the clip spans (see the vertical grid block).
+    let origin_bar_ticks = i64::from(meter.ticks_per_bar_at(clip.start_ticks).max(1));
     // P4: overlay lanes may extend past every MIDI clip, so the view window
     // (and therefore the fit scale) has to cover them too.
     let window = lanes
@@ -1691,7 +1695,7 @@ pub fn show(
     // once; Cancel closes without touching the document).
     if state.randomize_open {
         ui.horizontal(|ui| {
-            let bar = i64::from(bar_ticks);
+            let bar = origin_bar_ticks;
             ui.strong("Randomize ±");
             ui.label("pitch");
             ui.add(
@@ -1733,7 +1737,7 @@ pub fn show(
     // W5: strum parameters.
     if state.strum_open {
         ui.horizontal(|ui| {
-            let bar = i64::from(bar_ticks);
+            let bar = origin_bar_ticks;
             ui.strong("Strum");
             egui::ComboBox::from_id_salt("roll_strum_dir")
                 .selected_text(strum_direction_label(state.strum_options.direction))
@@ -1880,7 +1884,7 @@ pub fn show(
     // opens with every ghost on screen — but never narrower than two bars: a
     // one-bar clip used to fill the whole width with itself, leaving no room
     // to see what comes next (or to draw into the bar after it).
-    let fit_ticks = (window.end - window.start).max(2.0 * bar_ticks.max(1) as f32);
+    let fit_ticks = (window.end - window.start).max(2.0 * origin_bar_ticks as f32);
     let fit_ticks_to_x = width / fit_ticks.max(1.0);
     let (zoom2, wheel, nav_mods) = ui
         .ctx()
@@ -2111,16 +2115,26 @@ pub fn show(
 
     // 2. Vertical grid, re-anchored on every bar line (M2.1): lines are
     //    counted from each bar start, so they stay aligned with the bars
-    //    whatever the meter does to a bar's length. `bar_ticks` is the
-    //    document's meter (U3a), not the 4/4 constant.
-    let bar_ticks = i64::from(bar_ticks.max(1));
-    let bars = (loop_ticks + bar_ticks - 1) / bar_ticks;
-    for bar in 0..bars {
-        let bar_start = bar * bar_ticks;
-        let bar_end = (bar_start + bar_ticks).min(loop_ticks);
-        let mut tick = bar_start;
-        while tick < bar_end {
-            let is_bar_line = tick % bar_ticks == 0;
+    //    whatever the meter does to a bar's length. Met M4: the clip's tick
+    //    window is walked **per meter segment**, so a clip spanning a
+    //    mid-song change shows both grids (the segment's bars are relative to
+    //    the clip origin).
+    let grid = grid_ticks.max(1);
+    for (index, seg) in meter.segments().iter().enumerate() {
+        let seg_start_rel = i64::from(seg.tick) - origin_tick;
+        let seg_end_rel = meter
+            .segments()
+            .get(index + 1)
+            .map_or(i64::MAX, |next| i64::from(next.tick) - origin_tick);
+        let from = seg_start_rel.max(0);
+        let to = seg_end_rel.min(loop_ticks);
+        if to <= from {
+            continue;
+        }
+        let seg_bar_ticks = i64::from(seg.signature.ticks_per_bar().max(1));
+        let mut tick = from + (seg_start_rel - from).rem_euclid(grid);
+        while tick < to {
+            let is_bar_line = (tick - seg_start_rel).rem_euclid(seg_bar_ticks) == 0;
             let x = geom.x_of(tick as f32);
             let stroke = egui::Stroke::new(
                 if is_bar_line { 1.5 } else { 1.0 },
@@ -2134,7 +2148,7 @@ pub fn show(
                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
                 stroke,
             );
-            tick += grid_ticks;
+            tick += grid;
         }
     }
 

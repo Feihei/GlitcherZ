@@ -461,7 +461,11 @@ fn load_failure_exits_three() {
     let project = dir.join("song.glz");
     write_project(&project, &[(60, 0)]);
     let text = std::fs::read_to_string(&project).expect("read");
-    let bumped = text.replacen("version: 10", "version: 99", 1);
+    let bumped = text.replacen(
+        &format!("version: {}", glitcherz_model::PROJECT_VERSION),
+        "version: 99",
+        1,
+    );
     assert_ne!(bumped, text, "the fixture should carry a version field");
     std::fs::write(&project, bumped).expect("write");
 

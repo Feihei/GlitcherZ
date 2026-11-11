@@ -219,7 +219,7 @@ impl Fixture {
                     state,
                     0.0,
                     false,
-                    glitcherz_model::TICKS_PER_BAR,
+                    &glitcherz_model::MeterMap::default(),
                     router,
                 );
             });

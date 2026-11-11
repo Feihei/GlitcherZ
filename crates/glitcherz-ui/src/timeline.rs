@@ -37,7 +37,8 @@ use egui::{
 };
 use glitcherz_model::{
     AudioClip, AudioTrack, AutoPoint, ClipGroup, ControlClip, ControlTrack, CtrlEvent,
-    MAX_ARRANGEMENT_TICKS, MAX_CLIPS_PER_TRACK, Marker, MidiClip, MidiTrack, Note, SongLoop,
+    MAX_ARRANGEMENT_TICKS, MAX_CLIPS_PER_TRACK, Marker, MeterMap, MidiClip, MidiTrack, Note,
+    SongLoop,
 };
 
 /// Absolute arrangement ceiling in ticks (U3a). The bound is a **tick** count,
@@ -73,6 +74,9 @@ const EDGE_GRAB: f32 = 6.0;
 
 /// Accent color for selected clips (matches the roll's selection family).
 const SELECTED: Color32 = Color32::from_rgb(240, 190, 80);
+
+/// Meter-change line / capsule tint on the ruler (Met M4).
+const METER_CHANGE_LINE: Color32 = Color32::from_rgb(200, 175, 90);
 
 /// One selected clip, addressed across the arrangement (M4b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -671,10 +675,12 @@ pub struct TimelineParams<'a> {
     pub loop_range: &'a SongLoop,
     /// Timeline markers for the ruler (U1).
     pub markers: &'a [Marker],
-    /// Bar length in ticks from the document's meter (U3a). Everything that
-    /// measures in bars — grid, snapping, knife edges, resize minimums — reads
-    /// this instead of the 4/4 [`TICKS_PER_BAR`] constant.
-    pub bar_ticks: u32,
+    /// Piecewise meter table (Met M4): every bar-based measure — grid,
+    /// snapping, knife edges, resize minimums, ruler numbering — reads this
+    /// instead of the 4/4 [`TICKS_PER_BAR`] constant or a single bar length.
+    /// Pixels stay linear: `px_per_tick` is anchored on the first segment, so
+    /// only the grid / numbers / snapping switch at a marker (D5).
+    pub meter: &'a MeterMap,
     /// Seconds per tick at the project's **base** tempo (U11 D3): audio clips
     /// derive their tick footprint from their seconds window with this, and
     /// the modal geometry uses it for the same reason.
@@ -1526,11 +1532,11 @@ pub fn show(
     // real drag gets from the router's any-down freeze; set every frame so
     // it clears itself when the modal ends.
     router.set_focus_hold(state.modal.is_some() || state.knife_armed);
-    // U3a: the bar length comes from the document's meter, so "pixels per bar"
-    // keeps its on-screen meaning while the tick↔pixel mapping follows the
-    // meter (a clip's tick position therefore moves when the meter changes).
-    let bar_ticks = p.bar_ticks.max(1);
-    let px_per_tick = state.px_per_bar / bar_ticks as f32;
+    // Met M4 D5: pixels stay globally linear, anchored on the first segment's
+    // bar width — only grid lines, ruler numbers and snapping follow the
+    // segments, so `x ↔ tick` remains one straight line across the timeline.
+    let base_bar_ticks = p.meter.ticks_per_bar_at(0).max(1);
+    let px_per_tick = state.px_per_bar / base_bar_ticks as f32;
     let row_h = ROW_HEIGHT * state.row_zoom;
     // The lanes span the full arrangement bound, not just past the last clip:
     // the bar grid keeps drawing behind the content, so a G-modal ghost (or
@@ -1538,8 +1544,8 @@ pub fn show(
     // the scroll range matches the tick bound every interaction clamps to.
     // The grid/ruler drawing is viewport-culled, so the span costs nothing per
     // frame.
-    let content_bars = ARRANGEMENT_LIMIT_TICKS.div_ceil(bar_ticks);
-    let content_px = content_bars as f32 * state.px_per_bar;
+    let content_ticks = p.meter.next_bar(ARRANGEMENT_LIMIT_TICKS);
+    let content_px = content_ticks as f32 * px_per_tick;
 
     // ---- View navigation (read before the ScrollArea lays out, using last
     // frame's row geometry, so zoom and its offset compensation land in the
@@ -1574,9 +1580,9 @@ pub fn show(
                 let old = state.px_per_bar;
                 let new = (old * zoom2.x).clamp(PX_PER_BAR_MIN, PX_PER_BAR_MAX);
                 if new != old {
-                    let old_ppt = old / bar_ticks as f32;
+                    let old_ppt = old / base_bar_ticks as f32;
                     let tick = ((offset.x + ptr.x - vmin.x) / old_ppt).max(0.0);
-                    let new_ppt = new / bar_ticks as f32;
+                    let new_ppt = new / base_bar_ticks as f32;
                     let anchored = (tick * new_ppt - (ptr.x - vmin.x)).max(0.0);
                     state.px_per_bar = new;
                     scroll_target = Some(Vec2::new(anchored, offset.y));
@@ -1859,38 +1865,82 @@ pub fn show(
             );
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, Color32::from_gray(24));
-            let step = if state.px_per_bar < 28.0 { 4 } else { 1 };
             let clip = ui.clip_rect();
-            let first = (((clip.left() - rect.left()) / state.px_per_bar).ceil().max(0.0) as u32)
-                .div_ceil(step)
-                * step;
-            let last = (((clip.right() - rect.left()) / state.px_per_bar).floor().max(0.0) as u32)
-                .min(content_bars);
-            let mut bar = first;
-            while bar <= last {
-                let x = rect.left() + bar as f32 * state.px_per_bar;
+            // Met M4: bar lines / numbers follow the meter segments (the
+            // pixel mapping stays linear, D5). Numbers thin out to every 4th
+            // bar when the **segment's** bars get narrow.
+            let first_tick = ((clip.left() - rect.left()) / px_per_tick).max(0.0);
+            let last_tick = ((clip.right() - rect.left()) / px_per_tick).max(0.0);
+            for_each_bar_line(
+                p.meter,
+                f64::from(first_tick),
+                f64::from(last_tick),
+                |bar, tick, seg_bar_ticks| {
+                    let x = rect.left() + tick as f32 * px_per_tick;
+                    let step = if (px_per_tick * seg_bar_ticks as f32) < 28.0 {
+                        4
+                    } else {
+                        1
+                    };
+                    painter.line_segment(
+                        [pos2(x, rect.top() + 4.0), pos2(x, rect.bottom())],
+                        Stroke::new(1.0, Color32::from_gray(55)),
+                    );
+                    if bar % step == 0 {
+                        painter.text(
+                            pos2(x + 3.0, rect.top() + 2.0),
+                            Align2::LEFT_TOP,
+                            format!("{}", bar + 1),
+                            FontId::proportional(10.0),
+                            Color32::from_gray(150),
+                        );
+                    }
+                },
+            );
+            // Meter changes: a bold line + the signature in a small capsule
+            // (read-only until M5a adds the edit interactions). The base
+            // segment (tick 0) has no capsule — its meter is the transport's.
+            for seg in p.meter.segments() {
+                if seg.tick == 0 {
+                    continue;
+                }
+                let x = rect.left() + seg.tick as f32 * px_per_tick;
+                if x < clip.left() - 2.0 || x > clip.right() {
+                    continue;
+                }
                 painter.line_segment(
-                    [pos2(x, rect.top() + 4.0), pos2(x, rect.bottom())],
-                    Stroke::new(1.0, Color32::from_gray(55)),
+                    [pos2(x, rect.top()), pos2(x, rect.bottom())],
+                    Stroke::new(1.5, METER_CHANGE_LINE),
                 );
-                painter.text(
-                    pos2(x + 3.0, rect.top() + 2.0),
-                    Align2::LEFT_TOP,
-                    format!("{}", bar + 1),
-                    FontId::proportional(10.0),
-                    Color32::from_gray(150),
+                let text = seg.signature.to_string();
+                let galley = painter.layout_no_wrap(
+                    text,
+                    FontId::proportional(9.0),
+                    Color32::from_rgb(235, 225, 180),
                 );
-                bar += step;
+                let pad = egui::vec2(3.0, 1.0);
+                let cap = Rect::from_min_size(
+                    pos2(x + 2.0, rect.center().y - galley.size().y / 2.0 - pad.y),
+                    galley.size() + pad * 2.0,
+                );
+                painter.rect_filled(cap, 3.0, Color32::from_rgb(70, 62, 30));
+                painter.rect_stroke(
+                    cap,
+                    3.0,
+                    Stroke::new(1.0, METER_CHANGE_LINE),
+                    StrokeKind::Inside,
+                );
+                painter.galley(cap.min + pad, galley, Color32::WHITE);
             }
 
             // ---- U1 geometry helpers ----
-            let bar_ticks_f = f64::from(bar_ticks);
-            let max_tick = f64::from(content_bars) * bar_ticks_f;
+            let max_tick = f64::from(content_ticks);
             let tick_at = |x: f32| {
                 (((x - rect.left()) / px_per_tick).max(0.0) as f64).min(max_tick)
             };
-            let ruler_snap = Snap::on(i64::from(bar_ticks));
-            let snap_bar = |tick: f64| ruler_snap.ticks_f64(tick);
+            // The ruler's Ctrl path is "drag a song loop" (S6), so its own
+            // snapping is always on — a Ctrl drag still lands on bar lines.
+            let snap_bar = |tick: f64| p.meter.snap_bar(tick) as f64;
             let loop_has_range = p.loop_range.end_ticks > p.loop_range.start_ticks;
             let brace_y = (rect.bottom() - 5.0, rect.bottom() - 1.0);
             let start_x = rect.left() + p.loop_range.start_ticks as f32 * px_per_tick;
@@ -1971,7 +2021,8 @@ pub fn show(
                     let committed: Option<(u32, u32)> = match drag {
                         LoopDrag::New { anchor } => {
                             let (a, b) = if anchor <= cur { (anchor, cur) } else { (cur, anchor) };
-                            (b - a >= bar_ticks_f).then_some((a as u32, b as u32))
+                            let min_bar = f64::from(p.meter.ticks_per_bar_at(a as u32));
+                            (b - a >= min_bar).then_some((a as u32, b as u32))
                         }
                         LoopDrag::StartEdge => {
                             let end = f64::from(lr.end_ticks);
@@ -2083,7 +2134,7 @@ pub fn show(
                 RowKind::Midi(i),
                 &track.clips,
                 px_per_tick,
-                bar_ticks,
+                p.meter,
                 p.sec_per_tick,
                 row_h,
                 content_px,
@@ -2127,7 +2178,7 @@ pub fn show(
                     RowKind::Control(i),
                     &track.clips,
                     px_per_tick,
-                    bar_ticks,
+                    p.meter,
                     p.sec_per_tick,
                     row_h,
                     content_px,
@@ -2177,7 +2228,7 @@ pub fn show(
                     RowKind::Audio(i),
                     &track.clips,
                     px_per_tick,
-                    bar_ticks,
+                    p.meter,
                     p.sec_per_tick,
                     row_h,
                     content_px,
@@ -2289,6 +2340,26 @@ pub fn show(
             state.marquee = None;
             state.marquee_ending = false;
         }
+
+        // Modal transforms stay on whole bars (snap spec S7) and take their step
+        // from the segment holding the earliest selected clip, so G / T on a
+        // 6/8 section moves whole 6/8 bars.
+        let bar_ticks = state.modal.as_ref().map_or(base_bar_ticks, |m| {
+            m.origin
+                .iter()
+                .filter_map(|sel| {
+                    clip_geometry(
+                        midi_tracks,
+                        control_tracks,
+                        audio_tracks,
+                        p.sec_per_tick,
+                        *sel,
+                    )
+                })
+                .map(|(start, _)| start)
+                .min()
+                .map_or(base_bar_ticks, |start| p.meter.ticks_per_bar_at(start))
+        });
 
         // Modal transform (M4b.3): finalize on the confirming click, cancel
         // on RMB, otherwise draw the ghosts (they may land on any row of
@@ -2841,7 +2912,7 @@ fn lane_row<T: Placement>(
     row: RowKind,
     clips: &[T],
     px_per_tick: f32,
-    bar_ticks: u32,
+    meter: &MeterMap,
     sec_per_tick: f64,
     row_h: f32,
     content_px: f32,
@@ -2864,7 +2935,7 @@ fn lane_row<T: Placement>(
     {
         Snap::OFF
     } else {
-        Snap::on(i64::from(bar_ticks))
+        Snap::on(i64::from(meter.ticks_per_bar_at(0).max(1)))
     };
     // The row's widget ids must be STABLE. The lane is the keyboard focus
     // carrier, and egui auto ids are positional: anything above the rows
@@ -3018,19 +3089,23 @@ fn lane_row<T: Placement>(
 
     // Bar grid (viewport-culled: the lane spans the whole arrangement, so
     // iterating from bar 0 would walk hundreds of off-screen bars every
-    // frame).
-    let bar_px = px_per_tick * bar_ticks as f32;
-    let bars = (content_px / bar_px).floor() as u32;
+    // frame). Met M4: the grid follows the meter segments, so a 6/8 section
+    // shows its own bar lines while the pixel mapping stays linear.
     let clip_x = ui.clip_rect();
-    let first = (((clip_x.left() - lane.left()) / bar_px).ceil().max(0.0) as u32).min(bars);
-    let last = (((clip_x.right() - lane.left()) / bar_px).floor().max(0.0) as u32).min(bars);
-    for bar in first..=last {
-        let x = lane.left() + bar as f32 * bar_px;
-        painter.line_segment(
-            [pos2(x, lane.top()), pos2(x, lane.bottom())],
-            Stroke::new(1.0, colors.grid),
-        );
-    }
+    let first_tick = ((clip_x.left() - lane.left()) / px_per_tick).max(0.0);
+    let last_tick = ((clip_x.right() - lane.left()) / px_per_tick).max(0.0);
+    for_each_bar_line(
+        meter,
+        f64::from(first_tick),
+        f64::from(last_tick),
+        |_bar, tick, _seg_bar_ticks| {
+            let x = lane.left() + tick as f32 * px_per_tick;
+            painter.line_segment(
+                [pos2(x, lane.top()), pos2(x, lane.bottom())],
+                Stroke::new(1.0, colors.grid),
+            );
+        },
+    );
 
     let tick_at = |x: f32| ((x - lane.left()) / px_per_tick).max(0.0);
 
@@ -3270,7 +3345,7 @@ fn lane_row<T: Placement>(
                 let tiled = hit_clip(clips, tick_at(pos.x), sec_per_tick).is_some_and(|index| {
                     clips[index].loop_len(sec_per_tick) < clips[index].span(sec_per_tick)
                 });
-                match knife_target(clips, tick_at(pos.x), bar_ticks, sec_per_tick, snap) {
+                match knife_target(clips, tick_at(pos.x), meter, sec_per_tick, snap) {
                     // W2: a cut would need a phase-relative loop origin,
                     // which the model does not carry.
                     Some(_) if tiled => {
@@ -3302,7 +3377,7 @@ fn lane_row<T: Placement>(
     // snapped bar line through the hovered lane).
     if state.knife_armed && response.hovered() {
         if let Some(pos) = response.hover_pos() {
-            let at = snap_bar(tick_at(pos.x), bar_ticks, snap);
+            let at = snap_bar(meter, tick_at(pos.x), snap);
             let x = lane.left() + at as f32 * px_per_tick;
             painter.line_segment(
                 [pos2(x, lane.top()), pos2(x, lane.bottom())],
@@ -3371,8 +3446,9 @@ fn lane_row<T: Placement>(
                     }
                 }
             } else if clips.len() < MAX_CLIPS_PER_TRACK {
-                let bound = ARRANGEMENT_LIMIT_TICKS - bar_ticks;
-                let start = snap_bar(tick, bar_ticks, snap).min(bound);
+                let start = snap_bar(meter, tick, snap);
+                let bound = ARRANGEMENT_LIMIT_TICKS - meter.ticks_per_bar_at(start).max(1);
+                let start = start.min(bound);
                 if let RowKind::Audio(t) = row {
                     // U6 D2: an empty audio lane asks for a wav — the caller
                     // opens the file dialog and creates the clip.
@@ -3506,8 +3582,7 @@ fn lane_row<T: Placement>(
                     }) if clip < clips.len() => {
                         let span = clips[clip].span(sec_per_tick);
                         let limit = ARRANGEMENT_LIMIT_TICKS - span;
-                        let start =
-                            snap_bar(tick_at(pos.x) - grab_ticks, bar_ticks, snap).min(limit);
+                        let start = snap_bar(meter, tick_at(pos.x) - grab_ticks, snap).min(limit);
                         if clips[clip].start() != start {
                             let lane = row.lane();
                             let track = row.track();
@@ -3538,7 +3613,7 @@ fn lane_row<T: Placement>(
                                 tick_at(pos.x),
                                 origin_start,
                                 origin_span,
-                                bar_ticks,
+                                meter,
                                 snap,
                             );
                             let delta = new_start - origin_start;
@@ -3556,8 +3631,9 @@ fn lane_row<T: Placement>(
                         ResizeEdge::End => {
                             let start = clips[clip].start();
                             let limit = ARRANGEMENT_LIMIT_TICKS - start;
-                            let edge = snap_bar(tick_at(pos.x) - start as f32, bar_ticks, snap)
-                                .clamp(bar_ticks, limit.max(bar_ticks));
+                            let edge = snap_bar(meter, tick_at(pos.x) - start as f32, snap);
+                            let min_span = meter.ticks_per_bar_at(start).max(1);
+                            let edge = edge.clamp(min_span, limit.max(min_span));
                             // 2026-11-04: the plain right edge extends/trims
                             // the clip time. A single-period clip grows its
                             // content with the container; a tiled clip keeps
@@ -4085,47 +4161,99 @@ fn hit_clip<T: Placement>(clips: &[T], tick: f32, sec_per_tick: f64) -> Option<u
 /// Knife targeting (M4b.2): resolve a click at `tick` into the clip index
 /// and a bar-snapped cut position, requiring at least one bar of clip on
 /// both sides of the cut. `None` when the click misses every clip or the
-/// snapped position is too close to either edge.
+/// snapped position is too close to either edge. Met M4: the bar length is
+/// the segment containing the snapped cut.
 fn knife_target<T: Placement>(
     clips: &[T],
     tick: f32,
-    bar_ticks: u32,
+    meter: &MeterMap,
     sec_per_tick: f64,
     snap: Snap,
 ) -> Option<(usize, u32)> {
     let index = hit_clip(clips, tick, sec_per_tick)?;
     let clip = &clips[index];
-    let at = snap_bar(tick, bar_ticks, snap);
-    let left_ok = at >= clip.start() + bar_ticks;
-    let right_ok = at + bar_ticks <= clip.start() + clip.span(sec_per_tick);
+    let at = snap_bar(meter, tick, snap);
+    let bar = meter.ticks_per_bar_at(at).max(1);
+    let left_ok = at >= clip.start() + bar;
+    let right_ok = at + bar <= clip.start() + clip.span(sec_per_tick);
     (left_ok && right_ok).then_some((index, at))
 }
 
-/// Snaps to the nearest whole bar (0 stays 0). `bar_ticks` is the document's
-/// bar length (U3a), so the snap follows the meter; `snap` may turn the grid
-/// off (`Snap::OFF`) for a Ctrl drag.
-fn snap_bar(ticks: f32, _bar_ticks: u32, snap: Snap) -> u32 {
-    snap.ticks(ticks).max(0) as u32
+/// Enumerates every bar line inside `[from_tick, to_tick]`, following the
+/// meter segments (Met M4). `f` receives the 0-based **global** bar number,
+/// the line's tick, and the bar length of the segment it belongs to — the
+/// ruler needs the last one to thin its numbers out per segment. A segment
+/// boundary is emitted once, by the segment it starts.
+fn for_each_bar_line(
+    meter: &MeterMap,
+    from_tick: f64,
+    to_tick: f64,
+    mut f: impl FnMut(u32, u32, u32),
+) {
+    if to_tick < from_tick {
+        return;
+    }
+    let to = to_tick.min(f64::from(u32::MAX)) as u64;
+    let segments = meter.segments();
+    for (index, seg) in segments.iter().enumerate() {
+        let has_next = index + 1 < segments.len();
+        let seg_end = segments
+            .get(index + 1)
+            .map_or(u64::from(u32::MAX), |next| u64::from(next.tick));
+        if (seg_end as f64) < from_tick {
+            continue;
+        }
+        if f64::from(seg.tick) > to_tick {
+            break;
+        }
+        let bar_ticks = seg.signature.ticks_per_bar().max(1);
+        let offset = (from_tick - f64::from(seg.tick)).max(0.0);
+        let mut k = (offset / f64::from(bar_ticks)).ceil().max(0.0) as u64;
+        loop {
+            let tick = u64::from(seg.tick) + k * u64::from(bar_ticks);
+            if has_next && tick >= seg_end {
+                break;
+            }
+            if tick > to {
+                return;
+            }
+            f(seg.bar + k as u32, tick as u32, bar_ticks);
+            k += 1;
+        }
+    }
+}
+
+/// Snaps to the nearest bar line (0 stays 0). Met M4: the grid is the
+/// containing segment's, so a drag that crosses a meter change switches its
+/// snap basis at the boundary; `snap` may turn the grid off (`Snap::OFF`)
+/// for a Ctrl drag.
+fn snap_bar(meter: &MeterMap, ticks: f32, snap: Snap) -> u32 {
+    if snap.is_off() {
+        ticks.round().max(0.0) as u32
+    } else {
+        meter.snap_bar(f64::from(ticks.max(0.0)))
+    }
 }
 
 /// I6: the bar-snapped start of a head trim.
 ///
 /// Clamped to `[origin_start, origin_start + origin_span - 1 bar]`: the
 /// drag never extends the clip leftwards (MIDI/control carry no content
-/// offset to fill the gap) and never closes it past one bar.
+/// offset to fill the gap) and never closes it past one bar. The bar length
+/// is the one at the clip origin.
 pub(crate) fn trim_head_start(
     pointer_tick: f32,
     origin_start: u32,
     origin_span: u32,
-    bar_ticks: u32,
+    meter: &MeterMap,
     snap: Snap,
 ) -> u32 {
-    let bar = bar_ticks.max(1);
+    let bar = meter.ticks_per_bar_at(origin_start).max(1);
     let max_start = origin_start
         .saturating_add(origin_span)
         .saturating_sub(bar)
         .max(origin_start);
-    snap_bar(pointer_tick, bar, snap).clamp(origin_start, max_start)
+    snap_bar(meter, pointer_tick, snap).clamp(origin_start, max_start)
 }
 
 /// The insertion row a track-reorder drag points at, plus the screen y the
@@ -4318,7 +4446,12 @@ mod tests {
     use super::*;
     // The tests lock the 4/4 behavior: bar_ticks is the document's meter in
     // production, the constant is the 4/4 case they exercise.
-    use glitcherz_model::TICKS_PER_BAR;
+    use glitcherz_model::{MeterMarker, TICKS_PER_BAR, TimeSignature};
+
+    /// A single-segment meter at `(numerator, denominator)` (Met M4).
+    fn meter(signature: (u8, u8)) -> MeterMap {
+        MeterMap::new(TimeSignature::new(signature.0, signature.1), &[])
+    }
 
     /// Seconds per tick at 120 BPM / 960 PPQ — the base-tempo conversion the
     /// placement helpers take (U11 D3); MIDI/control clips ignore it.
@@ -4334,7 +4467,7 @@ mod tests {
         let span = 4 * bar;
         // Pointer left of the origin: refused.
         assert_eq!(
-            trim_head_start(0.0, start, span, bar, Snap::on(i64::from(bar))),
+            trim_head_start(0.0, start, span, &meter((4, 4)), Snap::on(i64::from(bar))),
             start
         );
         // Inside the clip: follows the bar grid.
@@ -4343,7 +4476,7 @@ mod tests {
                 (3 * bar) as f32 + 20.0,
                 start,
                 span,
-                bar,
+                &meter((4, 4)),
                 Snap::on(i64::from(bar))
             ),
             3 * bar
@@ -4354,7 +4487,7 @@ mod tests {
                 (99 * bar) as f32,
                 start,
                 span,
-                bar,
+                &meter((4, 4)),
                 Snap::on(i64::from(bar))
             ),
             start + span - bar
@@ -4857,7 +4990,7 @@ mod tests {
             knife_target(
                 &clips,
                 tick,
-                TICKS_PER_BAR,
+                &meter((4, 4)),
                 SPT,
                 Snap::on(i64::from(TICKS_PER_BAR))
             ),
@@ -4874,7 +5007,7 @@ mod tests {
             knife_target(
                 &clips,
                 TICKS_PER_BAR as f32,
-                TICKS_PER_BAR,
+                &meter((4, 4)),
                 SPT,
                 Snap::on(i64::from(TICKS_PER_BAR))
             ),
@@ -4885,7 +5018,7 @@ mod tests {
             knife_target(
                 &clips,
                 0.2 * TICKS_PER_BAR as f32,
-                TICKS_PER_BAR,
+                &meter((4, 4)),
                 SPT,
                 Snap::on(i64::from(TICKS_PER_BAR))
             ),
@@ -4896,7 +5029,7 @@ mod tests {
             knife_target(
                 &clips,
                 1.8 * TICKS_PER_BAR as f32,
-                TICKS_PER_BAR,
+                &meter((4, 4)),
                 SPT,
                 Snap::on(i64::from(TICKS_PER_BAR))
             ),
@@ -4907,7 +5040,7 @@ mod tests {
             knife_target(
                 &[clip(4 * TICKS_PER_BAR, TICKS_PER_BAR)],
                 4.4 * TICKS_PER_BAR as f32,
-                TICKS_PER_BAR,
+                &meter((4, 4)),
                 SPT,
                 Snap::on(i64::from(TICKS_PER_BAR))
             ),
@@ -4922,7 +5055,7 @@ mod tests {
             knife_target(
                 &clips,
                 6.0 * TICKS_PER_BAR as f32,
-                TICKS_PER_BAR,
+                &meter((4, 4)),
                 SPT,
                 Snap::on(i64::from(TICKS_PER_BAR))
             ),
@@ -4941,7 +5074,7 @@ mod tests {
             knife_target(
                 &clips,
                 1.6 * SIX_EIGHT as f32,
-                SIX_EIGHT,
+                &meter((6, 8)),
                 SPT,
                 Snap::on(i64::from(SIX_EIGHT))
             ),
@@ -4949,8 +5082,8 @@ mod tests {
         );
         assert_eq!(
             snap_bar(
+                &meter((6, 8)),
                 1.6 * SIX_EIGHT as f32,
-                SIX_EIGHT,
                 Snap::on(i64::from(SIX_EIGHT))
             ),
             2 * SIX_EIGHT
@@ -4962,12 +5095,66 @@ mod tests {
             knife_target(
                 &short,
                 0.4 * SIX_EIGHT as f32,
-                SIX_EIGHT,
+                &meter((6, 8)),
                 SPT,
                 Snap::on(i64::from(SIX_EIGHT))
             ),
             None
         );
+    }
+
+    #[test]
+    fn bar_lines_follow_meter_segments() {
+        // 6/8 for five bars, then 4/4. Numbering is global and continuous.
+        let six_eight = TimeSignature::new(6, 8);
+        let map = MeterMap::new(
+            six_eight,
+            &[MeterMarker {
+                tick: 2880 * 5,
+                signature: TimeSignature::COMMON,
+            }],
+        );
+        let mut lines = Vec::new();
+        for_each_bar_line(&map, 0.0, 25_000.0, |bar, tick, bar_ticks| {
+            lines.push((bar, tick, bar_ticks));
+        });
+        assert_eq!(
+            &lines[..8],
+            &[
+                (0, 0, 2880),
+                (1, 2880, 2880),
+                (2, 5760, 2880),
+                (3, 8640, 2880),
+                (4, 11_520, 2880),
+                (5, 14_400, 3840),
+                (6, 18_240, 3840),
+                (7, 22_080, 3840),
+            ],
+            "bar lines switch length and keep counting at the marker"
+        );
+    }
+
+    #[test]
+    fn snapping_switches_basis_at_a_meter_change() {
+        let start = 4 * TICKS_PER_BAR;
+        let map = MeterMap::new(
+            TimeSignature::COMMON,
+            &[MeterMarker {
+                tick: start,
+                signature: TimeSignature::new(6, 8),
+            }],
+        );
+        // 4/4 side: still the 3840 grid.
+        assert_eq!(
+            snap_bar(&map, 3.6 * TICKS_PER_BAR as f32, Snap::on(1)),
+            start
+        );
+        // 6/8 side: grid relative to the segment, so 1.6 bars in snaps to the
+        // second 2880 line.
+        let t = (f64::from(start) + 1.6 * 2880.0) as f32;
+        assert_eq!(snap_bar(&map, t, Snap::on(1)), start + 2 * 2880);
+        // Ctrl (Snap::OFF) lands on the nearest tick, not a bar line.
+        assert_eq!(snap_bar(&map, 100.4, Snap::OFF), 100);
     }
 
     #[test]

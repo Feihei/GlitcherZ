@@ -572,10 +572,10 @@ impl GlitcherZApp {
     }
 
     /// Arrangement end in ticks (U1: the skip-to-end target) — the latest
-    /// clip end across all tracks, rounded up to a bar (mirrors the
-    /// engine's D16 rule); `0` when the arrangement is empty.
+    /// clip end across all tracks, rounded up to the next bar line of the
+    /// meter (mirrors the engine's D16 rule); `0` when the arrangement is
+    /// empty.
     pub(crate) fn arrangement_end_ticks(&self) -> u32 {
-        let bar = u64::from(self.project().ticks_per_bar());
         let mut latest = 0u64;
         for track in &self.project().midi_tracks {
             for clip in &track.clips {
@@ -587,22 +587,31 @@ impl GlitcherZApp {
                 latest = latest.max(u64::from(clip.start_ticks) + u64::from(clip.span_ticks));
             }
         }
-        let end = if latest == 0 {
-            0
-        } else {
-            latest.div_ceil(bar) * bar
-        };
-        end.min(u64::from(u32::MAX)) as u32
+        // Met M4: `next_bar(latest - 1)` is exactly "ceil to the next bar
+        // line", and a clip that already ends on a line keeps that line.
+        if latest == 0 {
+            return 0;
+        }
+        let tick = (latest - 1).min(u64::from(u32::MAX)) as u32;
+        self.project().meter_map().next_bar(tick)
     }
 
     /// Moves the playhead by whole bars at the current meter (Ctrl+←/→).
     /// Never goes before the arrangement start; moving past the end is
     /// allowed, like dragging the playhead there.
     pub(crate) fn seek_by_bars(&mut self, bars: i64) {
-        let bar_ticks = f64::from(self.project().ticks_per_bar());
-        let pos = f64::from(self.engine.musical_ticks());
-        let target = (pos + bar_ticks * bars as f64).max(0.0);
-        self.engine.seek_ticks(target);
+        let map = self.project().meter_map();
+        let mut pos = self.engine.musical_ticks().max(0.0) as u32;
+        if bars >= 0 {
+            for _ in 0..bars {
+                pos = map.next_bar(pos);
+            }
+        } else {
+            for _ in 0..-bars {
+                pos = map.prev_bar(pos);
+            }
+        }
+        self.engine.seek_ticks(f64::from(pos));
     }
 
     /// Seeks to the nearest marker strictly before the playhead (U1);

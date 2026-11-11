@@ -130,6 +130,10 @@ impl GlitcherZApp {
             // Read-only: the timeline is a view now; its edit actions come
             // back as data and are applied (undoably) below.
             let project = session.project();
+            // Met M4: one meter table per frame — the ruler, grid and
+            // snapping all read it (D4 keeps the table tiny and the queries
+            // binary-search).
+            let meter = project.meter_map();
             let (midi, control, audio) = (
                 &project.midi_tracks,
                 &project.control_tracks,
@@ -150,8 +154,8 @@ impl GlitcherZApp {
                     edit_target,
                     loop_range: &project.metadata.loop_range,
                     markers: &project.metadata.markers,
-                    // U3a: the document's bar length, not the 4/4 constant.
-                    bar_ticks: project.ticks_per_bar(),
+                    // Met M4: the piecewise meter table, not a single bar.
+                    meter: &meter,
                     // U11 D3: audio clip spans are derived at the base tempo.
                     sec_per_tick: project.sec_per_tick(),
                     waveform_of: &waveform_of,
@@ -460,9 +464,9 @@ impl GlitcherZApp {
         start_ticks: u32,
     ) {
         let before = self.begin_edit();
-        // A new clip is one bar long — of the document's meter (U3a), not the
-        // 4/4 constant the model default carries.
-        let bar = self.project().ticks_per_bar();
+        // A new clip is one bar long — of the meter segment the clip starts in
+        // (Met M4), not the 4/4 constant the model default carries.
+        let bar = self.project().ticks_per_bar_at(start_ticks);
         let sec_per_tick = self.project().sec_per_tick();
         let added = match lane {
             timeline::TimelineLane::Control => self
@@ -552,7 +556,7 @@ impl GlitcherZApp {
         // within the arrangement bound.
         let seconds = data.frames().len() as f64 / f64::from(data.sample_rate());
         let sec_per_tick = self.project().sec_per_tick();
-        let min_len = f64::from(self.project().ticks_per_bar()) * sec_per_tick;
+        let min_len = f64::from(self.project().ticks_per_bar_at(start_ticks)) * sec_per_tick;
         let max_len = f64::from(MAX_ARRANGEMENT_TICKS as u32 - start_ticks) * sec_per_tick;
         let source_len = if max_len > min_len {
             seconds.clamp(min_len, max_len)

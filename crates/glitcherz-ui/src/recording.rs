@@ -378,17 +378,23 @@ impl GlitcherZApp {
             );
             return;
         }
-        let bar = f64::from(self.project().ticks_per_bar().max(1));
         let now = f64::from(self.engine.musical_ticks().max(0.0));
-        // Forward to the next bar line (a position already on one stays).
-        let start = (now / bar).ceil() * bar;
+        // Met M4: forward to the next bar line **of the current meter
+        // segment** (a position already on one stays).
+        let meter = self.project().meter_map();
+        let now_tick = now.max(0.0) as u32;
+        let start = if now_tick == 0 {
+            0.0
+        } else {
+            f64::from(meter.next_bar(now_tick - 1))
+        };
+        let bar = f64::from(meter.ticks_per_bar_at(start as u32).max(1));
         let pre_roll = f64::from(self.record_pre_roll_bars) * bar;
         let from = (start - pre_roll).max(0.0);
         let record_start = from + pre_roll;
         // R6 D27 (dry region): nothing may already occupy the take's span on
         // any armed track. The check is an interval overlap, not "track is
         // empty", so recording after existing material keeps working.
-        let bar_ticks = self.project().ticks_per_bar().max(1);
         let record_start_tick = record_start.round().max(0.0) as u64;
         for &track in &midi_armed {
             let Some(existing) = self.project().midi_tracks.get(track) else {
@@ -397,7 +403,7 @@ impl GlitcherZApp {
             if let Some(clip) = existing.clips.iter().find(|clip| {
                 u64::from(clip.start_ticks) + u64::from(clip.span_ticks) > record_start_tick
             }) {
-                let bar_no = clip.start_ticks / bar_ticks + 1;
+                let bar_no = self.project().bar_beat_at(clip.start_ticks).0 + 1;
                 self.recording_problem(format!(
                     "Track {} already has a clip at bar {bar_no}. Move the transport past it \
                      (or delete that clip), then press Rec again.",
@@ -417,7 +423,7 @@ impl GlitcherZApp {
                     u64::from(clip.start_ticks) + span > record_start_tick
                 });
                 if let Some(clip) = clash {
-                    let bar_no = clip.start_ticks / bar_ticks + 1;
+                    let bar_no = self.project().bar_beat_at(clip.start_ticks).0 + 1;
                     self.recording_problem(format!(
                         "Audio track {} already has a clip at bar {bar_no}. Move the transport \
                          past it (or delete that clip), then press Rec again.",
@@ -581,8 +587,8 @@ impl GlitcherZApp {
         label: &str,
         takes: &[(usize, Vec<Note>)],
     ) -> Option<(usize, usize)> {
-        let bar = self.project().ticks_per_bar();
         let start = self.recorder.start_ticks;
+        let bar = self.project().ticks_per_bar_at(start.max(0.0) as u32);
         let clips: Vec<(usize, MidiClip, usize)> = takes
             .iter()
             .filter_map(|(track, notes)| {
@@ -723,7 +729,7 @@ impl GlitcherZApp {
                     name: format!(
                         "Take {} · bar {}",
                         track + 1,
-                        start_ticks / self.project().ticks_per_bar() + 1
+                        self.project().bar_beat_at(start_ticks).0 + 1
                     ),
                     group: None,
                     muted: false,
@@ -790,8 +796,8 @@ impl GlitcherZApp {
         self.engine.set_record_mute(0);
         self.engine.set_audio_capture(false);
 
-        let bar = self.project().ticks_per_bar();
         let midi_start = self.recorder.start_ticks;
+        let bar = self.project().ticks_per_bar_at(midi_start.max(0.0) as u32);
         let midi_clips: Vec<(usize, MidiClip, usize)> = midi_takes
             .iter()
             .filter_map(|(track, notes)| {
@@ -799,7 +805,7 @@ impl GlitcherZApp {
                     clip.name = format!(
                         "Take {} · bar {}",
                         track + 1,
-                        clip.start_ticks / bar.max(1) + 1
+                        self.project().bar_beat_at(clip.start_ticks).0 + 1
                     );
                     (*track, clip, notes.len())
                 })

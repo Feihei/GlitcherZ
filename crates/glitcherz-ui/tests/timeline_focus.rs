@@ -155,7 +155,7 @@ impl Fixture {
                         edit_target: None,
                         loop_range: &loop_range,
                         markers: &[],
-                        bar_ticks: glitcherz_model::TICKS_PER_BAR,
+                        meter: &glitcherz_model::MeterMap::default(),
                         sec_per_tick: 60.0 / (120.0 * 960.0),
                         waveform_of: &|_| None,
                         clip_groups: &[],

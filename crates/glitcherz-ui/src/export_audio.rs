@@ -243,7 +243,6 @@ pub fn sanitize_file_part(name: &str) -> String {
 /// content; an audio clip ending later would be cut by the auto-stop).
 /// Rounded up to a whole bar, `0` for an empty arrangement.
 pub fn export_end_ticks(project: &Project) -> u32 {
-    let bar = u64::from(project.ticks_per_bar());
     let mut latest = 0u64;
     for track in &project.midi_tracks {
         for clip in &track.clips {
@@ -262,12 +261,14 @@ pub fn export_end_ticks(project: &Project) -> u32 {
                 .max(u64::from(clip.start_ticks) + u64::from(project.audio_clip_span_ticks(clip)));
         }
     }
-    let end = if latest == 0 {
+    // Met M4: ceil to the meter segment's next bar line (a clip already on
+    // a line keeps that line).
+    if latest == 0 {
         0
     } else {
-        latest.div_ceil(bar) * bar
-    };
-    end.min(u64::from(u32::MAX)) as u32
+        let tick = (latest - 1).min(u64::from(u32::MAX)) as u32;
+        project.meter_map().next_bar(tick)
+    }
 }
 
 /// Callback the job runs when a pass starts: the caller swaps the clip tables

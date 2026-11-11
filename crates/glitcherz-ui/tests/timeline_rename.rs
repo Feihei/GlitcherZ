@@ -10,7 +10,7 @@
 //! binding, the focus hand-off or the commit condition regress.
 
 use eframe::egui;
-use glitcherz_model::{AudioTrack, ControlTrack, MidiTrack, TICKS_PER_BAR};
+use glitcherz_model::{AudioTrack, ControlTrack, MidiTrack};
 use glitcherz_ui::timeline::{self, TimelineAction, TimelineLane, TimelineParams, TimelineState};
 
 const SCREEN: egui::Vec2 = egui::vec2(800.0, 600.0);
@@ -98,7 +98,7 @@ impl Fixture {
                         edit_target: None,
                         loop_range: &loop_range,
                         markers: &[],
-                        bar_ticks: TICKS_PER_BAR,
+                        meter: &glitcherz_model::MeterMap::default(),
                         sec_per_tick: 60.0 / (120.0 * 960.0),
                         waveform_of: &|_| None,
                         clip_groups: &[],

@@ -1602,6 +1602,16 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - 测试 +13：`meter.rs` 7 项（单段 / 跨段小节编号连续 / `bar_start` 往返 / 半小节吸附 / 乱序输入 / 段内吸附 / 跨段 `next`·`prev`）、`lib.rs` 5 项 validate（合法 / tick 0 / 乱序重复 / 超上限 / 非法签名）、`file.rs` 1 项 RON 往返 + 空表不落盘。
 - **门禁**：`cargo test -p glitcherz-model` = 194 通过；`fmt` / `clippy -D warnings` 干净。本阶段无调用点改动，零回归。
 
+#### Met M4：timeline 读取层分段（2026-11-11，spec `meter-map.md` §6）
+
+- `TimelineParams.bar_ticks: u32` → `meter: &MeterMap`；`px_per_tick = px_per_bar / 第 0 段小节长`（D5 像素仍全局线性，只有网格 / 标号 / 吸附按段变化）；内容宽度 = `meter.next_bar(ARRANGEMENT_LIMIT_TICKS)`（无 marker 时与旧 `div_ceil × px_per_bar` 逐像素一致）。
+- 新增纯函数 `for_each_bar_line(meter, from_tick, to_tick, f(bar, tick, seg_bar_ticks))`：ruler 与每条 lane 共用，视口裁剪；段边界只由「下一段」发出，标号是**全局**小节号。ruler 在段起点画加粗线 + 拍号胶囊（只读，M5a 接编辑），标号每 4 小节按**段内**小节像素宽度稀疏化。
+- 吸附：`snap_bar(meter, raw, snap)` 按 raw 所在段取网格（跨段拖动在边界切换基准）；`Snap::OFF`（Ctrl）落最近 tick。`knife_target` / `trim_head_start` 的「至少/保留一小节」用落点 / clip 起点所在段。模态 G / T / Tile 的步进取**选区最早 clip** 所在段（S7：模态仍是整小节）。
+- 其它读取点：状态栏 `Project::bar_beat_at`；`seek_by_bars` 用 `next_bar` / `prev_bar` 分段步进；`arrangement_end_ticks` 与 `export_end_ticks` 用 `next_bar(latest - 1)`（结束点已在线上就保持该线）；录音起点 `next_bar(now)`、录音 take 名字用 `bar_beat_at`；新建 clip 的默认长度取起点段。卷帘网格按段循环（段起点相对 clip origin），fit / randomize / strum 范围取 origin 段。
+- **与 spec §6.4 的偏离（记录在案）**：`MeterMap` 目前由 `timeline_ops` / `editing` 每帧各构造一次，尚未升级为 `GlitcherZApp` 字段缓存——缓存需要「文档变更即重建」的钩子，等 M5a 加入 marker 编辑时一并做，避免现在引入缓存过期风险。表上限 65 项，每帧一次小 `Vec` 分配的代价可忽略。
+- 测试 +2（`bar_lines_follow_meter_segments` 锁段内网格与连续编号、`snapping_switches_basis_at_a_meter_change` 锁跨段吸附 + Ctrl 关闭）+ 5 个既有调用点改传 `MeterMap`。
+- **门禁**：`cargo fmt` / `cargo clippy --workspace --all-targets -D warnings` / `cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
+
 #### 阶段边界（自 plan.md 归位）
 
 - **Y 系列 S0**：不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（stems / 24-bit / 采样率选择）。

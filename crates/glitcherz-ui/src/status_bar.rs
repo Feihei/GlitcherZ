@@ -180,13 +180,11 @@ impl GlitcherZApp {
                 // frozen while stopped). The raw seconds counter is engine uptime (audio
                 // callback keeps rendering silent blocks), kept as a secondary diagnostic.
                 let ticks = self.engine.musical_ticks();
-                // U3a: bar length and beat unit both come from the document's
-                // meter, so 6/8 counts six beats while 3/4 counts three.
-                let meter = self.project().metadata.time_signature;
-                let tpb = meter.ticks_per_bar() as f32;
-                let bar = (ticks / tpb).floor().max(0.0);
-                let beat = (ticks - bar * tpb) / meter.ticks_per_beat() as f32 + 1.0;
-                ui.label(format!("Pos {}.{}", bar as u32 + 1, beat));
+                // U3a / Met M4: bar number and beat both follow the document's meter
+                // **segments**, so 6/8 counts six beats while 3/4 counts three,
+                // and a mid-song change keeps the numbering continuous.
+                let (bar, beat) = self.project().bar_beat_at(ticks.max(0.0) as u32);
+                ui.label(format!("Pos {}.{}", bar + 1, beat + 1));
                 ui.separator();
                 ui.label(format!("Uptime {:.1} s", position));
                 // spec `snap.md` S3: Ctrl is the temporary snap override. The
