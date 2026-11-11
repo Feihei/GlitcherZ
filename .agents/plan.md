@@ -25,7 +25,7 @@
 
 ## 未完成项
 
-- [x] **命令族扩展（2026-11-11 交付）**：quantize / legato / glue / transpose 全部有命令与 UI 入口（`Notes` 菜单 + `Q` / `L` / `Shift+G`）；`glue` 是唯一会缩短音符表的 op（返回新索引重建选区）。
+- [x] **命令族扩展（2026-11-11 交付）**：quantize / legato / glue / remove_overlap / transpose 全部有命令与 UI 入口（`Notes` 菜单 + `Q` / `L` / `R` / `Shift+G`，菜单顶部可调 quantize 强度与 legato/glue 空隙）；`glue` 是唯一会缩短音符表的 op（返回新索引重建选区）。
 - [ ] **C5 一曲线多目标（暂不做，2026-11-11 用户拍板：暂时用不着）**：结论是**不需要**强制 map 节点——轴本来就是每条边自己的，放开多路后每路按目标各自推导即可。真正的阻塞在别处：`auto_routes` 每轨只 1 槽、`DedupKey::Auto` 是 per-track 的 CC/bend last-value 记忆（两条分支会互相污染）、model 的 `auto_endpoint` / `auto_target` / `remove_auto_cable` 都是单值语义。
 - [ ] **空闲重绘**（review 2026-11-01 遗留）：`request_repaint_after(50 ms)` 目前无条件调用，建议只在播放中 / 电平可见时开——纯 UI 性能项，不碰引擎。
 - [ ] **录音 PDC 自动对齐**（review 2026-11-01 遗留）：PDC 已进图（S2-3），但 R5 仍靠手动 `Latency` offset；自动值需要汇总「输入设备 → 轨道链」的往返延迟。

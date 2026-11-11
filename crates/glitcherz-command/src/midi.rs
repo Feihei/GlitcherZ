@@ -151,6 +151,15 @@ pub fn specs() -> Vec<crate::CommandSpec> {
             glue_cmd
         ),
         crate::cmd!(
+            "midi.remove_overlap",
+            "Remove Overlap",
+            ["Midi", "Event"],
+            None,
+            "{track, clip, indices?} → {changed, indices: [n]}",
+            always,
+            remove_overlap_cmd
+        ),
+        crate::cmd!(
             "midi.randomize",
             "Randomize",
             ["Midi", "Event"],
@@ -340,6 +349,20 @@ fn glue_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
 /// selection (or the whole clip). Every field is a **half-range**; the
 /// probability skips notes instead of deleting them, preserving the ops
 /// contract and the caller's selection count.
+fn remove_overlap_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let notes = notes_mut(session, "midi.remove_overlap", params)?;
+    let selected = indices_or_all(params, notes.len());
+    glitcherz_model::apply_to_selected(notes, &selected, |slice| {
+        glitcherz_model::apply_duration(slice, &glitcherz_model::DurationOp::RemoveOverlap)
+    });
+    let chosen: Vec<Note> = selected
+        .iter()
+        .filter_map(|&index| notes.get(index).copied())
+        .collect();
+    notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
+    Ok(json!({ "changed": selected.len(), "indices": locate(notes, &chosen) }))
+}
+
 fn randomize_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
     let bar = i64::from(glitcherz_model::TICKS_PER_BAR);
     let options = glitcherz_model::RandomizeOptions {

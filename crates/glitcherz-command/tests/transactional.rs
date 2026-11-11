@@ -470,6 +470,26 @@ fn legato_extends_each_note_into_the_next_start() {
 }
 
 #[test]
+fn remove_overlap_trims_at_the_next_same_pitch_note() {
+    let mut session = session_with_notes();
+    // Make the first two notes the same pitch and overlap the second.
+    {
+        let notes = session.project_mut().midi_tracks[0].clips[0].notes_mut();
+        notes[1].note = 60;
+        notes[0].length = 400; // runs past the second note's start (240)
+    }
+    session
+        .execute(
+            "midi.remove_overlap",
+            &json!({ "track": 0, "clip": 0, "indices": [0, 1] }),
+        )
+        .unwrap();
+    let after = notes(&session);
+    assert_eq!(after[0].length, 240, "trimmed at the next same-pitch start");
+    assert_eq!(after[1].length, 240, "the later note is untouched");
+}
+
+#[test]
 fn glue_merges_touching_notes_and_reports_the_new_selection() {
     let mut session = session_with_notes();
     session.project_mut().midi_tracks[0].clips[0].notes_mut()[1].note = 60;

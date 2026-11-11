@@ -161,6 +161,8 @@ struct Keys {
     q: bool,
     /// L: legato (extend each note to the next start).
     l: bool,
+    /// R: remove overlaps (trim at the next same-pitch note).
+    r: bool,
     s: bool,
     t: bool,
     k: bool,
@@ -176,11 +178,23 @@ struct Keys {
 /// A named MIDI command exposed by the roll's Notes menu (the W6 command
 /// family). The app turns it into a registered `midi.*` command, so the
 /// component never learns command ids or their parameter JSON.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MidiOp {
-    Quantize,
-    Legato,
-    Glue,
+    /// Quantize note starts to `grid_ticks`, pulled by `strength` (0..=1).
+    Quantize {
+        strength: f32,
+        grid_ticks: i64,
+    },
+    /// Extend each note to the next start minus `gap`.
+    Legato {
+        gap: i64,
+    },
+    /// Merge same-pitch notes whose gap is at most `gap`.
+    Glue {
+        gap: i64,
+    },
+    /// Trim a note where the next note of the same pitch starts (de-cluster).
+    RemoveOverlap,
     Transpose(i32),
 }
 
@@ -227,13 +241,9 @@ pub enum RollIntent {
     /// Bypasses the command layer — no document change, no undo.
     Seek { tick: i64 },
     /// A Notes-menu command over `indices` (empty = every note of the clip).
-    /// `grid_ticks` carries the roll's current grid so Quantize lands on the
-    /// same grid the user is drawing on.
-    MidiOp {
-        op: MidiOp,
-        indices: Vec<usize>,
-        grid_ticks: i64,
-    },
+    /// The op carries its own tuning (grid / strength / gap), so the intent
+    /// stays a plain "run this op on these notes" request.
+    MidiOp { op: MidiOp, indices: Vec<usize> },
     /// One frame of a time scale (the Scale command's drag): stretch the
     /// selection by `factor` around `pivot_tick` (the selection bbox
     /// *start*, frozen at grab time — scaling from the start keeps the
@@ -558,6 +568,10 @@ pub struct RollState {
     /// the length itself is written into the note at creation.
     pub draw_length: DrawLength,
     pub last_note_length: Option<i64>,
+    /// W6: Notes-menu tuning — quantize strength (0..=1) and the legato /
+    /// glue gap in ticks. View state only; the intent carries the values.
+    pub midi_strength: f32,
+    pub midi_gap: i64,
     /// I2: the note currently held for audition (key column or a note body).
     /// Drives the pressed-key highlight; the engine events themselves are
     /// queued in `preview_events` so they never share the intent slot.
@@ -1021,6 +1035,8 @@ impl RollState {
             strum_options: default_strum_options(),
             draw_length: DrawLength::Auto,
             last_note_length: None,
+            midi_strength: 1.0,
+            midi_gap: 0,
             preview_held: None,
             preview_events: Vec::new(),
             pending_arm: None,
@@ -1638,39 +1654,66 @@ pub fn show(
             state.modal = None;
             state.pending_arm = None;
         }
-        // W6: the MIDI command family — Quantize / Legato / Glue /
-        // Transpose. One menu keeps four entries out of the toolbar row;
-        // every entry works on the selection, or on the whole clip when
-        // nothing is selected (the command layer's `indices?`).
+        // W6: the MIDI command family — Quantize / Legato / Glue / Remove
+        // Overlap / Transpose. One menu keeps the entries out of the toolbar
+        // row; every entry works on the selection, or on the whole clip when
+        // nothing is selected (the command layer's `indices?`). The two
+        // tuning values are view state and travel with each intent.
         ui.menu_button("Notes", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("strength");
+                ui.add(
+                    egui::DragValue::new(&mut state.midi_strength)
+                        .range(0.0..=1.0)
+                        .speed(0.01)
+                        .max_decimals(2),
+                );
+                ui.label("gap");
+                ui.add(
+                    egui::DragValue::new(&mut state.midi_gap)
+                        .range(0..=4 * i64::from(TICKS_PER_QUARTER))
+                        .speed(1.0),
+                );
+            });
+            ui.separator();
             let selected = state.selection.clone();
+            let strength = state.midi_strength;
+            let gap = state.midi_gap;
             let mut fire = |ui: &mut egui::Ui, op: MidiOp, label: &str, hint: &str| {
                 if ui.button(label).on_hover_text(hint).clicked() {
                     intent = Some(RollIntent::MidiOp {
                         op,
                         indices: selected.clone(),
-                        grid_ticks,
                     });
                     ui.close();
                 }
             };
             fire(
                 ui,
-                MidiOp::Quantize,
+                MidiOp::Quantize {
+                    strength,
+                    grid_ticks,
+                },
                 "Quantize",
                 "Snap note starts to the current grid · Q",
             );
             fire(
                 ui,
-                MidiOp::Legato,
+                MidiOp::Legato { gap },
                 "Legato",
-                "Extend each note to the next start · L",
+                "Extend each note to the next start (minus gap) · L",
             );
             fire(
                 ui,
-                MidiOp::Glue,
+                MidiOp::Glue { gap },
                 "Glue",
-                "Merge touching same-pitch notes · Shift+G",
+                "Merge touching same-pitch notes (plus gap) · Shift+G",
+            );
+            fire(
+                ui,
+                MidiOp::RemoveOverlap,
+                "Remove Overlap",
+                "Trim a note where the next same-pitch note starts · R",
             );
             ui.separator();
             fire(
@@ -2633,6 +2676,7 @@ pub fn show(
             d: i.consume_key(egui::Modifiers::NONE, egui::Key::D),
             q: i.consume_key(egui::Modifiers::NONE, egui::Key::Q),
             l: i.consume_key(egui::Modifiers::NONE, egui::Key::L),
+            r: i.consume_key(egui::Modifiers::NONE, egui::Key::R),
             g: i.consume_key(egui::Modifiers::NONE, egui::Key::G),
             s: i.consume_key(egui::Modifiers::NONE, egui::Key::S),
             t: i.consume_key(egui::Modifiers::NONE, egui::Key::T),
@@ -2720,18 +2764,26 @@ pub fn show(
                 state.knife_armed = false;
                 state.pending_arm = None;
                 state.mode = state.mode.toggled();
-            } else if keys.q || keys.l || keys.shift_g {
+            } else if keys.q || keys.l || keys.shift_g || keys.r {
                 let op = if keys.q {
-                    MidiOp::Quantize
+                    MidiOp::Quantize {
+                        strength: state.midi_strength,
+                        grid_ticks,
+                    }
                 } else if keys.l {
-                    MidiOp::Legato
+                    MidiOp::Legato {
+                        gap: state.midi_gap,
+                    }
+                } else if keys.r {
+                    MidiOp::RemoveOverlap
                 } else {
-                    MidiOp::Glue
+                    MidiOp::Glue {
+                        gap: state.midi_gap,
+                    }
                 };
                 intent = Some(RollIntent::MidiOp {
                     op,
                     indices: state.selection.clone(),
-                    grid_ticks,
                 });
             } else if keys.g || keys.s || keys.t || keys.k {
                 // The keyboard family and the toolbar share one arming path

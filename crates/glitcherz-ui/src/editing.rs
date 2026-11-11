@@ -738,32 +738,39 @@ impl GlitcherZApp {
         &mut self,
         op: piano_roll::MidiOp,
         indices: Vec<usize>,
-        grid_ticks: i64,
         track: usize,
         clip: usize,
     ) {
         use serde_json::json;
         let (id, params, label) = match op {
-            piano_roll::MidiOp::Quantize => (
+            piano_roll::MidiOp::Quantize {
+                strength,
+                grid_ticks,
+            } => (
                 "midi.quantize",
                 json!({
                     "track": track,
                     "clip": clip,
                     "indices": indices,
                     "grid_ticks": grid_ticks,
-                    "strength": 1.0,
+                    "strength": strength.clamp(0.0, 1.0),
                 }),
                 "Quantize",
             ),
-            piano_roll::MidiOp::Legato => (
+            piano_roll::MidiOp::Legato { gap } => (
                 "midi.legato",
-                json!({ "track": track, "clip": clip, "indices": indices, "gap": 0 }),
+                json!({ "track": track, "clip": clip, "indices": indices, "gap": gap.max(0) }),
                 "Legato",
             ),
-            piano_roll::MidiOp::Glue => (
+            piano_roll::MidiOp::Glue { gap } => (
                 "midi.glue",
-                json!({ "track": track, "clip": clip, "indices": indices, "gap": 0 }),
+                json!({ "track": track, "clip": clip, "indices": indices, "gap": gap.max(0) }),
                 "Glue",
+            ),
+            piano_roll::MidiOp::RemoveOverlap => (
+                "midi.remove_overlap",
+                json!({ "track": track, "clip": clip, "indices": indices }),
+                "Remove Overlap",
             ),
             piano_roll::MidiOp::Transpose(semitones) => (
                 "midi.transpose",
@@ -811,14 +818,10 @@ impl GlitcherZApp {
                 self.engine.seek_ticks(*tick as f64);
                 return;
             }
-            RollIntent::MidiOp {
-                op,
-                indices,
-                grid_ticks,
-            } => {
+            RollIntent::MidiOp { op, indices } => {
                 // W6: the Notes menu / shortcut path. The command layer owns
                 // undo (one step per click) and returns the new selection.
-                self.apply_midi_op(*op, indices.clone(), *grid_ticks, track, clip);
+                self.apply_midi_op(*op, indices.clone(), track, clip);
                 return;
             }
             RollIntent::CurveUpsert {
