@@ -42,7 +42,15 @@ S5 收官时记下的硬阻塞：MCP 已能改音符（`midi.*` 19 条命令，F
 
 `{track}` → `{nodes:[{node_id, kind, label, params:[{key, min, max, value, kind}]}]}`。只读、不 undo、不进 journal。
 
-### 3.3 `clip.add`
+### 3.3 `graph.set_voice`
+
+```json
+{"node":12,"voice":"modal"}
+```
+
+把乐器的 `VoiceSpec` 切到内置（无文件）音色：`builtin` / `modal` / `pluck` / `organ` / `wavetable`。切换后使用该 voice 的默认参数，随后的 `graph.set_param` 用该 voice 的参数 key 调整。只对 instrument 节点有效；SF2 / sample 需要文件路径、插件需要宿主协商，均不做。
+
+### 3.4 `clip.add`
 
 ```json
 {"track":0,"lane":"midi","start_ticks":0,"span_ticks":3840,"name":"Verse"}
@@ -55,7 +63,8 @@ S5 收官时记下的硬阻塞：MCP 已能改音符（`midi.*` 19 条命令，F
 | 里程碑 | 内容 | 依赖 | 规模 |
 | :--- | :--- | :--- | :--- |
 | **V1a** 参数词汇表（2026-11-11 交付） | `NodeParam::key()` / `from_key()` / `from_key_indexed()` + `node_param_range` / `node_param_value` / `set_node_param` / `node_param_keys`；`graph.set_param` + `graph.query`。覆盖 instrument synth（resonance / attack / decay / sustain / release）、mixer channel（gain / pan / mute / solo）与 out pan / mute、feedback gain | — | 中 |
-| **V1b** 效果器 / 声源参数 | `effect_slot` 读写（需 effect 描述符槽映射）+ Modal / Pluck / Organ / Wavetable / Sf2 / Sample 参数 + `graph.set_voice` | V1a | 中 |
+| **V1b-1** 声源参数 + `set_voice`（2026-11-11 交付） | `node_param_value` / `set_node_param` 覆盖 Modal / Pluck / Organ / Wavetable / Sf2 / Sample 参数；`node_param_keys` 按 `VoiceSpec` 列出可写 key；`graph.set_voice`（builtin / modal / pluck / organ / wavetable；文件音色与插件不做） | V1a | 中 |
+| **V1b-2** 效果器槽 | `effect_slot` 读写：把 `glitcherz-ui::effect` 的槽映射下沉为 `EffectParams::slot_value` / `set_slot_value` / `slot_count`，UI 改为薄委托 | V1a | 中 |
 | **V2** `clip.add`（2026-11-11 交付） | `clip.add`（MIDI）：按拍号段给默认时长，`span = loop`，push 到轨道末尾 | — | 小 |
 | **V3** 端到端 | MCP `commands_run` 测试、CLI、`docs/`、plan 同步 | V1a、V2 | 小 |
 
@@ -72,4 +81,4 @@ S5 收官时记下的硬阻塞：MCP 已能改音符（`midi.*` 19 条命令，F
 - `graph.set_param` 改参数后文档读回正确值，且引擎收到参数更新。
 - `clip.add` 后 `midi.note_add` 能写入该 clip。
 - MCP 端到端：空工程 → `clip.add` → `midi.note_add` → `midi.transpose` → `render` 非静音。
-- MCP 工具数仍为 6；命令数 +3。
+- MCP 工具数仍为 6；命令数 +4（`graph.set_param` / `graph.query` / `graph.set_voice` / `clip.add`）。

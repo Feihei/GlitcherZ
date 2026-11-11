@@ -5,8 +5,8 @@
 //! can discover the vocabulary instead of hard-coding it.
 
 use glitcherz_model::{
-    ChannelParam, NodeDoc, NodeParam, node_param_keys, node_param_range, node_param_value,
-    set_node_param,
+    ChannelParam, ModalParams, NodeDoc, NodeParam, OrganParams, PluckParams, VoiceSpec,
+    WavetableParams, node_param_keys, node_param_range, node_param_value, set_node_param,
 };
 use serde_json::{Value, json};
 
@@ -33,6 +33,15 @@ pub fn specs() -> Vec<crate::CommandSpec> {
             "{track?} → {nodes: [{node, kind, params}]}",
             always,
             query
+        ),
+        crate::cmd!(
+            "graph.set_voice",
+            "Set Instrument Voice",
+            ["Event", "Patch"],
+            None,
+            "{node, voice: builtin|modal|pluck|organ|wavetable}",
+            always,
+            set_voice
         ),
     ]
 }
@@ -127,6 +136,48 @@ fn set_param(session: &mut Session, params: &Value) -> crate::Result<Value> {
         "param": param.key(),
         "value": value,
     }))
+}
+
+/// Switches an instrument's voice to one of the built-in (file-free) sound
+/// sources (F-039 V1b). Each voice starts from its documented defaults;
+/// `graph.set_param` then tunes it. External-file voices (SF2 / sample) and
+/// plugins stay out of scope (D5 / D6).
+fn set_voice(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let node_id = i64_or(params, "node", -1);
+    if node_id < 0 {
+        return Err(bad_params("graph.set_voice", "`node` is required"));
+    }
+    let node_id = node_id as u64;
+    let voice = params
+        .get("voice")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad_params("graph.set_voice", "`voice` is required"))?;
+    let node = node_mut(session, node_id, "graph.set_voice")?;
+    let NodeDoc::Instrument { voice: slot, .. } = node else {
+        return Err(bad_params("graph.set_voice", "node is not an instrument"));
+    };
+    *slot = match voice {
+        "builtin" => VoiceSpec::Builtin,
+        "modal" => VoiceSpec::Modal {
+            params: ModalParams::default(),
+        },
+        "pluck" => VoiceSpec::Pluck {
+            params: PluckParams::default(),
+        },
+        "organ" => VoiceSpec::Organ {
+            params: OrganParams::default(),
+        },
+        "wavetable" => VoiceSpec::Wavetable {
+            params: WavetableParams::default(),
+        },
+        other => {
+            return Err(bad_params(
+                "graph.set_voice",
+                format!("voice `{other}` is not supported (builtin|modal|pluck|organ|wavetable)"),
+            ));
+        }
+    };
+    Ok(json!({ "node": node_id, "voice": voice }))
 }
 
 fn query(session: &mut Session, _params: &Value) -> crate::Result<Value> {

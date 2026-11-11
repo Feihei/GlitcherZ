@@ -1,7 +1,7 @@
 //! The guarantees [`Session::execute`] makes, exercised end to end.
 
 use glitcherz_command::{CommandError, Session, command_specs};
-use glitcherz_model::{MidiClip, NodeDoc, Note, Project};
+use glitcherz_model::{MidiClip, NodeDoc, Note, Project, VoiceSpec};
 use serde_json::json;
 
 /// A session with one track holding one clip of four notes.
@@ -483,6 +483,74 @@ fn clip_add_creates_an_empty_midi_clip() {
     assert!(
         session
             .execute("clip.add", &json!({ "track": 0, "lane": "audio" }))
+            .is_err()
+    );
+}
+
+#[test]
+fn graph_set_voice_switches_and_exposes_voice_params() {
+    let mut session = Session::new(Project::default());
+    let node_id = session
+        .project()
+        .graph
+        .nodes
+        .iter()
+        .find(|node| matches!(node, NodeDoc::Instrument { .. }))
+        .map(NodeDoc::node_id)
+        .expect("the default template carries an instrument");
+
+    session
+        .execute(
+            "graph.set_voice",
+            &json!({ "node": node_id, "voice": "modal" }),
+        )
+        .expect("set_voice");
+    session
+        .execute(
+            "graph.set_param",
+            &json!({ "node": node_id, "param": "modal_decay", "value": 2.5 }),
+        )
+        .expect("modal param");
+
+    let node = session
+        .project()
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.node_id() == node_id)
+        .expect("node");
+    assert!(matches!(
+        node,
+        NodeDoc::Instrument {
+            voice: VoiceSpec::Modal { params },
+            ..
+        } if (params.decay_scale - 2.5).abs() < 1e-6
+    ));
+
+    // The query advertises the new voice's keys, not the synth's.
+    let queried = session.execute("graph.query", &json!({})).expect("query");
+    let entry = queried["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .find(|entry| entry["node"] == json!(node_id))
+        .expect("instrument in query");
+    let keys: Vec<&str> = entry["params"]
+        .as_array()
+        .expect("params")
+        .iter()
+        .filter_map(|param| param["key"].as_str())
+        .collect();
+    assert!(keys.contains(&"modal_decay"));
+    assert!(!keys.contains(&"attack"));
+
+    // File-based voices are out of V1b's scope.
+    assert!(
+        session
+            .execute(
+                "graph.set_voice",
+                &json!({ "node": node_id, "voice": "sf2" })
+            )
             .is_err()
     );
 }

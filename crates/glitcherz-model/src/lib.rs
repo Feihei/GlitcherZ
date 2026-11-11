@@ -2959,6 +2959,7 @@ pub fn node_param_value(node: &NodeDoc, param: NodeParam) -> Option<f32> {
         (NodeDoc::Mixer { out_pan, .. }, NodeParam::MixerOutPan) => Some(*out_pan),
         (NodeDoc::Mixer { out_muted, .. }, NodeParam::MixerOutMute) => Some(bool_value(*out_muted)),
         (NodeDoc::Feedback { gain, .. }, NodeParam::FeedbackGain) => Some(*gain),
+        (NodeDoc::Instrument { voice, .. }, param) => voice_param_value(voice, param),
         _ => None,
     }
 }
@@ -3015,6 +3016,142 @@ pub fn set_node_param(node: &mut NodeDoc, param: NodeParam, value: f32) -> bool 
             *gain = value.clamp(0.0, 1.0);
             true
         }
+        (NodeDoc::Instrument { voice, .. }, param) => set_voice_param(voice, param, value),
+        _ => false,
+    }
+}
+
+/// Reads a **voice-specific** parameter (F-039 V1b) from an instrument's
+/// [`VoiceSpec`]. The built-in synth's `Attack` / `Decay` / `Sustain` /
+/// `Release` / `Resonance` never reach here (`node_param_value` matches them
+/// first).
+fn voice_param_value(voice: &VoiceSpec, param: NodeParam) -> Option<f32> {
+    match (voice, param) {
+        (VoiceSpec::Modal { params }, NodeParam::ModalDecay) => Some(params.decay_scale),
+        (VoiceSpec::Modal { params }, NodeParam::ModalBeating) => Some(params.beating),
+        (VoiceSpec::Modal { params }, NodeParam::ModalHardness) => Some(params.hardness),
+        (VoiceSpec::Modal { params }, NodeParam::ModalBrightness) => Some(params.brightness),
+        (VoiceSpec::Modal { params }, NodeParam::ModalGain) => Some(params.gain),
+        (VoiceSpec::Pluck { params }, NodeParam::PluckDecay) => Some(params.decay_s),
+        (VoiceSpec::Pluck { params }, NodeParam::PluckDamping) => Some(params.damping),
+        (VoiceSpec::Pluck { params }, NodeParam::PluckBrightness) => Some(params.brightness),
+        (VoiceSpec::Pluck { params }, NodeParam::PluckRelease) => Some(params.release_s),
+        (VoiceSpec::Pluck { params }, NodeParam::PluckGain) => Some(params.gain),
+        (VoiceSpec::Organ { params }, NodeParam::OrganBar(index)) => params
+            .bars
+            .get(usize::from(index))
+            .map(|bar| f32::from(*bar)),
+        (VoiceSpec::Organ { params }, NodeParam::OrganPercussion) => Some(params.percussion),
+        (VoiceSpec::Organ { params }, NodeParam::OrganPercussionDecay) => {
+            Some(params.percussion_decay_s)
+        }
+        (VoiceSpec::Organ { params }, NodeParam::OrganAttack) => Some(params.attack_s),
+        (VoiceSpec::Organ { params }, NodeParam::OrganRelease) => Some(params.release_s),
+        (VoiceSpec::Organ { params }, NodeParam::OrganGain) => Some(params.gain),
+        (VoiceSpec::Wavetable { params }, NodeParam::WavetablePosition) => Some(params.position),
+        (VoiceSpec::Wavetable { params }, NodeParam::WavetableAttack) => Some(params.attack_s),
+        (VoiceSpec::Wavetable { params }, NodeParam::WavetableRelease) => Some(params.release_s),
+        (VoiceSpec::Wavetable { params }, NodeParam::WavetableGain) => Some(params.gain),
+        (VoiceSpec::SoundFont { gain, .. }, NodeParam::Sf2Gain) => Some(*gain),
+        (VoiceSpec::Sample { gain, .. }, NodeParam::SampleGain) => Some(*gain),
+        _ => None,
+    }
+}
+
+/// Writes a voice-specific parameter, clamping to its documented domain.
+fn set_voice_param(voice: &mut VoiceSpec, param: NodeParam, value: f32) -> bool {
+    match (voice, param) {
+        (VoiceSpec::Modal { params }, NodeParam::ModalDecay) => {
+            params.decay_scale = value.clamp(0.25, 4.0);
+            true
+        }
+        (VoiceSpec::Modal { params }, NodeParam::ModalBeating) => {
+            params.beating = value.clamp(0.0, 2.0);
+            true
+        }
+        (VoiceSpec::Modal { params }, NodeParam::ModalHardness) => {
+            params.hardness = value.clamp(0.0, 1.0);
+            true
+        }
+        (VoiceSpec::Modal { params }, NodeParam::ModalBrightness) => {
+            params.brightness = value.clamp(0.0, 1.0);
+            true
+        }
+        (VoiceSpec::Modal { params }, NodeParam::ModalGain) => {
+            params.gain = value.clamp(0.0, 2.0);
+            true
+        }
+        (VoiceSpec::Pluck { params }, NodeParam::PluckDecay) => {
+            params.decay_s = value.clamp(0.1, 20.0);
+            true
+        }
+        (VoiceSpec::Pluck { params }, NodeParam::PluckDamping) => {
+            params.damping = value.clamp(0.0, 1.0);
+            true
+        }
+        (VoiceSpec::Pluck { params }, NodeParam::PluckBrightness) => {
+            params.brightness = value.clamp(0.0, 1.0);
+            true
+        }
+        (VoiceSpec::Pluck { params }, NodeParam::PluckRelease) => {
+            params.release_s = value.clamp(0.005, 2.0);
+            true
+        }
+        (VoiceSpec::Pluck { params }, NodeParam::PluckGain) => {
+            params.gain = value.clamp(0.0, 2.0);
+            true
+        }
+        (VoiceSpec::Organ { params }, NodeParam::OrganBar(index)) => {
+            let Some(bar) = params.bars.get_mut(usize::from(index)) else {
+                return false;
+            };
+            *bar = value.clamp(0.0, 8.0).round() as u8;
+            true
+        }
+        (VoiceSpec::Organ { params }, NodeParam::OrganPercussion) => {
+            params.percussion = value.clamp(0.0, 1.0);
+            true
+        }
+        (VoiceSpec::Organ { params }, NodeParam::OrganPercussionDecay) => {
+            params.percussion_decay_s = value.clamp(0.1, 2.0);
+            true
+        }
+        (VoiceSpec::Organ { params }, NodeParam::OrganAttack) => {
+            params.attack_s = value.clamp(0.001, 0.2);
+            true
+        }
+        (VoiceSpec::Organ { params }, NodeParam::OrganRelease) => {
+            params.release_s = value.clamp(0.005, 1.0);
+            true
+        }
+        (VoiceSpec::Organ { params }, NodeParam::OrganGain) => {
+            params.gain = value.clamp(0.0, 2.0);
+            true
+        }
+        (VoiceSpec::Wavetable { params }, NodeParam::WavetablePosition) => {
+            params.position = value.clamp(0.0, 1.0);
+            true
+        }
+        (VoiceSpec::Wavetable { params }, NodeParam::WavetableAttack) => {
+            params.attack_s = value.clamp(0.001, 2.0);
+            true
+        }
+        (VoiceSpec::Wavetable { params }, NodeParam::WavetableRelease) => {
+            params.release_s = value.clamp(0.005, 5.0);
+            true
+        }
+        (VoiceSpec::Wavetable { params }, NodeParam::WavetableGain) => {
+            params.gain = value.clamp(0.0, 2.0);
+            true
+        }
+        (VoiceSpec::SoundFont { gain, .. }, NodeParam::Sf2Gain) => {
+            *gain = value.clamp(0.0, 2.0);
+            true
+        }
+        (VoiceSpec::Sample { gain, .. }, NodeParam::SampleGain) => {
+            *gain = value.clamp(0.0, 2.0);
+            true
+        }
         _ => false,
     }
 }
@@ -3024,13 +3161,49 @@ pub fn set_node_param(node: &mut NodeDoc, param: NodeParam, value: f32) -> bool 
 /// nodes gain first-class read/write support.
 pub fn node_param_keys(node: &NodeDoc) -> Vec<NodeParam> {
     match node {
-        NodeDoc::Instrument { .. } => vec![
-            NodeParam::Resonance,
-            NodeParam::Attack,
-            NodeParam::Decay,
-            NodeParam::Sustain,
-            NodeParam::Release,
-        ],
+        NodeDoc::Instrument { voice, .. } => match voice {
+            VoiceSpec::Builtin => vec![
+                NodeParam::Resonance,
+                NodeParam::Attack,
+                NodeParam::Decay,
+                NodeParam::Sustain,
+                NodeParam::Release,
+            ],
+            VoiceSpec::Modal { .. } => vec![
+                NodeParam::ModalDecay,
+                NodeParam::ModalBeating,
+                NodeParam::ModalHardness,
+                NodeParam::ModalBrightness,
+                NodeParam::ModalGain,
+            ],
+            VoiceSpec::Pluck { .. } => vec![
+                NodeParam::PluckDecay,
+                NodeParam::PluckDamping,
+                NodeParam::PluckBrightness,
+                NodeParam::PluckRelease,
+                NodeParam::PluckGain,
+            ],
+            VoiceSpec::Organ { .. } => {
+                let mut keys: Vec<NodeParam> = (0..9u8).map(NodeParam::OrganBar).collect();
+                keys.extend([
+                    NodeParam::OrganPercussion,
+                    NodeParam::OrganPercussionDecay,
+                    NodeParam::OrganAttack,
+                    NodeParam::OrganRelease,
+                    NodeParam::OrganGain,
+                ]);
+                keys
+            }
+            VoiceSpec::Wavetable { .. } => vec![
+                NodeParam::WavetablePosition,
+                NodeParam::WavetableAttack,
+                NodeParam::WavetableRelease,
+                NodeParam::WavetableGain,
+            ],
+            VoiceSpec::SoundFont { .. } => vec![NodeParam::Sf2Gain],
+            VoiceSpec::Sample { .. } => vec![NodeParam::SampleGain],
+            _ => Vec::new(),
+        },
         NodeDoc::Mixer { channels, .. } => {
             let mut keys = Vec::new();
             for channel in 0..channels.len() as u8 {
@@ -6989,6 +7162,71 @@ mod tests {
             super::node_param_value(&mixer, NodeParam::MixerOutMute),
             Some(1.0)
         );
+    }
+
+    #[test]
+    fn voice_params_read_and_write() {
+        let mut instrument = NodeDoc::Instrument {
+            node_id: 2,
+            track: 0,
+            voice: VoiceSpec::Modal {
+                params: super::ModalParams::default(),
+            },
+            synth: SynthParams::default(),
+        };
+        assert!(super::set_node_param(
+            &mut instrument,
+            NodeParam::ModalDecay,
+            2.5
+        ));
+        assert_eq!(
+            super::node_param_value(&instrument, NodeParam::ModalDecay),
+            Some(2.5)
+        );
+        // Voice-specific keys, not the synth's, are advertised.
+        let keys = super::node_param_keys(&instrument);
+        assert!(keys.contains(&NodeParam::ModalDecay));
+        assert!(!keys.contains(&NodeParam::Attack));
+
+        // Organ drawbars are indexed and clamped to 0..8.
+        let mut organ = NodeDoc::Instrument {
+            node_id: 3,
+            track: 0,
+            voice: VoiceSpec::Organ {
+                params: super::OrganParams::default(),
+            },
+            synth: SynthParams::default(),
+        };
+        assert!(super::set_node_param(
+            &mut organ,
+            NodeParam::OrganBar(4),
+            9.0
+        ));
+        assert_eq!(
+            super::node_param_value(&organ, NodeParam::OrganBar(4)),
+            Some(8.0)
+        );
+        assert_eq!(
+            super::node_param_value(&organ, NodeParam::OrganBar(9)),
+            None,
+            "the ninth drawbar is out of range"
+        );
+
+        // A SoundFont voice exposes its output gain.
+        let mut sf2 = NodeDoc::Instrument {
+            node_id: 4,
+            track: 0,
+            voice: VoiceSpec::SoundFont {
+                path: String::new(),
+                bank: 0,
+                program: 0,
+                gain: 1.0,
+                bend_range: 2.0,
+            },
+            synth: SynthParams::default(),
+        };
+        assert!(super::set_node_param(&mut sf2, NodeParam::Sf2Gain, 1.5));
+        assert_eq!(super::node_param_value(&sf2, NodeParam::Sf2Gain), Some(1.5));
     }
 
     fn effect_node(params: EffectParams) -> NodeDoc {

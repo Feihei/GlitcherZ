@@ -566,7 +566,7 @@ mod tests {
         let result = commands_list(&mut server, &json!({})).expect("call");
         let value: Value = serde_json::from_str(&result.text).expect("json");
         let commands = value["commands"].as_array().expect("commands");
-        assert_eq!(commands.len(), 22);
+        assert_eq!(commands.len(), 23);
         assert!(
             commands
                 .iter()

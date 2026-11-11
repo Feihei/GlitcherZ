@@ -1686,6 +1686,15 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - 测试：`clipboard` 5 条（相对偏移、负锚点 clamp、first-match 定位、包围盒对齐、内部线筛选）+ `patch` 的 `ctrl_c_on_the_patch_requests_a_copy`（真实 egui 帧 + hover + `COMMAND`）。
 - **门禁**：`cargo fmt` / `cargo clippy --workspace --all-targets -D warnings` 干净；`cargo test -p glitcherz-ui` 与 `cargo test --workspace` 全 `ok. 0 failed`（FSM 的 FAIL 为已知误报，以原始 `test result` 与退出码为准）。
 
+#### 命令词汇表 V1b-1：声源参数 + graph.set_voice（2026-11-11 交付）
+
+- model：`node_param_value` / `set_node_param` 增加 `VoiceSpec` 分支（`voice_param_value` / `set_voice_param`）——覆盖 Modal（decay / beating / hardness / brightness / gain）、Pluck（decay / damping / brightness / release / gain）、Organ（9 个 drawbar + percussion / decay / attack / release / gain）、Wavetable（position / attack / release / gain）、SoundFont gain、Sample gain；全部按 `node_param_range` 的域 clamp（Organ drawbar 取整、越界 index 返回不支持）。
+- `node_param_keys` 按 `VoiceSpec` 返回可写 key：Builtin → synth 五参数；Modal / Pluck / Wavetable → 各自；Organ → 9 个 `organ_bar` + 5 个宏观参数；SoundFont / Sample → 各自的 gain；插件 voice 为空。
+- 新命令 `graph.set_voice {node, voice: builtin|modal|pluck|organ|wavetable}`：切换 `VoiceSpec` 到对应内置音色的默认参数；只对 instrument 节点有效，文件音色（SF2 / sample）与插件拒绝。命令数 22 → 23。
+- 测试：model `voice_params_read_and_write`（Modal decay、Organ bar clamp / 越界、Sf2 gain、keys 按 voice）；command `graph_set_voice_switches_and_exposes_voice_params`（切换 → 调 `modal_decay` → 文档读回 + query 只列该 voice 参数 + `sf2` 拒绝）。
+- **门禁**：`cargo check -p glitcherz-model -p glitcherz-command --all-targets` / `cargo clippy -p glitcherz-model -p glitcherz-command --all-targets -- -D warnings` 干净；`cargo test -p glitcherz-model voice_param` 与 `cargo test -p glitcherz-command --test transactional graph_set_voice` 均 `ok. 1 passed; 0 failed`。**全量 `cargo test --workspace` 本轮无法跑完**：工作区 UI 有未提交的 F-040 剪贴板在途改动（`timeline.rs` 引用 `clipboard::…` 而 `lib.rs` 缺 `mod clipboard;`），与本轮无关、未触碰。
+- **V1b-2 待做**：`effect_slot` 读写（需把 `glitcherz-ui::effect` 的槽映射下沉到 model，`EffectParams::slot_value` / `set_slot_value` / `slot_count`）。
+
 #### 阶段边界（自 plan.md 归位）
 
 - **Y 系列 S0**：不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（stems / 24-bit / 采样率选择）。
