@@ -30,9 +30,23 @@
 - [ ] **空闲重绘**（review 2026-11-01 遗留）：`request_repaint_after(50 ms)` 目前无条件调用，建议只在播放中 / 电平可见时开——纯 UI 性能项，不碰引擎。
 - [ ] **录音 PDC 自动对齐**（review 2026-11-01 遗留）：PDC 已进图（S2-3），但 R5 仍靠手动 `Latency` offset；自动值需要汇总「输入设备 → 轨道链」的往返延迟。
 - **S5 之后的硬阻塞**（Y 系列收官时记下的三条）：
-  - **命令词汇表**是唯一的硬阻塞——16 条 `midi.*` 全都作用于既有 clip，改音色参数也还没有稳定字符串名（`NodeParam` 只有 UI 显示名）。MCP 能「改音符」但改不了「用什么音色」、也开不了新 clip。这一期 = `NodeParam` 稳定名 + `clip.add` + `graph.set_param`，按 `spec/` 的规矩先写独立 spec。
+  - **命令词汇表**（**F-039，2026-11-11 已立项**，见下方小节）——`midi.*` 全都作用于既有 clip，改音色参数也还没有稳定字符串名。MCP 能「改音符」但改不了「用什么音色」、也开不了新 clip。这一期 = `NodeParam` 稳定名 + `clip.add` + `graph.set_param`，spec 已写：`spec/command-vocabulary.md`（D1–D8）。
   - **用户表导入**（Wavetable S3 留的口子）：`.wav` / `.wt` 文件、命名、缓存淘汰、文件对话 UI；风险全在文件与 UI，不在 DSP。
   - **安全边界**：现在只管客户端给的路径，工程内部引用的媒体 / SF2 路径照单全收（等同于在窗口里打开一个不信任的工程）。要做就得先有「工程信任模型」。
+
+## 命令词汇表（F-039，2026-11-11 立项）
+
+用户一句话需求：**MCP 能改音符，也要能换音色、开新 clip**。
+
+Spec：`spec/command-vocabulary.md`（D1–D8：`NodeParam` 稳定 key、`node_id` 寻址、插件参数 V1 不做、`clip.add` 仅 MIDI、不新增 MCP 工具）。
+
+| 里程碑 | 内容 | 依赖 | 规模 |
+| :--- | :--- | :--- | :--- |
+| **V1** 参数词汇表 | `NodeParam::key()` / `from_key()` + `graph.set_param` + `graph.query` | — | 中 |
+| **V2** `clip.add` | `clip.add`（MIDI） | — | 小 |
+| **V3** 端到端 | MCP `commands_run` 测试、CLI、`docs/` 同步 | V1、V2 | 小 |
+
+顺序：**V1 → V2 → V3**；每个里程碑单独提交。
 
 ## 吸附统一与拍号变化（Met 系列 → F-033 / F-018，2026-11-10 立项）
 
