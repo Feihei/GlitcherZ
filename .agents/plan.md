@@ -44,7 +44,7 @@ Spec：`spec/command-vocabulary.md`（D1–D8：`NodeParam` 稳定 key、`node_i
 | :--- | :--- | :--- | :--- |
 | **V1a** 参数词汇表（2026-11-11 交付） | `NodeParam` 稳定 key + `graph.set_param` / `graph.query`（synth / mixer / feedback） | — | 中 |
 | **V1b** 效果器 / 声源参数 | `effect_slot` + 声源参数 + `graph.set_voice` | V1a | 中 |
-| **V2** `clip.add` | `clip.add`（MIDI） | — | 小 |
+| **V2** `clip.add`（2026-11-11 交付） | `clip.add`（MIDI）：按拍号段默认时长，`span = loop` | — | 小 |
 | **V3** 端到端 | MCP `commands_run` 测试、CLI、`docs/` 同步 | V1a、V2 | 小 |
 
 顺序：**V1a → V1b → V2 → V3**；每个里程碑单独提交。

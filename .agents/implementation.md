@@ -1660,6 +1660,14 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - **门禁**：`cargo fmt --all` / `cargo clippy --workspace --all-targets -D warnings` 干净；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
 - **V1a 覆盖边界**：`effect_slot` 与 Modal / Pluck / Organ / Wavetable / Sf2 / Sample 参数尚未读写（`set_param` 返回 unsupported），`graph.set_voice` 未做 —— 归 V1b。
 
+#### 命令词汇表 V2：clip.add（2026-11-11 交付）
+
+- 新 `glitcherz-command/src/clip.rs`：`clip.add {track, lane? midi, start_ticks? 0, span_ticks? bar, name?} → {clip, start_ticks, span_ticks, loop_ticks}`。
+- 默认 `span_ticks` = 起点所在拍号段的一小节（`Project::ticks_per_bar_at`，Met M4 语义），`loop_ticks = span_ticks`（一个内容周期 = 整段）；`start + span` 收敛到 `MAX_ARRANGEMENT_TICKS`；上限 `MAX_CLIPS_PER_TRACK`；`lane` 只接受 `midi`（control / audio 需目标 / 媒体路径，归后续）。
+- 命令数 21 → 22；新 clip 可直接被 `midi.note_add` 写入（命令按 `track` + `clip` 索引寻址）。
+- 测试：`clip_add_creates_an_empty_midi_clip`（追加、命名、`span == loop`、空内容、可写音符、`lane` 非 midi 报错）。
+- **门禁**：fmt / clippy workspace 干净；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
+
 #### 阶段边界（自 plan.md 归位）
 
 - **Y 系列 S0**：不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（stems / 24-bit / 采样率选择）。

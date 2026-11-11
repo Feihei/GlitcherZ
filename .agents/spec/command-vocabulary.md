@@ -56,7 +56,7 @@ S5 收官时记下的硬阻塞：MCP 已能改音符（`midi.*` 19 条命令，F
 | :--- | :--- | :--- | :--- |
 | **V1a** 参数词汇表（2026-11-11 交付） | `NodeParam::key()` / `from_key()` / `from_key_indexed()` + `node_param_range` / `node_param_value` / `set_node_param` / `node_param_keys`；`graph.set_param` + `graph.query`。覆盖 instrument synth（resonance / attack / decay / sustain / release）、mixer channel（gain / pan / mute / solo）与 out pan / mute、feedback gain | — | 中 |
 | **V1b** 效果器 / 声源参数 | `effect_slot` 读写（需 effect 描述符槽映射）+ Modal / Pluck / Organ / Wavetable / Sf2 / Sample 参数 + `graph.set_voice` | V1a | 中 |
-| **V2** `clip.add` | `clip.add`（MIDI） | — | 小 |
+| **V2** `clip.add`（2026-11-11 交付） | `clip.add`（MIDI）：按拍号段给默认时长，`span = loop`，push 到轨道末尾 | — | 小 |
 | **V3** 端到端 | MCP `commands_run` 测试、CLI、`docs/`、plan 同步 | V1a、V2 | 小 |
 
 ## 5. 明确不做

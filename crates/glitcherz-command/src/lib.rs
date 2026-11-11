@@ -38,6 +38,7 @@ use std::sync::Arc;
 use glitcherz_model::Project;
 use serde_json::Value;
 
+mod clip;
 mod graph;
 mod midi;
 mod registry;

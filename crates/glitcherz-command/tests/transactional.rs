@@ -448,6 +448,46 @@ fn restore_rolls_back_without_touching_history() {
 }
 
 #[test]
+fn clip_add_creates_an_empty_midi_clip() {
+    let mut session = Session::new(Project::default());
+    let before = session.project().midi_tracks[0].clips.len();
+    let outcome = session
+        .execute("clip.add", &json!({ "track": 0, "name": "Verse" }))
+        .expect("add");
+    assert_eq!(
+        session.project().midi_tracks[0].clips.len(),
+        before + 1,
+        "one clip appended"
+    );
+    let index = outcome["clip"].as_u64().expect("clip index") as usize;
+    let clip = &session.project().midi_tracks[0].clips[index];
+    assert_eq!(clip.name, "Verse");
+    assert_eq!(clip.start_ticks, 0);
+    assert!(clip.span_ticks > 0);
+    assert_eq!(clip.span_ticks, clip.loop_ticks, "one content period");
+    assert!(clip.notes().is_empty(), "the clip starts empty");
+
+    // The new clip accepts notes through the existing MIDI command.
+    session
+        .execute(
+            "midi.note_add",
+            &json!({ "track": 0, "clip": index, "start_ticks": 0, "note": 60 }),
+        )
+        .expect("note");
+    assert_eq!(
+        session.project().midi_tracks[0].clips[index].notes().len(),
+        1
+    );
+
+    // V2 is MIDI-only: control / audio clips need a target / media path.
+    assert!(
+        session
+            .execute("clip.add", &json!({ "track": 0, "lane": "audio" }))
+            .is_err()
+    );
+}
+
+#[test]
 fn graph_set_param_and_query_round_trip() {
     let mut session = Session::new(Project::default());
     let node_id = session

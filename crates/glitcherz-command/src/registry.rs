@@ -139,6 +139,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         let mut v = Vec::new();
         v.extend(crate::midi::specs());
         v.extend(crate::graph::specs());
+        v.extend(crate::clip::specs());
         v
     })
 }
