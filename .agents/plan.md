@@ -77,12 +77,12 @@ Spec：`spec/clip-data-instances.md`（D1–D17）。
 | 里程碑 | 内容 | 依赖 | 规模 |
 | :--- | :--- | :--- | :--- |
 | **M0** 文档（2026-11-11 完成） | 本 spec + 注册表 + 本小节 | — | 小 |
-| **M1** model | 数据池 + clip 结构 + helper + `validate` + `approx_bytes` + `PROJECT_VERSION 11→12` 迁移，**行为零变化**、单独提交 | M0 | 大 |
-| **M2** engine | `RtMidiClip` / `RtControlClip` 字段 + 相位调度 + 4 条数学单测 | M1 | 中 |
-| **M3** 接入 | `command` helper + `headless::midi_clip_table` + `sync_clip_data` + 剪贴板快照扩展 | M2 | 中 |
-| **M4** 卷帘 | 编辑范围 `length_ticks` + 窗口标线 + 窗降透明度 | M3 | 中偏大 |
-| **M5** timeline | `Placement` / trim / split / T / tile / 三种复制 / `×N` / seam | M3 | 中 |
-| **M6** UI 入口 | header 徽章 + Inspector clip 区块 + Edit 头 + 右键菜单 + `clip.link_data` / `clip.unlink_data` + 文档 | M4、M5 | 中 |
+| **M1** model（2026-11-11 交付） | 数据池 + clip 结构 + helper + `validate` + `approx_bytes` + `PROJECT_VERSION 11→12` 迁移 | M0 | 大 |
+| **M2** engine（2026-11-11 交付） | `RtMidiClip` / `RtControlClip` 字段 + 相位调度 + 长音符 / 头截断单测 | M1 | 中 |
+| **M3** 接入（2026-11-11 交付） | `command` helper + `headless::midi_clip_table` + 剪贴板成对快照（`MidiClip, MidiData` / `ControlClip, CurveData`） | M2 | 中 |
+| **M4** 卷帘（2026-11-11 交付编辑对象） | 编辑范围 `length_ticks`（窗口标线 / 窗降透明度留待后续打磨） | M3 | 中偏大 |
+| **M5** timeline（2026-11-11 交付） | `Placement` / trim / split / T / tile / 三种复制 / `×N` / seam | M3 | 中 |
+| **M6** UI 入口（2026-11-11 交付） | header 徽章 + Inspector clip 区块 + Edit 头 + `Ctrl+Shift+D` + `clip.link_data` / `clip.unlink_data` + 文档 | M4、M5 | 中 |
 | **M7** 数据面板（可选） | 池浏览 / 命名 / 批量替换引用 | M6 | 大 |
 
 顺序：**M1 → M2 → M3 → M4 / M5（可并行）→ M6 → M7**。

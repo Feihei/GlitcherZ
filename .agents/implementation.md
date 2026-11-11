@@ -272,6 +272,18 @@ spec `.agents/spec/dual-audio-input.md`。目标不是「加一个效果器」�
 
 ## 编辑与视图
 
+### F-041 · clip 与数据分离（2026-11-11 交付）
+
+- **数据池**：`Project.midi_data: Vec<MidiData>` / `curve_data: Vec<CurveData>`；clip 只存 `data: u32` + `source_offset` + `span_ticks`。`loop_ticks` 退休为 `data.length_ticks`；播放位置 = `(source_offset + t) mod length_ticks`。
+- **撤销 / 序列化**：池是 `Project` 的普通字段，`Arc<Project>` 快照天然隔离；运行时允许孤儿条目（`MAX_CLIP_DATA_ENTRIES = 4096`），保存时用临时副本 compact，不改内存索引。
+- **迁移 v11→v12**：`adopt_inline_content` 把每个旧 clip 的 `legacy_loop_ticks` / `legacy_sequence` / `legacy_curve` 移入池，`source_offset = 0`；SMF 导入与录音也先构造 legacy 内容，再在合入工程时 adopt。
+- **引擎**：`RtMidiClip` / `RtControlClip` 改 `source_offset + length_ticks`；头截断只发一个截断实例（不再重复触发），尾音保持自然长度跨窗口末尾；`value_at_absolute` 用 `(source_offset + local).rem_euclid(length)`。
+- **非破坏窗口**：头裁只 `source_offset += delta`、`span -= delta`；split 两半共享同一 `data`；tile 只改 `span`；`Placement` 删除 `loop_len` / `set_loop`，新增 `split_right`。
+- **剪贴板**：`ClipSnapshot::Midi(MidiClip, MidiData)` / `Control(ControlClip, CurveData)`；粘贴时 `push_midi_data` / `push_curve_data` 生成新索引，跨工程安全。
+- **影响面**：`sync_clip_row` 仍是单轨重推；跨轨共享的内容编辑用 `sync_selection_rows`（Link / Unlink）覆盖所有受影响 track。
+- **UI**：clip header 追加 `· shared:N`（ASCII，仅 N>1）；Inspector 新增 clip 区块（`Clip data · MIDI #id · shared by N clip(s)` + `Unlink` / `Link Data`）；Edit 头显示 `· shared by N clips`；`Ctrl+Shift+D` = Duplicate with New Data（`Shift+D` 保持共享）。
+- **命令**：`clip.link_data {track, clip, source_track, source_clip}` / `clip.unlink_data {track, clip}`；命令数 23 → 25（MCP / CLI 断言已同步）。
+
 ### UI（`glitcherz-ui`，eframe 0.36 glow）
 
 - **File 菜单**（U2 收口）：New / Open… / Open Recent ▸ / Save / Save As… / Import MIDI… / Export MIDI…，快捷键 `Ctrl+N` / `Ctrl+O` / `Ctrl+S` / `Ctrl+Shift+S`（优先于演奏键盘映射）；最近文件经 eframe `persistence` 存 RON，容量 8；窗口标题每帧按「文件名 + 未保存 `*`」重算；状态栏消息（8 秒自动消失）；`--open <文件>` 启动加载；
