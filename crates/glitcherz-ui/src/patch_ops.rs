@@ -238,6 +238,9 @@ impl GlitcherZApp {
     pub(crate) fn apply_patch_actions(&mut self, actions: Vec<patch::PatchAction>) {
         for action in actions {
             match action {
+                patch::PatchAction::CopySelection => self.copy_patch_selection(),
+                patch::PatchAction::PasteNodes { at } => self.paste_patch_nodes(at),
+                patch::PatchAction::DuplicateNodes { at } => self.duplicate_patch_nodes(at),
                 patch::PatchAction::AddNode { source, at } => {
                     self.add_patch_node(source, at);
                 }
@@ -568,6 +571,193 @@ impl GlitcherZApp {
             }
             None => {}
         }
+    }
+
+    /// F-040: snapshot the selected patch nodes (with their graph-space
+    /// positions) and the cables wholly inside the selection into the app
+    /// clipboard. A detached value copy, not ids.
+    pub(crate) fn copy_patch_selection(&mut self) {
+        let ids = self.patch_state.selected_node_ids();
+        if ids.is_empty() {
+            self.set_message("Copy: nothing selected".to_string());
+            return;
+        }
+        let mut nodes = Vec::new();
+        for id in &ids {
+            let Some(node) = self.project().graph.node_by_id(*id).cloned() else {
+                continue;
+            };
+            let pos = self.patch_state.node_position(*id).unwrap_or_default();
+            nodes.push((node, pos));
+        }
+        let cables = self.project().graph.cables.iter().cloned();
+        let Some(copy) = clipboard::NodesCopy::collect(nodes, cables) else {
+            self.set_message("Copy: nothing selected".to_string());
+            return;
+        };
+        let count = copy.nodes.len();
+        self.clipboard = Some(clipboard::Clipboard::Nodes(copy));
+        self.set_message(format!("Copied {count} node(s)"));
+    }
+
+    /// F-040: paste the clipboard's nodes at `at` (graph space).
+    pub(crate) fn paste_patch_nodes(&mut self, at: egui::Pos2) {
+        let copy = match self.clipboard.as_ref() {
+            Some(clipboard::Clipboard::Nodes(copy)) => copy.clone(),
+            Some(other) => {
+                let label = other.label();
+                self.set_message(format!("Paste: the clipboard holds {label} (not nodes)"));
+                return;
+            }
+            None => {
+                self.set_message("Paste: the clipboard is empty".to_string());
+                return;
+            }
+        };
+        self.insert_node_cluster(copy, at, "Paste Nodes");
+    }
+
+    /// F-040: `Shift+D` — duplicate the current selection at `at` without
+    /// touching the clipboard (spec §4.3).
+    pub(crate) fn duplicate_patch_nodes(&mut self, at: egui::Pos2) {
+        let ids = self.patch_state.selected_node_ids();
+        if ids.is_empty() {
+            self.set_message("Duplicate: nothing selected".to_string());
+            return;
+        }
+        let mut nodes = Vec::new();
+        for id in &ids {
+            let Some(node) = self.project().graph.node_by_id(*id).cloned() else {
+                continue;
+            };
+            let pos = self.patch_state.node_position(*id).unwrap_or_default();
+            nodes.push((node, pos));
+        }
+        let cables = self.project().graph.cables.iter().cloned();
+        let Some(copy) = clipboard::NodesCopy::collect(nodes, cables) else {
+            return;
+        };
+        self.insert_node_cluster(copy, at, "Duplicate Nodes");
+    }
+
+    /// Installs a copied node cluster: fresh ids, engine install, internal
+    /// cables reconnected, positions shifted so the top-left corner lands on
+    /// `at`. One undo step. A node the engine refuses is skipped individually
+    /// (with its cables) so the document and the engine stay in sync.
+    fn insert_node_cluster(&mut self, copy: clipboard::NodesCopy, at: egui::Pos2, label: &str) {
+        let sample_rate = self.engine.info().sample_rate;
+        let positions = copy.placed(at);
+        let before = self.begin_edit();
+        self.session.suspend_history();
+        let mut mapping: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        let mut created = Vec::new();
+        let mut skipped = 0usize;
+        for ((source, _), pos) in copy.nodes.iter().zip(positions) {
+            if self.project().graph.nodes.len() >= MAX_NODES {
+                skipped += 1;
+                continue;
+            }
+            let new_id = self.project().graph.next_node_id();
+            let mut node = source.clone();
+            node.set_node_id(new_id);
+            if node.is_keyboard() && self.project().graph.computer_keyboard().is_some() {
+                skipped += 1;
+                continue;
+            }
+            let expects_guard = matches!(
+                node,
+                NodeDoc::Instrument {
+                    voice: VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. },
+                    ..
+                } | NodeDoc::Effect {
+                    voice: VoiceSpec::Clap { .. } | VoiceSpec::Vst3 { .. },
+                    ..
+                }
+            );
+            self.project_mut().graph.nodes.push(node.clone());
+            self.install_node(&node, sample_rate);
+            let engine_id = self.node_map.get(&new_id).copied();
+            let installed = node.is_keyboard()
+                || engine_id.is_some_and(|engine_id| {
+                    !expects_guard
+                        || self
+                            .voice_guards
+                            .iter()
+                            .any(|entry| entry.node_id == engine_id)
+                });
+            if !installed {
+                self.project_mut()
+                    .graph
+                    .nodes
+                    .retain(|n| n.node_id() != new_id);
+                if let Some(engine_id) = engine_id {
+                    self.engine.remove_node(engine_id);
+                    self.node_map.remove(&new_id);
+                }
+                skipped += 1;
+                continue;
+            }
+            self.patch_state.place_node(new_id, pos);
+            if matches!(node, NodeDoc::Input { .. }) {
+                self.engine.set_input_monitor(true);
+            }
+            mapping.insert(source.node_id(), new_id);
+            created.push(new_id);
+        }
+        let mut cable_count = 0usize;
+        for cable in &copy.cables {
+            let (PortRef::Node(from), PortRef::Node(to)) = (&cable.from, &cable.to) else {
+                continue;
+            };
+            let (Some(&new_from), Some(&new_to)) = (mapping.get(from), mapping.get(to)) else {
+                continue;
+            };
+            match cable.kind {
+                CableKind::Audio => {
+                    self.connect_audio(new_from, PortRef::Node(new_to), cable.in_port);
+                    cable_count += 1;
+                }
+                CableKind::Midi => {
+                    self.connect_event_cable(
+                        new_from,
+                        new_to,
+                        CableKind::Midi,
+                        cable.param.clone(),
+                    );
+                    cable_count += 1;
+                }
+                CableKind::Automation => {
+                    self.connect_event_cable(
+                        new_from,
+                        new_to,
+                        CableKind::Automation,
+                        cable.param.clone(),
+                    );
+                    cable_count += 1;
+                }
+            }
+        }
+        self.session.resume_history();
+        if created.is_empty() {
+            let hint = if skipped > 0 {
+                "node table full / plug-in refused"
+            } else {
+                "nothing selected"
+            };
+            self.set_message(format!("{label} failed: {hint}"));
+            return;
+        }
+        self.commit_edit(label, before);
+        self.patch_state.select_node_ids(&created);
+        let suffix = if skipped > 0 {
+            format!(" ({skipped} skipped)")
+        } else {
+            String::new()
+        };
+        self.set_message(format!(
+            "{label}: {} node(s), {cable_count} cable(s){suffix}",
+            created.len()
+        ));
     }
 
     /// Add a new document node from the patch context menu: allocate the next document

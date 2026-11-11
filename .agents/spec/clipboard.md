@@ -94,7 +94,7 @@ Timeline 的 clip 类型三分支（MIDI / Control / Audio）与 `timeline_dupli
 - 每个新节点 `node_id = graph.next_node_id()` 依序分配；`NodeDoc` 的 `node_id` 字段重写（model 新增 `NodeDoc::set_node_id`）。
 - 位置 `new_pos = at + (old_pos - bbox_min)`，保证簇内相对位置不变。
 - `cables` 只复制两端都在集合内的线；端点 id 映射到新 id，`kind` / `param` / `in_port` 原样保留。跨选择边界的外部连线不复制。
-- 逐个 `install_node`（插件节点会重新实例化并沿用 `VoiceSpec` 里的 state）。任一节点安装失败（引擎槽满 / 插件加载失败）→ **整次粘贴回滚**文档并提示，保证文档与引擎一致。
+- 逐个 `install_node`（插件节点会重新实例化并沿用 `VoiceSpec` 里的 state）。引擎拒绝的节点（槽满 / 插件加载失败）**单独跳过**，其内部连线一并丢弃；成功节点保留，文档与引擎始终一致，状态栏报告跳过数量。
 - 粘贴后选区 = 新节点集合。
 - `Shift+D` = 对当前选中集执行同一套复制 + 在指针处落位 + 选中副本，一次 undo；位置属于视图 layout，之后可继续用鼠标拖动（拖动不入 undo，与现状一致）。
 

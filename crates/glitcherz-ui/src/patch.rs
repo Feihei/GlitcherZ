@@ -777,6 +777,19 @@ pub enum PatchAction {
         source: NodeSource,
         at: Pos2,
     },
+    /// Copy the selected nodes and the cables wholly inside the selection to
+    /// the app clipboard (F-040). Not a document edit.
+    CopySelection,
+    /// Paste the clipboard's nodes with the cluster's top-left corner at `at`
+    /// (graph space). One undo step.
+    PasteNodes {
+        at: Pos2,
+    },
+    /// Shift+D: duplicate the current selection at `at` (graph space) without
+    /// touching the clipboard. One undo step.
+    DuplicateNodes {
+        at: Pos2,
+    },
     /// Open the plugin picker for `category` (spec `plugin-browser.md` D4/D5,
     /// v3 D16): `None` category = the global `Search Nodes…` entry, whose pick
     /// decides the node category from the entry's own classification. The
@@ -2722,6 +2735,15 @@ impl PatchState {
         )
     }
 
+    /// The reverse of [`PatchState::to_screen`]: a screen point to graph space
+    /// (the paste / duplicate anchor is the pointer, spec §4.3).
+    fn to_graph(&self, rect_min: Pos2, sp: Pos2) -> Pos2 {
+        Pos2::new(
+            (sp.x - rect_min.x) / self.zoom + self.pan.x,
+            (sp.y - rect_min.y) / self.zoom + self.pan.y,
+        )
+    }
+
     /// Entity screen rect (returns `None` when no position exists).
     ///
     /// Single source of truth for entity geometry: box size is scaled by
@@ -2957,6 +2979,33 @@ impl PatchState {
     /// committing an [`PatchAction::AddNode`]; `ensure_positions` never overwrites it).
     pub fn place_node(&mut self, node_id: u64, at: Pos2) {
         self.positions.insert(PatchId::Node(node_id), at);
+    }
+
+    /// Document node ids of the current selection (fixed entities such as
+    /// Timeline / Master are view-only and never copied).
+    pub(crate) fn selected_node_ids(&self) -> Vec<u64> {
+        self.selection
+            .nodes
+            .iter()
+            .filter_map(|id| match id {
+                PatchId::Node(node_id) => Some(*node_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Graph-space position of a document node, if placed.
+    pub(crate) fn node_position(&self, node_id: u64) -> Option<Pos2> {
+        self.positions.get(&PatchId::Node(node_id)).copied()
+    }
+
+    /// Replaces the selection with `ids` (paste / duplicate select the new
+    /// nodes, mirroring the timeline's reselect behaviour).
+    pub(crate) fn select_node_ids(&mut self, ids: &[u64]) {
+        self.selection = Selection {
+            nodes: ids.iter().map(|id| PatchId::Node(*id)).collect(),
+            cables: Vec::new(),
+        };
     }
 
     /// Snapshot the current positions into a document layout (called by the glue right
@@ -5129,6 +5178,32 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             egui::Stroke::new(1.0, Color32::from_rgb(120, 170, 255)),
             egui::StrokeKind::Middle,
         );
+    }
+
+    // ---- Clipboard (F-040): Ctrl+C / Ctrl+V / Shift+D while hovering ----
+    if response.hovered() {
+        let (copy, paste, shift_d) = ui.ctx().input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::C),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::V),
+                i.consume_key(egui::Modifiers::SHIFT, egui::Key::D),
+            )
+        });
+        if copy {
+            actions.push(PatchAction::CopySelection);
+        }
+        if paste || shift_d {
+            let at = response
+                .hover_pos()
+                .or(pointer)
+                .map(|p| state.to_graph(rect.min, p))
+                .unwrap_or_else(|| state.to_graph(rect.min, rect.center()));
+            actions.push(if shift_d {
+                PatchAction::DuplicateNodes { at }
+            } else {
+                PatchAction::PasteNodes { at }
+            });
+        }
     }
 
     // ---- Delete removes the whole selection (while hovering the patch) ----
@@ -7621,5 +7696,62 @@ mod tests {
         assert_eq!(super::super::shifted_note(120, 7), Some(127));
         assert_eq!(super::super::shifted_note(120, 8), None);
         assert_eq!(super::super::shifted_note(2, -3), None);
+    }
+
+    /// F-040: hovering the patch and pressing Ctrl+C requests a clipboard
+    /// copy. The component never touches the clipboard itself — it only emits
+    /// the intent the app applies.
+    #[test]
+    fn ctrl_c_on_the_patch_requests_a_copy() {
+        let project = Project::default();
+        let track_name = |_: TrackKind, _: usize| String::new();
+        let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
+        let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
+        let deps = PatchDeps {
+            input: Default::default(),
+            doc: &project.graph,
+            track_count: project.midi_tracks.len(),
+            track_name: &track_name,
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
+        };
+        let ctx = egui::Context::default();
+        let mut state = PatchState::default();
+        state.ensure_positions(
+            &project.graph,
+            project.midi_tracks.len(),
+            project.control_tracks.len(),
+            project.audio_tracks.len(),
+        );
+        drive(
+            &ctx,
+            &mut state,
+            deps,
+            vec![egui::Event::PointerMoved(Pos2::new(400.0, 300.0))],
+            0.1,
+        );
+        let actions = drive(
+            &ctx,
+            &mut state,
+            deps,
+            vec![egui::Event::Key {
+                key: egui::Key::C,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+            0.2,
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, PatchAction::CopySelection)),
+            "Ctrl+C must ask the app for a copy"
+        );
     }
 }

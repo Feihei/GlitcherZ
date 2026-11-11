@@ -19,7 +19,7 @@
 
 路线图 1–10 全部落地；基础功能、节点图、MIDI 编辑、插件宿主、可用性（U 系列）、录音（R 系列）、内建效果器（E 系列）、声源扩展（Y / Z / B 系列）与交互打磨（I 系列）均已交付。已完成系列的设计与实现位置见下方「历史系列索引」——本文件不再逐项记录它们的实施细节。
 
-- **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）；命令词汇表（F-039）V1a / V2 / V3 已交付，V1b 待做；剪贴板（F-040）C1–C2 待做。
+- **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）；命令词汇表（F-039）V1a / V2 / V3 已交付，V1b 待做；剪贴板（F-040）C1–C2 已交付（2026-11-11）。
 - **下一步候选**：命令词汇表 V1b（`effect_slot` / 声源参数 / `graph.set_voice`）。
 - **门禁**：`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`，在本机沙箱外跑（沙箱内 cargo 会毒化 `target/debug/incremental`）。
 
@@ -55,8 +55,8 @@ Spec：`spec/clipboard.md`（D1–D9 + 剪贴板结构 + 粘贴语义）。
 
 | 里程碑 | 内容 | 依赖 | 规模 |
 | :--- | :--- | :--- | :--- |
-| **C1** | `Clipboard` 枚举 + `GlitcherZApp.clipboard` + Timeline / Edit Ctrl+C/V + 播放头锚点 + undo + 跨工程清空 | — | 中 |
-| **C2** | Patch Ctrl+C/V + `NodeDoc::set_node_id` + 内部连线复制 + `Shift+D` 复制到指针 + 插件失败回滚 | C1 | 中 |
+| **C1**（2026-11-11 交付） | `Clipboard` 枚举 + `GlitcherZApp.clipboard` + Timeline / Edit Ctrl+C/V + 播放头锚点 + undo + 跨工程清空 | — | 中 |
+| **C2**（2026-11-11 交付） | Patch Ctrl+C/V + `NodeDoc::set_node_id` + 内部连线复制 + `Shift+D` 复制到指针 + 引擎拒绝的节点单独跳过 | C1 | 中 |
 
 顺序：**C1 → C2**，每个里程碑单独提交。验收表见 spec §7。
 

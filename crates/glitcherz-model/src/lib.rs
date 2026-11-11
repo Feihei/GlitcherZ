@@ -4589,6 +4589,27 @@ impl NodeDoc {
         }
     }
 
+    /// Rewrites the node identity (F-040 paste assigns fresh ids while keeping
+    /// the rest of the node's settings). The caller owns id allocation and
+    /// uniqueness.
+    pub fn set_node_id(&mut self, id: u64) {
+        match self {
+            NodeDoc::Instrument { node_id, .. }
+            | NodeDoc::Effect { node_id, .. }
+            | NodeDoc::Mixer { node_id, .. }
+            | NodeDoc::Feedback { node_id, .. }
+            | NodeDoc::Keyboard { node_id, .. }
+            | NodeDoc::AudioTrack { node_id, .. }
+            | NodeDoc::Arpeggiator { node_id, .. }
+            | NodeDoc::Portamento { node_id, .. }
+            | NodeDoc::MidiEnvelope { node_id, .. }
+            | NodeDoc::Lfo { node_id, .. }
+            | NodeDoc::CurveMap { node_id, .. }
+            | NodeDoc::ChannelStrip { node_id, .. }
+            | NodeDoc::Input { node_id, .. } => *node_id = id,
+        }
+    }
+
     /// Owning track.
     pub fn track(&self) -> usize {
         match self {

@@ -1676,6 +1676,16 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - **门禁**：fmt / clippy workspace 干净；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`（新增集成用例计入 `mcp_cli`）。
 - **V1b 待做**：`effect_slot` 读写、声源参数（Modal / Pluck / Organ / Wavetable / Sf2 / Sample）、`graph.set_voice`；这三项是「换音色」诉求的最后一段。
 
+#### 剪贴板 C1–C2：Ctrl+C/V + Patch Shift+D（2026-11-11 交付）
+
+- 新模块 `glitcherz-ui/src/clipboard.rs`：`Clipboard::{Clips, Notes, Nodes}` 存**值快照**（不存选区索引，undo / 删除后仍可粘贴）；纯函数 `pasted_starts` / `pasted_notes` / `locate_notes` 与 `NodesCopy::{collect, placed}`。`GlitcherZApp.clipboard` 在 `do_new` 与 `adopt_document` 清空（快照引用旧工程的轨道 / 节点 id）。
+- 各视图只消费按键并返回意图，不碰剪贴板：Timeline `CopySelection` / `PasteClips`（`has_focus`）、钢琴卷帘 `CopyNotes` / `PasteNotes`（`has_focus`）、Patch `CopySelection` / `PasteNodes { at }` / `DuplicateNodes { at }`（`hovered`，后者即 `Shift+D`）。键位统一用 `Modifiers::COMMAND`（Win/Linux = Ctrl，macOS = Cmd）。
+- 锚点：Timeline / Edit 用 `engine.musical_ticks()`；Edit 再减 `clip.start_ticks` 并 clamp 0（clip-local）。Patch 用新增的 `PatchState::to_graph(rect.min, pointer)`（`to_screen` 的逆变换）。簇内相对偏移保持：Timeline 以最早 `start` 对播放头，Edit 以最早音符对播放头，Patch 以包围盒左上角对光标。
+- 粘贴走编辑守卫、**不新增命令**（避免 CLI/MCP 命令计数变化）：Timeline 克隆快照 push 后 `sync_clip_row`；卷帘 `notes_mut().extend + sort + locate_notes` 并切选区；Patch `NodeDoc::set_node_id`（model 新增）分配新 id → `install_node` → `connect_audio` / `connect_event_cable`，`suspend_history` 包住内部 commit，外层一次 `commit_edit`。
+- Patch 只复制**两端都在选中集内**的线（外部线不复制，避免把未选节点拖进副本）；引擎拒绝的节点（槽满 / 插件加载失败）单独回滚文档 + `engine.remove_node` 后跳过，其内部线一并丢弃，状态栏报跳过数量。
+- 测试：`clipboard` 5 条（相对偏移、负锚点 clamp、first-match 定位、包围盒对齐、内部线筛选）+ `patch` 的 `ctrl_c_on_the_patch_requests_a_copy`（真实 egui 帧 + hover + `COMMAND`）。
+- **门禁**：`cargo fmt` / `cargo clippy --workspace --all-targets -D warnings` 干净；`cargo test -p glitcherz-ui` 与 `cargo test --workspace` 全 `ok. 0 failed`（FSM 的 FAIL 为已知误报，以原始 `test result` 与退出码为准）。
+
 #### 阶段边界（自 plan.md 归位）
 
 - **Y 系列 S0**：不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（stems / 24-bit / 采样率选择）。
