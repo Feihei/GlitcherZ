@@ -32,11 +32,16 @@ pub fn midi_export_name(path: Option<&Path>) -> String {
 
 /// Whether a track can accept imported content without losing anything: no
 /// notes and no controller events in any of its clips.
-pub fn is_empty_track(track: &MidiTrack) -> bool {
+pub fn is_empty_track(track: &MidiTrack, midi_data: &[glitcherz_model::MidiData]) -> bool {
     track
         .clips
         .iter()
-        .all(|clip| clip.sequence.notes.is_empty() && clip.sequence.ctrls.is_empty())
+        .all(|clip| match midi_data.get(clip.data as usize) {
+            Some(data) => data.notes().is_empty() && data.sequence.ctrls.is_empty(),
+            // Unresolved inline content (importer batches, tests): the legacy
+            // fields still describe what the clip carries.
+            None => clip.legacy_sequence.notes.is_empty() && clip.legacy_sequence.ctrls.is_empty(),
+        })
 }
 
 /// Placement plan for importing tracks into a project that already has
@@ -53,11 +58,15 @@ pub struct ImportPlan {
 
 /// Empty tracks are reused before new ones are appended, so importing into a
 /// fresh project does not leave an empty track behind (U2).
-pub fn plan_import(tracks: &[MidiTrack], imported: usize) -> ImportPlan {
+pub fn plan_import(
+    tracks: &[MidiTrack],
+    midi_data: &[glitcherz_model::MidiData],
+    imported: usize,
+) -> ImportPlan {
     let reuse: Vec<usize> = tracks
         .iter()
         .enumerate()
-        .filter(|(_, track)| is_empty_track(track))
+        .filter(|(_, track)| is_empty_track(track, midi_data))
         .map(|(index, _)| index)
         .take(imported)
         .collect();
@@ -95,7 +104,10 @@ pub fn read_midi(path: &Path) -> Result<smf::SmfImport, String> {
 /// existing clips, so the project keeps its own and the status line reports
 /// the difference.
 pub fn is_unwritten(project: &Project) -> bool {
-    project.midi_tracks.iter().all(is_empty_track)
+    project
+        .midi_tracks
+        .iter()
+        .all(|track| is_empty_track(track, &project.midi_data))
         && project
             .control_tracks
             .iter()
@@ -111,9 +123,12 @@ mod tests {
     /// A project with one track holding one clip of `notes` notes.
     fn project_with_notes(count: usize) -> Project {
         let mut project = Project::default();
-        let mut clip = MidiClip::new(0);
+        let data = project.push_midi_data(glitcherz_model::MidiData {
+            length_ticks: 3840,
+            ..glitcherz_model::MidiData::default()
+        });
         for i in 0..count {
-            clip.sequence.notes.push(Note {
+            project.midi_data_mut(data).unwrap().notes_mut().push(Note {
                 start: i as i64 * glitcherz_model::TICKS_PER_STEP as i64,
                 length: glitcherz_model::TICKS_PER_STEP as i64,
                 note: 60 + (i % 12) as u8,
@@ -121,7 +136,12 @@ mod tests {
                 channel: 0,
             });
         }
-        project.midi_tracks[0].clips.push(clip);
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: 0,
+            span_ticks: 3840,
+            data,
+            ..MidiClip::default()
+        });
         project
     }
 
@@ -130,8 +150,8 @@ mod tests {
             name: name.to_string(),
             clips: Vec::new(),
         };
-        let mut clip = MidiClip::new(0);
-        clip.sequence.notes.push(Note {
+        let mut clip = MidiClip::default();
+        clip.legacy_sequence.notes.push(Note {
             start: 0,
             length: 960,
             note: 64,
@@ -165,14 +185,14 @@ mod tests {
     #[test]
     fn empty_track_means_no_notes_and_no_ctrls() {
         let empty = MidiTrack::default();
-        assert!(is_empty_track(&empty));
+        assert!(is_empty_track(&empty, &[]));
         // A blank clip is still empty.
         let blank = MidiTrack {
             name: "blank".to_string(),
-            clips: vec![MidiClip::new(0)],
+            clips: vec![MidiClip::default()],
         };
-        assert!(is_empty_track(&blank));
-        assert!(!is_empty_track(&track_with_notes("lead")));
+        assert!(is_empty_track(&blank, &[]));
+        assert!(!is_empty_track(&track_with_notes("lead"), &[]));
     }
 
     #[test]
@@ -180,7 +200,7 @@ mod tests {
         // A fresh project ships with DEFAULT_MIDI_TRACKS empty tracks, so a
         // small import lands in them and appends the rest.
         let project = Project::default();
-        let plan = plan_import(&project.midi_tracks, 3);
+        let plan = plan_import(&project.midi_tracks, &project.midi_data, 3);
         assert_eq!(plan.reuse, vec![0]);
         assert_eq!(plan.append, 2);
         assert_eq!(plan.dropped, 0);
@@ -188,6 +208,7 @@ mod tests {
         // More tracks than empty slots: the rest are appended.
         let plan = plan_import(
             &project.midi_tracks,
+            &project.midi_data,
             glitcherz_model::DEFAULT_MIDI_TRACKS + 2,
         );
         assert_eq!(plan.reuse.len(), glitcherz_model::DEFAULT_MIDI_TRACKS);
@@ -198,7 +219,7 @@ mod tests {
     #[test]
     fn import_appends_past_populated_tracks() {
         let tracks = vec![track_with_notes("a"), track_with_notes("b")];
-        let plan = plan_import(&tracks, 2);
+        let plan = plan_import(&tracks, &[], 2);
         assert!(plan.reuse.is_empty());
         assert_eq!(plan.append, 2);
         assert_eq!(plan.dropped, 0);
@@ -213,7 +234,7 @@ mod tests {
             .collect();
         tracks.push(MidiTrack::default());
         assert_eq!(tracks.len(), MAX_MIDI_TRACKS - 1);
-        let plan = plan_import(&tracks, 5);
+        let plan = plan_import(&tracks, &[], 5);
         assert_eq!(plan.reuse, vec![MAX_MIDI_TRACKS - 2]);
         assert_eq!(plan.append, 1);
         assert_eq!(plan.dropped, 3);
@@ -222,7 +243,7 @@ mod tests {
         let full: Vec<MidiTrack> = (0..MAX_MIDI_TRACKS)
             .map(|i| track_with_notes(&format!("t{i}")))
             .collect();
-        let plan = plan_import(&full, 4);
+        let plan = plan_import(&full, &[], 4);
         assert!(plan.reuse.is_empty());
         assert_eq!(plan.append, 0);
         assert_eq!(plan.dropped, 4);
@@ -245,7 +266,7 @@ mod tests {
         let tracks = read_midi(&path).expect("read smf");
         assert_eq!(tracks.tracks.len(), 1);
         assert_eq!(tracks.tracks[0].clips.len(), 1);
-        assert_eq!(tracks.tracks[0].clips[0].sequence.notes.len(), 3);
+        assert_eq!(tracks.tracks[0].clips[0].legacy_sequence.notes.len(), 3);
         // The imported clip sits at the earliest note, which is the start.
         assert_eq!(tracks.tracks[0].clips[0].start_ticks, 0);
         // Our own export always carries a meter, so the roundtrip sees 4/4.
@@ -272,7 +293,7 @@ mod tests {
         );
         project.control_tracks[0]
             .clips
-            .push(glitcherz_model::ControlClip::new(0));
+            .push(glitcherz_model::ControlClip::default());
         assert!(!is_unwritten(&project), "a control clip is content too");
     }
 }

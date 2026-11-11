@@ -6,7 +6,9 @@
 //! and a paste only runs in a view that accepts that kind (spec D1 / D5).
 
 use egui::Pos2;
-use glitcherz_model::{AudioClip, CableDoc, ControlClip, MidiClip, NodeDoc, Note};
+use glitcherz_model::{
+    AudioClip, CableDoc, ControlClip, CurveData, MidiClip, MidiData, NodeDoc, Note,
+};
 
 use crate::timeline::TimelineLane;
 
@@ -83,10 +85,13 @@ pub(crate) struct ClipCopy {
 }
 
 /// Lane-tagged clip body (the three timeline kinds).
+///
+/// MIDI / control snapshots carry their shared content too (F-041): a paste
+/// may land in another project, where the source pool index means nothing.
 #[derive(Clone)]
 pub(crate) enum ClipSnapshot {
-    Midi(MidiClip),
-    Control(ControlClip),
+    Midi(MidiClip, MidiData),
+    Control(ControlClip, CurveData),
     Audio(AudioClip),
 }
 
@@ -94,8 +99,8 @@ impl ClipSnapshot {
     /// The clip's arrangement start (all three kinds carry `start_ticks`).
     pub(crate) fn start_ticks(&self) -> u32 {
         match self {
-            ClipSnapshot::Midi(clip) => clip.start_ticks,
-            ClipSnapshot::Control(clip) => clip.start_ticks,
+            ClipSnapshot::Midi(clip, _) => clip.start_ticks,
+            ClipSnapshot::Control(clip, _) => clip.start_ticks,
             ClipSnapshot::Audio(clip) => clip.start_ticks,
         }
     }

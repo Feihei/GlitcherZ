@@ -32,6 +32,8 @@ struct Fixture {
     /// Hover-follow focus arbiter, mirroring the app's per-frame flow.
     router: glitcherz_ui::focus::FocusRouter,
     tracks: Vec<MidiTrack>,
+    /// Shared MIDI content pool (F-041).
+    midi_data: Vec<glitcherz_model::MidiData>,
     /// View-tab selection (the app's MainView; only Timeline matters
     /// here, but the tab row must exist to mirror its layout).
     view: bool,
@@ -49,6 +51,7 @@ impl Fixture {
         let clip = MidiClip {
             start_ticks: 0,
             span_ticks: 2 * TICKS_PER_BAR,
+            data: 0,
             ..MidiClip::default()
         };
         let mut tracks = vec![MidiTrack::default(), MidiTrack::default()];
@@ -58,6 +61,10 @@ impl Fixture {
             state: TimelineState::default(),
             router: glitcherz_ui::focus::FocusRouter::new(),
             tracks,
+            midi_data: vec![glitcherz_model::MidiData {
+                length_ticks: TICKS_PER_BAR,
+                ..glitcherz_model::MidiData::default()
+            }],
             view: true,
             tempo: 120.0,
             churn: false,
@@ -100,6 +107,7 @@ impl Fixture {
             state,
             router,
             tracks,
+            midi_data,
             view,
             tempo,
             churn,
@@ -160,6 +168,8 @@ impl Fixture {
                         sec_per_tick: 60.0 / (120.0 * 960.0),
                         waveform_of: &|_| None,
                         clip_groups: &[],
+                        midi_data: midi_data.as_slice(),
+                        curve_data: &[],
                     },
                     router,
                 );

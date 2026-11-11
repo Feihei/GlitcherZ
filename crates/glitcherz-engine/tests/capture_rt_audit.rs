@@ -238,7 +238,7 @@ fn sequencer_notes_are_not_captured() {
     // One bar of 16ths on track 0, so the sequencer definitely fires.
     let mut clip = RtMidiClip {
         span_ticks: TICKS_PER_BAR,
-        loop_ticks: TICKS_PER_BAR,
+        length_ticks: TICKS_PER_BAR,
         ..RtMidiClip::default()
     };
     for step in 0..16 {

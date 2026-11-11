@@ -68,9 +68,12 @@ fn exit_code(output: &Output) -> i32 {
 /// Writes a project with one clip holding `notes` on track 0.
 fn write_project(path: &Path, notes: &[(u8, i64)]) {
     let mut project = Project::default();
-    let mut clip = MidiClip::new(0);
+    let data = project.push_midi_data(glitcherz_model::MidiData {
+        length_ticks: 3840,
+        ..glitcherz_model::MidiData::default()
+    });
     for (note, start) in notes {
-        clip.sequence.notes.push(Note {
+        project.midi_data_mut(data).unwrap().notes_mut().push(Note {
             start: *start,
             length: 240,
             note: *note,
@@ -78,25 +81,25 @@ fn write_project(path: &Path, notes: &[(u8, i64)]) {
             channel: 0,
         });
     }
-    project.midi_tracks[0].clips.push(clip);
+    project.midi_tracks[0].clips.push(MidiClip {
+        start_ticks: 0,
+        span_ticks: 3840,
+        data,
+        ..MidiClip::default()
+    });
     glitcherz_model::file::save_project(&project, path).expect("save fixture project");
 }
 
 fn note_count(path: &Path) -> usize {
     let project = glitcherz_model::file::load_project(path).expect("load project");
-    project.midi_tracks[0]
-        .clips
-        .first()
-        .map(|clip| clip.notes().len())
-        .unwrap_or(0)
+    project.midi_clip_notes(0, 0).map_or(0, |notes| notes.len())
 }
 
 fn pitches(path: &Path) -> Vec<u8> {
     let project = glitcherz_model::file::load_project(path).expect("load project");
-    project.midi_tracks[0]
-        .clips
-        .first()
-        .map(|clip| clip.notes().iter().map(|n| n.note).collect())
+    project
+        .midi_clip_notes(0, 0)
+        .map(|notes| notes.iter().map(|n| n.note).collect())
         .unwrap_or_default()
 }
 

@@ -453,11 +453,16 @@ pub fn control_take_clip(
             })
             .collect()
     };
-    let mut clip = ControlClip::new(start as u32);
-    clip.span_ticks = span;
-    clip.loop_ticks = span;
-    clip.interp = CurveInterp::Linear;
-    clip.curve = curve;
+    let clip = ControlClip {
+        start_ticks: start as u32,
+        span_ticks: span,
+        source_offset: 0,
+        data: 0,
+        legacy_loop_ticks: span,
+        legacy_curve: curve,
+        legacy_interp: CurveInterp::Linear,
+        ..ControlClip::default()
+    };
     Some(clip)
 }
 
@@ -503,10 +508,19 @@ pub fn take_clip(start_ticks: f64, notes: &[Note], bar_ticks: u32) -> Option<Mid
     let end_rel = notes.iter().map(|n| n.end()).max().unwrap_or(0).max(0) as u64;
     let span = (end_rel.div_ceil(bar) * bar).max(bar);
     let limit = MAX_ARRANGEMENT_TICKS.saturating_sub(start).max(1);
-    let mut clip = MidiClip::new(start as u32);
-    clip.span_ticks = span.min(limit) as u32;
-    clip.loop_ticks = clip.span_ticks;
-    clip.sequence.notes = notes.to_vec();
+    let span_ticks = span.min(limit) as u32;
+    let clip = MidiClip {
+        start_ticks: start as u32,
+        span_ticks,
+        source_offset: 0,
+        data: 0,
+        legacy_loop_ticks: span_ticks,
+        legacy_sequence: glitcherz_model::Sequence {
+            notes: notes.to_vec(),
+            ctrls: Vec::new(),
+        },
+        ..MidiClip::default()
+    };
     Some(clip)
 }
 
@@ -775,8 +789,11 @@ mod tests {
         let clip = take_clip(1920.0, &notes, 960).expect("non-empty take");
         assert_eq!(clip.start_ticks, 1920);
         assert_eq!(clip.span_ticks, 1920, "1000 ticks rounds up to two bars");
-        assert_eq!(clip.loop_ticks, clip.span_ticks, "a take must not loop");
-        assert_eq!(clip.notes().len(), 2);
+        assert_eq!(
+            clip.legacy_loop_ticks, clip.span_ticks,
+            "a take must not loop"
+        );
+        assert_eq!(clip.legacy_sequence.notes.len(), 2);
     }
 
     #[test]
@@ -833,14 +850,18 @@ mod tests {
         assert_eq!(takes[0].0, 2);
         let clip = super::control_take_clip(0.0, &takes[0].1, 960).expect("clip");
         assert!(
-            clip.curve.len() <= glitcherz_model::MAX_CURVE_POINTS,
+            clip.legacy_curve.len() <= glitcherz_model::MAX_CURVE_POINTS,
             "bounded by the engine's fixed table"
         );
         assert_eq!(
             clip.span_ticks, 2880,
             "the last sample rounds to three bars"
         );
-        assert!(clip.curve.iter().all(|p| p.value >= -1.0 && p.value <= 1.0));
+        assert!(
+            clip.legacy_curve
+                .iter()
+                .all(|p| p.value >= -1.0 && p.value <= 1.0)
+        );
     }
 
     #[test]

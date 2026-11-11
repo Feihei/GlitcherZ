@@ -36,9 +36,8 @@ use egui::{
     StrokeKind, Vec2, pos2,
 };
 use glitcherz_model::{
-    AudioClip, AudioTrack, AutoPoint, ClipGroup, ControlClip, ControlTrack, CtrlEvent,
-    MAX_ARRANGEMENT_TICKS, MAX_CLIPS_PER_TRACK, Marker, MeterMap, MeterMarker, MidiClip, MidiTrack,
-    Note, SongLoop,
+    AudioClip, AudioTrack, ClipGroup, ControlClip, ControlTrack, MAX_ARRANGEMENT_TICKS,
+    MAX_CLIPS_PER_TRACK, Marker, MeterMap, MeterMarker, MidiClip, MidiTrack, SongLoop,
 };
 
 /// Absolute arrangement ceiling in ticks (U3a). The bound is a **tick** count,
@@ -243,7 +242,6 @@ enum Drag {
         /// original placement (not from the previous frame's result).
         origin_start: u32,
         origin_span: u32,
-        origin_loop: u32,
     },
 }
 
@@ -384,6 +382,9 @@ pub struct TimelineState {
     /// Drag-origin snapshot of an in-flight head trim (I6). `None` between
     /// gestures; the first trim frame fills it and `drag_stopped` drops it.
     pub(crate) head_trim: Option<HeadTrim>,
+    /// F-041: the armed Duplicate modal copies the shared content instead of
+    /// sharing it (Ctrl+Shift+D). Plain Shift+D keeps sharing.
+    duplicate_new_data: bool,
 }
 
 impl Default for TimelineState {
@@ -416,6 +417,7 @@ impl Default for TimelineState {
             clip_rename_focus: false,
             break_group: false,
             head_trim: None,
+            duplicate_new_data: false,
         }
     }
 }
@@ -559,6 +561,11 @@ pub enum TimelineAction {
     /// Clone every clip in the list onto its target (Shift+D finalize;
     /// originals untouched). One undo step.
     DuplicateClipsBatch {
+        dups: Vec<ClipDup>,
+    },
+    /// Clone every clip in the list onto its target **with a fresh copy of its
+    /// shared content** (F-041, Ctrl+Shift+D). Plain Shift+D keeps sharing.
+    DuplicateClipsWithNewData {
         dups: Vec<ClipDup>,
     },
     /// Copy the selected clips to the app clipboard (F-040). Not a document
@@ -731,9 +738,13 @@ pub struct TimelineParams<'a> {
     /// Clip-group table (W3b): member clips draw a colour stripe and a
     /// click on one member selects the whole group.
     pub clip_groups: &'a [ClipGroup],
+    /// Shared MIDI content pool (F-041): clip lengths and note summaries.
+    pub midi_data: &'a [glitcherz_model::MidiData],
+    /// Shared control-curve content pool (F-041).
+    pub curve_data: &'a [glitcherz_model::CurveData],
 }
 
-/// Placement semantics shared by MIDI and control clips.
+/// Placement semantics shared by MIDI, control and audio clips.
 pub(crate) trait Placement {
     fn start(&self) -> u32;
     /// Tick extent of the clip. `sec_per_tick` is the project's **base-tempo**
@@ -745,56 +756,21 @@ pub(crate) trait Placement {
     /// (native-rate playback: it changes how much material is exposed, never
     /// its speed).
     fn set_span(&mut self, v: u32, sec_per_tick: f64);
-    fn set_loop(&mut self, v: u32, sec_per_tick: f64);
-    /// Keeps only the content at/after `offset` (tick, relative to the clip
-    /// start) and shifts it to the clip origin — the right half of a split.
-    /// Notes crossing the offset continue at the cut with their tail; audio
-    /// trims its head (start + offset, window offset += offset·sec_per_tick,
-    /// window length −= offset·sec_per_tick).
+
+    /// The right half of a split: keeps the content from the cut onward.
+    fn split_right(&mut self, left_span: u32, right_span: u32, sec_per_tick: f64);
+    /// Non-destructive head trim: moves the window start forward by `offset`
+    /// and shortens the span. The content is never rewritten (F-041).
     fn retain_from(&mut self, offset: u32, sec_per_tick: f64);
     /// Optional user-facing clip name (W3a). Empty = unnamed.
     fn name(&self) -> &str;
     fn set_name(&mut self, name: String);
-    /// Content period (W2): the span repeats this every `loop_len` ticks.
-    /// Audio clips have no repeat semantics — they report their own span.
-    fn loop_len(&self, sec_per_tick: f64) -> u32;
     /// Optional clip-group id (W3b). Ungrouped clips return `None`.
     fn group(&self) -> Option<u32>;
     fn set_group(&mut self, group: Option<u32>);
     /// Temporary mute (B2): the clip keeps everything, playback skips it.
     fn muted(&self) -> bool;
     fn set_muted(&mut self, muted: bool);
-}
-
-/// W2: the loop length after a span edit that does NOT explicitly ask for a
-/// period (currently only moves, where the span is unchanged). Kept for the
-/// move path: a moved clip must not change its content period.
-pub(crate) fn resolve_loop(current: u32, span: u32, requested: Option<u32>) -> u32 {
-    match requested {
-        Some(v) => v.clamp(1, span.max(1)),
-        None => current.clamp(1, span.max(1)),
-    }
-}
-
-/// T semantics (2026-11-04): the content period after a **stretch/resize**.
-///
-/// - Single-period clip (`loop == span`): the content grows with the
-///   container, so `T` genuinely extends the clip's editable time — the
-///   piano roll's range is `loop_ticks`.
-/// - Tiled clip (`loop < span`): keep the repeat count, scale the period
-///   with the container.
-pub(crate) fn resolve_stretch_loop(current_loop: u32, old_span: u32, new_span: u32) -> u32 {
-    let old_span = old_span.max(1);
-    let new_span = new_span.max(1);
-    let current_loop = current_loop.max(1);
-    if current_loop >= old_span {
-        new_span
-    } else {
-        let repeats = f64::from(old_span) / f64::from(current_loop);
-        ((f64::from(new_span) / repeats).round() as u32)
-            .max(1)
-            .min(new_span)
-    }
 }
 
 impl Placement for MidiClip {
@@ -810,52 +786,19 @@ impl Placement for MidiClip {
     fn set_span(&mut self, v: u32, _sec_per_tick: f64) {
         self.span_ticks = v;
     }
-    fn set_loop(&mut self, v: u32, _sec_per_tick: f64) {
-        self.loop_ticks = v;
+    fn split_right(&mut self, left_span: u32, right_span: u32, _sec_per_tick: f64) {
+        self.source_offset = self.source_offset.saturating_add(left_span);
+        self.span_ticks = right_span.max(1);
     }
     fn retain_from(&mut self, offset: u32, _sec_per_tick: f64) {
-        let o = i64::from(offset);
-        self.sequence.notes = self
-            .sequence
-            .notes
-            .iter()
-            .filter_map(|n| {
-                if n.start >= o {
-                    Some(Note {
-                        start: n.start - o,
-                        ..*n
-                    })
-                } else if n.end() > o {
-                    Some(Note {
-                        start: 0,
-                        length: n.end() - o,
-                        ..*n
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-        self.sequence.ctrls = self
-            .sequence
-            .ctrls
-            .iter()
-            .filter(|&c| c.tick >= o)
-            .map(|c| CtrlEvent {
-                tick: c.tick - o,
-                ..*c
-            })
-            .collect();
-        self.sort();
+        self.source_offset = self.source_offset.saturating_add(offset);
+        self.span_ticks = self.span_ticks.saturating_sub(offset).max(1);
     }
     fn name(&self) -> &str {
         &self.name
     }
     fn set_name(&mut self, name: String) {
         self.name = name;
-    }
-    fn loop_len(&self, _sec_per_tick: f64) -> u32 {
-        self.loop_ticks
     }
     fn group(&self) -> Option<u32> {
         self.group
@@ -884,28 +827,19 @@ impl Placement for ControlClip {
     fn set_span(&mut self, v: u32, _sec_per_tick: f64) {
         self.span_ticks = v;
     }
-    fn set_loop(&mut self, v: u32, _sec_per_tick: f64) {
-        self.loop_ticks = v;
+    fn split_right(&mut self, left_span: u32, right_span: u32, _sec_per_tick: f64) {
+        self.source_offset = self.source_offset.saturating_add(left_span);
+        self.span_ticks = right_span.max(1);
     }
     fn retain_from(&mut self, offset: u32, _sec_per_tick: f64) {
-        self.curve = self
-            .curve
-            .iter()
-            .filter(|&p| p.tick >= offset)
-            .map(|p| AutoPoint {
-                tick: p.tick - offset,
-                ..*p
-            })
-            .collect();
+        self.source_offset = self.source_offset.saturating_add(offset);
+        self.span_ticks = self.span_ticks.saturating_sub(offset).max(1);
     }
     fn name(&self) -> &str {
         &self.name
     }
     fn set_name(&mut self, name: String) {
         self.name = name;
-    }
-    fn loop_len(&self, _sec_per_tick: f64) -> u32 {
-        self.loop_ticks
     }
     fn group(&self) -> Option<u32> {
         self.group
@@ -939,12 +873,14 @@ impl Placement for AudioClip {
     fn set_span(&mut self, v: u32, sec_per_tick: f64) {
         self.source_len = f64::from(v).max(1.0) * sec_per_tick;
     }
-    // Audio clips have no loop semantics (U6 D5 / U11): `loop == span` always
-    // held, so the setter is a no-op kept for the shared resize path.
-    fn set_loop(&mut self, _v: u32, _sec_per_tick: f64) {}
-    // The right half of a split plays the wav's second half (U11): trim the
-    // head — start shifts by the cut, the window start advances and the
-    // window length shrinks by the same seconds.
+
+    // The right half plays the wav's second half (U11): advance the window
+    // start by the cut and keep only the remaining seconds.
+    fn split_right(&mut self, left_span: u32, right_span: u32, sec_per_tick: f64) {
+        self.source_offset += f64::from(left_span) * sec_per_tick;
+        self.source_len = f64::from(right_span.max(1)) * sec_per_tick;
+    }
+    // Head trim: shift the start, advance the window, shrink the window.
     fn retain_from(&mut self, offset: u32, sec_per_tick: f64) {
         let secs = f64::from(offset) * sec_per_tick;
         self.start_ticks += offset;
@@ -956,9 +892,6 @@ impl Placement for AudioClip {
     }
     fn set_name(&mut self, name: String) {
         self.name = name;
-    }
-    fn loop_len(&self, sec_per_tick: f64) -> u32 {
-        self.span(sec_per_tick)
     }
     fn group(&self) -> Option<u32> {
         self.group
@@ -977,11 +910,10 @@ impl Placement for AudioClip {
 /// Splits `clips[index]` at `at` in place (M4b.2): the left half keeps the
 /// start with a shortened span, the right half is inserted at `index + 1`
 /// with the content from the cut onward shifted to its origin (notes
-/// crossing the cut continue in both halves). Only single-period clips
-/// (`loop == span`) are splittable: cutting a tiled clip would need a
-/// phase-relative loop origin, which the model does not carry (W2). Returns
-/// false untouched when the index is out of bounds, the track is full, `at`
-/// is not strictly inside the clip, or the clip is tiled.
+/// crossing the cut continue in both halves). Both halves share the same
+/// content entry (F-041), so any later content edit is visible in both.
+/// Returns false untouched when the index is out of bounds, the track is
+/// full, or `at` is not strictly inside the clip.
 pub(crate) fn split_clip_in<T: Placement + Clone>(
     clips: &mut Vec<T>,
     at: u32,
@@ -992,21 +924,15 @@ pub(crate) fn split_clip_in<T: Placement + Clone>(
         return false;
     };
     let (start, end) = (c.start(), c.start() + c.span(sec_per_tick));
-    if at <= start
-        || at >= end
-        || clips.len() >= MAX_CLIPS_PER_TRACK
-        || c.loop_len(sec_per_tick) < c.span(sec_per_tick)
-    {
+    if at <= start || at >= end || clips.len() >= MAX_CLIPS_PER_TRACK {
         return false;
     }
     let left_span = at - start;
+    let right_span = end - at;
     let mut right = clips[index].clone();
     right.set_start(at);
-    right.set_span(end - at, sec_per_tick);
-    right.set_loop(end - at, sec_per_tick);
-    right.retain_from(left_span, sec_per_tick);
+    right.split_right(left_span, right_span, sec_per_tick);
     clips[index].set_span(left_span, sec_per_tick);
-    clips[index].set_loop(left_span, sec_per_tick);
     clips.insert(index + 1, right);
     true
 }
@@ -1223,29 +1149,28 @@ fn stretch_targets(
     )
 }
 
-/// Looks up a selected clip's content period. Audio clips have no repeat
-/// semantics, so they report `None`.
+/// Looks up a selected clip's content period (F-041). Audio clips have no
+/// repeat semantics, so they report `None`.
 fn clip_loop_len(
     midi_tracks: &[MidiTrack],
+    midi_data: &[glitcherz_model::MidiData],
     control_tracks: &[ControlTrack],
-    sec_per_tick: f64,
+    curve_data: &[glitcherz_model::CurveData],
     sel: ClipSel,
 ) -> Option<u32> {
     match sel.lane {
-        TimelineLane::Control => Some(
-            control_tracks
-                .get(sel.track)?
-                .clips
-                .get(sel.clip)?
-                .loop_len(sec_per_tick),
-        ),
-        TimelineLane::Midi => Some(
-            midi_tracks
-                .get(sel.track)?
-                .clips
-                .get(sel.clip)?
-                .loop_len(sec_per_tick),
-        ),
+        TimelineLane::Control => control_tracks
+            .get(sel.track)?
+            .clips
+            .get(sel.clip)
+            .and_then(|clip| curve_data.get(clip.data as usize))
+            .map(|data| data.length_ticks.max(1)),
+        TimelineLane::Midi => midi_tracks
+            .get(sel.track)?
+            .clips
+            .get(sel.clip)
+            .and_then(|clip| midi_data.get(clip.data as usize))
+            .map(|data| data.length_ticks.max(1)),
         TimelineLane::Audio => None,
     }
 }
@@ -1264,7 +1189,9 @@ fn tile_targets(
     px_per_bar: f32,
     bar_ticks: u32,
     midi_tracks: &[MidiTrack],
+    midi_data: &[glitcherz_model::MidiData],
     control_tracks: &[ControlTrack],
+    curve_data: &[glitcherz_model::CurveData],
     sec_per_tick: f64,
 ) -> Option<Vec<ClipTileEdit>> {
     if !matches!(modal.kind, ModalKind::Tile) {
@@ -1285,9 +1212,10 @@ fn tile_targets(
                 let (start, span) =
                     clip_geometry(midi_tracks, control_tracks, &[], sec_per_tick, *sel)?;
                 let span = span.max(1);
-                let period = clip_loop_len(midi_tracks, control_tracks, sec_per_tick, *sel)
-                    .unwrap_or(span)
-                    .clamp(1, span);
+                let period =
+                    clip_loop_len(midi_tracks, midi_data, control_tracks, curve_data, *sel)
+                        .unwrap_or(span)
+                        .clamp(1, span);
                 // The pointer adds/removes whole repeats, one per period-width
                 // of travel: a single-period clip tiles as a whole, an
                 // already-tiled clip just adjusts its repeat count (2026-11-04,
@@ -2258,9 +2186,32 @@ pub fn show(
                 p.playhead_ticks,
                 RowColors::midi(p.selected_track == i),
                 highlight,
-                &|clip| format!("{} notes", clip.notes().len()),
+                &|clip: &MidiClip| {
+                    format!(
+                        "{} notes",
+                        p.midi_data
+                            .get(clip.data as usize)
+                            .map_or(0, |data| data.notes().len())
+                    )
+                },
                 &|_| None,
-                &|clip, painter, rect| draw_midi_preview(painter, rect, clip),
+                &|clip: &MidiClip, painter, rect| {
+                    if let Some(data) = p.midi_data.get(clip.data as usize) {
+                        draw_midi_preview(painter, rect, clip.span_ticks, data);
+                    }
+                },
+                &|clip: &MidiClip| {
+                    p.midi_data
+                        .get(clip.data as usize)
+                        .map_or(1, |data| data.length_ticks)
+                },
+                &|clip: &MidiClip| {
+                    midi_tracks
+                        .iter()
+                        .flat_map(|track| track.clips.iter())
+                        .filter(|other| other.data == clip.data)
+                        .count()
+                },
                 p.clip_groups,
             );
         }
@@ -2302,15 +2253,35 @@ pub fn show(
                     p.playhead_ticks,
                     RowColors::control(p.selected_auto == i),
                     highlight,
-                    &|clip| {
-                        if clip.curve.is_empty() {
+                    &|clip: &ControlClip| {
+                        let len = p
+                            .curve_data
+                            .get(clip.data as usize)
+                            .map_or(0, |data| data.points.len());
+                        if len == 0 {
                             "empty".to_string()
                         } else {
-                            format!("{} anchors", clip.curve.len())
+                            format!("{len} anchors")
                         }
                     },
                     &|_| None,
-                    &|clip, painter, rect| draw_control_preview(painter, rect, clip),
+                    &|clip: &ControlClip, painter, rect| {
+                        if let Some(data) = p.curve_data.get(clip.data as usize) {
+                            draw_control_preview(painter, rect, clip.span_ticks, data);
+                        }
+                    },
+                    &|clip: &ControlClip| {
+                        p.curve_data
+                            .get(clip.data as usize)
+                            .map_or(1, |data| data.length_ticks)
+                    },
+                    &|clip: &ControlClip| {
+                        control_tracks
+                            .iter()
+                            .flat_map(|track| track.clips.iter())
+                            .filter(|other| other.data == clip.data)
+                            .count()
+                    },
                     p.clip_groups,
                 );
             }
@@ -2362,6 +2333,8 @@ pub fn show(
                     // clip-keyed parameter lane_row takes.
                     &|clip: &AudioClip| (p.waveform_of)(&clip.path),
                     &|_, _, _| {},
+                    &|clip: &AudioClip| clip.span(p.sec_per_tick),
+                    &|_: &AudioClip| 1,
                     p.clip_groups,
                 );
             }
@@ -2565,14 +2538,27 @@ pub fn show(
                                     match m.kind {
                                         ModalKind::Duplicate { .. } => {
                                             if !kept.is_empty() {
-                                                actions.push(TimelineAction::DuplicateClipsBatch {
-                                                    dups: kept
-                                                        .into_iter()
-                                                        .map(|(from, (start_ticks, _), to_track, _)| {
-                                                            ClipDup { from, to_track, start_ticks }
-                                                        })
-                                                        .collect(),
-                                                });
+                                                let dups: Vec<ClipDup> = kept
+                                                    .into_iter()
+                                                    .map(|(from, (start_ticks, _), to_track, _)| {
+                                                        ClipDup {
+                                                            from,
+                                                            to_track,
+                                                            start_ticks,
+                                                        }
+                                                    })
+                                                    .collect();
+                                                if state.duplicate_new_data {
+                                                    actions.push(
+                                                        TimelineAction::DuplicateClipsWithNewData {
+                                                            dups,
+                                                        },
+                                                    );
+                                                } else {
+                                                    actions.push(
+                                                        TimelineAction::DuplicateClipsBatch { dups },
+                                                    );
+                                                }
                                             }
                                         }
                                         _ => {
@@ -2643,7 +2629,9 @@ pub fn show(
                                     px_per_bar,
                                     bar_ticks,
                                     midi_tracks,
+                                    p.midi_data,
                                     control_tracks,
+                                    p.curve_data,
                                     p.sec_per_tick,
                                 ) && !tiles.is_empty()
                                 {
@@ -2711,7 +2699,9 @@ pub fn show(
                         px_per_bar,
                         bar_ticks,
                         midi_tracks,
+                        p.midi_data,
                         control_tracks,
+                        p.curve_data,
                         p.sec_per_tick,
                     )
                     .map(|tiles| {
@@ -3043,6 +3033,11 @@ fn lane_row<T: Placement>(
     // Optional per-clip body decoration drawn over the clip block (U12: the
     // read-only control curve preview). MIDI/audio rows pass a no-op.
     clip_body: &dyn Fn(&T, &egui::Painter, Rect),
+    // F-041: the clip's content length (MIDI / control read the shared pool,
+    // audio reports its own span).
+    content_len: &dyn Fn(&T) -> u32,
+    // F-041: how many clips reference the same content (1 = private).
+    data_refs: &dyn Fn(&T) -> usize,
     // W3b: group table for the colour stripe + name tag.
     clip_groups: &[ClipGroup],
 ) {
@@ -3273,7 +3268,7 @@ fn lane_row<T: Placement>(
         // the sequencer does (`start + k·loop`), so what is drawn is what
         // plays. Single-period clips stay a plain solid block.
         let span_ticks = clip.span(sec_per_tick).max(1);
-        let loop_ticks = clip.loop_len(sec_per_tick).clamp(1, span_ticks);
+        let loop_ticks = content_len(clip).clamp(1, span_ticks);
         if loop_ticks < span_ticks {
             let seam_color = colors.clip_stroke.gamma_multiply(0.55);
             draw_tile_seams(&painter, rect, loop_ticks, px_per_tick, seam_color);
@@ -3399,6 +3394,12 @@ fn lane_row<T: Placement>(
         if repeats > 1 {
             label = format!("{label} ×{repeats}");
         }
+        // F-041: ASCII-only badge (egui's proportional font lacks symbol
+        // glyphs, see the `●` U+25CF precedent).
+        let shared = data_refs(clip);
+        if shared > 1 {
+            label = format!("{label} · shared:{shared}");
+        }
         let text_color = if muted {
             colors.clip_text.gamma_multiply(0.5)
         } else {
@@ -3459,17 +3460,7 @@ fn lane_row<T: Placement>(
             if clips.len() >= MAX_CLIPS_PER_TRACK {
                 state.set_status("this track is full — cannot split");
             } else {
-                let tiled = hit_clip(clips, tick_at(pos.x), sec_per_tick).is_some_and(|index| {
-                    clips[index].loop_len(sec_per_tick) < clips[index].span(sec_per_tick)
-                });
                 match knife_target(clips, tick_at(pos.x), meter, sec_per_tick, snap) {
-                    // W2: a cut would need a phase-relative loop origin,
-                    // which the model does not carry.
-                    Some(_) if tiled => {
-                        state.set_status(
-                            "a tiled clip must be trimmed to one period before cutting",
-                        );
-                    }
                     Some((index, at)) => {
                         actions.push(TimelineAction::SplitClip {
                             lane: lane_kind,
@@ -3639,7 +3630,7 @@ fn lane_row<T: Placement>(
                 }
                 let origin_start = clips[index].start();
                 let origin_span = clips[index].span(sec_per_tick);
-                let origin_loop = clips[index].loop_len(sec_per_tick);
+
                 let start_x = lane.left() + origin_start as f32 * px_per_tick;
                 let end_x = lane.left() + (origin_start + origin_span) as f32 * px_per_tick;
                 // I6: both edges resize. The left edge is only a handle when
@@ -3654,18 +3645,12 @@ fn lane_row<T: Placement>(
                     None
                 };
                 if let Some(edge) = edge {
-                    if origin_loop < origin_span {
-                        state.set_status(
-                            "tiled clip: the head trim shortens the container, the repeats keep their phase",
-                        );
-                    }
                     state.drag = Some(Drag::Resize {
                         row,
                         clip: index,
                         edge,
                         origin_start,
                         origin_span,
-                        origin_loop,
                     });
                 } else {
                     let grab = tick - origin_start as f32;
@@ -3718,7 +3703,6 @@ fn lane_row<T: Placement>(
                         edge,
                         origin_start,
                         origin_span,
-                        origin_loop,
                         ..
                     }) if clip < clips.len() => match edge {
                         ResizeEdge::Start => {
@@ -3758,11 +3742,7 @@ fn lane_row<T: Placement>(
                             // origin snapshot avoids drift across the
                             // per-frame updates.
                             let span = edge;
-                            let loop_ticks =
-                                Some(resolve_stretch_loop(origin_loop, origin_span, span));
-                            let loop_changed =
-                                loop_ticks.is_some_and(|l| l != clips[clip].loop_len(sec_per_tick));
-                            if clips[clip].span(sec_per_tick) != span || loop_changed {
+                            if clips[clip].span(sec_per_tick) != span {
                                 let lane = row.lane();
                                 let track = row.track();
                                 actions.push(TimelineAction::MoveResizeClip {
@@ -3771,7 +3751,7 @@ fn lane_row<T: Placement>(
                                     clip,
                                     start_ticks: start,
                                     span_ticks: span,
-                                    loop_ticks,
+                                    loop_ticks: None,
                                 });
                             }
                         }
@@ -3981,6 +3961,13 @@ fn lane_row<T: Placement>(
             .input_mut(|i| i.consume_key(Modifiers::NONE, Key::G));
         // Shift+D must be consumed before plain D would ever match
         // (consume_key ignores the shift qualifier when matching).
+        // F-041: Ctrl+Shift+D duplicates with a fresh copy of the shared content;
+        // plain Shift+D shares it (instance duplicate).
+        let ctrl_shift_d = {
+            let mut mods = Modifiers::CTRL;
+            mods.shift = true;
+            ui.ctx().input_mut(|i| i.consume_key(mods, Key::D))
+        };
         let shift_d = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::D));
@@ -4073,13 +4060,14 @@ fn lane_row<T: Placement>(
         }
         // Arm G / Shift+D / T / Alt+T (Blender-style modal; arming one
         // tool clears the other).
-        if (g || shift_d || t || alt_t) && state.modal.is_none() {
+        if (g || shift_d || ctrl_shift_d || t || alt_t) && state.modal.is_none() {
             state.knife_armed = false;
+            state.duplicate_new_data = ctrl_shift_d;
             let arm = if alt_t {
                 Arm::Tile
             } else if g {
                 Arm::Grab
-            } else if shift_d {
+            } else if shift_d || ctrl_shift_d {
                 Arm::Duplicate
             } else {
                 Arm::Stretch
@@ -4499,15 +4487,16 @@ fn draw_tile_seams(
 /// range) and clipped to the block. The content tiles by `loop_ticks` exactly
 /// like playback. There is no editing here: notes are edited in the piano
 /// roll.
-fn draw_midi_preview(painter: &egui::Painter, rect: Rect, clip: &MidiClip) {
-    if clip.sequence.notes.is_empty()
-        || clip.span_ticks == 0
-        || rect.width() < 6.0
-        || rect.height() < 6.0
-    {
+fn draw_midi_preview(
+    painter: &egui::Painter,
+    rect: Rect,
+    span_ticks: u32,
+    data: &glitcherz_model::MidiData,
+) {
+    let notes = data.notes();
+    if notes.is_empty() || span_ticks == 0 || rect.width() < 6.0 || rect.height() < 6.0 {
         return;
     }
-    let notes = &clip.sequence.notes;
     let mut lo = u8::MAX;
     let mut hi = 0u8;
     for n in notes {
@@ -4520,8 +4509,8 @@ fn draw_midi_preview(painter: &egui::Painter, rect: Rect, clip: &MidiClip) {
     let usable = (rect.height() - 2.0).max(1.0);
     let row_h = (usable / (pitch_span + 1.0)).max(1.0);
     let note_h = (row_h - 0.5).max(1.0);
-    let span = clip.span_ticks.max(1);
-    let period_ticks = clip.loop_ticks.max(1).min(span);
+    let span = span_ticks.max(1);
+    let period_ticks = data.length_ticks.max(1).min(span);
     let px_per_tick = rect.width() / span as f32;
     if px_per_tick <= 0.0 {
         return;
@@ -4560,8 +4549,13 @@ fn draw_midi_preview(painter: &egui::Painter, rect: Rect, clip: &MidiClip) {
 /// engine uses (`glitcherz_model::sample_curve`) and tiles it over the clip's
 /// span by `loop_ticks` — exactly what plays, mirrored on the block. There is
 /// no editing here: anchors are edited in the Edit tab (spec §8 D14).
-fn draw_control_preview(painter: &egui::Painter, rect: Rect, clip: &ControlClip) {
-    if clip.curve.is_empty() || clip.span_ticks == 0 || rect.width() < 6.0 || rect.height() < 6.0 {
+fn draw_control_preview(
+    painter: &egui::Painter,
+    rect: Rect,
+    span_ticks: u32,
+    data: &glitcherz_model::CurveData,
+) {
+    if data.points.is_empty() || span_ticks == 0 || rect.width() < 6.0 || rect.height() < 6.0 {
         return;
     }
     let height = rect.height() - 2.0;
@@ -4569,15 +4563,15 @@ fn draw_control_preview(painter: &egui::Painter, rect: Rect, clip: &ControlClip)
     // shape, the same way the Edit tab does, with no target axis involved.
     let value_y = |value: f32| rect.bottom() - 1.0 - crate::curve::y_of(value) * height;
     let color = Color32::from_rgb(150, 200, 250);
-    let span = f64::from(clip.span_ticks.max(1));
+    let span = f64::from(span_ticks.max(1));
     let span_px = rect.width();
-    let loop_ticks = f64::from(clip.loop_ticks.max(1));
+    let loop_ticks = f64::from(data.length_ticks.max(1));
     let mut prev: Option<Pos2> = None;
     let mut x = rect.left();
     while x <= rect.right() + 0.5 {
         let offset = (f64::from(x - rect.left()) / f64::from(span_px)) * span;
         let phase = offset.rem_euclid(loop_ticks);
-        if let Some(value) = glitcherz_model::sample_curve(&clip.curve, clip.interp, phase) {
+        if let Some(value) = glitcherz_model::sample_curve(&data.points, data.interp, phase) {
             let p = pos2(x, value_y(value));
             if let Some(prev) = prev {
                 painter.line_segment([prev, p], Stroke::new(1.5, color));
@@ -4593,7 +4587,7 @@ mod tests {
     use super::*;
     // The tests lock the 4/4 behavior: bar_ticks is the document's meter in
     // production, the constant is the 4/4 case they exercise.
-    use glitcherz_model::{MeterMarker, TICKS_PER_BAR, TimeSignature};
+    use glitcherz_model::{AutoPoint, MeterMarker, Note, TICKS_PER_BAR, TimeSignature};
 
     /// A single-segment meter at `(numerator, denominator)` (Met M4).
     fn meter(signature: (u8, u8)) -> MeterMap {
@@ -4641,39 +4635,19 @@ mod tests {
         );
     }
 
-    /// I6: a single-period clip's head cut removes the material before the
-    /// new start, and a note crossing the cut keeps its tail (this is the
-    /// `retain_from` contract the trim relies on).
+    /// F-041: a head trim moves the window; the shared content is untouched.
     #[test]
-    fn head_trim_cuts_midi_content_without_losing_the_crossing_tail() {
+    fn head_trim_moves_the_window_without_touching_content() {
         let mut clip = MidiClip {
             start_ticks: 0,
             span_ticks: 2 * TICKS_PER_BAR,
-            loop_ticks: 2 * TICKS_PER_BAR,
+            source_offset: 0,
             ..MidiClip::default()
         };
-        clip.sequence.notes = vec![
-            Note {
-                start: 0,
-                length: 480,
-                note: 60,
-                velocity: 100,
-                channel: 0,
-            },
-            Note {
-                start: 960,
-                length: 960,
-                note: 64,
-                velocity: 100,
-                channel: 0,
-            },
-        ];
         let delta = 1200;
         clip.retain_from(delta, SPT);
-        assert_eq!(clip.sequence.notes.len(), 1);
-        assert_eq!(clip.sequence.notes[0].note, 64);
-        assert_eq!(clip.sequence.notes[0].start, 0);
-        assert_eq!(clip.sequence.notes[0].end(), 1920 - i64::from(delta));
+        assert_eq!(clip.source_offset, delta);
+        assert_eq!(clip.span_ticks, 2 * TICKS_PER_BAR - delta);
     }
 
     /// W3a: clip names are optional and the `Placement` helpers are the
@@ -4834,43 +4808,16 @@ mod tests {
         assert_eq!(clamp_row_delta(1, &[ctrl_top], 2, 1, 0), 0);
     }
 
-    /// W2: growing a clip keeps its content period (it tiles), shrinking trims
-    /// the tail; an explicit Alt request wins but must fit the container.
-    #[test]
-    fn resize_loop_tiles_when_growing_and_trims_when_shrinking() {
-        let bar = TICKS_PER_BAR;
-        assert_eq!(resolve_loop(bar, 4 * bar, None), bar);
-        assert_eq!(resolve_loop(2 * bar, bar, None), bar);
-        assert_eq!(resolve_loop(bar, 4 * bar, Some(2 * bar)), 2 * bar);
-        assert_eq!(resolve_loop(bar, bar, Some(8 * bar)), bar);
-        // Never zero: the loop always covers at least one tick.
-        assert_eq!(resolve_loop(bar, 1, None), 1);
-    }
-
-    /// 2026-11-04: T extends a single-period clip's editable time; a tiled
-    /// clip keeps its repeat count and scales its period with the container.
-    #[test]
-    fn stretch_loop_extends_time_and_scales_tiled_periods() {
-        let bar = TICKS_PER_BAR;
-        // Single period: 1 bar -> 4 bars, still one period.
-        assert_eq!(resolve_stretch_loop(bar, bar, 4 * bar), 4 * bar);
-        // 4 bars in 2 periods: grow to 8 bars -> 4-bar period (2 repeats).
-        assert_eq!(resolve_stretch_loop(2 * bar, 4 * bar, 8 * bar), 4 * bar);
-        // Shrinking likewise keeps the repeat count.
-        assert_eq!(resolve_stretch_loop(2 * bar, 4 * bar, 2 * bar), bar);
-        // Never zero / never beyond the container.
-        assert_eq!(resolve_stretch_loop(bar, bar, 1), 1);
-        assert_eq!(resolve_stretch_loop(8 * bar, 8 * bar, 2), 2);
-    }
-
     /// 2026-11-04: the tile modal adds/removes whole repeats, one per
     /// period-width of travel. A single-period clip tiles as a whole; an
     /// already-tiled clip keeps its period and just adjusts the count.
     #[test]
     fn tile_targets_adjusts_repeats() {
-        let mut clip = MidiClip::new(0);
-        clip.span_ticks = 4 * TICKS_PER_BAR;
-        clip.loop_ticks = 4 * TICKS_PER_BAR;
+        let clip = MidiClip {
+            start_ticks: 0,
+            span_ticks: 4 * TICKS_PER_BAR,
+            ..MidiClip::default()
+        };
         let midi = vec![MidiTrack {
             clips: vec![clip],
             ..MidiTrack::default()
@@ -4884,77 +4831,96 @@ mod tests {
             }],
             grab: pos2(100.0, 100.0),
         };
-        let target = |dx_bars: f32, tracks: &[MidiTrack]| {
+        let target = |dx_bars: f32, tracks: &[MidiTrack], data: &[glitcherz_model::MidiData]| {
             tile_targets(
                 &modal,
                 Some(pos2(100.0 + dx_bars * 56.0, 100.0)),
                 56.0,
                 TICKS_PER_BAR,
                 tracks,
+                data,
+                &[],
                 &[],
                 SPT,
             )
             .unwrap()
         };
+        let four_bar = vec![glitcherz_model::MidiData {
+            length_ticks: 4 * TICKS_PER_BAR,
+            ..glitcherz_model::MidiData::default()
+        }];
         // No movement: the ghost is the clip itself (×1).
-        let tiles = target(0.0, &midi);
+        let tiles = target(0.0, &midi, &four_bar);
         assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
         assert_eq!(tiles[0].loop_ticks, 4 * TICKS_PER_BAR);
-        // Partial travel does not count until a full clip-width.
-        let tiles = target(2.0, &midi);
+        // Partial travel does not count until a full content width.
+        let tiles = target(2.0, &midi, &four_bar);
         assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
-        // One clip-width right: the whole clip repeats once (×2).
-        let tiles = target(4.0, &midi);
+        // One content-width right: the whole clip repeats once (×2).
+        let tiles = target(4.0, &midi, &four_bar);
         assert_eq!(tiles[0].span_ticks, 8 * TICKS_PER_BAR);
         assert_eq!(tiles[0].loop_ticks, 4 * TICKS_PER_BAR);
-        // Two clip-widths: ×3.
-        let tiles = target(8.0, &midi);
+        // Two content-widths: ×3.
+        let tiles = target(8.0, &midi, &four_bar);
         assert_eq!(tiles[0].span_ticks, 12 * TICKS_PER_BAR);
         // Left of the grab point never shrinks the clip.
-        let tiles = target(-3.0, &midi);
+        let tiles = target(-3.0, &midi, &four_bar);
         assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
 
-        // A single-bar clip tiles into two repeats after one bar of travel.
-        let mut one_bar = midi.clone();
-        one_bar[0].clips[0].span_ticks = TICKS_PER_BAR;
-        one_bar[0].clips[0].loop_ticks = TICKS_PER_BAR;
-        let tiles = target(1.0, &one_bar);
+        // A single-bar window over single-bar content tiles into two repeats.
+        let one_bar = vec![MidiTrack {
+            clips: vec![MidiClip {
+                start_ticks: 0,
+                span_ticks: TICKS_PER_BAR,
+                ..MidiClip::default()
+            }],
+            ..MidiTrack::default()
+        }];
+        let one_bar_data = vec![glitcherz_model::MidiData {
+            length_ticks: TICKS_PER_BAR,
+            ..glitcherz_model::MidiData::default()
+        }];
+        let tiles = target(1.0, &one_bar, &one_bar_data);
         assert_eq!(tiles[0].span_ticks, 2 * TICKS_PER_BAR);
         assert_eq!(tiles[0].loop_ticks, TICKS_PER_BAR);
 
-        // An already-tiled clip adjusts its repeat count and keeps its
-        // period — no nested tiling.
-        let mut tiled = midi.clone();
-        tiled[0].clips[0].loop_ticks = 2 * TICKS_PER_BAR;
-        // No movement: unchanged (×2).
-        let tiles = target(0.0, &tiled);
+        // An already-tiled window keeps its content period and only adjusts
+        // the repeat count — no nested tiling.
+        let two_bar = vec![glitcherz_model::MidiData {
+            length_ticks: 2 * TICKS_PER_BAR,
+            ..glitcherz_model::MidiData::default()
+        }];
+        let tiles = target(0.0, &midi, &two_bar);
         assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
         assert_eq!(tiles[0].loop_ticks, 2 * TICKS_PER_BAR);
-        // Right by two periods: ×4.
-        let tiles = target(4.0, &tiled);
+        let tiles = target(4.0, &midi, &two_bar);
         assert_eq!(tiles[0].span_ticks, 8 * TICKS_PER_BAR);
         assert_eq!(tiles[0].loop_ticks, 2 * TICKS_PER_BAR);
-        // Left by one period: back to a single period (×1).
-        let tiles = target(-2.0, &tiled);
+        let tiles = target(-2.0, &midi, &two_bar);
         assert_eq!(tiles[0].span_ticks, 2 * TICKS_PER_BAR);
         assert_eq!(tiles[0].loop_ticks, 2 * TICKS_PER_BAR);
     }
 
-    /// W2: splitting a tiled clip is refused (it would need a phase-relative
-    /// loop origin the model does not carry).
+    /// F-041: a long window can be split; both halves share the content.
     #[test]
-    fn a_tiled_clip_cannot_be_split() {
+    fn a_long_window_can_be_split() {
         let mut clips = vec![MidiClip {
             start_ticks: 0,
             span_ticks: 2 * TICKS_PER_BAR,
-            loop_ticks: TICKS_PER_BAR,
+            source_offset: 0,
+            data: 7,
             ..MidiClip::default()
         }];
-        assert!(
-            !split_clip_in(&mut clips, TICKS_PER_BAR + TICKS_PER_BAR / 2, 0, SPT),
-            "tiled clip must refuse the cut"
-        );
-        assert_eq!(clips.len(), 1);
+        assert!(split_clip_in(
+            &mut clips,
+            TICKS_PER_BAR + TICKS_PER_BAR / 2,
+            0,
+            SPT
+        ));
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0].data, 7);
+        assert_eq!(clips[1].data, 7);
+        assert_eq!(clips[1].source_offset, TICKS_PER_BAR + TICKS_PER_BAR / 2);
     }
 
     /// W3a: F2 targets the first selection entry on the focused row and
@@ -5025,10 +4991,8 @@ mod tests {
     /// zero span, tiny rect) — it must never panic inside the lane draw.
     #[test]
     fn control_preview_handles_degenerate_inputs() {
-        let clip = ControlClip {
-            span_ticks: TICKS_PER_BAR,
-            loop_ticks: TICKS_PER_BAR,
-            curve: vec![
+        let curve = glitcherz_model::CurveData {
+            points: vec![
                 AutoPoint {
                     tick: 0,
                     value: 0.0,
@@ -5038,7 +5002,8 @@ mod tests {
                     value: 127.0,
                 },
             ],
-            ..ControlClip::default()
+            length_ticks: TICKS_PER_BAR,
+            ..glitcherz_model::CurveData::default()
         };
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 120.0));
@@ -5060,11 +5025,16 @@ mod tests {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(300.0, 60.0), egui::Sense::hover());
                 let painter = ui.painter_at(rect);
-                draw_control_preview(&painter, rect, &clip);
+                draw_control_preview(&painter, rect, TICKS_PER_BAR, &curve);
                 // Degenerate cases: empty curve, and a rect too small to draw.
-                draw_control_preview(&painter, rect, &ControlClip::default());
+                draw_control_preview(
+                    &painter,
+                    rect,
+                    TICKS_PER_BAR,
+                    &glitcherz_model::CurveData::default(),
+                );
                 let tiny = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(3.0, 3.0));
-                draw_control_preview(&painter, tiny, &clip);
+                draw_control_preview(&painter, tiny, TICKS_PER_BAR, &curve);
             });
         });
         out.textures_delta.clear();
@@ -5074,23 +5044,26 @@ mod tests {
     /// inputs (empty notes, zero span, tiny rect) and tiles a tiled clip.
     #[test]
     fn midi_preview_handles_degenerate_inputs() {
-        let mut clip = MidiClip::new(0);
-        clip.span_ticks = 2 * TICKS_PER_BAR;
-        clip.loop_ticks = TICKS_PER_BAR;
-        clip.sequence.notes = vec![
-            Note {
-                start: 0,
-                length: 240,
-                note: 60,
-                ..Note::default()
+        let data = glitcherz_model::MidiData {
+            sequence: glitcherz_model::Sequence {
+                notes: vec![
+                    Note {
+                        start: 0,
+                        length: 240,
+                        note: 60,
+                        ..Note::default()
+                    },
+                    Note {
+                        start: i64::from(TICKS_PER_BAR) / 2,
+                        length: 480,
+                        note: 67,
+                        ..Note::default()
+                    },
+                ],
+                ctrls: Vec::new(),
             },
-            Note {
-                start: i64::from(TICKS_PER_BAR) / 2,
-                length: 480,
-                note: 67,
-                ..Note::default()
-            },
-        ];
+            length_ticks: TICKS_PER_BAR,
+        };
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 120.0));
         let mut viewports = egui::ViewportIdMap::default();
@@ -5111,10 +5084,15 @@ mod tests {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(300.0, 60.0), egui::Sense::hover());
                 let painter = ui.painter_at(rect);
-                draw_midi_preview(&painter, rect, &clip);
-                draw_midi_preview(&painter, rect, &MidiClip::default());
+                draw_midi_preview(&painter, rect, 2 * TICKS_PER_BAR, &data);
+                draw_midi_preview(
+                    &painter,
+                    rect,
+                    2 * TICKS_PER_BAR,
+                    &glitcherz_model::MidiData::default(),
+                );
                 let tiny = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(3.0, 3.0));
-                draw_midi_preview(&painter, tiny, &clip);
+                draw_midi_preview(&painter, tiny, 2 * TICKS_PER_BAR, &data);
             });
         });
         out.textures_delta.clear();
@@ -5124,7 +5102,7 @@ mod tests {
         MidiClip {
             start_ticks: start,
             span_ticks: span,
-            ..MidiClip::new(start)
+            ..MidiClip::default()
         }
     }
 
@@ -5327,10 +5305,13 @@ mod tests {
 
     #[test]
     fn split_halves_keep_start_end_and_content() {
-        let mut clip = MidiClip::new(2 * TICKS_PER_BAR);
-        clip.span_ticks = 4 * TICKS_PER_BAR;
-        clip.loop_ticks = 4 * TICKS_PER_BAR;
-        clip.sequence.notes = vec![
+        let mut clip = MidiClip {
+            start_ticks: 2 * TICKS_PER_BAR,
+            span_ticks: 4 * TICKS_PER_BAR,
+            data: 3,
+            ..MidiClip::default()
+        };
+        clip.legacy_sequence.notes = vec![
             Note {
                 start: 0,
                 length: 240,
@@ -5355,37 +5336,26 @@ mod tests {
         let at = 4 * TICKS_PER_BAR;
         assert!(split_clip_in(&mut clips, at, 0, SPT));
         assert_eq!(clips.len(), 2);
-        // Left: same start, ends at the cut, single-period.
+        // Left: same start, ends at the cut.
         assert_eq!(clips[0].start_ticks, 2 * TICKS_PER_BAR);
         assert_eq!(clips[0].span_ticks, 2 * TICKS_PER_BAR);
-        assert_eq!(clips[0].loop_ticks, 2 * TICKS_PER_BAR);
-        // Left keeps every note in the data (the past-span one included: it
-        // stays hidden until the clip grows back over it).
-        let left = clips[0].notes();
-        assert_eq!(left.len(), 3);
-        assert_eq!(left[1].note, 62);
-        assert_eq!(left[1].length, i64::from(TICKS_PER_BAR));
-        // Right: starts at the cut, runs to the old end, single-period.
+        assert_eq!(clips[0].source_offset, 0);
+        // Right: starts at the cut and shares the content.
         assert_eq!(clips[1].start_ticks, at);
         assert_eq!(clips[1].span_ticks, 2 * TICKS_PER_BAR);
-        assert_eq!(clips[1].loop_ticks, 2 * TICKS_PER_BAR);
-        let right = clips[1].notes();
-        assert_eq!(right.len(), 2);
-        // The crossing note's tail continues at the cut...
-        assert_eq!(right[0].note, 62);
-        assert_eq!(right[0].start, 0);
-        assert_eq!(right[0].length, i64::from(TICKS_PER_BAR) / 2);
-        // ...and the shifted note keeps its offset from the cut.
-        assert_eq!(right[1].note, 64);
-        assert_eq!(right[1].start, i64::from(TICKS_PER_BAR) / 2);
+        assert_eq!(clips[1].source_offset, 2 * TICKS_PER_BAR);
+        assert_eq!(clips[0].data, clips[1].data);
     }
 
     #[test]
     fn split_shifts_control_curve_anchors() {
-        let mut clip = ControlClip::new(TICKS_PER_BAR);
-        clip.span_ticks = 2 * TICKS_PER_BAR;
-        clip.loop_ticks = 2 * TICKS_PER_BAR;
-        clip.curve = vec![
+        let mut clip = ControlClip {
+            start_ticks: TICKS_PER_BAR,
+            span_ticks: 2 * TICKS_PER_BAR,
+            data: 4,
+            ..ControlClip::default()
+        };
+        clip.legacy_curve = vec![
             AutoPoint {
                 tick: 0,
                 value: 0.0,
@@ -5402,27 +5372,14 @@ mod tests {
         let mut clips = vec![clip];
         let at = 2 * TICKS_PER_BAR;
         assert!(split_clip_in(&mut clips, at, 0, SPT));
-        // Left keeps its anchors untouched (data survives a shorten).
+        // Left keeps its window and the shared curve content.
         assert_eq!(clips[0].span_ticks, TICKS_PER_BAR);
-        assert_eq!(clips[0].loop_ticks, TICKS_PER_BAR);
-        assert_eq!(clips[0].curve.len(), 3);
-        // Right carries the anchors from the cut onward, shifted.
+        assert_eq!(clips[0].source_offset, 0);
+        // Right starts at the cut and points into the same content.
         assert_eq!(clips[1].start_ticks, at);
         assert_eq!(clips[1].span_ticks, TICKS_PER_BAR);
-        assert_eq!(clips[1].loop_ticks, TICKS_PER_BAR);
-        assert_eq!(
-            clips[1].curve,
-            vec![
-                AutoPoint {
-                    tick: 0,
-                    value: 0.5
-                },
-                AutoPoint {
-                    tick: TICKS_PER_BAR / 2,
-                    value: 1.0
-                },
-            ]
-        );
+        assert_eq!(clips[1].source_offset, TICKS_PER_BAR);
+        assert_eq!(clips[0].data, clips[1].data);
     }
 
     #[test]

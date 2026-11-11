@@ -6,7 +6,7 @@
 //! permutes the vector, so an index-based selection held across the call
 //! would otherwise point at a different note.
 
-use glitcherz_model::{MidiClip, Note};
+use glitcherz_model::Note;
 use serde_json::{Value, json};
 
 use crate::registry::{always, i64_or, indices};
@@ -442,20 +442,32 @@ fn strum_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
     Ok(json!({ "strummed": chosen.len(), "indices": locate(notes, &chosen) }))
 }
 
-/// Mutable clip at `track`/`clip` from the parameters.
-fn clip_mut<'a>(
+/// Mutable shared content of the clip at `track`/`clip` (F-041).
+fn data_mut<'a>(
     session: &'a mut Session,
     command: &str,
     params: &Value,
-) -> crate::Result<&'a mut MidiClip> {
-    let track = i64_or(params, "track", 0);
-    let clip = i64_or(params, "clip", 0);
+) -> crate::Result<&'a mut glitcherz_model::MidiData> {
+    let track = i64_or(params, "track", 0).max(0) as usize;
+    let clip = i64_or(params, "clip", 0).max(0) as usize;
+    // Resolve the pool index first so the two table borrows never overlap.
+    let data = session
+        .project()
+        .midi_tracks
+        .get(track)
+        .and_then(|t| t.clips.get(clip))
+        .map(|clip| clip.data)
+        .ok_or_else(|| bad_params(command, format!("no clip {clip} on track {track}")))?;
     session
         .project_mut()
-        .midi_tracks
-        .get_mut(track.max(0) as usize)
-        .and_then(|t| t.clips.get_mut(clip.max(0) as usize))
-        .ok_or_else(|| bad_params(command, format!("no clip {clip} on track {track}")))
+        .midi_data
+        .get_mut(data as usize)
+        .ok_or_else(|| {
+            bad_params(
+                command,
+                format!("clip {clip} on track {track} references missing data {data}"),
+            )
+        })
 }
 
 /// Mutable note slice of the targeted clip.
@@ -464,7 +476,7 @@ fn notes_mut<'a>(
     command: &str,
     params: &Value,
 ) -> crate::Result<&'a mut Vec<Note>> {
-    Ok(clip_mut(session, command, params)?.notes_mut())
+    Ok(data_mut(session, command, params)?.notes_mut())
 }
 
 /// Position of `note` in the sequence, by value.
@@ -796,12 +808,18 @@ fn change_velocity(session: &mut Session, params: &Value) -> crate::Result<Value
 fn query(session: &mut Session, params: &Value) -> crate::Result<Value> {
     let track = i64_or(params, "track", 0).max(0) as usize;
     let clip = i64_or(params, "clip", 0).max(0) as usize;
-    let notes = session
+    let data = session
         .project()
         .midi_tracks
         .get(track)
         .and_then(|t| t.clips.get(clip))
-        .map(|c| c.notes().to_vec())
+        .map(|c| c.data)
         .ok_or_else(|| bad_params("midi.query", "no such clip"))?;
+    let notes = session
+        .project()
+        .midi_data
+        .get(data as usize)
+        .map(|d| d.notes().to_vec())
+        .ok_or_else(|| bad_params("midi.query", "clip references missing data"))?;
     Ok(json!({ "notes": notes }))
 }

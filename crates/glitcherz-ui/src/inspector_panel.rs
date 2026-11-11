@@ -60,6 +60,10 @@ impl GlitcherZApp {
                 }
             };
             ui.heading(title);
+            // F-041: the selected clip's shared-content summary and the
+            // Share / Unlink entry points. Clip-level, so it lives with the
+            // thing it acts on rather than in a new panel.
+            self.clip_data_section(ui);
             if target.is_none() && has_any_selection {
                 ui.weak("This node has no editable parameters.");
             }

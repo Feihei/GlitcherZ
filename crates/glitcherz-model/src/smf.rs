@@ -11,8 +11,8 @@
 //! offset. Event and track counts are capped.
 
 use crate::{
-    CtrlEvent, CtrlKind, MeterMarker, MidiClip, MidiTrack, Note, Sequence, TICKS_PER_QUARTER,
-    TimeSignature,
+    CtrlEvent, CtrlKind, MeterMarker, MidiClip, MidiData, MidiTrack, Note, Sequence,
+    TICKS_PER_QUARTER, TimeSignature,
 };
 
 /// Parser safety limits.
@@ -87,7 +87,10 @@ pub fn export_smf(project: &crate::Project) -> Vec<u8> {
     for track in &project.midi_tracks {
         let mut events: Vec<SmfEvent> = Vec::new();
         for clip in &track.clips {
-            for (offset, note) in tiled_notes(clip) {
+            let Some(data) = project.midi_data_of(clip) else {
+                continue;
+            };
+            for (offset, note) in tiled_notes(data, clip.source_offset, clip.span_ticks) {
                 let offset = offset + clip.start_ticks as i64;
                 let channel = note.channel.min(15);
                 events.push(SmfEvent::two(
@@ -105,7 +108,7 @@ pub fn export_smf(project: &crate::Project) -> Vec<u8> {
             }
             // P0: controller events travel with the clip they belong to, so a
             // file exported from a project that imported CC/bend keeps them.
-            for (offset, ctrl) in tiled_ctrls(clip) {
+            for (offset, ctrl) in tiled_ctrls(data, clip.source_offset, clip.span_ticks) {
                 events.push(ctrl_event(offset + clip.start_ticks as i64, &ctrl));
             }
         }
@@ -118,47 +121,70 @@ pub fn export_smf(project: &crate::Project) -> Vec<u8> {
     out
 }
 
-/// A clip's controller events with their loop repetitions laid out, as
-/// absolute offsets from the clip start (P0; mirrors [`tiled_notes`]' rules:
-/// content beyond one loop plays once, not tiled).
-fn tiled_ctrls(clip: &MidiClip) -> Vec<(i64, CtrlEvent)> {
-    let loop_ticks = clip.loop_ticks.max(1) as i64;
-    let span = clip.span_ticks.max(loop_ticks as u32) as i64;
-    let periods = (span + loop_ticks - 1) / loop_ticks;
-    let mut result = Vec::with_capacity(clip.sequence.ctrls.len() * periods as usize);
-    for period in 0..periods {
-        let shift = period * loop_ticks;
-        for ctrl in &clip.sequence.ctrls {
-            if ctrl.tick >= loop_ticks {
-                continue; // events beyond one loop play once, not tiled
+/// A clip's controller events with their window repetitions laid out, as
+/// offsets from the clip start (P0; mirrors [`tiled_notes`]' rules).
+fn tiled_ctrls(data: &MidiData, source_offset: u32, span_ticks: u32) -> Vec<(i64, CtrlEvent)> {
+    let length = i64::from(data.length_ticks.max(1));
+    let span = i64::from(span_ticks.max(1));
+    let offset = i64::from(source_offset);
+    let mut result = Vec::new();
+    for ctrl in &data.sequence.ctrls {
+        let base = ctrl.tick - offset;
+        let mut k = floor_div(-base, length);
+        loop {
+            let at = base + k * length;
+            if at >= span {
+                break;
             }
-            let mut ctrl = *ctrl;
-            ctrl.tick += shift;
-            result.push((ctrl.tick, ctrl));
+            if at >= 0 {
+                let mut ctrl = *ctrl;
+                ctrl.tick = at;
+                result.push((at, ctrl));
+            }
+            k += 1;
         }
     }
     result
 }
 
-/// A clip's notes with their loop repetitions laid out, as absolute offsets
-/// from the clip start.
-fn tiled_notes(clip: &MidiClip) -> Vec<(i64, Note)> {
-    let loop_ticks = clip.loop_ticks.max(1) as i64;
-    let span = clip.span_ticks.max(loop_ticks as u32) as i64;
-    let periods = (span + loop_ticks - 1) / loop_ticks;
-    let mut result = Vec::with_capacity(clip.sequence.notes.len() * periods as usize);
-    for period in 0..periods {
-        let shift = period * loop_ticks;
-        for note in &clip.sequence.notes {
-            if note.start >= loop_ticks {
-                continue; // notes beyond one loop play once, not tiled
+/// A clip's notes with their window repetitions laid out, as offsets from the
+/// clip start (F-041: `(source_offset + t) mod length`, truncated at both
+/// window edges).
+fn tiled_notes(data: &MidiData, source_offset: u32, span_ticks: u32) -> Vec<(i64, Note)> {
+    let length = i64::from(data.length_ticks.max(1));
+    let span = i64::from(span_ticks.max(1));
+    let offset = i64::from(source_offset);
+    let mut result = Vec::new();
+    for note in &data.sequence.notes {
+        let len = note.length.max(1);
+        let base = note.start - offset;
+        // Instances overlapping `[0, span)`: k from the one whose tail reaches
+        // past zero to the one that starts before the window end.
+        let first = floor_div(-base - len + 1, length);
+        let last = floor_div(span - 1 - base, length);
+        let mut k = first;
+        while k <= last {
+            let on = base + k * length;
+            let tail = on + len;
+            if tail > 0 {
+                let head = on.max(0);
+                let end = tail.min(span);
+                if end > head {
+                    let mut note = *note;
+                    note.start = head;
+                    note.length = end - head;
+                    result.push((head, note));
+                }
             }
-            let mut note = *note;
-            note.start += shift;
-            result.push((note.start, note));
+            k += 1;
         }
     }
     result
+}
+
+/// Floor division for a positive divisor.
+fn floor_div(value: i64, divisor: i64) -> i64 {
+    value.div_euclid(divisor)
 }
 
 fn write_chunk(out: &mut Vec<u8>, id: &[u8; 4], payload: &[u8]) {
@@ -370,7 +396,11 @@ pub fn import_smf(bytes: &[u8]) -> Result<SmfImport, SmfError> {
         let track = parse_track(payload, ticks_per_quarter, tracks.len(), &mut meters)?;
         // A format-1 conductor track carries only meta events: it folds into
         // the project's global tempo/meter, so it becomes no track here.
-        if !track.clips.iter().all(|c| c.sequence.notes.is_empty()) {
+        if !track
+            .clips
+            .iter()
+            .all(|c| c.legacy_sequence.notes.is_empty())
+        {
             tracks.push(track);
         }
         cursor.skip(length)?;
@@ -733,8 +763,10 @@ fn split_into_clips(notes: Vec<Note>, ctrls: Vec<CtrlEvent>) -> Vec<MidiClip> {
             muted: false,
             start_ticks: u32::try_from(clip_origin).unwrap_or(u32::MAX),
             span_ticks: u32::try_from(span).unwrap_or(u32::MAX),
-            loop_ticks: u32::try_from(span).unwrap_or(u32::MAX),
-            sequence: Sequence {
+            source_offset: 0,
+            data: 0,
+            legacy_loop_ticks: u32::try_from(span).unwrap_or(u32::MAX),
+            legacy_sequence: Sequence {
                 notes: chunk_notes,
                 ctrls: chunk_ctrls,
             },
@@ -781,14 +813,17 @@ mod tests {
         let clips = split_into_clips(notes, Vec::new());
 
         assert_eq!(clips.len(), 2, "5000 notes / 4096 per clip = 2 chunks");
-        assert_eq!(clips[0].sequence.notes.len(), super::IMPORT_CLIP_NOTES);
         assert_eq!(
-            clips[1].sequence.notes.len(),
+            clips[0].legacy_sequence.notes.len(),
+            super::IMPORT_CLIP_NOTES
+        );
+        assert_eq!(
+            clips[1].legacy_sequence.notes.len(),
             5_000 - super::IMPORT_CLIP_NOTES
         );
         // Both clips are non-looping single periods placed end to end.
         for clip in &clips {
-            assert_eq!(clip.loop_ticks, clip.span_ticks);
+            assert_eq!(clip.legacy_loop_ticks, clip.span_ticks);
         }
         // Chunks are placed end to end; the first clip's span reaches one
         // note length past the cut (its last note), which is fine — the second
@@ -799,7 +834,7 @@ mod tests {
         let absolute: Vec<i64> = clips
             .iter()
             .flat_map(|clip| {
-                clip.sequence
+                clip.legacy_sequence
                     .notes
                     .iter()
                     .map(move |n| i64::from(clip.start_ticks) + n.start)
@@ -812,9 +847,12 @@ mod tests {
     /// 64-note cap and could not be saved at all.
     #[test]
     fn imported_dense_track_stays_savable() {
-        let mut clip = MidiClip::new(0);
+        let mut clip = MidiClip {
+            legacy_loop_ticks: TICKS_PER_QUARTER * 4,
+            ..MidiClip::default()
+        };
         for i in 0..300 {
-            clip.sequence.notes.push(Note {
+            clip.legacy_sequence.notes.push(Note {
                 start: i * 8,
                 length: 8,
                 note: 60 + (i % 12) as u8,
@@ -833,12 +871,13 @@ mod tests {
         let imported = import_smf(&bytes).expect("parse");
         assert_eq!(imported.tracks.len(), 1);
         assert_eq!(imported.tracks[0].clips.len(), 1, "300 notes fit one clip");
-        assert_eq!(imported.tracks[0].clips[0].sequence.notes.len(), 300);
+        assert_eq!(imported.tracks[0].clips[0].legacy_sequence.notes.len(), 300);
 
         // A default project's graph already wires one timeline port per
         // default track, so the imported track takes slot 0.
         let mut project = Project::default();
         project.midi_tracks[0] = imported.tracks.into_iter().next().expect("one track");
+        project.adopt_inline_content();
         project
             .validate()
             .expect("an imported dense track must be savable");
@@ -848,6 +887,7 @@ mod tests {
         let mut project = Project::default();
         project.metadata.tempo_bpm = bpm;
         project.midi_tracks = tracks;
+        project.adopt_inline_content();
         project
     }
 
@@ -870,10 +910,10 @@ mod tests {
         let mut clip = MidiClip {
             start_ticks: TICKS_PER_QUARTER, // one bar in
             span_ticks: TICKS_PER_QUARTER * 4,
-            loop_ticks: TICKS_PER_QUARTER * 4,
+            legacy_loop_ticks: TICKS_PER_QUARTER * 4,
             ..Default::default()
         };
-        clip.sequence.notes = vec![
+        clip.legacy_sequence.notes = vec![
             Note {
                 start: 0,
                 length: 240,
@@ -902,7 +942,7 @@ mod tests {
         assert_eq!(imported.len(), 1);
         let track = imported.pop().expect("one track");
         assert_eq!(track.name, "lead");
-        let notes = &track.clips[0].sequence.notes;
+        let notes = &track.clips[0].legacy_sequence.notes;
         assert_eq!(notes.len(), 2);
         // The arrangement position survived: the clip sits one bar in and the
         // notes are relative to it.
@@ -923,17 +963,17 @@ mod tests {
         let mut clip = MidiClip {
             start_ticks: TICKS_PER_QUARTER, // one bar in
             span_ticks: TICKS_PER_QUARTER * 4,
-            loop_ticks: TICKS_PER_QUARTER * 4,
+            legacy_loop_ticks: TICKS_PER_QUARTER * 4,
             ..Default::default()
         };
-        clip.sequence.notes = vec![Note {
+        clip.legacy_sequence.notes = vec![Note {
             start: 0,
             length: 240,
             note: 60,
             velocity: 90,
             channel: 2,
         }];
-        clip.sequence.ctrls = vec![
+        clip.legacy_sequence.ctrls = vec![
             CtrlEvent {
                 tick: 0,
                 channel: 2,
@@ -973,7 +1013,7 @@ mod tests {
         let track = tracks.pop().expect("one track");
         // The arrangement position survived and the events are relative to it.
         assert_eq!(track.clips[0].start_ticks, TICKS_PER_QUARTER);
-        let ctrls = &track.clips[0].sequence.ctrls;
+        let ctrls = &track.clips[0].legacy_sequence.ctrls;
         assert_eq!(ctrls.len(), 4, "{ctrls:?}");
         assert_eq!(
             ctrls
@@ -997,17 +1037,17 @@ mod tests {
         let mut clip = MidiClip {
             start_ticks: 0,
             span_ticks: TICKS_PER_QUARTER * 2,
-            loop_ticks: TICKS_PER_QUARTER * 2,
+            legacy_loop_ticks: TICKS_PER_QUARTER * 2,
             ..Default::default()
         };
-        clip.sequence.notes = vec![Note {
+        clip.legacy_sequence.notes = vec![Note {
             start: 480,
             length: 240,
             note: 72,
             velocity: 100,
             channel: 0,
         }];
-        clip.sequence.ctrls = vec![
+        clip.legacy_sequence.ctrls = vec![
             CtrlEvent {
                 tick: 0,
                 channel: 0,
@@ -1033,12 +1073,12 @@ mod tests {
         let imported = import_smf(&bytes).expect("parse");
         let track = &imported.tracks[0];
         assert_eq!(
-            track.clips[0].sequence.notes.len(),
+            track.clips[0].legacy_sequence.notes.len(),
             1,
             "the note after two one-byte messages must survive"
         );
-        assert_eq!(track.clips[0].sequence.notes[0].note, 72);
-        assert_eq!(track.clips[0].sequence.ctrls.len(), 2);
+        assert_eq!(track.clips[0].legacy_sequence.notes[0].note, 72);
+        assert_eq!(track.clips[0].legacy_sequence.ctrls.len(), 2);
     }
 
     #[test]
@@ -1120,7 +1160,7 @@ mod tests {
         bytes.extend_from_slice(&track);
 
         let tracks = import_smf(&bytes).expect("parse").tracks;
-        let notes = &tracks[0].clips[0].sequence.notes;
+        let notes = &tracks[0].clips[0].legacy_sequence.notes;
         assert_eq!(notes.len(), 1);
         assert_eq!((notes[0].start, notes[0].length), (0, 240));
     }
@@ -1136,7 +1176,7 @@ mod tests {
         bytes.extend_from_slice(&track);
 
         let tracks = import_smf(&bytes).expect("parse").tracks;
-        let notes = &tracks[0].clips[0].sequence.notes;
+        let notes = &tracks[0].clips[0].legacy_sequence.notes;
         assert_eq!(notes.len(), 1, "the hanging note is closed, not dropped");
         assert_eq!(notes[0].length, 1000);
     }
@@ -1159,7 +1199,7 @@ mod tests {
         bytes.extend_from_slice(&track);
 
         let tracks = import_smf(&bytes).expect("parse").tracks;
-        let mut notes = tracks[0].clips[0].sequence.notes.clone();
+        let mut notes = tracks[0].clips[0].legacy_sequence.notes.clone();
         notes.sort_by_key(|n| n.start);
         assert_eq!(notes.len(), 2);
         assert_eq!(
@@ -1183,7 +1223,7 @@ mod tests {
         bytes.extend_from_slice(&track);
 
         let tracks = import_smf(&bytes).expect("parse").tracks;
-        let notes = &tracks[0].clips[0].sequence.notes;
+        let notes = &tracks[0].clips[0].legacy_sequence.notes;
         assert_eq!(notes.len(), 1);
         assert_eq!(
             notes[0].length, 960,

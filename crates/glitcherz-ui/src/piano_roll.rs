@@ -47,8 +47,8 @@ use eframe::egui;
 use crate::grid::GridValue;
 use crate::snap::Snap;
 use glitcherz_model::{
-    ControlClip, MeterMap, MidiClip, MidiTrack, Note, RandomizeOptions, StrumDirection,
-    StrumOptions, TICKS_PER_QUARTER, TICKS_PER_STEP,
+    ControlClip, CurveData, MeterMap, MidiClip, MidiData, MidiTrack, Note, RandomizeOptions,
+    StrumDirection, StrumOptions, TICKS_PER_QUARTER, TICKS_PER_STEP,
 };
 
 pub use crate::grid::NoteValue;
@@ -328,8 +328,10 @@ pub struct OverlayLane<'a> {
     /// The control clip this lane edits. Writing targets this clip and only
     /// this clip (D16: the roll writes notes, lanes write curves).
     pub clip: ClipRef,
-    /// The clip's curve, borrowed for this frame.
+    /// The clip's placement, borrowed for this frame.
     pub data: &'a ControlClip,
+    /// The shared curve content the clip's window points at (F-041).
+    pub curve: &'a CurveData,
     /// Caption drawn in the lane's top-left corner.
     pub label: String,
 }
@@ -514,7 +516,7 @@ pub struct RollState {
     view_origin: Option<i64>,
     /// Snap granularity / grid density.
     pub grid: GridValue,
-    /// Indices into `clip.notes()` of the selected notes.
+    /// Indices into `data.notes()` of the selected notes.
     pub selection: Vec<usize>,
     /// Persistent mode: what a left-drag on the roll means (M4).
     pub mode: RollMode,
@@ -739,7 +741,7 @@ impl Modal {
     /// ghosts should show, and what a confirming click would apply.
     fn frame(
         &self,
-        clip: &MidiClip,
+        data: &MidiData,
         selection: &[usize],
         pointer_tick: f32,
         pointer_note: u8,
@@ -758,7 +760,7 @@ impl Modal {
                     None => (want_start, want_note),
                 };
                 let (delta_start, delta_note) =
-                    clamped_move_deltas(clip, selection, want_start, want_note, loop_ticks);
+                    clamped_move_deltas(data, selection, want_start, want_note, loop_ticks);
                 ModalFrame {
                     delta_start,
                     delta_note,
@@ -805,7 +807,7 @@ impl Modal {
     /// undo step).
     fn finalize(
         &self,
-        clip: &MidiClip,
+        data: &MidiData,
         selection: &[usize],
         frame: ModalFrame,
         loop_ticks: i64,
@@ -813,7 +815,7 @@ impl Modal {
         match self.kind {
             ModalKind::Move { .. } if frame.delta_start != 0 || frame.delta_note != 0 => {
                 Some(clamped_move(
-                    clip,
+                    data,
                     selection,
                     frame.delta_start,
                     frame.delta_note,
@@ -911,7 +913,7 @@ enum DragKind {
 ///
 /// - *Frozen anchor* — every command re-sorts the clip, so a held index
 ///   stops pointing at the grabbed note after the first frame. Deriving
-///   the target from the anchor instead of re-reading `clip.notes()[i]`
+///   the target from the anchor instead of re-reading `data.notes()[i]`
 ///   keeps a trim attached to the note the user grabbed.
 /// - *Incremental* — commands apply *relative* deltas (`start + ticks`).
 ///   Re-emitting the grab-relative total every frame would compound
@@ -1193,7 +1195,7 @@ impl RollState {
     fn arm_tool(
         &mut self,
         arm: RollArm,
-        clip: &MidiClip,
+        data: &MidiData,
         grab_tick: f32,
         grab_note: u8,
         loop_ticks: i64,
@@ -1214,7 +1216,7 @@ impl RollState {
             }
             RollArm::Scale | RollArm::Stretch => {}
         }
-        let Some((lo, hi)) = selection_bbox(clip, &self.selection) else {
+        let Some((lo, hi)) = selection_bbox(data, &self.selection) else {
             self.note_status(match arm {
                 RollArm::Scale => "Scale: nothing selected",
                 _ => "Stretch: nothing selected",
@@ -1392,8 +1394,8 @@ impl RollGeom {
     /// empty space and paints a *new* note there. The slop keeps the last few
     /// pixels of aim error on the note instead of falling through to the
     /// draw-on-empty gesture.
-    fn note_at(&self, clip: &MidiClip, pos: egui::Pos2) -> Option<usize> {
-        clip.notes()
+    fn note_at(&self, data: &MidiData, pos: egui::Pos2) -> Option<usize> {
+        data.notes()
             .iter()
             .position(|n| self.note_hit_rect(n).contains(pos))
     }
@@ -1416,18 +1418,18 @@ impl ViewWindow {
     /// editor) is skipped; with no live clip the window collapses to zero at
     /// the focus origin, which the callers never reach because `show` bails
     /// out first.
-    fn of(tracks: &[MidiTrack], subject: &RollSubject) -> Self {
+    fn of(tracks: &[MidiTrack], midi_data: &[MidiData], subject: &RollSubject) -> Self {
         let mut start = f32::INFINITY;
         let mut end = f32::NEG_INFINITY;
         for ctx in subject.context() {
-            let Some(clip) = track_clip(tracks, *ctx) else {
+            let Some((clip, data)) = track_clip(tracks, midi_data, *ctx) else {
                 continue;
             };
             let origin = clip.start_ticks as f32;
             // Aud series: the window covers the clip's whole span. A tiled
             // clip opens on the full block instead of swallowing everything
             // past its first content period.
-            let span = clip.span_ticks.max(clip.loop_ticks).max(TICKS_PER_STEP) as f32;
+            let span = clip.span_ticks.max(data.length_ticks).max(TICKS_PER_STEP) as f32;
             start = start.min(origin);
             end = end.max(origin + span);
         }
@@ -1472,12 +1474,18 @@ fn playhead_local(playhead: f32, origin: i64, loop_ticks: i64, span: i64) -> Opt
 
 /// The clip a [`ClipRef`] points at, or `None` when the document moved on
 /// (a clip deleted while the editor was open).
-fn track_clip(tracks: &[MidiTrack], clip: ClipRef) -> Option<&MidiClip> {
+fn track_clip<'a>(
+    tracks: &'a [MidiTrack],
+    midi_data: &'a [MidiData],
+    clip: ClipRef,
+) -> Option<(&'a MidiClip, &'a MidiData)> {
     match clip.lane {
-        RollLane::Midi => tracks.get(clip.track)?.clips.get(clip.clip),
-        // A control clip is not a MIDI clip: the roll never asks for one here
-        // (the focus is always MIDI; control clips only feed overlay lanes).
-        RollLane::Control => None,
+        RollLane::Midi => {
+            let clip = tracks.get(clip.track)?.clips.get(clip.clip)?;
+            let data = midi_data.get(clip.data as usize)?;
+            Some((clip, data))
+        }
+        RollLane::Control => None, // the focus is always MIDI
     }
 }
 
@@ -1490,6 +1498,7 @@ fn track_clip(tracks: &[MidiTrack], clip: ClipRef) -> Option<&MidiClip> {
 pub fn show(
     ui: &mut egui::Ui,
     tracks: &[MidiTrack],
+    midi_data: &[MidiData],
     lanes: &[OverlayLane<'_>],
     subject: &RollSubject,
     state: &mut RollState,
@@ -1499,11 +1508,11 @@ pub fn show(
     router: &mut crate::focus::FocusRouter,
 ) -> Option<RollIntent> {
     let focus = subject.focus();
-    let clip = track_clip(tracks, focus)?;
-    let loop_ticks = i64::from(clip.loop_ticks.max(TICKS_PER_STEP)).max(1);
+    let (clip, data) = track_clip(tracks, midi_data, focus)?;
+    let loop_ticks = i64::from(data.length_ticks.max(TICKS_PER_STEP)).max(1);
     // Aud series: the whole clip block (tiled repeats included) — the ruler's
     // extent and the audition range's end.
-    let clip_span = i64::from(clip.span_ticks.max(clip.loop_ticks.max(TICKS_PER_STEP))).max(1);
+    let clip_span = i64::from(clip.span_ticks.max(data.length_ticks.max(TICKS_PER_STEP))).max(1);
     // P3: the focus clip's origin, and the visible window = the whole context
     // (`roll-multiclip.md` D2/D3). With one clip both degenerate to exactly
     // the P2 behaviour.
@@ -1514,17 +1523,18 @@ pub fn show(
     let origin_bar_ticks = i64::from(meter.ticks_per_bar_at(clip.start_ticks).max(1));
     // P4: overlay lanes may extend past every MIDI clip, so the view window
     // (and therefore the fit scale) has to cover them too.
-    let window = lanes
-        .iter()
-        .fold(ViewWindow::of(tracks, subject), |window, lane| {
+    let window = lanes.iter().fold(
+        ViewWindow::of(tracks, midi_data, subject),
+        |window, lane| {
             let start = lane.data.start_ticks as f32;
             let span = lane
                 .data
                 .span_ticks
-                .max(lane.data.loop_ticks)
+                .max(lane.curve.length_ticks)
                 .max(TICKS_PER_STEP) as f32;
             window.union(start, start + span)
-        });
+        },
+    );
     // `scroll_x` is absolute now, and the state outlives target switches: a
     // clip starting at bar 9 must open on its own left edge, not inherit a
     // scroll borrowed from the previous clip.
@@ -2275,7 +2285,7 @@ pub fn show(
             .round()
             .clamp(0.0, 127.0) as u8
     };
-    let hit_note = |pos: egui::Pos2| geom.note_at(clip, pos);
+    let hit_note = |pos: egui::Pos2| geom.note_at(data, pos);
     // D2: the view may scroll past the focus clip (to show a ghost), but
     // editing stops at its edges — a click out there must not conjure a note
     // clamped to tick 0.
@@ -2297,7 +2307,7 @@ pub fn show(
             .input(|i| i.pointer.latest_pos())
             .unwrap_or_else(|| rect.center());
         modal.frame(
-            clip,
+            data,
             &state.selection,
             pointer_tick(pos),
             pointer_note(pos),
@@ -2456,12 +2466,12 @@ pub fn show(
         if *ctx == focus {
             continue;
         }
-        let Some(ghost_clip) = track_clip(tracks, *ctx) else {
+        let Some((ghost_clip, ghost_data)) = track_clip(tracks, midi_data, *ctx) else {
             continue;
         };
         let ghost_geom = geom.at_origin(i64::from(ghost_clip.start_ticks));
-        let ghost_loop = i64::from(ghost_clip.loop_ticks.max(TICKS_PER_STEP)).max(1);
-        for note in ghost_clip.notes() {
+        let ghost_loop = i64::from(ghost_data.length_ticks.max(TICKS_PER_STEP)).max(1);
+        for note in ghost_data.notes() {
             // Past a shortened span: kept in the data, never drawn (same rule
             // as the focus clip).
             if note.start >= ghost_loop {
@@ -2480,7 +2490,7 @@ pub fn show(
     // ghost on top stays readable where the two overlap (Blender convention:
     // origin dimmed, transform preview solid).
     let modal_active = modal_frame.as_ref().is_some_and(|f| !f.is_identity());
-    for (index, note) in clip.notes().iter().enumerate() {
+    for (index, note) in data.notes().iter().enumerate() {
         // Notes past a shortened span stay in the data but are never drawn.
         if note.start >= loop_ticks {
             continue;
@@ -2519,7 +2529,7 @@ pub fn show(
         && !frame.is_identity()
     {
         for index in &state.selection {
-            let Some(note) = clip.notes().get(*index) else {
+            let Some(note) = data.notes().get(*index) else {
                 continue;
             };
             let ghost = modal_ghost(note, frame);
@@ -2583,7 +2593,7 @@ pub fn show(
     let lane_geom = geom.over(lane_rect);
     let lane_painter = ui.painter_at(lane_rect);
     lane_painter.rect_filled(lane_rect, 0.0, egui::Color32::from_gray(20));
-    for (index, note) in clip.notes().iter().enumerate() {
+    for (index, note) in data.notes().iter().enumerate() {
         let x = lane_geom.x_of(note.start as f32);
         let w = (note.length as f32 * ticks_to_x).clamp(3.0, 8.0);
         let h = (LANE_HEIGHT - 4.0) * f32::from(note.velocity) / 127.0;
@@ -2644,7 +2654,7 @@ pub fn show(
         match ui.ctx().input(|i| i.pointer.hover_pos()) {
             Some(pos) if rect.contains(pos) => {
                 state.pending_arm = None;
-                state.arm_tool(arm, clip, pointer_tick(pos), pointer_note(pos), loop_ticks);
+                state.arm_tool(arm, data, pointer_tick(pos), pointer_note(pos), loop_ticks);
             }
             _ if ui.ctx().input(|i| i.pointer.primary_pressed()) => state.pending_arm = None,
             _ => {}
@@ -2748,7 +2758,7 @@ pub fn show(
                 state.selection.clear();
                 state.note_status("Selection cleared");
             } else if keys.select_all {
-                state.selection = (0..clip.notes().len()).collect();
+                state.selection = (0..data.notes().len()).collect();
                 let count = state.selection.len();
                 if count == 0 {
                     state.note_status("Select all: the clip is empty");
@@ -2821,7 +2831,7 @@ pub fn show(
                 state.pending_arm = None;
                 state.arm_tool(
                     arm,
-                    clip,
+                    data,
                     pointer_tick(arm_pos),
                     pointer_note(arm_pos),
                     loop_ticks,
@@ -2846,7 +2856,7 @@ pub fn show(
         && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
         && let Some(index) = hit_note(pos)
     {
-        let note = clip.notes()[index];
+        let note = data.notes()[index];
         state.preview_held = Some(note.note);
         state
             .preview_events
@@ -2902,17 +2912,17 @@ pub fn show(
         if let Some(pos) = response.interact_pointer_pos() {
             if let Some(modal) = state.modal.take() {
                 let frame = modal.frame(
-                    clip,
+                    data,
                     &state.selection,
                     pointer_tick(pos),
                     pointer_note(pos),
                     snap,
                     loop_ticks,
                 );
-                intent = modal.finalize(clip, &state.selection, frame, loop_ticks);
+                intent = modal.finalize(data, &state.selection, frame, loop_ticks);
             } else if state.knife_armed {
                 let tick = pointer_tick(pos).round() as i64;
-                let cuts: Vec<(usize, i64)> = clip
+                let cuts: Vec<(usize, i64)> = data
                     .notes()
                     .iter()
                     .enumerate()
@@ -3010,7 +3020,7 @@ pub fn show(
         };
         if (delta_note != 0 || delta_start != 0) && !state.selection.is_empty() {
             intent = Some(clamped_move(
-                clip,
+                data,
                 &state.selection,
                 0,
                 delta_note,
@@ -3036,7 +3046,7 @@ pub fn show(
             if state.knife_armed {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             } else if let Some(index) = hit_note(pos) {
-                let note = &clip.notes()[index];
+                let note = &data.notes()[index];
                 let (x0, x1) = geom.note_edges(note);
                 if edge_zone(pos.x, x0, x1).is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -3090,13 +3100,13 @@ pub fn show(
                 // Edge-trim affordance is checked first: within EDGE_PX of a
                 // note's start/end the grab trims that edge instead of moving.
                 let edge = hit_note(pos).and_then(|index| {
-                    let note = &clip.notes()[index];
+                    let note = &data.notes()[index];
                     let (x0, x1) = geom.note_edges(note);
                     edge_zone(pos.x, x0, x1)
                 });
                 match hit_note(pos) {
                     Some(index) => {
-                        let grabbed = clip.notes()[index];
+                        let grabbed = data.notes()[index];
                         // Ctrl is the temporary snap override (spec `snap.md`
                         // S4): it no longer duplicates on drag — the copy
                         // entry points are Shift+D and the toolbar button.
@@ -3214,7 +3224,7 @@ pub fn show(
 
                 knife.last = pos;
                 knife.path.push(pos);
-                for (index, note) in clip.notes().iter().enumerate() {
+                for (index, note) in data.notes().iter().enumerate() {
                     if knife.cuts.iter().any(|(cut, _)| *cut == index) {
                         continue; // one cut per note per stroke
                     }
@@ -3249,7 +3259,7 @@ pub fn show(
                         let delta_note = want_note - drag.applied_note;
                         if delta_start != 0 || delta_note != 0 {
                             let step = clamped_move(
-                                clip,
+                                data,
                                 &state.selection,
                                 delta_start,
                                 delta_note
@@ -3317,7 +3327,7 @@ pub fn show(
         // A finished marquee selects what it covers.
         if let Some(marquee) = state.marquee.take() {
             let band = egui::Rect::from_two_pos(marquee.origin, marquee.current);
-            let hits: Vec<usize> = clip
+            let hits: Vec<usize> = data
                 .notes()
                 .iter()
                 .enumerate()
@@ -3411,7 +3421,7 @@ pub fn show(
                 .clamp(1.0, 127.0) as u8;
             let updates: Vec<(usize, u8)> = if state.selection.is_empty() {
                 let tick = lane_geom.local_at(pos.x).max(0.0) as i64;
-                clip.notes()
+                data.notes()
                     .iter()
                     .enumerate()
                     .filter(|(_, n)| tick >= n.start && tick < n.end())
@@ -3447,14 +3457,14 @@ pub fn show(
                 .input(|i| i.pointer.latest_pos())
                 .unwrap_or_else(|| rect.center());
             let frame = modal.frame(
-                clip,
+                data,
                 &state.selection,
                 pointer_tick(pos),
                 pointer_note(pos),
                 snap,
                 loop_ticks,
             );
-            intent = modal.finalize(clip, &state.selection, frame, loop_ticks);
+            intent = modal.finalize(data, &state.selection, frame, loop_ticks);
         }
         if rmb {
             state.modal = None;
@@ -3567,7 +3577,7 @@ fn curve_lanes(
             continue;
         }
 
-        let loop_ticks = i64::from(lane.data.loop_ticks.max(1));
+        let loop_ticks = i64::from(lane.curve.length_ticks.max(1));
         let span_ticks = i64::from(lane.data.span_ticks.max(1));
         // Only the clip's active span is drawn: outside it the engine plays
         // nothing, so drawing a held value would claim otherwise.
@@ -3582,7 +3592,7 @@ fn curve_lanes(
         while x <= x_end {
             let local = lane_geom.local_at(x);
             let phase = local.rem_euclid(loop_ticks as f32);
-            match lane.data.value_at(f64::from(phase)) {
+            match lane.curve.value_at(f64::from(phase)) {
                 Some(value) => points.push(egui::pos2(x, lane.value_to_y(value, rect))),
                 // An empty curve has nothing to draw; leave the gap.
                 None => {
@@ -3607,7 +3617,7 @@ fn curve_lanes(
         // Anchors. Only the first loop's anchors are real; the tiled repeats
         // are the same points played again.
         let mut anchor_positions: Vec<(u32, egui::Pos2)> = Vec::new();
-        for anchor in &lane.data.curve {
+        for anchor in &lane.curve.points {
             let pos = egui::pos2(
                 lane_geom.x_of(anchor.tick as f32),
                 lane.value_to_y(anchor.value, rect),
@@ -3820,11 +3830,11 @@ fn knife_crossing(from: egui::Pos2, to: egui::Pos2, note: &Note, geom: &RollGeom
 /// Start / end of the selection's bounding box — the Stretch command's
 /// anchor and the Scale command's pivot source. `None` for an empty or
 /// stale selection.
-fn selection_bbox(clip: &MidiClip, selection: &[usize]) -> Option<(i64, i64)> {
+fn selection_bbox(data: &MidiData, selection: &[usize]) -> Option<(i64, i64)> {
     let mut lo = i64::MAX;
     let mut hi = i64::MIN;
     for index in selection {
-        let note = clip.notes().get(*index)?;
+        let note = data.notes().get(*index)?;
         lo = lo.min(note.start);
         hi = hi.max(note.end());
     }
@@ -3879,7 +3889,7 @@ fn modal_ghost(note: &Note, frame: &ModalFrame) -> Note {
 /// Crossings against *unselected* notes can still happen; the command
 /// reports the moved notes' new indices and the caller re-selects them.
 fn clamped_move(
-    clip: &MidiClip,
+    data: &MidiData,
     indices: &[usize],
     raw_start_delta: i64,
     raw_note_delta: i8,
@@ -3887,7 +3897,7 @@ fn clamped_move(
     gesture: Option<u64>,
 ) -> RollIntent {
     let (delta_start, delta_note) = clamped_move_deltas(
-        clip,
+        data,
         indices,
         raw_start_delta,
         i64::from(raw_note_delta),
@@ -3905,13 +3915,13 @@ fn clamped_move(
 /// ghost must never promise a position the confirming intent would clamp
 /// away).
 fn clamped_move_deltas(
-    clip: &MidiClip,
+    data: &MidiData,
     indices: &[usize],
     raw_start_delta: i64,
     raw_note_delta: i64,
     loop_ticks: i64,
 ) -> (i64, i8) {
-    let notes = clip.notes();
+    let notes = data.notes();
     let mut delta_start = raw_start_delta;
     let mut delta_note = raw_note_delta;
     for index in indices {
@@ -4073,7 +4083,9 @@ mod tests {
     use crate::grid::{GridValue, NoteValue};
     use crate::snap::Snap;
     use eframe::egui;
-    use glitcherz_model::{MidiClip, MidiTrack, Note, TICKS_PER_QUARTER, TICKS_PER_STEP, strum};
+    use glitcherz_model::{
+        MidiClip, MidiData, MidiTrack, Note, TICKS_PER_QUARTER, TICKS_PER_STEP, strum,
+    };
 
     fn note(start: i64, length: i64, note: u8) -> Note {
         Note {
@@ -4081,6 +4093,16 @@ mod tests {
             length,
             note,
             ..Note::default()
+        }
+    }
+
+    fn data_with(notes: Vec<Note>) -> MidiData {
+        MidiData {
+            sequence: glitcherz_model::Sequence {
+                notes,
+                ctrls: Vec::new(),
+            },
+            length_ticks: 3840,
         }
     }
 
@@ -4179,12 +4201,15 @@ mod tests {
 
     #[test]
     fn clamped_move_keeps_notes_inside_the_clip_and_pitch_range() {
-        let mut clip = MidiClip::default();
-        clip.sequence.notes = vec![note(0, 240, 0), note(480, 240, 127), note(240, 240, 60)];
+        let data = data_with(vec![
+            note(0, 240, 0),
+            note(480, 240, 127),
+            note(240, 240, 60),
+        ]);
         let loop_ticks = 960;
 
         // Dragging everything left cannot pull the first note below 0...
-        let intent = clamped_move(&clip, &[0, 1, 2], -480, 0, loop_ticks, None);
+        let intent = clamped_move(&data, &[0, 1, 2], -480, 0, loop_ticks, None);
         let RollIntent::MoveNotes { delta_start, .. } = intent else {
             panic!("expected a move");
         };
@@ -4192,7 +4217,7 @@ mod tests {
 
         // ...or right past the loop end. The cap is the note's **tail**, not
         // its start: every note stays fully inside the clip.
-        let intent = clamped_move(&clip, &[0, 1, 2], 480, 0, loop_ticks, None);
+        let intent = clamped_move(&data, &[0, 1, 2], 480, 0, loop_ticks, None);
         let RollIntent::MoveNotes { delta_start, .. } = intent else {
             panic!("expected a move");
         };
@@ -4201,7 +4226,7 @@ mod tests {
             960 - 240 - 480,
             "limited by the latest note's tail"
         );
-        for note in &clip.sequence.notes {
+        for note in data.notes() {
             assert!(
                 note.start + delta_start + note.length <= loop_ticks,
                 "note at {} (len {}) ends outside the clip after the move",
@@ -4211,12 +4236,12 @@ mod tests {
         }
 
         // Pitch: the 0-note blocks downward, the 127-note blocks upward.
-        let intent = clamped_move(&clip, &[0, 1, 2], 0, -5, loop_ticks, None);
+        let intent = clamped_move(&data, &[0, 1, 2], 0, -5, loop_ticks, None);
         let RollIntent::MoveNotes { delta_note, .. } = intent else {
             panic!("expected a move");
         };
         assert_eq!(delta_note, 0);
-        let intent = clamped_move(&clip, &[0, 1, 2], 0, 5, loop_ticks, None);
+        let intent = clamped_move(&data, &[0, 1, 2], 0, 5, loop_ticks, None);
         let RollIntent::MoveNotes { delta_note, .. } = intent else {
             panic!("expected a move");
         };
@@ -4513,12 +4538,10 @@ mod tests {
     #[test]
     fn a_note_hit_test_matches_the_rectangle_it_is_drawn_into() {
         let rect = egui::Rect::from_min_size(egui::pos2(100.0, 200.0), egui::vec2(400.0, 200.0));
-        let mut clip = MidiClip::default();
-        // start 0, length 240; ticks_to_x = 1.0 → drawn 100.0 .. 340.0.
-        clip.sequence.notes = vec![note(0, 240, 60)];
+        let data = data_with(vec![note(0, 240, 60)]);
         let g = geom(rect, 0, 1.0, 60);
 
-        let drawn = g.note_rect(&clip.notes()[0]);
+        let drawn = g.note_rect(&data.notes()[0]);
         assert_eq!(drawn.left(), 100.0);
         assert_eq!(drawn.right(), 340.0);
 
@@ -4526,7 +4549,7 @@ mod tests {
         for x in [drawn.left(), drawn.center().x, drawn.right() - 0.5] {
             let pos = egui::pos2(x, drawn.center().y);
             assert_eq!(
-                g.note_at(&clip, pos),
+                g.note_at(&data, pos),
                 Some(0),
                 "x={x} is inside the drawn rect and must hit"
             );
@@ -4534,14 +4557,14 @@ mod tests {
         // HIT_SLOP keeps an off-by-a-few-pixels tail grab on the note
         // instead of letting it fall through to "draw a new note".
         assert_eq!(
-            g.note_at(&clip, egui::pos2(drawn.right() + 1.0, drawn.center().y)),
+            g.note_at(&data, egui::pos2(drawn.right() + 1.0, drawn.center().y)),
             Some(0),
             "a press a pixel past the tail still hits (aim error is not empty space)"
         );
         // Past the slack it really is empty space.
         assert_eq!(
             g.note_at(
-                &clip,
+                &data,
                 egui::pos2(drawn.right() + HIT_SLOP.x + 0.5, drawn.center().y)
             ),
             None
@@ -4550,7 +4573,7 @@ mod tests {
         // fills this note's own row gutter).
         assert_eq!(
             g.note_at(
-                &clip,
+                &data,
                 egui::pos2(drawn.center().x, drawn.center().y + ROW_HEIGHT)
             ),
             None
@@ -4562,15 +4585,14 @@ mod tests {
     #[test]
     fn a_short_note_is_hit_across_its_full_drawn_width() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0));
-        let mut clip = MidiClip::default();
-        clip.sequence.notes = vec![note(0, 1, 60)];
+        let data = data_with(vec![note(0, 1, 60)]);
         // ticks_to_x = 0.1 → one tick is 0.1 px, floored to the 3 px minimum.
         let g = geom(rect, 0, 0.1, 60);
-        let drawn = g.note_rect(&clip.notes()[0]);
+        let drawn = g.note_rect(&data.notes()[0]);
         assert_eq!(drawn.width(), 3.0, "the minimum width is what gets drawn");
         for x in [drawn.left() + 0.5, drawn.right() - 0.5] {
             assert_eq!(
-                g.note_at(&clip, egui::pos2(x, drawn.center().y)),
+                g.note_at(&data, egui::pos2(x, drawn.center().y)),
                 Some(0),
                 "x={x} within the drawn 3 px must hit the note"
             );
@@ -4759,16 +4781,14 @@ mod tests {
 
     #[test]
     fn a_modal_move_finalizes_with_the_clamped_total() {
-        let mut clip = MidiClip::default();
-        clip.sequence.notes = vec![note(0, 240, 60)];
-        clip.loop_ticks = 3840;
+        let data = data_with(vec![note(0, 240, 60)]);
         let modal = move_modal(240.0, 60);
 
         // The pointer walked one grid cell right and four semitones up.
-        let frame = modal.frame(&clip, &[0], 480.0, 64, Snap::on(240), 3840);
+        let frame = modal.frame(&data, &[0], 480.0, 64, Snap::on(240), 3840);
         assert_eq!((frame.delta_start, frame.delta_note), (240, 4));
         let intent = modal
-            .finalize(&clip, &[0], frame, 3840)
+            .finalize(&data, &[0], frame, 3840)
             .expect("a real move");
         assert!(matches!(
             intent,
@@ -4782,14 +4802,14 @@ mod tests {
 
         // A pointer parked on the grab point confirms nothing: a no-op
         // must not spend an undo step.
-        let frame = modal.frame(&clip, &[0], 240.0, 60, Snap::on(240), 3840);
-        assert_eq!(modal.finalize(&clip, &[0], frame, 3840), None);
+        let frame = modal.frame(&data, &[0], 240.0, 60, Snap::on(240), 3840);
+        assert_eq!(modal.finalize(&data, &[0], frame, 3840), None);
 
         // The move clamps against the loop end (snap(4000) = 4080 → a
         // want of 3840 ticks, clamped so the 240-tick note's **tail** lands
         // on the clip end: 3840 - 240 = 3600).
-        let frame = modal.frame(&clip, &[0], 4000.0, 60, Snap::on(240), 3840);
-        let intent = modal.finalize(&clip, &[0], frame, 3840).expect("clamps");
+        let frame = modal.frame(&data, &[0], 4000.0, 60, Snap::on(240), 3840);
+        let intent = modal.finalize(&data, &[0], frame, 3840).expect("clamps");
         match intent {
             RollIntent::MoveNotes { delta_start, .. } => assert_eq!(delta_start, 3600),
             other => panic!("expected a move, got {other:?}"),
@@ -4802,9 +4822,7 @@ mod tests {
         // scaling keeps the notes' relative layout intact. Grabbed 360
         // ticks right of the pivot; the pointer twice as far doubles the
         // selection in one final factor.
-        let mut clip = MidiClip::default();
-        clip.sequence.notes = vec![note(0, 240, 60), note(480, 240, 62)];
-        clip.loop_ticks = 3840;
+        let data = data_with(vec![note(0, 240, 60), note(480, 240, 62)]);
         let modal = Modal {
             kind: ModalKind::Scale {
                 pivot_tick: 0,
@@ -4815,10 +4833,10 @@ mod tests {
             grab_note: 60,
             gesture: 3,
         };
-        let frame = modal.frame(&clip, &[0, 1], 720.0, 60, Snap::on(240), 3840);
+        let frame = modal.frame(&data, &[0, 1], 720.0, 60, Snap::on(240), 3840);
         assert!((frame.scale_k - 2.0).abs() < 1e-6);
         let intent = modal
-            .finalize(&clip, &[0, 1], frame, 3840)
+            .finalize(&data, &[0, 1], frame, 3840)
             .expect("a real scale");
         assert!(matches!(
             intent,
@@ -4827,15 +4845,13 @@ mod tests {
         ));
 
         // A no-op scale (factor exactly 1) spends no undo step.
-        let frame = modal.frame(&clip, &[0, 1], 360.0, 60, Snap::on(240), 3840);
-        assert_eq!(modal.finalize(&clip, &[0, 1], frame, 3840), None);
+        let frame = modal.frame(&data, &[0, 1], 360.0, 60, Snap::on(240), 3840);
+        assert_eq!(modal.finalize(&data, &[0, 1], frame, 3840), None);
     }
 
     #[test]
     fn a_modal_stretch_trims_the_snapped_bbox_edge() {
-        let mut clip = MidiClip::default();
-        clip.sequence.notes = vec![note(0, 240, 60), note(480, 240, 62)];
-        clip.loop_ticks = 3840;
+        let data = data_with(vec![note(0, 240, 60), note(480, 240, 62)]);
         // bbox [0..720]; bare `t` pulls the end edge.
         let mut modal = Modal {
             kind: ModalKind::Stretch {
@@ -4847,10 +4863,10 @@ mod tests {
             grab_note: 60,
             gesture: 4,
         };
-        let frame = modal.frame(&clip, &[0, 1], 1200.0, 60, Snap::on(240), 3840);
+        let frame = modal.frame(&data, &[0, 1], 1200.0, 60, Snap::on(240), 3840);
         assert_eq!(frame.edge, Some((StretchEdge::End, 480)));
         let intent = modal
-            .finalize(&clip, &[0, 1], frame, 3840)
+            .finalize(&data, &[0, 1], frame, 3840)
             .expect("a real stretch");
         assert!(matches!(
             intent,
@@ -4867,10 +4883,10 @@ mod tests {
             lo: 0,
             hi: 720,
         };
-        let frame = modal.frame(&clip, &[0, 1], 480.0, 60, Snap::on(240), 3840);
+        let frame = modal.frame(&data, &[0, 1], 480.0, 60, Snap::on(240), 3840);
         assert_eq!(frame.edge, Some((StretchEdge::Start, 480)));
         let intent = modal
-            .finalize(&clip, &[0, 1], frame, 3840)
+            .finalize(&data, &[0, 1], frame, 3840)
             .expect("a real trim");
         assert!(matches!(
             intent,
@@ -4881,8 +4897,8 @@ mod tests {
         ));
 
         // A pointer at the edge confirms nothing.
-        let frame = modal.frame(&clip, &[0, 1], 0.0, 60, Snap::on(240), 3840);
-        assert_eq!(modal.finalize(&clip, &[0, 1], frame, 3840), None);
+        let frame = modal.frame(&data, &[0, 1], 0.0, 60, Snap::on(240), 3840);
+        assert_eq!(modal.finalize(&data, &[0, 1], frame, 3840), None);
     }
 
     #[test]
@@ -4929,10 +4945,9 @@ mod tests {
     #[test]
     fn knife_crossing_slashes_through_the_row_centreline() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0));
-        let mut clip = MidiClip::default();
-        clip.sequence.notes = vec![note(0, 240, 60)]; // x span 0..24 px at 0.1 px/tick
+        let data = data_with(vec![note(0, 240, 60)]); // x span 0..24 px at 0.1 px/tick
         let g = geom(rect, 0, 0.1, 60);
-        let n = &clip.notes()[0];
+        let n = &data.notes()[0];
         let row_top = rect.top();
         let centre = row_top + ROW_HEIGHT / 2.0;
         let k = |from: egui::Pos2, to: egui::Pos2| knife_crossing(from, to, n, &g);
@@ -5020,12 +5035,15 @@ mod tests {
 
     #[test]
     fn selection_bbox_spans_the_whole_selection() {
-        let mut clip = MidiClip::default();
-        clip.sequence.notes = vec![note(0, 240, 60), note(480, 240, 62), note(960, 240, 64)];
-        assert_eq!(selection_bbox(&clip, &[0, 2]), Some((0, 1200)));
-        assert_eq!(selection_bbox(&clip, &[1]), Some((480, 720)));
-        assert_eq!(selection_bbox(&clip, &[]), None);
-        assert_eq!(selection_bbox(&clip, &[7]), None, "a stale index");
+        let data = data_with(vec![
+            note(0, 240, 60),
+            note(480, 240, 62),
+            note(960, 240, 64),
+        ]);
+        assert_eq!(selection_bbox(&data, &[0, 2]), Some((0, 1200)));
+        assert_eq!(selection_bbox(&data, &[1]), Some((480, 720)));
+        assert_eq!(selection_bbox(&data, &[]), None);
+        assert_eq!(selection_bbox(&data, &[7]), None, "a stale index");
     }
 
     #[test]
@@ -5097,22 +5115,30 @@ mod tests {
         let early = MidiClip {
             start_ticks: 0,
             span_ticks: 1920,
-            loop_ticks: 960,
             ..MidiClip::default()
         };
         let late = MidiClip {
             start_ticks: 1920,
             span_ticks: 1920,
-            loop_ticks: 960,
             ..MidiClip::default()
         };
+        let data = [
+            MidiData {
+                length_ticks: 960,
+                ..MidiData::default()
+            },
+            MidiData {
+                length_ticks: 960,
+                ..MidiData::default()
+            },
+        ];
         let tracks = [MidiTrack {
             clips: vec![early, late],
             ..MidiTrack::default()
         }];
         let subject =
             RollSubject::assemble(ClipRef::midi(0, 1), &[ClipRef::midi(0, 0)], |_| 2, |_| 0);
-        let window = ViewWindow::of(&tracks, &subject);
+        let window = ViewWindow::of(&tracks, &data, &subject);
         assert_eq!(window.start, 0.0);
         // Aud series: the window covers each clip's whole span, not just its
         // first loop period (the ruler has to reach the tiled end too).
@@ -5233,16 +5259,9 @@ mod tests {
 
     // ---- I3: the toolbar's one-shot tools ----
 
-    /// A two-note clip (A: 60 @ 0..240, B: 62 @ 480..720) in a one-bar loop.
-    fn pair_clip() -> MidiClip {
-        MidiClip {
-            loop_ticks: TICKS_PER_QUARTER * 4,
-            sequence: glitcherz_model::Sequence {
-                notes: vec![note(0, 240, 60), note(480, 240, 62)],
-                ..glitcherz_model::Sequence::default()
-            },
-            ..MidiClip::default()
-        }
+    /// A two-note content entry (A: 60 @ 0..240, B: 62 @ 480..720).
+    fn pair_data() -> MidiData {
+        data_with(vec![note(0, 240, 60), note(480, 240, 62)])
     }
 
     /// The toolbar and the keyboard share `arm_tool`: the grab point is the
@@ -5250,17 +5269,17 @@ mod tests {
     /// roll. That deferral is what keeps the selection from jumping.
     #[test]
     fn arm_tool_moves_the_grab_point_to_the_caller() {
-        let clip = pair_clip();
+        let data = pair_data();
         let mut state = RollState::new();
         state.selection = vec![0, 1];
         state.knife_armed = true;
-        state.arm_tool(RollArm::Grab, &clip, 300.0, 60, 3840);
+        state.arm_tool(RollArm::Grab, &data, 300.0, 60, 3840);
         let modal = state.modal.as_ref().expect("grab must arm");
         assert_eq!(modal.grab_tick, 300.0);
         assert_eq!(modal.grab_note, 60);
         assert!(!state.knife_armed, "arming a modal disarms the knife");
         // Stretch arms on the selection's bbox, not on the pointer.
-        state.arm_tool(RollArm::Stretch, &clip, 300.0, 60, 3840);
+        state.arm_tool(RollArm::Stretch, &data, 300.0, 60, 3840);
         assert!(matches!(
             state.modal.as_ref().map(|m| m.kind),
             Some(ModalKind::Stretch {
@@ -5271,7 +5290,7 @@ mod tests {
         ));
         // Scale pivots on the bbox start and measures the grab distance from
         // it — the deferred grab point lands here, not on a button.
-        state.arm_tool(RollArm::Scale, &clip, 300.0, 60, 3840);
+        state.arm_tool(RollArm::Scale, &data, 300.0, 60, 3840);
         assert!(matches!(
             state.modal.as_ref().map(|m| m.kind),
             Some(ModalKind::Scale { pivot_tick: 0, .. })
@@ -5282,10 +5301,10 @@ mod tests {
     /// that would move nothing (and, for Scale, divide by a nonsense distance).
     #[test]
     fn arm_tool_refuses_an_empty_selection_out_loud() {
-        let clip = pair_clip();
+        let data = pair_data();
         let mut state = RollState::new();
         for arm in [RollArm::Grab, RollArm::Scale, RollArm::Stretch] {
-            state.arm_tool(arm, &clip, 0.0, 60, 3840);
+            state.arm_tool(arm, &data, 0.0, 60, 3840);
             assert!(!state.modal_active(), "{arm:?} must not arm empty");
             assert!(
                 state.take_status().is_some(),
@@ -5293,7 +5312,7 @@ mod tests {
             );
         }
         // The knife needs no selection: it cuts whatever the stroke crosses.
-        state.arm_tool(RollArm::Knife, &clip, 0.0, 60, 3840);
+        state.arm_tool(RollArm::Knife, &data, 0.0, 60, 3840);
         assert!(state.knife_armed);
     }
 

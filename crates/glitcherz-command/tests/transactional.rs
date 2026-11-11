@@ -7,9 +7,12 @@ use serde_json::json;
 /// A session with one track holding one clip of four notes.
 fn session_with_notes() -> Session {
     let mut project = Project::default();
-    let mut clip = MidiClip::default();
+    let data = project.push_midi_data(glitcherz_model::MidiData {
+        length_ticks: 384,
+        ..glitcherz_model::MidiData::default()
+    });
     for (index, start) in [0i64, 240, 480, 720].into_iter().enumerate() {
-        clip.notes_mut().push(Note {
+        project.midi_data_mut(data).unwrap().notes_mut().push(Note {
             start,
             length: 240,
             note: 60 + index as u8,
@@ -17,13 +20,22 @@ fn session_with_notes() -> Session {
             channel: 0,
         });
     }
-    clip.sort();
-    project.midi_tracks[0].clips.push(clip);
+    project.midi_data_mut(data).unwrap().sort();
+    project.midi_tracks[0].clips.push(MidiClip {
+        start_ticks: 0,
+        span_ticks: 384,
+        data,
+        ..MidiClip::default()
+    });
     Session::new(project)
 }
 
 fn notes(session: &Session) -> Vec<Note> {
-    session.project().midi_tracks[0].clips[0].notes().to_vec()
+    session
+        .project()
+        .midi_clip_notes(0, 0)
+        .expect("clip notes")
+        .to_vec()
 }
 
 #[test]
@@ -181,7 +193,10 @@ fn snapshots_share_the_document_until_one_side_edits() {
         !std::sync::Arc::ptr_eq(&snapshot, &session.project_arc()),
         "editing triggers copy-on-write, leaving the snapshot intact"
     );
-    assert_eq!(snapshot.midi_tracks[0].clips[0].notes()[0].velocity, 100);
+    assert_eq!(
+        snapshot.midi_clip_notes(0, 0).expect("clip notes")[0].velocity,
+        100
+    );
 }
 
 #[test]
@@ -407,7 +422,12 @@ fn push_undo_merged_collapses_out_of_band_gestures() {
     for _ in 0..5 {
         velocity -= 10;
         let before = session.project_arc();
-        session.project_mut().midi_tracks[0].clips[0].notes_mut()[0].velocity = velocity;
+        session
+            .project_mut()
+            .midi_clip_data_mut(0, 0)
+            .expect("clip data")
+            .notes_mut()[0]
+            .velocity = velocity;
         session.push_undo_merged("Fader", before, "fader:0");
     }
     session.end_merge();
@@ -418,7 +438,7 @@ fn push_undo_merged_collapses_out_of_band_gestures() {
     );
     assert!(session.undo());
     assert_eq!(
-        session.project().midi_tracks[0].clips[0].notes()[0].velocity,
+        session.project().midi_clip_notes(0, 0).expect("clip notes")[0].velocity,
         100
     );
 }
@@ -442,7 +462,7 @@ fn restore_rolls_back_without_touching_history() {
         "restore is not an undo step"
     );
     assert_eq!(
-        session.project().midi_tracks[0].clips[0].notes()[0].velocity,
+        session.project().midi_clip_notes(0, 0).expect("clip notes")[0].velocity,
         40
     );
 }
@@ -461,11 +481,12 @@ fn clip_add_creates_an_empty_midi_clip() {
     );
     let index = outcome["clip"].as_u64().expect("clip index") as usize;
     let clip = &session.project().midi_tracks[0].clips[index];
+    let data = session.project().midi_data_of(clip).expect("clip data");
     assert_eq!(clip.name, "Verse");
     assert_eq!(clip.start_ticks, 0);
     assert!(clip.span_ticks > 0);
-    assert_eq!(clip.span_ticks, clip.loop_ticks, "one content period");
-    assert!(clip.notes().is_empty(), "the clip starts empty");
+    assert_eq!(clip.span_ticks, data.length_ticks, "one content period");
+    assert!(data.notes().is_empty(), "the clip starts empty");
 
     // The new clip accepts notes through the existing MIDI command.
     session
@@ -475,7 +496,11 @@ fn clip_add_creates_an_empty_midi_clip() {
         )
         .expect("note");
     assert_eq!(
-        session.project().midi_tracks[0].clips[index].notes().len(),
+        session
+            .project()
+            .midi_clip_notes(0, index)
+            .expect("clip notes")
+            .len(),
         1
     );
 
@@ -688,7 +713,11 @@ fn graph_set_param_and_query_round_trip() {
 fn legato_extends_each_note_into_the_next_start() {
     let mut session = session_with_notes();
     {
-        let notes = session.project_mut().midi_tracks[0].clips[0].notes_mut();
+        let notes = session
+            .project_mut()
+            .midi_clip_data_mut(0, 0)
+            .expect("clip data")
+            .notes_mut();
         notes[0].length = 60;
         notes[1].length = 60;
         notes[3].length = 60;
@@ -711,7 +740,11 @@ fn remove_overlap_trims_at_the_next_same_pitch_note() {
     let mut session = session_with_notes();
     // Make the first two notes the same pitch and overlap the second.
     {
-        let notes = session.project_mut().midi_tracks[0].clips[0].notes_mut();
+        let notes = session
+            .project_mut()
+            .midi_clip_data_mut(0, 0)
+            .expect("clip data")
+            .notes_mut();
         notes[1].note = 60;
         notes[0].length = 400; // runs past the second note's start (240)
     }
@@ -729,7 +762,12 @@ fn remove_overlap_trims_at_the_next_same_pitch_note() {
 #[test]
 fn glue_merges_touching_notes_and_reports_the_new_selection() {
     let mut session = session_with_notes();
-    session.project_mut().midi_tracks[0].clips[0].notes_mut()[1].note = 60;
+    session
+        .project_mut()
+        .midi_clip_data_mut(0, 0)
+        .expect("clip data")
+        .notes_mut()[1]
+        .note = 60;
     let outcome = session
         .execute(
             "midi.glue",
@@ -747,37 +785,54 @@ fn glue_merges_touching_notes_and_reports_the_new_selection() {
 fn quantize_respects_the_selection() {
     let mut session = session_with_notes();
     // Three notes at 0 / 250 / 500 (only some on the grid).
-    session.project_mut().midi_tracks[0].clips[0].notes_mut()[1].start = 250;
-    session.project_mut().midi_tracks[0].clips[0].notes_mut()[2].start = 500;
+    session
+        .project_mut()
+        .midi_clip_data_mut(0, 0)
+        .expect("clip data")
+        .notes_mut()[1]
+        .start = 250;
+    session
+        .project_mut()
+        .midi_clip_data_mut(0, 0)
+        .expect("clip data")
+        .notes_mut()[2]
+        .start = 500;
     session
         .execute(
             "midi.quantize",
             &json!({ "track": 0, "clip": 0, "indices": [1], "grid_ticks": 240 }),
         )
         .unwrap();
-    let notes = session.project().midi_tracks[0].clips[0].notes();
+    let notes = session.project().midi_clip_notes(0, 0).expect("clip notes");
     assert_eq!(notes[0].start, 0, "unselected: untouched");
     assert_eq!(notes[1].start, 240, "selected: pulled to the line");
     assert_eq!(notes[2].start, 500, "unselected: untouched");
 
     // Undo restores the pre-quantize position.
     assert!(session.undo());
-    let notes = session.project().midi_tracks[0].clips[0].notes();
+    let notes = session.project().midi_clip_notes(0, 0).expect("clip notes");
     assert_eq!(notes[1].start, 250);
 }
 
 #[test]
 fn velocity_ramp_follows_time_order_within_the_selection() {
     let mut session = session_with_notes();
-    session.project_mut().midi_tracks[0].clips[0].notes_mut()[0].start = 480;
+    session
+        .project_mut()
+        .midi_clip_data_mut(0, 0)
+        .expect("clip data")
+        .notes_mut()[0]
+        .start = 480;
     session
         .execute(
             "midi.velocity_op",
             &json!({ "track": 0, "clip": 0, "op": "ramp", "from": 40, "to": 100 }),
         )
         .unwrap();
-    let mut by_start: Vec<(i64, u8)> = session.project().midi_tracks[0].clips[0]
-        .notes()
+    let mut by_start: Vec<(i64, u8)> = session
+        .project()
+        .midi_clip_notes(0, 0)
+        .expect("clip notes")
         .iter()
         .map(|n| (n.start, n.velocity))
         .collect();
@@ -798,7 +853,7 @@ fn legato_extends_each_note_to_the_next() {
             &json!({ "track": 0, "clip": 0, "op": "legato", "gap": 0 }),
         )
         .unwrap();
-    let notes = session.project().midi_tracks[0].clips[0].notes();
+    let notes = session.project().midi_clip_notes(0, 0).expect("clip notes");
     for window in notes.windows(2) {
         assert_eq!(
             window[0].start + window[0].length,

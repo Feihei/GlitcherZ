@@ -687,16 +687,20 @@ pub(crate) fn midi_clip_table(project: &Project, track: usize) -> MidiClipTable 
         return clips;
     };
     for (slot, clip) in clips.iter_mut().zip(midi_track.clips.iter()) {
+        let Some(data) = project.midi_data_of(clip) else {
+            continue;
+        };
         let mut rt = RtMidiClip {
             start_ticks: clip.start_ticks,
+            source_offset: clip.source_offset,
             span_ticks: clip.span_ticks,
-            loop_ticks: clip.loop_ticks,
+            length_ticks: data.length_ticks,
             // B2: mute travels with the clip; the engine skips it while
             // keeping its span (the arrangement length does not move).
             muted: clip.muted,
             ..RtMidiClip::default()
         };
-        for note in clip.notes() {
+        for note in data.notes() {
             rt.push(RtNote::new(
                 note.start,
                 note.length,
@@ -705,7 +709,7 @@ pub(crate) fn midi_clip_table(project: &Project, track: usize) -> MidiClipTable 
                 note.velocity,
             ));
         }
-        for ctrl in &clip.sequence.ctrls {
+        for ctrl in &data.sequence.ctrls {
             rt.push_ctrl(RtCtrl::new(
                 ctrl.tick,
                 ctrl.channel,
@@ -728,11 +732,14 @@ pub(crate) fn control_clip_table(
         return clips;
     };
     for (slot, clip) in clips.iter_mut().zip(track.clips.iter()) {
+        let Some(data) = project.curve_data_of(clip) else {
+            continue;
+        };
         let mut curve = RtAutomation {
-            interp: rt_curve_interp(clip.interp),
+            interp: rt_curve_interp(data.interp),
             ..RtAutomation::default()
         };
-        for point in clip.curve.iter().take(MAX_AUTO_POINTS) {
+        for point in data.points.iter().take(MAX_AUTO_POINTS) {
             curve.push(RtAutoPoint {
                 tick: point.tick,
                 value: point.value,
@@ -740,8 +747,9 @@ pub(crate) fn control_clip_table(
         }
         *slot = RtControlClip {
             start_ticks: clip.start_ticks,
+            source_offset: clip.source_offset,
             span_ticks: clip.span_ticks,
-            loop_ticks: clip.loop_ticks,
+            length_ticks: data.length_ticks,
             muted: clip.muted,
             curve,
         };
@@ -1110,15 +1118,23 @@ mod tests {
 
     fn project_with_note() -> Project {
         let mut project = Project::default();
-        let mut clip = MidiClip::new(0);
-        clip.sequence.notes.push(Note {
+        let data = project.push_midi_data(glitcherz_model::MidiData {
+            length_ticks: 960,
+            ..glitcherz_model::MidiData::default()
+        });
+        project.midi_data_mut(data).unwrap().notes_mut().push(Note {
             start: 0,
             length: 960,
             note: 60,
             velocity: 100,
             channel: 0,
         });
-        project.midi_tracks[0].clips.push(clip);
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: 0,
+            span_ticks: 960,
+            data,
+            ..MidiClip::default()
+        });
         project
     }
 

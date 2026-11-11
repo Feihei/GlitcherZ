@@ -261,7 +261,7 @@ impl GlitcherZApp {
     /// clips is not something an import may do silently.
     pub(crate) fn import_midi_tracks(
         &mut self,
-        imported: Vec<MidiTrack>,
+        mut imported: Vec<MidiTrack>,
         file_meter: Option<glitcherz_model::TimeSignature>,
         file_meter_markers: &[glitcherz_model::MeterMarker],
         source: &std::path::Path,
@@ -280,9 +280,23 @@ impl GlitcherZApp {
             .map(|t| t.clips.len())
             .sum::<usize>();
         let unwritten = project_files::is_unwritten(self.project());
-        let plan = project_files::plan_import(&self.project().midi_tracks, imported_len);
+        let plan = project_files::plan_import(
+            &self.project().midi_tracks,
+            &self.project().midi_data,
+            imported_len,
+        );
         let before = self.begin_edit();
         self.session.suspend_history();
+        // F-041: the importer builds clips with inline content; adopt it into
+        // the shared pool before the tracks enter the document.
+        {
+            let project = self.project_mut();
+            for track in &mut imported {
+                for clip in &mut track.clips {
+                    clip.attach_inline_content(&mut project.midi_data);
+                }
+            }
+        }
         let mut queue = imported.into_iter();
         let mut first_target = None;
         let mut placed = 0usize;

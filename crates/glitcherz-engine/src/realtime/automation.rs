@@ -198,10 +198,12 @@ fn sample_smooth(points: &[RtAutoPoint], tick: f64) -> Option<f32> {
 pub struct RtControlClip {
     /// Absolute start position on the arrangement (in ticks).
     pub start_ticks: u32,
+    /// Window start inside the shared content (in ticks).
+    pub source_offset: u32,
     /// How long the clip stays active (in ticks).
     pub span_ticks: u32,
-    /// Content loop length (in ticks).
-    pub loop_ticks: u32,
+    /// Content length (in ticks); a longer window loops (F-041).
+    pub length_ticks: u32,
     /// Temporarily muted (B2): nothing is delivered, so the target holds its
     /// last value for the whole span (same as being outside the clip).
     pub muted: bool,
@@ -213,11 +215,12 @@ impl Default for RtControlClip {
     fn default() -> Self {
         Self {
             start_ticks: 0,
+            source_offset: 0,
             // span 0 = inactive: an all-default clip table is an EMPTY control
             // track (nothing is delivered); every real clip carries its own
             // placement.
             span_ticks: 0,
-            loop_ticks: 384,
+            length_ticks: 384,
             muted: false,
             curve: RtAutomation::default(),
         }
@@ -228,8 +231,9 @@ impl RtControlClip {
     /// Samples the value at the absolute transport position: `None` outside
     /// `[start, start + span)` (D17: nothing is delivered outside the span,
     /// the target keeps its last value) and while the clip is muted; inside,
-    /// the local position is reduced modulo `loop_ticks` (periodic tiling,
-    /// D14) and mapped through the curve. RT-safe.
+    /// the local position is mapped to the content phase
+    /// `(source_offset + local) mod length_ticks` (F-041) and sampled through
+    /// the curve. RT-safe.
     pub fn value_at_absolute(&self, position_ticks: f64) -> Option<f32> {
         if self.span_ticks == 0 || self.muted {
             return None;
@@ -240,8 +244,8 @@ impl RtControlClip {
             return None;
         }
         let local = position_ticks - start;
-        let phase = if self.loop_ticks > 0 {
-            local % f64::from(self.loop_ticks)
+        let phase = if self.length_ticks > 0 {
+            (f64::from(self.source_offset) + local).rem_euclid(f64::from(self.length_ticks))
         } else {
             local
         };
@@ -340,7 +344,7 @@ mod tests {
             clip.span_ticks, 0,
             "the default clip is inactive (an all-default table = empty track)"
         );
-        assert_eq!(clip.loop_ticks, 384);
+        assert_eq!(clip.length_ticks, 384);
         assert!(
             !clip.curve.is_active(),
             "default curve is empty (unrouted and has no anchors)"
@@ -352,7 +356,7 @@ mod tests {
         let mut clip = RtControlClip {
             start_ticks: 384, // second bar
             span_ticks: 384,
-            loop_ticks: 384,
+            length_ticks: 384,
             curve: curve(&[(0, 1.0), (384, 0.0)]),
             ..RtControlClip::default()
         };
@@ -377,7 +381,7 @@ mod tests {
         let mut clip = RtControlClip {
             start_ticks: 0,
             span_ticks: 384,
-            loop_ticks: 384,
+            length_ticks: 384,
             curve: curve(&[(0, 1.0), (384, 0.0)]),
             ..RtControlClip::default()
         };
@@ -404,7 +408,7 @@ mod tests {
         let clip = RtControlClip {
             start_ticks: 0,
             span_ticks: 768,
-            loop_ticks: 384,
+            length_ticks: 384,
             curve: curve(&[(0, 1.0), (96, 0.5)]),
             ..RtControlClip::default()
         };

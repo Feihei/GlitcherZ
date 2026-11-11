@@ -127,9 +127,12 @@ impl Mcp {
 /// Writes a project with one clip of `notes` on track 0.
 fn write_project(path: &Path, notes: &[u8]) {
     let mut project = Project::default();
-    let mut clip = MidiClip::new(0);
+    let data = project.push_midi_data(glitcherz_model::MidiData {
+        length_ticks: 3840,
+        ..glitcherz_model::MidiData::default()
+    });
     for (index, note) in notes.iter().enumerate() {
-        clip.sequence.notes.push(Note {
+        project.midi_data_mut(data).unwrap().notes_mut().push(Note {
             start: index as i64 * 240,
             length: 240,
             note: *note,
@@ -137,14 +140,20 @@ fn write_project(path: &Path, notes: &[u8]) {
             channel: 0,
         });
     }
-    project.midi_tracks[0].clips.push(clip);
+    project.midi_tracks[0].clips.push(MidiClip {
+        start_ticks: 0,
+        span_ticks: 3840,
+        data,
+        ..MidiClip::default()
+    });
     glitcherz_model::file::save_project(&project, path).expect("save fixture project");
 }
 
 fn note_pitches(path: &Path) -> Vec<u8> {
     let project = glitcherz_model::file::load_project(path).expect("load project");
-    project.midi_tracks[0].clips[0]
-        .notes()
+    project
+        .midi_clip_notes(0, 0)
+        .expect("clip notes")
         .iter()
         .map(|note| note.note)
         .collect()
@@ -394,7 +403,7 @@ fn commands_list_enumerates_the_registry() {
     let (error, report) = mcp.call("commands_list", json!({}));
     assert!(!error, "{report}");
     let commands = report["commands"].as_array().expect("commands");
-    assert_eq!(commands.len(), 23);
+    assert_eq!(commands.len(), 25);
     assert!(
         commands
             .iter()
@@ -599,15 +608,23 @@ fn a_render_outside_the_root_is_refused() {
 fn plugins_are_disabled_by_default_and_reported() {
     let dir = scratch("plugins");
     let mut project = Project::default();
-    let mut clip = MidiClip::new(0);
-    clip.sequence.notes.push(Note {
+    let data = project.push_midi_data(glitcherz_model::MidiData {
+        length_ticks: 3840,
+        ..glitcherz_model::MidiData::default()
+    });
+    project.midi_data_mut(data).unwrap().notes_mut().push(Note {
         start: 0,
         length: 240,
         note: 60,
         velocity: 100,
         channel: 0,
     });
-    project.midi_tracks[0].clips.push(clip);
+    project.midi_tracks[0].clips.push(MidiClip {
+        start_ticks: 0,
+        span_ticks: 3840,
+        data,
+        ..MidiClip::default()
+    });
     // Replace track 0's instrument with a CLAP voice pointing at a file that
     // does not exist: if the server tried to load it, the render would log an
     // error and fall back, but the warning list is what proves the policy.

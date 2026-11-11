@@ -12,7 +12,7 @@
 
 use eframe::egui;
 
-use glitcherz_model::{MidiClip, note_name};
+use glitcherz_model::{Note, note_name};
 
 /// Absolute field changes for one note (unset fields keep their value).
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -47,7 +47,7 @@ pub enum EventListIntent {
 /// The caller owns the scroll container (the Edit tab puts this in a resizable
 /// bottom panel), so the grid is laid out directly in `ui` at its full
 /// height.
-pub fn show(ui: &mut egui::Ui, clip: &MidiClip) -> Option<EventListIntent> {
+pub fn show(ui: &mut egui::Ui, notes: &[Note]) -> Option<EventListIntent> {
     let mut intent = None;
     // All drag values of a frame funnel their changes into one edit.
     let pending: std::cell::RefCell<Option<NoteEdit>> = std::cell::RefCell::default();
@@ -62,7 +62,7 @@ pub fn show(ui: &mut egui::Ui, clip: &MidiClip) -> Option<EventListIntent> {
             }
             ui.end_row();
 
-            for (index, note) in clip.notes().iter().enumerate() {
+            for (index, note) in notes.iter().enumerate() {
                 drag_i64(
                     ui,
                     &pending,

@@ -662,10 +662,10 @@ impl GlitcherZApp {
             }
         }
         if written_tracks.is_empty() {
-            self.session.restore(before);
-            self.set_message("Recording discarded: the target track has no room".to_string());
             return None;
         }
+        // F-041: takes arrive with inline content; adopt it into the pool.
+        self.project_mut().adopt_inline_content();
         self.commit_edit(label, before);
         for &track in &written_tracks {
             self.sync_clip_row(timeline::TimelineLane::Midi, track);
@@ -955,6 +955,8 @@ impl GlitcherZApp {
             self.set_message("Recording discarded: the target track has no room".to_string());
             return;
         }
+        // F-041: takes arrive with inline content; adopt it into the pool.
+        self.project_mut().adopt_inline_content();
         self.commit_edit("Record", before);
         for &track in &midi_written {
             self.sync_clip_row(timeline::TimelineLane::Midi, track);

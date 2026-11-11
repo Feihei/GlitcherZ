@@ -248,7 +248,11 @@ fn summary(server: &Server) -> Value {
         .midi_tracks
         .iter()
         .flat_map(|track| track.clips.iter())
-        .map(|clip| clip.notes().len())
+        .map(|clip| {
+            project
+                .midi_data_of(clip)
+                .map_or(0, |data| data.notes().len())
+        })
         .sum::<usize>();
     json!({
         "path": server.source.as_ref().map(|path| path.display().to_string()),
@@ -502,15 +506,23 @@ mod tests {
 
     fn with_note(server: &mut Server) {
         let mut project = Project::default();
-        let mut clip = MidiClip::new(0);
-        clip.sequence.notes.push(Note {
+        let data = project.push_midi_data(glitcherz_model::MidiData {
+            length_ticks: 3840,
+            ..glitcherz_model::MidiData::default()
+        });
+        project.midi_data_mut(data).unwrap().notes_mut().push(Note {
             start: 0,
             length: 240,
             note: 60,
             velocity: 100,
             channel: 0,
         });
-        project.midi_tracks[0].clips.push(clip);
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: 0,
+            span_ticks: 3840,
+            data,
+            ..MidiClip::default()
+        });
         server.session.replace(project);
     }
 
@@ -566,7 +578,7 @@ mod tests {
         let result = commands_list(&mut server, &json!({})).expect("call");
         let value: Value = serde_json::from_str(&result.text).expect("json");
         let commands = value["commands"].as_array().expect("commands");
-        assert_eq!(commands.len(), 23);
+        assert_eq!(commands.len(), 25);
         assert!(
             commands
                 .iter()
@@ -586,7 +598,12 @@ mod tests {
         .expect("call");
         assert!(!result.is_error, "{}", result.text);
         assert_eq!(
-            server.session.project().midi_tracks[0].clips[0].notes()[0].note,
+            server
+                .session
+                .project()
+                .midi_clip_notes(0, 0)
+                .expect("clip notes")[0]
+                .note,
             72
         );
     }
@@ -612,7 +629,12 @@ mod tests {
         assert_eq!(value["skipped"], json!(["midi.transpose"]));
         // The first command did apply: the batch is not all-or-nothing.
         assert_eq!(
-            server.session.project().midi_tracks[0].clips[0].notes()[0].note,
+            server
+                .session
+                .project()
+                .midi_clip_notes(0, 0)
+                .expect("clip notes")[0]
+                .note,
             61
         );
     }
@@ -634,7 +656,12 @@ mod tests {
         let value: Value = serde_json::from_str(&result.text).expect("json");
         assert_eq!(value["applied"], json!(false));
         assert_eq!(
-            server.session.project().midi_tracks[0].clips[0].notes()[0].note,
+            server
+                .session
+                .project()
+                .midi_clip_notes(0, 0)
+                .expect("clip notes")[0]
+                .note,
             60
         );
         assert_eq!(server.session.project_arc(), before);

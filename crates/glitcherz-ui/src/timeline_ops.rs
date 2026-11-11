@@ -161,6 +161,8 @@ impl GlitcherZApp {
                     sec_per_tick: project.sec_per_tick(),
                     waveform_of: &waveform_of,
                     clip_groups: &project.clip_groups,
+                    midi_data: &project.midi_data,
+                    curve_data: &project.curve_data,
                 },
                 router,
             )
@@ -347,6 +349,9 @@ impl GlitcherZApp {
             }
             timeline::TimelineAction::DuplicateClipsBatch { dups } => {
                 self.timeline_duplicate_clips_batch(dups)
+            }
+            timeline::TimelineAction::DuplicateClipsWithNewData { dups } => {
+                self.timeline_duplicate_clips_with_data_batch(dups)
             }
             timeline::TimelineAction::CopySelection => self.copy_timeline_selection(),
             timeline::TimelineAction::PasteClips => self.paste_timeline_clips(),
@@ -596,20 +601,8 @@ impl GlitcherZApp {
         let added = match lane {
             timeline::TimelineLane::Control => self
                 .project_mut()
-                .control_tracks
-                .get_mut(track)
-                .map(|t| {
-                    if t.clips.len() < MAX_CLIPS_PER_TRACK {
-                        let mut clip = ControlClip::new(start_ticks);
-                        clip.span_ticks = bar;
-                        clip.loop_ticks = bar;
-                        t.clips.push(clip);
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .unwrap_or(false),
+                .add_control_clip(track, start_ticks)
+                .is_some(),
             timeline::TimelineLane::Audio => self
                 .project_mut()
                 .audio_tracks
@@ -634,20 +627,8 @@ impl GlitcherZApp {
                 .unwrap_or(false),
             timeline::TimelineLane::Midi => self
                 .project_mut()
-                .midi_tracks
-                .get_mut(track)
-                .map(|t| {
-                    if t.clips.len() < MAX_CLIPS_PER_TRACK {
-                        let mut clip = MidiClip::new(start_ticks);
-                        clip.span_ticks = bar;
-                        clip.loop_ticks = bar;
-                        t.clips.push(clip);
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .unwrap_or(false),
+                .add_midi_clip(track, start_ticks)
+                .is_some(),
         };
         if added {
             self.commit_edit("Add Clip", before);
@@ -722,7 +703,7 @@ impl GlitcherZApp {
         clip: usize,
         start_ticks: u32,
         span_ticks: u32,
-        loop_ticks: Option<u32>,
+        _loop_ticks: Option<u32>,
     ) {
         let before = self.begin_edit();
         let sec_per_tick = self.project().sec_per_tick();
@@ -733,15 +714,9 @@ impl GlitcherZApp {
                 .get_mut(track)
                 .and_then(|t| t.clips.get_mut(clip))
                 .map(|c| {
-                    let new_loop = timeline::resolve_loop(c.loop_ticks, span_ticks, loop_ticks);
-                    let changed = c.start_ticks != start_ticks
-                        || c.span_ticks != span_ticks
-                        || c.loop_ticks != new_loop;
+                    let changed = c.start_ticks != start_ticks || c.span_ticks != span_ticks;
                     c.start_ticks = start_ticks;
-                    // W2: growing the container tiles the content (the loop
-                    // stays), shrinking it trims the tail (`loop <= span`).
                     c.span_ticks = span_ticks;
-                    c.loop_ticks = new_loop;
                     changed
                 })
                 .unwrap_or(false),
@@ -776,13 +751,9 @@ impl GlitcherZApp {
                 .get_mut(track)
                 .and_then(|t| t.clips.get_mut(clip))
                 .map(|c| {
-                    let new_loop = timeline::resolve_loop(c.loop_ticks, span_ticks, loop_ticks);
-                    let changed = c.start_ticks != start_ticks
-                        || c.span_ticks != span_ticks
-                        || c.loop_ticks != new_loop;
+                    let changed = c.start_ticks != start_ticks || c.span_ticks != span_ticks;
                     c.start_ticks = start_ticks;
                     c.span_ticks = span_ticks;
-                    c.loop_ticks = new_loop;
                     changed
                 })
                 .unwrap_or(false),
@@ -870,15 +841,9 @@ impl GlitcherZApp {
                     .and_then(|t| t.clips.get_mut(clip))
                     .map(|c| {
                         let mut next = origin.clone();
-                        if origin.loop_ticks >= origin.span_ticks {
-                            // Single period: cut the material before the new
-                            // start (crossing notes keep their tails).
-                            next.retain_from(delta_ticks, sec_per_tick);
-                            next.loop_ticks = span_ticks;
-                        } else {
-                            next.loop_ticks =
-                                timeline::resolve_loop(origin.loop_ticks, span_ticks, None);
-                        }
+                        // F-041: the head trim only moves the window start;
+                        // the shared content is never rewritten.
+                        next.retain_from(delta_ticks, sec_per_tick);
                         next.start_ticks = start_ticks;
                         next.span_ticks = span_ticks;
                         let changed = *c != *next;
@@ -893,13 +858,8 @@ impl GlitcherZApp {
                         .and_then(|t| t.clips.get_mut(clip))
                         .map(|c| {
                             let mut next = origin.clone();
-                            if origin.loop_ticks >= origin.span_ticks {
-                                next.retain_from(delta_ticks, sec_per_tick);
-                                next.loop_ticks = span_ticks;
-                            } else {
-                                next.loop_ticks =
-                                    timeline::resolve_loop(origin.loop_ticks, span_ticks, None);
-                            }
+                            // F-041: move the window, keep the content.
+                            next.retain_from(delta_ticks, sec_per_tick);
                             next.start_ticks = start_ticks;
                             next.span_ticks = span_ticks;
                             let changed = *c != *next;
@@ -1231,7 +1191,8 @@ impl GlitcherZApp {
             .control_tracks
             .get(track)
             .and_then(|t| t.clips.get(clip))
-            .map(|c| c.loop_ticks.max(1))
+            .and_then(|c| self.project().curve_data_of(c))
+            .map(|data| data.length_ticks.max(1))
         else {
             return;
         };
@@ -1239,7 +1200,16 @@ impl GlitcherZApp {
         // nor play.
         let tick = tick.min(loop_ticks - 1);
         let before = self.begin_edit();
-        let curve = &mut self.project_mut().control_tracks[track].clips[clip];
+        let Some(curve) = self
+            .project_mut()
+            .control_tracks
+            .get(track)
+            .and_then(|t| t.clips.get(clip))
+            .map(|c| c.data)
+            .and_then(|data| self.project_mut().curve_data_mut(data))
+        else {
+            return;
+        };
         // A move drops the old anchor first; on the same tick the upsert
         // below already overwrites it.
         if let Some(from) = from
@@ -1260,12 +1230,15 @@ impl GlitcherZApp {
     /// step of `tick` (clip-relative).
     pub(crate) fn curve_remove_point(&mut self, track: usize, clip: usize, tick: u32) {
         let before = self.begin_edit();
-        let removed = self
-            .project_mut()
+        let data = self
+            .project()
             .control_tracks
-            .get_mut(track)
-            .and_then(|t| t.clips.get_mut(clip))
-            .is_some_and(|c| c.remove_near(tick, crate::curve::SNAP_TICKS / 2));
+            .get(track)
+            .and_then(|t| t.clips.get(clip))
+            .map(|c| c.data);
+        let removed = data
+            .and_then(|data| self.project_mut().curve_data_mut(data))
+            .is_some_and(|curve| curve.remove_near(tick, crate::curve::SNAP_TICKS / 2));
         if removed {
             self.commit_edit("Delete Anchor", before);
             self.send_control_clips(track);
@@ -1280,17 +1253,19 @@ impl GlitcherZApp {
             .control_tracks
             .get(track)
             .and_then(|t| t.clips.get(clip))
-            .map(|c| c.interp);
+            .and_then(|c| self.project().curve_data_of(c))
+            .map(|data| data.interp);
         if current == Some(interp) {
             return;
         }
         let before = self.begin_edit();
-        if let Some(target) = self
-            .project_mut()
+        let data = self
+            .project()
             .control_tracks
-            .get_mut(track)
-            .and_then(|t| t.clips.get_mut(clip))
-        {
+            .get(track)
+            .and_then(|t| t.clips.get(clip))
+            .map(|c| c.data);
+        if let Some(target) = data.and_then(|data| self.project_mut().curve_data_mut(data)) {
             target.interp = interp;
         }
         self.commit_edit("Curve Type", before);
@@ -1508,17 +1483,8 @@ impl GlitcherZApp {
                         .get_mut(e.sel.track)
                         .and_then(|t| t.clips.get_mut(e.sel.clip))
                         .map(|c| {
-                            let old_span = c.span_ticks;
                             c.start_ticks = e.start_ticks;
                             c.span_ticks = e.span_ticks;
-                            // 2026-11-04: T extends the clip's time for a
-                            // single-period clip, and scales a tiled clip's
-                            // period while keeping its repeat count.
-                            c.loop_ticks = timeline::resolve_stretch_loop(
-                                c.loop_ticks,
-                                old_span,
-                                e.span_ticks,
-                            );
                         })
                         .is_some(),
                     timeline::TimelineLane::Midi => project
@@ -1526,17 +1492,8 @@ impl GlitcherZApp {
                         .get_mut(e.sel.track)
                         .and_then(|t| t.clips.get_mut(e.sel.clip))
                         .map(|c| {
-                            let old_span = c.span_ticks;
                             c.start_ticks = e.start_ticks;
                             c.span_ticks = e.span_ticks;
-                            // 2026-11-04: T extends the clip's time for a
-                            // single-period clip, and scales a tiled clip's
-                            // period while keeping its repeat count.
-                            c.loop_ticks = timeline::resolve_stretch_loop(
-                                c.loop_ticks,
-                                old_span,
-                                e.span_ticks,
-                            );
                         })
                         .is_some(),
                     // U11: a stretch trims the seconds window (a left-edge
@@ -1592,10 +1549,9 @@ impl GlitcherZApp {
                         .get_mut(e.sel.track)
                         .and_then(|t| t.clips.get_mut(e.sel.clip))
                         .map(|c| {
-                            let new_span = e.span_ticks.max(e.loop_ticks.max(1));
-                            let changed = c.span_ticks != new_span || c.loop_ticks != e.loop_ticks;
+                            let new_span = e.span_ticks.max(1);
+                            let changed = c.span_ticks != new_span;
                             c.span_ticks = new_span;
-                            c.loop_ticks = e.loop_ticks.max(1).min(new_span);
                             changed
                         })
                         .unwrap_or(false),
@@ -1604,10 +1560,9 @@ impl GlitcherZApp {
                         .get_mut(e.sel.track)
                         .and_then(|t| t.clips.get_mut(e.sel.clip))
                         .map(|c| {
-                            let new_span = e.span_ticks.max(e.loop_ticks.max(1));
-                            let changed = c.span_ticks != new_span || c.loop_ticks != e.loop_ticks;
+                            let new_span = e.span_ticks.max(1);
+                            let changed = c.span_ticks != new_span;
                             c.span_ticks = new_span;
-                            c.loop_ticks = e.loop_ticks.max(1).min(new_span);
                             changed
                         })
                         .unwrap_or(false),
@@ -1736,6 +1691,126 @@ impl GlitcherZApp {
         }
     }
 
+    /// F-041 Ctrl+Shift+D: clone every clip and give each copy its own copy of
+    /// the shared content. One undo step.
+    pub(crate) fn timeline_duplicate_clips_with_data_batch(
+        &mut self,
+        dups: Vec<timeline::ClipDup>,
+    ) {
+        if dups.is_empty() {
+            return;
+        }
+        let before = self.begin_edit();
+        let mut new_sel = Vec::new();
+        let mut touched = Vec::new();
+        {
+            let project = self.project_mut();
+            for d in &dups {
+                match d.from.lane {
+                    timeline::TimelineLane::Midi => {
+                        let Some(mut clip) = project
+                            .midi_tracks
+                            .get(d.from.track)
+                            .and_then(|t| t.clips.get(d.from.clip))
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        if project
+                            .midi_tracks
+                            .get(d.to_track)
+                            .is_none_or(|t| t.clips.len() >= MAX_CLIPS_PER_TRACK)
+                        {
+                            continue;
+                        }
+                        let Some(data) = project.midi_data.get(clip.data as usize).cloned() else {
+                            continue;
+                        };
+                        clip.data = project.push_midi_data(data);
+                        clip.start_ticks = d.start_ticks;
+                        let index = project.midi_tracks[d.to_track].clips.len();
+                        project.midi_tracks[d.to_track].clips.push(clip);
+                        new_sel.push(timeline::ClipSel {
+                            lane: timeline::TimelineLane::Midi,
+                            track: d.to_track,
+                            clip: index,
+                        });
+                        if !touched.contains(&(timeline::TimelineLane::Midi, d.to_track)) {
+                            touched.push((timeline::TimelineLane::Midi, d.to_track));
+                        }
+                    }
+                    timeline::TimelineLane::Control => {
+                        let Some(mut clip) = project
+                            .control_tracks
+                            .get(d.from.track)
+                            .and_then(|t| t.clips.get(d.from.clip))
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        if project
+                            .control_tracks
+                            .get(d.to_track)
+                            .is_none_or(|t| t.clips.len() >= MAX_CLIPS_PER_TRACK)
+                        {
+                            continue;
+                        }
+                        let Some(data) = project.curve_data.get(clip.data as usize).cloned() else {
+                            continue;
+                        };
+                        clip.data = project.push_curve_data(data);
+                        clip.start_ticks = d.start_ticks;
+                        let index = project.control_tracks[d.to_track].clips.len();
+                        project.control_tracks[d.to_track].clips.push(clip);
+                        new_sel.push(timeline::ClipSel {
+                            lane: timeline::TimelineLane::Control,
+                            track: d.to_track,
+                            clip: index,
+                        });
+                        if !touched.contains(&(timeline::TimelineLane::Control, d.to_track)) {
+                            touched.push((timeline::TimelineLane::Control, d.to_track));
+                        }
+                    }
+                    timeline::TimelineLane::Audio => {
+                        let Some(mut clip) = project
+                            .audio_tracks
+                            .get(d.from.track)
+                            .and_then(|t| t.clips.get(d.from.clip))
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        if project
+                            .audio_tracks
+                            .get(d.to_track)
+                            .is_none_or(|t| t.clips.len() >= MAX_CLIPS_PER_TRACK)
+                        {
+                            continue;
+                        }
+                        clip.start_ticks = d.start_ticks;
+                        let index = project.audio_tracks[d.to_track].clips.len();
+                        project.audio_tracks[d.to_track].clips.push(clip);
+                        new_sel.push(timeline::ClipSel {
+                            lane: timeline::TimelineLane::Audio,
+                            track: d.to_track,
+                            clip: index,
+                        });
+                        if !touched.contains(&(timeline::TimelineLane::Audio, d.to_track)) {
+                            touched.push((timeline::TimelineLane::Audio, d.to_track));
+                        }
+                    }
+                }
+            }
+        }
+        if !new_sel.is_empty() {
+            self.commit_edit("Duplicate Clips with New Data", before);
+            for (lane, track) in touched {
+                self.sync_clip_row(lane, track);
+            }
+            self.timeline_state.selection = new_sel;
+        }
+    }
+
     /// F-040: snapshot the selected clips into the app clipboard. A detached
     /// value copy, not selection indices (undo would invalidate those).
     pub(crate) fn copy_timeline_selection(&mut self) {
@@ -1753,14 +1828,18 @@ impl GlitcherZApp {
                         .midi_tracks
                         .get(sel.track)
                         .and_then(|t| t.clips.get(sel.clip))
-                        .cloned()
-                        .map(clipboard::ClipSnapshot::Midi),
+                        .and_then(|clip| project.midi_data_of(clip).map(|data| (clip, data)))
+                        .map(|(clip, data)| {
+                            clipboard::ClipSnapshot::Midi(clip.clone(), data.clone())
+                        }),
                     timeline::TimelineLane::Control => project
                         .control_tracks
                         .get(sel.track)
                         .and_then(|t| t.clips.get(sel.clip))
-                        .cloned()
-                        .map(clipboard::ClipSnapshot::Control),
+                        .and_then(|clip| project.curve_data_of(clip).map(|data| (clip, data)))
+                        .map(|(clip, data)| {
+                            clipboard::ClipSnapshot::Control(clip.clone(), data.clone())
+                        }),
                     timeline::TimelineLane::Audio => project
                         .audio_tracks
                         .get(sel.track)
@@ -1816,17 +1895,22 @@ impl GlitcherZApp {
             for (copy, start_ticks) in copies.iter().zip(starts) {
                 let lane = copy.lane;
                 match &copy.clip {
-                    clipboard::ClipSnapshot::Midi(source) => {
-                        let Some(t) = project.midi_tracks.get_mut(copy.track) else {
-                            continue;
-                        };
-                        if t.clips.len() >= MAX_CLIPS_PER_TRACK {
+                    clipboard::ClipSnapshot::Midi(source, data) => {
+                        if project
+                            .midi_tracks
+                            .get(copy.track)
+                            .is_none_or(|t| t.clips.len() >= MAX_CLIPS_PER_TRACK)
+                        {
                             continue;
                         }
+                        // The clipboard is a value snapshot: the paste gets a
+                        // fresh pool entry, never a cross-project index.
+                        let data_index = project.push_midi_data(data.clone());
                         let mut clip = source.clone();
                         clip.start_ticks = start_ticks;
-                        let index = t.clips.len();
-                        t.clips.push(clip);
+                        clip.data = data_index;
+                        let index = project.midi_tracks[copy.track].clips.len();
+                        project.midi_tracks[copy.track].clips.push(clip);
                         new_sel.push(timeline::ClipSel {
                             lane,
                             track: copy.track,
@@ -1837,17 +1921,20 @@ impl GlitcherZApp {
                             touched.push(touched_row);
                         }
                     }
-                    clipboard::ClipSnapshot::Control(source) => {
-                        let Some(t) = project.control_tracks.get_mut(copy.track) else {
-                            continue;
-                        };
-                        if t.clips.len() >= MAX_CLIPS_PER_TRACK {
+                    clipboard::ClipSnapshot::Control(source, data) => {
+                        if project
+                            .control_tracks
+                            .get(copy.track)
+                            .is_none_or(|t| t.clips.len() >= MAX_CLIPS_PER_TRACK)
+                        {
                             continue;
                         }
+                        let data_index = project.push_curve_data(data.clone());
                         let mut clip = source.clone();
                         clip.start_ticks = start_ticks;
-                        let index = t.clips.len();
-                        t.clips.push(clip);
+                        clip.data = data_index;
+                        let index = project.control_tracks[copy.track].clips.len();
+                        project.control_tracks[copy.track].clips.push(clip);
                         new_sel.push(timeline::ClipSel {
                             lane,
                             track: copy.track,
@@ -1901,5 +1988,246 @@ impl GlitcherZApp {
             timeline::TimelineLane::Audio => self.send_audio_clips_for_track(index),
             timeline::TimelineLane::Midi => self.send_track_clips(index),
         }
+    }
+
+    /// Re-pushes every distinct row touched by a cross-lane selection.
+    fn sync_selection_rows(&mut self, selection: &[timeline::ClipSel]) {
+        let mut seen = Vec::new();
+        for sel in selection {
+            let key = (sel.lane, sel.track);
+            if !seen.contains(&key) {
+                seen.push(key);
+                self.sync_clip_row(sel.lane, sel.track);
+            }
+        }
+    }
+
+    /// F-041: shared-content summary and the Share / Unlink entry points.
+    pub(crate) fn clip_data_section(&mut self, ui: &mut egui::Ui) {
+        let selection = self.timeline_state.selection.clone();
+        let Some(first) = selection.first().copied() else {
+            return;
+        };
+        let (data, refs, kind) = match first.lane {
+            timeline::TimelineLane::Midi => {
+                let Some(clip) = self
+                    .project()
+                    .midi_tracks
+                    .get(first.track)
+                    .and_then(|t| t.clips.get(first.clip))
+                else {
+                    return;
+                };
+                (clip.data, self.project().midi_data_refs(clip.data), "MIDI")
+            }
+            timeline::TimelineLane::Control => {
+                let Some(clip) = self
+                    .project()
+                    .control_tracks
+                    .get(first.track)
+                    .and_then(|t| t.clips.get(first.clip))
+                else {
+                    return;
+                };
+                (
+                    clip.data,
+                    self.project().curve_data_refs(clip.data),
+                    "curve",
+                )
+            }
+            timeline::TimelineLane::Audio => return,
+        };
+        ui.separator();
+        ui.label(format!(
+            "Clip data · {kind} #{data} · shared by {refs} clip(s)"
+        ));
+        if refs > 1
+            && ui
+                .button("Unlink")
+                .on_hover_text("Give this clip its own copy of the content")
+                .clicked()
+        {
+            self.unlink_selected_clip_data();
+        }
+        if selection.len() > 1
+            && selection.iter().all(|sel| sel.lane == first.lane)
+            && ui
+                .button("Link Data")
+                .on_hover_text("Point every selected clip at the first one's content")
+                .clicked()
+        {
+            self.link_selected_clip_data();
+        }
+    }
+
+    /// F-041: point every selected clip at the first clip's content.
+    pub(crate) fn link_selected_clip_data(&mut self) {
+        let selection = self.timeline_state.selection.clone();
+        let Some(first) = selection.first().copied() else {
+            return;
+        };
+        let Some(data) = (match first.lane {
+            timeline::TimelineLane::Midi => self
+                .project()
+                .midi_tracks
+                .get(first.track)
+                .and_then(|t| t.clips.get(first.clip))
+                .map(|clip| clip.data),
+            timeline::TimelineLane::Control => self
+                .project()
+                .control_tracks
+                .get(first.track)
+                .and_then(|t| t.clips.get(first.clip))
+                .map(|clip| clip.data),
+            timeline::TimelineLane::Audio => None,
+        }) else {
+            return;
+        };
+        let needs = selection.iter().any(|sel| match sel.lane {
+            timeline::TimelineLane::Midi => self
+                .project()
+                .midi_tracks
+                .get(sel.track)
+                .and_then(|t| t.clips.get(sel.clip))
+                .is_some_and(|clip| clip.data != data),
+            timeline::TimelineLane::Control => self
+                .project()
+                .control_tracks
+                .get(sel.track)
+                .and_then(|t| t.clips.get(sel.clip))
+                .is_some_and(|clip| clip.data != data),
+            timeline::TimelineLane::Audio => false,
+        });
+        if !needs {
+            return;
+        }
+        let before = self.begin_edit();
+        {
+            let project = self.project_mut();
+            for sel in &selection {
+                match sel.lane {
+                    timeline::TimelineLane::Midi => {
+                        if let Some(clip) = project
+                            .midi_tracks
+                            .get_mut(sel.track)
+                            .and_then(|t| t.clips.get_mut(sel.clip))
+                        {
+                            clip.data = data;
+                        }
+                    }
+                    timeline::TimelineLane::Control => {
+                        if let Some(clip) = project
+                            .control_tracks
+                            .get_mut(sel.track)
+                            .and_then(|t| t.clips.get_mut(sel.clip))
+                        {
+                            clip.data = data;
+                        }
+                    }
+                    timeline::TimelineLane::Audio => {}
+                }
+            }
+        }
+        self.commit_edit("Link Clip Data", before);
+        self.sync_selection_rows(&selection);
+    }
+
+    /// F-041: give every selected shared clip its own copy of the content.
+    pub(crate) fn unlink_selected_clip_data(&mut self) {
+        let selection = self.timeline_state.selection.clone();
+        if selection.is_empty() {
+            return;
+        }
+        // Only clips whose content is still shared are touched; a lone clip
+        // must not spend an undo step (and must not get a pointless copy).
+        let needs = selection.iter().any(|sel| match sel.lane {
+            timeline::TimelineLane::Midi => self
+                .project()
+                .midi_tracks
+                .get(sel.track)
+                .and_then(|t| t.clips.get(sel.clip))
+                .is_some_and(|clip| self.project().midi_data_refs(clip.data) > 1),
+            timeline::TimelineLane::Control => self
+                .project()
+                .control_tracks
+                .get(sel.track)
+                .and_then(|t| t.clips.get(sel.clip))
+                .is_some_and(|clip| self.project().curve_data_refs(clip.data) > 1),
+            timeline::TimelineLane::Audio => false,
+        });
+        if !needs {
+            return;
+        }
+        let before = self.begin_edit();
+        {
+            let project = self.project_mut();
+            for sel in &selection {
+                match sel.lane {
+                    timeline::TimelineLane::Midi => {
+                        let Some(data) = project
+                            .midi_tracks
+                            .get(sel.track)
+                            .and_then(|t| t.clips.get(sel.clip))
+                            .map(|clip| clip.data)
+                        else {
+                            continue;
+                        };
+                        let refs = project
+                            .midi_tracks
+                            .iter()
+                            .flat_map(|t| t.clips.iter())
+                            .filter(|clip| clip.data == data)
+                            .count();
+                        if refs <= 1 {
+                            continue;
+                        }
+                        let Some(source) = project.midi_data.get(data as usize).cloned() else {
+                            continue;
+                        };
+                        let new_data = project.push_midi_data(source);
+                        if let Some(clip) = project
+                            .midi_tracks
+                            .get_mut(sel.track)
+                            .and_then(|t| t.clips.get_mut(sel.clip))
+                        {
+                            clip.data = new_data;
+                        }
+                    }
+                    timeline::TimelineLane::Control => {
+                        let Some(data) = project
+                            .control_tracks
+                            .get(sel.track)
+                            .and_then(|t| t.clips.get(sel.clip))
+                            .map(|clip| clip.data)
+                        else {
+                            continue;
+                        };
+                        let refs = project
+                            .control_tracks
+                            .iter()
+                            .flat_map(|t| t.clips.iter())
+                            .filter(|clip| clip.data == data)
+                            .count();
+                        if refs <= 1 {
+                            continue;
+                        }
+                        let Some(source) = project.curve_data.get(data as usize).cloned() else {
+                            continue;
+                        };
+                        let new_data = project.push_curve_data(source);
+                        if let Some(clip) = project
+                            .control_tracks
+                            .get_mut(sel.track)
+                            .and_then(|t| t.clips.get_mut(sel.clip))
+                        {
+                            clip.data = new_data;
+                        }
+                    }
+                    timeline::TimelineLane::Audio => {}
+                }
+            }
+        }
+        self.commit_edit("Unlink Clip Data", before);
+        self.sync_selection_rows(&selection);
     }
 }

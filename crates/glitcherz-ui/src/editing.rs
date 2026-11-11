@@ -77,13 +77,16 @@ impl GlitcherZApp {
     /// Points the Edit tab at the control clip `(track, clip)` and syncs the
     /// transient curve tool to the clip's persisted interpolation (U12).
     pub(crate) fn set_control_edit_target(&mut self, track: usize, clip: usize) {
-        self.curve_tool = self
-            .project()
-            .control_tracks
-            .get(track)
-            .and_then(|t| t.clips.get(clip))
-            .map(|c| CurveTool::of(c.interp))
-            .unwrap_or_default();
+        let interp = {
+            let project = self.project();
+            project
+                .control_tracks
+                .get(track)
+                .and_then(|t| t.clips.get(clip))
+                .and_then(|c| project.curve_data_of(c))
+                .map(|data| data.interp)
+        };
+        self.curve_tool = interp.map(CurveTool::of).unwrap_or_default();
         self.edit_clip = Some(EditTarget::Control { track, clip });
         self.edit_selection
             .clone_from(&self.timeline_state.selection);
@@ -164,11 +167,7 @@ impl GlitcherZApp {
         let sel = track.min(self.project().control_tracks.len() - 1);
         if self.project().control_tracks[sel].clips.is_empty() {
             let before = self.begin_edit();
-            let bar = self.project().ticks_per_bar();
-            let mut clip = ControlClip::new(0);
-            clip.span_ticks = bar;
-            clip.loop_ticks = bar;
-            self.project_mut().control_tracks[sel].clips.push(clip);
+            self.project_mut().add_control_clip(sel, 0);
             self.commit_edit("New Clip", before);
             self.send_control_clips(sel);
         }
@@ -256,8 +255,12 @@ impl GlitcherZApp {
             }
         };
         let (loop_ticks, interp, curve) = {
-            let clip = &self.project().control_tracks[sel].clips[clip_index];
-            (clip.loop_ticks.max(1), clip.interp, clip.curve.clone())
+            let project = self.project();
+            let clip = &project.control_tracks[sel].clips[clip_index];
+            match project.curve_data_of(clip) {
+                Some(data) => (data.length_ticks.max(1), data.interp, data.points.clone()),
+                None => (1, glitcherz_model::CurveInterp::Linear, Vec::new()),
+            }
         };
 
         // ---- Canvas ----
@@ -439,11 +442,7 @@ impl GlitcherZApp {
         let sel = focus.track.min(self.project().midi_tracks.len() - 1);
         if self.project().midi_tracks[sel].clips.is_empty() {
             let before = self.begin_edit();
-            let bar = self.project().ticks_per_bar();
-            let mut clip = MidiClip::new(0);
-            clip.span_ticks = bar;
-            clip.loop_ticks = bar;
-            self.project_mut().midi_tracks[sel].clips.push(clip);
+            self.project_mut().add_midi_clip(sel, 0);
             self.commit_edit("New Clip", before);
             self.send_track_clips(sel);
         }
@@ -461,11 +460,19 @@ impl GlitcherZApp {
         // Met M4: the roll's bar lines follow the meter segments.
         let meter = self.project().meter_map();
         let track_name = self.track_label(sel);
+        let shared_refs = self
+            .project()
+            .midi_tracks
+            .get(sel)
+            .and_then(|t| t.clips.get(clip_index))
+            .map(|clip| self.project().midi_data_refs(clip.data))
+            .unwrap_or(1);
         ui.horizontal(|ui| {
-            ui.label(format!(
-                "{track_name} · clip {} (of {clip_count})",
-                clip_index + 1
-            ));
+            let mut title = format!("{track_name} · clip {} (of {clip_count})", clip_index + 1);
+            if shared_refs > 1 {
+                title = format!("{title} · shared by {shared_refs} clips");
+            }
+            ui.label(title);
             if ui
                 .add_enabled(clip_index > 0, egui::Button::new("←"))
                 .on_hover_text("Previous clip")
@@ -571,9 +578,10 @@ impl GlitcherZApp {
         let mut toggle = false;
         egui::Panel::show_switched(ui, &mut open, collapsed, expanded, |ui, expanded| {
             ui.horizontal(|ui| {
-                let count = self.project().midi_tracks[sel].clips[clip_index]
-                    .notes()
-                    .len();
+                let count = self
+                    .project()
+                    .midi_clip_notes(sel, clip_index)
+                    .map_or(0, |notes| notes.len());
                 if ui
                     .selectable_label(expanded, "Event List")
                     .on_hover_text(if expanded {
@@ -591,10 +599,13 @@ impl GlitcherZApp {
                 return;
             }
             let list_intent = {
-                let clip = &self.project().midi_tracks[sel].clips[clip_index];
+                let notes = self
+                    .project()
+                    .midi_clip_notes(sel, clip_index)
+                    .unwrap_or(&[]);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show(ui, |ui| event_list::show(ui, clip))
+                    .show(ui, |ui| event_list::show(ui, notes))
                     .inner
             };
             if let Some(list_intent) = list_intent {
@@ -627,6 +638,7 @@ impl GlitcherZApp {
                 .filter(|c| matches!(c.lane, piano_roll::RollLane::Control))
                 .filter_map(|c| {
                     let data = project.control_tracks.get(c.track)?.clips.get(c.clip)?;
+                    let curve = project.curve_data_of(data)?;
                     // The caption names the destination (its range comes from
                     // the same map table the engine uses); the lane geometry
                     // itself is normalized now, so no axis travels with it.
@@ -644,6 +656,7 @@ impl GlitcherZApp {
                     Some(piano_roll::OverlayLane {
                         clip: *c,
                         data,
+                        curve,
                         label: format!("{name} · {dest}"),
                     })
                 })
@@ -651,6 +664,7 @@ impl GlitcherZApp {
             piano_roll::show(
                 ui,
                 &project.midi_tracks,
+                &project.midi_data,
                 &lanes,
                 subject,
                 roll_state,
@@ -807,17 +821,12 @@ impl GlitcherZApp {
             return;
         }
         let notes: Vec<glitcherz_model::Note> = {
-            let Some(midi) = self
-                .project()
-                .midi_tracks
-                .get(track)
-                .and_then(|t| t.clips.get(clip))
-            else {
+            let Some(source) = self.project().midi_clip_notes(track, clip) else {
                 return;
             };
             selection
                 .iter()
-                .filter_map(|index| midi.notes().get(*index))
+                .filter_map(|index| source.get(*index))
                 .copied()
                 .collect()
         };
@@ -866,17 +875,12 @@ impl GlitcherZApp {
         let pasted = clipboard::pasted_notes(&copy, anchor.max(0));
         let before = self.begin_edit();
         let indices = {
-            let Some(midi) = self
-                .project_mut()
-                .midi_tracks
-                .get_mut(track)
-                .and_then(|t| t.clips.get_mut(clip))
-            else {
+            let Some(data) = self.project_mut().midi_clip_data_mut(track, clip) else {
                 return;
             };
-            midi.notes_mut().extend(pasted.iter().copied());
-            midi.sort();
-            clipboard::locate_notes(midi.notes(), &pasted)
+            data.notes_mut().extend(pasted.iter().copied());
+            data.sort();
+            clipboard::locate_notes(data.notes(), &pasted)
         };
         self.commit_edit("Paste Notes", before);
         let count = indices.len();

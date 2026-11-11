@@ -298,15 +298,23 @@ mod tests {
 
     fn project_with_one_note() -> Project {
         let mut project = Project::default();
-        let mut clip = MidiClip::new(0);
-        clip.sequence.notes.push(Note {
+        let data = project.push_midi_data(glitcherz_model::MidiData {
+            length_ticks: 960,
+            ..glitcherz_model::MidiData::default()
+        });
+        project.midi_data_mut(data).unwrap().notes_mut().push(Note {
             start: 0,
             length: 960,
             note: 60,
             velocity: 100,
             channel: 0,
         });
-        project.midi_tracks[0].clips.push(clip);
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: 0,
+            span_ticks: 960,
+            data,
+            ..MidiClip::default()
+        });
         project
     }
 

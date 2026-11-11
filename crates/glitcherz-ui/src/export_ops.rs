@@ -75,11 +75,13 @@ impl GlitcherZApp {
                 target,
             ));
         };
-        for (index, track) in self.project().midi_tracks.iter().enumerate() {
-            let audible = track
-                .clips
-                .iter()
-                .any(|clip| !clip.sequence.notes.is_empty() || !clip.sequence.ctrls.is_empty());
+        let project = self.project();
+        for (index, track) in project.midi_tracks.iter().enumerate() {
+            let audible = track.clips.iter().any(|clip| {
+                project
+                    .midi_data_of(clip)
+                    .is_some_and(|data| !data.notes().is_empty() || !data.sequence.ctrls.is_empty())
+            });
             if !audible {
                 continue;
             }

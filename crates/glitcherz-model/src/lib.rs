@@ -1784,6 +1784,99 @@ impl Sequence {
     }
 }
 
+/// Upper bound of shared content entries (F-041). The pool may hold orphans
+/// until a compaction pass; this bound keeps a pathological edit loop from
+/// growing it without end.
+pub const MAX_CLIP_DATA_ENTRIES: usize = 4096;
+
+/// Shared MIDI content referenced by one or more [`MidiClip`]s (F-041).
+///
+/// Position semantics live on the clip (`start_ticks` / `source_offset` /
+/// `span_ticks`), so two clips can play different windows of the same data
+/// and editing one of them changes every reference.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MidiData {
+    /// Note and controller content, relative to the data start.
+    #[serde(default)]
+    pub sequence: Sequence,
+    /// Content length (tick), >= 1. A clip window longer than this loops.
+    #[serde(default = "default_clip_loop")]
+    pub length_ticks: u32,
+}
+
+impl MidiData {
+    /// Read-only access to the notes.
+    pub fn notes(&self) -> &[Note] {
+        &self.sequence.notes
+    }
+
+    /// Mutable access to the notes.
+    ///
+    /// The caller is responsible for restoring [`Sequence::sort`]'s invariant
+    /// afterwards if the mutation can break it.
+    pub fn notes_mut(&mut self) -> &mut Vec<Note> {
+        &mut self.sequence.notes
+    }
+
+    /// Number of notes in the data.
+    pub fn note_count(&self) -> usize {
+        self.sequence.notes.len()
+    }
+
+    /// Restores the sequence sort invariant.
+    pub fn sort(&mut self) {
+        self.sequence.sort();
+    }
+}
+
+/// Shared control-curve content referenced by one or more [`ControlClip`]s
+/// (F-041). Same window semantics as [`MidiData`]; `interp` travels with the
+/// content, so linked clips share the interpolation mode too.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CurveData {
+    /// Anchor curve (ticks relative to the data start, ascending).
+    #[serde(default)]
+    pub points: Vec<AutoPoint>,
+    /// Interpolation between anchors.
+    #[serde(default)]
+    pub interp: CurveInterp,
+    /// Content length (tick), >= 1.
+    #[serde(default = "default_clip_loop")]
+    pub length_ticks: u32,
+}
+
+impl CurveData {
+    /// Samples the curve at a data-relative tick; `None` when it is empty.
+    pub fn value_at(&self, tick: f64) -> Option<f32> {
+        sample_curve(&self.points, self.interp, tick)
+    }
+
+    /// Inserts or updates an anchor (overwrites the same tick), keeping
+    /// ascending tick order.
+    pub fn upsert_point(&mut self, point: AutoPoint) {
+        self.points.retain(|p| p.tick != point.tick);
+        let pos = self.points.partition_point(|p| p.tick < point.tick);
+        self.points.insert(pos, point);
+    }
+
+    /// Removes the nearest anchor within the `tick` tolerance; returns `true`
+    /// on a hit.
+    pub fn remove_near(&mut self, tick: u32, tolerance: u32) -> bool {
+        let Some(best) = self
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.tick.abs_diff(tick) <= tolerance)
+            .min_by_key(|(_, p)| p.tick.abs_diff(tick))
+            .map(|(index, _)| index)
+        else {
+            return false;
+        };
+        self.points.remove(best);
+        true
+    }
+}
+
 /// Upper bound of named clip groups (W3b).
 pub const MAX_CLIP_GROUPS: usize = 64;
 
@@ -1835,13 +1928,14 @@ fn clip_group_default_color() -> [u8; 3] {
     CLIP_GROUP_COLORS[0]
 }
 
-/// A MIDI clip placed on the arrangement timeline (D14/D15).
+/// A MIDI clip placed on the arrangement timeline (D14/D15, F-041).
 ///
-/// `start_ticks` is the absolute position on the arrangement; the clip is
-/// audible for `span_ticks` from there, and its note content repeats every
-/// `loop_ticks` within the span (D14). A single-period clip has
-/// `loop_ticks == span_ticks`; the timeline's Alt+T tool lowers `loop_ticks`
-/// to tile the content. Sequence positions are relative to the clip start.
+/// `start_ticks` is the absolute position on the arrangement. The clip is
+/// audible for `span_ticks` from there, playing a **window** into the shared
+/// [`MidiData`] at `Project::midi_data[data]`: the playback position is
+/// `(source_offset + t) mod length_ticks`, so a window longer than the data
+/// loops (the old tiling) and trimming only moves the window without touching
+/// the content.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MidiClip {
     /// Optional user-facing clip name (W3a). Empty means unnamed: the
@@ -1861,22 +1955,27 @@ pub struct MidiClip {
     /// Absolute start position on the arrangement (tick).
     #[serde(default)]
     pub start_ticks: u32,
-    /// How long the clip stays active (tick), ≥ `loop_ticks`.
+    /// Window start inside the shared data (tick), normalized to
+    /// `[0, length_ticks)`.
+    #[serde(default)]
+    pub source_offset: u32,
+    /// How long the clip stays active (tick), >= 1.
     #[serde(default = "default_clip_span")]
     pub span_ticks: u32,
-    /// Content loop length (tick), defaults to one bar (4/4).
-    #[serde(default = "default_clip_loop")]
-    pub loop_ticks: u32,
-    /// Note and controller content (relative to the clip start).
-    ///
-    /// Nested rather than flattened: `serde(flatten)` breaks RON's
-    /// tuple-struct form, which the file tests and hand-written fixtures rely
-    /// on.
+    /// Index into [`Project::midi_data`].
     #[serde(default)]
-    pub sequence: Sequence,
+    pub data: u32,
+    /// v11 content loop length. Read-only: the v11 -> v12 migration moves it
+    /// to [`MidiData::length_ticks`]. Never written back.
+    #[serde(default, rename = "loop_ticks", skip_serializing)]
+    pub legacy_loop_ticks: u32,
+    /// v11 note and controller content. Read-only: moved into
+    /// [`Project::midi_data`] by the v11 -> v12 migration.
+    #[serde(default, rename = "sequence", skip_serializing)]
+    pub legacy_sequence: Sequence,
     /// v5 documents stored notes directly on the clip. Read-only: the loader
-    /// moves them into [`MidiClip::sequence`] and rescales the ticks
-    /// (96 PPQ → 960 PPQ). Never written back.
+    /// moves them into the content (96 PPQ -> 960 PPQ) and the v11 -> v12
+    /// migration then puts them in the pool. Never written back.
     #[serde(default, rename = "notes", skip_serializing)]
     pub legacy_notes: Vec<LegacyNote>,
 }
@@ -1951,44 +2050,33 @@ impl Default for MidiClip {
             group: None,
             muted: false,
             start_ticks: 0,
+            source_offset: 0,
             span_ticks: default_clip_span(),
-            loop_ticks: default_clip_loop(),
-            sequence: Sequence::default(),
+            data: 0,
+            legacy_loop_ticks: 0,
+            legacy_sequence: Sequence::default(),
             legacy_notes: Vec::new(),
         }
     }
 }
 
 impl MidiClip {
-    /// Convenience constructor: one empty bar clip starting at `start_ticks`.
-    pub fn new(start_ticks: u32) -> Self {
-        Self {
-            start_ticks,
-            ..MidiClip::default()
-        }
-    }
-
-    /// Read-only access to the clip's notes.
-    pub fn notes(&self) -> &[Note] {
-        &self.sequence.notes
-    }
-
-    /// Mutable access to the clip's notes.
+    /// Moves v11-style inline content into `pool` and points `data` at it.
     ///
-    /// The caller is responsible for restoring [`Sequence::sort`]'s invariant
-    /// afterwards if the mutation can break it.
-    pub fn notes_mut(&mut self) -> &mut Vec<Note> {
-        &mut self.sequence.notes
-    }
-
-    /// Number of notes in the clip.
-    pub fn note_count(&self) -> usize {
-        self.sequence.notes.len()
-    }
-
-    /// Restores the sequence sort invariant.
-    pub fn sort(&mut self) {
-        self.sequence.sort();
+    /// Used by the SMF importer, which builds clips before the destination
+    /// project exists. The content length is the old `legacy_loop_ticks` (the
+    /// imported span), so the window covers the content exactly; the caller
+    /// must rebase `data` when appending a batch to an existing pool.
+    pub fn attach_inline_content(&mut self, pool: &mut Vec<MidiData>) {
+        let sequence = std::mem::take(&mut self.legacy_sequence);
+        let length = self.legacy_loop_ticks.max(self.span_ticks).max(1);
+        self.data = pool.len() as u32;
+        pool.push(MidiData {
+            sequence,
+            length_ticks: length,
+        });
+        self.source_offset = 0;
+        self.legacy_loop_ticks = 0;
     }
 }
 
@@ -2098,11 +2186,14 @@ pub enum CurveInterp {
     Smooth,
 }
 
-/// A control (automation) clip placed on the arrangement timeline (D17).
+/// A control (automation) clip placed on the arrangement timeline (D17,
+/// F-041).
 ///
-/// Same placement semantics as [`MidiClip`]; outside the span nothing is
-/// delivered (the target keeps its last value). The delivery endpoint is
-/// decided by the node graph's automation cable, not by the clip.
+/// Same window semantics as [`MidiClip`]: the clip plays
+/// `(source_offset + t) mod length_ticks` of the shared [`CurveData`] at
+/// `Project::curve_data[data]`. Outside the span nothing is delivered (the
+/// target keeps its last value). The delivery endpoint is decided by the node
+/// graph's automation cable, not by the clip.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ControlClip {
     /// Optional user-facing clip name (W3a). Empty means unnamed: the
@@ -2120,19 +2211,26 @@ pub struct ControlClip {
     /// Absolute start position on the arrangement (tick).
     #[serde(default)]
     pub start_ticks: u32,
-    /// How long the clip stays active (tick), ≥ `loop_ticks`.
+    /// Window start inside the shared data (tick), normalized to
+    /// `[0, length_ticks)`.
+    #[serde(default)]
+    pub source_offset: u32,
+    /// How long the clip stays active (tick), >= 1.
     #[serde(default = "default_clip_span")]
     pub span_ticks: u32,
-    /// Content loop length (tick), defaults to one bar (4/4).
-    #[serde(default = "default_clip_loop")]
-    pub loop_ticks: u32,
-    /// Anchor curve (ticks relative to the clip start, ascending).
+    /// Index into [`Project::curve_data`].
     #[serde(default)]
-    pub curve: Vec<AutoPoint>,
-    /// Interpolation between anchors (U12; additive serde field, default
-    /// `Linear` — old documents read back with the original behavior).
-    #[serde(default)]
-    pub interp: CurveInterp,
+    pub data: u32,
+    /// v11 content loop length. Read-only (see [`MidiClip::legacy_loop_ticks`]).
+    #[serde(default, rename = "loop_ticks", skip_serializing)]
+    pub legacy_loop_ticks: u32,
+    /// v11 anchor curve. Read-only: moved into [`Project::curve_data`] by the
+    /// v11 -> v12 migration.
+    #[serde(default, rename = "curve", skip_serializing)]
+    pub legacy_curve: Vec<AutoPoint>,
+    /// v11 interpolation mode. Read-only (see [`MidiClip::legacy_sequence`]).
+    #[serde(default, rename = "interp", skip_serializing)]
+    pub legacy_interp: CurveInterp,
 }
 
 impl Default for ControlClip {
@@ -2142,55 +2240,13 @@ impl Default for ControlClip {
             group: None,
             muted: false,
             start_ticks: 0,
+            source_offset: 0,
             span_ticks: default_clip_span(),
-            loop_ticks: default_clip_loop(),
-            curve: Vec::new(),
-            interp: CurveInterp::default(),
+            data: 0,
+            legacy_loop_ticks: 0,
+            legacy_curve: Vec::new(),
+            legacy_interp: CurveInterp::default(),
         }
-    }
-}
-
-impl ControlClip {
-    /// Convenience constructor: one empty bar clip starting at `start_ticks`.
-    pub fn new(start_ticks: u32) -> Self {
-        Self {
-            start_ticks,
-            ..ControlClip::default()
-        }
-    }
-
-    /// Samples the value at a clip-relative tick: returns `None` when the
-    /// curve is empty; otherwise the value is interpolated according to
-    /// [`ControlClip::interp`] and clamped to the endpoint values outside both
-    /// ends. Requires anchors to be ordered (editing interfaces maintain
-    /// this).
-    pub fn value_at(&self, tick: f64) -> Option<f32> {
-        sample_curve(&self.curve, self.interp, tick)
-    }
-
-    /// Inserts or updates an anchor (overwrites the same tick), keeping
-    /// ascending tick order.
-    pub fn upsert_point(&mut self, point: AutoPoint) {
-        self.curve.retain(|p| p.tick != point.tick);
-        let pos = self.curve.partition_point(|p| p.tick < point.tick);
-        self.curve.insert(pos, point);
-    }
-
-    /// Removes the nearest anchor within the `tick` tolerance; returns
-    /// `true` on a hit.
-    pub fn remove_near(&mut self, tick: u32, tolerance: u32) -> bool {
-        let Some(best) = self
-            .curve
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.tick.abs_diff(tick) <= tolerance)
-            .min_by_key(|(_, p)| p.tick.abs_diff(tick))
-            .map(|(index, _)| index)
-        else {
-            return false;
-        };
-        self.curve.remove(best);
-        true
     }
 }
 
@@ -6350,6 +6406,13 @@ pub struct Project {
     /// Audio tracks (U6, capped at [`MAX_AUDIO_TRACKS`]).
     #[serde(default)]
     pub audio_tracks: Vec<AudioTrack>,
+    /// Shared MIDI content pool (F-041). Clips reference entries by index;
+    /// unreferenced entries (orphans) are tolerated and compacted on save.
+    #[serde(default)]
+    pub midi_data: Vec<MidiData>,
+    /// Shared control-curve content pool (F-041).
+    #[serde(default)]
+    pub curve_data: Vec<CurveData>,
     /// Named clip groups (W3b, spec `timeline.md` D28). Membership lives on
     /// the clips (`group: Option<u32>`); an empty table means no groups.
     #[serde(default)]
@@ -6376,6 +6439,8 @@ impl Default for Project {
             midi_tracks: vec![MidiTrack::default(); DEFAULT_MIDI_TRACKS],
             control_tracks: vec![ControlTrack::default(); DEFAULT_CONTROL_TRACKS],
             audio_tracks: vec![AudioTrack::default(); DEFAULT_AUDIO_TRACKS],
+            midi_data: Vec::new(),
+            curve_data: Vec::new(),
             clip_groups: Vec::new(),
             graph: default_graph_doc(DEFAULT_MIDI_TRACKS, DEFAULT_AUDIO_TRACKS),
             base_dir: None,
@@ -6477,6 +6542,182 @@ fn voice_engine_identity_eq(a: &VoiceSpec, b: &VoiceSpec) -> bool {
 }
 
 impl Project {
+    /// Shared MIDI content referenced by `clip`, if the index is valid.
+    pub fn midi_data_of(&self, clip: &MidiClip) -> Option<&MidiData> {
+        self.midi_data.get(clip.data as usize)
+    }
+
+    /// Shared control content referenced by `clip`, if the index is valid.
+    pub fn curve_data_of(&self, clip: &ControlClip) -> Option<&CurveData> {
+        self.curve_data.get(clip.data as usize)
+    }
+
+    /// Mutable shared MIDI content by pool index.
+    pub fn midi_data_mut(&mut self, data: u32) -> Option<&mut MidiData> {
+        self.midi_data.get_mut(data as usize)
+    }
+
+    /// Mutable shared control content by pool index.
+    pub fn curve_data_mut(&mut self, data: u32) -> Option<&mut CurveData> {
+        self.curve_data.get_mut(data as usize)
+    }
+
+    /// Notes of the MIDI clip at `(track, clip)`.
+    pub fn midi_clip_notes(&self, track: usize, clip: usize) -> Option<&[Note]> {
+        let clip = self.midi_tracks.get(track)?.clips.get(clip)?;
+        Some(self.midi_data_of(clip)?.notes())
+    }
+
+    /// Mutable shared content of the MIDI clip at `(track, clip)`.
+    ///
+    /// Resolves the pool index first so the two table borrows never overlap.
+    pub fn midi_clip_data_mut(&mut self, track: usize, clip: usize) -> Option<&mut MidiData> {
+        let data = self.midi_tracks.get(track)?.clips.get(clip)?.data;
+        self.midi_data.get_mut(data as usize)
+    }
+
+    /// Mutable shared content of the control clip at `(track, clip)`.
+    pub fn curve_clip_data_mut(&mut self, track: usize, clip: usize) -> Option<&mut CurveData> {
+        let data = self.control_tracks.get(track)?.clips.get(clip)?.data;
+        self.curve_data.get_mut(data as usize)
+    }
+
+    /// How many MIDI clips reference `data`.
+    pub fn midi_data_refs(&self, data: u32) -> usize {
+        self.midi_tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .filter(|clip| clip.data == data)
+            .count()
+    }
+
+    /// How many control clips reference `data`.
+    pub fn curve_data_refs(&self, data: u32) -> usize {
+        self.control_tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .filter(|clip| clip.data == data)
+            .count()
+    }
+
+    /// Pushes a new MIDI data entry and returns its pool index.
+    pub fn push_midi_data(&mut self, data: MidiData) -> u32 {
+        let index = self.midi_data.len() as u32;
+        self.midi_data.push(data);
+        index
+    }
+
+    /// Pushes a new control-curve data entry and returns its pool index.
+    pub fn push_curve_data(&mut self, data: CurveData) -> u32 {
+        let index = self.curve_data.len() as u32;
+        self.curve_data.push(data);
+        index
+    }
+
+    /// Adds an empty MIDI clip to `track`, creating its private data entry.
+    pub fn add_midi_clip(&mut self, track: usize, start_ticks: u32) -> Option<usize> {
+        if self.midi_data.len() >= MAX_CLIP_DATA_ENTRIES {
+            return None;
+        }
+        if self.midi_tracks.get(track)?.clips.len() >= MAX_CLIPS_PER_TRACK {
+            return None;
+        }
+        let bar = self.ticks_per_bar_at(start_ticks).max(1);
+        let data = self.push_midi_data(MidiData {
+            length_ticks: bar,
+            ..MidiData::default()
+        });
+        let clips = &mut self.midi_tracks[track].clips;
+        clips.push(MidiClip {
+            start_ticks,
+            span_ticks: bar,
+            data,
+            ..MidiClip::default()
+        });
+        Some(clips.len() - 1)
+    }
+
+    /// Adds an empty control clip to `track`, creating its private data entry.
+    pub fn add_control_clip(&mut self, track: usize, start_ticks: u32) -> Option<usize> {
+        if self.curve_data.len() >= MAX_CLIP_DATA_ENTRIES {
+            return None;
+        }
+        if self.control_tracks.get(track)?.clips.len() >= MAX_CLIPS_PER_TRACK {
+            return None;
+        }
+        let bar = self.ticks_per_bar_at(start_ticks).max(1);
+        let data = self.push_curve_data(CurveData {
+            length_ticks: bar,
+            ..CurveData::default()
+        });
+        let clips = &mut self.control_tracks[track].clips;
+        clips.push(ControlClip {
+            start_ticks,
+            span_ticks: bar,
+            data,
+            ..ControlClip::default()
+        });
+        Some(clips.len() - 1)
+    }
+
+    /// Drops unreferenced data entries and remaps every clip index. Used by
+    /// the save path (on a temporary copy) and when the pool hits its cap.
+    pub fn compact_clip_data(&mut self) {
+        // MIDI pool.
+        let mut keep = vec![false; self.midi_data.len()];
+        for track in &self.midi_tracks {
+            for clip in &track.clips {
+                if let Some(slot) = keep.get_mut(clip.data as usize) {
+                    *slot = true;
+                }
+            }
+        }
+        if keep.iter().any(|k| !k) {
+            let map = compact_map(&keep);
+            let old = std::mem::take(&mut self.midi_data);
+            self.midi_data = old
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| keep[*index])
+                .map(|(_, value)| value)
+                .collect();
+            for track in &mut self.midi_tracks {
+                for clip in &mut track.clips {
+                    if let Some(&next) = map.get(clip.data as usize) {
+                        clip.data = next;
+                    }
+                }
+            }
+        }
+
+        // Control pool.
+        let mut keep = vec![false; self.curve_data.len()];
+        for track in &self.control_tracks {
+            for clip in &track.clips {
+                if let Some(slot) = keep.get_mut(clip.data as usize) {
+                    *slot = true;
+                }
+            }
+        }
+        if keep.iter().any(|k| !k) {
+            let map = compact_map(&keep);
+            let old = std::mem::take(&mut self.curve_data);
+            self.curve_data = old
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| keep[*index])
+                .map(|(_, value)| value)
+                .collect();
+            for track in &mut self.control_tracks {
+                for clip in &mut track.clips {
+                    if let Some(&next) = map.get(clip.data as usize) {
+                        clip.data = next;
+                    }
+                }
+            }
+        }
+    }
+
     /// Whether the real-time graph would be identical for both documents:
     /// node payloads, cables, and the three track-list lengths.
     ///
@@ -6636,12 +6877,12 @@ impl Project {
             for clip in &mut track.clips {
                 scale(&mut clip.start_ticks);
                 scale(&mut clip.span_ticks);
-                scale(&mut clip.loop_ticks);
+                scale(&mut clip.legacy_loop_ticks);
                 if !clip.legacy_notes.is_empty() {
-                    let mut seq = std::mem::take(&mut clip.sequence);
+                    let mut seq = std::mem::take(&mut clip.legacy_sequence);
                     seq.notes = clip.legacy_notes.iter().map(LegacyNote::upgrade).collect();
                     seq.sort();
-                    clip.sequence = seq;
+                    clip.legacy_sequence = seq;
                 }
                 clip.legacy_notes.clear();
             }
@@ -6650,8 +6891,8 @@ impl Project {
             for clip in &mut track.clips {
                 scale(&mut clip.start_ticks);
                 scale(&mut clip.span_ticks);
-                scale(&mut clip.loop_ticks);
-                for point in &mut clip.curve {
+                scale(&mut clip.legacy_loop_ticks);
+                for point in &mut clip.legacy_curve {
                     scale(&mut point.tick);
                 }
             }
@@ -6730,13 +6971,103 @@ impl Project {
         }
         for (track, track_map) in self.control_tracks.iter_mut().zip(track_maps) {
             for clip in &mut track.clips {
-                for point in &mut clip.curve {
+                for point in &mut clip.legacy_curve {
                     point.value = match track_map {
                         Some(map) => map.unmap(point.value),
                         None if point.value.is_finite() => point.value.clamp(-1.0, 1.0),
                         None => 0.0,
                     };
                 }
+            }
+        }
+    }
+
+    /// v11 -> v12 (F-041): clip content moves out of the clips into the shared
+    /// pools ([`Project::midi_data`] / [`Project::curve_data`]).
+    ///
+    /// Every existing clip gets its own pool entry and keeps its old
+    /// `loop_ticks` as the content length, so playback is tick-for-tick
+    /// unchanged; `source_offset` starts at zero. Idempotent for documents
+    /// that already carry pool entries (`legacy_*` are empty).
+    ///
+    /// Only call it for documents whose `version < 12`.
+    pub fn migrate_v11_to_v12(&mut self) {
+        self.adopt_inline_content();
+    }
+
+    /// Moves every clip's inline (`legacy_*`) content into the shared pools and
+    /// points the clips at their new entries.
+    ///
+    /// This is the v11 -> v12 migration; callers that build clips before a
+    /// project exists (SMF import, tests) use it the same way. A clip whose
+    /// `data` already resolves against the existing pool is left untouched, so
+    /// the pass is idempotent.
+    pub fn adopt_inline_content(&mut self) {
+        let midi_base = self.midi_data.len();
+        let curve_base = self.curve_data.len();
+        let mut midi_pending = Vec::new();
+        for (ti, track) in self.midi_tracks.iter_mut().enumerate() {
+            for (ci, clip) in track.clips.iter_mut().enumerate() {
+                let has_inline = clip.legacy_loop_ticks != 0
+                    || !clip.legacy_sequence.notes.is_empty()
+                    || !clip.legacy_sequence.ctrls.is_empty();
+                let unresolved = clip.data as usize >= midi_base;
+                if !has_inline && !unresolved {
+                    continue;
+                }
+                midi_pending.push((
+                    ti,
+                    ci,
+                    MidiData {
+                        sequence: std::mem::take(&mut clip.legacy_sequence),
+                        length_ticks: clip.legacy_loop_ticks.max(clip.span_ticks).max(1),
+                    },
+                ));
+                clip.legacy_loop_ticks = 0;
+            }
+        }
+        for (ti, ci, data) in midi_pending {
+            let index = self.push_midi_data(data);
+            if let Some(clip) = self
+                .midi_tracks
+                .get_mut(ti)
+                .and_then(|t| t.clips.get_mut(ci))
+            {
+                clip.data = index;
+                clip.source_offset = 0;
+            }
+        }
+
+        let mut curve_pending = Vec::new();
+        for (ti, track) in self.control_tracks.iter_mut().enumerate() {
+            for (ci, clip) in track.clips.iter_mut().enumerate() {
+                let has_inline = clip.legacy_loop_ticks != 0 || !clip.legacy_curve.is_empty();
+                let unresolved = clip.data as usize >= curve_base;
+                if !has_inline && !unresolved {
+                    continue;
+                }
+                curve_pending.push((
+                    ti,
+                    ci,
+                    CurveData {
+                        points: std::mem::take(&mut clip.legacy_curve),
+                        interp: clip.legacy_interp,
+                        length_ticks: clip.legacy_loop_ticks.max(clip.span_ticks).max(1),
+                    },
+                ));
+                clip.legacy_loop_ticks = 0;
+                clip.legacy_interp = CurveInterp::default();
+            }
+        }
+        for (ti, ci, data) in curve_pending {
+            let index = self.push_curve_data(data);
+            if let Some(clip) = self
+                .control_tracks
+                .get_mut(ti)
+                .and_then(|t| t.clips.get_mut(ci))
+            {
+                clip.data = index;
+                clip.source_offset = 0;
             }
         }
     }
@@ -6970,22 +7301,28 @@ impl Project {
             total += group.name.len();
         }
 
+        for data in &self.midi_data {
+            total += std::mem::size_of::<MidiData>();
+            total += data.sequence.notes.len() * std::mem::size_of::<Note>();
+            total += data.sequence.ctrls.len() * std::mem::size_of::<CtrlEvent>();
+        }
         for track in &self.midi_tracks {
             total += std::mem::size_of::<MidiTrack>() + track.name.len();
             total += track.clips.len() * std::mem::size_of::<MidiClip>();
             for clip in &track.clips {
                 total += clip.name.len();
-                total += clip.sequence.notes.len() * std::mem::size_of::<Note>();
-                total += clip.sequence.ctrls.len() * std::mem::size_of::<CtrlEvent>();
             }
         }
 
+        for data in &self.curve_data {
+            total += std::mem::size_of::<CurveData>();
+            total += data.points.len() * std::mem::size_of::<AutoPoint>();
+        }
         for track in &self.control_tracks {
             total += std::mem::size_of::<ControlTrack>() + track.name.len();
             total += track.clips.len() * std::mem::size_of::<ControlClip>();
             for clip in &track.clips {
                 total += clip.name.len();
-                total += clip.curve.len() * std::mem::size_of::<AutoPoint>();
             }
         }
 
@@ -7055,13 +7392,19 @@ impl Project {
                 ));
             }
             for (ci, clip) in track.clips.iter().enumerate() {
-                if clip.notes().len() > MAX_CLIP_NOTES {
+                let Some(data) = self.midi_data_of(clip) else {
+                    return Err(format!(
+                        "MIDI track #{ti} clip #{ci} references missing data {}",
+                        clip.data
+                    ));
+                };
+                if data.notes().len() > MAX_CLIP_NOTES {
                     return Err(format!(
                         "MIDI track #{ti} clip #{ci} holds {} notes, exceeding the limit {MAX_CLIP_NOTES}",
-                        clip.notes().len()
+                        data.notes().len()
                     ));
                 }
-                check_clip_placement(ti, ci, clip.start_ticks, clip.span_ticks, clip.loop_ticks)?;
+                check_clip_placement(ti, ci, clip.start_ticks, clip.span_ticks, data.length_ticks)?;
             }
         }
         for (ti, track) in self.control_tracks.iter().enumerate() {
@@ -7072,13 +7415,19 @@ impl Project {
                 ));
             }
             for (ci, clip) in track.clips.iter().enumerate() {
-                if clip.curve.len() > MAX_CURVE_POINTS {
+                let Some(data) = self.curve_data_of(clip) else {
+                    return Err(format!(
+                        "control track #{ti} clip #{ci} references missing data {}",
+                        clip.data
+                    ));
+                };
+                if data.points.len() > MAX_CURVE_POINTS {
                     return Err(format!(
                         "control track #{ti} clip #{ci} holds {} anchors, exceeding the limit {MAX_CURVE_POINTS}",
-                        clip.curve.len()
+                        data.points.len()
                     ));
                 }
-                check_clip_placement(ti, ci, clip.start_ticks, clip.span_ticks, clip.loop_ticks)?;
+                check_clip_placement(ti, ci, clip.start_ticks, clip.span_ticks, data.length_ticks)?;
             }
         }
         if self.audio_tracks.len() > MAX_AUDIO_TRACKS {
@@ -7198,16 +7547,16 @@ fn check_clip_placement(
     clip: usize,
     start_ticks: u32,
     span_ticks: u32,
-    loop_ticks: u32,
+    length_ticks: u32,
 ) -> Result<(), String> {
-    if loop_ticks == 0 {
+    if length_ticks == 0 {
         return Err(format!(
-            "track #{track} clip #{clip} has loop_ticks = 0 (must be ≥ 1)"
+            "track #{track} clip #{clip} has content length 0 (must be >= 1)"
         ));
     }
-    if span_ticks < loop_ticks {
+    if span_ticks == 0 {
         return Err(format!(
-            "track #{track} clip #{clip} has span_ticks {span_ticks} < loop_ticks {loop_ticks}"
+            "track #{track} clip #{clip} has span_ticks = 0 (must be >= 1)"
         ));
     }
     if u64::from(start_ticks) + u64::from(span_ticks) > MAX_ARRANGEMENT_TICKS {
@@ -7216,6 +7565,20 @@ fn check_clip_placement(
         ));
     }
     Ok(())
+}
+
+/// Old-to-new index map for [`Project::compact_clip_data`]: the new position
+/// of every kept entry, `0` for dropped ones.
+fn compact_map(keep: &[bool]) -> Vec<u32> {
+    let mut map = vec![0u32; keep.len()];
+    let mut next = 0u32;
+    for (old, kept) in keep.iter().enumerate() {
+        if *kept {
+            map[old] = next;
+            next += 1;
+        }
+    }
+    map
 }
 
 /// Project-level metadata.
@@ -8148,26 +8511,16 @@ mod tests {
 
     #[test]
     fn midi_clip_ron_roundtrip() {
-        let mut clip = MidiClip {
+        // F-041: content lives in the pool, so the clip round-trips its
+        // placement and its pool reference only.
+        let clip = MidiClip {
             name: "Intro".to_string(),
             start_ticks: 2 * TICKS_PER_BAR,
             span_ticks: 4 * TICKS_PER_BAR,
+            source_offset: 96,
+            data: 3,
             ..MidiClip::default()
         };
-        clip.notes_mut().push(super::Note {
-            start: 0,
-            length: 480,
-            note: 60,
-            velocity: super::DEFAULT_VELOCITY,
-            channel: 0,
-        });
-        clip.notes_mut().push(super::Note {
-            start: 240,
-            length: 240,
-            note: 64,
-            velocity: 127,
-            channel: 0,
-        });
         let text = ron::to_string(&clip).expect("serialization failed");
         let back: MidiClip = ron::from_str(&text).expect("deserialization failed");
         assert_eq!(clip, back);
@@ -8175,12 +8528,13 @@ mod tests {
 
     #[test]
     fn midi_clip_partial_fields_use_defaults() {
-        // Only `start_ticks` written: span/loop default to one bar.
+        // Only `start_ticks` written: span defaults to one bar, the window
+        // starts at zero and the pool reference is 0.
         let back: MidiClip = ron::from_str("(start_ticks: 384)").expect("parse failed");
         assert_eq!(back.start_ticks, 384);
         assert_eq!(back.span_ticks, TICKS_PER_BAR);
-        assert_eq!(back.loop_ticks, TICKS_PER_BAR);
-        assert!(back.notes().is_empty());
+        assert_eq!(back.source_offset, 0);
+        assert_eq!(back.data, 0);
         // W3a: clips written before the name field read back as unnamed.
         assert!(back.name.is_empty());
     }
@@ -8195,10 +8549,8 @@ mod tests {
             name: "Verse".to_string(),
             color: [10, 20, 30],
         });
-        project.midi_tracks[0].clips.push(MidiClip {
-            group: Some(1),
-            ..MidiClip::default()
-        });
+        let index = project.add_midi_clip(0, 0).expect("clip");
+        project.midi_tracks[0].clips[index].group = Some(1);
         let text = ron::to_string(&project).expect("serialize");
         let back: Project = ron::from_str(&text).expect("deserialize");
         assert_eq!(back.clip_groups, project.clip_groups);
@@ -8814,26 +9166,41 @@ mod tests {
         let mut project = Project::default();
         project.metadata.name = "demo".to_string();
         project.midi_tracks[0].name = "Bass".to_string();
-        let mut clip = MidiClip::new(TICKS_PER_BAR);
-        clip.span_ticks = 2 * TICKS_PER_BAR;
-        clip.notes_mut().push(super::Note {
-            start: 0,
-            length: 480,
-            note: 48,
-            velocity: super::DEFAULT_VELOCITY,
-            channel: 0,
+        let data = project.push_midi_data(super::MidiData {
+            length_ticks: 2 * TICKS_PER_BAR,
+            ..super::MidiData::default()
         });
-        project.midi_tracks[0].clips.push(clip);
+        project
+            .midi_data_mut(data)
+            .unwrap()
+            .notes_mut()
+            .push(super::Note {
+                start: 0,
+                length: 480,
+                note: 48,
+                velocity: super::DEFAULT_VELOCITY,
+                channel: 0,
+            });
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: TICKS_PER_BAR,
+            span_ticks: 2 * TICKS_PER_BAR,
+            data,
+            ..MidiClip::default()
+        });
+        let curve = project.push_curve_data(super::CurveData {
+            points: vec![AutoPoint {
+                tick: 0,
+                value: 1.0,
+            }],
+            length_ticks: TICKS_PER_BAR,
+            ..super::CurveData::default()
+        });
         project.control_tracks.push(super::ControlTrack {
             name: "Gain Ride".to_string(),
             clips: vec![super::ControlClip {
                 start_ticks: 0,
                 span_ticks: TICKS_PER_BAR,
-                loop_ticks: TICKS_PER_BAR,
-                curve: vec![AutoPoint {
-                    tick: 0,
-                    value: 1.0,
-                }],
+                data: curve,
                 ..super::ControlClip::default()
             }],
         });
@@ -9190,9 +9557,9 @@ mod tests {
     }
 
     #[test]
-    fn control_clip_value_at_segments() {
-        let mut clip = super::ControlClip {
-            curve: vec![
+    fn curve_data_value_at_segments() {
+        let mut curve = super::CurveData {
+            points: vec![
                 AutoPoint {
                     tick: 0,
                     value: 1.0,
@@ -9206,26 +9573,26 @@ mod tests {
                     value: 0.0,
                 },
             ],
-            ..super::ControlClip::default()
+            ..super::CurveData::default()
         };
-        assert!((clip.value_at(0.0).unwrap() - 1.0).abs() < 1e-6);
+        assert!((curve.value_at(0.0).unwrap() - 1.0).abs() < 1e-6);
         assert!(
-            (clip.value_at(48.0).unwrap() - 0.75).abs() < 1e-6,
+            (curve.value_at(48.0).unwrap() - 0.75).abs() < 1e-6,
             "linear midpoint"
         );
-        assert!((clip.value_at(192.0).unwrap()).abs() < 1e-6);
+        assert!((curve.value_at(192.0).unwrap()).abs() < 1e-6);
         assert!(
-            (clip.value_at(1_000.0).unwrap()).abs() < 1e-6,
+            (curve.value_at(1_000.0).unwrap()).abs() < 1e-6,
             "holds the end value past the tail"
         );
         assert!(
-            (clip.value_at(-5.0).unwrap() - 1.0).abs() < 1e-6,
+            (curve.value_at(-5.0).unwrap() - 1.0).abs() < 1e-6,
             "holds the end value before the head"
         );
 
-        clip.curve.clear();
+        curve.points.clear();
         assert!(
-            clip.value_at(48.0).is_none(),
+            curve.value_at(48.0).is_none(),
             "empty curve produces no automation"
         );
     }
@@ -9235,9 +9602,9 @@ mod tests {
     /// exactly, and endpoints are held outside the curve.
     #[test]
     fn smooth_interp_is_overshoot_free_and_hits_anchors() {
-        let clip = super::ControlClip {
+        let curve = super::CurveData {
             interp: super::CurveInterp::Smooth,
-            curve: vec![
+            points: vec![
                 AutoPoint {
                     tick: 0,
                     value: 0.0,
@@ -9251,16 +9618,16 @@ mod tests {
                     value: 0.0,
                 },
             ],
-            ..super::ControlClip::default()
+            ..super::CurveData::default()
         };
-        assert!((clip.value_at(-1.0).unwrap()).abs() < 1e-6, "head held");
-        assert!((clip.value_at(200.0).unwrap()).abs() < 1e-6, "tail held");
+        assert!((curve.value_at(-1.0).unwrap()).abs() < 1e-6, "head held");
+        assert!((curve.value_at(200.0).unwrap()).abs() < 1e-6, "tail held");
         assert!(
-            (clip.value_at(50.0).unwrap() - 10.0).abs() < 1e-6,
+            (curve.value_at(50.0).unwrap() - 10.0).abs() < 1e-6,
             "peak anchor hit exactly"
         );
         for k in 0..=400 {
-            let v = clip.value_at(f64::from(k) * 0.25).unwrap();
+            let v = curve.value_at(f64::from(k) * 0.25).unwrap();
             assert!(
                 (-1e-4..=10.0 + 1e-4).contains(&v),
                 "overshoot at tick {}: {v}",
@@ -9273,9 +9640,9 @@ mod tests {
     /// (samples increase between consecutive anchors).
     #[test]
     fn smooth_interp_preserves_monotonicity() {
-        let clip = super::ControlClip {
+        let curve = super::CurveData {
             interp: super::CurveInterp::Smooth,
-            curve: vec![
+            points: vec![
                 AutoPoint {
                     tick: 0,
                     value: 0.0,
@@ -9289,19 +9656,19 @@ mod tests {
                     value: 4.0,
                 },
             ],
-            ..super::ControlClip::default()
+            ..super::CurveData::default()
         };
-        let mut prev = clip.value_at(0.0).unwrap();
+        let mut prev = curve.value_at(0.0).unwrap();
         for k in 1..=192 {
-            let v = clip.value_at(f64::from(k)).unwrap();
+            let v = curve.value_at(f64::from(k)).unwrap();
             assert!(v >= prev - 1e-5, "dip at tick {k}: {prev} -> {v}");
             prev = v;
         }
-        assert!((v_at(&clip, 192.0) - 4.0).abs() < 1e-6);
+        assert!((v_at(&curve, 192.0) - 4.0).abs() < 1e-6);
     }
 
-    fn v_at(clip: &super::ControlClip, tick: f64) -> f32 {
-        clip.value_at(tick).unwrap()
+    fn v_at(curve: &super::CurveData, tick: f64) -> f32 {
+        curve.value_at(tick).unwrap()
     }
 
     /// U12: the new field is additive — an old document without `interp`
@@ -9310,53 +9677,54 @@ mod tests {
     #[test]
     fn curve_interp_defaults_to_linear_for_old_documents() {
         assert_eq!(
-            super::ControlClip::default().interp,
+            super::CurveData::default().interp,
             super::CurveInterp::Linear
         );
         let ron = "(start_ticks:0,span_ticks:384,loop_ticks:384,curve:[(tick:0,value:1.0)])";
         let clip: super::ControlClip = ron::from_str(ron).expect("legacy clip parses");
-        assert_eq!(clip.interp, super::CurveInterp::Linear);
+        assert_eq!(clip.legacy_interp, super::CurveInterp::Linear);
+        assert_eq!(clip.legacy_curve.len(), 1, "v11 curve lands in legacy");
     }
 
     #[test]
-    fn control_clip_upsert_keeps_order() {
-        let mut clip = super::ControlClip::default();
-        clip.upsert_point(AutoPoint {
+    fn curve_data_upsert_keeps_order() {
+        let mut curve = super::CurveData::default();
+        curve.upsert_point(AutoPoint {
             tick: 96,
             value: 0.5,
         });
-        clip.upsert_point(AutoPoint {
+        curve.upsert_point(AutoPoint {
             tick: 0,
             value: 1.0,
         });
-        clip.upsert_point(AutoPoint {
+        curve.upsert_point(AutoPoint {
             tick: 48,
             value: 0.75,
         });
-        clip.upsert_point(AutoPoint {
+        curve.upsert_point(AutoPoint {
             tick: 48,
             value: 0.8,
         }); // Overwrites the same tick
-        let ticks: Vec<u32> = clip.curve.iter().map(|p| p.tick).collect();
+        let ticks: Vec<u32> = curve.points.iter().map(|p| p.tick).collect();
         assert_eq!(
             ticks,
             vec![0, 48, 96],
             "anchors stay ascending and the same tick overwrites"
         );
-        assert!((clip.curve[1].value - 0.8).abs() < 1e-6);
+        assert!((curve.points[1].value - 0.8).abs() < 1e-6);
     }
 
     #[test]
-    fn control_clip_remove_near() {
-        let mut clip = super::ControlClip::default();
-        clip.upsert_point(AutoPoint {
+    fn curve_data_remove_near() {
+        let mut curve = super::CurveData::default();
+        curve.upsert_point(AutoPoint {
             tick: 48,
             value: 0.5,
         });
-        assert!(clip.remove_near(50, 6), "should hit within tolerance");
-        assert!(clip.curve.is_empty());
+        assert!(curve.remove_near(50, 6), "should hit within tolerance");
+        assert!(curve.points.is_empty());
         assert!(
-            !clip.remove_near(0, 6),
+            !curve.remove_near(0, 6),
             "removal on an empty curve returns false"
         );
     }
@@ -9447,9 +9815,16 @@ mod tests {
     fn validate_rejects_too_many_clips() {
         let mut project = Project::default();
         for i in 0..=MAX_CLIPS_PER_TRACK {
-            project.midi_tracks[0]
-                .clips
-                .push(MidiClip::new((i as u32) * TICKS_PER_BAR));
+            let data = project.push_midi_data(super::MidiData {
+                length_ticks: TICKS_PER_BAR,
+                ..super::MidiData::default()
+            });
+            project.midi_tracks[0].clips.push(MidiClip {
+                start_ticks: (i as u32) * TICKS_PER_BAR,
+                span_ticks: TICKS_PER_BAR,
+                data,
+                ..MidiClip::default()
+            });
         }
         let err = project.validate().expect_err("should reject");
         assert!(err.contains("clips"), "unexpected error: {err}");
@@ -9460,65 +9835,106 @@ mod tests {
         // D15 revision regression: 300 notes in one clip (a real imported
         // piano part) used to fail validation at save time.
         let mut project = Project::default();
-        let mut clip = MidiClip::default();
+        let data = project.push_midi_data(super::MidiData {
+            length_ticks: TICKS_PER_BAR,
+            ..super::MidiData::default()
+        });
         for i in 0..300 {
-            clip.notes_mut().push(super::Note {
-                start: (i as i64) * i64::from(TICKS_PER_STEP),
-                length: i64::from(TICKS_PER_STEP),
-                ..super::Note::default()
-            });
+            project
+                .midi_data_mut(data)
+                .unwrap()
+                .notes_mut()
+                .push(super::Note {
+                    start: (i as i64) * i64::from(TICKS_PER_STEP),
+                    length: i64::from(TICKS_PER_STEP),
+                    ..super::Note::default()
+                });
         }
-        project.midi_tracks[0].clips.push(clip);
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: 0,
+            span_ticks: TICKS_PER_BAR,
+            data,
+            ..MidiClip::default()
+        });
         project.validate().expect("a dense clip must validate");
     }
 
     #[test]
     fn validate_rejects_too_many_notes() {
         let mut project = Project::default();
-        let mut clip = MidiClip::default();
+        let data = project.push_midi_data(super::MidiData {
+            length_ticks: TICKS_PER_BAR,
+            ..super::MidiData::default()
+        });
         for i in 0..=MAX_CLIP_NOTES {
-            clip.notes_mut().push(super::Note {
-                start: (i as i64) * i64::from(TICKS_PER_STEP),
-                ..super::Note::default()
-            });
+            project
+                .midi_data_mut(data)
+                .unwrap()
+                .notes_mut()
+                .push(super::Note {
+                    start: (i as i64) * i64::from(TICKS_PER_STEP),
+                    ..super::Note::default()
+                });
         }
-        project.midi_tracks[0].clips.push(clip);
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: 0,
+            span_ticks: TICKS_PER_BAR,
+            data,
+            ..MidiClip::default()
+        });
         let err = project.validate().expect_err("should reject");
         assert!(err.contains("notes"), "unexpected error: {err}");
     }
 
     #[test]
-    fn validate_rejects_span_shorter_than_loop() {
+    fn validate_accepts_span_shorter_than_content() {
+        // F-041: a window shorter than its content is a legal tail trim.
         let mut project = Project::default();
+        let data = project.push_midi_data(super::MidiData {
+            length_ticks: 2 * TICKS_PER_BAR,
+            ..super::MidiData::default()
+        });
         project.midi_tracks[0].clips.push(MidiClip {
             start_ticks: 0,
             span_ticks: TICKS_PER_BAR,
-            loop_ticks: 2 * TICKS_PER_BAR,
+            data,
             ..MidiClip::default()
         });
-        let err = project.validate().expect_err("should reject");
-        assert!(err.contains("span_ticks"), "unexpected error: {err}");
+        project
+            .validate()
+            .expect("a short window over long content must validate");
     }
 
     #[test]
-    fn validate_rejects_zero_loop() {
+    fn validate_rejects_zero_content_length() {
         let mut project = Project::default();
+        let data = project.push_midi_data(super::MidiData {
+            length_ticks: 0,
+            ..super::MidiData::default()
+        });
         project.midi_tracks[0].clips.push(MidiClip {
             start_ticks: 0,
             span_ticks: TICKS_PER_BAR,
-            loop_ticks: 0,
+            data,
             ..MidiClip::default()
         });
-        assert!(project.validate().is_err());
+        let err = project
+            .validate()
+            .expect_err("zero content length is invalid");
+        assert!(err.contains("length"), "unexpected error: {err}");
     }
 
     #[test]
     fn validate_rejects_beyond_arrangement_bound() {
         let mut project = Project::default();
+        let data = project.push_midi_data(super::MidiData {
+            length_ticks: TICKS_PER_BAR,
+            ..super::MidiData::default()
+        });
         project.midi_tracks[0].clips.push(MidiClip {
             start_ticks: u32::try_from(MAX_ARRANGEMENT_TICKS).unwrap(),
             span_ticks: TICKS_PER_BAR,
-            loop_ticks: TICKS_PER_BAR,
+            data,
             ..MidiClip::default()
         });
         let err = project.validate().expect_err("should reject");
@@ -9528,11 +9944,15 @@ mod tests {
     #[test]
     fn validate_accepts_arrangement_ending_exactly_at_bound() {
         let mut project = Project::default();
+        let data = project.push_midi_data(super::MidiData {
+            length_ticks: TICKS_PER_BAR,
+            ..super::MidiData::default()
+        });
         let last_start = u64::from(MAX_ARRANGEMENT_BARS - 1) * u64::from(TICKS_PER_BAR);
         project.midi_tracks[0].clips.push(MidiClip {
             start_ticks: u32::try_from(last_start).unwrap(),
             span_ticks: TICKS_PER_BAR,
-            loop_ticks: TICKS_PER_BAR,
+            data,
             ..MidiClip::default()
         });
         assert!(project.validate().is_ok());
@@ -9541,16 +9961,28 @@ mod tests {
     #[test]
     fn validate_rejects_too_many_curve_points() {
         let mut project = Project::default();
-        let mut clip = super::ControlClip::default();
+        let data = project.push_curve_data(super::CurveData {
+            length_ticks: TICKS_PER_BAR,
+            ..super::CurveData::default()
+        });
         for i in 0..=super::MAX_CURVE_POINTS {
-            clip.curve.push(AutoPoint {
-                tick: (i as u32) * TICKS_PER_STEP,
-                value: 0.5,
-            });
+            project
+                .curve_data_mut(data)
+                .unwrap()
+                .points
+                .push(AutoPoint {
+                    tick: (i as u32) * TICKS_PER_STEP,
+                    value: 0.5,
+                });
         }
         project.control_tracks.push(super::ControlTrack {
             name: String::new(),
-            clips: vec![clip],
+            clips: vec![super::ControlClip {
+                start_ticks: 0,
+                span_ticks: TICKS_PER_BAR,
+                data,
+                ..super::ControlClip::default()
+            }],
         });
         let err = project.validate().expect_err("should reject");
         assert!(err.contains("anchors"), "unexpected error: {err}");
@@ -10840,7 +11272,7 @@ mod tests {
     /// number for the additive `meter_markers` field, without a migration.
     #[test]
     fn project_version_matches_the_curve_migration() {
-        assert_eq!(super::PROJECT_VERSION, 11);
+        assert_eq!(super::PROJECT_VERSION, 12);
     }
 
     // ---- SF2 bend range (spec `curve-map.md` D8/D9) ----
@@ -11155,7 +11587,8 @@ mod tests {
         project.control_tracks.resize_with(3, ControlTrack::default);
         // ±24 st axis: 0 st is the centre, +12 st is three quarters up.
         project.control_tracks[0].clips = vec![ControlClip {
-            curve: vec![
+            legacy_loop_ticks: TICKS_PER_BAR,
+            legacy_curve: vec![
                 AutoPoint {
                     tick: 0,
                     value: 0.0,
@@ -11173,7 +11606,8 @@ mod tests {
         }];
         // Tempo axis is log 20..300: 120 BPM is no longer the middle.
         project.control_tracks[1].clips = vec![ControlClip {
-            curve: vec![AutoPoint {
+            legacy_loop_ticks: TICKS_PER_BAR,
+            legacy_curve: vec![AutoPoint {
                 tick: 0,
                 value: 120.0,
             }],
@@ -11181,7 +11615,8 @@ mod tests {
         }];
         // No cable: values are clamped into the normalized domain.
         project.control_tracks[2].clips = vec![ControlClip {
-            curve: vec![
+            legacy_loop_ticks: TICKS_PER_BAR,
+            legacy_curve: vec![
                 AutoPoint {
                     tick: 0,
                     value: 4.0,
@@ -11195,8 +11630,12 @@ mod tests {
         }];
 
         project.migrate_v8_to_v9();
+        project.adopt_inline_content();
 
-        let pitch = &project.control_tracks[0].clips[0].curve;
+        let pitch = &project
+            .curve_data_of(&project.control_tracks[0].clips[0])
+            .expect("migrated pitch curve")
+            .points;
         assert_eq!(pitch[0].value, 0.0);
         assert!((pitch[1].value - 0.5).abs() < 1e-5);
         assert_eq!(pitch[2].value, -1.0);
@@ -11210,12 +11649,19 @@ mod tests {
             MapSpec::linear(-24.0, 24.0)
         );
 
-        let tempo = project.control_tracks[1].clips[0].curve[0].value;
+        let tempo = project
+            .curve_data_of(&project.control_tracks[1].clips[0])
+            .expect("migrated tempo curve")
+            .points[0]
+            .value;
         let spec = MapSpec::log(MIN_TEMPO_BPM, MAX_TEMPO_BPM);
         assert!((spec.map(tempo) - 120.0).abs() < 0.01, "tempo {tempo}");
         assert_eq!(project.graph.cables[1].map, None);
 
-        let loose = &project.control_tracks[2].clips[0].curve;
+        let loose = &project
+            .curve_data_of(&project.control_tracks[2].clips[0])
+            .expect("migrated loose curve")
+            .points;
         assert_eq!((loose[0].value, loose[1].value), (1.0, -1.0));
         // A dangling curve stays dangling: migration never invents a cable.
         assert!(project.graph.auto_target(2).is_none());
@@ -11229,12 +11675,19 @@ mod tests {
         let mut project = Project::default();
         project.graph.cables.push(CableDoc::tempo(0));
         project.graph.cables[0].map = Some(MapSpec::log(MIN_TEMPO_BPM, MAX_TEMPO_BPM));
+        let curve = project.push_curve_data(super::CurveData {
+            points: vec![AutoPoint {
+                tick: 0,
+                value: 0.25,
+            }],
+            length_ticks: TICKS_PER_BAR,
+            ..super::CurveData::default()
+        });
         project.control_tracks = vec![ControlTrack {
             clips: vec![ControlClip {
-                curve: vec![AutoPoint {
-                    tick: 0,
-                    value: 0.25,
-                }],
+                start_ticks: 0,
+                span_ticks: TICKS_PER_BAR,
+                data: curve,
                 ..ControlClip::default()
             }],
             ..ControlTrack::default()
@@ -11242,7 +11695,13 @@ mod tests {
         let text = ron::to_string(&project).expect("serialize");
         let back: Project = ron::from_str(&text).expect("deserialize");
         assert_eq!(back.graph.cables[0].map, project.graph.cables[0].map);
-        assert_eq!(back.control_tracks[0].clips[0].curve[0].value, 0.25);
+        assert_eq!(
+            back.curve_data_of(&back.control_tracks[0].clips[0])
+                .expect("curve data")
+                .points[0]
+                .value,
+            0.25
+        );
 
         // A cable written before v9 has no `map` key: it still parses, and the
         // compiler derives the map from the target instead.

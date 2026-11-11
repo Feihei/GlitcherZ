@@ -48,6 +48,8 @@ fn playhead_segments_share_one_x_and_join_vertically() {
                     sec_per_tick: 60.0 / (120.0 * 960.0),
                     waveform_of: &|_| None,
                     clip_groups: &[],
+                    midi_data: &[],
+                    curve_data: &[],
                 },
                 &mut router,
             );

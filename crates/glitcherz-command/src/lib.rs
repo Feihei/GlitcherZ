@@ -623,12 +623,24 @@ impl Session {
     ///
     /// ```
     /// # use glitcherz_command::Session;
-    /// # use glitcherz_model::{MidiClip, Note, Project};
+    /// # use glitcherz_model::{MidiClip, MidiData, Note, Project};
     /// # use serde_json::json;
     /// let mut project = Project::default();
-    /// let mut clip = MidiClip::default();
-    /// clip.notes_mut().push(Note::default());
-    /// project.midi_tracks[0].clips.push(clip);
+    /// let data = project.push_midi_data(MidiData {
+    ///     length_ticks: 3840,
+    ///     ..MidiData::default()
+    /// });
+    /// project
+    ///     .midi_data_mut(data)
+    ///     .unwrap()
+    ///     .notes_mut()
+    ///     .push(Note::default());
+    /// project.midi_tracks[0].clips.push(MidiClip {
+    ///     start_ticks: 0,
+    ///     span_ticks: 3840,
+    ///     data,
+    ///     ..MidiClip::default()
+    /// });
     /// let mut session = Session::new(project);
     ///
     /// for velocity in [40u8, 70, 100] {
@@ -674,9 +686,21 @@ mod journal_tests {
 
     fn session_with_note() -> Session {
         let mut project = Project::default();
-        let mut clip = MidiClip::default();
-        clip.notes_mut().push(Note::default());
-        project.midi_tracks[0].clips.push(clip);
+        let data = project.push_midi_data(glitcherz_model::MidiData {
+            length_ticks: 384,
+            ..glitcherz_model::MidiData::default()
+        });
+        project
+            .midi_data_mut(data)
+            .unwrap()
+            .notes_mut()
+            .push(Note::default());
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: 0,
+            span_ticks: 384,
+            data,
+            ..MidiClip::default()
+        });
         Session::new(project)
     }
 

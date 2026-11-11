@@ -904,7 +904,7 @@ mod tests {
     fn send_track_clips(tx: &mut Producer<GraphUpdate>, track: usize, notes: &[(u32, u8)]) {
         let mut clip = RtMidiClip {
             span_ticks: TICKS_PER_BAR,
-            loop_ticks: TICKS_PER_BAR,
+            length_ticks: TICKS_PER_BAR,
             ..RtMidiClip::default()
         };
         for (start, note) in notes {
@@ -999,7 +999,7 @@ mod tests {
         clips[0] = RtControlClip {
             start_ticks: 0,
             span_ticks: TICKS_PER_BAR,
-            loop_ticks: TICKS_PER_BAR,
+            length_ticks: TICKS_PER_BAR,
             curve,
             ..RtControlClip::default()
         };
@@ -1128,7 +1128,7 @@ mod tests {
         clips[0] = RtControlClip {
             start_ticks: 0,
             span_ticks: TICKS_PER_BAR,
-            loop_ticks: TICKS_PER_BAR,
+            length_ticks: TICKS_PER_BAR,
             curve,
             ..RtControlClip::default()
         };
@@ -1231,7 +1231,7 @@ mod tests {
         RtControlClip {
             start_ticks: start,
             span_ticks: span,
-            loop_ticks: span,
+            length_ticks: span,
             curve,
             ..RtControlClip::default()
         }

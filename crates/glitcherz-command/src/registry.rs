@@ -178,12 +178,16 @@ pub fn has_midi_tracks(session: &Session) -> std::result::Result<(), String> {
 
 /// The document has at least one note somewhere.
 pub fn has_notes(session: &Session) -> std::result::Result<(), String> {
-    if session
-        .project()
+    let project = session.project();
+    if project
         .midi_tracks
         .iter()
         .flat_map(|t| t.clips.iter())
-        .any(|c| !c.notes().is_empty())
+        .any(|c| {
+            project
+                .midi_data_of(c)
+                .is_some_and(|d| !d.notes().is_empty())
+        })
     {
         Ok(())
     } else {

@@ -16,15 +16,31 @@ fn note(start: i64, pitch: u8, velocity: u8) -> Note {
 
 fn session_with(notes: Vec<Note>) -> Session {
     let mut project = Project::default();
-    let mut clip = MidiClip::default();
-    clip.notes_mut().extend(notes);
-    clip.sort();
-    project.midi_tracks[0].clips.push(clip);
+    let data = project.push_midi_data(glitcherz_model::MidiData {
+        length_ticks: 384,
+        ..glitcherz_model::MidiData::default()
+    });
+    project
+        .midi_data_mut(data)
+        .unwrap()
+        .notes_mut()
+        .extend(notes);
+    project.midi_data_mut(data).unwrap().sort();
+    project.midi_tracks[0].clips.push(MidiClip {
+        start_ticks: 0,
+        span_ticks: 384,
+        data,
+        ..MidiClip::default()
+    });
     Session::new(project)
 }
 
 fn notes(session: &Session) -> Vec<Note> {
-    session.project().midi_tracks[0].clips[0].notes().to_vec()
+    session
+        .project()
+        .midi_clip_notes(0, 0)
+        .expect("clip notes")
+        .to_vec()
 }
 
 fn chord() -> Vec<Note> {

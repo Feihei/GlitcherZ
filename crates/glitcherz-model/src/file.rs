@@ -38,8 +38,10 @@ use crate::Project;
 /// migration function: v9 files simply contain none. v11 (Met M3) adds
 /// [`crate::ProjectMetadata::meter_markers`], likewise additive and
 /// migration-free: v10 files load with an empty table, which evaluates exactly
-/// like the single-meter behavior.
-pub const PROJECT_VERSION: u32 = 11;
+/// like the single-meter behavior. v12 (F-041) moves clip content into the
+/// shared pools, so `version < 12` goes through
+/// [`Project::migrate_v11_to_v12`] (each clip gets its own data entry).
+pub const PROJECT_VERSION: u32 = 12;
 
 fn default_version() -> u32 {
     PROJECT_VERSION
@@ -220,6 +222,9 @@ pub fn parse_project(text: &str) -> Result<Project, ModelError> {
     if version < 9 {
         project.migrate_v8_to_v9();
     }
+    if version < 12 {
+        project.migrate_v11_to_v12();
+    }
     project.validate().map_err(ModelError::InvalidGraph)?;
     Ok(project)
 }
@@ -248,37 +253,50 @@ mod tests {
         project.metadata.name = "Test Project".to_string();
         project.metadata.tempo_bpm = 140.0;
         project.midi_tracks[0].name = "Bass".to_string();
-        let mut clip = MidiClip::new(TICKS_PER_BAR);
-        clip.span_ticks = TICKS_PER_BAR;
-        clip.sequence.notes = vec![
-            Note {
-                start: 0,
-                length: 480,
-                note: 60,
-                velocity: crate::DEFAULT_VELOCITY,
-                channel: 0,
+        let data = project.push_midi_data(crate::MidiData {
+            sequence: crate::Sequence {
+                notes: vec![
+                    Note {
+                        start: 0,
+                        length: 480,
+                        note: 60,
+                        velocity: crate::DEFAULT_VELOCITY,
+                        channel: 0,
+                    },
+                    Note {
+                        start: 240,
+                        length: 240,
+                        note: 64,
+                        velocity: 127,
+                        channel: 0,
+                    },
+                ],
+                ctrls: Vec::new(),
             },
-            Note {
-                start: 240,
-                length: 240,
-                note: 64,
-                velocity: 127,
-                channel: 0,
-            },
-        ];
-        project.midi_tracks[0].clips.push(clip);
+            length_ticks: TICKS_PER_BAR,
+        });
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: TICKS_PER_BAR,
+            span_ticks: TICKS_PER_BAR,
+            data,
+            ..MidiClip::default()
+        });
         // Control track 0: one bar clip, cabled to the global mixer's
         // channel 0 gain.
+        let curve = project.push_curve_data(crate::CurveData {
+            points: vec![AutoPoint {
+                tick: 0,
+                value: 1.0,
+            }],
+            interp: crate::CurveInterp::Linear,
+            length_ticks: TICKS_PER_BAR,
+        });
         project.control_tracks.push(crate::ControlTrack {
             name: String::new(),
             clips: vec![crate::ControlClip {
                 start_ticks: 0,
                 span_ticks: TICKS_PER_BAR,
-                loop_ticks: TICKS_PER_BAR,
-                curve: vec![AutoPoint {
-                    tick: 0,
-                    value: 1.0,
-                }],
+                data: curve,
                 ..crate::ControlClip::default()
             }],
         });
@@ -771,12 +789,24 @@ mod tests {
         // 384 ticks @96 PPQ = one bar → 3840 @960 PPQ, still one bar.
         assert_eq!(clip.start_ticks, 3840);
         assert_eq!(clip.span_ticks, 3840);
-        assert_eq!(clip.loop_ticks, 3840);
+        assert_eq!(
+            project
+                .midi_data_of(clip)
+                .expect("migrated data")
+                .length_ticks,
+            3840
+        );
         assert_eq!(clip.start_ticks, crate::TICKS_PER_BAR);
         // Automation clips and their anchors rescale too.
         let ctrl = &project.control_tracks[0].clips[0];
         assert_eq!(ctrl.start_ticks, 1920);
-        let ticks: Vec<u32> = ctrl.curve.iter().map(|p| p.tick).collect();
+        let ticks: Vec<u32> = project
+            .curve_data_of(ctrl)
+            .expect("migrated curve")
+            .points
+            .iter()
+            .map(|p| p.tick)
+            .collect();
         assert_eq!(ticks, vec![0, 960]);
     }
 
@@ -784,21 +814,21 @@ mod tests {
     fn v5_notes_move_into_the_sequence_with_midi_velocity() {
         let project = parse_project(V5_DOC).expect("v5 document should migrate and load");
         let clip = &project.midi_tracks[0].clips[0];
-        assert_eq!(clip.notes().len(), 2, "legacy notes must not be lost");
+        let notes = project.midi_clip_notes(0, 0).expect("migrated notes");
+        assert_eq!(notes.len(), 2, "legacy notes must not be lost");
         assert!(
             clip.legacy_notes.is_empty(),
             "the legacy field is consumed, not carried"
         );
         // Notes are sorted by (start, note) after the upgrade.
-        let first = &clip.notes()[0];
+        let first = &notes[0];
         assert_eq!((first.start, first.note, first.length), (0, 60, 480));
         assert_eq!(first.velocity, 114, "0.9 × 127 = 114.3, rounded to 114");
-        let second = &clip.notes()[1];
+        let second = &notes[1];
         assert_eq!((second.start, second.note, second.length), (240, 64, 240));
         assert_eq!(second.velocity, 127, "1.0 × 127 is the maximum");
         assert!(
-            clip.sequence
-                .notes
+            notes
                 .windows(2)
                 .all(|w| (w[0].start, w[0].note) <= (w[1].start, w[1].note)),
             "the sort invariant must hold after migration"
@@ -808,9 +838,16 @@ mod tests {
     #[test]
     fn v6_documents_are_left_alone() {
         let mut project = Project::default();
-        project.midi_tracks[0]
-            .clips
-            .push(MidiClip::new(TICKS_PER_BAR));
+        project.midi_data.push(crate::MidiData {
+            length_ticks: TICKS_PER_BAR,
+            ..crate::MidiData::default()
+        });
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: TICKS_PER_BAR,
+            span_ticks: TICKS_PER_BAR,
+            data: 0,
+            ..MidiClip::default()
+        });
         let text = ron::ser::to_string_pretty(
             &ProjectFile {
                 version: PROJECT_VERSION,

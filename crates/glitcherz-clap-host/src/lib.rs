@@ -2600,7 +2600,7 @@ mod tests {
         let mut clips = empty_midi_clip_table();
         clips[0].start_ticks = 0;
         clips[0].span_ticks = 384;
-        clips[0].loop_ticks = 384;
+        clips[0].length_ticks = 384;
         clips[0].push(RtNote::new(0, 384, 60, 0, 127));
         graph_tx
             .push(glitcherz_engine::realtime::graph::GraphUpdate::SetMidiClips { track: 0, clips })
@@ -2698,7 +2698,7 @@ mod tests {
         let mut chords = empty_midi_clip_table();
         chords[0].start_ticks = 0;
         chords[0].span_ticks = 384;
-        chords[0].loop_ticks = 384;
+        chords[0].length_ticks = 384;
         chords[0].push(RtNote::new(0, 384, 58, 0, 100)); // Bb3
         chords[0].push(RtNote::new(0, 384, 53, 0, 100)); // F3
         graph_tx

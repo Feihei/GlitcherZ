@@ -250,16 +250,18 @@ impl RtNote {
 pub struct RtMidiClip {
     /// Absolute start position on the arrangement (in ticks).
     pub start_ticks: u32,
+    /// Window start inside the shared content (in ticks).
+    pub source_offset: u32,
     /// How long the clip stays active (in ticks).
     pub span_ticks: u32,
-    /// Content loop length (in ticks).
-    pub loop_ticks: u32,
+    /// Content length (in ticks); a longer window loops (F-041).
+    pub length_ticks: u32,
     /// Temporarily muted (B2): the clip keeps its span — the arrangement
     /// length does not shrink — but scheduling skips it entirely.
     pub muted: bool,
-    /// Notes, relative to the clip start.
+    /// Notes, relative to the content start.
     pub notes: Vec<RtNote>,
-    /// Controller events, relative to the clip start (P0).
+    /// Controller events, relative to the content start (P0).
     pub ctrls: Vec<RtCtrl>,
 }
 
@@ -267,11 +269,12 @@ impl Default for RtMidiClip {
     fn default() -> Self {
         Self {
             start_ticks: 0,
+            source_offset: 0,
             // span 0 = inactive: an all-default clip table is an EMPTY track
             // (the scheduler skips span-0 clips); every real clip carries its
             // own placement.
             span_ticks: 0,
-            loop_ticks: TICKS_PER_BAR,
+            length_ticks: TICKS_PER_BAR,
             muted: false,
             notes: Vec::new(),
             ctrls: Vec::new(),
@@ -1038,51 +1041,78 @@ impl Sequencer {
         let clips = &self.clips[track];
         let pending = &mut self.pending_offs[track];
         for clip in clips {
-            if clip.is_empty() || clip.loop_ticks == 0 || clip.span_ticks == 0 || clip.muted {
+            if clip.is_empty() || clip.length_ticks == 0 || clip.span_ticks == 0 || clip.muted {
                 continue;
             }
             let start = f64::from(clip.start_ticks);
             let clip_end = start + f64::from(clip.span_ticks);
-            let loop_ticks = f64::from(clip.loop_ticks);
+            let length_ticks = f64::from(clip.length_ticks.max(1));
+            let offset = f64::from(clip.source_offset);
             // Controller occurrences come **before** the notes of the same
             // block: a pitch bend or program change sets the state a note
             // starts in, so it must land first (mirrors the SMF export's
-            // off → controller → on ordering). Same tiling as notes, but a
-            // controller is a point event — no length, no pending off, no
-            // retrigger guard.
+            // off → controller → on ordering). The instance at content phase
+            // `(offset + local) mod length` is a point event — no length, no
+            // pending off, no retrigger guard.
             for ctrl in &clip.ctrls {
-                let offset = f64::from(ctrl.tick_ticks);
-                let mut m = ((t0 - start - offset) / loop_ticks).ceil();
-                if m < 0.0 {
-                    m = 0.0;
-                }
+                let base = f64::from(ctrl.tick_ticks) - offset;
+                let mut m = (-base / length_ticks).ceil();
                 loop {
-                    let at = start + m * loop_ticks + offset;
+                    let local = base + m * length_ticks;
+                    let at = start + local;
                     if at >= t1 || at >= clip_end {
                         break; // past the window or past the clip span
                     }
-                    if at >= t0 {
+                    if at >= t0 && local >= 0.0 {
                         sink.ctrl(track, *ctrl);
                     }
                     m += 1.0;
                 }
             }
             for note in &clip.notes {
-                let start_offset = f64::from(note.start_ticks);
+                let base = f64::from(note.start_ticks) - offset;
                 let length = f64::from(note.length_ticks.max(1));
-                // The m-th occurrence is at start + m·loop + s; find the first
-                // m with an on-time ≥ t0 (may be negative, clamped to 0).
-                let mut m = ((t0 - start - start_offset) / loop_ticks).ceil();
-                if m < 0.0 {
-                    m = 0.0;
+                let velocity = note.velocity_f32();
+                // A note whose onset lies before the window start keeps
+                // sounding its remaining tail from the window edge (F-041
+                // head trim): one truncated instance, never a duplicate.
+                let head_tail = base + length;
+                if base < 0.0 && head_tail > 0.0 && start >= t0 && start < t1 && !muted {
+                    for slot in pending.iter_mut() {
+                        if let Some((_, pending_note)) = *slot
+                            && pending_note == note.note
+                        {
+                            *slot = None;
+                            sink.note(track, NoteEvent::Off { note: note.note });
+                        }
+                    }
+                    sink.note(
+                        track,
+                        NoteEvent::On {
+                            note: note.note,
+                            velocity,
+                        },
+                    );
+                    set_pending_off(
+                        pending,
+                        start + head_tail,
+                        t0,
+                        block_start,
+                        samples_per_tick,
+                        note.note,
+                    );
                 }
+                // Every instance at or after the window start. The tail keeps
+                // its natural length past the window end, exactly like a long
+                // note across a loop wrap always did.
+                let mut m = 0.0;
                 loop {
-                    let on_tick = start + m * loop_ticks + start_offset;
-                    if on_tick >= t1 || on_tick >= clip_end {
+                    let local = base + m * length_ticks;
+                    let on_tick = start + local;
+                    if on_tick >= clip_end {
                         break; // past the window or past the clip span
                     }
-                    if on_tick >= t0 && !muted {
-                        let velocity = note.velocity_f32();
+                    if on_tick >= start && on_tick >= t0 && on_tick < t1 && !muted {
                         // Retrigger guard: a previous occurrence of this note
                         // may still be sounding (its off was scheduled past
                         // the clip end by the loop) — the new occurrence
@@ -1259,7 +1289,7 @@ mod tests {
         let mut clip = RtMidiClip {
             start_ticks: start,
             span_ticks: span,
-            loop_ticks,
+            length_ticks: loop_ticks,
             ..RtMidiClip::default()
         };
         for note in notes {
@@ -1282,7 +1312,7 @@ mod tests {
         let mut clip = RtMidiClip {
             start_ticks: start,
             span_ticks: span,
-            loop_ticks,
+            length_ticks: loop_ticks,
             ..RtMidiClip::default()
         };
         for ctrl in ctrls {
@@ -1385,7 +1415,7 @@ mod tests {
             let mut clip = RtMidiClip {
                 start_ticks: 0,
                 span_ticks: TICKS_PER_BAR,
-                loop_ticks: TICKS_PER_BAR,
+                length_ticks: TICKS_PER_BAR,
                 muted,
                 ..RtMidiClip::default()
             };
@@ -1439,7 +1469,7 @@ mod tests {
         let mut clip = RtMidiClip {
             start_ticks: 0,
             span_ticks: 384,
-            loop_ticks: 384,
+            length_ticks: 384,
             ..RtMidiClip::default()
         };
         clip.push(clip_note(0, 96, 60));
@@ -1792,7 +1822,7 @@ mod tests {
     fn dense_clip_plays_every_note() {
         let mut clip = RtMidiClip {
             span_ticks: 600,
-            loop_ticks: 600,
+            length_ticks: 600,
             ..RtMidiClip::default()
         };
         for i in 0..300u32 {
@@ -1834,7 +1864,7 @@ mod tests {
         // 16 notes per bar (every 16th note), unbounded arrangement.
         let mut clip = RtMidiClip {
             span_ticks: 256 * TICKS_PER_BAR,
-            loop_ticks: TICKS_PER_BAR,
+            length_ticks: TICKS_PER_BAR,
             ..RtMidiClip::default()
         };
         for i in 0..16u32 {
@@ -1949,7 +1979,7 @@ mod tests {
             *slot = RtControlClip {
                 start_ticks: i as u32 * TICKS_PER_BAR,
                 span_ticks: TICKS_PER_BAR,
-                loop_ticks: TICKS_PER_BAR,
+                length_ticks: TICKS_PER_BAR,
                 ..RtControlClip::default()
             };
         }
@@ -1971,7 +2001,7 @@ mod tests {
         clips[5] = RtControlClip {
             start_ticks: 0,
             span_ticks: TICKS_PER_BAR,
-            loop_ticks: 96, // decoupled from any MIDI clip loop (D7)
+            length_ticks: 96, // decoupled from any MIDI clip loop (D7)
             curve: {
                 let mut curve = crate::realtime::automation::RtAutomation::default();
                 curve.push(RtAutoPoint {
@@ -1985,7 +2015,7 @@ mod tests {
         seq.set_control_clips(5, clips);
         seq.set_control_clips(MAX_AUTO_TRACKS, clips); // out-of-range index ignored
         let tables = seq.control_clips();
-        assert_eq!(tables[5][5].loop_ticks, 96);
+        assert_eq!(tables[5][5].length_ticks, 96);
         assert_eq!(tables[5][5].curve.point_count, 1);
         assert!(
             tables

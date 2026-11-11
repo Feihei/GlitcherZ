@@ -19,15 +19,23 @@ fn render_subcommand_writes_a_wav_without_a_window() {
     let output = dir.join("song.wav");
 
     let mut project = Project::default();
-    let mut clip = MidiClip::new(0);
-    clip.sequence.notes.push(Note {
+    let data = project.push_midi_data(glitcherz_model::MidiData {
+        length_ticks: 960,
+        ..glitcherz_model::MidiData::default()
+    });
+    project.midi_data_mut(data).unwrap().notes_mut().push(Note {
         start: 0,
         length: 960,
         note: 60,
         velocity: 100,
         channel: 0,
     });
-    project.midi_tracks[0].clips.push(clip);
+    project.midi_tracks[0].clips.push(MidiClip {
+        start_ticks: 0,
+        span_ticks: 960,
+        data,
+        ..MidiClip::default()
+    });
     glitcherz_model::file::save_project(&project, &project_path).expect("save project");
 
     let result = Command::new(env!("CARGO_BIN_EXE_glitcherz"))

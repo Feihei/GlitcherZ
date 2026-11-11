@@ -16,7 +16,8 @@
 
 use eframe::egui;
 use glitcherz_model::{
-    AutoPoint, ControlClip, MidiClip, MidiTrack, Note, Sequence, TICKS_PER_BAR, TICKS_PER_QUARTER,
+    AutoPoint, ControlClip, CurveData, MidiClip, MidiData, MidiTrack, Note, Sequence,
+    TICKS_PER_BAR, TICKS_PER_QUARTER,
 };
 use glitcherz_ui::piano_roll::{
     CURVE_LANE_COLLAPSED_HEIGHT, ClipRef, KEYS_WIDTH, OverlayLane, ROW_HEIGHT, RollIntent,
@@ -41,6 +42,8 @@ struct Fixture {
     /// now (P3: a subject addresses clips by track/clip index). A test may
     /// push a ghost clip in and point the subject's context at it.
     tracks: Vec<MidiTrack>,
+    /// Shared MIDI content pool (F-041).
+    midi_data: Vec<MidiData>,
     /// What the roll shows; defaults to the single focus clip.
     subject: RollSubject,
     state: RollState,
@@ -62,14 +65,15 @@ struct Fixture {
 struct LaneFixture {
     clip: ClipRef,
     data: ControlClip,
+    /// Shared curve content (F-041).
+    curve: CurveData,
     axis: (f32, f32, bool),
     label: String,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let clip = MidiClip {
-            loop_ticks: TICKS_PER_BAR,
+        let data = MidiData {
             sequence: Sequence {
                 notes: vec![
                     Note {
@@ -87,6 +91,12 @@ impl Fixture {
                 ],
                 ..Sequence::default()
             },
+            length_ticks: TICKS_PER_BAR,
+        };
+        let clip = MidiClip {
+            start_ticks: 0,
+            span_ticks: TICKS_PER_BAR,
+            data: 0,
             ..MidiClip::default()
         };
         let mut fixture = Self {
@@ -95,6 +105,7 @@ impl Fixture {
                 clips: vec![clip],
                 ..MidiTrack::default()
             }],
+            midi_data: vec![data],
             subject: RollSubject::single(0, 0),
             state: RollState::new(),
             router: glitcherz_ui::focus::FocusRouter::new(),
@@ -189,6 +200,7 @@ impl Fixture {
         let Self {
             ctx,
             tracks,
+            midi_data,
             subject,
             state,
             router,
@@ -202,6 +214,7 @@ impl Fixture {
             .map(|lane| OverlayLane {
                 clip: lane.clip,
                 data: &lane.data,
+                curve: &lane.curve,
                 label: lane.label.clone(),
             })
             .collect();
@@ -214,6 +227,7 @@ impl Fixture {
                 intent = glitcherz_ui::piano_roll::show(
                     ui,
                     tracks,
+                    midi_data,
                     &lane_views,
                     subject,
                     state,
@@ -1065,10 +1079,8 @@ fn a_ghost_note_is_painted_but_never_hit() {
     let mut f = Fixture::new();
     let bar = TICKS_PER_BAR;
     // Ghost clip one bar after the focus, same pitch row as note A.
-    f.tracks[0].clips.push(MidiClip {
-        start_ticks: bar,
-        span_ticks: bar,
-        loop_ticks: bar,
+    let idx = f.midi_data.len() as u32;
+    f.midi_data.push(MidiData {
         sequence: Sequence {
             notes: vec![Note {
                 start: 0,
@@ -1078,6 +1090,12 @@ fn a_ghost_note_is_painted_but_never_hit() {
             }],
             ..Sequence::default()
         },
+        length_ticks: bar,
+    });
+    f.tracks[0].clips.push(MidiClip {
+        start_ticks: bar,
+        span_ticks: bar,
+        data: idx,
         ..MidiClip::default()
     });
     f.subject = RollSubject::assemble(ClipRef::midi(0, 0), &[ClipRef::midi(0, 1)], |_| 2, |_| 0);
@@ -1107,10 +1125,15 @@ fn a_ghost_note_is_painted_but_never_hit() {
 fn drawing_stops_at_the_focus_clips_edges() {
     let mut f = Fixture::new();
     let bar = TICKS_PER_BAR;
+    let idx = f.midi_data.len() as u32;
+    f.midi_data.push(MidiData {
+        length_ticks: bar,
+        ..MidiData::default()
+    });
     f.tracks[0].clips.push(MidiClip {
         start_ticks: bar,
         span_ticks: bar,
-        loop_ticks: bar,
+        data: idx,
         ..MidiClip::default()
     });
     f.subject = RollSubject::assemble(ClipRef::midi(0, 0), &[ClipRef::midi(0, 1)], |_| 2, |_| 0);
@@ -1150,8 +1173,10 @@ fn lane_fixture() -> Fixture {
     let data = ControlClip {
         start_ticks: 0,
         span_ticks: TICKS_PER_BAR,
-        loop_ticks: TICKS_PER_BAR,
-        curve: vec![
+        ..ControlClip::default()
+    };
+    let curve = CurveData {
+        points: vec![
             AutoPoint {
                 tick: 0,
                 value: -2.0,
@@ -1161,11 +1186,13 @@ fn lane_fixture() -> Fixture {
                 value: 2.0,
             },
         ],
-        ..ControlClip::default()
+        length_ticks: TICKS_PER_BAR,
+        ..CurveData::default()
     };
     fixture.lanes.push(LaneFixture {
         clip: ClipRef::control(0, 0),
         data,
+        curve,
         axis: (-2.0, 2.0, false),
         label: "Pitch Bend ±2.0 st".to_string(),
     });
@@ -1381,7 +1408,10 @@ fn a_drag_out_of_the_clip_stops_at_the_tail_and_undoes_in_one_step() {
     );
 
     // Replay the drag the way the app does: same command, same merged key.
-    let mut project = Project::default();
+    let mut project = Project {
+        midi_data: f.midi_data.clone(),
+        ..Project::default()
+    };
     project.midi_tracks[0]
         .clips
         .push(f.tracks[0].clips[0].clone());
@@ -1398,31 +1428,31 @@ fn a_drag_out_of_the_clip_stops_at_the_tail_and_undoes_in_one_step() {
             )
             .unwrap();
     }
-    let dragged = session.project().midi_tracks[0].clips[0].clone();
-    let note = dragged
-        .notes()
+    let dragged_note = session
+        .project()
+        .midi_clip_notes(0, 0)
+        .expect("clip notes")
         .iter()
         .find(|note| note.note == 60)
+        .copied()
         .expect("note A");
     assert!(
-        note.start + note.length <= i64::from(TICKS_PER_BAR),
+        dragged_note.start + dragged_note.length <= i64::from(TICKS_PER_BAR),
         "the tail stays inside the clip: {}..{}",
-        note.start,
-        note.end()
+        dragged_note.start,
+        dragged_note.end()
     );
 
     session.undo();
-    let restored = session.project().midi_tracks[0].clips[0].clone();
-    assert_eq!(
-        restored
-            .notes()
-            .iter()
-            .find(|note| note.note == 60)
-            .expect("note A")
-            .start,
-        0,
-        "one Ctrl+Z restores the whole drag"
-    );
+    let restored_note = session
+        .project()
+        .midi_clip_notes(0, 0)
+        .expect("clip notes")
+        .iter()
+        .find(|note| note.note == 60)
+        .copied()
+        .expect("note A");
+    assert_eq!(restored_note.start, 0, "one Ctrl+Z restores the whole drag");
 }
 
 // ---- The toolbar is part of the roll's keyboard surface -------------------
