@@ -81,6 +81,10 @@ pub const ROLL_HEIGHT: f32 = ROW_HEIGHT * 32.0;
 /// scrolls instead.
 const ROLL_MIN_HEIGHT: f32 = ROW_HEIGHT * 16.0;
 
+/// Height of the Edit view's clip ruler (bar numbers + playhead), matching the
+/// timeline's ruler. Aud series, spec `edit-audition.md`.
+const RULER_HEIGHT: f32 = 20.0;
+
 /// Velocity lane height (pixels), below the roll.
 pub const LANE_HEIGHT: f32 = 48.0;
 
@@ -198,10 +202,13 @@ pub enum RollIntent {
         delta_note: i8,
         gesture: Option<u64>,
     },
-    /// Copy the selected notes (Ctrl + drag). The command reports the
+    /// Copy the selected notes (`Shift+D` / the toolbar). The command reports the
     /// copies' indices; the caller selects them, and the move frames of the
-    /// same drag share `gesture`, so copy + move is a single undo step.
+    /// same gesture share `gesture`, so copy + move is a single undo step.
     Duplicate { indices: Vec<usize>, gesture: u64 },
+    /// Ruler seek (Aud series): move the transport to this absolute tick.
+    /// Bypasses the command layer — no document change, no undo.
+    Seek { tick: i64 },
     /// One frame of a time scale (the Scale command's drag): stretch the
     /// selection by `factor` around `pivot_tick` (the selection bbox
     /// *start*, frozen at grab time — scaling from the start keeps the
@@ -1263,6 +1270,11 @@ impl RollGeom {
         self.t0_x + (self.origin_tick as f32 + local_tick) * self.ticks_to_x
     }
 
+    /// Screen x of an **absolute** tick (the clip ruler shares this axis).
+    fn x_abs(&self, tick: f32) -> f32 {
+        self.t0_x + tick * self.ticks_to_x
+    }
+
     /// Clip-local tick under a screen x (negative left of the clip origin;
     /// callers that create notes clamp it themselves).
     fn local_at(&self, x: f32) -> f32 {
@@ -1361,7 +1373,10 @@ impl ViewWindow {
                 continue;
             };
             let origin = clip.start_ticks as f32;
-            let span = clip.loop_ticks.max(TICKS_PER_STEP) as f32;
+            // Aud series: the window covers the clip's whole span. A tiled
+            // clip opens on the full block instead of swallowing everything
+            // past its first content period.
+            let span = clip.span_ticks.max(clip.loop_ticks).max(TICKS_PER_STEP) as f32;
             start = start.min(origin);
             end = end.max(origin + span);
         }
@@ -1392,6 +1407,16 @@ impl ViewWindow {
         let max = (self.end - width / ticks_to_x).max(self.start);
         scroll.clamp(self.start, max)
     }
+}
+
+/// Clip-local playhead phase for the note area / velocity lane.
+///
+/// `None` when the transport is outside the clip, or positioned in a tiled
+/// repeat: the note area only shows the first content period, while the ruler
+/// carries the whole span (Aud series, spec `edit-audition.md`).
+fn playhead_local(playhead: f32, origin: i64, loop_ticks: i64, span: i64) -> Option<f32> {
+    let rel = playhead - origin as f32;
+    (rel >= 0.0 && rel < span as f32 && rel < loop_ticks as f32).then_some(rel)
 }
 
 /// The clip a [`ClipRef`] points at, or `None` when the document moved on
@@ -1425,6 +1450,9 @@ pub fn show(
     let focus = subject.focus();
     let clip = track_clip(tracks, focus)?;
     let loop_ticks = i64::from(clip.loop_ticks.max(TICKS_PER_STEP)).max(1);
+    // Aud series: the whole clip block (tiled repeats included) — the ruler's
+    // extent and the audition range's end.
+    let clip_span = i64::from(clip.span_ticks.max(clip.loop_ticks.max(TICKS_PER_STEP))).max(1);
     // P3: the focus clip's origin, and the visible window = the whole context
     // (`roll-multiclip.md` D2/D3). With one clip both degenerate to exactly
     // the P2 behaviour.
@@ -1439,7 +1467,11 @@ pub fn show(
         .iter()
         .fold(ViewWindow::of(tracks, subject), |window, lane| {
             let start = lane.data.start_ticks as f32;
-            let span = lane.data.loop_ticks.max(TICKS_PER_STEP) as f32;
+            let span = lane
+                .data
+                .span_ticks
+                .max(lane.data.loop_ticks)
+                .max(TICKS_PER_STEP) as f32;
             window.union(start, start + span)
         });
     // `scroll_x` is absolute now, and the state outlives target switches: a
@@ -1821,13 +1853,25 @@ pub fn show(
             .sum::<f32>()
         // One gap between the roll and the first strip, one more per strip.
         + ui.spacing().item_spacing.y * (lanes.len() + 1) as f32;
+    let full_width = ui.available_width();
+    // Aud series: the clip ruler sits between the toolbar and the notes. It
+    // takes its height out of the roll budget (the `allocate_space` below
+    // lowers `available_height`) so the strips underneath still fit.
+    let (_, ruler_outer) = ui.allocate_space(egui::vec2(full_width, RULER_HEIGHT));
+    let ruler_keys = egui::Rect::from_min_max(
+        ruler_outer.left_top(),
+        egui::pos2(ruler_outer.left() + KEYS_WIDTH, ruler_outer.bottom()),
+    );
+    let ruler_rect = egui::Rect::from_min_max(
+        egui::pos2(ruler_outer.left() + KEYS_WIDTH, ruler_outer.top()),
+        ruler_outer.right_bottom(),
+    );
     let available_h = ui.available_height();
     let roll_h = if available_h.is_finite() {
         (available_h - strip_stack).max(ROLL_MIN_HEIGHT)
     } else {
         ROLL_HEIGHT
     };
-    let full_width = ui.available_width();
     // The keyboard column is chrome, not note area: every note / tick / hit
     // test derives from `roll_rect`, so clicking a key name can never draw a
     // note on the row it labels. `allocate_space` reserves the row without
@@ -1968,6 +2012,120 @@ pub fn show(
         area: rect,
     };
     let painter = ui.painter_at(rect);
+
+    // ---- Clip ruler (Aud series): absolute bar numbers over the clip's whole
+    // span, including tiled repeats that the note area does not unfold. The
+    // grid follows the document's meter segments, like the timeline ruler.
+    let ruler_painter = ui.painter_at(ruler_rect);
+    ruler_painter.rect_filled(ruler_rect, 0.0, egui::Color32::from_gray(24));
+    let keys_painter = ui.painter_at(ruler_keys);
+    keys_painter.rect_filled(ruler_keys, 0.0, egui::Color32::from_gray(14));
+    keys_painter.text(
+        ruler_keys.left_top() + egui::vec2(6.0, 3.0),
+        egui::Align2::LEFT_TOP,
+        "bars",
+        egui::FontId::proportional(9.0),
+        egui::Color32::from_gray(120),
+    );
+    let ruler_clip = ruler_rect.intersect(ui.clip_rect());
+    if ruler_clip.width() > 1.0 {
+        let view_start = (geom.local_at(ruler_clip.left()) + origin_tick as f32).floor() as i64;
+        let view_end = (geom.local_at(ruler_clip.right()) + origin_tick as f32).ceil() as i64;
+        let segments = meter.segments();
+        for (index, seg) in segments.iter().enumerate() {
+            let seg_start = i64::from(seg.tick);
+            let has_next = index + 1 < segments.len();
+            let seg_end = segments
+                .get(index + 1)
+                .map_or(i64::MAX, |next| i64::from(next.tick));
+            let bar_ticks = i64::from(seg.signature.ticks_per_bar().max(1));
+            let from = seg_start.max(view_start);
+            let to = seg_end.min(view_end);
+            if to < from {
+                continue;
+            }
+            let step = if (bar_ticks as f32 * geom.ticks_to_x) < 28.0 {
+                4
+            } else {
+                1
+            };
+            let mut k = ((from - seg_start) as f64 / bar_ticks as f64).ceil() as i64;
+            k = k.max(0);
+            loop {
+                let tick = seg_start + k * bar_ticks;
+                if (has_next && tick >= seg_end) || tick > to {
+                    break;
+                }
+                let bar_no = seg.bar + k as u32;
+                if bar_no % step == 0 {
+                    let x = geom.x_abs(tick as f32);
+                    ruler_painter.line_segment(
+                        [
+                            egui::pos2(x, ruler_rect.top() + 4.0),
+                            egui::pos2(x, ruler_rect.bottom()),
+                        ],
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(55)),
+                    );
+                    ruler_painter.text(
+                        egui::pos2(x + 3.0, ruler_rect.top() + 2.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("{}", bar_no + 1),
+                        egui::FontId::proportional(10.0),
+                        egui::Color32::from_gray(150),
+                    );
+                }
+                k += 1;
+            }
+        }
+    }
+    // Clip bounds: the ruler's extent, even when the notes stop at `loop`.
+    for x in [
+        geom.x_abs(origin_tick as f32),
+        geom.x_abs((origin_tick + clip_span) as f32),
+    ] {
+        if x >= ruler_rect.left() && x <= ruler_rect.right() {
+            ruler_painter.line_segment(
+                [
+                    egui::pos2(x, ruler_rect.top()),
+                    egui::pos2(x, ruler_rect.bottom()),
+                ],
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 150, 190)),
+            );
+        }
+    }
+    // Playhead on the ruler: always drawn (clamped into the clip), so a
+    // stopped editor still shows where the transport is.
+    let ruler_playhead = playhead_ticks.clamp(origin_tick as f32, (origin_tick + clip_span) as f32);
+    let ruler_px = geom.x_abs(ruler_playhead);
+    ruler_painter.line_segment(
+        [
+            egui::pos2(ruler_px, ruler_rect.top()),
+            egui::pos2(ruler_px, ruler_rect.bottom()),
+        ],
+        egui::Stroke::new(if playing { 2.0 } else { 1.0 }, egui::Color32::YELLOW),
+    );
+
+    // Ruler interaction: click / drag seeks (bar-snapped; Ctrl releases the
+    // grid). No widget is registered on the ruler — an `ui.interact` rect
+    // there joins the hit test and steals drag ownership from the note grid
+    // below it. Raw pointer state instead.
+    let ruler_active = ui.ctx().input(|i| {
+        i.pointer.primary_down()
+            && i.pointer
+                .press_origin()
+                .is_some_and(|p| ruler_rect.contains(p))
+    });
+    if ruler_active && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+        let ctrl = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.command);
+        let raw = geom.local_at(pos.x) + origin_tick as f32;
+        let tick = if ctrl {
+            raw.round() as i64
+        } else {
+            i64::from(meter.snap_bar(f64::from(raw)))
+        };
+        let tick = tick.clamp(origin_tick, origin_tick + clip_span);
+        intent = Some(RollIntent::Seek { tick });
+    }
 
     // ---- Pointer → tick/pitch helpers (the keyboard section needs them
     // for the modal grab point; the interaction sections below reuse them).
@@ -2261,15 +2419,18 @@ pub fn show(
         ));
     }
 
-    // 5. Playhead: the transport position wrapped into the clip's content.
-    //    The clip loops from its own origin, so the wrapped position is the
-    //    one that actually plays there.
-    if playing {
-        let pos = playhead_ticks.rem_euclid(loop_ticks as f32);
-        let x = geom.x_of(pos);
+    // 5. Playhead: clip-local phase inside the first content period. Outside the
+    //    clip or in a tiled repeat the ruler carries it instead (Aud series).
+    if let Some(local) = playhead_local(playhead_ticks, origin_tick, loop_ticks, clip_span) {
+        let x = geom.x_of(local);
+        let (width, color) = if playing {
+            (2.0, egui::Color32::YELLOW)
+        } else {
+            (1.0, egui::Color32::from_rgb(150, 150, 60))
+        };
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(2.0, egui::Color32::YELLOW),
+            egui::Stroke::new(width, color),
         );
     }
 
@@ -2303,15 +2464,19 @@ pub fn show(
             color,
         );
     }
-    if playing {
-        let pos = playhead_ticks.rem_euclid(loop_ticks as f32);
-        let x = lane_geom.x_of(pos);
+    if let Some(local) = playhead_local(playhead_ticks, origin_tick, loop_ticks, clip_span) {
+        let x = lane_geom.x_of(local);
+        let (width, color) = if playing {
+            (2.0, egui::Color32::YELLOW)
+        } else {
+            (1.0, egui::Color32::from_rgb(150, 150, 60))
+        };
         lane_painter.line_segment(
             [
                 egui::pos2(x, lane_rect.top()),
                 egui::pos2(x, lane_rect.bottom()),
             ],
-            egui::Stroke::new(2.0, egui::Color32::YELLOW),
+            egui::Stroke::new(width, color),
         );
     }
 
@@ -2739,6 +2904,7 @@ pub fn show(
             } else if state.knife_armed {
                 // Knife stroke start: cuts gather along the swept path and
                 // land as one batch on release.
+
                 state.knife = Some(KnifeStroke {
                     last: pos,
                     gesture: state.next_gesture(),
@@ -2871,6 +3037,7 @@ pub fn show(
                 // crosses, where it crosses. Cuts only gather here — they
                 // land as one batch on release (see `drag_stopped`).
                 let from = knife.last;
+
                 knife.last = pos;
                 knife.path.push(pos);
                 for (index, note) in clip.notes().iter().enumerate() {
@@ -3002,6 +3169,7 @@ pub fn show(
         // A knife stroke ends here: the gathered cuts land as one batch
         // (one undo step). One stroke per arming — a stroke that crossed
         // nothing just disarms.
+
         if let Some(knife) = state.knife.take() {
             state.knife_armed = false;
             if !knife.cuts.is_empty() {
@@ -3455,9 +3623,17 @@ fn knife_crossing(from: egui::Pos2, to: egui::Pos2, note: &Note, geom: &RollGeom
         return (x_left..x_right).contains(&x).then_some(x).and_then(cut_at);
     }
     // Sweeping along the note's own row: cut in the middle of the span the
-    // segment covered.
-    let band = row_top..=(row_top + geom.row_h);
-    if band.contains(&ya) && band.contains(&yb) {
+    // segment covered. The vertical band is the **hit** rectangle (the drawn
+    // row plus `HIT_SLOP`), the same one `note_at` used to decide the stroke
+    // touched the note — a stroke a couple of pixels off the row edge still
+    // cuts, exactly as it still selects.
+    let hit = geom.note_hit_rect(note);
+    // Band edge tolerance: the row rectangle is a float layout result and the
+    // pointer is snapped to 2 px steps by the calibration / test harness, so
+    // a stroke that visually hugs the row edge may land 1–2 px outside the
+    // exact hit rectangle. Cutting tolerates that, selecting already does.
+    let (band_top, band_bottom) = (hit.top() - 2.0, hit.bottom() + 2.0);
+    if (band_top..=band_bottom).contains(&ya) && (band_top..=band_bottom).contains(&yb) {
         let lo = from.x.min(to.x).max(x_left);
         let hi = from.x.max(to.x).min(x_right);
         if hi > lo {
@@ -3717,8 +3893,8 @@ mod tests {
         EDGE_PX, HIT_SLOP, MAX_ROLL_CONTEXT, Modal, ModalFrame, ModalKind, ROLL_HEIGHT, ROW_HEIGHT,
         RollArm, RollGeom, RollIntent, RollMode, RollState, RollSubject, STRUM_DIVISIONS,
         StretchEdge, ViewWindow, clamped_move, default_strum_options, draw_end, draw_length_label,
-        edge_zone, is_black_key, key_at, knife_crossing, modal_ghost, scale_max_k, selection_bbox,
-        strum_division_label, trim_start, zoom_scroll_anchor, zoom_top_note_anchor,
+        edge_zone, is_black_key, key_at, knife_crossing, modal_ghost, playhead_local, scale_max_k,
+        selection_bbox, strum_division_label, trim_start, zoom_scroll_anchor, zoom_top_note_anchor,
     };
     use crate::grid::{GridValue, NoteValue};
     use crate::snap::Snap;
@@ -3905,6 +4081,28 @@ mod tests {
     #[test]
     fn lane_height_leaves_room_for_full_scale_bars() {
         assert_eq!(ROLL_HEIGHT, ROW_HEIGHT * 32.0);
+    }
+
+    #[test]
+    fn playhead_phase_stays_inside_the_first_period() {
+        // 1-bar loop, 4-bar clip (tiled): the note area shows the first bar.
+        assert_eq!(playhead_local(0.0, 0, 960, 3840), Some(0.0));
+        assert_eq!(playhead_local(959.0, 0, 960, 3840), Some(959.0));
+        assert_eq!(
+            playhead_local(960.0, 0, 960, 3840),
+            None,
+            "a tiled repeat is ruler-only"
+        );
+        assert_eq!(playhead_local(-1.0, 0, 960, 3840), None, "before the clip");
+        assert_eq!(
+            playhead_local(3840.0, 0, 960, 3840),
+            None,
+            "at the clip end"
+        );
+        // Origin-relative: a clip starting at bar 2 phases from its own start,
+        // not from tick 0 (the old `rem_euclid` bug).
+        assert_eq!(playhead_local(1100.0, 1000, 960, 3840), Some(100.0));
+        assert_eq!(playhead_local(900.0, 1000, 960, 3840), None);
     }
 
     #[test]
@@ -4724,11 +4922,13 @@ mod tests {
     fn the_view_window_is_the_whole_context() {
         let early = MidiClip {
             start_ticks: 0,
+            span_ticks: 1920,
             loop_ticks: 960,
             ..MidiClip::default()
         };
         let late = MidiClip {
             start_ticks: 1920,
+            span_ticks: 1920,
             loop_ticks: 960,
             ..MidiClip::default()
         };
@@ -4740,7 +4940,9 @@ mod tests {
             RollSubject::assemble(ClipRef::midi(0, 1), &[ClipRef::midi(0, 0)], |_| 2, |_| 0);
         let window = ViewWindow::of(&tracks, &subject);
         assert_eq!(window.start, 0.0);
-        assert_eq!(window.end, 2880.0);
+        // Aud series: the window covers each clip's whole span, not just its
+        // first loop period (the ruler has to reach the tiled end too).
+        assert_eq!(window.end, 3840.0);
     }
 
     /// I5: the panel's opening values must actually stagger a chord. The

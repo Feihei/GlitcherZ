@@ -745,6 +745,12 @@ impl GlitcherZApp {
         // fall through to the note commands (which target the focus clip) nor
         // to the MIDI clip push at the bottom.
         match &intent {
+            RollIntent::Seek { tick } => {
+                // Aud series: a ruler seek is transient — no document change,
+                // no undo entry (it only moves the transport).
+                self.engine.seek_ticks(*tick as f64);
+                return;
+            }
             RollIntent::CurveUpsert {
                 track,
                 clip,
@@ -774,6 +780,10 @@ impl GlitcherZApp {
         let draw_key = |gesture: u64| format!("roll-draw:{track}:{clip}:{gesture}");
         let mut created: Option<(usize, i64, i64)> = None;
         let result = match intent {
+            // Handled by the early transient-intent branch above; kept
+            // explicit so a new transient intent cannot silently fall through
+            // into the command layer.
+            RollIntent::Seek { .. } => return,
             RollIntent::AddNote {
                 note,
                 start,

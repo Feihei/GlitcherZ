@@ -19,7 +19,7 @@
 
 路线图 1–10 全部落地；基础功能、节点图、MIDI 编辑、插件宿主、可用性（U 系列）、录音（R 系列）、内建效果器（E 系列）、声源扩展（Y / Z / B 系列）与交互打磨（I 系列）均已交付。已完成系列的设计与实现位置见下方「历史系列索引」——本文件不再逐项记录它们的实施细节。
 
-- **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听，Aud1 / Aud2 已交付，Aud3 待做）。
+- **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）。
 - **下一步候选**：命令族扩展（quantize / legato / glue / transpose）、C5 一曲线多目标、CLI / MCP 的命令词汇表。
 - **门禁**：`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`，在本机沙箱外跑（沙箱内 cargo 会毒化 `target/debug/incremental`）。
 
@@ -122,7 +122,7 @@ Spec：`spec/edit-audition.md`（D1–D10）。
 | :--- | :--- | :--- | :--- |
 | **Aud1** 引擎（2026-11-10 交付） | `SetAuditionRange` + `Sequencer` 字段 + `advance` 三分支 + 4 条单测 | 无 | 中 |
 | **Aud2** 试听路由（2026-11-10 交付） | `audition` 会话态、`toggle_transport`（Play 按钮 + Space 共用）、自然结束清理、`set_view` + 切 tab 停止、策略纯函数单测；`docs/manual.md` / `docs/shortcuts.md` 同步 | Aud1 | 中 |
-| **Aud3** ruler + 播放头 | `clip_span` 参数、`ViewWindow` 扩到 span、ruler 绘制/seek、播放头相位与静态显示、roll fixture 测试、文档同步 | Aud2 | 中 |
+| **Aud3** ruler + 播放头（2026-11-11 交付） | `clip_span` 参数、`ViewWindow` 扩到 span、ruler 绘制/seek、播放头相位与静态显示、roll fixture 测试、文档同步 | Aud2 | 中 |
 
 顺序：**Aud1 → Aud2 → Aud3**。Aud3 会改 `piano_roll.rs`，需与 Met 系列的 M2b（同一文件）错开，避免两个系列在同一区域反复改。
 

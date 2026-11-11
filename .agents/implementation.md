@@ -1631,6 +1631,16 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - 测试：model 新增 `meter_changes_round_trip_as_multiple_ff_58_events`（3 条 `FF 58` + 往返相等）；metronome 四处 `resync` 调用点改签名。
 - **门禁（2026-11-11 实跑）**：`cargo fmt --all` / `cargo clippy --workspace --all-targets -- -D warnings` 干净；`cargo test --workspace` 日志中 **43 个 test binary 全 `ok. 0 failed`**，无 `FAILED` / `panicked` / `error`。补跑前修过两处：`sequencer.rs` 的 `MeterSeg` import 误落在测试模块（主模块找不到类型），SMF 测试 `windows(3)` 的结果是 `&&[u8]` 需解引用；clippy 另要求 `max(1).min(N)` → `clamp`。
 
+#### Aud3：Edit 独立标尺 + 播放头（2026-11-11，spec `edit-audition.md` §5.4–5.6）
+
+- `piano_roll::show` 新增 `clip_span`（= `span_ticks.max(loop_ticks)`）与上层 `RULER_HEIGHT = 20` 的标尺：位置在工具栏与音符区之间，左侧 `KEYS_WIDTH` 列写 `bars`，右侧按 **meter 段**画小节号（与 timeline ruler 同一分段逻辑，段内每 4 小节稀疏化），并画 clip 起止边界、静态播放头（播放时加粗）。
+- 标尺交互**不注册 widget**：`primary_down && press_origin 在标尺内` 时发 `RollIntent::Seek`，由 `editing.rs` 直接 `engine.seek_ticks`（不改文档、不进 undo）。若在标尺上 `ui.interact`，会抢走音符网格的 drag 归属。
+- `ViewWindow::of` 与 overlay lane 的窗口右边界从 `loop` 扩到 `span`，平铺区可横向滚到；主卷帘仍只展开一个内容周期（D7）。
+- 播放头：新增纯函数 `playhead_local(playhead, origin, loop, span)`，`Some(rel)` 仅当位置在 clip 内且落在首个内容周期；主区与 velocity 泳道共用它，`origin` 相对相位修正了旧的 `rem_euclid`（clip 起点非整周期会偏）。停止时按 1px 暗黄静态绘制。
+- **knife 回归的真正根因**：标尺让音符区下移后，测试 fixture 的 y 校准点（2px 步进得到的第一命中点）与真实行矩形可差 1–2px，而 `knife_crossing` 的沿行判定用的是**精确** hit 矩形 —— 点击能中（`note_at` 有 HIT_SLOP），拖动却一个 cut 都收不到。修法：沿行判定改用 hit 矩形并上下各留 2px 容差（`(hit.top()-2)..=(hit.bottom()+2)`），与「选择已经宽容」的口径一致。`roll_state_machine` 的 2 个 knife 拖动用例恢复。
+- 测试：`playhead_local` 的 7 条相位断言；`the_view_window_is_the_whole_context` 改为按 `span` 断言（期望 3840）。Aud 系列此前未提交的 `stash@{0}` 由此手工合并（未 pop，避免与 Met M4 的 `piano_roll.rs` 冲突）。
+- **门禁**：`cargo fmt --all` / `cargo clippy -p glitcherz-ui --all-targets -D warnings` 干净；`cargo test -p glitcherz-ui` = 11 个 test binary 全 `ok. 0 failed`；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
+
 #### 阶段边界（自 plan.md 归位）
 
 - **Y 系列 S0**：不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（stems / 24-bit / 采样率选择）。
