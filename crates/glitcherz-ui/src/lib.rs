@@ -2940,9 +2940,62 @@ impl eframe::App for GlitcherZApp {
         // in the quiet part of the frame. Disk IO on the UI thread only.
         self.tick_autosave(Instant::now());
 
-        // Audio-driven displays (level meter, playback position, envelope) need periodic
-        // repaints; without this, egui sleeps when idle and auto-close (smoke test) never fires.
-        ui.ctx().request_repaint_after(Duration::from_millis(50));
+        // Audio-driven displays (level meter, playback position, envelope) need
+        // periodic repaints; without a tick egui sleeps when idle and the
+        // smoke-test auto-close never fires. Only animate while audio runs or a
+        // pointer gesture is in flight — an idle document is event-driven.
+        if let Some(tick) = repaint_tick(
+            self.engine.is_playing() || self.is_recording(),
+            ui.ctx().input(|input| input.pointer.any_down()),
+            self.auto_close_after.is_some(),
+        ) {
+            ui.ctx().request_repaint_after(tick);
+        }
+    }
+}
+
+/// How often the UI must repaint when no window event arrives.
+///
+/// `animating` covers transport / recording; `interacting` keeps a drag or a
+/// modal ghost following the pointer at the same tick. Everything else is
+/// event-driven; only the smoke-test auto-close deadline needs a slow wake-up
+/// so its timer can reach zero.
+fn repaint_tick(animating: bool, interacting: bool, auto_close: bool) -> Option<Duration> {
+    if animating || interacting {
+        Some(Duration::from_millis(50))
+    } else if auto_close {
+        Some(Duration::from_millis(250))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod repaint_tick_tests {
+    use super::*;
+
+    #[test]
+    fn only_runs_while_the_ui_moves() {
+        assert_eq!(
+            repaint_tick(true, false, false),
+            Some(Duration::from_millis(50)),
+            "transport / recording animates"
+        );
+        assert_eq!(
+            repaint_tick(false, true, false),
+            Some(Duration::from_millis(50)),
+            "a pointer gesture follows"
+        );
+        assert_eq!(
+            repaint_tick(false, false, true),
+            Some(Duration::from_millis(250)),
+            "the smoke-test auto-close deadline still needs a wake-up"
+        );
+        assert_eq!(
+            repaint_tick(false, false, false),
+            None,
+            "an idle document is event-driven"
+        );
     }
 }
 

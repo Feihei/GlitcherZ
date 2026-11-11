@@ -19,20 +19,87 @@
 
 路线图 1–10 全部落地；基础功能、节点图、MIDI 编辑、插件宿主、可用性（U 系列）、录音（R 系列）、内建效果器（E 系列）、声源扩展（Y / Z / B 系列）与交互打磨（I 系列）均已交付。已完成系列的设计与实现位置见下方「历史系列索引」——本文件不再逐项记录它们的实施细节。
 
-- **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）；命令词汇表（F-039）V1a / V1b-1 / V1b-2 / V2 / V3 **全部交付**；剪贴板（F-040）C1–C2 已交付（2026-11-11）。
-- **下一步候选**：无固定下一项；未完成项见下方列表（空闲重绘 / 录音 PDC 自动对齐 / 用户表导入 / 安全边界）。
+- **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）；命令词汇表（F-039）V1a / V1b-1 / V1b-2 / V2 / V3 **全部交付**；剪贴板（F-040）C1–C2 已交付（2026-11-11）；clip 与数据分离（F-041）M0 文档已入库，M1 待实施。
+- **下一步候选**：无固定下一项；未完成项见下方列表（录音 PDC 自动对齐 / 用户表导入 / 安全边界）。
 - **门禁**：`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`，在本机沙箱外跑（沙箱内 cargo 会毒化 `target/debug/incremental`）。
 
 ## 未完成项
 
 - [x] **命令族扩展（2026-11-11 交付）**：quantize / legato / glue / remove_overlap / transpose 全部有命令与 UI 入口（`Notes` 菜单 + `Q` / `L` / `R` / `Shift+G`，菜单顶部可调 quantize 强度与 legato/glue 空隙）；`glue` 是唯一会缩短音符表的 op（返回新索引重建选区）。
 - [ ] **C5 一曲线多目标（暂不做，2026-11-11 用户拍板：暂时用不着）**：结论是**不需要**强制 map 节点——轴本来就是每条边自己的，放开多路后每路按目标各自推导即可。真正的阻塞在别处：`auto_routes` 每轨只 1 槽、`DedupKey::Auto` 是 per-track 的 CC/bend last-value 记忆（两条分支会互相污染）、model 的 `auto_endpoint` / `auto_target` / `remove_auto_cable` 都是单值语义。
-- [ ] **空闲重绘**（review 2026-11-01 遗留）：`request_repaint_after(50 ms)` 目前无条件调用，建议只在播放中 / 电平可见时开——纯 UI 性能项，不碰引擎。
+- [x] **空闲重绘（2026-11-11 交付）**：`ui()` 末尾不再无条件 `request_repaint_after(50 ms)`；`repaint_tick(animating, interacting, auto_close)` 只在播放 / 录音 / 指针按下时 50 ms 重绘，smoke auto-close 模式下 250 ms 唤醒，其余完全事件驱动。纯 UI 性能项，不碰引擎。
 - [ ] **录音 PDC 自动对齐**（review 2026-11-01 遗留）：PDC 已进图（S2-3），但 R5 仍靠手动 `Latency` offset；自动值需要汇总「输入设备 → 轨道链」的往返延迟。
 - **S5 之后的硬阻塞**（Y 系列收官时记下的三条）：
   - **命令词汇表**（**F-039，2026-11-11 已立项**，见下方小节）——`midi.*` 全都作用于既有 clip，改音色参数也还没有稳定字符串名。MCP 能「改音符」但改不了「用什么音色」、也开不了新 clip。这一期 = `NodeParam` 稳定名 + `clip.add` + `graph.set_param`，spec 已写：`spec/command-vocabulary.md`（D1–D8）。
   - **用户表导入**（Wavetable S3 留的口子）：`.wav` / `.wt` 文件、命名、缓存淘汰、文件对话 UI；风险全在文件与 UI，不在 DSP。
   - **安全边界**：现在只管客户端给的路径，工程内部引用的媒体 / SF2 路径照单全收（等同于在窗口里打开一个不信任的工程）。要做就得先有「工程信任模型」。
+
+## clip 与数据分离（F-041，2026-11-11 立项）
+
+用户一句话需求：**Blender 那样，多个 clip 共享同一段 MIDI / curve 数据；改一处全部变，位置各自独立。**
+
+Spec：`spec/clip-data-instances.md`（D1–D17）。
+
+### 现状评估（已核对代码）
+
+| 项 | 现状（位置） | 差距 | 体量 | 风险 |
+| :--- | :--- | :--- | :--- | :--- |
+| **MidiClip 内容** | `sequence: Sequence { notes, ctrls }` 内嵌值语义（`model/lib.rs:1846`，`Sequence` `:1698`） | 无任何共享载体 | **大**（结构 + 池 + 迁移） | 约 135 处 `.sequence` / `notes_mut()` / `.curve` 访问跨 24 文件 |
+| **ControlClip 内容** | `curve: Vec<AutoPoint>` + `interp` 内嵌（`model/lib.rs:2107`） | 同上 | 中 | 与 MIDI 必须同构，否则两套语义 |
+| **AudioClip** | `path` + 秒级 `source_offset` / `source_len`（`model/lib.rs:2007`） | 已经是「共享文件 + 独立窗口」 | 无 | 不改 |
+| **`loop_ticks`** | 同时承担①卷帘编辑范围②播放重复周期③头裁裁剪基准（`MidiClip::retain_from` 真删音符，`timeline.rs:816`） | 三职责必须拆开，否则共享 clip 一裁就毁掉所有引用者 | 大 | 卷帘 / 引擎 / timeline 三处联动 |
+| **tile** | 单 clip 内部按 `loop_ticks` 重复（`tile_targets` `timeline.rs:1261`） | 与共享正交，不替代 | 小 | 易被误认为要重做平铺 |
+| **undo** | `Arc<Project>` 快照 + `Arc::make_mut` COW | 池是 `Project` 普通字段，快照天然隔离 | 无 | 用 `Arc<Sequence>` 才会破坏（已否决） |
+| **引擎** | `RtMidiClip` / `RtControlClip` 各持 `Vec` 副本；`schedule_track_clips` `sequencer.rs:1026` 按 `loop_ticks` 取模 | 改相位公式 | 中 | note-off 截断、跨周期实例 |
+| **寻址** | 无 `ClipId`，一律 `(lane, track, index)` | 池索引 + 引用扫描已够，无需引入 ClipId | 小 | compact 后需重映射 |
+| **剪贴板** | `ClipSnapshot` 存整份 clip 值快照（`clipboard.rs`） | clip 只含 data 索引后，跨工程粘贴会指空 | 小 | 快照必须携带 data 内容 |
+
+### 决策（2026-11-11 已拍板）
+
+| ID | 问题 | 结论 |
+| :--- | :--- | :--- |
+| F041-D1 | 共享载体 | **数据池 + 索引**（`Project.midi_data` / `curve_data`，clip 存 `data: u32`）。否决 `Arc<Sequence>`（`make_mut` 会断开共享）与 master clip 引用 |
+| F041-D2 | `loop_ticks` | **退休** → `data.length_ticks` + `clip.source_offset` + `clip.span_ticks` |
+| F041-D3 | 窗口超出数据 | 允许，按 `length_ticks` 取模循环；不需要 `repeats` 字段 |
+| F041-D4 | 编辑传播 | 影响所有引用者；显式 Unlink 才独立 |
+| F041-D5 | trim / split | **非破坏窗口**；split 两半共享 data；取消「平铺 clip 不可切」 |
+| F041-D6 | 卷帘编辑对象 | 编辑 data，范围 = `length_ticks`；窗口画标线、窗口外降透明度 |
+| F041-D7 | ControlClip | 同构；`interp` 随数据走 |
+| F041-D8 | 音频 | 不动（已是同构形状）；不引入媒体池 |
+| F041-D9 | 复制 | `Shift+D` 共享 data；`Ctrl+C/V` 复制 data；另给 `Duplicate with New Data` |
+| F041-D10 | 撤销 | 算法不动；直接改池元素 |
+| F041-D13 | 文件版本 | 11 → 12；迁移每个 clip 独占 data，行为逐 tick 不变 |
+| F041-D14 | 池回收 | 允许孤儿；保存时临时副本 compact；4096 上限触发一次回收 |
+| F041-D15 | UI | header `shared:N` 徽章 + Inspector clip 区块（Link/Unlink）+ Edit 头；**不做独立面板** |
+
+### 里程碑与依赖
+
+| 里程碑 | 内容 | 依赖 | 规模 |
+| :--- | :--- | :--- | :--- |
+| **M0** 文档（2026-11-11 完成） | 本 spec + 注册表 + 本小节 | — | 小 |
+| **M1** model | 数据池 + clip 结构 + helper + `validate` + `approx_bytes` + `PROJECT_VERSION 11→12` 迁移，**行为零变化**、单独提交 | M0 | 大 |
+| **M2** engine | `RtMidiClip` / `RtControlClip` 字段 + 相位调度 + 4 条数学单测 | M1 | 中 |
+| **M3** 接入 | `command` helper + `headless::midi_clip_table` + `sync_clip_data` + 剪贴板快照扩展 | M2 | 中 |
+| **M4** 卷帘 | 编辑范围 `length_ticks` + 窗口标线 + 窗降透明度 | M3 | 中偏大 |
+| **M5** timeline | `Placement` / trim / split / T / tile / 三种复制 / `×N` / seam | M3 | 中 |
+| **M6** UI 入口 | header 徽章 + Inspector clip 区块 + Edit 头 + 右键菜单 + `clip.link_data` / `clip.unlink_data` + 文档 | M4、M5 | 中 |
+| **M7** 数据面板（可选） | 池浏览 / 命名 / 批量替换引用 | M6 | 大 |
+
+顺序：**M1 → M2 → M3 → M4 / M5（可并行）→ M6 → M7**。
+
+### 验收门禁
+
+- 每个里程碑单独 commit；`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` 全绿（`sf2_rt_audit` 并行 flaky 单跑确认）。
+- **M1 零回归**：v11 fixture 打开后播放与 `--render` 导出与 pre-F-041 二进制逐字节一致。
+- M2 相位单测覆盖 `source_offset` 非零、跨 3 周期、窗口起点落在音符中间、curve 相位。
+- M6 的命令计数断言从 23 更新到 25。
+
+### 明确不做（本系列）
+
+- 独立数据面板（M7 可选）、跨类型共享、数据命名、数据级自动化。
+- 音频媒体池 / 共享裁剪窗口（`path` 共享已足够）。
+- Blender 式 fake user / 持久化多用户计数。
+- 播放中实时切换 data（链接后重建 clip 表即可）。
 
 ## 剪贴板与复制粘贴（F-040，2026-11-11 立项）
 

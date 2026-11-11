@@ -15,7 +15,7 @@
 - **录音与 headless I/O**：录音、导出、Preferences、CLI、MCP
 - **框架升级与 gotchas**：依赖版本契约、egui 升级、跨平台构建
 - **系列实施补记与交互打磨**：2026-11-11 自 plan.md 归位的系列记录、I 系列
-- **特性 ID 注册表**：`F-001`–`F-039`（新特性先登记再实现）
+- **特性 ID 注册表**：`F-001`–`F-041`（新特性先登记再实现）
 
 ## 特性 ID 注册表
 
@@ -63,6 +63,7 @@
 | F-038 | MIDI 命令族（量化 / 连奏 / 粘合 / 去重叠 / 移调） | EDIT | `midi-commands.md` | W6 |
 | F-039 | CLI / MCP 命令词汇表（节点参数稳定名 + clip.add） | PATCH / EDIT / IO | `command-vocabulary.md` | 遗留硬阻塞 |
 | F-040 | 剪贴板与复制粘贴（Ctrl+C / Ctrl+V） | EDIT / PATCH / UI | `clipboard.md` | C1–C2 |
+| F-041 | clip 与数据分离（数据池 + 实例引用） | EDIT / PROJ / ENGINE | `clip-data-instances.md` | — |
 
 > 无独立 spec 的历史条目（transport / 文件管理 U2 / U10 / U14 / I 系列 / B2 / W3a–c 等）保留字母别名，不做回溯编号；新特性一律先写 spec 再领号。
 
@@ -1704,6 +1705,13 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - 测试：model `effect_slot_values_round_trip`（6 槽、越界、node_param_keys）；command `graph_set_effect_slot_param`（写入 / clamp 到描述符上限 / 越界 index 报错 / query 列出槽）。
 - **门禁**：`cargo fmt --all` / `cargo clippy --workspace --all-targets -D warnings` 干净；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
 - **F-039 收官**：V1a / V1b-1 / V1b-2 / V2 / V3 全部交付；命令数 23（MCP 工具面仍为 6）。
+
+#### 空闲重绘（2026-11-11 交付）
+
+- `glitcherz-ui/src/lib.rs` 的 `ui()` 末尾由无条件 `request_repaint_after(50 ms)` 改为 `repaint_tick(...)`：`engine.is_playing() || is_recording()` 或 `pointer.any_down()` 时 50 ms；仅 `auto_close_after` 生效（smoke test）时 250 ms；正常空闲不请求（完全事件驱动）。
+- 播放头 / 电平表 / 包络在播放或录音时仍 50 ms 刷新；停止后不主动重绘，下一次窗口事件 / 交互再刷（静态画面无需动画）。插件扫描 / 导出 / 阻塞任务原本就有 `request_repaint()`，不受影响。
+- 测试：`repaint_tick_tests::only_runs_while_the_ui_moves`（播放、指针、smoke、空闲四种）。
+- **门禁**：`cargo fmt --all` / `cargo clippy --workspace --all-targets -D warnings` 干净；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
 
 #### 阶段边界（自 plan.md 归位）
 
