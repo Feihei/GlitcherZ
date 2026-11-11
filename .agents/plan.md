@@ -42,11 +42,12 @@ Spec：`spec/command-vocabulary.md`（D1–D8：`NodeParam` 稳定 key、`node_i
 
 | 里程碑 | 内容 | 依赖 | 规模 |
 | :--- | :--- | :--- | :--- |
-| **V1** 参数词汇表 | `NodeParam::key()` / `from_key()` + `graph.set_param` + `graph.query` | — | 中 |
+| **V1a** 参数词汇表（2026-11-11 交付） | `NodeParam` 稳定 key + `graph.set_param` / `graph.query`（synth / mixer / feedback） | — | 中 |
+| **V1b** 效果器 / 声源参数 | `effect_slot` + 声源参数 + `graph.set_voice` | V1a | 中 |
 | **V2** `clip.add` | `clip.add`（MIDI） | — | 小 |
-| **V3** 端到端 | MCP `commands_run` 测试、CLI、`docs/` 同步 | V1、V2 | 小 |
+| **V3** 端到端 | MCP `commands_run` 测试、CLI、`docs/` 同步 | V1a、V2 | 小 |
 
-顺序：**V1 → V2 → V3**；每个里程碑单独提交。
+顺序：**V1a → V1b → V2 → V3**；每个里程碑单独提交。
 
 ## 吸附统一与拍号变化（Met 系列 → F-033 / F-018，2026-11-10 立项）
 

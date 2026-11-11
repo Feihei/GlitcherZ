@@ -1651,6 +1651,15 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - 测试：model 2 项 glue（合并 / gap + 选区），command 3 项（legato 延长 + undo、glue 合并 + indices、remove_overlap 截断），MCP 命令数 16 → 19。
 - **门禁**：`cargo fmt --all` / `cargo clippy --workspace --all-targets -D warnings` 干净；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
 
+#### 命令词汇表 V1a：NodeParam 稳定名 + graph.set_param/query（2026-11-11 交付）
+
+- model：`NodeParam::key()`（34 个 snake_case key，公开 API）+ `from_key()`（无参变体）/ `from_key_indexed()`（`effect_slot` / `organ_bar`）；`ChannelParam::key/from_key`；`node_param_range`（与 `node_param_map` 的常量域一致）、`node_param_value` / `set_node_param`（按节点类型 match 并 clamp 到域）、`node_param_keys`（query 用）、`NodeDoc::kind_key()`。
+- 命令：新 `glitcherz-command/src/graph.rs` —— `graph.set_param {node, param, value, index?, channel?, channel_param?}`（`node_id` 寻址、域 clamp、类型不匹配报错）与 `graph.query`（节点 + 支持的参数 key / value / min / max）；注册后命令数 19 → 21。
+- UI 无需改动：`execute` 后 `sync_engine` 在拓扑不变时走 `refresh_clips_and_transport`，其中已 `push_node_params` / `push_mixer_params`，参数即时生效。
+- 测试：model `node_param_keys_round_trip`（key 往返 + 下标边界）、`node_params_read_and_write`（synth attack clamp、mixer pan/mute、跨类型拒绝）；command `graph_set_param_and_query_round_trip`（写入 / 读回 / 超范围 clamp / 未知节点报错）；registry 的「非 query 命令都 journal」断言放行 `graph.query`。
+- **门禁**：`cargo fmt --all` / `cargo clippy --workspace --all-targets -D warnings` 干净；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
+- **V1a 覆盖边界**：`effect_slot` 与 Modal / Pluck / Organ / Wavetable / Sf2 / Sample 参数尚未读写（`set_param` 返回 unsupported），`graph.set_voice` 未做 —— 归 V1b。
+
 #### 阶段边界（自 plan.md 归位）
 
 - **Y 系列 S0**：不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（stems / 24-bit / 采样率选择）。

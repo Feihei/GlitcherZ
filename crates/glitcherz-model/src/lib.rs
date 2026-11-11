@@ -2788,6 +2788,275 @@ pub enum ChannelParam {
     Solo,
 }
 
+impl ChannelParam {
+    /// Stable snake_case key (F-039, spec `command-vocabulary.md` D2).
+    pub fn key(&self) -> &'static str {
+        match self {
+            Self::Gain => "gain",
+            Self::Pan => "pan",
+            Self::Mute => "mute",
+            Self::Solo => "solo",
+        }
+    }
+
+    /// Inverse of [`Self::key`].
+    pub fn from_key(key: &str) -> Option<Self> {
+        Some(match key {
+            "gain" => Self::Gain,
+            "pan" => Self::Pan,
+            "mute" => Self::Mute,
+            "solo" => Self::Solo,
+            _ => return None,
+        })
+    }
+}
+
+impl NodeParam {
+    /// Stable snake_case key (F-039, spec `command-vocabulary.md` D1). This is
+    /// the **public** CLI / MCP name: renaming a key is a breaking change, and
+    /// every new variant must add a key plus a round-trip test.
+    pub fn key(&self) -> &'static str {
+        match self {
+            Self::EffectSlot(_) => "effect_slot",
+            Self::MixerChannel { .. } => "mixer_channel",
+            Self::MixerOutPan => "mixer_out_pan",
+            Self::MixerOutMute => "mixer_out_mute",
+            Self::FeedbackGain => "feedback_gain",
+            Self::Sf2Gain => "sf2_gain",
+            Self::SampleGain => "sample_gain",
+            Self::PitchOffset => "pitch_offset",
+            Self::Resonance => "resonance",
+            Self::Attack => "attack",
+            Self::Decay => "decay",
+            Self::Sustain => "sustain",
+            Self::Release => "release",
+            Self::ModalDecay => "modal_decay",
+            Self::ModalBeating => "modal_beating",
+            Self::ModalHardness => "modal_hardness",
+            Self::ModalBrightness => "modal_brightness",
+            Self::ModalGain => "modal_gain",
+            Self::PluckDecay => "pluck_decay",
+            Self::PluckDamping => "pluck_damping",
+            Self::PluckBrightness => "pluck_brightness",
+            Self::PluckRelease => "pluck_release",
+            Self::PluckGain => "pluck_gain",
+            Self::OrganBar(_) => "organ_bar",
+            Self::OrganPercussion => "organ_percussion",
+            Self::OrganPercussionDecay => "organ_percussion_decay",
+            Self::OrganAttack => "organ_attack",
+            Self::OrganRelease => "organ_release",
+            Self::OrganGain => "organ_gain",
+            Self::WavetablePosition => "wavetable_position",
+            Self::WavetableAttack => "wavetable_attack",
+            Self::WavetableRelease => "wavetable_release",
+            Self::WavetableGain => "wavetable_gain",
+        }
+    }
+
+    /// Inverse of [`Self::key`] for the parameterless variants.
+    pub fn from_key(key: &str) -> Option<Self> {
+        Some(match key {
+            "mixer_out_pan" => Self::MixerOutPan,
+            "mixer_out_mute" => Self::MixerOutMute,
+            "feedback_gain" => Self::FeedbackGain,
+            "sf2_gain" => Self::Sf2Gain,
+            "sample_gain" => Self::SampleGain,
+            "pitch_offset" => Self::PitchOffset,
+            "resonance" => Self::Resonance,
+            "attack" => Self::Attack,
+            "decay" => Self::Decay,
+            "sustain" => Self::Sustain,
+            "release" => Self::Release,
+            "modal_decay" => Self::ModalDecay,
+            "modal_beating" => Self::ModalBeating,
+            "modal_hardness" => Self::ModalHardness,
+            "modal_brightness" => Self::ModalBrightness,
+            "modal_gain" => Self::ModalGain,
+            "pluck_decay" => Self::PluckDecay,
+            "pluck_damping" => Self::PluckDamping,
+            "pluck_brightness" => Self::PluckBrightness,
+            "pluck_release" => Self::PluckRelease,
+            "pluck_gain" => Self::PluckGain,
+            "organ_percussion" => Self::OrganPercussion,
+            "organ_percussion_decay" => Self::OrganPercussionDecay,
+            "organ_attack" => Self::OrganAttack,
+            "organ_release" => Self::OrganRelease,
+            "organ_gain" => Self::OrganGain,
+            "wavetable_position" => Self::WavetablePosition,
+            "wavetable_attack" => Self::WavetableAttack,
+            "wavetable_release" => Self::WavetableRelease,
+            "wavetable_gain" => Self::WavetableGain,
+            _ => return None,
+        })
+    }
+
+    /// Indexed variants (`effect_slot`, `organ_bar`).
+    pub fn from_key_indexed(key: &str, index: u8) -> Option<Self> {
+        match key {
+            "effect_slot" => Some(Self::EffectSlot(index)),
+            "organ_bar" if index < 9 => Some(Self::OrganBar(index)),
+            _ => None,
+        }
+    }
+}
+
+/// The `(min, max)` domain of a node parameter (F-039), mirroring
+/// [`node_param_map`] without needing the graph: `graph.set_param` clamps to
+/// it and `graph.query` reports it. `None` for the two address-based variants
+/// (`effect_slot`, `mixer_channel`), whose domain comes from the node's own
+/// descriptor / mixer channel.
+pub fn node_param_range(param: NodeParam) -> Option<(f32, f32)> {
+    Some(match param {
+        NodeParam::EffectSlot(_) | NodeParam::MixerChannel { .. } => return None,
+        NodeParam::MixerOutPan => (-1.0, 1.0),
+        NodeParam::MixerOutMute => (0.0, 1.0),
+        NodeParam::FeedbackGain => (0.0, 1.0),
+        NodeParam::Sf2Gain | NodeParam::SampleGain => (0.0, 2.0),
+        NodeParam::PitchOffset => (-24.0, 24.0),
+        NodeParam::Resonance => (0.0, 0.98),
+        NodeParam::Attack | NodeParam::Decay => (0.0, 2.0),
+        NodeParam::Sustain => (0.0, 1.0),
+        NodeParam::Release => (0.0, 3.0),
+        NodeParam::ModalDecay => (0.25, 4.0),
+        NodeParam::ModalBeating => (0.0, 2.0),
+        NodeParam::ModalHardness | NodeParam::ModalBrightness => (0.0, 1.0),
+        NodeParam::ModalGain => (0.0, 2.0),
+        NodeParam::PluckDecay => (0.1, 20.0),
+        NodeParam::PluckDamping | NodeParam::PluckBrightness => (0.0, 1.0),
+        NodeParam::PluckRelease => (0.005, 2.0),
+        NodeParam::PluckGain => (0.0, 2.0),
+        NodeParam::OrganBar(_) => (0.0, 8.0),
+        NodeParam::OrganPercussion => (0.0, 1.0),
+        NodeParam::OrganPercussionDecay => (0.1, 2.0),
+        NodeParam::OrganAttack => (0.001, 0.2),
+        NodeParam::OrganRelease => (0.005, 1.0),
+        NodeParam::OrganGain => (0.0, 2.0),
+        NodeParam::WavetablePosition => (0.0, 1.0),
+        NodeParam::WavetableAttack => (0.001, 2.0),
+        NodeParam::WavetableRelease => (0.005, 5.0),
+        NodeParam::WavetableGain => (0.0, 2.0),
+    })
+}
+
+/// Reads a node parameter (F-039). `None` when the node kind does not carry
+/// that parameter — the same condition that makes `graph.set_param` fail.
+pub fn node_param_value(node: &NodeDoc, param: NodeParam) -> Option<f32> {
+    match (node, param) {
+        (NodeDoc::Instrument { synth, .. }, NodeParam::Resonance) => Some(synth.resonance),
+        (NodeDoc::Instrument { synth, .. }, NodeParam::Attack) => Some(synth.attack_s),
+        (NodeDoc::Instrument { synth, .. }, NodeParam::Decay) => Some(synth.decay_s),
+        (NodeDoc::Instrument { synth, .. }, NodeParam::Sustain) => Some(synth.sustain),
+        (NodeDoc::Instrument { synth, .. }, NodeParam::Release) => Some(synth.release_s),
+        (NodeDoc::Mixer { channels, .. }, NodeParam::MixerChannel { channel, param }) => {
+            let channel = channels.get(usize::from(channel))?;
+            Some(match param {
+                ChannelParam::Gain => channel.gain,
+                ChannelParam::Pan => channel.pan,
+                ChannelParam::Mute => bool_value(channel.muted),
+                ChannelParam::Solo => bool_value(channel.solo),
+            })
+        }
+        (NodeDoc::Mixer { out_pan, .. }, NodeParam::MixerOutPan) => Some(*out_pan),
+        (NodeDoc::Mixer { out_muted, .. }, NodeParam::MixerOutMute) => Some(bool_value(*out_muted)),
+        (NodeDoc::Feedback { gain, .. }, NodeParam::FeedbackGain) => Some(*gain),
+        _ => None,
+    }
+}
+
+/// Writes a node parameter in place (F-039), clamping to
+/// [`node_param_range`]. Returns `false` when the node kind does not carry that
+/// parameter (or `value` is not finite).
+pub fn set_node_param(node: &mut NodeDoc, param: NodeParam, value: f32) -> bool {
+    if !value.is_finite() {
+        return false;
+    }
+    match (node, param) {
+        (NodeDoc::Instrument { synth, .. }, NodeParam::Resonance) => {
+            synth.resonance = value.clamp(0.0, 0.98);
+            true
+        }
+        (NodeDoc::Instrument { synth, .. }, NodeParam::Attack) => {
+            synth.attack_s = value.clamp(0.0, 2.0);
+            true
+        }
+        (NodeDoc::Instrument { synth, .. }, NodeParam::Decay) => {
+            synth.decay_s = value.clamp(0.0, 2.0);
+            true
+        }
+        (NodeDoc::Instrument { synth, .. }, NodeParam::Sustain) => {
+            synth.sustain = value.clamp(0.0, 1.0);
+            true
+        }
+        (NodeDoc::Instrument { synth, .. }, NodeParam::Release) => {
+            synth.release_s = value.clamp(0.0, 3.0);
+            true
+        }
+        (NodeDoc::Mixer { channels, .. }, NodeParam::MixerChannel { channel, param }) => {
+            let Some(channel) = channels.get_mut(usize::from(channel)) else {
+                return false;
+            };
+            match param {
+                ChannelParam::Gain => channel.gain = value.clamp(0.0, 1.5),
+                ChannelParam::Pan => channel.pan = value.clamp(-1.0, 1.0),
+                ChannelParam::Mute => channel.muted = value >= 0.5,
+                ChannelParam::Solo => channel.solo = value >= 0.5,
+            }
+            true
+        }
+        (NodeDoc::Mixer { out_pan, .. }, NodeParam::MixerOutPan) => {
+            *out_pan = value.clamp(-1.0, 1.0);
+            true
+        }
+        (NodeDoc::Mixer { out_muted, .. }, NodeParam::MixerOutMute) => {
+            *out_muted = value >= 0.5;
+            true
+        }
+        (NodeDoc::Feedback { gain, .. }, NodeParam::FeedbackGain) => {
+            *gain = value.clamp(0.0, 1.0);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The parameters a node supports today (F-039 `graph.query`), in a stable
+/// order. Address-based `effect_slot` / voice-specific axes are added as their
+/// nodes gain first-class read/write support.
+pub fn node_param_keys(node: &NodeDoc) -> Vec<NodeParam> {
+    match node {
+        NodeDoc::Instrument { .. } => vec![
+            NodeParam::Resonance,
+            NodeParam::Attack,
+            NodeParam::Decay,
+            NodeParam::Sustain,
+            NodeParam::Release,
+        ],
+        NodeDoc::Mixer { channels, .. } => {
+            let mut keys = Vec::new();
+            for channel in 0..channels.len() as u8 {
+                for param in [
+                    ChannelParam::Gain,
+                    ChannelParam::Pan,
+                    ChannelParam::Mute,
+                    ChannelParam::Solo,
+                ] {
+                    keys.push(NodeParam::MixerChannel { channel, param });
+                }
+            }
+            keys.push(NodeParam::MixerOutPan);
+            keys.push(NodeParam::MixerOutMute);
+            keys
+        }
+        NodeDoc::Feedback { .. } => vec![NodeParam::FeedbackGain],
+        _ => Vec::new(),
+    }
+}
+
+/// Boolean parameters use the 0/1 convention of the automation axes (F-039 D4).
+fn bool_value(value: bool) -> f32 {
+    if value { 1.0 } else { 0.0 }
+}
+
 /// Automatable / cable-connected node parameter (automation cable endpoint
 /// payload).
 ///
@@ -4279,6 +4548,25 @@ impl NodeDoc {
                 voice.payload_bytes()
             }
             _ => 0,
+        }
+    }
+
+    /// Stable node-kind label for CLI / MCP introspection (F-039).
+    pub fn kind_key(&self) -> &'static str {
+        match self {
+            NodeDoc::Instrument { .. } => "instrument",
+            NodeDoc::Effect { .. } => "effect",
+            NodeDoc::Mixer { .. } => "mixer",
+            NodeDoc::Keyboard { .. } => "keyboard",
+            NodeDoc::Arpeggiator { .. } => "arpeggiator",
+            NodeDoc::Portamento { .. } => "portamento",
+            NodeDoc::MidiEnvelope { .. } => "midi_envelope",
+            NodeDoc::Lfo { .. } => "lfo",
+            NodeDoc::CurveMap { .. } => "curve_map",
+            NodeDoc::Feedback { .. } => "feedback",
+            NodeDoc::Input { .. } => "input",
+            NodeDoc::AudioTrack { .. } => "audio_track",
+            NodeDoc::ChannelStrip { .. } => "channel_strip",
         }
     }
 
@@ -6550,6 +6838,137 @@ mod tests {
         TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, TrackKind, VoiceSpec,
         default_audio_source_len, default_graph_doc,
     };
+
+    #[test]
+    fn node_param_keys_round_trip() {
+        // Every parameterless key resolves back to the same variant.
+        for key in [
+            "mixer_out_pan",
+            "mixer_out_mute",
+            "feedback_gain",
+            "sf2_gain",
+            "sample_gain",
+            "pitch_offset",
+            "resonance",
+            "attack",
+            "decay",
+            "sustain",
+            "release",
+            "modal_decay",
+            "modal_beating",
+            "modal_hardness",
+            "modal_brightness",
+            "modal_gain",
+            "pluck_decay",
+            "pluck_damping",
+            "pluck_brightness",
+            "pluck_release",
+            "pluck_gain",
+            "organ_percussion",
+            "organ_percussion_decay",
+            "organ_attack",
+            "organ_release",
+            "organ_gain",
+            "wavetable_position",
+            "wavetable_attack",
+            "wavetable_release",
+            "wavetable_gain",
+        ] {
+            let param = NodeParam::from_key(key).expect("known key");
+            assert_eq!(param.key(), key);
+        }
+        assert_eq!(
+            NodeParam::from_key_indexed("effect_slot", 2),
+            Some(NodeParam::EffectSlot(2))
+        );
+        assert_eq!(
+            NodeParam::from_key_indexed("organ_bar", 8),
+            Some(NodeParam::OrganBar(8))
+        );
+        assert_eq!(NodeParam::from_key_indexed("organ_bar", 9), None);
+        assert_eq!(NodeParam::from_key("effect_slot"), None);
+        for key in ["gain", "pan", "mute", "solo"] {
+            let param = ChannelParam::from_key(key).expect("known channel key");
+            assert_eq!(param.key(), key);
+        }
+    }
+
+    #[test]
+    fn node_params_read_and_write() {
+        let mut instrument = NodeDoc::Instrument {
+            node_id: 2,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            synth: SynthParams::default(),
+        };
+        assert!(super::set_node_param(
+            &mut instrument,
+            NodeParam::Attack,
+            0.25
+        ));
+        assert_eq!(
+            super::node_param_value(&instrument, NodeParam::Attack),
+            Some(0.25)
+        );
+        // Clamped to the documented 0..2 domain.
+        assert!(super::set_node_param(
+            &mut instrument,
+            NodeParam::Attack,
+            9.0
+        ));
+        assert_eq!(
+            super::node_param_value(&instrument, NodeParam::Attack),
+            Some(2.0)
+        );
+        // A parameter of another node kind is refused, not silently ignored.
+        assert!(!super::set_node_param(
+            &mut instrument,
+            NodeParam::FeedbackGain,
+            0.5
+        ));
+
+        let mut mixer = NodeDoc::Mixer {
+            node_id: 5,
+            track: 0,
+            inputs: 1,
+            channels: vec![MixerChannel {
+                name: String::new(),
+                gain: 0.8,
+                pan: 0.0,
+                muted: false,
+                solo: false,
+            }],
+            out_pan: 0.0,
+            out_muted: false,
+        };
+        assert!(super::set_node_param(
+            &mut mixer,
+            NodeParam::MixerChannel {
+                channel: 0,
+                param: ChannelParam::Pan,
+            },
+            -0.5
+        ));
+        assert_eq!(
+            super::node_param_value(
+                &mixer,
+                NodeParam::MixerChannel {
+                    channel: 0,
+                    param: ChannelParam::Pan,
+                }
+            ),
+            Some(-0.5)
+        );
+        assert!(super::set_node_param(
+            &mut mixer,
+            NodeParam::MixerOutMute,
+            1.0
+        ));
+        assert_eq!(
+            super::node_param_value(&mixer, NodeParam::MixerOutMute),
+            Some(1.0)
+        );
+    }
 
     fn effect_node(params: EffectParams) -> NodeDoc {
         NodeDoc::Effect {

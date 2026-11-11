@@ -138,6 +138,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
     SPECS.get_or_init(|| {
         let mut v = Vec::new();
         v.extend(crate::midi::specs());
+        v.extend(crate::graph::specs());
         v
     })
 }
@@ -302,7 +303,7 @@ mod tests {
         assert!(
             command_specs()
                 .iter()
-                .all(|c| c.journal || c.id == "midi.query"),
+                .all(|c| c.journal || matches!(c.id, "midi.query" | "graph.query")),
             "every non-query command is journaled"
         );
     }

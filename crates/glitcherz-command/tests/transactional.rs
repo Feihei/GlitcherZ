@@ -1,7 +1,7 @@
 //! The guarantees [`Session::execute`] makes, exercised end to end.
 
 use glitcherz_command::{CommandError, Session, command_specs};
-use glitcherz_model::{MidiClip, Note, Project};
+use glitcherz_model::{MidiClip, NodeDoc, Note, Project};
 use serde_json::json;
 
 /// A session with one track holding one clip of four notes.
@@ -444,6 +444,70 @@ fn restore_rolls_back_without_touching_history() {
     assert_eq!(
         session.project().midi_tracks[0].clips[0].notes()[0].velocity,
         40
+    );
+}
+
+#[test]
+fn graph_set_param_and_query_round_trip() {
+    let mut session = Session::new(Project::default());
+    let node_id = session
+        .project()
+        .graph
+        .nodes
+        .iter()
+        .find(|node| matches!(node, NodeDoc::Instrument { .. }))
+        .map(NodeDoc::node_id)
+        .expect("the default template carries an instrument");
+
+    let outcome = session
+        .execute(
+            "graph.set_param",
+            &json!({"node": node_id, "param": "attack", "value": 0.25}),
+        )
+        .expect("set_param");
+    assert_eq!(outcome["value"], json!(0.25));
+    let node = session
+        .project()
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.node_id() == node_id)
+        .expect("node");
+    assert_eq!(
+        glitcherz_model::node_param_value(node, glitcherz_model::NodeParam::Attack),
+        Some(0.25)
+    );
+
+    // Clamped at the documented 0..2 domain.
+    let outcome = session
+        .execute(
+            "graph.set_param",
+            &json!({"node": node_id, "param": "attack", "value": 9.0}),
+        )
+        .expect("clamped");
+    assert_eq!(outcome["value"], json!(2.0));
+
+    let queried = session.execute("graph.query", &json!({})).expect("query");
+    let nodes = queried["nodes"].as_array().expect("nodes");
+    let instrument = nodes
+        .iter()
+        .find(|entry| entry["node"] == json!(node_id))
+        .expect("instrument in query");
+    assert_eq!(instrument["kind"], json!("instrument"));
+    assert!(
+        instrument["params"]
+            .as_array()
+            .is_some_and(|params| params.iter().any(|param| param["key"] == json!("attack")))
+    );
+
+    // Unknown node: a clear parameter error, never a silent no-op.
+    assert!(
+        session
+            .execute(
+                "graph.set_param",
+                &json!({"node": 9999, "param": "attack", "value": 0.1})
+            )
+            .is_err()
     );
 }
 
