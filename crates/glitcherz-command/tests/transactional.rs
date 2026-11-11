@@ -448,6 +448,45 @@ fn restore_rolls_back_without_touching_history() {
 }
 
 #[test]
+fn legato_extends_each_note_into_the_next_start() {
+    let mut session = session_with_notes();
+    {
+        let notes = session.project_mut().midi_tracks[0].clips[0].notes_mut();
+        notes[0].length = 60;
+        notes[1].length = 60;
+        notes[3].length = 60;
+    }
+    session
+        .execute("midi.legato", &json!({ "track": 0, "clip": 0, "gap": 0 }))
+        .unwrap();
+    let after = notes(&session);
+    assert_eq!(after[0].length, 240, "reaches the next note's start");
+    assert_eq!(after[1].length, 240);
+    assert_eq!(after[3].length, 60, "the last note keeps its length");
+
+    // Undo restores the short lengths.
+    assert!(session.undo());
+    assert_eq!(notes(&session)[0].length, 60);
+}
+
+#[test]
+fn glue_merges_touching_notes_and_reports_the_new_selection() {
+    let mut session = session_with_notes();
+    session.project_mut().midi_tracks[0].clips[0].notes_mut()[1].note = 60;
+    let outcome = session
+        .execute(
+            "midi.glue",
+            &json!({ "track": 0, "clip": 0, "indices": [0, 1] }),
+        )
+        .unwrap();
+    assert_eq!(outcome["merged"], 1);
+    assert_eq!(outcome["indices"], json!([0]), "the survivor is index 0");
+    let notes = notes(&session);
+    assert_eq!(notes.len(), 3, "two notes became one");
+    assert_eq!((notes[0].start, notes[0].length), (0, 480));
+}
+
+#[test]
 fn quantize_respects_the_selection() {
     let mut session = session_with_notes();
     // Three notes at 0 / 250 / 500 (only some on the grid).

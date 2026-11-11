@@ -133,6 +133,24 @@ pub fn specs() -> Vec<crate::CommandSpec> {
             duration_op_cmd
         ),
         crate::cmd!(
+            "midi.legato",
+            "Legato",
+            ["Midi", "Event"],
+            None,
+            "{track, clip, indices?, gap? 0} → {changed, indices: [n]}",
+            always,
+            legato_cmd
+        ),
+        crate::cmd!(
+            "midi.glue",
+            "Glue",
+            ["Midi", "Event"],
+            None,
+            "{track, clip, indices?, gap? 0} → {merged, indices: [n]}",
+            always,
+            glue_cmd
+        ),
+        crate::cmd!(
             "midi.randomize",
             "Randomize",
             ["Midi", "Event"],
@@ -190,8 +208,12 @@ fn quantize_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
     glitcherz_model::apply_to_selected(notes, &selected, |slice| {
         glitcherz_model::quantize(slice, &options)
     });
+    let chosen: Vec<Note> = selected
+        .iter()
+        .filter_map(|&index| notes.get(index).copied())
+        .collect();
     notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
-    Ok(json!({ "quantized": selected.len() }))
+    Ok(json!({ "quantized": selected.len(), "indices": locate(notes, &chosen) }))
 }
 
 fn transpose_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
@@ -201,9 +223,13 @@ fn transpose_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> 
     glitcherz_model::apply_to_selected(notes, &selected, |slice| {
         glitcherz_model::transpose(slice, semitones)
     });
+    let chosen: Vec<Note> = selected
+        .iter()
+        .filter_map(|&index| notes.get(index).copied())
+        .collect();
     // Pitch is part of the sort key: same-start notes may reorder.
     notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
-    Ok(json!({ "transposed": selected.len() }))
+    Ok(json!({ "transposed": selected.len(), "indices": locate(notes, &chosen) }))
 }
 
 fn velocity_op_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
@@ -267,8 +293,47 @@ fn duration_op_cmd(session: &mut Session, params: &Value) -> crate::Result<Value
     glitcherz_model::apply_to_selected(notes, &selected, |slice| {
         glitcherz_model::apply_duration(slice, &op)
     });
+    let chosen: Vec<Note> = selected
+        .iter()
+        .filter_map(|&index| notes.get(index).copied())
+        .collect();
     notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
-    Ok(json!({ "changed": selected.len() }))
+    Ok(json!({ "changed": selected.len(), "indices": locate(notes, &chosen) }))
+}
+
+fn legato_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let gap = i64_or(params, "gap", 0).max(0);
+    let notes = notes_mut(session, "midi.legato", params)?;
+    let selected = indices_or_all(params, notes.len());
+    let mut chosen: Vec<Note> = selected
+        .iter()
+        .filter_map(|&index| notes.get(index).copied())
+        .collect();
+    glitcherz_model::apply_duration(&mut chosen, &glitcherz_model::DurationOp::Legato { gap });
+    for (&index, updated) in selected.iter().zip(chosen.iter()) {
+        if let Some(slot) = notes.get_mut(index) {
+            *slot = *updated;
+        }
+    }
+    notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
+    Ok(json!({ "changed": chosen.len(), "indices": locate(notes, &chosen) }))
+}
+
+fn glue_cmd(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let gap = i64_or(params, "gap", 0).max(0);
+    let notes = notes_mut(session, "midi.glue", params)?;
+    let selected = indices_or_all(params, notes.len());
+    let before = selected.len();
+    let survivors = glitcherz_model::glue_selected(
+        notes,
+        &glitcherz_model::GlueOptions { gap_ticks: gap },
+        &selected,
+    );
+    notes.sort_by_key(|n| (n.start, n.note, n.channel, n.length, n.velocity));
+    Ok(json!({
+        "merged": before.saturating_sub(survivors.len()),
+        "indices": locate(notes, &survivors),
+    }))
 }
 
 /// W4: random pitch / timing / duration / velocity perturbation over a

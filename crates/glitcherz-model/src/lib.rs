@@ -57,10 +57,10 @@ pub use file::{
     parse_project, save_autosave, save_project,
 };
 pub use ops::{
-    DEFAULT_SEED, DurationOp, QuantizeOptions, RandomizeOptions, StrumDirection, StrumOptions,
-    VelocityOp, apply_duration, apply_to_selected, apply_velocity, assign_drum_notes,
-    nearest_free_note, note_name, quantize, randomize, reassign_drum_slot, scale_notes, strum,
-    transpose,
+    DEFAULT_SEED, DurationOp, GlueOptions, QuantizeOptions, RandomizeOptions, StrumDirection,
+    StrumOptions, VelocityOp, apply_duration, apply_to_selected, apply_velocity, assign_drum_notes,
+    glue_selected, nearest_free_note, note_name, quantize, randomize, reassign_drum_slot,
+    scale_notes, strum, transpose,
 };
 
 /// MIDI track capacity limit (D12; the engine side uses the same value).

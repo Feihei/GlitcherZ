@@ -340,6 +340,81 @@ pub fn apply_duration(notes: &mut [Note], op: &DurationOp) {
     }
 }
 
+// ---- Glue (command family) ----------------------------------------------------------------
+
+/// Options for [`glue_selected`] (the Glue command).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlueOptions {
+    /// Largest gap (ticks) between two notes that still merges them; `0`
+    /// merges only touching / overlapping notes.
+    pub gap_ticks: i64,
+}
+
+/// Merges adjacent same-pitch notes **inside `selected`** into one.
+///
+/// This is the one note op that **shrinks** the table (it removes absorbed
+/// notes), so it cannot use the `&mut [Note]` slice contract; the caller
+/// rebuilds its selection from the returned values, exactly like
+/// `midi.notes_split`. Two notes merge when they share `note` + `channel` and
+/// `next.start <= current.start + current.length + gap_ticks`; the earlier
+/// note survives (velocity / channel kept) and its length grows to the latest
+/// end. Indices outside `selected` are never touched.
+///
+/// Returns the surviving values (merged representatives and selected notes
+/// that did not merge) in pre-sort order.
+pub fn glue_selected(
+    notes: &mut Vec<Note>,
+    options: &GlueOptions,
+    selected: &[usize],
+) -> Vec<Note> {
+    let mut live: Vec<usize> = selected
+        .iter()
+        .copied()
+        .filter(|index| *index < notes.len())
+        .collect();
+    live.sort_unstable();
+    live.dedup();
+    if live.len() < 2 {
+        return live.iter().map(|index| notes[*index]).collect();
+    }
+    let mut order = live;
+    order.sort_by_key(|index| {
+        (
+            notes[*index].note,
+            notes[*index].channel,
+            notes[*index].start,
+            *index,
+        )
+    });
+    let gap = options.gap_ticks.max(0);
+    let mut absorbed = vec![false; notes.len()];
+    let mut survivors: Vec<usize> = Vec::with_capacity(order.len());
+    for index in order {
+        let note = notes[index];
+        let Some(&last) = survivors.last() else {
+            survivors.push(index);
+            continue;
+        };
+        let prev = notes[last];
+        let same_voice = prev.note == note.note && prev.channel == note.channel;
+        let touches = note.start <= prev.start.saturating_add(prev.length).saturating_add(gap);
+        if same_voice && touches {
+            let end = note
+                .start
+                .saturating_add(note.length)
+                .max(prev.start.saturating_add(prev.length));
+            notes[last].length = end.saturating_sub(prev.start).max(1);
+            absorbed[index] = true;
+        } else {
+            survivors.push(index);
+        }
+    }
+    let values: Vec<Note> = survivors.iter().map(|index| notes[*index]).collect();
+    let mut mask = absorbed.into_iter();
+    notes.retain(|_| !mask.next().unwrap_or(false));
+    values
+}
+
 // ---- Randomize (W4) ----------------------------------------------------------------------
 
 /// Random perturbation half-ranges. Each field is "±N": `pitch: 2` means up
@@ -630,9 +705,9 @@ pub fn reassign_drum_slot(slots: &mut [DrumSlot], from: u8, to: u8) -> Option<u8
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SEED, DurationOp, QuantizeOptions, RandomizeOptions, StrumDirection, StrumOptions,
-        VelocityOp, apply_duration, apply_to_selected, apply_velocity, quantize, randomize,
-        round_i64, scale_notes, strum, transpose,
+        DEFAULT_SEED, DurationOp, GlueOptions, QuantizeOptions, RandomizeOptions, StrumDirection,
+        StrumOptions, VelocityOp, apply_duration, apply_to_selected, apply_velocity, glue_selected,
+        quantize, randomize, round_i64, scale_notes, strum, transpose,
     };
     use crate::{DrumSlot, Note};
 
@@ -648,6 +723,47 @@ mod tests {
 
     fn pitches(notes: &[Note]) -> Vec<u8> {
         notes.iter().map(|n| n.note).collect()
+    }
+
+    #[test]
+    fn glue_merges_adjacent_same_pitch_notes() {
+        let mut notes = vec![
+            note(0, 240, 60, 100),
+            note(240, 240, 60, 100),
+            note(500, 240, 60, 100),
+            note(240, 240, 62, 100),
+        ];
+        let all: Vec<usize> = (0..notes.len()).collect();
+        let survivors = glue_selected(&mut notes, &GlueOptions { gap_ticks: 0 }, &all);
+        assert_eq!(notes.len(), 3, "the touching pair merged, the rest stayed");
+        assert_eq!(survivors.len(), 3);
+        let merged = notes
+            .iter()
+            .find(|item| item.note == 60 && item.start == 0)
+            .expect("the earlier note survives");
+        assert_eq!((merged.start, merged.length), (0, 480));
+        assert_eq!(
+            survivors
+                .iter()
+                .filter(|item| item.note == 60 && item.start == 0)
+                .count(),
+            1,
+            "the survivor list names the merged note once"
+        );
+    }
+
+    #[test]
+    fn glue_respects_the_gap_and_the_selection() {
+        let mut notes = vec![note(0, 240, 60, 100), note(300, 240, 60, 100)];
+        let all = vec![0, 1];
+        glue_selected(&mut notes, &GlueOptions { gap_ticks: 60 }, &all);
+        assert_eq!(notes.len(), 1);
+        assert_eq!((notes[0].start, notes[0].length), (0, 540));
+
+        let mut notes = vec![note(0, 240, 60, 100), note(240, 240, 60, 100)];
+        let survivors = glue_selected(&mut notes, &GlueOptions { gap_ticks: 0 }, &[0]);
+        assert_eq!(notes.len(), 2, "an unselected neighbour is untouched");
+        assert_eq!(survivors.len(), 1);
     }
 
     #[test]

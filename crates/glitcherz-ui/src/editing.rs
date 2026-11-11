@@ -731,6 +731,66 @@ impl GlitcherZApp {
         }
     }
 
+    /// W6: runs one Notes-menu MIDI command and rebuilds the roll selection
+    /// from its `indices` reply. The command layer owns undo (one step per
+    /// click / shortcut) and re-sorts the clip, so the reply is authoritative.
+    pub(crate) fn apply_midi_op(
+        &mut self,
+        op: piano_roll::MidiOp,
+        indices: Vec<usize>,
+        grid_ticks: i64,
+        track: usize,
+        clip: usize,
+    ) {
+        use serde_json::json;
+        let (id, params, label) = match op {
+            piano_roll::MidiOp::Quantize => (
+                "midi.quantize",
+                json!({
+                    "track": track,
+                    "clip": clip,
+                    "indices": indices,
+                    "grid_ticks": grid_ticks,
+                    "strength": 1.0,
+                }),
+                "Quantize",
+            ),
+            piano_roll::MidiOp::Legato => (
+                "midi.legato",
+                json!({ "track": track, "clip": clip, "indices": indices, "gap": 0 }),
+                "Legato",
+            ),
+            piano_roll::MidiOp::Glue => (
+                "midi.glue",
+                json!({ "track": track, "clip": clip, "indices": indices, "gap": 0 }),
+                "Glue",
+            ),
+            piano_roll::MidiOp::Transpose(semitones) => (
+                "midi.transpose",
+                json!({
+                    "track": track,
+                    "clip": clip,
+                    "indices": indices,
+                    "semitones": semitones,
+                }),
+                "Transpose",
+            ),
+        };
+        match self.execute(id, &params) {
+            Ok(value) => {
+                if let Some(list) = value.get("indices").and_then(serde_json::Value::as_array) {
+                    self.roll_state.selection = list
+                        .iter()
+                        .filter_map(serde_json::Value::as_u64)
+                        .map(|index| index as usize)
+                        .collect();
+                }
+                self.set_message(label.to_string());
+            }
+            Err(error) => self.set_message(format!("{label} failed: {error}")),
+        }
+    }
+
     /// Runs a piano-roll edit as a command (M1.4: no direct document mutation).
     pub(crate) fn apply_roll_intent(
         &mut self,
@@ -749,6 +809,16 @@ impl GlitcherZApp {
                 // Aud series: a ruler seek is transient — no document change,
                 // no undo entry (it only moves the transport).
                 self.engine.seek_ticks(*tick as f64);
+                return;
+            }
+            RollIntent::MidiOp {
+                op,
+                indices,
+                grid_ticks,
+            } => {
+                // W6: the Notes menu / shortcut path. The command layer owns
+                // undo (one step per click) and returns the new selection.
+                self.apply_midi_op(*op, indices.clone(), *grid_ticks, track, clip);
                 return;
             }
             RollIntent::CurveUpsert {
@@ -784,6 +854,7 @@ impl GlitcherZApp {
             // explicit so a new transient intent cannot silently fall through
             // into the command layer.
             RollIntent::Seek { .. } => return,
+            RollIntent::MidiOp { .. } => return,
             RollIntent::AddNote {
                 note,
                 start,

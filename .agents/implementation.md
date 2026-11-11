@@ -1641,6 +1641,14 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - 测试：`playhead_local` 的 7 条相位断言；`the_view_window_is_the_whole_context` 改为按 `span` 断言（期望 3840）。Aud 系列此前未提交的 `stash@{0}` 由此手工合并（未 pop，避免与 Met M4 的 `piano_roll.rs` 冲突）。
 - **门禁**：`cargo fmt --all` / `cargo clippy -p glitcherz-ui --all-targets -D warnings` 干净；`cargo test -p glitcherz-ui` = 11 个 test binary 全 `ok. 0 failed`；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
 
+#### 命令族扩展：Quantize / Legato / Glue / Transpose（2026-11-11 交付）
+
+- `midi.quantize` / `midi.transpose` / `midi.duration_op {op:"legato"}` 此前已有；本次补 `midi.legato`（薄命令）与 `midi.glue`，并给 quantize / transpose / legato / duration_op 的返回值补 `indices`（`locate` 重建），供 UI 在命令重排音符后保持选区。
+- `glue`：`model::ops::glue_selected(&mut Vec<Note>, GlueOptions { gap_ticks }, selected)` —— 唯一 **缩短**音符表 op（与 `notes_split` 同类例外）：同 `note` + `channel` 且 `next.start <= cur.start + cur.length + gap` 的相邻音符合并到较早者，end 取最晚；选区外不动；返回幸存值供 `locate`。命令返回 `{merged, indices}`。
+- UI：卷帘工具栏新增 `Notes` 菜单（Quantize / Legato / Glue / Transpose +1 −1 +12 −12）+ 快捷键 `Q` / `L` / `Shift+G`；`RollIntent::MidiOp { op, indices, grid_ticks }` 只表达意图，`editing.rs::apply_midi_op` 翻译成命令并写回 `indices`。Quantize 用当前网格（`grid_ticks` 由组件带上），选区为空 = 整 clip（命令层 `indices?` 语义）。
+- 测试：model 2 项 glue（合并 / gap + 选区），command 2 项（legato 延长 + undo、glue 合并 + indices），MCP 命令数 16 → 18。
+- **门禁**：`cargo fmt --all` / `cargo clippy --workspace --all-targets -D warnings` 干净；`cargo test --workspace` = 43 个 test binary 全 `ok. 0 failed`。
+
 #### 阶段边界（自 plan.md 归位）
 
 - **Y 系列 S0**：不碰 MCP、不改 `PROJECT_VERSION`、不动文档格式、不引入新 crate / 新依赖、不改 GUI 导出交互（stems / 24-bit / 采样率选择）。

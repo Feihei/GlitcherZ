@@ -155,6 +155,12 @@ struct Keys {
     escape: bool,
     d: bool,
     g: bool,
+    /// Shift+G: glue touching same-pitch notes.
+    shift_g: bool,
+    /// Q: quantize to the current grid.
+    q: bool,
+    /// L: legato (extend each note to the next start).
+    l: bool,
     s: bool,
     t: bool,
     k: bool,
@@ -165,6 +171,17 @@ struct Keys {
     select_all: bool,
     /// `Ctrl+Shift+A`: drop the selection.
     deselect_all: bool,
+}
+
+/// A named MIDI command exposed by the roll's Notes menu (the W6 command
+/// family). The app turns it into a registered `midi.*` command, so the
+/// component never learns command ids or their parameter JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MidiOp {
+    Quantize,
+    Legato,
+    Glue,
+    Transpose(i32),
 }
 
 /// An edit the roll wants performed.
@@ -209,6 +226,14 @@ pub enum RollIntent {
     /// Ruler seek (Aud series): move the transport to this absolute tick.
     /// Bypasses the command layer — no document change, no undo.
     Seek { tick: i64 },
+    /// A Notes-menu command over `indices` (empty = every note of the clip).
+    /// `grid_ticks` carries the roll's current grid so Quantize lands on the
+    /// same grid the user is drawing on.
+    MidiOp {
+        op: MidiOp,
+        indices: Vec<usize>,
+        grid_ticks: i64,
+    },
     /// One frame of a time scale (the Scale command's drag): stretch the
     /// selection by `factor` around `pivot_tick` (the selection bbox
     /// *start*, frozen at grab time — scaling from the start keeps the
@@ -1613,6 +1638,66 @@ pub fn show(
             state.modal = None;
             state.pending_arm = None;
         }
+        // W6: the MIDI command family — Quantize / Legato / Glue /
+        // Transpose. One menu keeps four entries out of the toolbar row;
+        // every entry works on the selection, or on the whole clip when
+        // nothing is selected (the command layer's `indices?`).
+        ui.menu_button("Notes", |ui| {
+            let selected = state.selection.clone();
+            let mut fire = |ui: &mut egui::Ui, op: MidiOp, label: &str, hint: &str| {
+                if ui.button(label).on_hover_text(hint).clicked() {
+                    intent = Some(RollIntent::MidiOp {
+                        op,
+                        indices: selected.clone(),
+                        grid_ticks,
+                    });
+                    ui.close();
+                }
+            };
+            fire(
+                ui,
+                MidiOp::Quantize,
+                "Quantize",
+                "Snap note starts to the current grid · Q",
+            );
+            fire(
+                ui,
+                MidiOp::Legato,
+                "Legato",
+                "Extend each note to the next start · L",
+            );
+            fire(
+                ui,
+                MidiOp::Glue,
+                "Glue",
+                "Merge touching same-pitch notes · Shift+G",
+            );
+            ui.separator();
+            fire(
+                ui,
+                MidiOp::Transpose(1),
+                "Transpose +1",
+                "Move pitches up one semitone",
+            );
+            fire(
+                ui,
+                MidiOp::Transpose(-1),
+                "Transpose -1",
+                "Move pitches down one semitone",
+            );
+            fire(
+                ui,
+                MidiOp::Transpose(12),
+                "Transpose +12",
+                "Move pitches up one octave",
+            );
+            fire(
+                ui,
+                MidiOp::Transpose(-12),
+                "Transpose -12",
+                "Move pitches down one octave",
+            );
+        });
         // spec `snap.md` S4: with Ctrl now owning the snap override, the
         // toolbar is the second copy entry point besides Shift+D. It copies
         // in place (no grab point is available on a button); press G to move.
@@ -2543,8 +2628,11 @@ pub fn show(
         // more specific Shift+D must be consumed before the plain `d`.
         let keys = ui.ctx().input_mut(|i| Keys {
             shift_d: i.consume_key(egui::Modifiers::SHIFT, egui::Key::D),
+            shift_g: i.consume_key(egui::Modifiers::SHIFT, egui::Key::G),
             escape: i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
             d: i.consume_key(egui::Modifiers::NONE, egui::Key::D),
+            q: i.consume_key(egui::Modifiers::NONE, egui::Key::Q),
+            l: i.consume_key(egui::Modifiers::NONE, egui::Key::L),
             g: i.consume_key(egui::Modifiers::NONE, egui::Key::G),
             s: i.consume_key(egui::Modifiers::NONE, egui::Key::S),
             t: i.consume_key(egui::Modifiers::NONE, egui::Key::T),
@@ -2632,6 +2720,19 @@ pub fn show(
                 state.knife_armed = false;
                 state.pending_arm = None;
                 state.mode = state.mode.toggled();
+            } else if keys.q || keys.l || keys.shift_g {
+                let op = if keys.q {
+                    MidiOp::Quantize
+                } else if keys.l {
+                    MidiOp::Legato
+                } else {
+                    MidiOp::Glue
+                };
+                intent = Some(RollIntent::MidiOp {
+                    op,
+                    indices: state.selection.clone(),
+                    grid_ticks,
+                });
             } else if keys.g || keys.s || keys.t || keys.k {
                 // The keyboard family and the toolbar share one arming path
                 // (I3): the pointer is where it is, so it *is* the grab point.

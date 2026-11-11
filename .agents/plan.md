@@ -20,13 +20,13 @@
 路线图 1–10 全部落地；基础功能、节点图、MIDI 编辑、插件宿主、可用性（U 系列）、录音（R 系列）、内建效果器（E 系列）、声源扩展（Y / Z / B 系列）与交互打磨（I 系列）均已交付。已完成系列的设计与实现位置见下方「历史系列索引」——本文件不再逐项记录它们的实施细节。
 
 - **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）。
-- **下一步候选**：命令族扩展（quantize / legato / glue / transpose）、C5 一曲线多目标、CLI / MCP 的命令词汇表。
+- **下一步候选**：CLI / MCP 的命令词汇表（`NodeParam` 稳定名 + `clip.add` + `graph.set_param`）。
 - **门禁**：`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`，在本机沙箱外跑（沙箱内 cargo 会毒化 `target/debug/incremental`）。
 
 ## 未完成项
 
-- [ ] **未来命令族扩展**：quantize / legato / glue / transpose = 同族零侵入（M3 已有 ops 与命令骨架，补齐菜单与快捷键即可）。
-- [ ] **C5 一曲线多目标（候选）**：结论是**不需要**强制 map 节点——轴本来就是每条边自己的，放开多路后每路按目标各自推导即可。真正的阻塞在别处：`auto_routes` 每轨只 1 槽、`DedupKey::Auto` 是 per-track 的 CC/bend last-value 记忆（两条分支会互相污染）、model 的 `auto_endpoint` / `auto_target` / `remove_auto_cable` 都是单值语义。
+- [x] **命令族扩展（2026-11-11 交付）**：quantize / legato / glue / transpose 全部有命令与 UI 入口（`Notes` 菜单 + `Q` / `L` / `Shift+G`）；`glue` 是唯一会缩短音符表的 op（返回新索引重建选区）。
+- [ ] **C5 一曲线多目标（暂不做，2026-11-11 用户拍板：暂时用不着）**：结论是**不需要**强制 map 节点——轴本来就是每条边自己的，放开多路后每路按目标各自推导即可。真正的阻塞在别处：`auto_routes` 每轨只 1 槽、`DedupKey::Auto` 是 per-track 的 CC/bend last-value 记忆（两条分支会互相污染）、model 的 `auto_endpoint` / `auto_target` / `remove_auto_cable` 都是单值语义。
 - [ ] **空闲重绘**（review 2026-11-01 遗留）：`request_repaint_after(50 ms)` 目前无条件调用，建议只在播放中 / 电平可见时开——纯 UI 性能项，不碰引擎。
 - [ ] **录音 PDC 自动对齐**（review 2026-11-01 遗留）：PDC 已进图（S2-3），但 R5 仍靠手动 `Latency` offset；自动值需要汇总「输入设备 → 轨道链」的往返延迟。
 - **S5 之后的硬阻塞**（Y 系列收官时记下的三条）：
