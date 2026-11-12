@@ -579,6 +579,12 @@ impl Session {
 
         match attempt {
             Ok(Ok(value)) => {
+                // F-041 M10: a content write may land past the current
+                // `length_ticks` (the window's silent tail). Grow the entry
+                // here — copy-on-write when shared — so the new content plays.
+                if id.starts_with("midi.") {
+                    self.grow_midi_data_to_notes(&params);
+                }
                 if spec.undoable && !self.history_suspended() && !Arc::ptr_eq(&before, &self.doc) {
                     self.record_history(spec.label, before);
                 }
@@ -611,6 +617,58 @@ impl Session {
                     message,
                 })
             }
+        }
+    }
+
+    /// F-041 M10: extends the targeted MIDI entry so it covers every note the
+    /// command just wrote. Shared content is copied first (the window stays
+    /// private, the content entry is owned by this clip).
+    fn grow_midi_data_to_notes(&mut self, params: &Value) {
+        let track = params.get("track").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let clip = params.get("clip").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let project = self.project();
+        let Some(target) = project
+            .midi_tracks
+            .get(track)
+            .and_then(|track| track.clips.get(clip))
+        else {
+            return;
+        };
+        let data_idx = target.data;
+        let Some(data) = project.midi_data.get(data_idx as usize) else {
+            return;
+        };
+        let end = data
+            .notes()
+            .iter()
+            .map(|note| note.start.saturating_add(note.length))
+            .max()
+            .unwrap_or(0);
+        if end <= i64::from(data.length_ticks) {
+            return;
+        }
+        let new_len = u32::try_from(end).unwrap_or(u32::MAX);
+        let source = if project.midi_data_refs(data_idx) > 1 {
+            project.midi_data.get(data_idx as usize).cloned()
+        } else {
+            None
+        };
+        let project = self.project_mut();
+        let data_idx = if let Some(source) = source {
+            let new_idx = project.push_midi_data(source);
+            if let Some(target) = project
+                .midi_tracks
+                .get_mut(track)
+                .and_then(|track| track.clips.get_mut(clip))
+            {
+                target.data = new_idx;
+            }
+            new_idx
+        } else {
+            data_idx
+        };
+        if let Some(data) = project.midi_data_mut(data_idx) {
+            data.length_ticks = data.length_ticks.max(new_len);
         }
     }
 
@@ -702,6 +760,70 @@ mod journal_tests {
             ..MidiClip::default()
         });
         Session::new(project)
+    }
+
+    /// F-041 M10: a note written past `length_ticks` grows the shared entry so
+    /// the new content is audible inside the window.
+    #[test]
+    fn note_add_grows_the_content_past_the_length() {
+        let mut session = session_with_note();
+        session
+            .execute(
+                "midi.note_add",
+                &json!({
+                    "track": 0,
+                    "clip": 0,
+                    "note": 70,
+                    "start_ticks": 600,
+                    "length_ticks": 240,
+                }),
+            )
+            .unwrap();
+        let project = session.project();
+        let clip = &project.midi_tracks[0].clips[0];
+        assert!(
+            project.midi_data_of(clip).expect("data").length_ticks >= 840,
+            "the entry grows to cover the written note"
+        );
+    }
+
+    /// F-041 M10: growing a shared entry copies it first; the other clip keeps
+    /// the original content untouched.
+    #[test]
+    fn note_add_copies_shared_content_when_growing() {
+        let mut session = session_with_note();
+        {
+            let project = session.project_mut();
+            let first = project.midi_tracks[0].clips[0].clone();
+            project.midi_tracks[0].clips.push(MidiClip {
+                start_ticks: 384,
+                ..first
+            });
+        }
+        let original = session.project().midi_tracks[0].clips[0].data;
+        assert_eq!(session.project().midi_data_refs(original), 2);
+
+        session
+            .execute(
+                "midi.note_add",
+                &json!({
+                    "track": 0,
+                    "clip": 0,
+                    "note": 70,
+                    "start_ticks": 600,
+                    "length_ticks": 240,
+                }),
+            )
+            .unwrap();
+
+        let project = session.project();
+        let first = &project.midi_tracks[0].clips[0];
+        let second = &project.midi_tracks[0].clips[1];
+        assert_ne!(first.data, original, "the written clip got its own entry");
+        assert_eq!(second.data, original, "the other clip keeps the original");
+        assert_eq!(project.midi_data_refs(first.data), 1);
+        assert!(project.midi_data[first.data as usize].length_ticks >= 840);
+        assert_eq!(project.midi_data[original as usize].length_ticks, 384);
     }
 
     #[test]

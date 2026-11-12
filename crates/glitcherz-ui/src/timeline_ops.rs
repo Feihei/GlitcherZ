@@ -1467,7 +1467,7 @@ impl GlitcherZApp {
         let mut touched = Vec::new();
         {
             let project = self.project_mut();
-            detach_stretch_data(project, &spans);
+
             for e in &spans {
                 let changed = match e.sel.lane {
                     timeline::TimelineLane::Control => stretch_curve_clip(
@@ -1476,7 +1476,6 @@ impl GlitcherZApp {
                         e.sel.clip,
                         e.start_ticks,
                         e.span_ticks,
-                        false,
                     ),
                     timeline::TimelineLane::Midi => stretch_midi_clip(
                         project,
@@ -1484,7 +1483,6 @@ impl GlitcherZApp {
                         e.sel.clip,
                         e.start_ticks,
                         e.span_ticks,
-                        false,
                     ),
                     // U11: a stretch trims the seconds window (a left-edge
                     // stretch also advances the window start).
@@ -2331,97 +2329,17 @@ impl GlitcherZApp {
         self.sync_selection_rows(&selection);
     }
 }
-/// F-041 M9: detach shared content once per data group before a batch stretch.
+/// One MIDI clip's T stretch (F-041 M10): a **pure window edit**.
 ///
-/// Members of the same selection keep sharing the new copy; references outside
-/// the selection stay on the old entry. Running this first lets the per-clip
-/// stretch skip its own copy-on-write, which would otherwise split a group
-/// whose members are stretched together.
-fn detach_stretch_data(project: &mut Project, spans: &[timeline::ClipSpanEdit]) {
-    let mut midi_groups: Vec<(u32, Vec<(usize, usize)>)> = Vec::new();
-    let mut curve_groups: Vec<(u32, Vec<(usize, usize)>)> = Vec::new();
-    for e in spans {
-        let data = match e.sel.lane {
-            timeline::TimelineLane::Midi => project
-                .midi_tracks
-                .get(e.sel.track)
-                .and_then(|t| t.clips.get(e.sel.clip))
-                .map(|clip| clip.data),
-            timeline::TimelineLane::Control => project
-                .control_tracks
-                .get(e.sel.track)
-                .and_then(|t| t.clips.get(e.sel.clip))
-                .map(|clip| clip.data),
-            timeline::TimelineLane::Audio => None,
-        };
-        let Some(data) = data else { continue };
-        let groups = match e.sel.lane {
-            timeline::TimelineLane::Midi => &mut midi_groups,
-            timeline::TimelineLane::Control => &mut curve_groups,
-            timeline::TimelineLane::Audio => continue,
-        };
-        if let Some(group) = groups.iter_mut().find(|(old, _)| *old == data) {
-            group.1.push((e.sel.track, e.sel.clip));
-        } else {
-            groups.push((data, vec![(e.sel.track, e.sel.clip)]));
-        }
-    }
-    for (data, members) in midi_groups {
-        if members.len() >= project.midi_data_refs(data) {
-            continue;
-        }
-        let Some(source) = project.midi_data.get(data as usize).cloned() else {
-            continue;
-        };
-        let new_data = project.push_midi_data(source);
-        for (track, clip) in members {
-            if let Some(clip) = project
-                .midi_tracks
-                .get_mut(track)
-                .and_then(|t| t.clips.get_mut(clip))
-            {
-                clip.data = new_data;
-            }
-        }
-    }
-    for (data, members) in curve_groups {
-        if members.len() >= project.curve_data_refs(data) {
-            continue;
-        }
-        let Some(source) = project.curve_data.get(data as usize).cloned() else {
-            continue;
-        };
-        let new_data = project.push_curve_data(source);
-        for (track, clip) in members {
-            if let Some(clip) = project
-                .control_tracks
-                .get_mut(track)
-                .and_then(|t| t.clips.get_mut(clip))
-            {
-                clip.data = new_data;
-            }
-        }
-    }
-}
-
-/// One MIDI clip's T stretch (F-041 revision, 2026-11-12): window and editable
-/// content stay in sync so the piano roll can write into the newly exposed
-/// time.
-///
-/// - Moving the window start left prepends blank ticks to the content (all
-///   notes/CCs shift right), so notes keep their arrangement position instead
-///   of jumping to the new head.
-/// - Moving the window end right extends `length_ticks`, so the roll's edit
-///   range reaches the new tail (the tail is blank until the user writes).
-/// - A shared content entry is copied first: stretching one clip must not
-///   mutate the data another clip references.
+/// Moving the start shifts `source_offset` (negative = leading blank); moving
+/// the end changes `span_ticks`. Events never move and `length_ticks` never
+/// grows — the roll grows the content only when the user writes past it.
 fn stretch_midi_clip(
     project: &mut Project,
     track: usize,
     index: usize,
     new_start: u32,
     new_span: u32,
-    allow_cow: bool,
 ) -> bool {
     let Some(clip) = project
         .midi_tracks
@@ -2430,62 +2348,19 @@ fn stretch_midi_clip(
     else {
         return false;
     };
-    let (old_start, old_span, old_off, data_idx, old_loop) = (
+    let (old_start, old_span, old_off, old_loop) = (
         clip.start_ticks,
         clip.span_ticks,
         clip.source_offset,
-        clip.data,
         clip.loop_ticks,
     );
-    let delta = i64::from(new_start) - i64::from(old_start);
-    let raw_off = i64::from(old_off) + delta;
-    let prepend = (-raw_off).max(0);
-    let mut off = raw_off.max(0);
-    let window_end = off + i64::from(new_span);
-    let old_length = project
-        .midi_data
-        .get(data_idx as usize)
-        .map_or(0, |data| data.length_ticks);
-    let extend = window_end > i64::from(old_length);
-    let changed = old_start != new_start || old_span != new_span || old_loop.is_some();
-    if !changed && prepend == 0 && !extend {
+    if old_start == new_start && old_span == new_span && old_loop.is_none() {
         return false;
     }
-    if prepend > 0 || extend {
-        let data_idx = if allow_cow && project.midi_data_refs(data_idx) > 1 {
-            let Some(source) = project.midi_data.get(data_idx as usize).cloned() else {
-                return false;
-            };
-            let new_idx = project.push_midi_data(source);
-            let Some(clip) = project
-                .midi_tracks
-                .get_mut(track)
-                .and_then(|t| t.clips.get_mut(index))
-            else {
-                return false;
-            };
-            clip.data = new_idx;
-            new_idx
-        } else {
-            data_idx
-        };
-        let Some(data) = project.midi_data_mut(data_idx) else {
-            return false;
-        };
-        if prepend > 0 {
-            let pad = u32::try_from(prepend).unwrap_or(u32::MAX);
-            for note in data.notes_mut() {
-                note.start = note.start.saturating_add(prepend);
-            }
-            for ctrl in &mut data.sequence.ctrls {
-                ctrl.tick = ctrl.tick.saturating_add(prepend);
-            }
-            data.length_ticks = data.length_ticks.saturating_add(pad);
-            off = 0;
-        }
-        let end = u32::try_from(off + i64::from(new_span)).unwrap_or(u32::MAX);
-        data.length_ticks = data.length_ticks.max(end);
-    }
+    // F-041 M10: a stretch is a pure window edit. Moving the start shifts the
+    // window inside the shared data (possibly negative, exposing leading
+    // blank); it never moves events and never grows `length_ticks`.
+    let shifted = old_off.saturating_add(i64::from(new_start) - i64::from(old_start));
     let Some(clip) = project
         .midi_tracks
         .get_mut(track)
@@ -2495,20 +2370,18 @@ fn stretch_midi_clip(
     };
     clip.start_ticks = new_start;
     clip.span_ticks = new_span;
-    clip.source_offset = off;
+    clip.source_offset = shifted;
     clip.loop_ticks = None;
     true
 }
 
-/// Control-clip counterpart of [`stretch_midi_clip`] (curve anchors move with
-/// the prepended blank head).
+/// Control-clip counterpart of [`stretch_midi_clip`]: same pure window edit.
 fn stretch_curve_clip(
     project: &mut Project,
     track: usize,
     index: usize,
     new_start: u32,
     new_span: u32,
-    allow_cow: bool,
 ) -> bool {
     let Some(clip) = project
         .control_tracks
@@ -2517,59 +2390,16 @@ fn stretch_curve_clip(
     else {
         return false;
     };
-    let (old_start, old_span, old_off, data_idx, old_loop) = (
+    let (old_start, old_span, old_off, old_loop) = (
         clip.start_ticks,
         clip.span_ticks,
         clip.source_offset,
-        clip.data,
         clip.loop_ticks,
     );
-    let delta = i64::from(new_start) - i64::from(old_start);
-    let raw_off = i64::from(old_off) + delta;
-    let prepend = (-raw_off).max(0);
-    let mut off = raw_off.max(0);
-    let window_end = off + i64::from(new_span);
-    let old_length = project
-        .curve_data
-        .get(data_idx as usize)
-        .map_or(0, |data| data.length_ticks);
-    let extend = window_end > i64::from(old_length);
-    let changed = old_start != new_start || old_span != new_span || old_loop.is_some();
-    if !changed && prepend == 0 && !extend {
+    if old_start == new_start && old_span == new_span && old_loop.is_none() {
         return false;
     }
-    if prepend > 0 || extend {
-        let data_idx = if allow_cow && project.curve_data_refs(data_idx) > 1 {
-            let Some(source) = project.curve_data.get(data_idx as usize).cloned() else {
-                return false;
-            };
-            let new_idx = project.push_curve_data(source);
-            let Some(clip) = project
-                .control_tracks
-                .get_mut(track)
-                .and_then(|t| t.clips.get_mut(index))
-            else {
-                return false;
-            };
-            clip.data = new_idx;
-            new_idx
-        } else {
-            data_idx
-        };
-        let Some(data) = project.curve_data_mut(data_idx) else {
-            return false;
-        };
-        if prepend > 0 {
-            let pad = u32::try_from(prepend).unwrap_or(u32::MAX);
-            for point in &mut data.points {
-                point.tick = point.tick.saturating_add(pad);
-            }
-            data.length_ticks = data.length_ticks.saturating_add(pad);
-            off = 0;
-        }
-        let end = u32::try_from(off + i64::from(new_span)).unwrap_or(u32::MAX);
-        data.length_ticks = data.length_ticks.max(end);
-    }
+    let shifted = old_off.saturating_add(i64::from(new_start) - i64::from(old_start));
     let Some(clip) = project
         .control_tracks
         .get_mut(track)
@@ -2579,14 +2409,13 @@ fn stretch_curve_clip(
     };
     clip.start_ticks = new_start;
     clip.span_ticks = new_span;
-    clip.source_offset = off;
+    clip.source_offset = shifted;
     clip.loop_ticks = None;
     true
 }
-/// Right-edge drag on a MIDI clip: same "edit range follows the window"
-/// contract as the T modal. A move (`new_span == old_span`) leaves the
-/// content alone; growing the right edge extends `length_ticks` so the newly
-/// exposed tail is writable in the piano roll (copy-on-write for shared data).
+/// Right-edge drag on a MIDI clip: a pure window edit (F-041 M10). Growth
+/// exposes silent tail; the piano roll grows the content only when something
+/// is written there.
 fn resize_midi_clip(
     project: &mut Project,
     track: usize,
@@ -2601,46 +2430,8 @@ fn resize_midi_clip(
     else {
         return false;
     };
-    let (old_start, old_span, off, data_idx) = (
-        clip.start_ticks,
-        clip.span_ticks,
-        clip.source_offset,
-        clip.data,
-    );
-    if old_start == new_start && old_span == new_span {
+    if clip.start_ticks == new_start && clip.span_ticks == new_span {
         return false;
-    }
-    if new_span > old_span {
-        let end = i64::from(off) + i64::from(new_span);
-        let length = project
-            .midi_data
-            .get(data_idx as usize)
-            .map_or(0, |data| data.length_ticks);
-        if end > i64::from(length) {
-            let data_idx = if project.midi_data_refs(data_idx) > 1 {
-                let Some(source) = project.midi_data.get(data_idx as usize).cloned() else {
-                    return false;
-                };
-                let new_idx = project.push_midi_data(source);
-                if let Some(clip) = project
-                    .midi_tracks
-                    .get_mut(track)
-                    .and_then(|t| t.clips.get_mut(index))
-                {
-                    clip.data = new_idx;
-                } else {
-                    return false;
-                }
-                new_idx
-            } else {
-                data_idx
-            };
-            if let Some(data) = project.midi_data_mut(data_idx) {
-                data.length_ticks = data
-                    .length_ticks
-                    .max(u32::try_from(end).unwrap_or(u32::MAX));
-            }
-        }
     }
     let Some(clip) = project
         .midi_tracks
@@ -2651,6 +2442,7 @@ fn resize_midi_clip(
     };
     clip.start_ticks = new_start;
     clip.span_ticks = new_span;
+    clip.loop_ticks = None;
     true
 }
 
@@ -2669,46 +2461,8 @@ fn resize_curve_clip(
     else {
         return false;
     };
-    let (old_start, old_span, off, data_idx) = (
-        clip.start_ticks,
-        clip.span_ticks,
-        clip.source_offset,
-        clip.data,
-    );
-    if old_start == new_start && old_span == new_span {
+    if clip.start_ticks == new_start && clip.span_ticks == new_span {
         return false;
-    }
-    if new_span > old_span {
-        let end = i64::from(off) + i64::from(new_span);
-        let length = project
-            .curve_data
-            .get(data_idx as usize)
-            .map_or(0, |data| data.length_ticks);
-        if end > i64::from(length) {
-            let data_idx = if project.curve_data_refs(data_idx) > 1 {
-                let Some(source) = project.curve_data.get(data_idx as usize).cloned() else {
-                    return false;
-                };
-                let new_idx = project.push_curve_data(source);
-                if let Some(clip) = project
-                    .control_tracks
-                    .get_mut(track)
-                    .and_then(|t| t.clips.get_mut(index))
-                {
-                    clip.data = new_idx;
-                } else {
-                    return false;
-                }
-                new_idx
-            } else {
-                data_idx
-            };
-            if let Some(data) = project.curve_data_mut(data_idx) {
-                data.length_ticks = data
-                    .length_ticks
-                    .max(u32::try_from(end).unwrap_or(u32::MAX));
-            }
-        }
     }
     let Some(clip) = project
         .control_tracks
@@ -2719,6 +2473,7 @@ fn resize_curve_clip(
     };
     clip.start_ticks = new_start;
     clip.span_ticks = new_span;
+    clip.loop_ticks = None;
     true
 }
 #[cfg(test)]
@@ -2749,137 +2504,81 @@ mod tests {
         clip
     }
 
-    /// M9: a batch stretch detaches shared content once per group, keeping the
-    /// selected members on one new entry and leaving outside references alone.
+    /// F-041 M10: a window stretch never copies or mutates the shared content, so
+    /// a group's members keep referencing the same entry.
     #[test]
-    fn batch_stretch_keeps_group_sharing() {
+    fn batch_stretch_keeps_data_sharing() {
         let mut project = Project::default();
         let clip = clip_with_one_note(&mut project);
-        // A second clip on the same track shares the entry (a group).
         project.midi_tracks[0].clips.push(MidiClip {
             start_ticks: TICKS_PER_BAR,
             ..clip.clone()
         });
-        // An outside reference on another track keeps the old entry.
         project.midi_tracks.push(MidiTrack::default());
         project.midi_tracks[1].clips.push(clip.clone());
         let old = clip.data;
         assert_eq!(project.midi_data_refs(old), 3);
 
-        let spans = vec![
-            timeline::ClipSpanEdit {
-                sel: timeline::ClipSel {
-                    lane: timeline::TimelineLane::Midi,
-                    track: 0,
-                    clip: 0,
-                },
-                start_ticks: 0,
-                span_ticks: 2 * TICKS_PER_BAR,
-            },
-            timeline::ClipSpanEdit {
-                sel: timeline::ClipSel {
-                    lane: timeline::TimelineLane::Midi,
-                    track: 0,
-                    clip: 1,
-                },
-                start_ticks: TICKS_PER_BAR,
-                span_ticks: 2 * TICKS_PER_BAR,
-            },
-        ];
-        detach_stretch_data(&mut project, &spans);
-
-        let a = project.midi_tracks[0].clips[0].data;
-        let b = project.midi_tracks[0].clips[1].data;
-        assert_eq!(a, b, "selected members keep sharing one entry");
-        assert_ne!(a, old, "the group was detached from the outside reference");
-        assert_eq!(project.midi_tracks[1].clips[0].data, old);
-
-        // Both stretches edit the new shared entry; the outside clip is intact.
-        assert!(stretch_midi_clip(
-            &mut project,
-            0,
-            0,
-            0,
-            2 * TICKS_PER_BAR,
-            false
-        ));
+        assert!(stretch_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
         assert!(stretch_midi_clip(
             &mut project,
             0,
             1,
             TICKS_PER_BAR,
-            2 * TICKS_PER_BAR,
-            false
-        ));
-        assert_eq!(project.midi_tracks[0].clips[0].data, a);
-        assert_eq!(project.midi_tracks[0].clips[1].data, a);
-        assert_eq!(
-            project.midi_data[a as usize].length_ticks,
             2 * TICKS_PER_BAR
-        );
+        ));
+
+        assert_eq!(project.midi_tracks[0].clips[0].data, old);
+        assert_eq!(project.midi_tracks[0].clips[1].data, old);
+        assert_eq!(project.midi_tracks[1].clips[0].data, old);
         assert_eq!(project.midi_data[old as usize].length_ticks, TICKS_PER_BAR);
     }
 
-    /// A T tail stretch extends the editable content, so the piano roll can
-    /// write into the newly exposed bar. The note does not move.
+    /// A T tail stretch only widens the window; the exposed tail stays silent
+    /// until the roll writes content there (write-time growth).
     #[test]
-    fn stretch_tail_extends_the_editable_content() {
+    fn stretch_tail_exposes_silent_window() {
         let mut project = Project::default();
         clip_with_one_note(&mut project);
 
-        assert!(stretch_midi_clip(
-            &mut project,
-            0,
-            0,
-            0,
-            2 * TICKS_PER_BAR,
-            true
-        ));
+        assert!(stretch_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
 
         let clip = &project.midi_tracks[0].clips[0];
         assert_eq!(clip.span_ticks, 2 * TICKS_PER_BAR);
         assert_eq!(clip.source_offset, 0);
         assert!(clip.loop_ticks.is_none());
         let data = project.midi_data_of(clip).expect("data");
-        assert_eq!(data.length_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(data.length_ticks, TICKS_PER_BAR, "content is untouched");
         assert_eq!(data.notes()[0].start, 0, "the note stays at its tick");
     }
 
-    /// A T start-edge stretch (T+S) prepends blank ticks: the note keeps its
-    /// arrangement position instead of jumping to the new head, and the head
-    /// becomes writable.
+    /// A T start-edge stretch (T+S) moves the window left of the content:
+    /// `source_offset` goes negative (leading blank), events and length stay
+    /// put.
     #[test]
-    fn stretch_head_prepends_blank_ticks() {
+    fn stretch_head_opens_negative_offset() {
         let mut project = Project::default();
         clip_with_one_note(&mut project);
         project.midi_tracks[0].clips[0].start_ticks = TICKS_PER_BAR;
 
-        assert!(stretch_midi_clip(
-            &mut project,
-            0,
-            0,
-            0,
-            2 * TICKS_PER_BAR,
-            true
-        ));
+        assert!(stretch_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
 
         let clip = &project.midi_tracks[0].clips[0];
         assert_eq!(clip.start_ticks, 0);
         assert_eq!(clip.span_ticks, 2 * TICKS_PER_BAR);
-        assert_eq!(clip.source_offset, 0);
+        assert_eq!(clip.source_offset, -i64::from(TICKS_PER_BAR));
         let data = project.midi_data_of(clip).expect("data");
-        assert_eq!(data.length_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(data.length_ticks, TICKS_PER_BAR, "content is untouched");
         assert_eq!(
             data.notes()[0].start,
-            i64::from(TICKS_PER_BAR),
-            "the note shifts right with the prepended blank head"
+            0,
+            "the note does not move with the window head"
         );
     }
 
-    /// Stretching one shared clip copies the content first: the other clip's
-    /// window and data stay untouched.
+    /// Stretching one shared clip leaves the other reference exactly as it was.
     #[test]
-    fn stretch_unlinks_shared_content() {
+    fn stretch_keeps_shared_content() {
         let mut project = Project::default();
         let source = clip_with_one_note(&mut project);
         project.midi_tracks[0].clips.push(MidiClip {
@@ -2887,32 +2586,18 @@ mod tests {
             ..source
         });
 
-        assert!(stretch_midi_clip(
-            &mut project,
-            0,
-            0,
-            0,
-            2 * TICKS_PER_BAR,
-            true
-        ));
+        assert!(stretch_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
 
         let first = &project.midi_tracks[0].clips[0];
         let second = &project.midi_tracks[0].clips[1];
-        assert_ne!(first.data, second.data, "stretched clip got its own data");
-        assert_eq!(
-            project
-                .midi_data_of(second)
-                .expect("second data")
-                .length_ticks,
-            TICKS_PER_BAR,
-            "the untouched clip keeps the original length"
-        );
+        assert_eq!(first.data, second.data, "the entry stays shared");
+        assert_eq!(project.midi_data_refs(first.data), 2);
         assert_eq!(
             project
                 .midi_data_of(first)
-                .expect("first data")
+                .expect("shared data")
                 .length_ticks,
-            2 * TICKS_PER_BAR
+            TICKS_PER_BAR
         );
     }
 }
