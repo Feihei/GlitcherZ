@@ -198,8 +198,8 @@ fn sample_smooth(points: &[RtAutoPoint], tick: f64) -> Option<f32> {
 pub struct RtControlClip {
     /// Absolute start position on the arrangement (in ticks).
     pub start_ticks: u32,
-    /// Window start inside the shared content (in ticks).
-    pub source_offset: u32,
+    /// Window start inside the shared content (in ticks; may be negative).
+    pub source_offset: i64,
     /// How long the clip stays active (in ticks).
     pub span_ticks: u32,
     /// Content length (in ticks); a plain window goes silent past it
@@ -250,7 +250,7 @@ impl RtControlClip {
             return None;
         }
         let local = position_ticks - start;
-        let offset = f64::from(self.source_offset);
+        let offset = self.source_offset as f64;
         let period = self
             .loop_ticks
             .map_or(self.length_ticks, |loop_ticks| loop_ticks.max(1));

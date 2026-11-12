@@ -129,12 +129,12 @@ pub fn export_smf(project: &crate::Project) -> Vec<u8> {
 /// offsets from the clip start (P0; mirrors [`tiled_notes`]' rules).
 fn tiled_ctrls(
     data: &MidiData,
-    source_offset: u32,
+    source_offset: i64,
     span_ticks: u32,
     loop_ticks: Option<u32>,
 ) -> Vec<(i64, CtrlEvent)> {
     let length = i64::from(data.length_ticks.max(1));
-    let offset = i64::from(source_offset);
+    let offset = source_offset;
     let period = loop_ticks.map_or(length, |loop_ticks| i64::from(loop_ticks.max(1)));
     // A non-looping window exposes the content once: the silent tail past
     // `length_ticks` exports nothing (F-041 revision).
@@ -168,12 +168,12 @@ fn tiled_ctrls(
 /// window edges).
 fn tiled_notes(
     data: &MidiData,
-    source_offset: u32,
+    source_offset: i64,
     span_ticks: u32,
     loop_ticks: Option<u32>,
 ) -> Vec<(i64, Note)> {
     let length = i64::from(data.length_ticks.max(1));
-    let offset = i64::from(source_offset);
+    let offset = source_offset;
     let period = loop_ticks.map_or(length, |loop_ticks| i64::from(loop_ticks.max(1)));
     // See `tiled_ctrls`: a plain window plays the content once, not on loop.
     let span = if loop_ticks.is_some() {

@@ -792,11 +792,11 @@ impl Placement for MidiClip {
         self.span_ticks = v;
     }
     fn split_right(&mut self, left_span: u32, right_span: u32, _sec_per_tick: f64) {
-        self.source_offset = self.source_offset.saturating_add(left_span);
+        self.source_offset = self.source_offset.saturating_add(i64::from(left_span));
         self.span_ticks = right_span.max(1);
     }
     fn retain_from(&mut self, offset: u32, _sec_per_tick: f64) {
-        self.source_offset = self.source_offset.saturating_add(offset);
+        self.source_offset = self.source_offset.saturating_add(i64::from(offset));
         self.span_ticks = self.span_ticks.saturating_sub(offset).max(1);
     }
     fn name(&self) -> &str {
@@ -833,11 +833,11 @@ impl Placement for ControlClip {
         self.span_ticks = v;
     }
     fn split_right(&mut self, left_span: u32, right_span: u32, _sec_per_tick: f64) {
-        self.source_offset = self.source_offset.saturating_add(left_span);
+        self.source_offset = self.source_offset.saturating_add(i64::from(left_span));
         self.span_ticks = right_span.max(1);
     }
     fn retain_from(&mut self, offset: u32, _sec_per_tick: f64) {
-        self.source_offset = self.source_offset.saturating_add(offset);
+        self.source_offset = self.source_offset.saturating_add(i64::from(offset));
         self.span_ticks = self.span_ticks.saturating_sub(offset).max(1);
     }
     fn name(&self) -> &str {
@@ -4603,7 +4603,7 @@ fn draw_midi_preview(
     painter: &egui::Painter,
     rect: Rect,
     span_ticks: u32,
-    source_offset: u32,
+    source_offset: i64,
     loop_ticks: Option<u32>,
     data: &glitcherz_model::MidiData,
 ) {
@@ -4628,10 +4628,10 @@ fn draw_midi_preview(
     let looping = loop_ticks.is_some();
     let period = loop_ticks.map_or(length, |loop_ticks| i64::from(loop_ticks.max(1)));
     // A head trim can move the window past the content: nothing to draw.
-    if i64::from(source_offset) >= length {
+    if source_offset >= length {
         return;
     }
-    let offset = i64::from(source_offset).max(0);
+    let offset = source_offset.max(0);
     // The content ends at `length - offset` inside the window; only a
     // looping clip fills the rest (F-041 revision).
     let play_end = if looping {
@@ -4684,7 +4684,7 @@ fn draw_control_preview(
     painter: &egui::Painter,
     rect: Rect,
     span_ticks: u32,
-    source_offset: u32,
+    source_offset: i64,
     loop_ticks: Option<u32>,
     data: &glitcherz_model::CurveData,
 ) {
@@ -4699,7 +4699,7 @@ fn draw_control_preview(
     let span = f64::from(span_ticks.max(1));
     let span_px = rect.width();
     let length = f64::from(data.length_ticks.max(1));
-    let offset = f64::from(source_offset);
+    let offset = source_offset as f64;
     let looping = loop_ticks.is_some();
     let period = loop_ticks.map_or(length, |loop_ticks| f64::from(loop_ticks.max(1)));
     if offset >= length {
@@ -4859,7 +4859,7 @@ mod tests {
         };
         let delta = 1200;
         clip.retain_from(delta, SPT);
-        assert_eq!(clip.source_offset, delta);
+        assert_eq!(clip.source_offset, i64::from(delta));
         assert_eq!(clip.span_ticks, 2 * TICKS_PER_BAR - delta);
     }
 
@@ -5133,7 +5133,10 @@ mod tests {
         assert_eq!(clips.len(), 2);
         assert_eq!(clips[0].data, 7);
         assert_eq!(clips[1].data, 7);
-        assert_eq!(clips[1].source_offset, TICKS_PER_BAR + TICKS_PER_BAR / 2);
+        assert_eq!(
+            clips[1].source_offset,
+            i64::from(TICKS_PER_BAR + TICKS_PER_BAR / 2)
+        );
     }
 
     /// W3a: F2 targets the first selection entry on the focused row and
@@ -5574,7 +5577,7 @@ mod tests {
         // Right: starts at the cut and shares the content.
         assert_eq!(clips[1].start_ticks, at);
         assert_eq!(clips[1].span_ticks, 2 * TICKS_PER_BAR);
-        assert_eq!(clips[1].source_offset, 2 * TICKS_PER_BAR);
+        assert_eq!(clips[1].source_offset, i64::from(2 * TICKS_PER_BAR));
         assert_eq!(clips[0].data, clips[1].data);
     }
 
@@ -5609,7 +5612,7 @@ mod tests {
         // Right starts at the cut and points into the same content.
         assert_eq!(clips[1].start_ticks, at);
         assert_eq!(clips[1].span_ticks, TICKS_PER_BAR);
-        assert_eq!(clips[1].source_offset, TICKS_PER_BAR);
+        assert_eq!(clips[1].source_offset, i64::from(TICKS_PER_BAR));
         assert_eq!(clips[0].data, clips[1].data);
     }
 

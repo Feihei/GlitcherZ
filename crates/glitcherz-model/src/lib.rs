@@ -1955,10 +1955,11 @@ pub struct MidiClip {
     /// Absolute start position on the arrangement (tick).
     #[serde(default)]
     pub start_ticks: u32,
-    /// Window start inside the shared data (tick), normalized to
-    /// `[0, length_ticks)`.
+    /// Window start inside the shared data (tick). May be negative: the
+    /// window then starts before the content and the leading ticks are silent
+    /// (F-041 M10).
     #[serde(default)]
-    pub source_offset: u32,
+    pub source_offset: i64,
     /// How long the clip stays active (tick), >= 1.
     #[serde(default = "default_clip_span")]
     pub span_ticks: u32,
@@ -2223,10 +2224,11 @@ pub struct ControlClip {
     /// Absolute start position on the arrangement (tick).
     #[serde(default)]
     pub start_ticks: u32,
-    /// Window start inside the shared data (tick), normalized to
-    /// `[0, length_ticks)`.
+    /// Window start inside the shared data (tick). May be negative: the
+    /// window then starts before the content and the leading ticks are silent
+    /// (F-041 M10).
     #[serde(default)]
-    pub source_offset: u32,
+    pub source_offset: i64,
     /// How long the clip stays active (tick), >= 1.
     #[serde(default = "default_clip_span")]
     pub span_ticks: u32,

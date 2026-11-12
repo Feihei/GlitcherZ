@@ -2495,7 +2495,7 @@ fn stretch_midi_clip(
     };
     clip.start_ticks = new_start;
     clip.span_ticks = new_span;
-    clip.source_offset = u32::try_from(off).unwrap_or(u32::MAX);
+    clip.source_offset = off;
     clip.loop_ticks = None;
     true
 }
@@ -2579,7 +2579,7 @@ fn stretch_curve_clip(
     };
     clip.start_ticks = new_start;
     clip.span_ticks = new_span;
-    clip.source_offset = u32::try_from(off).unwrap_or(u32::MAX);
+    clip.source_offset = off;
     clip.loop_ticks = None;
     true
 }

@@ -265,8 +265,8 @@ impl RtNote {
 pub struct RtMidiClip {
     /// Absolute start position on the arrangement (in ticks).
     pub start_ticks: u32,
-    /// Window start inside the shared content (in ticks).
-    pub source_offset: u32,
+    /// Window start inside the shared content (in ticks; may be negative).
+    pub source_offset: i64,
     /// How long the clip stays active (in ticks).
     pub span_ticks: u32,
     /// Content length (in ticks); a plain window goes silent past it
@@ -1085,7 +1085,7 @@ impl Sequencer {
             let start = f64::from(clip.start_ticks);
             let clip_end = start + f64::from(clip.span_ticks);
             let length_ticks = f64::from(clip.length_ticks.max(1));
-            let offset = f64::from(clip.source_offset);
+            let offset = clip.source_offset as f64;
             let looping = clip.loop_ticks.is_some();
             let period = f64::from(clip.loop_ticks.unwrap_or(clip.length_ticks).max(1));
             // The end the content actually reaches: a looping clip fills the
