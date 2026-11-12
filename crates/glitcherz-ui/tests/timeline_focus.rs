@@ -487,19 +487,15 @@ fn alt_t_click_confirms_tile_after_pointer_returns() {
         .iter()
         .filter_map(|a| match a {
             glitcherz_ui::timeline::TimelineAction::TileClipsBatch { tiles } => {
-                Some((tiles[0].span_ticks, tiles[0].period_ticks))
+                Some((tiles[0].span_ticks, tiles[0].count))
             }
             _ => None,
         })
         .collect();
     assert_eq!(
         tiled,
-        vec![(
-            2 * glitcherz_model::TICKS_PER_BAR,
-            glitcherz_model::TICKS_PER_BAR
-        )],
-        "confirming click at the grab point keeps the already-tiled \
-         clip unchanged (2-bar container, 1-bar period) — no nesting"
+        vec![(2 * glitcherz_model::TICKS_PER_BAR, 1)],
+        "confirming at the grab point keeps one copy of the armed clip"
     );
 }
 
@@ -554,7 +550,7 @@ fn alt_t_works_right_after_a_confirmed_stretch() {
         .iter()
         .filter_map(|a| match a {
             glitcherz_ui::timeline::TimelineAction::TileClipsBatch { tiles } => {
-                Some((tiles[0].span_ticks, tiles[0].period_ticks))
+                Some((tiles[0].span_ticks, tiles[0].count))
             }
             _ => None,
         })

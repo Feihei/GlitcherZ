@@ -137,14 +137,15 @@ pub struct ClipSpanEdit {
     pub span_ticks: u32,
 }
 
-/// One tile edit of the tile modal (Shift+T / Alt+T): the container grows to
-/// `span_ticks` while the content period stays `period_ticks` — the clip's
-/// full length at arm time, so the WHOLE clip repeats as one unit.
+/// One tile edit of the tile modal (Shift+T): `tile N` is a one-shot
+/// duplicate operation. `count` includes the source clip; each copy repeats
+/// the same window and shares its content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClipTileEdit {
     pub sel: ClipSel,
+    pub count: u32,
+    /// One copy's width (transient: used by the ghost preview only).
     pub span_ticks: u32,
-    pub period_ticks: u32,
 }
 
 /// Which axis a Grab / Duplicate is constrained to (Blender convention,
@@ -1154,39 +1155,10 @@ fn stretch_targets(
     )
 }
 
-/// Looks up a selected clip's content period (F-041). Audio clips have no
-/// repeat semantics, so they report `None`.
-fn clip_loop_len(
-    midi_tracks: &[MidiTrack],
-    midi_data: &[glitcherz_model::MidiData],
-    control_tracks: &[ControlTrack],
-    curve_data: &[glitcherz_model::CurveData],
-    sel: ClipSel,
-) -> Option<u32> {
-    match sel.lane {
-        TimelineLane::Control => control_tracks
-            .get(sel.track)?
-            .clips
-            .get(sel.clip)
-            .and_then(|clip| curve_data.get(clip.data as usize))
-            .map(|data| data.length_ticks.max(1)),
-        TimelineLane::Midi => midi_tracks
-            .get(sel.track)?
-            .clips
-            .get(sel.clip)
-            .and_then(|clip| midi_data.get(clip.data as usize))
-            .map(|data| data.length_ticks.max(1)),
-        TimelineLane::Audio => None,
-    }
-}
-
-/// The tile modal's per-clip edits (Shift+T / Alt+T). The pointer adds or
-/// removes whole repeats, one per period-width of travel:
-/// - a single-period clip tiles as a whole (period = its full length);
-/// - an ALREADY-TILED clip keeps its content period and the pointer just
-///   adjusts the repeat count — no nested tiling (2026-11-04).
-///   Until the pointer moves the clip keeps its exact armed span. `None`
-///   when the pointer is unavailable or the modal is not a Tile.
+/// The tile modal's per-clip edits (Shift+T). Dragging right adds copies, one
+/// per current clip width; dragging left removes them down to one. Until the
+/// pointer moves the armed clip stays a single copy. `None` when the pointer
+/// is unavailable or the modal is not a Tile.
 #[allow(clippy::too_many_arguments)]
 fn tile_targets(
     modal: &Modal,
@@ -1194,9 +1166,7 @@ fn tile_targets(
     px_per_bar: f32,
     bar_ticks: u32,
     midi_tracks: &[MidiTrack],
-    midi_data: &[glitcherz_model::MidiData],
     control_tracks: &[ControlTrack],
-    curve_data: &[glitcherz_model::CurveData],
     sec_per_tick: f64,
 ) -> Option<Vec<ClipTileEdit>> {
     if !matches!(modal.kind, ModalKind::Tile) {
@@ -1217,36 +1187,22 @@ fn tile_targets(
                 let (start, span) =
                     clip_geometry(midi_tracks, control_tracks, &[], sec_per_tick, *sel)?;
                 let span = span.max(1);
-                let period =
-                    clip_loop_len(midi_tracks, midi_data, control_tracks, curve_data, *sel)
-                        .unwrap_or(span)
-                        .clamp(1, span);
-                // The pointer adds/removes whole repeats, one per period-width
-                // of travel: a single-period clip tiles as a whole, an
-                // already-tiled clip just adjusts its repeat count (2026-11-04,
-                // no nested tiling). Until the pointer moves the clip keeps
-                // its exact armed span.
-                let span_ticks = if delta_bars == 0.0 {
-                    span
+                let step = if delta_bars == 0.0 {
+                    0.0
                 } else {
-                    let period_bars = (f64::from(period) / bar).max(f64::EPSILON);
-                    let base = (f64::from(span) / f64::from(period)).round().max(1.0);
-                    let step = (delta_bars.abs() / period_bars).floor();
-                    let repeats = if delta_bars > 0.0 {
-                        base + step
-                    } else {
-                        (base - step).max(1.0)
-                    };
-                    period.saturating_mul(repeats as u32)
+                    (delta_bars.abs() * bar / f64::from(span)).floor()
                 };
-                let room = f64::from(ARRANGEMENT_LIMIT_TICKS.saturating_sub(start).max(1))
-                    / f64::from(period.max(1));
-                let span_ticks =
-                    span_ticks.min((room.floor().max(1.0) as u32).saturating_mul(period));
+                let count = if delta_bars > 0.0 {
+                    1.0 + step
+                } else {
+                    (1.0 - step).max(1.0)
+                };
+                let room = (ARRANGEMENT_LIMIT_TICKS.saturating_sub(start) / span).max(1);
+                let count = (count as u32).clamp(1, room);
                 Some(ClipTileEdit {
                     sel: *sel,
-                    span_ticks,
-                    period_ticks: period,
+                    count,
+                    span_ticks: span,
                 })
             })
             .collect(),
@@ -2656,9 +2612,7 @@ pub fn show(
                                     px_per_bar,
                                     bar_ticks,
                                     midi_tracks,
-                                    p.midi_data,
                                     control_tracks,
-                                    p.curve_data,
                                     p.sec_per_tick,
                                 ) && !tiles.is_empty()
                                 {
@@ -2726,9 +2680,7 @@ pub fn show(
                         px_per_bar,
                         bar_ticks,
                         midi_tracks,
-                        p.midi_data,
                         control_tracks,
-                        p.curve_data,
                         p.sec_per_tick,
                     )
                     .map(|tiles| {
@@ -2746,8 +2698,8 @@ pub fn show(
                                     t.sel.lane,
                                     t.sel.track,
                                     start,
-                                    t.span_ticks,
-                                    Some(t.period_ticks),
+                                    t.span_ticks.saturating_mul(t.count),
+                                    Some(t.span_ticks),
                                 ))
                             })
                             .collect::<Vec<_>>()
@@ -5021,11 +4973,9 @@ mod tests {
         assert_eq!(clamp_row_delta(1, &[ctrl_top], 2, 1, 0), 0);
     }
 
-    /// 2026-11-04: the tile modal adds/removes whole repeats, one per
-    /// period-width of travel. A single-period clip tiles as a whole; an
-    /// already-tiled clip keeps its period and just adjusts the count.
+    /// F-041 M11: the tile modal counts copies, one per current clip width.
     #[test]
-    fn tile_targets_adjusts_repeats() {
+    fn tile_targets_counts_copies() {
         let clip = MidiClip {
             start_ticks: 0,
             span_ticks: 4 * TICKS_PER_BAR,
@@ -5044,43 +4994,28 @@ mod tests {
             }],
             grab: pos2(100.0, 100.0),
         };
-        let target = |dx_bars: f32, tracks: &[MidiTrack], data: &[glitcherz_model::MidiData]| {
+        let target = |dx_bars: f32, tracks: &[MidiTrack]| {
             tile_targets(
                 &modal,
                 Some(pos2(100.0 + dx_bars * 56.0, 100.0)),
                 56.0,
                 TICKS_PER_BAR,
                 tracks,
-                data,
-                &[],
                 &[],
                 SPT,
             )
             .unwrap()
         };
-        let four_bar = vec![glitcherz_model::MidiData {
-            length_ticks: 4 * TICKS_PER_BAR,
-            ..glitcherz_model::MidiData::default()
-        }];
-        // No movement: the ghost is the clip itself (×1).
-        let tiles = target(0.0, &midi, &four_bar);
-        assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
-        assert_eq!(tiles[0].period_ticks, 4 * TICKS_PER_BAR);
-        // Partial travel does not count until a full content width.
-        let tiles = target(2.0, &midi, &four_bar);
-        assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
-        // One content-width right: the whole clip repeats once (×2).
-        let tiles = target(4.0, &midi, &four_bar);
-        assert_eq!(tiles[0].span_ticks, 8 * TICKS_PER_BAR);
-        assert_eq!(tiles[0].period_ticks, 4 * TICKS_PER_BAR);
-        // Two content-widths: ×3.
-        let tiles = target(8.0, &midi, &four_bar);
-        assert_eq!(tiles[0].span_ticks, 12 * TICKS_PER_BAR);
-        // Left of the grab point never shrinks the clip.
-        let tiles = target(-3.0, &midi, &four_bar);
-        assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
+        // No movement: one copy (the clip itself).
+        assert_eq!(target(0.0, &midi)[0].count, 1);
+        // Partial travel does not count until a full clip width.
+        assert_eq!(target(2.0, &midi)[0].count, 1);
+        assert_eq!(target(4.0, &midi)[0].count, 2);
+        assert_eq!(target(8.0, &midi)[0].count, 3);
+        // Left of the grab point never drops below one copy.
+        assert_eq!(target(-3.0, &midi)[0].count, 1);
+        assert_eq!(target(4.0, &midi)[0].span_ticks, 4 * TICKS_PER_BAR);
 
-        // A single-bar window over single-bar content tiles into two repeats.
         let one_bar = vec![MidiTrack {
             clips: vec![MidiClip {
                 start_ticks: 0,
@@ -5089,29 +5024,7 @@ mod tests {
             }],
             ..MidiTrack::default()
         }];
-        let one_bar_data = vec![glitcherz_model::MidiData {
-            length_ticks: TICKS_PER_BAR,
-            ..glitcherz_model::MidiData::default()
-        }];
-        let tiles = target(1.0, &one_bar, &one_bar_data);
-        assert_eq!(tiles[0].span_ticks, 2 * TICKS_PER_BAR);
-        assert_eq!(tiles[0].period_ticks, TICKS_PER_BAR);
-
-        // An already-tiled window keeps its content period and only adjusts
-        // the repeat count — no nested tiling.
-        let two_bar = vec![glitcherz_model::MidiData {
-            length_ticks: 2 * TICKS_PER_BAR,
-            ..glitcherz_model::MidiData::default()
-        }];
-        let tiles = target(0.0, &midi, &two_bar);
-        assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
-        assert_eq!(tiles[0].period_ticks, 2 * TICKS_PER_BAR);
-        let tiles = target(4.0, &midi, &two_bar);
-        assert_eq!(tiles[0].span_ticks, 8 * TICKS_PER_BAR);
-        assert_eq!(tiles[0].period_ticks, 2 * TICKS_PER_BAR);
-        let tiles = target(-2.0, &midi, &two_bar);
-        assert_eq!(tiles[0].span_ticks, 2 * TICKS_PER_BAR);
-        assert_eq!(tiles[0].period_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(target(1.0, &one_bar)[0].count, 2);
     }
 
     /// F-041: a long window can be split; both halves share the content.

@@ -762,6 +762,31 @@ mod journal_tests {
         Session::new(project)
     }
 
+    /// F-041 M11: `clip.tile` appends contiguous copies that share one content
+    /// entry and store no tile count.
+    #[test]
+    fn clip_tile_appends_copies_sharing_data() {
+        let mut session = session_with_note();
+        session
+            .execute("clip.tile", &json!({ "track": 0, "clip": 0, "count": 3 }))
+            .unwrap();
+        let project = session.project();
+        let clips = &project.midi_tracks[0].clips;
+        assert_eq!(clips.len(), 3);
+        assert_eq!(
+            clips[1].start_ticks,
+            clips[0].start_ticks + clips[0].span_ticks
+        );
+        assert_eq!(
+            clips[2].start_ticks,
+            clips[0].start_ticks + 2 * clips[0].span_ticks
+        );
+        assert_eq!(clips[1].data, clips[0].data);
+        assert_eq!(clips[2].data, clips[0].data);
+        assert_eq!(project.midi_data_refs(clips[0].data), 3);
+        assert!(clips.iter().all(|clip| clip.loop_ticks.is_none()));
+    }
+
     /// F-041 M10: a note written past `length_ticks` grows the shared entry so
     /// the new content is audible inside the window.
     #[test]

@@ -41,6 +41,15 @@ pub fn specs() -> Vec<crate::CommandSpec> {
             always,
             unlink_data
         ),
+        crate::cmd!(
+            "clip.tile",
+            "Tile Clip",
+            ["Event", "Edit"],
+            None,
+            "{track, clip, count} → {clips, count}",
+            always,
+            tile
+        ),
     ]
 }
 
@@ -107,6 +116,43 @@ fn add(session: &mut Session, params: &Value) -> crate::Result<Value> {
         "loop_ticks": span,
     }))
 }
+/// F-041 M11: `tile N` is a one-shot duplicate operation. Appends `count - 1`
+/// copies that repeat the same window and share the content; nothing is
+/// grouped and no tile count is stored. Returns the appended clip indices.
+fn tile(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let track = i64_or(params, "track", 0).max(0) as usize;
+    let clip = i64_or(params, "clip", 0).max(0) as usize;
+    let count = i64_or(params, "count", 1).max(1) as u32;
+    let project = session.project_mut();
+    let Some(base) = project
+        .midi_tracks
+        .get(track)
+        .and_then(|t| t.clips.get(clip))
+        .cloned()
+    else {
+        return Err(bad_params(
+            "clip.tile",
+            format!("no clip {clip} on track {track}"),
+        ));
+    };
+    let Some(midi_track) = project.midi_tracks.get_mut(track) else {
+        return Err(bad_params("clip.tile", format!("no track {track}")));
+    };
+    let copies = (count.saturating_sub(1) as usize)
+        .min(MAX_CLIPS_PER_TRACK.saturating_sub(midi_track.clips.len()));
+    let first = midi_track.clips.len();
+    for k in 1..=copies {
+        let mut copy = base.clone();
+        copy.start_ticks = base
+            .start_ticks
+            .saturating_add(base.span_ticks.saturating_mul(k as u32));
+        copy.loop_ticks = None;
+        midi_track.clips.push(copy);
+    }
+    let clips: Vec<usize> = (first..first + copies).collect();
+    Ok(json!({ "clips": clips, "count": copies as u32 + 1 }))
+}
+
 /// Points one MIDI clip at another clip's shared content (F-041).
 fn link_data(session: &mut Session, params: &Value) -> crate::Result<Value> {
     let track = i64_or(params, "track", 0).max(0) as usize;

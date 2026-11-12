@@ -1518,58 +1518,105 @@ impl GlitcherZApp {
         }
     }
 
-    /// Tile-modal finalize: grows every clip's container to `span_ticks`
-    /// while the content period stays `loop_ticks` (the clip's armed
-    /// length), in ONE undo step. MIDI and control clips only; audio clips
-    /// have no repeat semantics.
+    /// F-041 M11: `tile N` is a one-shot duplicate operation. Existing clips stay
+    /// put; `count - 1` copies are appended, each repeating the same window and
+    /// sharing the content. The whole sequence (source + copies) is selected, but
+    /// nothing is grouped and no tile count is stored.
     pub(crate) fn timeline_tile_clips_batch(&mut self, tiles: Vec<timeline::ClipTileEdit>) {
         if tiles.is_empty() {
             return;
         }
         let before = self.begin_edit();
+        let mut new_sel = Vec::new();
         let mut touched = Vec::new();
         {
             let project = self.project_mut();
             for e in &tiles {
-                let changed = match e.sel.lane {
-                    timeline::TimelineLane::Control => project
-                        .control_tracks
-                        .get_mut(e.sel.track)
-                        .and_then(|t| t.clips.get_mut(e.sel.clip))
-                        .map(|c| {
-                            let new_span = e.span_ticks.max(1);
-                            let period = e.period_ticks.max(1);
-                            let changed = c.span_ticks != new_span || c.loop_ticks != Some(period);
-                            c.span_ticks = new_span;
-                            c.loop_ticks = Some(period);
-                            changed
-                        })
-                        .unwrap_or(false),
-                    timeline::TimelineLane::Midi => project
-                        .midi_tracks
-                        .get_mut(e.sel.track)
-                        .and_then(|t| t.clips.get_mut(e.sel.clip))
-                        .map(|c| {
-                            let new_span = e.span_ticks.max(1);
-                            let period = e.period_ticks.max(1);
-                            let changed = c.span_ticks != new_span || c.loop_ticks != Some(period);
-                            c.span_ticks = new_span;
-                            c.loop_ticks = Some(period);
-                            changed
-                        })
-                        .unwrap_or(false),
-                    timeline::TimelineLane::Audio => false,
-                };
-                if changed && !touched.contains(&(e.sel.lane, e.sel.track)) {
-                    touched.push((e.sel.lane, e.sel.track));
+                let copies_wanted = e.count.saturating_sub(1) as usize;
+                if copies_wanted == 0 {
+                    continue;
+                }
+                match e.sel.lane {
+                    timeline::TimelineLane::Control => {
+                        let Some(base) = project
+                            .control_tracks
+                            .get(e.sel.track)
+                            .and_then(|t| t.clips.get(e.sel.clip))
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        let Some(track) = project.control_tracks.get_mut(e.sel.track) else {
+                            continue;
+                        };
+                        let copies = copies_wanted
+                            .min(MAX_CLIPS_PER_TRACK.saturating_sub(track.clips.len()));
+                        for k in 1..=copies {
+                            let mut copy = base.clone();
+                            copy.start_ticks = base
+                                .start_ticks
+                                .saturating_add(base.span_ticks.saturating_mul(k as u32));
+                            copy.loop_ticks = None;
+                            let index = track.clips.len();
+                            track.clips.push(copy);
+                            new_sel.push(timeline::ClipSel {
+                                lane: timeline::TimelineLane::Control,
+                                track: e.sel.track,
+                                clip: index,
+                            });
+                        }
+                        if copies > 0
+                            && !touched.contains(&(timeline::TimelineLane::Control, e.sel.track))
+                        {
+                            touched.push((timeline::TimelineLane::Control, e.sel.track));
+                        }
+                    }
+                    timeline::TimelineLane::Midi => {
+                        let Some(base) = project
+                            .midi_tracks
+                            .get(e.sel.track)
+                            .and_then(|t| t.clips.get(e.sel.clip))
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        let Some(track) = project.midi_tracks.get_mut(e.sel.track) else {
+                            continue;
+                        };
+                        let copies = copies_wanted
+                            .min(MAX_CLIPS_PER_TRACK.saturating_sub(track.clips.len()));
+                        for k in 1..=copies {
+                            let mut copy = base.clone();
+                            copy.start_ticks = base
+                                .start_ticks
+                                .saturating_add(base.span_ticks.saturating_mul(k as u32));
+                            copy.loop_ticks = None;
+                            let index = track.clips.len();
+                            track.clips.push(copy);
+                            new_sel.push(timeline::ClipSel {
+                                lane: timeline::TimelineLane::Midi,
+                                track: e.sel.track,
+                                clip: index,
+                            });
+                        }
+                        if copies > 0
+                            && !touched.contains(&(timeline::TimelineLane::Midi, e.sel.track))
+                        {
+                            touched.push((timeline::TimelineLane::Midi, e.sel.track));
+                        }
+                    }
+                    timeline::TimelineLane::Audio => {}
                 }
             }
         }
-        if !touched.is_empty() {
+        if !new_sel.is_empty() {
             self.commit_edit("Tile Clips", before);
             for (lane, track) in touched {
                 self.sync_clip_row(lane, track);
             }
+            let mut selection: Vec<timeline::ClipSel> = tiles.iter().map(|edit| edit.sel).collect();
+            selection.extend(new_sel);
+            self.timeline_state.selection = selection;
         }
     }
 
