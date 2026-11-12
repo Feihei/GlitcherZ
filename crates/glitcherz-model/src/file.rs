@@ -362,20 +362,16 @@ mod tests {
         assert_eq!(orphan, 1);
         assert_eq!(project.midi_data.len(), 2);
 
-        let path = std::env::temp_dir().join(format!(
-            "glitcherz_compact_save_{}.glz",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("glitcherz_compact_save_{}.glz", std::process::id()));
         save_project(&project, &path).expect("save failed");
         let loaded = load_project(&path).expect("load failed");
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded.midi_data.len(), 1, "orphan must not reach the file");
         assert_eq!(loaded.midi_tracks[0].clips[0].data, 0);
 
-        let path = std::env::temp_dir().join(format!(
-            "glitcherz_compact_auto_{}.glz",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("glitcherz_compact_auto_{}.glz", std::process::id()));
         save_autosave(&project, &path).expect("autosave failed");
         let loaded = load_project(&path).expect("load autosave failed");
         let _ = std::fs::remove_file(&path);
