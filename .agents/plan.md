@@ -20,7 +20,7 @@
 路线图 1–10 全部落地；基础功能、节点图、MIDI 编辑、插件宿主、可用性（U 系列）、录音（R 系列）、内建效果器（E 系列）、声源扩展（Y / Z / B 系列）与交互打磨（I 系列）均已交付。已完成系列的设计与实现位置见下方「历史系列索引」——本文件不再逐项记录它们的实施细节。
 
 - **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）；命令词汇表（F-039）V1a / V1b-1 / V1b-2 / V2 / V3 **全部交付**；剪贴板（F-040）C1–C2 已交付（2026-11-11）；clip 与数据分离（F-041）M1–M6 已交付（2026-11-11），2026-11-12 M8 修订（`repeat` 标记 + 复制键位）。
-- **下一步候选**：无固定下一项；未完成项见下方列表（用户表导入 / 安全边界）。
+- **下一步候选**：F-041 review 续作（M9 → M10 → M11，spec §13 已定稿、未实施）；其余未完成项见下方列表（用户表导入 / 安全边界）。
 - **门禁**：`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`，在本机沙箱外跑（沙箱内 cargo 会毒化 `target/debug/incremental`）。
 
 ## 未完成项
@@ -85,8 +85,11 @@ Spec：`spec/clip-data-instances.md`（D1–D17）。
 | **M6** UI 入口（2026-11-11 交付） | header 徽章 + Inspector clip 区块 + Edit 头 + `Shift+D` / `Alt+D` + `clip.link_data` / `clip.unlink_data` + 文档 | M4、M5 | 中 |
 | **M7** 数据面板（可选） | 池浏览 / 命名 / 批量替换引用 | M6 | 大 |
 | **M8** 修订（2026-11-12 交付） | `repeat` 标记 + v12→v13 迁移 + 引擎/预览非循环尾部静默 + 复制键位交换（Shift+D 独立 / Alt+D 共享） | M6 | 中 |
+| **M9** 收敛补口（review 待实施） | `sync_clip_data` + 调用点；保存 temp compact；批量复制 / 拉伸按 data 分组 COW；`Link Data` 按原 data 分组合并；同轨 `Shift` 区间选择；无文件迁移 | M8 | 中 |
+| **M10** 窗口内嵌 + T 纯窗口（review 待实施） | clip 内嵌 `source_offset: i64` / `repeat` → `loop_ticks`（不拆 window 池）；单轨上限 32 → 128 + `Box` 载荷；T 纯窗口 + 写时增长；一次 v13→v14 迁移；零回归门禁 | M9 | 中 |
+| **M11** tile N 操作（review 待实施） | `Shift+T` 一次性生成 N 份紧密相邻 clip（窗口字段各自一份、共享 data），不记录份数、不识别已有序列；无 `TileSpec` / explode；`K` 即普通 split；`clip.tile` | M10 | 中 |
 
-顺序：**M1 → M2 → M3 → M4 / M5（可并行）→ M6 → M7**。
+顺序：**M1 → M2 → M3 → M4 / M5（可并行）→ M6 → M7**；review 续作 **M9 → M10 → M11**，M9 可单独先交付，M10 与 M11 之间不插其它文件格式变更。
 
 ### 验收门禁
 
@@ -102,6 +105,18 @@ Spec：`spec/clip-data-instances.md`（D1–D17）。
 - 音频媒体池 / 共享裁剪窗口（`path` 共享已足够）。
 - Blender 式 fake user / 持久化多用户计数。
 - 播放中实时切换 data（链接后重建 clip 表即可）。
+
+### 2026-11-12 review 续作（M9–M11）
+
+用户提出目标形态：保存 `events data1 / data2 / audio url`，clip 引用 data 并记录窗口，tile 引用 clip 并记录重复次数。随后补充两点：① tile 上切刀只允许在周期间切，切开后成为两个 tile，单周期段自动退化成普通 clip；② 更倾向**放弃 tile 类型**，改为 `tile N` 操作（紧密复制 N 份、数据关联、不合成整体）。
+
+结论：方向成立，并最终收敛为**两层结构**：只保留 `data` 池，`source_offset` / `span` / `loop` 直接内嵌在 clip 上，clip 间只共享 data。tile 进一步收敛为**操作**而不是类型：`tile N` 把当前 clip 紧密复制 N 份（窗口字段各自一份、共享 data），因此不需要 `window` 池、`TileSpec` / `explode`，`K` 切刀与单周期退化自动成立。
+
+- **M9** 先修真实 bug（跨轨共享不同步、孤儿写盘、组复制拆共享），不动文件格式；
+- **M10** 一次性完成窗口字段内嵌（`source_offset: i64`、`repeat → loop_ticks`，不拆 window 池）、T 纯窗口 + 写时增长，并做**唯一一次** v13→v14 迁移（旧平铺整数倍展开成 N 个 clip）；
+- **M11** 才做 `tile N` 操作（生成 / 增减序列、槽位上限、`clip.tile`）；`K` 是普通 split，不需要特判。
+
+音频继续不动：`path` 天然共享，秒级窗口已符合「数据 / 窗口 / 放置」形状，不纳入本续作。
 
 ## 剪贴板与复制粘贴（F-040，2026-11-11 立项）
 

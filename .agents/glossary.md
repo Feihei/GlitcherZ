@@ -109,8 +109,13 @@
 | 待录轨 | armed track | **已退役**（D22 取代 D16）；旧语义 = 录制开始时的当前选中 MIDI 轨。新代码不要再造这个词 |
 | 录音片段 | take | 一次录音产出的 clip；一次 take = 一个 undo 步（D15） |
 | 录音素材目录 | media directory | 工程旁的 `<stem>.media/`，clip 存相对路径（D11） |
-| 片段 | clip | 钢琴卷帘编辑的音符集合 |
+| 片段 | clip | 历史统称：时间轴上的一个块；内部同时持有窗口字段与放置字段，不拆类型，UI 文案仍说 clip |
 | 片段静音 | clip mute | clip 的 `muted` 标志：调度层跳过该片段（不发声 / 不投递自动化），位置、长度、内容不变；与 Mixer 的轨静音（track mute）是两个层级 |
+| 内容数据 | clip data | 池条目（`MidiData` / `CurveData`），与位置无关；多个 clip 可共享（F-041） |
+| 窗口 | clip window | clip 上的可播放区间：`data` + `source_offset` + `span` + `loop`；私有字段，不跨 clip 共享 |
+| 放置 | clip placement | 概念层：clip 的时间轴位置与组织字段（`start_ticks` + `group` / `muted` / `name`）；与窗口一起内嵌在同一 clip |
+| 平铺 N 次 | tile N | 操作工具，不是类型：把当前 clip 紧密复制 N 份（窗口字段各自一份、共享 data），生成 N 个普通 clip；一次性操作，不记录份数、不自动 group（M11） |
+| 区间选择 | range select | 同轨内单击设锚点、`Shift` + 单击另一 clip 选中两者之间全部 clip；跨轨退化为单选（M9） |
 | 恢复（静音） | reveal | `Alt+H`：把全编曲里所有 muted 片段清回可发声（Blender 的 reveal-all）；不要写成 unlock（"锁定"只由 ghost 表达） |
 | 音符 | note | MIDI 音符；音名如 `A4` |
 | 延音尾 | gate tail | 音符 off 事件前的延续播放（pending off 机制）；项目级"音长 gate"已随 Steps 退役，音符收尾用自身 length |
