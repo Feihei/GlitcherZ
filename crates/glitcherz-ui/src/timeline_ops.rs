@@ -2811,7 +2811,10 @@ mod tests {
         ));
         assert_eq!(project.midi_tracks[0].clips[0].data, a);
         assert_eq!(project.midi_tracks[0].clips[1].data, a);
-        assert_eq!(project.midi_data[a as usize].length_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(
+            project.midi_data[a as usize].length_ticks,
+            2 * TICKS_PER_BAR
+        );
         assert_eq!(project.midi_data[old as usize].length_ticks, TICKS_PER_BAR);
     }
 
