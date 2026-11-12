@@ -739,7 +739,7 @@ impl GlitcherZApp {
             ),
         };
         if result.is_ok() {
-            self.send_track_clips(track);
+            self.sync_midi_data_of(track, clip);
         } else if let Err(error) = result {
             self.set_message(format!("Edit failed: {error}"));
         }
@@ -1173,7 +1173,7 @@ impl GlitcherZApp {
             self.roll_state.selection.clear();
         }
         if result.is_ok() {
-            self.send_track_clips(track);
+            self.sync_midi_data_of(track, clip);
         } else if let Err(error) = result {
             self.set_message(format!("Edit failed: {error}"));
         }

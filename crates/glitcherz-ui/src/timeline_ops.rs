@@ -181,8 +181,8 @@ impl GlitcherZApp {
     /// Applies one timeline view action (engine pushes / cross-panel state).
     pub(crate) fn apply_timeline_action(&mut self, action: timeline::TimelineAction) {
         match action {
-            timeline::TimelineAction::MidiEdited(track) => self.send_track_clips(track),
-            timeline::TimelineAction::ControlEdited(index) => self.send_control_clips(index),
+            timeline::TimelineAction::MidiEdited(track) => self.sync_midi_track_data(track),
+            timeline::TimelineAction::ControlEdited(index) => self.sync_curve_track_data(index),
             timeline::TimelineAction::AudioEdited(track) => self.send_audio_clips_for_track(track),
             // Selecting a track row no longer closes the editor: the Edit tab
             // follows the **clip** selection, which this action does not touch.
@@ -1976,6 +1976,84 @@ impl GlitcherZApp {
             timeline::TimelineLane::Control => self.send_control_clips(index),
             timeline::TimelineLane::Audio => self.send_audio_clips_for_track(index),
             timeline::TimelineLane::Midi => self.send_track_clips(index),
+        }
+    }
+
+    /// F-041 M9: re-push every MIDI track that shares `data`.
+    ///
+    /// This is the only correct push after a content edit: the edited track
+    /// alone is not enough once another track references the same pool entry.
+    pub(crate) fn sync_midi_data(&mut self, data: u32) {
+        let tracks: Vec<usize> = self
+            .project()
+            .midi_tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, track)| track.clips.iter().any(|clip| clip.data == data))
+            .map(|(index, _)| index)
+            .collect();
+        for track in tracks {
+            self.send_track_clips(track);
+        }
+    }
+
+    /// F-041 M9: re-push every control track that shares `data`.
+    pub(crate) fn sync_curve_data(&mut self, data: u32) {
+        let tracks: Vec<usize> = self
+            .project()
+            .control_tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, track)| track.clips.iter().any(|clip| clip.data == data))
+            .map(|(index, _)| index)
+            .collect();
+        for index in tracks {
+            self.send_control_clips(index);
+        }
+    }
+
+    /// Re-pushes the content of `(track, clip)` and every other clip that
+    /// shares its pool entry.
+    pub(crate) fn sync_midi_data_of(&mut self, track: usize, clip: usize) {
+        let Some(data) = self
+            .project()
+            .midi_tracks
+            .get(track)
+            .and_then(|t| t.clips.get(clip))
+            .map(|clip| clip.data)
+        else {
+            return;
+        };
+        self.sync_midi_data(data);
+    }
+
+    /// Re-pushes every MIDI track sharing any content with `track`'s clips.
+    pub(crate) fn sync_midi_track_data(&mut self, track: usize) {
+        let mut datas: Vec<u32> = Vec::new();
+        if let Some(source) = self.project().midi_tracks.get(track) {
+            for clip in &source.clips {
+                if !datas.contains(&clip.data) {
+                    datas.push(clip.data);
+                }
+            }
+        }
+        for data in datas {
+            self.sync_midi_data(data);
+        }
+    }
+
+    /// Re-pushes every control track sharing any content with `track`'s clips.
+    pub(crate) fn sync_curve_track_data(&mut self, track: usize) {
+        let mut datas: Vec<u32> = Vec::new();
+        if let Some(source) = self.project().control_tracks.get(track) {
+            for clip in &source.clips {
+                if !datas.contains(&clip.data) {
+                    datas.push(clip.data);
+                }
+            }
+        }
+        for data in datas {
+            self.sync_curve_data(data);
         }
     }
 

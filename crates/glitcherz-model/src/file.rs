@@ -143,10 +143,14 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), ModelError> {
 /// because the new file is already durable by then.
 pub fn save_project(project: &Project, path: &Path) -> Result<(), ModelError> {
     project.validate().map_err(ModelError::InvalidGraph)?;
+    // F-041 M9: unreferenced pool entries never reach the file. Only the
+    // serialized copy is compacted; the in-memory pool keeps its indices.
+    let mut snapshot = project.clone();
+    snapshot.compact_clip_data();
     let text = ron::ser::to_string_pretty(
         &ProjectFileRef {
             version: PROJECT_VERSION,
-            project,
+            project: &snapshot,
         },
         ron::ser::PrettyConfig::new(),
     )?;
@@ -165,10 +169,14 @@ pub fn save_project(project: &Project, path: &Path) -> Result<(), ModelError> {
 /// because losing the user's work is the worse failure. The recovery path
 /// still validates on load, so an unreadable snapshot fails loudly there.
 pub fn save_autosave(project: &Project, path: &Path) -> Result<(), ModelError> {
+    // F-041 M9: same compact-on-write rule as `save_project`; recovery must
+    // not resurrect orphan pool entries either.
+    let mut snapshot = project.clone();
+    snapshot.compact_clip_data();
     let text = ron::ser::to_string_pretty(
         &ProjectFileRef {
             version: PROJECT_VERSION,
-            project,
+            project: &snapshot,
         },
         ron::ser::PrettyConfig::new(),
     )?;
@@ -342,6 +350,43 @@ mod tests {
             project, loaded,
             "save→load should fully restore the project"
         );
+    }
+
+    /// F-041 M9: orphan pool entries are unreachable from the document, so the
+    /// save path compacts a temporary copy before serializing. The in-memory
+    /// pool is untouched; only the written file drops them.
+    #[test]
+    fn save_and_autosave_drop_orphan_pool_entries() {
+        let mut project = demo_project();
+        let orphan = project.push_midi_data(crate::MidiData::default());
+        assert_eq!(orphan, 1);
+        assert_eq!(project.midi_data.len(), 2);
+
+        let path = std::env::temp_dir().join(format!(
+            "glitcherz_compact_save_{}.glz",
+            std::process::id()
+        ));
+        save_project(&project, &path).expect("save failed");
+        let loaded = load_project(&path).expect("load failed");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.midi_data.len(), 1, "orphan must not reach the file");
+        assert_eq!(loaded.midi_tracks[0].clips[0].data, 0);
+
+        let path = std::env::temp_dir().join(format!(
+            "glitcherz_compact_auto_{}.glz",
+            std::process::id()
+        ));
+        save_autosave(&project, &path).expect("autosave failed");
+        let loaded = load_project(&path).expect("load autosave failed");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            loaded.midi_data.len(),
+            1,
+            "orphan must not reach the autosave"
+        );
+
+        // The live document still holds the orphan: compaction is write-only.
+        assert_eq!(project.midi_data.len(), 2);
     }
 
     /// U3b: a tempo cable (control track → the fixed Timeline In terminal)
