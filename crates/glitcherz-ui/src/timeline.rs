@@ -138,13 +138,13 @@ pub struct ClipSpanEdit {
 }
 
 /// One tile edit of the tile modal (Shift+T / Alt+T): the container grows to
-/// `span_ticks` while the content period stays `loop_ticks` — the clip's
+/// `span_ticks` while the content period stays `period_ticks` — the clip's
 /// full length at arm time, so the WHOLE clip repeats as one unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClipTileEdit {
     pub sel: ClipSel,
     pub span_ticks: u32,
-    pub loop_ticks: u32,
+    pub period_ticks: u32,
 }
 
 /// Which axis a Grab / Duplicate is constrained to (Blender convention,
@@ -302,6 +302,8 @@ pub struct TimelineState {
     drag: Option<Drag>,
     /// Selected clips across tracks (M4b).
     pub selection: Vec<ClipSel>,
+    /// Anchor of same-track Shift range selection (F-041 M9).
+    pub selection_anchor: Option<ClipSel>,
     /// Rubber band in progress.
     marquee: Option<Marquee>,
     /// Set by the row that sees `drag_stopped` while a band is live; the
@@ -395,6 +397,7 @@ impl Default for TimelineState {
             row_zoom: 1.0,
             drag: None,
             selection: Vec::new(),
+            selection_anchor: None,
             marquee: None,
             marquee_ending: false,
             had_focus: false,
@@ -1243,7 +1246,7 @@ fn tile_targets(
                 Some(ClipTileEdit {
                     sel: *sel,
                     span_ticks,
-                    loop_ticks: period,
+                    period_ticks: period,
                 })
             })
             .collect(),
@@ -2744,7 +2747,7 @@ pub fn show(
                                     t.sel.track,
                                     start,
                                     t.span_ticks,
-                                    Some(t.loop_ticks),
+                                    Some(t.period_ticks),
                                 ))
                             })
                             .collect::<Vec<_>>()
@@ -3031,6 +3034,72 @@ fn track_header_cell(
 }
 
 /// One row: header cell + clip lane (grid, clips, playhead, interactions).
+#[allow(clippy::too_many_arguments)]
+/// F-041 M9: applies a clip click to the selection.
+///
+/// A plain click selects (or keeps a multi-selection if the clip is already
+/// in it); `Ctrl` toggles; `Shift` selects the same-track span between the
+/// anchor and the clicked clip, ordered by start tick. A cross-track `Shift`
+/// falls back to a single clip.
+fn select_clip_click<T: Placement>(
+    state: &mut TimelineState,
+    clips: &[T],
+    lane: TimelineLane,
+    track: usize,
+    index: usize,
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+) {
+    state.break_group = alt;
+    let sel = ClipSel {
+        lane,
+        track,
+        clip: index,
+    };
+
+    if shift && !ctrl {
+        let anchor = state
+            .selection_anchor
+            .filter(|anchor| anchor.lane == lane && anchor.track == track);
+        let Some(anchor) = anchor else {
+            state.selection = vec![sel];
+            state.selection_anchor = Some(sel);
+            return;
+        };
+        let mut order: Vec<usize> = (0..clips.len()).collect();
+        order.sort_by_key(|&clip| clips[clip].start());
+        let from = order.iter().position(|&clip| clip == anchor.clip);
+        let to = order.iter().position(|&clip| clip == index);
+        if let (Some(from), Some(to)) = (from, to) {
+            let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+            state.selection = order[lo..=hi]
+                .iter()
+                .map(|&clip| ClipSel { lane, track, clip })
+                .collect();
+            return;
+        }
+        state.selection = vec![sel];
+        state.selection_anchor = Some(sel);
+        return;
+    }
+
+    if ctrl {
+        if let Some(at) = state.selection.iter().position(|other| *other == sel) {
+            state.selection.remove(at);
+        } else {
+            state.selection.push(sel);
+        }
+        state.selection_anchor = Some(sel);
+        return;
+    }
+
+    if !state.selection.contains(&sel) {
+        state.selection = vec![sel];
+    }
+    state.selection_anchor = Some(sel);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lane_row<T: Placement>(
     parent: &mut egui::Ui,
@@ -3640,25 +3709,12 @@ fn lane_row<T: Placement>(
         if let Some(pos) = press {
             let tick = tick_at(pos.x);
             if let Some(index) = hit_clip(clips, tick, sec_per_tick) {
-                let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                let shift = ui.ctx().input(|i| i.modifiers.shift);
+                let ctrl = ui.ctx().input(|i| i.modifiers.ctrl);
                 // W3b: `Alt` picks this one clip out of its group (the
                 // expansion at the end of show() is skipped while it holds).
                 let alt = ui.ctx().input(|i| i.modifiers.alt);
-                state.break_group = alt;
-                let sel = ClipSel {
-                    lane: lane_kind,
-                    track,
-                    clip: index,
-                };
-                if additive {
-                    if let Some(at) = state.selection.iter().position(|s| *s == sel) {
-                        state.selection.remove(at);
-                    } else {
-                        state.selection.push(sel);
-                    }
-                } else if !state.selection.contains(&sel) {
-                    state.selection = vec![sel];
-                }
+                select_clip_click(state, clips, lane_kind, track, index, shift, ctrl, alt);
                 let origin_start = clips[index].start();
                 let origin_span = clips[index].span(sec_per_tick);
 
@@ -3695,6 +3751,7 @@ fn lane_row<T: Placement>(
                 let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
                 // A fresh band starts from group-expanded semantics.
                 state.break_group = false;
+                state.selection_anchor = None;
                 state.marquee = Some(Marquee {
                     origin: pos,
                     current: pos,
@@ -3855,28 +3912,19 @@ fn lane_row<T: Placement>(
         && state.modal.is_none()
     {
         if let Some(pos) = response.interact_pointer_pos() {
-            let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
+            let shift = ui.ctx().input(|i| i.modifiers.shift);
+            let ctrl = ui.ctx().input(|i| i.modifiers.ctrl);
             // W3b: Alt keeps the selection on the clicked clip only.
             state.break_group = ui.ctx().input(|i| i.modifiers.alt);
             match hit_clip(clips, tick_at(pos.x), sec_per_tick) {
                 Some(index) => {
-                    let sel = ClipSel {
-                        lane: lane_kind,
-                        track,
-                        clip: index,
-                    };
-                    if additive {
-                        if let Some(at) = state.selection.iter().position(|s| *s == sel) {
-                            state.selection.remove(at);
-                        } else {
-                            state.selection.push(sel);
-                        }
-                    } else if !state.selection.contains(&sel) {
-                        state.selection = vec![sel];
-                    }
+                    select_clip_click(state, clips, lane_kind, track, index, shift, ctrl, false);
                 }
-                None if additive => {}
-                None => state.selection.clear(),
+                None if shift || ctrl => {}
+                None => {
+                    state.selection.clear();
+                    state.selection_anchor = None;
+                }
             }
         }
     }
@@ -4686,7 +4734,7 @@ mod tests {
     use super::*;
     // The tests lock the 4/4 behavior: bar_ticks is the document's meter in
     // production, the constant is the 4/4 case they exercise.
-    use glitcherz_model::{AutoPoint, MeterMarker, Note, TICKS_PER_BAR, TimeSignature};
+    use glitcherz_model::{AutoPoint, MeterMarker, MidiClip, Note, TICKS_PER_BAR, TimeSignature};
 
     /// A single-segment meter at `(numerator, denominator)` (Met M4).
     fn meter(signature: (u8, u8)) -> MeterMap {
@@ -4696,6 +4744,65 @@ mod tests {
     /// Seconds per tick at 120 BPM / 960 PPQ — the base-tempo conversion the
     /// placement helpers take (U11 D3); MIDI/control clips ignore it.
     const SPT: f64 = 60.0 / (120.0 * 960.0);
+
+    /// F-041 M9: Shift-click selects the same-track span between the anchor
+    /// and the clicked clip, ordered by start tick rather than clip index.
+    #[test]
+    fn shift_click_selects_a_same_track_range() {
+        let lane = TimelineLane::Midi;
+        let mut state = TimelineState::default();
+        let mut clips = vec![MidiClip::default(); 4];
+        // Deliberately out of start order: 3, 1, 2, 0 bars.
+        clips[0].start_ticks = 3 * TICKS_PER_BAR;
+        clips[1].start_ticks = TICKS_PER_BAR;
+        clips[2].start_ticks = 2 * TICKS_PER_BAR;
+        clips[3].start_ticks = 0;
+
+        select_clip_click(&mut state, &clips, lane, 0, 1, false, false, false);
+        assert_eq!(
+            state.selection,
+            vec![ClipSel {
+                lane,
+                track: 0,
+                clip: 1
+            }]
+        );
+
+        select_clip_click(&mut state, &clips, lane, 0, 0, true, false, false);
+        let picked: Vec<usize> = state.selection.iter().map(|sel| sel.clip).collect();
+        assert_eq!(picked, vec![1, 2, 0], "start order, anchor..clicked");
+
+        // A cross-track Shift falls back to a single clip.
+        select_clip_click(&mut state, &clips, lane, 1, 3, true, false, false);
+        assert_eq!(
+            state.selection,
+            vec![ClipSel {
+                lane,
+                track: 1,
+                clip: 3
+            }]
+        );
+    }
+
+    /// Ctrl keeps toggling one clip at a time (the pre-M9 behavior).
+    #[test]
+    fn ctrl_click_toggles_a_single_clip() {
+        let lane = TimelineLane::Midi;
+        let mut state = TimelineState::default();
+        let clips = vec![MidiClip::default(); 3];
+        select_clip_click(&mut state, &clips, lane, 0, 0, false, false, false);
+        select_clip_click(&mut state, &clips, lane, 0, 1, false, true, false);
+        assert_eq!(state.selection.len(), 2);
+        select_clip_click(&mut state, &clips, lane, 0, 0, false, true, false);
+        assert_eq!(
+            state.selection,
+            vec![ClipSel {
+                lane,
+                track: 0,
+                clip: 1
+            }]
+        );
+    }
 
     /// I6: the head-trim start is bar-snapped, never moves left of the drag
     /// origin (no leftwards extension without a content offset), and always
@@ -4951,14 +5058,14 @@ mod tests {
         // No movement: the ghost is the clip itself (×1).
         let tiles = target(0.0, &midi, &four_bar);
         assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
-        assert_eq!(tiles[0].loop_ticks, 4 * TICKS_PER_BAR);
+        assert_eq!(tiles[0].period_ticks, 4 * TICKS_PER_BAR);
         // Partial travel does not count until a full content width.
         let tiles = target(2.0, &midi, &four_bar);
         assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
         // One content-width right: the whole clip repeats once (×2).
         let tiles = target(4.0, &midi, &four_bar);
         assert_eq!(tiles[0].span_ticks, 8 * TICKS_PER_BAR);
-        assert_eq!(tiles[0].loop_ticks, 4 * TICKS_PER_BAR);
+        assert_eq!(tiles[0].period_ticks, 4 * TICKS_PER_BAR);
         // Two content-widths: ×3.
         let tiles = target(8.0, &midi, &four_bar);
         assert_eq!(tiles[0].span_ticks, 12 * TICKS_PER_BAR);
@@ -4981,7 +5088,7 @@ mod tests {
         }];
         let tiles = target(1.0, &one_bar, &one_bar_data);
         assert_eq!(tiles[0].span_ticks, 2 * TICKS_PER_BAR);
-        assert_eq!(tiles[0].loop_ticks, TICKS_PER_BAR);
+        assert_eq!(tiles[0].period_ticks, TICKS_PER_BAR);
 
         // An already-tiled window keeps its content period and only adjusts
         // the repeat count — no nested tiling.
@@ -4991,13 +5098,13 @@ mod tests {
         }];
         let tiles = target(0.0, &midi, &two_bar);
         assert_eq!(tiles[0].span_ticks, 4 * TICKS_PER_BAR);
-        assert_eq!(tiles[0].loop_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(tiles[0].period_ticks, 2 * TICKS_PER_BAR);
         let tiles = target(4.0, &midi, &two_bar);
         assert_eq!(tiles[0].span_ticks, 8 * TICKS_PER_BAR);
-        assert_eq!(tiles[0].loop_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(tiles[0].period_ticks, 2 * TICKS_PER_BAR);
         let tiles = target(-2.0, &midi, &two_bar);
         assert_eq!(tiles[0].span_ticks, 2 * TICKS_PER_BAR);
-        assert_eq!(tiles[0].loop_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(tiles[0].period_ticks, 2 * TICKS_PER_BAR);
     }
 
     /// F-041: a long window can be split; both halves share the content.

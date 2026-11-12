@@ -487,7 +487,7 @@ fn alt_t_click_confirms_tile_after_pointer_returns() {
         .iter()
         .filter_map(|a| match a {
             glitcherz_ui::timeline::TimelineAction::TileClipsBatch { tiles } => {
-                Some((tiles[0].span_ticks, tiles[0].loop_ticks))
+                Some((tiles[0].span_ticks, tiles[0].period_ticks))
             }
             _ => None,
         })
@@ -554,7 +554,7 @@ fn alt_t_works_right_after_a_confirmed_stretch() {
         .iter()
         .filter_map(|a| match a {
             glitcherz_ui::timeline::TimelineAction::TileClipsBatch { tiles } => {
-                Some((tiles[0].span_ticks, tiles[0].loop_ticks))
+                Some((tiles[0].span_ticks, tiles[0].period_ticks))
             }
             _ => None,
         })
