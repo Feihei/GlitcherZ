@@ -87,7 +87,7 @@ Spec：`spec/clip-data-instances.md`（D1–D17）。
 | **M8** 修订（2026-11-12 交付） | `repeat` 标记 + v12→v13 迁移 + 引擎/预览非循环尾部静默 + 复制键位交换（Shift+D 独立 / Alt+D 共享） | M6 | 中 |
 | **M9** 收敛补口（2026-11-12 交付） | `sync_clip_data` + 调用点；保存 temp compact；批量复制 / 拉伸 / Unlink 按 data 分组；`Link Data` 显式合并；同轨 `Shift` 区间选择；无文件迁移 | M8 | 中 |
 | **M10** 窗口内嵌 + T 纯窗口（2026-11-12 交付） | clip 内嵌 `source_offset: i64` / `loop_ticks: Option<u32>`（不拆 window 池）；单轨上限 32 → 128 + `Box` 载荷；T / 拖边纯窗口 + 写时增长；一次 v13→v14 迁移；零回归门禁 | M9 | 中 |
-| **M11** tile N 操作（review 待实施） | `Shift+T` 一次性生成 N 份紧密相邻 clip（窗口字段各自一份、共享 data），不记录份数、不识别已有序列；无 `TileSpec` / explode；`K` 即普通 split；`clip.tile` | M10 | 中 |
+| **M11** tile N 操作（2026-11-12 交付） | `Shift+T` 一次性生成 N 份紧密相邻 clip（窗口字段各自一份、共享 data），不记录份数、不识别已有序列；无 `TileSpec` / explode；`K` 即普通 split；`clip.tile` | M10 | 中 |
 
 顺序：**M1 → M2 → M3 → M4 / M5（可并行）→ M6 → M7**；review 续作 **M9 → M10 → M11**，M9 可单独先交付，M10 与 M11 之间不插其它文件格式变更。
 

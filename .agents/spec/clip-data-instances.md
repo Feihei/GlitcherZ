@@ -1,7 +1,7 @@
 # clip 与数据分离（数据池 + 实例引用）
 
 > ID: F-041 · 域: EDIT / PROJ / ENGINE
-> 状态：M1–M6 已交付（2026-11-11）；2026-11-12 修订 T / 复制语义；2026-11-12 review 续作 **M9 / M10 已交付**（窗口内嵌 clip、`loop` 周期、`source_offset: i64`、T 纯窗口 + 写时增长、128 上限、v14 迁移），**M11（tile N）待实施**，设计见 §13
+> 状态：M1–M6 已交付（2026-11-11）；2026-11-12 修订 T / 复制语义；2026-11-12 review 续作 **M9 / M10 / M11 已交付**（窗口内嵌 clip、`loop` 周期、`source_offset: i64`、T 纯窗口 + 写时增长、128 上限、v14 迁移、`tile N` 一次性复制），设计见 §13
 > 关联：`timeline.md`（D14 / D15 / D31 / D32 / D33）、`editing-model.md`、`audio-trim.md`（D1 是同一形状的先例）、`clipboard.md`（F-040 快照需随之扩展）、`roll-multiclip.md`
 
 ## 1. 问题
