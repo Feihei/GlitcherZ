@@ -202,11 +202,12 @@ pub struct RtControlClip {
     pub source_offset: u32,
     /// How long the clip stays active (in ticks).
     pub span_ticks: u32,
-    /// Content length (in ticks); a longer window loops only when `repeat` is set
+    /// Content length (in ticks); a plain window goes silent past it
     /// (F-041 revision).
     pub length_ticks: u32,
-    /// Whether the window loops the content past `length_ticks`.
-    pub repeat: bool,
+    /// Explicit loop period (F-041 M10): `None` plays the window once,
+    /// `Some(p)` repeats with period `p`.
+    pub loop_ticks: Option<u32>,
     /// Temporarily muted (B2): nothing is delivered, so the target holds its
     /// last value for the whole span (same as being outside the clip).
     pub muted: bool,
@@ -224,7 +225,7 @@ impl Default for RtControlClip {
             // placement.
             span_ticks: 0,
             length_ticks: 384,
-            repeat: false,
+            loop_ticks: None,
             muted: false,
             curve: RtAutomation::default(),
         }
@@ -250,9 +251,12 @@ impl RtControlClip {
         }
         let local = position_ticks - start;
         let offset = f64::from(self.source_offset);
+        let period = self
+            .loop_ticks
+            .map_or(self.length_ticks, |loop_ticks| loop_ticks.max(1));
         let phase = if self.length_ticks > 0 {
-            if self.repeat {
-                (offset + local).rem_euclid(f64::from(self.length_ticks))
+            if self.loop_ticks.is_some() {
+                (offset + local).rem_euclid(f64::from(period))
             } else if offset + local < f64::from(self.length_ticks) {
                 offset + local
             } else {
@@ -421,7 +425,7 @@ mod tests {
             start_ticks: 0,
             span_ticks: 768,
             length_ticks: 384,
-            repeat: true,
+            loop_ticks: Some(384),
             curve: curve(&[(0, 1.0), (96, 0.5)]),
             ..RtControlClip::default()
         };
@@ -440,7 +444,7 @@ mod tests {
             start_ticks: 0,
             span_ticks: 768,
             length_ticks: 384,
-            repeat: false,
+            loop_ticks: None,
             curve: curve(&[(0, 1.0), (96, 0.5)]),
             ..RtControlClip::default()
         };

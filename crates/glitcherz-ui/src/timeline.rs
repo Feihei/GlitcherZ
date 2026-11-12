@@ -2216,7 +2216,7 @@ pub fn show(
                 &|_| None,
                 &|clip: &MidiClip, painter, rect| {
                     if let Some(data) = p.midi_data.get(clip.data as usize) {
-                        draw_midi_preview(painter, rect, clip.span_ticks, clip.source_offset, clip.repeat, data);
+                        draw_midi_preview(painter, rect, clip.span_ticks, clip.source_offset, clip.loop_ticks, data);
                     }
                 },
                 &|clip: &MidiClip| {
@@ -2224,7 +2224,7 @@ pub fn show(
                         .get(clip.data as usize)
                         .map_or(1, |data| data.length_ticks)
                 },
-                &|clip: &MidiClip| clip.repeat,
+                &|clip: &MidiClip| clip.loop_ticks,
 
                 &|clip: &MidiClip| {
                     midi_tracks
@@ -2288,7 +2288,7 @@ pub fn show(
                     &|_| None,
                     &|clip: &ControlClip, painter, rect| {
                         if let Some(data) = p.curve_data.get(clip.data as usize) {
-                            draw_control_preview(painter, rect, clip.span_ticks, clip.source_offset, clip.repeat, data);
+                            draw_control_preview(painter, rect, clip.span_ticks, clip.source_offset, clip.loop_ticks, data);
                         }
                     },
                     &|clip: &ControlClip| {
@@ -2296,7 +2296,7 @@ pub fn show(
                             .get(clip.data as usize)
                             .map_or(1, |data| data.length_ticks)
                     },
-                    &|clip: &ControlClip| clip.repeat,
+                    &|clip: &ControlClip| clip.loop_ticks,
 
                     &|clip: &ControlClip| {
                         control_tracks
@@ -2357,7 +2357,7 @@ pub fn show(
                     &|clip: &AudioClip| (p.waveform_of)(&clip.path),
                     &|_, _, _| {},
                     &|clip: &AudioClip| clip.span(p.sec_per_tick),
-                    &|_: &AudioClip| false,
+                    &|_: &AudioClip| None,
 
                     &|_: &AudioClip| 1,
                     p.clip_groups,
@@ -3129,8 +3129,8 @@ fn lane_row<T: Placement>(
     // F-041: the clip's content length (MIDI / control read the shared pool,
     // audio reports its own span).
     content_len: &dyn Fn(&T) -> u32,
-    // F-041 revision: whether the clip loops its content past the length.
-    content_repeat: &dyn Fn(&T) -> bool,
+    // F-041 M10: the clip's explicit loop period, if any.
+    content_loop: &dyn Fn(&T) -> Option<u32>,
     // F-041: how many clips reference the same content (1 = private).
     data_refs: &dyn Fn(&T) -> usize,
     // W3b: group table for the colour stripe + name tag.
@@ -3363,8 +3363,11 @@ fn lane_row<T: Placement>(
         // the sequencer does (`start + k·loop`), so what is drawn is what
         // plays. Single-period clips stay a plain solid block.
         let span_ticks = clip.span(sec_per_tick).max(1);
-        let loop_ticks = content_len(clip).clamp(1, span_ticks);
-        let repeat = content_repeat(clip);
+        let loop_period = content_loop(clip);
+        let loop_ticks = loop_period
+            .unwrap_or_else(|| content_len(clip))
+            .clamp(1, span_ticks);
+        let repeat = loop_period.is_some();
         if repeat && loop_ticks < span_ticks {
             let seam_color = colors.clip_stroke.gamma_multiply(0.55);
             draw_tile_seams(&painter, rect, loop_ticks, px_per_tick, seam_color);
@@ -4601,7 +4604,7 @@ fn draw_midi_preview(
     rect: Rect,
     span_ticks: u32,
     source_offset: u32,
-    repeat: bool,
+    loop_ticks: Option<u32>,
     data: &glitcherz_model::MidiData,
 ) {
     let notes = data.notes();
@@ -4622,6 +4625,8 @@ fn draw_midi_preview(
     let note_h = (row_h - 0.5).max(1.0);
     let span = i64::from(span_ticks.max(1));
     let length = i64::from(data.length_ticks.max(1));
+    let looping = loop_ticks.is_some();
+    let period = loop_ticks.map_or(length, |loop_ticks| i64::from(loop_ticks.max(1)));
     // A head trim can move the window past the content: nothing to draw.
     if i64::from(source_offset) >= length {
         return;
@@ -4629,7 +4634,7 @@ fn draw_midi_preview(
     let offset = i64::from(source_offset).max(0);
     // The content ends at `length - offset` inside the window; only a
     // looping clip fills the rest (F-041 revision).
-    let play_end = if repeat {
+    let play_end = if looping {
         span
     } else {
         span.min(length - offset)
@@ -4639,15 +4644,15 @@ fn draw_midi_preview(
         return;
     }
     let color = Color32::from_rgba_unmultiplied(215, 232, 255, 220);
-    let cycles = if repeat {
-        (play_end + offset).div_euclid(length) + 2
+    let cycles = if looping {
+        (play_end + offset).div_euclid(period) + 2
     } else {
         1
     };
     for k in 0..cycles.min(1024) {
         for n in notes {
             // Same phase formula as the sequencer: `note.start - offset + k·length`.
-            let local = n.start - offset + k * length;
+            let local = n.start - offset + k * period;
             let start = local.max(0);
             let end = (local + n.length.max(1)).min(play_end);
             if end <= start || start >= span {
@@ -4680,7 +4685,7 @@ fn draw_control_preview(
     rect: Rect,
     span_ticks: u32,
     source_offset: u32,
-    repeat: bool,
+    loop_ticks: Option<u32>,
     data: &glitcherz_model::CurveData,
 ) {
     if data.points.is_empty() || span_ticks == 0 || rect.width() < 6.0 || rect.height() < 6.0 {
@@ -4695,10 +4700,12 @@ fn draw_control_preview(
     let span_px = rect.width();
     let length = f64::from(data.length_ticks.max(1));
     let offset = f64::from(source_offset);
+    let looping = loop_ticks.is_some();
+    let period = loop_ticks.map_or(length, |loop_ticks| f64::from(loop_ticks.max(1)));
     if offset >= length {
         return;
     }
-    let play_end = if repeat {
+    let play_end = if looping {
         span
     } else {
         span.min(length - offset)
@@ -4713,8 +4720,8 @@ fn draw_control_preview(
         if local >= play_end {
             break;
         }
-        let phase = if repeat {
-            (offset + local).rem_euclid(length)
+        let phase = if looping {
+            (offset + local).rem_euclid(period)
         } else {
             offset + local
         };
@@ -5231,18 +5238,25 @@ mod tests {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(300.0, 60.0), egui::Sense::hover());
                 let painter = ui.painter_at(rect);
-                draw_control_preview(&painter, rect, TICKS_PER_BAR, 0, true, &curve);
+                draw_control_preview(
+                    &painter,
+                    rect,
+                    TICKS_PER_BAR,
+                    0,
+                    Some(TICKS_PER_BAR),
+                    &curve,
+                );
                 // Degenerate cases: empty curve, and a rect too small to draw.
                 draw_control_preview(
                     &painter,
                     rect,
                     TICKS_PER_BAR,
                     0,
-                    false,
+                    None,
                     &glitcherz_model::CurveData::default(),
                 );
                 let tiny = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(3.0, 3.0));
-                draw_control_preview(&painter, tiny, TICKS_PER_BAR, 0, false, &curve);
+                draw_control_preview(&painter, tiny, TICKS_PER_BAR, 0, None, &curve);
             });
         });
         out.textures_delta.clear();
@@ -5292,17 +5306,24 @@ mod tests {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(300.0, 60.0), egui::Sense::hover());
                 let painter = ui.painter_at(rect);
-                draw_midi_preview(&painter, rect, 2 * TICKS_PER_BAR, 0, true, &data);
                 draw_midi_preview(
                     &painter,
                     rect,
                     2 * TICKS_PER_BAR,
                     0,
-                    false,
+                    Some(TICKS_PER_BAR),
+                    &data,
+                );
+                draw_midi_preview(
+                    &painter,
+                    rect,
+                    2 * TICKS_PER_BAR,
+                    0,
+                    None,
                     &glitcherz_model::MidiData::default(),
                 );
                 let tiny = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(3.0, 3.0));
-                draw_midi_preview(&painter, tiny, 2 * TICKS_PER_BAR, 0, false, &data);
+                draw_midi_preview(&painter, tiny, 2 * TICKS_PER_BAR, 0, None, &data);
             });
         });
         out.textures_delta.clear();

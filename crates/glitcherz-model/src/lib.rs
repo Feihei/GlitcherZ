@@ -1933,8 +1933,8 @@ fn clip_group_default_color() -> [u8; 3] {
 /// `start_ticks` is the absolute position on the arrangement. The clip is
 /// audible for `span_ticks` from there, playing a **window** into the shared
 /// [`MidiData`] at `Project::midi_data[data]`: the playback position is
-/// `source_offset + t` (or `(source_offset + t) mod length_ticks` when
-/// [`MidiClip::repeat`] is set). Trimming only moves the window without
+/// `source_offset + t` (or `(source_offset + t) mod loop_ticks` when
+/// [`MidiClip::loop_ticks`] is set). Trimming only moves the window without
 /// touching the content.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MidiClip {
@@ -1962,12 +1962,15 @@ pub struct MidiClip {
     /// How long the clip stays active (tick), >= 1.
     #[serde(default = "default_clip_span")]
     pub span_ticks: u32,
-    /// Whether the window loops the content when it is longer than
-    /// `length_ticks` (F-041 + 2026-11-12 revision). Off by default: a plain
-    /// T stretch extends the window with silence instead of repeating the
-    /// content. The tile tool (`Shift+T` / `Alt+T`) turns it on explicitly.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub repeat: bool,
+    /// Explicit loop period inside the shared data (F-041 M10). `None` plays
+    /// the window once, with tails past the content silent; `Some(p)` repeats
+    /// with period `p` (>= 1), independent of [`MidiData::length_ticks`].
+    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub loop_ticks: Option<u32>,
+    /// v13 window-repeat flag. Read-only: the v13 -> v14 migration turns it
+    /// into `loop_ticks` (expanding integer-multiple tiles into clips).
+    #[serde(default, rename = "repeat", skip_serializing)]
+    pub legacy_repeat: bool,
     /// Index into [`Project::midi_data`].
     #[serde(default)]
     pub data: u32,
@@ -2058,7 +2061,8 @@ impl Default for MidiClip {
             start_ticks: 0,
             source_offset: 0,
             span_ticks: default_clip_span(),
-            repeat: false,
+            loop_ticks: None,
+            legacy_repeat: false,
             data: 0,
             legacy_loop_ticks: 0,
             legacy_sequence: Sequence::default(),
@@ -2197,8 +2201,8 @@ pub enum CurveInterp {
 /// F-041).
 ///
 /// Same window semantics as [`MidiClip`]: the clip plays
-/// `source_offset + t` (or `(source_offset + t) mod length_ticks` when
-/// [`ControlClip::repeat`] is set) of the shared [`CurveData`] at
+/// `source_offset + t` (or `(source_offset + t) mod loop_ticks` when
+/// [`ControlClip::loop_ticks`] is set) of the shared [`CurveData`] at
 /// `Project::curve_data[data]`. Outside the span nothing is delivered (the
 /// target keeps its last value). The delivery endpoint is decided by the node
 /// graph's automation cable, not by the clip.
@@ -2226,10 +2230,12 @@ pub struct ControlClip {
     /// How long the clip stays active (tick), >= 1.
     #[serde(default = "default_clip_span")]
     pub span_ticks: u32,
-    /// Whether the window loops the content when it is longer than
-    /// `length_ticks` (see [`MidiClip::repeat`]).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub repeat: bool,
+    /// Explicit loop period inside the shared data (see [`MidiClip::loop_ticks`]).
+    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub loop_ticks: Option<u32>,
+    /// v13 window-repeat flag. Read-only (see [`MidiClip::legacy_repeat`]).
+    #[serde(default, rename = "repeat", skip_serializing)]
+    pub legacy_repeat: bool,
     /// Index into [`Project::curve_data`].
     #[serde(default)]
     pub data: u32,
@@ -2254,7 +2260,8 @@ impl Default for ControlClip {
             start_ticks: 0,
             source_offset: 0,
             span_ticks: default_clip_span(),
-            repeat: false,
+            loop_ticks: None,
+            legacy_repeat: false,
             data: 0,
             legacy_loop_ticks: 0,
             legacy_curve: Vec::new(),
@@ -7019,7 +7026,7 @@ impl Project {
         let midi_data = &self.midi_data;
         for track in &mut self.midi_tracks {
             for clip in &mut track.clips {
-                clip.repeat = midi_data
+                clip.legacy_repeat = midi_data
                     .get(clip.data as usize)
                     .is_some_and(|data| clip.span_ticks > data.length_ticks);
             }
@@ -7027,10 +7034,142 @@ impl Project {
         let curve_data = &self.curve_data;
         for track in &mut self.control_tracks {
             for clip in &mut track.clips {
-                clip.repeat = curve_data
+                clip.legacy_repeat = curve_data
                     .get(clip.data as usize)
                     .is_some_and(|data| clip.span_ticks > data.length_ticks);
             }
+        }
+    }
+
+    /// v13 -> v14 (F-041 M10): the boolean repeat flag becomes an explicit
+    /// loop period, and window-only tiles expand into ordinary clips.
+    ///
+    /// - `repeat = false` → `loop_ticks = None`;
+    /// - `repeat = true`, `source_offset == 0` → q full periods plus (if any)
+    ///   one truncated tail clip, all sharing `data`; tracks that would exceed
+    ///   [`MAX_CLIPS_PER_TRACK`] keep a single looping clip instead;
+    /// - `repeat = true` with a non-zero offset keeps one clip with
+    ///   `loop_ticks = Some(length_ticks)` (the old window crossed the content
+    ///   boundary and cannot be expressed as contiguous clips).
+    ///
+    /// Only call it for documents whose `version < 14`.
+    pub fn migrate_v13_to_v14(&mut self) {
+        let midi_data = &self.midi_data;
+        let midi_expanded: Vec<Vec<MidiClip>> = self
+            .midi_tracks
+            .iter()
+            .map(|track| {
+                let mut out: Vec<MidiClip> = Vec::with_capacity(track.clips.len());
+                for clip in &track.clips {
+                    let mut clip = clip.clone();
+                    let repeat = clip.legacy_repeat;
+                    clip.legacy_repeat = false;
+                    let Some(length) = midi_data
+                        .get(clip.data as usize)
+                        .map(|data| data.length_ticks)
+                        .filter(|&length| length > 0)
+                    else {
+                        clip.loop_ticks = None;
+                        out.push(clip);
+                        continue;
+                    };
+                    if !repeat {
+                        clip.loop_ticks = None;
+                        out.push(clip);
+                        continue;
+                    }
+                    let q = clip.span_ticks / length;
+                    let r = clip.span_ticks % length;
+                    let extra = u32::from(r > 0);
+                    let fits = out.len() + (q + extra) as usize <= MAX_CLIPS_PER_TRACK;
+                    if clip.source_offset != 0 || !fits {
+                        clip.loop_ticks = Some(length);
+                        out.push(clip);
+                        continue;
+                    }
+                    for k in 0..q {
+                        let mut piece = clip.clone();
+                        piece.start_ticks =
+                            clip.start_ticks.saturating_add(k.saturating_mul(length));
+                        piece.span_ticks = length;
+                        piece.source_offset = 0;
+                        piece.loop_ticks = None;
+                        out.push(piece);
+                    }
+                    if r > 0 {
+                        let mut piece = clip.clone();
+                        piece.start_ticks =
+                            clip.start_ticks.saturating_add(q.saturating_mul(length));
+                        piece.span_ticks = r;
+                        piece.source_offset = 0;
+                        piece.loop_ticks = None;
+                        out.push(piece);
+                    }
+                }
+                out
+            })
+            .collect();
+        for (track, clips) in self.midi_tracks.iter_mut().zip(midi_expanded) {
+            track.clips = clips;
+        }
+
+        let curve_data = &self.curve_data;
+        let curve_expanded: Vec<Vec<ControlClip>> = self
+            .control_tracks
+            .iter()
+            .map(|track| {
+                let mut out: Vec<ControlClip> = Vec::with_capacity(track.clips.len());
+                for clip in &track.clips {
+                    let mut clip = clip.clone();
+                    let repeat = clip.legacy_repeat;
+                    clip.legacy_repeat = false;
+                    let Some(length) = curve_data
+                        .get(clip.data as usize)
+                        .map(|data| data.length_ticks)
+                        .filter(|&length| length > 0)
+                    else {
+                        clip.loop_ticks = None;
+                        out.push(clip);
+                        continue;
+                    };
+                    if !repeat {
+                        clip.loop_ticks = None;
+                        out.push(clip);
+                        continue;
+                    }
+                    let q = clip.span_ticks / length;
+                    let r = clip.span_ticks % length;
+                    let extra = u32::from(r > 0);
+                    let fits = out.len() + (q + extra) as usize <= MAX_CLIPS_PER_TRACK;
+                    if clip.source_offset != 0 || !fits {
+                        clip.loop_ticks = Some(length);
+                        out.push(clip);
+                        continue;
+                    }
+                    for k in 0..q {
+                        let mut piece = clip.clone();
+                        piece.start_ticks =
+                            clip.start_ticks.saturating_add(k.saturating_mul(length));
+                        piece.span_ticks = length;
+                        piece.source_offset = 0;
+                        piece.loop_ticks = None;
+                        out.push(piece);
+                    }
+                    if r > 0 {
+                        let mut piece = clip.clone();
+                        piece.start_ticks =
+                            clip.start_ticks.saturating_add(q.saturating_mul(length));
+                        piece.span_ticks = r;
+                        piece.source_offset = 0;
+                        piece.loop_ticks = None;
+                        out.push(piece);
+                    }
+                }
+                out
+            })
+            .collect();
+        for (track, clips) in self.control_tracks.iter_mut().zip(curve_expanded) {
+            track.clips = clips;
         }
     }
 
@@ -11311,7 +11450,7 @@ mod tests {
     /// number for the additive `meter_markers` field, without a migration.
     #[test]
     fn project_version_matches_the_curve_migration() {
-        assert_eq!(super::PROJECT_VERSION, 13);
+        assert_eq!(super::PROJECT_VERSION, 14);
     }
 
     /// F-041 revision: v12 had no `repeat` flag, so every window that
@@ -11342,12 +11481,84 @@ mod tests {
         project.migrate_v12_to_v13();
 
         assert!(
-            project.midi_tracks[0].clips[0].repeat,
+            project.midi_tracks[0].clips[0].legacy_repeat,
             "tiled window flagged"
         );
         assert!(
-            !project.midi_tracks[0].clips[1].repeat,
+            !project.midi_tracks[0].clips[1].legacy_repeat,
             "plain window stays off"
+        );
+    }
+
+    /// F-041 M10: v13 tiles expand into ordinary clips sharing one data entry;
+    /// a window with a non-zero offset keeps an explicit loop instead.
+    #[test]
+    fn migrate_v13_to_v14_expands_tiles() {
+        let mut project = Project::default();
+        let data = project.push_midi_data(super::MidiData {
+            length_ticks: TICKS_PER_BAR,
+            ..super::MidiData::default()
+        });
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: 2 * TICKS_PER_BAR,
+            span_ticks: 2 * TICKS_PER_BAR,
+            data,
+            legacy_repeat: true,
+            ..MidiClip::default()
+        });
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: 10 * TICKS_PER_BAR,
+            span_ticks: 2 * TICKS_PER_BAR,
+            source_offset: 1,
+            data,
+            legacy_repeat: true,
+            ..MidiClip::default()
+        });
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: 20 * TICKS_PER_BAR,
+            span_ticks: 2 * TICKS_PER_BAR + 100,
+            data,
+            legacy_repeat: true,
+            ..MidiClip::default()
+        });
+
+        project.migrate_v13_to_v14();
+
+        let clips = &project.midi_tracks[0].clips;
+        assert_eq!(clips.len(), 6, "2 + 1 loop + 2 whole + 1 tail");
+        assert_eq!(
+            (
+                clips[0].start_ticks,
+                clips[0].span_ticks,
+                clips[0].loop_ticks
+            ),
+            (2 * TICKS_PER_BAR, TICKS_PER_BAR, None)
+        );
+        assert_eq!(
+            (
+                clips[1].start_ticks,
+                clips[1].span_ticks,
+                clips[1].loop_ticks
+            ),
+            (3 * TICKS_PER_BAR, TICKS_PER_BAR, None)
+        );
+        assert_eq!(clips[2].loop_ticks, Some(TICKS_PER_BAR));
+        assert_eq!(
+            (clips[3].start_ticks, clips[3].span_ticks),
+            (20 * TICKS_PER_BAR, TICKS_PER_BAR)
+        );
+        assert_eq!(
+            (clips[4].start_ticks, clips[4].span_ticks),
+            (21 * TICKS_PER_BAR, TICKS_PER_BAR)
+        );
+        assert_eq!(
+            (clips[5].start_ticks, clips[5].span_ticks),
+            (22 * TICKS_PER_BAR, 100)
+        );
+        assert!(
+            clips
+                .iter()
+                .all(|clip| clip.data == data && !clip.legacy_repeat)
         );
     }
 

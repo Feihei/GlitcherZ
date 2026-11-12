@@ -91,7 +91,7 @@ pub fn export_smf(project: &crate::Project) -> Vec<u8> {
                 continue;
             };
             for (offset, note) in
-                tiled_notes(data, clip.source_offset, clip.span_ticks, clip.repeat)
+                tiled_notes(data, clip.source_offset, clip.span_ticks, clip.loop_ticks)
             {
                 let offset = offset + clip.start_ticks as i64;
                 let channel = note.channel.min(15);
@@ -111,7 +111,7 @@ pub fn export_smf(project: &crate::Project) -> Vec<u8> {
             // P0: controller events travel with the clip they belong to, so a
             // file exported from a project that imported CC/bend keeps them.
             for (offset, ctrl) in
-                tiled_ctrls(data, clip.source_offset, clip.span_ticks, clip.repeat)
+                tiled_ctrls(data, clip.source_offset, clip.span_ticks, clip.loop_ticks)
             {
                 events.push(ctrl_event(offset + clip.start_ticks as i64, &ctrl));
             }
@@ -131,13 +131,14 @@ fn tiled_ctrls(
     data: &MidiData,
     source_offset: u32,
     span_ticks: u32,
-    repeat: bool,
+    loop_ticks: Option<u32>,
 ) -> Vec<(i64, CtrlEvent)> {
     let length = i64::from(data.length_ticks.max(1));
     let offset = i64::from(source_offset);
+    let period = loop_ticks.map_or(length, |loop_ticks| i64::from(loop_ticks.max(1)));
     // A non-looping window exposes the content once: the silent tail past
     // `length_ticks` exports nothing (F-041 revision).
-    let span = if repeat {
+    let span = if loop_ticks.is_some() {
         i64::from(span_ticks.max(1))
     } else {
         i64::from(span_ticks).min(length - offset).max(0)
@@ -145,9 +146,9 @@ fn tiled_ctrls(
     let mut result = Vec::new();
     for ctrl in &data.sequence.ctrls {
         let base = ctrl.tick - offset;
-        let mut k = floor_div(-base, length);
+        let mut k = floor_div(-base, period);
         loop {
-            let at = base + k * length;
+            let at = base + k * period;
             if at >= span {
                 break;
             }
@@ -169,12 +170,13 @@ fn tiled_notes(
     data: &MidiData,
     source_offset: u32,
     span_ticks: u32,
-    repeat: bool,
+    loop_ticks: Option<u32>,
 ) -> Vec<(i64, Note)> {
     let length = i64::from(data.length_ticks.max(1));
     let offset = i64::from(source_offset);
+    let period = loop_ticks.map_or(length, |loop_ticks| i64::from(loop_ticks.max(1)));
     // See `tiled_ctrls`: a plain window plays the content once, not on loop.
-    let span = if repeat {
+    let span = if loop_ticks.is_some() {
         i64::from(span_ticks.max(1))
     } else {
         i64::from(span_ticks).min(length - offset).max(0)
@@ -185,11 +187,11 @@ fn tiled_notes(
         let base = note.start - offset;
         // Instances overlapping `[0, span)`: k from the one whose tail reaches
         // past zero to the one that starts before the window end.
-        let first = floor_div(-base - len + 1, length);
-        let last = floor_div(span - 1 - base, length);
+        let first = floor_div(-base - len + 1, period);
+        let last = floor_div(span - 1 - base, period);
         let mut k = first;
         while k <= last {
-            let on = base + k * length;
+            let on = base + k * period;
             let tail = on + len;
             if tail > 0 {
                 let head = on.max(0);
@@ -789,7 +791,8 @@ fn split_into_clips(notes: Vec<Note>, ctrls: Vec<CtrlEvent>) -> Vec<MidiClip> {
             start_ticks: u32::try_from(clip_origin).unwrap_or(u32::MAX),
             span_ticks: u32::try_from(span).unwrap_or(u32::MAX),
             source_offset: 0,
-            repeat: false,
+            loop_ticks: None,
+            legacy_repeat: false,
             data: 0,
             legacy_loop_ticks: u32::try_from(span).unwrap_or(u32::MAX),
             legacy_sequence: Sequence {

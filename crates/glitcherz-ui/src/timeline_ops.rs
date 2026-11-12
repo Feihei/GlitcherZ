@@ -1540,9 +1540,10 @@ impl GlitcherZApp {
                         .and_then(|t| t.clips.get_mut(e.sel.clip))
                         .map(|c| {
                             let new_span = e.span_ticks.max(1);
-                            let changed = c.span_ticks != new_span || !c.repeat;
+                            let period = e.period_ticks.max(1);
+                            let changed = c.span_ticks != new_span || c.loop_ticks != Some(period);
                             c.span_ticks = new_span;
-                            c.repeat = true;
+                            c.loop_ticks = Some(period);
                             changed
                         })
                         .unwrap_or(false),
@@ -1552,9 +1553,10 @@ impl GlitcherZApp {
                         .and_then(|t| t.clips.get_mut(e.sel.clip))
                         .map(|c| {
                             let new_span = e.span_ticks.max(1);
-                            let changed = c.span_ticks != new_span || !c.repeat;
+                            let period = e.period_ticks.max(1);
+                            let changed = c.span_ticks != new_span || c.loop_ticks != Some(period);
                             c.span_ticks = new_span;
-                            c.repeat = true;
+                            c.loop_ticks = Some(period);
                             changed
                         })
                         .unwrap_or(false),
@@ -2428,12 +2430,12 @@ fn stretch_midi_clip(
     else {
         return false;
     };
-    let (old_start, old_span, old_off, data_idx, old_repeat) = (
+    let (old_start, old_span, old_off, data_idx, old_loop) = (
         clip.start_ticks,
         clip.span_ticks,
         clip.source_offset,
         clip.data,
-        clip.repeat,
+        clip.loop_ticks,
     );
     let delta = i64::from(new_start) - i64::from(old_start);
     let raw_off = i64::from(old_off) + delta;
@@ -2445,7 +2447,7 @@ fn stretch_midi_clip(
         .get(data_idx as usize)
         .map_or(0, |data| data.length_ticks);
     let extend = window_end > i64::from(old_length);
-    let changed = old_start != new_start || old_span != new_span || old_repeat;
+    let changed = old_start != new_start || old_span != new_span || old_loop.is_some();
     if !changed && prepend == 0 && !extend {
         return false;
     }
@@ -2494,7 +2496,7 @@ fn stretch_midi_clip(
     clip.start_ticks = new_start;
     clip.span_ticks = new_span;
     clip.source_offset = u32::try_from(off).unwrap_or(u32::MAX);
-    clip.repeat = false;
+    clip.loop_ticks = None;
     true
 }
 
@@ -2515,12 +2517,12 @@ fn stretch_curve_clip(
     else {
         return false;
     };
-    let (old_start, old_span, old_off, data_idx, old_repeat) = (
+    let (old_start, old_span, old_off, data_idx, old_loop) = (
         clip.start_ticks,
         clip.span_ticks,
         clip.source_offset,
         clip.data,
-        clip.repeat,
+        clip.loop_ticks,
     );
     let delta = i64::from(new_start) - i64::from(old_start);
     let raw_off = i64::from(old_off) + delta;
@@ -2532,7 +2534,7 @@ fn stretch_curve_clip(
         .get(data_idx as usize)
         .map_or(0, |data| data.length_ticks);
     let extend = window_end > i64::from(old_length);
-    let changed = old_start != new_start || old_span != new_span || old_repeat;
+    let changed = old_start != new_start || old_span != new_span || old_loop.is_some();
     if !changed && prepend == 0 && !extend {
         return false;
     }
@@ -2578,7 +2580,7 @@ fn stretch_curve_clip(
     clip.start_ticks = new_start;
     clip.span_ticks = new_span;
     clip.source_offset = u32::try_from(off).unwrap_or(u32::MAX);
-    clip.repeat = false;
+    clip.loop_ticks = None;
     true
 }
 /// Right-edge drag on a MIDI clip: same "edit range follows the window"
@@ -2837,7 +2839,7 @@ mod tests {
         let clip = &project.midi_tracks[0].clips[0];
         assert_eq!(clip.span_ticks, 2 * TICKS_PER_BAR);
         assert_eq!(clip.source_offset, 0);
-        assert!(!clip.repeat);
+        assert!(clip.loop_ticks.is_none());
         let data = project.midi_data_of(clip).expect("data");
         assert_eq!(data.length_ticks, 2 * TICKS_PER_BAR);
         assert_eq!(data.notes()[0].start, 0, "the note stays at its tick");

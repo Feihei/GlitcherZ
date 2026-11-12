@@ -269,12 +269,12 @@ pub struct RtMidiClip {
     pub source_offset: u32,
     /// How long the clip stays active (in ticks).
     pub span_ticks: u32,
-    /// Content length (in ticks); a longer window loops only when `repeat` is set
+    /// Content length (in ticks); a plain window goes silent past it
     /// (F-041 revision: a plain T stretch leaves the tail silent).
     pub length_ticks: u32,
-    /// Whether the window loops the content past `length_ticks`. The tile
-    /// tool sets it; a plain stretch keeps it off.
-    pub repeat: bool,
+    /// Explicit loop period (F-041 M10): `None` plays the window once,
+    /// `Some(p)` repeats with period `p` (>= 1).
+    pub loop_ticks: Option<u32>,
     /// Temporarily muted (B2): the clip keeps its span — the arrangement
     /// length does not shrink — but scheduling skips it entirely.
     pub muted: bool,
@@ -294,7 +294,7 @@ impl Default for RtMidiClip {
             // own placement.
             span_ticks: 0,
             length_ticks: TICKS_PER_BAR,
-            repeat: false,
+            loop_ticks: None,
             muted: false,
             notes: Vec::new(),
             ctrls: Vec::new(),
@@ -1086,11 +1086,12 @@ impl Sequencer {
             let clip_end = start + f64::from(clip.span_ticks);
             let length_ticks = f64::from(clip.length_ticks.max(1));
             let offset = f64::from(clip.source_offset);
-            let repeat = clip.repeat;
+            let looping = clip.loop_ticks.is_some();
+            let period = f64::from(clip.loop_ticks.unwrap_or(clip.length_ticks).max(1));
             // The end the content actually reaches: a looping clip fills the
             // whole span, a plain window goes silent after `length_ticks`
             // (F-041 revision — a T stretch adds silence, not repeats).
-            let content_end = if repeat {
+            let content_end = if looping {
                 clip_end
             } else {
                 (start + (length_ticks - offset).max(0.0)).min(clip_end)
@@ -1103,21 +1104,21 @@ impl Sequencer {
             // pending off, no retrigger guard.
             for ctrl in &clip.ctrls {
                 let base = f64::from(ctrl.tick_ticks) - offset;
-                let mut m = if repeat {
-                    (-base / length_ticks).ceil()
+                let mut m = if looping {
+                    (-base / period).ceil()
                 } else {
                     0.0
                 };
                 loop {
-                    let local = base + m * length_ticks;
+                    let local = base + m * period;
                     let at = start + local;
                     if at >= t1 || at >= content_end {
                         break; // past the window or past the content
                     }
-                    if at >= t0 && local >= 0.0 && (repeat || m == 0.0) {
+                    if at >= t0 && local >= 0.0 && (looping || m == 0.0) {
                         sink.ctrl(track, *ctrl);
                     }
-                    if !repeat {
+                    if !looping {
                         break; // one pass over the content
                     }
                     m += 1.0;
@@ -1153,7 +1154,7 @@ impl Sequencer {
                             velocity,
                         },
                     );
-                    let off_tick = if repeat {
+                    let off_tick = if looping {
                         start + head_tail
                     } else {
                         (start + head_tail).min(content_end)
@@ -1173,7 +1174,7 @@ impl Sequencer {
                 // window truncates it at the content end.
                 let mut m = 0.0;
                 loop {
-                    let local = base + m * length_ticks;
+                    let local = base + m * period;
                     let on_tick = start + local;
                     if on_tick >= content_end {
                         break; // past the window or past the content
@@ -1182,7 +1183,7 @@ impl Sequencer {
                         && on_tick >= t0
                         && on_tick < t1
                         && !muted
-                        && (repeat || m == 0.0)
+                        && (looping || m == 0.0)
                     {
                         // Retrigger guard: a previous occurrence of this note
                         // may still be sounding (its off was scheduled past
@@ -1205,7 +1206,7 @@ impl Sequencer {
                                 velocity,
                             },
                         );
-                        let off_tick = if repeat {
+                        let off_tick = if looping {
                             on_tick + length
                         } else {
                             (on_tick + length).min(content_end)
@@ -1219,7 +1220,7 @@ impl Sequencer {
                             note.note,
                         );
                     }
-                    if !repeat {
+                    if !looping {
                         break; // one pass over the content
                     }
                     m += 1.0;
@@ -1371,7 +1372,7 @@ mod tests {
             length_ticks: loop_ticks,
             // Test helper: a span longer than the content is the classic
             // tiled clip, so it loops (production sets `repeat` explicitly).
-            repeat: span > loop_ticks,
+            loop_ticks: (span > loop_ticks).then_some(loop_ticks),
             ..RtMidiClip::default()
         };
         for note in notes {
@@ -1395,7 +1396,7 @@ mod tests {
             start_ticks: start,
             span_ticks: span,
             length_ticks: loop_ticks,
-            repeat: span > loop_ticks,
+            loop_ticks: (span > loop_ticks).then_some(loop_ticks),
             ..RtMidiClip::default()
         };
         for ctrl in ctrls {
@@ -1740,7 +1741,7 @@ mod tests {
             start_ticks: 0,
             span_ticks: 2 * TICKS_PER_BAR,
             length_ticks: TICKS_PER_BAR,
-            repeat: false,
+            loop_ticks: None,
             ..RtMidiClip::default()
         };
         clip.push(clip_note(0, TICKS_PER_STEP, 60));
@@ -1977,7 +1978,7 @@ mod tests {
         let mut clip = RtMidiClip {
             span_ticks: 256 * TICKS_PER_BAR,
             length_ticks: TICKS_PER_BAR,
-            repeat: true,
+            loop_ticks: Some(TICKS_PER_BAR),
             ..RtMidiClip::default()
         };
         for i in 0..16u32 {

@@ -43,8 +43,11 @@ use crate::Project;
 /// [`Project::migrate_v11_to_v12`] (each clip gets its own data entry).
 /// v13 (F-041 revision) adds the explicit `repeat` flag: `version < 13` goes
 /// through [`Project::migrate_v12_to_v13`], flagging every window that used to
-/// loop implicitly.
-pub const PROJECT_VERSION: u32 = 13;
+/// loop implicitly. v14 (F-041 M10) replaces that flag with an explicit
+/// `loop` period: `version < 14` goes through
+/// [`Project::migrate_v13_to_v14`], expanding integer-multiple tiles into
+/// ordinary clips that share one data entry.
+pub const PROJECT_VERSION: u32 = 14;
 
 fn default_version() -> u32 {
     PROJECT_VERSION
@@ -238,6 +241,9 @@ pub fn parse_project(text: &str) -> Result<Project, ModelError> {
     }
     if version < 13 {
         project.migrate_v12_to_v13();
+    }
+    if version < 14 {
+        project.migrate_v13_to_v14();
     }
     project.validate().map_err(ModelError::InvalidGraph)?;
     Ok(project)
