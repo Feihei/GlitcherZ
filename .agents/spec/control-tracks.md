@@ -88,6 +88,8 @@ UI ──cable(Cc{ch,cc})→ engine.set_auto_cc_route(index, node_id, ch, cc)
 > 起因：patch 里节点的 `gain` 之类的参数**根本不在自动化目标列表里**——`AutoParam` 只有 7 个变体（Track/Filter/Plugin/Tempo/CC/Bend），`auto_options` 只给乐器节点出 Cutoff 与插件参数，`accepts()` 又只允许 automation 电缆落在乐器节点。引擎侧其实早已能往**任意**节点的任意 `ParamId` 写值（`set_auto_route` + `auto_deliver` + `slot_set_param`），缺口全在上层的词汇表、入口与值域三处。
 >
 > 本阶段（A）**只补词汇表，不开参数端口**：仍沿用"整节点一条 automation 电缆 + 弹菜单选参数"的现有交互；每参数一个输入口留待 B（`param-ports`，未落地）。
+>
+> 2026-11-12 追加：节点左侧的**聚合 Curve 输入口**由 F-044（`curve-port.md`）提供——所有指向该节点的 automation 电缆落到同一个黄色环口，但**一条曲线仍只控制一个参数**，不改变 D19 的单目标语义。
 
 | # | 决策 | 内容 |
 | :-- | :-- | :-- |

@@ -1574,6 +1574,10 @@ const PORT_SPACING: f32 = 30.0;
 /// Title band at the top of a node box. Ports and inline rows are measured
 /// from below it, so a port dot never lands on the label.
 const NODE_TITLE_BAND: f32 = 24.0;
+/// Dedicated row above a controllable node's structural inlets that hosts the
+/// aggregated curve inlet (F-044). Kept tall enough that the yellow socket
+/// never touches the structural rings or the mixer channel ports.
+const CURVE_PORT_ROW: f32 = 16.0;
 /// Height of one in-node action row (the track / slot buttons).
 const ACTION_ROW_HEIGHT: f32 = 18.0;
 /// Below this zoom the in-node buttons are too small to hit; they are left
@@ -1653,6 +1657,11 @@ const CABLE_DASH_LENGTH: f32 = 7.0;
 const CABLE_DASH_GAP: f32 = 5.0;
 /// Bezier samples used to render a dashed cable.
 const CABLE_DASH_SAMPLES: usize = 32;
+/// Vertical fan-out gap between automation cables that share both endpoints
+/// (F-044 D5). A bezier midpoint moves by 0.75x the control-point offset, so
+/// 16 here yields a 12 px midpoint separation — the fixed 11 pt parameter
+/// labels stay apart. Screen-space: the labels do not scale with the zoom.
+const AUTOMATION_LANE_GAP: f32 = 16.0;
 /// Cable-cut hit distance (pointer path within this distance of a cable severs it).
 const CUT_HIT_DIST: f32 = 10.0;
 /// Cable midpoint control dot radius / hit radius.
@@ -2251,7 +2260,7 @@ fn size_of(id: PatchId, deps: &PatchDeps) -> Vec2 {
     };
     Vec2::new(
         base.x,
-        base.y + inline_row_count(id, deps) as f32 * INLINE_ROW_HEIGHT,
+        base.y + inline_row_count(id, deps) as f32 * INLINE_ROW_HEIGHT + curve_box_row(id, deps),
     )
 }
 
@@ -2759,7 +2768,7 @@ impl PatchState {
     /// Screen-space vertical extent of one box's port area: below the
     /// title / action band, above the inline slider rows.
     fn port_area(&self, r: Rect, id: PatchId, deps: &PatchDeps) -> (f32, f32) {
-        let top = r.top() + header_band(id, deps) * self.zoom;
+        let top = r.top() + (header_band(id, deps) + curve_slot_row(id, deps)) * self.zoom;
         let bottom = r.bottom() - inline_row_count(id, deps) as f32 * INLINE_ROW_HEIGHT * self.zoom;
         (top, bottom.max(top + 1.0))
     }
@@ -2844,8 +2853,18 @@ impl PatchState {
             },
         };
         // A mixer spreads its channels over the port area (below the slot
-        // buttons, above the inline row); single-port boxes keep the centre.
-        if n > 1 {
+        // buttons and the curve row, above the inline row); a single mixer
+        // channel is spread the same way so it clears the curve inlet. Other
+        // single-port boxes keep the box centre, where their output port sits.
+        let spread = n > 1
+            || match id {
+                PatchId::Node(node_id) => deps
+                    .doc
+                    .node_by_id(node_id)
+                    .is_some_and(|node| node.is_mixer()),
+                _ => false,
+            };
+        if spread {
             let (top, bottom) = self.port_area(r, id, deps);
             let step = (bottom - top) / n as f32;
             return (0..n)
@@ -2855,6 +2874,21 @@ impl PatchState {
         (0..n)
             .map(|i| (i as u8, Pos2::new(r.left(), r.center().y)))
             .collect()
+    }
+
+    /// Screen position of the aggregated curve inlet (F-044), when the entity
+    /// has one. It sits in its own row above the structural inlets; the Curve
+    /// Map is excluded because its only inlet already *is* the control input.
+    fn curve_port_screen(&self, rect_min: Pos2, id: PatchId, deps: &PatchDeps) -> Option<Pos2> {
+        let PatchId::Node(node_id) = id else {
+            return None;
+        };
+        if !deps.doc.node_by_id(node_id).is_some_and(has_curve_port) {
+            return None;
+        }
+        let r = self.screen_rect(rect_min, id, deps)?;
+        let top = r.top() + header_band(id, deps) * self.zoom;
+        Some(Pos2::new(r.left(), top + CURVE_PORT_ROW * 0.5 * self.zoom))
     }
 
     /// Fill in default placements for missing entities (never overwrites existing positions;
@@ -3099,13 +3133,30 @@ impl PatchState {
 
     /// Endpoint screen positions of a document cable → bezier control points
     /// (`None` when either endpoint has no position / the ports don't resolve).
-    /// The endpoint lands on the input port matching `cable.in_port` (D17:
-    /// the mixer channel the cable is bound to).
-    fn cable_controls(
+    /// For the cable at `index` in the document table; every automation cable
+    /// sharing both endpoints gets its own vertical lane (F-044 D5), so the
+    /// parameter labels no longer pile up at one midpoint.
+    fn cable_controls_indexed(
+        &self,
+        rect_min: Pos2,
+        index: usize,
+        deps: &PatchDeps,
+    ) -> Option<[Pos2; 4]> {
+        let cable = deps.doc.cables.get(index)?;
+        self.cable_controls_with_offset(
+            rect_min,
+            cable,
+            deps,
+            automation_lane_offset(deps.doc, index),
+        )
+    }
+
+    fn cable_controls_with_offset(
         &self,
         rect_min: Pos2,
         cable: &CableDoc,
         deps: &PatchDeps,
+        lane_offset: f32,
     ) -> Option<[Pos2; 4]> {
         let (from, from_port) = patch_port_from(&cable.from, deps)?;
         let (to, to_port) = match &cable.to {
@@ -3123,18 +3174,27 @@ impl PatchState {
             .into_iter()
             .find(|(k, _)| *k == from_port)?
             .1;
-        let p3 = self
-            .in_ports_screen(rect_min, to, deps)
-            .into_iter()
-            .find(|(k, _)| *k == to_port)?
-            .1;
-        Some(bezier_controls(p0, p3))
+        // F-044: an automation cable addresses a parameter, not a structural
+        // inlet; aim it at the node's aggregated curve socket when it has one.
+        let p3 = match self.curve_port_screen(rect_min, to, deps) {
+            Some(p) if cable.kind == CableKind::Automation => p,
+            _ => {
+                self.in_ports_screen(rect_min, to, deps)
+                    .into_iter()
+                    .find(|(k, _)| *k == to_port)?
+                    .1
+            }
+        };
+        let mut bez = bezier_controls(p0, p3);
+        bez[1].y += lane_offset;
+        bez[2].y += lane_offset;
+        Some(bez)
     }
 
     /// Hit-test a cable (returns the index into the document cable table).
     fn hit_cable(&self, rect_min: Pos2, sp: Pos2, deps: &PatchDeps) -> Option<usize> {
-        for (i, cable) in deps.doc.cables.iter().enumerate() {
-            let Some(c) = self.cable_controls(rect_min, cable, deps) else {
+        for i in 0..deps.doc.cables.len() {
+            let Some(c) = self.cable_controls_indexed(rect_min, i, deps) else {
                 continue;
             };
             for pt in bezier_points(c, 24) {
@@ -3148,8 +3208,8 @@ impl PatchState {
 
     /// Hit-test a cable midpoint control dot (returns the cable index).
     fn hit_cable_midpoint(&self, rect_min: Pos2, sp: Pos2, deps: &PatchDeps) -> Option<usize> {
-        for (i, cable) in deps.doc.cables.iter().enumerate() {
-            let Some(c) = self.cable_controls(rect_min, cable, deps) else {
+        for i in 0..deps.doc.cables.len() {
+            let Some(c) = self.cable_controls_indexed(rect_min, i, deps) else {
                 continue;
             };
             if bezier_points(c, 24)[12].distance(sp) <= MIDPOINT_HIT_RADIUS {
@@ -3166,8 +3226,8 @@ impl PatchState {
         if path.len() < 2 {
             return hits;
         }
-        for (i, cable) in deps.doc.cables.iter().enumerate() {
-            let Some(c) = self.cable_controls(rect_min, cable, deps) else {
+        for i in 0..deps.doc.cables.len() {
+            let Some(c) = self.cable_controls_indexed(rect_min, i, deps) else {
                 continue;
             };
             'cable: for pt in bezier_points(c, 32) {
@@ -3333,14 +3393,51 @@ fn node_out_port_kind(node: &NodeDoc, port: usize) -> CableKind {
     }
 }
 
+/// Whether a node gets the aggregated curve inlet (F-044).
+///
+/// Every control-cable destination except the Curve Map: the map's only
+/// inlet already *is* the control input, so a second yellow socket would be
+/// redundant.
+fn has_curve_port(node: &NodeDoc) -> bool {
+    node.accepts_control() && !matches!(node, NodeDoc::CurveMap { .. })
+}
+
+/// Graph-space height reserved above a node's structural inlets for the
+/// aggregated curve inlet (0 for fixed entities and non-targets).
+///
+/// A Mixer reuses the headroom of its existing port area, so its **box** does
+/// not grow (the track column stacks nodes 132 px apart); every other control
+/// target gains a real row.
+fn curve_box_row(id: PatchId, deps: &PatchDeps) -> f32 {
+    let PatchId::Node(node_id) = id else {
+        return 0.0;
+    };
+    match deps.doc.node_by_id(node_id) {
+        Some(node) if has_curve_port(node) && !node.is_mixer() => CURVE_PORT_ROW,
+        _ => 0.0,
+    }
+}
+
+/// Graph-space height the port area gives up to the curve row. Unlike
+/// [`curve_box_row`], the Mixer keeps its box height and simply starts its
+/// channel ports below the reserved row.
+fn curve_slot_row(id: PatchId, deps: &PatchDeps) -> f32 {
+    let PatchId::Node(node_id) = id else {
+        return 0.0;
+    };
+    match deps.doc.node_by_id(node_id) {
+        Some(node) if has_curve_port(node) => CURVE_PORT_ROW,
+        _ => 0.0,
+    }
+}
+
 /// Structural signal kind of a node's input ports (D27).
 ///
-/// Automation has no physical input port: a cable is addressed to
-/// `(node_id, param)` and only reuses the structural inlet as a layout
-/// landing spot. Input rings therefore show the signal the node consumes,
-/// not the cables currently attached to it — a yellow dashed automation line
-/// may legitimately end on a cyan or green ring. The cable's own dash and
-/// midpoint parameter label carry that distinction.
+/// Input rings show the signal the node consumes, not the cables currently
+/// attached to it. Before F-044 an automation cable reused the structural
+/// inlet as its layout landing spot, so a yellow dashed line could end on a
+/// cyan or green ring. Automation now has its own aggregated yellow socket
+/// above the structural inlets; the rings keep describing the signal.
 fn node_in_port_kind(node: &NodeDoc) -> CableKind {
     match node {
         NodeDoc::Instrument { .. }
@@ -3511,6 +3608,33 @@ fn accepts(kind: CableKind, target: PatchId, doc: &GraphDoc) -> bool {
 
 /// Virtual-keyboard glyph (G6): a mini white/black key strip inside the node
 /// box, drawn beneath the label.
+/// Vertical lane offset for an automation cable that shares both endpoints
+/// with other automation cables (F-044 D5). The group is centred on the
+/// original geometry: one cable stays put, two split ±6 px, three ±12 px.
+/// Only the bezier control points move; the endpoints stay on their ports.
+fn automation_lane_offset(doc: &GraphDoc, index: usize) -> f32 {
+    let Some(cable) = doc.cables.get(index) else {
+        return 0.0;
+    };
+    if cable.kind != CableKind::Automation {
+        return 0.0;
+    }
+    let group: Vec<usize> = doc
+        .cables
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            c.kind == CableKind::Automation && c.from == cable.from && c.to == cable.to
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if group.len() < 2 {
+        return 0.0;
+    }
+    let lane = group.iter().position(|&i| i == index).unwrap_or(0) as f32;
+    (lane - (group.len() as f32 - 1.0) * 0.5) * AUTOMATION_LANE_GAP
+}
+
 /// Cubic bezier control points: horizontal extension scales with distance.
 fn bezier_controls(p0: Pos2, p3: Pos2) -> [Pos2; 4] {
     let dx = ((p3.x - p0.x).abs() * 0.5).clamp(40.0, 140.0);
@@ -4119,7 +4243,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     // output, so its direct MIDI cables no longer dispatch. They stay in the
     // document (nothing is deleted automatically) but render dormant.
     for (i, cable) in doc.cables.iter().enumerate() {
-        let Some(bez) = state.cable_controls(rect.min, cable, &deps) else {
+        let Some(bez) = state.cable_controls_indexed(rect.min, i, &deps) else {
             continue;
         };
         let dormant = dormant_cable_track(doc, cable);
@@ -4185,7 +4309,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         && path.len() >= 2
     {
         for i in state.cables_crossing_path(rect.min, path, &deps) {
-            if let Some(bez) = state.cable_controls(rect.min, &doc.cables[i], &deps) {
+            if let Some(bez) = state.cable_controls_indexed(rect.min, i, &deps) {
                 painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
                     bez,
                     false,
@@ -4349,6 +4473,29 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                     Color32::from_gray(170),
                 );
             }
+        }
+        // F-044: aggregated curve inlet. One yellow socket per controllable
+        // node; every automation cable addressed to it lands here instead of
+        // borrowing a structural ring.
+        if let Some(p) = state.curve_port_screen(rect.min, id, &deps) {
+            painter.circle_filled(p, PORT_RADIUS, fill);
+            painter.circle_stroke(
+                p,
+                PORT_RADIUS,
+                egui::Stroke::new(PORT_RING_WIDTH, cable_color(CableKind::Automation)),
+            );
+            painter.circle_stroke(
+                p,
+                port_ring_outline_radius(),
+                egui::Stroke::new(PORT_RING_OUTLINE, Color32::BLACK),
+            );
+            painter.text(
+                Pos2::new(p.x + PORT_NAME_GAP * state.zoom, p.y),
+                egui::Align2::LEFT_CENTER,
+                "Curve",
+                FontId::proportional(10.0 * state.zoom),
+                Color32::from_gray(170),
+            );
         }
     }
 
@@ -5466,10 +5613,211 @@ mod tests {
         }
     }
 
+    /// F-044: only control-cable destinations get the aggregated curve inlet.
+    /// The Curve Map is excluded because its only inlet already is the control
+    /// input; fixed entities and non-targets have none.
+    #[test]
+    fn f044_only_control_targets_get_a_curve_inlet() {
+        let mut project = Project::default();
+        let effect = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::Effect {
+            node_id: effect,
+            track: 0,
+            voice: Default::default(),
+            params: Default::default(),
+            delay: None,
+        });
+        let feedback = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::Feedback {
+            node_id: feedback,
+            track: 0,
+            gain: 0.5,
+        });
+        let curve_map = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::CurveMap {
+            node_id: curve_map,
+            track: 0,
+            params: glitcherz_model::CurveMapParams::default(),
+        });
+        let lfo = project.graph.next_node_id();
+        project.graph.nodes.push(NodeDoc::Lfo {
+            node_id: lfo,
+            track: 0,
+            params: glitcherz_model::LfoParams::default(),
+        });
+        let doc = &project.graph;
+        let instrument = doc.instrument_of_track(0).expect("default synth").node_id();
+        let mixer = doc.first_mixer().expect("default mixer").node_id();
+        let deps = PatchDeps {
+            input: Default::default(),
+            doc,
+            track_count: project.midi_tracks.len(),
+            track_name: &|_, _| String::new(),
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &|_| Vec::new(),
+            plugin_inline: &|_| Vec::new(),
+            sf2_presets: &|_| Vec::new(),
+        };
+        let mut state = PatchState::default();
+        state.ensure_positions(doc, deps.track_count, deps.auto_count, deps.audio_count);
+
+        for id in [instrument, effect, mixer, feedback] {
+            assert!(
+                state
+                    .curve_port_screen(Pos2::ZERO, PatchId::Node(id), &deps)
+                    .is_some(),
+                "control target {id} must own a curve inlet"
+            );
+        }
+        for id in [curve_map, lfo] {
+            assert!(
+                state
+                    .curve_port_screen(Pos2::ZERO, PatchId::Node(id), &deps)
+                    .is_none(),
+                "node {id} must not get a second control inlet"
+            );
+        }
+        let keyboard = doc
+            .nodes
+            .iter()
+            .find(|node| node.is_keyboard())
+            .expect("default keyboard");
+        assert!(
+            state
+                .curve_port_screen(Pos2::ZERO, PatchId::Node(keyboard.node_id()), &deps)
+                .is_none()
+        );
+        for id in [PatchId::Timeline, PatchId::TimelineIn, PatchId::Master] {
+            assert!(state.curve_port_screen(Pos2::ZERO, id, &deps).is_none());
+        }
+    }
+
+    /// F-044: the aggregated inlet sits in its own row above the structural
+    /// inlets, and only controllable nodes grow by that row.
+    #[test]
+    fn f044_curve_inlet_clears_the_structural_inlets() {
+        let project = Project::default();
+        let doc = &project.graph;
+        let instrument = doc.instrument_of_track(0).expect("default synth").node_id();
+        let mixer = doc.first_mixer().expect("default mixer").node_id();
+        let keyboard = doc
+            .nodes
+            .iter()
+            .find(|node| node.is_keyboard())
+            .expect("default keyboard");
+        let deps = PatchDeps {
+            input: Default::default(),
+            doc,
+            track_count: project.midi_tracks.len(),
+            track_name: &|_, _| String::new(),
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &|_| Vec::new(),
+            plugin_inline: &|_| Vec::new(),
+            sf2_presets: &|_| Vec::new(),
+        };
+        let mut state = PatchState::default();
+        state.ensure_positions(doc, deps.track_count, deps.auto_count, deps.audio_count);
+        let zoom = state.zoom;
+
+        for id in [PatchId::Node(instrument), PatchId::Node(mixer)] {
+            let r = state.screen_rect(Pos2::ZERO, id, &deps).unwrap();
+            let p = state.curve_port_screen(Pos2::ZERO, id, &deps).unwrap();
+            let header_bottom = r.top() + header_band(id, &deps) * zoom;
+            assert!(p.y > header_bottom, "curve inlet must clear the header");
+            assert!((p.x - r.left()).abs() < 0.01);
+            let first = state.in_ports_screen(Pos2::ZERO, id, &deps)[0].1;
+            assert!(
+                first.y - p.y >= 15.0,
+                "curve inlet must not touch the structural ring: {first:?} vs {p:?}"
+            );
+        }
+
+        assert_eq!(
+            curve_box_row(PatchId::Node(instrument), &deps),
+            CURVE_PORT_ROW
+        );
+        assert_eq!(curve_box_row(PatchId::Node(keyboard.node_id()), &deps), 0.0);
+        assert_eq!(curve_box_row(PatchId::Timeline, &deps), 0.0);
+        assert_eq!(
+            curve_slot_row(PatchId::Node(mixer), &deps),
+            CURVE_PORT_ROW,
+            "the mixer reserves the row without growing its box"
+        );
+        assert!(size_of(PatchId::Node(instrument), &deps).y >= NODE_SIZE.y + CURVE_PORT_ROW);
+    }
+
+    /// F-044: automation cables end on the aggregated inlet, and cables that
+    /// share both endpoints fan out so their parameter labels stay readable.
+    #[test]
+    fn f044_automation_cables_use_the_curve_inlet_and_fan_out() {
+        let mut project = Project::default();
+        let instrument = project
+            .graph
+            .instrument_of_track(0)
+            .expect("default synth")
+            .node_id();
+        project.graph.cables.push(CableDoc::automation(
+            0,
+            instrument,
+            glitcherz_model::AutoParam::FilterCutoff,
+        ));
+        let first = project.graph.cables.len() - 1;
+        project.graph.cables.push(CableDoc::automation(
+            0,
+            instrument,
+            glitcherz_model::AutoParam::Node(glitcherz_model::NodeParam::Resonance),
+        ));
+        let second = project.graph.cables.len() - 1;
+        let doc = &project.graph;
+        let deps = PatchDeps {
+            input: Default::default(),
+            doc,
+            track_count: project.midi_tracks.len(),
+            track_name: &|_, _| String::new(),
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &|_| Vec::new(),
+            plugin_inline: &|_| Vec::new(),
+            sf2_presets: &|_| Vec::new(),
+        };
+        let mut state = PatchState::default();
+        state.ensure_positions(doc, deps.track_count, deps.auto_count, deps.audio_count);
+
+        let inlet = state
+            .curve_port_screen(Pos2::ZERO, PatchId::Node(instrument), &deps)
+            .expect("control target inlet");
+        for index in [first, second] {
+            let bez = state
+                .cable_controls_indexed(Pos2::ZERO, index, &deps)
+                .expect("cable endpoints resolve");
+            assert!(
+                (bez[3].x - inlet.x).abs() < 0.01 && (bez[3].y - inlet.y).abs() < 0.01,
+                "automation cable must land on the curve inlet"
+            );
+        }
+        let mid_a = bezier_points(
+            state
+                .cable_controls_indexed(Pos2::ZERO, first, &deps)
+                .unwrap(),
+            24,
+        )[12];
+        let mid_b = bezier_points(
+            state
+                .cable_controls_indexed(Pos2::ZERO, second, &deps)
+                .unwrap(),
+            24,
+        )[12];
+        assert!(
+            (mid_b.y - mid_a.y).abs() >= 11.9,
+            "parallel automation cables must fan out for their labels"
+        );
+    }
+
     /// D27: input rings show the *structural* signal a node consumes.
-    /// Automation has no physical port, so it must not steal the ring colour
-    /// of the nodes it modulates — the yellow dashed line and its midpoint
-    /// parameter label carry that distinction.
+    /// Automation has its own aggregated yellow inlet (F-044), so it never
+    /// steals the ring colour of the nodes it modulates.
     #[test]
     fn d27_input_rings_follow_the_structural_signal() {
         let project = Project::default();
@@ -6124,8 +6472,9 @@ mod tests {
             .graph
             .cables
             .iter()
-            .filter_map(|cable| {
-                let controls = state.cable_controls(Pos2::ZERO, cable, &deps)?;
+            .enumerate()
+            .filter_map(|(i, _)| {
+                let controls = state.cable_controls_indexed(Pos2::ZERO, i, &deps)?;
                 let mid = bezier_points(controls, 24)[12];
                 state
                     .hit_node(Pos2::ZERO, mid, &deps)
@@ -6411,7 +6760,7 @@ mod tests {
 
         let rect_min = Pos2::ZERO; // pan = 0, zoom = 1 → screen == graph space
         let bez = state
-            .cable_controls(rect_min, &doc.cables[idx], &deps)
+            .cable_controls_indexed(rect_min, idx, &deps)
             .expect("cable endpoints resolve");
         let path = bezier_points(bez, 8);
         let hits = state.cables_crossing_path(rect_min, &path, &deps);
@@ -6620,25 +6969,35 @@ mod tests {
         let mixer_base = header_band(PatchId::Node(mixer), &deps)
             + (*inputs as f32 * PORT_SPACING).max(NODE_HEIGHT_MIN);
 
-        // Built-in synth: 2 registry rows.
+        // Built-in synth: 2 registry rows + the dedicated curve inlet row.
         assert_eq!(
             size_of(PatchId::Node(instr), &deps),
-            Vec2::new(NODE_SIZE.x, NODE_SIZE.y + 2.0 * INLINE_ROW_HEIGHT)
+            Vec2::new(
+                NODE_SIZE.x,
+                NODE_SIZE.y + 2.0 * INLINE_ROW_HEIGHT + CURVE_PORT_ROW
+            )
         );
-        // Built-in delay: 3 registry rows.
+        // Built-in delay: 3 registry rows + the dedicated curve inlet row.
         assert_eq!(
             size_of(PatchId::Node(delay), &deps),
-            Vec2::new(NODE_SIZE.x, NODE_SIZE.y + 3.0 * INLINE_ROW_HEIGHT)
+            Vec2::new(
+                NODE_SIZE.x,
+                NODE_SIZE.y + 3.0 * INLINE_ROW_HEIGHT + CURVE_PORT_ROW
+            )
         );
         // Mixer: wider box (port-name column), channel-scaled base + 1 row.
+        // The curve row reuses the port area's headroom, so no extra height.
         assert_eq!(
             size_of(PatchId::Node(mixer), &deps),
             Vec2::new(MIXER_WIDTH, mixer_base + INLINE_ROW_HEIGHT)
         );
-        // Plugin node: 2 session-enumerated rows.
+        // Plugin node: 2 session-enumerated rows + the curve inlet row.
         assert_eq!(
             size_of(PatchId::Node(plugin_node), &deps),
-            Vec2::new(NODE_SIZE.x, NODE_SIZE.y + 2.0 * INLINE_ROW_HEIGHT)
+            Vec2::new(
+                NODE_SIZE.x,
+                NODE_SIZE.y + 2.0 * INLINE_ROW_HEIGHT + CURVE_PORT_ROW
+            )
         );
         // Fixed entities: no inline rows.
         assert_eq!(
@@ -7416,7 +7775,7 @@ mod tests {
                 size_of(id, &deps),
                 Vec2::new(
                     NODE_SIZE.x,
-                    NODE_SIZE.y + ACTION_ROW_HEIGHT + 3.0 * INLINE_ROW_HEIGHT
+                    NODE_SIZE.y + ACTION_ROW_HEIGHT + 3.0 * INLINE_ROW_HEIGHT + CURVE_PORT_ROW
                 )
             );
         }
@@ -7526,7 +7885,7 @@ mod tests {
                 size_of(id, &deps),
                 Vec2::new(
                     NODE_SIZE.x,
-                    NODE_SIZE.y + ACTION_ROW_HEIGHT + 2.0 * INLINE_ROW_HEIGHT
+                    NODE_SIZE.y + ACTION_ROW_HEIGHT + 2.0 * INLINE_ROW_HEIGHT + CURVE_PORT_ROW
                 )
             );
         }

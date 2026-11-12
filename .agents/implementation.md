@@ -15,7 +15,7 @@
 - **录音与 headless I/O**：录音、导出、Preferences、CLI、MCP
 - **框架升级与 gotchas**：依赖版本契约、egui 升级、跨平台构建
 - **系列实施补记与交互打磨**：2026-11-11 自 plan.md 归位的系列记录、I 系列
-- **特性 ID 注册表**：`F-001`–`F-043`（新特性先登记再实现）
+- **特性 ID 注册表**：`F-001`–`F-044`（新特性先登记再实现）
 
 ## 特性 ID 注册表
 
@@ -66,6 +66,7 @@
 | F-041 | clip 与数据分离（数据池 + 实例引用） | EDIT / PROJ / ENGINE | `clip-data-instances.md` | — |
 | F-042 | 工程信任模型（外部媒体 / SF2 / 插件路径审计） | PROJ / IO | `project-trust.md` | 安全边界 |
 | F-043 | 用户波表导入（单周期 WAV → 第 5 帧） | VOICE / PROJ | `wavetable-import.md` | 用户表导入 |
+| F-044 | 聚合 Curve 输入口（每个可控制节点一个黄口） | UI / PATCH / EDIT | `curve-port.md` | — |
 
 > 无独立 spec 的历史条目（transport / 文件管理 U2 / U10 / U14 / I 系列 / B2 / W3a–c 等）保留字母别名，不做回溯编号；新特性一律先写 spec 再领号。
 
@@ -283,6 +284,15 @@ spec `.agents/spec/dual-audio-input.md`。目标不是「加一个效果器」�
 - **影响面**：`sync_clip_row` 仍是单轨重推；跨轨共享的内容编辑用 `sync_selection_rows`（Link / Unlink）覆盖所有受影响 track。
 - **UI**：clip header 追加 `· shared:N`（ASCII，仅 N>1）；Inspector 新增 clip 区块（`Clip data · MIDI #id · shared by N clip(s)` + `Unlink` / `Link Data`）；Edit 头显示 `· shared by N clips`；`Ctrl+Shift+D` = Duplicate with New Data（`Shift+D` 保持共享）。
 - **命令**：`clip.link_data {track, clip, source_track, source_clip}` / `clip.unlink_data {track, clip}`；命令数 23 → 25（MCP / CLI 断言已同步）。
+
+### F-044 · 聚合 Curve 输入口（2026-11-12 交付）
+
+- **几何**：`CURVE_PORT_ROW = 16`（graph space）。非 Mixer 目标节点（Instrument / Effect / Feedback）`size_of` 增高 16；Mixer 复用现有 port area 顶部空间、盒子不增高（避免 132 px 轨道列间距导致相邻轨混音器重叠）。`port_area` 顶部统一预留 16；聚合口位于槽中心，结构口与 Mixer 通道口从槽下方开始；单通道 Mixer 也按 port area 均分。
+- **端点**：`cable_controls_indexed` 在 `CableKind::Automation` 且目标有聚合口时取 `curve_port_screen`；其余电缆仍落结构输入口。`Timeline In` 的 Tempo / 录音口不变。
+- **绘制**：黄色空心环（`cable_color(Automation)`）+ 节点底色洞 + 黑色细描边，右侧 `PORT_NAME_GAP` 处 10 pt 灰字 `Curve`。
+- **多线扇形**：同 `(from, to)` 的 Automation 电缆组按文档顺序分配 lane，贝塞尔控制点垂直偏移 `(lane - (n-1)/2) * 16 px`（中点约 12 px），参数标签不再叠在同一位置；绘制、命中、切割、中点菜单共用 `cable_controls_indexed`。
+- **无数据变更**：`CableDoc` / engine 路由 / `PROJECT_VERSION` 均不改；聚合口是纯显示层派生。
+- **测试**：新增 `f044_only_control_targets_get_a_curve_inlet` / `f044_curve_inlet_clears_the_structural_inlets` / `f044_automation_cables_use_the_curve_inlet_and_fan_out`；`sample` / `soundfont` 与 `node_size_grows_with_inline_rows` 的尺寸期望补 `CURVE_PORT_ROW`。UI 300 个单测 + 全 workspace 测试全 `ok`，clippy 干净。
 
 ### UI（`glitcherz-ui`，eframe 0.36 glow）
 
