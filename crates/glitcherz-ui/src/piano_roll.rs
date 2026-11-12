@@ -48,7 +48,7 @@ use crate::grid::GridValue;
 use crate::snap::Snap;
 use glitcherz_model::{
     ControlClip, CurveData, MeterMap, MidiClip, MidiData, MidiTrack, Note, RandomizeOptions,
-    StrumDirection, StrumOptions, TICKS_PER_QUARTER, TICKS_PER_STEP,
+    StrumDirection, StrumOptions, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP,
 };
 
 pub use crate::grid::NoteValue;
@@ -1429,7 +1429,10 @@ impl ViewWindow {
             // Aud series: the window covers the clip's whole span. A tiled
             // clip opens on the full block instead of swallowing everything
             // past its first content period.
-            let span = clip.span_ticks.max(data.length_ticks).max(TICKS_PER_STEP) as f32;
+            let span = clip
+                .span_ticks
+                .max(data.map_or(TICKS_PER_BAR, |data| data.length_ticks))
+                .max(TICKS_PER_STEP) as f32;
             start = start.min(origin);
             end = end.max(origin + span);
         }
@@ -1478,11 +1481,15 @@ fn track_clip<'a>(
     tracks: &'a [MidiTrack],
     midi_data: &'a [MidiData],
     clip: ClipRef,
-) -> Option<(&'a MidiClip, &'a MidiData)> {
+) -> Option<(&'a MidiClip, Option<&'a MidiData>)> {
     match clip.lane {
         RollLane::Midi => {
             let clip = tracks.get(clip.track)?.clips.get(clip.clip)?;
-            let data = midi_data.get(clip.data as usize)?;
+            // A dangling pool index must not make the whole editor return
+            // early (that also skipped the keyboard-surface registration, so
+            // the view lost every shortcut). Callers fall back to empty
+            // content instead.
+            let data = midi_data.get(clip.data as usize);
             Some((clip, data))
         }
         RollLane::Control => None, // the focus is always MIDI
@@ -1508,7 +1515,12 @@ pub fn show(
     router: &mut crate::focus::FocusRouter,
 ) -> Option<RollIntent> {
     let focus = subject.focus();
-    let (clip, data) = track_clip(tracks, midi_data, focus)?;
+    let (clip, data_opt) = track_clip(tracks, midi_data, focus)?;
+    let fallback = MidiData {
+        length_ticks: TICKS_PER_BAR,
+        ..MidiData::default()
+    };
+    let data = data_opt.unwrap_or(&fallback);
     let loop_ticks = i64::from(data.length_ticks.max(TICKS_PER_STEP)).max(1);
     // Aud series: the whole clip block (tiled repeats included) — the ruler's
     // extent and the audition range's end.
@@ -2470,8 +2482,13 @@ pub fn show(
             continue;
         };
         let ghost_geom = geom.at_origin(i64::from(ghost_clip.start_ticks));
-        let ghost_loop = i64::from(ghost_data.length_ticks.max(TICKS_PER_STEP)).max(1);
-        for note in ghost_data.notes() {
+        let ghost_loop = i64::from(
+            ghost_data
+                .map_or(TICKS_PER_BAR, |data| data.length_ticks)
+                .max(TICKS_PER_STEP),
+        )
+        .max(1);
+        for note in ghost_data.map_or(&[][..], |data| data.notes()) {
             // Past a shortened span: kept in the data, never drawn (same rule
             // as the focus clip).
             if note.start >= ghost_loop {

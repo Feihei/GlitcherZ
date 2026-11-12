@@ -78,7 +78,13 @@ impl GlitcherZApp {
     }
 
     pub(crate) fn timeline_panel(&mut self, ui: &mut egui::Ui) {
-        if self.project().midi_tracks.is_empty() && self.project().control_tracks.is_empty() {
+        // Audio-only projects still own the arrangement row: returning here
+        // left the panel with no keyboard surface at all (and no way to use
+        // its shortcuts).
+        if self.project().midi_tracks.is_empty()
+            && self.project().control_tracks.is_empty()
+            && self.project().audio_tracks.is_empty()
+        {
             return;
         }
 
@@ -2041,22 +2047,25 @@ impl GlitcherZApp {
         ui.label(format!(
             "Clip data · {kind} #{data} · shared by {refs} clip(s)"
         ));
-        if refs > 1
-            && ui
+        if refs > 1 {
+            let unlink = ui
                 .button("Unlink")
-                .on_hover_text("Give this clip its own copy of the content")
-                .clicked()
-        {
-            self.unlink_selected_clip_data();
+                .on_hover_text("Give this clip its own copy of the content");
+            if unlink.clicked() {
+                // Do not leave the keyboard parked on this button: the
+                // timeline / roll surfaces only regain it on pointer hover.
+                unlink.surrender_focus();
+                self.unlink_selected_clip_data();
+            }
         }
-        if selection.len() > 1
-            && selection.iter().all(|sel| sel.lane == first.lane)
-            && ui
+        if selection.len() > 1 && selection.iter().all(|sel| sel.lane == first.lane) {
+            let link = ui
                 .button("Link Data")
-                .on_hover_text("Point every selected clip at the first one's content")
-                .clicked()
-        {
-            self.link_selected_clip_data();
+                .on_hover_text("Point every selected clip at the first one's content");
+            if link.clicked() {
+                link.surrender_focus();
+                self.link_selected_clip_data();
+            }
         }
     }
 
