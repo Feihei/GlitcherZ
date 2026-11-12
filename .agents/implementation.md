@@ -275,15 +275,16 @@ spec `.agents/spec/dual-audio-input.md`。目标不是「加一个效果器」�
 
 ### F-041 · clip 与数据分离（2026-11-11 交付）
 
-- **数据池**：`Project.midi_data: Vec<MidiData>` / `curve_data: Vec<CurveData>`；clip 只存 `data: u32` + `source_offset` + `span_ticks`。`loop_ticks` 退休为 `data.length_ticks`；播放位置 = `(source_offset + t) mod length_ticks`。
+- **数据池**：`Project.midi_data: Vec<MidiData>` / `curve_data: Vec<CurveData>`；clip 只存 `data: u32` + `source_offset` + `span_ticks` + `repeat`。`loop_ticks` 退休为 `data.length_ticks`；播放位置 = `source_offset + t`，`repeat = true` 时取模循环，否则到内容末端为止（M8 修订）。
 - **撤销 / 序列化**：池是 `Project` 的普通字段，`Arc<Project>` 快照天然隔离；运行时允许孤儿条目（`MAX_CLIP_DATA_ENTRIES = 4096`），保存时用临时副本 compact，不改内存索引。
 - **迁移 v11→v12**：`adopt_inline_content` 把每个旧 clip 的 `legacy_loop_ticks` / `legacy_sequence` / `legacy_curve` 移入池，`source_offset = 0`；SMF 导入与录音也先构造 legacy 内容，再在合入工程时 adopt。
-- **引擎**：`RtMidiClip` / `RtControlClip` 改 `source_offset + length_ticks`；头截断只发一个截断实例（不再重复触发），尾音保持自然长度跨窗口末尾；`value_at_absolute` 用 `(source_offset + local).rem_euclid(length)`。
-- **非破坏窗口**：头裁只 `source_offset += delta`、`span -= delta`；split 两半共享同一 `data`；tile 只改 `span`；`Placement` 删除 `loop_len` / `set_loop`，新增 `split_right`。
+- **引擎**：`RtMidiClip` / `RtControlClip` 改 `source_offset + length_ticks + repeat`；头截断只发一个截断实例（不再重复触发），尾音保持自然长度跨窗口末尾；`value_at_absolute` 循环时用 `(source_offset + local).rem_euclid(length)`，非循环超出内容返回 `None`。
+- **非破坏窗口**：头裁只 `source_offset += delta`、`span -= delta`；split 两半共享同一 `data`；tile 只改 `span` + 设 `repeat`；`Placement` 删除 `loop_len` / `set_loop`，新增 `split_right`。
 - **剪贴板**：`ClipSnapshot::Midi(MidiClip, MidiData)` / `Control(ControlClip, CurveData)`；粘贴时 `push_midi_data` / `push_curve_data` 生成新索引，跨工程安全。
 - **影响面**：`sync_clip_row` 仍是单轨重推；跨轨共享的内容编辑用 `sync_selection_rows`（Link / Unlink）覆盖所有受影响 track。
-- **UI**：clip header 追加 `· shared:N`（ASCII，仅 N>1）；Inspector 新增 clip 区块（`Clip data · MIDI #id · shared by N clip(s)` + `Unlink` / `Link Data`）；Edit 头显示 `· shared by N clips`；`Ctrl+Shift+D` = Duplicate with New Data（`Shift+D` 保持共享）。
+- **UI**：clip header 追加 `· shared:N`（ASCII，仅 N>1）；Inspector 新增 clip 区块（`Clip data · MIDI #id · shared by N clip(s)` + `Unlink` / `Link Data`）；Edit 头显示 `· shared by N clips`；`Shift+D` = 复制并独立数据、`Alt+D` = 复制并共享数据（M8 修订；工具栏 Duplicate 与 Shift+D 同义）。
 - **命令**：`clip.link_data {track, clip, source_track, source_clip}` / `clip.unlink_data {track, clip}`；命令数 23 → 25（MCP / CLI 断言已同步）。
+- **M8 修订（2026-11-12）**：`MidiClip::repeat` / `ControlClip::repeat`（serde default false）区分「窗口」与「循环」；`PROJECT_VERSION` 12 → 13，`migrate_v12_to_v13` 把 `span > length` 的旧窗口标 true（旧平铺零回归）。T / 拖右缘清 `repeat` 并让**编辑范围跟随窗口**：尾部扩展把 `length_ticks` 扩到窗口末端（卷帘新尾部可直接写）；`T+S` 头部扩展前补空白（音符 / 锚点右移、`length` 增长），内容保持原时间位置；共享 data 先 COW 复制。`Shift+T` / `Alt+T` 设 `repeat = true`。引擎 `schedule_track_clips` 用 `content_end`（非循环到 `length - source_offset`）限制调度与长音符截断；`value_at_absolute` 非循环超出返回 `None`。timeline 预览（MIDI / curve）与 SMF 导出同步按 `repeat` 决定是否重复。复制键位改为 Blender 习惯：`Shift+D` → `DuplicateClipsWithNewData`，`Alt+D` → `DuplicateClipsBatch`（视图级扫描，Alt 丢指针也能 arm；旧 `Ctrl+Shift+D` 已移除）。
 
 ### F-044 · 聚合 Curve 输入口（2026-11-12 交付）
 

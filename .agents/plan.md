@@ -19,7 +19,7 @@
 
 路线图 1–10 全部落地；基础功能、节点图、MIDI 编辑、插件宿主、可用性（U 系列）、录音（R 系列）、内建效果器（E 系列）、声源扩展（Y / Z / B 系列）与交互打磨（I 系列）均已交付。已完成系列的设计与实现位置见下方「历史系列索引」——本文件不再逐项记录它们的实施细节。
 
-- **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）；命令词汇表（F-039）V1a / V1b-1 / V1b-2 / V2 / V3 **全部交付**；剪贴板（F-040）C1–C2 已交付（2026-11-11）；clip 与数据分离（F-041）M0 文档已入库，M1 待实施。
+- **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）；命令词汇表（F-039）V1a / V1b-1 / V1b-2 / V2 / V3 **全部交付**；剪贴板（F-040）C1–C2 已交付（2026-11-11）；clip 与数据分离（F-041）M1–M6 已交付（2026-11-11），2026-11-12 M8 修订（`repeat` 标记 + 复制键位）。
 - **下一步候选**：无固定下一项；未完成项见下方列表（用户表导入 / 安全边界）。
 - **门禁**：`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`，在本机沙箱外跑（沙箱内 cargo 会毒化 `target/debug/incremental`）。
 
@@ -60,15 +60,15 @@ Spec：`spec/clip-data-instances.md`（D1–D17）。
 | :--- | :--- | :--- |
 | F041-D1 | 共享载体 | **数据池 + 索引**（`Project.midi_data` / `curve_data`，clip 存 `data: u32`）。否决 `Arc<Sequence>`（`make_mut` 会断开共享）与 master clip 引用 |
 | F041-D2 | `loop_ticks` | **退休** → `data.length_ticks` + `clip.source_offset` + `clip.span_ticks` |
-| F041-D3 | 窗口超出数据 | 允许，按 `length_ticks` 取模循环；不需要 `repeats` 字段 |
+| F041-D3 | 窗口超出数据 | 允许；默认**不循环**（超出为空白），`Shift+T` / `Alt+T` 显式打开 `repeat` 后才按 `length_ticks` 重复（2026-11-12 修订） |
 | F041-D4 | 编辑传播 | 影响所有引用者；显式 Unlink 才独立 |
 | F041-D5 | trim / split | **非破坏窗口**；split 两半共享 data；取消「平铺 clip 不可切」 |
 | F041-D6 | 卷帘编辑对象 | 编辑 data，范围 = `length_ticks`；窗口画标线、窗口外降透明度 |
 | F041-D7 | ControlClip | 同构；`interp` 随数据走 |
 | F041-D8 | 音频 | 不动（已是同构形状）；不引入媒体池 |
-| F041-D9 | 复制 | `Shift+D` 共享 data；`Ctrl+C/V` 复制 data；另给 `Duplicate with New Data` |
+| F041-D9 | 复制 | `Shift+D` 复制并**独立 data**；`Alt+D` 复制并**共享 data**；`Ctrl+C/V` 复制 data（2026-11-12 修订） |
 | F041-D10 | 撤销 | 算法不动；直接改池元素 |
-| F041-D13 | 文件版本 | 11 → 12；迁移每个 clip 独占 data，行为逐 tick 不变 |
+| F041-D13 | 文件版本 | 11 → 12 → 13；v12→v13 把 `span > length` 的旧窗口标 `repeat = true`，保持旧平铺行为（2026-11-12 修订） |
 | F041-D14 | 池回收 | 允许孤儿；保存时临时副本 compact；4096 上限触发一次回收 |
 | F041-D15 | UI | header `shared:N` 徽章 + Inspector clip 区块（Link/Unlink）+ Edit 头；**不做独立面板** |
 
@@ -82,8 +82,9 @@ Spec：`spec/clip-data-instances.md`（D1–D17）。
 | **M3** 接入（2026-11-11 交付） | `command` helper + `headless::midi_clip_table` + 剪贴板成对快照（`MidiClip, MidiData` / `ControlClip, CurveData`） | M2 | 中 |
 | **M4** 卷帘（2026-11-11 交付编辑对象） | 编辑范围 `length_ticks`（窗口标线 / 窗降透明度留待后续打磨） | M3 | 中偏大 |
 | **M5** timeline（2026-11-11 交付） | `Placement` / trim / split / T / tile / 三种复制 / `×N` / seam | M3 | 中 |
-| **M6** UI 入口（2026-11-11 交付） | header 徽章 + Inspector clip 区块 + Edit 头 + `Ctrl+Shift+D` + `clip.link_data` / `clip.unlink_data` + 文档 | M4、M5 | 中 |
+| **M6** UI 入口（2026-11-11 交付） | header 徽章 + Inspector clip 区块 + Edit 头 + `Shift+D` / `Alt+D` + `clip.link_data` / `clip.unlink_data` + 文档 | M4、M5 | 中 |
 | **M7** 数据面板（可选） | 池浏览 / 命名 / 批量替换引用 | M6 | 大 |
+| **M8** 修订（2026-11-12 交付） | `repeat` 标记 + v12→v13 迁移 + 引擎/预览非循环尾部静默 + 复制键位交换（Shift+D 独立 / Alt+D 共享） | M6 | 中 |
 
 顺序：**M1 → M2 → M3 → M4 / M5（可并行）→ M6 → M7**。
 
@@ -93,6 +94,7 @@ Spec：`spec/clip-data-instances.md`（D1–D17）。
 - **M1 零回归**：v11 fixture 打开后播放与 `--render` 导出与 pre-F-041 二进制逐字节一致。
 - M2 相位单测覆盖 `source_offset` 非零、跨 3 周期、窗口起点落在音符中间、curve 相位。
 - M6 的命令计数断言从 23 更新到 25。
+- M8：v12 工程打开后平铺 clip 仍按原样重复（迁移设 `repeat`）；T 尾部扩展后卷帘新区域可直接写、`T+S` 头部扩展前补空白且音符保持原位（共享 data 自动 COW）；`Shift+D` / `Alt+D` 分别产出 `DuplicateClipsWithNewData` / `DuplicateClipsBatch`。
 
 ### 明确不做（本系列）
 
