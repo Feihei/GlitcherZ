@@ -61,7 +61,7 @@ Blender 式 object / mesh 分离：**多个 clip 可以引用同一份 MIDI / cu
 | D18 | 窗口两端越界（M10） | `source_offset` 改 `i64`；窗口 `[offset, offset+span)` 允许负起点（前导空白）与超出 `length`（尾部空白）；不再要求 offset ∈ [0, length) |
 | D19 | 显式周期（M10） | `repeat: bool` → `loop_ticks: Option<u32>`；`None` 不循环，`Some(p)` 以 `p` 为周期；周期与 `data.length_ticks` 解耦，允许 `p != length` 与 `p > span` |
 | D20 | T 纯窗口（M10） | T / 拖边只写窗口字段，**绝不改 `length_ticks`、不移动事件**；卷帘编辑范围 = 窗口，越界写入时把 `length` 增长到事件末端（写时增长），共享 data 在此时才 COW |
-| D21 | 组织层按 data 分组（M9） | 批量复制 / 拉伸 / Link 以 data 为单元去重：同一 data 一次操作只克隆或 COW 一次，副本间保持原共享结构；`Link Data` 按原 data 分组，不跨组合并；`Unlink` 逐个展开 |
+| D21 | 组织层按 data 分组（M9） | 批量复制 / 拉伸 / Unlink 以 data 为单元去重：同一 data 一次操作只克隆或 COW 一次，组内保持原共享结构；`Link Data` 是用户**显式合并**，选区统一指向首个成员的 data（不做分组）；`Unlink` 组内共享新副本 |
 | D22 | 同步与保存补口（M9） | 新增 `sync_clip_data(kind, data)`（扫描全部引用 track 重推）；卷帘 / `midi.*` / Link / Unlink 后统一调用；`save_project` / `save_autosave` 在临时副本上 compact 后序列化 |
 | D23 | 窗口内嵌 clip（M10） | **不拆 window 池**：只保留 `data` 池；`source_offset` / `span_ticks` / `loop_ticks` 与 `start_ticks` / `group` / `muted` / `name` 一起留在 clip 上。窗口永远私有，clip 间只共享 data |
 | D24 | tile 是操作，不是类型（M11） | **放弃 `TileSpec` / `tile` 字段 / explode**：`tile N` = 把当前 clip 紧密复制 N 份（窗口字段各自一份、共享 data），生成 N 个普通 clip；不合成整体，用户自行 group |
@@ -412,7 +412,7 @@ loop = Some(p)     → phase = window_pos.rem_euclid(p)，再按 p 的实例展�
 | 调用点 | `editing.rs` / `command/midi.rs` / `clip.rs` | 卷帘提交、`midi.*`、`clip.link_data` / `unlink_data` 之后 |
 | 保存 compact | `file.rs` | `save_project` / `save_autosave` 先在 `Project` 临时副本上 `compact_clip_data()`，内存索引不变 |
 | data 分组 COW | `timeline_ops.rs` | 批量复制 / 拉伸前把 data 索引分组；同组只克隆一次，副本共享同一新索引 |
-| Link / Unlink | `clip.rs` / UI | Link 按原 data 分组合并；Unlink 对选中集合逐个展开；组标签不参与 |
+| Link / Unlink | `clip.rs` / UI | Link 是显式合并：选区统一指向首个成员的 data；Unlink 按原 data 分组，一次克隆、组内共享新副本；组标签不参与 |
 | 同轨区间选择 | `timeline.rs` | 单击设 `selection_anchor`；`Shift` + 单击同轨另一 clip 选中两者之间（按 `start` 排序）的全部 clip；`Ctrl` 保持追加；跨轨退化单选 |
 | 命名清理 | `timeline.rs` | `ClipTileEdit.loop_ticks` → `period_ticks`；注释里「tiled clip == repeat」的旧描述改成分层表述 |
 
