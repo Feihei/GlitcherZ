@@ -757,6 +757,75 @@ fn the_toolbar_belongs_to_the_panel_surface_from_the_first_frame() {
         "hovering the timeline's own toolbar must hand it the keyboard"
     );
 }
+/// 2026-11-12: Blender-style duplicate modifiers. `Shift+D` copies a clip with
+/// its own data; `Alt+D` copies it and shares the source content. This pins
+/// the action the view emits (the app side turns it into the pool operation).
+fn select_first_clip_for_duplicate(f: &mut Fixture) -> egui::Pos2 {
+    f.frame(vec![]);
+    f.frame(vec![]);
+    let row = f
+        .ctx
+        .read_response(egui::Id::unique("glitcherz_timeline_row").with((false, 0usize)))
+        .expect("row 0 is missing from the widget stack")
+        .rect;
+    let pos = egui::pos2(row.left() + 130.0, row.center().y);
+    f.click(pos);
+    pos
+}
+
+fn confirm_duplicate_modal(f: &mut Fixture, pos: egui::Pos2) -> Vec<timeline::TimelineAction> {
+    let mut actions = f.frame(vec![hover(pos)]);
+    actions.extend(f.frame(vec![hover(pos), press(pos, true)]));
+    actions.extend(f.frame(vec![hover(pos)]));
+    actions.extend(f.frame(vec![hover(pos), press(pos, false)]));
+    actions
+}
+
+#[test]
+fn shift_d_duplicates_with_detached_data() {
+    let mut f = Fixture::new();
+    let pos = select_first_clip_for_duplicate(&mut f);
+    f.frame(vec![
+        hover(pos),
+        key_with(egui::Key::D, egui::Modifiers::SHIFT),
+    ]);
+    assert!(
+        f.state.modal_active(),
+        "Shift+D must arm the duplicate modal"
+    );
+    let actions = confirm_duplicate_modal(&mut f, pos);
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            timeline::TimelineAction::DuplicateClipsWithNewData { .. }
+        )),
+        "Shift+D must duplicate with fresh data: {actions:?}"
+    );
+}
+
+#[test]
+fn alt_d_duplicates_with_shared_data() {
+    let mut f = Fixture::new();
+    let pos = select_first_clip_for_duplicate(&mut f);
+    // Holding Alt can drop the cursor on Windows: the view-level scan must
+    // arm anyway, exactly like the tile shortcut.
+    f.frame(vec![
+        egui::Event::PointerGone,
+        key_with(egui::Key::D, egui::Modifiers::ALT),
+    ]);
+    assert!(
+        f.state.modal_active(),
+        "Alt+D must arm the duplicate modal without a pointer"
+    );
+    let actions = confirm_duplicate_modal(&mut f, pos);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, timeline::TimelineAction::DuplicateClipsBatch { .. })),
+        "Alt+D must duplicate sharing the content: {actions:?}"
+    );
+}
+
 /// Regression (2026-11-10): dragging a clip's edge must resize it. egui only
 /// fires `drag_started` after the pointer travelled past its click distance,
 /// so classifying by the *current* pointer put an edge drag outside the clip

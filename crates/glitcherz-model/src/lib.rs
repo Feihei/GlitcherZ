@@ -1933,9 +1933,9 @@ fn clip_group_default_color() -> [u8; 3] {
 /// `start_ticks` is the absolute position on the arrangement. The clip is
 /// audible for `span_ticks` from there, playing a **window** into the shared
 /// [`MidiData`] at `Project::midi_data[data]`: the playback position is
-/// `(source_offset + t) mod length_ticks`, so a window longer than the data
-/// loops (the old tiling) and trimming only moves the window without touching
-/// the content.
+/// `source_offset + t` (or `(source_offset + t) mod length_ticks` when
+/// [`MidiClip::repeat`] is set). Trimming only moves the window without
+/// touching the content.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MidiClip {
     /// Optional user-facing clip name (W3a). Empty means unnamed: the
@@ -1962,6 +1962,12 @@ pub struct MidiClip {
     /// How long the clip stays active (tick), >= 1.
     #[serde(default = "default_clip_span")]
     pub span_ticks: u32,
+    /// Whether the window loops the content when it is longer than
+    /// `length_ticks` (F-041 + 2026-11-12 revision). Off by default: a plain
+    /// T stretch extends the window with silence instead of repeating the
+    /// content. The tile tool (`Shift+T` / `Alt+T`) turns it on explicitly.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub repeat: bool,
     /// Index into [`Project::midi_data`].
     #[serde(default)]
     pub data: u32,
@@ -2052,6 +2058,7 @@ impl Default for MidiClip {
             start_ticks: 0,
             source_offset: 0,
             span_ticks: default_clip_span(),
+            repeat: false,
             data: 0,
             legacy_loop_ticks: 0,
             legacy_sequence: Sequence::default(),
@@ -2190,7 +2197,8 @@ pub enum CurveInterp {
 /// F-041).
 ///
 /// Same window semantics as [`MidiClip`]: the clip plays
-/// `(source_offset + t) mod length_ticks` of the shared [`CurveData`] at
+/// `source_offset + t` (or `(source_offset + t) mod length_ticks` when
+/// [`ControlClip::repeat`] is set) of the shared [`CurveData`] at
 /// `Project::curve_data[data]`. Outside the span nothing is delivered (the
 /// target keeps its last value). The delivery endpoint is decided by the node
 /// graph's automation cable, not by the clip.
@@ -2218,6 +2226,10 @@ pub struct ControlClip {
     /// How long the clip stays active (tick), >= 1.
     #[serde(default = "default_clip_span")]
     pub span_ticks: u32,
+    /// Whether the window loops the content when it is longer than
+    /// `length_ticks` (see [`MidiClip::repeat`]).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub repeat: bool,
     /// Index into [`Project::curve_data`].
     #[serde(default)]
     pub data: u32,
@@ -2242,6 +2254,7 @@ impl Default for ControlClip {
             start_ticks: 0,
             source_offset: 0,
             span_ticks: default_clip_span(),
+            repeat: false,
             data: 0,
             legacy_loop_ticks: 0,
             legacy_curve: Vec::new(),
@@ -6995,6 +7008,32 @@ impl Project {
         self.adopt_inline_content();
     }
 
+    /// v12 -> v13 (F-041 revision, 2026-11-12): the window no longer loops
+    /// implicitly. v12 had no `repeat` flag, so every clip whose window
+    /// exceeded its content length was tiled; flag exactly those to keep old
+    /// documents sounding the same. New clips default to a non-looping
+    /// window (T stretches with silence, the tile tool sets `repeat`).
+    ///
+    /// Only call it for documents whose `version < 13`.
+    pub fn migrate_v12_to_v13(&mut self) {
+        let midi_data = &self.midi_data;
+        for track in &mut self.midi_tracks {
+            for clip in &mut track.clips {
+                clip.repeat = midi_data
+                    .get(clip.data as usize)
+                    .is_some_and(|data| clip.span_ticks > data.length_ticks);
+            }
+        }
+        let curve_data = &self.curve_data;
+        for track in &mut self.control_tracks {
+            for clip in &mut track.clips {
+                clip.repeat = curve_data
+                    .get(clip.data as usize)
+                    .is_some_and(|data| clip.span_ticks > data.length_ticks);
+            }
+        }
+    }
+
     /// Moves every clip's inline (`legacy_*`) content into the shared pools and
     /// points the clips at their new entries.
     ///
@@ -11272,7 +11311,44 @@ mod tests {
     /// number for the additive `meter_markers` field, without a migration.
     #[test]
     fn project_version_matches_the_curve_migration() {
-        assert_eq!(super::PROJECT_VERSION, 12);
+        assert_eq!(super::PROJECT_VERSION, 13);
+    }
+
+    /// F-041 revision: v12 had no `repeat` flag, so every window that
+    /// exceeded its content was tiled. The migration flags exactly those,
+    /// leaving ordinary one-period clips non-looping.
+    #[test]
+    fn migrate_v12_to_v13_flags_implicit_loops() {
+        let mut project = Project::default();
+        let looping = project.push_midi_data(super::MidiData {
+            length_ticks: TICKS_PER_BAR,
+            ..super::MidiData::default()
+        });
+        let single = project.push_midi_data(super::MidiData {
+            length_ticks: TICKS_PER_BAR,
+            ..super::MidiData::default()
+        });
+        project.midi_tracks[0].clips.push(MidiClip {
+            span_ticks: 2 * TICKS_PER_BAR,
+            data: looping,
+            ..MidiClip::default()
+        });
+        project.midi_tracks[0].clips.push(MidiClip {
+            span_ticks: TICKS_PER_BAR,
+            data: single,
+            ..MidiClip::default()
+        });
+
+        project.migrate_v12_to_v13();
+
+        assert!(
+            project.midi_tracks[0].clips[0].repeat,
+            "tiled window flagged"
+        );
+        assert!(
+            !project.midi_tracks[0].clips[1].repeat,
+            "plain window stays off"
+        );
     }
 
     // ---- SF2 bend range (spec `curve-map.md` D8/D9) ----

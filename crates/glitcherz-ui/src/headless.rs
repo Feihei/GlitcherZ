@@ -695,6 +695,7 @@ pub(crate) fn midi_clip_table(project: &Project, track: usize) -> MidiClipTable 
             source_offset: clip.source_offset,
             span_ticks: clip.span_ticks,
             length_ticks: data.length_ticks,
+            repeat: clip.repeat,
             // B2: mute travels with the clip; the engine skips it while
             // keeping its span (the arrangement length does not move).
             muted: clip.muted,
@@ -750,6 +751,7 @@ pub(crate) fn control_clip_table(
             source_offset: clip.source_offset,
             span_ticks: clip.span_ticks,
             length_ticks: data.length_ticks,
+            repeat: clip.repeat,
             muted: clip.muted,
             curve,
         };

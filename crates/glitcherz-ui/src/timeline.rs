@@ -164,8 +164,8 @@ enum ModalKind {
     /// G: free move — bar delta in time + row delta (same kind only).
     /// X / Y lock an axis mid-modal (unified with the roll).
     Grab { locked: Option<Axis> },
-    /// Shift+D: duplicate the selection — the clones enter a grab-style
-    /// modal; the originals stay untouched until the drop.
+    /// Alt+D: duplicate the selection with SHARED content — the clones enter a
+    /// grab-style modal; the originals stay untouched until the drop.
     Duplicate { locked: Option<Axis> },
     /// T: stretch the end edge of every selected clip; S mid-modal flips
     /// to the start edge (unified with the roll's t+s). Bar delta only.
@@ -382,9 +382,10 @@ pub struct TimelineState {
     /// Drag-origin snapshot of an in-flight head trim (I6). `None` between
     /// gestures; the first trim frame fills it and `drag_stopped` drops it.
     pub(crate) head_trim: Option<HeadTrim>,
-    /// F-041: the armed Duplicate modal copies the shared content instead of
-    /// sharing it (Ctrl+Shift+D). Plain Shift+D keeps sharing.
-    duplicate_new_data: bool,
+    /// F-041 revision: the armed Duplicate modal shares the source content
+    /// instead of giving each copy its own copy (Alt+D). Plain Shift+D
+    /// duplicates with fresh, detached data.
+    duplicate_shared: bool,
 }
 
 impl Default for TimelineState {
@@ -417,7 +418,7 @@ impl Default for TimelineState {
             clip_rename_focus: false,
             break_group: false,
             head_trim: None,
-            duplicate_new_data: false,
+            duplicate_shared: false,
         }
     }
 }
@@ -564,7 +565,8 @@ pub enum TimelineAction {
         dups: Vec<ClipDup>,
     },
     /// Clone every clip in the list onto its target **with a fresh copy of its
-    /// shared content** (F-041, Ctrl+Shift+D). Plain Shift+D keeps sharing.
+    /// shared content** (F-041 revision: plain Shift+D; the copies are detached
+    /// from the originals). One undo step.
     DuplicateClipsWithNewData {
         dups: Vec<ClipDup>,
     },
@@ -1413,6 +1415,16 @@ pub fn show(
         // arrive while Alt has dropped the cursor on Windows).
         arm_modal(state, Arm::Tile, ui.ctx().pointer_hover_pos());
     }
+    // 2026-11-12: Blender's linked duplicate — Alt+D copies the clip and
+    // SHARES its content. A view-level scan like the tile shortcut: holding
+    // Alt makes Windows drop the egui cursor / lane focus, so a focus-gated
+    // lane key would silently do nothing. The modal latches its grab on the
+    // first real pointer.
+    if state.modal.is_none() && !state.knife_armed && take_linked_duplicate_shortcut(ui.ctx()) {
+        state.knife_armed = false;
+        state.duplicate_shared = true;
+        arm_modal(state, Arm::Duplicate, ui.ctx().pointer_hover_pos());
+    }
     // Ctrl+A / Ctrl+Shift+A (W3c): select every clip in the arrangement, or
     // drop the selection. A view-level command like the tile shortcut — the
     // lane rows only ever see their own track, and "all" is by definition
@@ -1685,7 +1697,7 @@ pub fn show(
                     "Duplicate",
                     "Shift+D",
                     Arm::Duplicate,
-                    "copy the selection, then move the copies · LMB drops · Esc cancels",
+                    "copy the selection, then move the copies · Shift+D: detached data · Alt+D: shares content · LMB drops · Esc cancels",
                 ),
             ] {
                 let is_armed = armed(state) == Some(arm);
@@ -1695,6 +1707,10 @@ pub fn show(
                         state.modal = None;
                     } else {
                         state.knife_armed = false;
+                        // The toolbar has no modifier: plain duplicate =
+                        // detached data (the Alt+D sharing variant is
+                        // keyboard-only, like Blender's linked duplicate).
+                        state.duplicate_shared = false;
                         arm_modal(state, arm, None);
                     }
                 }
@@ -1838,7 +1854,7 @@ pub fn show(
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(
-                        "Drag move · either edge: trim (head included) · T: extend time · Shift+T / Alt+T: tile · dbl-click edit · F2 / Alt+dbl-click: rename · Ctrl+G group · Ctrl+Shift+G ungroup · Alt+click: single · right-click delete · Ctrl+MMB mute clip · H mute / Alt+H unmute all · marquee select · Del · K knife · dots: reorder track · ruler: seek / Ctrl+loop / RMB marker · Ctrl+wheel zoom · Ctrl+Alt+wheel height · MMB pan",
+                        "Drag move · either edge: trim (head included) · T: extend time · Shift+T / Alt+T: tile · Shift+D: copy (own data) · Alt+D: copy (shared data) · dbl-click edit · F2 / Alt+dbl-click: rename · Ctrl+G group · Ctrl+Shift+G ungroup · Alt+click: single · right-click delete · Ctrl+MMB mute clip · H mute / Alt+H unmute all · marquee select · Del · K knife · dots: reorder track · ruler: seek / Ctrl+loop / RMB marker · Ctrl+wheel zoom · Ctrl+Alt+wheel height · MMB pan",
                     )
                     .weak(),
                 )
@@ -2197,7 +2213,7 @@ pub fn show(
                 &|_| None,
                 &|clip: &MidiClip, painter, rect| {
                     if let Some(data) = p.midi_data.get(clip.data as usize) {
-                        draw_midi_preview(painter, rect, clip.span_ticks, data);
+                        draw_midi_preview(painter, rect, clip.span_ticks, clip.source_offset, clip.repeat, data);
                     }
                 },
                 &|clip: &MidiClip| {
@@ -2205,6 +2221,8 @@ pub fn show(
                         .get(clip.data as usize)
                         .map_or(1, |data| data.length_ticks)
                 },
+                &|clip: &MidiClip| clip.repeat,
+
                 &|clip: &MidiClip| {
                     midi_tracks
                         .iter()
@@ -2267,7 +2285,7 @@ pub fn show(
                     &|_| None,
                     &|clip: &ControlClip, painter, rect| {
                         if let Some(data) = p.curve_data.get(clip.data as usize) {
-                            draw_control_preview(painter, rect, clip.span_ticks, data);
+                            draw_control_preview(painter, rect, clip.span_ticks, clip.source_offset, clip.repeat, data);
                         }
                     },
                     &|clip: &ControlClip| {
@@ -2275,6 +2293,8 @@ pub fn show(
                             .get(clip.data as usize)
                             .map_or(1, |data| data.length_ticks)
                     },
+                    &|clip: &ControlClip| clip.repeat,
+
                     &|clip: &ControlClip| {
                         control_tracks
                             .iter()
@@ -2334,6 +2354,8 @@ pub fn show(
                     &|clip: &AudioClip| (p.waveform_of)(&clip.path),
                     &|_, _, _| {},
                     &|clip: &AudioClip| clip.span(p.sec_per_tick),
+                    &|_: &AudioClip| false,
+
                     &|_: &AudioClip| 1,
                     p.clip_groups,
                 );
@@ -2548,15 +2570,17 @@ pub fn show(
                                                         }
                                                     })
                                                     .collect();
-                                                if state.duplicate_new_data {
+                                                if state.duplicate_shared {
                                                     actions.push(
-                                                        TimelineAction::DuplicateClipsWithNewData {
+                                                        TimelineAction::DuplicateClipsBatch {
                                                             dups,
                                                         },
                                                     );
                                                 } else {
                                                     actions.push(
-                                                        TimelineAction::DuplicateClipsBatch { dups },
+                                                        TimelineAction::DuplicateClipsWithNewData {
+                                                            dups,
+                                                        },
                                                     );
                                                 }
                                             }
@@ -3036,6 +3060,8 @@ fn lane_row<T: Placement>(
     // F-041: the clip's content length (MIDI / control read the shared pool,
     // audio reports its own span).
     content_len: &dyn Fn(&T) -> u32,
+    // F-041 revision: whether the clip loops its content past the length.
+    content_repeat: &dyn Fn(&T) -> bool,
     // F-041: how many clips reference the same content (1 = private).
     data_refs: &dyn Fn(&T) -> usize,
     // W3b: group table for the colour stripe + name tag.
@@ -3269,7 +3295,8 @@ fn lane_row<T: Placement>(
         // plays. Single-period clips stay a plain solid block.
         let span_ticks = clip.span(sec_per_tick).max(1);
         let loop_ticks = content_len(clip).clamp(1, span_ticks);
-        if loop_ticks < span_ticks {
+        let repeat = content_repeat(clip);
+        if repeat && loop_ticks < span_ticks {
             let seam_color = colors.clip_stroke.gamma_multiply(0.55);
             draw_tile_seams(&painter, rect, loop_ticks, px_per_tick, seam_color);
         }
@@ -3390,7 +3417,11 @@ fn lane_row<T: Placement>(
             custom_name.to_owned()
         };
         // W2: `×N` tells how many content periods the container covers.
-        let repeats = span_ticks.div_ceil(loop_ticks);
+        let repeats = if repeat {
+            span_ticks.div_ceil(loop_ticks)
+        } else {
+            1
+        };
         if repeats > 1 {
             label = format!("{label} ×{repeats}");
         }
@@ -3961,13 +3992,8 @@ fn lane_row<T: Placement>(
             .input_mut(|i| i.consume_key(Modifiers::NONE, Key::G));
         // Shift+D must be consumed before plain D would ever match
         // (consume_key ignores the shift qualifier when matching).
-        // F-041: Ctrl+Shift+D duplicates with a fresh copy of the shared content;
-        // plain Shift+D shares it (instance duplicate).
-        let ctrl_shift_d = {
-            let mut mods = Modifiers::CTRL;
-            mods.shift = true;
-            ui.ctx().input_mut(|i| i.consume_key(mods, Key::D))
-        };
+        // F-041 revision: Shift+D duplicates with fresh, detached data;
+        // Alt+D (view-level scan above) shares the source content.
         let shift_d = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::D));
@@ -4060,14 +4086,16 @@ fn lane_row<T: Placement>(
         }
         // Arm G / Shift+D / T / Alt+T (Blender-style modal; arming one
         // tool clears the other).
-        if (g || shift_d || ctrl_shift_d || t || alt_t) && state.modal.is_none() {
+        if (g || shift_d || t || alt_t) && state.modal.is_none() {
             state.knife_armed = false;
-            state.duplicate_new_data = ctrl_shift_d;
+            // Shift+D and the toolbar arm the detached-copy mode; only the
+            // view-level Alt+D sets `duplicate_shared`.
+            state.duplicate_shared = false;
             let arm = if alt_t {
                 Arm::Tile
             } else if g {
                 Arm::Grab
-            } else if shift_d || ctrl_shift_d {
+            } else if shift_d {
                 Arm::Duplicate
             } else {
                 Arm::Stretch
@@ -4133,6 +4161,39 @@ fn take_tile_shortcut(ctx: &egui::Context) -> bool {
                 && !modifiers.ctrl
                 && !modifiers.command
                 && (modifiers.shift || shift_held || modifiers.alt || alt_held)
+            {
+                found = true;
+                return false;
+            }
+            true
+        });
+        found
+    })
+}
+
+/// Consumes an `Alt+D` press (Blender's linked duplicate) and reports whether
+/// it was one. Like [`take_tile_shortcut`], this is a view-level scan: holding
+/// Alt lets Windows drop the egui cursor and the lane's keyboard focus, so a
+/// focus-gated lane key would silently do nothing. Shift / Ctrl variants are
+/// not this shortcut (`Alt+D` shares the content; `Shift+D` is the plain,
+/// detached duplicate).
+fn take_linked_duplicate_shortcut(ctx: &egui::Context) -> bool {
+    ctx.input_mut(|i| {
+        let alt_held = i.modifiers.alt;
+        let mut found = false;
+        i.events.retain(|event| {
+            if let egui::Event::Key {
+                key,
+                physical_key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+                && (*key == Key::D || physical_key.as_ref() == Some(&Key::D))
+                && !modifiers.ctrl
+                && !modifiers.command
+                && !modifiers.shift
+                && (modifiers.alt || alt_held)
             {
                 found = true;
                 return false;
@@ -4483,14 +4544,16 @@ fn draw_tile_seams(
 /// Draws a read-only note preview inside one MIDI clip block (2026-11-04,
 /// same role as [`draw_control_preview`] for curve clips).
 ///
-/// Notes are laid out at their tick positions (x) and pitch (y, adaptive
-/// range) and clipped to the block. The content tiles by `loop_ticks` exactly
-/// like playback. There is no editing here: notes are edited in the piano
-/// roll.
+/// Notes are laid out at their windows position (x) and pitch (y, adaptive
+/// range) and clipped to the block. A looping clip (`repeat`) repeats the
+/// content past `length_ticks`; a plain window goes blank there, matching the
+/// sequencer. There is no editing here: notes are edited in the piano roll.
 fn draw_midi_preview(
     painter: &egui::Painter,
     rect: Rect,
     span_ticks: u32,
+    source_offset: u32,
+    repeat: bool,
     data: &glitcherz_model::MidiData,
 ) {
     let notes = data.notes();
@@ -4509,24 +4572,40 @@ fn draw_midi_preview(
     let usable = (rect.height() - 2.0).max(1.0);
     let row_h = (usable / (pitch_span + 1.0)).max(1.0);
     let note_h = (row_h - 0.5).max(1.0);
-    let span = span_ticks.max(1);
-    let period_ticks = data.length_ticks.max(1).min(span);
+    let span = i64::from(span_ticks.max(1));
+    let length = i64::from(data.length_ticks.max(1));
+    // A head trim can move the window past the content: nothing to draw.
+    if i64::from(source_offset) >= length {
+        return;
+    }
+    let offset = i64::from(source_offset).max(0);
+    // The content ends at `length - offset` inside the window; only a
+    // looping clip fills the rest (F-041 revision).
+    let play_end = if repeat {
+        span
+    } else {
+        span.min(length - offset)
+    };
     let px_per_tick = rect.width() / span as f32;
-    if px_per_tick <= 0.0 {
+    if px_per_tick <= 0.0 || play_end <= 0 {
         return;
     }
     let color = Color32::from_rgba_unmultiplied(215, 232, 255, 220);
-    let mut period = 0u32;
-    let mut guard = 0;
-    while period < span && guard < 1024 {
-        let period_end = period.saturating_add(period_ticks).min(span);
+    let cycles = if repeat {
+        (play_end + offset).div_euclid(length) + 2
+    } else {
+        1
+    };
+    for k in 0..cycles.min(1024) {
         for n in notes {
-            let start = i64::from(period) + n.start;
-            if start >= i64::from(period_end) {
+            // Same phase formula as the sequencer: `note.start - offset + k·length`.
+            let local = n.start - offset + k * length;
+            let start = local.max(0);
+            let end = (local + n.length.max(1)).min(play_end);
+            if end <= start || start >= span {
                 continue;
             }
-            let end = (start + n.length.max(1)).min(i64::from(period_end));
-            let x0 = (rect.left() + start as f32 * px_per_tick).max(rect.left());
+            let x0 = rect.left() + start as f32 * px_per_tick;
             let x1 = (rect.left() + end as f32 * px_per_tick)
                 .max(x0 + 1.0)
                 .min(rect.right());
@@ -4538,21 +4617,22 @@ fn draw_midi_preview(
             let y1 = (y + note_h).min(rect.bottom() - 1.0);
             painter.rect_filled(Rect::from_min_max(pos2(x0, y), pos2(x1, y1)), 0.5, color);
         }
-        period = period.saturating_add(period_ticks);
-        guard += 1;
     }
 }
 
 /// Draws a read-only curve preview inside one control clip block (U12).
 ///
 /// The preview samples the clip's curve with the **same** interpolation the
-/// engine uses (`glitcherz_model::sample_curve`) and tiles it over the clip's
-/// span by `loop_ticks` — exactly what plays, mirrored on the block. There is
+/// engine uses (`glitcherz_model::sample_curve`) over the clip's span. A
+/// looping clip wraps past `length_ticks`; a plain window goes blank there
+/// (F-041 revision) — exactly what plays, mirrored on the block. There is
 /// no editing here: anchors are edited in the Edit tab (spec §8 D14).
 fn draw_control_preview(
     painter: &egui::Painter,
     rect: Rect,
     span_ticks: u32,
+    source_offset: u32,
+    repeat: bool,
     data: &glitcherz_model::CurveData,
 ) {
     if data.points.is_empty() || span_ticks == 0 || rect.width() < 6.0 || rect.height() < 6.0 {
@@ -4565,12 +4645,31 @@ fn draw_control_preview(
     let color = Color32::from_rgb(150, 200, 250);
     let span = f64::from(span_ticks.max(1));
     let span_px = rect.width();
-    let loop_ticks = f64::from(data.length_ticks.max(1));
+    let length = f64::from(data.length_ticks.max(1));
+    let offset = f64::from(source_offset);
+    if offset >= length {
+        return;
+    }
+    let play_end = if repeat {
+        span
+    } else {
+        span.min(length - offset)
+    };
+    if play_end <= 0.0 {
+        return;
+    }
     let mut prev: Option<Pos2> = None;
     let mut x = rect.left();
     while x <= rect.right() + 0.5 {
-        let offset = (f64::from(x - rect.left()) / f64::from(span_px)) * span;
-        let phase = offset.rem_euclid(loop_ticks);
+        let local = (f64::from(x - rect.left()) / f64::from(span_px)) * span;
+        if local >= play_end {
+            break;
+        }
+        let phase = if repeat {
+            (offset + local).rem_euclid(length)
+        } else {
+            offset + local
+        };
         if let Some(value) = glitcherz_model::sample_curve(&data.points, data.interp, phase) {
             let p = pos2(x, value_y(value));
             if let Some(prev) = prev {
@@ -5025,16 +5124,18 @@ mod tests {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(300.0, 60.0), egui::Sense::hover());
                 let painter = ui.painter_at(rect);
-                draw_control_preview(&painter, rect, TICKS_PER_BAR, &curve);
+                draw_control_preview(&painter, rect, TICKS_PER_BAR, 0, true, &curve);
                 // Degenerate cases: empty curve, and a rect too small to draw.
                 draw_control_preview(
                     &painter,
                     rect,
                     TICKS_PER_BAR,
+                    0,
+                    false,
                     &glitcherz_model::CurveData::default(),
                 );
                 let tiny = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(3.0, 3.0));
-                draw_control_preview(&painter, tiny, TICKS_PER_BAR, &curve);
+                draw_control_preview(&painter, tiny, TICKS_PER_BAR, 0, false, &curve);
             });
         });
         out.textures_delta.clear();
@@ -5084,15 +5185,17 @@ mod tests {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(300.0, 60.0), egui::Sense::hover());
                 let painter = ui.painter_at(rect);
-                draw_midi_preview(&painter, rect, 2 * TICKS_PER_BAR, &data);
+                draw_midi_preview(&painter, rect, 2 * TICKS_PER_BAR, 0, true, &data);
                 draw_midi_preview(
                     &painter,
                     rect,
                     2 * TICKS_PER_BAR,
+                    0,
+                    false,
                     &glitcherz_model::MidiData::default(),
                 );
                 let tiny = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(3.0, 3.0));
-                draw_midi_preview(&painter, tiny, 2 * TICKS_PER_BAR, &data);
+                draw_midi_preview(&painter, tiny, 2 * TICKS_PER_BAR, 0, false, &data);
             });
         });
         out.textures_delta.clear();

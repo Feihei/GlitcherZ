@@ -202,8 +202,11 @@ pub struct RtControlClip {
     pub source_offset: u32,
     /// How long the clip stays active (in ticks).
     pub span_ticks: u32,
-    /// Content length (in ticks); a longer window loops (F-041).
+    /// Content length (in ticks); a longer window loops only when `repeat` is set
+    /// (F-041 revision).
     pub length_ticks: u32,
+    /// Whether the window loops the content past `length_ticks`.
+    pub repeat: bool,
     /// Temporarily muted (B2): nothing is delivered, so the target holds its
     /// last value for the whole span (same as being outside the clip).
     pub muted: bool,
@@ -221,6 +224,7 @@ impl Default for RtControlClip {
             // placement.
             span_ticks: 0,
             length_ticks: 384,
+            repeat: false,
             muted: false,
             curve: RtAutomation::default(),
         }
@@ -232,8 +236,9 @@ impl RtControlClip {
     /// `[start, start + span)` (D17: nothing is delivered outside the span,
     /// the target keeps its last value) and while the clip is muted; inside,
     /// the local position is mapped to the content phase
-    /// `(source_offset + local) mod length_ticks` (F-041) and sampled through
-    /// the curve. RT-safe.
+    /// `(source_offset + local) mod length_ticks` when `repeat` is set, or to
+    /// `source_offset + local` otherwise (a non-looping window goes silent past
+    /// the content end). RT-safe.
     pub fn value_at_absolute(&self, position_ticks: f64) -> Option<f32> {
         if self.span_ticks == 0 || self.muted {
             return None;
@@ -244,8 +249,15 @@ impl RtControlClip {
             return None;
         }
         let local = position_ticks - start;
+        let offset = f64::from(self.source_offset);
         let phase = if self.length_ticks > 0 {
-            (f64::from(self.source_offset) + local).rem_euclid(f64::from(self.length_ticks))
+            if self.repeat {
+                (offset + local).rem_euclid(f64::from(self.length_ticks))
+            } else if offset + local < f64::from(self.length_ticks) {
+                offset + local
+            } else {
+                return None;
+            }
         } else {
             local
         };
@@ -409,6 +421,7 @@ mod tests {
             start_ticks: 0,
             span_ticks: 768,
             length_ticks: 384,
+            repeat: true,
             curve: curve(&[(0, 1.0), (96, 0.5)]),
             ..RtControlClip::default()
         };
@@ -416,6 +429,25 @@ mod tests {
         assert!(
             (clip.value_at_absolute(432.0).unwrap() - 0.75).abs() < 1e-6,
             "second period should map the same phase"
+        );
+    }
+
+    /// F-041 revision: a plain (non-looping) window goes silent past the
+    /// content instead of mapping the phase back to zero.
+    #[test]
+    fn control_clip_silent_tail_outside_content() {
+        let clip = RtControlClip {
+            start_ticks: 0,
+            span_ticks: 768,
+            length_ticks: 384,
+            repeat: false,
+            curve: curve(&[(0, 1.0), (96, 0.5)]),
+            ..RtControlClip::default()
+        };
+        assert!((clip.value_at_absolute(48.0).unwrap() - 0.75).abs() < 1e-6);
+        assert!(
+            clip.value_at_absolute(432.0).is_none(),
+            "past the content end nothing is delivered"
         );
     }
 }
