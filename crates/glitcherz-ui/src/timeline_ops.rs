@@ -1467,6 +1467,7 @@ impl GlitcherZApp {
         let mut touched = Vec::new();
         {
             let project = self.project_mut();
+            detach_stretch_data(project, &spans);
             for e in &spans {
                 let changed = match e.sel.lane {
                     timeline::TimelineLane::Control => stretch_curve_clip(
@@ -1475,6 +1476,7 @@ impl GlitcherZApp {
                         e.sel.clip,
                         e.start_ticks,
                         e.span_ticks,
+                        false,
                     ),
                     timeline::TimelineLane::Midi => stretch_midi_clip(
                         project,
@@ -1482,6 +1484,7 @@ impl GlitcherZApp {
                         e.sel.clip,
                         e.start_ticks,
                         e.span_ticks,
+                        false,
                     ),
                     // U11: a stretch trims the seconds window (a left-edge
                     // stretch also advances the window start).
@@ -1694,6 +1697,10 @@ impl GlitcherZApp {
         let mut touched = Vec::new();
         {
             let project = self.project_mut();
+            // M9: one clone per data entry per batch, so clips that shared a
+            // pool entry before the copy still share one after it.
+            let mut midi_copies: Vec<(u32, u32)> = Vec::new();
+            let mut curve_copies: Vec<(u32, u32)> = Vec::new();
             for d in &dups {
                 match d.from.lane {
                     timeline::TimelineLane::Midi => {
@@ -1712,10 +1719,20 @@ impl GlitcherZApp {
                         {
                             continue;
                         }
-                        let Some(data) = project.midi_data.get(clip.data as usize).cloned() else {
-                            continue;
+                        let new_data = if let Some(&(_, mapped)) =
+                            midi_copies.iter().find(|(old, _)| *old == clip.data)
+                        {
+                            mapped
+                        } else {
+                            let Some(data) = project.midi_data.get(clip.data as usize).cloned()
+                            else {
+                                continue;
+                            };
+                            let mapped = project.push_midi_data(data);
+                            midi_copies.push((clip.data, mapped));
+                            mapped
                         };
-                        clip.data = project.push_midi_data(data);
+                        clip.data = new_data;
                         clip.start_ticks = d.start_ticks;
                         let index = project.midi_tracks[d.to_track].clips.len();
                         project.midi_tracks[d.to_track].clips.push(clip);
@@ -1744,10 +1761,20 @@ impl GlitcherZApp {
                         {
                             continue;
                         }
-                        let Some(data) = project.curve_data.get(clip.data as usize).cloned() else {
-                            continue;
+                        let new_data = if let Some(&(_, mapped)) =
+                            curve_copies.iter().find(|(old, _)| *old == clip.data)
+                        {
+                            mapped
+                        } else {
+                            let Some(data) = project.curve_data.get(clip.data as usize).cloned()
+                            else {
+                                continue;
+                            };
+                            let mapped = project.push_curve_data(data);
+                            curve_copies.push((clip.data, mapped));
+                            mapped
                         };
-                        clip.data = project.push_curve_data(data);
+                        clip.data = new_data;
                         clip.start_ticks = d.start_ticks;
                         let index = project.control_tracks[d.to_track].clips.len();
                         project.control_tracks[d.to_track].clips.push(clip);
@@ -2231,69 +2258,70 @@ impl GlitcherZApp {
         let before = self.begin_edit();
         {
             let project = self.project_mut();
+            // M9: one copy per data group. Members of the group keep sharing
+            // the new entry; a lone selected member gets its own copy.
+            let mut midi_groups: Vec<(u32, Vec<(usize, usize)>)> = Vec::new();
+            let mut curve_groups: Vec<(u32, Vec<(usize, usize)>)> = Vec::new();
             for sel in &selection {
-                match sel.lane {
-                    timeline::TimelineLane::Midi => {
-                        let Some(data) = project
-                            .midi_tracks
-                            .get(sel.track)
-                            .and_then(|t| t.clips.get(sel.clip))
-                            .map(|clip| clip.data)
-                        else {
-                            continue;
-                        };
-                        let refs = project
-                            .midi_tracks
-                            .iter()
-                            .flat_map(|t| t.clips.iter())
-                            .filter(|clip| clip.data == data)
-                            .count();
-                        if refs <= 1 {
-                            continue;
-                        }
-                        let Some(source) = project.midi_data.get(data as usize).cloned() else {
-                            continue;
-                        };
-                        let new_data = project.push_midi_data(source);
-                        if let Some(clip) = project
-                            .midi_tracks
-                            .get_mut(sel.track)
-                            .and_then(|t| t.clips.get_mut(sel.clip))
-                        {
-                            clip.data = new_data;
-                        }
+                let data = match sel.lane {
+                    timeline::TimelineLane::Midi => project
+                        .midi_tracks
+                        .get(sel.track)
+                        .and_then(|t| t.clips.get(sel.clip))
+                        .map(|clip| clip.data),
+                    timeline::TimelineLane::Control => project
+                        .control_tracks
+                        .get(sel.track)
+                        .and_then(|t| t.clips.get(sel.clip))
+                        .map(|clip| clip.data),
+                    timeline::TimelineLane::Audio => None,
+                };
+                let Some(data) = data else { continue };
+                let groups = match sel.lane {
+                    timeline::TimelineLane::Midi => &mut midi_groups,
+                    timeline::TimelineLane::Control => &mut curve_groups,
+                    timeline::TimelineLane::Audio => continue,
+                };
+                if let Some(group) = groups.iter_mut().find(|(old, _)| *old == data) {
+                    group.1.push((sel.track, sel.clip));
+                } else {
+                    groups.push((data, vec![(sel.track, sel.clip)]));
+                }
+            }
+            for (data, members) in midi_groups {
+                if project.midi_data_refs(data) <= 1 {
+                    continue;
+                }
+                let Some(source) = project.midi_data.get(data as usize).cloned() else {
+                    continue;
+                };
+                let new_data = project.push_midi_data(source);
+                for (track, clip) in members {
+                    if let Some(clip) = project
+                        .midi_tracks
+                        .get_mut(track)
+                        .and_then(|t| t.clips.get_mut(clip))
+                    {
+                        clip.data = new_data;
                     }
-                    timeline::TimelineLane::Control => {
-                        let Some(data) = project
-                            .control_tracks
-                            .get(sel.track)
-                            .and_then(|t| t.clips.get(sel.clip))
-                            .map(|clip| clip.data)
-                        else {
-                            continue;
-                        };
-                        let refs = project
-                            .control_tracks
-                            .iter()
-                            .flat_map(|t| t.clips.iter())
-                            .filter(|clip| clip.data == data)
-                            .count();
-                        if refs <= 1 {
-                            continue;
-                        }
-                        let Some(source) = project.curve_data.get(data as usize).cloned() else {
-                            continue;
-                        };
-                        let new_data = project.push_curve_data(source);
-                        if let Some(clip) = project
-                            .control_tracks
-                            .get_mut(sel.track)
-                            .and_then(|t| t.clips.get_mut(sel.clip))
-                        {
-                            clip.data = new_data;
-                        }
+                }
+            }
+            for (data, members) in curve_groups {
+                if project.curve_data_refs(data) <= 1 {
+                    continue;
+                }
+                let Some(source) = project.curve_data.get(data as usize).cloned() else {
+                    continue;
+                };
+                let new_data = project.push_curve_data(source);
+                for (track, clip) in members {
+                    if let Some(clip) = project
+                        .control_tracks
+                        .get_mut(track)
+                        .and_then(|t| t.clips.get_mut(clip))
+                    {
+                        clip.data = new_data;
                     }
-                    timeline::TimelineLane::Audio => {}
                 }
             }
         }
@@ -2301,6 +2329,79 @@ impl GlitcherZApp {
         self.sync_selection_rows(&selection);
     }
 }
+/// F-041 M9: detach shared content once per data group before a batch stretch.
+///
+/// Members of the same selection keep sharing the new copy; references outside
+/// the selection stay on the old entry. Running this first lets the per-clip
+/// stretch skip its own copy-on-write, which would otherwise split a group
+/// whose members are stretched together.
+fn detach_stretch_data(project: &mut Project, spans: &[timeline::ClipSpanEdit]) {
+    let mut midi_groups: Vec<(u32, Vec<(usize, usize)>)> = Vec::new();
+    let mut curve_groups: Vec<(u32, Vec<(usize, usize)>)> = Vec::new();
+    for e in spans {
+        let data = match e.sel.lane {
+            timeline::TimelineLane::Midi => project
+                .midi_tracks
+                .get(e.sel.track)
+                .and_then(|t| t.clips.get(e.sel.clip))
+                .map(|clip| clip.data),
+            timeline::TimelineLane::Control => project
+                .control_tracks
+                .get(e.sel.track)
+                .and_then(|t| t.clips.get(e.sel.clip))
+                .map(|clip| clip.data),
+            timeline::TimelineLane::Audio => None,
+        };
+        let Some(data) = data else { continue };
+        let groups = match e.sel.lane {
+            timeline::TimelineLane::Midi => &mut midi_groups,
+            timeline::TimelineLane::Control => &mut curve_groups,
+            timeline::TimelineLane::Audio => continue,
+        };
+        if let Some(group) = groups.iter_mut().find(|(old, _)| *old == data) {
+            group.1.push((e.sel.track, e.sel.clip));
+        } else {
+            groups.push((data, vec![(e.sel.track, e.sel.clip)]));
+        }
+    }
+    for (data, members) in midi_groups {
+        if members.len() >= project.midi_data_refs(data) {
+            continue;
+        }
+        let Some(source) = project.midi_data.get(data as usize).cloned() else {
+            continue;
+        };
+        let new_data = project.push_midi_data(source);
+        for (track, clip) in members {
+            if let Some(clip) = project
+                .midi_tracks
+                .get_mut(track)
+                .and_then(|t| t.clips.get_mut(clip))
+            {
+                clip.data = new_data;
+            }
+        }
+    }
+    for (data, members) in curve_groups {
+        if members.len() >= project.curve_data_refs(data) {
+            continue;
+        }
+        let Some(source) = project.curve_data.get(data as usize).cloned() else {
+            continue;
+        };
+        let new_data = project.push_curve_data(source);
+        for (track, clip) in members {
+            if let Some(clip) = project
+                .control_tracks
+                .get_mut(track)
+                .and_then(|t| t.clips.get_mut(clip))
+            {
+                clip.data = new_data;
+            }
+        }
+    }
+}
+
 /// One MIDI clip's T stretch (F-041 revision, 2026-11-12): window and editable
 /// content stay in sync so the piano roll can write into the newly exposed
 /// time.
@@ -2318,6 +2419,7 @@ fn stretch_midi_clip(
     index: usize,
     new_start: u32,
     new_span: u32,
+    allow_cow: bool,
 ) -> bool {
     let Some(clip) = project
         .midi_tracks
@@ -2348,7 +2450,7 @@ fn stretch_midi_clip(
         return false;
     }
     if prepend > 0 || extend {
-        let data_idx = if project.midi_data_refs(data_idx) > 1 {
+        let data_idx = if allow_cow && project.midi_data_refs(data_idx) > 1 {
             let Some(source) = project.midi_data.get(data_idx as usize).cloned() else {
                 return false;
             };
@@ -2404,6 +2506,7 @@ fn stretch_curve_clip(
     index: usize,
     new_start: u32,
     new_span: u32,
+    allow_cow: bool,
 ) -> bool {
     let Some(clip) = project
         .control_tracks
@@ -2434,7 +2537,7 @@ fn stretch_curve_clip(
         return false;
     }
     if prepend > 0 || extend {
-        let data_idx = if project.curve_data_refs(data_idx) > 1 {
+        let data_idx = if allow_cow && project.curve_data_refs(data_idx) > 1 {
             let Some(source) = project.curve_data.get(data_idx as usize).cloned() else {
                 return false;
             };
@@ -2619,7 +2722,7 @@ fn resize_curve_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glitcherz_model::{MidiData, Sequence, TICKS_PER_BAR};
+    use glitcherz_model::{MidiData, MidiTrack, Sequence, TICKS_PER_BAR};
 
     fn clip_with_one_note(project: &mut Project) -> MidiClip {
         let data = project.push_midi_data(MidiData {
@@ -2644,6 +2747,74 @@ mod tests {
         clip
     }
 
+    /// M9: a batch stretch detaches shared content once per group, keeping the
+    /// selected members on one new entry and leaving outside references alone.
+    #[test]
+    fn batch_stretch_keeps_group_sharing() {
+        let mut project = Project::default();
+        let clip = clip_with_one_note(&mut project);
+        // A second clip on the same track shares the entry (a group).
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: TICKS_PER_BAR,
+            ..clip.clone()
+        });
+        // An outside reference on another track keeps the old entry.
+        project.midi_tracks.push(MidiTrack::default());
+        project.midi_tracks[1].clips.push(clip.clone());
+        let old = clip.data;
+        assert_eq!(project.midi_data_refs(old), 3);
+
+        let spans = vec![
+            timeline::ClipSpanEdit {
+                sel: timeline::ClipSel {
+                    lane: timeline::TimelineLane::Midi,
+                    track: 0,
+                    clip: 0,
+                },
+                start_ticks: 0,
+                span_ticks: 2 * TICKS_PER_BAR,
+            },
+            timeline::ClipSpanEdit {
+                sel: timeline::ClipSel {
+                    lane: timeline::TimelineLane::Midi,
+                    track: 0,
+                    clip: 1,
+                },
+                start_ticks: TICKS_PER_BAR,
+                span_ticks: 2 * TICKS_PER_BAR,
+            },
+        ];
+        detach_stretch_data(&mut project, &spans);
+
+        let a = project.midi_tracks[0].clips[0].data;
+        let b = project.midi_tracks[0].clips[1].data;
+        assert_eq!(a, b, "selected members keep sharing one entry");
+        assert_ne!(a, old, "the group was detached from the outside reference");
+        assert_eq!(project.midi_tracks[1].clips[0].data, old);
+
+        // Both stretches edit the new shared entry; the outside clip is intact.
+        assert!(stretch_midi_clip(
+            &mut project,
+            0,
+            0,
+            0,
+            2 * TICKS_PER_BAR,
+            false
+        ));
+        assert!(stretch_midi_clip(
+            &mut project,
+            0,
+            1,
+            TICKS_PER_BAR,
+            2 * TICKS_PER_BAR,
+            false
+        ));
+        assert_eq!(project.midi_tracks[0].clips[0].data, a);
+        assert_eq!(project.midi_tracks[0].clips[1].data, a);
+        assert_eq!(project.midi_data[a as usize].length_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(project.midi_data[old as usize].length_ticks, TICKS_PER_BAR);
+    }
+
     /// A T tail stretch extends the editable content, so the piano roll can
     /// write into the newly exposed bar. The note does not move.
     #[test]
@@ -2651,7 +2822,14 @@ mod tests {
         let mut project = Project::default();
         clip_with_one_note(&mut project);
 
-        assert!(stretch_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
+        assert!(stretch_midi_clip(
+            &mut project,
+            0,
+            0,
+            0,
+            2 * TICKS_PER_BAR,
+            true
+        ));
 
         let clip = &project.midi_tracks[0].clips[0];
         assert_eq!(clip.span_ticks, 2 * TICKS_PER_BAR);
@@ -2671,7 +2849,14 @@ mod tests {
         clip_with_one_note(&mut project);
         project.midi_tracks[0].clips[0].start_ticks = TICKS_PER_BAR;
 
-        assert!(stretch_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
+        assert!(stretch_midi_clip(
+            &mut project,
+            0,
+            0,
+            0,
+            2 * TICKS_PER_BAR,
+            true
+        ));
 
         let clip = &project.midi_tracks[0].clips[0];
         assert_eq!(clip.start_ticks, 0);
@@ -2697,7 +2882,14 @@ mod tests {
             ..source
         });
 
-        assert!(stretch_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
+        assert!(stretch_midi_clip(
+            &mut project,
+            0,
+            0,
+            0,
+            2 * TICKS_PER_BAR,
+            true
+        ));
 
         let first = &project.midi_tracks[0].clips[0];
         let second = &project.midi_tracks[0].clips[1];
