@@ -121,6 +121,9 @@ fn make_runner() -> (
     let (midi_trash_tx, midi_trash_rx) =
         glitcherz_engine::realtime::sequencer::midi_clip_trash_channel();
     drop(midi_trash_rx);
+    let (control_trash_tx, control_trash_rx) =
+        glitcherz_engine::realtime::sequencer::control_clip_trash_channel();
+    drop(control_trash_rx);
     let (capture_tx, capture_rx) = capture_channel(64);
     let overflow = std::sync::Arc::new(AtomicU64::new(0));
     let (_compiler, graph) = GraphCompiler::default_graph(SR, BLOCK);
@@ -136,6 +139,7 @@ fn make_runner() -> (
         recycle_tx,
         audio_trash_tx,
         midi_trash_tx,
+        control_trash_tx,
         CaptureTap::new(capture_tx, overflow),
         feedback,
     );
@@ -253,7 +257,10 @@ fn sequencer_notes_are_not_captured() {
     let mut clips = empty_midi_clip_table();
     clips[0] = clip;
     graph_tx
-        .push(GraphUpdate::SetMidiClips { track: 0, clips })
+        .push(GraphUpdate::SetMidiClips {
+            track: 0,
+            clips: Box::new(clips),
+        })
         .expect("queue not full");
 
     tx.push(EngineCommand::SetCapture(true))

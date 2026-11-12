@@ -87,19 +87,20 @@ pub const MIN_VELOCITY: u8 = 1;
 /// Maximum number of clips per track (D15 revision 2026-10-28; mirrors
 /// `glitcherz_model::MAX_CLIPS_PER_TRACK`).
 ///
-/// 32 since the control clip table left the command queue: neither clip table
-/// is a `Copy` command payload any more, so the limit no longer multiplies
-/// into queue memory. A control table is `32 × ~544 B ≈ 17 KB`, which the
-/// 256-slot structure queue absorbs as a one-time pre-allocation (~4.5 MB),
-/// while the command queue keeps its small variants.
-pub const MAX_TRACK_CLIPS: usize = 32;
+/// 128 since F-041 M10 (2026-11-12): both clip tables now travel as
+/// `Box<[...]>` payloads, so the structure queue stores pointers rather than
+/// full tables. A control table at this size would otherwise dwarf the queue's
+/// one-time pre-allocation; the audio thread recycles the box through its
+/// trash channel instead of dropping it.
+pub const MAX_TRACK_CLIPS: usize = 128;
 
 /// One control track's clip table (D15 revision 2026-10-28).
 ///
 /// Unlike [`MidiClipTable`] this owns **no heap** — every curve is a
-/// fixed-capacity `Copy` array — so it needs no trash channel: the block
-/// runner simply overwrites the old table in place. It still travels on the
-/// structure queue rather than the command queue, purely because of its size.
+/// fixed-capacity `Copy` array. It still travels as a `Box` payload on the
+/// structure queue (F-041 M10: at 128 clips a table is too large to copy
+/// through the queue), and the displaced box is recycled through the control
+/// trash channel so the audio thread never deallocates it.
 pub type ControlClipTable = [RtControlClip; MAX_TRACK_CLIPS];
 
 /// Trash-queue capacity for displaced MIDI clip tables (D15 revision,
@@ -111,7 +112,21 @@ pub const MIDI_CLIP_TRASH_CAPACITY: usize = 64;
 /// goes to the block runner (the audio thread pushes displaced tables), the
 /// consumer end to the engine (the control thread drains and drops them).
 /// **Not RT-safe**; call only before the stream starts.
-pub fn midi_clip_trash_channel() -> (rtrb::Producer<MidiClipTable>, rtrb::Consumer<MidiClipTable>) {
+pub fn midi_clip_trash_channel() -> (
+    rtrb::Producer<Box<MidiClipTable>>,
+    rtrb::Consumer<Box<MidiClipTable>>,
+) {
+    rtrb::RingBuffer::new(MIDI_CLIP_TRASH_CAPACITY)
+}
+
+/// Creates the control-clip trash channel pair (F-041 M10): same protocol as
+/// [`midi_clip_trash_channel`], but the displaced box is normally small. The
+/// audio thread pushes the recycled allocation; the control thread drops it.
+/// **Not RT-safe**; call only before the stream starts.
+pub fn control_clip_trash_channel() -> (
+    rtrb::Producer<Box<ControlClipTable>>,
+    rtrb::Consumer<Box<ControlClipTable>>,
+) {
     rtrb::RingBuffer::new(MIDI_CLIP_TRASH_CAPACITY)
 }
 
@@ -377,8 +392,10 @@ pub struct Sequencer {
     /// unconfigured tracks have default-empty clip tables).
     track_count: usize,
     /// Per-track clip tables (D15 revision: ≤ [`MAX_TRACK_CLIPS`] clips each,
-    /// replaced one track at a time through the structure queue).
-    clips: [MidiClipTable; MAX_MIDI_TRACKS],
+    /// replaced one track at a time through the structure queue). Heap-owned:
+    /// at 128 clips a table is several KB, so 16 inline tables would make every
+    /// `Sequencer` move a large stack copy.
+    clips: Box<[MidiClipTable]>,
     /// Per-control-track clip tables (D15/D17).
     ///
     /// **Heap-owned, and filled straight into the heap allocation**: at 32
@@ -442,7 +459,11 @@ impl Sequencer {
             meter_index: 0,
             position_ticks: 0.0,
             track_count: crate::realtime::DEFAULT_MIDI_TRACKS,
-            clips: std::array::from_fn(|_| empty_midi_clip_table()),
+            // `collect` fills the heap buffer element by element (same reason
+            // as `control_clips` below): no full-size stack temporary.
+            clips: (0..MAX_MIDI_TRACKS)
+                .map(|_| empty_midi_clip_table())
+                .collect(),
             // `collect::<Box<[T]>>` fills the heap buffer element by element —
             // no full-size stack temporary (see the field docs).
             control_clips: (0..MAX_AUTO_TRACKS)
@@ -816,25 +837,37 @@ impl Sequencer {
     }
 
     /// Replaces one MIDI track's clip table in one block (D15 revision; the
-    /// displaced table is returned so the caller can move it to the trash
-    /// queue — the audio thread must never drop it). Out-of-range tracks are
-    /// ignored and return `None`. Also refreshes the arrangement end. RT-safe.
-    pub fn set_track_clips(&mut self, track: usize, clips: MidiClipTable) -> Option<MidiClipTable> {
+    /// displaced table is returned in the same box so the caller can move it
+    /// to the trash queue — the audio thread must never drop it). Out-of-range
+    /// tracks are ignored and return `None`. Also refreshes the arrangement
+    /// end. RT-safe: no allocation, the incoming box is reused.
+    pub fn set_track_clips(
+        &mut self,
+        track: usize,
+        mut clips: Box<MidiClipTable>,
+    ) -> Option<Box<MidiClipTable>> {
         let slot = self.clips.get_mut(track)?;
-        let displaced = std::mem::replace(slot, clips);
+        // Move the new table out of the box and the old one back in.
+        let displaced = std::mem::replace(slot, *clips);
+        *clips = displaced;
         self.refresh_arrangement_end();
-        Some(displaced)
+        Some(clips)
     }
 
     /// Replaces one control track's clip table in one block (D15 revision;
-    /// out-of-range indices ignored). Also refreshes the arrangement end.
-    /// RT-safe: the table is `Copy` and owns no heap, so the overwrite needs
-    /// no trash receipt.
-    pub fn set_control_clips(&mut self, index: usize, clips: ControlClipTable) {
-        if let Some(slot) = self.control_clips.get_mut(index) {
-            *slot = clips;
-            self.refresh_arrangement_end();
-        }
+    /// out-of-range indices ignored). Returns the recycled box for the trash
+    /// channel, or `None` when the index is out of range. Also refreshes the
+    /// arrangement end. RT-safe: the box allocation is reused.
+    pub fn set_control_clips(
+        &mut self,
+        index: usize,
+        mut clips: Box<ControlClipTable>,
+    ) -> Option<Box<ControlClipTable>> {
+        let slot = self.control_clips.get_mut(index)?;
+        let displaced = std::mem::replace(slot, *clips);
+        *clips = displaced;
+        self.refresh_arrangement_end();
+        Some(clips)
     }
 
     /// Read-only access to all control clip tables (for the block runner to
@@ -1346,7 +1379,7 @@ mod tests {
         }
         let mut clips = empty_midi_clip_table();
         clips[0] = clip;
-        let _ = seq.set_track_clips(track, clips);
+        let _ = seq.set_track_clips(track, Box::new(clips));
     }
 
     /// One clip on one track carrying only controller events (P0).
@@ -1370,7 +1403,7 @@ mod tests {
         }
         let mut clips = empty_midi_clip_table();
         clips[0] = clip;
-        let _ = seq.set_track_clips(track, clips);
+        let _ = seq.set_track_clips(track, Box::new(clips));
     }
 
     /// A CC event at `tick`, channel 0.
@@ -1474,7 +1507,7 @@ mod tests {
             clips[0] = clip;
             clips
         };
-        seq.set_track_clips(0, table(true));
+        seq.set_track_clips(0, Box::new(table(true)));
         seq.play();
 
         let events = run(&mut seq, 375);
@@ -1490,7 +1523,7 @@ mod tests {
 
         // Un-mute: the identical clip is audible again.
         seq.seek(0.0);
-        seq.set_track_clips(0, table(false));
+        seq.set_track_clips(0, Box::new(table(false)));
         seq.play();
         assert_eq!(
             ons(&run(&mut seq, 375)),
@@ -1526,7 +1559,7 @@ mod tests {
         clip.push_ctrl(RtCtrl::new(0, 0, RtCtrlKind::PitchBend, 4096));
         let mut clips = empty_midi_clip_table();
         clips[0] = clip;
-        let _ = seq.set_track_clips(0, clips);
+        let _ = seq.set_track_clips(0, Box::new(clips));
         seq.play();
 
         let mut order = Order(Vec::new());
@@ -1713,7 +1746,7 @@ mod tests {
         clip.push(clip_note(0, TICKS_PER_STEP, 60));
         let mut clips = empty_midi_clip_table();
         clips[0] = clip;
-        let _ = seq.set_track_clips(0, clips);
+        let _ = seq.set_track_clips(0, Box::new(clips));
         seq.play();
 
         let events = run(&mut seq, 2_255);
@@ -1759,12 +1792,12 @@ mod tests {
             span_ticks: TICKS_PER_BAR,
             ..RtControlClip::default()
         };
-        seq.set_control_clips(0, clips);
+        seq.set_control_clips(0, Box::new(clips));
         assert_eq!(seq.arrangement_end_ticks(), 6 * TICKS_PER_BAR);
         // Removing all content makes the arrangement unbounded again.
-        let _ = seq.set_track_clips(0, empty_midi_clip_table());
-        let _ = seq.set_track_clips(1, empty_midi_clip_table());
-        seq.set_control_clips(0, [RtControlClip::default(); MAX_TRACK_CLIPS]);
+        let _ = seq.set_track_clips(0, Box::new(empty_midi_clip_table()));
+        let _ = seq.set_track_clips(1, Box::new(empty_midi_clip_table()));
+        seq.set_control_clips(0, Box::new([RtControlClip::default(); MAX_TRACK_CLIPS]));
         assert_eq!(seq.arrangement_end_ticks(), 0);
     }
 
@@ -1911,7 +1944,7 @@ mod tests {
         seq.set_bpm(120.0);
         let mut clips = empty_midi_clip_table();
         clips[0] = clip;
-        let _ = seq.set_track_clips(0, clips);
+        let _ = seq.set_track_clips(0, Box::new(clips));
         seq.play();
 
         // 130 blocks ≈ 665 ticks at 120 BPM: past the clip's 600-tick span.
@@ -1952,7 +1985,7 @@ mod tests {
         }
         let mut clips = empty_midi_clip_table();
         clips[0] = clip;
-        let _ = seq.set_track_clips(0, clips);
+        let _ = seq.set_track_clips(0, Box::new(clips));
 
         let count_ons = |events: &[Event]| {
             events
@@ -2051,9 +2084,9 @@ mod tests {
     /// **last** slot — the old 8-slot table would have dropped 24 of them
     /// silently.
     #[test]
-    fn control_table_accepts_32_clips() {
+    fn control_table_accepts_max_clips() {
         let mut seq = Sequencer::new(SR);
-        assert_eq!(MAX_TRACK_CLIPS, 32, "model and engine must agree");
+        assert_eq!(MAX_TRACK_CLIPS, 128, "model and engine must agree");
         let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
         for (i, slot) in clips.iter_mut().enumerate() {
             *slot = RtControlClip {
@@ -2063,13 +2096,16 @@ mod tests {
                 ..RtControlClip::default()
             };
         }
-        seq.set_control_clips(0, clips);
+        seq.set_control_clips(0, Box::new(clips));
         let table = seq.control_clips()[0];
         assert_eq!(table[0].start_ticks, 0);
-        assert_eq!(table[31].start_ticks, 31 * TICKS_PER_BAR);
+        assert_eq!(
+            table[MAX_TRACK_CLIPS - 1].start_ticks,
+            (MAX_TRACK_CLIPS as u32 - 1) * TICKS_PER_BAR
+        );
         assert_eq!(
             seq.arrangement_end_ticks(),
-            32 * TICKS_PER_BAR,
+            MAX_TRACK_CLIPS as u32 * TICKS_PER_BAR,
             "the last clip must set the arrangement end"
         );
     }
@@ -2092,8 +2128,8 @@ mod tests {
             },
             ..RtControlClip::default()
         };
-        seq.set_control_clips(5, clips);
-        seq.set_control_clips(MAX_AUTO_TRACKS, clips); // out-of-range index ignored
+        seq.set_control_clips(5, Box::new(clips));
+        seq.set_control_clips(MAX_AUTO_TRACKS, Box::new(clips)); // out-of-range index ignored
         let tables = seq.control_clips();
         assert_eq!(tables[5][5].length_ticks, 96);
         assert_eq!(tables[5][5].curve.point_count, 1);

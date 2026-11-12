@@ -107,6 +107,9 @@ fn make_runner() -> (BlockRunner, Producer<EngineCommand>) {
     let (midi_trash_tx, midi_trash_rx) =
         glitcherz_engine::realtime::sequencer::midi_clip_trash_channel();
     drop(midi_trash_rx);
+    let (control_trash_tx, control_trash_rx) =
+        glitcherz_engine::realtime::sequencer::control_clip_trash_channel();
+    drop(control_trash_rx);
     let (_compiler, graph) = GraphCompiler::default_graph(SR, BLOCK);
     let feedback = Feedback::new();
     let sequencer = Sequencer::new(SR);
@@ -121,6 +124,7 @@ fn make_runner() -> (BlockRunner, Producer<EngineCommand>) {
         recycle_tx,
         audio_trash_tx,
         midi_trash_tx,
+        control_trash_tx,
         glitcherz_engine::realtime::CaptureTap::detached(),
         feedback,
     );

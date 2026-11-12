@@ -129,8 +129,11 @@ pub struct AudioEngine {
     audio_trash: rtrb::Consumer<crate::realtime::audio_track::AudioClipTable>,
     /// Displaced MIDI clip tables (D15 revision): drained by
     /// [`AudioEngine::reclaim_midi_clips`]. The tables own `Vec`s, so the
-    /// audio thread must never drop them.
-    midi_trash: rtrb::Consumer<crate::realtime::MidiClipTable>,
+    /// audio thread must never drop them. The queue carries boxes (F-041 M10).
+    midi_trash: rtrb::Consumer<Box<crate::realtime::MidiClipTable>>,
+    /// Displaced control clip tables (F-041 M10): the box owns the allocation,
+    /// drained by [`AudioEngine::reclaim_control_clips`].
+    control_trash: rtrb::Consumer<Box<crate::realtime::ControlClipTable>>,
     /// Capture ring consumer end (spec `recording.md` D6): live input events
     /// stamped with the transport position, drained by
     /// [`AudioEngine::drain_captured`] on the control thread.
@@ -205,6 +208,7 @@ impl AudioEngine {
         let (audio_trash_tx, audio_trash_rx) =
             crate::realtime::audio_track::audio_clip_trash_channel();
         let (midi_trash_tx, midi_trash_rx) = crate::realtime::midi_clip_trash_channel();
+        let (control_trash_tx, control_trash_rx) = crate::realtime::control_clip_trash_channel();
         // Capture tap (spec `recording.md` D6): the audio thread holds the
         // producer, the control side keeps the consumer for `drain_captured`.
         let (capture_tx, capture_rx) =
@@ -236,6 +240,7 @@ impl AudioEngine {
             recycle_tx,
             audio_trash_tx,
             midi_trash_tx,
+            control_trash_tx,
             capture,
             feedback.clone(),
         ));
@@ -298,6 +303,7 @@ impl AudioEngine {
             recycle: recycle_rx,
             audio_trash: audio_trash_rx,
             midi_trash: midi_trash_rx,
+            control_trash: control_trash_rx,
             capture: capture_rx,
             capture_control: control_rx,
             capture_overflow,
@@ -338,6 +344,7 @@ impl AudioEngine {
         let (audio_trash_tx, audio_trash_rx) =
             crate::realtime::audio_track::audio_clip_trash_channel();
         let (midi_trash_tx, midi_trash_rx) = crate::realtime::midi_clip_trash_channel();
+        let (control_trash_tx, control_trash_rx) = crate::realtime::control_clip_trash_channel();
         // Same capture plumbing as the live engine, permanently disabled: the
         // offline engine exists to render a mix, and nothing in the export
         // path ever sends `SetCapture`.
@@ -357,6 +364,7 @@ impl AudioEngine {
             recycle_tx,
             audio_trash_tx,
             midi_trash_tx,
+            control_trash_tx,
             crate::realtime::CaptureTap::with_control(
                 capture_tx,
                 control_tx,
@@ -371,6 +379,7 @@ impl AudioEngine {
             recycle: recycle_rx,
             audio_trash: audio_trash_rx,
             midi_trash: midi_trash_rx,
+            control_trash: control_trash_rx,
             capture: capture_rx,
             capture_control: control_rx,
             capture_overflow,
@@ -598,7 +607,10 @@ impl AudioEngine {
     /// the old table).
     pub fn send_midi_clips(&mut self, track: usize, clips: crate::realtime::MidiClipTable) -> bool {
         self.structure
-            .push(GraphUpdate::SetMidiClips { track, clips })
+            .push(GraphUpdate::SetMidiClips {
+                track,
+                clips: Box::new(clips),
+            })
             .is_ok()
     }
 
@@ -607,6 +619,15 @@ impl AudioEngine {
     /// calls this every frame alongside `reclaim_audio_clips`.
     pub fn reclaim_midi_clips(&mut self) {
         while let Ok(_table) = self.midi_trash.pop() {
+            // Dropped here: control-thread deallocation only.
+        }
+    }
+
+    /// Drains the displaced-control-clip trash queue (F-041 M10): drops the
+    /// recycled boxes on the **control thread**. Called beside
+    /// [`AudioEngine::reclaim_midi_clips`].
+    pub fn reclaim_control_clips(&mut self) {
+        while let Ok(_table) = self.control_trash.pop() {
             // Dropped here: control-thread deallocation only.
         }
     }
@@ -644,7 +665,10 @@ impl AudioEngine {
         clips: crate::realtime::ControlClipTable,
     ) -> bool {
         self.structure
-            .push(GraphUpdate::SetControlClips { index, clips })
+            .push(GraphUpdate::SetControlClips {
+                index,
+                clips: Box::new(clips),
+            })
             .is_ok()
     }
 

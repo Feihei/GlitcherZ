@@ -2569,6 +2569,8 @@ mod tests {
             glitcherz_engine::realtime::audio_track::audio_clip_trash_channel();
         let (midi_trash_tx, _midi_trash_rx) =
             glitcherz_engine::realtime::sequencer::midi_clip_trash_channel();
+        let (control_trash_tx, _control_trash_rx) =
+            glitcherz_engine::realtime::sequencer::control_clip_trash_channel();
         let (mut compiler, graph) = GraphCompiler::default_graph(sr, fixed_block);
         let feedback = Feedback::new();
         let sequencer = Sequencer::new(sr);
@@ -2583,6 +2585,7 @@ mod tests {
             recycle_tx,
             audio_trash_tx,
             midi_trash_tx,
+            control_trash_tx,
             glitcherz_engine::realtime::CaptureTap::detached(),
             feedback.clone(),
         );
@@ -2603,7 +2606,12 @@ mod tests {
         clips[0].length_ticks = 384;
         clips[0].push(RtNote::new(0, 384, 60, 0, 127));
         graph_tx
-            .push(glitcherz_engine::realtime::graph::GraphUpdate::SetMidiClips { track: 0, clips })
+            .push(
+                glitcherz_engine::realtime::graph::GraphUpdate::SetMidiClips {
+                    track: 0,
+                    clips: Box::new(clips),
+                },
+            )
             .expect("structure queue");
 
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
@@ -2705,7 +2713,7 @@ mod tests {
             .push(
                 glitcherz_engine::realtime::graph::GraphUpdate::SetMidiClips {
                     track: 0,
-                    clips: chords,
+                    clips: Box::new(chords),
                 },
             )
             .expect("structure queue");

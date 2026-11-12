@@ -92,7 +92,7 @@ pub const MAX_MIXER_CHANNELS: usize = 32;
 /// 32 since both clip tables moved to the structure queue: the limit no longer
 /// multiplies into command-queue memory, so it can cover a real song (verse /
 /// chorus / bridge edits on one track) instead of forcing a single clip.
-pub const MAX_CLIPS_PER_TRACK: usize = 32;
+pub const MAX_CLIPS_PER_TRACK: usize = 128;
 
 /// Notes per MIDI clip capacity limit (D15 as revised 2026-10-28).
 ///

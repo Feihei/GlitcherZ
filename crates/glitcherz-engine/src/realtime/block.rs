@@ -134,11 +134,16 @@ pub struct BlockRunner {
     audio_trash_pending: Option<crate::realtime::audio_track::AudioClipTable>,
     /// Displaced MIDI clip tables (D15 revision): same protocol as
     /// `audio_trash` — pushed here by the audio thread, drained and dropped by
-    /// [`crate::engine::AudioEngine`]. The tables own `Vec`s, so dropping them
-    /// here would deallocate on the real-time thread.
-    midi_trash: rtrb::Producer<crate::realtime::sequencer::MidiClipTable>,
+    /// [`crate::engine::AudioEngine`]. The boxes own heap allocations, so
+    /// dropping them here would deallocate on the real-time thread.
+    midi_trash: rtrb::Producer<Box<crate::realtime::sequencer::MidiClipTable>>,
     /// Parked MIDI table that did not fit the trash queue last block.
-    midi_trash_pending: Option<crate::realtime::sequencer::MidiClipTable>,
+    midi_trash_pending: Option<Box<crate::realtime::sequencer::MidiClipTable>>,
+    /// Displaced control clip tables (F-041 M10): the table itself owns no
+    /// heap, but its box does, so it follows the same recycle protocol.
+    control_trash: rtrb::Producer<Box<crate::realtime::sequencer::ControlClipTable>>,
+    /// Parked control table that did not fit the trash queue last block.
+    control_trash_pending: Option<Box<crate::realtime::sequencer::ControlClipTable>>,
     /// Transport metronome (spec `recording.md` D1–D5): synthesized after the
     /// graph has run, so it never becomes a node, never enters automation and
     /// never shows up in the master peak meter. Disabled until the UI sends
@@ -172,7 +177,8 @@ impl BlockRunner {
         structure: Consumer<GraphUpdate>,
         recycle: rtrb::Producer<RecycledNode>,
         audio_trash: rtrb::Producer<crate::realtime::audio_track::AudioClipTable>,
-        midi_trash: rtrb::Producer<crate::realtime::sequencer::MidiClipTable>,
+        midi_trash: rtrb::Producer<Box<crate::realtime::sequencer::MidiClipTable>>,
+        control_trash: rtrb::Producer<Box<crate::realtime::sequencer::ControlClipTable>>,
         capture: CaptureTap,
         feedback: Feedback,
     ) -> Self {
@@ -194,6 +200,8 @@ impl BlockRunner {
             audio_trash_pending: None,
             midi_trash,
             midi_trash_pending: None,
+            control_trash,
+            control_trash_pending: None,
             metronome: Metronome::new(sample_rate),
             click: vec![0.0; fixed_block.max(1)],
             capture,
@@ -258,9 +266,11 @@ impl BlockRunner {
                     }
                 }
                 GraphUpdate::SetControlClips { index, clips } => {
-                    // D15 revision: a control table owns no heap, so the old
-                    // one is simply overwritten — no trash receipt.
-                    self.sequencer.set_control_clips(index, clips);
+                    // F-041 M10: the box owns the allocation even though the
+                    // table is `Copy`; recycle it instead of dropping it.
+                    if let Some(trashed) = self.sequencer.set_control_clips(index, clips) {
+                        self.trash_control_clips(trashed);
+                    }
                 }
                 topology => self.graph.apply_update(topology, &mut self.recycle),
             }
@@ -457,7 +467,7 @@ impl BlockRunner {
     /// Same protocol as [`Self::trash_audio_clips`]: park on a full queue and
     /// retry next block; never deallocate here (the tables own `Vec`s).
     /// RT-safe.
-    fn trash_midi_clips(&mut self, table: crate::realtime::sequencer::MidiClipTable) {
+    fn trash_midi_clips(&mut self, table: Box<crate::realtime::sequencer::MidiClipTable>) {
         if let Some(parked) = self.midi_trash_pending.take() {
             if let Err(rtrb::PushError::Full(parked)) = self.midi_trash.push(parked) {
                 self.midi_trash_pending = Some(parked);
@@ -465,6 +475,21 @@ impl BlockRunner {
         }
         if let Err(rtrb::PushError::Full(table)) = self.midi_trash.push(table) {
             if let Some(parked) = self.midi_trash_pending.replace(table) {
+                std::mem::forget(parked);
+            }
+        }
+    }
+
+    /// Forwards a displaced control clip table to its trash queue (F-041 M10).
+    /// Same park-and-retry protocol as [`Self::trash_midi_clips`]. RT-safe.
+    fn trash_control_clips(&mut self, table: Box<crate::realtime::sequencer::ControlClipTable>) {
+        if let Some(parked) = self.control_trash_pending.take() {
+            if let Err(rtrb::PushError::Full(parked)) = self.control_trash.push(parked) {
+                self.control_trash_pending = Some(parked);
+            }
+        }
+        if let Err(rtrb::PushError::Full(table)) = self.control_trash.push(table) {
+            if let Some(parked) = self.control_trash_pending.replace(table) {
                 std::mem::forget(parked);
             }
         }
@@ -684,6 +709,9 @@ mod tests {
         drop(audio_trash_rx);
         let (midi_trash_tx, midi_trash_rx) = crate::realtime::sequencer::midi_clip_trash_channel();
         drop(midi_trash_rx);
+        let (control_trash_tx, control_trash_rx) =
+            crate::realtime::sequencer::control_clip_trash_channel();
+        drop(control_trash_rx);
         let (compiler, graph) = GraphCompiler::default_graph(SR, fixed_block);
         let feedback = Feedback::new();
         let sequencer = Sequencer::new(SR);
@@ -698,6 +726,7 @@ mod tests {
             _recycle_tx,
             audio_trash_tx,
             midi_trash_tx,
+            control_trash_tx,
             crate::realtime::capture::CaptureTap::detached(),
             feedback.clone(),
         );
@@ -918,8 +947,11 @@ mod tests {
         }
         let mut clips = empty_midi_clip_table();
         clips[0] = clip;
-        tx.push(GraphUpdate::SetMidiClips { track, clips })
-            .expect("queue not full");
+        tx.push(GraphUpdate::SetMidiClips {
+            track,
+            clips: Box::new(clips),
+        })
+        .expect("queue not full");
     }
 
     #[test]
@@ -1004,7 +1036,10 @@ mod tests {
             ..RtControlClip::default()
         };
         structure_tx
-            .push(GraphUpdate::SetControlClips { index: 0, clips })
+            .push(GraphUpdate::SetControlClips {
+                index: 0,
+                clips: Box::new(clips),
+            })
             .expect("structure queue not full");
         let update = compiler
             .set_auto_route(0, mixer_id, ParamId::MixerGain(0), MapSpec::UNIT)
@@ -1133,7 +1168,10 @@ mod tests {
             ..RtControlClip::default()
         };
         structure_tx
-            .push(GraphUpdate::SetControlClips { index: 0, clips })
+            .push(GraphUpdate::SetControlClips {
+                index: 0,
+                clips: Box::new(clips),
+            })
             .expect("structure queue not full");
         let update = compiler
             .set_auto_route(0, voice_id, ParamId::PluginParam(1), MapSpec::UNIT)
@@ -1246,7 +1284,10 @@ mod tests {
         let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
         clips[0] = tempo_clip(0, TICKS_PER_BAR, 240.0);
         structure_tx
-            .push(GraphUpdate::SetControlClips { index: 0, clips })
+            .push(GraphUpdate::SetControlClips {
+                index: 0,
+                clips: Box::new(clips),
+            })
             .expect("structure queue not full");
         let update = compiler
             .set_timeline_in_route(0, TEMPO)
@@ -1290,7 +1331,10 @@ mod tests {
         clips[0] = tempo_clip(0, TICKS_PER_BAR, 240.0);
         clips[1] = tempo_clip(2 * TICKS_PER_BAR, TICKS_PER_BAR, 240.0);
         structure_tx
-            .push(GraphUpdate::SetControlClips { index: 0, clips })
+            .push(GraphUpdate::SetControlClips {
+                index: 0,
+                clips: Box::new(clips),
+            })
             .expect("structure queue not full");
         let update = compiler
             .set_timeline_in_route(0, TEMPO)
@@ -1324,7 +1368,10 @@ mod tests {
         let mut clips = [RtControlClip::default(); MAX_TRACK_CLIPS];
         clips[0] = tempo_clip(0, TICKS_PER_BAR, 240.0);
         structure_tx
-            .push(GraphUpdate::SetControlClips { index: 0, clips })
+            .push(GraphUpdate::SetControlClips {
+                index: 0,
+                clips: Box::new(clips),
+            })
             .expect("structure queue not full");
         tx.push(EngineCommand::Sequencer(SequencerCommand::Play))
             .expect("queue not full");

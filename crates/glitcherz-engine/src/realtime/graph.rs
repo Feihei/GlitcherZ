@@ -509,24 +509,26 @@ pub enum GraphUpdate {
     /// the old D15 note anticipated. The block runner peels this variant
     /// before the graph sees it (see [`Self::SetAudioClips`]); the displaced
     /// table is moved to the MIDI trash queue and dropped on the control
-    /// thread. There is **no** per-clip note cap any more.
+    /// thread. There is **no** per-clip note cap any more. The table travels in
+    /// a box (F-041 M10) so the variant stays pointer-sized.
     SetMidiClips {
         /// Target track index (the document's `midi_tracks` order).
         track: usize,
         /// The new clip table (built on the control thread).
-        clips: crate::realtime::sequencer::MidiClipTable,
+        clips: Box<crate::realtime::sequencer::MidiClipTable>,
     },
     /// Replace one control track's clip table (D15 revision 2026-10-28).
     ///
     /// D17 note: the delivery endpoint is **not** part of the table — it stays
     /// decided by the automation routing table (`AudioEngine::set_auto_route`).
-    /// The table owns no heap, so no trash receipt is needed: the runner
-    /// overwrites the previous table in place.
+    /// The table owns no heap, but it travels in a box (F-041 M10) so the variant
+    /// stays pointer-sized; the runner swaps the old table into the same box and
+    /// recycles it through the control trash channel.
     SetControlClips {
         /// Target automation track index (the document's `control_tracks` order).
         index: usize,
         /// The new clip table (built on the control thread).
-        clips: crate::realtime::sequencer::ControlClipTable,
+        clips: Box<crate::realtime::sequencer::ControlClipTable>,
     },
 }
 

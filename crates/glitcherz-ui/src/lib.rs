@@ -2676,6 +2676,9 @@ impl eframe::App for GlitcherZApp {
         // D15 revision: same cadence for displaced MIDI clip tables (their
         // `Vec`s must be released on the control thread).
         self.engine.reclaim_midi_clips();
+        // F-041 M10: control clip tables now travel in boxes, so the displaced
+        // allocations need the same control-thread drain.
+        self.engine.reclaim_control_clips();
 
         // R2: recording housekeeping (spec `recording.md`) — drain the capture
         // tap and advance pre-roll → recording. Runs before the transport

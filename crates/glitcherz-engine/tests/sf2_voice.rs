@@ -452,6 +452,8 @@ fn real_soundfont_full_graph_paths() {
         glitcherz_engine::realtime::audio_track::audio_clip_trash_channel();
     let (midi_trash_tx, _midi_trash_rx) =
         glitcherz_engine::realtime::sequencer::midi_clip_trash_channel();
+    let (control_trash_tx, _control_trash_rx) =
+        glitcherz_engine::realtime::sequencer::control_clip_trash_channel();
     let (mut compiler, graph) = GraphCompiler::default_graph(SR, BLOCK);
     let feedback = glitcherz_engine::realtime::Feedback::new();
     let runner = BlockRunner::new(
@@ -465,6 +467,7 @@ fn real_soundfont_full_graph_paths() {
         recycle_tx,
         audio_trash_tx,
         midi_trash_tx,
+        control_trash_tx,
         glitcherz_engine::realtime::CaptureTap::detached(),
         feedback,
     );
