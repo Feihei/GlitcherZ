@@ -826,38 +826,58 @@ impl GlitcherZApp {
             };
             let project = self.project_mut();
             match (&trim.origin, lane) {
-                (timeline::HeadTrimOrigin::Midi(origin), timeline::TimelineLane::Midi) => project
-                    .midi_tracks
-                    .get_mut(track)
-                    .and_then(|t| t.clips.get_mut(clip))
-                    .map(|c| {
-                        let mut next = origin.clone();
-                        // F-041: the head trim only moves the window start;
-                        // the shared content is never rewritten.
-                        next.retain_from(delta_ticks, sec_per_tick);
-                        next.start_ticks = start_ticks;
-                        next.span_ticks = span_ticks;
-                        let changed = *c != *next;
-                        *c = *next;
-                        changed
-                    })
-                    .unwrap_or(false),
+                (timeline::HeadTrimOrigin::Midi(origin), timeline::TimelineLane::Midi) => {
+                    let mut next = origin.clone();
+                    // F-041: the head trim only moves the window start;
+                    // the shared content is never rewritten.
+                    next.retain_from(delta_ticks, sec_per_tick);
+                    next.start_ticks = start_ticks;
+                    next.span_ticks = span_ticks;
+                    if !midi_window_has_content(
+                        project,
+                        next.data,
+                        next.source_offset,
+                        next.span_ticks,
+                    ) {
+                        false
+                    } else {
+                        project
+                            .midi_tracks
+                            .get_mut(track)
+                            .and_then(|t| t.clips.get_mut(clip))
+                            .map(|c| {
+                                let changed = *c != *next;
+                                *c = *next;
+                                changed
+                            })
+                            .unwrap_or(false)
+                    }
+                }
                 (timeline::HeadTrimOrigin::Control(origin), timeline::TimelineLane::Control) => {
-                    project
-                        .control_tracks
-                        .get_mut(track)
-                        .and_then(|t| t.clips.get_mut(clip))
-                        .map(|c| {
-                            let mut next = origin.clone();
-                            // F-041: move the window, keep the content.
-                            next.retain_from(delta_ticks, sec_per_tick);
-                            next.start_ticks = start_ticks;
-                            next.span_ticks = span_ticks;
-                            let changed = *c != *next;
-                            *c = *next;
-                            changed
-                        })
-                        .unwrap_or(false)
+                    let mut next = origin.clone();
+                    // F-041: move the window, keep the content.
+                    next.retain_from(delta_ticks, sec_per_tick);
+                    next.start_ticks = start_ticks;
+                    next.span_ticks = span_ticks;
+                    if !curve_window_has_content(
+                        project,
+                        next.data,
+                        next.source_offset,
+                        next.span_ticks,
+                    ) {
+                        false
+                    } else {
+                        project
+                            .control_tracks
+                            .get_mut(track)
+                            .and_then(|t| t.clips.get_mut(clip))
+                            .map(|c| {
+                                let changed = *c != *next;
+                                *c = *next;
+                                changed
+                            })
+                            .unwrap_or(false)
+                    }
                 }
                 (timeline::HeadTrimOrigin::Audio { offset, .. }, timeline::TimelineLane::Audio) => {
                     project
@@ -2376,6 +2396,36 @@ impl GlitcherZApp {
         self.sync_selection_rows(&selection);
     }
 }
+/// F-041 M10.2: a manual window trim may not leave a clip with nothing to
+/// play. Empty data is exempt (a new clip must be adjustable before its first
+/// note). A note counts when any part of it overlaps the window.
+fn midi_window_has_content(project: &Project, data_idx: u32, offset: i64, span: u32) -> bool {
+    let Some(data) = project.midi_data.get(data_idx as usize) else {
+        return true;
+    };
+    if data.notes().is_empty() {
+        return true;
+    }
+    let end = offset.saturating_add(i64::from(span));
+    data.notes().iter().any(|note| {
+        let note_end = note.start.saturating_add(note.length.max(1));
+        note.start < end && note_end > offset
+    })
+}
+
+/// Control-clip analogue: the window must overlap the anchor span (anchors
+/// are sparse; a window between two anchors still has a curve value).
+fn curve_window_has_content(project: &Project, data_idx: u32, offset: i64, span: u32) -> bool {
+    let Some(data) = project.curve_data.get(data_idx as usize) else {
+        return true;
+    };
+    let (Some(first), Some(last)) = (data.points.first(), data.points.last()) else {
+        return true;
+    };
+    let end = offset.saturating_add(i64::from(span));
+    i64::from(first.tick) < end && i64::from(last.tick) >= offset
+}
+
 /// One MIDI clip's T stretch (F-041 M10): a **pure window edit**.
 ///
 /// Moving the start shifts `source_offset` (negative = leading blank); moving
@@ -2395,19 +2445,26 @@ fn stretch_midi_clip(
     else {
         return false;
     };
-    let (old_start, old_span, old_off, old_loop) = (
+    let (old_start, old_span, old_off, old_loop, data_idx) = (
         clip.start_ticks,
         clip.span_ticks,
         clip.source_offset,
         clip.loop_ticks,
+        clip.data,
     );
     if old_start == new_start && old_span == new_span && old_loop.is_none() {
+        return false;
+    }
+    // F-041 M10.2: shrinking the window must keep at least one note audible.
+    let shifted = old_off.saturating_add(i64::from(new_start) - i64::from(old_start));
+    if (new_span < old_span || new_start > old_start)
+        && !midi_window_has_content(project, data_idx, shifted, new_span)
+    {
         return false;
     }
     // F-041 M10: a stretch is a pure window edit. Moving the start shifts the
     // window inside the shared data (possibly negative, exposing leading
     // blank); it never moves events and never grows `length_ticks`.
-    let shifted = old_off.saturating_add(i64::from(new_start) - i64::from(old_start));
     let Some(clip) = project
         .midi_tracks
         .get_mut(track)
@@ -2438,16 +2495,22 @@ fn stretch_curve_clip(
     else {
         return false;
     };
-    let (old_start, old_span, old_off, old_loop) = (
+    let (old_start, old_span, old_off, old_loop, data_idx) = (
         clip.start_ticks,
         clip.span_ticks,
         clip.source_offset,
         clip.loop_ticks,
+        clip.data,
     );
     if old_start == new_start && old_span == new_span && old_loop.is_none() {
         return false;
     }
     let shifted = old_off.saturating_add(i64::from(new_start) - i64::from(old_start));
+    if (new_span < old_span || new_start > old_start)
+        && !curve_window_has_content(project, data_idx, shifted, new_span)
+    {
+        return false;
+    }
     let Some(clip) = project
         .control_tracks
         .get_mut(track)
@@ -2482,6 +2545,10 @@ fn resize_midi_clip(
     if clip.start_ticks == new_start && clip.span_ticks == new_span {
         return false;
     }
+    let (off, data_idx, old_span) = (clip.source_offset, clip.data, clip.span_ticks);
+    if new_span < old_span && !midi_window_has_content(project, data_idx, off, new_span) {
+        return false;
+    }
     let Some(clip) = project
         .midi_tracks
         .get_mut(track)
@@ -2512,6 +2579,10 @@ fn resize_curve_clip(
         return false;
     };
     if clip.start_ticks == new_start && clip.span_ticks == new_span {
+        return false;
+    }
+    let (off, data_idx, old_span) = (clip.source_offset, clip.data, clip.span_ticks);
+    if new_span < old_span && !curve_window_has_content(project, data_idx, off, new_span) {
         return false;
     }
     let Some(clip) = project
@@ -2651,5 +2722,28 @@ mod tests {
                 .length_ticks,
             TICKS_PER_BAR
         );
+    }
+
+    /// F-041 M10.2: a window that no note overlaps is refused; empty data may
+    /// still be resized (nothing to play yet).
+    #[test]
+    fn stretch_rejects_an_empty_window() {
+        let mut project = Project::default();
+        clip_with_one_note(&mut project);
+        let before = project.midi_tracks[0].clips[0].clone();
+        // Move the window past the note: refused, the clip stays put.
+        assert!(!stretch_midi_clip(&mut project, 0, 0, TICKS_PER_BAR, 100));
+        let clip = &project.midi_tracks[0].clips[0];
+        assert_eq!(clip.start_ticks, before.start_ticks);
+        assert_eq!(clip.span_ticks, before.span_ticks);
+
+        // Empty content is exempt so a new clip can be prepared.
+        let data_idx = project.midi_tracks[0].clips[0].data;
+        project
+            .midi_data_mut(data_idx)
+            .expect("data")
+            .notes_mut()
+            .clear();
+        assert!(stretch_midi_clip(&mut project, 0, 0, TICKS_PER_BAR, 100));
     }
 }
