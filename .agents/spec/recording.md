@@ -146,6 +146,9 @@ LFO/curve ──automation──► Curve 1 输入口  （R8：块边界采样 t
   时回落到 armed track，与电脑键盘同规则）；Inspector 在选中键盘节点时显示输入源面板
   （电脑键盘 / 各端口，已被别的节点占用的端口禁用）、连接状态、目标乐器与"刷新设备"。
   设备绑定是**文档编辑**（一次 undo），不是应用配置（D18）。
+  端口列表由 UI 每秒自动重枚举一次（热插拔 1 秒内可见；枚举失败只记日志）；设备从后端
+  消失时 `set_bindings` 丢弃其失效连接，同名端口重新出现会自动重开。Inspector 的
+  `Refresh devices` 额外 `close_all` 强制重建全部连接，用于端口仍在列表但连接已静默。
   测试：`midi_input` 单元 8 项（note on/off、vel-0、CC、bend 居中/上下限、系统消息丢弃、
   node 目标、track 目标拒收 CC、满队列报告丢弃）+ `node_ctrl_reaches_only_the_addressed_slot`。
 - [x] **R6 轨输入口（录音归属，R4 的前置）** ✅ 2026-11-01

@@ -1861,6 +1861,9 @@ pub struct GlitcherZApp {
     /// Ports the last binding pass could not find (bound but unplugged). Shown
     /// once in the status bar, not every frame.
     midi_missing: Vec<String>,
+    /// Wall-clock of the last automatic port enumeration (hot-plug detection).
+    /// `None` until the first frame; polling is throttled to once a second.
+    midi_ports_polled_at: Option<Instant>,
     /// Held computer keys: physical pitch → the pitch actually sent (after the
     /// node's transpose). Note-off and route-change releases must use the
     /// sounding pitch, or a transposed voice rings forever.
@@ -2276,6 +2279,7 @@ impl GlitcherZApp {
             midi_ports: Vec::new(),
             midi_bindings: Vec::new(),
             midi_missing: Vec::new(),
+            midi_ports_polled_at: None,
             held_notes: keyboard::HeldNotes::default(),
             current_note: None,
             meter_l: PeakMeter::new(),
@@ -2411,17 +2415,59 @@ impl GlitcherZApp {
         app
     }
 
-    /// Re-enumerates hardware MIDI input ports (startup, and the Inspector's
-    /// refresh button). Errors are reported in the status bar rather than
-    /// propagated: no MIDI backend is a degraded, not a broken, app.
+    /// Re-enumerates hardware MIDI input ports (startup, the Inspector's refresh
+    /// button, and the automatic hot-plug poll). Errors are reported in the
+    /// status bar rather than propagated: no MIDI backend is a degraded, not a
+    /// broken, app.
     fn refresh_midi_ports(&mut self) -> Result<(), glitcherz_engine::MidiInputError> {
         let result = self.midi_hub.refresh_ports();
-        self.midi_ports = self.midi_hub.ports().to_vec();
-        log::info!("MIDI input ports: {:?}", self.midi_ports);
-        // Force the next sync to re-evaluate: a port that just appeared may
-        // satisfy a binding that was reported missing.
-        self.midi_bindings.clear();
+        if result.is_ok() {
+            let changed = self.midi_ports.as_slice() != self.midi_hub.ports();
+            self.midi_ports = self.midi_hub.ports().to_vec();
+            if changed {
+                // Force the next sync to re-evaluate: a port that just
+                // appeared may satisfy a binding that was reported missing.
+                // Unchanged polls must leave the bindings alone, or the push
+                // would rerun every second for nothing.
+                self.midi_bindings.clear();
+            }
+        }
+        log::debug!("MIDI input ports: {:?}", self.midi_ports);
         result
+    }
+
+    /// Manual "Refresh devices": re-enumerate **and** rebuild every connection.
+    ///
+    /// Used by the Inspector button instead of [`Self::refresh_midi_ports`]:
+    /// a controller can go silent while its endpoint stays in the backend's
+    /// list, so dropping the handles is the only reliable reconnect. The
+    /// automatic poll keeps the handles and only reopens ports that actually
+    /// appeared or vanished.
+    fn reconnect_midi_ports(&mut self) -> Result<(), glitcherz_engine::MidiInputError> {
+        self.midi_hub.close_all();
+        self.midi_bindings.clear();
+        self.refresh_midi_ports()
+    }
+
+    /// Re-enumerates MIDI ports at most once a second so a device plugged in
+    /// after launch shows up without the user having to find the Inspector's
+    /// refresh button (macOS especially: the port list is a snapshot, and a
+    /// USB keyboard is normally connected while the app is already running).
+    ///
+    /// A failed enumeration is a log line only — a machine without MIDI
+    /// support must not spam the status bar every second.
+    fn poll_midi_ports(&mut self) {
+        const POLL_INTERVAL: Duration = Duration::from_secs(1);
+        if self
+            .midi_ports_polled_at
+            .is_some_and(|at| at.elapsed() < POLL_INTERVAL)
+        {
+            return;
+        }
+        self.midi_ports_polled_at = Some(Instant::now());
+        if let Err(err) = self.refresh_midi_ports() {
+            log::warn!("MIDI input unavailable: {err}");
+        }
     }
 
     // ---- Convenient accessors for document fields (data source for track panels in node-graph
@@ -2610,7 +2656,10 @@ impl eframe::App for GlitcherZApp {
         // the keyboard handling below reads it.
         self.refresh_vk_targets();
         // R3: hardware input ports follow the same rule — their callbacks read
-        // a routing snapshot rebuilt from the document.
+        // a routing snapshot rebuilt from the document. Ports are re-enumerated
+        // on a timer first so a keyboard plugged in after launch appears (and
+        // a stale connection to an unplugged one is dropped).
+        self.poll_midi_ports();
         self.sync_midi_bindings();
 
         // U2: an open unsaved-changes modal owns the keyboard (its Escape

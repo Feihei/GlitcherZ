@@ -297,6 +297,7 @@ impl GlitcherZApp {
         ui.separator();
         if self.midi_ports.is_empty() {
             ui.weak("No MIDI input devices found.");
+            ui.weak("Plug a controller in — the list refreshes automatically.");
         } else {
             ui.label("MIDI devices");
             for port in &self.midi_ports {
@@ -328,7 +329,7 @@ impl GlitcherZApp {
 
         ui.add_space(6.0);
         if ui.button("Refresh devices").clicked() {
-            match self.refresh_midi_ports() {
+            match self.reconnect_midi_ports() {
                 Ok(()) => self.set_message("MIDI devices refreshed".to_string()),
                 Err(err) => self.set_message(format!("MIDI input: {err}")),
             }

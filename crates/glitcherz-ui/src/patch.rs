@@ -3697,7 +3697,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             state.pan = Vec2::ZERO;
             state.zoom = 1.0;
         }
-        ui.weak("Shift+A / right-click to add node · right-click a port name to rename · Ctrl+right-drag to cut cables · click a cable dot to insert/delete · click to select · drag bg to box-select · middle-drag to pan · scroll to zoom · drag ports to connect · Delete to remove");
+        ui.weak("Shift+A / right-click to add node · right-click a port name to rename · Ctrl+right-drag to cut cables · click a cable dot to insert/delete · click to select · drag bg to box-select · middle-drag to pan · scroll to zoom · drag ports to connect · Delete / Backspace to remove");
     });
 
     // ---- Patch ----
@@ -5358,7 +5358,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     }
 
     // ---- Delete removes the whole selection (while hovering the patch) ----
-    if response.hovered() && ui.ctx().input(|i| i.key_pressed(egui::Key::Delete)) {
+    // macOS keyboards have no forward-delete key; Backspace is the primary
+    // delete there, so both keys must do the same thing.
+    let delete = ui
+        .ctx()
+        .input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+    if response.hovered() && delete {
         // Cables first, in descending index order (each removal shifts later
         // indices); nodes after (node deletion may cascade attached cables in
         // the caller).
@@ -5956,6 +5961,69 @@ mod tests {
         assert!(
             timeline_in_drop_action(&timeline_drag(auto_out), 200, doc, &deps).is_none(),
             "an out-of-range port must not be read as Tempo"
+        );
+    }
+
+    /// macOS keyboards have no forward-delete key, so Backspace must delete the
+    /// current selection exactly like Delete does.
+    #[test]
+    fn backspace_deletes_the_selection() {
+        let project = Project::default();
+        let instrument = project
+            .graph
+            .instrument_of_track(0)
+            .expect("default synth")
+            .node_id();
+        let track_name = |_: TrackKind, _: usize| String::new();
+        let auto_options = |_: u64| -> Vec<(String, AutoParam)> { Vec::new() };
+        let plugin_inline = |_: u64| -> Vec<InlinePluginControl> { Vec::new() };
+        let sf2_presets = |_: u64| -> Vec<(u8, u8, String)> { Vec::new() };
+        let deps = PatchDeps {
+            input: Default::default(),
+            doc: &project.graph,
+            track_count: project.midi_tracks.len(),
+            track_name: &track_name,
+            auto_count: project.control_tracks.len(),
+            audio_count: project.audio_tracks.len(),
+            auto_options: &auto_options,
+            plugin_inline: &plugin_inline,
+            sf2_presets: &sf2_presets,
+        };
+        let ctx = egui::Context::default();
+        let mut state = PatchState::default();
+        state.ensure_positions(
+            &project.graph,
+            deps.track_count,
+            deps.auto_count,
+            deps.audio_count,
+        );
+
+        // Park the pointer on the canvas first: the delete shortcut is
+        // hover-gated, and egui only reports `hovered()` once it knows where
+        // the pointer is.
+        let probe = Pos2::new(400.0, 300.0);
+        let _ = drive(
+            &ctx,
+            &mut state,
+            deps,
+            vec![egui::Event::PointerMoved(probe)],
+            0.0,
+        );
+        state.select_node_ids(&[instrument]);
+
+        let backspace = egui::Event::Key {
+            key: egui::Key::Backspace,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        let actions = drive(&ctx, &mut state, deps, vec![backspace], 0.1);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PatchAction::DeleteNode(id) if *id == instrument)),
+            "Backspace must delete the selected node: {actions:?}"
         );
     }
 

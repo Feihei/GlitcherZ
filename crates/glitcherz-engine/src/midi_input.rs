@@ -140,6 +140,15 @@ impl MidiInputHub {
         self.open.iter().any(|p| p.port == port)
     }
 
+    /// Drops every connection. The next [`Self::set_bindings`] reopens them
+    /// from scratch — the manual "Refresh devices" escape hatch for a port
+    /// whose connection went dead without the backend dropping the endpoint
+    /// (so the name never leaves the enumeration and the stale handle would
+    /// otherwise be kept forever).
+    pub fn close_all(&mut self) {
+        self.open.clear();
+    }
+
     /// Counters shared with the callbacks.
     pub fn stats(&self) -> Arc<MidiInputStats> {
         self.stats.clone()
@@ -161,9 +170,17 @@ impl MidiInputHub {
         bindings: &[(String, Vec<MidiTarget>)],
         sender: &CommandSender,
     ) -> Result<Vec<String>, MidiInputError> {
-        // 1. Close ports that are no longer wanted.
-        self.open
-            .retain(|open| bindings.iter().any(|(port, _)| port == &open.port));
+        // 1. Close ports that are no longer wanted, and ports the backend no
+        //    longer reports (unplugged): a stale connection never recovers, so
+        //    dropping it lets the next enumeration reopen the device when it
+        //    comes back under the same name. The cache is cloned because the
+        //    `retain` closure cannot borrow `self` while `self.open` is mutably
+        //    borrowed; `set_bindings` only runs when the routing snapshot
+        //    changes, so the allocation is negligible.
+        let present = self.ports.clone();
+        self.open.retain(|open| {
+            present.contains(&open.port) && bindings.iter().any(|(port, _)| port == &open.port)
+        });
 
         let mut missing = Vec::new();
         for (port, targets) in bindings {
