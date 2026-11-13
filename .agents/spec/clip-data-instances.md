@@ -1,7 +1,7 @@
 # clip 与数据分离（数据池 + 实例引用）
 
 > ID: F-041 · 域: EDIT / PROJ / ENGINE
-> 状态：M1–M6 已交付（2026-11-11）；2026-11-12 修订 T / 复制语义；2026-11-12 review 续作 **M9 / M10 / M11 已交付**（窗口内嵌 clip、`loop` 周期、`source_offset: i64`、T 纯窗口 + 写时增长、128 上限、v14 迁移、`tile N` 一次性复制），**M10.1 编辑范围 / 窗口跟随已交付**（卷帘编辑 `max(content, window)`、`window_follow`、`clip.fit_window`），设计见 §13
+> 状态：M1–M6 已交付（2026-11-11）；2026-11-12 修订 T / 复制语义；2026-11-12 review 续作 **M9 / M10 / M11 已交付**（窗口内嵌 clip、`loop` 周期、`source_offset: i64`、T 纯窗口 + 写时增长、128 上限、v14 迁移、`tile N` 一次性复制），**M10.1 编辑范围 / 窗口跟随已交付**（卷帘编辑 `max(content, window)`、`window_follow`、`clip.fit_window`），**M10.2 卷帘对齐已交付**（数据坐标 offset 映射、指针行 floor、头空白写入），设计见 §13
 > 关联：`timeline.md`（D14 / D15 / D31 / D32 / D33）、`editing-model.md`、`audio-trim.md`（D1 是同一形状的先例）、`clipboard.md`（F-040 快照需随之扩展）、`roll-multiclip.md`
 
 ## 1. 问题
@@ -72,6 +72,8 @@ Blender 式 object / mesh 分离：**多个 clip 可以引用同一份 MIDI / cu
 | D30 | 编辑范围独立于窗口（M10.1） | 卷帘编辑范围 = `max(data.length, window end)`（数据坐标）：T 扩出的尾部可写，手动裁短后窗口外内容仍可编辑；窗口只是播放裁剪，不限制内容编辑 |
 | D31 | 窗口自动跟随（M10.1） | `window_follow` 默认对新 clip 开启；T / 拖边 / trim 关闭。跟随期间窗口末端 = 最后一个 note-off 向上取整到小节（至少 1 小节）；`clip.fit_window` 重新开启并立即按内容末端调整 |
 | D32 | 禁止空窗口（M10.1） | 手动缩小 / 移动窗口（T、拖边、左缘 trim）后必须至少有一个音符与窗口相交；数据本身为空时豁免，便于新建 clip 先准备内容 |
+| D33 | 卷帘以数据坐标对齐窗口（M10.2） | 卷帘绘制 / 命中按数据 tick（`note.start`），`x_of` 减 `source_offset`、`local_at` 加回；播放头用窗口局部 tick 再加 offset 绘制。窗口移动后音符相对窗口移位、绝对试听位置不变 |
+| D34 | 指针行与头空白写入（M10.2） | 指针 y 用 `floor` 落到所在行（不再四舍五入到下一音）；前导空白可用负数据 tick 写入：`midi.note_add` 接受负 `start_ticks`，`grow_midi_data_to_notes` 把整份内容右移 `shift`、`data.length += shift`、`source_offset += shift`，绝对位置不变（共享先 COW） |
 | D27 | 本次不做 | `TileSpec` / explode / 嵌套 tile / 记录 tile 份数、per-repeat override、自动 group、音频 tile、独立 window 面板（归 M7 扩展）、`ClipId` |
 
 ## 3. 数据结构
