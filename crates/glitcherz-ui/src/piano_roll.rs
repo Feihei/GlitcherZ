@@ -1307,6 +1307,9 @@ fn key_at(keys: egui::Rect, top_note: i32, row_h: f32, pos: egui::Pos2) -> Optio
 struct RollGeom {
     /// Arrangement tick of the clip the local ticks belong to.
     origin_tick: i64,
+    /// Window start inside the shared data (F-041 M10.2). Note ticks are data
+    /// ticks, so every x conversion subtracts this offset.
+    data_offset: i64,
     /// Screen x of absolute tick 0.
     t0_x: f32,
     ticks_to_x: f32,
@@ -1318,9 +1321,11 @@ struct RollGeom {
 }
 
 impl RollGeom {
-    /// Screen x of a **clip-local** tick.
-    fn x_of(&self, local_tick: f32) -> f32 {
-        self.t0_x + (self.origin_tick as f32 + local_tick) * self.ticks_to_x
+    /// Screen x of a **data** tick (the window offset maps it into clip-local
+    /// time; note ticks are data ticks, F-041 M10.2).
+    fn x_of(&self, data_tick: f32) -> f32 {
+        self.t0_x
+            + (self.origin_tick as f32 + (data_tick - self.data_offset as f32)) * self.ticks_to_x
     }
 
     /// Screen x of an **absolute** tick (the clip ruler shares this axis).
@@ -1328,10 +1333,10 @@ impl RollGeom {
         self.t0_x + tick * self.ticks_to_x
     }
 
-    /// Clip-local tick under a screen x (negative left of the clip origin;
-    /// callers that create notes clamp it themselves).
+    /// Data tick under a screen x (the window offset is added back, so every
+    /// command keeps working in data ticks).
     fn local_at(&self, x: f32) -> f32 {
-        (x - self.t0_x) / self.ticks_to_x - self.origin_tick as f32
+        (x - self.t0_x) / self.ticks_to_x - self.origin_tick as f32 + self.data_offset as f32
     }
 
     /// Screen y of the row for `note`.
@@ -1426,15 +1431,13 @@ impl ViewWindow {
                 continue;
             };
             let origin = clip.start_ticks as f32;
-            // Aud series: the window covers the clip's whole span. A tiled
-            // clip opens on the full block instead of swallowing everything
-            // past its first content period.
-            let span = clip
-                .span_ticks
-                .max(data.map_or(TICKS_PER_BAR, |data| data.length_ticks))
-                .max(TICKS_PER_STEP) as f32;
-            start = start.min(origin);
-            end = end.max(origin + span);
+            let offset = clip.source_offset as f32;
+            let data_len = data.map_or(TICKS_PER_BAR, |data| data.length_ticks) as f32;
+            let span = clip.span_ticks.max(TICKS_PER_STEP) as f32;
+            // Cover both the window and the whole data: editing may leave the
+            // window (F-041 M10.2).
+            start = start.min(origin.min(origin - offset));
+            end = end.max((origin + span).max(origin - offset + data_len));
         }
         if start.is_finite() && end.is_finite() {
             Self { start, end }
@@ -1524,7 +1527,17 @@ pub fn show(
     // F-041 M10: the roll edits the **window**, not the content length. A T
     // stretch may extend the window past `length_ticks`; that tail must be
     // writable (the command layer grows the data on the first write).
-    let loop_ticks = i64::from(data.length_ticks.max(clip.span_ticks.max(TICKS_PER_STEP))).max(1);
+    // F-041 M10.2: the editable end is a data tick and covers the whole
+    // content plus the whole window (whose start may be negative).
+    let window_end = clip
+        .source_offset
+        .saturating_add(i64::from(clip.span_ticks));
+    let loop_ticks = i64::from(data.length_ticks)
+        .max(window_end)
+        .max(i64::from(TICKS_PER_STEP))
+        .max(1);
+    // The playhead stays inside the first content period.
+    let content_len = i64::from(data.length_ticks.max(1));
     // Aud series: the whole clip block (tiled repeats included) — the ruler's
     // extent and the audition range's end.
     let clip_span = i64::from(clip.span_ticks.max(data.length_ticks.max(TICKS_PER_STEP))).max(1);
@@ -2168,6 +2181,7 @@ pub fn show(
     // hit-testing can never drift apart.
     let geom = RollGeom {
         origin_tick,
+        data_offset: clip.source_offset,
         t0_x: rect.left() - state.scroll_x * ticks_to_x,
         ticks_to_x,
         top_note,
@@ -2294,17 +2308,21 @@ pub fn show(
     // for the modal grab point; the interaction sections below reuse them).
     // Ticks stay **clip-local**: every command, modal and clamp is expressed
     // in local ticks, so only the geometry knows about the origin.
-    let pointer_tick = |pos: egui::Pos2| geom.local_at(pos.x).max(0.0);
+    let pointer_tick = |pos: egui::Pos2| geom.local_at(pos.x);
     let pointer_note = |pos: egui::Pos2| {
         (top_note as f32 - (pos.y - rect.top()) / row_h)
-            .round()
+            .floor()
             .clamp(0.0, 127.0) as u8
     };
     let hit_note = |pos: egui::Pos2| geom.note_at(data, pos);
     // D2: the view may scroll past the focus clip (to show a ghost), but
     // editing stops at its edges — a click out there must not conjure a note
     // clamped to tick 0.
-    let over_focus = |pos: egui::Pos2| (0.0..loop_ticks as f32).contains(&geom.local_at(pos.x));
+    // The leading blank is part of the editable data range now: a negative
+    // `source_offset` lets the first write land there (F-041 M10.2).
+    let edit_start = clip.source_offset.min(0) as f32;
+    let over_focus =
+        |pos: egui::Pos2| (edit_start..loop_ticks as f32).contains(&geom.local_at(pos.x));
     let modifiers = ui.ctx().input(|i| i.modifiers);
     let snap = if modifiers.ctrl || modifiers.command {
         Snap::OFF
@@ -2589,8 +2607,8 @@ pub fn show(
 
     // 5. Playhead: clip-local phase inside the first content period. Outside the
     //    clip or in a tiled repeat the ruler carries it instead (Aud series).
-    if let Some(local) = playhead_local(playhead_ticks, origin_tick, loop_ticks, clip_span) {
-        let x = geom.x_of(local);
+    if let Some(local) = playhead_local(playhead_ticks, origin_tick, content_len, clip_span) {
+        let x = geom.x_of(local + clip.source_offset as f32);
         let (width, color) = if playing {
             (2.0, egui::Color32::YELLOW)
         } else {
@@ -2632,8 +2650,8 @@ pub fn show(
             color,
         );
     }
-    if let Some(local) = playhead_local(playhead_ticks, origin_tick, loop_ticks, clip_span) {
-        let x = lane_geom.x_of(local);
+    if let Some(local) = playhead_local(playhead_ticks, origin_tick, content_len, clip_span) {
+        let x = lane_geom.x_of(local + clip.source_offset as f32);
         let (width, color) = if playing {
             (2.0, egui::Color32::YELLOW)
         } else {
@@ -4547,6 +4565,7 @@ mod tests {
     fn geom(rect: egui::Rect, origin: i64, ticks_to_x: f32, top: i32) -> RollGeom {
         RollGeom {
             origin_tick: origin,
+            data_offset: 0,
             t0_x: rect.left() - origin as f32 * ticks_to_x,
             ticks_to_x,
             top_note: top,
@@ -5011,6 +5030,7 @@ mod tests {
         // One scroll position for both: absolute tick 0 sits at x = 0.
         let a = RollGeom {
             origin_tick: 0,
+            data_offset: 0,
             t0_x: 0.0,
             ticks_to_x: t_x,
             top_note: top,
@@ -5247,6 +5267,25 @@ mod tests {
             assert_eq!(bar % ticks, 0, "{label} must divide the bar");
             assert_eq!(draw_length_label(DrawLength::Fixed(ticks)), label);
         }
+    }
+
+    /// F-041 M10.2: the window offset is applied to the drawn/hit axis, so a
+    /// head-extended window keeps notes at the same arrangement position.
+    #[test]
+    fn a_window_offset_shifts_the_note_axis() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0));
+        let zero = geom(rect, 0, 0.1, 60);
+        let shifted = RollGeom {
+            data_offset: -480,
+            ..zero
+        };
+        let n = note(0, 240, 60);
+        assert_eq!(
+            shifted.note_rect(&n).left() - zero.note_rect(&n).left(),
+            48.0,
+            "a -480 data offset moves the note 48 px right"
+        );
+        assert!((shifted.local_at(48.0) - 0.0).abs() < 1e-3);
     }
 
     /// I2: the key column maps a row to its MIDI note; a black key owns its

@@ -506,7 +506,7 @@ fn locate(notes: &[Note], edited: &[Note]) -> Vec<usize> {
 
 fn note_add(session: &mut Session, params: &Value) -> crate::Result<Value> {
     let note = Note {
-        start: i64_or(params, "start_ticks", 0).max(0),
+        start: i64_or(params, "start_ticks", 0),
         length: i64_or(params, "length_ticks", 240).max(1),
         note: i64_or(params, "note", 60).clamp(0, 127) as u8,
         velocity: i64_or(

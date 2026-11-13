@@ -627,6 +627,9 @@ impl Session {
     fn grow_midi_data_to_notes(&mut self, params: &Value) {
         let track = params.get("track").and_then(Value::as_u64).unwrap_or(0) as usize;
         let clip = params.get("clip").and_then(Value::as_u64).unwrap_or(0) as usize;
+        // F-041 M10.2: a first write in the leading blank may use a negative
+        // data tick; normalize it before growing/fitting.
+        self.pull_negative_note_starts_into_data(track, clip);
         let (data_idx, offset, start_ticks, follow, end, length) = {
             let project = self.project();
             let Some(target) = project
@@ -695,6 +698,74 @@ impl Session {
             {
                 target.span_ticks = span;
             }
+        }
+    }
+
+    /// F-041 M10.2: a first write inside the leading blank uses negative data
+    /// ticks. Shift the whole entry right so the window offset catches up;
+    /// absolute playback positions do not move, and the blank becomes real
+    /// content. Shared data is copied first.
+    fn pull_negative_note_starts_into_data(&mut self, track: usize, clip: usize) {
+        let (data_idx, min_start, refs) = {
+            let project = self.project();
+            let Some(target) = project
+                .midi_tracks
+                .get(track)
+                .and_then(|t| t.clips.get(clip))
+            else {
+                return;
+            };
+            let Some(data) = project.midi_data.get(target.data as usize) else {
+                return;
+            };
+            (
+                target.data,
+                data.notes()
+                    .iter()
+                    .map(|note| note.start)
+                    .min()
+                    .unwrap_or(0),
+                project.midi_data_refs(target.data),
+            )
+        };
+        if min_start >= 0 {
+            return;
+        }
+        let shift = u32::try_from(min_start.saturating_neg()).unwrap_or(u32::MAX);
+        let source = if refs > 1 {
+            self.project().midi_data.get(data_idx as usize).cloned()
+        } else {
+            None
+        };
+        let project = self.project_mut();
+        let data_idx = if let Some(source) = source {
+            let new_idx = project.push_midi_data(source);
+            if let Some(target) = project
+                .midi_tracks
+                .get_mut(track)
+                .and_then(|t| t.clips.get_mut(clip))
+            {
+                target.data = new_idx;
+            }
+            new_idx
+        } else {
+            data_idx
+        };
+        if let Some(data) = project.midi_data_mut(data_idx) {
+            for note in data.notes_mut() {
+                note.start = note.start.saturating_add(i64::from(shift));
+            }
+            for ctrl in &mut data.sequence.ctrls {
+                ctrl.tick = ctrl.tick.saturating_add(i64::from(shift));
+            }
+            data.length_ticks = data.length_ticks.saturating_add(shift);
+        }
+        if let Some(target) = project
+            .midi_tracks
+            .get_mut(track)
+            .and_then(|t| t.clips.get_mut(clip))
+        {
+            target.source_offset = target.source_offset.saturating_add(i64::from(shift));
         }
     }
 
@@ -788,8 +859,42 @@ mod journal_tests {
         Session::new(project)
     }
 
+    /// F-041 M10.2: a note written in the leading blank shifts the content right
+    /// so absolute positions stay put; the window offset catches up.
+    #[test]
+    fn note_add_into_the_leading_blank_shifts_the_entry() {
+        let mut session = session_with_note();
+        session.project_mut().midi_tracks[0].clips[0].source_offset = -384;
+        session
+            .execute(
+                "midi.note_add",
+                &json!({
+                    "track": 0,
+                    "clip": 0,
+                    "note": 60,
+                    "start_ticks": -384,
+                    "length_ticks": 120,
+                }),
+            )
+            .unwrap();
+        let project = session.project();
+        let clip = &project.midi_tracks[0].clips[0];
+        assert_eq!(clip.source_offset, 0, "the head blank becomes content");
+        let data = project.midi_data_of(clip).expect("data");
+        assert_eq!(data.length_ticks, 768);
+        assert!(
+            data.notes()
+                .iter()
+                .any(|note| note.start == 0 && note.length == 120)
+        );
+        assert!(
+            data.notes()
+                .iter()
+                .any(|note| note.start == 384 && note.length == 240)
+        );
+    }
+
     /// F-041 M10.1: `clip.fit_window` turns the window follower back on and sizes
-    /// the window to the last note-off rounded up to the meter bar.
     #[test]
     fn fit_window_follows_the_last_note_off() {
         let mut session = session_with_note();
