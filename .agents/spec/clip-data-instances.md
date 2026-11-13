@@ -1,7 +1,7 @@
 # clip 与数据分离（数据池 + 实例引用）
 
 > ID: F-041 · 域: EDIT / PROJ / ENGINE
-> 状态：M1–M6 已交付（2026-11-11）；2026-11-12 修订 T / 复制语义；2026-11-12 review 续作 **M9 / M10 / M11 已交付**（窗口内嵌 clip、`loop` 周期、`source_offset: i64`、T 纯窗口 + 写时增长、128 上限、v14 迁移、`tile N` 一次性复制），设计见 §13
+> 状态：M1–M6 已交付（2026-11-11）；2026-11-12 修订 T / 复制语义；2026-11-12 review 续作 **M9 / M10 / M11 已交付**（窗口内嵌 clip、`loop` 周期、`source_offset: i64`、T 纯窗口 + 写时增长、128 上限、v14 迁移、`tile N` 一次性复制），**M10.1 编辑范围 / 窗口跟随已交付**（卷帘编辑 `max(content, window)`、`window_follow`、`clip.fit_window`），设计见 §13
 > 关联：`timeline.md`（D14 / D15 / D31 / D32 / D33）、`editing-model.md`、`audio-trim.md`（D1 是同一形状的先例）、`clipboard.md`（F-040 快照需随之扩展）、`roll-multiclip.md`
 
 ## 1. 问题
@@ -69,6 +69,8 @@ Blender 式 object / mesh 分离：**多个 clip 可以引用同一份 MIDI / cu
 | D26 | 文件版本（M10） | `13 → 14`：旧 clip 字段升级（`source_offset` → i64、`repeat` → `loop_ticks`）；`repeat=true` 且 `offset = 0` 按周期展开成 N 个 clip（窗口字段各自一份、共享 data），非整数倍尾部另起一个截断 clip；`loop_ticks` 仅作旧态兼容保留 |
 | D28 | 单轨 clip 上限（M10） | `MAX_CLIPS_PER_TRACK` 32 → 128，model 与 engine `MAX_TRACK_CLIPS` 同步；`SetMidiClips` / `SetControlClips` 载荷改 `Box<[...]>`（控制线程分配、实时侧 `mem::replace`、旧表进 trash），避免 `GraphUpdate` 变体增大超过 4 KiB 触发栈溢出 |
 | D29 | 同轨区间选择（M9） | 单击 clip 设锚点；`Shift` + 单击同轨另一 clip 选中两者之间（按 `start_ticks` 排序）的全部 clip；`Ctrl` 保持追加；跨轨 `Shift` 退化为单选；区间选后仍走现有组扩选 |
+| D30 | 编辑范围独立于窗口（M10.1） | 卷帘编辑范围 = `max(data.length, window end)`（数据坐标）：T 扩出的尾部可写，手动裁短后窗口外内容仍可编辑；窗口只是播放裁剪，不限制内容编辑 |
+| D31 | 窗口自动跟随（M10.1） | `window_follow` 默认对新 clip 开启；T / 拖边 / trim 关闭。跟随期间窗口末端 = 最后一个 note-off 向上取整到小节（至少 1 小节）；`clip.fit_window` 重新开启并立即按内容末端调整 |
 | D27 | 本次不做 | `TileSpec` / explode / 嵌套 tile / 记录 tile 份数、per-repeat override、自动 group、音频 tile、独立 window 面板（归 M7 扩展）、`ClipId` |
 
 ## 3. 数据结构
