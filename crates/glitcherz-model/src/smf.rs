@@ -792,6 +792,7 @@ fn split_into_clips(notes: Vec<Note>, ctrls: Vec<CtrlEvent>) -> Vec<MidiClip> {
             span_ticks: u32::try_from(span).unwrap_or(u32::MAX),
             source_offset: 0,
             loop_ticks: None,
+            window_follow: false,
             legacy_repeat: false,
             data: 0,
             legacy_loop_ticks: u32::try_from(span).unwrap_or(u32::MAX),

@@ -2419,6 +2419,7 @@ fn stretch_midi_clip(
     clip.span_ticks = new_span;
     clip.source_offset = shifted;
     clip.loop_ticks = None;
+    clip.window_follow = false;
     true
 }
 
@@ -2458,6 +2459,7 @@ fn stretch_curve_clip(
     clip.span_ticks = new_span;
     clip.source_offset = shifted;
     clip.loop_ticks = None;
+    clip.window_follow = false;
     true
 }
 /// Right-edge drag on a MIDI clip: a pure window edit (F-041 M10). Growth
@@ -2490,6 +2492,7 @@ fn resize_midi_clip(
     clip.start_ticks = new_start;
     clip.span_ticks = new_span;
     clip.loop_ticks = None;
+    clip.window_follow = false;
     true
 }
 
@@ -2521,6 +2524,7 @@ fn resize_curve_clip(
     clip.start_ticks = new_start;
     clip.span_ticks = new_span;
     clip.loop_ticks = None;
+    clip.window_follow = false;
     true
 }
 #[cfg(test)]
@@ -2594,6 +2598,7 @@ mod tests {
         assert_eq!(clip.span_ticks, 2 * TICKS_PER_BAR);
         assert_eq!(clip.source_offset, 0);
         assert!(clip.loop_ticks.is_none());
+        assert!(!clip.window_follow, "a manual T trim stops following");
         let data = project.midi_data_of(clip).expect("data");
         assert_eq!(data.length_ticks, TICKS_PER_BAR, "content is untouched");
         assert_eq!(data.notes()[0].start, 0, "the note stays at its tick");

@@ -1968,6 +1968,11 @@ pub struct MidiClip {
     /// with period `p` (>= 1), independent of [`MidiData::length_ticks`].
     #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
     pub loop_ticks: Option<u32>,
+    /// Whether the window follows the content end (F-041 M10.1). New clips
+    /// start following; a manual T trim / edge drag turns it off. Missing in
+    /// older files → false, so their manual windows stay put.
+    #[serde(default)]
+    pub window_follow: bool,
     /// v13 window-repeat flag. Read-only: the v13 -> v14 migration turns it
     /// into `loop_ticks` (expanding integer-multiple tiles into clips).
     #[serde(default, rename = "repeat", skip_serializing)]
@@ -2063,6 +2068,7 @@ impl Default for MidiClip {
             source_offset: 0,
             span_ticks: default_clip_span(),
             loop_ticks: None,
+            window_follow: true,
             legacy_repeat: false,
             data: 0,
             legacy_loop_ticks: 0,
@@ -2235,6 +2241,11 @@ pub struct ControlClip {
     /// Explicit loop period inside the shared data (see [`MidiClip::loop_ticks`]).
     #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
     pub loop_ticks: Option<u32>,
+    /// Whether the window follows the content end (F-041 M10.1). New clips
+    /// start following; a manual T trim / edge drag turns it off. Missing in
+    /// older files → false, so their manual windows stay put.
+    #[serde(default)]
+    pub window_follow: bool,
     /// v13 window-repeat flag. Read-only (see [`MidiClip::legacy_repeat`]).
     #[serde(default, rename = "repeat", skip_serializing)]
     pub legacy_repeat: bool,
@@ -2263,6 +2274,7 @@ impl Default for ControlClip {
             source_offset: 0,
             span_ticks: default_clip_span(),
             loop_ticks: None,
+            window_follow: true,
             legacy_repeat: false,
             data: 0,
             legacy_loop_ticks: 0,

@@ -620,55 +620,81 @@ impl Session {
         }
     }
 
-    /// F-041 M10: extends the targeted MIDI entry so it covers every note the
-    /// command just wrote. Shared content is copied first (the window stays
-    /// private, the content entry is owned by this clip).
+    /// F-041 M10/M10.1: extends the targeted MIDI entry to cover every note the
+    /// command wrote, then — when the window follows the content — resizes the
+    /// window to the last note-off rounded up to a bar. Shared content is
+    /// copied first (the window stays private).
     fn grow_midi_data_to_notes(&mut self, params: &Value) {
         let track = params.get("track").and_then(Value::as_u64).unwrap_or(0) as usize;
         let clip = params.get("clip").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let project = self.project();
-        let Some(target) = project
-            .midi_tracks
-            .get(track)
-            .and_then(|track| track.clips.get(clip))
-        else {
-            return;
+        let (data_idx, offset, start_ticks, follow, end, length) = {
+            let project = self.project();
+            let Some(target) = project
+                .midi_tracks
+                .get(track)
+                .and_then(|track| track.clips.get(clip))
+            else {
+                return;
+            };
+            let Some(data) = project.midi_data.get(target.data as usize) else {
+                return;
+            };
+            let end = data
+                .notes()
+                .iter()
+                .map(|note| note.start.saturating_add(note.length))
+                .max()
+                .unwrap_or(0);
+            (
+                target.data,
+                target.source_offset,
+                target.start_ticks,
+                target.window_follow,
+                end,
+                i64::from(data.length_ticks),
+            )
         };
-        let data_idx = target.data;
-        let Some(data) = project.midi_data.get(data_idx as usize) else {
-            return;
-        };
-        let end = data
-            .notes()
-            .iter()
-            .map(|note| note.start.saturating_add(note.length))
-            .max()
-            .unwrap_or(0);
-        if end <= i64::from(data.length_ticks) {
-            return;
+        if end > length {
+            let new_len = u32::try_from(end).unwrap_or(u32::MAX);
+            let source = {
+                let project = self.project();
+                if project.midi_data_refs(data_idx) > 1 {
+                    project.midi_data.get(data_idx as usize).cloned()
+                } else {
+                    None
+                }
+            };
+            let project = self.project_mut();
+            let data_idx = if let Some(source) = source {
+                let new_idx = project.push_midi_data(source);
+                if let Some(target) = project
+                    .midi_tracks
+                    .get_mut(track)
+                    .and_then(|track| track.clips.get_mut(clip))
+                {
+                    target.data = new_idx;
+                }
+                new_idx
+            } else {
+                data_idx
+            };
+            if let Some(data) = project.midi_data_mut(data_idx) {
+                data.length_ticks = data.length_ticks.max(new_len);
+            }
         }
-        let new_len = u32::try_from(end).unwrap_or(u32::MAX);
-        let source = if project.midi_data_refs(data_idx) > 1 {
-            project.midi_data.get(data_idx as usize).cloned()
-        } else {
-            None
-        };
-        let project = self.project_mut();
-        let data_idx = if let Some(source) = source {
-            let new_idx = project.push_midi_data(source);
-            if let Some(target) = project
+        if follow {
+            let bar = self.project().ticks_per_bar_at(start_ticks).max(1);
+            let local_end = end.saturating_sub(offset).max(1);
+            let bars = (local_end + i64::from(bar) - 1) / i64::from(bar);
+            let span = (bars as u32).saturating_mul(bar).max(bar);
+            if let Some(target) = self
+                .project_mut()
                 .midi_tracks
                 .get_mut(track)
                 .and_then(|track| track.clips.get_mut(clip))
             {
-                target.data = new_idx;
+                target.span_ticks = span;
             }
-            new_idx
-        } else {
-            data_idx
-        };
-        if let Some(data) = project.midi_data_mut(data_idx) {
-            data.length_ticks = data.length_ticks.max(new_len);
         }
     }
 
@@ -760,6 +786,36 @@ mod journal_tests {
             ..MidiClip::default()
         });
         Session::new(project)
+    }
+
+    /// F-041 M10.1: `clip.fit_window` turns the window follower back on and sizes
+    /// the window to the last note-off rounded up to the meter bar.
+    #[test]
+    fn fit_window_follows_the_last_note_off() {
+        let mut session = session_with_note();
+        {
+            let project = session.project_mut();
+            let clip = &mut project.midi_tracks[0].clips[0];
+            clip.span_ticks = 10 * glitcherz_model::TICKS_PER_BAR;
+            clip.window_follow = false;
+            let data_idx = clip.data;
+            let data = project.midi_data_mut(data_idx).expect("data");
+            data.notes_mut().push(Note {
+                start: 480,
+                length: 120,
+                ..Note::default()
+            });
+        }
+        session
+            .execute("clip.fit_window", &json!({ "track": 0, "clip": 0 }))
+            .unwrap();
+        let clip = &session.project().midi_tracks[0].clips[0];
+        assert!(clip.window_follow, "fit restores the automatic window");
+        assert_eq!(
+            clip.span_ticks,
+            glitcherz_model::TICKS_PER_BAR,
+            "600 ticks round up to one bar"
+        );
     }
 
     /// F-041 M11: `clip.tile` appends contiguous copies that share one content

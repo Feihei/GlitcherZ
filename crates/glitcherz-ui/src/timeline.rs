@@ -799,6 +799,7 @@ impl Placement for MidiClip {
     fn retain_from(&mut self, offset: u32, _sec_per_tick: f64) {
         self.source_offset = self.source_offset.saturating_add(i64::from(offset));
         self.span_ticks = self.span_ticks.saturating_sub(offset).max(1);
+        self.window_follow = false;
     }
     fn name(&self) -> &str {
         &self.name
@@ -840,6 +841,7 @@ impl Placement for ControlClip {
     fn retain_from(&mut self, offset: u32, _sec_per_tick: f64) {
         self.source_offset = self.source_offset.saturating_add(i64::from(offset));
         self.span_ticks = self.span_ticks.saturating_sub(offset).max(1);
+        self.window_follow = false;
     }
     fn name(&self) -> &str {
         &self.name

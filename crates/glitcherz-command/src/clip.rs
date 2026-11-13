@@ -50,6 +50,15 @@ pub fn specs() -> Vec<crate::CommandSpec> {
             always,
             tile
         ),
+        crate::cmd!(
+            "clip.fit_window",
+            "Fit Window to Data",
+            ["Event", "Edit"],
+            None,
+            "{track, clip} → {span_ticks, length_ticks}",
+            always,
+            fit_window
+        ),
     ]
 }
 
@@ -151,6 +160,89 @@ fn tile(session: &mut Session, params: &Value) -> crate::Result<Value> {
     }
     let clips: Vec<usize> = (first..first + copies).collect();
     Ok(json!({ "clips": clips, "count": copies as u32 + 1 }))
+}
+
+/// F-041 M10.1: restores the automatic window — on from now on, sized to the
+/// last note-off rounded up to a bar. Also covers legacy windows that were
+/// trimmed manually.
+fn fit_window(session: &mut Session, params: &Value) -> crate::Result<Value> {
+    let track = i64_or(params, "track", 0).max(0) as usize;
+    let clip = i64_or(params, "clip", 0).max(0) as usize;
+    let (data_idx, offset, start, end, length) = {
+        let project = session.project();
+        let Some(target) = project
+            .midi_tracks
+            .get(track)
+            .and_then(|t| t.clips.get(clip))
+        else {
+            return Err(bad_params(
+                "clip.fit_window",
+                format!("no clip {clip} on track {track}"),
+            ));
+        };
+        let Some(data) = project.midi_data.get(target.data as usize) else {
+            return Err(bad_params(
+                "clip.fit_window",
+                "clip references missing data",
+            ));
+        };
+        let end = data
+            .notes()
+            .iter()
+            .map(|note| note.start.saturating_add(note.length))
+            .max()
+            .unwrap_or(0);
+        (
+            target.data,
+            target.source_offset,
+            target.start_ticks,
+            end,
+            i64::from(data.length_ticks),
+        )
+    };
+    if end > length {
+        let new_len = u32::try_from(end).unwrap_or(u32::MAX);
+        let source = {
+            let project = session.project();
+            if project.midi_data_refs(data_idx) > 1 {
+                project.midi_data.get(data_idx as usize).cloned()
+            } else {
+                None
+            }
+        };
+        let project = session.project_mut();
+        let data_idx = if let Some(source) = source {
+            let new_idx = project.push_midi_data(source);
+            if let Some(target) = project
+                .midi_tracks
+                .get_mut(track)
+                .and_then(|t| t.clips.get_mut(clip))
+            {
+                target.data = new_idx;
+            }
+            new_idx
+        } else {
+            data_idx
+        };
+        if let Some(data) = project.midi_data_mut(data_idx) {
+            data.length_ticks = data.length_ticks.max(new_len);
+        }
+    }
+    let bar = session.project().ticks_per_bar_at(start).max(1);
+    let local_end = end.saturating_sub(offset).max(1);
+    let bars = (local_end + i64::from(bar) - 1) / i64::from(bar);
+    let span = (bars as u32).saturating_mul(bar).max(bar);
+    let Some(target) = session
+        .project_mut()
+        .midi_tracks
+        .get_mut(track)
+        .and_then(|t| t.clips.get_mut(clip))
+    else {
+        return Err(bad_params("clip.fit_window", "clip vanished"));
+    };
+    target.span_ticks = span;
+    target.window_follow = true;
+    Ok(json!({ "span_ticks": span, "length_ticks": end.max(0) }))
 }
 
 /// Points one MIDI clip at another clip's shared content (F-041).

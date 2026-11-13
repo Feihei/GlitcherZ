@@ -1521,7 +1521,10 @@ pub fn show(
         ..MidiData::default()
     };
     let data = data_opt.unwrap_or(&fallback);
-    let loop_ticks = i64::from(data.length_ticks.max(TICKS_PER_STEP)).max(1);
+    // F-041 M10: the roll edits the **window**, not the content length. A T
+    // stretch may extend the window past `length_ticks`; that tail must be
+    // writable (the command layer grows the data on the first write).
+    let loop_ticks = i64::from(data.length_ticks.max(clip.span_ticks.max(TICKS_PER_STEP))).max(1);
     // Aud series: the whole clip block (tiled repeats included) — the ruler's
     // extent and the audition range's end.
     let clip_span = i64::from(clip.span_ticks.max(data.length_ticks.max(TICKS_PER_STEP))).max(1);

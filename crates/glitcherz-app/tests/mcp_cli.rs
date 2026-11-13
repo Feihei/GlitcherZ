@@ -403,7 +403,7 @@ fn commands_list_enumerates_the_registry() {
     let (error, report) = mcp.call("commands_list", json!({}));
     assert!(!error, "{report}");
     let commands = report["commands"].as_array().expect("commands");
-    assert_eq!(commands.len(), 26);
+    assert_eq!(commands.len(), 27);
     assert!(
         commands
             .iter()
