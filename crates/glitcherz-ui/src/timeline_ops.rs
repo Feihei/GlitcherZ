@@ -2455,6 +2455,10 @@ fn stretch_midi_clip(
     if old_start == new_start && old_span == new_span && old_loop.is_none() {
         return false;
     }
+    // F-041 M10.3: T left expansion is retired; use notes-right + clip-left.
+    if new_start < old_start {
+        return false;
+    }
     // F-041 M10.2: shrinking the window must keep at least one note audible.
     let shifted = old_off.saturating_add(i64::from(new_start) - i64::from(old_start));
     if (new_span < old_span || new_start > old_start)
@@ -2503,6 +2507,10 @@ fn stretch_curve_clip(
         clip.data,
     );
     if old_start == new_start && old_span == new_span && old_loop.is_none() {
+        return false;
+    }
+    // F-041 M10.3: no left expansion for control clips either.
+    if new_start < old_start {
         return false;
     }
     let shifted = old_off.saturating_add(i64::from(new_start) - i64::from(old_start));
@@ -2675,28 +2683,20 @@ mod tests {
         assert_eq!(data.notes()[0].start, 0, "the note stays at its tick");
     }
 
-    /// A T start-edge stretch (T+S) moves the window left of the content:
-    /// `source_offset` goes negative (leading blank), events and length stay
-    /// put.
+    /// F-041 M10.3: the start-edge stretch is retired; a left expansion is
+    /// refused and the clip stays put (use notes-right + clip-left instead).
     #[test]
-    fn stretch_head_opens_negative_offset() {
+    fn stretch_left_expansion_is_rejected() {
         let mut project = Project::default();
         clip_with_one_note(&mut project);
         project.midi_tracks[0].clips[0].start_ticks = TICKS_PER_BAR;
 
-        assert!(stretch_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
+        assert!(!stretch_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
 
         let clip = &project.midi_tracks[0].clips[0];
-        assert_eq!(clip.start_ticks, 0);
-        assert_eq!(clip.span_ticks, 2 * TICKS_PER_BAR);
-        assert_eq!(clip.source_offset, -i64::from(TICKS_PER_BAR));
-        let data = project.midi_data_of(clip).expect("data");
-        assert_eq!(data.length_ticks, TICKS_PER_BAR, "content is untouched");
-        assert_eq!(
-            data.notes()[0].start,
-            0,
-            "the note does not move with the window head"
-        );
+        assert_eq!(clip.start_ticks, TICKS_PER_BAR);
+        assert_eq!(clip.span_ticks, TICKS_PER_BAR);
+        assert_eq!(clip.source_offset, 0);
     }
 
     /// Stretching one shared clip leaves the other reference exactly as it was.

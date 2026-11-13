@@ -1529,13 +1529,19 @@ pub fn show(
     // writable (the command layer grows the data on the first write).
     // F-041 M10.2: the editable end is a data tick and covers the whole
     // content plus the whole window (whose start may be negative).
+    // F-041 M10.3: a following clip can be edited beyond the window (the window
+    // expands on write). A manually trimmed clip is capped to its window until
+    // the right edge is grown again.
     let window_end = clip
         .source_offset
         .saturating_add(i64::from(clip.span_ticks));
-    let loop_ticks = i64::from(data.length_ticks)
-        .max(window_end)
-        .max(i64::from(TICKS_PER_STEP))
-        .max(1);
+    let loop_ticks = if clip.window_follow {
+        i64::from(data.length_ticks).max(window_end)
+    } else {
+        window_end
+    }
+    .max(i64::from(TICKS_PER_STEP))
+    .max(1);
     // The playhead stays inside the first content period.
     let content_len = i64::from(data.length_ticks.max(1));
     // Aud series: the whole clip block (tiled repeats included) — the ruler's
@@ -2320,7 +2326,11 @@ pub fn show(
     // clamped to tick 0.
     // The leading blank is part of the editable data range now: a negative
     // `source_offset` lets the first write land there (F-041 M10.2).
-    let edit_start = clip.source_offset.min(0) as f32;
+    let edit_start = if clip.window_follow {
+        clip.source_offset.min(0)
+    } else {
+        clip.source_offset
+    } as f32;
     let over_focus =
         |pos: egui::Pos2| (edit_start..loop_ticks as f32).contains(&geom.local_at(pos.x));
     let modifiers = ui.ctx().input(|i| i.modifiers);
@@ -2530,7 +2540,7 @@ pub fn show(
     let modal_active = modal_frame.as_ref().is_some_and(|f| !f.is_identity());
     for (index, note) in data.notes().iter().enumerate() {
         // Notes past a shortened span stay in the data but are never drawn.
-        if note.start >= loop_ticks {
+        if note.start >= loop_ticks || (!clip.window_follow && note.end() <= clip.source_offset) {
             continue;
         }
         let note_i = i32::from(note.note);

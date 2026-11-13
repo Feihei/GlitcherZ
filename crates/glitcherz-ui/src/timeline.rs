@@ -1120,7 +1120,7 @@ fn stretch_targets(
     audio_tracks: &[AudioTrack],
     sec_per_tick: f64,
 ) -> Option<Vec<ClipSpanEdit>> {
-    let ModalKind::Stretch { start_edge } = modal.kind else {
+    let ModalKind::Stretch { .. } = modal.kind else {
         return None;
     };
     let ptr = ptr?;
@@ -1140,16 +1140,14 @@ fn stretch_targets(
                     sec_per_tick,
                     *sel,
                 )?;
-                let (new_start, new_span) = if start_edge {
-                    let d = tick_delta.clamp(-(start as i64), span as i64 - bar);
-                    ((start as i64 + d) as u32, (span as i64 - d) as u32)
-                } else {
-                    let d = tick_delta.clamp(bar - span as i64, max_end - (start + span) as i64);
-                    (start, (span as i64 + d) as u32)
-                };
+                // F-041 M10.3: T only grows the end edge. Left expansion is replaced by
+                // "move the notes right, move the clip left"; left trim (inside)
+                // stays available.
+                let d = tick_delta.clamp(bar - span as i64, max_end - (start + span) as i64);
+                let new_span = (span as i64 + d) as u32;
                 Some(ClipSpanEdit {
                     sel: *sel,
-                    start_ticks: new_start,
+                    start_ticks: start,
                     span_ticks: new_span,
                 })
             })
@@ -1768,9 +1766,9 @@ pub fn show(
                 }) => {
                     ui.weak(
                         egui::RichText::new(if *start_edge {
-                            "Stretch start: LMB drop · RMB / Esc cancel"
+                            "Stretch: LMB drop · RMB / Esc cancel"
                         } else {
-                            "Stretch end: LMB drop · RMB / Esc cancel · S: pull start instead"
+                            "Stretch end: LMB drop · RMB / Esc cancel"
                         })
                         .color(Color32::from_rgb(140, 200, 250)),
                     );
@@ -3987,11 +3985,8 @@ fn lane_row<T: Placement>(
             });
             (alt_t, plain_t)
         });
-        // S is a mid-modal qualifier (flips a Stretch to its start edge,
-        // unified with the roll's t+s) — never an arming key here.
-        let s = ui
-            .ctx()
-            .input_mut(|i| i.consume_key(Modifiers::NONE, Key::S));
+        // F-041 M10.3: T no longer flips to the start edge — left expansion was
+        // removed (move notes right + move clip left instead). Left trim stays.
         let g = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::NONE, Key::G));
@@ -4082,13 +4077,7 @@ fn lane_row<T: Placement>(
                 }
             }
         }
-        // A live modal owns the keyboard: only the qualifiers answer —
-        // S flips a Stretch to its start edge (the roll's t+s).
-        if let Some(modal) = &mut state.modal {
-            if s && matches!(modal.kind, ModalKind::Stretch { .. }) {
-                modal.kind = ModalKind::Stretch { start_edge: true };
-            }
-        }
+        // A live modal owns the keyboard; the clip-stretch start qualifier is gone.
         // Arm G / Shift+D / T / Alt+T (Blender-style modal; arming one
         // tool clears the other).
         if (g || shift_d || t || alt_t) && state.modal.is_none() {
@@ -5779,8 +5768,8 @@ mod tests {
         .unwrap();
         assert_eq!(targets[0].span_ticks, TICKS_PER_BAR);
         assert_eq!(targets[0].start_ticks, 2 * TICKS_PER_BAR);
-        // Start edge, pointer 3 bars right: start would pass the end →
-        // clamps to one bar remaining.
+        // F-041 M10.3: the start qualifier is retired; it behaves as the end edge
+        // (2 bars + 3 bars).
         let start = Modal {
             kind: ModalKind::Stretch { start_edge: true },
             origin: vec![ClipSel {
@@ -5801,8 +5790,8 @@ mod tests {
             SPT,
         )
         .unwrap();
-        assert_eq!(targets[0].start_ticks, 3 * TICKS_PER_BAR);
-        assert_eq!(targets[0].span_ticks, TICKS_PER_BAR);
+        assert_eq!(targets[0].start_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(targets[0].span_ticks, 5 * TICKS_PER_BAR);
     }
 
     // ---- U11: audio clips take the same modal geometry ------------------
