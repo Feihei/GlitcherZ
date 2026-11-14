@@ -4542,6 +4542,60 @@ fn draw_tile_seams(
 /// range) and clipped to the block. A looping clip (`repeat`) repeats the
 /// content past `length_ticks`; a plain window goes blank there, matching the
 /// sequencer. There is no editing here: notes are edited in the piano roll.
+/// F-041 M10.5: shows where the content actually lives inside the window.
+/// A thin line spans the first..last event; two small teeth appear when the
+/// window edge cuts into that content. An adaptive fit never cuts, so it reads
+/// as "flush"; a manual trim that clips notes shows the teeth.
+fn draw_content_extent(
+    painter: &egui::Painter,
+    rect: Rect,
+    content_start: i64,
+    content_end: i64,
+    source_offset: i64,
+    span_ticks: u32,
+) {
+    let span = i64::from(span_ticks.max(1));
+    if span <= 0 || rect.width() < 6.0 {
+        return;
+    }
+    let window_end = source_offset.saturating_add(span);
+    let x_of =
+        |tick: i64| rect.left() + ((tick - source_offset) as f32 / span as f32) * rect.width();
+    let x0 = x_of(content_start).clamp(rect.left(), rect.right());
+    let x1 = x_of(content_end).clamp(rect.left(), rect.right());
+    if x1 > x0 + 1.0 {
+        painter.line_segment(
+            [pos2(x0, rect.bottom() - 2.0), pos2(x1, rect.bottom() - 2.0)],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(140, 175, 215, 135)),
+        );
+    }
+    let tooth = Color32::from_rgba_unmultiplied(195, 220, 250, 200);
+    if content_start < source_offset {
+        for k in 0..2 {
+            let x = rect.left() + 3.0 + k as f32 * 3.0;
+            painter.line_segment(
+                [
+                    pos2(x, rect.bottom() - 9.0),
+                    pos2(x - 3.0, rect.bottom() - 3.0),
+                ],
+                Stroke::new(1.2, tooth),
+            );
+        }
+    }
+    if content_end > window_end {
+        for k in 0..2 {
+            let x = rect.right() - 3.0 - k as f32 * 3.0;
+            painter.line_segment(
+                [
+                    pos2(x, rect.bottom() - 9.0),
+                    pos2(x + 3.0, rect.bottom() - 3.0),
+                ],
+                Stroke::new(1.2, tooth),
+            );
+        }
+    }
+}
+
 fn draw_midi_preview(
     painter: &egui::Painter,
     rect: Rect,
@@ -4554,6 +4608,20 @@ fn draw_midi_preview(
     if notes.is_empty() || span_ticks == 0 || rect.width() < 6.0 || rect.height() < 6.0 {
         return;
     }
+    let content_start = notes.iter().map(|note| note.start).min().unwrap_or(0);
+    let content_end = notes
+        .iter()
+        .map(|note| note.start.saturating_add(note.length))
+        .max()
+        .unwrap_or(0);
+    draw_content_extent(
+        painter,
+        rect,
+        content_start,
+        content_end,
+        source_offset,
+        span_ticks,
+    );
     let mut lo = u8::MAX;
     let mut hi = 0u8;
     for n in notes {
@@ -4633,6 +4701,16 @@ fn draw_control_preview(
 ) {
     if data.points.is_empty() || span_ticks == 0 || rect.width() < 6.0 || rect.height() < 6.0 {
         return;
+    }
+    if let (Some(first), Some(last)) = (data.points.first(), data.points.last()) {
+        draw_content_extent(
+            painter,
+            rect,
+            i64::from(first.tick),
+            i64::from(last.tick).saturating_add(1),
+            source_offset,
+            span_ticks,
+        );
     }
     let height = rect.height() - 2.0;
     // Anchors are normalized (`curve-map.md` D1): the preview shows the stored
