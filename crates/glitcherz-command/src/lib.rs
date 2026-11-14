@@ -894,6 +894,44 @@ mod journal_tests {
         );
     }
 
+    /// F-041 M10.4: left and right fits are independent; each snaps to the bar
+    /// around the first note-on / last note-off inside the current window.
+    #[test]
+    fn fit_window_edges_are_independent() {
+        let mut session = session_with_note();
+        {
+            let project = session.project_mut();
+            let clip = &mut project.midi_tracks[0].clips[0];
+            clip.source_offset = 1920;
+            clip.span_ticks = 4 * glitcherz_model::TICKS_PER_BAR;
+            let data_idx = clip.data;
+            let data = project.midi_data_mut(data_idx).expect("data");
+            data.notes_mut().push(Note {
+                start: 5000,
+                length: 100,
+                ..Note::default()
+            });
+        }
+        session
+            .execute(
+                "clip.fit_window",
+                &json!({ "track": 0, "clip": 0, "edge": "left" }),
+            )
+            .unwrap();
+        let clip = &session.project().midi_tracks[0].clips[0];
+        assert_eq!(clip.source_offset, 3840, "first note-on rounds down");
+        assert_eq!(clip.span_ticks, 17280 - 3840, "the right edge stays put");
+
+        session
+            .execute(
+                "clip.fit_window",
+                &json!({ "track": 0, "clip": 0, "edge": "right" }),
+            )
+            .unwrap();
+        let clip = &session.project().midi_tracks[0].clips[0];
+        assert_eq!(clip.span_ticks, 7680 - 3840, "last note-off rounds up");
+    }
+
     /// F-041 M10.1: `clip.fit_window` turns the window follower back on and sizes
     #[test]
     fn fit_window_follows_the_last_note_off() {

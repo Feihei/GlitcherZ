@@ -55,7 +55,7 @@ pub fn specs() -> Vec<crate::CommandSpec> {
             "Fit Window to Data",
             ["Event", "Edit"],
             None,
-            "{track, clip} → {span_ticks, length_ticks}",
+            "{track, clip, edge?: both} → {source_offset, span_ticks, length_ticks}",
             always,
             fit_window
         ),
@@ -162,13 +162,22 @@ fn tile(session: &mut Session, params: &Value) -> crate::Result<Value> {
     Ok(json!({ "clips": clips, "count": copies as u32 + 1 }))
 }
 
-/// F-041 M10.1: restores the automatic window — on from now on, sized to the
-/// last note-off rounded up to a bar. Also covers legacy windows that were
-/// trimmed manually.
+/// F-041 M10.4: one-shot edge fit. `edge` is `left`, `right` or `both`
+/// (default). Left snaps to the bar containing the first note-on inside the
+/// window; right snaps to the bar containing the last note-off inside it.
+/// Fitting one side keeps the opposite edge. `window_follow` is left unchanged
+/// — this is an explicit adjustment, not a mode switch.
 fn fit_window(session: &mut Session, params: &Value) -> crate::Result<Value> {
     let track = i64_or(params, "track", 0).max(0) as usize;
     let clip = i64_or(params, "clip", 0).max(0) as usize;
-    let (data_idx, offset, start, end, length) = {
+    let edge = params.get("edge").and_then(Value::as_str).unwrap_or("both");
+    if !matches!(edge, "left" | "right" | "both") {
+        return Err(bad_params(
+            "clip.fit_window",
+            "`edge` must be left, right or both",
+        ));
+    }
+    let (data_idx, offset, span, start, end, length, first, last) = {
         let project = session.project();
         let Some(target) = project
             .midi_tracks
@@ -186,6 +195,21 @@ fn fit_window(session: &mut Session, params: &Value) -> crate::Result<Value> {
                 "clip references missing data",
             ));
         };
+        let window_end = target
+            .source_offset
+            .saturating_add(i64::from(target.span_ticks));
+        let first = data
+            .notes()
+            .iter()
+            .filter(|note| note.start >= target.source_offset && note.start < window_end)
+            .map(|note| note.start)
+            .min();
+        let last = data
+            .notes()
+            .iter()
+            .filter(|note| note.start < window_end && note.end() > target.source_offset)
+            .map(|note| note.end())
+            .max();
         let end = data
             .notes()
             .iter()
@@ -195,9 +219,12 @@ fn fit_window(session: &mut Session, params: &Value) -> crate::Result<Value> {
         (
             target.data,
             target.source_offset,
+            target.span_ticks,
             target.start_ticks,
             end,
             i64::from(data.length_ticks),
+            first,
+            last,
         )
     };
     if end > length {
@@ -228,10 +255,29 @@ fn fit_window(session: &mut Session, params: &Value) -> crate::Result<Value> {
             data.length_ticks = data.length_ticks.max(new_len);
         }
     }
-    let bar = session.project().ticks_per_bar_at(start).max(1);
-    let local_end = end.saturating_sub(offset).max(1);
-    let bars = (local_end + i64::from(bar) - 1) / i64::from(bar);
-    let span = (bars as u32).saturating_mul(bar).max(bar);
+    let bar = i64::from(session.project().ticks_per_bar_at(start).max(1));
+    let mut new_offset = offset;
+    let mut new_span = i64::from(span);
+    if matches!(edge, "left" | "both")
+        && let Some(first) = first
+    {
+        let right = offset.saturating_add(i64::from(span));
+        let floor = first.div_euclid(bar).saturating_mul(bar);
+        if floor < right {
+            new_offset = floor;
+            new_span = (right - floor).max(1);
+        }
+    }
+    if matches!(edge, "right" | "both")
+        && let Some(last) = last
+    {
+        let ceil = last
+            .saturating_add(bar.saturating_sub(1))
+            .div_euclid(bar)
+            .saturating_mul(bar);
+        new_span = (ceil - new_offset).max(bar);
+    }
+    let span = u32::try_from(new_span).unwrap_or(u32::MAX);
     let Some(target) = session
         .project_mut()
         .midi_tracks
@@ -240,9 +286,14 @@ fn fit_window(session: &mut Session, params: &Value) -> crate::Result<Value> {
     else {
         return Err(bad_params("clip.fit_window", "clip vanished"));
     };
+    target.source_offset = new_offset;
     target.span_ticks = span;
-    target.window_follow = true;
-    Ok(json!({ "span_ticks": span, "length_ticks": end.max(0) }))
+    Ok(json!({
+        "source_offset": new_offset,
+        "span_ticks": span,
+        "length_ticks": end.max(0),
+        "edge": edge,
+    }))
 }
 
 /// Points one MIDI clip at another clip's shared content (F-041).
