@@ -149,6 +149,8 @@ LFO/curve ──automation──► Curve 1 输入口  （R8：块边界采样 t
   端口列表由 UI 每秒自动重枚举一次（热插拔 1 秒内可见；枚举失败只记日志）；设备从后端
   消失时 `set_bindings` 丢弃其失效连接，同名端口重新出现会自动重开。Inspector 的
   `Refresh devices` 额外 `close_all` 强制重建全部连接，用于端口仍在列表但连接已静默。
+  添加节点菜单在枚举到端口时，为每个端口列一项 `Keyboard In · <port>`（创建即绑定，
+  `NodeSource::KeyboardDevice`）；电脑键盘项在默认工程的源已被占用时禁用。
   测试：`midi_input` 单元 8 项（note on/off、vel-0、CC、bend 居中/上下限、系统消息丢弃、
   node 目标、track 目标拒收 CC、满队列报告丢弃）+ `node_ctrl_reaches_only_the_addressed_slot`。
 - [x] **R6 轨输入口（录音归属，R4 的前置）** ✅ 2026-11-01

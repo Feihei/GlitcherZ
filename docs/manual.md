@@ -216,6 +216,7 @@ MIDI / 曲线片段的**内容与窗口**是分开的：一个片段只保存一
 | `MIDI FX…` | `Arpeggiator`、`Portamento`、`MIDI Envelope`、`LFO`、`Curve Map` |
 | `Mixer` | 多通道求和节点（1–32 通道，可加 / 减通道） |
 | `Keyboard In (computer)` | 电脑键盘输入节点，一个源只允许一个节点；节点上的音条可直接点击试听（`G(octave)..G(octave+2)`，默认 `G3..G5`），`Oct -/Oct +` 改音区、`Tr -/Tr +` 移调，两者都存盘并影响该节点发出的音符；音区同时决定电脑键盘从哪个音开始（窗口的 C），电脑键盘按下时音条上对应的键会亮 |
+| `Keyboard In · <设备名>` | 硬件 MIDI 输入节点。检测到的每个输入口各列一项，选中即创建并绑定该设备；一个源只允许一个节点，已绑定的口显示 `(in use)`。创建后可在 Inspector 里切换设备、看连接状态 |
 | `Audio Input (microphone)` | 实时输入节点，带设备选择和电平表 |
 | `Feedback Tap` | 反馈抽头：把输入晚一个块求和，让环路合法 |
 | `Rescan Plug-ins` | 重新扫描插件 |
@@ -541,7 +542,8 @@ Nyquist 折回成不合谐的杂音（混叠）。所以引擎为每张表预生
 
 录音前要先让轨道"布防"：时间轴每条轨都有一个输入口，只有接上源才会录。
 
-硬件 MIDI 键盘插上后会在约 1 秒内出现在 `Keyboard In` 节点的设备列表里（不必重启或手动刷新）；
+硬件 MIDI 键盘插上后会在约 1 秒内出现在 `Patch` 右键菜单的 `Keyboard In · <设备名>` 项里，
+也会出现在 `Keyboard In` 节点的 Inspector 设备列表中（不必重启或手动刷新）；
 设备仍在列表里但弹奏无声时，点 Inspector 里的 `Refresh devices` 重建连接。
 
 | 类型 | 接法 |

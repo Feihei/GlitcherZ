@@ -195,6 +195,7 @@ impl PickChoice {
                     .to_string()
             }
             NodeSource::Mixer | NodeSource::Feedback | NodeSource::Keyboard => String::new(),
+            NodeSource::KeyboardDevice(port) => format!("Hardware MIDI input: {port}"),
         }
     }
 }

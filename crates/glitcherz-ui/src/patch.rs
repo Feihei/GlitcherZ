@@ -719,8 +719,15 @@ pub enum NodeSource {
     /// block late, which is what makes a loop legal.
     Feedback,
     /// Virtual keyboard node (G6, spec `plugin-gui.md` §8): document-only
-    /// routing node.
+    /// routing node. This variant is the computer keyboard; a hardware port
+    /// uses [`Self::KeyboardDevice`].
     Keyboard,
+    /// Virtual keyboard node bound to one hardware MIDI input port.
+    ///
+    /// The add menu lists one entry per enumerated port, so a controller is
+    /// added **and** bound in one action — the node's Inspector then only
+    /// switches between detected devices.
+    KeyboardDevice(String),
     /// Live audio input node (R4, spec `recording.md` D9): 1 audio out, no
     /// MIDI. Routes a microphone / instrument into the graph and arms audio
     /// track recording inputs.
@@ -1295,6 +1302,10 @@ pub struct InputDeps<'a> {
     pub peak: Option<&'a dyn Fn(u8) -> f32>,
     /// Enumerated recording sources; `None` where devices cannot be probed.
     pub sources: Option<&'a dyn Fn() -> Vec<InputSourceItem>>,
+    /// Hardware MIDI input ports from the last enumeration (R3). Empty where
+    /// the backend cannot be probed; the add menu lists one
+    /// [`crate::patch::NodeSource::KeyboardDevice`] entry per name.
+    pub midi_ports: &'a [String],
 }
 
 impl InputDeps<'_> {
@@ -3931,8 +3942,46 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 if ui.button("Mixer").clicked() {
                     return Some(AddPick::Add(NodeSource::Mixer));
                 }
-                if ui.button("Keyboard In (computer)").clicked() {
+                // The computer keyboard owns exactly one source, so the entry
+                // is disabled once the default project already carries it.
+                let computer_taken = deps.doc.computer_keyboard().is_some();
+                let computer =
+                    ui.add_enabled(!computer_taken, egui::Button::new("Keyboard In (computer)"));
+                let computer = if computer_taken {
+                    computer.on_disabled_hover_text("Already in the project (one node per source)")
+                } else {
+                    computer
+                };
+                if computer.clicked() {
                     return Some(AddPick::Add(NodeSource::Keyboard));
+                }
+                // One entry per detected hardware port: picking it creates the
+                // keyboard node already bound to that device. Without this the
+                // menu only ever offered the computer keyboard, and the default
+                // project had already taken it — a plugged-in controller looked
+                // invisible even though the backend enumerated it.
+                if !deps.input.midi_ports.is_empty() {
+                    ui.weak("MIDI input devices");
+                    for port in deps.input.midi_ports {
+                        let taken = deps.doc.nodes.iter().any(|n| {
+                            matches!(
+                                n,
+                                NodeDoc::Keyboard {
+                                    source: MidiSource::Device(bound),
+                                    ..
+                                } if bound == port
+                            )
+                        });
+                        let label = if taken {
+                            format!("Keyboard In · {port} (in use)")
+                        } else {
+                            format!("Keyboard In · {port}")
+                        };
+                        let item = ui.add_enabled(!taken, egui::Button::new(label));
+                        if item.clicked() {
+                            return Some(AddPick::Add(NodeSource::KeyboardDevice(port.clone())));
+                        }
+                    }
                 }
                 if ui
                     .button("Audio Input (microphone)")

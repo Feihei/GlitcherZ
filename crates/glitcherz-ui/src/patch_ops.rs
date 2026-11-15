@@ -226,6 +226,7 @@ impl GlitcherZApp {
                         error: input_error.as_deref(),
                         peak: Some(&input_peak),
                         sources: Some(&input_sources),
+                        midi_ports: &self.midi_ports,
                     },
                 },
             )
@@ -811,17 +812,34 @@ impl GlitcherZApp {
             self.set_message("Add node failed: node table full (64)".to_string());
             return None;
         }
-        // G6 (A design): an input source belongs to exactly one node, and the
-        // only wired source today is the computer keyboard — so a second
-        // input node has nothing to listen to. Refuse instead of writing a
-        // document `validate` would reject.
-        if matches!(source, patch::NodeSource::Keyboard)
-            && self.project().graph.computer_keyboard().is_some()
-        {
-            self.set_message(
-                "The computer keyboard already has an input node (one source per node)".to_string(),
-            );
-            return None;
+        // G6 (A design): an input source belongs to exactly one node. Refuse a
+        // second node for the same source instead of writing a document
+        // `validate` would reject.
+        match &source {
+            patch::NodeSource::Keyboard if self.project().graph.computer_keyboard().is_some() => {
+                self.set_message(
+                    "The computer keyboard already has an input node (one source per node)"
+                        .to_string(),
+                );
+                return None;
+            }
+            patch::NodeSource::KeyboardDevice(port)
+                if self.project().graph.nodes.iter().any(|n| {
+                    matches!(
+                        n,
+                        NodeDoc::Keyboard {
+                            source: MidiSource::Device(bound),
+                            ..
+                        } if bound == port
+                    )
+                }) =>
+            {
+                self.set_message(format!(
+                    "MIDI input '{port}' already has an input node (one source per node)"
+                ));
+                return None;
+            }
+            _ => {}
         }
         let node_id = self.project().graph.next_node_id();
         let track = track.min(self.project().midi_tracks.len().saturating_sub(1));
@@ -961,6 +979,13 @@ impl GlitcherZApp {
                 node_id,
                 track,
                 source: MidiSource::Computer,
+                transpose: 0,
+                octave: DEFAULT_KEYBOARD_OCTAVE,
+            },
+            patch::NodeSource::KeyboardDevice(port) => NodeDoc::Keyboard {
+                node_id,
+                track,
+                source: MidiSource::Device(port),
                 transpose: 0,
                 octave: DEFAULT_KEYBOARD_OCTAVE,
             },

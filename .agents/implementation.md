@@ -1589,6 +1589,7 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - **R2 capture**：`realtime/capture.rs`（`CaptureTap` + `CapturedNote` + 8192 ring + 溢出计数）；`EngineCommand::SetCapture`；`BlockRunner` 在 Note 入口先取 `position_ticks()` 再入库——**sequencer 排的音符不经命令队列，天然不入 ring**。
 - **R3 midir**：`CommandSender(Arc<Mutex<Producer>>)` 让驱动回调直推命令队列；`MidiInputHub` 差量开合 + 回调内零分配的**路由快照**；`EngineCommand::CtrlAtNode` 接进既有 `dispatch_ctrl`。设备绑定是文档编辑（一次 undo），不是应用配置。
   - 2026-11-13 热插拔：UI 每秒自动重枚举端口（`poll_midi_ports`；列表变化才清 `midi_bindings`）；`set_bindings` 丢弃后端已消失端口的连接，同名端口重现会自动重开；Inspector `Refresh devices` 改走 `reconnect_midi_ports`（`close_all` + 重枚举），覆盖"端口仍在列表但连接已静默"。
+  - 2026-11-13 添加入口：`NodeSource::KeyboardDevice(String)` + `InputDeps::midi_ports`，Patch 右键菜单按枚举结果逐设备列出 `Keyboard In · <port>`（创建即绑定）；电脑键盘项在 `computer_keyboard()` 已存在时禁用；重复源由 `create_patch_node_on` 拒绝。
 - **R6 轨输入口**：`PortRef::TrackIn{kind,track}`（v10，无迁移）+ `GraphDoc::{track_input_source, track_input_tracks, node_track_inputs}`；录音归属由 `Timeline In` 的轨输入口连线决定（默认工程不预接）。`SequencerCommand::SetRecordMute` 只丢 On。
 - **R4 音频录音**：`NodeDoc::Input` + `crossbeam-queue` 双无锁 ring（monitor + take，Arc 句柄跨图重建存活）；cpal 输入流按引擎采样率打开、f32、无重采样；`realtime::input::InputProcessor`（通道选择 / gain / 欠采样计数）；`.media/` 写 32-bit float mono wav（相对路径）。
 - **R7 / R8 烘培**：`RtGraph` 烘培表 + 块末 `baked_notes` / `baked_controls`；MIDI 在事件派发处抓取（Arp / Portamento 输出），控制源在块边界抓值（LFO / Envelope / Portamento / CurveMap）。限制：Timeline 曲线出口 → 曲线输入仍未采样，见 spec R8 备注。

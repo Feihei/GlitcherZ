@@ -3803,6 +3803,7 @@ mod splice_tests {
                 class_id: "i".to_string(),
             },
             NodeSource::Keyboard,
+            NodeSource::KeyboardDevice("MidAir".to_string()),
             NodeSource::Feedback,
         ];
         for source in &rejected {
