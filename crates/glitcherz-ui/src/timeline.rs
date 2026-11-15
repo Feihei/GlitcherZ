@@ -2045,6 +2045,24 @@ pub fn show(
                 }
                 state.loop_drag = None;
             }
+            // A bare click (press + release without a 6 pt move) never fires
+            // `drag_started_by` in egui, so without this branch a click on
+            // the ruler placed nothing at all. The same priority chain as
+            // the drag start applies (meter capsule, loop edges, Ctrl), so a
+            // click cannot steal a gesture from those paths; a drag's
+            // release is not a click, so the two paths never double-seek.
+            if response.clicked_by(egui::PointerButton::Primary)
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let on_loop_edge = loop_has_range
+                    && ((pos.x - start_x).abs() <= LOOP_EDGE_GRAB
+                        || (pos.x - end_x).abs() <= LOOP_EDGE_GRAB);
+                if meter_hit(pos.x).is_none() && !on_loop_edge && !ctrl {
+                    actions.push(TimelineAction::Seek {
+                        ticks: tick_at(pos.x),
+                    });
+                }
+            }
             // Double-click a meter capsule: open its signature editor (Met
             // M5a). Anywhere else closes it.
             if response.double_clicked()

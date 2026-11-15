@@ -1532,6 +1532,7 @@ plan.md 此后只保留未完成项与活跃系列；下列系列的实施记录
 - model：`ProjectMetadata.loop_range: SongLoop{enabled,start,end}`（serde default，版本不动）+ `markers: Vec<Marker>`（上限 32）+ validate。
 - UI：transport 按钮组；Space 全局 play/pause（`egui_wants_keyboard_input` 守卫防劫持文本编辑）、Home/End；ruler 交互化——裸点击/拖 = seek scrub、Ctrl+拖 = 拉选 song loop（bar 吸附，一次拖 = 一步 undo）、拖 loop 边 = 单端重塑、右键 = 加 marker。undo/redo 与 `do_open` 经 `apply_document` 重推 loop range。
 - 测试：引擎 7 新增 + model 3；sequencer 两条旧测试补显式 `seek(0)`（play 语义变了）。
+  - 2026-11-14 裸点击 seek 修复：egui 0.36 起**原地按下永不触发 `drag_started`**（移动 > `max_click_dist` 6 pt 才算 drag），U1 把 seek 只挂在 `drag_started_by` 上，裸点击标尺于是完全失效（拖动 scrub 仍好，问题被掩盖）。修法：`drag_stopped_by` 块后补 `clicked_by(Primary)` 分支，复用同一条优先级链（meter 胶囊 / loop 边缘 / Ctrl 不抢），拖动的 release 不是 click，两条路径不双发。Edit tab 卷帘标尺不受影响——它用 raw pointer（`primary_down` + `press_origin`）判定，按下即 seek。契约由 `tests/ruler_seek.rs` 钉住（裸点击恰好一次 seek / 拖动逐帧 scrub / 卷帘裸点击）。
 
 #### U11：audio clip 裁剪 + 模态编辑（2026-10-26，spec `audio-trim.md`）
 
