@@ -272,9 +272,15 @@ impl SampleVoiceProcessor {
             // sound). Ties resolve to the lowest index deterministically.
             let mut victim = 0;
             let mut best_age = self.voices[0].age;
-            for i in 1..self.active_count {
-                if self.voices[i].age > best_age {
-                    best_age = self.voices[i].age;
+            for (i, v) in self
+                .voices
+                .iter()
+                .enumerate()
+                .take(self.active_count)
+                .skip(1)
+            {
+                if v.age > best_age {
+                    best_age = v.age;
                     victim = i;
                 }
             }

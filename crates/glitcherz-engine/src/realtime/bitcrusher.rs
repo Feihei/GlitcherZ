@@ -91,12 +91,12 @@ impl Processor for BitcrusherProcessor {
             let mix = self.params.tick(SLOT_MIX).clamp(0.0, 1.0);
 
             if self.phase == 0 {
-                for ch in 0..channels {
+                for (ch, hold) in self.hold.iter_mut().enumerate().take(channels) {
                     let input = buffer
                         .channel(ch)
                         .and_then(|channel| channel.get(index).copied())
                         .unwrap_or(0.0);
-                    self.hold[ch] = (input * drive * levels).round() / levels;
+                    *hold = (input * drive * levels).round() / levels;
                 }
             }
             self.phase = if self.phase + 1 >= ratio as u32 {
@@ -105,7 +105,7 @@ impl Processor for BitcrusherProcessor {
                 self.phase + 1
             };
 
-            for ch in 0..channels {
+            for (ch, hold) in self.hold.iter().enumerate().take(channels) {
                 let input = buffer
                     .channel(ch)
                     .and_then(|channel| channel.get(index).copied())
@@ -114,7 +114,7 @@ impl Processor for BitcrusherProcessor {
                     .channel_mut(ch)
                     .and_then(|channel| channel.get_mut(index))
                 {
-                    *sample = input * (1.0 - mix) + self.hold[ch] * mix;
+                    *sample = input * (1.0 - mix) + *hold * mix;
                 }
             }
         }
