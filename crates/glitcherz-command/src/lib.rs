@@ -630,7 +630,7 @@ impl Session {
         // F-041 M10.2: a first write in the leading blank may use a negative
         // data tick; normalize it before growing/fitting.
         self.pull_negative_note_starts_into_data(track, clip);
-        let (data_idx, offset, start_ticks, follow, end, length) = {
+        let (data_idx, end, length) = {
             let project = self.project();
             let Some(target) = project
                 .midi_tracks
@@ -648,14 +648,7 @@ impl Session {
                 .map(|note| note.start.saturating_add(note.length))
                 .max()
                 .unwrap_or(0);
-            (
-                target.data,
-                target.source_offset,
-                target.start_ticks,
-                target.window_follow,
-                end,
-                i64::from(data.length_ticks),
-            )
+            (target.data, end, i64::from(data.length_ticks))
         };
         if end > length {
             let new_len = u32::try_from(end).unwrap_or(u32::MAX);
@@ -683,20 +676,6 @@ impl Session {
             };
             if let Some(data) = project.midi_data_mut(data_idx) {
                 data.length_ticks = data.length_ticks.max(new_len);
-            }
-        }
-        if follow {
-            let bar = self.project().ticks_per_bar_at(start_ticks).max(1);
-            let local_end = end.saturating_sub(offset).max(1);
-            let bars = (local_end + i64::from(bar) - 1) / i64::from(bar);
-            let span = (bars as u32).saturating_mul(bar).max(bar);
-            if let Some(target) = self
-                .project_mut()
-                .midi_tracks
-                .get_mut(track)
-                .and_then(|track| track.clips.get_mut(clip))
-            {
-                target.span_ticks = span;
             }
         }
     }
@@ -953,7 +932,7 @@ mod journal_tests {
             .execute("clip.fit_window", &json!({ "track": 0, "clip": 0 }))
             .unwrap();
         let clip = &session.project().midi_tracks[0].clips[0];
-        assert!(clip.window_follow, "fit restores the automatic window");
+        assert!(!clip.window_follow, "fit does not change the follow state");
         assert_eq!(
             clip.span_ticks,
             glitcherz_model::TICKS_PER_BAR,

@@ -2461,6 +2461,26 @@ fn stretch_midi_clip(
     }
     // F-041 M10.2: shrinking the window must keep at least one note audible.
     let shifted = old_off.saturating_add(i64::from(new_start) - i64::from(old_start));
+    // F-041 M10.6: the window may not grow past the last content bar.
+    let bar = i64::from(project.ticks_per_bar_at(clip.start_ticks).max(1));
+    let content_end = project
+        .midi_data
+        .get(data_idx as usize)
+        .and_then(|data| {
+            data.notes()
+                .iter()
+                .map(|note| note.start.saturating_add(note.length))
+                .max()
+        })
+        .unwrap_or(0);
+    let new_span = if content_end > 0 {
+        let limit = content_end.saturating_add(bar - 1).div_euclid(bar) * bar;
+        u32::try_from((limit - shifted).max(1))
+            .unwrap_or(u32::MAX)
+            .min(new_span)
+    } else {
+        new_span
+    };
     if (new_span < old_span || new_start > old_start)
         && !midi_window_has_content(project, data_idx, shifted, new_span)
     {
@@ -2514,6 +2534,21 @@ fn stretch_curve_clip(
         return false;
     }
     let shifted = old_off.saturating_add(i64::from(new_start) - i64::from(old_start));
+    // F-041 M10.6: control windows stop at the last anchor bar as well.
+    let bar = i64::from(project.ticks_per_bar_at(clip.start_ticks).max(1));
+    let content_end = project
+        .curve_data
+        .get(data_idx as usize)
+        .and_then(|data| data.points.last().map(|point| i64::from(point.tick) + 1))
+        .unwrap_or(0);
+    let new_span = if content_end > 0 {
+        let limit = content_end.saturating_add(bar - 1).div_euclid(bar) * bar;
+        u32::try_from((limit - shifted).max(1))
+            .unwrap_or(u32::MAX)
+            .min(new_span)
+    } else {
+        new_span
+    };
     if (new_span < old_span || new_start > old_start)
         && !curve_window_has_content(project, data_idx, shifted, new_span)
     {
@@ -2674,7 +2709,10 @@ mod tests {
         assert!(stretch_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
 
         let clip = &project.midi_tracks[0].clips[0];
-        assert_eq!(clip.span_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(
+            clip.span_ticks, TICKS_PER_BAR,
+            "T stops at the last content bar"
+        );
         assert_eq!(clip.source_offset, 0);
         assert!(clip.loop_ticks.is_none());
         assert!(!clip.window_follow, "a manual T trim stops following");
