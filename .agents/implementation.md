@@ -291,14 +291,16 @@ spec `.agents/spec/dual-audio-input.md`。目标不是「加一个效果器」�
 - **M10.1 编辑范围与窗口跟随（2026-11-12 交付）**：卷帘编辑边界从 `data.length_ticks` 改为 `max(data.length, clip.span_ticks)`（数据坐标），因此 T 扩出的尾部可直接写入、手动裁短后窗口外内容仍可编辑；窗口只负责播放裁剪。新增 `MidiClip` / `ControlClip.window_follow`（serde default false，新建 clip 默认 true）：T / 拖边 / `retain_from` 关闭跟随；跟随期间每次 `midi.*` 内容命令后由 `grow_midi_data_to_notes` 把窗口长度设为「最后一个 note-off 向上取整到小节」（含 `source_offset` 前导偏移，至少 1 小节），并在写时增长共享 data 前先 COW。新增命令 `clip.fit_window {track, clip}`（命令数 26 → 27），重新开启跟随并按内容末端立即调整窗口；两处命令数断言同步。T / 拖边 / 左缘 trim 若把窗口缩到没有任何音符相交则拒绝（clip 不变），数据为空时豁免。
 - **M10.2 卷帘对齐（2026-11-13 交付，`247e741`）**：`RollGeom` 增加 `data_offset`，`x_of` 减 `source_offset`、`local_at` 加回，绘制 / 命中 / 拖拽 / 刀切全部以数据 tick 工作；播放头仍在窗口局部相位，绘制时加回 offset。`pointer_note` 由 `round` 改为 `floor`（行内任意位置都落到该行，不再低一音）。`midi.note_add` 接受负 `start_ticks`（头空白可写），`grow_midi_data_to_notes` 检测负起点后把整份 notes/ctrls 右移 `shift`、`data.length += shift`、`source_offset += shift`，绝对播放位置不变（共享先 COW）；编辑上限 `loop_ticks = max(content, offset + span)` 覆盖窗口尾部。测试：`a_window_offset_shifts_the_note_axis`、`note_add_into_the_leading_blank_shifts_the_entry`。
 
-### F-044 · 聚合 Curve 输入口（2026-11-12 交付）
+### F-044 · 聚合 Curve 输入口（2026-11-12 交付；2026-11-16 几何修订）
 
-- **几何**：`CURVE_PORT_ROW = 16`（graph space）。非 Mixer 目标节点（Instrument / Effect / Feedback）`size_of` 增高 16；Mixer 复用现有 port area 顶部空间、盒子不增高（避免 132 px 轨道列间距导致相邻轨混音器重叠）。`port_area` 顶部统一预留 16；聚合口位于槽中心，结构口与 Mixer 通道口从槽下方开始；单通道 Mixer 也按 port area 均分。
+- **几何（修订 2026-11-16）**：`CURVE_PORT_ROW = 16`（graph space）的槽位从结构输入口**上方**移到盒子**底部**（inline 行之下），所有可控制目标（Instrument / Effect / **Mixer** / Feedback）`size_of` 统一增高 16，`port_area` 底部让位；inline 行绘制上移同一行高。原「Mixer 不增高、槽位从端口区顶部借位」方案废弃：借位使 n 通道行距变为 `(n·30 − 16)/n`，随通道数向 30 爬升（实测 24→24.7→26→26.8→27.3…）；增高后 n≥3 行距恒为 `PORT_SPACING`。单结构口节点口位不变（盒高不变，仍在盒中心、与输出口对齐）。已知副作用：默认摆放下相邻轨 1–2 通道 Mixer（盒高 138 > 132 轨距）重叠 6px；n≥3 修订前即超轨距，属既有类别。
+- **端口标注（修订 2026-11-16）**：Z0 的 `Main`/`Mod` 标注抽成 `dual_input_caption(node, port)`，带 `!is_mixer()` 守卫——2 通道 Mixer 的 `audio_inputs()` 也返回 2，原判断曾在通道名标签同一坐标叠加 "Main"/"Mod"（用户报告的「2 通道文字重叠」根因）。
 - **端点**：`cable_controls_indexed` 在 `CableKind::Automation` 且目标有聚合口时取 `curve_port_screen`；其余电缆仍落结构输入口。`Timeline In` 的 Tempo / 录音口不变。
 - **绘制**：黄色空心环（`cable_color(Automation)`）+ 节点底色洞 + 黑色细描边，右侧 `PORT_NAME_GAP` 处 10 pt 灰字 `Curve`。
+- **inline 行锚点**：`inline_rows_top(r, id, deps, zoom, rows)` 是行块顶边的唯一来源（`bottom − (rows·16 + curve row)`，与 `size_of` 同一算术式）。`curve_inlet_row` 返回的是**高度**（0 或 16），任何调用点不得再乘 `CURVE_PORT_ROW`；绘制处曾二次相乘，导致整块 inline 行被抬到盒外约 240 px（表现：Mixer 的 pan 滑条飞到盒子上方，且通道增多、盒子变高时逐渐下移）。
 - **多线扇形**：同 `(from, to)` 的 Automation 电缆组按文档顺序分配 lane，贝塞尔控制点垂直偏移 `(lane - (n-1)/2) * 16 px`（中点约 12 px），参数标签不再叠在同一位置；绘制、命中、切割、中点菜单共用 `cable_controls_indexed`。
 - **无数据变更**：`CableDoc` / engine 路由 / `PROJECT_VERSION` 均不改；聚合口是纯显示层派生。
-- **测试**：新增 `f044_only_control_targets_get_a_curve_inlet` / `f044_curve_inlet_clears_the_structural_inlets` / `f044_automation_cables_use_the_curve_inlet_and_fan_out`；`sample` / `soundfont` 与 `node_size_grows_with_inline_rows` 的尺寸期望补 `CURVE_PORT_ROW`。UI 300 个单测 + 全 workspace 测试全 `ok`，clippy 干净。
+- **测试**：`f044_only_control_targets_get_a_curve_inlet` / `f044_curve_inlet_clears_the_structural_inlets`（修订为断言口在底部条带、最后一个结构口之下 ≥15px）/ `f044_automation_cables_use_the_curve_inlet_and_fan_out`；修订新增 `mixer_channel_spacing_does_not_creep_with_channel_count`（行距平坦性）、`only_dual_input_effects_get_main_mod_captions` 与 `inline_rows_stay_inside_the_box`（1–6 通道 Mixer + 内置 Synth 的行块顶边必须 ≥ header 底边，且行块 + 曲线行正好填满 `size_of` 预留的空间）。`node_size_grows_with_inline_rows` 的 Mixer 期望补 `CURVE_PORT_ROW`。UI 321 个单测 + 全 workspace 测试全 `ok`，clippy `-D warnings` 干净。
 
 ### UI（`glitcherz-ui`，eframe 0.36 glow）
 
