@@ -553,6 +553,15 @@ pub struct RollState {
     /// sorted index until the command reports back, but the draw-drag must
     /// start immediately — the gesture id is kept here.
     awaiting_create: Option<AwaitCreate>,
+    /// Time scale (`ticks_to_x`) frozen for the active note drag, or `None`
+    /// when no drag is in flight. The fit basis follows the live window and
+    /// a draw-drag grows that window every frame (M10.8): recomputing the
+    /// scale from the live basis re-maps the stationary pointer to a farther
+    /// tick each frame, the note grows again, and the runaway compounds.
+    /// Frozen at grab time the pointer→tick map stays stable for the whole
+    /// gesture; the release absorbs the frozen scale into `zoom_x` (no
+    /// refit jump).
+    drag_scale: Option<f32>,
     /// Monotonic id for press-draw gestures: each draw (AddNote + its
     /// ResizeEnd frames) becomes one undo step.
     draw_seq: u64,
@@ -1010,6 +1019,9 @@ struct AwaitCreate {
     grab_tick: f32,
     grab_note: u8,
     gesture: u64,
+    /// Time scale at press — the draw-drag freezes to it (see
+    /// [`RollState::drag_scale`]).
+    scale: f32,
 }
 
 impl RollState {
@@ -1037,6 +1049,7 @@ impl RollState {
             marquee: None,
             knife: None,
             awaiting_create: None,
+            drag_scale: None,
             draw_seq: 0,
             curve_drag: None,
             lane_rects: Vec::new(),
@@ -1086,6 +1099,10 @@ impl RollState {
                 length,
                 ..Note::default()
             };
+            // The draw-drag freezes the press-frame time scale (grab.scale):
+            // window growth from the creation itself must not re-map the
+            // pointer under the held button.
+            self.drag_scale = Some(grab.scale);
             self.drag = Some(DragSelection::anchored(
                 &anchor,
                 grab.grab_tick,
@@ -1121,6 +1138,7 @@ impl RollState {
         self.drag = None;
         self.marquee = None;
         self.awaiting_create = None;
+        self.drag_scale = None;
         self.modal = None;
         self.knife = None;
         self.knife_armed = false;
@@ -2111,9 +2129,12 @@ pub fn show(
     let (zoom2, wheel, nav_mods) = ui
         .ctx()
         .input(|i| (i.zoom_delta_2d(), i.smooth_scroll_delta, i.modifiers));
+    // Ctrl+wheel zoom is refused while a drag is frozen: the frozen scale
+    // ignores `zoom_x`, and `zoom_scroll_anchor` would still mutate
+    // `scroll_x` — a zoom attempt mid-drag would pan the view instead.
     if response.hovered() {
         let ctrl = nav_mods.ctrl || nav_mods.command;
-        if ctrl {
+        if ctrl && state.drag_scale.is_none() {
             if let Some(sp) = response.hover_pos() {
                 let (zx, zy) = (zoom2.x, zoom2.y);
                 // Pure Ctrl gives a uniform factor; Ctrl+Alt gives a
@@ -2173,7 +2194,7 @@ pub fn show(
         ui.ctx().request_repaint();
     }
 
-    let ticks_to_x = fit_ticks_to_x * state.zoom_x;
+    let ticks_to_x = effective_scale(state.drag_scale, fit_ticks_to_x, state.zoom_x);
     let row_h = ROW_HEIGHT * state.zoom_y;
     let visible_rows = (roll_h / row_h).ceil().max(1.0) as i32;
     let top_note = state.top_note.round() as i32;
@@ -2958,6 +2979,7 @@ pub fn show(
             grab_tick: pointer_tick(pos),
             grab_note: pointer_note(pos),
             gesture,
+            scale: ticks_to_x,
         });
     }
 
@@ -2970,6 +2992,9 @@ pub fn show(
         // no `drag_started`, so the draw-drag `resolve_created` armed must be
         // dropped here — it would otherwise swallow the next gesture.
         if state.mode == RollMode::Draw {
+            // The parked draw-drag (armed by `resolve_created` on press) may
+            // hold a frozen scale even though nothing moved — release it.
+            unfreeze_scale(state, fit_ticks_to_x);
             state.drag = None;
         }
         if let Some(pos) = response.interact_pointer_pos() {
@@ -3179,6 +3204,7 @@ pub fn show(
                             if !state.selection.contains(&index) {
                                 state.selection = vec![index];
                             }
+                            state.drag_scale = Some(ticks_to_x);
                             state.drag = Some(DragSelection::anchored(
                                 &grabbed,
                                 pointer_tick(pos),
@@ -3199,6 +3225,7 @@ pub fn show(
                                 state.selection = vec![index];
                             }
                             if !state.selection.is_empty() {
+                                state.drag_scale = Some(ticks_to_x);
                                 state.drag = Some(DragSelection::anchored(
                                     &grabbed,
                                     pointer_tick(pos),
@@ -3252,6 +3279,7 @@ pub fn show(
                                 grab_tick: pointer_tick(pos),
                                 grab_note: pointer_note(pos),
                                 gesture,
+                                scale: ticks_to_x,
                             });
                         } else {
                             // Select mode: a plain empty drag is a marquee that
@@ -3410,6 +3438,9 @@ pub fn show(
                 state.selection = hits;
             }
         }
+        // Any release unfreezes the drag scale (absorbs it into `zoom_x`,
+        // keeping the view continuous — see `unfreeze_scale`).
+        unfreeze_scale(state, fit_ticks_to_x);
         if let Some(drag) = state.drag.take()
             && drag.kind == DragKind::ResizeEnd
         {
@@ -3443,6 +3474,7 @@ pub fn show(
         && state.drag.is_some()
         && !ui.ctx().input(|i| i.pointer.primary_down())
     {
+        unfreeze_scale(state, fit_ticks_to_x);
         state.drag = None;
     }
 
@@ -3818,6 +3850,27 @@ fn draw_end(start: i64, pointer_tick: f32, snap: Snap) -> i64 {
     snap.ticks(pointer_tick).max(start + snap.grid())
 }
 
+/// The frame's time scale: the frozen drag scale while a note drag is in
+/// flight (see [`RollState::drag_scale`]), else the live fit basis × zoom.
+fn effective_scale(drag_scale: Option<f32>, fit_ticks_to_x: f32, zoom_x: f32) -> f32 {
+    drag_scale.unwrap_or(fit_ticks_to_x * zoom_x)
+}
+
+/// Keeps the effective scale continuous across a drag's release: the frozen
+/// scale becomes the new `zoom_x` relative to the live fit basis, so the
+/// view does not refit-jump the moment the drag ends. Window growth from the
+/// drag (M10.8) reads afterwards as a slightly lower zoom relative to fit.
+fn unfreeze_scale(state: &mut RollState, fit_ticks_to_x: f32) {
+    if let Some(frozen) = state.drag_scale.take() {
+        // A degenerate basis (zero-width frame) keeps the old zoom — there is
+        // nothing sane to absorb into. Note `fit_ticks_to_x` is px per tick
+        // and usually far below 1.0, so no `.max(1.0)` here.
+        if fit_ticks_to_x > 0.0 {
+            state.zoom_x = (frozen / fit_ticks_to_x).clamp(ZOOM_X_MIN, ZOOM_X_MAX);
+        }
+    }
+}
+
 /// Start tick of a left-edge trim: the pointer snapped to the grid, never
 /// past the note's own end (min length one tick), never negative. `end` is
 /// the grabbed note's *current* end — the trim's fixed boundary.
@@ -4141,8 +4194,9 @@ mod tests {
         EDGE_PX, HIT_SLOP, MAX_ROLL_CONTEXT, Modal, ModalFrame, ModalKind, ROLL_HEIGHT, ROW_HEIGHT,
         RollArm, RollGeom, RollIntent, RollMode, RollState, RollSubject, STRUM_DIVISIONS,
         StretchEdge, ViewWindow, clamped_move, default_strum_options, draw_end, draw_length_label,
-        edge_zone, is_black_key, key_at, knife_crossing, modal_ghost, playhead_local, scale_max_k,
-        selection_bbox, strum_division_label, trim_start, zoom_scroll_anchor, zoom_top_note_anchor,
+        edge_zone, effective_scale, is_black_key, key_at, knife_crossing, modal_ghost,
+        playhead_local, scale_max_k, selection_bbox, strum_division_label, trim_start,
+        unfreeze_scale, zoom_scroll_anchor, zoom_top_note_anchor,
     };
     use crate::grid::{GridValue, NoteValue};
     use crate::snap::Snap;
@@ -4404,6 +4458,7 @@ mod tests {
             grab_tick: 12.0,
             grab_note: 60,
             gesture: 7,
+            scale: 0.5,
         });
         state.resolve_created(3, 0, TICKS_PER_STEP as i64);
         assert_eq!(state.selection, vec![3]);
@@ -4420,6 +4475,8 @@ mod tests {
             (0, TICKS_PER_STEP as i64),
             "the draw anchors on the note as it was created"
         );
+        // The draw-drag freezes the press-frame scale for its whole life.
+        assert_eq!(state.drag_scale, Some(0.5));
     }
 
     #[test]
@@ -4429,6 +4486,49 @@ mod tests {
         state.resolve_created(5, 240, 240);
         assert_eq!(state.selection, vec![5]);
         assert!(!state.is_dragging());
+        assert_eq!(state.drag_scale, None, "no drag armed, no frozen scale");
+    }
+
+    #[test]
+    fn unfreezing_absorbs_the_frozen_scale_into_zoom() {
+        // The fit basis grew while the drag ran (M10.8 window growth):
+        // keeping the effective scale continuous means zoom_x drops by the
+        // same factor — no refit jump at release.
+        let mut state = RollState::new();
+        state.zoom_x = 2.0;
+        state.drag_scale = Some(0.5);
+        unfreeze_scale(&mut state, 0.25); // live basis: 0.25 px/tick
+        assert_eq!(state.zoom_x, 2.0, "0.5 / 0.25 = 2: same effective scale");
+        assert_eq!(state.drag_scale, None);
+
+        // Degenerate basis: nothing sane to absorb into, zoom stays as-is
+        // (the frozen scale is still released).
+        let mut state = RollState::new();
+        state.zoom_x = 3.0;
+        state.drag_scale = Some(4.0);
+        unfreeze_scale(&mut state, 0.0);
+        assert_eq!(state.zoom_x, 3.0);
+        assert_eq!(state.drag_scale, None);
+
+        // No frozen scale: a no-op.
+        let mut state = RollState::new();
+        state.zoom_x = 3.0;
+        unfreeze_scale(&mut state, 1.0);
+        assert_eq!(state.zoom_x, 3.0);
+    }
+
+    #[test]
+    fn effective_scale_prefers_the_frozen_drag_scale() {
+        assert_eq!(effective_scale(Some(7.0), 2.0, 3.0), 7.0);
+        assert_eq!(effective_scale(None, 2.0, 3.0), 6.0);
+    }
+
+    #[test]
+    fn clear_gesture_drops_the_frozen_scale() {
+        let mut state = RollState::new();
+        state.drag_scale = Some(1.5);
+        state.clear_gesture();
+        assert_eq!(state.drag_scale, None);
     }
 
     #[test]
@@ -4660,6 +4760,7 @@ mod tests {
             grab_tick: 120.0,
             grab_note: 64,
             gesture: 7,
+            scale: 1.0,
         });
         state.resolve_created(3, 120, 240);
         assert_eq!(state.selection, vec![3]);
