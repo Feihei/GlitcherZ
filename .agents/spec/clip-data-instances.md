@@ -78,6 +78,7 @@ Blender 式 object / mesh 分离：**多个 clip 可以引用同一份 MIDI / cu
 | D36 | 跟随与编辑范围（M10.3） | `window_follow = true` 时编辑范围 `max(content, window)`，写音符自动撑窗口；手动裁剪后 `window_follow = false`，编辑范围限于窗口，右侧必须先 T 右扩才能写；窗口外音符不绘制 |
 | D37 | 边界操作统一（M10.4） | 窗口只保留边界拖动（自由裁剪 / 放宽）与自适应；`clip.fit_window {edge: left/right/both}` 以**窗口内**第一个 note-on / 最后一个 note-off 为基准，左向下、右向上取整到小节；fit 不改变 `window_follow`（持续跟随仍默认开启） |
 | D38 | 边界视觉区分（M10.5） | clip 内画内容范围细线（首 note-on..末 note-off；control 为首末 anchor），窗口边缘裁进内容时画两个小裁剪齿；fit 不裁内容 → 无齿，手动裁剪裁到内容 → 有齿；不新增状态 |
+| D39 | 窗口上限与编辑范围（M10.6） | T / 右缘扩展上限 = 最后一个事件所在小节的末端；写入不自动扩窗口；卷帘编辑范围 = `max(content, window)`，窗口外内容可编辑；fit 仍是一次性手动操作 |
 | D27 | 本次不做 | `TileSpec` / explode / 嵌套 tile / 记录 tile 份数、per-repeat override、自动 group、音频 tile、独立 window 面板（归 M7 扩展）、`ClipId` |
 
 ## 3. 数据结构
