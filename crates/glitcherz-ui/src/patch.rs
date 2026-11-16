@@ -1585,9 +1585,10 @@ const PORT_SPACING: f32 = 30.0;
 /// Title band at the top of a node box. Ports and inline rows are measured
 /// from below it, so a port dot never lands on the label.
 const NODE_TITLE_BAND: f32 = 24.0;
-/// Dedicated row above a controllable node's structural inlets that hosts the
-/// aggregated curve inlet (F-044). Kept tall enough that the yellow socket
-/// never touches the structural rings or the mixer channel ports.
+/// Dedicated row at the **bottom** of a controllable node's box that hosts
+/// the aggregated curve inlet (F-044). Kept tall enough that the yellow
+/// socket never touches the structural rings, the mixer channel ports or the
+/// inline slider rows.
 const CURVE_PORT_ROW: f32 = 16.0;
 /// Height of one in-node action row (the track / slot buttons).
 const ACTION_ROW_HEIGHT: f32 = 18.0;
@@ -2271,7 +2272,7 @@ fn size_of(id: PatchId, deps: &PatchDeps) -> Vec2 {
     };
     Vec2::new(
         base.x,
-        base.y + inline_row_count(id, deps) as f32 * INLINE_ROW_HEIGHT + curve_box_row(id, deps),
+        base.y + inline_row_count(id, deps) as f32 * INLINE_ROW_HEIGHT + curve_inlet_row(id, deps),
     )
 }
 
@@ -2667,6 +2668,22 @@ fn port_name_labels(
     out
 }
 
+/// Z0 caption painted next to a node's input port: `Main` / `Mod` on the
+/// dual-input effects only, so the Mod inlet is not a second unmarked dot.
+///
+/// A two-channel Mixer is **not** a dual-input node: `audio_inputs()` returns
+/// its channel count, and its ports are already captioned by the channel-name
+/// pass (`port_name_labels`) at the very same spot — without the mixer guard
+/// both texts superimposed, which read as overlapping captions.
+fn dual_input_caption(node: Option<&NodeDoc>, port: u8) -> String {
+    match node {
+        Some(n) if !n.is_mixer() && n.audio_inputs() == 2 => {
+            if port == 0 { "Main" } else { "Mod" }.to_string()
+        }
+        _ => String::new(),
+    }
+}
+
 /// Destination input port for an audio cable drop (Z0 Z-D8).
 ///
 /// Mixer and dual-input nodes expose several ports: a precise hit on a dot
@@ -2777,10 +2794,13 @@ impl PatchState {
     }
 
     /// Screen-space vertical extent of one box's port area: below the
-    /// title / action band, above the inline slider rows.
+    /// title / action band, above the inline slider rows and the curve inlet
+    /// row (F-044) that now sits at the very bottom of the box.
     fn port_area(&self, r: Rect, id: PatchId, deps: &PatchDeps) -> (f32, f32) {
-        let top = r.top() + (header_band(id, deps) + curve_slot_row(id, deps)) * self.zoom;
-        let bottom = r.bottom() - inline_row_count(id, deps) as f32 * INLINE_ROW_HEIGHT * self.zoom;
+        let top = r.top() + header_band(id, deps) * self.zoom;
+        let bottom = r.bottom()
+            - (inline_row_count(id, deps) as f32 * INLINE_ROW_HEIGHT + curve_inlet_row(id, deps))
+                * self.zoom;
         (top, bottom.max(top + 1.0))
     }
 
@@ -2864,9 +2884,10 @@ impl PatchState {
             },
         };
         // A mixer spreads its channels over the port area (below the slot
-        // buttons and the curve row, above the inline row); a single mixer
-        // channel is spread the same way so it clears the curve inlet. Other
-        // single-port boxes keep the box centre, where their output port sits.
+        // buttons, above the inline rows and the curve inlet row); a single
+        // mixer channel is spread the same way so it clears the curve inlet.
+        // Other single-port boxes keep the box centre, where their output
+        // port sits.
         let spread = n > 1
             || match id {
                 PatchId::Node(node_id) => deps
@@ -2888,8 +2909,9 @@ impl PatchState {
     }
 
     /// Screen position of the aggregated curve inlet (F-044), when the entity
-    /// has one. It sits in its own row above the structural inlets; the Curve
-    /// Map is excluded because its only inlet already *is* the control input.
+    /// has one. It sits in its own row **below** the structural inlets and the
+    /// inline rows, at the very bottom of the box; the Curve Map is excluded
+    /// because its only inlet already *is* the control input.
     fn curve_port_screen(&self, rect_min: Pos2, id: PatchId, deps: &PatchDeps) -> Option<Pos2> {
         let PatchId::Node(node_id) = id else {
             return None;
@@ -2898,8 +2920,10 @@ impl PatchState {
             return None;
         }
         let r = self.screen_rect(rect_min, id, deps)?;
-        let top = r.top() + header_band(id, deps) * self.zoom;
-        Some(Pos2::new(r.left(), top + CURVE_PORT_ROW * 0.5 * self.zoom))
+        Some(Pos2::new(
+            r.left(),
+            r.bottom() - curve_inlet_row(id, deps) * 0.5 * self.zoom,
+        ))
     }
 
     /// Fill in default placements for missing entities (never overwrites existing positions;
@@ -3413,26 +3437,17 @@ fn has_curve_port(node: &NodeDoc) -> bool {
     node.accepts_control() && !matches!(node, NodeDoc::CurveMap { .. })
 }
 
-/// Graph-space height reserved above a node's structural inlets for the
-/// aggregated curve inlet (0 for fixed entities and non-targets).
+/// Graph-space height every control target reserves for the aggregated curve
+/// inlet (0 for fixed entities and non-targets).
 ///
-/// A Mixer reuses the headroom of its existing port area, so its **box** does
-/// not grow (the track column stacks nodes 132 px apart); every other control
-/// target gains a real row.
-fn curve_box_row(id: PatchId, deps: &PatchDeps) -> f32 {
-    let PatchId::Node(node_id) = id else {
-        return 0.0;
-    };
-    match deps.doc.node_by_id(node_id) {
-        Some(node) if has_curve_port(node) && !node.is_mixer() => CURVE_PORT_ROW,
-        _ => 0.0,
-    }
-}
-
-/// Graph-space height the port area gives up to the curve row. Unlike
-/// [`curve_box_row`], the Mixer keeps its box height and simply starts its
-/// channel ports below the reserved row.
-fn curve_slot_row(id: PatchId, deps: &PatchDeps) -> f32 {
+/// Revised 2026-11-16: the row used to sit between the header and the
+/// structural inlets, with the Mixer as a special case that stole the row
+/// from its port area instead of growing. The row now sits **below** the
+/// structural inlets (under the inline rows), and the Mixer grows by it like
+/// every other target — the stolen 16 px was what made the per-channel
+/// spacing creep toward `PORT_SPACING` as channels were added
+/// (`(n·30 − 16) / n` instead of a flat 30).
+fn curve_inlet_row(id: PatchId, deps: &PatchDeps) -> f32 {
     let PatchId::Node(node_id) = id else {
         return 0.0;
     };
@@ -3440,6 +3455,15 @@ fn curve_slot_row(id: PatchId, deps: &PatchDeps) -> f32 {
         Some(node) if has_curve_port(node) => CURVE_PORT_ROW,
         _ => 0.0,
     }
+}
+
+/// Screen-space top edge of a node's inline row block: the rows stack upward
+/// from just above the curve inlet row (F-044), i.e. from
+/// `bottom − (rows · INLINE_ROW_HEIGHT + curve row)` — the same sum `size_of`
+/// adds to the box height. Single source of truth so the painted strips, their
+/// hit rects and the reserved box space cannot drift apart.
+fn inline_rows_top(r: Rect, id: PatchId, deps: &PatchDeps, zoom: f32, rows: usize) -> f32 {
+    r.bottom() - (rows as f32 * INLINE_ROW_HEIGHT + curve_inlet_row(id, deps)).max(0.0) * zoom
 }
 
 /// Structural signal kind of a node's input ports (D27).
@@ -4491,13 +4515,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                 PatchId::Node(node_id) => {
                     let node = deps.doc.node_by_id(node_id);
                     let color = cable_color(node.map_or(CableKind::Audio, node_in_port_kind));
-                    // Z0: label the two ports of a dual-input effect so the
-                    // Mod inlet is not a second unmarked dot.
-                    let label = if node.is_some_and(|n| n.audio_inputs() == 2) {
-                        if port == 0 { "Main" } else { "Mod" }.to_string()
-                    } else {
-                        String::new()
-                    };
+                    let label = dual_input_caption(node, port);
                     (color, label)
                 }
             };
@@ -4736,8 +4754,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
         }
         let row_h = INLINE_ROW_HEIGHT * state.zoom;
         let n = rows.len();
+        // F-044: the curve inlet row sits below the inline rows, so the block
+        // starts one `CURVE_PORT_ROW` above the box bottom. `curve_inlet_row`
+        // already returns that height (0 for non-targets) — do not scale it
+        // again, or the whole block lands above a short box.
+        let block_top = inline_rows_top(r, id, &deps, state.zoom, n);
         for (i, row) in rows.into_iter().enumerate() {
-            let top = r.bottom() - (n - i) as f32 * row_h;
+            let top = block_top + i as f32 * row_h;
             let strip =
                 Rect::from_min_max(Pos2::new(r.left(), top), Pos2::new(r.right(), top + row_h));
             let (label_pos, rail, value_pos, hit) = inline_row_parts(strip, state.zoom);
@@ -5747,8 +5770,9 @@ mod tests {
         }
     }
 
-    /// F-044: the aggregated inlet sits in its own row above the structural
-    /// inlets, and only controllable nodes grow by that row.
+    /// F-044 (2026-11-16 revision): the aggregated inlet sits in its own row
+    /// **below** the structural inlets, and every controllable node — the
+    /// Mixer included — grows its box by that row.
     #[test]
     fn f044_curve_inlet_clears_the_structural_inlets() {
         let project = Project::default();
@@ -5778,28 +5802,206 @@ mod tests {
         for id in [PatchId::Node(instrument), PatchId::Node(mixer)] {
             let r = state.screen_rect(Pos2::ZERO, id, &deps).unwrap();
             let p = state.curve_port_screen(Pos2::ZERO, id, &deps).unwrap();
-            let header_bottom = r.top() + header_band(id, &deps) * zoom;
-            assert!(p.y > header_bottom, "curve inlet must clear the header");
-            assert!((p.x - r.left()).abs() < 0.01);
-            let first = state.in_ports_screen(Pos2::ZERO, id, &deps)[0].1;
+            // The inlet owns the bottom strip of the box, below everything.
             assert!(
-                first.y - p.y >= 15.0,
-                "curve inlet must not touch the structural ring: {first:?} vs {p:?}"
+                p.y > r.bottom() - CURVE_PORT_ROW * zoom,
+                "curve inlet must sit in the bottom strip: {p:?} vs {r:?}"
+            );
+            assert!((p.x - r.left()).abs() < 0.01);
+            let ports = state.in_ports_screen(Pos2::ZERO, id, &deps);
+            let last = ports.last().expect("at least one structural inlet").1;
+            assert!(
+                p.y - last.y >= 15.0,
+                "curve inlet must not touch the structural ring: {last:?} vs {p:?}"
             );
         }
 
         assert_eq!(
-            curve_box_row(PatchId::Node(instrument), &deps),
+            curve_inlet_row(PatchId::Node(instrument), &deps),
             CURVE_PORT_ROW
         );
-        assert_eq!(curve_box_row(PatchId::Node(keyboard.node_id()), &deps), 0.0);
-        assert_eq!(curve_box_row(PatchId::Timeline, &deps), 0.0);
         assert_eq!(
-            curve_slot_row(PatchId::Node(mixer), &deps),
+            curve_inlet_row(PatchId::Node(keyboard.node_id()), &deps),
+            0.0
+        );
+        assert_eq!(curve_inlet_row(PatchId::Timeline, &deps), 0.0);
+        assert_eq!(
+            curve_inlet_row(PatchId::Node(mixer), &deps),
             CURVE_PORT_ROW,
-            "the mixer reserves the row without growing its box"
+            "the mixer grows by the row like every other control target"
         );
         assert!(size_of(PatchId::Node(instrument), &deps).y >= NODE_SIZE.y + CURVE_PORT_ROW);
+    }
+
+    /// The mixer's per-channel spacing must not depend on the channel count:
+    /// the curve row used to be stolen from the shared port area, so each
+    /// channel lost `CURVE_PORT_ROW / n` and the spacing crept toward
+    /// `PORT_SPACING` as channels were added. With the row outside the port
+    /// area the spacing is flat for every `n >= 3`.
+    #[test]
+    fn mixer_channel_spacing_does_not_creep_with_channel_count() {
+        for inputs in 1..=8usize {
+            let mut project = Project::default();
+            let old = project
+                .graph
+                .nodes
+                .iter()
+                .position(|n| n.is_mixer())
+                .expect("default project has a mixer");
+            let mixer_id = project.graph.nodes[old].node_id();
+            project.graph.nodes[old] = NodeDoc::Mixer {
+                node_id: mixer_id,
+                track: 0,
+                inputs: inputs as u8,
+                channels: vec![Default::default(); inputs],
+                out_pan: 0.0,
+                out_muted: false,
+            };
+            let doc = &project.graph;
+            let deps = PatchDeps {
+                input: Default::default(),
+                doc,
+                track_count: project.midi_tracks.len(),
+                track_name: &|_, _| String::new(),
+                auto_count: project.control_tracks.len(),
+                audio_count: project.audio_tracks.len(),
+                auto_options: &|_| Vec::new(),
+                plugin_inline: &|_| Vec::new(),
+                sf2_presets: &|_| Vec::new(),
+            };
+            let mut state = PatchState::default();
+            state.ensure_positions(doc, deps.track_count, deps.auto_count, deps.audio_count);
+            let id = PatchId::Node(mixer_id);
+            let ports = state.in_ports_screen(Pos2::ZERO, id, &deps);
+            let curve = state
+                .curve_port_screen(Pos2::ZERO, id, &deps)
+                .expect("mixer owns a curve inlet");
+            for pair in ports.windows(2) {
+                let gap = pair[1].1.y - pair[0].1.y;
+                let expected = if inputs >= 3 {
+                    PORT_SPACING * state.zoom
+                } else {
+                    // The 64 px minimum-height floor spreads one or two
+                    // channels wider than the nominal spacing.
+                    (64.0 / inputs as f32) * state.zoom
+                };
+                assert!(
+                    (gap - expected).abs() < 0.01,
+                    "inputs={inputs}: channel gap {gap} != expected {expected}"
+                );
+            }
+            // The inlet clears the last channel port and stays in the box.
+            let last = ports.last().expect("at least one channel").1;
+            assert!(
+                curve.y - last.y >= 15.0,
+                "inputs={inputs}: curve inlet {curve:?} too close to channel {last:?}"
+            );
+            let r = state.screen_rect(Pos2::ZERO, id, &deps).unwrap();
+            assert!(curve.y < r.bottom(), "curve inlet left the box");
+        }
+    }
+
+    /// F-044 regression: the inline block is anchored to `bottom − rows − curve
+    /// row`. `curve_inlet_row` already returns a height, so scaling it by
+    /// `CURVE_PORT_ROW` again threw the block ~240 px above its box — the
+    /// mixer's pan row was the conspicuous one, and it drifted down as extra
+    /// channels made the box taller.
+    #[test]
+    fn inline_rows_stay_inside_the_box() {
+        for inputs in 1..=6usize {
+            let mut project = Project::default();
+            let old = project
+                .graph
+                .nodes
+                .iter()
+                .position(|n| n.is_mixer())
+                .expect("default project has a mixer");
+            let mixer_id = project.graph.nodes[old].node_id();
+            project.graph.nodes[old] = NodeDoc::Mixer {
+                node_id: mixer_id,
+                track: 0,
+                inputs: inputs as u8,
+                channels: vec![Default::default(); inputs],
+                out_pan: 0.0,
+                out_muted: false,
+            };
+            let doc = &project.graph;
+            let deps = PatchDeps {
+                input: Default::default(),
+                doc,
+                track_count: project.midi_tracks.len(),
+                track_name: &|_, _| String::new(),
+                auto_count: project.control_tracks.len(),
+                audio_count: project.audio_tracks.len(),
+                auto_options: &|_| Vec::new(),
+                plugin_inline: &|_| Vec::new(),
+                sf2_presets: &|_| Vec::new(),
+            };
+            let mut state = PatchState::default();
+            state.ensure_positions(doc, deps.track_count, deps.auto_count, deps.audio_count);
+            let z = state.zoom;
+
+            let cases = [
+                (PatchId::Node(mixer_id), 1usize, "mixer out-pan"),
+                (
+                    PatchId::Node(doc.instrument_of_track(0).unwrap().node_id()),
+                    2,
+                    "synth",
+                ),
+            ];
+            for (id, rows, what) in cases {
+                assert_eq!(inline_row_count(id, &deps), rows, "{what}: row count");
+                let r = state.screen_rect(Pos2::ZERO, id, &deps).unwrap();
+                let top = inline_rows_top(r, id, &deps, z, rows);
+                let header_bottom = r.top() + header_band(id, &deps) * z;
+                assert!(
+                    top >= header_bottom,
+                    "inputs={inputs} {what}: inline block top {top} is above the header bottom {header_bottom}"
+                );
+                let reserved = (rows as f32 * INLINE_ROW_HEIGHT + curve_inlet_row(id, &deps)) * z;
+                assert!(
+                    (top + reserved - r.bottom()).abs() < 0.01,
+                    "inputs={inputs} {what}: rows must fill the space `size_of` reserved"
+                );
+            }
+        }
+    }
+
+    /// Only the dual-input effects carry `Main` / `Mod` captions. A two-
+    /// channel mixer answers `audio_inputs() == 2` too, and painting its
+    /// ports here superimposed these captions over the channel names.
+    #[test]
+    fn only_dual_input_effects_get_main_mod_captions() {
+        let mixer2 = NodeDoc::Mixer {
+            node_id: 1,
+            track: 0,
+            inputs: 2,
+            channels: vec![Default::default(); 2],
+            out_pan: 0.0,
+            out_muted: false,
+        };
+        let mixer3 = NodeDoc::Mixer {
+            node_id: 1,
+            track: 0,
+            inputs: 3,
+            channels: vec![Default::default(); 3],
+            out_pan: 0.0,
+            out_muted: false,
+        };
+        let dual = NodeDoc::Effect {
+            node_id: 2,
+            track: 0,
+            voice: VoiceSpec::Builtin,
+            params: glitcherz_model::EffectParams::RingMod(Box::default()),
+            delay: None,
+        };
+        assert!(dual.audio_inputs() == 2, "the fixture must be dual-input");
+        assert_eq!(dual_input_caption(Some(&mixer2), 0), String::new());
+        assert_eq!(dual_input_caption(Some(&mixer2), 1), String::new());
+        assert_eq!(dual_input_caption(Some(&mixer3), 0), String::new());
+        assert_eq!(dual_input_caption(Some(&dual), 0), "Main");
+        assert_eq!(dual_input_caption(Some(&dual), 1), "Mod");
+        assert_eq!(dual_input_caption(None, 0), String::new());
     }
 
     /// F-044: automation cables end on the aggregated inlet, and cables that
@@ -7102,11 +7304,11 @@ mod tests {
                 NODE_SIZE.y + 3.0 * INLINE_ROW_HEIGHT + CURVE_PORT_ROW
             )
         );
-        // Mixer: wider box (port-name column), channel-scaled base + 1 row.
-        // The curve row reuses the port area's headroom, so no extra height.
+        // Mixer: wider box (port-name column), channel-scaled base + 1 row,
+        // and the curve inlet row at the bottom like every control target.
         assert_eq!(
             size_of(PatchId::Node(mixer), &deps),
-            Vec2::new(MIXER_WIDTH, mixer_base + INLINE_ROW_HEIGHT)
+            Vec2::new(MIXER_WIDTH, mixer_base + INLINE_ROW_HEIGHT + CURVE_PORT_ROW)
         );
         // Plugin node: 2 session-enumerated rows + the curve inlet row.
         assert_eq!(
