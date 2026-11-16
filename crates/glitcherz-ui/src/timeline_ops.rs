@@ -320,17 +320,8 @@ impl GlitcherZApp {
                 lane,
                 track,
                 clip,
-                start_ticks,
-                span_ticks,
                 delta_ticks,
-            } => self.timeline_trim_clip_head(
-                lane,
-                track,
-                clip,
-                start_ticks,
-                span_ticks,
-                delta_ticks,
-            ),
+            } => self.timeline_trim_clip_head(lane, track, clip, delta_ticks),
             timeline::TimelineAction::EndClipTrim => self.timeline_end_clip_trim(),
             timeline::TimelineAction::RemoveClip { lane, track, clip } => {
                 self.timeline_remove_clip(lane, track, clip)
@@ -777,12 +768,8 @@ impl GlitcherZApp {
         lane: timeline::TimelineLane,
         track: usize,
         clip: usize,
-        start_ticks: u32,
-        span_ticks: u32,
-        delta_ticks: u32,
+        delta_ticks: i64,
     ) {
-        use crate::timeline::Placement;
-
         let sel = timeline::ClipSel { lane, track, clip };
         if self
             .timeline_state
@@ -808,9 +795,7 @@ impl GlitcherZApp {
                     .audio_tracks
                     .get(track)
                     .and_then(|t| t.clips.get(clip))
-                    .map(|c| timeline::HeadTrimOrigin::Audio {
-                        offset: c.source_offset,
-                    }),
+                    .map(|c| timeline::HeadTrimOrigin::Audio(Box::new(c.clone()))),
             };
             let Some(origin) = origin else {
                 return;
@@ -827,12 +812,13 @@ impl GlitcherZApp {
             let project = self.project_mut();
             match (&trim.origin, lane) {
                 (timeline::HeadTrimOrigin::Midi(origin), timeline::TimelineLane::Midi) => {
-                    let mut next = origin.clone();
-                    // F-041: the head trim only moves the window start;
-                    // the shared content is never rewritten.
-                    next.retain_from(delta_ticks, sec_per_tick);
-                    next.start_ticks = start_ticks;
-                    next.span_ticks = span_ticks;
+                    let mut next = (**origin).clone();
+                    // F-041: the head trim adjusts the window start (positive
+                    // = deeper, negative = restore); the shared content is
+                    // never rewritten. The start/span follow the applied
+                    // shift, so a restore clamped at the data start stops
+                    // dead instead of sliding the whole clip (M10.10).
+                    trim_head_window(&mut next, delta_ticks, sec_per_tick);
                     if !midi_window_has_content(
                         project,
                         next.data,
@@ -846,19 +832,18 @@ impl GlitcherZApp {
                             .get_mut(track)
                             .and_then(|t| t.clips.get_mut(clip))
                             .map(|c| {
-                                let changed = *c != *next;
-                                *c = *next;
+                                let changed = *c != next;
+                                *c = next;
                                 changed
                             })
                             .unwrap_or(false)
                     }
                 }
                 (timeline::HeadTrimOrigin::Control(origin), timeline::TimelineLane::Control) => {
-                    let mut next = origin.clone();
-                    // F-041: move the window, keep the content.
-                    next.retain_from(delta_ticks, sec_per_tick);
-                    next.start_ticks = start_ticks;
-                    next.span_ticks = span_ticks;
+                    let mut next = (**origin).clone();
+                    // F-041: move the window (both trim and restore), keep the
+                    // content. Same applied-shift clamp as MIDI (M10.10).
+                    trim_head_window(&mut next, delta_ticks, sec_per_tick);
                     if !curve_window_has_content(
                         project,
                         next.data,
@@ -872,29 +857,29 @@ impl GlitcherZApp {
                             .get_mut(track)
                             .and_then(|t| t.clips.get_mut(clip))
                             .map(|c| {
-                                let changed = *c != *next;
-                                *c = *next;
+                                let changed = *c != next;
+                                *c = next;
                                 changed
                             })
                             .unwrap_or(false)
                     }
                 }
-                (timeline::HeadTrimOrigin::Audio { offset, .. }, timeline::TimelineLane::Audio) => {
+                (timeline::HeadTrimOrigin::Audio(origin), timeline::TimelineLane::Audio) => {
+                    let mut next = (**origin).clone();
+                    // U11 + M10.10: the trim window advances with the head so
+                    // the remaining material stays where it is on screen; the
+                    // restore clamps at the material head and the start
+                    // follows the applied shift.
+                    trim_head_window(&mut next, delta_ticks, sec_per_tick);
                     project
                         .audio_tracks
                         .get_mut(track)
                         .and_then(|t| t.clips.get_mut(clip))
                         .map(|c| {
-                            // U11: the trim window advances with the head so the
-                            // remaining material stays where it is on screen.
-                            let offset = (offset + delta_ticks as f64 * sec_per_tick).max(0.0);
-                            let len = f64::from(span_ticks).max(1.0) * sec_per_tick;
-                            let changed = c.start_ticks != start_ticks
-                                || (c.source_offset - offset).abs() > f64::EPSILON
-                                || (c.source_len - len).abs() > f64::EPSILON;
-                            c.start_ticks = start_ticks;
-                            c.source_offset = offset;
-                            c.source_len = len;
+                            let changed = c.start_ticks != next.start_ticks
+                                || (c.source_offset - next.source_offset).abs() > f64::EPSILON
+                                || (c.source_len - next.source_len).abs() > f64::EPSILON;
+                            *c = next;
                             changed
                         })
                         .unwrap_or(false)
@@ -2399,6 +2384,31 @@ impl GlitcherZApp {
 /// F-041 M10.2: a manual window trim may not leave a clip with nothing to
 /// play. Empty data is exempt (a new clip must be adjustable before its first
 /// note). A note counts when any part of it overlaps the window.
+/// F-041 M10.7/M10.10: one head-trim frame against a window snapshot.
+///
+/// The clip start follows the *applied* shift — what actually moved after the
+/// data-start clamp — never the raw pointer delta. A restore past the data
+/// start (`source_offset` already 0) therefore moves nothing: the clip no
+/// longer slides leftward while its right edge silently inflates.
+pub(crate) fn trim_head_window<P: crate::timeline::Placement>(
+    window: &mut P,
+    delta_ticks: i64,
+    sec_per_tick: f64,
+) {
+    let origin_start = window.start();
+    let applied = window.retain_from(delta_ticks, sec_per_tick);
+    window.set_start((i64::from(origin_start) + applied).max(0) as u32);
+}
+
+/// F-041 M10.6: the window's right-edge cap as a span in ticks — the last
+/// content end rounded up to a bar, minus the window's data offset, so the
+/// edge lands on the bar grid and never cuts into content. Writing past it
+/// grows the window automatically instead (M10.8/M10.9).
+fn content_span_cap(content_end: i64, offset: i64, bar: i64) -> u32 {
+    let limit = content_end.saturating_add(bar - 1).div_euclid(bar) * bar;
+    u32::try_from((limit - offset).max(1)).unwrap_or(u32::MAX)
+}
+
 fn midi_window_has_content(project: &Project, data_idx: u32, offset: i64, span: u32) -> bool {
     let Some(data) = project.midi_data.get(data_idx as usize) else {
         return true;
@@ -2455,10 +2465,11 @@ fn stretch_midi_clip(
     if old_start == new_start && old_span == new_span && old_loop.is_none() {
         return false;
     }
-    // F-041 M10.3: T left expansion is retired; use notes-right + clip-left.
-    if new_start < old_start {
-        return false;
-    }
+    // F-041 M10.7: the start edge adjusts the left trim both ways. Restoring
+    // moves the window start left, bounded by the data start (`offset` may
+    // not go below 0 — a legacy negative offset has nothing left to restore).
+    let restore_floor = i64::from(old_start).saturating_sub(old_off.max(0));
+    let new_start = new_start.clamp(restore_floor.max(0) as u32, u32::MAX);
     // F-041 M10.2: shrinking the window must keep at least one note audible.
     let shifted = old_off.saturating_add(i64::from(new_start) - i64::from(old_start));
     // F-041 M10.6: the window may not grow past the last content bar.
@@ -2474,13 +2485,15 @@ fn stretch_midi_clip(
         })
         .unwrap_or(0);
     let new_span = if content_end > 0 {
-        let limit = content_end.saturating_add(bar - 1).div_euclid(bar) * bar;
-        u32::try_from((limit - shifted).max(1))
-            .unwrap_or(u32::MAX)
-            .min(new_span)
+        new_span.min(content_span_cap(content_end, shifted, bar))
     } else {
         new_span
     };
+    // M10.7: a request clamped all the way back to the current window (no
+    // restore room, no span change) is a no-op, not an edit.
+    if new_start == old_start && new_span == old_span && old_loop.is_none() {
+        return false;
+    }
     if (new_span < old_span || new_start > old_start)
         && !midi_window_has_content(project, data_idx, shifted, new_span)
     {
@@ -2529,10 +2542,11 @@ fn stretch_curve_clip(
     if old_start == new_start && old_span == new_span && old_loop.is_none() {
         return false;
     }
-    // F-041 M10.3: no left expansion for control clips either.
-    if new_start < old_start {
-        return false;
-    }
+    // F-041 M10.7: the start edge adjusts the left trim both ways. Restoring
+    // moves the window start left, bounded by the data start (`offset` may
+    // not go below 0 — a legacy negative offset has nothing left to restore).
+    let restore_floor = i64::from(old_start).saturating_sub(old_off.max(0));
+    let new_start = new_start.clamp(restore_floor.max(0) as u32, u32::MAX);
     let shifted = old_off.saturating_add(i64::from(new_start) - i64::from(old_start));
     // F-041 M10.6: control windows stop at the last anchor bar as well.
     let bar = i64::from(project.ticks_per_bar_at(clip.start_ticks).max(1));
@@ -2542,13 +2556,15 @@ fn stretch_curve_clip(
         .and_then(|data| data.points.last().map(|point| i64::from(point.tick) + 1))
         .unwrap_or(0);
     let new_span = if content_end > 0 {
-        let limit = content_end.saturating_add(bar - 1).div_euclid(bar) * bar;
-        u32::try_from((limit - shifted).max(1))
-            .unwrap_or(u32::MAX)
-            .min(new_span)
+        new_span.min(content_span_cap(content_end, shifted, bar))
     } else {
         new_span
     };
+    // M10.7: a request clamped all the way back to the current window (no
+    // restore room, no span change) is a no-op, not an edit.
+    if new_start == old_start && new_span == old_span && old_loop.is_none() {
+        return false;
+    }
     if (new_span < old_span || new_start > old_start)
         && !curve_window_has_content(project, data_idx, shifted, new_span)
     {
@@ -2569,8 +2585,9 @@ fn stretch_curve_clip(
     true
 }
 /// Right-edge drag on a MIDI clip: a pure window edit (F-041 M10). Growth
-/// exposes silent tail; the piano roll grows the content only when something
-/// is written there.
+/// exposes silent tail up to the last content bar only (F-041 M10.10 —
+/// writing past it grows the window automatically instead); shrinking is
+/// free and may cut content (the trim teeth show it).
 fn resize_midi_clip(
     project: &mut Project,
     track: usize,
@@ -2585,10 +2602,29 @@ fn resize_midi_clip(
     else {
         return false;
     };
+    let (off, data_idx, old_span) = (clip.source_offset, clip.data, clip.span_ticks);
+    // F-041 M10.6/M10.10: the right edge may not grow past the last content
+    // bar. A legacy oversized window stays put on extension (cap.max(old)),
+    // so dragging right neither grows nor shrinks it; shrinking stays free.
+    let bar = i64::from(project.ticks_per_bar_at(clip.start_ticks).max(1));
+    let content_end = project
+        .midi_data
+        .get(data_idx as usize)
+        .and_then(|data| {
+            data.notes()
+                .iter()
+                .map(|note| note.start.saturating_add(note.length))
+                .max()
+        })
+        .unwrap_or(0);
+    let new_span = if new_span > old_span && content_end > 0 {
+        new_span.min(content_span_cap(content_end, off, bar).max(old_span))
+    } else {
+        new_span
+    };
     if clip.start_ticks == new_start && clip.span_ticks == new_span {
         return false;
     }
-    let (off, data_idx, old_span) = (clip.source_offset, clip.data, clip.span_ticks);
     if new_span < old_span && !midi_window_has_content(project, data_idx, off, new_span) {
         return false;
     }
@@ -2621,10 +2657,23 @@ fn resize_curve_clip(
     else {
         return false;
     };
+    let (off, data_idx, old_span) = (clip.source_offset, clip.data, clip.span_ticks);
+    // F-041 M10.6/M10.10: same right-edge cap as MIDI, measured at the last
+    // anchor (curve content ends at its final anchor tick).
+    let bar = i64::from(project.ticks_per_bar_at(clip.start_ticks).max(1));
+    let content_end = project
+        .curve_data
+        .get(data_idx as usize)
+        .and_then(|data| data.points.last().map(|point| i64::from(point.tick) + 1))
+        .unwrap_or(0);
+    let new_span = if new_span > old_span && content_end > 0 {
+        new_span.min(content_span_cap(content_end, off, bar).max(old_span))
+    } else {
+        new_span
+    };
     if clip.start_ticks == new_start && clip.span_ticks == new_span {
         return false;
     }
-    let (off, data_idx, old_span) = (clip.source_offset, clip.data, clip.span_ticks);
     if new_span < old_span && !curve_window_has_content(project, data_idx, off, new_span) {
         return false;
     }
@@ -2644,7 +2693,7 @@ fn resize_curve_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glitcherz_model::{MidiData, MidiTrack, Sequence, TICKS_PER_BAR};
+    use glitcherz_model::{AudioClip, MidiData, MidiTrack, Sequence, TICKS_PER_BAR};
 
     fn clip_with_one_note(project: &mut Project) -> MidiClip {
         let data = project.push_midi_data(MidiData {
@@ -2684,6 +2733,11 @@ mod tests {
         let old = clip.data;
         assert_eq!(project.midi_data_refs(old), 3);
 
+        // Start both windows narrow so the stretches below actually widen
+        // them — M10.6 caps the window at the last content bar, so a 1-bar
+        // window asking for 2 bars would clamp back into a no-op (M10.7).
+        project.midi_tracks[0].clips[0].span_ticks = 240;
+        project.midi_tracks[0].clips[1].span_ticks = 240;
         assert!(stretch_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
         assert!(stretch_midi_clip(
             &mut project,
@@ -2705,6 +2759,10 @@ mod tests {
     fn stretch_tail_exposes_silent_window() {
         let mut project = Project::default();
         clip_with_one_note(&mut project);
+        // Start narrow so the stretch actually widens (M10.6 caps at the
+        // last content bar; M10.7 turns a fully-clamped request into a
+        // no-op).
+        project.midi_tracks[0].clips[0].span_ticks = 240;
 
         assert!(stretch_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
 
@@ -2721,10 +2779,11 @@ mod tests {
         assert_eq!(data.notes()[0].start, 0, "the note stays at its tick");
     }
 
-    /// F-041 M10.3: the start-edge stretch is retired; a left expansion is
-    /// refused and the clip stays put (use notes-right + clip-left instead).
+    /// F-041 M10.7: with nothing trimmed away (`source_offset = 0`) a left
+    /// move has nothing to restore — the request clamps back to the current
+    /// window and the clip stays put.
     #[test]
-    fn stretch_left_expansion_is_rejected() {
+    fn stretch_left_move_without_trimmed_content_is_a_no_op() {
         let mut project = Project::default();
         clip_with_one_note(&mut project);
         project.midi_tracks[0].clips[0].start_ticks = TICKS_PER_BAR;
@@ -2737,6 +2796,26 @@ mod tests {
         assert_eq!(clip.source_offset, 0);
     }
 
+    /// F-041 M10.7: a head-trimmed clip restores to the left — the window
+    /// start moves back over the trimmed content and `source_offset`
+    /// returns to 0 (the trimmed head becomes audible again).
+    #[test]
+    fn stretch_restores_a_trimmed_head() {
+        let mut project = Project::default();
+        clip_with_one_note(&mut project);
+        let clip = &mut project.midi_tracks[0].clips[0];
+        clip.start_ticks = TICKS_PER_BAR;
+        clip.source_offset = i64::from(TICKS_PER_BAR); // one bar trimmed away
+        clip.span_ticks = TICKS_PER_BAR;
+
+        assert!(stretch_midi_clip(&mut project, 0, 0, 0, TICKS_PER_BAR));
+
+        let clip = &project.midi_tracks[0].clips[0];
+        assert_eq!(clip.start_ticks, 0);
+        assert_eq!(clip.source_offset, 0, "the trimmed head is restored");
+        assert_eq!(clip.span_ticks, TICKS_PER_BAR);
+    }
+
     /// Stretching one shared clip leaves the other reference exactly as it was.
     #[test]
     fn stretch_keeps_shared_content() {
@@ -2746,6 +2825,9 @@ mod tests {
             start_ticks: 4 * TICKS_PER_BAR,
             ..source
         });
+        // Start narrow so the stretch actually widens (M10.6 + M10.7: a
+        // fully-clamped request would be a no-op).
+        project.midi_tracks[0].clips[0].span_ticks = 240;
 
         assert!(stretch_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
 
@@ -2783,5 +2865,119 @@ mod tests {
             .notes_mut()
             .clear();
         assert!(stretch_midi_clip(&mut project, 0, 0, TICKS_PER_BAR, 100));
+    }
+
+    /// F-041 M10.10: a head-trim restore clamped at the data start moves
+    /// nothing — the start follows the applied shift, so dragging the left
+    /// edge past the data start can no longer slide the whole clip leftward
+    /// while its right edge silently inflates.
+    #[test]
+    fn trim_head_stops_dead_at_the_data_start() {
+        let mut clip = MidiClip {
+            start_ticks: 2 * TICKS_PER_BAR,
+            span_ticks: 4 * TICKS_PER_BAR,
+            source_offset: 0,
+            ..MidiClip::default()
+        };
+        trim_head_window(&mut clip, -(TICKS_PER_BAR as i64), 0.0);
+        assert_eq!(clip.start_ticks, 2 * TICKS_PER_BAR, "nothing moved");
+        assert_eq!(clip.span_ticks, 4 * TICKS_PER_BAR);
+        assert_eq!(clip.source_offset, 0);
+    }
+
+    /// F-041 M10.7/M10.10: restoring a trimmed head comes back only by what
+    /// the data start allows; the start/span track that applied amount, and
+    /// the right edge never moves.
+    #[test]
+    fn trim_head_restore_follows_the_applied_shift() {
+        let bar = i64::from(TICKS_PER_BAR);
+        let mut clip = MidiClip {
+            start_ticks: 3 * TICKS_PER_BAR,
+            span_ticks: 2 * TICKS_PER_BAR,
+            source_offset: i64::from(TICKS_PER_BAR), // one bar trimmed away
+            ..MidiClip::default()
+        };
+        // Asking for two bars back: only the trimmed bar exists to restore.
+        trim_head_window(&mut clip, -2 * bar, 0.0);
+        assert_eq!(
+            clip.start_ticks,
+            2 * TICKS_PER_BAR,
+            "moved by one applied bar"
+        );
+        assert_eq!(clip.source_offset, 0, "restore stops at the data start");
+        assert_eq!(clip.span_ticks, 3 * TICKS_PER_BAR, "the head grew back");
+        // Any further leftward drag is dead weight.
+        trim_head_window(&mut clip, -bar, 0.0);
+        assert_eq!(clip.start_ticks, 2 * TICKS_PER_BAR);
+        assert_eq!(clip.span_ticks, 3 * TICKS_PER_BAR);
+        assert_eq!(clip.source_offset, 0);
+    }
+
+    /// F-041 M10.7: trimming deeper moves the window into the data and keeps
+    /// the right edge pinned.
+    #[test]
+    fn trim_head_deeper_keeps_the_right_edge_pinned() {
+        let mut clip = MidiClip {
+            start_ticks: 2 * TICKS_PER_BAR,
+            span_ticks: 4 * TICKS_PER_BAR,
+            source_offset: 0,
+            ..MidiClip::default()
+        };
+        trim_head_window(&mut clip, i64::from(TICKS_PER_BAR), 0.0);
+        assert_eq!(clip.start_ticks, 3 * TICKS_PER_BAR);
+        assert_eq!(clip.source_offset, i64::from(TICKS_PER_BAR));
+        assert_eq!(
+            i64::from(clip.start_ticks) + i64::from(clip.span_ticks),
+            6 * i64::from(TICKS_PER_BAR),
+            "the right edge never moves"
+        );
+    }
+
+    /// F-041 M10.10: audio head trim clamps at the material head the same
+    /// way — past it, nothing moves.
+    #[test]
+    fn trim_head_window_stops_audio_at_the_material_head() {
+        let bar = i64::from(TICKS_PER_BAR);
+        // One bar already trimmed away (window starts 1s into the material).
+        let mut clip = AudioClip {
+            start_ticks: 2 * TICKS_PER_BAR,
+            source_offset: f64::from(TICKS_PER_BAR),
+            source_len: f64::from(3 * TICKS_PER_BAR),
+            ..AudioClip::default()
+        };
+        // Two bars requested back: only the trimmed bar exists.
+        trim_head_window(&mut clip, -2 * bar, 1.0);
+        assert_eq!(clip.start_ticks, TICKS_PER_BAR, "moved by one applied bar");
+        assert!((clip.source_offset - 0.0).abs() < f64::EPSILON);
+        assert!((clip.source_len - f64::from(4 * TICKS_PER_BAR)).abs() < f64::EPSILON);
+        // Past the material head: dead weight.
+        trim_head_window(&mut clip, -bar, 1.0);
+        assert_eq!(clip.start_ticks, TICKS_PER_BAR);
+        assert!((clip.source_len - f64::from(4 * TICKS_PER_BAR)).abs() < f64::EPSILON);
+    }
+
+    /// F-041 M10.10: the right-edge drag may not grow the window past the
+    /// last content bar; a legacy oversized window stays put on extension,
+    /// but shrinking stays free.
+    #[test]
+    fn resize_right_edge_stops_at_the_last_content_bar() {
+        let mut project = Project::default();
+        clip_with_one_note(&mut project); // note [0, 480) — content bar 1
+        // Widening past the content bar clamps back to a no-op.
+        assert!(!resize_midi_clip(&mut project, 0, 0, 0, 3 * TICKS_PER_BAR));
+        let clip = &project.midi_tracks[0].clips[0];
+        assert_eq!(clip.span_ticks, TICKS_PER_BAR, "capped at the content bar");
+
+        // A legacy oversized window neither grows nor shrinks on extension…
+        project.midi_tracks[0].clips[0].span_ticks = 8 * TICKS_PER_BAR;
+        assert!(!resize_midi_clip(&mut project, 0, 0, 0, 9 * TICKS_PER_BAR));
+        let clip = &project.midi_tracks[0].clips[0];
+        assert_eq!(clip.span_ticks, 8 * TICKS_PER_BAR, "extension is a no-op");
+        // …but shrinking is free.
+        assert!(resize_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
+        assert_eq!(
+            project.midi_tracks[0].clips[0].span_ticks,
+            2 * TICKS_PER_BAR
+        );
     }
 }

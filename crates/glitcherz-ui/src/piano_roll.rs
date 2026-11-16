@@ -788,7 +788,7 @@ impl Modal {
             }
             ModalKind::Stretch { edge, lo, hi } => {
                 let delta = match edge {
-                    StretchEdge::End => draw_end(lo, pointer_tick, snap, loop_ticks) - hi,
+                    StretchEdge::End => draw_end(lo, pointer_tick, snap) - hi,
                     StretchEdge::Start => trim_start(hi, pointer_tick, snap) - lo,
                 };
                 ModalFrame {
@@ -1674,7 +1674,7 @@ pub fn show(
         }
         if crate::toolbar::action_button(
             ui,
-            "Stretch",
+            "Tweak",
             "t",
             stretch_armed,
             "trims the selection's end edge · s flips to the start · LMB confirms",
@@ -2318,13 +2318,31 @@ pub fn show(
     };
     let hit_note = |pos: egui::Pos2| geom.note_at(data, pos);
     // D2: the view may scroll past the focus clip (to show a ghost), but
-    // editing stops at its edges — a click out there must not conjure a note
-    // clamped to tick 0.
-    // The leading blank is part of the editable data range now: a negative
-    // `source_offset` lets the first write land there (F-041 M10.2).
+    // editing a ghost region is still a no-op — a click there must not
+    // conjure a note clamped to tick 0.
+    // F-041 M10.2: a negative `source_offset` lets the first write land in
+    // the leading blank.
+    // F-041 M10.9: the editable right edge is the visible area, not the
+    // window — drawing past the clip's right edge grows the window to the
+    // note (the command layer rounds the span up to a bar, M10.8). But the
+    // blank must be *blank*: a ghost clip's body stays off-limits (writing
+    // there would grow this window over the neighbour), so the range stops
+    // at the nearest ghost to the right, in focus data ticks (M10.10).
     let edit_start = clip.source_offset.min(0) as f32;
-    let over_focus =
-        |pos: egui::Pos2| (edit_start..loop_ticks as f32).contains(&geom.local_at(pos.x));
+    let visible_end = geom.local_at(rect.right()) + 1.0;
+    let ghost_floor = subject
+        .context()
+        .iter()
+        .filter_map(|ctx| {
+            track_clip(tracks, midi_data, *ctx).map(|(ghost, _)| {
+                i64::from(ghost.start_ticks) - i64::from(clip.start_ticks) + clip.source_offset
+            })
+        })
+        .filter(|left| *left as f32 > edit_start)
+        .min()
+        .map_or(visible_end, |left| left as f32);
+    let edit_end = visible_end.min(ghost_floor);
+    let over_focus = |pos: egui::Pos2| (edit_start..edit_end).contains(&geom.local_at(pos.x));
     let modifiers = ui.ctx().input(|i| i.modifiers);
     let snap = if modifiers.ctrl || modifiers.command {
         Snap::OFF
@@ -2468,7 +2486,11 @@ pub fn show(
             .get(index + 1)
             .map_or(i64::MAX, |next| i64::from(next.tick) - origin_tick);
         let from = seg_start_rel.max(0);
-        let to = seg_end_rel.min(loop_ticks);
+        // F-041 M10.9: the grid covers the visible area too — drawing past
+        // the window lands on grid lines, not in the void. The loop stays
+        // the floor.
+        let visible_end = geom.local_at(rect.right()) as i64 + grid;
+        let to = seg_end_rel.min(loop_ticks.max(visible_end));
         if to <= from {
             continue;
         }
@@ -2922,7 +2944,8 @@ pub fn show(
         && hit_note(pos).is_none()
     {
         let gesture = state.next_gesture();
-        let start = snap.ticks(pointer_tick(pos)).min(loop_ticks - 1);
+        // M10.9: no clamp — a start past the window grows it (M10.8).
+        let start = snap.ticks(pointer_tick(pos));
         let length = state.draw_note_length();
         state.last_note_length = Some(length);
         intent = Some(RollIntent::AddNote {
@@ -3014,7 +3037,7 @@ pub fn show(
                                 state.last_note_length = Some(length);
                                 intent = Some(RollIntent::AddNote {
                                     note: pointer_note(pos),
-                                    start: snap.ticks(pointer_tick(pos)).min(loop_ticks - 1),
+                                    start: snap.ticks(pointer_tick(pos)),
                                     length,
                                     gesture: state.next_gesture(),
                                 });
@@ -3211,7 +3234,9 @@ pub fn show(
                             // parks in `awaiting_create` and `resolve_created`
                             // starts the draw-drag.
                             let gesture = state.next_gesture();
-                            let start = snap.ticks(pointer_tick(pos)).min(loop_ticks - 1);
+                            // M10.9: no clamp — a start past the window
+                            // grows it (M10.8).
+                            let start = snap.ticks(pointer_tick(pos));
                             // I4: the note enters at the chosen length (the
                             // last one used in Auto); a drag that follows
                             // replaces it with the pointer's extent.
@@ -3326,11 +3351,12 @@ pub fn show(
                     DragKind::ResizeEnd => {
                         // Drawing / right-edge trim: the grabbed note's end
                         // follows the pointer (snapped, at least one grid
-                        // cell, never past the loop); the whole selection
-                        // stretches by the same delta. The start is the
-                        // frozen anchor — a right-edge trim never moves it.
+                        // cell — past the window it grows, M10.9); the whole
+                        // selection stretches by the same delta. The start is
+                        // the frozen anchor — a right-edge trim never moves
+                        // it.
                         let start = drag.current_start();
-                        let target = draw_end(start, pointer_tick(pos), snap, loop_ticks);
+                        let target = draw_end(start, pointer_tick(pos), snap);
                         let delta = target - drag.current_end();
                         if delta != 0 {
                             drag.applied_end += delta;
@@ -3786,12 +3812,10 @@ fn zoom_top_note_anchor(
 
 /// End tick of a note being drawn: the pointer snapped to the grid, at least
 /// one grid cell after the start (a zero-length note is invisible and cannot
-/// be grabbed), and never past the loop end.
-fn draw_end(start: i64, pointer_tick: f32, snap: Snap, loop_ticks: i64) -> i64 {
-    let snapped = snap.ticks(pointer_tick);
-    snapped
-        .max(start + snap.grid())
-        .min(loop_ticks.max(start + 1))
+/// be grabbed). No loop cap — drawing past the window grows it instead
+/// (F-041 M10.9; the command layer rounds the span up to a bar, M10.8).
+fn draw_end(start: i64, pointer_tick: f32, snap: Snap) -> i64 {
+    snap.ticks(pointer_tick).max(start + snap.grid())
 }
 
 /// Start tick of a left-edge trim: the pointer snapped to the grid, never
@@ -4348,18 +4372,10 @@ mod tests {
 
     fn draw_end_follows_the_pointer_snapped_to_the_grid() {
         let grid = TICKS_PER_STEP as i64; // 1/16
-        assert_eq!(
-            draw_end(0, 240.0, Snap::on(grid), 3840),
-            240,
-            "one cell right"
-        );
-        assert_eq!(draw_end(0, 300.0, Snap::on(grid), 3840), 240, "rounds down");
-        assert_eq!(draw_end(0, 360.0, Snap::on(grid), 3840), 480, "rounds up");
-        assert_eq!(
-            draw_end(480, 700.0, Snap::on(grid), 3840),
-            720,
-            "start-relative"
-        );
+        assert_eq!(draw_end(0, 240.0, Snap::on(grid)), 240, "one cell right");
+        assert_eq!(draw_end(0, 300.0, Snap::on(grid)), 240, "rounds down");
+        assert_eq!(draw_end(0, 360.0, Snap::on(grid)), 480, "rounds up");
+        assert_eq!(draw_end(480, 700.0, Snap::on(grid)), 720, "start-relative");
     }
 
     #[test]
@@ -4367,16 +4383,18 @@ mod tests {
         let grid = TICKS_PER_STEP as i64;
         // Dragging left of the press point (note on) still leaves a visible
         // note — a zero-length note would be invisible and ungrabbable.
-        assert_eq!(draw_end(960, 0.0, Snap::on(grid), 3840), 960 + grid);
-        assert_eq!(draw_end(960, 1000.0, Snap::on(grid), 3840), 960 + grid);
+        assert_eq!(draw_end(960, 0.0, Snap::on(grid)), 960 + grid);
+        assert_eq!(draw_end(960, 1000.0, Snap::on(grid)), 960 + grid);
     }
 
     #[test]
-    fn draw_end_stays_inside_the_loop() {
+    fn draw_end_grows_past_the_loop() {
         let grid = TICKS_PER_STEP as i64;
-        assert_eq!(draw_end(0, 999_999.0, Snap::on(grid), 3840), 3840);
-        // Even a note starting in the last grid cell keeps a positive length.
-        assert_eq!(draw_end(3840 - grid, 999_999.0, Snap::on(grid), 3840), 3840);
+        // F-041 M10.9: no loop cap — an end past the old loop_ticks stands,
+        // and the command layer grows the window to it (M10.8).
+        assert_eq!(draw_end(0, 999_999.0, Snap::on(grid)), 1_000_080);
+        // Even a note starting in the old last grid cell keeps growing.
+        assert_eq!(draw_end(3840 - grid, 999_999.0, Snap::on(grid)), 1_000_080);
     }
 
     #[test]
@@ -4479,7 +4497,7 @@ mod tests {
         let mut drag = DragSelection::anchored(&note(0, grid, 60), 0.0, 60, DragKind::ResizeEnd, 1);
         for cell in 1..=5 {
             let pointer = cell as f32 * grid as f32;
-            let target = draw_end(drag.current_start(), pointer, Snap::on(grid), 3840);
+            let target = draw_end(drag.current_start(), pointer, Snap::on(grid));
             let delta = target - drag.current_end();
             drag.applied_end += delta;
         }
@@ -4489,12 +4507,7 @@ mod tests {
             "the note's end sits under the pointer after five frames"
         );
         // A sixth frame at the same spot owes nothing.
-        let target = draw_end(
-            drag.current_start(),
-            5.0 * grid as f32,
-            Snap::on(grid),
-            3840,
-        );
+        let target = draw_end(drag.current_start(), 5.0 * grid as f32, Snap::on(grid));
         assert_eq!(target - drag.current_end(), 0);
     }
 

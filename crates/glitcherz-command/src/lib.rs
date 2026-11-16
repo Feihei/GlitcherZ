@@ -620,17 +620,17 @@ impl Session {
         }
     }
 
-    /// F-041 M10/M10.1: extends the targeted MIDI entry to cover every note the
-    /// command wrote, then — when the window follows the content — resizes the
-    /// window to the last note-off rounded up to a bar. Shared content is
-    /// copied first (the window stays private).
+    /// F-041 M10/M10.8: extends the targeted MIDI entry to cover every note the
+    /// command wrote, then grows the window's right edge to the last note-off
+    /// rounded up to a bar (never shrinking it). Shared content is copied
+    /// first (the window stays private).
     fn grow_midi_data_to_notes(&mut self, params: &Value) {
         let track = params.get("track").and_then(Value::as_u64).unwrap_or(0) as usize;
         let clip = params.get("clip").and_then(Value::as_u64).unwrap_or(0) as usize;
         // F-041 M10.2: a first write in the leading blank may use a negative
         // data tick; normalize it before growing/fitting.
         self.pull_negative_note_starts_into_data(track, clip);
-        let (data_idx, end, length) = {
+        let (data_idx, offset, start_ticks, end, length) = {
             let project = self.project();
             let Some(target) = project
                 .midi_tracks
@@ -648,7 +648,13 @@ impl Session {
                 .map(|note| note.start.saturating_add(note.length))
                 .max()
                 .unwrap_or(0);
-            (target.data, end, i64::from(data.length_ticks))
+            (
+                target.data,
+                target.source_offset,
+                target.start_ticks,
+                end,
+                i64::from(data.length_ticks),
+            )
         };
         if end > length {
             let new_len = u32::try_from(end).unwrap_or(u32::MAX);
@@ -677,6 +683,35 @@ impl Session {
             if let Some(data) = project.midi_data_mut(data_idx) {
                 data.length_ticks = data.length_ticks.max(new_len);
             }
+        } else if end < length {
+            // F-041 M10.10: the stored content length follows the notes down
+            // as well — shortening a note shrinks the data block instead of
+            // leaving a 100-bar ghost behind. Every reference sees the same
+            // (truly shorter) content.
+            if let Some(data) = self.project_mut().midi_data_mut(data_idx) {
+                data.length_ticks = u32::try_from(end).unwrap_or(u32::MAX).max(1);
+            }
+        }
+        // F-041 M10.8/M10.10: the window's right edge sits at the last
+        // note-off rounded up to a bar — growing AND shrinking with the
+        // notes, so a shortened note no longer leaves an oversized window
+        // behind. The cap is computed in data coordinates (same formula the
+        // timeline's stretch/resize use), then pulled back by the window
+        // offset, so the edge lands on the bar grid.
+        let bar = i64::from(self.project().ticks_per_bar_at(start_ticks).max(1));
+        let content_limit = end.saturating_add(bar - 1).div_euclid(bar) * bar;
+        let span = content_limit
+            .saturating_sub(offset)
+            .max(bar)
+            .min(i64::from(u32::MAX));
+        let span = u32::try_from(span).unwrap_or(u32::MAX);
+        if let Some(target) = self
+            .project_mut()
+            .midi_tracks
+            .get_mut(track)
+            .and_then(|track| track.clips.get_mut(clip))
+        {
+            target.span_ticks = span;
         }
     }
 
@@ -860,7 +895,9 @@ mod journal_tests {
         let clip = &project.midi_tracks[0].clips[0];
         assert_eq!(clip.source_offset, 0, "the head blank becomes content");
         let data = project.midi_data_of(clip).expect("data");
-        assert_eq!(data.length_ticks, 768);
+        // M10.10: the stored length is the true content end — the shifted
+        // notes end at 384 + 240, no ghost tail behind them.
+        assert_eq!(data.length_ticks, 624);
         assert!(
             data.notes()
                 .iter()
@@ -1027,6 +1064,49 @@ mod journal_tests {
         assert_eq!(project.midi_data_refs(first.data), 1);
         assert!(project.midi_data[first.data as usize].length_ticks >= 840);
         assert_eq!(project.midi_data[original as usize].length_ticks, 384);
+    }
+
+    /// F-041 M10.10: the window follows the content both ways — a note
+    /// written far past it grows the window to that note's bar, and moving
+    /// the note back shrinks it again (no oversized ghost window survives
+    /// the fix).
+    #[test]
+    fn the_window_follows_the_content_down_as_well_as_up() {
+        let mut session = session_with_note();
+        let bar = i64::from(glitcherz_model::TICKS_PER_BAR);
+        let far = 20 * bar;
+        session
+            .execute(
+                "midi.note_add",
+                &json!({
+                    "track": 0,
+                    "clip": 0,
+                    "note": 70,
+                    "start_ticks": far,
+                    "length_ticks": 240,
+                }),
+            )
+            .unwrap();
+        let clip = &session.project().midi_tracks[0].clips[0];
+        assert_eq!(
+            clip.span_ticks,
+            (21 * bar) as u32,
+            "the window grew to the far note's bar"
+        );
+
+        // Drag the note back near the start: the window follows it down.
+        session
+            .execute("midi.note_edit", &json!({ "index": 1, "start_ticks": 120 }))
+            .unwrap();
+        let project = session.project();
+        let clip = &project.midi_tracks[0].clips[0];
+        assert_eq!(
+            clip.span_ticks,
+            glitcherz_model::TICKS_PER_BAR,
+            "the window shrank back to the content bar"
+        );
+        let data = project.midi_data_of(clip).expect("data");
+        assert_eq!(data.length_ticks, 360, "the stored content shrank too");
     }
 
     #[test]

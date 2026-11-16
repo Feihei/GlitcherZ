@@ -168,8 +168,9 @@ enum ModalKind {
     /// Alt+D: duplicate the selection with SHARED content — the clones enter a
     /// grab-style modal; the originals stay untouched until the drop.
     Duplicate { locked: Option<Axis> },
-    /// T: stretch the end edge of every selected clip; S mid-modal flips
-    /// to the start edge (unified with the roll's t+s). Bar delta only.
+    /// T: trim the end edge of every selected clip; S mid-modal flips
+    /// to the start edge (unified with the roll's t+s). The start edge
+    /// adjusts the left trim both ways — deeper, or restored (F-041 M10.7).
     Stretch { start_edge: bool },
     /// Alt+T: set the content period of every selected clip, bar-aligned.
     /// The container length is unchanged, so this changes the repeat count.
@@ -262,11 +263,9 @@ pub(crate) struct HeadTrim {
 pub(crate) enum HeadTrimOrigin {
     Midi(Box<MidiClip>),
     Control(Box<ControlClip>),
-    /// Audio needs no content copy — the trim window is a pair of scalars,
-    /// and only the origin offset is read back.
-    Audio {
-        offset: f64,
-    },
+    /// Full audio snapshot: the trim rebuilds the window from it every frame
+    /// (start follows the applied shift, not the raw pointer — M10.10).
+    Audio(Box<AudioClip>),
 }
 
 /// Rubber band in progress (screen coordinates; may span several rows).
@@ -512,17 +511,17 @@ pub enum TimelineAction {
         loop_ticks: Option<u32>,
     },
     /// One frame of a head trim (I6): the left edge follows the pointer and
-    /// the content is re-based from the drag-origin snapshot. The caller
-    /// merges the gesture into a single undo step.
+    /// the content is re-based from the drag-origin snapshot. The start and
+    /// span follow the *applied* shift (a restore clamped at the data start
+    /// moves nothing — F-041 M10.10). The caller merges the gesture into a
+    /// single undo step.
     TrimClipHead {
         lane: TimelineLane,
         track: usize,
         clip: usize,
-        /// Absolute start after the trim (bar-snapped, ≥ 1 bar kept).
-        start_ticks: u32,
-        span_ticks: u32,
-        /// Ticks removed from the head since the drag started (`> 0`).
-        delta_ticks: u32,
+        /// Ticks the head moved since the drag started: positive = trim
+        /// deeper, negative = restore (F-041 M10.7).
+        delta_ticks: i64,
     },
     /// End a head-trim gesture: drop the origin snapshot so the next trim
     /// starts from the then-current clip.
@@ -765,9 +764,14 @@ pub(crate) trait Placement {
 
     /// The right half of a split: keeps the content from the cut onward.
     fn split_right(&mut self, left_span: u32, right_span: u32, sec_per_tick: f64);
-    /// Non-destructive head trim: moves the window start forward by `offset`
-    /// and shortens the span. The content is never rewritten (F-041).
-    fn retain_from(&mut self, offset: u32, sec_per_tick: f64);
+    /// Non-destructive head trim: moves the window start by `offset` and
+    /// adjusts the span. Positive = trim deeper, negative = restore (the
+    /// model layer bounds the restore at the data start). The content is
+    /// never rewritten (F-041 M10.7). Returns the *applied* shift — what
+    /// actually moved after the data-start clamp — so the caller can move
+    /// the clip start by the same amount (a clamped restore must not drift
+    /// the window leftward, F-041 M10.10).
+    fn retain_from(&mut self, offset: i64, sec_per_tick: f64) -> i64;
     /// Optional user-facing clip name (W3a). Empty = unnamed.
     fn name(&self) -> &str;
     fn set_name(&mut self, name: String);
@@ -796,10 +800,15 @@ impl Placement for MidiClip {
         self.source_offset = self.source_offset.saturating_add(i64::from(left_span));
         self.span_ticks = right_span.max(1);
     }
-    fn retain_from(&mut self, offset: u32, _sec_per_tick: f64) {
-        self.source_offset = self.source_offset.saturating_add(i64::from(offset));
-        self.span_ticks = self.span_ticks.saturating_sub(offset).max(1);
+    fn retain_from(&mut self, offset: i64, _sec_per_tick: f64) -> i64 {
+        // Span tracks the *applied* shift: a restore clamped at the data
+        // start grows the window back only by what actually moved.
+        let new_offset = (self.source_offset + offset).max(0);
+        let applied = new_offset - self.source_offset;
+        self.source_offset = new_offset;
+        self.span_ticks = (i64::from(self.span_ticks) - applied).max(1) as u32;
         self.window_follow = false;
+        applied
     }
     fn name(&self) -> &str {
         &self.name
@@ -838,10 +847,15 @@ impl Placement for ControlClip {
         self.source_offset = self.source_offset.saturating_add(i64::from(left_span));
         self.span_ticks = right_span.max(1);
     }
-    fn retain_from(&mut self, offset: u32, _sec_per_tick: f64) {
-        self.source_offset = self.source_offset.saturating_add(i64::from(offset));
-        self.span_ticks = self.span_ticks.saturating_sub(offset).max(1);
+    fn retain_from(&mut self, offset: i64, _sec_per_tick: f64) -> i64 {
+        // Span tracks the *applied* shift: a restore clamped at the data
+        // start grows the window back only by what actually moved.
+        let new_offset = (self.source_offset + offset).max(0);
+        let applied = new_offset - self.source_offset;
+        self.source_offset = new_offset;
+        self.span_ticks = (i64::from(self.span_ticks) - applied).max(1) as u32;
         self.window_follow = false;
+        applied
     }
     fn name(&self) -> &str {
         &self.name
@@ -888,12 +902,17 @@ impl Placement for AudioClip {
         self.source_offset += f64::from(left_span) * sec_per_tick;
         self.source_len = f64::from(right_span.max(1)) * sec_per_tick;
     }
-    // Head trim: shift the start, advance the window, shrink the window.
-    fn retain_from(&mut self, offset: u32, sec_per_tick: f64) {
-        let secs = f64::from(offset) * sec_per_tick;
-        self.start_ticks += offset;
-        self.source_offset += secs;
-        self.source_len = (self.source_len - secs).max(sec_per_tick);
+    // Head trim: advance/shrink the window (seconds), bounded at the material
+    // head — once `source_offset` sits at 0, a leftward drag moves nothing
+    // (F-041 M10.7/M10.10). The clip start follows the *applied* shift, which
+    // the caller derives from the returned value.
+    fn retain_from(&mut self, offset: i64, sec_per_tick: f64) -> i64 {
+        let offset_secs = offset as f64 * sec_per_tick;
+        let new_offset = (self.source_offset + offset_secs).max(0.0);
+        let applied_secs = new_offset - self.source_offset;
+        self.source_offset = new_offset;
+        self.source_len = (self.source_len - applied_secs).max(sec_per_tick);
+        (applied_secs / sec_per_tick).round() as i64
     }
     fn name(&self) -> &str {
         &self.name
@@ -1120,7 +1139,7 @@ fn stretch_targets(
     audio_tracks: &[AudioTrack],
     sec_per_tick: f64,
 ) -> Option<Vec<ClipSpanEdit>> {
-    let ModalKind::Stretch { .. } = modal.kind else {
+    let ModalKind::Stretch { start_edge } = modal.kind else {
         return None;
     };
     let ptr = ptr?;
@@ -1140,14 +1159,20 @@ fn stretch_targets(
                     sec_per_tick,
                     *sel,
                 )?;
-                // F-041 M10.3: T only grows the end edge. Left expansion is replaced by
-                // "move the notes right, move the clip left"; left trim (inside)
-                // stays available.
-                let d = tick_delta.clamp(bar - span as i64, max_end - (start + span) as i64);
-                let new_span = (span as i64 + d) as u32;
+                let (new_start, new_span) = if start_edge {
+                    // F-041 M10.7: the start edge adjusts the left trim —
+                    // deeper to the right, restore to the left. The model
+                    // layer caps the restore at the window's data start.
+                    let d = tick_delta.clamp(-(start as i64), span as i64 - bar);
+                    ((start as i64 + d) as u32, (span as i64 - d) as u32)
+                } else {
+                    // F-041 M10.6: the end edge stops at the last content bar.
+                    let d = tick_delta.clamp(bar - span as i64, max_end - (start + span) as i64);
+                    (start, (span as i64 + d) as u32)
+                };
                 Some(ClipSpanEdit {
                     sel: *sel,
-                    start_ticks: start,
+                    start_ticks: new_start,
                     span_ticks: new_span,
                 })
             })
@@ -1641,10 +1666,10 @@ pub fn show(
                     "the clips follow the pointer · LMB drops · RMB / Esc cancels",
                 ),
                 (
-                    "Stretch",
+                    "Trim",
                     "t",
                     Arm::Stretch,
-                    "pull the selection's end · s flips to the start · LMB drops",
+                    "trim the selection's end edge · s flips to the start edge · LMB drops",
                 ),
                 (
                     "Tile",
@@ -1766,9 +1791,9 @@ pub fn show(
                 }) => {
                     ui.weak(
                         egui::RichText::new(if *start_edge {
-                            "Stretch: LMB drop · RMB / Esc cancel"
+                            "Trim start: LMB drop · RMB / Esc cancel"
                         } else {
-                            "Stretch end: LMB drop · RMB / Esc cancel"
+                            "Trim end: LMB drop · RMB / Esc cancel · S: pull start instead"
                         })
                         .color(Color32::from_rgb(140, 200, 250)),
                     );
@@ -3767,10 +3792,11 @@ fn lane_row<T: Placement>(
                         ..
                     }) if clip < clips.len() => match edge {
                         ResizeEdge::Start => {
-                            // I6: the left edge trims the head — the start
-                            // moves right, the span shrinks, and the content
-                            // is re-based from the snapshot. Bar-snapped and
-                            // never closer than one bar to the tail.
+                            // I6 + F-041 M10.7: the left edge adjusts the head
+                            // trim both ways — deeper to the right, restore to
+                            // the left (bounded by the data start in the model
+                            // layer). Bar-snapped, never closer than one bar
+                            // to the tail.
                             let new_start = trim_head_start(
                                 tick_at(pos.x),
                                 origin_start,
@@ -3778,14 +3804,12 @@ fn lane_row<T: Placement>(
                                 meter,
                                 snap,
                             );
-                            let delta = new_start - origin_start;
-                            if delta > 0 {
+                            let delta = i64::from(new_start) - i64::from(origin_start);
+                            if delta != 0 {
                                 actions.push(TimelineAction::TrimClipHead {
                                     lane: row.lane(),
                                     track: row.track(),
                                     clip,
-                                    start_ticks: new_start,
-                                    span_ticks: origin_span - delta,
                                     delta_ticks: delta,
                                 });
                             }
@@ -4003,8 +4027,11 @@ fn lane_row<T: Placement>(
             });
             (alt_t, plain_t)
         });
-        // F-041 M10.3: T no longer flips to the start edge — left expansion was
-        // removed (move notes right + move clip left instead). Left trim stays.
+        // F-041 M10.7: S flips a live Stretch between the end edge and the start
+        // edge — the start edge adjusts the left trim (deeper, or restore).
+        let s = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::NONE, Key::S));
         let g = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::NONE, Key::G));
@@ -4095,7 +4122,16 @@ fn lane_row<T: Placement>(
                 }
             }
         }
-        // A live modal owns the keyboard; the clip-stretch start qualifier is gone.
+        // A live modal owns the keyboard: only the qualifiers answer —
+        // S flips a Stretch between the end edge and the start edge (the
+        // start edge adjusts the left trim, F-041 M10.7).
+        if s && let Some(modal) = &mut state.modal
+            && let ModalKind::Stretch { start_edge } = modal.kind
+        {
+            modal.kind = ModalKind::Stretch {
+                start_edge: !start_edge,
+            };
+        }
         // Arm G / Shift+D / T / Alt+T (Blender-style modal; arming one
         // tool clears the other).
         if (g || shift_d || t || alt_t) && state.modal.is_none() {
@@ -4445,10 +4481,11 @@ fn snap_bar(meter: &MeterMap, ticks: f32, snap: Snap) -> u32 {
 
 /// I6: the bar-snapped start of a head trim.
 ///
-/// Clamped to `[origin_start, origin_start + origin_span - 1 bar]`: the
-/// drag never extends the clip leftwards (MIDI/control carry no content
-/// offset to fill the gap) and never closes it past one bar. The bar length
-/// is the one at the clip origin.
+/// Clamped to `[0, origin_start + origin_span - 1 bar]`: the drag adjusts the
+/// left trim both ways (F-041 M10.7) — deeper to the right, restore to the
+/// left (bounded by the arrangement start; the model layer caps the restore
+/// at the window's data start) — and never closes the clip past one bar. The
+/// bar length is the one at the clip origin.
 pub(crate) fn trim_head_start(
     pointer_tick: f32,
     origin_start: u32,
@@ -4457,11 +4494,8 @@ pub(crate) fn trim_head_start(
     snap: Snap,
 ) -> u32 {
     let bar = meter.ticks_per_bar_at(origin_start).max(1);
-    let max_start = origin_start
-        .saturating_add(origin_span)
-        .saturating_sub(bar)
-        .max(origin_start);
-    snap_bar(meter, pointer_tick, snap).clamp(origin_start, max_start)
+    let max_start = origin_start.saturating_add(origin_span).saturating_sub(bar);
+    snap_bar(meter, pointer_tick, snap).clamp(0, max_start)
 }
 
 /// The insertion row a track-reorder drag points at, plus the screen y the
@@ -4561,9 +4595,10 @@ fn draw_tile_seams(
 /// content past `length_ticks`; a plain window goes blank there, matching the
 /// sequencer. There is no editing here: notes are edited in the piano roll.
 /// F-041 M10.5: shows where the content actually lives inside the window.
-/// A thin line spans the first..last event; two small teeth appear when the
-/// window edge cuts into that content. An adaptive fit never cuts, so it reads
-/// as "flush"; a manual trim that clips notes shows the teeth.
+/// A thin line spans the first..last event. A manual trim that cuts into that
+/// content draws a full-height zig-zag band along the clipped edge — corner
+/// teeth were too small to tell a trimmed edge from a plain one. An adaptive
+/// fit never cuts, so it reads as "flush" (no band).
 fn draw_content_extent(
     painter: &egui::Painter,
     rect: Rect,
@@ -4587,29 +4622,36 @@ fn draw_content_extent(
             Stroke::new(1.0, Color32::from_rgba_unmultiplied(140, 175, 215, 135)),
         );
     }
-    let tooth = Color32::from_rgba_unmultiplied(195, 220, 250, 200);
+    // F-041 M10.5: a trimmed edge wears a full-height zig-zag band — short
+    // diagonal strokes stacked down the clipped side, unmistakable next to a
+    // plain edge.
+    const TOOTH_W: f32 = 4.0;
+    const TOOTH_H: f32 = 5.0;
+    let tooth = Stroke::new(1.3, Color32::from_rgba_unmultiplied(175, 215, 255, 255));
     if content_start < source_offset {
-        for k in 0..2 {
-            let x = rect.left() + 3.0 + k as f32 * 3.0;
+        let mut y = rect.top() + 1.0;
+        while y + TOOTH_H <= rect.bottom() {
             painter.line_segment(
                 [
-                    pos2(x, rect.bottom() - 9.0),
-                    pos2(x - 3.0, rect.bottom() - 3.0),
+                    pos2(rect.left() + 1.0, y),
+                    pos2(rect.left() + 1.0 + TOOTH_W, y + TOOTH_H),
                 ],
-                Stroke::new(1.2, tooth),
+                tooth,
             );
+            y += TOOTH_H;
         }
     }
     if content_end > window_end {
-        for k in 0..2 {
-            let x = rect.right() - 3.0 - k as f32 * 3.0;
+        let mut y = rect.top() + 1.0;
+        while y + TOOTH_H <= rect.bottom() {
             painter.line_segment(
                 [
-                    pos2(x, rect.bottom() - 9.0),
-                    pos2(x + 3.0, rect.bottom() - 3.0),
+                    pos2(rect.right() - 1.0 - TOOTH_W, y),
+                    pos2(rect.right() - 1.0, y + TOOTH_H),
                 ],
-                Stroke::new(1.2, tooth),
+                tooth,
             );
+            y += TOOTH_H;
         }
     }
 }
@@ -4850,18 +4892,18 @@ mod tests {
         );
     }
 
-    /// I6: the head-trim start is bar-snapped, never moves left of the drag
-    /// origin (no leftwards extension without a content offset), and always
-    /// leaves at least one bar of clip.
+    /// I6 + F-041 M10.7: the head-trim start is bar-snapped, restores left of
+    /// the drag origin (down to the arrangement start), and always leaves at
+    /// least one bar of clip.
     #[test]
     fn head_trim_start_is_snapped_and_clamped() {
         let bar = TICKS_PER_BAR;
         let start = 2 * bar;
         let span = 4 * bar;
-        // Pointer left of the origin: refused.
+        // Pointer left of the origin: restores all the way to the start.
         assert_eq!(
             trim_head_start(0.0, start, span, &meter((4, 4)), Snap::on(i64::from(bar))),
-            start
+            0
         );
         // Inside the clip: follows the bar grid.
         assert_eq!(
@@ -4887,7 +4929,8 @@ mod tests {
         );
     }
 
-    /// F-041: a head trim moves the window; the shared content is untouched.
+    /// F-041 M10.7: a head trim moves the window (positive delta) and a
+    /// restore moves it back (negative delta); the content is untouched.
     #[test]
     fn head_trim_moves_the_window_without_touching_content() {
         let mut clip = MidiClip {
@@ -4896,10 +4939,18 @@ mod tests {
             source_offset: 0,
             ..MidiClip::default()
         };
-        let delta = 1200;
+        let delta: i64 = 1200;
         clip.retain_from(delta, SPT);
-        assert_eq!(clip.source_offset, i64::from(delta));
-        assert_eq!(clip.span_ticks, 2 * TICKS_PER_BAR - delta);
+        assert_eq!(clip.source_offset, delta);
+        assert_eq!(clip.span_ticks as i64, 2 * i64::from(TICKS_PER_BAR) - delta);
+        // Restore: bounded at the data start (offset never goes below 0).
+        clip.retain_from(-delta - 500, SPT);
+        assert_eq!(clip.source_offset, 0, "restore stops at the data start");
+        assert_eq!(
+            clip.span_ticks as i64,
+            2 * i64::from(TICKS_PER_BAR),
+            "the window is whole again"
+        );
     }
 
     /// W3a: clip names are optional and the `Placement` helpers are the
@@ -5864,8 +5915,8 @@ mod tests {
         .unwrap();
         assert_eq!(targets[0].span_ticks, TICKS_PER_BAR);
         assert_eq!(targets[0].start_ticks, 2 * TICKS_PER_BAR);
-        // F-041 M10.3: the start qualifier is retired; it behaves as the end edge
-        // (2 bars + 3 bars).
+        // F-041 M10.7: the start edge adjusts the head trim — pointer 3 bars
+        // right trims deeper, clamped at one bar kept (2 bars + 1 bar deep).
         let start = Modal {
             kind: ModalKind::Stretch { start_edge: true },
             origin: vec![ClipSel {
@@ -5886,8 +5937,8 @@ mod tests {
             SPT,
         )
         .unwrap();
-        assert_eq!(targets[0].start_ticks, 2 * TICKS_PER_BAR);
-        assert_eq!(targets[0].span_ticks, 5 * TICKS_PER_BAR);
+        assert_eq!(targets[0].start_ticks, 3 * TICKS_PER_BAR);
+        assert_eq!(targets[0].span_ticks, TICKS_PER_BAR);
     }
 
     // ---- U11: audio clips take the same modal geometry ------------------
