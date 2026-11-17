@@ -12,4 +12,3 @@ crate-type = ["cdylib"]
 
 [dependencies]
 vst3 = { workspace = true }
-log = { workspace = true }

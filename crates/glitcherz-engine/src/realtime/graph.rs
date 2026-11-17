@@ -3276,11 +3276,8 @@ mod tests {
             "master output should carry a signal after track 0 is triggered"
         );
         assert!(levels.tracks[0] > 0.05);
-        for i in 1..DEFAULT_MIDI_TRACKS {
-            assert!(
-                levels.tracks[i].abs() < 1e-9,
-                "untriggered tracks should be silent"
-            );
+        for level in &levels.tracks[1..DEFAULT_MIDI_TRACKS] {
+            assert!(level.abs() < 1e-9, "untriggered tracks should be silent");
         }
         // In the fixed-capacity 16 tracks, unconfigured tracks (beyond the
         // default 4) are always 0.

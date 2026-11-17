@@ -1227,7 +1227,6 @@ dependencies = [
 name = "glitcherz-test-vst3"
 version = "0.1.0-preview.1"
 dependencies = [
- "log",
  "vst3",
 ]
 
