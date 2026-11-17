@@ -68,7 +68,7 @@
 | F-043 | 用户波表导入（单周期 WAV → 第 5 帧） | VOICE / PROJ | `wavetable-import.md` | 用户表导入 |
 | F-044 | 聚合 Curve 输入口（每个可控制节点一个黄口） | UI / PATCH / EDIT | `curve-port.md` | — |
 | F-045 | 吸附档位与磁性边界（精确裁剪） | EDIT / UI | `snap-granularity.md` | — |
-| F-046 | 数据池面板与 clip 右键菜单（F-041 M7 展开） | EDIT / UI / PROJ | `clip-data-panel.md` | — |
+| F-046 | 数据池面板与 clip 右键菜单（F-041 M7 展开） | EDIT / UI / PROJ | `clip-data-panel.md` | M1 已交付（M2/M3 待做） |
 | F-047 | 时间轴缩放：只留滚轮与键盘 | UI / EDIT | `timeline-zoom.md` | — |
 
 > 无独立 spec 的历史条目（transport / 文件管理 U2 / U10 / U14 / I 系列 / B2 / W3a–c 等）保留字母别名，不做回溯编号；新特性一律先写 spec 再领号。

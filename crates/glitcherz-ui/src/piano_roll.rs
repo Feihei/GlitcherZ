@@ -4216,6 +4216,7 @@ mod tests {
 
     fn data_with(notes: Vec<Note>) -> MidiData {
         MidiData {
+            name: String::new(),
             sequence: glitcherz_model::Sequence {
                 notes,
                 ctrls: Vec::new(),

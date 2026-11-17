@@ -1,7 +1,7 @@
 # 数据池面板与 clip 右键菜单
 
 > ID: F-046 · 域: EDIT / UI / PROJ
-> 状态：**设计已定，待实施**（2026-11-17 立项）
+> 状态：**M1 已实施**（2026-11-17）；M2 / M3 待做
 > 关联：`clip-data-instances.md`（F-041 D15/D17/D27 的 M7 展开，本特性取代之）、`timeline.md`（W3b 编组、B2 静音）、`clipboard.md`、`snap.md`、`command-vocabulary.md`
 
 ## 1. 问题
@@ -174,4 +174,32 @@ data_focus: Option<(DataKind, u32)>,        // Show in Data 的目标行高亮
 
 ## 9. 实施记录
 
-（待实施）
+### M1 · 2026-11-17 交付
+
+**落了什么**
+
+| 项 | 落点 |
+| :--- | :--- |
+| 数据名称 | `MidiData::name` / `CurveData::name`，`#[serde(default, skip_serializing_if = "String::is_empty")]`；`PROJECT_VERSION` 未动（仍 14）。构造点用 `..Default::default()` 或显式 `String::new()` 补齐 |
+| 池查询 | `Project::midi_data_users` / `curve_data_users` / `unused_data_count`（`model/lib.rs`，紧邻已有的 `*_data_refs`） |
+| 面板 | 新 `crates/glitcherz-ui/src/data_panel.rs`：`DataFilter`、`DataRow`、`rows()`、`summary()`、`show()` |
+| 布局 | `timeline_ops.rs::timeline_panel`，`timeline::show` **之前**声明 `Panel::bottom`（D3） |
+| 视图状态 | `GlitcherZApp::{data_panel_open, data_filter}`，默认 `false` / `All`（D4） |
+| 文档 | `docs/manual.md` 新增「数据面板」一节 |
+
+**与设计不同的地方**
+
+1. **调用点在波形闭包之前**，不是笼统的「`timeline::show` 之前」：`timeline_panel` 里那个 `waveform_of` 闭包借了 `&self.sample_library` 活到 `timeline::show` 结束，之后没法再拿 `&mut self.data_panel_open`。面板因此放在闭包构造之前，语义仍是「先占高度、轨道拿剩余」。
+2. **过滤用三个 `selectable_label`**（`right_to_left` 布局，阅读顺序 `All | MIDI | Curve`），不是 `ComboBox`：三个固定值不值得一次弹层；也避免像吸附下拉那样在测试里从外部点不到。
+3. **引用数按帧建表**：`ref_counts()` 扫一遍所有 clip 得到 `Vec<usize>`，行查询是 O(1)。逐行调 `midi_data_refs` 是 O(行 × clip)，池到 4096 时会卡。与 §3 的「按需算并缓存在帧内」同义。
+4. **`Length` 列按 4/4 折算**（`TICKS_PER_BAR`）：池里的数据没有自己的拍号，长度只是给行之间做比较用的量级，不参与任何放置。
+5. **表格手绘列**（`add_sized` + `Label::truncate`）而非 `egui::Grid`：配 `ScrollArea::show_rows` 只画可见行（§8 的性能缓解），Grid 做不到按行切片。
+6. **`data_search` / `data_rename` / `data_focus` 未加**：属于 M2，字段等实现时再进 `GlitcherZApp`，现在加空壳只会漂移。
+
+**验收进度**（§6 编号）
+
+- ✅ 1（面板出现两行、`引用` 各 1、名称为 `MIDI #N`）、15（工程不含分栏状态、版本仍 14）、16（只在 Timeline 出现、开合与高度保持、轨道与标尺照常滚动缩放）
+- ⏳ 2–14 依赖 M2 / M3
+
+**测试**：`data_panel` 5 个单测（空名回退、命名显示、孤儿计数、过滤、引用数与 `*_data_users`）；`cargo test -p glitcherz-model -p glitcherz-ui` 全绿；`cargo clippy -p glitcherz-ui --all-targets -- -D warnings` 零告警；`cargo check --workspace --all-targets` 干净（沙箱外）。
+

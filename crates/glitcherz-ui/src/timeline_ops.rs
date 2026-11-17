@@ -106,6 +106,19 @@ impl GlitcherZApp {
             // MIDI outline (its curve editor is separate, U12).
             EditTarget::Control { .. } => None,
         });
+        // F-046 D3/D4: the `Data` strip is a bottom panel *of this view*. It
+        // has to claim its height before `timeline::show` lays the rows out —
+        // a bottom panel declared afterwards would be pushed off the tab —
+        // so it sits here, above the waveform closure that borrows `self`.
+        {
+            let project = self.session.project();
+            data_panel::show(
+                ui,
+                project,
+                &mut self.data_panel_open,
+                &mut self.data_filter,
+            );
+        }
         // U6: audio clip bodies read peaks from the session sample cache
         // (read-only lookup — decoding happens on the edit paths).
         //
@@ -2648,6 +2661,7 @@ mod tests {
 
     fn clip_with_one_note(project: &mut Project) -> MidiClip {
         let data = project.push_midi_data(MidiData {
+            name: String::new(),
             sequence: Sequence {
                 notes: vec![Note {
                     start: 0,

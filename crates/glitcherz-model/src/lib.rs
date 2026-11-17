@@ -1796,6 +1796,12 @@ pub const MAX_CLIP_DATA_ENTRIES: usize = 4096;
 /// and editing one of them changes every reference.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MidiData {
+    /// Display name (F-046 D1). Additive field: a project saved before it
+    /// existed loads with an empty name and shows its pool slot instead, and
+    /// `PROJECT_VERSION` stays put. This is the only stable handle a data
+    /// entry has — `#id` is a pool slot that `compact_clip_data` renumbers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     /// Note and controller content, relative to the data start.
     #[serde(default)]
     pub sequence: Sequence,
@@ -1834,6 +1840,9 @@ impl MidiData {
 /// content, so linked clips share the interpolation mode too.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CurveData {
+    /// Display name (F-046 D1); see [`MidiData::name`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     /// Anchor curve (ticks relative to the data start, ascending).
     #[serde(default)]
     pub points: Vec<AutoPoint>,
@@ -2090,6 +2099,7 @@ impl MidiClip {
         let length = self.legacy_loop_ticks.max(self.span_ticks).max(1);
         self.data = pool.len() as u32;
         pool.push(MidiData {
+            name: String::new(),
             sequence,
             length_ticks: length,
         });
@@ -6634,6 +6644,58 @@ impl Project {
             .count()
     }
 
+    /// Every MIDI clip that references `data`, as `(track, clip)` (F-046 D11:
+    /// the data panel's reference column selects them).
+    pub fn midi_data_users(&self, data: u32) -> Vec<(usize, usize)> {
+        let mut users = Vec::new();
+        for (track, t) in self.midi_tracks.iter().enumerate() {
+            for (clip, c) in t.clips.iter().enumerate() {
+                if c.data == data {
+                    users.push((track, clip));
+                }
+            }
+        }
+        users
+    }
+
+    /// Every control clip that references `data`, as `(track, clip)`.
+    pub fn curve_data_users(&self, data: u32) -> Vec<(usize, usize)> {
+        let mut users = Vec::new();
+        for (track, t) in self.control_tracks.iter().enumerate() {
+            for (clip, c) in t.clips.iter().enumerate() {
+                if c.data == data {
+                    users.push((track, clip));
+                }
+            }
+        }
+        users
+    }
+
+    /// Orphan entries in the pools, as `(midi, curve)` (F-046 D15: the data
+    /// panel greys them out and offers `Purge Unused`).
+    pub fn unused_data_count(&self) -> (usize, usize) {
+        let mut midi_used = vec![false; self.midi_data.len()];
+        for track in &self.midi_tracks {
+            for clip in &track.clips {
+                if let Some(slot) = midi_used.get_mut(clip.data as usize) {
+                    *slot = true;
+                }
+            }
+        }
+        let mut curve_used = vec![false; self.curve_data.len()];
+        for track in &self.control_tracks {
+            for clip in &track.clips {
+                if let Some(slot) = curve_used.get_mut(clip.data as usize) {
+                    *slot = true;
+                }
+            }
+        }
+        (
+            midi_used.iter().filter(|u| !**u).count(),
+            curve_used.iter().filter(|u| !**u).count(),
+        )
+    }
+
     /// Pushes a new MIDI data entry and returns its pool index.
     pub fn push_midi_data(&mut self, data: MidiData) -> u32 {
         let index = self.midi_data.len() as u32;
@@ -7211,6 +7273,7 @@ impl Project {
                     ti,
                     ci,
                     MidiData {
+                        name: String::new(),
                         sequence: std::mem::take(&mut clip.legacy_sequence),
                         length_ticks: clip.legacy_loop_ticks.max(clip.span_ticks).max(1),
                     },
@@ -7242,6 +7305,7 @@ impl Project {
                     ti,
                     ci,
                     CurveData {
+                        name: String::new(),
                         points: std::mem::take(&mut clip.legacy_curve),
                         interp: clip.legacy_interp,
                         length_ticks: clip.legacy_loop_ticks.max(clip.span_ticks).max(1),

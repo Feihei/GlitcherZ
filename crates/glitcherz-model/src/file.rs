@@ -274,6 +274,7 @@ mod tests {
         project.metadata.tempo_bpm = 140.0;
         project.midi_tracks[0].name = "Bass".to_string();
         let data = project.push_midi_data(crate::MidiData {
+            name: String::new(),
             sequence: crate::Sequence {
                 notes: vec![
                     Note {
@@ -304,6 +305,7 @@ mod tests {
         // Control track 0: one bar clip, cabled to the global mixer's
         // channel 0 gain.
         let curve = project.push_curve_data(crate::CurveData {
+            name: String::new(),
             points: vec![AutoPoint {
                 tick: 0,
                 value: 1.0,

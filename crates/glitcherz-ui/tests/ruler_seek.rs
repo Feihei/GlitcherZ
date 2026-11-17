@@ -269,6 +269,7 @@ fn timeline_ruler_drag_still_scrubs() {
 fn roll_ruler_bare_click_places_the_playhead() {
     let ctx = egui::Context::default();
     let data = MidiData {
+        name: String::new(),
         sequence: Sequence::default(),
         length_ticks: TICKS_PER_BAR,
     };

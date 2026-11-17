@@ -74,6 +74,7 @@ struct LaneFixture {
 impl Fixture {
     fn new() -> Self {
         let data = MidiData {
+            name: String::new(),
             sequence: Sequence {
                 notes: vec![
                     Note {
@@ -1081,6 +1082,7 @@ fn a_ghost_note_is_painted_but_never_hit() {
     // Ghost clip one bar after the focus, same pitch row as note A.
     let idx = f.midi_data.len() as u32;
     f.midi_data.push(MidiData {
+        name: String::new(),
         sequence: Sequence {
             notes: vec![Note {
                 start: 0,

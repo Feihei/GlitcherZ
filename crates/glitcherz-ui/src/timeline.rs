@@ -5270,6 +5270,7 @@ mod tests {
     #[test]
     fn content_edges_are_mapped_through_the_source_offset() {
         let data = MidiData {
+            name: String::new(),
             sequence: glitcherz_model::Sequence {
                 notes: vec![
                     glitcherz_model::Note {
@@ -5695,6 +5696,7 @@ mod tests {
     #[test]
     fn midi_preview_handles_degenerate_inputs() {
         let data = glitcherz_model::MidiData {
+            name: String::new(),
             sequence: glitcherz_model::Sequence {
                 notes: vec![
                     Note {
