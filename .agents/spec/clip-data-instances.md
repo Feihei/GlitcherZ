@@ -55,9 +55,9 @@ Blender 式 object / mesh 分离：**多个 clip 可以引用同一份 MIDI / cu
 | D12 | 影响面 | 改 data 时要重推**所有引用它的 track** 的 clip 表，不能只推当前 track。新增 `sync_clip_data(data_id)` 按引用扫描 |
 | D13 | 文件版本 | `PROJECT_VERSION` 11 → 12；再 12 → 13（2026-11-12 修订加入 `repeat`）。v11→v12：旧 `loop_ticks` → `length_ticks`，`source_offset = 0`，每个旧 clip **各自独占一份 data**。v12→v13：`span > length` 的旧窗口全部标 `repeat = true`，保持旧平铺行为；新 clip 默认 `repeat = false` |
 | D14 | 池回收 | 允许孤儿数据。保存时用临时副本 compact（只影响落盘内容）；运行时池达到 `MAX_CLIP_DATA_ENTRIES`（4096）时做一次 compact + 索引重映射 |
-| D15 | UI 入口 | clip header 徽章行追加共享徽章 + 引用数；Inspector 新增 clip 区块，给 `Link Data` / `Unlink`；Edit 头显示 `shared by N clips`。**不做独立数据面板**（留 M7） |
+| D15 | UI 入口 | clip header 徽章行追加共享徽章 + 引用数；Edit 头显示 `shared by N clips`。~~Inspector 新增 clip 区块~~ **已由 F-046 撤销**：Inspector 只显示节点参数，`Link Data` / `Unlink` 与数据浏览迁入时间轴底部 `Data` 分栏 + clip 右键菜单（`clip-data-panel.md` D3/D5/D7） |
 | D16 | 命令层 | M6 新增 `clip.link_data` / `clip.unlink_data`；同步更新命令计数断言（F-039 V3 的 23 → 25） |
-| D17 | 明确不做 | 跨类型共享（MIDI data 给 curve clip）、独立数据面板（M7）、数据命名、播放中切换 data、音频媒体池、数据级自动化 |
+| D17 | 明确不做 | 跨类型共享（MIDI data 给 curve clip）、播放中切换 data、音频媒体池、数据级自动化。~~独立数据面板（M7）、数据命名~~ **改由 F-046 承接**（数据名 + 底部面板，见 `clip-data-panel.md`） |
 | D18 | 窗口两端越界（M10） | `source_offset` 改 `i64`；窗口 `[offset, offset+span)` 允许负起点（前导空白）与超出 `length`（尾部空白）；不再要求 offset ∈ [0, length) |
 | D19 | 显式周期（M10） | `repeat: bool` → `loop_ticks: Option<u32>`；`None` 不循环，`Some(p)` 以 `p` 为周期；周期与 `data.length_ticks` 解耦，允许 `p != length` 与 `p > span` |
 | D20 | T 纯窗口（M10） | T / 拖边只写窗口字段，**绝不改 `length_ticks`、不移动事件**；卷帘编辑范围 = 窗口，越界写入时把 `length` 增长到事件末端（写时增长），共享 data 在此时才 COW |
@@ -283,8 +283,8 @@ enum ClipSnapshot {
 | **M3** 接入 | `command` helper + `headless::midi_clip_table` + `sync_clip_data` + 剪贴板快照扩展 | M2 | 中 |
 | **M4** 卷帘 | 编辑范围 `length_ticks`、窗口标线、窗口外降透明度、`RollSubject` 传 data 切片 | M3 | 中偏大 |
 | **M5** timeline | `Placement` / trim / split / T / tile / 复制模式 / `×N` / seam | M3 | 中 |
-| **M6** UI 入口 | header 徽章 + Inspector clip 区块 + Edit 头 + 右键菜单 + `clip.link_data` / `clip.unlink_data` + 文档 | M4、M5 | 中 |
-| **M7** 数据面板（可选） | 数据池浏览 / 命名 / 批量替换引用 | M6 | 大 |
+| **M6** UI 入口 | header 徽章 + Edit 头 + `clip.link_data` / `clip.unlink_data` + 文档（Inspector clip 区块已由 F-046 撤销） | M4、M5 | 中 |
+| **M7** 数据面板 | **已独立为 F-046**（`clip-data-panel.md`）：数据命名 + 时间轴底部 `Data` 分栏 + 引用跳转 + `Purge Unused` + clip 右键菜单 | M6 | 大 |
 | **M8**（2026-11-12 修订） | `repeat` 标记 + v12→v13 迁移 + 引擎/预览非循环尾部静默 + `Shift+D`/`Alt+D` 复制语义 + T 清 `repeat` / Tile 设 `repeat` | M6 | 中 |
 | **M9** 收敛补口（2026-11-12 review，无迁移） | `sync_clip_data` + 卷帘 / 命令 / Link 调用点；保存与自动保存 temp compact；批量复制 / 拉伸按 data 分组 COW；`Link Data` 按原 data 分组合并、`Unlink` 逐个展开；同轨 `Shift` 区间选择；`ClipTileEdit.loop_ticks` 改名 `period_ticks`（纯改名） | M8 | 中 |
 | **M10** 窗口内嵌 + T 纯窗口（2026-11-12 review） | clip 内嵌窗口字段：`source_offset: i64`、`repeat` → `loop_ticks: Option<u32>`（**不拆 window 池**）；单轨上限 32 → 128 + 结构队列 `Box` 载荷；T / 拖边纯窗口 + 卷帘写时增长；引擎负相位与显式周期；**一次** v13→v14 迁移（含平铺 → N 个 clip）；零回归门禁 | M9 | 中 |
