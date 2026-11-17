@@ -84,6 +84,7 @@ Blender 式 object / mesh 分离：**多个 clip 可以引用同一份 MIDI / cu
 | D42 | 卷帘编辑范围 = 可见空白（M10.9，2026-11-16 修订） | 创建 / 拖长音符的右界 = 可见右缘（不再 clamp 到 `loop_ticks`）：在 clip 右缘之外的空白处点击 / 拖动直接写入，窗口随后按 D41 自动跟随；但可写区止于**右侧最近的 ghost clip 左缘**——ghost 身体永远是 no-op（写入会让本 clip 扩窗盖住邻居，P3 D2 保留）；网格绘制覆盖可见区域；`window_follow` 关闭时同样成立（写入即扩窗，覆盖 D36 的「先 T 右扩才能写」） |
 | D43 | 窗口边界钳制（M10.10） | 左缘拖动钳制在**数据起点**：`retain_from` 返回 applied（实际移动量，`source_offset=0` 后恢复量为 0），clip start/span 按 applied 推导——拖过数据起点不再整体左滑 + 右缘膨胀（audio 同规则，钳在素材头）；右缘拖动 / `T` 扩展钳制在**最后内容小节末端**（`content_span_cap`，遗留超限窗口扩展为 no-op、缩短自由）；head trim 应用层不再用指针绝对值覆盖 start/span |
 | D44 | 拖动期间冻结时间轴比例（M10.11） | D41 的每帧扩窗 + 卷帘 fit 基准跟随窗口构成正反馈：`ticks_to_x = width / fit_ticks` 随窗口每帧变小，指针同一屏幕 x 映射到越来越远的 tick → 音符指数增长（误画 100+ 小节的根因）。修复：音符拖动（move / 两侧 trim / draw）抓住时冻结有效 `ticks_to_x`（`RollState::drag_scale`，draw 经 `AwaitCreate.scale` 传给 `resolve_created`），整段手势 pointer→tick 映射稳定；松手时把冻结比例折算进 `zoom_x`（`frozen / fit_ticks_to_x`，钳在 ZOOM_X 上下限）——视图无 refit 跳变；冻结期间 Ctrl+滚轮缩放禁用（避免 `zoom_scroll_anchor` 在冻结比例下改 scroll_x 造成平移假象） |
+| D45 | 空片段不可扩展（2026-11-17） | 数据池里没有任何事件时，右缘拖动与 `T` 的增长上限 = 当前窗口（可缩不可长）：双击新建的一小节空 clip 不能被拖成任意长。要加长先在卷帘写音符——D41/D42 的写时增长会自动扩窗，这是唯一允许窗口超过内容的路径。曲线 clip 同规则（无 anchor = 不可长）。旧实现用 `content_end > 0` 判断，空数据刚好落进「不钳制」分支，等于没有上限。 |
 | D27 | 本次不做 | `TileSpec` / explode / 嵌套 tile / 记录 tile 份数、per-repeat override、自动 group、音频 tile、独立 window 面板（归 M7 扩展）、`ClipId` |
 
 ## 3. 数据结构
