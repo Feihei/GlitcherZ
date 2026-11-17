@@ -58,10 +58,13 @@ pub const ROW_HEIGHT: f32 = 40.0;
 /// Row-height zoom bounds (multiplier over [`ROW_HEIGHT`]).
 const ROW_ZOOM_MIN: f32 = 0.5;
 const ROW_ZOOM_MAX: f32 = 3.0;
-/// Horizontal zoom bounds (pixels per bar; the toolbar +/- buttons share
-/// them).
+/// Horizontal zoom bounds (pixels per bar; the wheel and the `-` / `=`
+/// keys share them).
 pub const PX_PER_BAR_MIN: f32 = 14.0;
 pub const PX_PER_BAR_MAX: f32 = 280.0;
+/// One keyboard zoom step (F-047): the factor the retired toolbar `-` / `+`
+/// pair used, now on `-` / `=`. The wheel stays continuous.
+const ZOOM_STEP: f32 = 1.3;
 /// Height of the bar-number ruler.
 const RULER_HEIGHT: f32 = 20.0;
 /// Half-width of the grab zone at a loop brace's edges (U1).
@@ -350,9 +353,10 @@ pub struct TimelineState {
     /// the pointer is over the rows, so zoom can be applied *before* the
     /// ScrollArea lays out (zoom + offset compensation in one frame).
     rows_rect: Option<Rect>,
-    /// Last frame's scroll viewport origin (screen coordinates) — the
-    /// anchor math for pointer-anchored horizontal zoom.
-    rows_viewport_min: Pos2,
+    /// Last frame's scroll viewport (screen coordinates) — the anchor math
+    /// for pointer-anchored horizontal zoom, and the centre the `-` / `=`
+    /// keys zoom around. `None` before the first frame with rows.
+    rows_viewport: Option<Rect>,
 
     /// Track-reorder drag (header grab handle): the lane and track index the
     /// grab started on.
@@ -414,7 +418,7 @@ impl Default for TimelineState {
             modal_confirm: false,
             modal_cancel: false,
             rows_rect: None,
-            rows_viewport_min: Pos2::ZERO,
+            rows_viewport: None,
             reorder: None,
             loop_drag: None,
             meter_drag: None,
@@ -474,6 +478,38 @@ impl TimelineState {
             msg.into(),
             std::time::Instant::now() + std::time::Duration::from_secs(5),
         ));
+    }
+
+    /// F-047: one horizontal zoom step anchored on the screen x `anchor` —
+    /// the pointer for the wheel, the viewport centre for `-` / `=`. Keeps
+    /// the tick under `anchor` in place by returning the scroll offset the
+    /// ScrollArea should adopt, or `None` when the scale is already clamped
+    /// at that end (no offset to chase).
+    ///
+    /// Both callers run *before* the ScrollArea lays out (see the view
+    /// navigation block), so the zoom and its offset compensation land in
+    /// the same frame instead of jumping for one.
+    fn zoom_time_axis(
+        &mut self,
+        ctx: &egui::Context,
+        scroll_id: Id,
+        base_bar_ticks: u32,
+        anchor: f32,
+        factor: f32,
+    ) -> Option<Vec2> {
+        let old = self.px_per_bar;
+        let new = (old * factor).clamp(PX_PER_BAR_MIN, PX_PER_BAR_MAX);
+        if new == old {
+            return None;
+        }
+        let offset = egui::containers::scroll_area::State::load(ctx, scroll_id)
+            .map_or(Vec2::ZERO, |s| s.clamped_offset());
+        let dx = anchor - self.rows_viewport.map_or(Pos2::ZERO, |r| r.min).x;
+        let old_ppt = old / base_bar_ticks as f32;
+        let tick = ((offset.x + dx) / old_ppt).max(0.0);
+        let new_ppt = new / base_bar_ticks as f32;
+        self.px_per_bar = new;
+        Some(Vec2::new((tick * new_ppt - dx).max(0.0), offset.y))
     }
 }
 
@@ -1547,22 +1583,13 @@ pub fn show(
             let Some(ptr) = ptr else {
                 unreachable!("in_rows implies ptr")
             };
-            let vmin = state.rows_viewport_min;
-            let offset = egui::containers::scroll_area::State::load(ui.ctx(), scroll_id)
-                .map_or(Vec2::ZERO, |s| s.clamped_offset());
             // Time axis: uniform zoom (pure Ctrl) or horizontal-only (the
             // touch pinch case). Anchor the tick under the pointer.
-            if zoom2.x != 1.0 {
-                let old = state.px_per_bar;
-                let new = (old * zoom2.x).clamp(PX_PER_BAR_MIN, PX_PER_BAR_MAX);
-                if new != old {
-                    let old_ppt = old / base_bar_ticks as f32;
-                    let tick = ((offset.x + ptr.x - vmin.x) / old_ppt).max(0.0);
-                    let new_ppt = new / base_bar_ticks as f32;
-                    let anchored = (tick * new_ppt - (ptr.x - vmin.x)).max(0.0);
-                    state.px_per_bar = new;
-                    scroll_target = Some(Vec2::new(anchored, offset.y));
-                }
+            if zoom2.x != 1.0
+                && let Some(target) =
+                    state.zoom_time_axis(ui.ctx(), scroll_id, base_bar_ticks, ptr.x, zoom2.x)
+            {
+                scroll_target = Some(target);
             }
             // Row height: only a vertical-only factor (Ctrl+Alt) resizes
             // the rows — a uniform zoom belongs to the time axis above.
@@ -1570,6 +1597,45 @@ pub fn show(
                 state.row_zoom = (state.row_zoom * zoom2.y).clamp(ROW_ZOOM_MIN, ROW_ZOOM_MAX);
             }
             ui.ctx().request_repaint();
+        }
+        // F-047: the discrete step the toolbar's old -/+ pair used to give,
+        // now on the keyboard. `=` / `-` are unshifted on every layout we
+        // ship for, so they need no modifier; `+` (Shift+=) and the numpad
+        // spellings come along. Anchored on the viewport centre: there is no
+        // pointer that means "here" when the keys drive the view, and a lane
+        // hover would make the same key zoom different spots. View-level
+        // like Ctrl+A — gated on the timeline owning the keys, never on a
+        // hovered lane.
+        if state.modal.is_none()
+            && !ui.ctx().text_edit_focused()
+            && state.owns_keyboard_focus(ui.ctx())
+            && let Some(viewport) = state.rows_viewport
+        {
+            let step = ui.ctx().input_mut(|i| {
+                let zoom_out = i.consume_key(Modifiers::NONE, Key::Minus);
+                let zoom_in = i.consume_key(Modifiers::NONE, Key::Equals)
+                    || i.consume_key(Modifiers::SHIFT, Key::Equals)
+                    || i.consume_key(Modifiers::SHIFT, Key::Plus);
+                if zoom_out {
+                    Some(1.0 / ZOOM_STEP)
+                } else if zoom_in {
+                    Some(ZOOM_STEP)
+                } else {
+                    None
+                }
+            });
+            if let Some(factor) = step
+                && let Some(target) = state.zoom_time_axis(
+                    ui.ctx(),
+                    scroll_id,
+                    base_bar_ticks,
+                    viewport.center().x,
+                    factor,
+                )
+            {
+                scroll_target = Some(target);
+                ui.ctx().request_repaint();
+            }
         }
         // Middle-drag pans the viewport (the ScrollArea's drag-to-scroll is
         // touch-only by default). Ctrl+middle is the clip-mute toggle (B2),
@@ -1609,16 +1675,11 @@ pub fn show(
         view = view.scroll_offset(target);
     }
     view.show(ui, |ui| {
-        // Toolbar: zoom + track add/remove + hints.
+        // Toolbar: snap grid + track add/remove + hints. No zoom widget
+        // (F-047): the axis has two dimensions, so one -/+ pair can only
+        // ever lie about one of them, and `Ctrl` / `Ctrl+Alt` + wheel
+        // already covers both continuously.
         ui.horizontal(|ui| {
-            ui.strong("Arrangement");
-            if ui.button("-").on_hover_text("Zoom out").clicked() {
-                state.px_per_bar = (state.px_per_bar / 1.3).max(PX_PER_BAR_MIN);
-            }
-            if ui.button("+").on_hover_text("Zoom in").clicked() {
-                state.px_per_bar = (state.px_per_bar * 1.3).min(PX_PER_BAR_MAX);
-            }
-            ui.separator();
             // F-045: the timeline's snap grid. Session-level view state, the
             // same rule the roll's grid follows — a working preference, not
             // project data. No Off / Tick entry: Ctrl is the tick override.
@@ -1865,7 +1926,7 @@ pub fn show(
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(
-                        "Drag move · either edge: trim (head included) · T: extend time · Shift+T / Alt+T: tile · Shift+D: copy (own data) · Alt+D: copy (shared data) · dbl-click edit · F2 / Alt+dbl-click: rename · Ctrl+G group · Ctrl+Shift+G ungroup · Alt+click: single · right-click delete · Ctrl+MMB mute clip · H mute / Alt+H unmute all · marquee select · Del · K knife · dots: reorder track · ruler: seek / Ctrl+loop / RMB marker · Ctrl+wheel zoom · Ctrl+Alt+wheel height · MMB pan",
+                        "Drag move · either edge: trim (head included) · T: extend time · Shift+T / Alt+T: tile · Shift+D: copy (own data) · Alt+D: copy (shared data) · dbl-click edit · F2 / Alt+dbl-click: rename · Ctrl+G group · Ctrl+Shift+G ungroup · Alt+click: single · right-click delete · Ctrl+MMB mute clip · H mute / Alt+H unmute all · marquee select · Del · K knife · dots: reorder track · ruler: seek / Ctrl+loop / RMB marker · Ctrl+wheel or -/= zoom · Ctrl+Alt+wheel height · MMB pan",
                     )
                     .weak(),
                 )
@@ -2415,7 +2476,7 @@ pub fn show(
         // the previous anchor if a frame somehow laid out no rows.
         state.lane_anchor = state.frame_lane.or(state.lane_anchor);
         if rows_frame.is_some() {
-            state.rows_viewport_min = ui.clip_rect().min;
+            state.rows_viewport = Some(ui.clip_rect());
         }
 
         // ---- Track reorder (header grab handle). The target is the
@@ -5007,6 +5068,54 @@ mod tests {
     /// Seconds per tick at 120 BPM / 960 PPQ — the base-tempo conversion the
     /// placement helpers take (U11 D3); MIDI/control clips ignore it.
     const SPT: f64 = 60.0 / (120.0 * 960.0);
+
+    /// F-047: the wheel and the `-` / `=` keys share one anchor formula — the
+    /// tick under `anchor` must land on the same screen x after the step.
+    #[test]
+    fn zoom_time_axis_keeps_the_anchor_tick_in_place() {
+        let ctx = egui::Context::default();
+        let scroll_id = Id::unique("test_scroll");
+        let mut state = TimelineState {
+            px_per_bar: 56.0,
+            rows_viewport: Some(Rect::from_min_max(pos2(100.0, 40.0), pos2(900.0, 400.0))),
+            ..TimelineState::default()
+        };
+        let anchor = 500.0;
+        let old_ppt = state.px_per_bar / TICKS_PER_BAR as f32;
+        let tick = (anchor - 100.0) / old_ppt;
+
+        let target = state
+            .zoom_time_axis(&ctx, scroll_id, TICKS_PER_BAR, anchor, ZOOM_STEP)
+            .expect("the first step is inside the bounds");
+        assert!((state.px_per_bar - 56.0 * ZOOM_STEP).abs() < 1e-4);
+
+        // `x(tick) = viewport.min.x + tick * ppt - offset`; the anchored tick
+        // has to come back to the same x, or the step drifts the view.
+        let new_ppt = state.px_per_bar / TICKS_PER_BAR as f32;
+        let x = 100.0 + tick * new_ppt - target.x;
+        assert!((x - anchor).abs() < 1e-2, "anchored tick moved to {x}");
+        assert_eq!(target.y, 0.0);
+    }
+
+    /// A step into the clamp reports "nothing to compensate", so the caller
+    /// leaves the scroll offset alone instead of pinning the view.
+    #[test]
+    fn zoom_time_axis_reports_the_clamped_end() {
+        let ctx = egui::Context::default();
+        let scroll_id = Id::unique("test_scroll");
+        let mut state = TimelineState {
+            px_per_bar: PX_PER_BAR_MAX,
+            rows_viewport: Some(Rect::from_min_max(pos2(0.0, 0.0), pos2(800.0, 400.0))),
+            ..TimelineState::default()
+        };
+
+        assert!(
+            state
+                .zoom_time_axis(&ctx, scroll_id, TICKS_PER_BAR, 400.0, ZOOM_STEP)
+                .is_none()
+        );
+        assert_eq!(state.px_per_bar, PX_PER_BAR_MAX);
+    }
 
     /// F-041 M9: Shift-click selects the same-track span between the anchor
     /// and the clicked clip, ordered by start tick rather than clip index.

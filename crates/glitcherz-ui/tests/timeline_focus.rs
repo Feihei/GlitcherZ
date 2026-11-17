@@ -183,11 +183,12 @@ impl Fixture {
 
     /// A click (press + release, no movement). Four frames, matching what
     /// a real platform delivers: hover, press, hold, release.
-    fn click(&mut self, pos: egui::Pos2) {
+    fn click(&mut self, pos: egui::Pos2) -> Vec<timeline::TimelineAction> {
         self.frame(vec![hover(pos)]);
-        self.frame(vec![hover(pos), press(pos, true)]);
+        let mut actions = self.frame(vec![hover(pos), press(pos, true)]);
         self.frame(vec![hover(pos)]);
-        self.frame(vec![hover(pos), press(pos, false)]);
+        actions.extend(self.frame(vec![hover(pos), press(pos, false)]));
+        actions
     }
 
     /// A press-drag-release along one row; returns every action the frames
@@ -280,33 +281,38 @@ fn focus_survives_the_rows_own_hints_coming_and_going() {
     }
 }
 
-/// The toolbar (zoom, add/remove track) sits above the lanes, so clicking
-/// one of its buttons is a click *outside* the focused lane for egui, which
-/// surrenders the lane's focus (`SurrenderFocusOn::Clicks`). The hover-follow
-/// router only hands focus back once the pointer is inside a lane — with the
-/// pointer parked on the button that was just clicked, G / T / Shift+D /
-/// Delete / Esc stayed dead. The toolbar row is registered as part of the
-/// focused row's surface, so the keys survive the click.
+/// The toolbar (snap grid, add/remove track, the one-shot tools) sits above
+/// the lanes, so clicking one of its buttons is a click *outside* the focused
+/// lane for egui, which surrenders the lane's focus
+/// (`SurrenderFocusOn::Clicks`). The hover-follow router only hands focus back
+/// once the pointer is inside a lane — with the pointer parked on the button
+/// that was just clicked, G / T / Shift+D / Delete / Esc stayed dead. The
+/// toolbar row is registered as part of the focused row's surface, so the keys
+/// survive the click.
 #[test]
 fn clicking_a_toolbar_button_keeps_the_lanes_keyboard_focus() {
     let mut f = Fixture::new();
     let _ = f.click_into_a_lane();
     assert!(f.owns_focus(), "a clicked lane holds the keyboard");
     // Find a toolbar button by probing the row above the lanes (the layout
-    // stack puts it below the transport and view-tab panels): a zoom button
-    // is the observable one (`px_per_bar` moves).
+    // stack puts it below the transport and view-tab panels): `+ MIDI` is the
+    // observable one — it reports `AddMidiTrack`. The probe starts right of
+    // the snap combo (the toolbar's leftmost widget) so it never opens the
+    // grid popup, and stays left of the one-shot tools so it arms nothing.
     let mut hit = None;
     'outer: for y in (36..160).step_by(4) {
-        for x in (2..320).step_by(4) {
-            let before = f.state.px_per_bar;
-            f.click(egui::pos2(x as f32, y as f32));
-            if f.state.px_per_bar != before {
+        for x in (74..400).step_by(4) {
+            let actions = f.click(egui::pos2(x as f32, y as f32));
+            if actions
+                .iter()
+                .any(|a| matches!(a, timeline::TimelineAction::AddMidiTrack))
+            {
                 hit = Some(egui::pos2(x as f32, y as f32));
                 break 'outer;
             }
         }
     }
-    let at = hit.expect("no toolbar button changed the zoom");
+    let at = hit.expect("no toolbar button added a MIDI track");
     // The router resolves at the start of a frame, so the pointer resting on
     // the button is what must restore the focus — exactly the user's state
     // right after clicking a tool.

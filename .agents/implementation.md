@@ -15,7 +15,7 @@
 - **录音与 headless I/O**：录音、导出、Preferences、CLI、MCP
 - **框架升级与 gotchas**：依赖版本契约、egui 升级、跨平台构建
 - **系列实施补记与交互打磨**：2026-11-11 自 plan.md 归位的系列记录、I 系列
-- **特性 ID 注册表**：`F-001`–`F-046`（新特性先登记再实现）
+- **特性 ID 注册表**：`F-001`–`F-047`（新特性先登记再实现）
 
 ## 特性 ID 注册表
 
@@ -69,6 +69,7 @@
 | F-044 | 聚合 Curve 输入口（每个可控制节点一个黄口） | UI / PATCH / EDIT | `curve-port.md` | — |
 | F-045 | 吸附档位与磁性边界（精确裁剪） | EDIT / UI | `snap-granularity.md` | — |
 | F-046 | 数据池面板与 clip 右键菜单（F-041 M7 展开） | EDIT / UI / PROJ | `clip-data-panel.md` | — |
+| F-047 | 时间轴缩放：只留滚轮与键盘 | UI / EDIT | `timeline-zoom.md` | — |
 
 > 无独立 spec 的历史条目（transport / 文件管理 U2 / U10 / U14 / I 系列 / B2 / W3a–c 等）保留字母别名，不做回溯编号；新特性一律先写 spec 再领号。
 
@@ -274,6 +275,14 @@ spec `.agents/spec/dual-audio-input.md`。目标不是「加一个效果器」�
 **测试**（+4）：`media_references_are_enumerated_rewritten_and_checked`（去重 / 空路径跳过 / 重写 / 缺失判定）、`relative_media_paths_resolve_against_the_project_directory`（新增 `/` 存储与 `\` 兼容读两条断言）、`a_free_name_is_used_as_is` / `name_clashes_get_a_suffix_but_the_same_file_does_not`、`relocation_finds_a_file_by_name_inside_a_picked_folder`。
 
 ## 编辑与视图
+
+### F-047 · 时间轴缩放：只留滚轮与键盘（2026-11-17 交付）
+
+- **删除**：工具栏的 `Arrangement` 标题与 `-` / `+` 两个按钮。一对按钮管不了两个轴（水平 `px_per_bar` / 行高 `row_zoom`），补成两对太重；而且按钮那条路径没有偏移补偿——滚动过的视图里点 `+`，内容整体漂移。
+- **共用算法**：`TimelineState::zoom_time_axis(ctx, scroll_id, base_bar_ticks, anchor, factor) -> Option<Vec2>`，滚轮与键盘同一份锚点数学；`None` 表示已到限位（无可补偿的偏移）。
+- **几何**：`rows_viewport_min: Pos2` → `rows_viewport: Option<Rect>`（键盘要视口中心，一个点不够；滚轮的 `min` 语义不变）。
+- **键盘**：`-` / `=`（及 `+` / `Shift+=`）按 1.3× 一档，锚在视口中心；与 `G`/`T`/`K` 同级门控（时间轴焦点 + 无模态 + 非文本输入）。不绑 `Ctrl+±`：eframe 把这两个组合留给整个 UI 的 DPI 缩放。
+- **提示**：静态提示行尾部改为 `Ctrl+wheel or -/= zoom · Ctrl+Alt+wheel height · MMB pan`；`manual.md` / `shortcuts.md` 同步。
 
 ### F-041 · clip 与数据分离（2026-11-11 交付）
 
