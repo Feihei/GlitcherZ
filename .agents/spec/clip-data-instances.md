@@ -71,7 +71,7 @@ Blender 式 object / mesh 分离：**多个 clip 可以引用同一份 MIDI / cu
 | D29 | 同轨区间选择（M9） | 单击 clip 设锚点；`Shift` + 单击同轨另一 clip 选中两者之间（按 `start_ticks` 排序）的全部 clip；`Ctrl` 保持追加；跨轨 `Shift` 退化为单选；区间选后仍走现有组扩选 |
 | D30 | 编辑范围独立于窗口（M10.1） | 卷帘编辑范围 = `max(data.length, window end)`（数据坐标）：T 扩出的尾部可写，手动裁短后窗口外内容仍可编辑；窗口只是播放裁剪，不限制内容编辑 |
 | D31 | 窗口自动跟随（M10.1） | `window_follow` 默认对新 clip 开启；T / 拖边 / trim 关闭。跟随期间窗口末端 = 最后一个 note-off 向上取整到小节（至少 1 小节）；`clip.fit_window` 重新开启并立即按内容末端调整 |
-| D32 | 禁止空窗口（M10.1） | 手动缩小 / 移动窗口（T、拖边、左缘 trim）后必须至少有一个音符与窗口相交；数据本身为空时豁免，便于新建 clip 先准备内容 |
+| D32 | 禁止空窗口（M10.1） | ~~手动缩小 / 移动窗口（T、拖边、左缘 trim）后必须至少有一个音符与窗口相交；数据本身为空时豁免，便于新建 clip 先准备内容~~ **已由 F-045 D11 废除（2026-11-17）**：裁到两个音符之间是合法操作，D38 的全高锯齿带已经是充分反馈；且 K 切刀本就能产出空半边，硬拒绝反而自相矛盾。 |
 | D33 | 卷帘以数据坐标对齐窗口（M10.2） | 卷帘绘制 / 命中按数据 tick（`note.start`），`x_of` 减 `source_offset`、`local_at` 加回；播放头用窗口局部 tick 再加 offset 绘制。窗口移动后音符相对窗口移位、绝对试听位置不变 |
 | D34 | 指针行与头空白写入（M10.2） | 指针 y 用 `floor` 落到所在行（不再四舍五入到下一音）；前导空白可用负数据 tick 写入：`midi.note_add` 接受负 `start_ticks`，`grow_midi_data_to_notes` 把整份内容右移 `shift`、`data.length += shift`、`source_offset += shift`，绝对位置不变（共享先 COW） |
 | D35 | T 左扩退役（M10.3） | `T` / `stretch_targets` 只改右缘；`S` 左缘资格键移除；需要左扩时改为「音符整体右移 + clip 左移（或先右扩）」；左缘 trim（向内裁）保留 |

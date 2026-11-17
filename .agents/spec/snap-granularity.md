@@ -1,8 +1,8 @@
 # 吸附档位与磁性边界（精确裁剪）
 
 > ID: F-045 · 域: EDIT / UI
-> 状态：设计已定，待实施（2026-11-17）
-> 关联：`snap.md`（Met 系列 S1–S7，本特性修订 S3/S7）、`clip-data-instances.md`（F-041 D32/D35/D38/D39/D43）、`timeline.md`、`editing-model.md`、`meter-map.md`
+> 状态：**已实施**（2026-11-17，M1–M3；实施偏差见 §3、§10）
+> 关联：`snap.md`（Met 系列 S1–S7，本特性修订 S1/S3/S7）、`clip-data-instances.md`（F-041 D32/D35/D38/D39/D43）、`timeline.md`、`editing-model.md`、`meter-map.md`
 
 ## 1. 问题
 
@@ -57,38 +57,45 @@ fn snap_bar(meter: &MeterMap, ticks: f32, snap: Snap) -> u32 {
 | D15 | 快捷键 | 不新增档位循环快捷键；通过时间轴工具栏下拉选择（同卷帘网格下拉）。修饰键空间已饱和，且下拉更可发现。 |
 | D16 | 例外保留 | 标尺 loop 绘制 / 新建 / marker（`timeline.rs:1938` 及其消费点）与 meter marker 拖动保持小节吸附——loop 范围是音乐段落，小节是正确的单位。录音 `take_clip` 的整小节向上取整不动。 |
 
-## 3. 建议 API 形状
+## 3. API 形状（已实施）
+
+设计时的草案是「`ticks` 一律接 `MeterMap`」。实施时保留了 `ticks(raw)` 的旧签名，另开绝对时间入口，原因见下。
 
 ```rust
 // glitcherz-ui/src/snap.rs
 pub enum SnapGrid {
     Bar,                 // meter-relative, segment aware
-    Beat,                // meter-relative, segment aware
-    Step,                // fixed TICKS_PER_STEP (240)
-    Fixed(i64),          // piano-roll / curve legacy grids
+    Beat,                // meter-relative, segment aware (default)
+    Step,                // fixed TICKS_PER_STEP = 240
+    Fixed(i64),          // piano-roll / curve grids
 }
 
-pub struct Snap {
-    grid: SnapGrid,
-    off: bool,           // true only for the Ctrl override
-}
+pub struct Snap { grid: SnapGrid, off: bool }
 impl Snap {
-    pub const OFF: Self = Self { grid: SnapGrid::Fixed(1), off: true };
-    pub fn on(grid: SnapGrid) -> Self;
-    pub fn ticks(&self, meter: &MeterMap, raw: f32) -> i64;
-    pub fn grid_ticks(&self, meter: &MeterMap, at: u32) -> i64;
-    pub fn is_off(&self) -> bool;
+    pub const OFF: Self;                        // == Fixed(1) + off
+    pub fn on(width: i64) -> Self;              // Fixed — roll / curve, unchanged call sites
+    pub fn musical(grid: SnapGrid) -> Self;     // timeline
+    pub fn kind(self) -> SnapGrid;
+    pub fn is_off(self) -> bool;
+    pub fn grid(self) -> i64;                   // fixed width; 1 for musical/off
+    pub fn width_at(self, meter: &MeterMap, at: u32) -> i64;
+    pub fn at(self, meter: &MeterMap, raw: f32) -> u32;   // absolute arrangement ticks
+    pub fn ticks(self, raw: f32) -> i64;        // fixed grids only
+    pub fn ticks_f64(self, raw: f64) -> f64;
 }
 
 // glitcherz-model/src/meter.rs
 impl MeterMap {
-    /// Nearest grid line inside the containing segment; the grid width is
-    /// resolved from that segment's meter, anchored at its start.
-    pub fn snap_grid(&self, raw: f64, grid: i64) -> u32;
+    pub fn snap_bar(&self, raw: f64) -> u32;    // unchanged behaviour
+    pub fn snap_beat(&self, raw: f64) -> u32;   // new: segment-anchored beat grid
+    // private engine: snap_relative(raw, |signature| width)
 }
 ```
 
-`Snap::OFF` 与 `SnapGrid::Fixed(1)` 数值等价（§1.2）；`off` 只为状态栏与「磁性关闭」判定服务，不作为档位暴露。
+两处与草案的偏差，都是为了让改动面收在时间轴内：
+
+1. **`ticks` 不接 meter**。卷帘与曲线编辑器根本没有 `MeterMap`（`piano_roll.rs` 全文件无 `meter` 变量），为了一个它们用不到的参数把 meter 穿过十几层函数不值得。它们的网格是 `Fixed`，`ticks(raw)` 语义完整；音乐网格只在时间轴出现，走 `at`。
+2. **`MeterMap` 加 `snap_beat` 而不是通用 `snap_grid(raw, grid)`**。`Bar` 与 `Beat` 的宽度都随拍号段变化，必须由 map 自己按段解析；`Step` / `Fixed` 的宽度是常数且能整除所有段起点（240 整除 3840/2880/3360），用 `Snap::ticks` 就够，不需要再进 model 层。通用版本只能服务一个用不上的场景。
 
 ## 4. 接入面
 
@@ -168,3 +175,25 @@ impl MeterMap {
 - 标尺 loop / marker / 录音落点的档位化（D16 保留小节）。
 - 统一时间轴档位与卷帘网格为单一设置（两套 view state 并存）。
 - 把 F-041 D32 的非空规则改成软提示——直接删除，锯齿带即为反馈（D11）。
+
+## 10. 实施记录（2026-11-17）
+
+| 层 | 文件 | 落点 |
+| :--- | :--- | :--- |
+| 吸附类型 | `glitcherz-ui/src/snap.rs` | `SnapGrid`（`Bar/Beat/Step/Fixed`）+ `Snap::{musical, at, width_at, ticks}`；`TICKS_PER_STEP = 240`；`SnapGrid::CHOICES` 供工具栏 |
+| 拍号网格 | `glitcherz-model/src/meter.rs` | `snap_beat`，`snap_bar` 重构为 `snap_relative` 的 Bar 特例（行为逐 tick 不变） |
+| 工程查询 | `glitcherz-model/src/lib.rs` | `Project::ticks_per_beat_at`（`fit_window` 的 1 拍下限要用） |
+| 视图状态 | `glitcherz-ui/src/timeline.rs` | `TimelineState::snap_grid`（默认 `Beat`）；工具栏 ComboBox；`MAGNET_PX = 8.0` |
+| 磁性 | `timeline.rs` | `snap_with_magnet`（网格 vs 边界，像素比较、等距取网格）+ `midi_content_edges` / `curve_content_edges`（数据 tick → 排列 tick） |
+| 接入 | `timeline.rs` | 右缘 resize、头裁、刀片（落点 + 预览线）；`knife_target` 的「两侧余量」从小节改为**一个网格单元** |
+| 最短窗口 | `timeline.rs` / `glitcherz-command/src/clip.rs` | 右缘 `min_span`、头裁上限、`fit_window` 的 `.max()` 全部改 1 拍 |
+| 模态 | `timeline.rs` | `grab_targets` / `stretch_targets` / `tile_targets` 改吃 `px_per_step` + `step_ticks`；stretch 额外吃 `floor_ticks`（= 1 拍） |
+| 非空规则 | `glitcherz-ui/src/timeline_ops.rs` | 删除 6 处调用 + 2 个 helper；`stretch_allows_a_window_past_the_last_note` 取代 `stretch_rejects_an_empty_window` |
+| 状态栏 | `glitcherz-ui/src/status_bar.rs` | 常驻 `Snap Bar/Beat/Step`；Ctrl 时切换为黄色 `Snap off` |
+
+实施时确认的细节：
+
+- **刀片余量必须跟着网格走**。原来要求切点两侧各留一小节，默认改拍后这一条会把绝大多数切口拒掉；现在留一个网格单元（`snap.width_at`），Bar 档下与旧行为一致。
+- **模态的 `px_per_bar` 换成 `px_per_step`**。旧代码用 tick 0 的小节宽度换算像素，却在 6/8 段落按 2880 步进，两者不一致；现在像素与步进都来自同一档位。
+- **`snap_beat` 的段锚定有测试兜底**：7/8 → 4/4 段落（3360 不是 960 的整数倍），验证 4/4 的拍线仍然对齐小节线。
+- 磁吸不作用于普通 clip 移动（D6），也不作用于标尺 / loop / 录音（D16）。

@@ -28,13 +28,13 @@
 
 | # | 决策 | 内容 |
 | :--- | :--- | :--- |
-| S1 | **统一 `Snap` 值类型，`0` = 关闭** | `Snap { grid: i64 }`；`Snap::OFF`、`Snap::on(grid)`、`ticks(raw: f32) -> i64`、`ticks_f64(raw: f64) -> f64`。关闭时 = 四舍五入到最近 tick（不是截断），仍保持整数 tick 域。 |
+| S1 | **统一 `Snap` 值类型，`0` = 关闭** | F-045 修订：`Snap { grid: SnapGrid, off: bool }`，`SnapGrid::{Bar, Beat, Step, Fixed(i64)}`。固定网格（卷帘音符值、曲线步长）仍走 `ticks(raw)`；音乐网格（`Bar` / `Beat`）宽度依赖拍号段，走 `Snap::at(meter, raw)` / `width_at(meter, at)`。`Snap::OFF` 与 `Fixed(1)` 数值完全等价，`off` 只服务状态栏与磁吸开关。 |
 | S2 | **`Ctrl` / `Cmd` 按住临时关闭** | 每帧在视图入口派生一次：`let snap = if ctrl_or_cmd { Snap::OFF } else { Snap::on(grid) };`，再向下传。**不用 Alt**：Windows 松开 Alt 触发 `SC_KEYMENU` 吞掉鼠标事件、按住 Alt 时 egui 指针会 `PointerGone`（`timeline.md` D29 已实证）；Alt 在 timeline 还绑定拆组（`timeline.rs:3364`）。 |
-| S3 | **网格线照画，状态栏提示** | 关闭吸附时网格线不隐藏（否则失去位置参照）；按住期间状态栏右侧显示 `Snap off`，松开消失。不做全局持久开关（用户 2026-11-10 只要临时禁用）。 |
+| S3 | **网格线照画，状态栏提示** | 关闭吸附时网格线不隐藏（否则失去位置参照）；按住期间状态栏右侧显示 `Snap off`，松开消失。不做全局持久开关（用户 2026-11-10 只要临时禁用）。**F-045 修订**：*网格档位*是会话级持久选择（时间轴工具栏 `Bar / Beat / Step`，默认 `Beat`），状态栏常驻显示 `Snap <档位>`；吸附的*开关*仍只由 Ctrl 临时决定——档位与开关是两件事。 |
 | S4 | **复制只保留 `Shift+D` + 工具栏按钮** | 删除卷帘 `Ctrl+拖动复制`（`piano_roll.rs:2649-2668`）与对应 `RollIntent::Duplicate` 的拖动分支。卷帘工具栏（`toolbar.rs`，I3 已交付）加 `Duplicate ⇧D` 动作按钮；timeline 工具栏同样加。`Shift+D` 模态语义不变（复制 + Grab）。 |
 | S5 | **删除命中的容差不属于吸附** | `timeline_ops.rs:1134` `remove_near(tick, SNAP_TICKS/2)` 是「点得够近就删」，与落点吸附无关，不改。 |
 | S6 | **Ctrl 的既有拖动语义与新语义叠加，不迁移** | 时间轴：ruler 区 `Ctrl+拖 = 新建 loop`（区域隔离，不冲突）；clip 区 `Ctrl+拖 = 追加选择 + 不吸附`。卷帘：`Ctrl+单击 = 多选`（单击无落点，不冲突）；`Ctrl+拖` 改为纯「不吸附」（复制已按 S4 移除）。`Ctrl+中键 = clip mute` 不涉及位置。 |
-| S7 | **G / T / Shift+T 模态不参与 Ctrl 禁吸附** | 这三者是**离散的 bar / 周期工具**，关掉吸附会让「按小节移动 / 拉伸 / 平铺」失去意义；只有直接拖拽、边缘裁剪、切刀、曲线锚点享受自由落点。模态保持原步进，实现上它们同样吃 `Snap`，但传进去的永远是 `Snap::on(...)`。 |
+| S7 | **G / T / Shift+T 模态不参与 Ctrl 禁吸附** | **F-045 修订**：这三者按**当前档位**步进（`Bar` / `Beat` / `Step`，取自选区最早片段所在拍号段），但**不吃 Ctrl**——模态中途改变步进不可读，且「按拍移动 / 拉伸 / 平铺」正是档位的用途；自由落点只属于直接拖拽、边缘裁剪、切刀、曲线锚点。 |
 
 ## 4. 统一类型
 
@@ -158,7 +158,7 @@ pub fn snap_bar(meter: &MeterMap, raw: f64, snap: Snap) -> u32 {
 
 ## 8. 明确不做
 
-- 持久化的「吸附开关」或「网格关闭」设置（`GridValue::Off` 不引入）。
-- 时间轴的可配置吸附粒度（本次仍是整小节；将来若引入，作为 `Snap` 的 grid 值即可）。
+- 持久化的「吸附开关」或「网格关闭」设置（`GridValue::Off` 不引入）。网格**档位**由 F-045 提供，是会话级视图状态。
+- ~~时间轴的可配置吸附粒度~~（F-045 已交付：`Bar / Beat / Step`）。
 - 把 `Ctrl+拖动复制` 迁到 `Alt+拖动`（S2 已排除 Alt）。
 - 改变删除命中容差、方向键步进、框选（marquee）行为。
