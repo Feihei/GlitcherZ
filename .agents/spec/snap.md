@@ -1,6 +1,6 @@
 # 吸附统一入口与临时禁用（Snap）Spec
 
-> 状态：**设计已定，待实施**（2026-11-10 立项）。
+> 状态：**设计已定，待实施**（2026-11-10 立项）。**2026-11-17 修订**：后续特性 `F-045`（`snap-granularity.md`）在本文件基础上加时间轴档位 `Bar / Beat / Step`（默认 Beat）、`MeterMap::snap_grid`、边缘磁性吸附，并修订 S3（会话级档位）与 S7（模态跟档位不跟 Ctrl）；§9「将来引入可配置粒度」由 F-045 兑现。
 > 上游：`timeline.md`（D29 吸附与模态）、`editing-model.md`（卷帘手势）、`control-tracks.md`（曲线编辑）。
 > 涉及：`glitcherz-ui` 的 `timeline.rs` / `piano_roll.rs` / `editing.rs` / `curve.rs` / `timeline_ops.rs` / `toolbar.rs` / `status_bar.rs`。
 

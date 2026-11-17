@@ -20,7 +20,7 @@
 路线图 1–10 全部落地；基础功能、节点图、MIDI 编辑、插件宿主、可用性（U 系列）、录音（R 系列）、内建效果器（E 系列）、声源扩展（Y / Z / B 系列）与交互打磨（I 系列）均已交付。已完成系列的设计与实现位置见下方「历史系列索引」——本文件不再逐项记录它们的实施细节。
 
 - **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）；命令词汇表（F-039）V1a / V1b-1 / V1b-2 / V2 / V3 **全部交付**；剪贴板（F-040）C1–C2 已交付（2026-11-11）；clip 与数据分离（F-041）M1–M6 已交付（2026-11-11），2026-11-12 M8 修订（`repeat` 标记 + 复制键位）。
-- **下一步候选**：F-041 review 续作（M9 → M10 → M11，spec §13 已定稿、未实施）；其余未完成项见下方列表（用户表导入 / 安全边界）。
+- **下一步候选**：**F-045 吸附档位与磁性边界（2026-11-17 立项，spec §待实施）**——时间轴档位 `Bar / Beat / Step`（默认 Beat，无 Off/Tick）；Ctrl 保持临时 tick；边缘操作吸内容边界；最短窗口从 1 小节降为 1 拍；删除 F-041 D32 非空规则。详见 `spec/snap-granularity.md`（D1–D16，M0→M3）。F-041 review 续作（M9 → M10 → M11，spec §13 已定稿、未实施）；其余未完成项见下方列表（用户表导入 / 安全边界）。
 - **门禁**：`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`，在本机沙箱外跑（沙箱内 cargo 会毒化 `target/debug/incremental`）。
 
 ## 未完成项
@@ -33,6 +33,17 @@
   - **命令词汇表**（**F-039，2026-11-11 已立项**，见下方小节）——`midi.*` 全都作用于既有 clip，改音色参数也还没有稳定字符串名。MCP 能「改音符」但改不了「用什么音色」、也开不了新 clip。这一期 = `NodeParam` 稳定名 + `clip.add` + `graph.set_param`，spec 已写：`spec/command-vocabulary.md`（D1–D8）。
   - **用户表导入**（**F-043，2026-11-11 已立项**，见 `spec/wavetable-import.md`）：单周期 WAV → 内置 bank 的第 5 帧；不做 `.wt` / 命名库 / 缓存淘汰。风险在文件与 UI，不在 DSP。
   - **安全边界**（**F-042，2026-11-11 已立项**，见 `spec/project-trust.md`）：现在只管客户端给的路径，工程内部引用的媒体 / SF2 / 插件路径照单全收（等同于在窗口里打开一个不信任的工程）；按「工程信任模型」审计 + 默认仅内部 + CLI `--trust-project`。
+
+## 吸附档位与磁性边界（F-045，2026-11-17 立项）
+
+用户诉求：**时间轴默认按拍对齐，偶尔要精确裁到音符末尾（含非网格位置）**。
+
+Spec：`spec/snap-granularity.md`（D1–D16）。
+
+- **起因**：现有 snap 只有「小节 / Ctrl→tick」两档；`timeline.rs:4474` 的 `snap_bar` 完全忽略 `snap.grid()`，换入口 grid 不生效。off 与 tick 数值等价，菜单不需要两者。
+- **范围**：档位 + `MeterMap::snap_grid` + 边缘磁性吸附（note-on/off、curve anchor）+ 1 拍最短窗口 + 删除 F-041 D32 非空规则 + G/T/Shift+T 模态跟档位。
+- **门禁**：M1 单提交，Bar 档落点与改造前逐 tick 一致；M2/M3 按 spec §6 验收 13 条；全量 fmt + clippy `-D warnings` + test（沙箱外）。
+- **状态**：设计已定，未实施。
 
 ## clip 与数据分离（F-041，2026-11-11 立项）
 
