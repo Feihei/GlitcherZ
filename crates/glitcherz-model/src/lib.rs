@@ -7456,6 +7456,12 @@ impl Project {
         self.meter_map().ticks_per_bar_at(tick)
     }
 
+    /// Beat length in ticks at an absolute tick, following meter changes
+    /// (F-045: the minimum clip window is one beat).
+    pub fn ticks_per_beat_at(&self, tick: u32) -> u32 {
+        self.meter_map().ticks_per_beat_at(tick)
+    }
+
     /// Seconds per tick at the project's **base** tempo (U11 D2). Audio clips
     /// convert between the tick domain and seconds with this constant — they
     /// deliberately do not follow the tempo curve.

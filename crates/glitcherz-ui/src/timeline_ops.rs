@@ -819,50 +819,36 @@ impl GlitcherZApp {
                     // shift, so a restore clamped at the data start stops
                     // dead instead of sliding the whole clip (M10.10).
                     trim_head_window(&mut next, delta_ticks, sec_per_tick);
-                    if !midi_window_has_content(
-                        project,
-                        next.data,
-                        next.source_offset,
-                        next.span_ticks,
-                    ) {
-                        false
-                    } else {
-                        project
-                            .midi_tracks
-                            .get_mut(track)
-                            .and_then(|t| t.clips.get_mut(clip))
-                            .map(|c| {
-                                let changed = *c != next;
-                                *c = next;
-                                changed
-                            })
-                            .unwrap_or(false)
-                    }
+                    // F-045 D11: a window between two notes is a legal trim.
+                    // The crop teeth (F-041 D38) already show that nothing is
+                    // audible there, so the old hard refusal is gone.
+                    project
+                        .midi_tracks
+                        .get_mut(track)
+                        .and_then(|t| t.clips.get_mut(clip))
+                        .map(|c| {
+                            let changed = *c != next;
+                            *c = next;
+                            changed
+                        })
+                        .unwrap_or(false)
                 }
                 (timeline::HeadTrimOrigin::Control(origin), timeline::TimelineLane::Control) => {
                     let mut next = (**origin).clone();
                     // F-041: move the window (both trim and restore), keep the
                     // content. Same applied-shift clamp as MIDI (M10.10).
                     trim_head_window(&mut next, delta_ticks, sec_per_tick);
-                    if !curve_window_has_content(
-                        project,
-                        next.data,
-                        next.source_offset,
-                        next.span_ticks,
-                    ) {
-                        false
-                    } else {
-                        project
-                            .control_tracks
-                            .get_mut(track)
-                            .and_then(|t| t.clips.get_mut(clip))
-                            .map(|c| {
-                                let changed = *c != next;
-                                *c = next;
-                                changed
-                            })
-                            .unwrap_or(false)
-                    }
+                    // F-045 D11: same as MIDI — an empty window is legal.
+                    project
+                        .control_tracks
+                        .get_mut(track)
+                        .and_then(|t| t.clips.get_mut(clip))
+                        .map(|c| {
+                            let changed = *c != next;
+                            *c = next;
+                            changed
+                        })
+                        .unwrap_or(false)
                 }
                 (timeline::HeadTrimOrigin::Audio(origin), timeline::TimelineLane::Audio) => {
                     let mut next = (**origin).clone();
@@ -2409,33 +2395,6 @@ fn content_span_cap(content_end: i64, offset: i64, bar: i64) -> u32 {
     u32::try_from((limit - offset).max(1)).unwrap_or(u32::MAX)
 }
 
-fn midi_window_has_content(project: &Project, data_idx: u32, offset: i64, span: u32) -> bool {
-    let Some(data) = project.midi_data.get(data_idx as usize) else {
-        return true;
-    };
-    if data.notes().is_empty() {
-        return true;
-    }
-    let end = offset.saturating_add(i64::from(span));
-    data.notes().iter().any(|note| {
-        let note_end = note.start.saturating_add(note.length.max(1));
-        note.start < end && note_end > offset
-    })
-}
-
-/// Control-clip analogue: the window must overlap the anchor span (anchors
-/// are sparse; a window between two anchors still has a curve value).
-fn curve_window_has_content(project: &Project, data_idx: u32, offset: i64, span: u32) -> bool {
-    let Some(data) = project.curve_data.get(data_idx as usize) else {
-        return true;
-    };
-    let (Some(first), Some(last)) = (data.points.first(), data.points.last()) else {
-        return true;
-    };
-    let end = offset.saturating_add(i64::from(span));
-    i64::from(first.tick) < end && i64::from(last.tick) >= offset
-}
-
 /// One MIDI clip's T stretch (F-041 M10): a **pure window edit**.
 ///
 /// Moving the start shifts `source_offset` (negative = leading blank); moving
@@ -2492,11 +2451,6 @@ fn stretch_midi_clip(
     // M10.7: a request clamped all the way back to the current window (no
     // restore room, no span change) is a no-op, not an edit.
     if new_start == old_start && new_span == old_span && old_loop.is_none() {
-        return false;
-    }
-    if (new_span < old_span || new_start > old_start)
-        && !midi_window_has_content(project, data_idx, shifted, new_span)
-    {
         return false;
     }
     // F-041 M10: a stretch is a pure window edit. Moving the start shifts the
@@ -2565,11 +2519,6 @@ fn stretch_curve_clip(
     if new_start == old_start && new_span == old_span && old_loop.is_none() {
         return false;
     }
-    if (new_span < old_span || new_start > old_start)
-        && !curve_window_has_content(project, data_idx, shifted, new_span)
-    {
-        return false;
-    }
     let Some(clip) = project
         .control_tracks
         .get_mut(track)
@@ -2625,9 +2574,6 @@ fn resize_midi_clip(
     if clip.start_ticks == new_start && clip.span_ticks == new_span {
         return false;
     }
-    if new_span < old_span && !midi_window_has_content(project, data_idx, off, new_span) {
-        return false;
-    }
     let Some(clip) = project
         .midi_tracks
         .get_mut(track)
@@ -2672,9 +2618,6 @@ fn resize_curve_clip(
         new_span
     };
     if clip.start_ticks == new_start && clip.span_ticks == new_span {
-        return false;
-    }
-    if new_span < old_span && !curve_window_has_content(project, data_idx, off, new_span) {
         return false;
     }
     let Some(clip) = project
@@ -2844,27 +2787,24 @@ mod tests {
         );
     }
 
-    /// F-041 M10.2: a window that no note overlaps is refused; empty data may
-    /// still be resized (nothing to play yet).
+    /// F-045 D11: a window that no note overlaps is a legal edit — the crop
+    /// teeth (F-041 D38) already show that nothing is audible there, and the
+    /// old hard refusal contradicted `split_clip_in`, which happily produced
+    /// the same empty half.
     #[test]
-    fn stretch_rejects_an_empty_window() {
+    fn stretch_allows_a_window_past_the_last_note() {
         let mut project = Project::default();
         clip_with_one_note(&mut project);
-        let before = project.midi_tracks[0].clips[0].clone();
-        // Move the window past the note: refused, the clip stays put.
-        assert!(!stretch_midi_clip(&mut project, 0, 0, TICKS_PER_BAR, 100));
-        let clip = &project.midi_tracks[0].clips[0];
-        assert_eq!(clip.start_ticks, before.start_ticks);
-        assert_eq!(clip.span_ticks, before.span_ticks);
-
-        // Empty content is exempt so a new clip can be prepared.
-        let data_idx = project.midi_tracks[0].clips[0].data;
-        project
-            .midi_data_mut(data_idx)
-            .expect("data")
-            .notes_mut()
-            .clear();
+        // The note lives at [0, 480); the new window starts a bar later, so it
+        // contains nothing at all.
         assert!(stretch_midi_clip(&mut project, 0, 0, TICKS_PER_BAR, 100));
+        let clip = &project.midi_tracks[0].clips[0];
+        assert_eq!(
+            clip.start_ticks, TICKS_PER_BAR,
+            "the window moved past the note instead of being refused"
+        );
+        assert!(clip.span_ticks >= 1);
+        assert_eq!(clip.source_offset, i64::from(TICKS_PER_BAR));
     }
 
     /// F-041 M10.10: a head-trim restore clamped at the data start moves

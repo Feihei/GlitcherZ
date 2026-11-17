@@ -29,15 +29,15 @@
 //! (re-push clips) or cross-panel state (selection, editor target) is reported
 //! back as [`TimelineAction`]s.
 
-use crate::snap::Snap;
+use crate::snap::{Snap, SnapGrid};
 use eframe::egui;
 use egui::{
     Align2, Color32, EventFilter, FontId, Id, Key, Modifiers, Pos2, Rect, Sense, Stroke,
     StrokeKind, Vec2, pos2,
 };
 use glitcherz_model::{
-    AudioClip, AudioTrack, ClipGroup, ControlClip, ControlTrack, MAX_ARRANGEMENT_TICKS,
-    MAX_CLIPS_PER_TRACK, Marker, MeterMap, MeterMarker, MidiClip, MidiTrack, SongLoop,
+    AudioClip, AudioTrack, ClipGroup, ControlClip, ControlTrack, CurveData, MAX_ARRANGEMENT_TICKS,
+    MAX_CLIPS_PER_TRACK, Marker, MeterMap, MeterMarker, MidiClip, MidiData, MidiTrack, SongLoop,
 };
 
 /// Absolute arrangement ceiling in ticks (U3a). The bound is a **tick** count,
@@ -388,6 +388,10 @@ pub struct TimelineState {
     /// instead of giving each copy its own copy (Alt+D). Plain Shift+D
     /// duplicates with fresh, detached data.
     duplicate_shared: bool,
+    /// F-045: the timeline's snap grid. Session-level view state on purpose —
+    /// it is a working preference, not project data, so it never enters
+    /// `Project` or `PROJECT_VERSION` (same rule as the roll's grid).
+    pub snap_grid: SnapGrid,
 }
 
 impl Default for TimelineState {
@@ -422,6 +426,7 @@ impl Default for TimelineState {
             break_group: false,
             head_trim: None,
             duplicate_shared: false,
+            snap_grid: SnapGrid::default(),
         }
     }
 }
@@ -1069,8 +1074,8 @@ fn track_spans<T: Placement>(clips: &[T], skip: &[usize], sec_per_tick: f64) -> 
 fn grab_targets(
     modal: &Modal,
     ptr: Option<Pos2>,
-    px_per_bar: f32,
-    bar_ticks: u32,
+    px_per_step: f32,
+    step_ticks: u32,
     row_h: f32,
     rows_midi: usize,
     rows_control: usize,
@@ -1084,7 +1089,10 @@ fn grab_targets(
         return None;
     };
     let ptr = ptr?;
-    let mut bar_delta = ((ptr.x - modal.grab.x) / px_per_bar).round() as i64;
+    // F-045 D12: the modal steps by the timeline's grid (Bar / Beat / Step).
+    // It deliberately does NOT follow Ctrl — a modal drag that silently
+    // changed its step mid-gesture would be unreadable (snap.md S7).
+    let mut step_delta = ((ptr.x - modal.grab.x) / px_per_step.max(0.001)).round() as i64;
     let mut row_delta = ((ptr.y - modal.grab.y) / row_h).round() as i32;
     // A mixed selection moves as one rigid group: each kind clamps the
     // delta against its own row count and all limits must hold at once.
@@ -1099,7 +1107,7 @@ fn grab_targets(
     // named axis is the one that still moves).
     match locked {
         Some(Axis::Time) => row_delta = 0,
-        Some(Axis::Row) => bar_delta = 0,
+        Some(Axis::Row) => step_delta = 0,
         None => {}
     }
     Some(
@@ -1115,7 +1123,7 @@ fn grab_targets(
                     *sel,
                 )?;
                 let to_track = (sel.track as i32 + row_delta).max(0) as usize;
-                let new_start = (start as i64 + bar_delta * i64::from(bar_ticks)).max(0) as u32;
+                let new_start = (start as i64 + step_delta * i64::from(step_ticks)).max(0) as u32;
                 Some(ClipMove {
                     from: *sel,
                     to_track,
@@ -1126,14 +1134,16 @@ fn grab_targets(
     )
 }
 
-/// The T modal's per-clip span edits (bar-aligned, ≥ 1 bar, within the
-/// arrangement). `None` when the pointer is unavailable or not a Stretch.
+/// The T modal's per-clip span edits (grid-stepped, at least `floor_ticks`,
+/// within the arrangement). `None` when the pointer is unavailable or not a
+/// Stretch.
 #[allow(clippy::too_many_arguments)]
 fn stretch_targets(
     modal: &Modal,
     ptr: Option<Pos2>,
-    px_per_bar: f32,
-    bar_ticks: u32,
+    px_per_step: f32,
+    step_ticks: u32,
+    floor_ticks: u32,
     midi_tracks: &[MidiTrack],
     control_tracks: &[ControlTrack],
     audio_tracks: &[AudioTrack],
@@ -1143,9 +1153,10 @@ fn stretch_targets(
         return None;
     };
     let ptr = ptr?;
-    let bar_delta = ((ptr.x - modal.grab.x) / px_per_bar).round() as i64;
-    let bar = i64::from(bar_ticks);
-    let tick_delta = bar_delta * bar;
+    let step_delta = ((ptr.x - modal.grab.x) / px_per_step.max(0.001)).round() as i64;
+    let step = i64::from(step_ticks.max(1));
+    let floor = i64::from(floor_ticks.max(1)).max(step);
+    let tick_delta = step_delta * step;
     let max_end = i64::from(ARRANGEMENT_LIMIT_TICKS);
     Some(
         modal
@@ -1163,11 +1174,11 @@ fn stretch_targets(
                     // F-041 M10.7: the start edge adjusts the left trim —
                     // deeper to the right, restore to the left. The model
                     // layer caps the restore at the window's data start.
-                    let d = tick_delta.clamp(-(start as i64), span as i64 - bar);
+                    let d = tick_delta.clamp(-(start as i64), span as i64 - floor);
                     ((start as i64 + d) as u32, (span as i64 - d) as u32)
                 } else {
                     // F-041 M10.6: the end edge stops at the last content bar.
-                    let d = tick_delta.clamp(bar - span as i64, max_end - (start + span) as i64);
+                    let d = tick_delta.clamp(floor - span as i64, max_end - (start + span) as i64);
                     (start, (span as i64 + d) as u32)
                 };
                 Some(ClipSpanEdit {
@@ -1188,8 +1199,8 @@ fn stretch_targets(
 fn tile_targets(
     modal: &Modal,
     ptr: Option<Pos2>,
-    px_per_bar: f32,
-    bar_ticks: u32,
+    px_per_step: f32,
+    step_ticks: u32,
     midi_tracks: &[MidiTrack],
     control_tracks: &[ControlTrack],
     sec_per_tick: f64,
@@ -1198,9 +1209,10 @@ fn tile_targets(
         return None;
     }
     let ptr = ptr?;
-    let bar = f64::from(bar_ticks.max(1));
-    let delta_bars = if modal.grab.x.is_finite() {
-        f64::from(ptr.x - modal.grab.x) / f64::from(px_per_bar.max(0.001))
+    // F-045 D12: the period follows the timeline grid, same as G / T.
+    let step = f64::from(step_ticks.max(1));
+    let delta_steps = if modal.grab.x.is_finite() {
+        f64::from(ptr.x - modal.grab.x) / f64::from(px_per_step.max(0.001))
     } else {
         0.0
     };
@@ -1212,15 +1224,15 @@ fn tile_targets(
                 let (start, span) =
                     clip_geometry(midi_tracks, control_tracks, &[], sec_per_tick, *sel)?;
                 let span = span.max(1);
-                let step = if delta_bars == 0.0 {
+                let count_step = if delta_steps == 0.0 {
                     0.0
                 } else {
-                    (delta_bars.abs() * bar / f64::from(span)).floor()
+                    (delta_steps.abs() * step / f64::from(span)).floor()
                 };
-                let count = if delta_bars > 0.0 {
-                    1.0 + step
+                let count = if delta_steps > 0.0 {
+                    1.0 + count_step
                 } else {
-                    (1.0 - step).max(1.0)
+                    (1.0 - count_step).max(1.0)
                 };
                 let room = (ARRANGEMENT_LIMIT_TICKS.saturating_sub(start) / span).max(1);
                 let count = (count as u32).clamp(1, room);
@@ -1606,6 +1618,21 @@ pub fn show(
             if ui.button("+").on_hover_text("Zoom in").clicked() {
                 state.px_per_bar = (state.px_per_bar * 1.3).min(PX_PER_BAR_MAX);
             }
+            ui.separator();
+            // F-045: the timeline's snap grid. Session-level view state, the
+            // same rule the roll's grid follows — a working preference, not
+            // project data. No Off / Tick entry: Ctrl is the tick override.
+            egui::ComboBox::from_id_salt("timeline_snap_grid")
+                .selected_text(state.snap_grid.label())
+                .width(62.0)
+                .show_ui(ui, |ui| {
+                    for grid in SnapGrid::CHOICES {
+                        ui.selectable_value(&mut state.snap_grid, grid, grid.label())
+                            .on_hover_text(grid.hint());
+                    }
+                })
+                .response
+                .on_hover_text("Snap grid · hold Ctrl to land on the nearest tick instead");
             ui.separator();
             // Three track kinds, each with an add / remove pair — the same
             // rows (and order) the patch timeline node exposes: MIDI, then
@@ -2224,6 +2251,7 @@ pub fn show(
                         .map_or(1, |data| data.length_ticks)
                 },
                 &|clip: &MidiClip| clip.loop_ticks,
+                &|clip: &MidiClip| midi_content_edges(clip, p.midi_data.get(clip.data as usize)),
 
                 &|clip: &MidiClip| {
                     midi_tracks
@@ -2296,6 +2324,9 @@ pub fn show(
                             .map_or(1, |data| data.length_ticks)
                     },
                     &|clip: &ControlClip| clip.loop_ticks,
+                    &|clip: &ControlClip| {
+                        curve_content_edges(clip, p.curve_data.get(clip.data as usize))
+                    },
 
                     &|clip: &ControlClip| {
                         control_tracks
@@ -2357,6 +2388,7 @@ pub fn show(
                     &|_, _, _| {},
                     &|clip: &AudioClip| clip.span(p.sec_per_tick),
                     &|_: &AudioClip| None,
+                    &|_: &AudioClip| Vec::new(),
 
                     &|_: &AudioClip| 1,
                     p.clip_groups,
@@ -2458,7 +2490,12 @@ pub fn show(
         // Modal transforms stay on whole bars (snap spec S7) and take their step
         // from the segment holding the earliest selected clip, so G / T on a
         // 6/8 section moves whole 6/8 bars.
-        let bar_ticks = state.modal.as_ref().map_or(base_bar_ticks, |m| {
+        // F-045 D12: the modal transforms step by the timeline's snap grid,
+        // taken from the meter segment holding the earliest selected clip, so
+        // G / T / Shift+T agree with what an edge drag would do. Ctrl is
+        // deliberately ignored here (snap.md S7 — a modal that changed step
+        // mid-gesture would be unreadable).
+        let modal_anchor = state.modal.as_ref().and_then(|m| {
             m.origin
                 .iter()
                 .filter_map(|sel| {
@@ -2469,11 +2506,20 @@ pub fn show(
                         p.sec_per_tick,
                         *sel,
                     )
+                    .map(|(start, _)| start)
                 })
-                .map(|(start, _)| start)
                 .min()
-                .map_or(base_bar_ticks, |start| p.meter.ticks_per_bar_at(start))
         });
+        let modal_snap = Snap::musical(state.snap_grid);
+        let anchor = modal_anchor.unwrap_or(0);
+        let step_ticks = modal_snap
+            .width_at(p.meter, anchor)
+            .clamp(1, i64::from(u32::MAX)) as u32;
+        // The structural floor is one beat even when the grid is finer
+        // (F-045 D10) — Step may position, but it may not shrink a clip below
+        // a beat.
+        let floor_ticks = p.meter.ticks_per_beat_at(anchor).max(1);
+        let px_per_step = (px_per_tick * step_ticks as f32).max(0.001);
 
         // Modal transform (M4b.3): finalize on the confirming click, cancel
         // on RMB, otherwise draw the ghosts (they may land on any row of
@@ -2509,7 +2555,6 @@ pub fn show(
                 state.modal_cancel = true;
             }
             let ptr = ui.ctx().pointer_hover_pos();
-            let px_per_bar = state.px_per_bar;
             if state.modal_cancel || state.modal_confirm {
                 if state.modal_confirm {
                     if let Some(m) = &state.modal {
@@ -2518,8 +2563,8 @@ pub fn show(
                                 if let Some(moves) = grab_targets(
                                     m,
                                     ptr,
-                                    px_per_bar,
-                                    bar_ticks,
+                                    px_per_step,
+                                    step_ticks,
                                     row_h,
                                     midi_tracks.len(),
                                     control_tracks.len(),
@@ -2606,8 +2651,9 @@ pub fn show(
                                 if let Some(spans) = stretch_targets(
                                     m,
                                     ptr,
-                                    px_per_bar,
-                                    bar_ticks,
+                                    px_per_step,
+                                    step_ticks,
+                                    floor_ticks,
                                     midi_tracks,
                                     control_tracks,
                                     audio_tracks,
@@ -2652,8 +2698,8 @@ pub fn show(
                                 if let Some(tiles) = tile_targets(
                                     m,
                                     ptr,
-                                    px_per_bar,
-                                    bar_ticks,
+                                    px_per_step,
+                                    step_ticks,
                                     midi_tracks,
                                     control_tracks,
                                     p.sec_per_tick,
@@ -2675,8 +2721,8 @@ pub fn show(
                     ModalKind::Grab { .. } | ModalKind::Duplicate { .. } => grab_targets(
                         m,
                         ptr,
-                        px_per_bar,
-                        bar_ticks,
+                        px_per_step,
+                        step_ticks,
                         row_h,
                         midi_tracks.len(),
                         control_tracks.len(),
@@ -2703,8 +2749,9 @@ pub fn show(
                     ModalKind::Stretch { .. } => stretch_targets(
                         m,
                         ptr,
-                        px_per_bar,
-                        bar_ticks,
+                        px_per_step,
+                        step_ticks,
+                        floor_ticks,
                         midi_tracks,
                         control_tracks,
                         audio_tracks,
@@ -2720,8 +2767,8 @@ pub fn show(
                     ModalKind::Tile => tile_targets(
                         m,
                         ptr,
-                        px_per_bar,
-                        bar_ticks,
+                        px_per_step,
+                        step_ticks,
                         midi_tracks,
                         control_tracks,
                         p.sec_per_tick,
@@ -3126,18 +3173,27 @@ fn lane_row<T: Placement>(
     content_len: &dyn Fn(&T) -> u32,
     // F-041 M10: the clip's explicit loop period, if any.
     content_loop: &dyn Fn(&T) -> Option<u32>,
+    // F-045 D5: the clip's content boundaries in arrangement ticks (note
+    // on/off for MIDI, anchor ticks for a curve) — the magnet targets for the
+    // edge drags. Audio passes a no-op: it has no note-level content.
+    content_edges: &dyn Fn(&T) -> Vec<u32>,
     // F-041: how many clips reference the same content (1 = private).
     data_refs: &dyn Fn(&T) -> usize,
     // W3b: group table for the colour stripe + name tag.
     clip_groups: &[ClipGroup],
 ) {
+    // F-045: Ctrl is the temporary tick override; otherwise the grid comes
+    // from the toolbar choice (Bar / Beat / Step, default Beat). Both are
+    // absolute-time snaps — `Snap::at` resolves a musical grid's width from
+    // the segment the pointer is in, so a drag across a meter change switches
+    // basis at the boundary.
     let snap = if parent
         .ctx()
         .input(|i| i.modifiers.ctrl || i.modifiers.command)
     {
         Snap::OFF
     } else {
-        Snap::on(i64::from(meter.ticks_per_bar_at(0).max(1)))
+        Snap::musical(state.snap_grid)
     };
     // The row's widget ids must be STABLE. The lane is the keyboard focus
     // carrier, and egui auto ids are positional: anything above the rows
@@ -3558,7 +3614,13 @@ fn lane_row<T: Placement>(
             if clips.len() >= MAX_CLIPS_PER_TRACK {
                 state.set_status("this track is full — cannot split");
             } else {
-                match knife_target(clips, tick_at(pos.x), meter, sec_per_tick, snap) {
+                // F-045 D6: the blade is an edge operation, so a nearby note
+                // boundary wins over the grid line under the pointer.
+                let tick = tick_at(pos.x);
+                let edges = hit_clip(clips, tick, sec_per_tick)
+                    .map(|index| content_edges(&clips[index]))
+                    .unwrap_or_default();
+                match knife_target(clips, tick, meter, sec_per_tick, snap, &edges, px_per_tick) {
                     Some((index, at)) => {
                         actions.push(TimelineAction::SplitClip {
                             lane: lane_kind,
@@ -3570,8 +3632,8 @@ fn lane_row<T: Placement>(
                             .selection
                             .retain(|s| s.lane != lane_kind || s.track != track || s.clip != index);
                     }
-                    None if hit_clip(clips, tick_at(pos.x), sec_per_tick).is_some() => {
-                        state.set_status("a cut needs at least one bar on both sides");
+                    None if hit_clip(clips, tick, sec_per_tick).is_some() => {
+                        state.set_status("a cut needs at least one grid cell on both sides");
                     }
                     None => {}
                 }
@@ -3580,10 +3642,14 @@ fn lane_row<T: Placement>(
     }
 
     // Knife preview: while armed, mark where the cut would land (the
-    // snapped bar line through the hovered lane).
+    // snapped line through the hovered lane).
     if state.knife_armed && response.hovered() {
         if let Some(pos) = response.hover_pos() {
-            let at = snap_bar(meter, tick_at(pos.x), snap);
+            let tick = tick_at(pos.x);
+            let edges = hit_clip(clips, tick, sec_per_tick)
+                .map(|index| content_edges(&clips[index]))
+                .unwrap_or_default();
+            let at = snap_with_magnet(meter, tick, snap, &edges, px_per_tick);
             let x = lane.left() + at as f32 * px_per_tick;
             painter.line_segment(
                 [pos2(x, lane.top()), pos2(x, lane.bottom())],
@@ -3652,7 +3718,7 @@ fn lane_row<T: Placement>(
                     }
                 }
             } else if clips.len() < MAX_CLIPS_PER_TRACK {
-                let start = snap_bar(meter, tick, snap);
+                let start = snap.at(meter, tick);
                 let bound = ARRANGEMENT_LIMIT_TICKS - meter.ticks_per_bar_at(start).max(1);
                 let start = start.min(bound);
                 if let RowKind::Audio(t) = row {
@@ -3770,7 +3836,7 @@ fn lane_row<T: Placement>(
                     }) if clip < clips.len() => {
                         let span = clips[clip].span(sec_per_tick);
                         let limit = ARRANGEMENT_LIMIT_TICKS - span;
-                        let start = snap_bar(meter, tick_at(pos.x) - grab_ticks, snap).min(limit);
+                        let start = snap.at(meter, tick_at(pos.x) - grab_ticks).min(limit);
                         if clips[clip].start() != start {
                             let lane = row.lane();
                             let track = row.track();
@@ -3795,14 +3861,17 @@ fn lane_row<T: Placement>(
                             // I6 + F-041 M10.7: the left edge adjusts the head
                             // trim both ways — deeper to the right, restore to
                             // the left (bounded by the data start in the model
-                            // layer). Bar-snapped, never closer than one bar
-                            // to the tail.
+                            // layer). Grid-snapped with the content magnet
+                            // (F-045 D6), never closer than one beat to the
+                            // tail.
                             let new_start = trim_head_start(
                                 tick_at(pos.x),
                                 origin_start,
                                 origin_span,
                                 meter,
                                 snap,
+                                &content_edges(&clips[clip]),
+                                px_per_tick,
                             );
                             let delta = i64::from(new_start) - i64::from(origin_start);
                             if delta != 0 {
@@ -3817,8 +3886,22 @@ fn lane_row<T: Placement>(
                         ResizeEdge::End => {
                             let start = clips[clip].start();
                             let limit = ARRANGEMENT_LIMIT_TICKS - start;
-                            let edge = snap_bar(meter, tick_at(pos.x) - start as f32, snap);
-                            let min_span = meter.ticks_per_bar_at(start).max(1);
+                            // The edge is snapped in ABSOLUTE ticks and then
+                            // expressed as a span: a musical grid is anchored
+                            // to its meter segment, so snapping the local
+                            // length would anchor it to the clip start instead.
+                            // F-045 D6: a nearby note-off wins over the grid.
+                            let edge_abs = snap_with_magnet(
+                                meter,
+                                tick_at(pos.x),
+                                snap,
+                                &content_edges(&clips[clip]),
+                                px_per_tick,
+                            );
+                            let edge = edge_abs.saturating_sub(start);
+                            // F-045 D10: the structural floor is one beat here
+                            // too, so a short clip stays usable at fast tempos.
+                            let min_span = meter.ticks_per_beat_at(start).max(1);
                             let edge = edge.clamp(min_span, limit.max(min_span));
                             // 2026-11-04: the plain right edge extends/trims
                             // the clip time. A single-period clip grows its
@@ -4390,23 +4473,26 @@ fn hit_clip<T: Placement>(clips: &[T], tick: f32, sec_per_tick: f64) -> Option<u
 }
 
 /// Knife targeting (M4b.2): resolve a click at `tick` into the clip index
-/// and a bar-snapped cut position, requiring at least one bar of clip on
+/// and a snapped cut position, requiring at least one grid cell of clip on
 /// both sides of the cut. `None` when the click misses every clip or the
-/// snapped position is too close to either edge. Met M4: the bar length is
-/// the segment containing the snapped cut.
+/// snapped position is too close to either edge. Met M4: the cell width is
+/// the one at the snapped cut (F-045: a bar, a beat or a step depending on
+/// the timeline's grid choice).
 fn knife_target<T: Placement>(
     clips: &[T],
     tick: f32,
     meter: &MeterMap,
     sec_per_tick: f64,
     snap: Snap,
+    edges: &[u32],
+    px_per_tick: f32,
 ) -> Option<(usize, u32)> {
     let index = hit_clip(clips, tick, sec_per_tick)?;
     let clip = &clips[index];
-    let at = snap_bar(meter, tick, snap);
-    let bar = meter.ticks_per_bar_at(at).max(1);
-    let left_ok = at >= clip.start() + bar;
-    let right_ok = at + bar <= clip.start() + clip.span(sec_per_tick);
+    let at = snap_with_magnet(meter, tick, snap, edges, px_per_tick);
+    let unit = snap.width_at(meter, at).clamp(1, i64::from(u32::MAX)) as u32;
+    let left_ok = at >= clip.start() + unit;
+    let right_ok = at + unit <= clip.start() + clip.span(sec_per_tick);
     (left_ok && right_ok).then_some((index, at))
 }
 
@@ -4467,35 +4553,124 @@ fn clamp_meter_tick(markers: &[MeterMarker], index: usize, tick: u32) -> u32 {
     tick.max(lo).min(hi)
 }
 
-/// Snaps to the nearest bar line (0 stays 0). Met M4: the grid is the
-/// containing segment's, so a drag that crosses a meter change switches its
-/// snap basis at the boundary; `snap` may turn the grid off (`Snap::OFF`)
-/// for a Ctrl drag.
-fn snap_bar(meter: &MeterMap, ticks: f32, snap: Snap) -> u32 {
-    if snap.is_off() {
-        ticks.round().max(0.0) as u32
+/// Screen distance inside which a dragged edge prefers a content boundary over
+/// the grid line (F-045 D7).
+const MAGNET_PX: f32 = 8.0;
+
+/// F-045 D5–D7: snap an edge drag, letting a nearby content boundary win over
+/// the grid line.
+///
+/// `edges` are **arrangement** ticks (already mapped through the clip's
+/// `source_offset` by [`midi_content_edges`] / [`curve_content_edges`]). Both
+/// candidates are compared in screen pixels; the boundary must also be
+/// strictly closer than the grid, so an exact tie stays on the grid and the
+/// result never flickers between the two. The Ctrl override disables both.
+fn snap_with_magnet(
+    meter: &MeterMap,
+    raw: f32,
+    snap: Snap,
+    edges: &[u32],
+    px_per_tick: f32,
+) -> u32 {
+    let grid = snap.at(meter, raw);
+    if snap.is_off() || edges.is_empty() || px_per_tick <= 0.0 {
+        return grid;
+    }
+    let raw = raw.max(0.0);
+    let Some(edge) = edges.iter().copied().min_by(|a, b| {
+        let da = (*a as f32 - raw).abs();
+        let db = (*b as f32 - raw).abs();
+        da.total_cmp(&db)
+    }) else {
+        return grid;
+    };
+    let edge_dist = (edge as f32 - raw).abs();
+    let grid_dist = (grid as f32 - raw).abs();
+    if edge_dist <= MAGNET_PX / px_per_tick && edge_dist < grid_dist {
+        edge
     } else {
-        meter.snap_bar(f64::from(ticks.max(0.0)))
+        grid
     }
 }
 
-/// I6: the bar-snapped start of a head trim.
+/// F-045 D5/D8: a MIDI clip's note boundaries in arrangement ticks — every
+/// note-on and note-off inside the clip's window. Data ticks are mapped
+/// through `source_offset`, which is what lets a head trim hit a note even
+/// when the data starts earlier than the window.
+fn midi_content_edges(clip: &MidiClip, data: Option<&MidiData>) -> Vec<u32> {
+    let Some(data) = data else {
+        return Vec::new();
+    };
+    let window_end = clip
+        .source_offset
+        .saturating_add(i64::from(clip.span_ticks));
+    let mut edges = Vec::with_capacity(data.notes().len() * 2);
+    for note in data.notes() {
+        let on = note.start;
+        let off = on.saturating_add(note.length.max(1));
+        for tick in [on, off] {
+            if tick < clip.source_offset || tick > window_end {
+                continue;
+            }
+            let arrangement = i64::from(clip.start_ticks)
+                .saturating_add(tick)
+                .saturating_sub(clip.source_offset);
+            if let Ok(tick) = u32::try_from(arrangement) {
+                edges.push(tick);
+            }
+        }
+    }
+    edges
+}
+
+/// Control-clip counterpart: the anchors are the only content boundaries a
+/// curve has, so both ends of the window can land exactly on one.
+fn curve_content_edges(clip: &ControlClip, data: Option<&CurveData>) -> Vec<u32> {
+    let Some(data) = data else {
+        return Vec::new();
+    };
+    let window_end = clip
+        .source_offset
+        .saturating_add(i64::from(clip.span_ticks));
+    data.points
+        .iter()
+        .filter_map(|point| {
+            let tick = i64::from(point.tick);
+            if tick < clip.source_offset || tick > window_end {
+                return None;
+            }
+            u32::try_from(
+                i64::from(clip.start_ticks)
+                    .saturating_add(tick)
+                    .saturating_sub(clip.source_offset),
+            )
+            .ok()
+        })
+        .collect()
+}
+
+/// I6: the snapped start of a head trim.
 ///
-/// Clamped to `[0, origin_start + origin_span - 1 bar]`: the drag adjusts the
+/// Clamped to `[0, origin_start + origin_span - 1 beat]`: the drag adjusts the
 /// left trim both ways (F-041 M10.7) — deeper to the right, restore to the
 /// left (bounded by the arrangement start; the model layer caps the restore
-/// at the window's data start) — and never closes the clip past one bar. The
-/// bar length is the one at the clip origin.
+/// at the window's data start) — and never closes the clip past one beat
+/// (F-045 D10: the floor is a beat, not a bar, so short clips stay usable at
+/// fast tempos). The beat length is the one at the clip origin.
 pub(crate) fn trim_head_start(
     pointer_tick: f32,
     origin_start: u32,
     origin_span: u32,
     meter: &MeterMap,
     snap: Snap,
+    edges: &[u32],
+    px_per_tick: f32,
 ) -> u32 {
-    let bar = meter.ticks_per_bar_at(origin_start).max(1);
-    let max_start = origin_start.saturating_add(origin_span).saturating_sub(bar);
-    snap_bar(meter, pointer_tick, snap).clamp(0, max_start)
+    let beat = meter.ticks_per_beat_at(origin_start).max(1);
+    let max_start = origin_start
+        .saturating_add(origin_span)
+        .saturating_sub(beat);
+    snap_with_magnet(meter, pointer_tick, snap, edges, px_per_tick).clamp(0, max_start)
 }
 
 /// The insertion row a track-reorder drag points at, plus the screen y the
@@ -4892,17 +5067,26 @@ mod tests {
         );
     }
 
-    /// I6 + F-041 M10.7: the head-trim start is bar-snapped, restores left of
+    /// I6 + F-041 M10.7: the head-trim start is grid-snapped, restores left of
     /// the drag origin (down to the arrangement start), and always leaves at
-    /// least one bar of clip.
+    /// least one BEAT of clip (F-045 D10 — a bar floor was too coarse).
     #[test]
     fn head_trim_start_is_snapped_and_clamped() {
         let bar = TICKS_PER_BAR;
+        let beat = TICKS_PER_BAR / 4;
         let start = 2 * bar;
         let span = 4 * bar;
         // Pointer left of the origin: restores all the way to the start.
         assert_eq!(
-            trim_head_start(0.0, start, span, &meter((4, 4)), Snap::on(i64::from(bar))),
+            trim_head_start(
+                0.0,
+                start,
+                span,
+                &meter((4, 4)),
+                Snap::musical(SnapGrid::Bar),
+                &[],
+                0.0
+            ),
             0
         );
         // Inside the clip: follows the bar grid.
@@ -4912,21 +5096,102 @@ mod tests {
                 start,
                 span,
                 &meter((4, 4)),
-                Snap::on(i64::from(bar))
+                Snap::musical(SnapGrid::Bar),
+                &[],
+                0.0
             ),
             3 * bar
         );
-        // Past the tail: the tail keeps one bar.
+        // Past the tail: the tail keeps one beat.
         assert_eq!(
             trim_head_start(
                 (99 * bar) as f32,
                 start,
                 span,
                 &meter((4, 4)),
-                Snap::on(i64::from(bar))
+                Snap::musical(SnapGrid::Bar),
+                &[],
+                0.0
             ),
-            start + span - bar
+            start + span - beat
         );
+    }
+
+    /// F-045 D6/D8: a dragged edge within the magnet radius lands exactly on a
+    /// note boundary even when that boundary is off the grid; beyond the radius
+    /// (or with Ctrl) the grid wins.
+    #[test]
+    fn the_magnet_wins_inside_its_radius_and_loses_outside() {
+        let map = meter((4, 4));
+        let beat = Snap::musical(SnapGrid::Beat);
+        // A note-off at 1000, deliberately off the 960 beat grid. 8 px at
+        // 1 tick/px is a 8-tick radius.
+        let edges = [1000u32];
+        assert_eq!(
+            snap_with_magnet(&map, 996.0, beat, &edges, 1.0),
+            1000,
+            "within 8 px the note-off wins"
+        );
+        assert_eq!(
+            snap_with_magnet(&map, 940.0, beat, &edges, 1.0),
+            960,
+            "outside the radius the beat grid wins"
+        );
+        assert_eq!(
+            snap_with_magnet(&map, 996.0, Snap::OFF, &edges, 1.0),
+            996,
+            "Ctrl disables the magnet and the grid alike"
+        );
+    }
+
+    /// F-045 D7: an exact tie stays on the grid — a magnet that sometimes wins
+    /// a tie would flicker between two equally valid answers.
+    #[test]
+    fn the_magnet_yields_to_the_grid_on_a_tie() {
+        let map = meter((4, 4));
+        let beat = Snap::musical(SnapGrid::Beat);
+        // Grid line 960 and boundary 960: same tick, so the grid answers.
+        assert_eq!(snap_with_magnet(&map, 960.0, beat, &[960], 1.0), 960);
+        // Midway between grid (960) and boundary (1000): 40 > 8 px at 1:1.
+        assert_eq!(snap_with_magnet(&map, 980.0, beat, &[1000], 1.0), 960);
+    }
+
+    /// F-045 D5/D8: a clip whose data starts before the window still exposes
+    /// the boundaries that fall inside it, mapped into arrangement ticks.
+    #[test]
+    fn content_edges_are_mapped_through_the_source_offset() {
+        let data = MidiData {
+            sequence: glitcherz_model::Sequence {
+                notes: vec![
+                    glitcherz_model::Note {
+                        start: 0,
+                        length: 480,
+                        ..glitcherz_model::Note::default()
+                    },
+                    glitcherz_model::Note {
+                        start: 960,
+                        length: 480,
+                        ..glitcherz_model::Note::default()
+                    },
+                ],
+                ctrls: Vec::new(),
+            },
+            length_ticks: 4 * TICKS_PER_BAR,
+        };
+        // Window starts at data tick 960 and sits at arrangement tick 3840:
+        // the second note's on/off map to 3840 and 4320; the first note is
+        // behind the window start and drops out.
+        let clip = MidiClip {
+            start_ticks: TICKS_PER_BAR,
+            span_ticks: 2 * TICKS_PER_BAR,
+            source_offset: 960,
+            ..MidiClip::default()
+        };
+        assert_eq!(
+            midi_content_edges(&clip, Some(&data)),
+            vec![TICKS_PER_BAR, TICKS_PER_BAR + 480]
+        );
+        assert_eq!(midi_content_edges(&clip, None), Vec::<u32>::new());
     }
 
     /// F-041 M10.7: a head trim moves the window (positive delta) and a
@@ -5402,7 +5667,9 @@ mod tests {
                 tick,
                 &meter((4, 4)),
                 SPT,
-                Snap::on(i64::from(TICKS_PER_BAR))
+                Snap::musical(SnapGrid::Bar),
+                &[],
+                0.0
             ),
             Some((0, 3 * TICKS_PER_BAR)),
             "the cut lands on the nearest bar line"
@@ -5419,7 +5686,9 @@ mod tests {
                 TICKS_PER_BAR as f32,
                 &meter((4, 4)),
                 SPT,
-                Snap::on(i64::from(TICKS_PER_BAR))
+                Snap::musical(SnapGrid::Bar),
+                &[],
+                0.0
             ),
             Some((0, TICKS_PER_BAR))
         );
@@ -5430,7 +5699,9 @@ mod tests {
                 0.2 * TICKS_PER_BAR as f32,
                 &meter((4, 4)),
                 SPT,
-                Snap::on(i64::from(TICKS_PER_BAR))
+                Snap::musical(SnapGrid::Bar),
+                &[],
+                0.0
             ),
             None
         );
@@ -5441,7 +5712,9 @@ mod tests {
                 1.8 * TICKS_PER_BAR as f32,
                 &meter((4, 4)),
                 SPT,
-                Snap::on(i64::from(TICKS_PER_BAR))
+                Snap::musical(SnapGrid::Bar),
+                &[],
+                0.0
             ),
             None
         );
@@ -5452,7 +5725,59 @@ mod tests {
                 4.4 * TICKS_PER_BAR as f32,
                 &meter((4, 4)),
                 SPT,
-                Snap::on(i64::from(TICKS_PER_BAR))
+                Snap::musical(SnapGrid::Bar),
+                &[],
+                0.0
+            ),
+            None
+        );
+    }
+
+    /// F-045 D1: with the default Beat grid the blade lands on beats, and the
+    /// "both sides" margin shrinks from a bar to a beat — otherwise a beat
+    /// cut near a clip edge would still be refused as if it were a bar cut.
+    #[test]
+    fn knife_cuts_on_beats_when_the_grid_is_a_beat() {
+        let beat = TICKS_PER_BAR / 4;
+        let clips = vec![clip(0, 4 * TICKS_PER_BAR)];
+        assert_eq!(
+            knife_target(
+                &clips,
+                (3 * beat) as f32 + 100.0,
+                &meter((4, 4)),
+                SPT,
+                Snap::musical(SnapGrid::Beat),
+                &[],
+                0.0
+            ),
+            Some((0, 3 * beat)),
+            "the cut lands on the nearest beat"
+        );
+        // Two beats of clip: a cut on the middle beat is legal (one beat on
+        // each side), which a bar-wide margin would have refused.
+        let short = vec![clip(0, 2 * beat)];
+        assert_eq!(
+            knife_target(
+                &short,
+                beat as f32,
+                &meter((4, 4)),
+                SPT,
+                Snap::musical(SnapGrid::Beat),
+                &[],
+                0.0
+            ),
+            Some((0, beat))
+        );
+        // The edges themselves still have nothing to cut.
+        assert_eq!(
+            knife_target(
+                &short,
+                20.0,
+                &meter((4, 4)),
+                SPT,
+                Snap::musical(SnapGrid::Beat),
+                &[],
+                0.0
             ),
             None
         );
@@ -5467,7 +5792,9 @@ mod tests {
                 6.0 * TICKS_PER_BAR as f32,
                 &meter((4, 4)),
                 SPT,
-                Snap::on(i64::from(TICKS_PER_BAR))
+                Snap::musical(SnapGrid::Bar),
+                &[],
+                0.0
             ),
             None
         );
@@ -5486,16 +5813,14 @@ mod tests {
                 1.6 * SIX_EIGHT as f32,
                 &meter((6, 8)),
                 SPT,
-                Snap::on(i64::from(SIX_EIGHT))
+                Snap::musical(SnapGrid::Bar),
+                &[],
+                0.0
             ),
             Some((0, 2 * SIX_EIGHT))
         );
         assert_eq!(
-            snap_bar(
-                &meter((6, 8)),
-                1.6 * SIX_EIGHT as f32,
-                Snap::on(i64::from(SIX_EIGHT))
-            ),
+            Snap::musical(SnapGrid::Bar).at(&meter((6, 8)), 1.6 * SIX_EIGHT as f32),
             2 * SIX_EIGHT
         );
         // A 3/4 clip of exactly one bar still cannot be cut (one bar minimum
@@ -5507,7 +5832,9 @@ mod tests {
                 0.4 * SIX_EIGHT as f32,
                 &meter((6, 8)),
                 SPT,
-                Snap::on(i64::from(SIX_EIGHT))
+                Snap::musical(SnapGrid::Bar),
+                &[],
+                0.0
             ),
             None
         );
@@ -5556,15 +5883,15 @@ mod tests {
         );
         // 4/4 side: still the 3840 grid.
         assert_eq!(
-            snap_bar(&map, 3.6 * TICKS_PER_BAR as f32, Snap::on(1)),
+            Snap::musical(SnapGrid::Bar).at(&map, 3.6 * TICKS_PER_BAR as f32),
             start
         );
         // 6/8 side: grid relative to the segment, so 1.6 bars in snaps to the
         // second 2880 line.
         let t = (f64::from(start) + 1.6 * 2880.0) as f32;
-        assert_eq!(snap_bar(&map, t, Snap::on(1)), start + 2 * 2880);
+        assert_eq!(Snap::musical(SnapGrid::Bar).at(&map, t), start + 2 * 2880);
         // Ctrl (Snap::OFF) lands on the nearest tick, not a bar line.
-        assert_eq!(snap_bar(&map, 100.4, Snap::OFF), 100);
+        assert_eq!(Snap::OFF.at(&map, 100.4), 100);
     }
 
     #[test]
@@ -5907,6 +6234,7 @@ mod tests {
             Some(pos2(-3.0 * 56.0, 0.0)),
             56.0,
             TICKS_PER_BAR,
+            TICKS_PER_BAR,
             &midi,
             &[],
             &[],
@@ -5930,6 +6258,7 @@ mod tests {
             &start,
             Some(pos2(3.0 * 56.0, 0.0)),
             56.0,
+            TICKS_PER_BAR,
             TICKS_PER_BAR,
             &midi,
             &[],
@@ -6031,6 +6360,7 @@ mod tests {
             &modal,
             Some(ptr),
             56.0,
+            TICKS_PER_BAR,
             TICKS_PER_BAR,
             &[],
             &[],

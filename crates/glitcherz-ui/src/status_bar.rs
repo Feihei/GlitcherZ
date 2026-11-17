@@ -187,13 +187,15 @@ impl GlitcherZApp {
                 ui.label(format!("Pos {}.{}", bar + 1, beat + 1));
                 ui.separator();
                 ui.label(format!("Uptime {:.1} s", position));
-                // spec `snap.md` S3: Ctrl is the temporary snap override. The
-                // hint appears while it is held, so a drop that stopped
-                // targeting the grid is explained; text fields keep Ctrl for
-                // their own shortcuts.
+                // spec `snap.md` S3 + F-045 D13: the active grid is always
+                // visible, and the Ctrl override takes the slot over with a
+                // warning colour while it is held — a drop that stopped
+                // targeting the grid is then explained. Text fields keep Ctrl
+                // for their own shortcuts, so the override only shows where it
+                // actually applies.
                 let ctrl = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.command);
+                ui.separator();
                 if ctrl && !ui.ctx().text_edit_focused() {
-                    ui.separator();
                     ui.label(
                         egui::RichText::new("Snap off")
                             .color(egui::Color32::from_rgb(230, 190, 70)),
@@ -201,6 +203,9 @@ impl GlitcherZApp {
                     .on_hover_text(
                         "Ctrl is held: drags land on the nearest tick instead of the grid",
                     );
+                } else {
+                    ui.label(format!("Snap {}", self.timeline_state.snap_grid.label()))
+                        .on_hover_text(self.timeline_state.snap_grid.hint());
                 }
                 if std::env::var_os("GLITCHERZ_FOCUS_DEBUG").is_some() {
                     ui.separator();

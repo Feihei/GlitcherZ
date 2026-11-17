@@ -206,6 +206,24 @@ impl MeterMap {
     /// relative to the segment start, so a 6/8 section keeps a 2880-tick grid
     /// even when the preceding 4/4 section used 3840).
     pub fn snap_bar(&self, raw: f64) -> u32 {
+        self.snap_relative(raw, |signature| signature.ticks_per_bar())
+    }
+
+    /// [`MeterMap::snap_bar`] one beat down: the grid is the containing
+    /// segment's beat (4/4 = 960, 6/8 = 480), anchored at the segment start.
+    ///
+    /// The anchor is what keeps a beat grid from drifting across a meter
+    /// change — a 7/8 bar is 3360 ticks, so a 4/4 beat grid anchored at tick 0
+    /// would sit half a beat off the new bar (F-045 D4).
+    pub fn snap_beat(&self, raw: f64) -> u32 {
+        self.snap_relative(raw, |signature| signature.ticks_per_beat())
+    }
+
+    /// Shared engine: round `raw` to the nearest multiple of `width` measured
+    /// from the containing segment's start, clamping a round-up at a segment
+    /// end onto the next segment's first line (which is always itself a line of
+    /// the new grid).
+    fn snap_relative(&self, raw: f64, width: impl Fn(&TimeSignature) -> u32) -> u32 {
         if !raw.is_finite() || raw <= 0.0 {
             return 0;
         }
@@ -214,9 +232,9 @@ impl MeterMap {
         let Some(seg) = self.segments.get(index) else {
             return tick;
         };
-        let bar_ticks = f64::from(seg.signature.ticks_per_bar().max(1));
-        let rel = (f64::from(tick) - f64::from(seg.tick)) / bar_ticks;
-        let snapped = f64::from(seg.tick) + rel.round() * bar_ticks;
+        let line_ticks = f64::from(width(&seg.signature).max(1));
+        let rel = (f64::from(tick) - f64::from(seg.tick)) / line_ticks;
+        let snapped = f64::from(seg.tick) + rel.round() * line_ticks;
         let snapped = snapped.clamp(0.0, f64::from(u32::MAX)) as u32;
         match self.segments.get(index + 1) {
             // Rounding up at the end of a segment lands exactly on the next
@@ -341,6 +359,24 @@ mod tests {
             TICKS_PER_BAR
         );
         assert_eq!(map.snap_bar(-5.0), 0);
+    }
+
+    #[test]
+    fn beat_snapping_anchors_at_the_segment_start() {
+        // One 7/8 bar (3360 ticks) then 4/4. 3360 is 3.5 beats of 4/4, so a
+        // beat grid anchored at tick 0 would sit half a beat off every 4/4
+        // bar; anchoring at the segment start keeps the beats aligned
+        // (F-045 D4).
+        let start = 3360;
+        let map = MeterMap::new(TimeSignature::new(7, 8), &[marker(start, 4, 4)]);
+        // 7/8 side: the beat is the eighth note, 480 ticks.
+        assert_eq!(map.snap_beat(f64::from(start) - 20.0), start);
+        assert_eq!(map.snap_beat(f64::from(start) - 1000.0), 2400);
+        // 4/4 side: 960-tick beats measured from the segment start.
+        assert_eq!(map.snap_beat(f64::from(start) + 460.0), start);
+        assert_eq!(map.snap_beat(f64::from(start) + 500.0), start + 960);
+        assert_eq!(map.snap_beat(f64::from(start) + 960.0), start + 960);
+        assert_eq!(map.snap_beat(-1.0), 0);
     }
 
     #[test]

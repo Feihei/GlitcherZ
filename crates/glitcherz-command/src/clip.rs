@@ -256,6 +256,9 @@ fn fit_window(session: &mut Session, params: &Value) -> crate::Result<Value> {
         }
     }
     let bar = i64::from(session.project().ticks_per_bar_at(start).max(1));
+    // F-045 D10: the structural floor is one beat, not one bar — a fit on a
+    // short clip must not inflate it to a whole bar.
+    let beat = i64::from(session.project().ticks_per_beat_at(start).max(1));
     let mut new_offset = offset;
     let mut new_span = i64::from(span);
     if matches!(edge, "left" | "both")
@@ -275,7 +278,7 @@ fn fit_window(session: &mut Session, params: &Value) -> crate::Result<Value> {
             .saturating_add(bar.saturating_sub(1))
             .div_euclid(bar)
             .saturating_mul(bar);
-        new_span = (ceil - new_offset).max(bar);
+        new_span = (ceil - new_offset).max(beat);
     }
     let span = u32::try_from(new_span).unwrap_or(u32::MAX);
     let Some(target) = session
