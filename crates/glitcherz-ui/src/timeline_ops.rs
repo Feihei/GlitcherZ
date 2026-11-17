@@ -2395,6 +2395,16 @@ fn content_span_cap(content_end: i64, offset: i64, bar: i64) -> u32 {
     u32::try_from((limit - offset).max(1)).unwrap_or(u32::MAX)
 }
 
+/// F-041 D39/D43 + F-045: the ceiling a window edit may grow to, as a span in
+/// ticks. `None` means the data holds no events, so there is nothing to grow
+/// over: the window may not widen at all. A fresh one-bar clip therefore
+/// cannot be dragged into empty space — the roll widens it when the first
+/// note is written (D41/D42 write-time growth), which is the only path that
+/// is allowed to make a window longer than its content.
+fn window_growth_cap(content_end: Option<i64>, offset: i64, bar: i64) -> Option<u32> {
+    content_end.map(|end| content_span_cap(end, offset, bar))
+}
+
 /// One MIDI clip's T stretch (F-041 M10): a **pure window edit**.
 ///
 /// Moving the start shifts `source_offset` (negative = leading blank); moving
@@ -2431,22 +2441,18 @@ fn stretch_midi_clip(
     let new_start = new_start.clamp(restore_floor.max(0) as u32, u32::MAX);
     // F-041 M10.2: shrinking the window must keep at least one note audible.
     let shifted = old_off.saturating_add(i64::from(new_start) - i64::from(old_start));
-    // F-041 M10.6: the window may not grow past the last content bar.
+    // F-041 M10.6: the window may not grow past the last content bar, and an
+    // empty data block gives it no room to grow at all.
     let bar = i64::from(project.ticks_per_bar_at(clip.start_ticks).max(1));
-    let content_end = project
-        .midi_data
-        .get(data_idx as usize)
-        .and_then(|data| {
-            data.notes()
-                .iter()
-                .map(|note| note.start.saturating_add(note.length))
-                .max()
-        })
-        .unwrap_or(0);
-    let new_span = if content_end > 0 {
-        new_span.min(content_span_cap(content_end, shifted, bar))
-    } else {
-        new_span
+    let content_end = project.midi_data.get(data_idx as usize).and_then(|data| {
+        data.notes()
+            .iter()
+            .map(|note| note.start.saturating_add(note.length))
+            .max()
+    });
+    let new_span = match window_growth_cap(content_end, shifted, bar) {
+        Some(cap) => new_span.min(cap),
+        None => new_span.min(old_span),
     };
     // M10.7: a request clamped all the way back to the current window (no
     // restore room, no span change) is a no-op, not an edit.
@@ -2502,17 +2508,16 @@ fn stretch_curve_clip(
     let restore_floor = i64::from(old_start).saturating_sub(old_off.max(0));
     let new_start = new_start.clamp(restore_floor.max(0) as u32, u32::MAX);
     let shifted = old_off.saturating_add(i64::from(new_start) - i64::from(old_start));
-    // F-041 M10.6: control windows stop at the last anchor bar as well.
+    // F-041 M10.6: control windows stop at the last anchor bar as well; with
+    // no anchors there is no bar to stop at, so the window cannot grow.
     let bar = i64::from(project.ticks_per_bar_at(clip.start_ticks).max(1));
     let content_end = project
         .curve_data
         .get(data_idx as usize)
-        .and_then(|data| data.points.last().map(|point| i64::from(point.tick) + 1))
-        .unwrap_or(0);
-    let new_span = if content_end > 0 {
-        new_span.min(content_span_cap(content_end, shifted, bar))
-    } else {
-        new_span
+        .and_then(|data| data.points.last().map(|point| i64::from(point.tick) + 1));
+    let new_span = match window_growth_cap(content_end, shifted, bar) {
+        Some(cap) => new_span.min(cap),
+        None => new_span.min(old_span),
     };
     // M10.7: a request clamped all the way back to the current window (no
     // restore room, no span change) is a no-op, not an edit.
@@ -2555,19 +2560,19 @@ fn resize_midi_clip(
     // F-041 M10.6/M10.10: the right edge may not grow past the last content
     // bar. A legacy oversized window stays put on extension (cap.max(old)),
     // so dragging right neither grows nor shrinks it; shrinking stays free.
+    // An empty data block offers no bar at all: the right edge is pinned.
     let bar = i64::from(project.ticks_per_bar_at(clip.start_ticks).max(1));
-    let content_end = project
-        .midi_data
-        .get(data_idx as usize)
-        .and_then(|data| {
-            data.notes()
-                .iter()
-                .map(|note| note.start.saturating_add(note.length))
-                .max()
-        })
-        .unwrap_or(0);
-    let new_span = if new_span > old_span && content_end > 0 {
-        new_span.min(content_span_cap(content_end, off, bar).max(old_span))
+    let content_end = project.midi_data.get(data_idx as usize).and_then(|data| {
+        data.notes()
+            .iter()
+            .map(|note| note.start.saturating_add(note.length))
+            .max()
+    });
+    let new_span = if new_span > old_span {
+        match window_growth_cap(content_end, off, bar) {
+            Some(cap) => new_span.min(cap.max(old_span)),
+            None => old_span,
+        }
     } else {
         new_span
     };
@@ -2605,15 +2610,18 @@ fn resize_curve_clip(
     };
     let (off, data_idx, old_span) = (clip.source_offset, clip.data, clip.span_ticks);
     // F-041 M10.6/M10.10: same right-edge cap as MIDI, measured at the last
-    // anchor (curve content ends at its final anchor tick).
+    // anchor (curve content ends at its final anchor tick). No anchors means
+    // nothing to grow over, so the edge stays where it is.
     let bar = i64::from(project.ticks_per_bar_at(clip.start_ticks).max(1));
     let content_end = project
         .curve_data
         .get(data_idx as usize)
-        .and_then(|data| data.points.last().map(|point| i64::from(point.tick) + 1))
-        .unwrap_or(0);
-    let new_span = if new_span > old_span && content_end > 0 {
-        new_span.min(content_span_cap(content_end, off, bar).max(old_span))
+        .and_then(|data| data.points.last().map(|point| i64::from(point.tick) + 1));
+    let new_span = if new_span > old_span {
+        match window_growth_cap(content_end, off, bar) {
+            Some(cap) => new_span.min(cap.max(old_span)),
+            None => old_span,
+        }
     } else {
         new_span
     };
@@ -2636,7 +2644,7 @@ fn resize_curve_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glitcherz_model::{AudioClip, MidiData, MidiTrack, Sequence, TICKS_PER_BAR};
+    use glitcherz_model::{AudioClip, CurveData, MidiData, MidiTrack, Sequence, TICKS_PER_BAR};
 
     fn clip_with_one_note(project: &mut Project) -> MidiClip {
         let data = project.push_midi_data(MidiData {
@@ -2919,5 +2927,78 @@ mod tests {
             project.midi_tracks[0].clips[0].span_ticks,
             2 * TICKS_PER_BAR
         );
+    }
+
+    /// F-041 D39/D43: an empty data block offers no content bar to grow to, so
+    /// the window is pinned. A double-clicked empty clip stays at its one bar
+    /// until the roll writes the first note (M10.8 write-time growth) — its
+    /// edge must not drag a silent void into the arrangement.
+    #[test]
+    fn resize_does_not_widen_an_empty_clip() {
+        let mut project = Project::default();
+        let data = project.push_midi_data(MidiData {
+            length_ticks: TICKS_PER_BAR,
+            ..MidiData::default()
+        });
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: 0,
+            span_ticks: TICKS_PER_BAR,
+            data,
+            ..MidiClip::default()
+        });
+
+        assert!(
+            !resize_midi_clip(&mut project, 0, 0, 0, 4 * TICKS_PER_BAR),
+            "an empty clip cannot be extended"
+        );
+        assert_eq!(
+            project.midi_tracks[0].clips[0].span_ticks, TICKS_PER_BAR,
+            "the window stayed at its original length"
+        );
+
+        // Shrinking is still a legal window edit.
+        assert!(resize_midi_clip(&mut project, 0, 0, 0, TICKS_PER_BAR / 2));
+        assert_eq!(
+            project.midi_tracks[0].clips[0].span_ticks,
+            TICKS_PER_BAR / 2
+        );
+    }
+
+    /// Same rule on the T / curve paths: no anchors, no growth.
+    #[test]
+    fn stretch_does_not_widen_an_empty_clip() {
+        let mut project = Project::default();
+        let midi_data = project.push_midi_data(MidiData {
+            length_ticks: TICKS_PER_BAR,
+            ..MidiData::default()
+        });
+        project.midi_tracks[0].clips.push(MidiClip {
+            start_ticks: 0,
+            span_ticks: TICKS_PER_BAR,
+            data: midi_data,
+            ..MidiClip::default()
+        });
+        assert!(!stretch_midi_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
+        assert_eq!(project.midi_tracks[0].clips[0].span_ticks, TICKS_PER_BAR);
+
+        let curve_data = project.push_curve_data(CurveData {
+            length_ticks: TICKS_PER_BAR,
+            ..CurveData::default()
+        });
+        project.control_tracks[0].clips.push(ControlClip {
+            start_ticks: 0,
+            span_ticks: TICKS_PER_BAR,
+            data: curve_data,
+            ..ControlClip::default()
+        });
+        assert!(!stretch_curve_clip(
+            &mut project,
+            0,
+            0,
+            0,
+            2 * TICKS_PER_BAR
+        ));
+        assert!(!resize_curve_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
+        assert_eq!(project.control_tracks[0].clips[0].span_ticks, TICKS_PER_BAR);
     }
 }
