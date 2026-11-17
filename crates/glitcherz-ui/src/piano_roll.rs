@@ -2786,7 +2786,8 @@ pub fn show(
             k: i.consume_key(egui::Modifiers::NONE, egui::Key::K),
             x: i.consume_key(egui::Modifiers::NONE, egui::Key::X),
             y: i.consume_key(egui::Modifiers::NONE, egui::Key::Y),
-            delete: i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
+            delete: i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace),
             // The Shift variant is consumed first: `consume_key` matches
             // logically, so the plain Ctrl+A pattern would swallow it too.
             deselect_all: {

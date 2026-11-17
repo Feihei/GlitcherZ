@@ -110,15 +110,7 @@ impl GlitcherZApp {
         // has to claim its height before `timeline::show` lays the rows out —
         // a bottom panel declared afterwards would be pushed off the tab —
         // so it sits here, above the waveform closure that borrows `self`.
-        {
-            let project = self.session.project();
-            data_panel::show(
-                ui,
-                project,
-                &mut self.data_panel_open,
-                &mut self.data_filter,
-            );
-        }
+        self.timeline_data_panel(ui);
         // U6: audio clip bodies read peaks from the session sample cache
         // (read-only lookup — decoding happens on the edit paths).
         //
@@ -189,6 +181,142 @@ impl GlitcherZApp {
         for action in actions {
             self.apply_timeline_action(action);
         }
+    }
+
+    /// F-046: the `Data` strip plus the edits it asks for.
+    ///
+    /// The panel is read-only, so this is the one place that turns its
+    /// intents into undoable document edits. The borrow split is why it is a
+    /// method: `project()` is held immutably for the whole frame the panel
+    /// draws, and the state it writes lives in `self.data_panel`.
+    pub(crate) fn timeline_data_panel(&mut self, ui: &mut egui::Ui) {
+        let intent = {
+            let project = self.session.project();
+            data_panel::show(ui, project, &mut self.data_panel)
+        };
+        match intent {
+            Some(data_panel::DataIntent::Rename { kind, index, name }) => {
+                self.rename_clip_data(kind, index, name)
+            }
+            Some(data_panel::DataIntent::SelectUsers { kind, index }) => {
+                self.select_data_users(kind, index)
+            }
+            Some(data_panel::DataIntent::Purge) => self.purge_unused_data(),
+            None => {}
+        }
+    }
+
+    /// F-046 D16: commit an inline rename. Presentation only — the name is
+    /// never pushed to the engine and no row has to be re-synced — so this is
+    /// one undo step and nothing else.
+    fn rename_clip_data(&mut self, kind: data_panel::DataKind, index: u32, name: String) {
+        let current = match kind {
+            data_panel::DataKind::Midi => self
+                .project()
+                .midi_data
+                .get(index as usize)
+                .map(|d| d.name.clone()),
+            data_panel::DataKind::Curve => self
+                .project()
+                .curve_data
+                .get(index as usize)
+                .map(|d| d.name.clone()),
+        };
+        if !current.is_some_and(|current| current != name) {
+            return;
+        }
+        let before = self.begin_edit();
+        match kind {
+            data_panel::DataKind::Midi => {
+                if let Some(data) = self.project_mut().midi_data.get_mut(index as usize) {
+                    data.name = name;
+                }
+            }
+            data_panel::DataKind::Curve => {
+                if let Some(data) = self.project_mut().curve_data.get_mut(index as usize) {
+                    data.name = name;
+                }
+            }
+        }
+        self.commit_edit("Rename Data", before);
+    }
+
+    /// F-046 D11: the reference column — select every clip that points at the
+    /// row. The selection is the timeline's, so this is the reverse of the
+    /// clip menu's `Show in Data` and needs no document edit.
+    fn select_data_users(&mut self, kind: data_panel::DataKind, index: u32) {
+        let (lane, users) = match kind {
+            data_panel::DataKind::Midi => (
+                timeline::TimelineLane::Midi,
+                self.project().midi_data_users(index),
+            ),
+            data_panel::DataKind::Curve => (
+                timeline::TimelineLane::Control,
+                self.project().curve_data_users(index),
+            ),
+        };
+        if users.is_empty() {
+            return;
+        }
+        let selection: Vec<timeline::ClipSel> = users
+            .iter()
+            .map(|&(track, clip)| timeline::ClipSel { lane, track, clip })
+            .collect();
+        match kind {
+            data_panel::DataKind::Midi => self.selected_track = users[0].0,
+            data_panel::DataKind::Curve => self.selected_auto = users[0].0,
+        }
+        self.timeline_state.selection_anchor = selection.first().copied();
+        self.timeline_state.selection = selection;
+        // The rows own their geometry; ask them to reveal the selection on
+        // the next frame.
+        self.timeline_state.scroll_to_selection = true;
+    }
+
+    /// F-046 D15: drop orphan pool entries. Same call the save path makes, so
+    /// there is exactly one remapping implementation.
+    fn purge_unused_data(&mut self) {
+        let (midi, curve) = self.project().unused_data_count();
+        if midi + curve == 0 {
+            return;
+        }
+        let before = self.begin_edit();
+        self.project_mut().compact_clip_data();
+        self.commit_edit("Purge Unused Data", before);
+        // The slots moved: a highlight or an inline rename pointing at one is
+        // now meaningless (D15 / §8 "池索引漂移").
+        self.data_panel.focus = None;
+        self.data_panel.rename = None;
+    }
+
+    /// F-046 D7: open the `Data` strip on a clip's pool entry (`Show in
+    /// Data`). The panel clears its own filter and search first — the point of
+    /// the command is that the row is visible, so leaving a stale name search
+    /// in place would make it do nothing.
+    fn show_clip_data(&mut self, lane: timeline::TimelineLane, track: usize, clip: usize) {
+        let found = match lane {
+            timeline::TimelineLane::Midi => self
+                .project()
+                .midi_tracks
+                .get(track)
+                .and_then(|t| t.clips.get(clip))
+                .map(|c| (data_panel::DataKind::Midi, c.data)),
+            timeline::TimelineLane::Control => self
+                .project()
+                .control_tracks
+                .get(track)
+                .and_then(|t| t.clips.get(clip))
+                .map(|c| (data_panel::DataKind::Curve, c.data)),
+            timeline::TimelineLane::Audio => None,
+        };
+        let Some((kind, index)) = found else {
+            return;
+        };
+        let panel = &mut self.data_panel;
+        panel.open = true;
+        panel.focus = Some((kind, index));
+        panel.filter = data_panel::DataFilter::All;
+        panel.search.clear();
     }
 
     /// Applies one timeline view action (engine pushes / cross-panel state).
@@ -305,6 +433,14 @@ impl GlitcherZApp {
             // B2: temporary clip mute (Ctrl+middle click / H / Alt+H).
             timeline::TimelineAction::SetClipMuted { clips, muted } => {
                 self.timeline_set_clip_muted(clips, muted)
+            }
+            // F-046 D7: the clip context menu's data items. Same handlers the
+            // Inspector's buttons called, now fed the menu's snapshot so the
+            // action matches the selection the menu was opened on.
+            timeline::TimelineAction::LinkClipData { clips } => self.link_clip_data(&clips),
+            timeline::TimelineAction::UnlinkClipData { clips } => self.unlink_clip_data(&clips),
+            timeline::TimelineAction::ShowInData { lane, track, clip } => {
+                self.show_clip_data(lane, track, clip)
             }
             timeline::TimelineAction::AddClip {
                 lane,
@@ -2147,70 +2283,12 @@ impl GlitcherZApp {
         }
     }
 
-    /// F-041: shared-content summary and the Share / Unlink entry points.
-    pub(crate) fn clip_data_section(&mut self, ui: &mut egui::Ui) {
-        let selection = self.timeline_state.selection.clone();
-        let Some(first) = selection.first().copied() else {
-            return;
-        };
-        let (data, refs, kind) = match first.lane {
-            timeline::TimelineLane::Midi => {
-                let Some(clip) = self
-                    .project()
-                    .midi_tracks
-                    .get(first.track)
-                    .and_then(|t| t.clips.get(first.clip))
-                else {
-                    return;
-                };
-                (clip.data, self.project().midi_data_refs(clip.data), "MIDI")
-            }
-            timeline::TimelineLane::Control => {
-                let Some(clip) = self
-                    .project()
-                    .control_tracks
-                    .get(first.track)
-                    .and_then(|t| t.clips.get(first.clip))
-                else {
-                    return;
-                };
-                (
-                    clip.data,
-                    self.project().curve_data_refs(clip.data),
-                    "curve",
-                )
-            }
-            timeline::TimelineLane::Audio => return,
-        };
-        ui.separator();
-        ui.label(format!(
-            "Clip data · {kind} #{data} · shared by {refs} clip(s)"
-        ));
-        if refs > 1 {
-            let unlink = ui
-                .button("Unlink")
-                .on_hover_text("Give this clip its own copy of the content");
-            if unlink.clicked() {
-                // Do not leave the keyboard parked on this button: the
-                // timeline / roll surfaces only regain it on pointer hover.
-                unlink.surrender_focus();
-                self.unlink_selected_clip_data();
-            }
-        }
-        if selection.len() > 1 && selection.iter().all(|sel| sel.lane == first.lane) {
-            let link = ui
-                .button("Link Data")
-                .on_hover_text("Point every selected clip at the first one's content");
-            if link.clicked() {
-                link.surrender_focus();
-                self.link_selected_clip_data();
-            }
-        }
-    }
-
-    /// F-041: point every selected clip at the first clip's content.
-    pub(crate) fn link_selected_clip_data(&mut self) {
-        let selection = self.timeline_state.selection.clone();
+    /// F-041: point every listed clip at the first one's content. F-046 moved
+    /// the entry point from the Inspector to the clip context menu, which is
+    /// why the selection arrives as an argument: the menu acts on the
+    /// selection as it was when the menu opened.
+    pub(crate) fn link_clip_data(&mut self, clips: &[timeline::ClipSel]) {
+        let selection = clips.to_vec();
         let Some(first) = selection.first().copied() else {
             return;
         };
@@ -2280,9 +2358,9 @@ impl GlitcherZApp {
         self.sync_selection_rows(&selection);
     }
 
-    /// F-041: give every selected shared clip its own copy of the content.
-    pub(crate) fn unlink_selected_clip_data(&mut self) {
-        let selection = self.timeline_state.selection.clone();
+    /// F-041: give every listed shared clip its own copy of the content.
+    pub(crate) fn unlink_clip_data(&mut self, clips: &[timeline::ClipSel]) {
+        let selection = clips.to_vec();
         if selection.is_empty() {
             return;
         }

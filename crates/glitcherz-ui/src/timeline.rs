@@ -29,6 +29,7 @@
 //! (re-push clips) or cross-panel state (selection, editor target) is reported
 //! back as [`TimelineAction`]s.
 
+use crate::data_panel::DataKind;
 use crate::snap::{Snap, SnapGrid};
 use eframe::egui;
 use egui::{
@@ -396,6 +397,14 @@ pub struct TimelineState {
     /// it is a working preference, not project data, so it never enters
     /// `Project` or `PROJECT_VERSION` (same rule as the roll's grid).
     pub snap_grid: SnapGrid,
+    /// F-046 D6: where the clip context menu was opened, if it is open.
+    /// The items act on the **live selection**, not on this position, so a
+    /// multi-clip menu keeps working while the pointer wanders.
+    clip_menu: Option<Pos2>,
+    /// One-shot: scroll the rows so the selection is visible. Set by the
+    /// data panel's reference jump (F-046 D11) — the rows are the only place
+    /// that knows their own geometry.
+    pub(crate) scroll_to_selection: bool,
 }
 
 impl Default for TimelineState {
@@ -431,6 +440,8 @@ impl Default for TimelineState {
             head_trim: None,
             duplicate_shared: false,
             snap_grid: SnapGrid::default(),
+            clip_menu: None,
+            scroll_to_selection: false,
         }
     }
 }
@@ -713,6 +724,23 @@ pub enum TimelineAction {
     SetClipMuted {
         clips: Vec<ClipSel>,
         muted: bool,
+    },
+    /// F-046 D7: point every listed clip at the first one's shared data
+    /// (`Link Data` in the clip context menu; the Inspector's old button).
+    LinkClipData {
+        clips: Vec<ClipSel>,
+    },
+    /// F-046 D7: give every listed clip its own copy of its shared data
+    /// (`Unlink Data`).
+    UnlinkClipData {
+        clips: Vec<ClipSel>,
+    },
+    /// F-046 D7: open the `Data` strip with this clip's pool entry
+    /// highlighted — the clip → data direction of the reference jump.
+    ShowInData {
+        lane: TimelineLane,
+        track: usize,
+        clip: usize,
     },
     OpenMidiEditor {
         track: usize,
@@ -1436,6 +1464,17 @@ pub fn show(
         let area = ui.max_rect().expand(ui.style().interaction.interact_radius);
         router.register_keyboard(id, area);
     }
+    // F-046 D6: an open clip menu owns Esc. It has to be consumed here, before
+    // the rows run: a lane's Esc means "cancel the modal / clear the
+    // selection", and letting both fire closes the menu *and* wipes the
+    // selection the menu was going to act on.
+    if state.clip_menu.is_some()
+        && ui
+            .ctx()
+            .input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+    {
+        state.clip_menu = None;
+    }
     // 2026-11-04: the tile shortcut (Shift+T, Alt+T as a fallback) is a
     // view-level command, not a focus-gated lane key — losing lane focus
     // while a modifier is pressed would otherwise swallow it; run it before
@@ -1926,7 +1965,7 @@ pub fn show(
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(
-                        "Drag move · either edge: trim (head included) · T: extend time · Shift+T / Alt+T: tile · Shift+D: copy (own data) · Alt+D: copy (shared data) · dbl-click edit · F2 / Alt+dbl-click: rename · Ctrl+G group · Ctrl+Shift+G ungroup · Alt+click: single · right-click delete · Ctrl+MMB mute clip · H mute / Alt+H unmute all · marquee select · Del · K knife · dots: reorder track · ruler: seek / Ctrl+loop / RMB marker · Ctrl+wheel or -/= zoom · Ctrl+Alt+wheel height · MMB pan",
+                        "Drag move · either edge: trim (head included) · T: extend time · Shift+T / Alt+T: tile · Shift+D: copy (own data) · Alt+D: copy (shared data) · dbl-click edit · F2 / Alt+dbl-click: rename · Ctrl+G group · Ctrl+Shift+G ungroup · Alt+click: single · right-click: menu · Ctrl+MMB mute clip · H mute / Alt+H unmute all · marquee select · Del / ⌫ · K knife · dots: reorder track · ruler: seek / Ctrl+loop / RMB marker · Ctrl+wheel or -/= zoom · Ctrl+Alt+wheel height · MMB pan",
                     )
                     .weak(),
                 )
@@ -2293,12 +2332,15 @@ pub fn show(
                 RowColors::midi(p.selected_track == i),
                 highlight,
                 &|clip: &MidiClip| {
-                    format!(
-                        "{} notes",
-                        p.midi_data
-                            .get(clip.data as usize)
-                            .map_or(0, |data| data.notes().len())
-                    )
+                    // F-046 D2: the data name travels with the content, so a
+                    // clip that has no name of its own shows it — otherwise the
+                    // only place a name ever appeared would be the pool table.
+                    let data = p.midi_data.get(clip.data as usize);
+                    let notes = data.map_or(0, |data| data.notes().len());
+                    match data.map(|data| data.name.as_str()) {
+                        Some(name) if !name.is_empty() => format!("{name} · {notes} notes"),
+                        _ => format!("{notes} notes"),
+                    }
                 },
                 &|_| None,
                 &|clip: &MidiClip, painter, rect| {
@@ -2363,14 +2405,16 @@ pub fn show(
                     RowColors::control(p.selected_auto == i),
                     highlight,
                     &|clip: &ControlClip| {
-                        let len = p
-                            .curve_data
-                            .get(clip.data as usize)
-                            .map_or(0, |data| data.points.len());
-                        if len == 0 {
+                        let data = p.curve_data.get(clip.data as usize);
+                        let len = data.map_or(0, |data| data.points.len());
+                        let body = if len == 0 {
                             "empty".to_string()
                         } else {
                             format!("{len} anchors")
+                        };
+                        match data.map(|data| data.name.as_str()) {
+                            Some(name) if !name.is_empty() => format!("{name} · {body}"),
+                            _ => body,
                         }
                     },
                     &|_| None,
@@ -2920,6 +2964,23 @@ pub fn show(
             state.selection = expanded;
         }
     }
+    // F-046 D6/D7: the clip context menu, drawn last so its items see the
+    // click before anything below the pointer does.
+    if let Some(pos) = state.clip_menu {
+        draw_clip_menu(
+            ui.ctx(),
+            state,
+            pos,
+            midi_tracks,
+            control_tracks,
+            audio_tracks,
+            p.midi_data,
+            p.curve_data,
+            &mut actions,
+        );
+    }
+    // One-shot: the reveal request is spent once the rows have been laid out.
+    state.scroll_to_selection = false;
     actions
 }
 
@@ -3024,6 +3085,198 @@ pub(crate) fn expand_group_selection(
         }
     }
     out
+}
+
+/// F-046 D6/D7: the clip context menu.
+///
+/// It lives at the view level rather than in `lane_row` because its items act
+/// on the **selection**, which can span tracks and lane kinds — a row only
+/// knows its own track. Availability follows D8: mute always, grouping from
+/// two clips, link for two or more clips of one non-audio lane, unlink when
+/// any of them still shares its data, delete always.
+#[allow(clippy::too_many_arguments)]
+fn draw_clip_menu(
+    ctx: &egui::Context,
+    state: &mut TimelineState,
+    pos: Pos2,
+    midi: &[MidiTrack],
+    control: &[ControlTrack],
+    audio: &[AudioTrack],
+    midi_data: &[MidiData],
+    curve_data: &[CurveData],
+    actions: &mut Vec<TimelineAction>,
+) {
+    let selection = state.selection.clone();
+    if selection.is_empty() {
+        state.clip_menu = None;
+        return;
+    }
+    // Mute / group / data lookups over the three lane tables.
+    let muted = |sel: &ClipSel| -> bool {
+        match sel.lane {
+            TimelineLane::Midi => midi
+                .get(sel.track)
+                .and_then(|t| t.clips.get(sel.clip))
+                .is_some_and(|c| c.muted),
+            TimelineLane::Control => control
+                .get(sel.track)
+                .and_then(|t| t.clips.get(sel.clip))
+                .is_some_and(|c| c.muted),
+            TimelineLane::Audio => audio
+                .get(sel.track)
+                .and_then(|t| t.clips.get(sel.clip))
+                .is_some_and(|c| c.muted),
+        }
+    };
+    let grouped = |sel: &ClipSel| -> bool {
+        match sel.lane {
+            TimelineLane::Midi => midi
+                .get(sel.track)
+                .and_then(|t| t.clips.get(sel.clip))
+                .is_some_and(|c| c.group.is_some()),
+            TimelineLane::Control => control
+                .get(sel.track)
+                .and_then(|t| t.clips.get(sel.clip))
+                .is_some_and(|c| c.group.is_some()),
+            TimelineLane::Audio => audio
+                .get(sel.track)
+                .and_then(|t| t.clips.get(sel.clip))
+                .is_some_and(|c| c.group.is_some()),
+        }
+    };
+    let data_of = |sel: &ClipSel| -> Option<(DataKind, u32)> {
+        match sel.lane {
+            TimelineLane::Midi => midi
+                .get(sel.track)
+                .and_then(|t| t.clips.get(sel.clip))
+                .map(|c| (DataKind::Midi, c.data)),
+            TimelineLane::Control => control
+                .get(sel.track)
+                .and_then(|t| t.clips.get(sel.clip))
+                .map(|c| (DataKind::Curve, c.data)),
+            TimelineLane::Audio => None,
+        }
+    };
+
+    let all_muted = selection.iter().all(muted);
+    let any_grouped = selection.iter().any(grouped);
+    let same_lane = selection.iter().all(|sel| sel.lane == selection[0].lane);
+    let linkable = selection.len() >= 2 && same_lane && selection[0].lane != TimelineLane::Audio;
+    let mut midi_refs = vec![0usize; midi_data.len()];
+    for track in midi {
+        for clip in &track.clips {
+            if let Some(slot) = midi_refs.get_mut(clip.data as usize) {
+                *slot += 1;
+            }
+        }
+    }
+    let mut curve_refs = vec![0usize; curve_data.len()];
+    for track in control {
+        for clip in &track.clips {
+            if let Some(slot) = curve_refs.get_mut(clip.data as usize) {
+                *slot += 1;
+            }
+        }
+    }
+    let unlinkable = selection.iter().any(|sel| match data_of(sel) {
+        Some((DataKind::Midi, index)) => midi_refs.get(index as usize).copied().unwrap_or(0) > 1,
+        Some((DataKind::Curve, index)) => curve_refs.get(index as usize).copied().unwrap_or(0) > 1,
+        None => false,
+    });
+    let showable = data_of(&selection[0]).is_some();
+
+    let mut close = false;
+    let area = egui::Area::new(egui::Id::unique("glitcherz_clip_menu"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            egui::Frame::menu(ui.style()).show(ui, |ui| {
+                ui.set_min_width(190.0);
+                if ui
+                    .button(if all_muted { "Unmute" } else { "Mute" })
+                    .clicked()
+                {
+                    actions.push(TimelineAction::SetClipMuted {
+                        clips: selection.clone(),
+                        muted: !all_muted,
+                    });
+                    close = true;
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(selection.len() >= 2, egui::Button::new("Group Clips"))
+                    .clicked()
+                {
+                    actions.push(TimelineAction::GroupClips {
+                        clips: selection.clone(),
+                    });
+                    close = true;
+                }
+                if ui
+                    .add_enabled(any_grouped, egui::Button::new("Ungroup"))
+                    .clicked()
+                {
+                    actions.push(TimelineAction::UngroupClips {
+                        clips: selection.clone(),
+                    });
+                    close = true;
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(linkable, egui::Button::new("Link Data"))
+                    .on_hover_text("Point every selected clip at the first one's data")
+                    .clicked()
+                {
+                    actions.push(TimelineAction::LinkClipData {
+                        clips: selection.clone(),
+                    });
+                    close = true;
+                }
+                if ui
+                    .add_enabled(unlinkable, egui::Button::new("Unlink Data"))
+                    .on_hover_text("Give every selected clip its own copy of the data")
+                    .clicked()
+                {
+                    actions.push(TimelineAction::UnlinkClipData {
+                        clips: selection.clone(),
+                    });
+                    close = true;
+                }
+                if ui
+                    .add_enabled(showable, egui::Button::new("Show in Data"))
+                    .clicked()
+                {
+                    let sel = selection[0];
+                    actions.push(TimelineAction::ShowInData {
+                        lane: sel.lane,
+                        track: sel.track,
+                        clip: sel.clip,
+                    });
+                    close = true;
+                }
+                ui.separator();
+                // D12: Lock/Unlock goes here when it exists — additive field,
+                // no version bump, so only the items above move.
+                if ui
+                    .add(egui::Button::new("Delete").shortcut_text("Del / ⌫"))
+                    .clicked()
+                {
+                    actions.push(TimelineAction::RemoveClipsBatch {
+                        clips: selection.clone(),
+                    });
+                    close = true;
+                }
+            });
+        });
+    // Clicking outside dismisses. Primary only: the right-click that opened
+    // the menu is itself a click, and would close it in its first frame.
+    let clicked_outside = ctx.input(|i| i.pointer.primary_clicked())
+        && !ctx
+            .pointer_latest_pos()
+            .is_some_and(|p| area.response.rect.contains(p));
+    if close || clicked_outside {
+        state.clip_menu = None;
+    }
 }
 
 /// Draws one audio clip's waveform body (U6 D6): min/max peak columns
@@ -3439,6 +3692,18 @@ fn lane_row<T: Placement>(
             pos2(x0 + 1.0, lane.top() + 2.0),
             pos2(x1 - 1.0, lane.bottom() - 2.0),
         );
+        // F-046 D11: the data panel's reference jump asked the rows to reveal
+        // the selection. The request is checked before the viewport cull —
+        // the clip that needs revealing is usually the off-screen one.
+        if state.scroll_to_selection
+            && state.selection.contains(&ClipSel {
+                lane: lane_kind,
+                track,
+                clip: index,
+            })
+        {
+            ui.scroll_to_rect(rect, Some(egui::Align::Center));
+        }
         if rect.right() < lane.left() || rect.left() > lane.right() || rect.width() < 2.0 {
             continue;
         }
@@ -4093,23 +4358,32 @@ fn lane_row<T: Placement>(
         state.set_status(if muted { "clip muted" } else { "clip unmuted" });
     }
 
-    // Right-click: cancel a live band, disarm the knife, otherwise
-    // delete the clip under the pointer.
+    // Right-click: cancel a live band, disarm the knife, otherwise open the
+    // clip menu (F-046 D6 — it used to delete the clip on the spot).
     if response.secondary_clicked() && state.modal.is_none() {
         if state.knife_armed {
             state.knife_armed = false;
         } else if let Some(pos) = response.interact_pointer_pos() {
             if state.marquee.take().is_none() {
                 if let Some(index) = hit_clip(clips, tick_at(pos.x), sec_per_tick) {
-                    actions.push(TimelineAction::RemoveClip {
-                        lane: lane_kind,
-                        track,
-                        clip: index,
-                    });
                     state.drag = None;
                     if state.head_trim.take().is_some() {
                         actions.push(TimelineAction::EndClipTrim);
                     }
+                    // D9: a right-click inside the selection keeps it — the
+                    // menu acts on the whole selection — while a click on a
+                    // clip outside it makes that clip the selection first.
+                    let sel = ClipSel {
+                        lane: lane_kind,
+                        track,
+                        clip: index,
+                    };
+                    if !state.selection.contains(&sel) {
+                        state.selection = vec![sel];
+                        state.selection_anchor = Some(sel);
+                        state.break_group = false;
+                    }
+                    state.clip_menu = Some(pos);
                 }
             }
         }
@@ -4136,9 +4410,12 @@ fn lane_row<T: Placement>(
         let escape = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
-        let delete = ui
-            .ctx()
-            .input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete));
+        // F-046 D13: Backspace deletes too. The three delete surfaces (clips,
+        // roll notes, patch nodes) used to disagree; patch already took both.
+        let delete = ui.ctx().input_mut(|i| {
+            i.consume_key(Modifiers::NONE, Key::Delete)
+                || i.consume_key(Modifiers::NONE, Key::Backspace)
+        });
         let knife = ui
             .ctx()
             .input_mut(|i| i.consume_key(Modifiers::NONE, Key::K));

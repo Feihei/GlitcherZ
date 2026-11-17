@@ -1,7 +1,7 @@
 # 数据池面板与 clip 右键菜单
 
 > ID: F-046 · 域: EDIT / UI / PROJ
-> 状态：**M1 已实施**（2026-11-17）；M2 / M3 待做
+> 状态：**已实施**（M1–M3，2026-11-17）
 > 关联：`clip-data-instances.md`（F-041 D15/D17/D27 的 M7 展开，本特性取代之）、`timeline.md`（W3b 编组、B2 静音）、`clipboard.md`、`snap.md`、`command-vocabulary.md`
 
 ## 1. 问题
@@ -202,4 +202,43 @@ data_focus: Option<(DataKind, u32)>,        // Show in Data 的目标行高亮
 - ⏳ 2–14 依赖 M2 / M3
 
 **测试**：`data_panel` 5 个单测（空名回退、命名显示、孤儿计数、过滤、引用数与 `*_data_users`）；`cargo test -p glitcherz-model -p glitcherz-ui` 全绿；`cargo clippy -p glitcherz-ui --all-targets -- -D warnings` 零告警；`cargo check --workspace --all-targets` 干净（沙箱外）。
+
+### M2 / M3 · 2026-11-17 交付
+
+**M2（面板自身有了手脚）**
+
+| 项 | 落点 |
+| :--- | :--- |
+| 视图状态收拢 | 五个字段合并成 `data_panel::DataPanelState { open, filter, search, rename, focus }`，`GlitcherZApp` 只留一个字段（M1 时的两个散字段退役） |
+| 面板 → 文档的单向出口 | `DataIntent::{Rename, SelectUsers, Purge}` + `GlitcherZApp::timeline_data_panel` 里统一转成 undo 步骤；面板本身仍然只读 |
+| 行内改名 | 双击名称 → `RenameDraft`，`TextEdit` 首帧 `request_focus`；`Enter` / 失焦提交，`Esc` 取消，空串清除（D16） |
+| 引用列跳转 | `Refs` 数字是可点标签 → `SelectUsers` → 写 `timeline_state.selection` + `selection_anchor`，并置 `scroll_to_selection`（D11） |
+| 滚动到选区 | `TimelineState::scroll_to_selection`（一次性），在 clip 绘制处 `ui.scroll_to_rect`；放在视口裁剪**之前**，否则要露出的那个 clip 恰好在屏外而被跳过 |
+| `Purge Unused` | 标题行右侧按钮，仅在 `unused > 0` 时可用；调 `compact_clip_data()`（D15），顺手清掉 `focus` / `rename`（槽位已重排） |
+| 名称搜索 | 第二行输入框，大小写不敏感，匹配显示名（空名用 `MIDI #N` 参与匹配） |
+
+**M3（菜单与摘区）**
+
+| 项 | 落点 |
+| :--- | :--- |
+| Inspector 摘区 | 删除 `clip_data_section`（61 行）与 `inspector_panel.rs` 的调用；Inspector 回到纯节点参数 |
+| link / unlink 参数化 | `link_clip_data(&[ClipSel])` / `unlink_clip_data(&[ClipSel])`，由菜单快照驱动（不再读 live selection） |
+| 右键菜单 | `TimelineState::clip_menu: Option<Pos2>`；`draw_clip_menu` 在 `show` 末尾画 `egui::Area`（Foreground 层），项：Mute/Unmute → Group/Ungroup → Link/Unlink → Show in Data → Delete（附 `Del / ⌫`） |
+| 菜单可用性 | 按 D8 就地算：`all_muted` / `any_grouped` / 同 lane 且 ≥2 才可 Link / 任一 refs>1 才可 Unlink / 第一个可选才算 Show in Data |
+| 右键与选区 | D9：点在选区内保留整选区；选区外先单选（`state.selection = vec![sel]` + `break_group = false`） |
+| 关闭 | 主键点击菜单外、`Esc`（在 `show` 开头 `consume_key`，先于 lane 的 Esc 语义）、或点任一项 |
+| 删除键 | 时间轴与卷帘都接受 `Delete` **和** `Backspace`（D13）；两处都由 `response.has_focus()` 门控，文本框焦点时不会误吃退格 |
+| 文档 | `manual.md`（右键菜单行、数据面板交互、link/unlink 指向）、`shortcuts.md`（删除键、右键行、新增数据面板小节） |
+
+**与设计不同的地方（续）**
+
+7. **菜单用 `Area` 而不是 `Popup::context_menu`**：`Popup` 挂在 `response` 上，而 `response` 属于某一行；菜单要作用于**跨轨、跨 lane** 的选区，挂在行上等于让行决定菜单的存活。`Area` + 手动关闭（主键点外部 / Esc / 选中项）还顺手解决了「右键即开即关」的一帧问题——关闭判定只看主键。
+8. **`Show in Data` 会清空面板的搜索与过滤**：否则目标行可能被过滤掉，命令看起来没反应。
+9. **没有做逐行删除**（D15 原样）：面板唯一的删除路径是 `Purge Unused`。
+
+**验收进度**（§6 编号）
+
+- ✅ 1–16 全部走通（面板内容、改名 + 撤销、旧工程空名、`Alt+D` / `Shift+D` 引用计数、`Link` 合并与孤儿、`Purge`、引用跳转、单选/多选菜单可用性、选区内右键保留选区、选外右键先单选、Mute/Unmute、菜单与两键删除、模态/框选/刀片时右键只取消、Inspector 无 clip 区、工程不含面板状态、只在 Timeline 出现）
+- 新增测试：`timeline_focus::backspace_deletes_the_selection`（Backspace 与 Delete 同效）；`data_panel::search_matches_names_and_the_pool_label`
+
 

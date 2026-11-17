@@ -1,4 +1,4 @@
-//! Data panel — the pool of shared MIDI / curve content (F-046 M1).
+//! Data panel — the pool of shared MIDI / curve content (F-046).
 //!
 //! A bottom strip **inside the timeline view**, above which the toolbar and
 //! the rows keep their full height (D3): the panel declares itself before
@@ -6,8 +6,9 @@
 //! Event List is the model — same `Panel::show_switched` folded/expanded pair,
 //! same draggable divider, same "click the caption to collapse".
 //!
-//! Read-only over the document: the pool is borrowed from `Project`, and
-//! anything that edits it (rename, purge, reference jump) belongs to M2.
+//! Read-only over the document: the panel borrows `Project`, and every edit
+//! (rename, purge) leaves through [`DataIntent`] so the caller can wrap it in
+//! one undo step. Nothing here mutates the project.
 //!
 //! Why a pool table at all: `clip.data` is a **slot index**, and
 //! `compact_clip_data` renumbers slots on save, so `#3` is not an identity.
@@ -47,13 +48,55 @@ pub enum DataKind {
     Curve,
 }
 
+/// The panel's own view state (D14: never written to the project).
+#[derive(Debug, Clone, Default)]
+pub struct DataPanelState {
+    /// Expanded / collapsed (D4). Collapsed on first run.
+    pub open: bool,
+    pub filter: DataFilter,
+    /// Name search (M2): case-insensitive substring on the displayed name.
+    pub search: String,
+    /// Inline rename draft (D16).
+    pub rename: Option<RenameDraft>,
+    /// Row to highlight and scroll to — written by the clip menu's
+    /// `Show in Data`, cleared once the rows have been drawn.
+    pub focus: Option<(DataKind, u32)>,
+}
+
+/// One in-progress inline rename (D16).
+#[derive(Debug, Clone)]
+pub struct RenameDraft {
+    pub kind: DataKind,
+    pub index: u32,
+    pub draft: String,
+    /// The editor lands one frame after the double-click, so the first frame
+    /// that draws it has to ask for focus explicitly.
+    pub focus: bool,
+}
+
+/// What the panel wants the document to do. Everything is one undo step, so
+/// the panel stays a view and the caller keeps the edit boundaries.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DataIntent {
+    /// Commit an inline rename (empty clears back to `#id`).
+    Rename {
+        kind: DataKind,
+        index: u32,
+        name: String,
+    },
+    /// Select every clip that references the row (D11).
+    SelectUsers { kind: DataKind, index: u32 },
+    /// Drop the orphan entries (D15, `compact_clip_data`).
+    Purge,
+}
+
 /// One table row. Borrows the name so a frame copies nothing.
 pub struct DataRow<'a> {
     pub kind: DataKind,
     /// Pool slot — display-only (D2/§8: it moves when the pool compacts).
     pub index: u32,
     pub name: &'a str,
-    /// Notes (MIDI) or anchors (curve) — the `内容量` column.
+    /// Notes (MIDI) or anchors (curve) — the `Contents` column.
     pub items: usize,
     pub length_ticks: u32,
     pub refs: usize,
@@ -80,6 +123,11 @@ impl DataRow<'_> {
             DataKind::Curve => "Curve",
         }
     }
+
+    /// Whether this row is the one the panel is asked to highlight.
+    fn is_focused(&self, focus: Option<(DataKind, u32)>) -> bool {
+        focus == Some((self.kind, self.index))
+    }
 }
 
 /// Reference counts per pool slot, in one pass over the clips.
@@ -103,11 +151,12 @@ fn ref_counts(project: &Project) -> (Vec<usize>, Vec<usize>) {
     (midi, curve)
 }
 
-/// Builds the visible rows for the current filter. Order is pool order — the
-/// slots themselves are not a stable identity, so there is nothing better to
-/// sort on until M2 adds the name column's search.
-pub fn rows(project: &Project, filter: DataFilter) -> Vec<DataRow<'_>> {
+/// Builds the visible rows for the current filter and search. Order is pool
+/// order — the slots are not a stable identity, so there is nothing better to
+/// sort on until the name column's search (which is exactly why it exists).
+pub fn rows<'a>(project: &'a Project, filter: DataFilter, search: &str) -> Vec<DataRow<'a>> {
     let (midi_refs, curve_refs) = ref_counts(project);
+    let needle = search.trim().to_lowercase();
     let mut rows = Vec::with_capacity(project.midi_data.len() + project.curve_data.len());
     if filter != DataFilter::Curve {
         for (index, data) in project.midi_data.iter().enumerate() {
@@ -127,6 +176,10 @@ pub fn rows(project: &Project, filter: DataFilter) -> Vec<DataRow<'_>> {
             ));
         }
     }
+    if needle.is_empty() {
+        return rows;
+    }
+    rows.retain(|row| row.label().to_lowercase().contains(&needle));
     rows
 }
 
@@ -167,12 +220,17 @@ pub fn summary(project: &Project) -> String {
     text
 }
 
-/// Shows the strip. `open` is the expanded/collapsed flag (D4, view state).
+/// Shows the strip and returns at most one intent per frame.
 ///
 /// Must be called **before** `timeline::show`: a bottom panel takes its space
 /// out of the available rect, so declaring it afterwards would push it
 /// off-screen.
-pub fn show(ui: &mut egui::Ui, project: &Project, open: &mut bool, filter: &mut DataFilter) {
+pub fn show(
+    ui: &mut egui::Ui,
+    project: &Project,
+    state: &mut DataPanelState,
+) -> Option<DataIntent> {
+    let mut intent = None;
     let avail_h = ui.available_height();
     let first_h = (avail_h * DATA_PANEL_HEIGHT_FRACTION).clamp(DATA_PANEL_MIN_H, avail_h);
     let max_h = (avail_h * DATA_PANEL_MAX_FRACTION).max(DATA_PANEL_MIN_H);
@@ -185,9 +243,11 @@ pub fn show(ui: &mut egui::Ui, project: &Project, open: &mut bool, filter: &mut 
         .default_size(first_h)
         .min_size(DATA_PANEL_MIN_H)
         .max_size(max_h);
-    let mut open_state = *open;
-    let mut toggle = false;
     let caption = summary(project);
+    let (unused_midi, unused_curve) = project.unused_data_count();
+    let has_orphans = unused_midi + unused_curve > 0;
+    let mut open_state = state.open;
+    let mut toggle = false;
     egui::Panel::show_switched(ui, &mut open_state, collapsed, expanded, |ui, expanded| {
         ui.horizontal(|ui| {
             if ui
@@ -203,6 +263,32 @@ pub fn show(ui: &mut egui::Ui, project: &Project, open: &mut bool, filter: &mut 
             }
             ui.weak(&caption);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // D15: the only deletion path in the pool — per-row delete
+                // would have to renumber `clip.data` and duplicate
+                // `compact_clip_data`.
+                let purge = ui
+                    .add_enabled(has_orphans, egui::Button::new("Purge Unused"))
+                    .on_hover_text("Remove data that no clip points at (the save-time compaction)");
+                if purge.clicked() {
+                    intent = Some(DataIntent::Purge);
+                }
+            });
+        });
+        if !expanded {
+            return;
+        }
+        let rows = rows(project, state.filter, &state.search);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut state.search)
+                    .hint_text("Search name…")
+                    .desired_width(160.0)
+                    .font(egui::TextStyle::Small),
+            );
+            if !state.search.is_empty() && ui.small_button("×").on_hover_text("Clear").clicked() {
+                state.search.clear();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Right-to-left: listed Curve → MIDI → All so they read
                 // All | MIDI | Curve on screen.
                 for (value, label) in [
@@ -210,23 +296,24 @@ pub fn show(ui: &mut egui::Ui, project: &Project, open: &mut bool, filter: &mut 
                     (DataFilter::Midi, "MIDI"),
                     (DataFilter::All, "All"),
                 ] {
-                    if ui.selectable_label(*filter == value, label).clicked() {
-                        *filter = value;
+                    if ui.selectable_label(state.filter == value, label).clicked() {
+                        state.filter = value;
                     }
                 }
             });
         });
-        if !expanded {
-            return;
-        }
-        let rows = rows(project, *filter);
         if rows.is_empty() {
             ui.add_space(2.0);
-            ui.weak(match filter {
-                DataFilter::All => "No shared data yet — draw in a clip to create some.",
-                DataFilter::Midi => "No MIDI data.",
-                DataFilter::Curve => "No curve data.",
-            });
+            ui.weak(
+                if project.midi_data.is_empty() && project.curve_data.is_empty() {
+                    "No shared data yet — draw in a clip to create some."
+                } else if state.search.is_empty() {
+                    "Nothing matches this filter."
+                } else {
+                    "No name matches the search."
+                },
+            );
+            state.focus = None;
             return;
         }
         let name_w =
@@ -237,14 +324,20 @@ pub fn show(ui: &mut egui::Ui, project: &Project, open: &mut bool, filter: &mut 
             .auto_shrink([false, false])
             .show_rows(ui, ROW_H, rows.len(), |ui, range| {
                 for row in &rows[range] {
-                    table_row(ui, row, name_w);
+                    if let Some(next) = table_row(ui, row, name_w, state) {
+                        intent = Some(next);
+                    }
                 }
             });
+        // The highlight is one-shot: `Show in Data` set it, the row has been
+        // drawn (and scrolled to) once, done.
+        state.focus = None;
     });
     if toggle {
         open_state = !open_state;
     }
-    *open = open_state;
+    state.open = open_state;
+    intent
 }
 
 fn header(ui: &mut egui::Ui, name_w: f32) {
@@ -264,39 +357,120 @@ fn header(ui: &mut egui::Ui, name_w: f32) {
     });
 }
 
-fn table_row(ui: &mut egui::Ui, row: &DataRow<'_>, name_w: f32) {
-    ui.horizontal(|ui| {
-        // Orphans are greyed rather than hidden (D15): the row is still the
-        // only place `Purge Unused` and a future row-click can act on.
-        let text = |s: String| {
-            let rich = egui::RichText::new(s).small().monospace();
-            if row.refs == 0 { rich.weak() } else { rich }
-        };
-        ui.add_sized(
-            [name_w, ROW_H],
-            egui::Label::new(text(row.label())).truncate(),
-        );
-        ui.add_sized(
-            [ID_W, ROW_H],
-            egui::Label::new(text(format!("#{}", row.index))).truncate(),
-        );
-        ui.add_sized(
-            [KIND_W, ROW_H],
-            egui::Label::new(text(row.kind_label().to_string())).truncate(),
-        );
-        ui.add_sized(
-            [ITEMS_W, ROW_H],
-            egui::Label::new(text(row.items.to_string())).truncate(),
-        );
-        ui.add_sized(
-            [LENGTH_W, ROW_H],
-            egui::Label::new(text(format!("{} bars", bars(row.length_ticks)))).truncate(),
-        );
-        ui.add_sized(
-            [REFS_W, ROW_H],
-            egui::Label::new(text(row.refs.to_string())).truncate(),
-        );
+/// Draws one row and returns the intent it produced (rename commit or the
+/// reference jump). The row also owns the inline rename editor.
+fn table_row(
+    ui: &mut egui::Ui,
+    row: &DataRow<'_>,
+    name_w: f32,
+    state: &mut DataPanelState,
+) -> Option<DataIntent> {
+    let mut intent = None;
+    let editing = state
+        .rename
+        .as_ref()
+        .is_some_and(|r| r.kind == row.kind && r.index == row.index);
+    // Orphans are greyed rather than hidden (D15): the row is still where
+    // `Purge Unused` acts, and its disappearance on save would be a surprise
+    // without the hint.
+    let dim = row.refs == 0;
+    let text = |s: String| {
+        let rich = egui::RichText::new(s).small().monospace();
+        if dim { rich.weak() } else { rich }
+    };
+    let focused = row.is_focused(state.focus);
+
+    let response = ui.horizontal(|ui| {
+        if editing {
+            let Some(draft) = state.rename.as_mut() else {
+                return;
+            };
+            let editor = ui.add_sized(
+                [name_w, ROW_H],
+                egui::TextEdit::singleline(&mut draft.draft)
+                    .font(egui::TextStyle::Small)
+                    .margin(egui::Margin::symmetric(2, 1)),
+            );
+            if draft.focus {
+                editor.request_focus();
+                draft.focus = false;
+            }
+            let escaped = editor.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if escaped {
+                // Esc cancels: the caller never sees a Rename intent.
+                state.rename = None;
+            } else if editor.lost_focus() {
+                if let Some(draft) = state.rename.take() {
+                    intent = Some(DataIntent::Rename {
+                        kind: draft.kind,
+                        index: draft.index,
+                        name: draft.draft,
+                    });
+                }
+            }
+        } else {
+            let label = ui
+                .add_sized(
+                    [name_w, ROW_H],
+                    egui::Label::new(egui::RichText::new(row.label()).small().monospace().color(
+                        if dim {
+                            ui.visuals().weak_text_color()
+                        } else if focused {
+                            ui.visuals().strong_text_color()
+                        } else {
+                            ui.visuals().text_color()
+                        },
+                    ))
+                    .truncate()
+                    .sense(egui::Sense::click()),
+                )
+                .on_hover_text("Double-click to rename");
+            if label.double_clicked() {
+                state.rename = Some(RenameDraft {
+                    kind: row.kind,
+                    index: row.index,
+                    draft: row.name.to_string(),
+                    focus: true,
+                });
+            }
+            ui.add_sized(
+                [ID_W, ROW_H],
+                egui::Label::new(text(format!("#{}", row.index))).truncate(),
+            );
+            ui.add_sized(
+                [KIND_W, ROW_H],
+                egui::Label::new(text(row.kind_label().to_string())).truncate(),
+            );
+            ui.add_sized(
+                [ITEMS_W, ROW_H],
+                egui::Label::new(text(row.items.to_string())).truncate(),
+            );
+            ui.add_sized(
+                [LENGTH_W, ROW_H],
+                egui::Label::new(text(format!("{} bars", bars(row.length_ticks)))).truncate(),
+            );
+            // D11: the reference count is a button — select every clip that
+            // points at this data. The reverse of `Show in Data`.
+            let refs = ui
+                .add_sized(
+                    [REFS_W, ROW_H],
+                    egui::Label::new(text(row.refs.to_string()))
+                        .truncate()
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text("Select the clips that use this data");
+            if refs.clicked() && row.refs > 0 {
+                intent = Some(DataIntent::SelectUsers {
+                    kind: row.kind,
+                    index: row.index,
+                });
+            }
+        }
     });
+    if focused && !editing {
+        ui.scroll_to_rect(response.response.rect, Some(egui::Align::Center));
+    }
+    intent
 }
 
 /// `length_ticks` shown in bars. The pool has no meter of its own (a window
@@ -354,9 +528,23 @@ mod tests {
         let mut project = Project::default();
         project.push_midi_data(MidiData::default());
         project.push_curve_data(CurveData::default());
-        assert_eq!(rows(&project, DataFilter::All).len(), 2);
-        assert_eq!(rows(&project, DataFilter::Midi).len(), 1);
-        assert_eq!(rows(&project, DataFilter::Curve).len(), 1);
+        assert_eq!(rows(&project, DataFilter::All, "").len(), 2);
+        assert_eq!(rows(&project, DataFilter::Midi, "").len(), 1);
+        assert_eq!(rows(&project, DataFilter::Curve, "").len(), 1);
+    }
+
+    #[test]
+    fn search_matches_names_and_the_pool_label() {
+        let mut project = Project::default();
+        project.push_midi_data(MidiData {
+            name: "Verse drums".into(),
+            ..MidiData::default()
+        });
+        project.push_midi_data(MidiData::default());
+        assert_eq!(rows(&project, DataFilter::All, "verse").len(), 1);
+        // An unnamed entry still matches its displayed `MIDI #N` label.
+        assert_eq!(rows(&project, DataFilter::All, "midi #1").len(), 1);
+        assert_eq!(rows(&project, DataFilter::All, "nothing").len(), 0);
     }
 
     #[test]
@@ -374,7 +562,7 @@ mod tests {
                 ..Default::default()
             });
         }
-        let rows = rows(&project, DataFilter::All);
+        let rows = rows(&project, DataFilter::All, "");
         assert_eq!(rows[0].refs, 2);
         assert_eq!(project.midi_data_users(data), vec![(0, 0), (1, 0)]);
     }

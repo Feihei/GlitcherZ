@@ -55,7 +55,7 @@ Spec：`spec/clip-data-panel.md`（D1–D16）。
 - **范围**：`MidiData` / `CurveData` 加 `name`（additive，不动 `PROJECT_VERSION`）+ 时间轴底部上下分栏（默认收起，与 Edit 的 Event List 同构）+ 行内重命名 / 引用跳转 / `Purge Unused` + Inspector 摘区 + clip 右键菜单（Mute、Group、Link/Unlink、Show in Data、Delete）+ `Delete`/`Backspace` 统一。
 - **不做**：数据拖放、目录标签、音频媒体池、跨类型共享、`.001` 自动后缀、Lock 实现（只留菜单位置）。
 - **门禁**：M1 命名 + 分栏 + 只读列表；M2 编辑类条目；M3 菜单 + 摘区 + 键位。验收 16 条见 spec §6；全量 fmt + clippy `-D warnings` + test（沙箱外）。
-- **状态**：**M1 已实施**（2026-11-17：`name` additive 字段 + 时间轴底部 `Data` 分栏 + 只读表 + 类型过滤）；M2（重命名 / 引用跳转 / `Purge Unused` / 搜索）与 M3（Inspector 摘区 + clip 右键菜单 + 删除键统一）待做。
+- **状态**：**已实施**（M1–M3：`name` additive 字段、时间轴底部 `Data` 分栏、重命名 / 引用跳转 / `Purge Unused` / 搜索、Inspector 摘区、clip 右键菜单、`Delete`/`Backspace` 统一）。实施偏差见 spec §9。
 
 ## clip 与数据分离（F-041，2026-11-11 立项）
 

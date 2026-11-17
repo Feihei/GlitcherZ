@@ -1798,13 +1798,10 @@ pub struct GlitcherZApp {
     /// bottom panel: the roll takes everything above it, and dragging the
     /// divider past its minimum collapses the strip to its caption row.
     event_list_open: bool,
-    /// Whether the Timeline view's `Data` strip (the shared pool table) is
-    /// expanded. F-046 D4: collapsed on first run — it is a bottom split
-    /// inside the timeline, so it must not eat the arrangement by default.
-    /// View state, never written to the project.
-    data_panel_open: bool,
-    /// Which pools the `Data` strip lists (F-046 D10).
-    data_filter: data_panel::DataFilter,
+    /// The Timeline view's `Data` strip (the shared pool table) and its view
+    /// state — fold, filter, search, inline rename, highlight. F-046 D4/D14:
+    /// collapsed on first run, and none of it enters the project.
+    data_panel: data_panel::DataPanelState,
     /// Piano roll cross-frame state (scroll/drag).
     roll_state: piano_roll::RollState,
     /// Hover-follow keyboard focus arbiter (Blender-style context; see
@@ -2271,8 +2268,7 @@ impl GlitcherZApp {
             curve_tool: CurveTool::default(),
             curve_drag: None,
             event_list_open: true,
-            data_panel_open: false,
-            data_filter: data_panel::DataFilter::default(),
+            data_panel: data_panel::DataPanelState::default(),
             roll_state: piano_roll::RollState::new(),
             focus_router: focus::FocusRouter::new(),
             patch_state: patch::PatchState::default(),

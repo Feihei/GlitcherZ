@@ -861,3 +861,30 @@ fn dragging_a_clip_edge_resizes_instead_of_starting_a_band() {
         "an edge drag must resize, not start a rubber band: {actions:?}"
     );
 }
+
+/// F-046 D13: Backspace deletes the selection, like Delete. The three
+/// delete surfaces used to disagree — the timeline and the roll took only
+/// Delete while patch nodes took both — so the same word meant three
+/// things depending on where you were.
+#[test]
+fn backspace_deletes_the_selection() {
+    let mut f = Fixture::new();
+    let y = f.click_into_a_lane();
+    // Find the clip on this row: the first x whose click leaves a selection.
+    let mut hit = None;
+    for x in (120..=400).step_by(4) {
+        f.click(egui::pos2(x as f32, y));
+        if !f.state.selection.is_empty() {
+            hit = Some(x as f32);
+            break;
+        }
+    }
+    let x = hit.expect("no clip was selected along the probe line");
+    let actions = f.frame(vec![hover(egui::pos2(x, y)), key(egui::Key::Backspace)]);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, timeline::TimelineAction::RemoveClipsBatch { .. })),
+        "Backspace must delete the selection: {actions:?}"
+    );
+}
