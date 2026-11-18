@@ -9,18 +9,26 @@ impl GlitcherZApp {
     /// Points the Edit tab at the MIDI clip `(track, clip)`, dropping any
     /// in-flight roll gesture: selection indices refer to the clip that was
     /// being edited.
-    ///
-    /// P3 (spec `roll-multiclip.md` D5): the roll's ghost context is the
-    /// timeline's clip selection, so whatever was multi-selected in the
-    /// arrangement is what shows up behind the focus.
     pub(crate) fn set_edit_target(&mut self, track: usize, clip: usize) {
+        self.set_edit_focus(piano_roll::ClipRef::midi(track, clip));
+    }
+
+    /// Points the Editor at the control clip `(track, clip)` — F-049: the
+    /// curve is now a focus of the **same** roll canvas, not a separate form.
+    pub(crate) fn set_control_edit_target(&mut self, track: usize, clip: usize) {
+        self.set_edit_focus(piano_roll::ClipRef::control(track, clip));
+    }
+
+    /// Builds the roll subject around `focus` (P3, spec `roll-multiclip.md`
+    /// D5): the timeline's clip selection is the ghost context, whatever lane
+    /// each clip lives in (F-049 added the control focus).
+    ///
+    /// `set_edit_target` / `set_control_edit_target` are the two entries;
+    /// both are view-state changes only — no command, no undo entry.
+    fn set_edit_focus(&mut self, focus: piano_roll::ClipRef) {
         // Clears the gesture *and* the note selection (the indices belong to
         // whichever clip used to be focused).
         self.roll_state.clear_gesture();
-        let focus = piano_roll::ClipRef::midi(track, clip);
-        // P4: control clips in the selection ride along as overlay lanes; the
-        // focus itself stays a MIDI clip (a control clip opens the curve
-        // editor instead).
         let selection: Vec<piano_roll::ClipRef> = self
             .timeline_state
             .selection
@@ -50,7 +58,7 @@ impl GlitcherZApp {
             )
         };
         let dropped = subject.dropped();
-        self.edit_clip = Some(EditTarget::Midi(subject));
+        self.edit_clip = Some(subject);
         self.edit_selection
             .clone_from(&self.timeline_state.selection);
         if dropped > 0 {
@@ -65,31 +73,13 @@ impl GlitcherZApp {
     /// view-state change — no command, no undo entry, no document touch. The
     /// note selection is dropped because its indices belong to the old focus.
     pub(crate) fn set_roll_focus(&mut self, clip: piano_roll::ClipRef) {
-        let Some(EditTarget::Midi(subject)) = &mut self.edit_clip else {
+        let Some(subject) = &mut self.edit_clip else {
             return;
         };
         if subject.focus() == clip || !subject.set_focus(clip) {
             return;
         }
         self.roll_state.clear_gesture();
-    }
-
-    /// Points the Edit tab at the control clip `(track, clip)` and syncs the
-    /// transient curve tool to the clip's persisted interpolation (U12).
-    pub(crate) fn set_control_edit_target(&mut self, track: usize, clip: usize) {
-        let interp = {
-            let project = self.project();
-            project
-                .control_tracks
-                .get(track)
-                .and_then(|t| t.clips.get(clip))
-                .and_then(|c| project.curve_data_of(c))
-                .map(|data| data.interp)
-        };
-        self.curve_tool = interp.map(CurveTool::of).unwrap_or_default();
-        self.edit_clip = Some(EditTarget::Control { track, clip });
-        self.edit_selection
-            .clone_from(&self.timeline_state.selection);
     }
 
     /// Re-derives the Edit tab's target from the timeline's clip selection.
@@ -149,50 +139,201 @@ impl GlitcherZApp {
         }
     }
 
-    /// Body of the curve editor (Edit tab, U12): edits the anchors of the
-    /// targeted control clip. The canvas shows **one loop period** (anchors
-    /// are loop-relative); the interpolation follows the selected tool
-    /// (Draw/Line → Linear, Curve → Smooth).
-    pub(crate) fn control_editor_body(
-        &mut self,
-        ui: &mut egui::Ui,
-        track: usize,
-        clip_index: usize,
-    ) {
-        if self.project().control_tracks.is_empty() {
-            // The target track was removed underneath the editor.
-            self.edit_clip = None;
+    /// F-048: one chip per editable clip in the timeline selection — MIDI and
+    /// curve clips side by side.
+    ///
+    /// The tab used to follow only the **last** selected clip, so a mixed
+    /// selection (a MIDI clip plus a curve clip) could not reach the curve
+    /// editor without re-selecting it in the Timeline. With two or more
+    /// editable clips the strip appears; a single one keeps the plain header
+    /// (the roll's own chip strip already covers multi-clip focus).
+    pub(crate) fn edit_target_strip(&mut self, ui: &mut egui::Ui) {
+        let editable: Vec<(timeline::ClipSel, String)> = {
+            let project = self.project();
+            self.edit_selection
+                .iter()
+                .filter_map(|sel| match sel.lane {
+                    timeline::TimelineLane::Midi => {
+                        let clip = project.midi_tracks.get(sel.track)?.clips.get(sel.clip)?;
+                        let name = self.track_label(sel.track);
+                        Some((
+                            *sel,
+                            format!(
+                                "{name} · bar {}",
+                                project.bar_beat_at(clip.start_ticks).0 + 1
+                            ),
+                        ))
+                    }
+                    timeline::TimelineLane::Control => {
+                        let clip = project.control_tracks.get(sel.track)?.clips.get(sel.clip)?;
+                        let name = project.control_tracks[sel.track].name.clone();
+                        let name = if name.is_empty() {
+                            format!("Curve {}", sel.track + 1)
+                        } else {
+                            name
+                        };
+                        Some((
+                            *sel,
+                            format!(
+                                "{name} · bar {}",
+                                project.bar_beat_at(clip.start_ticks).0 + 1
+                            ),
+                        ))
+                    }
+                    timeline::TimelineLane::Audio => None,
+                })
+                .collect()
+        };
+        if editable.len() < 2 {
             return;
         }
-        let sel = track.min(self.project().control_tracks.len() - 1);
-        if self.project().control_tracks[sel].clips.is_empty() {
-            let before = self.begin_edit();
-            self.project_mut().add_control_clip(sel, 0);
-            self.commit_edit("New Clip", before);
-            self.send_control_clips(sel);
+        let current = self.edit_clip.as_ref().map(|subject| subject.focus());
+        let mut pick: Option<timeline::ClipSel> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.add(egui::Label::new(egui::RichText::new("editing").weak()));
+            for (sel, label) in &editable {
+                let lane = match sel.lane {
+                    timeline::TimelineLane::Midi => piano_roll::RollLane::Midi,
+                    timeline::TimelineLane::Control => piano_roll::RollLane::Control,
+                    timeline::TimelineLane::Audio => continue,
+                };
+                let chosen = current.is_some_and(|focus| {
+                    focus.lane == lane && focus.track == sel.track && focus.clip == sel.clip
+                });
+                if ui
+                    .selectable_label(chosen, label)
+                    .on_hover_text("Edit this clip in the Editor")
+                    .clicked()
+                    && !chosen
+                {
+                    pick = Some(*sel);
+                }
+            }
+        });
+        if let Some(sel) = pick {
+            match sel.lane {
+                timeline::TimelineLane::Midi => self.set_edit_target(sel.track, sel.clip),
+                timeline::TimelineLane::Control => {
+                    self.set_control_edit_target(sel.track, sel.clip);
+                }
+                timeline::TimelineLane::Audio => {}
+            }
         }
-        let clip_count = self.project().control_tracks[sel].clips.len();
-        // Same rule as the roll body: a vanished clip closes the editor rather
-        // than retargeting a neighbour (see `sync_edit_target`).
+    }
+
+    /// One-line chip text for a context clip (P3; F-049 covers both lanes):
+    /// "track · bar N", so the chips read the same for notes and curves.
+    fn clip_chip_label(&self, clip: piano_roll::ClipRef) -> Option<String> {
+        let project = self.project();
+        match clip.lane {
+            piano_roll::RollLane::Midi => {
+                let c = project.midi_tracks.get(clip.track)?.clips.get(clip.clip)?;
+                Some(format!(
+                    "{} · bar {}",
+                    self.track_label(clip.track),
+                    project.bar_beat_at(c.start_ticks).0 + 1
+                ))
+            }
+            piano_roll::RollLane::Control => {
+                let c = project
+                    .control_tracks
+                    .get(clip.track)?
+                    .clips
+                    .get(clip.clip)?;
+                let name = &project.control_tracks[clip.track].name;
+                let name = if name.is_empty() {
+                    format!("Curve {}", clip.track + 1)
+                } else {
+                    name.clone()
+                };
+                Some(format!(
+                    "{name} · bar {}",
+                    project.bar_beat_at(c.start_ticks).0 + 1
+                ))
+            }
+        }
+    }
+
+    /// Body of the Editor (Edit tab): **one** roll canvas for both lanes
+    /// (F-049).
+    ///
+    /// A MIDI focus edits notes, with the other context clips as ghosts and
+    /// the selected curve clips as dimmed (read-only) lanes. A control focus
+    /// flips that: its curve lane is the writable subject and takes the tall
+    /// strip, while every MIDI clip of the context draws as a ghost. Switching
+    /// the focus is the chip strip or Ctrl+Tab — the canvas, its time axis and
+    /// its scroll position stay put, exactly like several selected MIDI clips.
+    pub(crate) fn editor_body(&mut self, ui: &mut egui::Ui, subject: &piano_roll::RollSubject) {
+        let focus = subject.focus();
+        let (track, clip_index) = (focus.track, focus.clip);
+        let on_notes = matches!(focus.lane, piano_roll::RollLane::Midi);
+        let clip_count = if on_notes {
+            if self.project().midi_tracks.is_empty() {
+                // The target track was removed underneath the editor.
+                self.edit_clip = None;
+                return;
+            }
+            let sel = track.min(self.project().midi_tracks.len() - 1);
+            if self.project().midi_tracks[sel].clips.is_empty() {
+                let before = self.begin_edit();
+                self.project_mut().add_midi_clip(sel, 0);
+                self.commit_edit("New Clip", before);
+                self.send_track_clips(sel);
+            }
+            self.project().midi_tracks[sel].clips.len()
+        } else {
+            let Some(tracks) = self.project().control_tracks.get(track) else {
+                self.edit_clip = None;
+                return;
+            };
+            tracks.clips.len()
+        };
+        let sel = if on_notes {
+            track.min(self.project().midi_tracks.len().saturating_sub(1))
+        } else {
+            track
+        };
+        // A clip deleted underneath the editor (an undo, or a removal from a
+        // path that did not clear the selection): close instead of silently
+        // editing a neighbour — `sync_edit_target` re-derives the target from
+        // the selection on the next frame, and falls back to the hint when
+        // nothing live is left there.
         if clip_index >= clip_count {
             self.edit_clip = None;
             return;
         }
-
-        // ---- Header: identity + clip navigation + tool selector ----
-        let name = if self.project().control_tracks[sel].name.is_empty() {
-            format!("Curve {}", sel + 1)
+        // Met M4: the roll's bar lines follow the meter segments.
+        let meter = self.project().meter_map();
+        let name = if on_notes {
+            self.track_label(sel)
         } else {
-            self.project().control_tracks[sel].name.clone()
+            let name = self.project().control_tracks[track].name.clone();
+            if name.is_empty() {
+                format!("Curve {}", track + 1)
+            } else {
+                name
+            }
+        };
+        let shared_refs = if on_notes {
+            self.project()
+                .midi_tracks
+                .get(sel)
+                .and_then(|t| t.clips.get(clip_index))
+                .map(|clip| self.project().midi_data_refs(clip.data))
+                .unwrap_or(1)
+        } else {
+            1
         };
         let mut goto: Option<usize> = None;
-        let mut tool_pick: Option<CurveTool> = None;
-        let curve_tool = self.curve_tool;
         ui.horizontal(|ui| {
-            ui.label(format!(
-                "{name} · clip {} (of {clip_count})",
-                clip_index + 1
-            ));
+            let mut title = format!("{name} · clip {} (of {clip_count})", clip_index + 1);
+            if shared_refs > 1 {
+                title = format!("{title} · shared by {shared_refs} clips");
+            }
+            if !on_notes {
+                title = format!("{title} · curve");
+            }
+            ui.label(title);
             if ui
                 .add_enabled(clip_index > 0, egui::Button::new("←"))
                 .on_hover_text("Previous clip")
@@ -207,316 +348,37 @@ impl GlitcherZApp {
             {
                 goto = Some(clip_index + 1);
             }
-            ui.separator();
-            for (tool, label, hover) in [
-                (CurveTool::Draw, "Draw", "Freehand draw (linear)"),
-                (
-                    CurveTool::Line,
-                    "Line",
-                    "Control points, straight segments (linear)",
-                ),
-                (
-                    CurveTool::Curve,
-                    "Curve",
-                    "Control points, smooth monotone curve",
-                ),
-            ] {
-                if ui
-                    .selectable_label(curve_tool == tool, label)
-                    .on_hover_text(hover)
-                    .clicked()
-                {
-                    tool_pick = Some(tool);
-                }
-            }
         });
         if let Some(next) = goto {
-            self.set_control_edit_target(sel, next);
-            return;
-        }
-        if let Some(tool) = tool_pick {
-            self.curve_tool = tool;
-            self.set_clip_interp(sel, clip_index, tool.interp());
-        }
-
-        // ---- Snapshot the clip (avoid holding a borrow of `self` across the
-        // widget calls below) ----
-        // The axis needs the endpoint *and* its target node (an effect slot's
-        // range lives in the node's payload), and it is now only a **caption**:
-        // the curve itself is stored normalized (spec `curve-map.md` D1/D11).
-        let (map, axis_label) = {
-            let graph = &self.project().graph;
-            match graph.auto_target(sel) {
-                Some((port, param)) => (
-                    crate::curve::map_in(&param, graph, &port),
-                    crate::patch::auto_param_label_at(&param, graph, &port),
-                ),
-                None => (glitcherz_model::MapSpec::UNIT, "not connected".to_string()),
-            }
-        };
-        let (loop_ticks, interp, curve) = {
-            let project = self.project();
-            let clip = &project.control_tracks[sel].clips[clip_index];
-            match project.curve_data_of(clip) {
-                Some(data) => (data.length_ticks.max(1), data.interp, data.points.clone()),
-                None => (1, glitcherz_model::CurveInterp::Linear, Vec::new()),
-            }
-        };
-
-        // ---- Canvas ----
-        let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width().max(200.0), 320.0),
-            egui::Sense::click_and_drag(),
-        );
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(20, 22, 26));
-        let inner = rect.shrink(2.0);
-        // Normalized geometry: -1 at the bottom, 0 mid, +1 at the top (D1).
-        // The axis caption is the only thing that speaks in real units.
-        let value_y = |v: f32| inner.bottom() - crate::curve::y_of(v) * inner.height();
-        let y_value = |y: f32| crate::curve::norm_of_y((inner.bottom() - y) / inner.height());
-        let x_at = |tick: f32| inner.left() + (tick / loop_ticks as f32) * inner.width();
-        let tick_at = |x: f32| (x - inner.left()) / inner.width() * loop_ticks as f32;
-
-        // Vertical grid (quarter notes) + value midline.
-        let quarter = glitcherz_model::TICKS_PER_QUARTER.max(1);
-        let mut t = 0u32;
-        while t < loop_ticks {
-            let x = x_at(t as f32);
-            painter.line_segment(
-                [egui::pos2(x, inner.top()), egui::pos2(x, inner.bottom())],
-                egui::Stroke::new(1.0, egui::Color32::from_gray(38)),
-            );
-            t += quarter;
-        }
-        // The centre line is the axis centre — always normalized 0.
-        painter.line_segment(
-            [
-                egui::pos2(inner.left(), value_y(0.0)),
-                egui::pos2(inner.right(), value_y(0.0)),
-            ],
-            egui::Stroke::new(1.0, egui::Color32::from_gray(46)),
-        );
-        painter.text(
-            egui::pos2(inner.left() + 4.0, inner.top() + 2.0),
-            egui::Align2::LEFT_TOP,
-            format!("{axis_label} · {}", crate::curve::axis_caption(map)),
-            egui::FontId::proportional(11.0),
-            egui::Color32::from_gray(150),
-        );
-
-        // Curve, sampled with the **same** math the engine uses.
-        let color = egui::Color32::from_rgb(150, 200, 250);
-        let mut prev: Option<egui::Pos2> = None;
-        let mut x = inner.left();
-        while x <= inner.right() {
-            let phase = f64::from(tick_at(x).max(0.0));
-            if let Some(v) = glitcherz_model::sample_curve(&curve, interp, phase) {
-                let p = egui::pos2(x, value_y(v));
-                if let Some(prev) = prev {
-                    painter.line_segment([prev, p], egui::Stroke::new(2.0, color));
-                }
-                prev = Some(p);
-            }
-            x += 1.5;
-        }
-        // Anchors.
-        for a in &curve {
-            let p = egui::pos2(x_at(a.tick as f32), value_y(a.value));
-            painter.circle_filled(p, 4.0, egui::Color32::WHITE);
-            painter.circle_stroke(p, 4.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
-        }
-
-        // ---- Interaction ----
-        let snap = if ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.command) {
-            crate::snap::Snap::OFF
-        } else {
-            crate::snap::Snap::on(i64::from(crate::curve::SNAP_TICKS))
-        };
-        let mapped = |pos: egui::Pos2| -> (u32, f32) {
-            let phase = tick_at(pos.x).max(0.0);
-            let limit = i64::from(loop_ticks.saturating_sub(1));
-            let tick = snap.ticks(phase).clamp(0, limit) as u32;
-            (tick, y_value(pos.y))
-        };
-        let hit_anchor = |pos: egui::Pos2| -> Option<u32> {
-            curve
-                .iter()
-                .find(|a| {
-                    let p = egui::pos2(x_at(a.tick as f32), value_y(a.value));
-                    (pos - p).length() <= 8.0
-                })
-                .map(|a| a.tick)
-        };
-
-        let pointer = response.interact_pointer_pos();
-        let started = response.drag_started_by(egui::PointerButton::Primary);
-        let mut pending: Option<(Option<u32>, u32, f32, bool)> = None;
-        let mut remove: Option<u32> = None;
-        let mut drag_end = false;
-        if curve_tool == CurveTool::Draw {
-            if response.dragged_by(egui::PointerButton::Primary)
-                && let Some(pos) = pointer
-            {
-                let (tick, value) = mapped(pos);
-                pending = Some((None, tick, value, true));
-            } else if response.clicked_by(egui::PointerButton::Primary)
-                && let Some(pos) = pointer
-            {
-                let (tick, value) = mapped(pos);
-                pending = Some((None, tick, value, false));
-            }
-            if response.drag_stopped_by(egui::PointerButton::Primary) {
-                drag_end = true;
-            }
-        } else {
-            if started && let Some(pos) = pointer {
-                let (tick, value) = mapped(pos);
-                let from = hit_anchor(pos);
-                self.curve_drag = Some(tick);
-                pending = Some((from, tick, value, true));
-            }
-            if response.clicked_by(egui::PointerButton::Primary)
-                && let Some(pos) = pointer
-                && hit_anchor(pos).is_none()
-            {
-                let (tick, value) = mapped(pos);
-                pending = Some((None, tick, value, false));
-            }
-            if !started
-                && response.dragged_by(egui::PointerButton::Primary)
-                && let Some(pos) = pointer
-                && self.curve_drag.is_some()
-            {
-                let (tick, value) = mapped(pos);
-                pending = Some((self.curve_drag, tick, value, true));
-            }
-            if response.drag_stopped_by(egui::PointerButton::Primary)
-                && self.curve_drag.take().is_some()
-            {
-                drag_end = true;
+            if on_notes {
+                self.set_edit_target(sel, next);
+            } else {
+                self.set_control_edit_target(track, next);
             }
         }
-        if response.secondary_clicked()
-            && let Some(pos) = pointer
-        {
-            let (tick, _) = mapped(pos);
-            remove = Some(tick);
-        }
-
-        // ---- Apply ----
-        if let Some((from, tick, value, dragging)) = pending {
-            if curve_tool == CurveTool::Draw && interp != CurveInterp::Linear {
-                self.set_clip_interp(sel, clip_index, CurveInterp::Linear);
-            }
-            self.curve_upsert(sel, clip_index, from, tick, value, dragging);
-            if dragging && curve_tool != CurveTool::Draw {
-                self.curve_drag = Some(tick);
-            }
-        }
-        if let Some(tick) = remove {
-            self.curve_remove_point(sel, clip_index, tick);
-        }
-        if drag_end {
-            self.end_param_edit();
-        }
-        ui.weak("Click to add an anchor · drag to move · right-click to delete · Draw paints as you drag");
-    }
-
-    /// Body of the piano-roll editor (Edit tab): edits the targeted clip,
-    /// pushes edits to the audio thread immediately.
-    /// Edit tab body for a MIDI subject (P3, spec `roll-multiclip.md` D4–D7):
-    /// the focus clip's roll, the rest of the context as read-only ghosts, and
-    /// a chip strip to switch focus.
-    pub(crate) fn midi_editor_body(
-        &mut self,
-        ui: &mut egui::Ui,
-        subject: &piano_roll::RollSubject,
-    ) {
-        if self.project().midi_tracks.is_empty() {
-            // The target track was removed underneath the editor.
-            self.edit_clip = None;
-            return;
-        }
-        let focus = subject.focus();
-        let sel = focus.track.min(self.project().midi_tracks.len() - 1);
-        if self.project().midi_tracks[sel].clips.is_empty() {
-            let before = self.begin_edit();
-            self.project_mut().add_midi_clip(sel, 0);
-            self.commit_edit("New Clip", before);
-            self.send_track_clips(sel);
-        }
-        let clip_count = self.project().midi_tracks[sel].clips.len();
-        // A clip deleted underneath the editor (an undo, or a removal from a
-        // path that did not clear the selection): close instead of silently
-        // editing a neighbour — `sync_edit_target` re-derives the target from
-        // the selection on the next frame, and falls back to the hint when
-        // nothing live is left there.
-        if focus.clip >= clip_count {
-            self.edit_clip = None;
-            return;
-        }
-        let clip_index = focus.clip;
-        // Met M4: the roll's bar lines follow the meter segments.
-        let meter = self.project().meter_map();
-        let track_name = self.track_label(sel);
-        let shared_refs = self
-            .project()
-            .midi_tracks
-            .get(sel)
-            .and_then(|t| t.clips.get(clip_index))
-            .map(|clip| self.project().midi_data_refs(clip.data))
-            .unwrap_or(1);
-        ui.horizontal(|ui| {
-            let mut title = format!("{track_name} · clip {} (of {clip_count})", clip_index + 1);
-            if shared_refs > 1 {
-                title = format!("{title} · shared by {shared_refs} clips");
-            }
-            ui.label(title);
-            if ui
-                .add_enabled(clip_index > 0, egui::Button::new("←"))
-                .on_hover_text("Previous clip")
-                .clicked()
-            {
-                self.set_edit_target(sel, clip_index - 1);
-            }
-            if ui
-                .add_enabled(clip_index + 1 < clip_count, egui::Button::new("→"))
-                .on_hover_text("Next clip")
-                .clicked()
-            {
-                self.set_edit_target(sel, clip_index + 1);
-            }
-        });
         // P3 (D7): the focus chip strip. Ghosts are read-only and never take
         // clicks, so focus is switched *here* — a chip click or Tab/Shift+Tab.
         // Clicking a ghost would re-open the "empty drag = marquee" ambiguity
-        // M4 spent a whole spec closing.
+        // M4 spent a whole spec closing. F-049: the chips cover both lanes.
         if subject.context().len() > 1 {
             let mut switch: Option<piano_roll::ClipRef> = None;
             ui.horizontal_wrapped(|ui| {
                 ui.add(egui::Label::new(egui::RichText::new("showing").weak()));
                 for clip in subject.context() {
-                    let Some(c) = self
-                        .project()
-                        .midi_tracks
-                        .get(clip.track)
-                        .and_then(|t| t.clips.get(clip.clip))
-                    else {
+                    let Some(label) = self.clip_chip_label(*clip) else {
                         continue;
                     };
-                    let label = format!(
-                        "{} · bar {}",
-                        self.track_label(clip.track),
-                        self.project().bar_beat_at(c.start_ticks).0 + 1
-                    );
                     let focused = *clip == focus;
                     if ui
                         .selectable_label(focused, label)
                         .on_hover_text(if focused {
-                            "Editing this clip (writable)"
+                            if on_notes {
+                                "Editing this clip (writable)"
+                            } else {
+                                "Editing this curve (writable)"
+                            }
                         } else {
-                            "Click (or Ctrl+Tab) to edit this clip · its notes are ghosts until then"
+                            "Click (or Ctrl+Tab) to edit this clip · it is dimmed until then"
                         })
                         .clicked()
                         && !focused
@@ -545,13 +407,10 @@ impl GlitcherZApp {
             let forward =
                 !backward && ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab));
             if backward || forward {
-                let next = match &mut self.edit_clip {
-                    Some(EditTarget::Midi(subject)) => Some(subject.cycle_focus(backward)),
-                    _ => None,
-                };
-                if next.is_some() {
-                    self.roll_state.clear_gesture();
+                if let Some(subject) = &mut self.edit_clip {
+                    subject.cycle_focus(backward);
                 }
+                self.roll_state.clear_gesture();
             }
         }
         // Event List (M3.6): spreadsheet-style precision editing. It is a
@@ -560,62 +419,64 @@ impl GlitcherZApp {
         // laid out off-screen. The split defaults to a third of the tab
         // (two thirds stay with the roll) and the divider is draggable; pulling
         // it below the minimum collapses the strip to its caption row, as does
-        // clicking the caption.
-        let avail_h = ui.available_height();
-        let first_h =
-            (avail_h * EVENT_LIST_HEIGHT_FRACTION).clamp(EVENT_LIST_MIN_H, EVENT_LIST_MAX_H);
-        let collapsed = egui::Panel::bottom("glitcherz_event_list_collapsed");
-        // A fresh id: the old collapsible block stored its ~190 px height under
-        // the plain name, and a stale size would open the strip at the floor.
-        let expanded = egui::Panel::bottom("glitcherz_event_list_expanded")
-            .resizable(true)
-            .default_size(first_h)
-            .min_size(EVENT_LIST_MIN_H)
-            .max_size((avail_h * 0.75).max(EVENT_LIST_MIN_H));
-        // `show_switched` owns the `bool` for the duration of the call, so the
-        // caption writes into a local and the field is updated after.
-        let mut open = self.event_list_open;
-        let mut toggle = false;
-        egui::Panel::show_switched(ui, &mut open, collapsed, expanded, |ui, expanded| {
-            ui.horizontal(|ui| {
-                let count = self
-                    .project()
-                    .midi_clip_notes(sel, clip_index)
-                    .map_or(0, |notes| notes.len());
-                if ui
-                    .selectable_label(expanded, "Event List")
-                    .on_hover_text(if expanded {
-                        "Click to collapse · drag the divider to resize"
-                    } else {
-                        "Click to open the note table"
-                    })
-                    .clicked()
-                {
-                    toggle = true;
+        // clicking the caption. F-049: a curve focus has no notes to tabulate.
+        if on_notes {
+            let avail_h = ui.available_height();
+            let first_h =
+                (avail_h * EVENT_LIST_HEIGHT_FRACTION).clamp(EVENT_LIST_MIN_H, EVENT_LIST_MAX_H);
+            let collapsed = egui::Panel::bottom("glitcherz_event_list_collapsed");
+            // A fresh id: the old collapsible block stored its ~190 px height under
+            // the plain name, and a stale size would open the strip at the floor.
+            let expanded = egui::Panel::bottom("glitcherz_event_list_expanded")
+                .resizable(true)
+                .default_size(first_h)
+                .min_size(EVENT_LIST_MIN_H)
+                .max_size((avail_h * 0.75).max(EVENT_LIST_MIN_H));
+            // `show_switched` owns the `bool` for the duration of the call, so the
+            // caption writes into a local and the field is updated after.
+            let mut open = self.event_list_open;
+            let mut toggle = false;
+            egui::Panel::show_switched(ui, &mut open, collapsed, expanded, |ui, expanded| {
+                ui.horizontal(|ui| {
+                    let count = self
+                        .project()
+                        .midi_clip_notes(sel, clip_index)
+                        .map_or(0, |notes| notes.len());
+                    if ui
+                        .selectable_label(expanded, "Event List")
+                        .on_hover_text(if expanded {
+                            "Click to collapse · drag the divider to resize"
+                        } else {
+                            "Click to open the note table"
+                        })
+                        .clicked()
+                    {
+                        toggle = true;
+                    }
+                    ui.weak(format!("{count} notes"));
+                });
+                if !expanded {
+                    return;
                 }
-                ui.weak(format!("{count} notes"));
+                let list_intent = {
+                    let notes = self
+                        .project()
+                        .midi_clip_notes(sel, clip_index)
+                        .unwrap_or(&[]);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| event_list::show(ui, notes))
+                        .inner
+                };
+                if let Some(list_intent) = list_intent {
+                    self.apply_event_list_intent(sel, clip_index, list_intent);
+                }
             });
-            if !expanded {
-                return;
+            if toggle {
+                open = !open;
             }
-            let list_intent = {
-                let notes = self
-                    .project()
-                    .midi_clip_notes(sel, clip_index)
-                    .unwrap_or(&[]);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| event_list::show(ui, notes))
-                    .inner
-            };
-            if let Some(list_intent) = list_intent {
-                self.apply_event_list_intent(sel, clip_index, list_intent);
-            }
-        });
-        if toggle {
-            open = !open;
+            self.event_list_open = open;
         }
-        self.event_list_open = open;
         let playhead = self.engine.musical_ticks();
         let playing = self.engine.is_playing();
         let intent = {
@@ -628,10 +489,11 @@ impl GlitcherZApp {
                 ..
             } = self;
             let project = session.project();
-            // P4: one overlay lane per control clip in the context. The
-            // vertical axis comes from the *automation destination* of that
-            // track's cable — the same mapping the standalone curve editor
-            // uses, so a curve looks identical in both places.
+            // P4: one overlay lane per control clip in the context. F-049:
+            // the lane matching the focus is the writable one; every other
+            // lane is dimmed scenery, so "which of these am I editing" needs
+            // no guessing. The caption names the destination (its range comes
+            // from the same map table the engine uses).
             let lanes: Vec<piano_roll::OverlayLane<'_>> = subject
                 .context()
                 .iter()
@@ -639,9 +501,6 @@ impl GlitcherZApp {
                 .filter_map(|c| {
                     let data = project.control_tracks.get(c.track)?.clips.get(c.clip)?;
                     let curve = project.curve_data_of(data)?;
-                    // The caption names the destination (its range comes from
-                    // the same map table the engine uses); the lane geometry
-                    // itself is normalized now, so no axis travels with it.
                     let dest = match project.graph.auto_target(c.track) {
                         Some((port, param)) => {
                             crate::patch::auto_param_label_at(&param, &project.graph, &port)
@@ -653,11 +512,27 @@ impl GlitcherZApp {
                     } else {
                         project.control_tracks[c.track].name.clone()
                     };
+                    let focused = *c == focus;
+                    // F-049: the focused lane is the old curve editor's
+                    // successor, so it also carries the axis caption (the real
+                    // unit range) the canvas used to print.
+                    let label = if focused {
+                        let map = match project.graph.auto_target(c.track) {
+                            Some((port, param)) => {
+                                crate::curve::map_in(&param, &project.graph, &port)
+                            }
+                            None => glitcherz_model::MapSpec::UNIT,
+                        };
+                        format!("{name} · {dest} · {}", crate::curve::axis_caption(map))
+                    } else {
+                        format!("{name} · {dest}")
+                    };
                     Some(piano_roll::OverlayLane {
                         clip: *c,
                         data,
                         curve,
-                        label: format!("{name} · {dest}"),
+                        label,
+                        focused,
                     })
                 })
                 .collect();
@@ -676,20 +551,27 @@ impl GlitcherZApp {
         };
         // I2: audition events bypass the command layer entirely — no undo
         // entry, no document change. They go to the focus track's
-        // instrument (the same fan-out the recording path listens to).
-        for (note, velocity, on) in self.roll_state.take_preview_events() {
-            self.engine.send(EngineCommand::Note {
-                track: sel,
-                event: if on {
-                    NoteEvent::On { note, velocity }
-                } else {
-                    NoteEvent::Off { note }
-                },
-            });
+        // instrument (the same fan-out the recording path listens to). A
+        // curve focus has no instrument to audition.
+        if on_notes {
+            for (note, velocity, on) in self.roll_state.take_preview_events() {
+                self.engine.send(EngineCommand::Note {
+                    track: sel,
+                    event: if on {
+                        NoteEvent::On { note, velocity }
+                    } else {
+                        NoteEvent::Off { note }
+                    },
+                });
+            }
+        } else {
+            self.roll_state.take_preview_events();
         }
         // Intents run as commands, so every roll edit is undoable. A drag
         // emits one intent per frame under the same gesture key: one drag,
-        // one undo step.
+        // one undo step. Curve intents carry their own `(track, clip)`, so the
+        // indices here only matter to note commands (never emitted with a
+        // curve focus — the roll drops them).
         if let Some(intent) = intent {
             self.apply_roll_intent(sel, clip_index, intent);
         }
@@ -941,6 +823,14 @@ impl GlitcherZApp {
                 self.end_param_edit();
                 return;
             }
+            RollIntent::CurveInterp {
+                track,
+                clip,
+                interp,
+            } => {
+                self.set_clip_interp(*track, *clip, *interp);
+                return;
+            }
             _ => {}
         }
 
@@ -956,6 +846,9 @@ impl GlitcherZApp {
             // into the command layer.
             RollIntent::Seek { .. } => return,
             RollIntent::MidiOp { .. } => return,
+            // F-049: the curve tool's interpolation moved to the command
+            // layer's `set_clip_interp`, above.
+            RollIntent::CurveInterp { .. } => return,
             RollIntent::CopyNotes | RollIntent::PasteNotes => {
                 unreachable!("clipboard intents never reach the note command table")
             }

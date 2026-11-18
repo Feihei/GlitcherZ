@@ -682,6 +682,11 @@ impl GlitcherZApp {
     /// No-op when the track has no node installed yet (dangling document
     /// node — the next `apply_document` rebuild installs it).
     pub(crate) fn send_audio_clips_for_track(&mut self, track: usize) {
+        // F-048: audio is not sequencer content, so the engine's auto-stop
+        // would end the transport at the last MIDI bar. Keep the floor at the
+        // arrangement end the UI draws — pushed before the node lookup so a
+        // removed track still lowers it.
+        self.push_arrangement_floor();
         let Some(doc_id) = self
             .project()
             .graph

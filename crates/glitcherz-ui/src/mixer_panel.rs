@@ -667,10 +667,11 @@ impl GlitcherZApp {
         self.project_mut().midi_tracks.pop();
         self.selected_track = self.selected_track.min(last.saturating_sub(1));
         // The editor may have targeted the removed track's clip.
-        if let Some(EditTarget::Midi(subject)) = &self.edit_clip
-            && subject.focus().track == last
-        {
-            self.edit_clip = None;
+        if let Some(subject) = &self.edit_clip {
+            let focus = subject.focus();
+            if focus.lane == piano_roll::RollLane::Midi && focus.track == last {
+                self.edit_clip = None;
+            }
         }
         self.commit_edit("Remove MIDI Track", before);
     }
@@ -859,9 +860,10 @@ impl GlitcherZApp {
         }
         // P3: every context member follows the permutation, not just the
         // focus — a ghost left on the old index would point at another track.
-        if let Some(EditTarget::Midi(subject)) = &mut self.edit_clip {
+        if let Some(subject) = &mut self.edit_clip {
+            // F-049: only MIDI members follow the MIDI permutation.
             for clip in subject.context_mut() {
-                if clip.track < len {
+                if clip.lane == piano_roll::RollLane::Midi && clip.track < len {
                     clip.track = perm[clip.track];
                 }
             }
@@ -925,10 +927,14 @@ impl GlitcherZApp {
         if self.selected_auto < len {
             self.selected_auto = perm[self.selected_auto];
         }
-        if let Some(EditTarget::Control { track, .. }) = &mut self.edit_clip
-            && *track < len
-        {
-            *track = perm[*track];
+        if let Some(subject) = &mut self.edit_clip {
+            // F-049: only this lane's members follow this lane's permutation —
+            // the context now mixes MIDI and control clips.
+            for clip in subject.context_mut() {
+                if clip.lane == piano_roll::RollLane::Control && clip.track < len {
+                    clip.track = perm[clip.track];
+                }
+            }
         }
         for sel in &mut self.timeline_state.selection {
             if matches!(sel.lane, timeline::TimelineLane::Control) && sel.track < len {

@@ -93,18 +93,15 @@ impl GlitcherZApp {
         let selected_track = self.selected_track;
         let selected_auto = self.selected_auto;
         let selected_audio = self.selected_audio;
-        let edit_target = self.edit_clip.as_ref().and_then(|t| match t {
+        let edit_target = self.edit_clip.as_ref().and_then(|subject| {
+            let focus = subject.focus();
             // P3: the outline follows the *focus* clip, not the whole context.
-            EditTarget::Midi(subject) => {
-                let focus = subject.focus();
-                Some(timeline::EditHighlight {
-                    track: focus.track,
-                    clip: focus.clip,
-                })
-            }
-            // The MIDI row consumes this outline; a control target has no
-            // MIDI outline (its curve editor is separate, U12).
-            EditTarget::Control { .. } => None,
+            // F-049: the MIDI row consumes this outline; a control focus has
+            // no MIDI row to outline.
+            matches!(focus.lane, piano_roll::RollLane::Midi).then_some(timeline::EditHighlight {
+                track: focus.track,
+                clip: focus.clip,
+            })
         });
         // F-046 D3/D4: the `Data` strip is a bottom panel *of this view*. It
         // has to claim its height before `timeline::show` lays the rows out —
@@ -1303,8 +1300,14 @@ impl GlitcherZApp {
         }
     }
 
-    /// Curve editor (U12): inserts an anchor, or moves the one at `from` to
+    /// Curve lane (U12): inserts an anchor, or moves the one at `from` to
     /// `tick` (one frame of a drag).
+    ///
+    /// `tick` is a **data** tick (the clip's `source_offset` already folded
+    /// in). F-049: a tick past the content is no longer clamped into the first
+    /// period — the content grows to it and, without an explicit loop, the
+    /// window grows to the next bar line so the new anchor is actually played.
+    /// That is what lets a one-bar curve become a four-bar one by drawing.
     ///
     /// `dragging` frames go through the merged undo gesture (one Ctrl+Z for a
     /// whole drag); a click lands a single step.
@@ -1317,20 +1320,47 @@ impl GlitcherZApp {
         value: f32,
         dragging: bool,
     ) {
-        let Some(loop_ticks) = self
+        let Some((offset, span, length, start, looping)) = self
             .project()
             .control_tracks
             .get(track)
             .and_then(|t| t.clips.get(clip))
-            .and_then(|c| self.project().curve_data_of(c))
-            .map(|data| data.length_ticks.max(1))
+            .map(|c| {
+                (
+                    c.source_offset,
+                    c.span_ticks,
+                    self.project()
+                        .curve_data_of(c)
+                        .map_or(1, |d| d.length_ticks),
+                    c.start_ticks,
+                    c.loop_ticks.is_some(),
+                )
+            })
         else {
             return;
         };
-        // Anchors live in loop space: a tick past the loop would neither draw
-        // nor play.
-        let tick = tick.min(loop_ticks - 1);
+        let bar = i64::from(self.project().ticks_per_bar_at(start).max(1));
+        let growth = curve_growth(offset, span, length, tick, bar, looping);
         let before = self.begin_edit();
+        if let Some((new_length, new_span)) = growth {
+            let project = self.project_mut();
+            if let Some(target) = project
+                .control_tracks
+                .get_mut(track)
+                .and_then(|t| t.clips.get_mut(clip))
+            {
+                target.span_ticks = new_span;
+            }
+            let data = self
+                .project()
+                .control_tracks
+                .get(track)
+                .and_then(|t| t.clips.get(clip))
+                .map(|c| c.data);
+            if let Some(data) = data.and_then(|data| self.project_mut().curve_data_mut(data)) {
+                data.length_ticks = new_length;
+            }
+        }
         let Some(curve) = self
             .project_mut()
             .control_tracks
@@ -2486,6 +2516,43 @@ fn content_span_cap(content_end: i64, offset: i64, bar: i64) -> u32 {
     u32::try_from((limit - offset).max(1)).unwrap_or(u32::MAX)
 }
 
+/// F-049: the content length and window span a control clip needs so an
+/// anchor at `tick` (data ticks) fits inside both. `None` when it already
+/// does, or when the clip has an explicit loop (anchors live inside the loop;
+/// the loop tiles, so there is nothing to grow).
+///
+/// Content grows to the anchor itself, exactly like `midi.note_add`; the
+/// window grows to the next **bar** line, so a curve edited by ear still lands
+/// on musical boundaries.
+fn curve_growth(
+    offset: i64,
+    span: u32,
+    length: u32,
+    tick: u32,
+    bar: i64,
+    looping: bool,
+) -> Option<(u32, u32)> {
+    if looping {
+        return None;
+    }
+    let end = i64::from(tick).saturating_add(1);
+    let length = length.max(1);
+    let span = span.max(1);
+    let content = u32::try_from(end).unwrap_or(u32::MAX).max(length);
+    // Ticks from the clip's start: the window has to cover this much.
+    let needed = end.saturating_sub(offset);
+    let new_span = if needed > i64::from(span) {
+        let bar = bar.max(1);
+        let bars = needed.saturating_add(bar - 1) / bar;
+        u32::try_from(bars.saturating_mul(bar))
+            .unwrap_or(u32::MAX)
+            .max(span)
+    } else {
+        span
+    };
+    (content != length || new_span != span).then_some((content, new_span))
+}
+
 /// F-041 D39/D43 + F-045: the ceiling a window edit may grow to, as a span in
 /// ticks. `None` means the data holds no events, so there is nothing to grow
 /// over: the window may not widen at all. A fresh one-bar clip therefore
@@ -3092,5 +3159,80 @@ mod tests {
         ));
         assert!(!resize_curve_clip(&mut project, 0, 0, 0, 2 * TICKS_PER_BAR));
         assert_eq!(project.control_tracks[0].clips[0].span_ticks, TICKS_PER_BAR);
+    }
+
+    /// F-049: a curve is no longer trapped in its first bar. An anchor drawn
+    /// past the content grows the content to it and the window to the next
+    /// bar line — the same write-time growth a MIDI note gets (D41/D42).
+    #[test]
+    fn a_curve_anchor_past_the_content_grows_both_content_and_window() {
+        let bar = i64::from(TICKS_PER_BAR);
+        // A one-bar clip, anchor written in bar 3 (tick 2 bars + 100).
+        let tick = (3 * bar + 100) as u32;
+        let (length, span) = curve_growth(0, TICKS_PER_BAR, TICKS_PER_BAR, tick, bar, false)
+            .expect("past the content there is something to grow");
+        assert_eq!(length, tick + 1, "the content covers the new anchor");
+        assert_eq!(
+            span,
+            4 * TICKS_PER_BAR,
+            "the window rounds up to the bar line that contains it"
+        );
+    }
+
+    /// Inside the content there is nothing to grow: the anchor is written and
+    /// the clip stays exactly as it was.
+    #[test]
+    fn an_anchor_inside_the_content_grows_nothing() {
+        let bar = i64::from(TICKS_PER_BAR);
+        assert_eq!(
+            curve_growth(0, TICKS_PER_BAR, TICKS_PER_BAR, 480, bar, false),
+            None
+        );
+        // Content one tick short of the window still needs growing at the edge
+        // — and the window grows to the bar line the anchor lands in.
+        assert_eq!(
+            curve_growth(
+                0,
+                TICKS_PER_BAR,
+                TICKS_PER_BAR - 1,
+                TICKS_PER_BAR,
+                bar,
+                false
+            ),
+            Some((TICKS_PER_BAR + 1, 2 * TICKS_PER_BAR))
+        );
+    }
+
+    /// A looping clip tiles its content: the anchor lives inside the loop and
+    /// the loop repeats, so there is never anything to grow.
+    #[test]
+    fn a_looping_curve_never_grows() {
+        let bar = i64::from(TICKS_PER_BAR);
+        assert_eq!(
+            curve_growth(0, TICKS_PER_BAR, 480, 4 * TICKS_PER_BAR, bar, true),
+            None
+        );
+    }
+
+    /// A window that starts inside the content counts from its own data
+    /// offset: the span is what the window must cover, not the absolute tick.
+    #[test]
+    fn growth_measures_the_window_from_its_source_offset() {
+        let bar = i64::from(TICKS_PER_BAR);
+        let (length, span) = curve_growth(
+            bar,
+            2 * TICKS_PER_BAR,
+            3 * TICKS_PER_BAR,
+            5 * TICKS_PER_BAR,
+            bar,
+            false,
+        )
+        .expect("the anchor sits past the window");
+        assert_eq!(length, 5 * TICKS_PER_BAR + 1);
+        assert_eq!(
+            span,
+            5 * TICKS_PER_BAR,
+            "local tick 7681 needs 5 bars of window from a 1-bar data offset"
+        );
     }
 }

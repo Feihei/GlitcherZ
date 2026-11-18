@@ -47,8 +47,9 @@ use eframe::egui;
 use crate::grid::GridValue;
 use crate::snap::Snap;
 use glitcherz_model::{
-    ControlClip, CurveData, MeterMap, MidiClip, MidiData, MidiTrack, Note, RandomizeOptions,
-    StrumDirection, StrumOptions, TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP,
+    ControlClip, CurveData, CurveInterp, MeterMap, MidiClip, MidiData, MidiTrack, Note,
+    RandomizeOptions, StrumDirection, StrumOptions, TICKS_PER_BAR, TICKS_PER_QUARTER,
+    TICKS_PER_STEP,
 };
 
 pub use crate::grid::NoteValue;
@@ -93,6 +94,11 @@ pub const LANE_HEIGHT: f32 = 48.0;
 /// the user drags within.
 pub const CURVE_LANE_HEIGHT: f32 = 64.0;
 
+/// Height of the **focused** curve lane (F-049). A curve focus is the
+/// editor's main subject — it gets the room the retired standalone curve
+/// canvas used to have, while the notes above stay visible as ghosts.
+pub const CURVE_FOCUS_LANE_HEIGHT: f32 = 112.0;
+
 /// Anchor hit radius (px) inside a curve lane.
 const ANCHOR_RADIUS: f32 = 8.0;
 
@@ -106,6 +112,12 @@ const LANE_TOGGLE: f32 = 12.0;
 /// green notes and the yellow playhead so a curve never reads as a selection.
 const CURVE_LINE: egui::Color32 = egui::Color32::from_rgb(110, 170, 235);
 const ANCHOR: egui::Color32 = egui::Color32::from_rgb(190, 220, 255);
+
+/// Scenery lanes (F-049): the same blue at ~30% alpha — present, clearly not
+/// the thing being edited. Premultiplied so these stay `const` (the same
+/// convention [`GHOST_NOTE`] uses).
+const CURVE_LINE_DIM: egui::Color32 = egui::Color32::from_rgba_premultiplied(34, 52, 72, 78);
+const ANCHOR_DIM: egui::Color32 = egui::Color32::from_rgba_premultiplied(67, 78, 90, 90);
 
 /// Horizontal zoom bounds (multiplier over the fit-to-width scale; 1.0 shows
 /// the whole loop).
@@ -279,10 +291,12 @@ pub enum RollIntent {
     DeleteNotes { indices: Vec<usize> },
     /// Set absolute velocities (index, velocity) pairs.
     SetVelocities { updates: Vec<(usize, u8)> },
-    /// One frame of an overlay-lane anchor edit (P4, D16): upsert `tick` (clip
-    /// relative) at `value`, first removing the anchor at `from` when the drag
-    /// is moving one. `dragging` selects the merged undo gesture, exactly like
-    /// the standalone curve editor — one drag, one Ctrl+Z.
+    /// One frame of an overlay-lane anchor edit (P4, D16): upsert `tick`
+    /// (**data** tick — the clip's `source_offset` already folded in) at
+    /// `value`, first removing the anchor at `from` when the drag is moving
+    /// one. `dragging` selects the merged undo gesture — one drag, one Ctrl+Z.
+    /// F-049: a tick past the content grows it (and the window) instead of
+    /// being clamped into the first period.
     CurveUpsert {
         track: usize,
         clip: usize,
@@ -299,6 +313,13 @@ pub enum RollIntent {
     },
     /// The lane drag ended: close the merged undo gesture.
     CurveDragEnd,
+    /// F-049: the curve focus's input mode picks the persisted
+    /// interpolation (Line/Draw → Linear, Smooth → Smooth).
+    CurveInterp {
+        track: usize,
+        clip: usize,
+        interp: CurveInterp,
+    },
     /// W4: randomize the selected notes (the whole clip when the selection
     /// is empty; the command handles the fallback).
     Randomize { options: RandomizeOptions },
@@ -334,6 +355,11 @@ pub struct OverlayLane<'a> {
     pub curve: &'a CurveData,
     /// Caption drawn in the lane's top-left corner.
     pub label: String,
+    /// F-049: this lane is the Editor's focus. It is drawn at full strength,
+    /// taller, and is the only writable lane; every other lane is scenery
+    /// (dimmed, no hit test) — the same focus/ghost split the note area uses
+    /// for several MIDI clips.
+    pub focused: bool,
 }
 
 impl OverlayLane<'_> {
@@ -1513,7 +1539,9 @@ fn track_clip<'a>(
             let data = midi_data.get(clip.data as usize);
             Some((clip, data))
         }
-        RollLane::Control => None, // the focus is always MIDI
+        // A control clip has no note content: when it is the focus, `show`
+        // resolves it from the overlay lanes instead (F-049).
+        RollLane::Control => None,
     }
 }
 
@@ -1536,12 +1564,50 @@ pub fn show(
     router: &mut crate::focus::FocusRouter,
 ) -> Option<RollIntent> {
     let focus = subject.focus();
-    let (clip, data_opt) = track_clip(tracks, midi_data, focus)?;
+    // F-049: the focus may be a **control** clip. The Editor then shows the
+    // same canvas as a MIDI focus — notes are ghosts, the focused curve lane
+    // is the writable subject — so the two clip kinds share one time axis
+    // instead of living in two editors that could not be looked at together.
+    let on_notes = matches!(focus.lane, RollLane::Midi);
+    let focus_lane = (!on_notes)
+        .then(|| lanes.iter().find(|lane| lane.clip == focus))
+        .flatten();
+    if !on_notes && focus_lane.is_none() {
+        // A stale control focus (clip deleted underneath the editor): paint
+        // nothing and let `sync_edit_target` re-derive the target next frame.
+        return None;
+    }
+    // The note machinery below wants a clip + content. For a curve focus it
+    // gets an empty MIDI content spanning the same window: ghosts draw, and
+    // every note hit test / gesture finds nothing.
+    let empty = MidiData {
+        length_ticks: focus_lane.map_or(TICKS_PER_BAR, |lane| {
+            lane.curve.length_ticks.max(lane.data.span_ticks).max(1)
+        }),
+        ..MidiData::default()
+    };
+    let synthetic;
+    let (clip, data_opt) = match focus_lane {
+        Some(lane) => {
+            synthetic = MidiClip {
+                start_ticks: lane.data.start_ticks,
+                span_ticks: lane.data.span_ticks,
+                source_offset: lane.data.source_offset,
+                ..MidiClip::default()
+            };
+            (&synthetic, None)
+        }
+        None => track_clip(tracks, midi_data, focus)?,
+    };
     let fallback = MidiData {
         length_ticks: TICKS_PER_BAR,
         ..MidiData::default()
     };
-    let data = data_opt.unwrap_or(&fallback);
+    let data = if focus_lane.is_some() {
+        &empty
+    } else {
+        data_opt.unwrap_or(&fallback)
+    };
     // F-041 M10: the roll edits the **window**, not the content length. A T
     // stretch may extend the window past `length_ticks`; that tail must be
     // writable (the command layer grows the data on the first write).
@@ -1583,6 +1649,15 @@ pub fn show(
             window.union(start, start + span)
         },
     );
+    // F-049: a curve focus opens with one bar of blank past its window. That
+    // blank is the target for "make this curve longer": clicking there writes
+    // an anchor and the command layer grows the content and window to it
+    // (the same draw-past-the-edge rule the note area follows, M10.9).
+    let window = if on_notes {
+        window
+    } else {
+        window.union(window.start, window.end + origin_bar_ticks as f32)
+    };
     // `scroll_x` is absolute now, and the state outlives target switches: a
     // clip starting at bar 9 must open on its own left edge, not inherit a
     // scroll borrowed from the previous clip.
@@ -1609,425 +1684,433 @@ pub fn show(
     // `register_keyboard` call after the grid is measured).
     let toolbar_top = ui.cursor().min.y;
 
-    ui.horizontal(|ui| {
-        let current = state.grid;
-        egui::ComboBox::from_id_salt("roll_grid")
-            .selected_text(grid_label(&current))
-            .width(64.0)
-            .show_ui(ui, |ui| {
-                for value in GridValue::note_presets() {
-                    let grid = GridValue::Note(value);
-                    if ui
-                        .selectable_label(current == grid, grid_label(&grid))
-                        .clicked()
-                    {
-                        state.grid = grid;
-                    }
-                }
-            });
-        // I3: [Select][Draw] is the *mode* group — mutually exclusive,
-        // persistent, filled while active. Everything right of the separator
-        // is a *one-shot* action: it arms, it never stays down, and while
-        // armed it is outlined instead of filled (I-D2).
-        if let Some(picked) = crate::toolbar::mode_group(
-            ui,
-            usize::from(state.mode == RollMode::Draw),
-            &[("Select", "d toggles"), ("Draw", "d")],
-        ) {
-            state.mode = if picked == 0 {
-                RollMode::Select
-            } else {
-                RollMode::Draw
-            };
-            state.knife_armed = false;
-            state.pending_arm = None;
-        }
-        ui.separator();
-        let grab_armed = state.pending_arm == Some(RollArm::Grab)
-            || matches!(state.modal.as_ref().map(|m| m.kind), Some(ModalKind::Move { .. }));
-        let scale_armed = state.pending_arm == Some(RollArm::Scale)
-            || matches!(state.modal.as_ref().map(|m| m.kind), Some(ModalKind::Scale { .. }));
-        let stretch_armed = state.pending_arm == Some(RollArm::Stretch)
-            || matches!(
-                state.modal.as_ref().map(|m| m.kind),
-                Some(ModalKind::Stretch { .. })
-            );
-        if crate::toolbar::action_button(
-            ui,
-            "Grab",
-            "g",
-            grab_armed,
-            "the selection follows the pointer · LMB confirms · RMB / Esc cancels",
-        )
-        .clicked()
-        {
-            // A second click on an armed tool cancels it (the same click that
-            // armed it would otherwise be un-cancellable by mouse).
-            if grab_armed {
-                state.modal = None;
-                state.pending_arm = None;
-            } else {
-                state.knife_armed = false;
-                state.knife = None;
-                state.pending_arm = Some(RollArm::Grab);
-            }
-        }
-        if crate::toolbar::action_button(
-            ui,
-            "Scale",
-            "s",
-            scale_armed,
-            "time-scales the selection around its start · LMB confirms · Esc cancels",
-        )
-        .clicked()
-        {
-            if scale_armed {
-                state.modal = None;
-                state.pending_arm = None;
-            } else {
-                state.knife_armed = false;
-                state.knife = None;
-                state.pending_arm = Some(RollArm::Scale);
-            }
-        }
-        if crate::toolbar::action_button(
-            ui,
-            "Tweak",
-            "t",
-            stretch_armed,
-            "trims the selection's end edge · s flips to the start · LMB confirms",
-        )
-        .clicked()
-        {
-            if stretch_armed {
-                state.modal = None;
-                state.pending_arm = None;
-            } else {
-                state.knife_armed = false;
-                state.knife = None;
-                state.pending_arm = Some(RollArm::Stretch);
-            }
-        }
-        if crate::toolbar::action_button(
-            ui,
-            "Knife",
-            "k",
-            state.knife_armed,
-            "a stroke cuts every note it crosses · Esc / RMB cancels",
-        )
-        .clicked()
-        {
-            // The knife needs no grab point, so it arms immediately.
-            state.knife_armed = !state.knife_armed;
-            state.modal = None;
-            state.pending_arm = None;
-        }
-        // W6: the MIDI command family — Quantize / Legato / Glue / Remove
-        // Overlap / Transpose. One menu keeps the entries out of the toolbar
-        // row; every entry works on the selection, or on the whole clip when
-        // nothing is selected (the command layer's `indices?`). The two
-        // tuning values are view state and travel with each intent.
-        ui.menu_button("Notes", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("strength");
-                ui.add(
-                    egui::DragValue::new(&mut state.midi_strength)
-                        .range(0.0..=1.0)
-                        .speed(0.01)
-                        .max_decimals(2),
-                );
-                ui.label("gap");
-                ui.add(
-                    egui::DragValue::new(&mut state.midi_gap)
-                        .range(0..=4 * i64::from(TICKS_PER_QUARTER))
-                        .speed(1.0),
-                );
-            });
-            ui.separator();
-            let selected = state.selection.clone();
-            let strength = state.midi_strength;
-            let gap = state.midi_gap;
-            let mut fire = |ui: &mut egui::Ui, op: MidiOp, label: &str, hint: &str| {
-                if ui.button(label).on_hover_text(hint).clicked() {
-                    intent = Some(RollIntent::MidiOp {
-                        op,
-                        indices: selected.clone(),
-                    });
-                    ui.close();
-                }
-            };
-            fire(
-                ui,
-                MidiOp::Quantize {
-                    strength,
-                    grid_ticks,
-                },
-                "Quantize",
-                "Snap note starts to the current grid · Q",
-            );
-            fire(
-                ui,
-                MidiOp::Legato { gap },
-                "Legato",
-                "Extend each note to the next start (minus gap) · L",
-            );
-            fire(
-                ui,
-                MidiOp::Glue { gap },
-                "Glue",
-                "Merge touching same-pitch notes (plus gap) · Shift+G",
-            );
-            fire(
-                ui,
-                MidiOp::RemoveOverlap,
-                "Remove Overlap",
-                "Trim a note where the next same-pitch note starts · R",
-            );
-            ui.separator();
-            fire(
-                ui,
-                MidiOp::Transpose(1),
-                "Transpose +1",
-                "Move pitches up one semitone",
-            );
-            fire(
-                ui,
-                MidiOp::Transpose(-1),
-                "Transpose -1",
-                "Move pitches down one semitone",
-            );
-            fire(
-                ui,
-                MidiOp::Transpose(12),
-                "Transpose +12",
-                "Move pitches up one octave",
-            );
-            fire(
-                ui,
-                MidiOp::Transpose(-12),
-                "Transpose -12",
-                "Move pitches down one octave",
-            );
-        });
-        // spec `snap.md` S4: with Ctrl now owning the snap override, the
-        // toolbar is the second copy entry point besides Shift+D. It copies
-        // in place (no grab point is available on a button); press G to move.
-        if crate::toolbar::action_button(
-            ui,
-            "Duplicate",
-            "Shift+D",
-            false,
-            "copies the selection in place · Shift+D copies and starts a move",
-        )
-        .clicked()
-        {
-            if state.selection.is_empty() {
-                state.note_status("Duplicate: nothing selected");
-            } else {
-                let gesture = state.next_gesture();
-                intent = Some(RollIntent::Duplicate {
-                    indices: state.selection.clone(),
-                    gesture,
-                });
-                state.knife_armed = false;
-                state.pending_arm = None;
-            }
-        }
-        ui.separator();
-        // The live modal transform beside the group (with its qualifiers);
-        // clicking it cancels. The action button tells *which* tool is armed,
-        // this chip tells how far it has been pulled (G·X, T·S).
-        let modal_label = state.modal.as_ref().map(Modal::label);
-        if let Some(label) = modal_label
-            && ui
-                .add(
-                    egui::Label::new(
-                        egui::RichText::new(label).color(egui::Color32::YELLOW).strong(),
-                    )
-                    .sense(egui::Sense::click()),
-                )
-                .on_hover_text("Modal transform — the selection follows the pointer · LMB confirms · RMB/Esc cancels")
-                .clicked()
-        {
-            state.modal = None;
-        }
-        // W4/W5: generator panels (view state + a one-shot command on
-        // Apply). Opening one closes the other: they share the parameter row.
-        if ui
-            .selectable_label(state.randomize_open, "Randomize")
-            .on_hover_text(
-                "Randomize pitch / timing / length / velocity over the selection",
-            )
-            .clicked()
-        {
-            state.randomize_open = !state.randomize_open;
-            state.strum_open = false;
-        }
-        if ui
-            .selectable_label(state.strum_open, "Strum")
-            .on_hover_text("Stagger chord attacks: direction, gap, ramp, jitter")
-            .clicked()
-        {
-            state.strum_open = !state.strum_open;
-            state.randomize_open = false;
-        }
-        // I4: length of a click-created note (Draw mode and double-click).
-        ui.label("len");
-        egui::ComboBox::from_id_salt("roll_draw_length")
-            .selected_text(draw_length_label(state.draw_length))
-            .width(56.0)
-            .show_ui(ui, |ui| {
-                if ui
-                    .selectable_label(state.draw_length == DrawLength::Auto, "auto")
-                    .on_hover_text("The last note's length — a quarter note until one exists")
-                    .clicked()
-                {
-                    state.draw_length = DrawLength::Auto;
-                }
-                for (ticks, label) in DRAW_LENGTH_DIVISIONS {
-                    if ui
-                        .selectable_label(state.draw_length == DrawLength::Fixed(ticks), label)
-                        .on_hover_text(format!("{ticks} ticks"))
-                        .clicked()
-                    {
-                        state.draw_length = DrawLength::Fixed(ticks);
-                    }
-                }
-            });
-        // The hint must never overflow the panel: an overflowing child
-        // expands the ui's available rect (egui grows `max_rect` to include
-        // every allocated frame), and the roll below would then be laid out
-        // wider than the panel itself. Truncating keeps it on one row.
-        if !state.had_focus {
-            // Keyboard shortcuts are focus-gated; make the invisible gate
-            // visible so "the keys do nothing" is diagnosable at a glance.
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new("no keyboard focus — hover the roll")
-                        .color(egui::Color32::YELLOW),
-                ),
-            );
-        }
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(
-                    "click: select · drag: tweak · dbl-click: insert · edges: trim · Ctrl+drag: copy · d: draw · G move · S scale · T stretch (LMB ok · RMB/Esc cancel) · K knife · Del del · RMB: delete · arrows: nudge · wheel: pitch · Shift+wheel: time · Ctrl+wheel: zoom time · Ctrl+Alt+wheel: zoom pitch · middle-drag: pan",
-                )
-                .weak(),
-            )
-            .truncate(),
-        );
-    });
-
-    // W4: randomize parameters (view state only — Apply runs the command
-    // once; Cancel closes without touching the document).
-    if state.randomize_open {
+    // F-049: the tool row follows the focus — note tools for a MIDI clip, the
+    // curve tools for a control clip. It is one canvas, two subjects.
+    if on_notes {
         ui.horizontal(|ui| {
-            let bar = origin_bar_ticks;
-            ui.strong("Randomize ±");
-            ui.label("pitch");
-            ui.add(
-                egui::DragValue::new(&mut state.randomize_options.pitch)
-                    .range(0..=24)
-                    .suffix(" st"),
-            );
-            ui.label("start");
-            ui.add(
-                egui::DragValue::new(&mut state.randomize_options.start)
-                    .range(0..=4 * bar)
-                    .suffix(" t"),
-            );
-            ui.label("len");
-            ui.add(
-                egui::DragValue::new(&mut state.randomize_options.length)
-                    .range(0..=4 * bar)
-                    .suffix(" t"),
-            );
-            ui.label("vel");
-            ui.add(egui::DragValue::new(&mut state.randomize_options.velocity).range(0..=127));
-            ui.label("chance");
-            ui.add(
-                egui::DragValue::new(&mut state.randomize_options.probability)
-                    .range(0.0..=1.0)
-                    .speed(0.01),
-            );
-            if ui.button("Apply").clicked() {
-                intent = Some(RollIntent::Randomize {
-                    options: state.randomize_options,
-                });
-                state.randomize_open = false;
-            }
-            if ui.button("Cancel").clicked() {
-                state.randomize_open = false;
-            }
-        });
-    }
-    // W5: strum parameters.
-    if state.strum_open {
-        ui.horizontal(|ui| {
-            let bar = origin_bar_ticks;
-            ui.strong("Strum");
-            egui::ComboBox::from_id_salt("roll_strum_dir")
-                .selected_text(strum_direction_label(state.strum_options.direction))
-                .width(76.0)
+            let current = state.grid;
+            egui::ComboBox::from_id_salt("roll_grid")
+                .selected_text(grid_label(&current))
+                .width(64.0)
                 .show_ui(ui, |ui| {
-                    for direction in [
-                        StrumDirection::Up,
-                        StrumDirection::Down,
-                        StrumDirection::Alternate,
-                        StrumDirection::Random,
-                    ] {
+                    for value in GridValue::note_presets() {
+                        let grid = GridValue::Note(value);
                         if ui
-                            .selectable_label(
-                                state.strum_options.direction == direction,
-                                strum_direction_label(direction),
-                            )
+                            .selectable_label(current == grid, grid_label(&grid))
                             .clicked()
                         {
-                            state.strum_options.direction = direction;
+                            state.grid = grid;
                         }
                     }
                 });
-            ui.label("spread");
-            strum_division_combo(
+            // I3: [Select][Draw] is the *mode* group — mutually exclusive,
+            // persistent, filled while active. Everything right of the separator
+            // is a *one-shot* action: it arms, it never stays down, and while
+            // armed it is outlined instead of filled (I-D2).
+            if let Some(picked) = crate::toolbar::mode_group(
                 ui,
-                "roll_strum_spread",
-                &mut state.strum_options.spread_ticks,
-                true,
-            );
-            ui.label("chord window");
-            strum_division_combo(
-                ui,
-                "roll_strum_window",
-                &mut state.strum_options.group_window_ticks,
-                false,
-            );
-            ui.label("ramp");
-            ui.add(egui::DragValue::new(&mut state.strum_options.velocity_ramp).range(-64..=64))
-                .on_hover_text("Velocity change from the first attack to the last");
-            ui.label("jitter");
-            ui.add(
-                egui::DragValue::new(&mut state.strum_options.jitter_ticks)
-                    .range(0..=(bar / 2).max(1))
-                    .suffix(" t"),
-            )
-            .on_hover_text("Random ± ticks added to each attack");
-            if ui.button("Apply").clicked() {
-                if state.strum_options.spread_ticks == 0 {
-                    // A zero gap is the model's identity: keep the panel open
-                    // and say why nothing would happen.
-                    state.note_status("Strum: spread is off — pick a note division");
+                usize::from(state.mode == RollMode::Draw),
+                &[("Select", "d toggles"), ("Draw", "d")],
+            ) {
+                state.mode = if picked == 0 {
+                    RollMode::Select
                 } else {
-                    intent = Some(RollIntent::Strum {
-                        options: state.strum_options,
-                    });
-                    state.strum_open = false;
+                    RollMode::Draw
+                };
+                state.knife_armed = false;
+                state.pending_arm = None;
+            }
+            ui.separator();
+            let grab_armed = state.pending_arm == Some(RollArm::Grab)
+                || matches!(state.modal.as_ref().map(|m| m.kind), Some(ModalKind::Move { .. }));
+            let scale_armed = state.pending_arm == Some(RollArm::Scale)
+                || matches!(state.modal.as_ref().map(|m| m.kind), Some(ModalKind::Scale { .. }));
+            let stretch_armed = state.pending_arm == Some(RollArm::Stretch)
+                || matches!(
+                    state.modal.as_ref().map(|m| m.kind),
+                    Some(ModalKind::Stretch { .. })
+                );
+            if crate::toolbar::action_button(
+                ui,
+                "Grab",
+                "g",
+                grab_armed,
+                "the selection follows the pointer · LMB confirms · RMB / Esc cancels",
+            )
+            .clicked()
+            {
+                // A second click on an armed tool cancels it (the same click that
+                // armed it would otherwise be un-cancellable by mouse).
+                if grab_armed {
+                    state.modal = None;
+                    state.pending_arm = None;
+                } else {
+                    state.knife_armed = false;
+                    state.knife = None;
+                    state.pending_arm = Some(RollArm::Grab);
                 }
             }
-            if ui.button("Cancel").clicked() {
+            if crate::toolbar::action_button(
+                ui,
+                "Scale",
+                "s",
+                scale_armed,
+                "time-scales the selection around its start · LMB confirms · Esc cancels",
+            )
+            .clicked()
+            {
+                if scale_armed {
+                    state.modal = None;
+                    state.pending_arm = None;
+                } else {
+                    state.knife_armed = false;
+                    state.knife = None;
+                    state.pending_arm = Some(RollArm::Scale);
+                }
+            }
+            if crate::toolbar::action_button(
+                ui,
+                "Tweak",
+                "t",
+                stretch_armed,
+                "trims the selection's end edge · s flips to the start · LMB confirms",
+            )
+            .clicked()
+            {
+                if stretch_armed {
+                    state.modal = None;
+                    state.pending_arm = None;
+                } else {
+                    state.knife_armed = false;
+                    state.knife = None;
+                    state.pending_arm = Some(RollArm::Stretch);
+                }
+            }
+            if crate::toolbar::action_button(
+                ui,
+                "Knife",
+                "k",
+                state.knife_armed,
+                "a stroke cuts every note it crosses · Esc / RMB cancels",
+            )
+            .clicked()
+            {
+                // The knife needs no grab point, so it arms immediately.
+                state.knife_armed = !state.knife_armed;
+                state.modal = None;
+                state.pending_arm = None;
+            }
+            // W6: the MIDI command family — Quantize / Legato / Glue / Remove
+            // Overlap / Transpose. One menu keeps the entries out of the toolbar
+            // row; every entry works on the selection, or on the whole clip when
+            // nothing is selected (the command layer's `indices?`). The two
+            // tuning values are view state and travel with each intent.
+            ui.menu_button("Notes", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("strength");
+                    ui.add(
+                        egui::DragValue::new(&mut state.midi_strength)
+                            .range(0.0..=1.0)
+                            .speed(0.01)
+                            .max_decimals(2),
+                    );
+                    ui.label("gap");
+                    ui.add(
+                        egui::DragValue::new(&mut state.midi_gap)
+                            .range(0..=4 * i64::from(TICKS_PER_QUARTER))
+                            .speed(1.0),
+                    );
+                });
+                ui.separator();
+                let selected = state.selection.clone();
+                let strength = state.midi_strength;
+                let gap = state.midi_gap;
+                let mut fire = |ui: &mut egui::Ui, op: MidiOp, label: &str, hint: &str| {
+                    if ui.button(label).on_hover_text(hint).clicked() {
+                        intent = Some(RollIntent::MidiOp {
+                            op,
+                            indices: selected.clone(),
+                        });
+                        ui.close();
+                    }
+                };
+                fire(
+                    ui,
+                    MidiOp::Quantize {
+                        strength,
+                        grid_ticks,
+                    },
+                    "Quantize",
+                    "Snap note starts to the current grid · Q",
+                );
+                fire(
+                    ui,
+                    MidiOp::Legato { gap },
+                    "Legato",
+                    "Extend each note to the next start (minus gap) · L",
+                );
+                fire(
+                    ui,
+                    MidiOp::Glue { gap },
+                    "Glue",
+                    "Merge touching same-pitch notes (plus gap) · Shift+G",
+                );
+                fire(
+                    ui,
+                    MidiOp::RemoveOverlap,
+                    "Remove Overlap",
+                    "Trim a note where the next same-pitch note starts · R",
+                );
+                ui.separator();
+                fire(
+                    ui,
+                    MidiOp::Transpose(1),
+                    "Transpose +1",
+                    "Move pitches up one semitone",
+                );
+                fire(
+                    ui,
+                    MidiOp::Transpose(-1),
+                    "Transpose -1",
+                    "Move pitches down one semitone",
+                );
+                fire(
+                    ui,
+                    MidiOp::Transpose(12),
+                    "Transpose +12",
+                    "Move pitches up one octave",
+                );
+                fire(
+                    ui,
+                    MidiOp::Transpose(-12),
+                    "Transpose -12",
+                    "Move pitches down one octave",
+                );
+            });
+            // spec `snap.md` S4: with Ctrl now owning the snap override, the
+            // toolbar is the second copy entry point besides Shift+D. It copies
+            // in place (no grab point is available on a button); press G to move.
+            if crate::toolbar::action_button(
+                ui,
+                "Duplicate",
+                "Shift+D",
+                false,
+                "copies the selection in place · Shift+D copies and starts a move",
+            )
+            .clicked()
+            {
+                if state.selection.is_empty() {
+                    state.note_status("Duplicate: nothing selected");
+                } else {
+                    let gesture = state.next_gesture();
+                    intent = Some(RollIntent::Duplicate {
+                        indices: state.selection.clone(),
+                        gesture,
+                    });
+                    state.knife_armed = false;
+                    state.pending_arm = None;
+                }
+            }
+            ui.separator();
+            // The live modal transform beside the group (with its qualifiers);
+            // clicking it cancels. The action button tells *which* tool is armed,
+            // this chip tells how far it has been pulled (G·X, T·S).
+            let modal_label = state.modal.as_ref().map(Modal::label);
+            if let Some(label) = modal_label
+                && ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(label).color(egui::Color32::YELLOW).strong(),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text("Modal transform — the selection follows the pointer · LMB confirms · RMB/Esc cancels")
+                    .clicked()
+            {
+                state.modal = None;
+            }
+            // W4/W5: generator panels (view state + a one-shot command on
+            // Apply). Opening one closes the other: they share the parameter row.
+            if ui
+                .selectable_label(state.randomize_open, "Randomize")
+                .on_hover_text(
+                    "Randomize pitch / timing / length / velocity over the selection",
+                )
+                .clicked()
+            {
+                state.randomize_open = !state.randomize_open;
                 state.strum_open = false;
             }
+            if ui
+                .selectable_label(state.strum_open, "Strum")
+                .on_hover_text("Stagger chord attacks: direction, gap, ramp, jitter")
+                .clicked()
+            {
+                state.strum_open = !state.strum_open;
+                state.randomize_open = false;
+            }
+            // I4: length of a click-created note (Draw mode and double-click).
+            ui.label("len");
+            egui::ComboBox::from_id_salt("roll_draw_length")
+                .selected_text(draw_length_label(state.draw_length))
+                .width(56.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(state.draw_length == DrawLength::Auto, "auto")
+                        .on_hover_text("The last note's length — a quarter note until one exists")
+                        .clicked()
+                    {
+                        state.draw_length = DrawLength::Auto;
+                    }
+                    for (ticks, label) in DRAW_LENGTH_DIVISIONS {
+                        if ui
+                            .selectable_label(state.draw_length == DrawLength::Fixed(ticks), label)
+                            .on_hover_text(format!("{ticks} ticks"))
+                            .clicked()
+                        {
+                            state.draw_length = DrawLength::Fixed(ticks);
+                        }
+                    }
+                });
+            // The hint must never overflow the panel: an overflowing child
+            // expands the ui's available rect (egui grows `max_rect` to include
+            // every allocated frame), and the roll below would then be laid out
+            // wider than the panel itself. Truncating keeps it on one row.
+            if !state.had_focus {
+                // Keyboard shortcuts are focus-gated; make the invisible gate
+                // visible so "the keys do nothing" is diagnosable at a glance.
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("no keyboard focus — hover the roll")
+                            .color(egui::Color32::YELLOW),
+                    ),
+                );
+            }
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "click: select · drag: tweak · dbl-click: insert · edges: trim · Ctrl+drag: copy · d: draw · G move · S scale · T stretch (LMB ok · RMB/Esc cancel) · K knife · Del del · RMB: delete · arrows: nudge · wheel: pitch · Shift+wheel: time · Ctrl+wheel: zoom time · Ctrl+Alt+wheel: zoom pitch · middle-drag: pan",
+                    )
+                    .weak(),
+                )
+                .truncate(),
+            );
         });
+
+        // W4: randomize parameters (view state only — Apply runs the command
+        // once; Cancel closes without touching the document).
+        if state.randomize_open {
+            ui.horizontal(|ui| {
+                let bar = origin_bar_ticks;
+                ui.strong("Randomize ±");
+                ui.label("pitch");
+                ui.add(
+                    egui::DragValue::new(&mut state.randomize_options.pitch)
+                        .range(0..=24)
+                        .suffix(" st"),
+                );
+                ui.label("start");
+                ui.add(
+                    egui::DragValue::new(&mut state.randomize_options.start)
+                        .range(0..=4 * bar)
+                        .suffix(" t"),
+                );
+                ui.label("len");
+                ui.add(
+                    egui::DragValue::new(&mut state.randomize_options.length)
+                        .range(0..=4 * bar)
+                        .suffix(" t"),
+                );
+                ui.label("vel");
+                ui.add(egui::DragValue::new(&mut state.randomize_options.velocity).range(0..=127));
+                ui.label("chance");
+                ui.add(
+                    egui::DragValue::new(&mut state.randomize_options.probability)
+                        .range(0.0..=1.0)
+                        .speed(0.01),
+                );
+                if ui.button("Apply").clicked() {
+                    intent = Some(RollIntent::Randomize {
+                        options: state.randomize_options,
+                    });
+                    state.randomize_open = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    state.randomize_open = false;
+                }
+            });
+        }
+        // W5: strum parameters.
+        if state.strum_open {
+            ui.horizontal(|ui| {
+                let bar = origin_bar_ticks;
+                ui.strong("Strum");
+                egui::ComboBox::from_id_salt("roll_strum_dir")
+                    .selected_text(strum_direction_label(state.strum_options.direction))
+                    .width(76.0)
+                    .show_ui(ui, |ui| {
+                        for direction in [
+                            StrumDirection::Up,
+                            StrumDirection::Down,
+                            StrumDirection::Alternate,
+                            StrumDirection::Random,
+                        ] {
+                            if ui
+                                .selectable_label(
+                                    state.strum_options.direction == direction,
+                                    strum_direction_label(direction),
+                                )
+                                .clicked()
+                            {
+                                state.strum_options.direction = direction;
+                            }
+                        }
+                    });
+                ui.label("spread");
+                strum_division_combo(
+                    ui,
+                    "roll_strum_spread",
+                    &mut state.strum_options.spread_ticks,
+                    true,
+                );
+                ui.label("chord window");
+                strum_division_combo(
+                    ui,
+                    "roll_strum_window",
+                    &mut state.strum_options.group_window_ticks,
+                    false,
+                );
+                ui.label("ramp");
+                ui.add(
+                    egui::DragValue::new(&mut state.strum_options.velocity_ramp).range(-64..=64),
+                )
+                .on_hover_text("Velocity change from the first attack to the last");
+                ui.label("jitter");
+                ui.add(
+                    egui::DragValue::new(&mut state.strum_options.jitter_ticks)
+                        .range(0..=(bar / 2).max(1))
+                        .suffix(" t"),
+                )
+                .on_hover_text("Random ± ticks added to each attack");
+                if ui.button("Apply").clicked() {
+                    if state.strum_options.spread_ticks == 0 {
+                        // A zero gap is the model's identity: keep the panel open
+                        // and say why nothing would happen.
+                        state.note_status("Strum: spread is off — pick a note division");
+                    } else {
+                        intent = Some(RollIntent::Strum {
+                            options: state.strum_options,
+                        });
+                        state.strum_open = false;
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    state.strum_open = false;
+                }
+            });
+        }
+    } else if let Some(lane) = focus_lane {
+        curve_toolbar(ui, state, lane, &mut intent);
     }
 
     // ---- Roll area: fills the height the caller left. The Edit tab *is* the
@@ -2036,12 +2119,16 @@ pub fn show(
     // overlay curve lane) are reserved out of the budget and the notes get
     // everything else. `available_height` is unbounded inside a scroll area —
     // that caller falls back to the fixed height.
-    let strip_stack = LANE_HEIGHT
+    // F-049: a curve focus has no notes, so the velocity strip is not laid
+    // out at all — the focused curve lane takes that height instead.
+    let strip_stack = (if on_notes { LANE_HEIGHT } else { 0.0 })
         + lanes
             .iter()
             .map(|lane| {
                 if state.collapsed_lanes.contains(&lane.clip.track) {
                     CURVE_LANE_COLLAPSED_HEIGHT
+                } else if lane.focused {
+                    CURVE_FOCUS_LANE_HEIGHT
                 } else {
                     CURVE_LANE_HEIGHT
                 }
@@ -2665,8 +2752,25 @@ pub fn show(
         );
     }
 
-    // ---- Velocity lane (M2.4): bars under the roll, drag to set. ----
-    let (lane_rect, lane_response) = allocate_roll_strip(ui, LANE_HEIGHT, egui::Sense::drag());
+    // ---- Velocity lane (M2.4): bars under the roll, drag to set. A curve
+    // focus has no notes, so the strip is skipped outright (F-049): a
+    // zero-height row still burned a line of the layout, and that 20 px the
+    // reservation did not know about pushed the lane stack out of the panel —
+    // its bottom rows fell outside the clip rect and stopped taking clicks.
+    let (lane_rect, lane_response) = if on_notes {
+        allocate_roll_strip(ui, LANE_HEIGHT, egui::Sense::drag())
+    } else {
+        let empty = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.bottom()),
+            egui::vec2(rect.width(), 0.0),
+        );
+        let response = ui.interact(
+            empty,
+            ui.scope_id().with("velocity-none"),
+            egui::Sense::hover(),
+        );
+        (empty, response)
+    };
     // The velocity strip is part of the same panel, so it is part of the same
     // keyboard surface (see the `register_keyboard` call above): dragging a
     // velocity bar must not cost the roll its shortcuts either.
@@ -2675,45 +2779,39 @@ pub fn show(
     // vertical anchor, so the bars line up with the notes above them.
     let lane_geom = geom.over(lane_rect);
     let lane_painter = ui.painter_at(lane_rect);
-    lane_painter.rect_filled(lane_rect, 0.0, egui::Color32::from_gray(20));
-    for (index, note) in data.notes().iter().enumerate() {
-        let x = lane_geom.x_of(note.start as f32);
-        let w = (note.length as f32 * ticks_to_x).clamp(3.0, 8.0);
-        let h = (LANE_HEIGHT - 4.0) * f32::from(note.velocity) / 127.0;
-        let selected = state.selection.contains(&index);
-        let color = if selected {
-            SELECTED
-        } else {
-            egui::Color32::from_rgb(64, 160, 96)
-        };
-        lane_painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(x, lane_rect.bottom() - h),
-                egui::pos2(x + w, lane_rect.bottom()),
-            ),
-            1.0,
-            color,
-        );
-    }
-    if let Some(local) = playhead_local(playhead_ticks, origin_tick, content_len, clip_span) {
-        let x = lane_geom.x_of(local + clip.source_offset as f32);
-        let (width, color) = if playing {
-            (2.0, egui::Color32::YELLOW)
-        } else {
-            (1.0, egui::Color32::from_rgb(150, 150, 60))
-        };
-        lane_painter.line_segment(
-            [
-                egui::pos2(x, lane_rect.top()),
-                egui::pos2(x, lane_rect.bottom()),
-            ],
-            egui::Stroke::new(width, color),
-        );
+    if on_notes {
+        lane_painter.rect_filled(lane_rect, 0.0, egui::Color32::from_gray(20));
+        for (index, note) in data.notes().iter().enumerate() {
+            let selected = state.selection.contains(&index);
+            let color = if selected {
+                SELECTED
+            } else {
+                egui::Color32::from_rgb(64, 160, 96)
+            };
+            lane_painter.rect_filled(velocity_bar_rect(lane_rect, &lane_geom, note), 1.0, color);
+        }
+        if let Some(local) = playhead_local(playhead_ticks, origin_tick, content_len, clip_span) {
+            let x = lane_geom.x_of(local + clip.source_offset as f32);
+            let (width, color) = if playing {
+                (2.0, egui::Color32::YELLOW)
+            } else {
+                (1.0, egui::Color32::from_rgb(150, 150, 60))
+            };
+            lane_painter.line_segment(
+                [
+                    egui::pos2(x, lane_rect.top()),
+                    egui::pos2(x, lane_rect.bottom()),
+                ],
+                egui::Stroke::new(width, color),
+            );
+        }
     }
 
     // ---- Overlay curve lanes (P4, D8/D16): one strip per control clip in
     // the context, sharing the roll's time axis and carrying its own value
-    // axis. They are writable and write **their own** clip, never the focus.
+    // axis. F-049: only the focused lane is writable; a lane that is not the
+    // focus is scenery (dimmed, no hit test) — the same split the note area
+    // uses between the focus clip and its ghosts.
     let lane_intent = curve_lanes(ui, &geom, lanes, state);
 
     // The keyboard column ends with the notes, but the strips below keep the
@@ -3509,23 +3607,22 @@ pub fn show(
     }
 
     // Velocity lane: drag sets absolute velocities. With a selection, every
-    // selected note follows the pointer; without one, the notes under the
-    // pointer do (a sweep across the lane "paints" velocities).
-    if lane_response.dragged_by(egui::PointerButton::Primary)
-        || lane_response.drag_started_by(egui::PointerButton::Primary)
+    // selected note follows the pointer; without one, the bar under the
+    // pointer does — a sweep across the lane then "paints" the bars it passes.
+    // The target is the bar (a note's start marker), never the whole tick
+    // span, so a long note cannot swallow its neighbours.
+    if on_notes
+        && (lane_response.dragged_by(egui::PointerButton::Primary)
+            || lane_response.drag_started_by(egui::PointerButton::Primary))
     {
         if let Some(pos) = lane_response.interact_pointer_pos() {
             let velocity = ((lane_rect.bottom() - pos.y) / (LANE_HEIGHT - 4.0) * 127.0)
                 .round()
                 .clamp(1.0, 127.0) as u8;
             let updates: Vec<(usize, u8)> = if state.selection.is_empty() {
-                let tick = lane_geom.local_at(pos.x).max(0.0) as i64;
-                data.notes()
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, n)| tick >= n.start && tick < n.end())
-                    .map(|(i, _)| (i, velocity))
-                    .collect()
+                velocity_target(data.notes(), lane_rect, &lane_geom, pos.x)
+                    .map(|index| vec![(index, velocity)])
+                    .unwrap_or_default()
             } else {
                 state.selection.iter().map(|i| (*i, velocity)).collect()
             };
@@ -3572,7 +3669,59 @@ pub fn show(
 
     // A lane edit and a note gesture cannot start in the same frame (one
     // pointer), but the lane is drawn first — let it win if both are set.
-    lane_intent.or(intent)
+    // F-049: a curve focus writes curves only. The note gestures above run
+    // against empty content, so their intents are dropped; a ruler seek is
+    // still wanted (it moves the transport, not the document).
+    if on_notes {
+        lane_intent.or(intent)
+    } else {
+        lane_intent.or(intent.filter(|i| matches!(i, RollIntent::Seek { .. })))
+    }
+}
+
+/// Screen rectangle of one velocity bar (M2.4).
+///
+/// The velocity lane is a marker strip, not a squashed copy of the note area:
+/// each note owns a short bar at its **start** (3–8 px wide, height = the
+/// value), so two notes that overlap in time never fight over the same
+/// pixels. Painting and hit-testing both read this rectangle.
+fn velocity_bar_rect(lane: egui::Rect, geom: &RollGeom, note: &Note) -> egui::Rect {
+    let x = geom.x_of(note.start as f32);
+    let w = (note.length as f32 * geom.ticks_to_x).clamp(3.0, 8.0);
+    let h = (LANE_HEIGHT - 4.0) * f32::from(note.velocity) / 127.0;
+    egui::Rect::from_min_max(
+        egui::pos2(x, lane.bottom() - h),
+        egui::pos2(x + w, lane.bottom()),
+    )
+}
+
+/// The note whose velocity bar is under `x` (within [`HIT_SLOP`]), if any.
+///
+/// At most one note: a bar marks a note's **start**, so a long note does not
+/// own the whole lane beneath it. The earlier tick-span test (`start <= tick <
+/// end`) did exactly that — dragging a late note also retuned every longer
+/// note covering the same tick, which read as "the notes before it all
+/// changed". A chord's stacked bars share one x; the first in note order wins,
+/// and selecting the chord (then dragging) still tunes them together.
+fn velocity_target(notes: &[Note], lane: egui::Rect, geom: &RollGeom, x: f32) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (index, note) in notes.iter().enumerate() {
+        let bar = velocity_bar_rect(lane, geom, note);
+        let distance = if x < bar.left() {
+            bar.left() - x
+        } else if x > bar.right() {
+            x - bar.right()
+        } else {
+            0.0
+        };
+        if distance > HIT_SLOP.x {
+            continue;
+        }
+        if best.is_none_or(|(_, best_distance)| distance < best_distance) {
+            best = Some((index, distance));
+        }
+    }
+    best.map(|(index, _)| index)
 }
 
 /// Draws the overlay curve lanes and returns their edit for this frame.
@@ -3614,6 +3763,9 @@ fn curve_lanes(
         let collapsed = state.collapsed_lanes.contains(&lane.clip.track);
         let height = if collapsed {
             CURVE_LANE_COLLAPSED_HEIGHT
+        } else if lane.focused {
+            // F-049: the focus gets the room the standalone curve canvas had.
+            CURVE_FOCUS_LANE_HEIGHT
         } else {
             CURVE_LANE_HEIGHT
         };
@@ -3622,10 +3774,17 @@ fn curve_lanes(
         state.lane_rects.push(rect);
         let lane_geom = geom.at_origin(i64::from(lane.data.start_ticks)).over(rect);
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, egui::Color32::from_gray(16));
+        painter.rect_filled(
+            rect,
+            0.0,
+            egui::Color32::from_gray(if lane.focused { 19 } else { 14 }),
+        );
         painter.line_segment(
             [rect.left_top(), rect.right_top()],
-            egui::Stroke::new(1.0, egui::Color32::from_gray(52)),
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_gray(if lane.focused { 96 } else { 44 }),
+            ),
         );
         // Collapse toggle (P5): a 12 px square in the caption. A stack of
         // eight lanes is 512 px of roll the notes do not get, and the usual
@@ -3655,7 +3814,7 @@ fn curve_lanes(
             egui::Align2::LEFT_TOP,
             &lane.label,
             egui::FontId::proportional(10.0),
-            egui::Color32::from_gray(150),
+            egui::Color32::from_gray(if lane.focused { 205 } else { 112 }),
         );
         // The toggle is checked before any curve interaction: a click there
         // folds the lane, it does not add an anchor.
@@ -3676,12 +3835,30 @@ fn curve_lanes(
             continue;
         }
 
-        let loop_ticks = i64::from(lane.curve.length_ticks.max(1));
+        // F-049: address the lane in **data** ticks. `local` is the tick from
+        // the clip's start; the data tick folds in `source_offset`, so a
+        // window that starts inside the content draws the slice it plays.
+        let offset = lane.data.source_offset;
         let span_ticks = i64::from(lane.data.span_ticks.max(1));
-        // Only the clip's active span is drawn: outside it the engine plays
-        // nothing, so drawing a held value would claim otherwise.
-        let x_start = lane_geom.x_of(0.0).max(rect.left());
-        let x_end = lane_geom.x_of(span_ticks as f32).min(rect.right());
+        let length_ticks = i64::from(lane.curve.length_ticks.max(1));
+        let period = lane.data.loop_ticks.map(|p| i64::from(p.max(1)));
+        let x_data = |tick: f32| lane_geom.x_of(tick - offset as f32);
+        let data_at = |x: f32| lane_geom.local_at(x) + offset as f32;
+        // The engine plays [offset, offset + span); without an explicit loop
+        // it also stops at the content end (F-041 revision), so the preview
+        // must stop there too.
+        let play_end = if period.is_some() {
+            offset + span_ticks
+        } else {
+            (offset + span_ticks).min(length_ticks)
+        };
+        let x_start = x_data(offset as f32).max(rect.left());
+        let x_end = x_data(play_end as f32).min(rect.right());
+        let (line_color, anchor_color) = if lane.focused {
+            (CURVE_LINE, ANCHOR)
+        } else {
+            (CURVE_LINE_DIM, ANCHOR_DIM)
+        };
 
         // Curve: one sample per pixel, folded into the loop the same way the
         // sequencer tiles control clips (D17). A seam between tiles is a jump
@@ -3689,8 +3866,11 @@ fn curve_lanes(
         let mut points: Vec<egui::Pos2> = Vec::new();
         let mut x = x_start;
         while x <= x_end {
-            let local = lane_geom.local_at(x);
-            let phase = local.rem_euclid(loop_ticks as f32);
+            let data = data_at(x);
+            let phase = match period {
+                Some(p) => data.rem_euclid(p as f32),
+                None => data,
+            };
             match lane.curve.value_at(f64::from(phase)) {
                 Some(value) => points.push(egui::pos2(x, lane.value_to_y(value, rect))),
                 // An empty curve has nothing to draw; leave the gap.
@@ -3698,7 +3878,7 @@ fn curve_lanes(
                     if points.len() > 1 {
                         painter.add(egui::Shape::line(
                             std::mem::take(&mut points),
-                            egui::Stroke::new(1.5, CURVE_LINE),
+                            egui::Stroke::new(1.5, line_color),
                         ));
                     }
                     points.clear();
@@ -3709,7 +3889,7 @@ fn curve_lanes(
         if points.len() > 1 {
             painter.add(egui::Shape::line(
                 points,
-                egui::Stroke::new(1.5, CURVE_LINE),
+                egui::Stroke::new(1.5, line_color),
             ));
         }
 
@@ -3718,14 +3898,19 @@ fn curve_lanes(
         let mut anchor_positions: Vec<(u32, egui::Pos2)> = Vec::new();
         for anchor in &lane.curve.points {
             let pos = egui::pos2(
-                lane_geom.x_of(anchor.tick as f32),
+                x_data(anchor.tick as f32),
                 lane.value_to_y(anchor.value, rect),
             );
             if pos.x < rect.left() - 4.0 || pos.x > rect.right() + 4.0 {
                 continue;
             }
             anchor_positions.push((anchor.tick, pos));
-            painter.circle_filled(pos, 3.0, ANCHOR);
+            painter.circle_filled(pos, if lane.focused { 4.0 } else { 2.5 }, anchor_color);
+        }
+        // F-049: scenery lanes end here. Present, readable, not clickable —
+        // focus is switched from the chip strip, never by editing a ghost.
+        if !lane.focused {
+            continue;
         }
 
         // ---- Interaction: click adds, drag moves, right-click deletes ----
@@ -3735,9 +3920,20 @@ fn curve_lanes(
             Snap::on(i64::from(crate::curve::SNAP_TICKS))
         };
         let mapped = |pos: egui::Pos2| -> (u32, f32) {
-            let local = lane_geom.local_at(pos.x).max(0.0);
-            let tick = snap.ticks(local).clamp(0, (loop_ticks - 1).max(0)) as u32;
-            (tick, lane.y_to_value(pos.y, rect))
+            let data = data_at(pos.x).max(0.0);
+            // An explicit loop keeps anchors inside its period (a tiled
+            // repeat is the same anchor played again). A plain window may
+            // write past the content end: that is how a one-bar curve
+            // becomes a longer one (F-049 — the command layer grows the
+            // content, then the window, to the new anchor).
+            let tick = match period {
+                Some(p) => snap.ticks(data).max(0) % p,
+                None => snap.ticks(data).max(0),
+            };
+            (
+                tick.min(i64::from(u32::MAX)) as u32,
+                lane.y_to_value(pos.y, rect),
+            )
         };
         let hit_anchor = |pos: egui::Pos2| -> Option<u32> {
             anchor_positions
@@ -3745,13 +3941,24 @@ fn curve_lanes(
                 .find(|(_, p)| (*p - pos).length() <= ANCHOR_RADIUS)
                 .map(|(tick, _)| *tick)
         };
-        let pointer = response.interact_pointer_pos();
+        // Nothing left of the clip's start belongs to this clip: a press
+        // there is blank canvas, not an anchor at tick 0.
+        let clip_left = x_data(offset as f32);
+        let in_clip = |pos: egui::Pos2| pos.x >= clip_left - 1.0;
+        let pointer = response.interact_pointer_pos().filter(|pos| in_clip(*pos));
         // A drag is classified by the **press** point (the same rule the note
         // gestures follow): by the time egui reports `drag_started` the
         // pointer has already moved, and grabbing the anchor under the moved
         // pointer would let go of the one the user actually pressed on.
-        let press_pos = ui.ctx().input(|i| i.pointer.press_origin()).or(pointer);
+        let press_pos = ui
+            .ctx()
+            .input(|i| i.pointer.press_origin())
+            .filter(|pos| in_clip(*pos))
+            .or(pointer);
         let dragging = state.curve_drag.is_some_and(|(i, _)| i == index);
+        // F-049: Draw paints a fresh anchor every frame; Line drags the one
+        // the press created.
+        let freehand = matches!(state.mode, RollMode::Draw);
         if response.drag_started_by(egui::PointerButton::Primary)
             && let Some(pos) = press_pos
         {
@@ -3772,8 +3979,14 @@ fn curve_lanes(
         {
             let (tick, value) = mapped(pos);
             let from = state.curve_drag.and_then(|(_, from)| from);
-            // The anchor now lives at `tick`; the next frame moves *that* one.
-            state.curve_drag = Some((index, Some(tick)));
+            let from = if freehand && from.is_none() {
+                // Paint mode: leave the anchor behind and drop a new one.
+                None
+            } else {
+                // The anchor now lives at `tick`; the next frame moves it.
+                state.curve_drag = Some((index, Some(tick)));
+                from
+            };
             intent = Some(RollIntent::CurveUpsert {
                 track: lane.clip.track,
                 clip: lane.clip.clip,
@@ -3809,6 +4022,75 @@ fn curve_lanes(
         }
     }
     intent
+}
+
+/// F-049: the curve focus's tool row — U12's three input modes, now beside
+/// the roll instead of in a separate editor.
+///
+/// `Line` and `Draw` both write `Linear`; they differ in the gesture (`Draw`
+/// paints anchors along the drag, `Line` moves the one the press created).
+/// `Smooth` writes the monotone-cubic interpolation.
+fn curve_toolbar(
+    ui: &mut egui::Ui,
+    state: &mut RollState,
+    lane: &OverlayLane<'_>,
+    intent: &mut Option<RollIntent>,
+) {
+    ui.horizontal(|ui| {
+        let interp = lane.curve.interp;
+        let freehand = matches!(state.mode, RollMode::Draw);
+        let mut pick: Option<(RollMode, CurveInterp)> = None;
+        for (label, hover, mode, target) in [
+            (
+                "Line",
+                "Control points, straight segments",
+                RollMode::Select,
+                CurveInterp::Linear,
+            ),
+            (
+                "Draw",
+                "Freehand: drag paints anchors (linear)",
+                RollMode::Draw,
+                CurveInterp::Linear,
+            ),
+            (
+                "Smooth",
+                "Control points, smooth monotone curve",
+                RollMode::Select,
+                CurveInterp::Smooth,
+            ),
+        ] {
+            let is_draw = matches!(mode, RollMode::Draw);
+            let active = interp == target && (target == CurveInterp::Smooth || freehand == is_draw);
+            if ui
+                .selectable_label(active, label)
+                .on_hover_text(hover)
+                .clicked()
+            {
+                pick = Some((mode, target));
+            }
+        }
+        ui.separator();
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "click: add anchor · drag: move · drag past the end: grow the clip · right-click: delete · Ctrl: snap off",
+                )
+                .weak(),
+            )
+            .truncate(),
+        );
+        if let Some((mode, target)) = pick {
+            state.mode = mode;
+            if target != interp {
+                *intent = Some(RollIntent::CurveInterp {
+                    track: lane.clip.track,
+                    clip: lane.clip.clip,
+                    interp: target,
+                });
+            }
+        }
+    });
 }
 
 /// Time-axis zoom anchored at the pointer: the tick under `anchor_x` stays
@@ -4192,12 +4474,13 @@ fn strum_division_combo(ui: &mut egui::Ui, id: &str, value: &mut i64, allow_off:
 mod tests {
     use super::{
         AwaitCreate, Axis, ClipRef, DRAW_LENGTH_DIVISIONS, DragKind, DragSelection, DrawLength,
-        EDGE_PX, HIT_SLOP, MAX_ROLL_CONTEXT, Modal, ModalFrame, ModalKind, ROLL_HEIGHT, ROW_HEIGHT,
-        RollArm, RollGeom, RollIntent, RollMode, RollState, RollSubject, STRUM_DIVISIONS,
-        StretchEdge, ViewWindow, clamped_move, default_strum_options, draw_end, draw_length_label,
-        edge_zone, effective_scale, is_black_key, key_at, knife_crossing, modal_ghost,
-        playhead_local, scale_max_k, selection_bbox, strum_division_label, trim_start,
-        unfreeze_scale, zoom_scroll_anchor, zoom_top_note_anchor,
+        EDGE_PX, HIT_SLOP, LANE_HEIGHT, MAX_ROLL_CONTEXT, Modal, ModalFrame, ModalKind,
+        ROLL_HEIGHT, ROW_HEIGHT, RollArm, RollGeom, RollIntent, RollMode, RollState, RollSubject,
+        STRUM_DIVISIONS, StretchEdge, ViewWindow, clamped_move, default_strum_options, draw_end,
+        draw_length_label, edge_zone, effective_scale, is_black_key, key_at, knife_crossing,
+        modal_ghost, playhead_local, scale_max_k, selection_bbox, strum_division_label, trim_start,
+        unfreeze_scale, velocity_bar_rect, velocity_target, zoom_scroll_anchor,
+        zoom_top_note_anchor,
     };
     use crate::grid::{GridValue, NoteValue};
     use crate::snap::Snap;
@@ -4451,6 +4734,29 @@ mod tests {
         assert_eq!(draw_end(0, 999_999.0, Snap::on(grid)), 1_000_080);
         // Even a note starting in the old last grid cell keeps growing.
         assert_eq!(draw_end(3840 - grid, 999_999.0, Snap::on(grid)), 1_000_080);
+    }
+
+    /// F-048: the velocity lane hits **bars**, not tick spans. A long note
+    /// covering a later note's start must not be retuned when that later
+    /// note's bar is dragged (the reported "every note before it changed").
+    #[test]
+    fn a_velocity_drag_hits_one_bar_not_every_note_under_the_tick() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0));
+        let lane =
+            egui::Rect::from_min_size(egui::pos2(0.0, 200.0), egui::vec2(400.0, LANE_HEIGHT));
+        let g = geom(rect, 0, 0.1, 60);
+        // A pad 0..960 that covers B's start, B at 960..1200.
+        let notes = vec![note(0, 960, 60), note(960, 240, 64)];
+        // A's bar is 0..8 px, B's bar starts at x = 96 (960 × 0.1).
+        let b_bar = velocity_bar_rect(lane, &g, &notes[1]);
+        assert_eq!((b_bar.left(), b_bar.right()), (96.0, 104.0));
+        assert_eq!(velocity_target(&notes, lane, &g, 100.0), Some(1));
+        assert_eq!(velocity_target(&notes, lane, &g, 2.0), Some(0));
+        assert_eq!(
+            velocity_target(&notes, lane, &g, 300.0),
+            None,
+            "an empty part of the lane owns no note"
+        );
     }
 
     #[test]

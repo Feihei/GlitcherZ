@@ -2463,6 +2463,7 @@ pub fn show(
                     selected: p.selected_audio == i,
                 };
                 let highlight = None;
+                let colors = RowColors::audio(p.selected_audio == i);
                 lane_row(
                     ui,
                     state,
@@ -2479,7 +2480,7 @@ pub fn show(
                     row_h,
                     content_px,
                     p.playhead_ticks,
-                    RowColors::audio(p.selected_audio == i),
+                    colors,
                     highlight,
                     &|clip: &AudioClip| {
                         std::path::Path::new(&clip.path)
@@ -2488,9 +2489,29 @@ pub fn show(
                             .unwrap_or_else(|| "clip".to_string())
                     },
                     // Adapt the path-keyed lookup (TimelineParams) to the
-                    // clip-keyed parameter lane_row takes.
-                    &|clip: &AudioClip| (p.waveform_of)(&clip.path),
-                    &|_, _, _| {},
+                    // clip-keyed parameter lane_row takes. F-048: the trim
+                    // window rides along so the columns show the played slice.
+                    &|clip: &AudioClip| {
+                        (p.waveform_of)(&clip.path)
+                            .map(|data| (data, clip.source_offset, clip.source_len))
+                    },
+                    // F-048: audio now wears the same crop teeth as the other
+                    // lane kinds — a trimmed wav reads as cropped, not as a
+                    // shorter file.
+                    &|clip: &AudioClip, painter: &egui::Painter, rect: Rect| {
+                        let Some(data) = (p.waveform_of)(&clip.path) else {
+                            draw_crop_teeth(painter, rect, clip.source_offset > 0.0, false);
+                            return;
+                        };
+                        let rate = f64::from(data.sample_rate().max(1));
+                        let file = data.frames().len() as f64 / rate;
+                        draw_crop_teeth(
+                            painter,
+                            rect,
+                            clip.source_offset > 1e-9,
+                            clip.source_offset + clip.source_len < file - 1e-9,
+                        );
+                    },
                     &|clip: &AudioClip| clip.span(p.sec_per_tick),
                     &|_: &AudioClip| None,
                     &|_: &AudioClip| Vec::new(),
@@ -3280,18 +3301,28 @@ fn draw_clip_menu(
 }
 
 /// Draws one audio clip's waveform body (U6 D6): min/max peak columns
-/// spread across the clip rect — the same proportional mapping the RT
-/// reader uses (frame = (t − start)/span × wav), so what you see is what
-/// you hear. The peaks cover the whole file and the rect IS the span, so
-/// the mapping needs no extra inputs.
+/// spread across the clip rect.
+///
+/// F-048: the peaks cover the whole **file**, the clip rect covers the
+/// **trim window** — the columns are mapped through `source_offset` /
+/// `source_len` instead of stretching the entire file into the block. Before
+/// this the preview slid with the edge while playback read the window, so a
+/// trimmed clip looked like the wav had been squeezed rather than cropped.
 fn draw_waveform(
     painter: &egui::Painter,
     rect: Rect,
     data: &glitcherz_engine::SampleData,
+    source_offset: f64,
+    source_len: f64,
     color: Color32,
 ) {
     let peaks = data.peaks();
     if peaks.is_empty() || rect.width() < 2.0 {
+        return;
+    }
+    let rate = f64::from(data.sample_rate().max(1));
+    let file_secs = data.frames().len() as f64 / rate;
+    if file_secs <= 0.0 || source_len <= 0.0 {
         return;
     }
     let mid = rect.center().y;
@@ -3299,20 +3330,34 @@ fn draw_waveform(
     let columns = (rect.width() / 1.5).floor().max(1.0) as usize;
     let stroke = Stroke::new(1.0, color);
     for column in 0..columns {
-        // Column j maps to the peaks slice [j/n, (j+1)/n) — the slice's
-        // combined extent is the column's min/max.
-        let from = column * peaks.len() / columns;
-        let to = ((column + 1) * peaks.len() / columns).max(from + 1);
+        // The column's **window** seconds, then the file frames they map to.
+        // Ticks outside the file (a window dragged past the tail) simply do
+        // not draw, so the block keeps its blank right edge.
+        let t0 = source_offset + source_len * column as f64 / columns as f64;
+        let t1 = source_offset + source_len * (column + 1) as f64 / columns as f64;
+        let (a, b) = (t0.max(0.0), t1.min(file_secs));
+        if b <= a {
+            continue;
+        }
+        let from = (a / file_secs * peaks.len() as f64).floor() as usize;
+        let to = ((b / file_secs * peaks.len() as f64).ceil() as usize)
+            .max(from + 1)
+            .min(peaks.len());
         let mut lo = f32::INFINITY;
         let mut hi = f32::NEG_INFINITY;
-        for &(p_min, p_max) in &peaks[from..to.min(peaks.len())] {
+        for &(p_min, p_max) in &peaks[from..to] {
             lo = lo.min(p_min);
             hi = hi.max(p_max);
         }
         if lo > hi {
             continue;
         }
-        let x = rect.left() + (column as f32 + 0.5) * rect.width() / columns as f32;
+        // Centre the stroke on the part of the column that has content.
+        let left = f64::from(rect.left());
+        let width = f64::from(rect.width());
+        let x0 = left + (a - source_offset) / source_len * width;
+        let x1 = left + (b - source_offset) / source_len * width;
+        let x = ((x0 + x1) * 0.5) as f32;
         let y0 = mid - hi.clamp(-1.0, 1.0) * half;
         let y1 = mid - lo.clamp(-1.0, 1.0) * half;
         let (y0, y1) = (y0.min(y1), y0.max(y1).max(y0 + 1.0));
@@ -3456,6 +3501,11 @@ fn select_clip_click<T: Placement>(
     state.selection_anchor = Some(sel);
 }
 
+/// Waveform source for a clip body: decoded samples plus the clip's trim
+/// window (start, length) in seconds. `source_offset` / `source_len` pick the
+/// slice of the file the preview draws (F-048).
+type WaveformSource = (std::sync::Arc<glitcherz_engine::SampleData>, f64, f64);
+
 #[allow(clippy::too_many_arguments)]
 fn lane_row<T: Placement>(
     parent: &mut egui::Ui,
@@ -3477,8 +3527,10 @@ fn lane_row<T: Placement>(
     highlight: Option<usize>,
     clip_label: &dyn Fn(&T) -> String,
     // Waveform source for the clip bodies (U6): `Some` renders peaks
-    // columns instead of the flat fill. MIDI/control rows pass `&|_| None`.
-    waveform_of: &dyn Fn(&T) -> Option<std::sync::Arc<glitcherz_engine::SampleData>>,
+    // columns instead of the flat fill. The window `(offset, length)` is in
+    // seconds — F-048 draws only the trimmed slice of the file.
+    // MIDI/control rows pass `&|_| None`.
+    waveform_of: &dyn Fn(&T) -> Option<WaveformSource>,
     // Optional per-clip body decoration drawn over the clip block (U12: the
     // read-only control curve preview). MIDI/audio rows pass a no-op.
     clip_body: &dyn Fn(&T, &egui::Painter, Rect),
@@ -3750,9 +3802,11 @@ fn lane_row<T: Placement>(
             draw_tile_seams(&painter, rect, loop_ticks, px_per_tick, seam_color);
         }
         // U6: a clip with waveform data draws min/max peak columns across
-        // its body (stretched to the span, exactly like playback reads it).
-        if let Some(data) = waveform_of(clip) {
-            draw_waveform(&painter, rect, &data, colors.clip_stroke);
+        // its body. F-048: the columns follow the clip's trim window, so a
+        // cropped clip shows the cropped part of the file (the same slice
+        // playback reads).
+        if let Some((data, offset, len)) = waveform_of(clip) {
+            draw_waveform(&painter, rect, &data, offset, len, colors.clip_stroke);
         }
         // U12: per-clip preview drawn over the block (control curve).
         clip_body(clip, &painter, rect);
@@ -5138,10 +5192,24 @@ fn draw_content_extent(
     // F-041 M10.5: a trimmed edge wears a full-height zig-zag band — short
     // diagonal strokes stacked down the clipped side, unmistakable next to a
     // plain edge.
+    draw_crop_teeth(
+        painter,
+        rect,
+        content_start < source_offset,
+        content_end > window_end,
+    );
+}
+
+/// Full-height zig-zag down the clip's cropped edge(s).
+///
+/// Shared by every lane kind (F-048 gives audio the same mark): `left` / `right`
+/// say which side the window cuts into the content. Corner teeth were too
+/// small to tell a trimmed edge from a plain one.
+fn draw_crop_teeth(painter: &egui::Painter, rect: Rect, left: bool, right: bool) {
     const TOOTH_W: f32 = 4.0;
     const TOOTH_H: f32 = 5.0;
     let tooth = Stroke::new(1.3, Color32::from_rgba_unmultiplied(175, 215, 255, 255));
-    if content_start < source_offset {
+    if left {
         let mut y = rect.top() + 1.0;
         while y + TOOTH_H <= rect.bottom() {
             painter.line_segment(
@@ -5154,7 +5222,7 @@ fn draw_content_extent(
             y += TOOTH_H;
         }
     }
-    if content_end > window_end {
+    if right {
         let mut y = rect.top() + 1.0;
         while y + TOOTH_H <= rect.bottom() {
             painter.line_segment(

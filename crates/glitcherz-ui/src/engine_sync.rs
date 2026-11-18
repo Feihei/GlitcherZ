@@ -243,6 +243,10 @@ impl GlitcherZApp {
         // 6) Song loop range (U1): metadata lives outside the graph, so the
         //    full rebuild is also the undo/redo/open refresh path for it.
         self.push_loop_range();
+        // F-048: keep the auto-stop past the audio tail. A removed audio
+        // track never reaches the 5b loop, so the full rebuild lowers the
+        // floor here.
+        self.push_arrangement_floor();
     }
 
     /// Install a document node: build the processor through the shared

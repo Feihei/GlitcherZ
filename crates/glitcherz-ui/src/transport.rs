@@ -72,33 +72,28 @@ impl GlitcherZApp {
     /// The Edit target's `[start, start + span)` in ticks. Audio clips have no
     /// editor, so they never reach this path.
     fn audition_range(&self) -> Option<(u32, u32)> {
-        match self.edit_clip.as_ref()? {
-            EditTarget::Midi(subject) => {
-                let focus = subject.focus();
+        let focus = self.edit_clip.as_ref()?.focus();
+        let (start, span) = match focus.lane {
+            piano_roll::RollLane::Midi => {
                 let clip = self
                     .project()
                     .midi_tracks
                     .get(focus.track)?
                     .clips
                     .get(focus.clip)?;
-                Some((
-                    clip.start_ticks,
-                    clip.start_ticks.saturating_add(clip.span_ticks),
-                ))
+                (clip.start_ticks, clip.span_ticks)
             }
-            EditTarget::Control { track, clip } => {
+            piano_roll::RollLane::Control => {
                 let clip = self
                     .project()
                     .control_tracks
-                    .get(*track)?
+                    .get(focus.track)?
                     .clips
-                    .get(*clip)?;
-                Some((
-                    clip.start_ticks,
-                    clip.start_ticks.saturating_add(clip.span_ticks),
-                ))
+                    .get(focus.clip)?;
+                (clip.start_ticks, clip.span_ticks)
             }
-        }
+        };
+        Some((start, start.saturating_add(span)))
     }
 
     /// Clears the audition state and the engine range (idempotent).
@@ -576,24 +571,24 @@ impl GlitcherZApp {
     /// meter (mirrors the engine's D16 rule); `0` when the arrangement is
     /// empty.
     pub(crate) fn arrangement_end_ticks(&self) -> u32 {
-        let mut latest = 0u64;
-        for track in &self.project().midi_tracks {
-            for clip in &track.clips {
-                latest = latest.max(u64::from(clip.start_ticks) + u64::from(clip.span_ticks));
-            }
-        }
-        for track in &self.project().control_tracks {
-            for clip in &track.clips {
-                latest = latest.max(u64::from(clip.start_ticks) + u64::from(clip.span_ticks));
-            }
-        }
-        // Met M4: `next_bar(latest - 1)` is exactly "ceil to the next bar
-        // line", and a clip that already ends on a line keeps that line.
-        if latest == 0 {
-            return 0;
-        }
-        let tick = (latest - 1).min(u64::from(u32::MAX)) as u32;
-        self.project().meter_map().next_bar(tick)
+        // F-048: one source of truth for the arrangement end. The export's
+        // version already counts audio clips (base-tempo tick footprint) and
+        // rounds up to the meter's next bar — `End` / `⏭` and the engine
+        // floor must agree with what a full-song render covers, otherwise the
+        // transport stops at the last MIDI bar and the audio tail never plays.
+        crate::export_audio::export_end_ticks(self.project())
+    }
+
+    /// F-048: hands the engine the same arrangement end the UI shows.
+    ///
+    /// The sequencer's auto-stop only knows MIDI/control clips, so without
+    /// this the transport stopped at the last MIDI bar and the audio tail
+    /// never played (the export already passed the same value as its floor).
+    /// Call after any audio-clip change; `0` (empty arrangement) means
+    /// "unbounded", exactly like the engine's default.
+    pub(crate) fn push_arrangement_floor(&mut self) {
+        let end = self.arrangement_end_ticks();
+        self.engine.set_arrangement_floor(end);
     }
 
     /// Moves the playhead by whole bars at the current meter (Ctrl+←/→).

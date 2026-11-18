@@ -1555,7 +1555,7 @@ impl MainView {
         match self {
             Self::Patch => "Patch",
             Self::Timeline => "Timeline",
-            Self::Edit => "Edit",
+            Self::Edit => "Editor",
             Self::Inspector => "Inspector",
         }
     }
@@ -1686,49 +1686,6 @@ enum ConfirmChoice {
     Cancel,
 }
 
-/// Which clip the Edit tab is targeting (U12: it hosts both the MIDI piano
-/// roll and the control curve editor).
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum EditTarget {
-    /// MIDI clips: the writable focus plus the read-only ghost context (P3,
-    /// spec `roll-multiclip.md` D4).
-    Midi(piano_roll::RollSubject),
-    /// Control clip (curve editor).
-    Control { track: usize, clip: usize },
-}
-
-/// Curve editor input tool (U12, spec `control-tracks.md` §8 D15). Transient
-/// (never persisted): the persisted data is `ControlClip::interp`, which the
-/// tool selects — `Draw`/`Line` write `Linear`, `Curve` writes `Smooth`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum CurveTool {
-    /// Control-point polyline (discrete points, straight segments).
-    #[default]
-    Line,
-    /// Freehand multi-point draw.
-    Draw,
-    /// Control-point smooth curve (monotone cubic).
-    Curve,
-}
-
-impl CurveTool {
-    /// The interpolation this tool writes into the document.
-    fn interp(self) -> CurveInterp {
-        match self {
-            CurveTool::Draw | CurveTool::Line => CurveInterp::Linear,
-            CurveTool::Curve => CurveInterp::Smooth,
-        }
-    }
-
-    /// The tool matching a clip's persisted interpolation.
-    fn of(interp: CurveInterp) -> Self {
-        match interp {
-            CurveInterp::Linear => CurveTool::Line,
-            CurveInterp::Smooth => CurveTool::Curve,
-        }
-    }
-}
-
 /// A control-thread job that blocks the UI while it runs (U13).
 ///
 /// The motivating case is loading a SoundFont: `SoundFont::new` parses the
@@ -1777,9 +1734,10 @@ pub struct GlitcherZApp {
     timeline_state: timeline::TimelineState,
     /// Which clip the Edit tab is targeting (`None` = nothing selected, the
     /// tab shows its hint). Derived from the timeline's clip selection by
-    /// [`Self::sync_edit_target`]: the target kind picks the editor (MIDI
-    /// piano roll vs control curve, U12).
-    edit_clip: Option<EditTarget>,
+    /// [`Self::sync_edit_target`]. F-049: MIDI and control clips are both
+    /// focuses of this one roll subject — the focus's lane picks the subject
+    /// (notes vs curve), never the editor.
+    edit_clip: Option<piano_roll::RollSubject>,
     /// Timeline selection the current [`Self::edit_clip`] was assembled from.
     /// Kept so [`Self::sync_edit_target`] only rebuilds the roll when the
     /// selection actually moved — the roll's own focus (chip strip / Tab)
@@ -1789,11 +1747,6 @@ pub struct GlitcherZApp {
     /// Edit view previews its clip. Session-only — never persisted, never part
     /// of undo (spec `edit-audition.md`).
     audition: Option<(u32, u32)>,
-    /// Curve editor tool (U12; transient input mode, not persisted).
-    curve_tool: CurveTool,
-    /// Anchor tick currently being dragged in the curve editor (U12; `None`
-    /// = no drag). The anchor's tick is its identity while it moves.
-    curve_drag: Option<u32>,
     /// Whether the Edit tab's Event List strip is expanded. It is a resizable
     /// bottom panel: the roll takes everything above it, and dragging the
     /// divider past its minimum collapses the strip to its caption row.
@@ -2265,8 +2218,6 @@ impl GlitcherZApp {
             edit_clip: None,
             edit_selection: Vec::new(),
             audition: None,
-            curve_tool: CurveTool::default(),
-            curve_drag: None,
             event_list_open: true,
             data_panel: data_panel::DataPanelState::default(),
             roll_state: piano_roll::RollState::new(),

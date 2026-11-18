@@ -28,7 +28,12 @@ use glitcherz_ui::piano_roll::{
 /// the original ~0.21 px/tick scale (one bar = 800 px) the pointer maths in
 /// these tests was written against — a 16th note stays wide enough to have a
 /// body between its two edge-trim zones.
-const SCREEN: egui::Vec2 = egui::vec2(1600.0, 600.0);
+///
+/// Tall enough for a curve focus's lane: the lane stack is reserved out of
+/// the panel, and a 112 px focused lane under a roll that will not shrink
+/// past `ROLL_MIN_HEIGHT` needs the room — at 600 px the lane's bottom rows
+/// fell off the screen and stopped taking clicks.
+const SCREEN: egui::Vec2 = egui::vec2(1600.0, 760.0);
 
 /// A roll fixture: one clip with two notes, a live egui context, and the
 /// measured screen geometry.
@@ -69,6 +74,9 @@ struct LaneFixture {
     curve: CurveData,
     axis: (f32, f32, bool),
     label: String,
+    /// F-049: only the focused lane is writable; a fixture that edits a lane
+    /// therefore makes it the subject's focus.
+    focused: bool,
 }
 
 impl Fixture {
@@ -217,6 +225,7 @@ impl Fixture {
                 data: &lane.data,
                 curve: &lane.curve,
                 label: lane.label.clone(),
+                focused: lane.focused,
             })
             .collect();
         let mut intent = None;
@@ -1011,7 +1020,7 @@ fn keyboard_ownership_tracks_egui_focus_exactly() {
     // with hover-follow focus, a pointer still over the roll (the toolbar
     // included: it is part of the roll's surface now) re-acquires focus the
     // very next frame by design.
-    f.frame(vec![hover(egui::pos2(20.0, 599.0))]);
+    f.frame(vec![hover(egui::pos2(20.0, SCREEN.y - 1.0))]);
     assert!(
         !f.state.owns_keyboard_focus(&f.ctx),
         "a roll without focus does not own the keyboard"
@@ -1197,7 +1206,11 @@ fn lane_fixture() -> Fixture {
         curve,
         axis: (-2.0, 2.0, false),
         label: "Pitch Bend ±2.0 st".to_string(),
+        focused: true,
     });
+    // F-049: the curve is a focus of the same roll — a lane edit needs the
+    // control clip as the subject's writable focus.
+    fixture.subject = RollSubject::assemble(ClipRef::control(0, 0), &[], |_| 1, |_| 1);
     // One idle frame lays the lanes out, so `lane_rects` is populated for the
     // pointer math below (the fixture measures geometry by *running* frames).
     let _ = fixture.frame(vec![]);
@@ -1286,6 +1299,67 @@ fn dragging_a_lane_anchor_reports_the_anchor_it_moved() {
             }
         )),
         "the drag lands on the release tick: {intents:?}"
+    );
+}
+
+/// F-049: the lane is addressed in **data** ticks with no clamp — an anchor
+/// drawn past the content is what turns a one-bar curve into a longer one
+/// (the command layer then grows the content and the window).
+#[test]
+fn a_lane_click_past_the_content_is_not_clamped_into_the_loop() {
+    let mut f = lane_fixture();
+    // Well past the one-bar content (and past the two-bar default view).
+    let pos = f.lane_pos(0, 3000.0, 0.0);
+    let intents = f.click(pos);
+    let tick = intents.iter().rev().find_map(|intent| match intent {
+        RollIntent::CurveUpsert { tick, dragging, .. } => {
+            assert!(!dragging, "a click is a single undo step");
+            Some(*tick)
+        }
+        _ => None,
+    });
+    assert_eq!(
+        tick,
+        Some(3000),
+        "the click must land where it was made, not fold back into the loop: {intents:?}"
+    );
+}
+
+/// F-049: a lane that is not the focus is scenery — painted, readable, not
+/// writable. Focus moves from the chip strip, never by editing a ghost.
+#[test]
+fn a_lane_outside_the_focus_takes_no_edits() {
+    let mut f = lane_fixture();
+    f.lanes.push(LaneFixture {
+        clip: ClipRef::control(1, 0),
+        data: ControlClip {
+            start_ticks: 0,
+            span_ticks: TICKS_PER_BAR,
+            data: 1,
+            ..ControlClip::default()
+        },
+        curve: CurveData {
+            points: vec![AutoPoint {
+                tick: 0,
+                value: 0.5,
+            }],
+            length_ticks: TICKS_PER_BAR,
+            ..CurveData::default()
+        },
+        axis: (-1.0, 1.0, false),
+        label: "Cutoff".to_string(),
+        focused: false,
+    });
+    // A frame lays both lanes out; `lane_rects` is the layout's own record.
+    let _ = f.frame(vec![]);
+    assert_eq!(f.state.lane_rects.len(), 2, "both lanes are laid out");
+    let pos = f.lane_pos(1, 960.0, 0.0);
+    let intents = f.click(pos);
+    assert!(
+        intents
+            .iter()
+            .all(|intent| !matches!(intent, RollIntent::CurveUpsert { .. })),
+        "a scenery lane must swallow nothing into its curve: {intents:?}"
     );
 }
 

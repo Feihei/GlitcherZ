@@ -13,17 +13,17 @@ impl GlitcherZApp {
     pub(crate) fn edit_panel(&mut self, ui: &mut egui::Ui) {
         // Cloned rather than borrowed: the body needs `&mut self` (focus chip
         // strip, roll state), and a roll subject is a handful of indices.
-        let Some(target) = self.edit_clip.clone() else {
+        let Some(subject) = self.edit_clip.clone() else {
             let audio_only = !self.timeline_state.selection.is_empty();
             ui.vertical_centered(|ui| {
                 ui.add_space(48.0);
-                ui.heading("Edit");
+                ui.heading("Editor");
                 ui.add_space(8.0);
                 if audio_only {
                     ui.label("Audio clips have no editor.");
                     ui.add_space(4.0);
                     ui.weak(
-                        "Select a MIDI clip (piano roll) or a curve clip (curve editor) \
+                        "Select a MIDI clip (piano roll) or a curve clip (curve lane) \
                          in the Timeline.",
                     );
                 } else {
@@ -37,17 +37,12 @@ impl GlitcherZApp {
             });
             return;
         };
-        // The MIDI target gets no scroll container: the piano roll *is* this
-        // tab and sizes itself to the window (its Event List lives in its own
-        // bottom strip). The curve editor stays a scrollable form.
-        match target {
-            EditTarget::Midi(subject) => self.midi_editor_body(ui, &subject),
-            EditTarget::Control { track, clip } => {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.control_editor_body(ui, track, clip);
-                });
-            }
-        }
+        // F-048: a mixed selection (MIDI + curve clips) gets one chip per
+        // editable clip, so the two focuses are a click apart.
+        self.edit_target_strip(ui);
+        // F-049: one body for every focus — the roll canvas renders notes or
+        // a curve depending on the focus's lane.
+        self.editor_body(ui, &subject);
     }
 
     /// U9 E2: thin banner shown while the startup plugin scan still has
