@@ -68,7 +68,7 @@
 | F-043 | 用户波表导入（单周期 WAV → 第 5 帧） | VOICE / PROJ | `wavetable-import.md` | 用户表导入 |
 | F-044 | 聚合 Curve 输入口（每个可控制节点一个黄口） | UI / PATCH / EDIT | `curve-port.md` | — |
 | F-045 | 吸附档位与磁性边界（精确裁剪） | EDIT / UI | `snap-granularity.md` | — |
-| F-046 | 数据池面板与 clip 右键菜单（F-041 M7 展开） | EDIT / UI / PROJ | `clip-data-panel.md` | ✅ |
+| F-046 | Clip 属性面板与 clip 右键菜单（F-041 M7 展开；R2 改为属性面板） | EDIT / UI / PROJ | `clip-data-panel.md` | ✅ |
 | F-047 | 时间轴缩放：只留滚轮与键盘 | UI / EDIT | `timeline-zoom.md` | — |
 | F-048 | Editor 视图修缮（力度单音 / 音频尾段 / 波形裁剪 / 曲线时间轴） | EDIT / UI / ENGINE | `editor-view.md` | — |
 | F-049 | Editor 单一画布：curve 焦点并入钢琴卷帘 + 曲线写时增长 | EDIT / UI | `editor-curve-focus.md` | ✅ |

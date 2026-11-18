@@ -20,7 +20,7 @@
 路线图 1–10 全部落地；基础功能、节点图、MIDI 编辑、插件宿主、可用性（U 系列）、录音（R 系列）、内建效果器（E 系列）、声源扩展（Y / Z / B 系列）与交互打磨（I 系列）均已交付。已完成系列的设计与实现位置见下方「历史系列索引」——本文件不再逐项记录它们的实施细节。
 
 - **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）；命令词汇表（F-039）V1a / V1b-1 / V1b-2 / V2 / V3 **全部交付**；剪贴板（F-040）C1–C2 已交付（2026-11-11）；clip 与数据分离（F-041）M1–M6 已交付（2026-11-11），2026-11-12 M8 修订（`repeat` 标记 + 复制键位）。
-- **下一步候选**：**F-046 M2/M3 待做**（数据池面板 M1 已实施，重命名 / 引用跳转 / Purge 与 Inspector 摘区 / clip 右键菜单待做；详见 `spec/clip-data-panel.md`）。F-045 已实施（吸附档位与磁性边界，2026-11-17；详见 `spec/snap-granularity.md`）。F-047 已实施（时间轴缩放删掉工具栏 `-`/`+`，只留滚轮 + `-`/`=`；详见 `spec/timeline-zoom.md`）。F-041 review 续作（M9 → M10 → M11，spec §13 已定稿、未实施）；其余未完成项见下方列表（用户表导入 / 安全边界）。
+- **下一步候选**：**F-046 已收口**（M1–M3 + R2 改版：面板从数据池表格改成 clip 属性面板；详见 `spec/clip-data-panel.md`）。F-045 已实施（吸附档位与磁性边界，2026-11-17；详见 `spec/snap-granularity.md`）。F-047 已实施（时间轴缩放删掉工具栏 `-`/`+`，只留滚轮 + `-`/`=`；详见 `spec/timeline-zoom.md`）。F-041 review 续作（M9 → M10 → M11，spec §13 已定稿、未实施）；其余未完成项见下方列表（用户表导入 / 安全边界）。
 - **门禁**：`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`，在本机沙箱外跑（沙箱内 cargo 会毒化 `target/debug/incremental`）。
 
 ## 未完成项
@@ -49,13 +49,14 @@ Spec：`spec/snap-granularity.md`（D1–D16）。
 
 用户诉求：**数据加名称便于管理，列表放时间轴内部上下分栏（同 Edit 的 Event List），Inspector 摘掉 clip 区，clip 改右键菜单**（含 unlink data / delete / mute-unmute / 多选编组，未来 lock-unlock）。
 
-Spec：`spec/clip-data-panel.md`（D1–D16）。
+Spec：`spec/clip-data-panel.md`（D1–D16；R2 改版见 §2R）。
 
 - **起因**：数据只有池索引 `#id`，且 `compact_clip_data` 保存时会重排它，无法指认"那段鼓点"；Inspector 把 clip 数据挂在节点参数下，两个选择域串在一起；右键当前是**直接删除**（`timeline.rs:4037`），与菜单互斥；删除键三处三种行为。
 - **范围**：`MidiData` / `CurveData` 加 `name`（additive，不动 `PROJECT_VERSION`）+ 时间轴底部上下分栏（默认收起，与 Edit 的 Event List 同构）+ 行内重命名 / 引用跳转 / `Purge Unused` + Inspector 摘区 + clip 右键菜单（Mute、Group、Link/Unlink、Show in Data、Delete）+ `Delete`/`Backspace` 统一。
 - **不做**：数据拖放、目录标签、音频媒体池、跨类型共享、`.001` 自动后缀、Lock 实现（只留菜单位置）。
 - **门禁**：M1 命名 + 分栏 + 只读列表；M2 编辑类条目；M3 菜单 + 摘区 + 键位。验收 16 条见 spec §6；全量 fmt + clippy `-D warnings` + test（沙箱外）。
 - **状态**：**已实施**（M1–M3：`name` additive 字段、时间轴底部 `Data` 分栏、重命名 / 引用跳转 / `Purge Unused` / 搜索、Inspector 摘区、clip 右键菜单、`Delete`/`Backspace` 统一）。实施偏差见 spec §9。
+- **R2 改版（2026-11-18，已实施）**：用户判定池表格是错的方向——编排时被编辑的是 clip，data 只是它的一个属性。面板改为 Blender Properties 式：显示 **active clip**（最后点选）的属性，其中 `Data` 行 = 同类数据选择器（`▾`）+ 可编辑数据名（改名影响所有共享者）+ 引用数（点击 = 解除共享、建立私有副本）。池表格、过滤、搜索、引用跳转退役；菜单 `Show in Data` → `Properties`。决策见 spec §2R（R1–R11）。
 
 ## clip 与数据分离（F-041，2026-11-11 立项）
 

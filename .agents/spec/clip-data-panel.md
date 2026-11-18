@@ -1,7 +1,7 @@
 # 数据池面板与 clip 右键菜单
 
 > ID: F-046 · 域: EDIT / UI / PROJ
-> 状态：**已实施**（M1–M3，2026-11-17）
+> 状态：**已实施**（M1–M3 2026-11-17；R2 改版 2026-11-18）
 > 关联：`clip-data-instances.md`（F-041 D15/D17/D27 的 M7 展开，本特性取代之）、`timeline.md`（W3b 编组、B2 静音）、`clipboard.md`、`snap.md`、`command-vocabulary.md`
 
 ## 1. 问题
@@ -57,18 +57,66 @@ if response.secondary_clicked() && state.modal.is_none() {
 | D4 | 默认收起 | 首帧只显示标题行 `Data · 12 MIDI · 3 curve · 2 unused`，与 Event List 的折叠行为一致：点标题展开/收起，向下拖分隔线可拖到最小高度收起。展开默认占标签页高度的 1/3（`EVENT_LIST_HEIGHT_FRACTION` 同款），上限 60%。开合状态是 view state（D14） |
 | D5 | **Inspector 删除 clip 区** | `clip_data_section` 整体删除（含两个按钮与其调用点），Inspector 回到"只有节点参数"。`Link Data` / `Unlink` 迁入右键菜单（D8），否则失去唯一入口 |
 | D6 | **右键菜单取代右键删除** | 命中 clip 时弹菜单，不再删除。模态进行中 / 刀片待命 / 框选进行中的右键仍然是**取消**，不弹菜单（保持 `timeline.rs:4037-4046` 的现有分支顺序）；空车道右键不弹（现状即无操作） |
-| D7 | 菜单项与顺序 | `Mute`/`Unmute` → ─ → `Group Clips` / `Ungroup` → ─ → `Link Data` / `Unlink Data` → `Show in Data` → ─ → `Delete`（附 `Del` / `⌫` 提示）。Lock/Unlock 未来插在 `Delete` 之上（D12） |
-| D8 | 菜单项可用性 | Mute/Unmute 恒可用（选区**全部**已静音 → 显示 `Unmute`，否则 `Mute`）；Group ≥2 选中；Ungroup 任一成员有 group；`Link Data` ≥2 且**同 lane**（沿用 Inspector 旧规则）；`Unlink Data` 任一成员 `refs > 1`；`Show in Data` 取选区首个；Delete 恒可用 |
+| D7 | 菜单项与顺序 | `Mute`/`Unmute` → ─ → `Group Clips` / `Ungroup` → ─ → `Link Data` / `Unlink Data` → `Properties`（R9 前叫 `Show in Data`）→ ─ → `Delete`（附 `Del` / `⌫` 提示）。Lock/Unlock 未来插在 `Delete` 之上（D12） |
+| D8 | 菜单项可用性 | Mute/Unmute 恒可用（选区**全部**已静音 → 显示 `Unmute`，否则 `Mute`）；Group ≥2 选中；Ungroup 任一成员有 group；`Link Data` ≥2 且**同 lane**（沿用 Inspector 旧规则）；`Unlink Data` 任一成员 `refs > 1`；`Properties` 恒可用（面板跟随选区，R9）；Delete 恒可用 |
 | D9 | 右键与选区的交互 | 右键点在**选区内** → 保留整个选区（多选操作生效）；点在选区**外**的 clip 上 → 先单选它（清空其余）再弹菜单。这是所有 DAW 与 Blender 的共同约定，避免"菜单作用于你没看着的东西" |
 | D10 | 面板内容 | 单表：`名称 / #id / 类型 / 内容量 / 长度 / 引用`。`内容量` = 音符数或锚点数；`长度` = `length_ticks` 的小节数；`引用` = 引用该数据的 clip 数。顶部过滤 `All / MIDI / Curve`；M2 加名称搜索框 |
-| D11 | 引用列可点 | 点某行的引用数 → 选中所有引用该数据的 clip（跨轨、跨 lane 同类型），视图已在 `Timeline`。这是 `Show in Data` 的反向动作：一个从 clip 找数据，一个从数据找 clip，都只要一次点击 |
+| D11 | 引用列可点 | ~~点某行的引用数 → 选中所有引用该数据的 clip~~ **R2 退役（R8）**：同一个数字改为"解除共享"（R6） |
 | D12 | Lock/Unlock 只留位 | 本次**不加字段、不做实现**，只在菜单顺序上预留位置。未来加 `locked: bool` 仍是 additive 字段，同样不动 `PROJECT_VERSION` |
 | D13 | **删除键统一** | 时间轴 clip 与卷帘音符都接受 `Delete` **和** `Backspace`（Patch 已是两者）。文本框焦点时 Backspace 仍是退格，靠现有 `text_edit_focused()` 守卫 |
 | D14 | 持久化边界 | 数据名称进工程文件（D1）；分栏开合 / 高度 / 当前过滤 / 高亮行都是 view state，不进工程、不改版本 |
 | D15 | 孤儿只清不删 | 面板**不做逐行删除**。`refs == 0` 的行置灰，顶部 `Purge Unused` 调用现有 `compact_clip_data()`（索引重映射已有 `save_and_autosave_drop_orphan_pool_entries` 测过）。逐行删除会重排池索引，等于写第二份重映射逻辑 |
 | D16 | 重命名交互 | 双击名称单元格行内编辑（复用 track rename 的 `TimelineState::rename` 模式）；Enter / 失焦提交，Esc 取消；提交空串 = 清除名称（回退 `#id`）。一步 undo，不重推引擎（名称是纯 UI 字段） |
 
+## 2R. R2 改版：从数据池表格到 clip 属性面板（2026-11-18）
+
+### 动因
+
+M1–M3 把面板做成了一张**池表格**：行是 data，列是名称 / 类型 / 内容量 / 引用。它回答的是"池里有什么"，而编排时真正要编辑的对象是 **clip**——data 只是 clip 的一个属性。表格把浏览当成主任务，编辑动作（改名、换 data、解除共享）却要先在表里找回那一行；而且 clip 与 data 在时间轴上没有共享的视觉入口，改名之后也只能回到表里确认。
+
+Blender 的 Properties 是正解：面板显示 **active 对象**，其中一行是它引用的 data block（材质槽）。以下决策取代 D10 / D11 / D15 / D16 的**表格形态**，D1–D9、D12–D14 不变。
+
+### 决策
+
+| # | 决策 | 内容 |
+| :--- | :--- | :--- |
+| R1 | **面板语义转为 clip 属性** | 标题 `Clip`，展开后是 active clip 的属性表。池表格退役：`All / MIDI / Curve` 过滤、名称搜索框、行高亮、行选择全部删除。仍是 Timeline 内部底部条带（D3），开合与高度行为不变（D4） |
+| R2 | **active clip = 最后点选的那个** | `selection_anchor` 若仍在选区内就用它，否则 `selection.last()`（Ctrl 取消后锚点可能已不在选区）。多选时标题追加 `· N selected`，属性只显示 / 编辑 active 一个——与 Blender 的 active object 一致 |
+| R3 | 属性行 | `Name`（clip 名，就地可编辑）/ `Track`（只读）/ `Start`（`bar.beat`，按 `MeterMap` 算）/ `Length`（小节）/ `Muted`（checkbox，复用 B2 静音）/ `Group`（只读）。MIDI / curve 追加 `Data` 行与摘要行；audio 追加 `File` / `Source`，没有 data 行 |
+| R4 | **Data 行 = 选择器 + 名称 + 引用数** | 左 `▾` 弹出**同类池**列表（带搜索、每项显示条目数、当前项高亮），选中即改 `clip.data`（一步 undo）。窗口（`source_offset` / `span_ticks`）**不动**：F-041 的窗口属于 clip，换 data 不应重裁用户设过的窗口 |
+| R5 | **data 名就地可编辑** | 改的是池条目，所有引用它的 clip 一起变（Blender 材质语义）；clips 头顶的标签也随之更新。一步 undo |
+| R6 | **引用数是 unlink 按钮** | `refs > 1` 时可点：为当前 clip 建私有副本（复用 `unlink_clip_data`），之后编辑内容互不影响；`refs == 1` 显示为静态数字并注明"只有它用" |
+| R7 | 数据摘要下移 | 原表格的 `Contents` / `Length` 变成 Data 行下方的弱色小字：`MIDI · 12 notes · 1 bars`。数据长度仍按 4/4 折算（池条目没有自己的拍号） |
+| R8 | 引用跳转退役 | D11 的"点引用数选中所有引用者"取消——同一个数字现在表示"解除共享"。要从 data 找 clip，走时间轴上的 `shared:N` 徽标与标签 |
+| R9 | 菜单第 5 项改名 | `Show in Data` → `Properties`：打开面板（面板本来就跟随选区，因此不再传 lane/track/clip）。`TimelineAction::ShowInData { .. }` → `ShowClipPanel` |
+| R10 | 意图改名 | `DataIntent` → `ClipIntent::{RenameClip, RenameData, Relink, MakeSingleUser, SetMuted, Purge}`；`DataPanelState` → `ClipPanelState { open, rename, pick_search }` |
+| R11 | 只读边界不变 | 面板仍借 `&Project`，编辑全部经 intent 由 app 落成 undo；`Purge N unused` 留在标题行右侧（D15 的唯一删除路径） |
+
+### 结构
+
+```rust
+// glitcherz-ui/src/clip_panel.rs
+pub struct ClipPanelState { pub open: bool, pub rename: Option<RenameDraft>, pub pick_search: String }
+pub enum RenameTarget { Clip(ClipSel), Data(DataKind, u32) }
+pub enum ClipIntent {
+    RenameClip { sel: ClipSel, name: String },
+    RenameData { kind: DataKind, index: u32, name: String },
+    Relink { sel: ClipSel, kind: DataKind, index: u32 },
+    MakeSingleUser { sel: ClipSel },
+    SetMuted { sel: ClipSel, muted: bool },
+    Purge,
+}
+pub fn active_sel(selection: &[ClipSel], anchor: Option<ClipSel>) -> Option<ClipSel>;
+pub fn active_clip(project: &Project, selection: &[ClipSel], anchor: Option<ClipSel>) -> Option<ActiveClip>;
+pub fn show(ui, project, selection, anchor, state) -> Option<ClipIntent>;
+```
+
+`GlitcherZApp::data_panel` → `clip_panel`；`timeline_ops::timeline_data_panel` → `timeline_clip_panel`，新增 `rename_clip_at` / `relink_clip_data`，`open_clip_panel` 取代 `show_clip_data`。
+
 ## 3. 结构与 API
+
+> 本节是 M1–M3 的形状（池表格 + `DataPanelState`）。R2 之后面板改为 clip 属性表，结构与意图见 §2R——旧字段 `filter` / `search` / `focus` / `SelectUsers` 已随表格删除。
+
 
 ```rust
 // glitcherz-model/src/lib.rs
@@ -114,7 +162,7 @@ data_focus: Option<(DataKind, u32)>,        // Show in Data 的目标行高亮
 | 层 | 文件 | 落点 |
 | :--- | :--- | :--- |
 | 模型字段 | `glitcherz-model/src/lib.rs` | `MidiData::name` / `CurveData::name`（D1）；`*_data_users` / `unused_data_count`（§3） |
-| 面板 | 新 `glitcherz-ui/src/data_panel.rs` | 面板本体：标题行、表格、过滤、重命名、Purge、引用跳转 |
+| 面板 | `glitcherz-ui/src/clip_panel.rs`（R2 前身 `data_panel.rs`） | 面板本体：active clip 属性表、Data 选择器、重命名、unlink、Purge |
 | 布局 | `timeline_ops.rs:80`（`timeline_panel`） | 在 `timeline::show(ui, ...)` **之前**声明 `Panel::bottom`（先占位，轨道区拿剩余高度——与 `editing.rs:565` 的顺序一致），面板通过 `show_switched` 折叠/展开 |
 | Inspector | `inspector_panel.rs:66` | 删除 `clip_data_section(ui)` 调用 |
 | 旧区块 | `timeline_ops.rs:2137-2200` | 删除 `clip_data_section`；`link_/unlink_selected_clip_data` 改签名或改为动作处理器 |
@@ -129,6 +177,7 @@ data_focus: Option<(DataKind, u32)>,        // Show in Data 的目标行高亮
 | **M1** | 数据命名 + 时间轴上下分栏 + 只读列表（名称 / #id / 类型 / 内容量 / 长度 / 引用）+ 过滤 | — | 中 |
 | **M2** | 重命名（行内）+ 引用列跳转 + `Purge Unused` + 名称搜索 | M1 | 中 |
 | **M3** | Inspector 摘区 + clip 右键菜单（全部条目）+ 删除键统一 + 文档 | M1（`Show in Data` 依赖分栏） | 中 |
+| **M4**（R2） | 池表格换成 clip 属性面板：active clip、Data 选择器 / 改名 / unlink、菜单项改名 | M1–M3 | 中 |
 
 顺序：M1 → M2 / M3 可并行。M3 的 `Show in Data` 是唯一硬依赖 M1 的条目，其余菜单项只依赖已有的动作，可以先落。
 
@@ -150,6 +199,12 @@ data_focus: Option<(DataKind, u32)>,        // Show in Data 的目标行高亮
 14. Inspector 在选中 clip 时不再出现任何 clip 数据区块。
 15. 工程文件不含分栏状态（开合 / 高度 / 过滤）；`PROJECT_VERSION` 仍为 14。
 16. 分栏只出现在 `Timeline` 视图：切到 `Edit` / `Patch` / `Inspector` 时不显示；切回时保持上次的开合与高度。拖分隔线到最小高度即折叠成标题行；点标题行可展开/收起。展开后轨道行与标尺仍可正常滚动、缩放，不被挤压变形。
+17. 选中一个 clip → 标题行显示轨道 / 类型 / clip 名；属性表出现，`Data` 行显示数据名与引用数。
+18. 多选三个 clip 并最后点第二个 → 面板显示第二个（active），标题带 `· 3 selected`。
+19. Ctrl 点掉 active → 面板切到选区里剩下的最后一个，不显示已取消的那个。
+20. 点 `▾` → 列出同类全部 data（可搜索）；选另一条 → clip 换数据、窗口不变、一步 undo。
+21. 改 `Data` 名 → 所有引用它的 clip 标签同步变；撤销恢复原名。
+22. 引用数 `2` 可点 → 当前 clip 得到私有副本（数字变 1，副本可独立编辑）；引用数为 `1` 时不可点。
 
 ## 7. 不做
 
@@ -241,4 +296,26 @@ data_focus: Option<(DataKind, u32)>,        // Show in Data 的目标行高亮
 - ✅ 1–16 全部走通（面板内容、改名 + 撤销、旧工程空名、`Alt+D` / `Shift+D` 引用计数、`Link` 合并与孤儿、`Purge`、引用跳转、单选/多选菜单可用性、选区内右键保留选区、选外右键先单选、Mute/Unmute、菜单与两键删除、模态/框选/刀片时右键只取消、Inspector 无 clip 区、工程不含面板状态、只在 Timeline 出现）
 - 新增测试：`timeline_focus::backspace_deletes_the_selection`（Backspace 与 Delete 同效）；`data_panel::search_matches_names_and_the_pool_label`
 
+### R2 · 2026-11-18 交付
 
+| 项 | 落点 |
+| :--- | :--- |
+| 模块 | `data_panel.rs` → `clip_panel.rs`；`DataPanelState` → `ClipPanelState { open, rename, pick_search }`；`DataIntent` → `ClipIntent`（R10） |
+| active 解析 | `active_sel(selection, anchor)`：anchor 仍在选区内就用它，否则 `selection.last()`；`active_clip` 把三类 clip 解析成 `ActiveClip`（轨道名、名字、静音、编组、起点、长度、data / audio） |
+| 属性行 | 手绘 `horizontal`（标签列 64px + 内容填满），不用 `Grid`；`Start` 走 `MeterMap::bar_beat_at`（`小节.拍`），`Length` 走 `ticks_per_bar_at` |
+| `Data` 行 | `▾` → `egui::Popup::menu` + `CloseOnClickOutside`：搜索框 + `ScrollArea::show_rows` 的同类池列表（每项 `名字 · 条目数`，当前项高亮）；选中即 `Relink` |
+| 命名 | `name_field` 就地编辑：`Enter` / 失焦提交，`Esc` 取消；clip 名与 data 名共用 `RenameDraft` + `RenameTarget` |
+| 引用数 | `refs > 1` 时才可点 → `MakeSingleUser` → `unlink_clip_data(&[sel])`；`refs == 1` 静态数字 + "只有它用" |
+| 菜单 | `Show in Data` → `Properties`；`TimelineAction::ShowInData { .. }` → `ShowClipPanel` → `open_clip_panel()` |
+| 退役 | `DataFilter` / 名称搜索 / `focus` 高亮 / `select_data_users` / `show_clip_data` / `DataRow` 全部删除 |
+
+**与设计不同的地方**
+
+1. **属性行不用 `Grid`**：内容宽度取决于"行内剩余宽度"（名称框要填满），而 `Grid` 按内容算列宽，第一次布局会把文本框撑到面板外。手绘 `horizontal` + 固定标签列即可。
+2. **`▾` 用 `Popup::menu` 而不是 `ComboBox`**：需要搜索框与每项附带的条目数，且 `ComboBox` 的按钮 id 由 salt 派生、测试里从外部点不到（M3 的教训）。必须显式 `CloseOnClickOutside`——默认的 `CloseOnClick` 会把点击搜索框当成"选中"而关掉弹层。
+3. **relink 的同 lane 约束用 `match (kind, sel.lane)` 表达**：`DataKind::lane()` 这个映射没保留，少一层"类型 → 轨道"的转译。
+4. **audio clip 的 `Length`** 由 `source_len / sec_per_tick` 折算（音频窗口以秒计），仅用于显示。
+
+**验收**：§6 的 17–22 按 R2 语义走通（active 解析 / 多选标题 / Ctrl 取消回退 / 选择器换 data / 数据改名同步 / 引用数 unlink 均有单测覆盖解析层）；1–16 回归，面板相关条目按 R2 解释。
+
+**测试**：`clip_panel` 6 个单测（anchor 优先、取消后回退、无名回退 `#id`、active 解析含 refs/起点、picker 过滤、caption 计数）；`cargo test -p glitcherz-ui` 全绿（344 单测 + 集成）；`cargo clippy -p glitcherz-ui --all-targets -- -D warnings` 零告警（沙箱外）。
