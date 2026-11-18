@@ -64,9 +64,9 @@ use glitcherz_model::{
 };
 
 pub mod autosave;
+pub mod clip_panel;
 pub mod clipboard;
 pub mod curve;
-pub mod data_panel;
 pub mod editing;
 pub mod effect;
 pub mod engine_sync;
@@ -1754,7 +1754,7 @@ pub struct GlitcherZApp {
     /// The Timeline view's `Data` strip (the shared pool table) and its view
     /// state — fold, filter, search, inline rename, highlight. F-046 D4/D14:
     /// collapsed on first run, and none of it enters the project.
-    data_panel: data_panel::DataPanelState,
+    clip_panel: clip_panel::ClipPanelState,
     /// Piano roll cross-frame state (scroll/drag).
     roll_state: piano_roll::RollState,
     /// Hover-follow keyboard focus arbiter (Blender-style context; see
@@ -2219,7 +2219,7 @@ impl GlitcherZApp {
             edit_selection: Vec::new(),
             audition: None,
             event_list_open: true,
-            data_panel: data_panel::DataPanelState::default(),
+            clip_panel: clip_panel::ClipPanelState::default(),
             roll_state: piano_roll::RollState::new(),
             focus_router: focus::FocusRouter::new(),
             patch_state: patch::PatchState::default(),

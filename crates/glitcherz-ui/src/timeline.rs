@@ -29,7 +29,7 @@
 //! (re-push clips) or cross-panel state (selection, editor target) is reported
 //! back as [`TimelineAction`]s.
 
-use crate::data_panel::DataKind;
+use crate::clip_panel::DataKind;
 use crate::snap::{Snap, SnapGrid};
 use eframe::egui;
 use egui::{
@@ -735,13 +735,9 @@ pub enum TimelineAction {
     UnlinkClipData {
         clips: Vec<ClipSel>,
     },
-    /// F-046 D7: open the `Data` strip with this clip's pool entry
-    /// highlighted — the clip → data direction of the reference jump.
-    ShowInData {
-        lane: TimelineLane,
-        track: usize,
-        clip: usize,
-    },
+    /// F-046 R9: open the `Clip` strip on the selection. The panel follows
+    /// the active clip, so there is nothing to address.
+    ShowClipPanel,
     OpenMidiEditor {
         track: usize,
         clip: usize,
@@ -3204,8 +3200,6 @@ fn draw_clip_menu(
         Some((DataKind::Curve, index)) => curve_refs.get(index as usize).copied().unwrap_or(0) > 1,
         None => false,
     });
-    let showable = data_of(&selection[0]).is_some();
-
     let mut close = false;
     let area = egui::Area::new(egui::Id::unique("glitcherz_clip_menu"))
         .order(egui::Order::Foreground)
@@ -3264,15 +3258,11 @@ fn draw_clip_menu(
                     close = true;
                 }
                 if ui
-                    .add_enabled(showable, egui::Button::new("Show in Data"))
+                    .button("Properties")
+                    .on_hover_text("Open the clip/panel with this clip's properties")
                     .clicked()
                 {
-                    let sel = selection[0];
-                    actions.push(TimelineAction::ShowInData {
-                        lane: sel.lane,
-                        track: sel.track,
-                        clip: sel.clip,
-                    });
+                    actions.push(TimelineAction::ShowClipPanel);
                     close = true;
                 }
                 ui.separator();
