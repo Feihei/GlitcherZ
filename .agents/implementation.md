@@ -15,7 +15,7 @@
 - **录音与 headless I/O**：录音、导出、Preferences、CLI、MCP
 - **框架升级与 gotchas**：依赖版本契约、egui 升级、跨平台构建
 - **系列实施补记与交互打磨**：2026-11-11 自 plan.md 归位的系列记录、I 系列
-- **特性 ID 注册表**：`F-001`–`F-047`（新特性先登记再实现）
+- **特性 ID 注册表**：`F-001`–`F-049`（新特性先登记再实现）
 
 ## 特性 ID 注册表
 
@@ -70,6 +70,8 @@
 | F-045 | 吸附档位与磁性边界（精确裁剪） | EDIT / UI | `snap-granularity.md` | — |
 | F-046 | 数据池面板与 clip 右键菜单（F-041 M7 展开） | EDIT / UI / PROJ | `clip-data-panel.md` | ✅ |
 | F-047 | 时间轴缩放：只留滚轮与键盘 | UI / EDIT | `timeline-zoom.md` | — |
+| F-048 | Editor 视图修缮（力度单音 / 音频尾段 / 波形裁剪 / 曲线时间轴） | EDIT / UI / ENGINE | `editor-view.md` | — |
+| F-049 | Editor 单一画布：curve 焦点并入钢琴卷帘 + 曲线写时增长 | EDIT / UI | `editor-curve-focus.md` | ✅ |
 
 > 无独立 spec 的历史条目（transport / 文件管理 U2 / U10 / U14 / I 系列 / B2 / W3a–c 等）保留字母别名，不做回溯编号；新特性一律先写 spec 再领号。
 
@@ -275,6 +277,28 @@ spec `.agents/spec/dual-audio-input.md`。目标不是「加一个效果器」�
 **测试**（+4）：`media_references_are_enumerated_rewritten_and_checked`（去重 / 空路径跳过 / 重写 / 缺失判定）、`relative_media_paths_resolve_against_the_project_directory`（新增 `/` 存储与 `\` 兼容读两条断言）、`a_free_name_is_used_as_is` / `name_clashes_get_a_suffix_but_the_same_file_does_not`、`relocation_finds_a_file_by_name_inside_a_picked_folder`。
 
 ## 编辑与视图
+
+### F-049 · Editor 单一画布：curve 焦点并入钢琴卷帘（2026-11-18 交付）
+
+- **一种焦点**：`ClipRef` 的 `RollLane`（`Midi` / `Control`）成为唯一焦点维度，`EditTarget` / `CurveTool` / `control_editor_body`（约 380 行）整体删除；`GlitcherZApp.edit_clip` 改为 `Option<RollSubject>`，`set_edit_target` / `set_control_edit_target` 都汇到 `set_edit_focus`（用时间轴选区装配 context）。
+- **空 MIDI 占位**：`piano_roll::show` 在焦点是 control clip 时合成同窗口的空 `MidiClip` + `MidiData`，note 几何 / ghost / `ViewWindow` / ruler / 播放头全部照旧；焦点 lane 视窗额外留一节空白，小节之外一开始就点得到。note intent 除 `Seek` 外全部丢弃，`Event List` 与 note 试听一并跳过。
+- **焦点 / scenery**：焦点 lane `CURVE_FOCUS_LANE_HEIGHT = 112` + 亮色（`CURVE_LINE` / `ANCHOR`，4 px），其余 lane 64 px + ~30% alpha 暗色（`CURVE_LINE_DIM` / `ANCHOR_DIM`，2.5 px）且画完即返回、不做命中；标题行焦点 lane 追加目标单位（`curve::map_in` + `axis_caption`）。与 note 区「焦点可写 / ghost 只读」同构，切换仍走 chips 与 `Ctrl+Tab`（lane 无关）。
+- **写时增长**：`curve_upsert` 不再把 tick 钳进循环；新增 `curve_growth(offset, span, length, tick, bar, looping)` —— 内容长到 `tick + 1`，窗口长到下一根小节线，`loop` 时返回 `None`（平铺没有「更长」）。与 `midi.note_add` 的写时增长同规则，一次命令一步 undo，拖拽帧走合并手势 `curve:{track}:{clip}`。
+- **lane 坐标**：`curve_lanes` 全部改成数据 tick（`x_data(tick) = x_of(tick − offset)`、`data_at(x) = local_at(x) + offset`），无 `loop` 时只画 `[offset, min(offset + span, length))`；拖动按按下点抓锚点；`in_clip` 排除 clip 起点左侧；`Draw` 模式逐帧落点（`Line` 拖同一锚点）。
+- **工具行**：新增 `curve_toolbar`（`Line` / `Draw` / `Smooth`）顶替 note 工具栏，`RollIntent::CurveInterp` 直接调 `set_clip_interp`。
+- **布局修正**：curve 焦点**不分配**力度条（而非 0 高度）—— 0 高度的一行仍吃掉约 20 px，把 lane 栈顶出面板，底部像素落在 clip rect 外、点击全无反应（这是「lane 拖不动」的真因）；lane 高 112 时这条尤其致命。
+- **验收**：`dragging_a_lane_anchor_reports_the_anchor_it_moved` / `a_lane_outside_the_focus_takes_no_edits` / `a_lane_click_past_the_content_is_not_clamped_into_the_loop` + 4 个 `curve_growth` 单测；`roll_state_machine` 的测试屏幕改为 1600×760（112 px 焦点 lane 需要的高度，`keyboard_ownership` 的「离卷帘」落点随之改用 `SCREEN.y − 1`）。
+
+### F-048 · Editor 视图修缮（2026-11-18 交付）
+
+- **力度命中（钢琴窗）**：新增 `velocity_bar_rect` / `velocity_target`，绘制与命中同读一个矩形；未选中音符时只改指针下**最近的一根柱**（`HIT_SLOP.x` = 4 px），不再用 `start <= tick < end` 的跨度命中——旧逻辑让长音符"拥有"整条 lane，拖后置音符会连带改掉所有覆盖该 tick 的长音符。和弦柱重叠时取音符序第一个；有选区仍整选区跟随。
+- **编排结束（audio 尾巴）**：`arrangement_end_ticks` 增加 audio 轨（`Project::audio_clip_span_ticks`，base tempo 换算）；新增 `push_arrangement_floor` 把同一个值交给 engine（`SetArrangementFloor`）。此前 auto-stop 只认识 MIDI/control，live 播放停在最后一个 MIDI 小节、`⏭` / `End` 也偏短。floor 在 `send_audio_clips_for_track` 开头（节点已删也生效）与 `sync_graph` 尾部（撤销 / 打开 / 删轨回落）各推一次。
+- **波形裁剪预览**：`draw_waveform` 新增 `(source_offset, source_len)`，峰值索引按窗口切片（`offset / file_secs × peaks.len()`）再列化；此前把整个文件铺满 rect，裁剪后预览像"整段挤压"。`lane_row` 的 `waveform_of` 改为 `Option<(Arc<SampleData>, f64, f64)>`。
+- **裁剪锯齿**：`draw_content_extent` 的锯齿段抽成 `draw_crop_teeth(painter, rect, left, right)`，MIDI / control 行为不变；audio 行 `clip_body` 按 `source_offset > 0` / `window_end < 文件时长` 调用（拿不到样本时只判左缘）。
+- **曲线编辑器时间轴**：`control_editor_body` 画布顶部加 16 px ruler（小节号 + 点击 `seek_ticks`），曲线区按 `MeterMap` 画小节线（gray 52）/ 拍线（gray 34，拍宽 < 6 px 时省略），并画播放头（播放黄 / 停止暗黄）。`base = clip.start_ticks − clip.source_offset` 把内容周期映射到绝对位置；曲线编辑（加点 / 拖点 / 右键删点）限定在 canvas 内，ruler 点击不会落锚点。
+- **编辑目标 chips**：新增 `GlitcherZApp::edit_target_strip`，选区含 ≥ 2 个可编辑 clip 时在 Editor 顶部列出 MIDI + curve（`editing` 标签），点击走 `set_edit_target` / `set_control_edit_target`；此前目标只跟"最后选中"，混选时够不到 curve。
+- **命名**：`MainView::Edit` 标签与占位标题改为 `Editor`（`Edit` 留给 `File / Edit` 菜单）；`docs/README.md` / `manual.md` / `shortcuts.md` 同步。
+- **测试**：`a_velocity_drag_hits_one_bar_not_every_note_under_the_tick`（长音符 + 后置音符只命中后者；空 lane 无目标；柱宽 3–8 px 与绘制一致）。
 
 ### F-047 · 时间轴缩放：只留滚轮与键盘（2026-11-17 交付）
 
@@ -561,7 +585,7 @@ let _ = self.slot_set_param(route.slot, ParamId::PitchOffset, value); // synth /
 | `timeline_ops.rs` | 1240 | 时间轴动作、clip 增删改、曲线点 |
 | `inspector_panel.rs` | 1978 | Inspector 及各 voice / effect 子面板 |
 | `mixer_panel.rs` | 897 | 混音台通道条与轨道增删 |
-| `editing.rs` | 960 | 编辑目标、卷帘与曲线编辑器 |
+| `editing.rs` | 960 | 编辑焦点、卷帘与曲线 lane |
 | `transport.rs` | 580 | 走带条、master 段、跳转、视图 tab |
 | `keyboard.rs` | 585 | 电脑键盘 / MIDI 输入、键盘节点面板 |
 | `settings.rs` | 379 | Preferences、设备菜单、undo 历史窗口 |

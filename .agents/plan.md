@@ -311,6 +311,8 @@ Spec：`spec/edit-audition.md`（D1–D10）。
 | Y 系列 | S0–S5（headless 渲染、三个乐器、CLI、MCP） | 已交付 | `spec/{cli-commands,mcp-server,pluck-instrument,organ-instrument,wavetable-instrument}.md` | `implementation.md` S0–S5 各节 |
 | Z / B 系列 | Z0–Z2、B1–B2（双口、侧链、vocoder、模态声源、clip mute） | 已交付 | `spec/{dual-audio-input,sidechain-compressor,vocoder,modal-instrument}.md` / `timeline.md` D31 | `implementation.md` 各同名节 |
 | I 系列 | I1–I6（交互打磨） | 已交付 | 决策表见 `implementation.md` | `implementation.md` I 系列 |
+| F-048 | Editor 视图修缮（力度单音 / 音频尾段播放 / 波形裁剪 / 曲线时间轴 + 目标切换） | 已交付（2026-11-18） | `spec/editor-view.md` | `implementation.md` F-048 |
+| F-049 | Editor 单一画布（curve 焦点并入钢琴卷帘 / 非焦点淡显 / 曲线写时增长） | 已交付（2026-11-18） | `spec/editor-curve-focus.md` | `implementation.md` F-049 |
 
 ## 明确不做（全局）
 
