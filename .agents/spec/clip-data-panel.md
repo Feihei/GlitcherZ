@@ -1,7 +1,7 @@
 # 数据池面板与 clip 右键菜单
 
 > ID: F-046 · 域: EDIT / UI / PROJ
-> 状态：**已实施**（M1–M3 2026-11-17；R2 改版 2026-11-18）
+> 状态：**已实施**（M1–M3 2026-11-17；R2 改版 2026-11-18；R3 修订 2026-11-19）
 > 关联：`clip-data-instances.md`（F-041 D15/D17/D27 的 M7 展开，本特性取代之）、`timeline.md`（W3b 编组、B2 静音）、`clipboard.md`、`snap.md`、`command-vocabulary.md`
 
 ## 1. 问题
@@ -113,6 +113,38 @@ pub fn show(ui, project, selection, anchor, state) -> Option<ClipIntent>;
 
 `GlitcherZApp::data_panel` → `clip_panel`；`timeline_ops::timeline_data_panel` → `timeline_clip_panel`，新增 `rename_clip_at` / `relink_clip_data`，`open_clip_panel` 取代 `show_clip_data`。
 
+## 2S. R3 修订：默认展开 · 正文字号 · 自动命名 · 手绘箭头（2026-11-19）
+
+### 动因
+
+R2 落地后用户先撞上三件小事，又提出一件缺失：
+
+1. **面板默认收起**，`Clip` 条带只剩标题行，看起来像"没有这个面板"。
+2. 面板内所有标签与值都是 `.small()`，比标题小一档，读起来像脚注。
+3. `▾`（U+25BE）在字体栈里**没有字形**——egui 自带字体与内嵌 Noto Sans SC 子集都没有，按钮画成豆腐块。
+4. clip 与 data 创建时名字为空：`Name` 行是空框，`Data` 行显示 `MIDI #3`（池槽位号）。用户得先想个名字才能指认一个片段。
+
+### 决策
+
+| # | 决策 | 内容 |
+| :--- | :--- | :--- |
+| R12 | **默认展开** | `ClipPanelState::default().open = true`，取代 D4 的"默认收起"。点标题行仍可收起、分隔线仍可拖、开合与高度仍是 view state（D14 不变） |
+| R13 | **字号统一** | 面板内标签与值一律正文（去掉 `.small()`）；行高 20 → 22，最小高度 26 → 44（标题行 + 一行属性，否则拖到最小只剩一条滚动缝）；选择器搜索框与列表项、列表行高（18 → 20）同步放大 |
+| R14 | **自动命名** | ① 新 clip → `clip_1`、`clip_2`…（`Project::next_clip_name`，全集 = 三条 lane 的所有 clip）；② 新 data → `midi_1` / `curve_1`…（`push_midi_data` / `push_curve_data` 对**空名**就地补名，`adopt_inline_content` 等旧路径一并覆盖）；③ 复制走 `copy_name`：尾随 `_N` 则 +1（`clip_1` → `clip_2`），无后缀则加 `_1`（`Verse` → `Verse_1`），并跳过已占用的名字。数据副本（`push_midi_data_copy` / `push_curve_data_copy`）同样改名——**取代 D2 的"名字一起复制、不生成后缀"**：两个独立数据块不该同名。覆盖 unlink / COW / 粘贴 / `Ctrl+Shift+D` / `clip.tile`；④ 命令层 `clip.add` 缺省名取下一个 `clip_N` |
+| R15 | **箭头手绘** | `▾` 无字形，改为 20×22 的小按钮框 + 两道描边 chevron（与 `patch.rs` 里 SF2 声库切角的做法一致，那里也是同一个字形问题），hover 时手型光标 |
+
+名字仍是纯 UI 字段（D1/D14）：进工程文件，但不是身份——`PROJECT_VERSION` 保持 14，空名的旧工程照旧回退 `MIDI #N`。改名仍走 `RenameClip` / `RenameData`，各一步 undo。
+
+### 落点
+
+| 层 | 文件 | 落点 |
+| :--- | :--- | :--- |
+| 模型 | `glitcherz-model/src/lib.rs` | `copy_name` / `series_name`（自由函数，`_N` 解析 + 跳过占用）；`Project::{clip_names, next_clip_name, copy_clip_name, midi_data_names, curve_data_names, next_midi_data_name, next_curve_data_name}`；`push_{midi,curve}_data` 补空名、`push_{midi,curve}_data_copy` 起副本名；`add_midi_clip` / `add_control_clip` 给 clip 起名 |
+| 面板 | `glitcherz-ui/src/clip_panel.rs` | `ClipPanelState` 手写 `Default`（`open: true`）；`ROW_H` / `PICK_ROW_H` / `CLIP_PANEL_MIN_H` 放大；去掉各处 `.small()`；`picker_button` 手绘 chevron |
+| 复制路径 | `glitcherz-ui/src/timeline_ops.rs`、`recording.rs` | `Shift+D` / `Ctrl+Shift+D` / 粘贴 / `unlink_clip_data` / 新建 audio clip / 录音 take 都经 `copy_clip_name` 与 `push_*_data_copy` |
+| 命令层 | `glitcherz-command/src/clip.rs`、`lib.rs` | `clip.add` 缺省名；`clip.tile` 的重复项逐个起名；COW 拷贝改用 `push_midi_data_copy` |
+| 文档 | `docs/manual.md` | 「Clip 属性面板」节：默认展开、自动命名规则、下拉箭头表述（不再引用 `▾` 字形） |
+
 ## 3. 结构与 API
 
 > 本节是 M1–M3 的形状（池表格 + `DataPanelState`）。R2 之后面板改为 clip 属性表，结构与意图见 §2R——旧字段 `filter` / `search` / `focus` / `SelectUsers` 已随表格删除。
@@ -202,9 +234,15 @@ data_focus: Option<(DataKind, u32)>,        // Show in Data 的目标行高亮
 17. 选中一个 clip → 标题行显示轨道 / 类型 / clip 名；属性表出现，`Data` 行显示数据名与引用数。
 18. 多选三个 clip 并最后点第二个 → 面板显示第二个（active），标题带 `· 3 selected`。
 19. Ctrl 点掉 active → 面板切到选区里剩下的最后一个，不显示已取消的那个。
-20. 点 `▾` → 列出同类全部 data（可搜索）；选另一条 → clip 换数据、窗口不变、一步 undo。
+20. 点下拉箭头 → 列出同类全部 data（可搜索）；选另一条 → clip 换数据、窗口不变、一步 undo。
 21. 改 `Data` 名 → 所有引用它的 clip 标签同步变；撤销恢复原名。
 22. 引用数 `2` 可点 → 当前 clip 得到私有副本（数字变 1，副本可独立编辑）；引用数为 `1` 时不可点。
+23. 打开工程即见展开的属性面板（R12）；点标题行可收起，分隔线可拖。
+24. 面板所有文字与标题同号（R13）；拖到最小高度时属性表可滚动，不是一条缝。
+25. `Data` 行左边的箭头是画的 chevron，不是豆腐块（R15）。
+26. 新建 clip → `clip_1`，第二个 → `clip_2`；两个新数据块 → `midi_1` / `curve_1`（R14）。
+27. `Shift+D` 复制 `clip_1` → 副本叫 `clip_2`；把名字改成 `Verse` 再复制 → `Verse_1`（再复制 → `Verse_2`）。
+28. 点引用数解除共享 → 数据副本改名为 `midi_2`，原块仍是 `midi_1`（两个独立块不同名）。
 
 ## 7. 不做
 
@@ -319,3 +357,21 @@ data_focus: Option<(DataKind, u32)>,        // Show in Data 的目标行高亮
 **验收**：§6 的 17–22 按 R2 语义走通（active 解析 / 多选标题 / Ctrl 取消回退 / 选择器换 data / 数据改名同步 / 引用数 unlink 均有单测覆盖解析层）；1–16 回归，面板相关条目按 R2 解释。
 
 **测试**：`clip_panel` 6 个单测（anchor 优先、取消后回退、无名回退 `#id`、active 解析含 refs/起点、picker 过滤、caption 计数）；`cargo test -p glitcherz-ui` 全绿（344 单测 + 集成）；`cargo clippy -p glitcherz-ui --all-targets -- -D warnings` 零告警（沙箱外）。
+
+### R3 · 2026-11-19 交付
+
+| 项 | 落点 |
+| :--- | :--- |
+| 默认展开 | `ClipPanelState` 手写 `Default { open: true, .. }`（R12） |
+| 字号 | `clip_panel.rs` 去掉全部 `.small()`；`ROW_H` 22、`PICK_ROW_H` 20、`CLIP_PANEL_MIN_H` 44（R13） |
+| 箭头 | `picker_button(ui)`：`allocate_exact_size(20 × ROW_H)` + `style().interact` 取按钮视觉 + 两道 `line_segment` chevron（R15） |
+| 命名 | 模型层 `copy_name` / `series_name` / `Project::{clip_names, next_clip_name, copy_clip_name, midi_data_names, curve_data_names, next_*_data_name}`；`push_{midi,curve}_data` 补空名；`push_{midi,curve}_data_copy` 起副本名（R14） |
+| 复制路径 | `timeline_ops`：`Shift+D`、`Ctrl+Shift+D`、粘贴、`unlink_clip_data`、新建 audio clip；`recording.rs`：`commit_take_clips`；命令层：`clip.add` 缺省名、`clip.tile`、两处 COW |
+| 字形注记 | `fonts.rs` 的 `UI_SYMBOLS` 注释补一行：`▾` 与 `▸` 同样无字形，故两处都手绘 |
+
+**与设计不同的地方**
+
+1. **tab 文件一开就展开**会让 `Panel::bottom` 在第一帧就吃掉 1/3 高度；这是 R12 的意图（属性面板是新 clip 的落点），不是回归——高度可拖、可折叠，仍是 view state。
+2. **`clip.split` 两半同名**：切分不是"复制"，两半属于同一个片段，因此没有套 `copy_name`（与 `Alt+D` 的关联副本同理）。
+
+**测试**：新增 `series_names_fill_the_first_gap`、`a_copy_bumps_its_suffix`、`new_data_and_clips_are_named_automatically`（模型层）；`clip_panel::the_picker_lists_one_pool_and_honours_the_search` 改为断言自动名 `midi_1` 命中、旧工程空名仍回退 `midi #0`。

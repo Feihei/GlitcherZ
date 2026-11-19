@@ -57,6 +57,7 @@ Spec：`spec/clip-data-panel.md`（D1–D16；R2 改版见 §2R）。
 - **门禁**：M1 命名 + 分栏 + 只读列表；M2 编辑类条目；M3 菜单 + 摘区 + 键位。验收 16 条见 spec §6；全量 fmt + clippy `-D warnings` + test（沙箱外）。
 - **状态**：**已实施**（M1–M3：`name` additive 字段、时间轴底部 `Data` 分栏、重命名 / 引用跳转 / `Purge Unused` / 搜索、Inspector 摘区、clip 右键菜单、`Delete`/`Backspace` 统一）。实施偏差见 spec §9。
 - **R2 改版（2026-11-18，已实施）**：用户判定池表格是错的方向——编排时被编辑的是 clip，data 只是它的一个属性。面板改为 Blender Properties 式：显示 **active clip**（最后点选）的属性，其中 `Data` 行 = 同类数据选择器（`▾`）+ 可编辑数据名（改名影响所有共享者）+ 引用数（点击 = 解除共享、建立私有副本）。池表格、过滤、搜索、引用跳转退役；菜单 `Show in Data` → `Properties`。决策见 spec §2R（R1–R11）。
+- **R3 修订（2026-11-19，已实施）**：默认展开（原 D4 的"默认收起"作废）；面板统一正文字号（行高 22、最小高 44）；`▾` 无字形 → 手绘 chevron；clip / data 创建时自动命名（`clip_1` / `midi_1` / `curve_1`），复制按 `_N` 后缀 +1、无后缀补 `_1`（**推翻**上面"不做 `.001` 自动后缀"一条）。决策见 spec §2S（R12–R15）。
 
 ## clip 与数据分离（F-041，2026-11-11 立项）
 
