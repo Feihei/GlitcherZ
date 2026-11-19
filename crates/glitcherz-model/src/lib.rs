@@ -6696,15 +6696,96 @@ impl Project {
         )
     }
 
-    /// Pushes a new MIDI data entry and returns its pool index.
-    pub fn push_midi_data(&mut self, data: MidiData) -> u32 {
+    /// Every named clip in the arrangement: MIDI, then control, then audio.
+    /// F-046 R14 reads this to pick a fresh `clip_N`.
+    pub fn clip_names(&self) -> Vec<String> {
+        let midi = self.midi_tracks.iter().flat_map(|track| &track.clips);
+        let control = self.control_tracks.iter().flat_map(|track| &track.clips);
+        let audio = self.audio_tracks.iter().flat_map(|track| &track.clips);
+        midi.map(|clip| clip.name.clone())
+            .chain(control.map(|clip| clip.name.clone()))
+            .chain(audio.map(|clip| clip.name.clone()))
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+
+    /// The name a new clip gets: the smallest free `clip_N` (F-046 R14).
+    pub fn next_clip_name(&self) -> String {
+        series_name("clip", &self.clip_names())
+    }
+
+    /// The name a copy of `name` gets: `clip_1` → `clip_2`, `Verse` → `Verse_1`.
+    pub fn copy_clip_name(&self, name: &str) -> String {
+        copy_name(name, "clip", &self.clip_names())
+    }
+
+    /// Every named MIDI data entry.
+    pub fn midi_data_names(&self) -> Vec<String> {
+        self.midi_data
+            .iter()
+            .map(|data| data.name.clone())
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+
+    /// Every named control-curve data entry.
+    pub fn curve_data_names(&self) -> Vec<String> {
+        self.curve_data
+            .iter()
+            .map(|data| data.name.clone())
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+
+    /// The name a new MIDI data entry gets: the smallest free `midi_N`.
+    pub fn next_midi_data_name(&self) -> String {
+        series_name("midi", &self.midi_data_names())
+    }
+
+    /// The name a new control-curve data entry gets: the smallest free `curve_N`.
+    pub fn next_curve_data_name(&self) -> String {
+        series_name("curve", &self.curve_data_names())
+    }
+
+    /// Pushes a new MIDI data entry and returns its pool index. An unnamed
+    /// entry is named `midi_N` on the way in (F-046 R14): every data block a
+    /// project creates has a handle a person can read and retype.
+    pub fn push_midi_data(&mut self, mut data: MidiData) -> u32 {
+        if data.name.is_empty() {
+            data.name = self.next_midi_data_name();
+        }
         let index = self.midi_data.len() as u32;
         self.midi_data.push(data);
         index
     }
 
     /// Pushes a new control-curve data entry and returns its pool index.
-    pub fn push_curve_data(&mut self, data: CurveData) -> u32 {
+    /// Unnamed entries become `curve_N` (same rule as [`Self::push_midi_data`]).
+    pub fn push_curve_data(&mut self, mut data: CurveData) -> u32 {
+        if data.name.is_empty() {
+            data.name = self.next_curve_data_name();
+        }
+        let index = self.curve_data.len() as u32;
+        self.curve_data.push(data);
+        index
+    }
+
+    /// A *copy* of a MIDI data entry: same content, a name of its own
+    /// (`midi_1` → `midi_2`). Every clone-on-write path goes through here, so
+    /// two independent blocks never share a name.
+    pub fn push_midi_data_copy(&mut self, source: &MidiData) -> u32 {
+        let mut data = source.clone();
+        data.name = copy_name(&source.name, "midi", &self.midi_data_names());
+        let index = self.midi_data.len() as u32;
+        self.midi_data.push(data);
+        index
+    }
+
+    /// A *copy* of a control-curve data entry — see
+    /// [`Self::push_midi_data_copy`].
+    pub fn push_curve_data_copy(&mut self, source: &CurveData) -> u32 {
+        let mut data = source.clone();
+        data.name = copy_name(&source.name, "curve", &self.curve_data_names());
         let index = self.curve_data.len() as u32;
         self.curve_data.push(data);
         index
@@ -6723,8 +6804,10 @@ impl Project {
             length_ticks: bar,
             ..MidiData::default()
         });
+        let name = self.next_clip_name();
         let clips = &mut self.midi_tracks[track].clips;
         clips.push(MidiClip {
+            name,
             start_ticks,
             span_ticks: bar,
             data,
@@ -6746,8 +6829,10 @@ impl Project {
             length_ticks: bar,
             ..CurveData::default()
         });
+        let name = self.next_clip_name();
         let clips = &mut self.control_tracks[track].clips;
         clips.push(ControlClip {
+            name,
             start_ticks,
             span_ticks: bar,
             data,
@@ -7843,6 +7928,51 @@ fn compact_map(keep: &[bool]) -> Vec<u32> {
     map
 }
 
+/// Splits a trailing `_<digits>` off a name: `("Verse_2", Some(2))`,
+/// `("Verse", None)`. A lone `_1` has an empty stem and counts as no suffix.
+fn split_index_suffix(name: &str) -> (&str, Option<u32>) {
+    let Some((stem, tail)) = name.rsplit_once('_') else {
+        return (name, None);
+    };
+    if stem.is_empty() || tail.is_empty() || !tail.chars().all(|ch| ch.is_ascii_digit()) {
+        return (name, None);
+    }
+    match tail.parse::<u32>() {
+        Ok(index) => (stem, Some(index)),
+        // Overflow (a 10-digit tail): not a counter this code can continue.
+        Err(_) => (name, None),
+    }
+}
+
+/// The name a copy gets (F-046 R14): `Verse_2` → `Verse_3`, `Verse` →
+/// `Verse_1`. `base` names the series when `name` is empty (`clip`, `midi`,
+/// `curve`). Existing names are skipped, so a batch copy never collides.
+pub fn copy_name(name: &str, base: &str, taken: &[String]) -> String {
+    let name = name.trim();
+    let root = if name.is_empty() { base } else { name };
+    let (stem, index) = split_index_suffix(root);
+    let stem = if stem.is_empty() { base } else { stem };
+    numbered(stem, index.map_or(1, |index| u64::from(index) + 1), taken)
+}
+
+/// The next free name of a series: the smallest `base_N` that `taken` lacks.
+pub fn series_name(base: &str, taken: &[String]) -> String {
+    numbered(base, 1, taken)
+}
+
+/// `stem_N` for the first `N` from `first` that `taken` does not hold.
+fn numbered(stem: &str, first: u64, taken: &[String]) -> String {
+    for index in first..=u64::from(u32::MAX) {
+        let candidate = format!("{stem}_{index}");
+        if !taken.iter().any(|other| other == &candidate) {
+            return candidate;
+        }
+    }
+    // Every number up to `u32::MAX` is taken — astronomically unlikely, and a
+    // duplicate name is still better than looping forever.
+    format!("{stem}_{}", u32::MAX)
+}
+
 /// Project-level metadata.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProjectMetadata {
@@ -7984,7 +8114,7 @@ mod tests {
         EffectParams, GraphDoc, LFO_DEFAULT_DIVISION, LFO_DIVISION_COUNT, LFO_DIVISION_LABELS,
         LfoParams, LfoWaveform, MASTER_NODE_ID, MAX_ARRANGEMENT_BARS, MAX_ARRANGEMENT_TICKS,
         MAX_AUDIO_TRACKS, MAX_BEND_RANGE, MAX_CLIP_NOTES, MAX_CLIPS_PER_TRACK, MAX_NODES,
-        MAX_TEMPO_BPM, MIN_BEND_RANGE, MIN_TEMPO_BPM, MapMode, MapSpec, MidiClip,
+        MAX_TEMPO_BPM, MIN_BEND_RANGE, MIN_TEMPO_BPM, MapMode, MapSpec, MidiClip, MidiData,
         MidiEnvelopeParams, MidiSource, MidiTrack, MixerChannel, NodeDoc, NodeParam, PortRef,
         PortamentoParams, Project, SamplePlayMode, SampleRegion, SynthParams, SynthWaveform,
         TICKS_PER_BAR, TICKS_PER_QUARTER, TICKS_PER_STEP, TrackKind, VoiceSpec,
@@ -8840,6 +8970,63 @@ mod tests {
             ..Project::default()
         };
         assert!(oversized.validate().is_err(), "the table is capped");
+    }
+
+    /// F-046 R14: a series name is the smallest free `base_N`.
+    #[test]
+    fn series_names_fill_the_first_gap() {
+        let taken = vec!["clip_1".to_string(), "clip_3".to_string()];
+        assert_eq!(super::series_name("clip", &taken), "clip_2");
+        assert_eq!(super::series_name("clip", &[]), "clip_1");
+        // A different series is unaffected by its neighbours.
+        assert_eq!(super::series_name("midi", &taken), "midi_1");
+    }
+
+    /// F-046 R14: copying bumps a `_N` tail, adds `_1` when there is none, and
+    /// never lands on a name that is already taken.
+    #[test]
+    fn a_copy_bumps_its_suffix() {
+        let taken: Vec<String> = Vec::new();
+        assert_eq!(super::copy_name("clip_1", "clip", &taken), "clip_2");
+        assert_eq!(super::copy_name("Verse", "clip", &taken), "Verse_1");
+        assert_eq!(super::copy_name("", "midi", &taken), "midi_1");
+        // `_1` already exists: the copy skips to `_2`.
+        let taken = vec!["Verse_1".to_string()];
+        assert_eq!(super::copy_name("Verse", "clip", &taken), "Verse_2");
+        // A tail that is not a counter is part of the name.
+        assert_eq!(
+            super::copy_name("Take 3 · bar 2", "clip", &taken),
+            "Take 3 · bar 2_1"
+        );
+        // A bare `_1` has no stem to count up from — it becomes `_1_1`.
+        assert_eq!(super::copy_name("_1", "clip", &taken), "_1_1");
+    }
+
+    /// F-046 R14: every pool entry a project creates is named on the way in,
+    /// and a copy of one gets a name of its own.
+    #[test]
+    fn new_data_and_clips_are_named_automatically() {
+        let mut project = Project::default();
+        let first = project.add_midi_clip(0, 0).expect("clip");
+        let second = project.add_control_clip(0, 0).expect("clip");
+        assert_eq!(project.midi_tracks[0].clips[first].name, "clip_1");
+        assert_eq!(project.control_tracks[0].clips[second].name, "clip_2");
+        assert_eq!(project.midi_data[0].name, "midi_1");
+        assert_eq!(project.curve_data[0].name, "curve_1");
+
+        let source = project.midi_data[0].clone();
+        let copy = project.push_midi_data_copy(&source);
+        assert_eq!(project.midi_data[copy as usize].name, "midi_2");
+        // A hand-named entry keeps its name through a plain push…
+        let named = project.push_midi_data(MidiData {
+            name: "Verse drums".to_string(),
+            ..MidiData::default()
+        });
+        assert_eq!(project.midi_data[named as usize].name, "Verse drums");
+        // …and its copy steps the suffix up.
+        let source = project.midi_data[named as usize].clone();
+        let named_copy = project.push_midi_data_copy(&source);
+        assert_eq!(project.midi_data[named_copy as usize].name, "Verse drums_1");
     }
 
     /// U6/U11: audio track round-trip + partial defaults + old-file loading.

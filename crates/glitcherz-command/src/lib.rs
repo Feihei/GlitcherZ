@@ -668,7 +668,7 @@ impl Session {
             };
             let project = self.project_mut();
             let data_idx = if let Some(source) = source {
-                let new_idx = project.push_midi_data(source);
+                let new_idx = project.push_midi_data_copy(&source);
                 if let Some(target) = project
                     .midi_tracks
                     .get_mut(track)
@@ -753,7 +753,7 @@ impl Session {
         };
         let project = self.project_mut();
         let data_idx = if let Some(source) = source {
-            let new_idx = project.push_midi_data(source);
+            let new_idx = project.push_midi_data_copy(&source);
             if let Some(target) = project
                 .midi_tracks
                 .get_mut(track)

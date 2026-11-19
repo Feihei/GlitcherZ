@@ -92,6 +92,13 @@ fn add(session: &mut Session, params: &Value) -> crate::Result<Value> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    // F-046 R14: a clip always carries a readable handle; an absent `name`
+    // gets the next `clip_N` rather than staying blank.
+    let name = if name.is_empty() {
+        session.project().next_clip_name()
+    } else {
+        name
+    };
 
     let track = raw_track as usize;
     if session.project().midi_tracks.get(track).is_none() {
@@ -144,14 +151,26 @@ fn tile(session: &mut Session, params: &Value) -> crate::Result<Value> {
             format!("no clip {clip} on track {track}"),
         ));
     };
+    let Some(len) = project.midi_tracks.get(track).map(|t| t.clips.len()) else {
+        return Err(bad_params("clip.tile", format!("no track {track}")));
+    };
+    let copies = (count.saturating_sub(1) as usize).min(MAX_CLIPS_PER_TRACK.saturating_sub(len));
+    // F-046 R14: each repeat is its own clip, so each gets its own name.
+    let mut taken = project.clip_names();
+    let mut names = Vec::with_capacity(copies);
+    for _ in 0..copies {
+        let name = glitcherz_model::copy_name(&base.name, "clip", &taken);
+        taken.push(name.clone());
+        names.push(name);
+    }
     let Some(midi_track) = project.midi_tracks.get_mut(track) else {
         return Err(bad_params("clip.tile", format!("no track {track}")));
     };
-    let copies = (count.saturating_sub(1) as usize)
-        .min(MAX_CLIPS_PER_TRACK.saturating_sub(midi_track.clips.len()));
     let first = midi_track.clips.len();
-    for k in 1..=copies {
+    for (k, name) in names.into_iter().enumerate() {
+        let k = k + 1;
         let mut copy = base.clone();
+        copy.name = name;
         copy.start_ticks = base
             .start_ticks
             .saturating_add(base.span_ticks.saturating_mul(k as u32));
@@ -239,7 +258,7 @@ fn fit_window(session: &mut Session, params: &Value) -> crate::Result<Value> {
         };
         let project = session.project_mut();
         let data_idx = if let Some(source) = source {
-            let new_idx = project.push_midi_data(source);
+            let new_idx = project.push_midi_data_copy(&source);
             if let Some(target) = project
                 .midi_tracks
                 .get_mut(track)
@@ -367,7 +386,7 @@ fn unlink_data(session: &mut Session, params: &Value) -> crate::Result<Value> {
                 format!("clip references missing data {data}"),
             )
         })?;
-    let new_data = session.project_mut().push_midi_data(source);
+    let new_data = session.project_mut().push_midi_data_copy(&source);
     let target = session
         .project_mut()
         .midi_tracks

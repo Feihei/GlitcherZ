@@ -812,6 +812,7 @@ impl GlitcherZApp {
         // (Met M4), not the 4/4 constant the model default carries.
         let bar = self.project().ticks_per_bar_at(start_ticks);
         let sec_per_tick = self.project().sec_per_tick();
+        let clip_name = self.project().next_clip_name();
         let added = match lane {
             timeline::TimelineLane::Control => self
                 .project_mut()
@@ -826,6 +827,7 @@ impl GlitcherZApp {
                     // empty path with a wav right after (U11: a seconds window).
                     if t.clips.len() < MAX_CLIPS_PER_TRACK {
                         t.clips.push(glitcherz_model::AudioClip {
+                            name: clip_name.clone(),
                             path: String::new(),
                             start_ticks,
                             source_offset: 0.0,
@@ -884,6 +886,7 @@ impl GlitcherZApp {
             min_len
         };
         let before = self.begin_edit();
+        let clip_name = self.project().next_clip_name();
         let added = self
             .project_mut()
             .audio_tracks
@@ -891,6 +894,7 @@ impl GlitcherZApp {
             .map(|t| {
                 if t.clips.len() < MAX_CLIPS_PER_TRACK {
                     t.clips.push(glitcherz_model::AudioClip {
+                        name: clip_name,
                         path: stored_path.clone(),
                         start_ticks,
                         source_offset: 0.0,
@@ -1885,13 +1889,16 @@ impl GlitcherZApp {
                         else {
                             continue;
                         };
+                        c.start_ticks = d.start_ticks;
+                        // F-046 R14: a copy gets a name of its own, so two
+                        // clips made from one never read the same.
+                        c.name = project.copy_clip_name(&c.name);
                         let Some(t) = project.control_tracks.get_mut(d.to_track) else {
                             continue;
                         };
                         if t.clips.len() >= MAX_CLIPS_PER_TRACK {
                             continue;
                         }
-                        c.start_ticks = d.start_ticks;
                         let index = t.clips.len();
                         t.clips.push(c);
                         new_sel.push(timeline::ClipSel {
@@ -1912,13 +1919,14 @@ impl GlitcherZApp {
                         else {
                             continue;
                         };
+                        c.start_ticks = d.start_ticks;
+                        c.name = project.copy_clip_name(&c.name);
                         let Some(t) = project.midi_tracks.get_mut(d.to_track) else {
                             continue;
                         };
                         if t.clips.len() >= MAX_CLIPS_PER_TRACK {
                             continue;
                         }
-                        c.start_ticks = d.start_ticks;
                         let index = t.clips.len();
                         t.clips.push(c);
                         new_sel.push(timeline::ClipSel {
@@ -1941,13 +1949,14 @@ impl GlitcherZApp {
                         else {
                             continue;
                         };
+                        c.start_ticks = d.start_ticks;
+                        c.name = project.copy_clip_name(&c.name);
                         let Some(t) = project.audio_tracks.get_mut(d.to_track) else {
                             continue;
                         };
                         if t.clips.len() >= MAX_CLIPS_PER_TRACK {
                             continue;
                         }
-                        c.start_ticks = d.start_ticks;
                         let index = t.clips.len();
                         t.clips.push(c);
                         new_sel.push(timeline::ClipSel {
@@ -2016,12 +2025,13 @@ impl GlitcherZApp {
                             else {
                                 continue;
                             };
-                            let mapped = project.push_midi_data(data);
+                            let mapped = project.push_midi_data_copy(&data);
                             midi_copies.push((clip.data, mapped));
                             mapped
                         };
                         clip.data = new_data;
                         clip.start_ticks = d.start_ticks;
+                        clip.name = project.copy_clip_name(&clip.name);
                         let index = project.midi_tracks[d.to_track].clips.len();
                         project.midi_tracks[d.to_track].clips.push(clip);
                         new_sel.push(timeline::ClipSel {
@@ -2058,12 +2068,13 @@ impl GlitcherZApp {
                             else {
                                 continue;
                             };
-                            let mapped = project.push_curve_data(data);
+                            let mapped = project.push_curve_data_copy(&data);
                             curve_copies.push((clip.data, mapped));
                             mapped
                         };
                         clip.data = new_data;
                         clip.start_ticks = d.start_ticks;
+                        clip.name = project.copy_clip_name(&clip.name);
                         let index = project.control_tracks[d.to_track].clips.len();
                         project.control_tracks[d.to_track].clips.push(clip);
                         new_sel.push(timeline::ClipSel {
@@ -2092,6 +2103,7 @@ impl GlitcherZApp {
                             continue;
                         }
                         clip.start_ticks = d.start_ticks;
+                        clip.name = project.copy_clip_name(&clip.name);
                         let index = project.audio_tracks[d.to_track].clips.len();
                         project.audio_tracks[d.to_track].clips.push(clip);
                         new_sel.push(timeline::ClipSel {
@@ -2209,10 +2221,11 @@ impl GlitcherZApp {
                         }
                         // The clipboard is a value snapshot: the paste gets a
                         // fresh pool entry, never a cross-project index.
-                        let data_index = project.push_midi_data(data.clone());
+                        let data_index = project.push_midi_data_copy(data);
                         let mut clip = source.clone();
                         clip.start_ticks = start_ticks;
                         clip.data = data_index;
+                        clip.name = project.copy_clip_name(&clip.name);
                         let index = project.midi_tracks[copy.track].clips.len();
                         project.midi_tracks[copy.track].clips.push(clip);
                         new_sel.push(timeline::ClipSel {
@@ -2233,10 +2246,11 @@ impl GlitcherZApp {
                         {
                             continue;
                         }
-                        let data_index = project.push_curve_data(data.clone());
+                        let data_index = project.push_curve_data_copy(data);
                         let mut clip = source.clone();
                         clip.start_ticks = start_ticks;
                         clip.data = data_index;
+                        clip.name = project.copy_clip_name(&clip.name);
                         let index = project.control_tracks[copy.track].clips.len();
                         project.control_tracks[copy.track].clips.push(clip);
                         new_sel.push(timeline::ClipSel {
@@ -2250,14 +2264,15 @@ impl GlitcherZApp {
                         }
                     }
                     clipboard::ClipSnapshot::Audio(source) => {
+                        let mut clip = source.clone();
+                        clip.start_ticks = start_ticks;
+                        clip.name = project.copy_clip_name(&clip.name);
                         let Some(t) = project.audio_tracks.get_mut(copy.track) else {
                             continue;
                         };
                         if t.clips.len() >= MAX_CLIPS_PER_TRACK {
                             continue;
                         }
-                        let mut clip = source.clone();
-                        clip.start_ticks = start_ticks;
                         let index = t.clips.len();
                         t.clips.push(clip);
                         new_sel.push(timeline::ClipSel {
@@ -2525,7 +2540,7 @@ impl GlitcherZApp {
                 let Some(source) = project.midi_data.get(data as usize).cloned() else {
                     continue;
                 };
-                let new_data = project.push_midi_data(source);
+                let new_data = project.push_midi_data_copy(&source);
                 for (track, clip) in members {
                     if let Some(clip) = project
                         .midi_tracks
@@ -2543,7 +2558,7 @@ impl GlitcherZApp {
                 let Some(source) = project.curve_data.get(data as usize).cloned() else {
                     continue;
                 };
-                let new_data = project.push_curve_data(source);
+                let new_data = project.push_curve_data_copy(&source);
                 for (track, clip) in members {
                     if let Some(clip) = project
                         .control_tracks

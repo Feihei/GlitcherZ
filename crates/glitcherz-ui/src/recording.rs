@@ -642,6 +642,10 @@ impl GlitcherZApp {
         let mut written_notes = 0usize;
         let mut full = Vec::new();
         for (track, clip, note_count) in clips {
+            // F-046 R14: a take is a clip like any other — it gets the next
+            // `clip_N` so the panel can name it.
+            let mut clip = clip;
+            clip.name = self.project().next_clip_name();
             let pushed = self
                 .project_mut()
                 .midi_tracks

@@ -9,7 +9,7 @@
 //! Blender's Properties is the model. The active clip is the last one picked
 //! (`selection_anchor`); a multi-selection still shows one clip — the one the
 //! gestures act on — with the count in the caption. One row of that panel is
-//! the clip's **data block**: a `▾` picker listing every data entry of the
+//! the clip's **data block**: a chevron picker listing every data entry of the
 //! same kind, the entry's name (editing it renames it for every clip that
 //! shares it, like renaming a material), and the reference count, which is a
 //! button that gives this clip a private copy.
@@ -25,16 +25,19 @@ use crate::timeline::{ClipSel, TimelineLane};
 
 /// Share of the tab the strip takes when first opened (Event List's value).
 pub const CLIP_PANEL_HEIGHT_FRACTION: f32 = 1.0 / 3.0;
-/// Caption row plus a couple of property rows: the divider's floor.
-pub const CLIP_PANEL_MIN_H: f32 = 26.0;
+/// Caption row plus one property row: the divider's floor (R13 grew it with
+/// the body-size text; below this the strip only shows a sliver of the scroll
+/// area).
+pub const CLIP_PANEL_MIN_H: f32 = 44.0;
 /// Ceiling as a share of the tab, so the arrangement keeps a usable band.
 const CLIP_PANEL_MAX_FRACTION: f32 = 0.6;
-/// Height of one property row.
-const ROW_H: f32 = 20.0;
+/// Height of one property row. Sized for the body text the rows now use
+/// (R13: `.small()` made the panel read as a footnote).
+const ROW_H: f32 = 22.0;
 /// Width of the label column.
 const LABEL_W: f32 = 64.0;
 /// Height of one entry in the data picker.
-const PICK_ROW_H: f32 = 18.0;
+const PICK_ROW_H: f32 = 20.0;
 
 /// Which pool a data block belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,14 +56,26 @@ impl DataKind {
 }
 
 /// The panel's own view state (never written to the project).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ClipPanelState {
-    /// Expanded / collapsed (D4). Collapsed on first run.
+    /// Expanded / collapsed (D4). **Open on first run** (R13): the panel is
+    /// where a new clip reveals its name and data block, so hiding it made
+    /// both look missing.
     pub open: bool,
     /// The field currently being edited — clip name or data name.
     pub rename: Option<RenameDraft>,
     /// Filter text of the data picker popup.
     pub pick_search: String,
+}
+
+impl Default for ClipPanelState {
+    fn default() -> Self {
+        Self {
+            open: true,
+            rename: None,
+            pick_search: String::new(),
+        }
+    }
 }
 
 /// What a name field edits. Only one field is in flight at a time.
@@ -484,7 +499,7 @@ fn properties(
     row(ui, "Track", |ui| {
         ui.add_sized(
             [ui.available_width(), ROW_H],
-            egui::Label::new(egui::RichText::new(active.track_label()).small().weak()),
+            egui::Label::new(egui::RichText::new(active.track_label()).weak()),
         );
     });
     row(ui, "Start", |ui| {
@@ -540,7 +555,6 @@ fn properties(
                         },
                         bars_label(data.length_ticks, glitcherz_model::TICKS_PER_BAR.max(1))
                     ))
-                    .small()
                     .weak(),
                 )
                 .truncate(),
@@ -554,7 +568,7 @@ fn properties(
                 .unwrap_or(&audio.path);
             ui.add_sized(
                 [ui.available_width(), ROW_H],
-                egui::Label::new(egui::RichText::new(name).small()).truncate(),
+                egui::Label::new(egui::RichText::new(name)).truncate(),
             )
             .on_hover_text(&audio.path);
         });
@@ -572,7 +586,7 @@ fn row(ui: &mut egui::Ui, text: &str, content: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
         ui.add_sized(
             [LABEL_W, ROW_H],
-            egui::Label::new(egui::RichText::new(text).small().weak()),
+            egui::Label::new(egui::RichText::new(text).weak()),
         );
         content(ui);
     });
@@ -588,9 +602,7 @@ fn data_row(
 ) -> Option<ClipIntent> {
     let mut intent = None;
     ui.horizontal(|ui| {
-        let arrow = ui
-            .small_button("▾")
-            .on_hover_text("Pick another data block of the same kind");
+        let arrow = picker_button(ui).on_hover_text("Pick another data block of the same kind");
         let refs_w = 34.0;
         let width = (ui.available_width() - refs_w - 12.0).max(90.0);
         if let Some(next) = name_field(
@@ -627,8 +639,7 @@ fn data_row(
                 ui.add(
                     egui::TextEdit::singleline(&mut state.pick_search)
                         .hint_text("Search…")
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Small),
+                        .desired_width(f32::INFINITY),
                 );
                 let entries = pick_entries(project, data.kind, &state.pick_search);
                 if entries.is_empty() {
@@ -643,7 +654,7 @@ fn data_row(
                             let current = entry.index == data.index;
                             let text = format!("{} · {}", entry.label, entry.items);
                             if ui
-                                .selectable_label(current, egui::RichText::new(text).small())
+                                .selectable_label(current, egui::RichText::new(text))
                                 .clicked()
                             {
                                 if !current {
@@ -660,6 +671,45 @@ fn data_row(
             });
     });
     intent
+}
+
+/// The data picker's disclosure arrow, **painted rather than typed** (R13).
+///
+/// `▾` (U+25BE) has no face in the font stack — neither egui's bundled fonts
+/// nor the embedded Noto Sans SC subset carries it — so the button rendered a
+/// tofu box. Two strokes and a small button frame say the same thing.
+fn picker_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, ROW_H), egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        visuals.corner_radius,
+        visuals.bg_fill,
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let center = rect.center();
+    let wing = 4.0;
+    let stroke = egui::Stroke::new(1.4, visuals.fg_stroke.color);
+    painter.line_segment(
+        [
+            egui::pos2(center.x - wing, center.y - wing * 0.5),
+            egui::pos2(center.x, center.y + wing * 0.5),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(center.x, center.y + wing * 0.5),
+            egui::pos2(center.x + wing, center.y - wing * 0.5),
+        ],
+        stroke,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
 }
 
 /// A name field: always looks like a field (R5 — an inspector's names are
@@ -687,7 +737,6 @@ fn name_field(
         egui::TextEdit::singleline(&mut text)
             .id(id)
             .hint_text(hint)
-            .font(egui::TextStyle::Small)
             .margin(egui::Margin::symmetric(4, 2)),
     );
     if response.gained_focus() || response.changed() {
@@ -821,8 +870,12 @@ mod tests {
         project.push_curve_data(CurveData::default());
         assert_eq!(pick_entries(&project, DataKind::Midi, "").len(), 2);
         assert_eq!(pick_entries(&project, DataKind::Midi, "verse").len(), 1);
-        // An unnamed entry still matches its displayed slot label.
-        assert_eq!(pick_entries(&project, DataKind::Midi, "midi #1").len(), 1);
+        // A new entry is auto-named (`midi_1`) and matches that name…
+        assert_eq!(pick_entries(&project, DataKind::Midi, "midi_1").len(), 1);
+        // …while an entry from an older project, which has no name, still
+        // matches the slot label it displays (R14 keeps the fallback).
+        project.midi_data[0].name.clear();
+        assert_eq!(pick_entries(&project, DataKind::Midi, "midi #0").len(), 1);
         assert_eq!(pick_entries(&project, DataKind::Curve, "").len(), 1);
     }
 
