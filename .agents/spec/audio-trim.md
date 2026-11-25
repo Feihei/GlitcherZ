@@ -59,7 +59,8 @@ else:
 
 **边界钳制**：
 - `source_offset ≥ 0`（不能裁到文件头之前；左端最多拖到 `Δ = −O0/spt`）。
-- `source_len ≥` 1 个 grid step（防止零长 clip）；超出文件尾部分听觉为静音（保留，不自动截断——用户可能先拖后调）。
+- `source_len` 增长不超过素材尾：`source_len ≤ wav 时长 − source_offset`；已越界的旧窗口保持不变（`cap.max(old_span)`），只是不再继续增长——与 MIDI / curve 右缘的 content cap 一致（trim-only）。
+- `source_len ≥` 1 个 grid step（防止零长 clip）；短于 1 bar 的文件创建时仍抬到 1 bar，这类窗口本来就越过素材尾，多出的部分听觉为静音（保留，不自动截断）。
 - 吸附：落点吸附到当前 grid step（同 timeline 既有 `SNAP_TICKS`）；bar 吸附不强制（采样裁剪常需精细）。
 
 ## 5. 已知取舍（D2 的代价，实现前必须知情）
@@ -102,7 +103,7 @@ pub struct AudioClip {
   - app 层 `timeline_move_clips_batch` / `timeline_duplicate_clips_batch` / `timeline_stretch_clips_batch` 补 `TimelineLane::Audio` 分支。
 - **T 落地**：`timeline_stretch_clips_batch` 的 audio 分支按 §4 写 `start_ticks` / `source_offset` / `source_len`（若改动触及文件头/尾则钳制）。
 - **G / Shift+D 落地**：移动 / 复制后调 `send_audio_clips_for_track`；跨轨时对源轨 + 目标轨各推一次，整段包在 `suspend_history` + 单次 `commit_edit` 里（D9）。
-- **direct drag（拖身/resize）**：现走 `timeline_move_resize_clip`（已有 Audio 分支）。语义对齐 T——resize **右缘 = 裁尾**、**左缘 = 裁头**（与裸 T / `t+s` 一致），不再改 `span` 重采样。
+- **direct drag（拖身/resize）**：现走 `timeline_move_resize_clip`（已有 Audio 分支）。语义对齐 T——resize **右缘 = 裁尾**、**左缘 = 裁头**（与裸 T / `t+s` 一致），不再改 `span` 重采样；右缘增长以素材尾为上限（`resize_audio_clip`，未解码的 sample 视为无可暴露素材，不增长）。
 
 ## 9. 实现拆分（U11）
 

@@ -925,37 +925,25 @@ impl GlitcherZApp {
     ) {
         let before = self.begin_edit();
         let sec_per_tick = self.project().sec_per_tick();
+        let material_secs = match lane {
+            timeline::TimelineLane::Audio => self.audio_material_secs(track, clip),
+            _ => None,
+        };
         let moved = {
             let project = self.project_mut();
             match lane {
                 timeline::TimelineLane::Control => {
                     resize_curve_clip(project, track, clip, start_ticks, span_ticks)
                 }
-                timeline::TimelineLane::Audio => project
-                    .audio_tracks
-                    .get_mut(track)
-                    .and_then(|t| t.clips.get_mut(clip))
-                    .map(|c| {
-                        let old_span = (c.source_len / sec_per_tick).round().max(1.0) as u32;
-                        let old_start = c.start_ticks;
-                        let changed = old_start != start_ticks || old_span != span_ticks;
-                        // U11: resize = trim. Only a length change rewrites the
-                        // window; a move or a right-edge drag keeps the window
-                        // start.
-                        if span_ticks != old_span {
-                            // A left-edge drag (the start moved too) advances
-                            // the window start so the material stays put.
-                            if start_ticks != old_start {
-                                let delta = i64::from(start_ticks) - i64::from(old_start);
-                                c.source_offset =
-                                    (c.source_offset + delta as f64 * sec_per_tick).max(0.0);
-                            }
-                            c.source_len = f64::from(span_ticks).max(1.0) * sec_per_tick;
-                        }
-                        c.start_ticks = start_ticks;
-                        changed
-                    })
-                    .unwrap_or(false),
+                timeline::TimelineLane::Audio => resize_audio_clip(
+                    project,
+                    track,
+                    clip,
+                    start_ticks,
+                    span_ticks,
+                    sec_per_tick,
+                    material_secs,
+                ),
                 timeline::TimelineLane::Midi => {
                     resize_midi_clip(project, track, clip, start_ticks, span_ticks)
                 }
@@ -974,6 +962,24 @@ impl GlitcherZApp {
             // unrelated edit, so the new span never sounded.
             self.sync_clip_row(lane, track);
         }
+    }
+
+    /// Duration of an audio clip's wav in seconds, when this session already
+    /// decoded it (the timeline waveform cache). `None` means unknown material:
+    /// the right edge has nothing verified to expose, so it may not grow.
+    fn audio_material_secs(&self, track: usize, clip: usize) -> Option<f64> {
+        let project = self.project();
+        let stored = project
+            .audio_tracks
+            .get(track)?
+            .clips
+            .get(clip)?
+            .path
+            .clone();
+        let resolved = project.resolve_media_path(&stored);
+        self.sample_library
+            .get(&resolved)
+            .map(|data| data.frames().len() as f64 / f64::from(data.sample_rate()))
     }
 
     /// I6: one frame of a head trim (dragging a clip's left edge).
@@ -1708,12 +1714,21 @@ impl GlitcherZApp {
             return;
         }
         let sec_per_tick = self.project().sec_per_tick();
+        // Audio growth is bounded by the wav's duration; resolve each one
+        // before the mutable borrow below.
+        let materials: Vec<Option<f64>> = spans
+            .iter()
+            .map(|e| match e.sel.lane {
+                timeline::TimelineLane::Audio => self.audio_material_secs(e.sel.track, e.sel.clip),
+                _ => None,
+            })
+            .collect();
         let before = self.begin_edit();
         let mut touched = Vec::new();
         {
             let project = self.project_mut();
 
-            for e in &spans {
+            for (e, material) in spans.iter().zip(&materials) {
                 let changed = match e.sel.lane {
                     timeline::TimelineLane::Control => stretch_curve_clip(
                         project,
@@ -1730,25 +1745,17 @@ impl GlitcherZApp {
                         e.span_ticks,
                     ),
                     // U11: a stretch trims the seconds window (a left-edge
-                    // stretch also advances the window start).
-                    timeline::TimelineLane::Audio => project
-                        .audio_tracks
-                        .get_mut(e.sel.track)
-                        .and_then(|t| t.clips.get_mut(e.sel.clip))
-                        .map(|c| {
-                            let old_span = (c.source_len / sec_per_tick).round().max(1.0) as u32;
-                            let old_start = c.start_ticks;
-                            if e.span_ticks != old_span {
-                                if e.start_ticks != old_start {
-                                    let delta = i64::from(e.start_ticks) - i64::from(old_start);
-                                    c.source_offset =
-                                        (c.source_offset + delta as f64 * sec_per_tick).max(0.0);
-                                }
-                                c.source_len = f64::from(e.span_ticks).max(1.0) * sec_per_tick;
-                            }
-                            c.start_ticks = e.start_ticks;
-                        })
-                        .is_some(),
+                    // stretch also advances the window start); growth stops at
+                    // the material tail, like the direct right-edge drag.
+                    timeline::TimelineLane::Audio => resize_audio_clip(
+                        project,
+                        e.sel.track,
+                        e.sel.clip,
+                        e.start_ticks,
+                        e.span_ticks,
+                        sec_per_tick,
+                        *material,
+                    ),
                 };
                 if changed && !touched.contains(&(e.sel.lane, e.sel.track)) {
                     touched.push((e.sel.lane, e.sel.track));
@@ -2782,6 +2789,76 @@ fn stretch_curve_clip(
     clip.window_follow = false;
     true
 }
+/// Audio counterpart of [`resize_midi_clip`]: the tick span maps onto the
+/// seconds trim window (native-rate playback — this exposes more or less of
+/// the wav, it never stretches it).
+///
+/// The right edge stops at the material tail: `material_secs` is the wav's
+/// duration, so growth is clamped to what remains after `source_offset`. An
+/// already-oversized window stays put on extension (`cap.max(old_span)`) so
+/// legacy clips are not shortened behind the user's back; shrinking is free.
+/// `None` (the sample is not decoded this session) offers nothing to expose,
+/// so the window may not grow — the audio analogue of an empty MIDI block.
+///
+/// Only a span change re-bases the window: a pure move keeps `source_offset`.
+fn resize_audio_clip(
+    project: &mut Project,
+    track: usize,
+    index: usize,
+    new_start: u32,
+    new_span: u32,
+    sec_per_tick: f64,
+    material_secs: Option<f64>,
+) -> bool {
+    let Some(clip) = project
+        .audio_tracks
+        .get(track)
+        .and_then(|t| t.clips.get(index))
+    else {
+        return false;
+    };
+    let old_start = clip.start_ticks;
+    let old_span = (clip.source_len / sec_per_tick).round().max(1.0) as u32;
+    if old_start == new_start && old_span == new_span {
+        return false;
+    }
+    // A left-edge drag (the start moved too) advances the window start so the
+    // material keeps its place in time; a pure move leaves the window alone.
+    let shifted = if new_start != old_start && new_span != old_span {
+        let delta = i64::from(new_start) - i64::from(old_start);
+        (clip.source_offset + delta as f64 * sec_per_tick).max(0.0)
+    } else {
+        clip.source_offset
+    };
+    let new_span = if new_span > old_span {
+        match material_secs {
+            Some(secs) => {
+                let cap = ((secs - shifted).max(0.0) / sec_per_tick).round().max(1.0) as u32;
+                new_span.min(cap.max(old_span))
+            }
+            None => old_span,
+        }
+    } else {
+        new_span
+    };
+    if old_start == new_start && old_span == new_span {
+        return false;
+    }
+    let Some(clip) = project
+        .audio_tracks
+        .get_mut(track)
+        .and_then(|t| t.clips.get_mut(index))
+    else {
+        return false;
+    };
+    clip.start_ticks = new_start;
+    clip.source_offset = shifted;
+    if new_span != old_span {
+        clip.source_len = f64::from(new_span).max(1.0) * sec_per_tick;
+    }
+    true
+}
+
 /// Right-edge drag on a MIDI clip: a pure window edit (F-041 M10). Growth
 /// exposes silent tail up to the last content bar only (F-041 M10.10 —
 /// writing past it grows the window automatically instead); shrinking is
@@ -3172,6 +3249,103 @@ mod tests {
             project.midi_tracks[0].clips[0].span_ticks,
             2 * TICKS_PER_BAR
         );
+    }
+
+    /// Audio mirrors the MIDI/curve right-edge cap: growth stops at the
+    /// material tail, an oversized legacy window stays put on extension, and
+    /// shrinking is free.
+    #[test]
+    fn resize_audio_right_edge_stops_at_the_material_tail() {
+        let mut project = Project::default();
+        let bar = f64::from(TICKS_PER_BAR);
+        // sec_per_tick = 1.0 keeps the seconds window numerically in ticks.
+        let material = 2.0 * bar;
+        project.audio_tracks[0].clips.push(AudioClip {
+            start_ticks: 0,
+            source_offset: 0.0,
+            source_len: bar,
+            ..AudioClip::default()
+        });
+
+        assert!(resize_audio_clip(
+            &mut project,
+            0,
+            0,
+            0,
+            3 * TICKS_PER_BAR,
+            1.0,
+            Some(material)
+        ));
+        assert!(
+            (project.audio_tracks[0].clips[0].source_len - material).abs() < f64::EPSILON,
+            "growth is capped at the material tail"
+        );
+
+        // A legacy oversized window neither grows nor shrinks on extension…
+        project.audio_tracks[0].clips[0].source_len = 3.0 * bar;
+        assert!(!resize_audio_clip(
+            &mut project,
+            0,
+            0,
+            0,
+            4 * TICKS_PER_BAR,
+            1.0,
+            Some(material)
+        ));
+        assert!((project.audio_tracks[0].clips[0].source_len - 3.0 * bar).abs() < f64::EPSILON);
+        // …but shrinking is free.
+        assert!(resize_audio_clip(
+            &mut project,
+            0,
+            0,
+            0,
+            TICKS_PER_BAR,
+            1.0,
+            Some(material)
+        ));
+        assert!((project.audio_tracks[0].clips[0].source_len - bar).abs() < f64::EPSILON);
+    }
+
+    /// Audio: an undecoded sample offers nothing to expose, so the right edge
+    /// is pinned; a pure move still keeps the seconds window untouched.
+    #[test]
+    fn resize_audio_does_not_grow_without_material() {
+        let mut project = Project::default();
+        let bar = f64::from(TICKS_PER_BAR);
+        project.audio_tracks[0].clips.push(AudioClip {
+            start_ticks: 0,
+            source_offset: 0.0,
+            source_len: bar,
+            ..AudioClip::default()
+        });
+
+        assert!(!resize_audio_clip(
+            &mut project,
+            0,
+            0,
+            0,
+            4 * TICKS_PER_BAR,
+            1.0,
+            None
+        ));
+        assert!((project.audio_tracks[0].clips[0].source_len - bar).abs() < f64::EPSILON);
+
+        assert!(resize_audio_clip(
+            &mut project,
+            0,
+            0,
+            TICKS_PER_BAR,
+            TICKS_PER_BAR,
+            1.0,
+            None
+        ));
+        let clip = &project.audio_tracks[0].clips[0];
+        assert_eq!(clip.start_ticks, TICKS_PER_BAR);
+        assert!(
+            (clip.source_offset - 0.0).abs() < f64::EPSILON,
+            "a move keeps the window"
+        );
+        assert!((clip.source_len - bar).abs() < f64::EPSILON);
     }
 
     /// F-041 D39/D43: an empty data block offers no content bar to grow to, so
