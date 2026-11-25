@@ -2793,12 +2793,13 @@ fn stretch_curve_clip(
 /// seconds trim window (native-rate playback — this exposes more or less of
 /// the wav, it never stretches it).
 ///
-/// The right edge stops at the material tail: `material_secs` is the wav's
-/// duration, so growth is clamped to what remains after `source_offset`. An
-/// already-oversized window stays put on extension (`cap.max(old_span)`) so
-/// legacy clips are not shortened behind the user's back; shrinking is free.
-/// `None` (the sample is not decoded this session) offers nothing to expose,
-/// so the window may not grow — the audio analogue of an empty MIDI block.
+/// The right edge stops at the end of the bar holding the material tail — the
+/// same ceiling MIDI/curve use (F-041 M10.6) — so an over-drag lands on the
+/// last bar line and may expose under a bar of silence. An already-oversized
+/// window stays put on extension (`cap.max(old_span)`) so legacy clips are not
+/// shortened behind the user's back; shrinking is free. `None` (the sample is
+/// not decoded this session) offers nothing to expose, so the window may not
+/// grow — the audio analogue of an empty MIDI block.
 ///
 /// Only a span change re-bases the window: a pure move keeps `source_offset`.
 fn resize_audio_clip(
@@ -2832,9 +2833,17 @@ fn resize_audio_clip(
     };
     let new_span = if new_span > old_span {
         match material_secs {
+            // Same ceiling as MIDI/curve (F-041 M10.6): the end of the bar
+            // holding the material tail, so an over-drag lands on the last
+            // bar line with at most a bar of silence.
             Some(secs) => {
-                let cap = ((secs - shifted).max(0.0) / sec_per_tick).round().max(1.0) as u32;
-                new_span.min(cap.max(old_span))
+                let material_end = (secs / sec_per_tick).round() as i64;
+                let offset = shifted.round() as i64;
+                let bar = i64::from(project.ticks_per_bar_at(new_start).max(1));
+                match window_growth_cap(Some(material_end), offset, bar) {
+                    Some(cap) => new_span.min(cap.max(old_span)),
+                    None => old_span,
+                }
             }
             None => old_span,
         }
@@ -3251,9 +3260,9 @@ mod tests {
         );
     }
 
-    /// Audio mirrors the MIDI/curve right-edge cap: growth stops at the
-    /// material tail, an oversized legacy window stays put on extension, and
-    /// shrinking is free.
+    /// Audio mirrors the MIDI/curve right-edge cap: growth stops at the end of
+    /// the bar holding the material tail, an oversized legacy window stays put
+    /// on extension, and shrinking is free.
     #[test]
     fn resize_audio_right_edge_stops_at_the_material_tail() {
         let mut project = Project::default();
@@ -3304,6 +3313,19 @@ mod tests {
             Some(material)
         ));
         assert!((project.audio_tracks[0].clips[0].source_len - bar).abs() < f64::EPSILON);
+
+        // A material tail mid-bar rounds up to the last bar line: 1.5 bars
+        // grow to 2 bars (under a bar of silence), like MIDI/curve.
+        assert!(resize_audio_clip(
+            &mut project,
+            0,
+            0,
+            0,
+            4 * TICKS_PER_BAR,
+            1.0,
+            Some(1.5 * bar)
+        ));
+        assert!((project.audio_tracks[0].clips[0].source_len - 2.0 * bar).abs() < f64::EPSILON);
     }
 
     /// Audio: an undecoded sample offers nothing to expose, so the right edge
