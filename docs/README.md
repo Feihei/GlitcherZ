@@ -5,6 +5,8 @@ GlitcherZ 是一款免费、开源的数字音频工作站，支持 Windows / ma
 
 界面文案是英文的，本文档保留英文原文（`File ▸ Export Audio…`），方便和屏幕对上。
 
+文档里的 `Ctrl` 指命令修饰键：Windows / Linux 上是 `Ctrl`，macOS 上是 `⌘`（物理 `Control` 也照样可用；`Ctrl+Tab` 例外，固定物理 `Control`）。
+
 | 文档 | 内容 |
 | :--- | :--- |
 | [manual.md](manual.md) | 主手册：界面、轨道、编曲、钢琴卷帘、Patch 接线、混音、自动化、插件、录音、导出 |
@@ -88,7 +90,7 @@ glitcherz --mcp --root ~/Music/glitcherz
 | 按键盘没声音 | 看 `Keyboard In` 节点是否有一条 MIDI 线连到乐器；再看乐器是否接到了 `Mixer` / `Master`。`Ctrl+L` 可以快速把选中乐器接到电脑键盘。 |
 | 播放时完全没声音 | `Edit ▸ Preferences…` 里换一个输出设备；设备被拔掉时窗口顶部会报 `Last output error`。右侧 `Master` 有电平表，可先确认引擎在出声。 |
 | 按 `R` 提示 `no input` | 录音要求轨道的时间轴输入口被接上：`Patch` 里把 `Keyboard In` 的 MIDI 输出拖到 `T1`（MIDI 轨），或把 `Audio Input` 拖到 `A1`（音频轨）。默认工程没有接。 |
-| 插件列表是空的 | `Patch` 空白处右键 → `Rescan Plug-ins`。插件需装在标准目录，或用 `GLITCHERZ_CLAP_PATH` / `GLITCHERZ_VST3_PATH` 指定（见 [manual.md](manual.md#插件)）。 |
+| 插件列表是空的 | `Patch` 空白处右键 → `Rescan Plug-ins`。插件需装在系统的标准目录（Windows / macOS / Linux 各有默认路径），或用 `GLITCHERZ_CLAP_PATH` / `GLITCHERZ_VST3_PATH` 指定（见 [manual.md](manual.md#插件)）。 |
 | 换台机器打开工程，采样全丢了 | 存盘前用 `File ▸ Collect Media Files…` 把外部素材收进 `<工程名>.media/`；已经丢了的用 `File ▸ Relocate Missing Media…` 按文件名找回。 |
 | 崩溃后工作还在吗 | 在。启动时会弹 `Recover unsaved work`，见 [project-files.md](project-files.md#自动保存与崩溃恢复)。 |
 | 导出采样率能高于声卡吗 | 能。下拉第一项是当前设备采样率，其余是 44.1 / 48 / 88.2 / 96 kHz；导出用离线引擎，选 96 kHz 不需要 96 kHz 声卡。 |

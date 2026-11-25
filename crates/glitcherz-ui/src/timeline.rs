@@ -1492,19 +1492,17 @@ pub fn show(
         state.duplicate_shared = true;
         arm_modal(state, Arm::Duplicate, ui.ctx().pointer_hover_pos());
     }
-    // Ctrl+A / Ctrl+Shift+A (W3c): select every clip in the arrangement, or
+    // mod1+A / mod1+Shift+A (W3c): select every clip in the arrangement, or
     // drop the selection. A view-level command like the tile shortcut — the
     // lane rows only ever see their own track, and "all" is by definition
     // cross-lane. The inline rename editor (a live text edit) keeps the combo
     // for itself.
     if state.modal.is_none() && !ui.ctx().text_edit_focused() {
         let (deselect, select_all) = ui.ctx().input_mut(|i| {
-            let mut ctrl_shift = Modifiers::CTRL;
-            ctrl_shift.shift = true;
             // Shift first: `consume_key` matches modifiers logically, so the
-            // plain Ctrl+A pattern would eat Ctrl+Shift+A as well.
-            let clear = i.consume_key(ctrl_shift, Key::A);
-            let all = i.consume_key(Modifiers::CTRL, Key::A);
+            // plain pattern would eat the shifted one as well.
+            let clear = crate::mod_keys::consume_mod1_shift(i, Key::A);
+            let all = crate::mod_keys::consume_mod1(i, Key::A);
             (clear, all)
         });
         if deselect {
@@ -1596,9 +1594,10 @@ pub fn show(
 
     // ---- View navigation (read before the ScrollArea lays out, using last
     // frame's row geometry, so zoom and its offset compensation land in the
-    // same frame). Ctrl+wheel zooms the time axis anchored on the pointer,
-    // Ctrl+Alt+wheel zooms the row height, middle-drag pans both axes. Plain
-    // / Shift wheel stay with the ScrollArea (vertical / horizontal
+    // same frame). mod1+wheel zooms the time axis anchored on the pointer,
+    // mod1+Alt+wheel zooms the row height, a pinch zooms the time axis too
+    // (no modifier required, spec F-050 D7), middle-drag pans both axes.
+    // Plain / Shift wheel stay with the ScrollArea (vertical / horizontal
     // scrolling).
     //
     // eframe 0.37 made `ScrollArea::State`'s offset private: it can be *read*
@@ -1609,29 +1608,33 @@ pub fn show(
     let mut scroll_target: Option<Vec2> = None;
     {
         let (zoom2, mods) = ui.ctx().input(|i| (i.zoom_delta_2d(), i.modifiers));
-        let ctrl = mods.ctrl || mods.command;
+        let ctrl = crate::mod_keys::mod1(mods);
         let ptr = ui.ctx().pointer_hover_pos();
         let in_rows = state
             .rows_rect
             .is_some_and(|r| ptr.is_some_and(|p| r.contains(p)));
-        if in_rows && ctrl {
+        if in_rows {
             let Some(ptr) = ptr else {
                 unreachable!("in_rows implies ptr")
             };
-            // Time axis: uniform zoom (pure Ctrl) or horizontal-only (the
-            // touch pinch case). Anchor the tick under the pointer.
+            // Time axis: uniform zoom (pure mod1 or a pinch) or horizontal-only.
+            // Anchor the tick under the pointer.
             if zoom2.x != 1.0
                 && let Some(target) =
                     state.zoom_time_axis(ui.ctx(), scroll_id, base_bar_ticks, ptr.x, zoom2.x)
             {
                 scroll_target = Some(target);
             }
-            // Row height: only a vertical-only factor (Ctrl+Alt) resizes
+            // Row height: only a vertical-only factor (mod1+Alt) resizes
             // the rows — a uniform zoom belongs to the time axis above.
             if zoom2.y != 1.0 && (zoom2.x - zoom2.y).abs() > 1e-4 {
                 state.row_zoom = (state.row_zoom * zoom2.y).clamp(ROW_ZOOM_MIN, ROW_ZOOM_MAX);
             }
-            ui.ctx().request_repaint();
+            // Only ask for another frame when a pinch / wheel actually zoomed;
+            // a plain hover must not pin the repaint loop at 60 fps.
+            if zoom2.x != 1.0 || zoom2.y != 1.0 {
+                ui.ctx().request_repaint();
+            }
         }
         // F-047: the discrete step the toolbar's old -/+ pair used to give,
         // now on the keyboard. `=` / `-` are unshifted on every layout we
@@ -1728,7 +1731,10 @@ pub fn show(
                     }
                 })
                 .response
-                .on_hover_text("Snap grid · hold Ctrl to land on the nearest tick instead");
+                .on_hover_text(format!(
+                    "Snap grid · hold {} to land on the nearest tick instead",
+                    crate::mod_keys::mod_key_label()
+                ));
             ui.separator();
             // Three track kinds, each with an add / remove pair — the same
             // rows (and order) the patch timeline node exposes: MIDI, then
@@ -1958,11 +1964,12 @@ pub fn show(
             // The static hint goes last and truncates: an overflowing child
             // expands the ui's available rect, and the rows below would be
             // laid out wider than the panel itself.
+            let mod1 = crate::mod_keys::mod_key_label();
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(
-                        "Drag move · either edge: trim (head included) · T: extend time · Shift+T / Alt+T: tile · Shift+D: copy (own data) · Alt+D: copy (shared data) · dbl-click edit · F2 / Alt+dbl-click: rename · Ctrl+G group · Ctrl+Shift+G ungroup · Alt+click: single · right-click: menu · Ctrl+MMB mute clip · H mute / Alt+H unmute all · marquee select · Del / ⌫ · K knife · dots: reorder track · ruler: seek / Ctrl+loop / RMB marker · Ctrl+wheel or -/= zoom · Ctrl+Alt+wheel height · MMB pan",
-                    )
+                    egui::RichText::new(format!(
+                        "Drag move · either edge: trim (head included) · T: extend time · Shift+T / Alt+T: tile · Shift+D: copy (own data) · Alt+D: copy (shared data) · dbl-click edit · F2 / Alt+dbl-click: rename · {mod1}+G group · {mod1}+Shift+G ungroup · Alt+click: single · right-click: menu · {mod1}+MMB mute clip (trackpad: H) · H mute / Alt+H unmute all · marquee select · Del / ⌫ · K knife · dots: reorder track · ruler: seek / {mod1}+loop / RMB marker · {mod1}+wheel or -/= zoom · {mod1}+Alt+wheel height · MMB / two-finger scroll pan"
+                    ))
                     .weak(),
                 )
                 .truncate(),
@@ -2101,7 +2108,7 @@ pub fn show(
             }
 
             // ---- Interaction: drag intent locks in at drag start. ----
-            let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+            let ctrl = ui.input(crate::mod_keys::mod1_held);
             let meter_hit = |x: f32| -> Option<usize> {
                 p.meter_markers.iter().enumerate().find_map(|(index, marker)| {
                     ((rect.left() + marker.tick as f32 * px_per_tick - x).abs() <= MARKER_GRAB)
@@ -2273,9 +2280,10 @@ pub fn show(
                 Stroke::new(1.5, Color32::from_rgb(250, 220, 90)),
             );
 
-            let _ = response.on_hover_text(
-                "Click/drag: seek · Ctrl+drag: set song loop · drag loop edges: reshape · right-click: add marker (on a marker: remove)",
-            );
+            let _ = response.on_hover_text(format!(
+                "Click/drag: seek · {}+drag: set song loop · drag loop edges: reshape · right-click: add marker (on a marker: remove)",
+                crate::mod_keys::mod_key_label()
+            ));
         });
 
         // Marquee selection: every row reports the clips its lane segment
@@ -3543,10 +3551,7 @@ fn lane_row<T: Placement>(
     // absolute-time snaps — `Snap::at` resolves a musical grid's width from
     // the segment the pointer is in, so a drag across a meter change switches
     // basis at the boundary.
-    let snap = if parent
-        .ctx()
-        .input(|i| i.modifiers.ctrl || i.modifiers.command)
-    {
+    let snap = if parent.ctx().input(crate::mod_keys::mod1_held) {
         Snap::OFF
     } else {
         Snap::musical(state.snap_grid)
@@ -4144,7 +4149,7 @@ fn lane_row<T: Placement>(
             let tick = tick_at(pos.x);
             if let Some(index) = hit_clip(clips, tick, sec_per_tick) {
                 let shift = ui.ctx().input(|i| i.modifiers.shift);
-                let ctrl = ui.ctx().input(|i| i.modifiers.ctrl);
+                let ctrl = ui.ctx().input(crate::mod_keys::mod1_held);
                 // W3b: `Alt` picks this one clip out of its group (the
                 // expansion at the end of show() is skipped while it holds).
                 let alt = ui.ctx().input(|i| i.modifiers.alt);
@@ -4182,7 +4187,9 @@ fn lane_row<T: Placement>(
                     });
                 }
             } else {
-                let additive = ui.ctx().input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                let additive = ui
+                    .ctx()
+                    .input(|i| i.modifiers.shift || crate::mod_keys::mod1_held(i));
                 // A fresh band starts from group-expanded semantics.
                 state.break_group = false;
                 state.selection_anchor = None;
@@ -4363,7 +4370,7 @@ fn lane_row<T: Placement>(
     {
         if let Some(pos) = response.interact_pointer_pos() {
             let shift = ui.ctx().input(|i| i.modifiers.shift);
-            let ctrl = ui.ctx().input(|i| i.modifiers.ctrl);
+            let ctrl = ui.ctx().input(crate::mod_keys::mod1_held);
             // W3b: Alt keeps the selection on the clicked clip only.
             state.break_group = ui.ctx().input(|i| i.modifiers.alt);
             match hit_clip(clips, tick_at(pos.x), sec_per_tick) {
@@ -4386,7 +4393,7 @@ fn lane_row<T: Placement>(
     // never toggles.
     if response.clicked_by(egui::PointerButton::Middle)
         && state.modal.is_none()
-        && ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.command)
+        && ui.ctx().input(crate::mod_keys::mod1_held)
         && let Some(pos) = response.interact_pointer_pos()
         && let Some(index) = hit_clip(clips, tick_at(pos.x), sec_per_tick)
     {
@@ -4542,16 +4549,14 @@ fn lane_row<T: Placement>(
                 state.modal = None;
             }
         }
-        // W3b: Ctrl+G groups the selection (cross-track / cross-lane),
-        // Ctrl+Shift+G dissolves every group it touches.
-        let shift_g = {
-            let mut mods = Modifiers::CTRL;
-            mods.shift = true;
-            ui.ctx().input_mut(|i| i.consume_key(mods, Key::G))
-        };
+        // W3b: mod1+G groups the selection (cross-track / cross-lane),
+        // mod1+Shift+G dissolves every group it touches.
+        let shift_g = ui
+            .ctx()
+            .input_mut(|i| crate::mod_keys::consume_mod1_shift(i, Key::G));
         let ctrl_g = ui
             .ctx()
-            .input_mut(|i| i.consume_key(Modifiers::CTRL, Key::G));
+            .input_mut(|i| crate::mod_keys::consume_mod1(i, Key::G));
         if !state.selection.is_empty() {
             if shift_g {
                 actions.push(TimelineAction::UngroupClips {
@@ -4671,8 +4676,7 @@ fn take_tile_shortcut(ctx: &egui::Context) -> bool {
                 ..
             } = event
                 && (*key == Key::T || physical_key.as_ref() == Some(&Key::T))
-                && !modifiers.ctrl
-                && !modifiers.command
+                && !crate::mod_keys::mod1(*modifiers)
                 && (modifiers.shift || shift_held || modifiers.alt || alt_held)
             {
                 found = true;
@@ -4703,8 +4707,7 @@ fn take_linked_duplicate_shortcut(ctx: &egui::Context) -> bool {
                 ..
             } = event
                 && (*key == Key::D || physical_key.as_ref() == Some(&Key::D))
-                && !modifiers.ctrl
-                && !modifiers.command
+                && !crate::mod_keys::mod1(*modifiers)
                 && !modifiers.shift
                 && (modifiers.alt || alt_held)
             {
@@ -4727,7 +4730,7 @@ fn take_linked_duplicate_shortcut(ctx: &egui::Context) -> bool {
 fn take_mute_shortcut(ctx: &egui::Context) -> Option<bool> {
     ctx.input_mut(|i| {
         let alt_held = i.modifiers.alt;
-        let ctrl_held = i.modifiers.ctrl || i.modifiers.command;
+        let ctrl_held = crate::mod_keys::mod1_held(i);
         let mut plain = false;
         let mut with_alt = false;
         i.events.retain(|event| {
@@ -4746,7 +4749,7 @@ fn take_mute_shortcut(ctx: &egui::Context) -> Option<bool> {
             }
             if modifiers.alt || alt_held {
                 with_alt = true;
-            } else if modifiers.ctrl || modifiers.command || ctrl_held {
+            } else if crate::mod_keys::mod1(*modifiers) || ctrl_held {
                 return true;
             } else {
                 plain = true;

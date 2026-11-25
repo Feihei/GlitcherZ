@@ -394,6 +394,11 @@ impl GlitcherZApp {
             // egui's focus traversal never steals it, and so the app-wide view
             // cycle — which owns the bare Tab — leaves this alone. The roll
             // itself never reads a bare Tab.
+            //
+            // F-050 D5: this is the one shortcut that stays on the **physical
+            // `Control`** key. `Cmd+Tab` is the macOS application switcher, so
+            // promoting it to `mod1` would hand Mac users a dead key; physical
+            // `Control` works on Windows / Linux exactly as before.
             let backward = ui.input_mut(|i| {
                 i.consume_key(
                     egui::Modifiers {

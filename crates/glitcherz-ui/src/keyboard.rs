@@ -4,6 +4,7 @@
 //! functions stay there and reach here through the glob import.
 
 use super::*;
+use crate::mod_keys::mod1;
 use crate::patch::strip_key_for;
 
 /// Physical computer key → the pitch actually sent to the engine.
@@ -596,21 +597,21 @@ impl GlitcherZApp {
             // click.
             if !text_edit_owns_keys {
                 match key {
-                    egui::Key::Space if pressed && !modifiers.ctrl => {
+                    egui::Key::Space if pressed && !mod1(modifiers) => {
                         ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::Space));
                         if !repeat {
                             self.toggle_transport();
                         }
                         continue;
                     }
-                    egui::Key::Home if pressed && !modifiers.ctrl => {
+                    egui::Key::Home if pressed && !mod1(modifiers) => {
                         ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::Home));
                         if !repeat {
                             self.engine.seek_ticks(0.0);
                         }
                         continue;
                     }
-                    egui::Key::End if pressed && !modifiers.ctrl => {
+                    egui::Key::End if pressed && !mod1(modifiers) => {
                         ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::End));
                         if !repeat {
                             let end = f64::from(self.arrangement_end_ticks());
@@ -618,28 +619,28 @@ impl GlitcherZApp {
                         }
                         continue;
                     }
-                    egui::Key::Comma if pressed && !modifiers.ctrl => {
+                    egui::Key::Comma if pressed && !mod1(modifiers) => {
                         ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::Comma));
                         if !repeat {
                             self.seek_to_previous_marker();
                         }
                         continue;
                     }
-                    egui::Key::Period if pressed && !modifiers.ctrl => {
+                    egui::Key::Period if pressed && !mod1(modifiers) => {
                         ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::Period));
                         if !repeat {
                             self.seek_to_next_marker();
                         }
                         continue;
                     }
-                    egui::Key::ArrowLeft if pressed && modifiers.ctrl => {
+                    egui::Key::ArrowLeft if pressed && mod1(modifiers) => {
                         ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::ArrowLeft));
                         if !repeat {
                             self.seek_by_bars(-1);
                         }
                         continue;
                     }
-                    egui::Key::ArrowRight if pressed && modifiers.ctrl => {
+                    egui::Key::ArrowRight if pressed && mod1(modifiers) => {
                         ctx.input_mut(|i| i.consume_key(modifiers, egui::Key::ArrowRight));
                         if !repeat {
                             self.seek_by_bars(1);
@@ -666,7 +667,7 @@ impl GlitcherZApp {
                     _ => None,
                 }
             } else if key == egui::Key::Tab {
-                if modifiers.ctrl && roll_has_keys {
+                if mod1(modifiers) && roll_has_keys {
                     None
                 } else {
                     Some(self.view.cycle(!modifiers.shift))
@@ -688,8 +689,11 @@ impl GlitcherZApp {
                 continue;
             }
             // Shortcuts take precedence over the playing map (Ctrl+S save / Ctrl+O open /
-            // Ctrl+Z undo).
-            if modifiers.ctrl && pressed {
+            // Ctrl+Z undo). `mod1` makes them `Cmd+…` on macOS and keeps the
+            // physical `Control` chords working everywhere (spec F-050 D1/D4);
+            // the catch-all below keeps unknown command chords out of `KEYMAP`,
+            // so `Cmd+Z` can no longer lower the octave or play a note.
+            if mod1(modifiers) && pressed {
                 match key {
                     egui::Key::S if modifiers.shift => {
                         self.save_project_as();

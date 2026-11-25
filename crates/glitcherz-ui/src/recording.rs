@@ -1089,6 +1089,24 @@ impl GlitcherZApp {
 /// Total record offset in samples (R5): device round-trip (input + output
 /// buffers) + the track chain's PDC + the user's manual trim. `None` input
 /// falls back to the output buffer; the result is never negative.
+/// Whether the platform exposes system-playback ("loopback") recording
+/// sources. Only Windows has WASAPI loopback; the settings picker and the
+/// patch input badge hide the concept elsewhere (spec F-050 D11).
+pub(crate) fn loopback_supported() -> bool {
+    cfg!(target_os = "windows")
+}
+
+/// Badge text for a loopback input in the patch overview, platform-accurate
+/// so a stale project does not advertise a WASAPI feature on macOS / Linux
+/// (spec F-050 D11).
+pub(crate) fn loopback_label() -> &'static str {
+    if loopback_supported() {
+        "WASAPI loopback (what this output plays)"
+    } else {
+        "system-audio loopback input"
+    }
+}
+
 fn record_latency_total(input: Option<u32>, output: Option<u32>, chain: i64, manual: i64) -> i64 {
     let input = input.or(output).unwrap_or(0) as i64;
     let output = output.unwrap_or(0) as i64;

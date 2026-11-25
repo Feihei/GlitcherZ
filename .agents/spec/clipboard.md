@@ -29,7 +29,7 @@
 | D1 | 剪贴板作用域 | **全局单剪贴板**：`GlitcherZApp.clipboard: Option<Clipboard>`，内容带类型标记。任何视图都可复制，但粘贴只在类型匹配的视图生效 |
 | D2 | 存索引还是存值 | **存值快照**。undo / 删除会让 `ClipSel` 的 clip 索引、`RollState.selection` 的音符索引失效，剪贴板不能持有索引 |
 | D3 | 键位与归属 | 视图消费 **`Event::Copy` / `Event::Paste`**：egui-winit 把 Ctrl+C/V 转成这两个事件，并在推 `Event::Key` 之前 `return`，所以真实窗口里 `consume_key` 永远收不到。同时保留 `consume_key(COMMAND, C/V)` 以兼容 headless 测试与非 winit 后端。Timeline / Edit 用 `response.has_focus()`，Patch 用 `response.hovered()`（与 Delete 一致）。全局 `keyboard.rs` 白名单保持现状（只 `continue`、不消费） |
-| D4 | macOS 兼容 | 用 `egui::Modifiers::COMMAND` 匹配：Windows / Linux 等价 Ctrl，macOS 为 Cmd。既有全局 Ctrl 白名单不动（其 Cmd 缺口是历史问题，不在本特性范围） |
+| D4 | macOS 兼容 | 用 `egui::Modifiers::COMMAND` 匹配：Windows / Linux 等价 Ctrl，macOS 为 Cmd。全局快捷键白名单原先的 Cmd 缺口已由 F-050 收口（`mod_keys`），此处不动 |
 | D5 | 空选 / 空剪贴板 | 不覆盖既有剪贴板；状态栏提示 `Copy: nothing selected` / `Paste: clipboard is empty`。类型不匹配提示 `Paste: clipboard holds <notes/clips/nodes>`，不改文档 |
 | D6 | 文本输入冲突 | 焦点在文本输入框时视图不消费（`ctx.text_edit_focused()`），交给系统剪贴板——与 eframe 的 `clipboard` feature 分工不变 |
 | D7 | Undo | 每次粘贴记**一步** undo：

@@ -83,6 +83,7 @@ pub mod keyboard;
 pub mod media;
 pub mod meter_ui;
 pub mod mixer_panel;
+pub mod mod_keys;
 pub mod patch;
 pub mod patch_ops;
 pub mod piano_roll;

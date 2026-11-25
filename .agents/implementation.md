@@ -15,7 +15,7 @@
 - **录音与 headless I/O**：录音、导出、Preferences、CLI、MCP
 - **框架升级与 gotchas**：依赖版本契约、egui 升级、跨平台构建
 - **系列实施补记与交互打磨**：2026-11-11 自 plan.md 归位的系列记录、I 系列
-- **特性 ID 注册表**：`F-001`–`F-049`（新特性先登记再实现）
+- **特性 ID 注册表**：`F-001`–`F-050`（新特性先登记再实现）
 
 ## 特性 ID 注册表
 
@@ -72,6 +72,7 @@
 | F-047 | 时间轴缩放：只留滚轮与键盘 | UI / EDIT | `timeline-zoom.md` | — |
 | F-048 | Editor 视图修缮（力度单音 / 音频尾段 / 波形裁剪 / 曲线时间轴） | EDIT / UI / ENGINE | `editor-view.md` | — |
 | F-049 | Editor 单一画布：curve 焦点并入钢琴卷帘 + 曲线写时增长 | EDIT / UI | `editor-curve-focus.md` | ✅ |
+| F-050 | 平台键位与提示修缮（macOS `Cmd` 化 / 捏合 / 插件默认目录 / 文案） | UI / PLUG | `platform-keys.md` | ✅ |
 
 > 无独立 spec 的历史条目（transport / 文件管理 U2 / U10 / U14 / I 系列 / B2 / W3a–c 等）保留字母别名，不做回溯编号；新特性一律先写 spec 再领号。
 
@@ -661,6 +662,18 @@ spec `timeline.md` D31。需求原话是「ctrl 中键切换 mute、mute 之后�
 **淡显是一层遮罩，不是逐个调色。** clip 块上有缝线、波形、曲线预览、组色条四层绘制，逐个降 alpha 会漏。做法是这些画完之后压一层 lane 底色的半透明矩形（alpha 165），再画选中/编辑描边（保持全强度：静音不能把"选中"也吃掉），最后是降透明度的标签和右上角 `M` 角标（窄块没有标签时仍可认出静音）。选择态与 modal 变暗是两个独立效果，可以叠加。
 
 **测试**：`timeline_mute.rs` 两条集成用例驱动真实 egui 帧（Ctrl+中键切换、裸中键不切换、`H` 静音选区、`Alt+H` 全恢复且未静音时为零动作）；引擎三条（muted clip 不排任何事件但 arrangement end 不变、un-mute 后同一份表恢复发声；control clip 不投递、span 仍在；audio clip 静音/恢复）；model 一条（未静音不写键、静音往返，三张表都覆盖）。
+
+### F-050 · 平台键位与提示修缮（2026-11-25 交付）
+
+- **一处判定**：新模块 `glitcherz-ui/src/mod_keys.rs` 收口命令修饰键——`mod1(Modifiers)` / `mod1_held(&InputState)` 判「`Ctrl` 或 `command`」（Windows / Linux 正交，macOS `Cmd` 为 `command`）；`consume_mod1` / `consume_mod1_shift` 先试 `COMMAND` 再试 `CTRL`，于是 macOS 上 `Cmd` 与物理 `Control` 都认。业务代码不再出现 `modifiers.ctrl` / `Modifiers::CTRL`，唯一例外是 `editing.rs` 的 `Ctrl+Tab`（`Cmd+Tab` 是系统切换器，D5）。`mod_key_label()` → macOS `⌘` / 其他 `Ctrl`，写进 `fonts.rs` 的 `UI_SYMBOLS` 后用字形测试兜底。
+- **`Shift+A` 永远先于 `A` 消费**：`consume_key` 按 `matches_logically` 匹配，不带 `shift` 的模式同样命中 `Shift+A`；卷帘 / 时间轴的 `consume_mod1_shift` 都写在 `consume_mod1` 之前（与剪贴板既有写法一致）。
+- **全局键白名单**：`keyboard.rs` 的 `mod1` 守卫把 macOS `Cmd+字母` 从 `KEYMAP` 里挡掉——修掉 `Cmd+Z` 降八度、`Cmd+S` / `Cmd+A` 弹音的旧 bug；`Space` / `Home` / `End` / `,` / `.` 的「无修饰键」判定同步换成 `!mod1`，`mod1+←/→` 照旧走「上一/下一小节」。
+- **捏合不再要求修饰键**：`egui-winit` 把触控板捏合转成 `Event::Zoom`，它**不带任何 modifier**；卷帘与时间轴改成「`zoom_delta` 非中性即缩放」（卷帘仍拒绝在冻结拖拽中缩放，否则会误平移）。新增 `egui_event_semantics` 用例钉住「捏合无修饰键也能缩放」。
+- **Patch 平移**：`Shift`+滚轮 = 平移（`smooth_scroll_delta`；egui 在 `Shift` 下把纵向 delta 折进 x 轴，`horizontal_scroll_modifier` 的默认行为），中键拖照旧；纯滚轮仍是缩放（F-047 结论不变）。
+- **插件默认目录**：CLAP / VST3 各拆出 `standard_*_dirs_for(os, env)` 纯函数——Windows 列表逐项保持原样，新增 macOS（`/Library/Audio/Plug-Ins/*` + `~/Library/Audio/Plug-Ins/*`）与 Linux（CLAP `~/.clap`、`/usr/lib/clap`、`/usr/local/lib/clap`；VST3 `~/.vst3`、`/usr/local/lib/vst3`、`/usr/lib/vst3`）。OS 与 `var_os` 注入后可跨平台断言。
+- **loopback 收敛**：`recording::loopback_supported()`（`cfg!(windows)`）门控设置里的 loopback 区块，`recording::loopback_label()` 让 Patch / 设置里的陈旧 loopback 在非 Windows 上不再冒充 WASAPI。
+- **文案**：菜单 `shortcut_text`、状态栏 `Snap off`、时间轴 / 卷帘 / Patch 的静态提示行与悬停文案统一走 `mod_key_label()`；`docs/{README,manual,shortcuts}.md` 顶部加一句「`Ctrl` = 命令修饰键（macOS `⌘`），`Ctrl+Tab` 例外」。触控板无中键的替代（`H` 静音、Patch `Shift`+滚轮平移、捏合缩放）一并写进文档。
+- **测试**（+10）：`mod_keys` 五条（三种命令键拼写都消费、Shift 先于裸键、无修饰键不命中、`Cmd`/`Control` 持有态、标签按 OS）；roll `Cmd+A` / `Cmd+Shift+A`；`egui_event_semantics` 三条（Ctrl+滚轮、捏合、Shift+滚轮落进 `smooth_scroll_delta.x`）；两个 host 各一条目录断言（Windows / macOS / Linux）。既有 `ctrl()` fixture 补 `command: true`，断言未改。
 
 ## 节点图与面板
 

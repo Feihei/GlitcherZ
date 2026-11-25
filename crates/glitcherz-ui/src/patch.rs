@@ -3732,7 +3732,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
             state.pan = Vec2::ZERO;
             state.zoom = 1.0;
         }
-        ui.weak("Shift+A / right-click to add node · right-click a port name to rename · Ctrl+right-drag to cut cables · click a cable dot to insert/delete · click to select · drag bg to box-select · middle-drag to pan · scroll to zoom · drag ports to connect · Delete / Backspace to remove");
+        ui.weak(format!(
+            "Shift+A / right-click to add node · right-click a port name to rename · {}+right-drag to cut cables · click a cable dot to insert/delete · click to select · drag bg to box-select · middle-drag or Shift+scroll to pan · scroll to zoom · drag ports to connect · Delete / Backspace to remove",
+            crate::mod_keys::mod_key_label()
+        ));
     });
 
     // ---- Patch ----
@@ -3748,29 +3751,38 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 2.0, Color32::from_rgb(22, 24, 28));
 
-    // Wheel zoom (plain wheel and Ctrl+wheel / pinch, anchored at the pointer).
-    // NOTE: `zoom_delta()` is a *multiplicative* factor whose neutral value is
-    // 1.0 (NOT 0.0) — comparing against 0.0 would zoom ×2 every frame and pin
-    // the view at ZOOM_MAX.
-    let (zoom_factor, scroll_y) = ui
+    // Wheel / pinch zoom, anchored at the pointer. NOTE: `zoom_delta()` is a
+    // *multiplicative* factor whose neutral value is 1.0 (NOT 0.0) — comparing
+    // against 0.0 would zoom ×2 every frame and pin the view at ZOOM_MAX.
+    //
+    // F-050 D8: `Shift`+wheel pans instead. A MacBook trackpad (and the Magic
+    // Mouse) has no middle button, which used to leave the patch impossible
+    // to pan; egui folds the vertical delta into the horizontal axis under
+    // `Shift`, so both axes arrive through `smooth_scroll_delta`. A plain
+    // wheel keeps zooming (F-047's "scroll = zoom" conclusion).
+    let (zoom_factor, scroll, shift) = ui
         .ctx()
-        .input(|i| (i.zoom_delta(), i.smooth_scroll_delta.y));
+        .input(|i| (i.zoom_delta(), i.smooth_scroll_delta, i.modifiers.shift));
     if response.hovered() {
-        let mult = if zoom_factor != 1.0 {
-            // Ctrl+wheel / pinch: egui already gives the multiplicative factor.
-            zoom_factor
-        } else if scroll_y != 0.0 {
-            // Plain wheel: convert the scroll delta into a zoom multiplier.
-            1.0 + scroll_y * 0.005
+        if shift && scroll != Vec2::ZERO && zoom_factor == 1.0 {
+            state.pan -= scroll / state.zoom;
         } else {
-            1.0
-        };
-        if mult != 1.0 {
-            let old = state.zoom;
-            state.zoom = (state.zoom * mult).clamp(ZOOM_MIN, ZOOM_MAX);
-            if let Some(sp) = response.hover_pos() {
-                let graph = state.pan + (sp - rect.min) / old;
-                state.pan = graph - (sp - rect.min) / state.zoom;
+            let mult = if zoom_factor != 1.0 {
+                // Ctrl+wheel / pinch: egui already gives the multiplicative factor.
+                zoom_factor
+            } else if scroll.y != 0.0 {
+                // Plain wheel: convert the scroll delta into a zoom multiplier.
+                1.0 + scroll.y * 0.005
+            } else {
+                1.0
+            };
+            if mult != 1.0 {
+                let old = state.zoom;
+                state.zoom = (state.zoom * mult).clamp(ZOOM_MIN, ZOOM_MAX);
+                if let Some(sp) = response.hover_pos() {
+                    let graph = state.pan + (sp - rect.min) / old;
+                    state.pan = graph - (sp - rect.min) / state.zoom;
+                }
             }
         }
     }
@@ -3779,7 +3791,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     let drag_started = response.drag_started_by(egui::PointerButton::Primary);
     let drag_stopped = response.drag_stopped_by(egui::PointerButton::Primary);
     let shift = ui.ctx().input(|i| i.modifiers.shift);
-    let ctrl = ui.ctx().input(|i| i.modifiers.ctrl);
+    let ctrl = ui.ctx().input(crate::mod_keys::mod1_held);
 
     // Shorthands for the port geometry (the timeline box grows with tracks).
     let midi_count = deps.track_count;
@@ -3879,9 +3891,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
     // A right-click ON a port caption belongs to the inline rename instead.
     let shift_a = !ctrl
         && !ui.ctx().egui_wants_keyboard_input()
-        && ui
-            .ctx()
-            .input(|i| i.modifiers.shift && !i.modifiers.command && i.key_pressed(egui::Key::A));
+        && ui.ctx().input(|i| {
+            i.modifiers.shift && !crate::mod_keys::mod1_held(i) && i.key_pressed(egui::Key::A)
+        });
     // While an editor is open, the right-click belongs to "click elsewhere
     // to commit" — do not also open a menu / start a second rename.
     let right_click = response.secondary_clicked() && !ctrl && state.rename.is_none();
@@ -5203,7 +5215,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut PatchState, deps: PatchDeps<'_>) -> V
                                 "{} ch · {}",
                                 deps.input.channels,
                                 if deps.input.loopback {
-                                    "WASAPI loopback (what this output plays)"
+                                    crate::recording::loopback_label()
                                 } else {
                                     "capture input"
                                 }

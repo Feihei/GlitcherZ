@@ -188,16 +188,17 @@ impl GlitcherZApp {
                 // targeting the grid is then explained. Text fields keep Ctrl
                 // for their own shortcuts, so the override only shows where it
                 // actually applies.
-                let ctrl = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.command);
+                let ctrl = ui.ctx().input(crate::mod_keys::mod1_held);
                 ui.separator();
                 if ctrl && !ui.ctx().text_edit_focused() {
                     ui.label(
                         egui::RichText::new("Snap off")
                             .color(egui::Color32::from_rgb(230, 190, 70)),
                     )
-                    .on_hover_text(
-                        "Ctrl is held: drags land on the nearest tick instead of the grid",
-                    );
+                    .on_hover_text(format!(
+                        "{} is held: drags land on the nearest tick instead of the grid",
+                        crate::mod_keys::mod_key_label()
+                    ));
                 } else {
                     ui.label(format!("Snap {}", self.timeline_state.snap_grid.label()))
                         .on_hover_text(self.timeline_state.snap_grid.hint());

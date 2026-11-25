@@ -193,6 +193,7 @@ fn ctrl_middle_click_toggles_the_clip_under_the_pointer() {
 
     f.modifiers = egui::Modifiers {
         ctrl: true,
+        command: true,
         ..egui::Modifiers::default()
     };
     let actions = f.click(pos, egui::PointerButton::Middle);
@@ -218,6 +219,34 @@ fn ctrl_middle_click_toggles_the_clip_under_the_pointer() {
                 if !*muted && clips == &vec![expected])
         ),
         "the second gesture must clear the flag, got {actions:?}"
+    );
+}
+
+/// Same gesture as macOS reports `Cmd` (spec F-050 D14): `command` is set,
+/// the physical `ctrl` flag is not. The mute toggle must behave identically.
+#[test]
+fn cmd_middle_click_toggles_the_clip_like_ctrl() {
+    let mut f = Fixture::new();
+    let y = f.lane_y_on_the_clip();
+    let pos = egui::pos2(LANE_X, y);
+    f.modifiers = egui::Modifiers {
+        mac_cmd: true,
+        command: true,
+        ..egui::Modifiers::default()
+    };
+
+    let actions = f.click(pos, egui::PointerButton::Middle);
+    let expected = ClipSel {
+        lane: TimelineLane::Midi,
+        track: 0,
+        clip: 0,
+    };
+    assert!(
+        actions.iter().any(
+            |a| matches!(a, TimelineAction::SetClipMuted { clips, muted }
+                if *muted && clips == &vec![expected])
+        ),
+        "Cmd+middle click must mute the clip under the pointer, got {actions:?}"
     );
 }
 

@@ -153,7 +153,7 @@ mod tests {
     /// so the button paints the instrument itself (`transport_icons`).
     const UI_SYMBOLS: &str = "\u{A7}\u{B1}\u{B7}\u{D7}\u{2013}\u{2014}\u{2026}\u{2039}\u{203A}\
                               \u{2190}\u{2191}\u{2192}\u{2193}\u{21A9}\u{2212}\u{221E}\u{2248}\
-                              \u{23ED}\u{23EE}\u{23F8}\u{23F9}\u{23FA}\u{25B6}\u{266A}\u{1F501}";
+                              \u{2318}\u{23ED}\u{23EE}\u{23F8}\u{23F9}\u{23FA}\u{25B6}\u{266A}\u{1F501}";
 
     #[test]
     fn every_symbol_the_ui_labels_with_has_a_glyph() {

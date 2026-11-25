@@ -409,6 +409,7 @@ fn shift() -> egui::Modifiers {
 fn ctrl_shift() -> egui::Modifiers {
     egui::Modifiers {
         ctrl: true,
+        command: true,
         shift: true,
         ..Default::default()
     }
@@ -417,6 +418,17 @@ fn ctrl_shift() -> egui::Modifiers {
 fn ctrl() -> egui::Modifiers {
     egui::Modifiers {
         ctrl: true,
+        command: true,
+        ..Default::default()
+    }
+}
+
+/// macOS `Cmd` as egui-winit reports it (spec F-050 D14): the physical
+/// `ctrl` flag stays false, `command` is what business code must read.
+fn cmd() -> egui::Modifiers {
+    egui::Modifiers {
+        mac_cmd: true,
+        command: true,
         ..Default::default()
     }
 }
@@ -1445,6 +1457,25 @@ fn ctrl_a_selects_every_note_and_ctrl_shift_a_clears() {
 
     let _ = f.tap_key_with(egui::Key::A, ctrl_shift());
     assert!(f.state.selection.is_empty(), "Ctrl+Shift+A clears");
+}
+
+/// Same gesture with macOS `Cmd` (spec F-050 D14): business code reads the
+/// command modifier, not the physical `Control` flag.
+#[test]
+fn cmd_a_selects_every_note_and_cmd_shift_a_clears() {
+    let mut f = Fixture::new();
+    let _ = f.frame(vec![hover(f.pos(120.0, 60))]);
+    let _ = f.tap_key_with(egui::Key::A, cmd());
+    assert_eq!(
+        f.state.selection,
+        vec![0, 1],
+        "Cmd+A must select every note like Ctrl+A"
+    );
+
+    let mut cmd_shift = cmd();
+    cmd_shift.shift = true;
+    let _ = f.tap_key_with(egui::Key::A, cmd_shift);
+    assert!(f.state.selection.is_empty(), "Cmd+Shift+A clears");
 }
 
 /// Regression (user report, 2026-11-05): dragging a note past the clip edge

@@ -118,23 +118,52 @@ pub enum HostError {
 // Plugin scanning
 // ---------------------------------------------------------------------------
 
-/// Platform-specific standard CLAP plugin search directories.
+/// Platform-specific standard CLAP plugin search directories (spec F-050
+/// D10). Windows keeps its long-standing four entries; macOS / Linux follow
+/// the CLAP spec's standard locations instead of scanning nothing.
 fn standard_clap_dirs() -> Vec<PathBuf> {
+    standard_clap_dirs_for(std::env::consts::OS, |name| std::env::var_os(name))
+}
+
+/// [`standard_clap_dirs`] with the OS and environment injected so every
+/// platform's list is testable on any host.
+fn standard_clap_dirs_for(
+    os: &str,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(program_files) = std::env::var_os("ProgramFiles") {
-        dirs.push(
-            PathBuf::from(program_files)
-                .join("Common Files")
-                .join("CLAP"),
-        );
-    }
-    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        let local_app_data = PathBuf::from(local_app_data);
-        dirs.push(local_app_data.join("Programs").join("Common").join("CLAP"));
-        dirs.push(local_app_data.join("CLAP"));
-    }
-    if let Some(app_data) = std::env::var_os("APPDATA") {
-        dirs.push(PathBuf::from(app_data).join("CLAP"));
+    match os {
+        "windows" => {
+            if let Some(program_files) = env("ProgramFiles") {
+                dirs.push(
+                    PathBuf::from(program_files)
+                        .join("Common Files")
+                        .join("CLAP"),
+                );
+            }
+            if let Some(local_app_data) = env("LOCALAPPDATA") {
+                let local_app_data = PathBuf::from(local_app_data);
+                dirs.push(local_app_data.join("Programs").join("Common").join("CLAP"));
+                dirs.push(local_app_data.join("CLAP"));
+            }
+            if let Some(app_data) = env("APPDATA") {
+                dirs.push(PathBuf::from(app_data).join("CLAP"));
+            }
+        }
+        "macos" => {
+            dirs.push(PathBuf::from("/Library/Audio/Plug-Ins/CLAP"));
+            if let Some(home) = env("HOME") {
+                dirs.push(PathBuf::from(home).join("Library/Audio/Plug-Ins/CLAP"));
+            }
+        }
+        "linux" => {
+            if let Some(home) = env("HOME") {
+                dirs.push(PathBuf::from(home).join(".clap"));
+            }
+            dirs.push(PathBuf::from("/usr/lib/clap"));
+            dirs.push(PathBuf::from("/usr/local/lib/clap"));
+        }
+        _ => {}
     }
     dirs
 }
@@ -1044,7 +1073,7 @@ impl Processor for ClapNode {
 mod tests {
     use super::{
         ClapInstance, ClapInstanceConfig, ClapPluginInfo, HostError, list_clap_plugins_in,
-        scan_clap_files,
+        scan_clap_files, standard_clap_dirs_for,
     };
     use glitcherz_engine::realtime::NoteEvent;
     use glitcherz_engine::realtime::buffer::AudioBuffer;
@@ -1053,6 +1082,55 @@ mod tests {
     use glitcherz_engine::realtime::processor::Processor;
 
     use std::path::PathBuf;
+
+    #[test]
+    fn standard_clap_dirs_follow_the_os() {
+        use std::ffi::OsString;
+
+        let windows = standard_clap_dirs_for("windows", |name| match name {
+            "ProgramFiles" => Some(OsString::from("C:/Program Files")),
+            "LOCALAPPDATA" => Some(OsString::from("C:/Users/me/AppData/Local")),
+            "APPDATA" => Some(OsString::from("C:/Users/me/AppData/Roaming")),
+            _ => None,
+        });
+        assert_eq!(
+            windows,
+            vec![
+                PathBuf::from("C:/Program Files")
+                    .join("Common Files")
+                    .join("CLAP"),
+                PathBuf::from("C:/Users/me/AppData/Local")
+                    .join("Programs")
+                    .join("Common")
+                    .join("CLAP"),
+                PathBuf::from("C:/Users/me/AppData/Local").join("CLAP"),
+                PathBuf::from("C:/Users/me/AppData/Roaming").join("CLAP"),
+            ]
+        );
+
+        let macos = standard_clap_dirs_for("macos", |name| {
+            (name == "HOME").then(|| OsString::from("/Users/me"))
+        });
+        assert_eq!(
+            macos,
+            vec![
+                PathBuf::from("/Library/Audio/Plug-Ins/CLAP"),
+                PathBuf::from("/Users/me/Library/Audio/Plug-Ins/CLAP"),
+            ]
+        );
+
+        let linux = standard_clap_dirs_for("linux", |name| {
+            (name == "HOME").then(|| OsString::from("/home/me"))
+        });
+        assert_eq!(
+            linux,
+            vec![
+                PathBuf::from("/home/me/.clap"),
+                PathBuf::from("/usr/lib/clap"),
+                PathBuf::from("/usr/local/lib/clap"),
+            ]
+        );
+    }
 
     /// Dynamic library path of the test plugin (`cargo test --workspace`
     /// builds the cdylib first).

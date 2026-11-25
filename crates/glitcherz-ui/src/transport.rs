@@ -116,6 +116,9 @@ impl GlitcherZApp {
 
     pub(crate) fn transport_panel(&mut self, ui: &mut egui::Ui) {
         let playing = self.engine.is_playing();
+        // F-050 D12: menu shortcut labels render the platform's command
+        // modifier (`⌘` on macOS, `Ctrl` elsewhere).
+        let mod1 = crate::mod_keys::mod_key_label();
         let response = egui::Panel::top("glitcherz_transport").show(ui, |ui| {
             ui.horizontal(|ui| {
                 // The row is short of width by design: every control is either
@@ -128,14 +131,14 @@ impl GlitcherZApp {
                 // here now).
                 ui.menu_button("File", |ui| {
                     if ui
-                        .add(egui::Button::new("New").shortcut_text("Ctrl+N"))
+                        .add(egui::Button::new("New").shortcut_text(format!("{mod1}+N")))
                         .clicked()
                     {
                         ui.close();
                         self.request_file_action(FileAction::New);
                     }
                     if ui
-                        .add(egui::Button::new("Open…").shortcut_text("Ctrl+O"))
+                        .add(egui::Button::new("Open…").shortcut_text(format!("{mod1}+O")))
                         .clicked()
                     {
                         ui.close();
@@ -155,14 +158,17 @@ impl GlitcherZApp {
                     });
                     ui.separator();
                     if ui
-                        .add(egui::Button::new("Save").shortcut_text("Ctrl+S"))
+                        .add(egui::Button::new("Save").shortcut_text(format!("{mod1}+S")))
                         .clicked()
                     {
                         ui.close();
                         self.save_project();
                     }
                     if ui
-                        .add(egui::Button::new("Save As…").shortcut_text("Ctrl+Shift+S"))
+                        .add(
+                            egui::Button::new("Save As…")
+                                .shortcut_text(format!("{mod1}+Shift+S")),
+                        )
                         .clicked()
                     {
                         ui.close();
@@ -223,7 +229,7 @@ impl GlitcherZApp {
                     if ui
                         .add_enabled(
                             self.session.can_undo(),
-                            egui::Button::new(undo_text).shortcut_text("Ctrl+Z"),
+                            egui::Button::new(undo_text).shortcut_text(format!("{mod1}+Z")),
                         )
                         .clicked()
                     {
@@ -233,7 +239,7 @@ impl GlitcherZApp {
                     if ui
                         .add_enabled(
                             self.session.can_redo(),
-                            egui::Button::new(redo_text).shortcut_text("Ctrl+Y"),
+                            egui::Button::new(redo_text).shortcut_text(format!("{mod1}+Y")),
                         )
                         .clicked()
                     {
@@ -305,7 +311,9 @@ impl GlitcherZApp {
                 let loop_on = self.project().metadata.loop_range.is_active();
                 let loop_btn = egui::Button::new("🔁").selected(loop_on);
                 if icon_button(ui, loop_btn)
-                    .on_hover_text("Song loop — drag the range out on the ruler with Ctrl")
+                    .on_hover_text(format!(
+                        "Song loop — drag the range out on the ruler with {mod1}"
+                    ))
                     .clicked()
                 {
                     let enable = !loop_on;

@@ -1986,11 +1986,12 @@ pub fn show(
                     ),
                 );
             }
+            let mod1 = crate::mod_keys::mod_key_label();
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(
-                        "click: select · drag: tweak · dbl-click: insert · edges: trim · Ctrl+drag: copy · d: draw · G move · S scale · T stretch (LMB ok · RMB/Esc cancel) · K knife · Del del · RMB: delete · arrows: nudge · wheel: pitch · Shift+wheel: time · Ctrl+wheel: zoom time · Ctrl+Alt+wheel: zoom pitch · middle-drag: pan",
-                    )
+                    egui::RichText::new(format!(
+                        "click: select · drag: tweak · dbl-click: insert · edges: trim · {mod1}+drag: copy · d: draw · G move · S scale · T stretch (LMB ok · RMB/Esc cancel) · K knife · Del del · RMB: delete · arrows: nudge · wheel: pitch · Shift+wheel: time · {mod1}+wheel: zoom time · {mod1}+Alt+wheel: zoom pitch · middle-drag / two-finger scroll: pan"
+                    ))
                     .weak(),
                 )
                 .truncate(),
@@ -2202,10 +2203,11 @@ pub fn show(
     state.focus_id = Some(response.id);
     let width = rect.width();
 
-    // ---- View navigation: Ctrl+wheel zooms the time axis, Ctrl+Alt+wheel
-    // zooms the pitch axis (egui's vertical-only zoom), Shift+wheel scrolls
-    // the time axis, the plain wheel scrolls pitch, middle-drag pans both
-    // axes. Zoom is anchored on the pointer so the note under it stays put.
+    // ---- View navigation: `mod1`+wheel zooms the time axis, `mod1`+Alt+wheel
+    // zooms the pitch axis (egui's vertical-only zoom), a pinch zooms the same
+    // way (it carries no modifier, spec F-050 D7), Shift+wheel scrolls the
+    // time axis, the plain wheel scrolls pitch, middle-drag pans both axes.
+    // Zoom is anchored on the pointer so the note under it stays put.
     //
     // The fit basis is the **context** span (P3, D3), so a multi-clip subject
     // opens with every ghost on screen — but never narrower than two bars: a
@@ -2213,21 +2215,21 @@ pub fn show(
     // to see what comes next (or to draw into the bar after it).
     let fit_ticks = (window.end - window.start).max(2.0 * origin_bar_ticks as f32);
     let fit_ticks_to_x = width / fit_ticks.max(1.0);
-    let (zoom2, wheel, nav_mods) = ui
+    let (zoom2, wheel) = ui
         .ctx()
-        .input(|i| (i.zoom_delta_2d(), i.smooth_scroll_delta, i.modifiers));
-    // Ctrl+wheel zoom is refused while a drag is frozen: the frozen scale
-    // ignores `zoom_x`, and `zoom_scroll_anchor` would still mutate
-    // `scroll_x` — a zoom attempt mid-drag would pan the view instead.
+        .input(|i| (i.zoom_delta_2d(), i.smooth_scroll_delta));
+    // Zoom is refused while a drag is frozen: the frozen scale ignores
+    // `zoom_x`, and `zoom_scroll_anchor` would still mutate `scroll_x` — a
+    // zoom attempt mid-drag would pan the view instead.
+    let zooming = zoom2.x != 1.0 || zoom2.y != 1.0;
     if response.hovered() {
-        let ctrl = nav_mods.ctrl || nav_mods.command;
-        if ctrl && state.drag_scale.is_none() {
+        if zooming && state.drag_scale.is_none() {
             if let Some(sp) = response.hover_pos() {
                 let (zx, zy) = (zoom2.x, zoom2.y);
-                // Pure Ctrl gives a uniform factor; Ctrl+Alt gives a
-                // vertical-only factor. Treat the time axis as the default
-                // (a uniform zoom only ever moves time), and the pitch axis
-                // only when the factor is vertical-only.
+                // Pure mod1 (or a pinch) gives a uniform factor; mod1+Alt
+                // gives a vertical-only factor. Treat the time axis as the
+                // default (a uniform zoom only ever moves time), and the pitch
+                // axis only when the factor is vertical-only.
                 let uniform = (zx - zy).abs() < 1e-4;
                 if zx != 1.0 {
                     let new_zoom = (state.zoom_x * zx).clamp(ZOOM_X_MIN, ZOOM_X_MAX);
@@ -2403,7 +2405,7 @@ pub fn show(
                 .is_some_and(|p| ruler_rect.contains(p))
     });
     if ruler_active && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
-        let ctrl = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.command);
+        let ctrl = ui.ctx().input(crate::mod_keys::mod1_held);
         let raw = geom.local_at(pos.x) + origin_tick as f32;
         let tick = if ctrl {
             raw.round() as i64
@@ -2452,12 +2454,12 @@ pub fn show(
     let edit_end = visible_end.min(ghost_floor);
     let over_focus = |pos: egui::Pos2| (edit_start..edit_end).contains(&geom.local_at(pos.x));
     let modifiers = ui.ctx().input(|i| i.modifiers);
-    let snap = if modifiers.ctrl || modifiers.command {
+    let snap = if crate::mod_keys::mod1(modifiers) {
         Snap::OFF
     } else {
         Snap::on(grid_ticks)
     };
-    let additive = modifiers.shift || modifiers.ctrl;
+    let additive = modifiers.shift || crate::mod_keys::mod1(modifiers);
 
     // Live modal geometry: computed from the pointer's latest position (a
     // modal transform follows the mouse even outside the roll), feeding the
@@ -2887,13 +2889,9 @@ pub fn show(
             delete: i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
                 || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace),
             // The Shift variant is consumed first: `consume_key` matches
-            // logically, so the plain Ctrl+A pattern would swallow it too.
-            deselect_all: {
-                let mut mods = egui::Modifiers::CTRL;
-                mods.shift = true;
-                i.consume_key(mods, egui::Key::A)
-            },
-            select_all: i.consume_key(egui::Modifiers::CTRL, egui::Key::A),
+            // logically, so the plain mod1+A pattern would swallow it too.
+            deselect_all: crate::mod_keys::consume_mod1_shift(i, egui::Key::A),
+            select_all: crate::mod_keys::consume_mod1(i, egui::Key::A),
             // F-040: winit turns Ctrl+C/V into `Event::Copy` / `Event::Paste`
             // and pushes no Key event, so the events are the real path; the
             // key checks serve headless tests / other backends.
@@ -3914,7 +3912,7 @@ fn curve_lanes(
         }
 
         // ---- Interaction: click adds, drag moves, right-click deletes ----
-        let snap = if ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.command) {
+        let snap = if ui.ctx().input(crate::mod_keys::mod1_held) {
             Snap::OFF
         } else {
             Snap::on(i64::from(crate::curve::SNAP_TICKS))
@@ -4073,9 +4071,10 @@ fn curve_toolbar(
         ui.separator();
         ui.add(
             egui::Label::new(
-                egui::RichText::new(
-                    "click: add anchor · drag: move · drag past the end: grow the clip · right-click: delete · Ctrl: snap off",
-                )
+                egui::RichText::new(format!(
+                    "click: add anchor · drag: move · drag past the end: grow the clip · right-click: delete · {}: snap off",
+                    crate::mod_keys::mod_key_label()
+                ))
                 .weak(),
             )
             .truncate(),

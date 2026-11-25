@@ -283,7 +283,7 @@ impl GlitcherZApp {
                 Some(info) => {
                     ui.label(egui::RichText::new(&info.device_name).strong());
                     let kind = if info.loopback {
-                        "WASAPI loopback (what this output plays)"
+                        crate::recording::loopback_label()
                     } else {
                         "capture input"
                     };
@@ -341,22 +341,26 @@ impl GlitcherZApp {
                 }
             }
 
-            ui.add_space(2.0);
-            ui.weak("System playback (loopback)");
-            if loopbacks.is_empty() {
-                ui.weak("(none found)");
-            }
-            for name in loopbacks {
-                let source = RecordSource::Loopback(name.clone());
-                let hint = "WASAPI loopback: records everything this output device plays — \
-                            other apps, and this project's own playback if the engine outputs \
-                            to it.";
-                if ui
-                    .selectable_label(current == source, format!("↩ {name}"))
-                    .on_hover_text(hint)
-                    .clicked()
-                {
-                    pick = Some(source);
+            // F-050 D11: WASAPI loopback only exists on Windows — do not offer
+            // (or describe) a source the platform cannot record.
+            if crate::recording::loopback_supported() {
+                ui.add_space(2.0);
+                ui.weak("System playback (loopback)");
+                if loopbacks.is_empty() {
+                    ui.weak("(none found)");
+                }
+                for name in loopbacks {
+                    let source = RecordSource::Loopback(name.clone());
+                    let hint = "WASAPI loopback: records everything this output device plays — \
+                                other apps, and this project's own playback if the engine outputs \
+                                to it.";
+                    if ui
+                        .selectable_label(current == source, format!("↩ {name}"))
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        pick = Some(source);
+                    }
                 }
             }
 
@@ -366,10 +370,12 @@ impl GlitcherZApp {
             }
         })
         .response
-        .on_hover_text(
+        .on_hover_text(if crate::recording::loopback_supported() {
             "Recording source (one stream: applies to every audio take). ↩ entries record what \
-             the machine plays.",
-        );
+             the machine plays."
+        } else {
+            "Recording source (one stream: applies to every audio take)."
+        });
 
         if let Some(source) = pick {
             self.pick_audio_source(source);

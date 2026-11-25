@@ -20,7 +20,7 @@
 路线图 1–10 全部落地；基础功能、节点图、MIDI 编辑、插件宿主、可用性（U 系列）、录音（R 系列）、内建效果器（E 系列）、声源扩展（Y / Z / B 系列）与交互打磨（I 系列）均已交付。已完成系列的设计与实现位置见下方「历史系列索引」——本文件不再逐项记录它们的实施细节。
 
 - **进行中**：Met 系列（吸附统一 + 拍号变化）**已收官**（M1–M5b 全部交付）；Aud 系列（Edit 试听 + 独立标尺）**已收官**（Aud1–Aud3 全部交付）；命令词汇表（F-039）V1a / V1b-1 / V1b-2 / V2 / V3 **全部交付**；剪贴板（F-040）C1–C2 已交付（2026-11-11）；clip 与数据分离（F-041）M1–M6 已交付（2026-11-11），2026-11-12 M8 修订（`repeat` 标记 + 复制键位）。
-- **下一步候选**：**F-046 已收口**（M1–M3 + R2 改版：面板从数据池表格改成 clip 属性面板；详见 `spec/clip-data-panel.md`）。F-045 已实施（吸附档位与磁性边界，2026-11-17；详见 `spec/snap-granularity.md`）。F-047 已实施（时间轴缩放删掉工具栏 `-`/`+`，只留滚轮 + `-`/`=`；详见 `spec/timeline-zoom.md`）。F-041 review 续作（M9 → M10 → M11，spec §13 已定稿、未实施）；其余未完成项见下方列表（用户表导入 / 安全边界）。
+- **下一步候选**：**F-046 已收口**（M1–M3 + R2 改版：面板从数据池表格改成 clip 属性面板；详见 `spec/clip-data-panel.md`）。F-045 已实施（吸附档位与磁性边界，2026-11-17；详见 `spec/snap-granularity.md`）。F-047 已实施（时间轴缩放删掉工具栏 `-`/`+`，只留滚轮 + `-`/`=`；详见 `spec/timeline-zoom.md`）。**F-050 已交付**（macOS 键位 `Cmd` 化 + 捏合与中键替代 + 插件默认目录 + 文案，2026-11-25；详见 `spec/platform-keys.md`）。F-041 review 续作（M9 → M10 → M11，spec §13 已定稿、未实施）；其余未完成项见下方列表（用户表导入 / 安全边界）。
 - **门禁**：`cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`，在本机沙箱外跑（沙箱内 cargo 会毒化 `target/debug/incremental`）。
 
 ## 未完成项
@@ -33,6 +33,7 @@
   - **命令词汇表**（**F-039，2026-11-11 已立项**，见下方小节）——`midi.*` 全都作用于既有 clip，改音色参数也还没有稳定字符串名。MCP 能「改音符」但改不了「用什么音色」、也开不了新 clip。这一期 = `NodeParam` 稳定名 + `clip.add` + `graph.set_param`，spec 已写：`spec/command-vocabulary.md`（D1–D8）。
   - **用户表导入**（**F-043，2026-11-11 已立项**，见 `spec/wavetable-import.md`）：单周期 WAV → 内置 bank 的第 5 帧；不做 `.wt` / 命名库 / 缓存淘汰。风险在文件与 UI，不在 DSP。
   - **安全边界**（**F-042，2026-11-11 已立项**，见 `spec/project-trust.md`）：现在只管客户端给的路径，工程内部引用的媒体 / SF2 / 插件路径照单全收（等同于在窗口里打开一个不信任的工程）；按「工程信任模型」审计 + 默认仅内部 + CLI `--trust-project`。
+- [x] **macOS 平台修缮（F-050，2026-11-25 交付）**：`Ctrl` 命令键在 macOS 上换成 `Cmd`（含"按 `Cmd+字母` 会误弹音"的全局守卫）、触控板无中键与捏合失效、CLAP/VST3 默认目录只有 Windows、界面提示与 `docs` 口径——见下方小节与 `spec/platform-keys.md`。
 
 ## 吸附档位与磁性边界（F-045，2026-11-17 立项）
 
@@ -291,6 +292,20 @@ Spec：`spec/edit-audition.md`（D1–D10）。
 
 - 试听循环、Edit 独立播放按钮、audio clip 的 Edit 波形/试听、平铺区在主卷帘展开、audition 序列化、试听淡入淡出。
 
+## 平台键位与提示修缮（F-050，2026-11-25 立项）
+
+用户诉求：**macOS 上把所有命令类 `Ctrl` 键位换成 `Cmd`**，并把同一批平台问题（键盘之外、提示文案）一起落成计划。
+
+Spec：`spec/platform-keys.md`（D1–D16 + 逐文件改动清单 + 验收 8 条）。
+
+- **起因**：`af9ee07` 只修了 `Delete`/`Backspace`。项目里三种修饰键写法并存——只有剪贴板用了跨平台的 `Modifiers::COMMAND`，其余是 `Modifiers::CTRL` 或直接读 `i.modifiers.ctrl`，在 macOS 上都只认物理 `Control`。已写 `ctrl || command` 的（滚轮缩放 / 吸附开关 / 标尺 loop）是另一半，于是同一套语义两半各走一边。
+- **更糟的一条**：`keyboard.rs:692` 的全局白名单只认 `modifiers.ctrl`，macOS 上 `Cmd+Z` 会落到 `:731` 变成**降八度**、`Cmd+S`/`Cmd+A` 会落到 `KEYMAP` **弹出一个音**。
+- **范围**：① 新模块 `ui/src/mod_keys.rs`（`consume_mod1` / `mod1_held` / `mod_key_label`）收口全部判定；② 全局键与卷帘/时间轴/patch 的 `A` / `Shift+A` / `G` / 加选 / 切线；③ 捏合不再要求修饰键、Patch 补 `Shift+滚轮` 平移；④ CLAP / VST3 默认目录按 OS 分支；⑤ 非 Windows 隐藏 WASAPI loopback 文案；⑥ 菜单 `shortcut_text` 与静态提示行按平台渲染 `⌘`；⑦ `docs` 口径统一。
+- **不做**：macOS 输入法、非 QWERTY 音位重映射、插件 GUI 内嵌的 mac/Linux 实现、可配置键位表、`⌥`/`⌃` 字形。
+- **顺序**：M1 helper → M2 全局键 → M3 视图键与鼠标（M6 插件目录可并行）→ M4 手势 → M5 文案 → M7 文档。
+- **门禁**：两种修饰键组合（`{ctrl,command}` 与 `{command,mac_cmd}`）跑同一批断言；`rg "modifiers\.ctrl|Modifiers::CTRL"` 只剩 helper 与 `editing.rs` 的 `Ctrl+Tab` 例外；全量 fmt + clippy `-D warnings` + test（沙箱外）。
+- **状态**：**已交付（2026-11-25）**，M1–M7 全部落地；实施要点与测试见 `implementation.md` F-050。
+
 ## 历史系列索引
 
 已完成系列的细节不再占用本文件；下表保证 spec 里「对应 `plan.md` 某系列」的旧引用仍可解析。按**特性**检索请用 `implementation.md` 的「特性 ID 注册表」（`F-ID` ↔ spec ↔ 原系列），编号规则见 `AGENTS.md`「特性编号（F-ID）」。
@@ -315,6 +330,7 @@ Spec：`spec/edit-audition.md`（D1–D10）。
 | I 系列 | I1–I6（交互打磨） | 已交付 | 决策表见 `implementation.md` | `implementation.md` I 系列 |
 | F-048 | Editor 视图修缮（力度单音 / 音频尾段播放 / 波形裁剪 / 曲线时间轴 + 目标切换） | 已交付（2026-11-18） | `spec/editor-view.md` | `implementation.md` F-048 |
 | F-049 | Editor 单一画布（curve 焦点并入钢琴卷帘 / 非焦点淡显 / 曲线写时增长） | 已交付（2026-11-18） | `spec/editor-curve-focus.md` | `implementation.md` F-049 |
+| F-050 | 平台键位与提示修缮（macOS `Cmd` 化 / 捏合 / 插件默认目录 / 文案） | 已交付（2026-11-25） | `spec/platform-keys.md` | `implementation.md` F-050 |
 
 ## 明确不做（全局）
 

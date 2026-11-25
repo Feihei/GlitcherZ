@@ -23,6 +23,7 @@ struct Probe {
     dragged_middle: bool,
     hovered: bool,
     smooth_y: f32,
+    smooth_x: f32,
     zoom_delta: f32,
     global_primary_clicked: bool,
     press_origin: Option<egui::Pos2>,
@@ -60,6 +61,7 @@ fn frame(ctx: &egui::Context, events: Vec<egui::Event>, t: f64) -> Probe {
             p.hovered = r.hovered();
         });
         p.smooth_y = ctx.input(|i| i.smooth_scroll_delta.y);
+        p.smooth_x = ctx.input(|i| i.smooth_scroll_delta.x);
         p.zoom_delta = ctx.input(|i| i.zoom_delta());
         p.global_primary_clicked =
             ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
@@ -324,6 +326,48 @@ fn ctrl_wheel_reaches_zoom_delta() {
     assert!(
         p.zoom_delta > 1.0,
         "ctrl+wheel must produce a zoom factor via zoom_delta (COMMAND == ctrl off macOS)"
+    );
+}
+
+/// spec F-050 D7: `egui-winit` folds a trackpad pinch into `Event::Zoom`,
+/// which carries **no modifier**. The roll / timeline therefore must zoom on
+/// a non-neutral `zoom_delta`, not on a held `mod1`.
+#[test]
+fn pinch_reaches_zoom_delta_without_any_modifier() {
+    let ctx = egui::Context::default();
+    frame(&ctx, vec![hover(CENTER)], 0.0);
+    let p = frame(&ctx, vec![hover(CENTER), egui::Event::Zoom(1.25)], 0.1);
+
+    assert!(
+        p.zoom_delta > 1.0,
+        "a pinch must zoom even though no modifier is held (D7)"
+    );
+}
+
+/// spec F-050 D8: under `Shift`, egui folds the vertical wheel delta into the
+/// horizontal axis (`horizontal_scroll_modifier`), which is the channel the
+/// patch reads for its Shift+wheel pan.
+#[test]
+fn shift_wheel_lands_in_smooth_scroll_for_patch_panning() {
+    let ctx = egui::Context::default();
+    let mods = egui::Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    frame(&ctx, vec![hover(CENTER)], 0.0);
+    let p = frame(
+        &ctx,
+        vec![hover(CENTER), wheel(egui::vec2(0.0, 3.0), mods)],
+        0.1,
+    );
+
+    assert_eq!(
+        p.zoom_delta, 1.0,
+        "Shift+wheel must not zoom — it is the patch pan gesture (D8)"
+    );
+    assert!(
+        p.smooth_x != 0.0,
+        "Shift+wheel must reach smooth_scroll_delta.x (patch pan depends on this)"
     );
 }
 /// Transport keys (Space / Home / End) must stay global while a click-sensing

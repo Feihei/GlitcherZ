@@ -283,9 +283,12 @@ impl GlitcherZApp {
                 "Song loop",
             )
             .on_disabled_hover_text(if loop_valid {
-                ""
+                String::new()
             } else {
-                "No song loop set — Ctrl+drag on the ruler to draw one"
+                format!(
+                    "No song loop set — {}+drag on the ruler to draw one",
+                    crate::mod_keys::mod_key_label()
+                )
             })
             .on_hover_text("The enabled loop range on the ruler");
             ui.add_space(10.0);
