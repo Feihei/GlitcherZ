@@ -73,6 +73,7 @@
 | F-048 | Editor 视图修缮（力度单音 / 音频尾段 / 波形裁剪 / 曲线时间轴） | EDIT / UI / ENGINE | `editor-view.md` | — |
 | F-049 | Editor 单一画布：curve 焦点并入钢琴卷帘 + 曲线写时增长 | EDIT / UI | `editor-curve-focus.md` | ✅ |
 | F-050 | 平台键位与提示修缮（macOS `Cmd` 化 / 捏合 / 插件默认目录 / 文案） | UI / PLUG | `platform-keys.md` | ✅ |
+| F-051 | macOS `.app` 打包与未签名安装指引 | IO | `macos-app-bundle.md` | ✅ |
 
 > 无独立 spec 的历史条目（transport / 文件管理 U2 / U10 / U14 / I 系列 / B2 / W3a–c 等）保留字母别名，不做回溯编号；新特性一律先写 spec 再领号。
 
@@ -674,6 +675,26 @@ spec `timeline.md` D31。需求原话是「ctrl 中键切换 mute、mute 之后�
 - **loopback 收敛**：`recording::loopback_supported()`（`cfg!(windows)`）门控设置里的 loopback 区块，`recording::loopback_label()` 让 Patch / 设置里的陈旧 loopback 在非 Windows 上不再冒充 WASAPI。
 - **文案**：菜单 `shortcut_text`、状态栏 `Snap off`、时间轴 / 卷帘 / Patch 的静态提示行与悬停文案统一走 `mod_key_label()`；`docs/{README,manual,shortcuts}.md` 顶部加一句「`Ctrl` = 命令修饰键（macOS `⌘`），`Ctrl+Tab` 例外」。触控板无中键的替代（`H` 静音、Patch `Shift`+滚轮平移、捏合缩放）一并写进文档。
 - **测试**（+10）：`mod_keys` 五条（三种命令键拼写都消费、Shift 先于裸键、无修饰键不命中、`Cmd`/`Control` 持有态、标签按 OS）；roll `Cmd+A` / `Cmd+Shift+A`；`egui_event_semantics` 三条（Ctrl+滚轮、捏合、Shift+滚轮落进 `smooth_scroll_delta.x`）；两个 host 各一条目录断言（Windows / macOS / Linux）。既有 `ctrl()` fixture 补 `command: true`，断言未改。
+
+### F-051 · macOS `.app` 打包与未签名安装指引（2026-11-25 交付）
+
+- **为什么**：`lipo` 合并后的裸二进制丢掉链接器签名，Apple Silicon 会直接拒绝执行；`tar.gz` 里的
+  二进制在 Finder 里也双击不了。改成 bundle 后一次解决"能启动"和"会用"两件事。
+- **打包**：`release.yml` 把原 `Package (Unix)` 拆成 `Package (Linux)` 与
+  `Package (macOS app bundle)`。macOS 步骤建 `GlitcherZ.app/Contents/{MacOS,Resources}`，执行
+  `plutil -lint` → `codesign --force --sign -` → `codesign --verify --deep --strict` → `lipo -archs`
+  复核，再用 `ditto -c -k --sequesterRsrc --keepParent` 产出
+  `glitcherz-<tag>-macos-universal.zip`。`ditto` 是必须的：`zip` 会丢权限 / 扩展属性，解压后
+  codesign 失效。
+- **版本号**：`CFBundleShortVersionString` / `CFBundleVersion` 取 tag 去掉 `v` 后的**首个数字点分段**
+  （`0.1.0-preview.1` → `0.1.0`），Apple 不接受字母后缀。
+- **CLI**：不额外发裸二进制，文档指向 `/Applications/GlitcherZ.app/Contents/MacOS/glitcherz`。
+- **docs**：手册 / 快捷键 / 工程文件说明与 `THIRD-PARTY-NOTICES.md` 进 `Contents/Resources`，
+  OFL 声明继续随包分发。
+- **发布页**：下载表标注 zip 内含 `.app`；运行时说明改写 macOS 三步放行（System Settings →
+  Privacy & Security → Open Anyway）与 `xattr -dr com.apple.quarantine` 兜底，Windows / Linux
+  仍沿用原有提示。根 `README.md` 新增中英双语「下载与安装」。
+- **不做**：Developer ID / notarization、DMG、自动更新、图标与 `.glz` 文件关联。
 
 ## 节点图与面板
 

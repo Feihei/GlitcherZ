@@ -16,6 +16,35 @@ Make music entirely on your computer: compose melodies, arrange beats, mix track
 - **Automation** — draw curves to bring your mix to life over time
 - **Cross-platform & project files** — works on all three major desktop systems, and your projects are saved in an open, readable format
 
+## Install
+
+Grab the archive for your system from the release page.
+
+**macOS** — the download is a `.zip` containing `GlitcherZ.app`. Unzip it, drag the app into
+`/Applications`, and launch it. The builds are **not notarized** (there is no Apple Developer
+certificate), so Gatekeeper blocks the very first launch:
+
+1. Open **System Settings → Privacy & Security**.
+2. Scroll to the message about *GlitcherZ* and click **Open Anyway**.
+3. Confirm with **Open**.
+
+On older macOS versions you can also right-click the app in Finder and choose *Open*. Terminal
+fallback if the dialog refuses to appear:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/GlitcherZ.app
+```
+
+This is a one-time step and nothing leaves your machine. The command-line interface
+(`--render`, `--ops`, `--mcp`) is inside the bundle:
+`/Applications/GlitcherZ.app/Contents/MacOS/glitcherz`.
+
+**Windows** — unzip and run `glitcherz.exe`. If SmartScreen warns, click *More info* →
+*Run anyway*.
+
+**Linux** — extract the `tar.gz` and run `./glitcherz`. ALSA, OpenGL and an X11 or Wayland session
+are required (see the release notes for the Debian/Ubuntu package list).
+
 ## Documentation
 
 The user manual lives in [`docs/`](docs/README.md): the
@@ -42,6 +71,31 @@ The user manual lives in [`docs/`](docs/README.md): the
 - **插件支持** — 加载你喜欢的 CLAP / VST3 乐器与效果器插件
 - **自动化** — 绘制曲线，让参数随时间自动变化，让音乐动起来
 - **跨平台 + 开放的项目文件格式** — 三大桌面系统通用，项目文件开放可读
+
+## 下载与安装
+
+到 Releases 页面下载对应系统的归档。
+
+**macOS** — 下载的是含 `GlitcherZ.app` 的 `.zip`。解压后把 App 拖进 `/Applications` 再启动。构建
+**没有经过公证**（没有 Apple 开发者证书），所以 Gatekeeper 会拦住第一次启动：
+
+1. 打开 **系统设置 → 隐私与安全性**。
+2. 向下找到关于 *GlitcherZ* 的提示，点 **仍要打开**。
+3. 在确认框里再点 **打开**。
+
+较老的 macOS 也可以直接在 Finder 里右键 App → *打开*。如果对话框始终不出现，可在终端执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/GlitcherZ.app
+```
+
+只需放行一次，整个过程不会上传任何数据。命令行接口（`--render`、`--ops`、`--mcp`）在 App 包内：
+`/Applications/GlitcherZ.app/Contents/MacOS/glitcherz`。
+
+**Windows** — 解压后运行 `glitcherz.exe`；SmartScreen 提示时点 *更多信息* → *仍要运行*。
+
+**Linux** — 解压 `tar.gz` 后运行 `./glitcherz`，需要 ALSA、OpenGL 以及 X11 或 Wayland 会话（依赖包
+清单见发布页）。
 
 ## 文档
 

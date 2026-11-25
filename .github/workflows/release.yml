@@ -115,9 +115,10 @@ jobs:
           lipo -archs target/glitcherz-universal
 
       # Archive layout: a top-level directory so extracting never scatters the
-      # binary over the user's cwd.
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      # binary over the user's cwd. macOS gets a real `.app` below instead, so
+      # Finder users can drag it into /Applications.
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -131,6 +132,55 @@ jobs:
           tar -czf "$stage.tar.gz" -C dist "$(basename "$stage")"
           # Only the archive is uploaded; drop the staging tree.
           rm -rf "$stage"
+          ls -l dist
+
+      # macOS ships a real `.app` bundle. `ditto` keeps permissions and the
+      # ad-hoc signature intact; the docs ride in Contents/Resources so the
+      # OFL notice still travels with the code.
+      - name: Package (macOS app bundle)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="dist/GlitcherZ.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp "${{ matrix.bin }}" "$app/Contents/MacOS/glitcherz"
+          chmod +x "$app/Contents/MacOS/glitcherz"
+          cp README.md THIRD-PARTY-NOTICES.md "$app/Contents/Resources/"
+          cp docs/manual.md docs/shortcuts.md docs/project-files.md "$app/Contents/Resources/"
+          # Apple version strings only take numeric components; the tag may
+          # carry a pre-release suffix (0.1.0-preview.1 -> 0.1.0).
+          short="${VERSION#v}"
+          short="$(printf '%s' "$short" | sed -E 's/[^0-9.].*$//')"
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>GlitcherZ</string>
+            <key>CFBundleDisplayName</key><string>GlitcherZ</string>
+            <key>CFBundleIdentifier</key><string>app.glitcherz.GlitcherZ</string>
+            <key>CFBundleExecutable</key><string>glitcherz</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${short}</string>
+            <key>CFBundleVersion</key><string>${short}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.music</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSPrincipalClass</key><string>NSApplication</string>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$app/Contents/Info.plist"
+          # `lipo` invalidates the linker's per-slice signature, and Apple
+          # Silicon refuses unsigned code. Ad-hoc signing is enough for a
+          # locally built, unnotarized app (no Developer ID here).
+          codesign --force --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          lipo -archs "$app/Contents/MacOS/glitcherz"
+          ditto -c -k --sequesterRsrc --keepParent "$app" \
+            "dist/glitcherz-${VERSION}-macos-universal.zip"
+          rm -rf "$app"
           ls -l dist
 
       - name: Package (Windows)
@@ -210,16 +260,17 @@ jobs:
             echo "| Platform | Archive |"
             echo "| :--- | :--- |"
             echo "| Windows x86_64 | \`glitcherz-$VERSION-windows-x86_64.zip\` |"
-            echo "| macOS (Apple Silicon + Intel) | \`glitcherz-$VERSION-macos-universal.tar.gz\` |"
+            echo "| macOS (Apple Silicon + Intel) | \`glitcherz-$VERSION-macos-universal.zip\` (contains \`GlitcherZ.app\`) |"
             echo "| Linux x86_64 | \`glitcherz-$VERSION-linux-x86_64.tar.gz\` |"
             echo
             echo "Verify with \`sha256sum -c sha256sums.txt\` (Windows: \`Get-FileHash\`)."
             echo
             echo "## Runtime requirements"
             echo
-            echo "- **Windows / macOS**: nothing extra, just unpack and run."
-            echo "- **Unsigned binaries**: macOS Gatekeeper and Windows SmartScreen will warn on first launch. On macOS, right-click the binary and choose *Open*, or allow it under System Settings → Privacy & Security. On Windows, click *More info* → *Run anyway*."
-            echo "- **Linux**: needs ALSA, OpenGL and an X11 or Wayland session, e.g. on Debian/Ubuntu:"
+            echo "- **macOS**: unzip and drag \`GlitcherZ.app\` into \`/Applications\`. The build is **not notarized** (no Apple Developer certificate), so Gatekeeper blocks the first launch. Open **System Settings → Privacy & Security**, click **Open Anyway** next to *GlitcherZ*, then confirm. On older macOS, right-clicking the app → *Open* also works. Terminal fallback: \`xattr -dr com.apple.quarantine /Applications/GlitcherZ.app\`. This is needed once; nothing is sent anywhere."
+            echo "- **macOS CLI**: the command-line tools live inside the bundle — \`/Applications/GlitcherZ.app/Contents/MacOS/glitcherz --render in.glz out.wav\` (also \`--ops\` / \`--mcp\`)."
+            echo "- **Windows**: unzip and run \`glitcherz.exe\`; when SmartScreen warns, click *More info* → *Run anyway*."
+            echo "- **Linux**: nothing extra to unpack — extract the \`tar.gz\` and run \`./glitcherz\`. Needs ALSA, OpenGL and an X11 or Wayland session, e.g. on Debian/Ubuntu:"
             echo "  \`sudo apt install libasound2 libgl1 libxkbcommon0 libwayland-client0\`."
             echo "- CLAP / VST3 plugins are optional; point GlitcherZ at your plugin folders in the app."
             echo

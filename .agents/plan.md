@@ -306,6 +306,17 @@ Spec：`spec/platform-keys.md`（D1–D16 + 逐文件改动清单 + 验收 8 条
 - **门禁**：两种修饰键组合（`{ctrl,command}` 与 `{command,mac_cmd}`）跑同一批断言；`rg "modifiers\.ctrl|Modifiers::CTRL"` 只剩 helper 与 `editing.rs` 的 `Ctrl+Tab` 例外；全量 fmt + clippy `-D warnings` + test（沙箱外）。
 - **状态**：**已交付（2026-11-25）**，M1–M7 全部落地；实施要点与测试见 `implementation.md` F-050。
 
+## macOS 应用打包（F-051，2026-11-25 立项）
+
+用户诉求：macOS 发布物从"压缩的裸二进制"改成 `.app`，并在 README 与发布页补上未签名应用的放行说明。
+
+Spec：`spec/macos-app-bundle.md`（D1–D7 + 验收 5 条）。
+
+- **起因**：`release.yml` 的 Unix 分支把 universal 二进制直接塞进 `tar.gz`，Finder 不能双击；`lipo` 之后原签名失效，Apple Silicon 上还可能直接被杀。
+- **范围**：① macOS job 单独打 `GlitcherZ.app`（`Info.plist` + `Contents/Resources` 文档 + ad-hoc 签名 + `ditto` zip）；② 发布页下载表与运行时说明改口径；③ 根 `README.md` 增加"下载与安装"（英文 + 中文），写清 Gatekeeper 三步放行与 CLI 路径。
+- **不做**：Developer ID / notarization、DMG、自动更新、图标设计、`.glz` 文件关联。
+- **状态**：**已交付（2026-11-25）**。
+
 ## 历史系列索引
 
 已完成系列的细节不再占用本文件；下表保证 spec 里「对应 `plan.md` 某系列」的旧引用仍可解析。按**特性**检索请用 `implementation.md` 的「特性 ID 注册表」（`F-ID` ↔ spec ↔ 原系列），编号规则见 `AGENTS.md`「特性编号（F-ID）」。
@@ -331,6 +342,7 @@ Spec：`spec/platform-keys.md`（D1–D16 + 逐文件改动清单 + 验收 8 条
 | F-048 | Editor 视图修缮（力度单音 / 音频尾段播放 / 波形裁剪 / 曲线时间轴 + 目标切换） | 已交付（2026-11-18） | `spec/editor-view.md` | `implementation.md` F-048 |
 | F-049 | Editor 单一画布（curve 焦点并入钢琴卷帘 / 非焦点淡显 / 曲线写时增长） | 已交付（2026-11-18） | `spec/editor-curve-focus.md` | `implementation.md` F-049 |
 | F-050 | 平台键位与提示修缮（macOS `Cmd` 化 / 捏合 / 插件默认目录 / 文案） | 已交付（2026-11-25） | `spec/platform-keys.md` | `implementation.md` F-050 |
+| F-051 | macOS `.app` 打包与未签名安装指引 | 已交付（2026-11-25） | `spec/macos-app-bundle.md` | `implementation.md` F-051 |
 
 ## 明确不做（全局）
 
